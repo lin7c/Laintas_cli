@@ -93,6 +93,8 @@ class TerminalInfo:
     session: Any  # SubTerminalSession
     created_at: float
     created_by: str  # "depth=0"
+    stationed_agent_id: Optional[str] = None  # deprecated, use stationed_agent_ids
+    stationed_agent_ids: list = field(default_factory=list)
 
 
 _debug_logs: list[DebugEntry] = []
@@ -205,6 +207,123 @@ def rename_terminal(old_name: str, new_name: str) -> bool:
     return True
 
 
+# ── Agent Registry ──────────────────────────────────────────────────────
+
+@dataclass
+class AgentInfo:
+    """Metadata about a logical AI agent managed by the REPL."""
+    id: str
+    name: str
+    stationed_terminal: Optional[str] = None
+    chat_history: list = field(default_factory=list)
+    state: dict = field(default_factory=dict)
+    created_at: float = 0.0
+
+_agent_registry: dict[str, AgentInfo] = {}
+_agent_counter: int = 0
+_current_agent_id: Optional[str] = None
+
+
+def register_agent(name: str = None, depth: int = 0) -> AgentInfo:
+    """Create and register a new AI agent. Returns the AgentInfo."""
+    global _agent_registry, _agent_counter
+    _agent_counter += 1
+    agent_id = name if name else f"AI-{_agent_counter}"
+    if agent_id in _agent_registry:
+        unregister_agent(agent_id)
+    info = AgentInfo(
+        id=agent_id,
+        name=agent_id,
+        chat_history=[],
+        state={"shortTermMemory": "", "lastReply": "", "lastOutput": ""},
+        created_at=time.time(),
+    )
+    _agent_registry[agent_id] = info
+    return info
+
+
+def unregister_agent(agent_id: str) -> bool:
+    """Remove an agent. Returns True if it existed."""
+    global _current_agent_id
+    if _current_agent_id == agent_id:
+        _current_agent_id = None
+    return _agent_registry.pop(agent_id, None) is not None
+
+
+def get_agent(agent_id: str) -> Optional[AgentInfo]:
+    return _agent_registry.get(agent_id)
+
+
+def get_all_agents() -> list:
+    return sorted(_agent_registry.values(), key=lambda a: a.created_at)
+
+
+def get_current_agent() -> Optional[AgentInfo]:
+    if _current_agent_id:
+        return _agent_registry.get(_current_agent_id)
+    return None
+
+
+def switch_to_agent(agent_id: str) -> bool:
+    """Switch the active agent. Returns True on success."""
+    global _current_agent_id
+    if agent_id not in _agent_registry:
+        return False
+    _current_agent_id = agent_id
+    return True
+
+
+def set_current_agent_id(agent_id: str) -> None:
+    global _current_agent_id
+    _current_agent_id = agent_id
+
+
+def rename_agent(agent_id: str, new_name: str) -> bool:
+    info = _agent_registry.get(agent_id)
+    if info is None:
+        return False
+    info.name = new_name
+    return True
+
+
+def station_agent(agent_id: str, terminal_name: str) -> bool:
+    """Station an agent in a terminal. Multiple agents can share one terminal."""
+    agent = _agent_registry.get(agent_id)
+    term = _terminal_registry.get(terminal_name)
+    if agent is None:
+        return False
+    # Remove from old terminal's list
+    if agent.stationed_terminal and agent.stationed_terminal in _terminal_registry:
+        old_term = _terminal_registry[agent.stationed_terminal]
+        if agent_id in old_term.stationed_agent_ids:
+            old_term.stationed_agent_ids.remove(agent_id)
+        old_term.stationed_agent_id = old_term.stationed_agent_ids[0] if old_term.stationed_agent_ids else None
+    agent.stationed_terminal = terminal_name
+    if term:
+        if agent_id not in term.stationed_agent_ids:
+            term.stationed_agent_ids.append(agent_id)
+        term.stationed_agent_id = term.stationed_agent_ids[0]  # keep first as legacy
+    return True
+
+
+def unstation_agent(agent_id: str) -> None:
+    agent = _agent_registry.get(agent_id)
+    if agent and agent.stationed_terminal:
+        term = _terminal_registry.get(agent.stationed_terminal)
+        if term:
+            if agent_id in term.stationed_agent_ids:
+                term.stationed_agent_ids.remove(agent_id)
+            term.stationed_agent_id = term.stationed_agent_ids[0] if term.stationed_agent_ids else None
+        agent.stationed_terminal = None
+
+
+def close_all_agents() -> None:
+    """Clean up all agent registrations."""
+    _agent_registry.clear()
+    global _current_agent_id
+    _current_agent_id = None
+
+
 # ── Dependencies Container ─────────────────────────────────────────────
 
 @dataclass
@@ -242,6 +361,11 @@ Last Result: {last_output}
 """.strip()
     if terminals_snapshot:
         result += '\n\n' + terminals_snapshot
+    current_agent = get_current_agent()
+    if current_agent:
+        result += f"\n\n[AGENT CONTEXT]\nCurrent agent: {current_agent.name} ({current_agent.id})"
+        if current_agent.stationed_terminal:
+            result += f"\nStationed in: {current_agent.stationed_terminal}"
     return result
 
 
@@ -261,7 +385,8 @@ def get_terminals_snapshot() -> str:
             output = t.session.full_output or ""
             n = int(get_runtime_config("terminal_tail_lines"))
             tail = '\n'.join(output.split('\n')[-n:])
-            lines.append(f"  {t.name} ({t.command}):")
+            st_info = f" [stationed: {', '.join(t.stationed_agent_ids)}]" if t.stationed_agent_ids else ""
+            lines.append(f"  {t.name} ({t.command}){st_info}:")
             if tail.strip():
                 for tl in tail.split('\n'):
                     lines.append(f"    | {tl}")
@@ -363,6 +488,31 @@ def run_agent_loop(
         # 1. Read .helpwo memory
         global_memory = deps.read_file(".helpwo") or ""
 
+        # 1.5. Check for parent commands from sub-agents (depth=0 only)
+        if depth == 0:
+            parent_cmd_path = os.path.join(os.getcwd(), ".parent_cmd")
+            try:
+                if os.path.exists(parent_cmd_path):
+                    with open(parent_cmd_path, "r") as f:
+                        parent_cmd = f.read().strip()
+                    with open(parent_cmd_path, "w") as f:
+                        pass  # clear the file
+                    if parent_cmd:
+                        import subprocess as _sp
+                        try:
+                            result = _sp.run(
+                                parent_cmd, shell=True, capture_output=True, text=True,
+                                timeout=30, cwd=os.getcwd(),
+                            )
+                            output = (result.stdout + result.stderr).strip()
+                            state["lastOutput"] = output[:3000]
+                        except _sp.TimeoutExpired:
+                            state["lastOutput"] = f"Parent command timed out: {parent_cmd}"
+                        except Exception as _e:
+                            state["lastOutput"] = f"Parent command error: {_e}"
+            except Exception:
+                pass
+
         # 2. Read .cli.prop system prompt
         prompt_template = deps.read_file(".cli.prop") or ""
         if not prompt_template:
@@ -444,9 +594,9 @@ def run_agent_loop(
             add_debug_log(debug_entry)
             break
 
-        reply = response.get("reply", "")
-        command = response.get("command", "").strip()
-        memory = response.get("memory", "").strip()
+        reply = response.get("reply") or ""
+        command = (response.get("command") or "").strip()
+        memory = (response.get("memory") or "").strip()
         done = response.get("done", False)
         billing = response.get("_billing", {})
 
@@ -535,81 +685,147 @@ def run_agent_loop(
                     debug_entry.exec_command = command
                     debug_entry.exec_returncode = -1
 
-            # ── Meta-command: /term new <name> <shell-command> ──────────
-            elif (_meta_term_new := re.match(r'^/term\s+new\s+(\S+)\s+(.+)$', command)):
-                requested_name = _meta_term_new.group(1)
-                term_cmd = _meta_term_new.group(2).strip()
-                # Launch as a persistent laintas terminal (like term0)
-                wrapped = f"{sys.executable} {_LAINTAS_CLI} --depth {depth + 1} --simple-prompt"
-                sub = deps.SubTerminalSession(wrapped)
-                sub.start()
-                time.sleep(0.5)  # wait for laintas REPL to start
-                if sub.is_alive():
-                    sub.read_output(timeout=0.3)
-                    sub.send_keys(term_cmd + "\n")
-                assigned_name = register_terminal(sub, term_cmd, depth, name=requested_name)
-                if assigned_name != requested_name:
-                    if events_cb is not None:
-                        deps.console.print(
-                            f"[dim yellow]Name '{requested_name}' taken; "
-                            f"assigned '{assigned_name}'[/dim yellow]")
+            # ── Meta-command: /station <name> ────────────────────────────
+            elif (_meta_station := re.match(r'^/station\s+(\S+)\s*$', command)):
+                name = _meta_station.group(1)
+                existing_term = get_terminal(name)
+                if existing_term and not existing_term.session.is_alive():
+                    unregister_terminal(name)
+                    existing_term = None
+                if existing_term is None:
+                    shell = os.environ.get("SHELL", "/bin/bash")
+                    sub = deps.SubTerminalSession(shell)
+                    sub.start()
+                    time.sleep(0.3)
+                    if sub.is_alive():
+                        sub.read_output(timeout=0.3)
+                    register_terminal(sub, shell, depth, name=name)
+                current_agent = get_current_agent()
+                if current_agent:
+                    station_agent(current_agent.id, name)
                 if events_cb is not None:
                     deps.console.print(
-                        f"[dim green]+ Terminal [bold]{assigned_name}[/bold]: "
-                        f"{term_cmd[:80]}[/dim green]")
-                state["lastOutput"] = f"Created terminal {assigned_name}: {term_cmd}"
+                        f"[dim green]Stationed in terminal [bold]{name}[/bold][/dim green]")
+                state["lastOutput"] = f"Stationed in terminal {name}"
                 debug_entry.exec_command = command
-                debug_entry.session_command = term_cmd
-                debug_entry.exec_stdout = sub.full_output
-                debug_entry.exec_returncode = -1
+                debug_entry.exec_returncode = 0
                 if events_cb is not None:
                     pending_events.append({"type": "system", "kind": "command", "content": command})
                     events_cb(pending_events)
                     pending_events.clear()
 
-            # ── Meta-command: /term send <name> <keys> ──────────────────
-            elif (_meta_term_send := re.match(r'^/term\s+send\s+(\S+)\s+(.*)$', command)):
-                target_name = _meta_term_send.group(1)
-                keys = _meta_term_send.group(2)
-                term = get_terminal(target_name)
-                if term is None:
-                    deps.console.print(f"[yellow]Warning: terminal '{target_name}' not found[/yellow]")
-                    state["lastOutput"] = f"Error: terminal '{target_name}' not found"
-                elif not term.session.is_alive():
-                    deps.console.print(f"[yellow]Warning: terminal '{target_name}' is no longer alive[/yellow]")
-                    state["lastOutput"] = f"Warning: terminal '{target_name}' is dead"
+            # ── Meta-command: /terminate <name> ─────────────────────────
+            elif (_meta_terminate := re.match(r'^/terminate\s+(\S+)\s*$', command)):
+                target = _meta_terminate.group(1)
+                term = get_terminal(target)
+                if term:
+                    for aid in list(term.stationed_agent_ids):
+                        unstation_agent(aid)
+                if unregister_terminal(target):
+                    if events_cb is not None:
+                        deps.console.print(
+                            f"[dim yellow]- Terminated [bold]{target}[/bold][/dim yellow]")
+                    state["lastOutput"] = f"Terminated {target}"
                 else:
-                    deps.console.print(f"[dim yellow]> /term send {target_name} {keys[:60]}...[/dim yellow]")
-                    term.session.send_keys(keys)
+                    state["lastOutput"] = f"Warning: terminal '{target}' not found"
+                debug_entry.exec_command = command
+                debug_entry.exec_returncode = 0
+                if events_cb is not None:
+                    pending_events.append({"type": "system", "kind": "close_session", "content": target})
+                    events_cb(pending_events)
+                    pending_events.clear()
+
+            # ── Meta-command: /send <name> <cmd> ────────────────────────
+            elif (_meta_send := re.match(r'^/send\s+(\S+)\s+(.+)$', command)):
+                target = _meta_send.group(1)
+                keys = _meta_send.group(2)
+                term = get_terminal(target)
+                if term is None:
+                    state["lastOutput"] = f"Error: terminal '{target}' not found"
+                    if events_cb is not None:
+                        deps.console.print(f"[yellow]Warning: terminal '{target}' not found[/yellow]")
+                elif not term.session.is_alive():
+                    state["lastOutput"] = f"Warning: terminal '{target}' is dead"
+                    if events_cb is not None:
+                        deps.console.print(f"[yellow]Warning: terminal '{target}' is dead[/yellow]")
+                else:
+                    if events_cb is not None:
+                        deps.console.print(f"[dim yellow]> /send {target} {keys[:60]}...[/dim yellow]")
+                    term.session.send_keys(keys + "\n")
                     time.sleep(0.3)
                     term.session.read_output(timeout=0.5)
                     cmd_output = term.session.full_output
                     state["lastOutput"] = cmd_output
-                    debug_entry.exec_command = command
                     debug_entry.exec_stdout = cmd_output
                     debug_entry.exec_returncode = term.session.returncode
-                    debug_entry.session_command = term.command
+                    debug_entry.session_command = f"{target}: {keys}"
                     if events_cb is not None:
                         pending_events.append({"type": "system", "kind": "send_keys", "content": keys[:200]})
                         pending_events.append({"type": "system", "kind": "output", "content": cmd_output[:2000]})
                         events_cb(pending_events)
                         pending_events.clear()
                     if not term.session.is_alive():
-                        deps.console.print(f"[dim yellow]Terminal [bold]{target_name}[/bold] exited[/dim yellow]")
+                        if events_cb is not None:
+                            deps.console.print(f"[dim yellow]Terminal [bold]{target}[/bold] exited[/dim yellow]")
+                debug_entry.exec_command = command
+                debug_entry.exec_returncode = -1
 
-            # ── Meta-command: /term close <name> ─────────────────────────
-            elif (_meta_term_close := re.match(r'^/term\s+close\s+(\S+)\s*$', command)):
-                target_name = _meta_term_close.group(1)
-                if unregister_terminal(target_name):
-                    deps.console.print(f"[dim yellow]- Terminal [bold]{target_name}[/bold] closed[/dim yellow]")
-                    state["lastOutput"] = f"Closed terminal {target_name}"
-                else:
-                    deps.console.print(f"[yellow]Warning: terminal '{target_name}' not found[/yellow]")
-                    state["lastOutput"] = f"Warning: terminal '{target_name}' not found"
+            # ── Meta-command: /hire ─────────────────────────────────────
+            elif re.match(r'^/hire\s*$', command):
+                agent_info = register_agent(depth=depth)
+                if events_cb is not None:
+                    deps.console.print(
+                        f"[dim green]+ Hired [bold]{agent_info.id}[/bold][/dim green]")
+                state["lastOutput"] = f"Hired {agent_info.id}"
                 debug_entry.exec_command = command
                 debug_entry.exec_returncode = 0
                 if events_cb is not None:
-                    pending_events.append({"type": "system", "kind": "close_session", "content": target_name})
+                    pending_events.append({"type": "system", "kind": "command", "content": command})
+                    events_cb(pending_events)
+                    pending_events.clear()
+
+            # ── Meta-command: /agents [name|name <n>] ───────────────────
+            elif (_meta_agents := re.match(r'^/agents(?:\s+(.+))?$', command)):
+                rest = (_meta_agents.group(1) or "").strip()
+                if not rest:
+                    agents = get_all_agents()
+                    current = get_current_agent()
+                    lines = ["Available agents:"]
+                    for a in agents:
+                        marker = " <-- current" if (current and a.id == current.id) else ""
+                        st = f" [stationed: {a.stationed_terminal}]" if a.stationed_terminal else ""
+                        lines.append(f"  {a.id}: {a.name}{st}{marker}")
+                    state["lastOutput"] = "\n".join(lines)
+                    if events_cb is not None:
+                        deps.console.print("\n".join(lines))
+                elif rest.startswith("name "):
+                    new_name = rest[5:].strip()
+                    current = get_current_agent()
+                    if current and rename_agent(current.id, new_name):
+                        state["lastOutput"] = f"Agent renamed to {new_name}"
+                        if events_cb is not None:
+                            deps.console.print(f"[green]Agent renamed to [bold]{new_name}[/bold][/green]")
+                    else:
+                        state["lastOutput"] = "No current agent to rename"
+                else:
+                    if switch_to_agent(rest):
+                        agent = get_agent(rest)
+                        state["lastOutput"] = f"Switched to {agent.name} ({agent.id})"
+                        if events_cb is not None:
+                            deps.console.print(
+                                f"[green]Switched to [bold]{agent.name}[/bold][/green]")
+                    else:
+                        state["lastOutput"] = f"Agent '{rest}' not found"
+                debug_entry.exec_command = command
+                debug_entry.exec_returncode = 0
+
+            # ── Meta-command: /term, /t (list terminals) ───────────────
+            elif re.match(r'^/(?:term|t)\s*$', command):
+                state["lastOutput"] = get_terminals_snapshot() or "(no sub-terminals)"
+                debug_entry.exec_command = command
+                debug_entry.exec_returncode = 0
+                if events_cb is not None:
+                    pending_events.append({"type": "system", "kind": "command", "content": command})
                     events_cb(pending_events)
                     pending_events.clear()
 
@@ -639,6 +855,10 @@ def run_agent_loop(
                     "register_terminal": register_terminal,
                     "unregister_terminal": unregister_terminal,
                     "close_all_terminals": close_all_terminals,
+                    "get_agent": get_agent, "get_all_agents": get_all_agents,
+                    "get_current_agent": get_current_agent,
+                    "switch_to_agent": switch_to_agent,
+                    "station_agent": station_agent, "unstation_agent": unstation_agent,
                     "get_config": get_runtime_config,
                     "set_config": set_runtime_config,
                     "list_config": list_runtime_config,
@@ -689,58 +909,78 @@ def run_agent_loop(
                     state["lastOutput"] = f".loop_command.py error: {e}"
 
             else:
-                # ── Normal command: start in sub-terminal (unnamed session) ──
-                # Close any existing session first
-                if interactive_session is not None:
+                # ── Normal command: stationed or sub-terminal ──
+                current_agent = get_current_agent()
+                stationed_name = current_agent.stationed_terminal if current_agent else None
+                stationed_term = get_terminal(stationed_name) if stationed_name else None
+
+                if stationed_term and stationed_term.session.is_alive():
+                    # ── Stationed: execute in agent's persistent terminal ──
                     if events_cb is not None:
-                        deps.console.print(f"[dim yellow]Closing previous session: {interactive_session.command[:60]}[/dim yellow]")
-                        pending_events.append({"type": "system", "kind": "close_session", "content": interactive_session.command[:200]})
-                    interactive_session.close()
-                    interactive_session = None
-
-                if events_cb is not None:
-                    _sub_msg = f"[dim]→ {command[:80]} [sub-terminal][/dim]"
-                    deps.console.print(_sub_msg)
-                    pending_events.append({"type": "system", "kind": "command", "content": command})
-
-                # depth 0: commands run through a child laintas terminal
-                # depth > 0: system command → execute directly
-                if depth == 0:
-                    terminal_cmd = f"{sys.executable} {_LAINTAS_CLI} --execute {shlex.quote(command)} --depth 1"
-                else:
-                    terminal_cmd = command
-
-                sub = deps.SubTerminalSession(terminal_cmd)
-                sub.start()
-                interactive_session = sub
-
-                # Poll for output: wait up to 10s for first bytes
-                cmd_output = ""
-                poll_start = time.time()
-                while time.time() - poll_start < float(get_runtime_config("poll_timeout")):
+                        deps.console.print(f"[dim]> [{stationed_name}] {command[:80]}[/dim]")
+                        pending_events.append({"type": "system", "kind": "command", "content": command})
+                    stationed_term.session.send_keys(command + "\n")
                     time.sleep(0.3)
-                    chunk = sub.read_output(timeout=0.3)
-                    if chunk:
-                        cmd_output = sub.full_output
-                        if len(cmd_output.strip()) > 50:
+                    cmd_output = stationed_term.session.full_output
+                    state["lastOutput"] = cmd_output
+                    debug_entry.exec_command = command
+                    debug_entry.session_command = command
+                    debug_entry.exec_stdout = cmd_output
+                    debug_entry.exec_returncode = -1
+                    if events_cb is not None:
+                        pending_events.append({"type": "system", "kind": "output", "content": cmd_output[-2000:]})
+                        events_cb(pending_events)
+                        pending_events.clear()
+
+                else:
+                    # ── Unstationed: spawn one-off sub-terminal ──
+                    if interactive_session is not None:
+                        if events_cb is not None:
+                            deps.console.print(f"[dim yellow]Closing previous session: {interactive_session.command[:60]}[/dim yellow]")
+                            pending_events.append({"type": "system", "kind": "close_session", "content": interactive_session.command[:200]})
+                        interactive_session.close()
+                        interactive_session = None
+
+                    if events_cb is not None:
+                        _sub_msg = f"[dim]→ {command[:80]} [sub-terminal][/dim]"
+                        deps.console.print(_sub_msg)
+                        pending_events.append({"type": "system", "kind": "command", "content": command})
+
+                    if depth == 0:
+                        terminal_cmd = f"{sys.executable} {_LAINTAS_CLI} --execute {shlex.quote(command)} --depth 1"
+                    else:
+                        terminal_cmd = command
+
+                    sub = deps.SubTerminalSession(terminal_cmd)
+                    sub.start()
+                    interactive_session = sub
+
+                    cmd_output = ""
+                    poll_start = time.time()
+                    while time.time() - poll_start < float(get_runtime_config("poll_timeout")):
+                        time.sleep(0.3)
+                        chunk = sub.read_output(timeout=0.3)
+                        if chunk:
+                            cmd_output = sub.full_output
+                            if len(cmd_output.strip()) > 50:
+                                break
+                        if not sub.is_alive():
+                            cmd_output = sub.full_output
                             break
-                    if not sub.is_alive():
-                        cmd_output = sub.full_output
-                        break
 
-                debug_entry.exec_command = command
-                debug_entry.session_command = command
-                debug_entry.exec_stdout = cmd_output
-                debug_entry.exec_returncode = -1
-                state["lastOutput"] = cmd_output
+                    debug_entry.exec_command = command
+                    debug_entry.session_command = command
+                    debug_entry.exec_stdout = cmd_output
+                    debug_entry.exec_returncode = -1
+                    state["lastOutput"] = cmd_output
 
-                if events_cb is not None:
-                    pending_events.append({"type": "system", "kind": "output", "content": cmd_output[:2000]})
-                    events_cb(pending_events)
-                    pending_events.clear()
+                    if events_cb is not None:
+                        pending_events.append({"type": "system", "kind": "output", "content": cmd_output[:2000]})
+                        events_cb(pending_events)
+                        pending_events.clear()
 
-                if events_cb is not None:
-                    deps.display_sub_terminal_preview(command, cmd_output, depth=depth + 1, alive=sub.is_alive())
+                    if events_cb is not None:
+                        deps.display_sub_terminal_preview(command, cmd_output, depth=depth + 1, alive=sub.is_alive())
 
         # 10. Update state
         action_desc = command if command else ""

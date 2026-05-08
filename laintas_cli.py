@@ -66,13 +66,18 @@ console = Console()
 # ── Agent Loop (extracted module) ─────────────────────────────────────
 from agent_loop import (
     MAX_LOOPS, MAX_TOKENS, MAX_DEBUG_ENTRIES,
-    DebugEntry, TerminalInfo,
+    DebugEntry, TerminalInfo, AgentInfo,
     add_debug_log, clear_debug_logs,
     next_debug_loop, get_debug_logs,
     run_agent_loop, LoopDeps,
     register_terminal, unregister_terminal,
     get_terminal, get_all_terminals, close_all_terminals,
     rename_terminal,
+    register_agent, unregister_agent,
+    get_agent, get_all_agents, get_current_agent,
+    switch_to_agent, set_current_agent_id,
+    rename_agent, station_agent, unstation_agent,
+    close_all_agents,
     get_runtime_config, set_runtime_config,
     list_runtime_config, reset_runtime_config,
     clear_loop_command_cache,
@@ -874,7 +879,9 @@ class MetaCompleter(Completer):
     """Completer that handles /-commands and falls back to path completion."""
     META_COMMANDS = [
         "/help", "/login", "/name", "/memory", "/prop",
-        "/scan", "/debug", "/cwd", "/t", "/term", "/terminals",
+        "/scan", "/debug", "/cwd",
+        "/station", "/terminate", "/send", "/hire", "/agents",
+        "/t", "/term",
         "/clear", "/exit", "/quit",
     ]
 
@@ -1430,7 +1437,9 @@ def ensure_auth() -> Optional[dict]:
 EXTRA_COMMAND_TEMPLATE = '''# .extra_command.py — define custom slash commands for the REPL
 # context keys: session, interactive_session, agent_registry, console,
 #   get_terminal, get_all_terminals, unregister_terminal, register_terminal,
-#   rename_terminal, SubTerminalSession, observe_session, _show_terminal_detail,
+#   rename_terminal, get_agent, get_all_agents, get_current_agent,
+#   station_agent, unstation_agent,
+#   SubTerminalSession, observe_session, _show_terminal_detail,
 #   get_config, set_config, list_config, reset_config, reload_default_files
 
 
@@ -1517,7 +1526,24 @@ def handle_extra_command(action, parts, ctx):
     return False
 '''
 
-LOOP_COMMAND_TEMPLATE = ""
+LOOP_COMMAND_TEMPLATE = """import os
+import re
+
+
+def handle_loop_command(command, ctx):
+    \"\"\"Handle custom loop commands defined in .loop_command.py.\"\"\"
+
+    # parent(<shell command>) — queue a command for execution in the parent terminal
+    m = re.match(r'^parent\\((.+)\\)\\s*$', command)
+    if m:
+        parent_cmd = m.group(1).strip()
+        cmd_file = os.path.join(os.getcwd(), '.parent_cmd')
+        with open(cmd_file, 'w') as f:
+            f.write(parent_cmd)
+        return f"Parent command queued: {parent_cmd}"
+
+    return None
+"""
 
 
 def generate_cli_prop_template() -> str:
@@ -1583,29 +1609,34 @@ CRITICAL RULES:
 [META COMMANDS]
 These slash-commands are handled by the CLI shell directly (not by the AI).
 You can tell the user about them when relevant:
-  /help     — Show available commands
-  /login    — Re-authenticate with laintas.com
-  /name     — Set or view your CLI agent name; /name term<N> <new> to rename a terminal
-  /memory   — View .helpwo memory (project rules & learnings)
-  /prop     — View the .cli.prop system prompt template
-  /scan     — Scan PATH and list available system commands
-  /debug    — Browse recent AI interaction logs
-  /cwd      — Show current working directory
-  /t, /term — /term new <n> <cmd>, /term send <n> <k>, /term close <n>, /term details <n>
-  /clear    — Clear the terminal screen
-  /exit     — Exit Laintas CLI
+  /help      — Show available commands
+  /login     — Re-authenticate with laintas.com
+  /name      — Set or view your CLI agent name
+  /memory    — View .helpwo memory (project rules & learnings)
+  /prop      — View the .cli.prop system prompt template
+  /scan      — Scan PATH and list available system commands
+  /debug     — Browse recent AI interaction logs
+  /cwd       — Show current working directory
+  /station   — /station <name> create persistent terminal and station AI there
+  /terminate — /terminate <name> close and destroy a terminal
+  /send      — /send <name> <cmd> send a command to a named terminal
+  /hire      — Create a new AI agent (AI-1, AI-2...)
+  /agents    — List/switch agents
+  /t, /term  — List sub-terminals and browse details
+  /clear     — Clear the terminal screen
+  /exit      — Exit Laintas CLI
 
 [RESPONSE FORMAT]
 Respond ONLY with a single JSON object:
 {{
   "reply": "what to tell the user",
-  "command": "shell cmd, /term new/send/close, or wait(N)",
+  "command": "shell cmd, /station, /send, /terminate, /hire, wait(N), or parent(cmd)",
   "memory": "information to remember (appended to .helpwo)",
   "done": true/false
 }}
 
 Each response must include exactly one "command".
-Use /term slash commands for persistent sub-terminals (see below).
+Use /station, /send, /terminate for persistent terminal management (see below).
 
 [RECURSIVE ORCHESTRATION]
 You are running at depth {{{{depth}}}}.
@@ -1628,25 +1659,39 @@ Self-recursion rules:
 - At depth >= 2, prefer completing the task directly.
 - Prefer calling tools directly over spawning sub-agents for simple tasks.
 - Use sub-agents when you need parallel analysis or AI reasoning on sub-problems.
+- When at depth >= 1, use parent(cmd) to queue a command for the parent terminal.
+  The parent checks .parent_cmd at the start of each loop and executes it.
+  Use this for actions that must happen in the parent context (file ops, service mgmt, etc.).
 
 [TERMINAL MANAGEMENT]
-Two command modes:
-  Plain "ls -la" → one-off shell cmd, auto-closes on done or next command.
-  /term commands → persistent named terminals, survive done=true.
+You can create persistent terminals that maintain state (cd, env vars) across commands,
+and optionally station yourself in one for automatic command execution.
 
-  /term new <name> <cmd>    — create persistent terminal (e.g. /term new srv npm run dev)
-  /term send <name> <keys>  — send keystrokes; MUST end with \\n to execute
-                               Escape codes: \\n=Enter \\t=Tab \\x03=Ctrl+C \\x04=Ctrl+D \\x1b=Esc
-                               Output captured to lastOutput for next iteration
-  /term close <name>        — close and destroy a terminal
-  wait(N)                   — sleep N seconds (e.g. wait(3) for server startup)
+  /station <name>           — create a persistent bash terminal AND station yourself there.
+                              Once stationed, ALL subsequent commands you issue
+                              automatically execute inside this terminal.
+                              No /send needed — just return normal shell commands.
+
+  /send <name> <cmd>        — send a command to a named terminal (captures output).
+                              Use this when you're NOT stationed in that terminal.
+
+  /terminate <name>         — close and destroy a terminal.
+
+  /hire                     — create a new AI agent (numbered ID like AI-1, AI-2).
+                              The user can switch between agents with /agents.
+
+  /agents                   — list available AI agents.
+  /agents <name>            — switch conversation to another agent.
+
+  wait(N)                   — sleep N seconds (e.g. wait(3) for server startup).
+  parent(cmd)               — queue a shell command for the parent terminal (depth>=1 only).
 
 Rules:
-- Named terminals persist until /term close. Unnamed auto-close.
-- /term send with just \\n reads current output without executing anything.
-- Close all your terminals before done=true when possible.
-- Use named terminals for: servers, watchers, REPLs, claude, vim, python.
-- Use plain command for: one-off shell commands (ls, grep, find, git, etc.).
+- Station in a terminal when you want persistent shell state across commands.
+- When stationed, the terminal starts as a fresh bash shell.
+- Close terminals with /terminate when done.
+- Use /hire to delegate subtasks to another AI agent.
+- Plain commands (not stationed) work as before: one-off in temporary sub-shells.
 
 [LANGUAGE]
 You MUST respond in English. All replies, commands, and memory must be in English."""
@@ -2377,7 +2422,7 @@ def show_terminal_manager(primary_session=None) -> None:
 
         elif action == "close":
             if name == "term0 (primary)":
-                console.print("\n[yellow]Cannot close the primary session via /term. "
+                console.print("\n[yellow]Cannot close the primary session. "
                               "Use /exit or close the parent terminal.[/yellow]")
                 input("[dim]Press Enter to continue...[/dim]")
                 continue
@@ -2584,7 +2629,7 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
             current = config.get("agentName", socket.gethostname())
             console.print(f"Current agent name: [bold]{current}[/bold]")
             console.print("Usage: /name <new-name>")
-            console.print("       /name term<N> <new-name>  (rename a terminal)")
+            console.print("       /agents name <new-name>  (rename current agent)")
 
     elif action == "/memory":
         memory = read_file(".helpwo")
@@ -2640,72 +2685,101 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
         else:
             show_debug_browser_interactive()
 
-    elif action in ("/t", "/term", "/terminals"):
-        terminals = get_all_terminals()
-        has_primary = interactive_session is not None and interactive_session.is_alive()
-
-        # Sub-command: /term new <name> <command>
-        if len(parts) >= 4 and parts[1].lower() == "new":
-            name = parts[2]
-            cmd = ' '.join(parts[3:])
-            if name in ("term0", "primary"):
-                console.print("[yellow]Cannot use reserved name 'term0'.[/yellow]")
-            elif get_terminal(name):
-                console.print(f"[yellow]Terminal '{name}' already exists. Close it first.[/yellow]")
-            else:
-                sub = SubTerminalSession(cmd)
+    elif action in ("/station", "/st"):
+        if len(parts) < 2:
+            console.print("[yellow]Usage: /station <name>[/yellow]")
+            console.print("  Creates a persistent bash terminal and stations your AI agent there.")
+        else:
+            name = parts[1]
+            existing = get_terminal(name)
+            if existing and not existing.session.is_alive():
+                unregister_terminal(name)
+                existing = None
+            if existing is None:
+                sub = SubTerminalSession(DEFAULT_SHELL)
                 sub.start()
                 time.sleep(0.3)
                 if sub.is_alive():
                     sub.read_output(timeout=0.3)
-                register_terminal(sub, cmd, 0, name=name)
-                console.print(f"[green]Created terminal [bold]{name}[/bold]: {cmd}[/green]")
-
-        # Sub-command: /term send <name> <keys>
-        elif len(parts) >= 4 and parts[1].lower() == "send":
-            target = parts[2]
-            keys = ' '.join(parts[3:])
-            term = get_terminal(target)
-            if term is None:
-                console.print(f"[red]Terminal '{target}' not found.[/red]")
-            elif not term.session.is_alive():
-                console.print(f"[yellow]Terminal '{target}' is dead.[/yellow]")
+                register_terminal(sub, DEFAULT_SHELL, 0, name=name)
+            current = get_current_agent()
+            if current:
+                station_agent(current.id, name)
+                console.print(f"[green]Stationed [bold]{current.name}[/bold] in terminal [bold]{name}[/bold][/green]")
             else:
-                term.session.send_keys(keys)
+                console.print(f"[green]Created terminal [bold]{name}[/bold][/green]")
+
+    elif action == "/terminate":
+        if len(parts) < 2:
+            console.print("[yellow]Usage: /terminate <name>[/yellow]")
+        else:
+            name = parts[1]
+            term = get_terminal(name)
+            if term:
+                for aid in list(term.stationed_agent_ids):
+                    unstation_agent(aid)
+            if unregister_terminal(name):
+                console.print(f"[green]Terminated [bold]{name}[/bold][/green]")
+            else:
+                console.print(f"[red]Terminal '{name}' not found.[/red]")
+
+    elif action == "/send":
+        if len(parts) < 3:
+            console.print("[yellow]Usage: /send <name> <command>[/yellow]")
+        else:
+            name = parts[1]
+            cmd = " ".join(parts[2:])
+            term = get_terminal(name)
+            if term is None:
+                console.print(f"[red]Terminal '{name}' not found.[/red]")
+            elif not term.session.is_alive():
+                console.print(f"[yellow]Terminal '{name}' is dead.[/yellow]")
+            else:
+                term.session.send_keys(cmd + "\n")
                 time.sleep(0.3)
                 term.session.read_output(timeout=0.5)
                 output = term.session.full_output
-                console.print(f"[dim]Sent to [bold]{target}[/bold]: {keys[:80]}[/dim]")
+                console.print(f"[dim]Sent to [bold]{name}[/bold]: {cmd[:80]}[/dim]")
                 if output.strip():
-                    console.print(Panel(output[-2000:], title=f"{target} output"))
+                    console.print(Panel(output[-2000:], title=f"{name} output"))
 
-        # Sub-command: /term close <name>
-        elif len(parts) >= 3 and parts[1].lower() == "close":
-            target = parts[2]
-            if target in ("term0", "primary"):
-                console.print("[yellow]Cannot close the primary session via /term close.[/yellow]")
-            elif unregister_terminal(target):
-                console.print(f"[green]Closed terminal [bold]{target}[/bold][/green]")
+    elif action == "/hire":
+        agent_info = register_agent(depth=0)
+        console.print(f"[green]Hired [bold]{agent_info.id}[/bold][/green]")
+        console.print(f"  Switch with [bold]/agents {agent_info.id}[/bold]")
+
+    elif action == "/agents":
+        if len(parts) == 1:
+            agents = get_all_agents()
+            current = get_current_agent()
+            if not agents:
+                console.print("[dim]No agents.[/dim]")
             else:
-                console.print(f"[red]Terminal '{target}' not found.[/red]")
-
-        # Sub-command: /term details <name>
-        elif len(parts) >= 3 and parts[1].lower() == "details":
-            target = parts[2]
-            term = get_terminal(target)
-            if term:
-                _show_terminal_detail(term.name, term.command, term.session,
-                                     term.created_at, term.session.is_alive())
-            elif target == "term0" and interactive_session:
-                _show_terminal_detail("term0 (primary)", interactive_session.command,
-                                     interactive_session, 0, interactive_session.is_alive())
+                for a in agents:
+                    marker = " [bold cyan]<- current[/bold cyan]" if (current and a.id == current.id) else ""
+                    st = f" [dim]stationed: {a.stationed_terminal}[/dim]" if a.stationed_terminal else ""
+                    console.print(f"  [bold]{a.id}[/bold]: {a.name}{st}{marker}")
+        elif len(parts) == 2:
+            agent_id = parts[1]
+            if switch_to_agent(agent_id):
+                agent = get_agent(agent_id)
+                console.print(f"[green]Switched to [bold]{agent.name}[/bold] ({agent.id})[/green]")
             else:
-                console.print(f"[red]Terminal '{target}' not found.[/red]")
+                console.print(f"[red]Agent '{agent_id}' not found. Use /hire to create one.[/red]")
+        elif len(parts) >= 3 and parts[1].lower() == "name":
+            new_name = " ".join(parts[2:])
+            current = get_current_agent()
+            if current and rename_agent(current.id, new_name):
+                console.print(f"[green]Agent renamed to [bold]{new_name}[/bold][/green]")
+            else:
+                console.print("[red]No current agent to rename.[/red]")
 
-        # No sub-command: interactive browser
-        elif not terminals and not has_primary:
+    elif action in ("/t", "/term"):
+        terminals = get_all_terminals()
+        has_primary = interactive_session is not None and interactive_session.is_alive()
+        if not terminals and not has_primary:
             console.print("[dim]No active sub-terminal sessions. "
-                          "Run an AI task that spawns a command to create one.[/dim]")
+                          "Use /station or let the AI spawn a command.[/dim]")
         elif not terminals and has_primary:
             observe_session(interactive_session)
         else:
@@ -2721,6 +2795,9 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
                 "get_terminal": get_terminal, "get_all_terminals": get_all_terminals,
                 "unregister_terminal": unregister_terminal, "register_terminal": register_terminal,
                 "rename_terminal": rename_terminal,
+                "get_agent": get_agent, "get_all_agents": get_all_agents,
+                "get_current_agent": get_current_agent,
+                "station_agent": station_agent, "unstation_agent": unstation_agent,
                 "SubTerminalSession": SubTerminalSession,
                 "observe_session": observe_session,
                 "_show_terminal_detail": _show_terminal_detail,
@@ -2751,13 +2828,18 @@ def show_help():
     table.add_row("<natural language>", "Not a recognized command → AI agent loop")
     table.add_row("/help", "Show this help")
     table.add_row("/login", "Re-authenticate with laintas.com (opens browser)")
-    table.add_row("/name [name]", "Set agent name, or /name term<N> <new> to rename a terminal")
+    table.add_row("/name [name]", "Set current agent name")
     table.add_row("/memory", "View .helpwo memory file")
     table.add_row("/prop", "View .cli.prop prompt template")
     table.add_row("/scan", "Scan and list all available system commands from PATH")
     table.add_row("/debug", "Browse last 20 AI/CMD interactions (use /debug <N> for detail, /debug clear)")
     table.add_row("/cwd", "Show current working directory")
-    table.add_row("/t, /term, /terminals", "/term new <n> <cmd>, /term send <n> <k>, /term close <n>, /term details <n>")
+    table.add_row("/station <name>", "Create persistent terminal and station AI there")
+    table.add_row("/terminate <name>", "Close and destroy a terminal")
+    table.add_row("/send <name> <cmd>", "Send a command to a named terminal")
+    table.add_row("/hire", "Create a new AI agent (AI-1, AI-2...)")
+    table.add_row("/agents [name]", "List/switch agents, /agents name <n> to rename")
+    table.add_row("/t, /term", "List sub-terminals and browse details")
     table.add_row("/clear", "Clear screen")
     table.add_row("/exit", "Log out and exit (clears cached session)")
     table.add_row("/quit, /q", "Exit without logging out (keeps cached session)")
@@ -2941,10 +3023,15 @@ def main():
     # PTY session managed at REPL level (must be before shutdown for nonlocal)
     interactive_session = None
 
+    # Register the primary agent
+    primary = register_agent(name="primary", depth=0)
+    set_current_agent_id("primary")
+
     # Setup graceful shutdown
     def shutdown(signum=None, frame=None):
         console.print("\n[yellow]Shutting down...[/yellow]")
         close_all_terminals()
+        close_all_agents()
         nonlocal interactive_session
         if interactive_session:
             interactive_session.close()
