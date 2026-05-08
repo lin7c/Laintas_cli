@@ -4,6 +4,7 @@
 import os
 import re
 import shlex
+import subprocess
 import sys
 import time
 from typing import Optional, Callable, Any
@@ -433,6 +434,48 @@ def _load_loop_commands():
         _loop_cmd_mtime_cache = 0
         return None
 
+
+def _execute_parent_command(cmd: str) -> str:
+    """Execute a command in the parent process context so side effects
+    (cd, clear, etc.) apply to the parent terminal, not a child PTY."""
+    stripped = cmd.strip()
+    if stripped in ("cd",) or stripped.startswith("cd "):
+        path = stripped[3:].strip() if stripped.startswith("cd ") else os.path.expanduser("~")
+        try:
+            os.chdir(path)
+            return f"cd → {os.getcwd()}"
+        except Exception as e:
+            return f"cd error: {e}"
+    if stripped in ("clear",) or stripped.startswith("clear "):
+        sys.stdout.write("\033[2J\033[H")
+        sys.stdout.flush()
+        return ""
+    try:
+        result = subprocess.run(
+            cmd, shell=True, capture_output=True, text=True, timeout=30,
+            cwd=os.getcwd(),
+        )
+        return (result.stdout + result.stderr).strip()
+    except subprocess.TimeoutExpired:
+        return f"Parent command timed out: {cmd}"
+    except Exception as e:
+        return f"Parent command error: {e}"
+
+
+def _process_parent_cmd_marker(cmd_output: str) -> tuple:
+    """Scan sub-terminal output for __PARENT_CMD__:<cmd> markers.
+    Execute any found commands in the parent context and return
+    (cleaned_output, parent_result | None)."""
+    import re as _re
+    m = _re.search(r'__PARENT_CMD__:(.*?)(?:\n|$)', cmd_output)
+    if not m:
+        return cmd_output, None
+    cmd = m.group(1).strip()
+    cleaned = _re.sub(r'__PARENT_CMD__:[^\n]*\n?', '', cmd_output).strip()
+    result = _execute_parent_command(cmd)
+    return cleaned, result
+
+
 def run_agent_loop(
     deps: LoopDeps,
     original_input: str,
@@ -488,31 +531,6 @@ def run_agent_loop(
         # 1. Read .helpwo memory
         global_memory = deps.read_file(".helpwo") or ""
 
-        # 1.5. Check for parent commands from sub-agents (depth=0 only)
-        if depth == 0:
-            parent_cmd_path = os.path.join(os.getcwd(), ".parent_cmd")
-            try:
-                if os.path.exists(parent_cmd_path):
-                    with open(parent_cmd_path, "r") as f:
-                        parent_cmd = f.read().strip()
-                    with open(parent_cmd_path, "w") as f:
-                        pass  # clear the file
-                    if parent_cmd:
-                        import subprocess as _sp
-                        try:
-                            result = _sp.run(
-                                parent_cmd, shell=True, capture_output=True, text=True,
-                                timeout=30, cwd=os.getcwd(),
-                            )
-                            output = (result.stdout + result.stderr).strip()
-                            state["lastOutput"] = output[:3000]
-                        except _sp.TimeoutExpired:
-                            state["lastOutput"] = f"Parent command timed out: {parent_cmd}"
-                        except Exception as _e:
-                            state["lastOutput"] = f"Parent command error: {_e}"
-            except Exception:
-                pass
-
         # 2. Read .cli.prop system prompt
         prompt_template = deps.read_file(".cli.prop") or ""
         if not prompt_template:
@@ -523,7 +541,7 @@ def run_agent_loop(
         if chat_history and len(chat_history) > 0:
             recent = chat_history[-20:]
             conversation_text = "\n".join(
-                f"{'User' if m.get('role') == 'user' else 'AI'}: {m.get('content', '')}"
+                f"{'[KNOWLEDGE]' if m.get('role') == 'knowledge' else 'User' if m.get('role') == 'user' else 'AI'}: {m.get('content', '')}"
                 for m in recent
             )
 
@@ -849,6 +867,7 @@ def run_agent_loop(
             elif (loop_handler := _load_loop_commands()):
                 ctx = {
                     "deps": deps, "state": state, "debug_entry": debug_entry,
+                    "chat_history": chat_history,
                     "interactive_session_ref": [interactive_session],
                     "events_cb": events_cb, "pending_events_ref": [pending_events],
                     "get_terminal": get_terminal, "get_all_terminals": get_all_terminals,
@@ -863,6 +882,7 @@ def run_agent_loop(
                     "set_config": set_runtime_config,
                     "list_config": list_runtime_config,
                     "reset_config": reset_runtime_config,
+                    "depth": depth,
                 }
                 try:
                     result = loop_handler(command, ctx)
@@ -892,7 +912,9 @@ def run_agent_loop(
                             if not sub.is_alive():
                                 cmd_output = sub.full_output
                                 break
-                        state["lastOutput"] = cmd_output if cmd_output.strip() else "(no output)"
+                        cleaned, parent_result = _process_parent_cmd_marker(cmd_output)
+                        cmd_output = cleaned
+                        state["lastOutput"] = parent_result if parent_result else (cleaned.strip() or "(no output)")
                         debug_entry.exec_command = command
                         debug_entry.exec_stdout = cmd_output
                         debug_entry.exec_returncode = sub.returncode
@@ -968,11 +990,13 @@ def run_agent_loop(
                             cmd_output = sub.full_output
                             break
 
+                    cleaned, parent_result = _process_parent_cmd_marker(cmd_output)
+                    cmd_output = cleaned
+                    state["lastOutput"] = parent_result if parent_result else (cleaned.strip() or "(no output)")
                     debug_entry.exec_command = command
                     debug_entry.session_command = command
                     debug_entry.exec_stdout = cmd_output
                     debug_entry.exec_returncode = -1
-                    state["lastOutput"] = cmd_output
 
                     if events_cb is not None:
                         pending_events.append({"type": "system", "kind": "output", "content": cmd_output[:2000]})

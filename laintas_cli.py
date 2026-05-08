@@ -1528,21 +1528,210 @@ def handle_extra_command(action, parts, ctx):
 
 LOOP_COMMAND_TEMPLATE = """import os
 import re
+import json
+import subprocess
+import sys
 
 
 def handle_loop_command(command, ctx):
     \"\"\"Handle custom loop commands defined in .loop_command.py.\"\"\"
 
-    # parent(<shell command>) — queue a command for execution in the parent terminal
+    # parent(<shell command>) \\u2014 execute in parent terminal context (side effects like cd/clear)
     m = re.match(r'^parent\\((.+)\\)\\s*$', command)
     if m:
         parent_cmd = m.group(1).strip()
-        cmd_file = os.path.join(os.getcwd(), '.parent_cmd')
-        with open(cmd_file, 'w') as f:
-            f.write(parent_cmd)
-        return f"Parent command queued: {parent_cmd}"
+        if ctx.get("depth", 0) == 0:
+            return _execute_parent_command(parent_cmd)
+        else:
+            return f"__PARENT_CMD__:{parent_cmd}"
+
+    # learn(<text|path|url>) — extract knowledge into conversation history as [KNOWLEDGE]
+    m = re.match(r'^learn\\((.+)\\)\\s*$', command)
+    if m:
+        return _learn(m.group(1).strip(), ctx)
+
+    # forget(N) — trim chat_history, keeping knowledge + last N messages
+    m = re.match(r'^forget\\((\\d+)\\)\\s*$', command)
+    if m:
+        return _forget(int(m.group(1)), ctx)
 
     return None
+
+
+def _execute_parent_command(cmd):
+    \"\"\"Execute a command in the parent process context so side effects
+    (cd, clear) apply to the parent terminal, not a child PTY.\"\"\"
+    stripped = cmd.strip()
+    if stripped in ("cd",) or stripped.startswith("cd "):
+        path = stripped[3:].strip() if stripped.startswith("cd ") else os.path.expanduser("~")
+        try:
+            os.chdir(path)
+            return f"cd -> {os.getcwd()}"
+        except Exception as e:
+            return f"cd error: {e}"
+    if stripped in ("clear",):
+        sys.stdout.write("\\033[2J\\033[H")
+        sys.stdout.flush()
+        return ""
+    try:
+        result = subprocess.run(
+            cmd, shell=True, capture_output=True, text=True, timeout=30,
+            cwd=os.getcwd(),
+        )
+        return (result.stdout + result.stderr).strip()
+    except subprocess.TimeoutExpired:
+        return f"Parent command timed out: {cmd}"
+    except Exception as e:
+        return f"Parent command error: {e}"
+
+
+def _learn(target, ctx):
+    \"\"\"Extract text from a file, URL, image (OCR), or raw string and add to conversation history as [KNOWLEDGE].\"\"\"
+    chat_history = ctx.get("chat_history", [])
+
+    # 1. URL
+    if target.startswith(('http://', 'https://')):
+        try:
+            result = subprocess.run(
+                ['curl', '-sL', '--max-time', '30', target],
+                capture_output=True, text=True, timeout=35
+            )
+            text = result.stdout[:50000]
+            source = target
+        except Exception as e:
+            return f"learn() failed to fetch URL: {e}"
+
+    # 2. Existing file
+    elif os.path.isfile(target):
+        path = target
+        ext = os.path.splitext(path)[1].lower()
+        source = os.path.abspath(path)
+
+        # Text files (code, config, logs, data)
+        if ext in ('.txt', '.md', '.py', '.js', '.ts', '.jsx', '.tsx', '.json',
+                     '.xml', '.html', '.css', '.scss', '.less',
+                     '.yaml', '.yml', '.toml', '.cfg', '.ini', '.conf',
+                     '.sh', '.bash', '.zsh', '.fish', '.log', '.csv', '.tsv',
+                     '.sql', '.r', '.rb', '.go', '.rs', '.java', '.c', '.cpp',
+                     '.h', '.hpp', '.php', '.swift', '.kt', '.scala', '.clj',
+                     '.env', '.gitignore', '.dockerignore', '.editorconfig'):
+            try:
+                with open(path, 'r', encoding='utf-8', errors='replace') as f:
+                    text = f.read()[:50000]
+            except Exception as e:
+                return f"learn() failed to read file: {e}"
+
+        # PDF
+        elif ext == '.pdf':
+            try:
+                result = subprocess.run(
+                    ['pdftotext', path, '-', '-l', '50'],
+                    capture_output=True, text=True, timeout=30
+                )
+                text = result.stdout[:50000]
+                if not text.strip():
+                    return "learn() could not extract text from PDF (empty or image-based, try OCR)"
+            except FileNotFoundError:
+                return "learn() needs 'pdftotext' (poppler-utils). Install: apt install poppler-utils"
+            except Exception as e:
+                return f"learn() failed on PDF: {e}"
+
+        # Images — OCR
+        elif ext in ('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.tiff', '.webp'):
+            try:
+                result = subprocess.run(
+                    ['tesseract', path, 'stdout'],
+                    capture_output=True, text=True, timeout=30
+                )
+                text = result.stdout.strip()[:50000]
+                if not text:
+                    return "learn() OCR found no text in image"
+            except FileNotFoundError:
+                return "learn() needs 'tesseract' for images. Install: apt install tesseract-ocr"
+            except Exception as e:
+                return f"learn() failed on image: {e}"
+
+        # Video — metadata + subtitle scan
+        elif ext in ('.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv'):
+            try:
+                result = subprocess.run(
+                    ['ffprobe', '-v', 'quiet', '-print_format', 'json',
+                     '-show_format', '-show_streams', path],
+                    capture_output=True, text=True, timeout=15
+                )
+                info = json.loads(result.stdout)
+                sub_lines = []
+                for s in info.get('streams', []):
+                    if s.get('codec_type') == 'subtitle':
+                        lang = s.get('tags', {}).get('language', 'unknown')
+                        sub_lines.append(
+                            f"  Subtitle: {s.get('codec_name', '?')} lang={lang}"
+                        )
+                meta = info.get('format', {}).get('tags', {})
+                meta_text = '\\n'.join(f"  {k}: {v}" for k, v in meta.items())
+
+                text = f"Video: {os.path.basename(path)}\\n"
+                if meta_text:
+                    text += f"Metadata:\\n{meta_text}\\n"
+                if sub_lines:
+                    text += f"Subtitle tracks:\\n" + '\\n'.join(sub_lines) + "\\n"
+                    text += "(Extract with: ffmpeg -i <video> -map 0:s:<N> subs.srt)"
+                else:
+                    text += "No embedded subtitles found. To learn from audio:\\n"
+                    text += "  ffmpeg -i <video> -vn -acodec pcm_s16le audio.wav\\n"
+                    text += "  whisper audio.wav --model small"
+                text = text[:50000]
+            except FileNotFoundError:
+                return "learn() needs 'ffprobe' (ffmpeg). Install: apt install ffmpeg"
+            except Exception as e:
+                return f"learn() failed on video: {e}"
+
+        # Unknown extension — try as text
+        else:
+            try:
+                with open(path, 'r', encoding='utf-8', errors='replace') as f:
+                    text = f.read()[:50000]
+            except Exception as e:
+                return f"learn() cannot handle '{ext}' files. Try .txt, .md, .pdf, .png, .mp4, etc."
+
+    # 3. Raw text (user's sentence / knowledge)
+    else:
+        text = target[:50000]
+        source = "user-provided knowledge"
+
+    # Append knowledge to conversation history (short-term, cleared on session end)
+    knowledge_text = text[:5000]  # cap per entry to keep prompts manageable
+    chat_history.append({
+        "role": "knowledge",
+        "content": f"(Source: {source})\\n{knowledge_text}"
+    })
+
+    preview = text[:300].replace('\\n', ' ')
+    return f"Learned ({len(text)} chars) from: {source}\\nPreview: {preview}..."
+
+
+def _forget(keep_n, ctx):
+    \"\"\"Trim chat_history: keep all [KNOWLEDGE] entries + last N regular messages.\"\"\"
+    chat_history = ctx.get("chat_history", [])
+    if not chat_history or keep_n < 0:
+        return f"Nothing to forget (history has {len(chat_history)} messages)"
+
+    # Separate knowledge entries from regular ones
+    knowledge_entries = [m for m in chat_history if m.get('role') == 'knowledge']
+    regular_entries = [m for m in chat_history if m.get('role') != 'knowledge']
+
+    # Keep last N regular entries
+    trimmed_regular = regular_entries[-keep_n:] if keep_n > 0 else []
+
+    # Rebuild: knowledge first, then recent regular messages
+    trimmed = knowledge_entries + trimmed_regular
+    removed = len(chat_history) - len(trimmed)
+
+    # Mutate in-place
+    chat_history.clear()
+    chat_history.extend(trimmed)
+
+    return f"Forgot {removed} messages ({len(knowledge_entries)} knowledge kept, {len(trimmed_regular)} recent kept, {len(chat_history)} total)"
 """
 
 
@@ -1630,7 +1819,7 @@ You can tell the user about them when relevant:
 Respond ONLY with a single JSON object:
 {{
   "reply": "what to tell the user",
-  "command": "shell cmd, /station, /send, /terminate, /hire, wait(N), or parent(cmd)",
+  "command": "shell cmd, /station, /send, /terminate, /hire, wait(N), parent(cmd), learn(text), or forget(N)",
   "memory": "information to remember (appended to .helpwo)",
   "done": true/false
 }}
@@ -1659,9 +1848,9 @@ Self-recursion rules:
 - At depth >= 2, prefer completing the task directly.
 - Prefer calling tools directly over spawning sub-agents for simple tasks.
 - Use sub-agents when you need parallel analysis or AI reasoning on sub-problems.
-- When at depth >= 1, use parent(cmd) to queue a command for the parent terminal.
-  The parent checks .parent_cmd at the start of each loop and executes it.
-  Use this for actions that must happen in the parent context (file ops, service mgmt, etc.).
+- When at depth >= 1, use parent(cmd) for commands that need parent-terminal side effects
+  (cd, clear, etc.) — the parent intercepts and executes them directly.  For ordinary
+  commands (ls, cat, mkdir, git, etc.), just output the command normally.
 
 [TERMINAL MANAGEMENT]
 You can create persistent terminals that maintain state (cd, env vars) across commands,
@@ -1684,7 +1873,15 @@ and optionally station yourself in one for automatic command execution.
   /agents <name>            — switch conversation to another agent.
 
   wait(N)                   — sleep N seconds (e.g. wait(3) for server startup).
-  parent(cmd)               — queue a shell command for the parent terminal (depth>=1 only).
+  parent(cmd)               — run this command in the terminal the user is talking to (depth>=1 only).
+  learn(text|path|url)      — extract knowledge from text, file, image (OCR via tesseract),
+                              video (subtitle/metadata via ffprobe), or URL (curl) and
+                              add to conversation history as [KNOWLEDGE] (short-term).
+  forget(N)                 — trim conversation history: drop old regular messages,
+                              keeping only [KNOWLEDGE] entries + last N messages.
+                              Use after learn() to compress context: first summarize
+                              key facts with learn(summary), then forget(3) to drop
+                              the verbose originals. Keeps prompt small.
 
 Rules:
 - Station in a terminal when you want persistent shell state across commands.
