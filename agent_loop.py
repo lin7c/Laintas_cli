@@ -3,10 +3,12 @@
 
 import os
 import re
+import json
 import shlex
 import subprocess
 import sys
 import time
+import uuid
 from typing import Optional, Callable, Any
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -332,6 +334,7 @@ class LoopDeps:
     """External dependencies injected from laintas_cli."""
     read_file: Callable[[str], Optional[str]]
     append_file: Callable[[str, str], None]
+    write_file: Callable[[str, str], None]
     strip_ansi: Callable[[str], str]
     generate_prompt: Callable[[], str]
     call_backend: Callable[..., dict]
@@ -342,32 +345,161 @@ class LoopDeps:
     Markdown: type  # rich.markdown.Markdown
 
 
-# ── Execution State Builder ────────────────────────────────────────────
+# ── Structured Memory System (.helpwo) ──────────────────────────────────
+# .helpwo stores a JSON array of entries: [{"id": N, "content": "...", "created": "...", "updated": "..."}]
+# AI can append, modify (~N:), or delete (-N) entries via the "memory" field.
 
-def build_execution_state(state: dict) -> str:
-    """Build execution state snapshot (mirrors AutonomousKernel.ts)."""
-    last_output = state.get('lastOutput', 'Ready to begin.')
-    truncate = int(get_runtime_config("output_truncate"))
-    if len(last_output) > truncate:
-        last_output = "...(truncated)...\n" + last_output[-truncate:]
-    terminals_snapshot = get_terminals_snapshot()
-    result = f"""
-[STEP_EXECUTED_HISTORY]
-{{
-{state.get('shortTermMemory', '')}
-}}
+_MEMORY_FILE = ".helpwo"
 
-[PHYSICAL_OBSERVATION]
-Last Result: {last_output}
-""".strip()
-    if terminals_snapshot:
-        result += '\n\n' + terminals_snapshot
-    current_agent = get_current_agent()
-    if current_agent:
-        result += f"\n\n[AGENT CONTEXT]\nCurrent agent: {current_agent.name} ({current_agent.id})"
-        if current_agent.stationed_terminal:
-            result += f"\nStationed in: {current_agent.stationed_terminal}"
-    return result
+
+def _read_memory(deps: LoopDeps) -> list[dict]:
+    """Read and parse .helpwo as a JSON array of entries. Returns [] on failure."""
+    raw = deps.read_file(_MEMORY_FILE)
+    if not raw or not raw.strip():
+        return []
+    try:
+        entries = json.loads(raw)
+        if isinstance(entries, list):
+            return entries
+    except json.JSONDecodeError:
+        pass
+    # Legacy plain-text: wrap as single entry
+    text = raw.strip()
+    if text:
+        return [{"id": 1, "content": text, "created": datetime.now().isoformat(), "updated": datetime.now().isoformat()}]
+    return []
+
+
+def _write_memory(deps: LoopDeps, entries: list[dict]) -> None:
+    """Write entries to .helpwo as pretty-printed JSON."""
+    deps.write_file(_MEMORY_FILE, json.dumps(entries, ensure_ascii=False, indent=2))
+
+
+def _format_memory(entries: list[dict]) -> str:
+    """Format entries for prompt display."""
+    if not entries:
+        return "(empty)"
+    return "\n".join(f"  [{e['id']}] {e['content']}" for e in entries)
+
+
+def _apply_memory(deps: LoopDeps, instruction: str) -> str:
+    """Apply a CRUD instruction to .helpwo memory.
+
+    Instruction formats:
+      "text"        → append new entry (auto-assigned id)
+      "~N: text"    → update (modify) entry with id N
+      "-N"          → delete entry with id N
+    Returns a description of what was done.
+    """
+    entries = _read_memory(deps)
+    stripped = instruction.strip()
+    if not stripped:
+        return ""
+
+    # -- Delete: "-N" --
+    m = re.match(r'^-(\d+)$', stripped)
+    if m:
+        eid = int(m.group(1))
+        before = len(entries)
+        entries = [e for e in entries if e.get("id") != eid]
+        if len(entries) < before:
+            for i, e in enumerate(entries, 1):
+                e["id"] = i
+            _write_memory(deps, entries)
+            return f"Deleted memory entry [{eid}]"
+        return f"Entry [{eid}] not found"
+
+    # -- Modify: "~N: new text" --
+    m = re.match(r'^~(\d+)\s*:\s*(.+)$', stripped)
+    if m:
+        eid = int(m.group(1))
+        new_content = m.group(2).strip()
+        for e in entries:
+            if e.get("id") == eid:
+                e["content"] = new_content
+                e["updated"] = datetime.now().isoformat()
+                _write_memory(deps, entries)
+                return f"Modified memory entry [{eid}]"
+        return f"Entry [{eid}] not found"
+
+    # -- Append: plain text --
+    max_id = max((e.get("id", 0) for e in entries), default=0)
+    entries.append({
+        "id": max_id + 1,
+        "content": stripped,
+        "created": datetime.now().isoformat(),
+        "updated": datetime.now().isoformat(),
+    })
+    _write_memory(deps, entries)
+    return f"Added memory entry [{max_id + 1}]"
+
+
+# ── Context Builders (3 clean sections) ──────────────────────────────────
+
+_MAX_TERMINAL_LINES = 100
+
+
+def _build_terminal_section(state: dict) -> str:
+    """Section 1: recent terminal outputs (last 5 steps)."""
+    history = state.get('terminalHistory', [])
+    if not history:
+        return state.get('lastOutput', 'Ready to begin.')
+    parts = []
+    recent = history[-5:]
+    offset = len(history) - len(recent)
+    for i, entry in enumerate(recent, 1):
+        output = entry.get('output', '')
+        lines = output.split('\n')
+        if len(lines) > _MAX_TERMINAL_LINES:
+            output = f"...(truncated)...\n" + '\n'.join(lines[-_MAX_TERMINAL_LINES:])
+        cmd_label = entry.get('command', '')[:80]
+        parts.append(f"--- Step {offset + i}: {cmd_label} ---")
+        parts.append(output)
+    return '\n'.join(parts)
+
+
+def _build_memory_section(global_entries: list, state: dict, chat_history: list) -> str:
+    """Section 2: session memory (short-term) + learned knowledge."""
+    parts = []
+
+    # Session memory (shortTermMemory from state)
+    stm = state.get('shortTermMemory', '').strip()
+    if stm:
+        parts.append("[Session Memory]")
+        for line in stm.split('\n'):
+            line = line.strip()
+            if line:
+                parts.append(f"  {line}")
+
+    # Learned knowledge (chat_history KNOWLEDGE entries)
+    knowledge = [m for m in (chat_history or []) if m.get('role') == 'knowledge']
+    if knowledge:
+        parts.append("[Learned Knowledge]")
+        for k in knowledge[-5:]:  # last 5 entries max
+            content = k.get('content', '')[:500]
+            if content:
+                parts.append(f"  {content}")
+
+    return '\n'.join(parts) if parts else "(empty)"
+
+
+def _build_conversation_section(chat_history: list) -> str:
+    """Section 3: recent conversation between user and AI (last 20 messages)."""
+    if not chat_history:
+        return "(no history)"
+    recent = chat_history[-20:]
+    lines = []
+    for m in recent:
+        role = m.get('role', '?')
+        content = m.get('content', '')
+        if role == 'knowledge':
+            continue  # already shown in MEMORY SYSTEM
+        if isinstance(content, list):
+            content = ' '.join(str(c.get('text', c)) for c in content if isinstance(c, dict))
+        content = str(content)[:300]
+        label = "User" if role == "user" else "AI"
+        lines.append(f"  [{label}] {content}")
+    return '\n'.join(lines) if lines else "(no history)"
 
 
 def get_terminals_snapshot() -> str:
@@ -501,6 +633,7 @@ def run_agent_loop(
     state.setdefault("shortTermMemory", "")
     state.setdefault("lastReply", "")
     state.setdefault("lastOutput", "")
+    state.setdefault("terminalHistory", [])
     chat_history = chat_history or []
 
     step_replies = []
@@ -528,32 +661,56 @@ def run_agent_loop(
     for loop in range(max_loops):
         _loop_id = next_debug_loop()
 
-        # 1. Read .helpwo memory
-        global_memory = deps.read_file(".helpwo") or ""
+        # 1. Read .helpwo memory (structured)
+        memory_entries = _read_memory(deps)
 
-        # 2. Read .cli.prop system prompt
+        # 2. Build global memory string for system prompt
+        if memory_entries:
+            global_memory_lines = []
+            for e in memory_entries:
+                global_memory_lines.append(f"[{e['id']}] {e['content']}")
+            global_memory_str = '\n'.join(global_memory_lines)
+        else:
+            global_memory_str = "(empty)"
+
+        # 3. Read .cli.prop system prompt
         prompt_template = deps.read_file(".cli.prop") or ""
         if not prompt_template:
             prompt_template = deps.generate_prompt()
 
-        # 3. Build conversation history text
-        conversation_text = ""
-        if chat_history and len(chat_history) > 0:
-            recent = chat_history[-20:]
-            conversation_text = "\n".join(
-                f"{'[KNOWLEDGE]' if m.get('role') == 'knowledge' else 'User' if m.get('role') == 'user' else 'AI'}: {m.get('content', '')}"
-                for m in recent
-            )
-
-        # 4. Build system prompt (same template vars as Helpwo)
+        # 4. Build system prompt
+        current_agent = get_current_agent()
+        agent_name = current_agent.name if current_agent else "Laintas CLI"
+        agent_id = current_agent.id if current_agent else "unknown"
         system_prompt = prompt_template \
+            .replace("{{globalMemory}}", global_memory_str) \
+            .replace("{{agentName}}", agent_name) \
+            .replace("{{agentId}}", agent_id) \
             .replace("{{currentPath}}", os.getcwd()) \
             .replace("{{activeFile}}", "None") \
-            .replace("{{globalMemory}}", global_memory or "(empty)") \
-            .replace("{{lastOutput}}", build_execution_state(state)) \
-            .replace("{{conversationHistory}}", conversation_text or "(no conversation history)") \
             .replace("{{depth}}", str(depth)) \
             .replace("{{nextDepth}}", str(depth + 1))
+
+        # 5. Build user message: 5 sections (terminal | conversation | memory | terminals | task)
+        terminal_section = _build_terminal_section(state)
+        memory_section = _build_memory_section(memory_entries, state, chat_history)
+        conversation_section = _build_conversation_section(chat_history)
+        terminals_snapshot = get_terminals_snapshot()
+        user_input = f"""[TERMINAL OUTPUT]
+{terminal_section}
+
+[CONVERSATION HISTORY]
+{conversation_section}
+
+[MEMORY SYSTEM]
+{memory_section}
+
+[SUB-TERMINALS]
+{terminals_snapshot or "(none)"}
+
+Task: {original_input}
+
+Progress: step {loop+1}/{max_loops} — {len(state.get('terminalHistory', []))} commands executed so far."""
 
         # ── Debug: create entry before API call ──
         debug_entry = DebugEntry(
@@ -562,8 +719,10 @@ def run_agent_loop(
             user_input=user_input[:2000],
             current_path=os.getcwd(),
             context_sizes={
-                "global": len(global_memory or ""),
-                "conversation": len(conversation_text or ""),
+                "memory": len(memory_section),
+                "terminal": len(terminal_section),
+                "conversation": len(conversation_section),
+                "terminals": len(terminals_snapshot),
                 "prompt": len(system_prompt),
             },
             request_body={
@@ -572,8 +731,7 @@ def run_agent_loop(
                 "history": chat_history[-20:] if chat_history else [],
                 "promptLen": len(system_prompt),
                 "promptPreview": system_prompt[:500],
-                "globalContext": (global_memory or "(empty)")[:500],
-                "conversationContext": conversation_text or "(no history)",
+                "memorySection": memory_section[:500],
             },
         )
 
@@ -637,13 +795,12 @@ def run_agent_loop(
                     deps.console.print(f"[dim]({billing_text})[/dim]")
                     pending_events.append({"type": "system", "kind": "billing", "content": billing_text})
 
-        # 8. Write memory to .helpwo
+        # 8. Write memory to .helpwo (append / modify / delete)
         if memory:
+            mem_result = _apply_memory(deps, memory)
             if events_cb is not None:
-                deps.console.print(f"[dim cyan]Memory: {memory[:100]}...[/dim cyan]")
-            deps.append_file(".helpwo", memory)
-            if events_cb is not None:
-                pending_events.append({"type": "system", "kind": "memory", "content": memory[:200]})
+                deps.console.print(f"[dim cyan]{mem_result}[/dim cyan]")
+                pending_events.append({"type": "system", "kind": "memory", "content": mem_result[:200]})
 
         # 9. Handle command dispatch (close_session/send_keys normalized to /session close, /keys)
 
@@ -655,11 +812,11 @@ def run_agent_loop(
                     if events_cb is not None:
                         pending_events.append({"type": "system", "kind": "close_session", "content": interactive_session.command[:200]})
                     interactive_session.close()
-                    cmd_output = interactive_session.full_output
+                    cmd_output = deps.strip_ansi(interactive_session.full_output)
                     debug_entry.exec_command = command
                     debug_entry.exec_stdout = cmd_output
                     debug_entry.exec_returncode = interactive_session.returncode
-                    state["lastOutput"] = cmd_output
+                    state["lastOutput"] = cmd_output.strip() or "(no output)"
                     if events_cb is not None:
                         pending_events.append({"type": "system", "kind": "output", "content": cmd_output[:2000]})
                         events_cb(pending_events)
@@ -676,18 +833,20 @@ def run_agent_loop(
             elif (_meta_keys := re.match(r'^/keys\s+(.*)$', command)):
                 keys = _meta_keys.group(1)
                 if interactive_session is not None:
-                    deps.console.print(f"[dim yellow]> {keys[:60]}...[/dim yellow]")
+                    _ks = keys[:60]
+                    _suf = "" if len(keys) <= 60 else "..."
+                    deps.console.print(f"[dim yellow]> {_ks}{_suf}[/dim yellow]")
                     if events_cb is not None:
                         pending_events.append({"type": "system", "kind": "send_keys", "content": keys[:200]})
                     interactive_session.send_keys(keys)
                     time.sleep(0.3)
                     new_output = interactive_session.read_output(timeout=0.5)
-                    cmd_output = interactive_session.full_output
+                    cmd_output = deps.strip_ansi(interactive_session.full_output)
                     debug_entry.exec_command = command
                     debug_entry.exec_stdout = cmd_output
                     debug_entry.exec_returncode = interactive_session.returncode
                     debug_entry.session_command = interactive_session.command
-                    state["lastOutput"] = cmd_output
+                    state["lastOutput"] = cmd_output.strip() or "(no output)"
                     if events_cb is not None:
                         pending_events.append({"type": "system", "kind": "output", "content": cmd_output[:2000]})
                         events_cb(pending_events)
@@ -711,13 +870,13 @@ def run_agent_loop(
                     unregister_terminal(name)
                     existing_term = None
                 if existing_term is None:
-                    shell = os.environ.get("SHELL", "/bin/bash")
-                    sub = deps.SubTerminalSession(shell)
+                    lain_cmd = f"{sys.executable} {_LAINTAS_CLI} --simple-prompt"
+                    sub = deps.SubTerminalSession(lain_cmd)
                     sub.start()
                     time.sleep(0.3)
                     if sub.is_alive():
                         sub.read_output(timeout=0.3)
-                    register_terminal(sub, shell, depth, name=name)
+                    register_terminal(sub, "laintas-cli", depth, name=name)
                 current_agent = get_current_agent()
                 if current_agent:
                     station_agent(current_agent.id, name)
@@ -767,13 +926,15 @@ def run_agent_loop(
                     if events_cb is not None:
                         deps.console.print(f"[yellow]Warning: terminal '{target}' is dead[/yellow]")
                 else:
+                    _ks = keys[:60]
+                    _suf = "" if len(keys) <= 60 else "..."
                     if events_cb is not None:
-                        deps.console.print(f"[dim yellow]> /send {target} {keys[:60]}...[/dim yellow]")
+                        deps.console.print(f"[dim yellow]> /send {target} {_ks}{_suf}[/dim yellow]")
                     term.session.send_keys(keys + "\n")
                     time.sleep(0.3)
                     term.session.read_output(timeout=0.5)
-                    cmd_output = term.session.full_output
-                    state["lastOutput"] = cmd_output
+                    cmd_output = deps.strip_ansi(term.session.full_output)
+                    state["lastOutput"] = cmd_output.strip() or "(no output)"
                     debug_entry.exec_stdout = cmd_output
                     debug_entry.exec_returncode = term.session.returncode
                     debug_entry.session_command = f"{target}: {keys}"
@@ -913,11 +1074,11 @@ def run_agent_loop(
                                 cmd_output = sub.full_output
                                 break
                         cleaned, parent_result = _process_parent_cmd_marker(cmd_output)
-                        cmd_output = cleaned
-                        state["lastOutput"] = parent_result if parent_result else (cleaned.strip() or "(no output)")
+                        cmd_output = deps.strip_ansi(cleaned)
+                        state["lastOutput"] = parent_result if parent_result else (cmd_output.strip() or "(no output)")
                         debug_entry.exec_command = command
                         debug_entry.exec_stdout = cmd_output
-                        debug_entry.exec_returncode = sub.returncode
+                        debug_entry.exec_returncode = sub.returncode if sub.returncode is not None else -1
                         debug_entry.session_command = command
                         if events_cb is not None:
                             pending_events.append({"type": "system", "kind": "output", "content": cmd_output[:2000]})
@@ -937,20 +1098,89 @@ def run_agent_loop(
                 stationed_term = get_terminal(stationed_name) if stationed_name else None
 
                 if stationed_term and stationed_term.session.is_alive():
-                    # ── Stationed: execute in agent's persistent terminal ──
+                    # ── Stationed: run command in persistent PTY with markers ──
                     if events_cb is not None:
                         deps.console.print(f"[dim]> [{stationed_name}] {command[:80]}[/dim]")
                         pending_events.append({"type": "system", "kind": "command", "content": command})
-                    stationed_term.session.send_keys(command + "\n")
-                    time.sleep(0.3)
-                    cmd_output = stationed_term.session.full_output
-                    state["lastOutput"] = cmd_output
+
+                    session = stationed_term.session
+                    marker_id = uuid.uuid4().hex[:8]
+                    start_marker = f"__CMD_BEGIN_{marker_id}__"
+                    end_marker = f"__CMD_END_{marker_id}__"
+
+                    # Wrap command: capture stderr and return code between markers
+                    wrapped = f"echo {start_marker}; {command} 2>&1; __laintas_rc=$?; echo {end_marker}:$__laintas_rc"
+
+                    # Track output length before sending
+                    try:
+                        old_len = len(session.raw_output)
+                    except Exception:
+                        old_len = len(session.full_output)
+
+                    session.send_keys(wrapped + "\n")
+
+                    # Poll for end marker
+                    cmd_output = ""
+                    returncode = -1
+                    poll_start = time.time()
+                    poll_timeout = float(get_runtime_config("poll_timeout"))
+
+                    while time.time() - poll_start < poll_timeout:
+                        time.sleep(0.3)
+                        session.read_output(timeout=0.3)
+
+                        try:
+                            raw = session.raw_output
+                        except Exception:
+                            raw = session.full_output
+
+                        new_content = raw[old_len:] if old_len > 0 else raw
+
+                        # Look for end marker with return code (must be on its own line)
+                        end_match = re.search(
+                            rf'(?:^|\r?\n){re.escape(end_marker)}:(\d+)',
+                            new_content, re.MULTILINE
+                        )
+                        if end_match:
+                            returncode = int(end_match.group(1))
+                            # Extract output between start marker and end marker
+                            start_match = re.search(
+                                rf'(?:^|\r?\n){re.escape(start_marker)}\s*\r?\n',
+                                new_content, re.MULTILINE
+                            )
+                            if start_match:
+                                cmd_output = new_content[start_match.end():end_match.start()].strip()
+                            else:
+                                # Fallback: split on marker text
+                                parts = new_content.split(start_marker, 1)
+                                if len(parts) > 1:
+                                    cmd_output = parts[1].split(end_marker, 1)[0].strip()
+                            break
+
+                        if not session.is_alive():
+                            try:
+                                cmd_output = session.raw_output[old_len:] if old_len > 0 else session.raw_output
+                            except Exception:
+                                cmd_output = session.full_output[old_len:] if old_len > 0 else session.full_output
+                            break
+
+                    if not cmd_output:
+                        # Timeout — command may still be running (e.g., claude, vim)
+                        try:
+                            tail = session.raw_output[old_len:] if old_len > 0 else session.raw_output
+                        except Exception:
+                            tail = session.full_output[old_len:] if old_len > 0 else session.full_output
+                        cmd_output = tail
+
+                    clean_output = deps.strip_ansi(cmd_output).strip()
+                    state["lastOutput"] = clean_output or "(command running...)"
                     debug_entry.exec_command = command
                     debug_entry.session_command = command
-                    debug_entry.exec_stdout = cmd_output
-                    debug_entry.exec_returncode = -1
+                    debug_entry.exec_stdout = deps.strip_ansi(cmd_output)
+                    debug_entry.exec_returncode = returncode
+
                     if events_cb is not None:
-                        pending_events.append({"type": "system", "kind": "output", "content": cmd_output[-2000:]})
+                        pending_events.append({"type": "system", "kind": "output", "content": state["lastOutput"][:2000]})
                         events_cb(pending_events)
                         pending_events.clear()
 
@@ -991,12 +1221,12 @@ def run_agent_loop(
                             break
 
                     cleaned, parent_result = _process_parent_cmd_marker(cmd_output)
-                    cmd_output = cleaned
-                    state["lastOutput"] = parent_result if parent_result else (cleaned.strip() or "(no output)")
+                    cmd_output = deps.strip_ansi(cleaned)
+                    state["lastOutput"] = parent_result if parent_result else (cmd_output.strip() or "(no output)")
                     debug_entry.exec_command = command
                     debug_entry.session_command = command
                     debug_entry.exec_stdout = cmd_output
-                    debug_entry.exec_returncode = -1
+                    debug_entry.exec_returncode = sub.returncode if sub.returncode is not None else -1
 
                     if events_cb is not None:
                         pending_events.append({"type": "system", "kind": "output", "content": cmd_output[:2000]})
@@ -1009,7 +1239,11 @@ def run_agent_loop(
         # 10. Update state
         action_desc = command if command else ""
         state["shortTermMemory"] += \
-            f"\n  -shortTermMemory Step: Replay=`{reply}` {action_desc} -> Result=\"{state['lastOutput']}\""
+            f"\n  Step {loop+1}: {reply} | cmd: {action_desc} | result: {state['lastOutput'][:200]}"
+        state["terminalHistory"].append({
+            "command": action_desc,
+            "output": state['lastOutput'],
+        })
 
         # ── Debug: persist this loop's entry ──
         add_debug_log(debug_entry)
@@ -1044,18 +1278,27 @@ def run_agent_loop(
                 deps.console.print("\n[yellow]Agent loop interrupted.[/yellow]")
                 break
 
-        # 12. Prepare next input (same pattern as AutonomousKernel.ts)
+        # 12. Prepare next input — rebuild sections with updated state
+        memory_entries = _read_memory(deps)  # re-read in case AI wrote memory
+        terminal_section = _build_terminal_section(state)
+        memory_section = _build_memory_section(memory_entries, state, chat_history)
+        conversation_section = _build_conversation_section(chat_history)
         terminals_snapshot = get_terminals_snapshot()
-        terminals_block = f"\n\n[Named Sub-Terminals]\n{terminals_snapshot}" if terminals_snapshot else ""
-        user_input = f"""[STATUS — Loop {loop + 1}/{max_loops}]
-Current location: {os.getcwd()}
-Last command output: {state['lastOutput']}{terminals_block}
+        user_input = f"""[TERMINAL OUTPUT]
+{terminal_section}
 
-Overall objective (this is the long-term goal, NOT a new instruction):
-{original_input}
+[CONVERSATION HISTORY]
+{conversation_section}
 
-Your last response: {state['lastReply']}
-→ Continue from here. What is the single next step?"""
+[MEMORY SYSTEM]
+{memory_section}
+
+[SUB-TERMINALS]
+{terminals_snapshot or "(none)"}
+
+Task: {original_input}
+
+Progress: step {loop+1}/{max_loops} — {len(state.get('terminalHistory', []))} commands executed so far."""
 
     # Clean up session only when NOT managed by REPL (existing_session=None)
     # When REPL manages the session, it handles lifecycle externally.

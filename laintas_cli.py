@@ -35,12 +35,34 @@ from urllib.parse import urlparse, parse_qs
 SYSTEM = platform.system()  # "Linux", "Windows", "Darwin"
 IS_WINDOWS = SYSTEM == "Windows"
 
+# Windows cmd.exe internal commands — not on PATH but always available
+_WINDOWS_CMD_BUILTINS = {
+    # Navigation
+    "dir", "cd", "chdir", "md", "mkdir", "rd", "rmdir", "tree",
+    "pushd", "popd", "dironly",
+    # Files
+    "copy", "del", "erase", "type", "ren", "rename", "move",
+    "attrib", "icacls", "replace", "robocopy", "xcopy",
+    # Text
+    "find", "findstr", "more", "sort", "comp", "fc",
+    # System
+    "cls", "ver", "vol", "date", "time", "tasklist", "taskkill",
+    "shutdown", "systeminfo", "driverquery",
+    # Shell
+    "echo", "set", "prompt", "title", "color", "exit", "start",
+    "call", "cmd", "doskey", "path", "pause", "rem",
+    # Utility
+    "where", "whoami", "assoc", "ftype", "chkdsk", "mklink",
+    "help", "print", "clip",
+}
+
 # Unix-only modules (don't exist on Windows)
 if not IS_WINDOWS:
     import pty
     import select
     import fcntl
     import termios
+    import tty
 
 import requests
 from rich.console import Console
@@ -84,7 +106,7 @@ from agent_loop import (
 )
 
 # ── ANSI escape sequence stripping ─────────────────────────────────────
-_ANSI_RE = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]|\x1b\][0-9;]*[^\x07]*\x07|\x1b[()][AB12]|\x1b[>=]|\x1b\[[?]?[0-9]*[hl]|\x0d')
+_ANSI_RE = re.compile(r'\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[@-Z\\-~]|\x1b[()][AB12]|\x0d')
 def strip_ansi(text: str) -> str:
     """Strip ANSI escape sequences and carriage returns from text."""
     return _ANSI_RE.sub('', text).replace('\r', '')
@@ -348,6 +370,31 @@ class SubTerminalSession:
             return "".join(self._output_buf)
 
     @property
+    def raw_output(self) -> str:
+        """Full accumulated output including ANSI escape codes."""
+        if self._use_tmux:
+            import subprocess as _sp
+            try:
+                result = _sp.run(
+                    ["tmux", "capture-pane", "-p", "-t", self._tmux_window, "-S", "-2000"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                return result.stdout or ""
+            except Exception:
+                return "".join(self._output_buf)
+        else:
+            if self._pty:
+                return self._pty.raw_output
+            return "".join(self._output_buf)
+
+    @property
+    def master_fd(self) -> int:
+        """PTY master file descriptor for raw I/O (non-tmux only)."""
+        if self._pty:
+            return self._pty.master_fd
+        return -1
+
+    @property
     def returncode(self) -> int:
         """Return code. -1 while running."""
         if self._pty:
@@ -404,9 +451,8 @@ def _child_env() -> dict:
 
 
 def _strip_ansi(text: str) -> str:
-    """Strip ANSI escape sequences from text."""
-    ansi_re = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]')
-    return ansi_re.sub('', text)
+    """Strip ANSI escape sequences from text (delegates to strip_ansi)."""
+    return strip_ansi(text)
 
 
 # ── Interactive Session (PTY with stdin support) ─────────────────────────
@@ -827,8 +873,6 @@ def display_command_output(command: str, returncode: int, output: str, depth: in
     title = f"[bold]{command[:80]}[/bold]  [{border_style}]{status_text}{time_part}[/{border_style}]"
 
     preview = output[:200]
-    if len(output) > 200:
-        preview += "[dim]...[/dim]"
 
     if line_count == 0 and byte_count == 0:
         summary = "[dim](no output)[/dim]"
@@ -998,6 +1042,9 @@ def scan_path_commands() -> set:
                         commands.add(entry.name)
             except (PermissionError, OSError):
                 pass
+
+    if IS_WINDOWS:
+        commands.update(_WINDOWS_CMD_BUILTINS)
 
     return commands
 
@@ -1739,33 +1786,27 @@ def generate_cli_prop_template() -> str:
     """Generate the .cli.prop system prompt template for the current OS."""
     shell_info = "cmd.exe" if IS_WINDOWS else f"{SHELL_NAME}"
 
-    return f"""You are 'Laintas CLI', an autonomous AI agent running in a {shell_info} terminal on {SYSTEM}.
-Always respond with valid JSON.
+    return f"""You are '{{{{agentName}}}}', an autonomous AI agent running in a laintas-cli REPL on {SYSTEM}.
+Always respond with valid JSON. Your agent ID is '{{{{agentId}}}}'.
 
-[ENVIRONMENT]
-- OS: {SYSTEM}
-- Shell: {shell_info}
-- Current Path: {{{{currentPath}}}}
-- Active File: {{{{activeFile}}}}
-
-[EXECUTION STATE]
-{{{{lastOutput}}}}
-
-[GLOBAL CONTEXT (/.helpwo)]
-This contains project-level rules and memory. Always follow these:
+[GLOBAL RULES (.helpwo)]
+These are persistent rules set by the user. Follow them above all else:
 {{{{globalMemory}}}}
 
-[CONVERSATION HISTORY]
-Recent messages between you and the user (newest last):
-{{{{conversationHistory}}}}
+[ENVIRONMENT]
+- You are agent '{{{{agentName}}}}' (ID: {{{{agentId}}}}) — use /agents to view or rename yourself.
+- OS: {SYSTEM} | Shell: {shell_info} | Path: {{{{currentPath}}}} | Depth: {{{{depth}}}}
+- Active File: {{{{activeFile}}}}
 
 [REASONING PROTOCOL]
-1. Review [STEP_EXECUTED_HISTORY] and [EXECUTION STATE] to understand what has already been tried.
-2. Check [PHYSICAL_OBSERVATION] for the last command result.
-3. Do NOT repeat commands that have already failed unless you changed parameters.
-4. If the user asks a question you already answered, repeat the reply and set done=true.
-5. To ask the user for more information, ask clearly and set done=true.
-6. Record important details in memory like a student taking notes.
+1. Check [TERMINAL OUTPUT] for what just happened.
+2. Check [MEMORY SYSTEM] for recent conversation context (session memory).
+3. Explore before acting: if the task involves unfamiliar files or project structure, ls/cat/grep first to understand the landscape, then execute.
+4. Do NOT repeat commands that have already failed unless you changed parameters.
+5. If the user asks a question you already answered, repeat the reply and set done=true.
+6. To ask the user for more information, ask clearly and set done=true.
+7. Actively maintain global rules in .helpwo — add new rules, update outdated ones, remove obsolete ones.
+8. Set done=false when you run a command that needs its output — the loop will feed it back. Set done=true ONLY when the full task is finished or you need the user to answer.
 
 [AVAILABLE COMMANDS]
 You have access to standard {shell_info} commands and all executables on $PATH.
@@ -1773,127 +1814,63 @@ Use pipelines (|), redirects (>), and command substitution ($(...)).
 When uncertain about paths, explore with ls/pwd/cat first.
 For npm/node/python projects, check package.json/requirements.txt first.
 
-[LOOP ARCHITECTURE]
-Each loop you receive:
-  - "Current location" — directory you are in RIGHT NOW
-  - "Last command output" — what just happened (read carefully!)
-  - "Overall objective" — the ORIGINAL user request. This is CONTEXT, not a fresh instruction.
-
-Each loop you return exactly ONE command. Multi-step tasks spread across loops.
-
-CRITICAL RULES:
+[CRITICAL RULES]
 1. ONE command per response.
-2. Read "Current location" FIRST — it tells you where you are.
-3. Read "Last command output" — if a command succeeded, move forward.
-4. "Overall objective" is the long-term goal, NOT a new command.
-5. Track progress: "Step 2/3: created X. Next: create Y inside it."
-6. PREFER absolute/relative paths over cd: "cat src/App.tsx" not "cd src" + "cat App.tsx".
+2. Use "rules" field to manage .helpwo global rules: "text" → append, "~N:text" → modify, "-N" → delete.
+3. Track progress: "Step 2/3: created X. Next: create Y inside it."
+4. PREFER absolute/relative paths over cd: "cat src/App.tsx" not "cd src" + "cat App.tsx".
 
 [SAFETY]
 - Never use destructive commands (rm -rf, del /F, format) unless the user explicitly requests.
-- Write important patterns/preferences to .helpwo memory.
-- When a task is complete, set done=true and summarize.
 - If a command errors, analyze and adapt — don't repeat.
 
-[META COMMANDS]
-These slash-commands are handled by the CLI shell directly (not by the AI).
-You can tell the user about them when relevant:
-  /help      — Show available commands
-  /login     — Re-authenticate with laintas.com
-  /name      — Set or view your CLI agent name
-  /memory    — View .helpwo memory (project rules & learnings)
-  /prop      — View the .cli.prop system prompt template
-  /scan      — Scan PATH and list available system commands
-  /debug     — Browse recent AI interaction logs
-  /cwd       — Show current working directory
-  /station   — /station <name> create persistent terminal and station AI there
-  /terminate — /terminate <name> close and destroy a terminal
-  /send      — /send <name> <cmd> send a command to a named terminal
-  /hire      — Create a new AI agent (AI-1, AI-2...)
-  /agents    — List/switch agents
-  /t, /term  — List sub-terminals and browse details
-  /clear     — Clear the terminal screen
-  /exit      — Exit Laintas CLI
+[TERMINAL MANAGEMENT]
+CLI-level slash commands (handled by shell): /help /login /name /memory /prop /scan /debug /cwd /clear /exit /back /q /agents
+AI-level commands you can issue:
+- /station <name> — create a persistent laintas-cli REPL terminal and station yourself there.
+- /send <name> <cmd> — send a command to a named terminal (captures output).
+- /terminate <name> — close and destroy a terminal.
+- /t or /term — list all sub-terminals and enter/observe them.
+- /hire — create a new AI agent; /agents — list all agents and their names; /agents <name> — switch to that agent.
+- wait(N) — sleep N seconds (e.g. wait(3) for server startup).
+- learn(text|path|url) — extract knowledge into conversation history as [KNOWLEDGE] (short-term).
+- forget(N) — trim conversation history, keeping [KNOWLEDGE] + last N messages.
+Rules:
+- Every sub-terminal created by /station is a full laintas-cli instance — a peer AI agent just like you, with its own name, identity, and reasoning loop.
+- Each sub-terminal AI has its own agent name (e.g. AI-1, AI-2, or custom names). Use /agents to see all agents and their names, and /agents <name> to switch yourself into an existing agent slot.
+- When stationed, commands run inside the persistent laintas-cli REPL (cd, export, etc. persist across commands).
+- When sending commands to a sub-terminal AI via /send, the target AI will process the command autonomously. The output you see is its reply.
+- Plain commands (not stationed) work as before: one-off in temporary sub-shells.
 
 [RESPONSE FORMAT]
 Respond ONLY with a single JSON object:
 {{
   "reply": "what to tell the user",
   "command": "shell cmd, /station, /send, /terminate, /hire, wait(N), parent(cmd), learn(text), or forget(N)",
-  "memory": "information to remember (appended to .helpwo)",
+  "rules": "text (append new) or ~N:text (modify entry N) or -N (delete entry N)",
   "done": true/false
 }}
 
 Each response must include exactly one "command".
-Use /station, /send, /terminate for persistent terminal management (see below).
+
+Example — listing a directory:
+{{"reply": "Let me check what files are in this project.", "command": "ls -la", "rules": "", "done": false}}
+
+Example — task complete:
+{{"reply": "Done. Created the config file with the settings you specified.", "command": "cat config.yaml", "rules": "Created config.yaml for the project", "done": true}}
 
 [RECURSIVE ORCHESTRATION]
-You are running at depth {{{{depth}}}}.
+You are agent '{{{{agentName}}}}' running at depth {{{{depth}}}}.
 - Depth 0 = user's terminal (output streams directly to user).
 - Depth 1+ = sub-agent or tool (output shown in indented collapsed panels).
-
-Sub-agent delegation:
-  command: "laintas-cli --execute 'task description' --depth {{{{nextDepth}}}}"
-  The sub-agent runs ONE agent loop iteration, prints results, and exits.
-  Capture its stdout from lastOutput and incorporate into your reply.
-  Use this for single-turn subtasks that don't need follow-up questions.
-
-Tool usage (claude, python, vim, etc.):
-  command: "claude -p 'your prompt'" (or other tool)
-  The tool's output appears in indented panels automatically.
-
-Self-recursion rules:
-- You ARE laintas-cli. You can spawn child instances of yourself.
-- Maximum nesting depth: 3 levels (depth 0 → 1 → 2)
-- At depth >= 2, prefer completing the task directly.
-- Prefer calling tools directly over spawning sub-agents for simple tasks.
-- Use sub-agents when you need parallel analysis or AI reasoning on sub-problems.
-- When at depth >= 1, use parent(cmd) for commands that need parent-terminal side effects
-  (cd, clear, etc.) — the parent intercepts and executes them directly.  For ordinary
-  commands (ls, cat, mkdir, git, etc.), just output the command normally.
-
-[TERMINAL MANAGEMENT]
-You can create persistent terminals that maintain state (cd, env vars) across commands,
-and optionally station yourself in one for automatic command execution.
-
-  /station <name>           — create a persistent bash terminal AND station yourself there.
-                              Once stationed, ALL subsequent commands you issue
-                              automatically execute inside this terminal.
-                              No /send needed — just return normal shell commands.
-
-  /send <name> <cmd>        — send a command to a named terminal (captures output).
-                              Use this when you're NOT stationed in that terminal.
-
-  /terminate <name>         — close and destroy a terminal.
-
-  /hire                     — create a new AI agent (numbered ID like AI-1, AI-2).
-                              The user can switch between agents with /agents.
-
-  /agents                   — list available AI agents.
-  /agents <name>            — switch conversation to another agent.
-
-  wait(N)                   — sleep N seconds (e.g. wait(3) for server startup).
-  parent(cmd)               — run this command in the terminal the user is talking to (depth>=1 only).
-  learn(text|path|url)      — extract knowledge from text, file, image (OCR via tesseract),
-                              video (subtitle/metadata via ffprobe), or URL (curl) and
-                              add to conversation history as [KNOWLEDGE] (short-term).
-  forget(N)                 — trim conversation history: drop old regular messages,
-                              keeping only [KNOWLEDGE] entries + last N messages.
-                              Use after learn() to compress context: first summarize
-                              key facts with learn(summary), then forget(3) to drop
-                              the verbose originals. Keeps prompt small.
-
-Rules:
-- Station in a terminal when you want persistent shell state across commands.
-- When stationed, the terminal starts as a fresh bash shell.
-- Close terminals with /terminate when done.
-- Use /hire to delegate subtasks to another AI agent.
-- Plain commands (not stationed) work as before: one-off in temporary sub-shells.
+Sub-agent delegation: command "laintas-cli --execute 'task description' --depth {{{{nextDepth}}}}"
+When you /station a new terminal, a new peer AI agent starts there with its own name and reasoning loop.
+At depth >= 2, prefer completing the task directly.
+Use parent(cmd) for parent-terminal side effects (cd, clear) when at depth >= 1.
 
 [LANGUAGE]
-You MUST respond in English. All replies, commands, and memory must be in English."""
-
-
+You MUST respond in English. All replies, commands, and rules must be in English.
+"""
 # ── File Helpers ───────────────────────────────────────────────────────
 
 def read_file(path: str) -> Optional[str]:
@@ -2015,9 +1992,9 @@ def call_backend_stream(
         if response.status_code != 200:
             try:
                 err_data = response.json()
-                return {"reply": f"Server Error: {err_data.get('detail', response.text[:200])}", "command": "", "memory": "", "done": True, "error": True}
+                return {"reply": f"Server Error: {err_data.get('detail', response.text[:200])}", "command": "", "rules": "", "done": True, "error": True}
             except Exception:
-                return {"reply": f"Server Error: HTTP {response.status_code}", "command": "", "memory": "", "done": True, "error": True}
+                return {"reply": f"Server Error: HTTP {response.status_code}", "command": "", "rules": "", "done": True, "error": True}
 
         # Parse SSE stream
         response_data = None
@@ -2030,12 +2007,12 @@ def call_backend_stream(
             try:
                 response_data = json.loads(data_str)
                 if response_data.get("error"):
-                    return {"reply": f"Server Error: {response_data['error']}", "command": "", "memory": "", "done": True, "error": True}
+                    return {"reply": f"Server Error: {response_data['error']}", "command": "", "rules": "", "done": True, "error": True}
             except json.JSONDecodeError:
                 continue
 
         if not response_data:
-            return {"reply": "No response from AI", "command": "", "memory": "", "done": True, "error": True}
+            return {"reply": "No response from AI", "command": "", "rules": "", "done": True, "error": True}
 
         # Normalize legacy send_keys/close_session into meta-commands
         command = response_data.get("command", "")
@@ -2049,18 +2026,18 @@ def call_backend_stream(
         return {
             "reply": response_data.get("reply", ""),
             "command": command,
-            "memory": response_data.get("memory", ""),
+            "memory": response_data.get("rules", response_data.get("memory", "")),
             "done": response_data.get("done", False),
             "error": False,
             "_billing": response_data.get("_billing", {}),
         }
 
     except requests.Timeout:
-        return {"reply": "Request timed out. Please try again.", "command": "", "memory": "", "done": True, "error": True}
+        return {"reply": "Request timed out. Please try again.", "command": "", "rules": "", "done": True, "error": True}
     except requests.ConnectionError:
-        return {"reply": f"Cannot connect to backend ({backend_url}). Check your network.", "command": "", "memory": "", "done": True, "error": True}
+        return {"reply": f"Cannot connect to backend ({backend_url}). Check your network.", "command": "", "rules": "", "done": True, "error": True}
     except Exception as e:
-        return {"reply": f"Error: {e}", "command": "", "memory": "", "done": True, "error": True}
+        return {"reply": f"Error: {e}", "command": "", "rules": "", "done": True, "error": True}
 
 
 # ── Agent Registration with Helpwo Backend ─────────────────────────────
@@ -2360,7 +2337,7 @@ def show_debug_browser_interactive() -> None:
             lines.append((style, f" {prefix} #{i+1:2d}  {ts}  [{tag}]  {summary}\n"))
 
         lines.append(("", "\n"))
-        lines.append(("dim", f"{len(entries)} entries shown.  /debug clear to clear all."))
+        lines.append(("dim", f"{len(entries)} entries shown.  /debug clear | /debug <N> | /debug <N> <file>"))
         return lines
 
     def _get_text():
@@ -2434,10 +2411,16 @@ def show_debug_detail(index: int) -> None:
     if e.request_body:
         rb = e.request_body
         sections = []
-        sections.append(f"[bold]Message:[/bold]\n{rb.get('message', '')[:1000]}")
-        sections.append(f"[bold]Context sizes:[/bold] global={e.context_sizes.get('global', 0)} chars, conversation={e.context_sizes.get('conversation', 0)} chars, prompt={e.context_sizes.get('prompt', 0)} chars")
-        sections.append(f"[bold]Global Context:[/bold]\n{rb.get('globalContext', '')[:800]}")
-        sections.append(f"[bold]Conversation Context:[/bold]\n{rb.get('conversationContext', '')[:800]}")
+        sections.append(f"[bold]Message:[/bold]\n{rb.get('message', '')[:2000]}")
+        ctx = e.context_sizes
+        sections.append(
+            f"[bold]Context sizes:[/bold] "
+            f"terminal={ctx.get('terminal', 0)} chars, "
+            f"conversation={ctx.get('conversation', 0)} chars, "
+            f"memory={ctx.get('memory', 0)} chars, "
+            f"terminals={ctx.get('terminals', 0)} chars, "
+            f"prompt={ctx.get('prompt', 0)} chars"
+        )
         sections.append(f"[bold]Prompt Preview (first 500 chars):[/bold]\n{rb.get('promptPreview', '')[:500]}")
         console.print(Panel("\n\n".join(sections), title="Request Payload"))
 
@@ -2508,10 +2491,11 @@ def _show_terminal_detail(name: str, cmd: str, sess, created: float, alive: bool
 
 
 def show_terminal_manager(primary_session=None) -> None:
-    """Interactive terminal manager — list, observe, close, view details.
+    """Interactive terminal manager — list, enter, observe, close, view details.
 
     Shows the primary session (if alive) plus all registered terminals.
-    Arrow keys to navigate, Enter to observe, c to close, d for details, q to exit.
+    Arrow keys to navigate, Enter to fully enter (interactive takeover),
+    o to observe read-only, c to close, d for details, q to exit.
     """
     items: list = []  # [(display_name, command, session, created_at, is_alive)]
 
@@ -2533,7 +2517,7 @@ def show_terminal_manager(primary_session=None) -> None:
     def _build_lines():
         lines = []
         lines.append(("bold cyan", "Terminal Manager\n"))
-        lines.append(("dim", "↑↓ navigate  ↵ observe  c close  d details  q back\n\n"))
+        lines.append(("dim", "↑↓ navigate  ↵ enter  o observe  c close  d details  q back\n\n"))
 
         for i, (name, cmd, sess, created, alive) in enumerate(items):
             prefix = "▶" if i == selected[0] else " "
@@ -2554,7 +2538,7 @@ def show_terminal_manager(primary_session=None) -> None:
 
         lines.append(("", "\n"))
         lines.append(("dim", f"{len(items)} terminal(s).  "
-                      "Enter=observe  c=close  d=details  q=back"))
+                      "Enter=embody  o=observe  c=close  d=details  q=back"))
         return lines
 
     def _get_text():
@@ -2571,6 +2555,10 @@ def show_terminal_manager(primary_session=None) -> None:
         selected[0] = min(len(items) - 1, selected[0] + 1)
 
     @kb.add("enter")
+    def _(event):
+        event.app.exit(result=("enter", selected[0]))
+
+    @kb.add("o")
     def _(event):
         event.app.exit(result=("observe", selected[0]))
 
@@ -2610,7 +2598,20 @@ def show_terminal_manager(primary_session=None) -> None:
 
         name, cmd, sess, created, alive = items[idx]
 
-        if action == "observe":
+        if action == "enter":
+            if not alive:
+                console.print("\n[yellow]Session has already ended.[/yellow]")
+                input("[dim]Press Enter to continue...[/dim]")
+                continue
+            enter_session(sess, display_name=name, display_cmd=cmd)
+            # After detaching from enter_session, the terminal may need
+            # a moment to restore before prompt_toolkit takes over again
+            time.sleep(0.1)
+            # If session died during enter (user typed /q), unregister it
+            if name != "term0 (primary)" and not sess.is_alive():
+                unregister_terminal(name)
+
+        elif action == "observe":
             if not alive:
                 console.print("\n[yellow]Session has already ended.[/yellow]")
                 input("[dim]Press Enter to continue...[/dim]")
@@ -2731,6 +2732,145 @@ def observe_session(session, display_name: str = "", display_cmd: str = "") -> N
     app.run()
 
 
+def enter_session(session, display_name: str = "", display_cmd: str = "") -> None:
+    """Full interactive takeover of a sub-terminal session.
+
+    All keystrokes are forwarded to the session. Type /back in the
+    sub-terminal to detach without closing it. Type /q to close the
+    sub-terminal and return to term0. Ctrl+\\ also detaches.
+
+    Session output streams directly to the terminal — exactly like
+    using a real terminal.
+    """
+    if not session:
+        console.print("[dim]No active sub-terminal session.[/dim]")
+        return
+
+    if not session.is_alive():
+        console.print("[yellow]Session has already ended.[/yellow]")
+        return
+
+    mfd = getattr(session, 'master_fd', -1)
+    if mfd < 0:
+        console.print("[yellow]Session does not support raw PTY I/O (tmux mode).[/yellow]")
+        return
+
+    fd = sys.stdin.fileno()
+
+    # Display info
+    if display_name:
+        cmd_display = f"{display_name}: {display_cmd[:60]}" if display_cmd else display_name
+    else:
+        cmd_display = getattr(session, 'command', 'sub-terminal')[:80]
+
+    # Save terminal state
+    old_tcattr = termios.tcgetattr(fd)
+    old_sigquit = signal.getsignal(signal.SIGQUIT)
+
+    # Clear screen and show header
+    sys.stdout.write("\033[2J\033[H")
+    sys.stdout.write(f"● Entered: {cmd_display}\n")
+    sys.stdout.write("  /back to detach  |  /q to close  |  Ctrl+\\ to force detach\n")
+    sys.stdout.write("─" * 60 + "\n\n")
+    sys.stdout.flush()
+
+    # Show pending output (current terminal state, last 100 lines)
+    session.read_output(timeout=0.1)
+    try:
+        pending = session.raw_output
+    except Exception:
+        pending = session.full_output
+    if pending:
+        lines = pending.split('\n')
+        if len(lines) > 100:
+            pending = '\n'.join(lines[-100:])
+        sys.stdout.write(pending)
+        sys.stdout.flush()
+
+    detached = False
+    session_died = False
+
+    def _on_sigquit(signum, frame):
+        nonlocal detached
+        detached = True
+
+    signal.signal(signal.SIGQUIT, _on_sigquit)
+
+    # Detach marker: emitted by laintas-cli when user types /back
+    DETACH_MARKER = b'\x1b]777;LAINTAS_DETACH\x07'
+    partial_buf = b''
+
+    try:
+        tty.setraw(fd)
+
+        while session.is_alive() and not detached:
+            try:
+                r, _, _ = select.select([fd, mfd], [], [], 0.1)
+            except (select.error, ValueError):
+                break
+
+            if fd in r:
+                try:
+                    data = os.read(fd, 4096)
+                except OSError:
+                    break
+                if not data:
+                    break
+                # Ctrl+\ (byte 0x1c) → force detach
+                if data == b'\x1c':
+                    detached = True
+                    break
+                try:
+                    os.write(mfd, data)
+                except OSError:
+                    break
+
+            if mfd in r:
+                try:
+                    data = os.read(mfd, 4096)
+                except OSError:
+                    break
+                if data:
+                    # Prepend any partial marker from previous read
+                    data = partial_buf + data
+                    partial_buf = b''
+
+                    # Check for /back detach marker
+                    if DETACH_MARKER in data:
+                        data = data.replace(DETACH_MARKER, b'')
+                        detached = True
+
+                    # Keep suffix that might be a partial marker
+                    for i in range(len(DETACH_MARKER) - 1, 0, -1):
+                        if data.endswith(DETACH_MARKER[:i]):
+                            partial_buf = data[-i:]
+                            data = data[:-i]
+                            break
+
+                    if data:
+                        try:
+                            sys.stdout.buffer.write(data)
+                            sys.stdout.flush()
+                        except (OSError, BrokenPipeError):
+                            break
+                else:
+                    # EOF — sub-terminal exited (e.g., /q)
+                    session_died = True
+                    break
+
+    finally:
+        try:
+            termios.tcsetattr(fd, termios.TCSANOW, old_tcattr)
+        except termios.error:
+            pass
+        signal.signal(signal.SIGQUIT, old_sigquit)
+
+    if session_died:
+        console.print(f"\n[dim]● Sub-terminal exited. Returned to term0[/dim]")
+    else:
+        console.print(f"\n[green]● Detached. Returned to term0[/green]")
+
+
 _extra_cmd_handler_cache = None
 _extra_cmd_mtime_cache = 0
 
@@ -2773,6 +2913,13 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
         agent_registry.unregister()
         console.print("[green]Goodbye![/green]")
         return True
+
+    elif action == "/back":
+        # Signal parent enter_session to detach without closing this terminal
+        sys.stdout.write("\x1b]777;LAINTAS_DETACH\x07")
+        sys.stdout.flush()
+        console.print("[green]Detaching...[/green]")
+        return False
 
     elif action == "/help":
         show_help()
@@ -2829,9 +2976,18 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
             console.print("       /agents name <new-name>  (rename current agent)")
 
     elif action == "/memory":
-        memory = read_file(".helpwo")
-        if memory:
-            console.print(Panel(memory, title=".helpwo Memory"))
+        raw = read_file(".helpwo")
+        if raw and raw.strip():
+            try:
+                entries = json.loads(raw)
+                if isinstance(entries, list) and entries:
+                    lines = [f"[bold]{e['id']}.[/bold] {e['content']}" for e in entries]
+                    text = "\n".join(lines)
+                    console.print(Panel(text, title=f".helpwo Memory ({len(entries)} entries)"))
+                else:
+                    console.print(Panel(raw.strip(), title=".helpwo Memory"))
+            except json.JSONDecodeError:
+                console.print(Panel(raw.strip(), title=".helpwo Memory"))
         else:
             console.print("[dim]No memory yet. The AI will record learnings here.[/dim]")
 
@@ -2872,20 +3028,72 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
             if sub == "clear":
                 clear_debug_logs()
                 console.print("[green]Debug log cleared.[/green]")
+            elif len(parts) >= 3 and sub.isdigit():
+                # /debug <N> <filename> — save latest N entries to file
+                try:
+                    n = int(sub)
+                    filename = parts[2]
+                    entries = get_debug_logs()[:n]
+                    if not entries:
+                        console.print("[yellow]No debug entries to save.[/yellow]")
+                    else:
+                        filepath = Path(filename)
+                        lines = []
+                        for i, e in enumerate(entries, 1):
+                            lines.append(f"{'='*60}")
+                            lines.append(f"Entry #{i}  Loop #{e.loop}  {e.timestamp}  Path: {e.current_path}")
+                            lines.append(f"{'='*60}")
+                            if e.user_input:
+                                lines.append(f"\n[User Input]\n{e.user_input[:3000]}")
+                            if e.request_body:
+                                lines.append(f"\n[Context Sizes] terminal={e.context_sizes.get('terminal', 0)} conversation={e.context_sizes.get('conversation', 0)} memory={e.context_sizes.get('memory', 0)} terminals={e.context_sizes.get('terminals', 0)} prompt={e.context_sizes.get('prompt', 0)}")
+                                lines.append(f"\n[Prompt Preview]\n{e.request_body.get('promptPreview', '')[:500]}")
+                            if e.reply:
+                                lines.append(f"\n[AI Reply]\n{e.reply[:1500]}")
+                            if e.command:
+                                lines.append(f"\n[Command]\n{e.command}")
+                            if e.memory:
+                                lines.append(f"\n[Memory]\n{e.memory[:500]}")
+                            lines.append(f"\n[Done] {e.done}")
+                            if e.error:
+                                lines.append("\n[Error] true")
+                            if e.billing:
+                                cost = e.billing.get("costCents", 0)
+                                balance = e.billing.get("balanceCents", 0)
+                                lines.append(f"\n[Billing] ${cost / 100:.2f} (balance ${balance / 100:.2f})")
+                            if e.exec_command:
+                                lines.append(f"\n[Executed] {e.exec_command}")
+                                lines.append(f"[Return Code] {e.exec_returncode}")
+                                if e.exec_stdout:
+                                    lines.append(f"\n[Stdout]\n{e.exec_stdout}")
+                                if e.exec_stderr:
+                                    lines.append(f"\n[Stderr]\n{e.exec_stderr}")
+                            if e.response_raw:
+                                try:
+                                    raw_json = json.dumps(e.response_raw, ensure_ascii=False, indent=2)
+                                except Exception:
+                                    raw_json = str(e.response_raw)
+                                lines.append(f"\n[Raw Response]\n{raw_json[:2000]}")
+                            lines.append("")
+                        filepath.write_text('\n'.join(lines), encoding='utf-8')
+                        console.print(f"[green]Saved {n} debug entries to {filepath.absolute()}[/green]")
+                except (ValueError, IndexError) as exc:
+                    console.print(f"[red]Error: {exc}[/red]")
+                    console.print("Usage: [bold]/debug <N> <filename>[/bold]")
             else:
                 try:
                     idx = int(sub) - 1
                     show_debug_detail(idx)
                 except (ValueError, IndexError):
                     console.print(f"[red]Invalid entry number: {sub}[/red]")
-                    console.print("Use [bold]/debug[/bold] to browse entries.")
+                    console.print("Use [bold]/debug[/bold] to browse entries. [bold]/debug <N> <file>[/bold] to save to file.")
         else:
             show_debug_browser_interactive()
 
     elif action in ("/station", "/st"):
         if len(parts) < 2:
             console.print("[yellow]Usage: /station <name>[/yellow]")
-            console.print("  Creates a persistent bash terminal and stations your AI agent there.")
+            console.print("  Creates a persistent terminal running laintas-cli and stations your AI agent there.")
         else:
             name = parts[1]
             existing = get_terminal(name)
@@ -2893,12 +3101,13 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
                 unregister_terminal(name)
                 existing = None
             if existing is None:
-                sub = SubTerminalSession(DEFAULT_SHELL)
+                lain_cmd = f"{sys.executable} {os.path.abspath(__file__)} --simple-prompt"
+                sub = SubTerminalSession(lain_cmd)
                 sub.start()
                 time.sleep(0.3)
                 if sub.is_alive():
                     sub.read_output(timeout=0.3)
-                register_terminal(sub, DEFAULT_SHELL, 0, name=name)
+                register_terminal(sub, "laintas-cli", 0, name=name)
             current = get_current_agent()
             if current:
                 station_agent(current.id, name)
@@ -2978,7 +3187,7 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
             console.print("[dim]No active sub-terminal sessions. "
                           "Use /station or let the AI spawn a command.[/dim]")
         elif not terminals and has_primary:
-            observe_session(interactive_session)
+            enter_session(interactive_session)
         else:
             show_terminal_manager(interactive_session)
 
@@ -2997,6 +3206,7 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
                 "station_agent": station_agent, "unstation_agent": unstation_agent,
                 "SubTerminalSession": SubTerminalSession,
                 "observe_session": observe_session,
+                "enter_session": enter_session,
                 "_show_terminal_detail": _show_terminal_detail,
                 "get_config": get_runtime_config,
                 "set_config": set_runtime_config,
@@ -3029,14 +3239,15 @@ def show_help():
     table.add_row("/memory", "View .helpwo memory file")
     table.add_row("/prop", "View .cli.prop prompt template")
     table.add_row("/scan", "Scan and list all available system commands from PATH")
-    table.add_row("/debug", "Browse last 20 AI/CMD interactions (use /debug <N> for detail, /debug clear)")
+    table.add_row("/debug", "Browse debug entries (/debug), view detail (/debug <N>), save to file (/debug <N> <file>), clear (/debug clear)")
     table.add_row("/cwd", "Show current working directory")
     table.add_row("/station <name>", "Create persistent terminal and station AI there")
     table.add_row("/terminate <name>", "Close and destroy a terminal")
     table.add_row("/send <name> <cmd>", "Send a command to a named terminal")
     table.add_row("/hire", "Create a new AI agent (AI-1, AI-2...)")
     table.add_row("/agents [name]", "List/switch agents, /agents name <n> to rename")
-    table.add_row("/t, /term", "List sub-terminals and browse details")
+    table.add_row("/t, /term", "List sub-terminals, Enter to embody, o to observe")
+    table.add_row("/back", "Detach from sub-terminal without closing it")
     table.add_row("/clear", "Clear screen")
     table.add_row("/exit", "Log out and exit (clears cached session)")
     table.add_row("/quit, /q", "Exit without logging out (keeps cached session)")
@@ -3055,6 +3266,7 @@ def get_loop_deps() -> LoopDeps:
         _loop_deps = LoopDeps(
             read_file=read_file,
             append_file=append_file,
+            write_file=write_file,
             strip_ansi=strip_ansi,
             generate_prompt=generate_cli_prop_template,
             call_backend=call_backend_stream,
