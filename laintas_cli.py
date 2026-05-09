@@ -3571,16 +3571,17 @@ def main():
                 interactive_session = None
 
             # Drain any queued terminal query responses before passthrough
-            _fl = fcntl.fcntl(sys.stdin.fileno(), fcntl.F_GETFL)
-            fcntl.fcntl(sys.stdin.fileno(), fcntl.F_SETFL, _fl | os.O_NONBLOCK)
-            try:
-                while True:
-                    if not sys.stdin.buffer.read(4096):
-                        break
-            except (BlockingIOError, OSError):
-                pass
-            finally:
-                fcntl.fcntl(sys.stdin.fileno(), fcntl.F_SETFL, _fl)
+            if not IS_WINDOWS:
+                _fl = fcntl.fcntl(sys.stdin.fileno(), fcntl.F_GETFL)
+                fcntl.fcntl(sys.stdin.fileno(), fcntl.F_SETFL, _fl | os.O_NONBLOCK)
+                try:
+                    while True:
+                        if not sys.stdin.buffer.read(4096):
+                            break
+                except (BlockingIOError, OSError):
+                    pass
+                finally:
+                    fcntl.fcntl(sys.stdin.fileno(), fcntl.F_SETFL, _fl)
 
             # Full terminal passthrough — user interacts directly with the command
             result = pty_passthrough(user_input)
