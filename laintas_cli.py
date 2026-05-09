@@ -1082,6 +1082,8 @@ def get_dispatch_commands() -> set:
         if not _CLI_ALL:
             _CLI_ALL = scan_path_commands()
             write_cli_file(_CLI_ALL)
+    if IS_WINDOWS:
+        _CLI_ALL.update(_WINDOWS_CMD_BUILTINS)
     return _CLI_ALL
 
 
