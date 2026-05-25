@@ -16,6 +16,7 @@ import json
 import time
 import uuid
 import errno
+import queue
 import shlex
 import signal
 import socket
@@ -25,7 +26,7 @@ import webbrowser
 import threading
 import subprocess
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 from dataclasses import dataclass, field
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -77,11 +78,13 @@ from rich.text import Text
 from prompt_toolkit import PromptSession
 from prompt_toolkit.application import Application
 from prompt_toolkit.history import FileHistory
-from prompt_toolkit.completion import Completer, Completion, PathCompleter
+from prompt_toolkit.completion import Completer, Completion, PathCompleter, WordCompleter
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import Layout, HSplit, Window, FormattedTextControl
 from prompt_toolkit.styles import Style
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
+from prompt_toolkit.buffer import Buffer
+from prompt_toolkit.layout.controls import BufferControl
 
 console = Console()
 
@@ -100,10 +103,16 @@ from agent_loop import (
     switch_to_agent, set_current_agent_id,
     rename_agent, station_agent, unstation_agent,
     close_all_agents,
+    spawn_subagent, send_to_agent, recv_from_inbox, drain_inbox,
+    abort_agent, wait_for_agent, build_agents_tree,
     get_runtime_config, set_runtime_config,
     list_runtime_config, reset_runtime_config,
     clear_loop_command_cache,
 )
+
+import tools as tools_mod    # noqa: E402 — load after agent_loop so registry inits once
+import skills as skills_mod  # noqa: E402
+import mcp_client as mcp_mod # noqa: E402
 
 # ── ANSI escape sequence stripping ─────────────────────────────────────
 _ANSI_RE = re.compile(r'\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[@-Z\\-~]|\x1b[()][AB12]|\x0d')
@@ -920,7 +929,8 @@ def display_sub_terminal_preview(command: str, output: str, depth: int = 0, aliv
 # ── prompt_toolkit Input Setup ──────────────────────────────────────────
 
 class MetaCompleter(Completer):
-    """Completer that handles /-commands and falls back to path completion."""
+    """Context-aware completer: /-commands, shell commands from PATH, and paths."""
+
     META_COMMANDS = [
         "/help", "/login", "/name", "/memory", "/prop",
         "/scan", "/debug", "/cwd",
@@ -931,16 +941,50 @@ class MetaCompleter(Completer):
 
     def __init__(self):
         self._path = PathCompleter(expanduser=True)
+        self._cmd_completer: WordCompleter | None = None
+        self._cmd_words: list[str] = []
+        self._cmd_mtime: float = 0.0
+
+    def _refresh_commands(self):
+        """Refresh the cached command list if PATH has changed."""
+        now = time.time()
+        if now - self._cmd_mtime < 5 and self._cmd_completer is not None:
+            return
+        words = set(_builtins_for_platform())
+        for path_dir in os.environ.get("PATH", "").split(os.pathsep):
+            p = Path(path_dir)
+            if not p.is_dir():
+                continue
+            try:
+                for entry in p.iterdir():
+                    if entry.is_file() and os.access(entry, os.X_OK):
+                        words.add(entry.name)
+            except (PermissionError, OSError):
+                continue
+        self._cmd_words = sorted(words)
+        self._cmd_completer = WordCompleter(self._cmd_words, ignore_case=True, sentence=True)
+        self._cmd_mtime = now
 
     def get_completions(self, document, complete_event):
         text = document.text_before_cursor.lstrip()
+        if not text:
+            return
         # /-command completion
         if text.startswith("/"):
             for cmd in self.META_COMMANDS:
                 if cmd.startswith(text):
                     yield Completion(cmd, start_position=-len(text))
             return
-        # Path completion for arguments
+
+        # First word — complete from PATH + builtins
+        stripped = document.text_before_cursor.lstrip()
+        cursor_in_first_word = " " not in stripped
+        if cursor_in_first_word:
+            self._refresh_commands()
+            yield from self._cmd_completer.get_completions(document, complete_event)
+            return
+
+        # After a command — path/file completion
         yield from self._path.get_completions(document, complete_event)
 
 
@@ -1004,18 +1048,50 @@ def pt_prompt(cwd: str) -> str:
 
 
 # ── Dynamic Command Discovery ──────────────────────────────────────────
-# No hardcoded command lists. On startup we scan $PATH (Linux/Mac) or
-# %PATH%+%PATHEXT% (Windows) and write every executable name to .cli .
-# The AI prompt (.cli.prop) gets a filtered subset — system daemons and
-# single-char names are hidden so the AI focuses on user-facing commands.
+# Routing decision (system command vs natural language) is made at runtime
+# via shutil.which() plus a fixed set of shell builtins. No persisted
+# snapshot — newly-installed binaries are picked up immediately.
 
 import re
+import shutil
 
-CLI_FILE = ".cli"
+# bash/sh/zsh builtins that aren't on PATH but should still route as commands.
+_POSIX_SHELL_BUILTINS = {
+    "alias", "bg", "break", "builtin", "case", "cd", "command", "compgen",
+    "complete", "continue", "declare", "dirs", "disown", "echo", "enable",
+    "eval", "exec", "exit", "export", "false", "fg", "for", "function",
+    "getopts", "hash", "help", "history", "if", "jobs", "kill", "let",
+    "local", "logout", "popd", "printf", "pushd", "pwd", "read", "readonly",
+    "return", "select", "set", "shift", "shopt", "source", "suspend", "test",
+    "time", "times", "trap", "true", "type", "typeset", "ulimit", "umask",
+    "unalias", "unset", "until", "wait", "while", ".", ":",
+}
 
 
-def scan_path_commands() -> set:
-    """Scan all directories in $PATH for available executables."""
+def _builtins_for_platform() -> set:
+    return _WINDOWS_CMD_BUILTINS if IS_WINDOWS else _POSIX_SHELL_BUILTINS
+
+
+def extract_first_word(user_input: str) -> str:
+    """Extract the first shell word from user input."""
+    m = re.match(r'^\s*(\S+)', user_input)
+    if not m:
+        return ""
+    return m.group(1).strip("'\"`;&|")
+
+
+def is_system_command(user_input: str) -> bool:
+    """True if the first word is a shell builtin or resolvable on PATH."""
+    first = extract_first_word(user_input)
+    if not first:
+        return False
+    if first in _builtins_for_platform():
+        return True
+    return shutil.which(first) is not None
+
+
+def list_path_commands() -> list:
+    """Enumerate user-facing commands currently on PATH (for /scan display)."""
     commands = set()
     path_dirs = os.environ.get("PATH", "").split(os.pathsep)
 
@@ -1031,6 +1107,7 @@ def scan_path_commands() -> set:
                         commands.add(entry.stem)
             except (PermissionError, OSError):
                 pass
+        commands.update(_WINDOWS_CMD_BUILTINS)
     else:
         for path_dir in path_dirs:
             p = Path(path_dir)
@@ -1043,89 +1120,16 @@ def scan_path_commands() -> set:
             except (PermissionError, OSError):
                 pass
 
-    if IS_WINDOWS:
-        commands.update(_WINDOWS_CMD_BUILTINS)
-
-    return commands
-
-
-def write_cli_file(commands: set) -> None:
-    """Write discovered commands to .cli (one per line, sorted)."""
-    Path(CLI_FILE).write_text("\n".join(sorted(commands)) + "\n", encoding="utf-8")
-
-
-def load_cli_commands() -> set:
-    """Load command set from .cli file. Returns empty set if file missing."""
-    p = Path(CLI_FILE)
-    if not p.exists():
-        return set()
-    text = p.read_text(encoding="utf-8", errors="replace")
-    return {line.strip() for line in text.splitlines() if line.strip()}
-
-
-# Cached command set for dispatch
-_CLI_ALL: set = set()       # every command on PATH
-
-
-def refresh_commands() -> None:
-    """Re-scan PATH, rewrite .cli, refresh cache."""
-    global _CLI_ALL
-    _CLI_ALL = scan_path_commands()
-    write_cli_file(_CLI_ALL)
-
-
-def get_dispatch_commands() -> set:
-    """Return the full command set used for dispatch matching."""
-    global _CLI_ALL
-    if not _CLI_ALL:
-        _CLI_ALL = load_cli_commands()
-        if not _CLI_ALL:
-            _CLI_ALL = scan_path_commands()
-            write_cli_file(_CLI_ALL)
-    if IS_WINDOWS:
-        _CLI_ALL.update(_WINDOWS_CMD_BUILTINS)
-    return _CLI_ALL
-
-
-def _filter_user_commands(all_cmds: set) -> list:
-    """Filter out obscure system commands for the AI prompt.
-
-    Keeps commands that look user-facing: 2+ chars, lowercase start,
-    no weird characters, not a known system daemon prefix.
-    """
     result = []
-    for c in sorted(all_cmds):
-        if len(c) < 2:
-            continue
-        if c[0].isupper():
+    for c in sorted(commands):
+        if len(c) < 2 or c[0].isupper():
             continue
         if "." in c or ":" in c or c.startswith("_"):
             continue
-        # systemd / dbus / kernel internal
         if c.startswith("systemd-") or c.startswith("dbus-") or c.startswith("ksvgtop"):
             continue
         result.append(c)
     return result
-
-
-def extract_first_word(user_input: str) -> str:
-    """Extract the first shell word from user input. Returns lowercase."""
-    m = re.match(r'^\s*(\S+)', user_input)
-    if not m:
-        return ""
-    w = m.group(1)
-    # strip common wrappers: quotes, semicolons
-    w = w.strip("'\"`;&|")
-    return w
-
-
-def is_system_command(user_input: str) -> bool:
-    """Check whether the first word of input matches a command on PATH."""
-    first = extract_first_word(user_input)
-    if not first:
-        return False
-    dispatch = get_dispatch_commands()
-    return first in dispatch
 
 
 # ── Shell Detection ──────────────────────────────────────────────────────
@@ -1785,93 +1789,160 @@ def _forget(keep_n, ctx):
 
 
 def generate_cli_prop_template() -> str:
-    """Generate the .cli.prop system prompt template for the current OS."""
-    shell_info = "cmd.exe" if IS_WINDOWS else f"{SHELL_NAME}"
+    """Generate the .cli.prop system prompt template for the current OS.
 
-    return f"""You are '{{{{agentName}}}}', an autonomous AI agent running in a laintas-cli REPL on {SYSTEM}.
-Always respond with valid JSON. Your agent ID is '{{{{agentId}}}}'.
+    The template uses XML-style sections (Anthropic's recommended pattern —
+    Claude attends to them better than ALL-CAPS brackets) and teaches the
+    agent the full surface: shell, /tool dispatch, /term, /spawn, memory.
 
-[GLOBAL RULES (.helpwo)]
-These are persistent rules set by the user. Follow them above all else:
+    Variables substituted at run time (see agent_loop.run_agent_loop):
+      {{agentName}} {{agentId}} {{currentPath}} {{depth}} {{nextDepth}}
+      {{activeFile}} {{globalMemory}} {{persistentMemory}}
+      {{planMode}} {{tools}} {{inbox}} {{children}} {{parent}}
+    """
+    shell_info = "cmd.exe" if IS_WINDOWS else SHELL_NAME
+
+    return f"""<role>
+You are {{{{agentName}}}} (id: {{{{agentId}}}}), an autonomous coding agent running inside a laintas-cli REPL.
+You earn your keep by solving real engineering tasks: explore the codebase, edit files, run commands, verify the result, and report back tersely. You are not a chatbot — you act, then explain what you did.
+</role>
+
+<environment>
+- OS: {SYSTEM} | Shell: {shell_info} | CWD: {{{{currentPath}}}}
+- Recursion depth: {{{{depth}}}} (0 = user's terminal; ≥1 = sub-agent in a collapsed panel)
+- Parent agent: {{{{parent}}}} | Children: {{{{children}}}}
+- Inbox (messages from other agents this iteration): {{{{inbox}}}}
+- Plan mode: {{{{planMode}}}}
+</environment>
+
+<persistent_memory>
+These memories survive across sessions. Treat them as authoritative context about the user and project.
+{{{{persistentMemory}}}}
+</persistent_memory>
+
+<project_rules>
+Project-local rules stored in .helpwo. They override defaults; follow them strictly.
 {{{{globalMemory}}}}
+</project_rules>
 
-[ENVIRONMENT]
-- You are agent '{{{{agentName}}}}' (ID: {{{{agentId}}}}) — use /agents to view or rename yourself.
-- OS: {SYSTEM} | Shell: {shell_info} | Path: {{{{currentPath}}}} | Depth: {{{{depth}}}}
-- Active File: {{{{activeFile}}}}
+<tools>
+You have two ways to act, both expressed in the `command` field of your JSON response:
 
-[REASONING PROTOCOL]
-1. Check [TERMINAL OUTPUT] for what just happened.
-2. Check [MEMORY SYSTEM] for recent conversation context (session memory).
-3. Explore before acting: if the task involves unfamiliar files or project structure, ls/cat/grep first to understand the landscape, then execute.
-4. Do NOT repeat commands that have already failed unless you changed parameters.
-5. If the user asks a question you already answered, repeat the reply and set done=true.
-6. To ask the user for more information, ask clearly and set done=true.
-7. Actively maintain global rules in .helpwo — add new rules, update outdated ones, remove obsolete ones.
-8. Set done=false when you run a command that needs its output — the loop will feed it back. Set done=true ONLY when the full task is finished or you need the user to answer.
+(A) Shell command — any executable on PATH, with pipes/redirects/substitution. Examples:
+    ls -la src/
+    grep -rn "TODO" --include="*.py" .
+    python -c "import json; print(json.load(open('package.json'))['version'])"
 
-[AVAILABLE COMMANDS]
-You have access to standard {shell_info} commands and all executables on $PATH.
-Use pipelines (|), redirects (>), and command substitution ($(...)).
-When uncertain about paths, explore with ls/pwd/cat first.
-For npm/node/python projects, check package.json/requirements.txt first.
+(B) Structured tool — use this form for filesystem, memory, plan, task, and web operations.
+    /tool <name> <json-params>
 
-[CRITICAL RULES]
-1. ONE command per response.
-2. Use "rules" field to manage .helpwo global rules: "text" → append, "~N:text" → modify, "-N" → delete.
-3. Track progress: "Step 2/3: created X. Next: create Y inside it."
-4. PREFER absolute/relative paths over cd: "cat src/App.tsx" not "cd src" + "cat App.tsx".
+    Example: /tool fs.read {{"path": "src/app.py", "max_bytes": 4000}}
 
-[SAFETY]
-- Never use destructive commands (rm -rf, del /F, format) unless the user explicitly requests.
-- If a command errors, analyze and adapt — don't repeat.
+The structured tools below are preferred over raw shell when both work, because they return
+clean JSON the loop can use directly, and they don't spawn a PTY. Use shell for: pipelines,
+build tools, package managers, git, version control, anything PTY-driven.
 
-[TERMINAL MANAGEMENT]
-CLI-level slash commands (handled by shell): /help /login /name /memory /prop /scan /debug /cwd /clear /exit /back /q /agents
-AI-level commands you can issue:
-- /station <name> — create a persistent laintas-cli REPL terminal and station yourself there.
-- /send <name> <cmd> — send a command to a named terminal (captures output).
-- /terminate <name> — close and destroy a terminal.
-- /t or /term — list all sub-terminals and enter/observe them.
-- /hire — create a new AI agent; /agents — list all agents and their names; /agents <name> — switch to that agent.
-- wait(N) — sleep N seconds (e.g. wait(3) for server startup).
-- learn(text|path|url) — extract knowledge into conversation history as [KNOWLEDGE] (short-term).
-- forget(N) — trim conversation history, keeping [KNOWLEDGE] + last N messages.
-Rules:
-- Every sub-terminal created by /station is a full laintas-cli instance — a peer AI agent just like you, with its own name, identity, and reasoning loop.
-- Each sub-terminal AI has its own agent name (e.g. AI-1, AI-2, or custom names). Use /agents to see all agents and their names, and /agents <name> to switch yourself into an existing agent slot.
-- When stationed, commands run inside the persistent laintas-cli REPL (cd, export, etc. persist across commands).
-- When sending commands to a sub-terminal AI via /send, the target AI will process the command autonomously. The output you see is its reply.
-- Plain commands (not stationed) work as before: one-off in temporary sub-shells.
+Catalog:
+{{{{tools}}}}
 
-[RESPONSE FORMAT]
-Respond ONLY with a single JSON object:
-{{
-  "reply": "what to tell the user",
-  "command": "shell cmd, /station, /send, /terminate, /hire, wait(N), parent(cmd), learn(text), or forget(N)",
-  "rules": "text (append new) or ~N:text (modify entry N) or -N (delete entry N)",
-  "done": true/false
-}}
+Meta-commands (also valid in `command`):
+- /station [name]               station this agent (depth=0 commands run directly, like user input)
+- /send <name> <keys>          send keystrokes / commands to a named terminal
+- /terminate <name>            close and destroy a terminal
+- /t [name]                    list sub-terminals, or /t <name> to create one (no agent stationed)
+- /term <name>                 same as /t <name> — spawn a sub-terminal without stationing
+- /spawn [name:] <task>        fork an in-process child agent (parent keeps running)
+- /tell <agent_id> <message>   send a JSON or text message to another agent's inbox
+- /wait <agent_id> [secs]      block until child agent finishes (cap 300s)
+- /abort <agent_id>            signal another agent to stop
+- /hire                        create a new sibling agent slot
+- /agents [name|tree|name X]   inspect or switch agent identity
+- /session close               close the current one-off PTY session
+- /keys <text>                 send keys to the current one-off PTY session
+- wait(N)                      sleep N seconds (e.g. wait(3) after starting a dev server)
+</tools>
 
-Each response must include exactly one "command".
+<workflow>
+For every non-trivial task, follow this loop:
 
-Example — listing a directory:
-{{"reply": "Let me check what files are in this project.", "command": "ls -la", "rules": "", "done": false}}
+1. UNDERSTAND. Re-state the user's goal in one sentence (in your `reply`). If ambiguous, ask in `reply` and set `done: true` — do not guess.
 
-Example — task complete:
-{{"reply": "Done. Created the config file with the settings you specified.", "command": "cat config.yaml", "rules": "Created config.yaml for the project", "done": true}}
+2. EXPLORE before changing. For unfamiliar code use fs.glob → fs.grep → fs.read (offset/limit if large). Cite findings as `path:line` so the user can jump.
 
-[RECURSIVE ORCHESTRATION]
-You are agent '{{{{agentName}}}}' running at depth {{{{depth}}}}.
-- Depth 0 = user's terminal (output streams directly to user).
-- Depth 1+ = sub-agent or tool (output shown in indented collapsed panels).
-Sub-agent delegation: command "laintas-cli --execute 'task description' --depth {{{{nextDepth}}}}"
-When you /station a new terminal, a new peer AI agent starts there with its own name and reasoning loop.
-At depth >= 2, prefer completing the task directly.
-Use parent(cmd) for parent-terminal side effects (cd, clear) when at depth >= 1.
+3. PLAN for multi-step work. If the task has >3 steps OR touches >2 files, create tasks via task.create before editing. One in_progress task at a time. If plan mode is active (see <environment>), explore only — no writes — until the user runs /plan approve.
 
-[LANGUAGE]
-You MUST respond in English. All replies, commands, and rules must be in English.
+4. ACT in small, verifiable increments. Prefer fs.edit (exact string replacement) for code changes; fs.write only for new files or full rewrites. After edits, run the project's test/typecheck/lint command if one is obvious (package.json scripts, pytest, cargo test, etc.).
+
+5. VERIFY before claiming done. Read the file back, run the test, exit-code-check the build. Saying "done" without verification is the most common failure mode — avoid it.
+
+6. RECOVER from errors. If a command fails: read the error, decide if it's transient (retry once with a fix) or fundamental (change approach). Never re-run the identical failing command. Look at the inline `[error: ...]` hints the loop adds to terminal output — they classify the failure for you.
+
+7. REMEMBER what's worth remembering. Use the `rules` field for project-local facts ("uses Vite", "tests live in __tests__/"). Use `/tool mem.save` for cross-session memories (user role, feedback, project constraints). Don't save derivable facts (git history, current file layout).
+</workflow>
+
+<output_rules>
+Every response is a single JSON object with these fields:
+
+  {{
+    "reply":   "Brief user-facing message. Markdown OK. Reference files as path:line.",
+    "command": "Exactly one shell command, /tool ..., or meta-command. May be empty if done.",
+    "rules":   "Memory mutation (see below) or empty string.",
+    "done":    true | false
+  }}
+
+Field rules:
+- `reply` is what the user sees on the terminal. 1–3 sentences for routine steps. Longer only when summarizing a finished task or asking a clarifying question. No filler ("Sure!", "I'll now…", "Let me know if you need anything else"). Don't restate what the command obviously does.
+- `command`: exactly one action per turn. Use shell pipes if you'd otherwise chain. If you have nothing to run (asking the user, or task finished), leave it `""`.
+- `rules` mutates project memory (.helpwo). Forms: `"text"` appends, `"~N: text"` modifies entry N, `"-N"` deletes entry N, `""` no-op.
+- `done: true` ONLY when the task is fully complete and verified, OR you're blocked waiting on the user. `done: false` whenever you ran a command whose output you need to inspect next iteration.
+
+JSON must parse. No prose outside the object. No code fences around it.
+</output_rules>
+
+<tone>
+- Terse. Direct. No preamble, no flattery, no "Great question!". No final summary if a diff or test result already shows what changed.
+- Cite code as `path:line` (e.g. `agent_loop.py:1042`). Never use placeholder file paths.
+- Use markdown lists/code blocks in `reply` when they help, not as decoration.
+- Match the user's language for replies (English if uncertain). Code identifiers stay English regardless.
+</tone>
+
+<safety>
+- Destructive commands (`rm -rf`, `mkfs`, `dd of=/dev/...`, `chmod 777 /`) are blocked by the local policy engine. Do not try to bypass it. If a user explicitly asks for a destructive action, run the policy-approved equivalent (e.g. `rm` on specific files).
+- Never invent file paths, package names, or APIs. If unsure, read first.
+- Do not commit, push, or publish without an explicit request from the user.
+- Do not run `curl ... | sh` or pipe untrusted input into a shell.
+</safety>
+
+<recursive_orchestration>
+You can delegate sub-tasks two ways:
+
+- `/spawn task description` — in-process child agent. Cheap, shares process state, posts result to your inbox.
+- shell: `laintas-cli --execute "task description" --depth {{{{nextDepth}}}}` — full sub-process. Heavier, but isolated.
+
+Rule of thumb: spawn for parallel exploration ("read these 3 files in parallel"); execute for isolated long-running tasks. At depth ≥ 2 prefer doing the work yourself — deeper recursion costs more than it saves.
+
+For parent-terminal side effects (cd, clear) at depth ≥ 1, use `parent(cmd)` form.
+</recursive_orchestration>
+
+<examples>
+Task: "What does this project do?"
+{{"reply": "Reading the README to find out.", "command": "/tool fs.read {{\\"path\\": \\"README.md\\", \\"max_bytes\\": 4000}}", "rules": "", "done": false}}
+
+Task (next iteration, after seeing README):
+{{"reply": "It's a Python CLI that turns a backend LLM into a terminal coding agent. Entrypoint is `laintas_cli.py:1`; the loop lives in `agent_loop.py:1018`.", "command": "", "rules": "Entrypoint=laintas_cli.py; loop=agent_loop.run_agent_loop", "done": true}}
+
+Task: "Fix the typo on line 42 of utils.py"
+{{"reply": "Replacing `recieve` with `receive` in utils.py:42.", "command": "/tool fs.edit {{\\"path\\": \\"utils.py\\", \\"old_string\\": \\"recieve\\", \\"new_string\\": \\"receive\\"}}", "rules": "", "done": false}}
+
+Task: "Run the tests"
+{{"reply": "Running pytest.", "command": "pytest -x --tb=short", "rules": "", "done": false}}
+
+Task complete after the test passes:
+{{"reply": "All 23 tests pass. The typo fix didn't break anything.", "command": "", "rules": "", "done": true}}
+
+Task: needs clarification
+{{"reply": "Which `config.json` did you mean — the one at the repo root or in `src/`? Both exist.", "command": "", "rules": "", "done": true}}
+</examples>
 """
 # ── File Helpers ───────────────────────────────────────────────────────
 
@@ -1895,19 +1966,11 @@ def append_file(path: str, content: str) -> None:
 
 
 def ensure_files_exist() -> None:
-    """Create .cli, .cli.prop, .helpwo, .extra_command.py and .loop_command.py if they don't exist in cwd."""
-    global _CLI_ALL
-    cli_path = Path.cwd() / CLI_FILE
+    """Create .cli.prop, .helpwo, .extra_command.py and .loop_command.py if they don't exist in cwd."""
     cli_prop_path = Path.cwd() / ".cli.prop"
     helpwo_path = Path.cwd() / ".helpwo"
     extra_cmd_path = Path.cwd() / ".extra_command.py"
     loop_cmd_path = Path.cwd() / ".loop_command.py"
-
-    if not cli_path.exists():
-        refresh_commands()
-        console.print(f"[dim]Scanned PATH → {cli_path} ({len(_CLI_ALL)} commands)[/dim]")
-    else:
-        _CLI_ALL = load_cli_commands()
 
     if not cli_prop_path.exists():
         template = generate_cli_prop_template()
@@ -1930,7 +1993,7 @@ def ensure_files_exist() -> None:
 def reload_default_files() -> None:
     """Delete all default files and restart laintas_cli."""
     cwd = Path.cwd()
-    for name in (".cli", ".cli.prop", ".helpwo", ".extra_command.py", ".loop_command.py"):
+    for name in (".cli.prop", ".helpwo", ".extra_command.py", ".loop_command.py"):
         f = cwd / name
         if f.exists():
             f.unlink()
@@ -1957,6 +2020,94 @@ def get_auth_headers(session: dict) -> dict:
     return headers
 
 
+def _extract_json_object(text: str) -> Optional[dict]:
+    """Extract the first top-level JSON object from text. Handles code fences,
+    leading prose, and trailing prose. Returns None if no object parses."""
+    if not text:
+        return None
+    s = text.strip()
+    # Strip ```json ... ``` or ``` ... ``` fences if present
+    if s.startswith("```"):
+        s = re.sub(r"^```(?:json)?\s*", "", s)
+        s = re.sub(r"\s*```\s*$", "", s)
+    # Find the first '{' and walk to its matching '}', respecting strings.
+    start = s.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(s)):
+        c = s[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+            continue
+        if c == '"':
+            in_str = True
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                candidate = s[start:i + 1]
+                try:
+                    return json.loads(candidate)
+                except json.JSONDecodeError:
+                    return None
+    return None
+
+
+def _try_parse_partial_json(text: str) -> Optional[dict]:
+    """Try to parse an in-progress JSON object by closing unfinished structures.
+    Used for incremental rendering during SSE streaming."""
+    if not text:
+        return None
+    s = text.strip()
+    if s.startswith("```"):
+        s = re.sub(r"^```(?:json)?\s*", "", s)
+    start = s.find("{")
+    if start < 0:
+        return None
+    s = s[start:]
+    # Quickly attempt a clean parse
+    try:
+        return json.loads(s)
+    except json.JSONDecodeError:
+        pass
+    # Walk and close open strings + braces
+    depth = 0
+    in_str = False
+    esc = False
+    for c in s:
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+        else:
+            if c == '"':
+                in_str = True
+            elif c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+    closed = s
+    if in_str:
+        closed += '"'
+    closed += "}" * max(depth, 0)
+    try:
+        return json.loads(closed)
+    except json.JSONDecodeError:
+        return None
+
+
 def call_backend_stream(
     session: dict,
     message: str,
@@ -1964,6 +2115,7 @@ def call_backend_stream(
     current_path: str,
     history: list = None,
     lang: str = "EN",
+    on_chunk: Optional[Callable[[str, str], None]] = None,
 ) -> dict:
     """Call Helpwo backend /api/chat/stream, same as Helpwo frontend.
     Returns parsed {reply, command, memory, done, _billing} dict."""
@@ -1998,8 +2150,14 @@ def call_backend_stream(
             except Exception:
                 return {"reply": f"Server Error: HTTP {response.status_code}", "command": "", "rules": "", "done": True, "error": True}
 
-        # Parse SSE stream
-        response_data = None
+        # Parse SSE stream. Backend pass-through DeepSeek's OpenAI-compatible
+        # chunks: each event is `{"choices":[{"delta":{"content":"..."}}]}`.
+        # Accumulate deltas into one string, then parse JSON {reply,command,...}.
+        accumulated = ""
+        billing_info: dict = {}
+        got_any_event = False
+        prev_reply_for_chunks = ""
+        prev_command_for_chunks = ""
         for line in response.iter_lines(decode_unicode=True):
             if not line or not line.startswith("data: "):
                 continue
@@ -2007,31 +2165,67 @@ def call_backend_stream(
             if data_str == "[DONE]":
                 break
             try:
-                response_data = json.loads(data_str)
-                if response_data.get("error"):
-                    return {"reply": f"Server Error: {response_data['error']}", "command": "", "rules": "", "done": True, "error": True}
+                evt = json.loads(data_str)
             except json.JSONDecodeError:
                 continue
+            got_any_event = True
+            if evt.get("error"):
+                return {"reply": f"Server Error: {evt['error']}", "command": "", "rules": "", "done": True, "error": True}
+            if "_billing" in evt:
+                billing_info = evt["_billing"]
+                continue
+            delta_content = (
+                evt.get("choices", [{}])[0].get("delta", {}).get("content")
+                if isinstance(evt.get("choices"), list)
+                else None
+            )
+            if delta_content:
+                accumulated += delta_content
+                if on_chunk is not None:
+                    parsed = _try_parse_partial_json(accumulated)
+                    if parsed is not None:
+                        cur_reply = parsed.get("reply", "") or ""
+                        cur_cmd = parsed.get("command", "") or ""
+                        if cur_reply != prev_reply_for_chunks:
+                            delta_r = cur_reply[len(prev_reply_for_chunks):] if cur_reply.startswith(prev_reply_for_chunks) else cur_reply
+                            try: on_chunk("reply", delta_r)
+                            except Exception: pass
+                            prev_reply_for_chunks = cur_reply
+                        if cur_cmd != prev_command_for_chunks:
+                            try: on_chunk("command", cur_cmd)
+                            except Exception: pass
+                            prev_command_for_chunks = cur_cmd
 
-        if not response_data:
+        if not got_any_event:
             return {"reply": "No response from AI", "command": "", "rules": "", "done": True, "error": True}
 
-        # Normalize legacy send_keys/close_session into meta-commands
-        command = response_data.get("command", "")
-        send_keys = response_data.get("send_keys", "")
-        close_session = response_data.get("close_session", False)
+        # Extract the JSON object from accumulated text. Model may wrap in ```json fences or prose.
+        parsed = _extract_json_object(accumulated)
+        if parsed is None:
+            return {
+                "reply": accumulated.strip() or "(no parseable response)",
+                "command": "",
+                "memory": "",
+                "done": True,
+                "error": False,
+                "_billing": billing_info,
+            }
+
+        command = parsed.get("command", "") or ""
+        send_keys = parsed.get("send_keys", "")
+        close_session = parsed.get("close_session", False)
         if not command and close_session:
             command = "/session close"
         elif not command and send_keys:
             command = f"/keys {send_keys}"
 
         return {
-            "reply": response_data.get("reply", ""),
+            "reply": parsed.get("reply", "") or "",
             "command": command,
-            "memory": response_data.get("rules", response_data.get("memory", "")),
-            "done": response_data.get("done", False),
+            "memory": parsed.get("rules", parsed.get("memory", "")) or "",
+            "done": bool(parsed.get("done", False)),
             "error": False,
-            "_billing": response_data.get("_billing", {}),
+            "_billing": billing_info,
         }
 
     except requests.Timeout:
@@ -2056,6 +2250,22 @@ class AgentRegistry:
         self._session: Optional[dict] = None
         self._processing_message = threading.Event()
         self._pending_responses: list = []  # thread-safe queue for responses to send
+
+        # ── Async event bus (Phase 1) ───────────────────────────────────
+        # _event_q holds batches of events (each item is a list[dict]).
+        # _sender_thread coalesces batches into single POSTs in the background
+        # so the REPL/handlers never block on HTTP. _sender_stop tells it to
+        # finish draining and exit.
+        self._event_q: "queue.Queue[list]" = queue.Queue(maxsize=10000)
+        self._sender_thread: Optional[threading.Thread] = None
+        self._sender_stop = threading.Event()
+
+        # ── Active request tracking (Phase A1) ───────────────────────────
+        # Maps reqId → threading.Event for abort signalling.
+        self._active_requests: dict[str, threading.Event] = {}
+        # Maps reqId → threading.Event + decision for approval flow.
+        self._pending_approvals: dict[str, tuple[threading.Event, dict]] = {}
+        self._active_req_lock = threading.RLock()
 
     def register(self, session: dict, name: str = None, quiet: bool = False) -> bool:
         """Register this CLI as a remote agent with Helpwo backend."""
@@ -2137,18 +2347,133 @@ class AgentRegistry:
         self._running = True
         self._heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
         self._heartbeat_thread.start()
+        # Start the async event sender alongside heartbeat — _push_events
+        # becomes non-blocking only once this thread is alive.
+        self._start_event_sender()
+
+    def _start_event_sender(self):
+        """Start the background event-sender thread if not already running."""
+        if self._sender_thread is not None and self._sender_thread.is_alive():
+            return
+        self._sender_stop.clear()
+        self._sender_thread = threading.Thread(
+            target=self._event_sender_loop, daemon=True,
+            name="laintas-event-sender",
+        )
+        self._sender_thread.start()
+
+    def _event_sender_loop(self):
+        """Drain _event_q, coalesce up to 50 batches within 200ms, POST once.
+
+        Runs until _sender_stop is set AND the queue is empty, so a graceful
+        shutdown can request the loop drain remaining events before exiting.
+        """
+        while True:
+            try:
+                first = self._event_q.get(timeout=0.5)
+            except queue.Empty:
+                if self._sender_stop.is_set():
+                    return
+                continue
+
+            batch = list(first)
+            deadline = time.time() + 0.2
+            while len(batch) < 50:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    break
+                try:
+                    more = self._event_q.get(timeout=remaining)
+                    batch.extend(more)
+                except queue.Empty:
+                    break
+
+            try:
+                self._do_post_events(batch)
+            except Exception:
+                # Never let a POST exception kill the sender — that would
+                # silently break every subsequent _push_events call.
+                pass
+
+    def _do_post_events(self, events: list):
+        """Synchronous POST. Called only from the sender thread."""
+        if not self.agent_id or not events:
+            return
+        backend_url = os.environ.get("LAINTAS_BACKEND", BACKEND_URL)
+        headers = get_auth_headers(self._session) if self._session else {}
+        cookies = get_auth_cookies(self._session) if self._session else {}
+        try:
+            requests.post(
+                f"{backend_url}/api/agents/{self.agent_id}/events",
+                json={
+                    "events": events,
+                    "state": {"cwd": os.getcwd(), "status": "running"},
+                },
+                headers=headers,
+                cookies=cookies,
+                timeout=5,
+            )
+        except requests.RequestException:
+            pass
+
+    def _flush_events(self, timeout: float = 2.0):
+        """Block until the sender drains _event_q, capped at timeout seconds."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self._event_q.empty():
+                return
+            time.sleep(0.05)
 
     def _heartbeat_loop(self):
-        """Send heartbeat every HEARTBEAT_INTERVAL seconds."""
+        """Send heartbeat every HEARTBEAT_INTERVAL seconds with extended state."""
         backend_url = os.environ.get("LAINTAS_BACKEND", BACKEND_URL)
         headers = get_auth_headers(self._session) if self._session else {}
         cookies = get_auth_cookies(self._session) if self._session else {}
 
+        # Try to import psutil for metrics (optional dependency)
+        try:
+            import psutil as _psutil_mod
+            _has_psutil = True
+        except ImportError:
+            _has_psutil = False
+
         while self._running and self.agent_id:
             try:
+                payload = {
+                    "agentId": self.agent_id,
+                    "cwd": os.getcwd(),
+                    "shell": SHELL_NAME,
+                }
+
+                # Running terminals snapshot
+                terminals = get_all_terminals()
+                running_terms = []
+                for t in terminals:
+                    running_terms.append({
+                        "name": t.name,
+                        "alive": bool(t.session.is_alive()) if t.session else False,
+                        "cmd": t.command[:120],
+                    })
+                payload["runningTerminals"] = running_terms
+
+                # System metrics
+                if _has_psutil:
+                    try:
+                        load = _psutil_mod.getloadavg()
+                        mem = _psutil_mod.virtual_memory()
+                        disk = _psutil_mod.disk_usage(os.getcwd())
+                        payload["metrics"] = {
+                            "loadAvg": [round(load[0], 2), round(load[1], 2), round(load[2], 2)],
+                            "memFreeMB": round(mem.available / (1024 * 1024), 1),
+                            "memTotalMB": round(mem.total / (1024 * 1024), 1),
+                            "diskFreeGB": round(disk.free / (1024**3), 1),
+                        }
+                    except Exception:
+                        pass
+
                 requests.post(
                     f"{backend_url}/api/agents/heartbeat",
-                    json={"agentId": self.agent_id, "cwd": os.getcwd()},
+                    json=payload,
                     headers=headers,
                     cookies=cookies,
                     timeout=5,
@@ -2202,10 +2527,53 @@ class AgentRegistry:
             time.sleep(2)
 
     def _handle_remote_message(self, msg: dict, agent_state_cb, chat_history_cb):
-        """Process an incoming message from Helpwo UI through the agent loop."""
-        self._processing_message.set()
+        """Dispatch an incoming message by 'kind' per HelpwoAI protocol.
 
-        content = msg.get("content", "")
+        Backwards-compatible: if a message has no 'kind' field, it is treated
+        as a legacy chat message (content → run_agent_loop / system command).
+        Exactly one 'final' event must be pushed per reqId — handlers below
+        enforce this; the catch-all also pushes a fail-final on exception.
+        """
+        self._processing_message.set()
+        req_id = msg.get("reqId") or msg.get("id")
+        try:
+            kind = msg.get("kind")
+            payload = msg.get("payload") or {}
+
+            if not kind:
+                # Legacy chat message: {id, content, timestamp}
+                kind = "chat"
+                payload = {"message": msg.get("content", "")}
+
+            if kind == "exec":
+                self._handle_exec(req_id, payload)
+            elif kind == "query":
+                self._handle_query(req_id, payload)
+            elif kind == "chat":
+                self._handle_chat(req_id, payload, agent_state_cb, chat_history_cb)
+            elif kind == "delegate":
+                self._handle_delegate(req_id, payload, agent_state_cb, chat_history_cb)
+            elif kind == "abort":
+                self._handle_abort(req_id, payload)
+            elif kind == "approval-response":
+                self._handle_approval_response(req_id, payload)
+            else:
+                self._push_final(req_id, "fail", f"unknown kind '{kind}'")
+        except Exception as e:
+            console.print(f"[red]Error handling remote message: {e}[/red]")
+            if req_id:
+                self._push_final(req_id, "fail", f"handler exception: {e}")
+        finally:
+            self._processing_message.clear()
+
+    def _handle_chat(self, req_id: str, payload: dict, agent_state_cb, chat_history_cb):
+        """Inject a remote chat message into the main REPL loop.
+
+        The message goes through the exact same input→route→execute pipeline as
+        local user input. We block the poll thread until the main loop finishes
+        processing, then push the terminal 'final' event.
+        """
+        content = payload.get("message", "")
 
         console.print(Panel(
             f"[bold cyan]Remote message from Helpwo:[/bold cyan]\n{content}",
@@ -2213,82 +2581,407 @@ class AgentRegistry:
             border_style="cyan",
         ))
 
+        done = threading.Event()
+        _inject_input(content, done)
+
+        if not done.wait(timeout=120):
+            self._push_final(req_id, "fail", "processing timeout — main loop busy")
+            return
+
+        state = agent_state_cb() if callable(agent_state_cb) else {}
+        summary = state.get("lastReply", "") or state.get("lastOutput", "") or "done"
+        self._push_final(req_id, "success", summary[:2000])
+
+    def _handle_exec(self, req_id: str, payload: dict):
+        """Run a shell command in a PTY and stream stdout under req_id.
+
+        Pushes cmd-start → stdout chunks → cmd-end → final. PTY merges
+        stderr into stdout; splitting is deferred to a later phase.
+        """
+        cmd = payload.get("command")
+        cwd = payload.get("cwd") or os.getcwd()
         try:
-            state = agent_state_cb() if callable(agent_state_cb) else {
-                "shortTermMemory": "", "lastReply": "", "lastOutput": ""
-            }
-            chat_history = chat_history_cb() if callable(chat_history_cb) else []
-            session = self._session or {}
+            timeout = int(payload.get("timeout", 30))
+        except (TypeError, ValueError):
+            timeout = 30
+        if not cmd:
+            self._push_final(req_id, "fail", "missing 'command' in payload")
+            return
 
-            # Build event callback that pushes to backend
-            def events_cb(events: list):
-                self._push_events(events)
+        # ── Security policy check ──────────────────────────────────────
+        import policy as _policy
+        decision = _policy.evaluate(cmd, cwd, req_id=req_id,
+                                    agent_id=self.agent_id)
+        if decision.action == "deny":
+            self._push_final(req_id, "fail", f"Blocked by policy: {decision.reason}")
+            console.print(f"[red]BLOCKED remote exec: {cmd[:100]} — {decision.reason}[/red]")
+            return
+        if decision.action == "needs_approval":
+            approval = self._request_approval(req_id, cmd, cwd, timeout=300)
+            if approval != "approve":
+                self._push_final(req_id, "aborted",
+                                 f"User {approval}: {cmd[:100]}")
+                return
 
-            # Route system commands directly (same as main REPL)
-            if is_system_command(content):
-                self._push_events([{"type": "system", "kind": "command", "content": content}])
-                result = execute_command_pty(content)
-                output = (result.get("stdout") or result.get("stderr") or "(no output)")[:2000]
-                self._push_events([{"type": "system", "kind": "output", "content": output}])
-            else:
-                # Run the agent loop — events flow through events_cb in real-time
-                result = run_agent_loop(get_loop_deps(), content, session, state, chat_history, events_cb=events_cb)
+        console.print(Panel(
+            f"[bold yellow]remote_exec[/bold yellow] {cmd}\n[dim]cwd={cwd} timeout={timeout}s[/dim]",
+            title=f"Incoming exec ({req_id})",
+            border_style="yellow",
+        ))
 
-            # Update lastOutput in agent state on backend
-            new_state = result.get("state", state)
-            backend_url = os.environ.get("LAINTAS_BACKEND", BACKEND_URL)
-            headers = get_auth_headers(session) if session else {}
-            cookies = get_auth_cookies(session) if session else {}
-
+        self._push(req_id, "cmd-start", "", {"command": cmd, "cwd": cwd})
+        sess = InteractiveSession(cmd, timeout=timeout)
+        old_cwd = os.getcwd()
+        start = time.time()
+        try:
             try:
-                requests.post(
-                    f"{backend_url}/api/agents/{self.agent_id}/events",
-                    json={
-                        "events": [],
-                        "state": {
-                            "cwd": os.getcwd(),
-                            "lastOutput": new_state.get("lastOutput", ""),
-                            "status": "running",
-                        },
-                    },
-                    headers=headers,
-                    cookies=cookies,
-                    timeout=10,
-                )
-            except requests.RequestException:
+                os.chdir(cwd)
+            except OSError as e:
+                self._push_final(req_id, "fail", f"cd {cwd} failed: {e}")
+                return
+            try:
+                sess.start()
+            finally:
+                try:
+                    os.chdir(old_cwd)
+                except OSError:
+                    pass
+
+            # Line-buffered streaming: hold a partial-line buffer between
+            # PTY reads so the UI never displays a half-formed line.
+            # Backend can still see real-time progress because we flush on
+            # every '\n'. Any final partial line is flushed after cmd-end.
+            line_buf = ""
+            while sess.is_alive():
+                chunk = sess.read_output(timeout=0.2)
+                if chunk:
+                    line_buf += chunk
+                    if "\n" in line_buf:
+                        complete, line_buf = line_buf.rsplit("\n", 1)
+                        self._push(req_id, "stdout", complete + "\n")
+                if time.time() - start > timeout:
+                    sess.close()
+                    if line_buf:
+                        self._push(req_id, "stdout", line_buf)
+                        line_buf = ""
+                    self._push(req_id, "cmd-end", "", {
+                        "exitCode": -1,
+                        "durationMs": int((time.time() - start) * 1000),
+                    })
+                    self._push_final(req_id, "fail", f"timeout after {timeout}s")
+                    return
+
+            # Drain any output buffered after process exit.
+            chunk = sess.read_output(timeout=0.2)
+            if chunk:
+                line_buf += chunk
+            if line_buf:
+                # Final flush — may not end in newline (e.g. trailing prompt).
+                self._push(req_id, "stdout", line_buf)
+            sess.close()
+            rc = sess._returncode
+            duration_ms = int((time.time() - start) * 1000)
+            self._push(req_id, "cmd-end", "", {
+                "exitCode": rc, "durationMs": duration_ms,
+            })
+            status = "success" if rc == 0 else "fail"
+            self._push_final(req_id, status, f"exit={rc}")
+        except Exception as e:
+            try:
+                sess.close()
+            except Exception:
                 pass
+            self._push_final(req_id, "fail", f"exec error: {e}")
+
+    def _handle_query(self, req_id: str, payload: dict):
+        """Read-only reconnaissance. Returns one final with data in meta."""
+        what = payload.get("what")
+        target = payload.get("target")
+        try:
+            if what == "cwd":
+                data = os.getcwd()
+            elif what == "files":
+                data = os.listdir(os.getcwd())
+            elif what == "env":
+                data = dict(os.environ)
+            elif what == "processes":
+                # Stub: psutil dependency deferred to Phase B1.
+                data = []
+            elif what == "term-snapshot":
+                term = get_terminal(target) if target else None
+                if term is None:
+                    data = None
+                else:
+                    n = int(get_runtime_config("terminal_tail_lines") or 20)
+                    output = getattr(term.session, "full_output", "") or ""
+                    data = "\n".join(output.split("\n")[-n:])
+            else:
+                self._push_final(req_id, "fail", f"unknown query.what={what!r}")
+                return
+            self._push_final(
+                req_id, "success", f"query {what}",
+                meta={"what": what, "data": data},
+            )
+        except Exception as e:
+            self._push_final(req_id, "fail", f"query error: {e}")
+
+    def _handle_delegate(self, req_id: str, payload: dict,
+                         agent_state_cb, chat_history_cb):
+        """Launch a local agent loop for a delegated task.
+
+        Reuses run_agent_loop with events_cb wired to push ai-reply/ai-command
+        events under reqId. On completion, pushes final.
+        """
+        goal = payload.get("goal", "").strip()
+        if not goal:
+            self._push_final(req_id, "fail", "missing 'goal' in delegate payload")
+            return
+
+        max_loops_val = int(payload.get("maxLoops", get_runtime_config("max_loops")))
+        # Temporarily override max_loops for this delegation
+        old_max = get_runtime_config("max_loops")
+        set_runtime_config("max_loops", min(max_loops_val, 20))
+
+        console.print(Panel(
+            f"[bold magenta]delegate[/bold magenta] {goal[:200]}\n"
+            f"[dim]maxLoops={max_loops_val}[/dim]",
+            title=f"Incoming delegate ({req_id})",
+            border_style="magenta",
+        ))
+
+        # Track this request for abort support
+        abort_ev = threading.Event()
+        with self._active_req_lock:
+            self._active_requests[req_id] = abort_ev
+
+        # Build deps for agent_loop
+        deps = LoopDeps(
+            read_file=read_file, append_file=append_file,
+            write_file=write_file, strip_ansi=strip_ansi,
+            generate_prompt=generate_cli_prop_template,
+            call_backend=lambda **kw: call_backend_stream(**kw),
+            SubTerminalSession=SubTerminalSession,
+            display_command_output=display_command_output,
+            display_sub_terminal_preview=display_sub_terminal_preview,
+            console=console, Markdown=Markdown,
+            pty_passthrough=pty_passthrough,
+        )
+
+        session = self._session or {}
+        chat_history = chat_history_cb() if callable(chat_history_cb) else []
+
+        def _delegate_events(events):
+            """Push loop events to backend with reqId."""
+            if abort_ev.is_set():
+                raise InterruptedError("delegate aborted")
+            for ev in events:
+                ev["reqId"] = req_id
+            self._push_events(events, req_id=req_id)
+
+        try:
+            # Run in a thread so we can monitor abort
+            result = {"success": False, "msg": "", "state": {}}
+            run_done = threading.Event()
+
+            def _run():
+                nonlocal result
+                try:
+                    result = run_agent_loop(
+                        deps=deps, original_input=goal,
+                        session=session, state={},
+                        chat_history=chat_history,
+                        events_cb=_delegate_events,
+                        depth=0,
+                    )
+                except InterruptedError:
+                    result = {"success": False, "msg": "aborted", "state": {}}
+                except Exception as e:
+                    result = {"success": False, "msg": str(e), "state": {}}
+                finally:
+                    run_done.set()
+
+            t = threading.Thread(target=_run, daemon=True,
+                                 name=f"laintas-delegate-{req_id}")
+            t.start()
+
+            # Wait for completion or abort
+            while not run_done.wait(timeout=0.5):
+                if abort_ev.is_set():
+                    self._push_final(req_id, "aborted", "delegate aborted by remote")
+                    return
+
+            reply = result.get("msg", "") or (
+                result.get("state", {}).get("lastReply", "") if isinstance(result, dict) else ""
+            )
+            status = "success" if result.get("success") else "fail"
+            self._push_final(req_id, status, reply[:2000])
 
         except Exception as e:
-            console.print(f"[red]Error handling remote message: {e}[/red]")
-            self._push_events([{"type": "system", "kind": "error", "content": str(e)}])
-
+            self._push_final(req_id, "fail", f"delegate error: {e}")
         finally:
-            self._processing_message.clear()
+            set_runtime_config("max_loops", old_max)
+            with self._active_req_lock:
+                self._active_requests.pop(req_id, None)
 
-    def _push_events(self, events: list):
-        """Push events to the backend event stream."""
+    def _handle_abort(self, req_id: str, payload: dict):
+        """Abort a running request identified by targetReqId.
+
+        Sets the abort event for the target request; handlers check it at
+        each loop/poll iteration boundary.
+        """
+        target = payload.get("targetReqId", "")
+        reason = payload.get("reason", "")
+        if not target:
+            self._push_final(req_id, "fail", "missing 'targetReqId' in abort payload")
+            return
+
+        console.print(f"[dim yellow]Abort request for {target}: {reason or '(no reason)'}[/dim yellow]")
+
+        with self._active_req_lock:
+            abort_ev = self._active_requests.get(target)
+
+        if abort_ev:
+            abort_ev.set()
+            self._push_final(req_id, "success", f"abort signal sent to {target}")
+        else:
+            # The request may have already completed or doesn't support abort
+            self._push_final(req_id, "fail", f"request '{target}' not found or not abortable")
+
+    def _handle_approval_response(self, req_id: str, payload: dict):
+        """Handle user's response to a needs-approval event.
+
+        Sets the decision on the pending approval, unblocking the waiting handler.
+        """
+        target = payload.get("targetReqId", "")
+        decision = payload.get("decision", "reject")  # approve | reject | modify
+        feedback = payload.get("feedback", "")
+
+        if not target:
+            self._push_final(req_id, "fail", "missing 'targetReqId' in approval-response")
+            return
+
+        with self._active_req_lock:
+            entry = self._pending_approvals.get(target)
+
+        if entry is None:
+            self._push_final(req_id, "fail", f"no pending approval for '{target}'")
+            return
+
+        approval_ev, response_dict = entry
+        response_dict["decision"] = decision
+        response_dict["feedback"] = feedback
+        approval_ev.set()
+
+        console.print(
+            f"[dim green]Approval response for {target}: "
+            f"{decision}" + (f" — {feedback}" if feedback else "") + "[/dim green]"
+        )
+        self._push_final(req_id, "success", f"approval {decision} applied to {target}")
+
+    def _request_approval(self, req_id: str, command: str, cwd: str,
+                          timeout: float = 300.0) -> str:
+        """Push needs-approval event and block until user responds.
+
+        Returns "approve", "reject", or "modify". Timeout defaults to 5 min.
+        """
+        approval_ev = threading.Event()
+        response_dict: dict = {}
+
+        with self._active_req_lock:
+            self._pending_approvals[req_id] = (approval_ev, response_dict)
+
+        self._push_events(
+            [{
+                "type": "needs-approval",
+                "content": f"Approve execution of: {command}",
+                "meta": {
+                    "summary": f"Execute: {command[:200]}",
+                    "command": command,
+                    "cwd": cwd,
+                    "targetReqId": req_id,
+                },
+            }],
+            req_id=req_id,
+        )
+
+        approved = approval_ev.wait(timeout=timeout)
+
+        with self._active_req_lock:
+            self._pending_approvals.pop(req_id, None)
+
+        if not approved:
+            return "reject"  # timeout = reject
+        return response_dict.get("decision", "reject")
+
+
+    def _push_events(self, events: list, req_id: str = None):
+        """Enqueue events for the background sender to POST.
+
+        Non-blocking: returns immediately after enqueueing. The background
+        _event_sender_loop coalesces batches and does the actual HTTP. If
+        the queue is full (>10000 batches buffered), drop the oldest batch.
+
+        If req_id is given, every event missing 'reqId' gets it injected,
+        and every event missing 'meta' gets an empty dict. Events that
+        already carry their own reqId/meta are left alone.
+        """
         if not self.agent_id or not events:
             return
-        backend_url = os.environ.get("LAINTAS_BACKEND", BACKEND_URL)
-        headers = get_auth_headers(self._session) if self._session else {}
-        cookies = get_auth_cookies(self._session) if self._session else {}
+        if req_id:
+            for ev in events:
+                ev.setdefault("reqId", req_id)
+                ev.setdefault("meta", {})
         try:
-            requests.post(
-                f"{backend_url}/api/agents/{self.agent_id}/events",
-                json={
-                    "events": events,
-                    "state": {"cwd": os.getcwd(), "status": "running"},
-                },
-                headers=headers,
-                cookies=cookies,
-                timeout=5,
-            )
-        except requests.RequestException:
-            pass
+            self._event_q.put_nowait(events)
+        except queue.Full:
+            # Drop oldest to make room — recovering connectivity matters more
+            # than preserving stale telemetry.
+            try:
+                self._event_q.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._event_q.put_nowait(events)
+            except queue.Full:
+                pass
+
+    # ── Per-request push helpers (HelpwoAI protocol) ─────────────────────
+    def _push(self, req_id: str, type_: str, content: str = "", meta: dict = None):
+        """Push a single typed event under a request id."""
+        self._push_events(
+            [{"type": type_, "content": content, "meta": meta or {}}],
+            req_id=req_id,
+        )
+
+    def _push_final(self, req_id: str, status: str, summary: str,
+                    artifacts: list = None, meta: dict = None):
+        """Push the terminal 'final' event for a request. Exactly one per reqId."""
+        final_meta = dict(meta or {})
+        final_meta["status"] = status
+        final_meta["summary"] = summary
+        if artifacts:
+            final_meta["artifacts"] = artifacts
+        self._push_events(
+            [{"type": "final", "content": summary, "meta": final_meta}],
+            req_id=req_id,
+        )
 
     def unregister(self):
-        """Unregister agent on exit."""
+        """Unregister agent on exit. Drains the event queue first so in-flight
+        finals/outputs make it to the backend before the process exits.
+        """
         self._running = False
+
+        # Flush queued events (≤2s) then stop the sender thread so the
+        # final unregister POST is the last thing we do.
+        if self._sender_thread is not None and self._sender_thread.is_alive():
+            self._flush_events(timeout=2.0)
+            self._sender_stop.set()
+            try:
+                self._sender_thread.join(timeout=1.0)
+            except RuntimeError:
+                pass
+
         if not self.agent_id:
             return
 
@@ -2609,7 +3302,7 @@ def show_terminal_manager(primary_session=None) -> None:
             # After detaching from enter_session, the terminal may need
             # a moment to restore before prompt_toolkit takes over again
             time.sleep(0.1)
-            # If session died during enter (user typed /q), unregister it
+            # If session died during enter, unregister it
             if name != "term0 (primary)" and not sess.is_alive():
                 unregister_terminal(name)
 
@@ -2737,9 +3430,8 @@ def observe_session(session, display_name: str = "", display_cmd: str = "") -> N
 def enter_session(session, display_name: str = "", display_cmd: str = "") -> None:
     """Full interactive takeover of a sub-terminal session.
 
-    All keystrokes are forwarded to the session. Type /back in the
-    sub-terminal to detach without closing it. Type /q to close the
-    sub-terminal and return to term0. Ctrl+\\ also detaches.
+    All keystrokes are forwarded to the session. Type /back or /q in the
+    sub-terminal to detach without closing it. Ctrl+\\ also detaches.
 
     Session output streams directly to the terminal — exactly like
     using a real terminal.
@@ -2772,7 +3464,7 @@ def enter_session(session, display_name: str = "", display_cmd: str = "") -> Non
     # Clear screen and show header
     sys.stdout.write("\033[2J\033[H")
     sys.stdout.write(f"● Entered: {cmd_display}\n")
-    sys.stdout.write("  /back to detach  |  /q to close  |  Ctrl+\\ to force detach\n")
+    sys.stdout.write("  /back or /q to detach  |  Ctrl+\\ to force detach\n")
     sys.stdout.write("─" * 60 + "\n\n")
     sys.stdout.flush()
 
@@ -2856,7 +3548,7 @@ def enter_session(session, display_name: str = "", display_cmd: str = "") -> Non
                         except (OSError, BrokenPipeError):
                             break
                 else:
-                    # EOF — sub-terminal exited (e.g., /q)
+                    # EOF — sub-terminal exited
                     session_died = True
                     break
 
@@ -2903,6 +3595,12 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
     parts = cmd.strip().split()
     action = parts[0].lower()
 
+    if action == "/":
+        selected = show_command_palette()
+        if selected:
+            return handle_meta_command(selected, agent_registry, session, interactive_session)
+        return False
+
     if action == "/exit":
         close_all_terminals()
         agent_registry.unregister()
@@ -2911,6 +3609,12 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
         return True
 
     if action in ("/quit", "/q"):
+        if _IN_SUB_TERMINAL:
+            # Running inside a sub-terminal — detach like /back instead of quitting
+            sys.stdout.write("\x1b]777;LAINTAS_DETACH\x07")
+            sys.stdout.flush()
+            console.print("[green]Detaching...[/green]")
+            return False
         close_all_terminals()
         agent_registry.unregister()
         console.print("[green]Goodbye![/green]")
@@ -3001,11 +3705,8 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
             console.print("[dim]No .cli.prop found.[/dim]")
 
     elif action == "/scan":
-        refresh_commands()
-        all_cmds = get_dispatch_commands()
-        user_cmds = _filter_user_commands(all_cmds)
-        console.print(f"[bold]{len(all_cmds)} total on PATH, {len(user_cmds)} user-facing:[/bold]\n")
-        # Show user-facing commands grouped by first letter
+        user_cmds = list_path_commands()
+        console.print(f"[bold]{len(user_cmds)} user-facing commands on PATH:[/bold]\n")
         groups: dict = {}
         for c in user_cmds:
             groups.setdefault(c[0], []).append(c)
@@ -3013,16 +3714,64 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
             console.print(f"  [cyan]{letter}[/cyan]: {', '.join(groups[letter][:40])}")
             if len(groups[letter]) > 40:
                 console.print(f"       [dim](+{len(groups[letter]) - 40} more)[/dim]")
-        # Show count of filtered-out system commands
-        hidden = len(all_cmds) - len(user_cmds)
-        if hidden:
-            console.print(f"\n[dim]{hidden} system/internal commands hidden (see .cli for full list)[/dim]")
 
     elif action == "/cwd":
         console.print(f"Working directory: [bold]{os.getcwd()}[/bold]")
 
     elif action == "/clear":
         console.clear()
+
+    elif action == "/plan":
+        import plan_mode as _pm
+        if len(parts) >= 3 and parts[1] == "enter":
+            task = " ".join(parts[2:])
+            plan = _pm.enter_plan_mode(task)
+            console.print(Panel(
+                f"[bold]Plan Mode: [green]ENTERED[/green][/bold]\n\n"
+                f"Task: {task}\n"
+                f"Plan file: {plan['file']}\n\n"
+                f"[dim]The AI will now explore and design — no code will be executed.[/dim]\n"
+                f"[dim]When the plan is ready, run [bold]/plan approve[/bold].[/dim]",
+                title="Plan Mode",
+                border_style="green",
+            ))
+        elif len(parts) >= 2 and parts[1] == "approve":
+            plan = _pm.exit_plan_mode(approve=True)
+            if plan:
+                console.print(Panel(
+                    f"[bold]Plan [green]APPROVED[/green][/bold]\n\n"
+                    f"File: {plan['file']}\n\n"
+                    f"[dim]AI will now execute the plan. Run /plan exit to leave without executing.[/dim]",
+                    title="Plan Approved",
+                    border_style="green",
+                ))
+            else:
+                console.print("[yellow]No active plan to approve.[/yellow]")
+        elif len(parts) >= 2 and parts[1] == "exit":
+            plan = _pm.exit_plan_mode(approve=False)
+            console.print(f"[dim]Exited plan mode (plan saved).[/dim]")
+        elif len(parts) >= 2 and parts[1] == "status":
+            plan = _pm.get_current_plan()
+            if plan:
+                content = _pm.read_plan() or "(empty)"
+                console.print(Panel(content[:2000], title=f"Plan: {plan['task'][:60]}"))
+            else:
+                console.print("[dim]Not in plan mode.[/dim]")
+        elif len(parts) >= 2 and parts[1] == "list":
+            plans = _pm.list_plans()
+            if plans:
+                console.print(f"[bold]Saved Plans:[/bold]")
+                for p in plans:
+                    console.print(f"  [cyan]{p['name']}[/cyan] — {p['title'][:80]}")
+            else:
+                console.print("[dim]No saved plans.[/dim]")
+        else:
+            console.print("Usage:\n"
+                          "  [bold]/plan enter <task>[/bold] — Enter plan mode\n"
+                          "  [bold]/plan approve[/bold]      — Approve and execute\n"
+                          "  [bold]/plan exit[/bold]         — Exit without approving\n"
+                          "  [bold]/plan status[/bold]       — Show current plan\n"
+                          "  [bold]/plan list[/bold]         — List saved plans")
 
     elif action == "/debug":
         if len(parts) > 1:
@@ -3094,28 +3843,24 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
 
     elif action in ("/station", "/st"):
         if len(parts) < 2:
-            console.print("[yellow]Usage: /station <name>[/yellow]")
-            console.print("  Creates a persistent terminal running laintas-cli and stations your AI agent there.")
+            name = "main"
         else:
             name = parts[1]
-            existing = get_terminal(name)
-            if existing and not existing.session.is_alive():
-                unregister_terminal(name)
-                existing = None
-            if existing is None:
-                lain_cmd = f"{sys.executable} {os.path.abspath(__file__)} --simple-prompt"
-                sub = SubTerminalSession(lain_cmd)
-                sub.start()
-                time.sleep(0.3)
-                if sub.is_alive():
-                    sub.read_output(timeout=0.3)
-                register_terminal(sub, "laintas-cli", 0, name=name)
-            current = get_current_agent()
-            if current:
-                station_agent(current.id, name)
-                console.print(f"[green]Stationed [bold]{current.name}[/bold] in terminal [bold]{name}[/bold][/green]")
-            else:
-                console.print(f"[green]Created terminal [bold]{name}[/bold][/green]")
+
+        existing = get_terminal(name)
+        if existing and existing.session and not existing.session.is_alive():
+            unregister_terminal(name)
+            existing = None
+        if existing is None:
+            register_terminal(None, name, 0, name=name)
+
+        current = get_current_agent()
+        if current:
+            station_agent(current.id, name)
+            label = "current terminal" if name == "main" else f"terminal [bold]{name}[/bold]"
+            console.print(f"[green]Stationed [bold]{current.name}[/bold] in {label}[/green]")
+        else:
+            console.print(f"[green]Created terminal [bold]{name}[/bold] (no agent stationed)[/green]")
 
     elif action == "/terminate":
         if len(parts) < 2:
@@ -3166,7 +3911,11 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
                 for a in agents:
                     marker = " [bold cyan]<- current[/bold cyan]" if (current and a.id == current.id) else ""
                     st = f" [dim]stationed: {a.stationed_terminal}[/dim]" if a.stationed_terminal else ""
-                    console.print(f"  [bold]{a.id}[/bold]: {a.name}{st}{marker}")
+                    status_str = f" [dim]({a.status})[/dim]" if a.status != "idle" else ""
+                    inbox_str = f" [dim yellow]inbox={a.inbox.qsize()}[/dim yellow]" if a.inbox.qsize() else ""
+                    console.print(f"  [bold]{a.id}[/bold]: {a.name}{st}{status_str}{inbox_str}{marker}")
+        elif len(parts) == 2 and parts[1].lower() == "tree":
+            console.print(build_agents_tree())
         elif len(parts) == 2:
             agent_id = parts[1]
             if switch_to_agent(agent_id):
@@ -3182,16 +3931,235 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
             else:
                 console.print("[red]No current agent to rename.[/red]")
 
-    elif action in ("/t", "/term"):
-        terminals = get_all_terminals()
-        has_primary = interactive_session is not None and interactive_session.is_alive()
-        if not terminals and not has_primary:
-            console.print("[dim]No active sub-terminal sessions. "
-                          "Use /station or let the AI spawn a command.[/dim]")
-        elif not terminals and has_primary:
-            enter_session(interactive_session)
+    elif action == "/spawn":
+        if len(parts) < 2:
+            console.print("[yellow]Usage: /spawn [name:] <task...>[/yellow]")
         else:
-            show_terminal_manager(interactive_session)
+            # Parse optional "name:" prefix
+            rest = " ".join(parts[1:])
+            m = re.match(r'^(\S+):\s+(.+)$', rest)
+            child_name = m.group(1) if m else None
+            task = m.group(2) if m else rest
+            parent = get_current_agent()
+            if parent is None:
+                console.print("[red]No current agent. /hire one first.[/red]")
+            else:
+                child_id = spawn_subagent(
+                    parent_id=parent.id, task=task, deps=get_loop_deps(),
+                    name=child_name, session=session,
+                    events_cb=(lambda evs: agent_registry._push_events(evs))
+                                if agent_registry.agent_id else None,
+                )
+                if child_id is None:
+                    console.print(f"[red]Spawn failed (parent={parent.id})[/red]")
+                else:
+                    console.print(f"[green]Spawned [bold]{child_id}[/bold][/green] "
+                                  f"[dim](parent={parent.id}, task={task[:60]})[/dim]")
+
+    elif action == "/tell":
+        if len(parts) < 3:
+            console.print("[yellow]Usage: /tell <agent_id> <message...>[/yellow]")
+        else:
+            target_id = parts[1]
+            raw = " ".join(parts[2:])
+            try:
+                body = json.loads(raw)
+                if not isinstance(body, dict):
+                    body = {"kind": "msg", "text": raw}
+            except (ValueError, TypeError):
+                body = {"kind": "msg", "text": raw}
+            body.setdefault("from", "user")
+            if send_to_agent(target_id, body):
+                console.print(f"[green]→ {target_id}:[/green] {raw[:120]}")
+            else:
+                console.print(f"[red]Agent '{target_id}' not found or inbox full.[/red]")
+
+    elif action == "/abort":
+        if len(parts) < 2:
+            console.print("[yellow]Usage: /abort <agent_id>[/yellow]")
+        else:
+            target_id = parts[1]
+            if abort_agent(target_id):
+                console.print(f"[yellow]Abort signaled to [bold]{target_id}[/bold][/yellow]")
+            else:
+                console.print(f"[red]Agent '{target_id}' not found.[/red]")
+
+    elif action == "/tools":
+        registry = tools_mod.get_registry()
+        groups = registry.list_by_source()
+        if not groups:
+            console.print("[dim]No tools registered.[/dim]")
+        else:
+            for src in sorted(groups):
+                console.print(f"[bold]{src}[/bold]")
+                for t in groups[src]:
+                    console.print(f"  [cyan]{t.name}[/cyan] — {t.description}")
+
+    elif action == "/tool":
+        if len(parts) < 2:
+            console.print("[yellow]Usage: /tool <name> [json_params][/yellow]")
+        else:
+            tool_name = parts[1]
+            raw = " ".join(parts[2:]) if len(parts) > 2 else ""
+            try:
+                params = json.loads(raw) if raw else {}
+                if not isinstance(params, dict):
+                    params = {"value": params}
+            except (ValueError, TypeError):
+                params = {"raw": raw}
+            ctx = tools_mod.ToolCtx(
+                deps=get_loop_deps(),
+                agent_id=(get_current_agent().id if get_current_agent() else None),
+                session=session,
+                events_cb=(lambda evs: agent_registry._push_events(evs))
+                          if agent_registry.agent_id else None,
+                cwd=os.getcwd(),
+            )
+            result = tools_mod.get_registry().invoke(tool_name, params, ctx)
+            try:
+                console.print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+            except (TypeError, ValueError):
+                console.print(repr(result))
+
+    elif action == "/skill":
+        sub = parts[1] if len(parts) > 1 else "list"
+        if sub == "list":
+            dirs = skills_mod.list_skill_dirs()
+            if not dirs:
+                console.print(f"[dim]No skills in {skills_mod.SKILLS_DIR}[/dim]")
+                console.print("[dim]Create one with: /skill new <name>[/dim]")
+            else:
+                groups = tools_mod.get_registry().list_by_source()
+                for sd in dirs:
+                    src = f"skill:{sd.name}"
+                    tools = groups.get(src, [])
+                    console.print(f"[bold]{sd.name}[/bold] [dim]({sd})[/dim]")
+                    for t in tools:
+                        console.print(f"  [cyan]{t.name}[/cyan] — {t.description}")
+                    if not tools:
+                        console.print("  [yellow](not loaded — run /skill reload)[/yellow]")
+        elif sub == "reload":
+            results = skills_mod.reload_all()
+            for name, ok, msg in results:
+                style = "green" if ok else "red"
+                console.print(f"[{style}]{msg}[/{style}]")
+            if not results:
+                console.print(f"[dim]No skills in {skills_mod.SKILLS_DIR}[/dim]")
+        elif sub == "new":
+            if len(parts) < 3:
+                console.print("[yellow]Usage: /skill new <name>[/yellow]")
+            else:
+                ok, msg = skills_mod.install_template(parts[2])
+                style = "green" if ok else "red"
+                console.print(f"[{style}]{msg}[/{style}]")
+                if ok:
+                    console.print("[dim]Edit the file, then run /skill reload[/dim]")
+        elif sub == "dir":
+            console.print(str(skills_mod.SKILLS_DIR))
+        else:
+            console.print("[yellow]Usage: /skill {list|reload|new <name>|dir}[/yellow]")
+
+    elif action == "/mcp":
+        if not mcp_mod.MCP_AVAILABLE:
+            console.print(f"[yellow]mcp SDK not installed: {mcp_mod.MCP_IMPORT_ERROR}[/yellow]")
+            console.print("[dim]Install with:  pip install mcp[/dim]")
+            return False
+        sub = parts[1] if len(parts) > 1 else "list"
+        mgr = mcp_mod.get_manager()
+        if sub == "list":
+            cfg = mgr.load_config().get("servers", {})
+            if not cfg:
+                console.print(f"[dim]No servers in {mcp_mod.CONFIG_PATH}[/dim]")
+                console.print("[dim]Create one with: /mcp init[/dim]")
+            else:
+                for name, sc in cfg.items():
+                    srv = mgr.servers.get(name)
+                    enabled = sc.get("enabled", True)
+                    if srv is None:
+                        status = "(not connected)" if enabled else "(disabled)"
+                        style = "dim"
+                    else:
+                        status = f"({srv.status}, {len(srv.tools)} tools)"
+                        style = "green" if srv.status == "up" else "yellow"
+                    cmd_str = sc.get("command", "?")
+                    console.print(f"  [{style}]{name}[/{style}] {status} [dim]{cmd_str}[/dim]")
+                    if srv and srv.last_error and srv.status != "up":
+                        console.print(f"    [red]{srv.last_error}[/red]")
+        elif sub == "tools":
+            if len(parts) < 3:
+                console.print("[yellow]Usage: /mcp tools <server>[/yellow]")
+            else:
+                srv_name = parts[2]
+                groups = tools_mod.get_registry().list_by_source()
+                ts = groups.get(f"mcp:{srv_name}", [])
+                if not ts:
+                    console.print(f"[dim]No tools for mcp:{srv_name} (not connected?)[/dim]")
+                else:
+                    for t in ts:
+                        console.print(f"  [cyan]{t.name}[/cyan] — {t.description}")
+        elif sub == "connect":
+            if len(parts) < 3:
+                console.print("[yellow]Usage: /mcp connect <server>[/yellow]")
+            else:
+                ok, msg = mgr.connect(parts[2])
+                style = "green" if ok else "red"
+                console.print(f"[{style}]{parts[2]}: {msg}[/{style}]")
+        elif sub == "disconnect":
+            if len(parts) < 3:
+                console.print("[yellow]Usage: /mcp disconnect <server>[/yellow]")
+            else:
+                ok, msg = mgr.disconnect(parts[2])
+                style = "green" if ok else "red"
+                console.print(f"[{style}]{parts[2]}: {msg}[/{style}]")
+        elif sub == "reload":
+            results = mgr.reload()
+            for n, ok, m in results:
+                if n == "(none)":
+                    console.print(f"[yellow]{m}[/yellow]")
+                    continue
+                style = "green" if ok else "yellow"
+                console.print(f"[{style}]{n}: {m}[/{style}]")
+        elif sub == "init":
+            ok, msg = mcp_mod.MCPManager.write_template_config()
+            style = "green" if ok else "red"
+            console.print(f"[{style}]{msg}[/{style}]")
+            if ok:
+                console.print("[dim]Edit the file, enable a server, then /mcp reload[/dim]")
+        elif sub == "config":
+            console.print(str(mcp_mod.CONFIG_PATH))
+        else:
+            console.print("[yellow]Usage: /mcp {list|connect <n>|disconnect <n>|reload|tools <n>|init|config}[/yellow]")
+
+    elif action in ("/t", "/term"):
+        if len(parts) >= 2:
+            # /t <name> or /term <name> — create sub-terminal (no agent stationed)
+            name = parts[1]
+            existing = get_terminal(name)
+            if existing and not existing.session.is_alive():
+                unregister_terminal(name)
+                existing = None
+            if existing is not None:
+                console.print(f"[yellow]Terminal '{name}' already exists. /t to view, /terminate {name} to remove.[/yellow]")
+            else:
+                lain_cmd = f"{sys.executable} {os.path.abspath(__file__)} --simple-prompt"
+                sub = SubTerminalSession(lain_cmd)
+                sub.start()
+                time.sleep(0.3)
+                if sub.is_alive():
+                    sub.read_output(timeout=0.3)
+                register_terminal(sub, "laintas-cli", 0, name=name)
+                console.print(f"[green]Created sub-terminal [bold]{name}[/bold] (no agent stationed)[/green]")
+        else:
+            # /t or /term (no args) — list terminals browser
+            terminals = get_all_terminals()
+            has_primary = interactive_session is not None and interactive_session.is_alive()
+            if not terminals and not has_primary:
+                console.print("[dim]No active sub-terminal sessions. "
+                              "Use /station or let the AI spawn a command.[/dim]")
+            elif not terminals and has_primary:
+                enter_session(interactive_session)
+            else:
+                show_terminal_manager(interactive_session)
 
     else:
         # Try .extra_command.py custom handler first
@@ -3227,6 +4195,162 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
     return False
 
 
+# ── Command palette registry ───────────────────────────────────────────
+# (name, description) tuples for the interactive / command selector.
+# Keep this list in sync when adding new slash commands to handle_meta_command.
+
+_COMMANDS = [
+    ("/help",      "Show this help"),
+    ("/login",     "Re-authenticate with laintas.com (opens browser)"),
+    ("/name",      "Set current agent name"),
+    ("/memory",    "View .helpwo memory file"),
+    ("/prop",      "View .cli.prop prompt template"),
+    ("/scan",      "Scan and list all available system commands from PATH"),
+    ("/debug",     "Browse debug entries (/debug), view detail (/debug <N>)"),
+    ("/cwd",       "Show current working directory"),
+    ("/clear",     "Clear screen"),
+    ("/exit",      "Log out and exit (clears cached session)"),
+    ("/quit",      "Exit without logging out (keeps cached session)"),
+    ("/q",         "Detach from sub-terminal (alias for /back in sub-term, /quit in REPL)"),
+    ("/back",      "Detach from sub-terminal without closing it"),
+    ("/station",   "Station agent in a persistent shell (current or named terminal)"),
+    ("/terminate", "Close and destroy a terminal"),
+    ("/send",      "Send a command to a named terminal"),
+    ("/hire",      "Create a new AI agent (AI-1, AI-2...)"),
+    ("/agents",    "List/switch agents, /agents name <n> to rename"),
+    ("/t",         "List sub-terminals (/t), or create new one (/t <name>)"),
+    ("/term",      "Same as /t <name> — create a laintas-cli sub-terminal"),
+    ("/spawn",     "Spawn a sub-agent with optional name"),
+    ("/tell",      "Send a message to another agent"),
+    ("/abort",     "Signal abort to an agent"),
+    ("/tools",     "List registered tools by source"),
+    ("/tool",      "Invoke a tool directly"),
+    ("/skill",     "Manage skills"),
+    ("/mcp",       "Manage MCP servers"),
+    ("/config",    "View or set runtime configuration"),
+    ("/reload",    "Reload default files and restart"),
+]
+
+
+def _fuzzy_match(text: str, pattern: str) -> bool:
+    """Return True if all chars of pattern appear in text in order (fuzzy match)."""
+    it = iter(text)
+    return all(c in it for c in pattern)
+
+
+def show_command_palette():
+    """Interactive full-screen command selector — fuzzy filter, arrow keys, Enter.
+
+    Returns the selected command string (e.g. \"/help\") or None if cancelled.
+    """
+    filter_buffer = Buffer()
+    selected = [0]
+
+    def _get_filtered():
+        filt = filter_buffer.text.strip().lower()
+        if not filt:
+            return _COMMANDS[:]
+        return [(n, d) for n, d in _COMMANDS if _fuzzy_match(n.lower(), filt)]
+
+    def _build_lines():
+        lines = []
+        lines.append(("bold cyan", "Commands — type to filter\n"))
+        filt = filter_buffer.text.strip()
+        if filt:
+            lines.append(("", f"  filter: [white bold]{filt}[/white bold]\n"))
+        else:
+            lines.append(("dim", "  (start typing to filter)\n"))
+        lines.append(("dim", "─" * 50 + "\n"))
+
+        filtered = _get_filtered()
+        if not filtered:
+            lines.append(("", "\n"))
+            lines.append(("dim", "  No matching commands.\n"))
+            lines.append(("", "\n"))
+            return lines
+
+        # Clamp selection
+        if selected[0] >= len(filtered):
+            selected[0] = max(0, len(filtered) - 1)
+
+        # Compute visible range
+        import shutil
+        term_h = shutil.get_terminal_size().lines
+        list_h = max(4, term_h - 5)
+        start = 0
+        if len(filtered) > list_h:
+            start = min(selected[0], len(filtered) - list_h)
+            start = max(0, start)
+        end = min(start + list_h, len(filtered))
+
+        if start > 0:
+            lines.append(("dim", f"  ... {start} more above ...\n"))
+
+        for i in range(start, end):
+            cmd, desc = filtered[i]
+            prefix = "▶" if i == selected[0] else " "
+            style = "class:selected" if i == selected[0] else ""
+            lines.append((style, f" {prefix} [cyan]{cmd:14}[/cyan] {desc}\n"))
+
+        if end < len(filtered):
+            lines.append(("dim", f"  ... {len(filtered) - end} more below ...\n"))
+
+        lines.append(("", "\n"))
+        lines.append(("dim", f" {len(filtered)} commands  ↑↓ navigate  ↵ select  Esc/q cancel"))
+        return lines
+
+    # ── Key bindings ──────────────────────────────────────────────
+    kb = KeyBindings()
+
+    @kb.add("up")
+    def _(event):
+        filtered = _get_filtered()
+        if filtered:
+            selected[0] = max(0, selected[0] - 1)
+
+    @kb.add("down")
+    def _(event):
+        filtered = _get_filtered()
+        if filtered:
+            selected[0] = min(len(filtered) - 1, selected[0] + 1)
+
+    @kb.add("enter")
+    def _(event):
+        filtered = _get_filtered()
+        if filtered and 0 <= selected[0] < len(filtered):
+            event.app.exit(result=filtered[selected[0]][0])
+
+    @kb.add("escape")
+    @kb.add("q")
+    @kb.add("c-c")
+    def _(event):
+        event.app.exit(result=None)
+
+    # ── Layout ────────────────────────────────────────────────────
+    search_control = BufferControl(buffer=filter_buffer)
+    search_window = Window(content=search_control, height=1)
+
+    list_control = FormattedTextControl(_build_lines)
+    list_window = Window(content=list_control)
+
+    layout = Layout(HSplit([search_window, list_window]))
+
+    # ── Style ─────────────────────────────────────────────────────
+    style = Style.from_dict({
+        "selected": "reverse",
+    })
+
+    # ── Run ───────────────────────────────────────────────────────
+    app = Application(
+        layout=layout,
+        key_bindings=kb,
+        style=style,
+        full_screen=True,
+        refresh_interval=0.05,
+    )
+    return app.run()
+
+
 def show_help():
     """Display help."""
     table = Table(title="laintas_cli Commands")
@@ -3243,16 +4367,16 @@ def show_help():
     table.add_row("/scan", "Scan and list all available system commands from PATH")
     table.add_row("/debug", "Browse debug entries (/debug), view detail (/debug <N>), save to file (/debug <N> <file>), clear (/debug clear)")
     table.add_row("/cwd", "Show current working directory")
-    table.add_row("/station <name>", "Create persistent terminal and station AI there")
+    table.add_row("/station [name]", "Station agent in a persistent shell (current terminal, or named)")
     table.add_row("/terminate <name>", "Close and destroy a terminal")
     table.add_row("/send <name> <cmd>", "Send a command to a named terminal")
     table.add_row("/hire", "Create a new AI agent (AI-1, AI-2...)")
     table.add_row("/agents [name]", "List/switch agents, /agents name <n> to rename")
-    table.add_row("/t, /term", "List sub-terminals, Enter to embody, o to observe")
+    table.add_row("/t, /term [name]", "List sub-terminals, or create new one (/t <name>)")
     table.add_row("/back", "Detach from sub-terminal without closing it")
     table.add_row("/clear", "Clear screen")
     table.add_row("/exit", "Log out and exit (clears cached session)")
-    table.add_row("/quit, /q", "Exit without logging out (keeps cached session)")
+    table.add_row("/quit, /q", "Detach from sub-terminal (/q) or exit without logging out (/quit)")
 
     console.print(table)
 
@@ -3277,6 +4401,7 @@ def get_loop_deps() -> LoopDeps:
             display_sub_terminal_preview=display_sub_terminal_preview,
             console=console,
             Markdown=Markdown,
+            pty_passthrough=pty_passthrough,
         )
     return _loop_deps
 
@@ -3304,7 +4429,7 @@ def show_banner(agent_name: str, session: dict = None):
         f"OS: {SYSTEM} | Shell: {shell_info}\n"
         f"Working: {os.getcwd()}\n"
         f"Backend: {os.environ.get('LAINTAS_BACKEND', BACKEND_URL)}\n\n"
-        f"Commands from PATH ({len(get_dispatch_commands())} total) → executed directly.\n"
+        f"Commands from PATH → executed directly.\n"
         "Natural language → AI agent loop.\n"
         "Type [bold]/help[/bold] for commands.",
         title="laintas_cli",
@@ -3323,6 +4448,91 @@ def _simple_prompt(cwd: str) -> str:
         return sys.stdin.readline().strip()
     except (KeyboardInterrupt, EOFError):
         return ""
+
+
+# ── Remote Message Injection ──────────────────────────────────────────────
+# Messages from HelpwoAI (poll thread) are injected into the main REPL loop
+# so they go through the exact same input→route→execute pipeline as local
+# user input. A wakeup pipe unblocks the main thread when a message arrives.
+
+class _InjectedInput:
+    """A message injected from the remote poll thread into the main loop."""
+    __slots__ = ("text", "done")
+    def __init__(self, text: str, done: threading.Event):
+        self.text = text
+        self.done = done
+
+
+_injected_input_queue: queue.Queue = queue.Queue()
+_wakeup_r: Optional[int] = None
+_wakeup_w: Optional[int] = None
+_IN_SUB_TERMINAL = False
+
+
+def _init_injection_pipe():
+    """Create the wakeup pipe (Unix only). Idempotent, thread-safe enough."""
+    global _wakeup_r, _wakeup_w
+    if _wakeup_r is None and not IS_WINDOWS:
+        _wakeup_r, _wakeup_w = os.pipe()
+        for fd in (_wakeup_r, _wakeup_w):
+            fl = fcntl.fcntl(fd, fcntl.F_GETFL)
+            fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+
+
+def _drain_pipe(fd: int):
+    """Read and discard all bytes from the wakeup pipe."""
+    try:
+        while True:
+            os.read(fd, 4096)
+    except (BlockingIOError, OSError):
+        pass
+
+
+def _inject_input(text: str, done: threading.Event):
+    """Enqueue a message and wake up the main loop. Thread-safe."""
+    _init_injection_pipe()
+    try:
+        _injected_input_queue.put_nowait(_InjectedInput(text, done))
+    except queue.Full:
+        pass
+    if not IS_WINDOWS and _wakeup_w is not None:
+        try:
+            os.write(_wakeup_w, b'\x00')
+        except (BlockingIOError, OSError):
+            pass
+
+
+def _get_input(cwd: str):
+    """Return user input or an _InjectedInput from the remote queue.
+
+    Checks the wakeup pipe non-blockingly so that remote messages queued
+    between prompts are processed immediately. Does NOT block on stdin —
+    prompt_toolkit handles its own blocking read after the prompt is shown.
+    """
+    # Already-queued message (fast path)
+    try:
+        return _injected_input_queue.get_nowait()
+    except queue.Empty:
+        pass
+
+    if IS_WINDOWS:
+        return pt_prompt(cwd)
+
+    # Non-blocking check: is there a remote message waiting?
+    _init_injection_pipe()
+    try:
+        r, _, _ = select.select([_wakeup_r], [], [], 0)
+    except (select.error, ValueError, OSError):
+        pass
+    else:
+        if _wakeup_r in r:
+            _drain_pipe(_wakeup_r)
+            try:
+                return _injected_input_queue.get_nowait()
+            except queue.Empty:
+                pass  # spurious wakeup — fall through to prompt
+
+    return pt_prompt(cwd)
 
 
 def run_execute_mode(task: str, session: dict, depth: int) -> int:
@@ -3372,6 +4582,9 @@ def main():
                         help="Nesting depth (0=user terminal, 1+=sub-agent)")
     parser.add_argument("--simple-prompt", action="store_true", default=False,
                         help="Use plain input() instead of prompt_toolkit")
+    parser.add_argument("--monitor-only", action="store_true", default=False,
+                        help="Start as a remote executor only — register, heartbeat, "
+                             "and poll HelpwoAI for tasks. No local REPL.")
     args = parser.parse_args()
 
     # Apply environment overrides
@@ -3405,8 +4618,9 @@ def main():
     # ── Simple prompt (PTY subprocess mode) ──
     _use_simple_prompt = args.simple_prompt or not sys.stdin.isatty()
     if _use_simple_prompt:
-        global pt_prompt
+        global pt_prompt, _IN_SUB_TERMINAL
         pt_prompt = _simple_prompt
+        _IN_SUB_TERMINAL = True
 
     # Show banner (skip in child terminals to avoid Rich output in PTY)
     if args.depth == 0:
@@ -3438,11 +4652,43 @@ def main():
     primary = register_agent(name="primary", depth=0)
     set_current_agent_id("primary")
 
+    # Load user skills from ~/.laintas_cli_skills. Failures are surfaced
+    # but never block startup.
+    try:
+        _skill_results = skills_mod.load_all()
+        _failed = [(n, m) for n, ok, m in _skill_results if not ok]
+        if _failed and args.depth == 0:
+            for n, m in _failed:
+                console.print(f"[yellow]skill {n}: {m}[/yellow]")
+    except Exception as _e:
+        console.print(f"[yellow]skill loader error: {_e}[/yellow]")
+
+    # Connect MCP servers (if any configured + mcp SDK installed). Best-effort.
+    if args.depth == 0:
+        try:
+            if not mcp_mod.MCP_AVAILABLE:
+                if mcp_mod.CONFIG_PATH.exists():
+                    console.print(f"[dim yellow]mcp config present but SDK missing: {mcp_mod.MCP_IMPORT_ERROR}[/dim yellow]")
+                    console.print("[dim]Install with: pip install mcp[/dim]")
+            else:
+                _mcp_results = mcp_mod.get_manager().connect_all_enabled()
+                for n, ok, m in _mcp_results:
+                    if n == "(none)":
+                        continue
+                    style = "green" if ok else "yellow"
+                    console.print(f"[{style}]mcp {n}: {m}[/{style}]")
+        except Exception as _e:
+            console.print(f"[yellow]mcp connect error: {_e}[/yellow]")
+
     # Setup graceful shutdown
     def shutdown(signum=None, frame=None):
         console.print("\n[yellow]Shutting down...[/yellow]")
         close_all_terminals()
         close_all_agents()
+        try:
+            mcp_mod.get_manager().shutdown()
+        except Exception:
+            pass
         nonlocal interactive_session
         if interactive_session:
             interactive_session.close()
@@ -3452,15 +4698,50 @@ def main():
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
 
+    # ── Monitor-only mode (no interactive REPL) ──
+    # Runs purely as a remote executor: heartbeat + /poll loop already
+    # started above when the agent registered. Here we just park the main
+    # thread until SIGINT/SIGTERM. See HELPWO_INTEGRATION_PLAN.md phase D.
+    if args.monitor_only:
+        if not session.get("userId"):
+            console.print("[red]--monitor-only requires authentication. Run /login first.[/red]")
+            sys.exit(1)
+        if not agent_registry.agent_id:
+            console.print("[red]--monitor-only requires successful agent registration. "
+                          "Check backend URL and credentials.[/red]")
+            sys.exit(1)
+        console.print(Panel(
+            f"[green]Monitor-only mode active[/green]\n"
+            f"Agent: [bold]{agent_registry.agent_name}[/bold] ({agent_registry.agent_id})\n"
+            f"Listening for remote exec/query/delegate requests…\n"
+            f"[dim]Ctrl+C to exit.[/dim]",
+            title="laintas-cli monitor",
+            border_style="green",
+        ))
+        try:
+            while True:
+                time.sleep(3600)
+        except (KeyboardInterrupt, SystemExit):
+            shutdown()
+
     # Main interactive loop
 
     while True:
         try:
-            user_input = pt_prompt(str(os.getcwd()))
+            item = _get_input(str(os.getcwd()))
         except (KeyboardInterrupt, EOFError):
             shutdown()
 
+        if isinstance(item, _InjectedInput):
+            user_input = item.text
+            injected_done = item.done
+        else:
+            user_input = item
+            injected_done = None
+
         if not user_input:
+            if injected_done is not None:
+                injected_done.set()
             continue
 
         # Ctrl+D → exit
@@ -3471,6 +4752,8 @@ def main():
             agent_registry.unregister()
             clear_session()
             console.print("[green]Logged out. Goodbye![/green]")
+            if injected_done is not None:
+                injected_done.set()
             return
 
         # Check for meta commands
@@ -3479,7 +4762,11 @@ def main():
             if should_exit:
                 if interactive_session:
                     interactive_session.close()
+                if injected_done is not None:
+                    injected_done.set()
                 return
+            if injected_done is not None:
+                injected_done.set()
             continue
 
         # ── Session-aware routing ──────────────────────────────────
@@ -3548,6 +4835,8 @@ def main():
                 "lastReply": "",
                 "lastOutput": response.get("state", {}).get("lastOutput", ""),
             }
+            if injected_done is not None:
+                injected_done.set()
             continue
 
         # ── Normal input routing ───────────────────────────────────
@@ -3559,7 +4848,7 @@ def main():
         if agent_registry.agent_id:
             agent_registry._push_events([{"type": "user", "content": user_input}])
 
-        # Regex match first word against .cli → system command or AI
+        # Route first word against PATH/builtins → system command or AI
         # Child terminals (depth > 0): always route through AI — the parent
         # controls this terminal and expects intelligent processing.
         if args.depth == 0 and is_system_command(user_input):
@@ -3572,21 +4861,33 @@ def main():
                 interactive_session.close()
                 interactive_session = None
 
-            # Drain any queued terminal query responses before passthrough
-            if not IS_WINDOWS:
-                _fl = fcntl.fcntl(sys.stdin.fileno(), fcntl.F_GETFL)
-                fcntl.fcntl(sys.stdin.fileno(), fcntl.F_SETFL, _fl | os.O_NONBLOCK)
+            # `cd` must mutate the parent process CWD — a PTY subshell can't.
+            _first = extract_first_word(user_input)
+            if _first == "cd":
+                _arg = user_input.strip()[2:].strip() or os.path.expanduser("~")
                 try:
-                    while True:
-                        if not sys.stdin.buffer.read(4096):
-                            break
-                except (BlockingIOError, OSError):
-                    pass
-                finally:
-                    fcntl.fcntl(sys.stdin.fileno(), fcntl.F_SETFL, _fl)
+                    os.chdir(os.path.expanduser(_arg))
+                    result = {"stdout": "", "stderr": "", "returncode": 0, "success": True}
+                except OSError as _e:
+                    msg = f"cd: {_e}\n"
+                    console.print(f"[red]{msg.strip()}[/red]")
+                    result = {"stdout": "", "stderr": msg, "returncode": 1, "success": False}
+            else:
+                # Drain any queued terminal query responses before passthrough
+                if not IS_WINDOWS:
+                    _fl = fcntl.fcntl(sys.stdin.fileno(), fcntl.F_GETFL)
+                    fcntl.fcntl(sys.stdin.fileno(), fcntl.F_SETFL, _fl | os.O_NONBLOCK)
+                    try:
+                        while True:
+                            if not sys.stdin.buffer.read(4096):
+                                break
+                    except (BlockingIOError, OSError):
+                        pass
+                    finally:
+                        fcntl.fcntl(sys.stdin.fileno(), fcntl.F_SETFL, _fl)
 
-            # Full terminal passthrough — user interacts directly with the command
-            result = pty_passthrough(user_input)
+                # Full terminal passthrough — user interacts directly with the command
+                result = pty_passthrough(user_input)
 
             # ── Debug: log command execution ──
             loop_id = next_debug_loop()
@@ -3615,6 +4916,8 @@ def main():
         else:
             if not session.get("userId"):
                 console.print("[yellow]Not authenticated. Use /login first.[/yellow]")
+                if injected_done is not None:
+                    injected_done.set()
                 continue
             console.print("[dim]Not a system command, asking AI...[/dim]")
 
@@ -3641,6 +4944,9 @@ def main():
             "lastReply": "",
             "lastOutput": response.get("state", {}).get("lastOutput", ""),
         }
+
+        if injected_done is not None:
+            injected_done.set()
 
 
 if __name__ == "__main__":

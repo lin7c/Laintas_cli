@@ -1,3 +1,8 @@
 requests>=2.28.0
 rich>=13.0.0
 prompt_toolkit>=3.0.0
+
+# Optional — enables /mcp commands and MCP-server tools.
+# laintas-cli starts and runs without this; the /mcp command will tell
+# you it's missing and how to install. Comment out if you don't need MCP.
+mcp>=1.0

@@ -2,9 +2,15 @@ venv/
 __pycache__/
 *.egg-info/
 *.pyc
-.cli
 .cli.prop
 .extra_command.py
 .helpwo
 .loop_command.py
 .parent_cmd
+build/**/*.deb
+build/**/tmp/
+
+# laintas_cli_download (React/Vite)
+laintas_cli_download/node_modules/
+laintas_cli_download/dist/
+

@@ -1,14 +1,16 @@
-from setuptools import setup, find_packages
+from setuptools import setup
 
 setup(
     name="laintas-cli",
     version="0.1.0",
     description="Laintas CLI - Autonomous AI agent for your terminal",
     author="Laintas",
-    py_modules=["laintas_cli"],
+    url="https://github.com/lin7c/laintas_cli_pre",
+    py_modules=["laintas_cli", "agent_loop"],
     install_requires=[
         "requests>=2.28.0",
         "rich>=13.0.0",
+        "prompt_toolkit>=3.0.0",
     ],
     entry_points={
         "console_scripts": [
@@ -16,4 +18,16 @@ setup(
         ],
     },
     python_requires=">=3.10",
+    classifiers=[
+        "Development Status :: 3 - Alpha",
+        "Environment :: Console",
+        "Intended Audience :: Developers",
+        "License :: OSI Approved :: MIT License",
+        "Operating System :: POSIX :: Linux",
+        "Operating System :: Microsoft :: Windows",
+        "Programming Language :: Python :: 3.10",
+        "Programming Language :: Python :: 3.11",
+        "Programming Language :: Python :: 3.12",
+        "Topic :: Terminals",
+    ],
 )

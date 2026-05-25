@@ -133,7 +133,7 @@ Two auto-generated files provide pluggable command handling:
 - **`.extra_command.py`** — Defines `handle_extra_command(action, parts, ctx)` for custom slash commands (`/config`, `/reload`). Loaded with mtime-based caching so edits take effect without restart.
 - **`.loop_command.py`** — Defines `handle_loop_command(command, ctx)` for custom loop-level commands (`wait(N)`). If the handler returns a string, it becomes `lastOutput`; if None, the command executes normally.
 
-Both files are created empty (or from templates) alongside `.cli` and `.cli.prop` on first run.
+Both files are created empty (or from templates) alongside `.cli.prop` on first run.
 
 ### 8. Agent Registry (`AgentRegistry`)
 
@@ -178,7 +178,6 @@ The AI system prompt is templated from `.cli.prop` (auto-generated if missing). 
 | `~/.laintas_cli_session.json` | Home directory | Cached auth session (chmod 600) |
 | `~/.laintas_cli_config.json` | Home directory | CLI config (agent name, preferences) |
 | `~/.laintas_cli_history` | Home directory | prompt_toolkit command history |
-| `.cli` | Working directory | Discovered PATH executables (auto-generated) |
 | `.cli.prop` | Working directory | AI system prompt template (auto-generated) |
 | `.helpwo` | Working directory | AI memory / project rules (auto-created empty) |
 | `.extra_command.py` | Working directory | Custom slash command handlers (auto-created) |
@@ -191,7 +190,7 @@ The AI system prompt is templated from `.cli.prop` (auto-generated if missing). 
 ### System Command
 ```
 User: "ls -la"
-  → is_system_command() → True ("ls" in .cli)
+  → is_system_command() → True (shutil.which("ls") resolves)
   → pty_passthrough("ls -la")
   → InteractiveSession forks, execs, output streams to terminal
 ```
@@ -261,5 +260,4 @@ laintas-cli --simple-prompt          # PTY-safe simple input mode
 
 - Windows support is partial — interactive programs fall back to `subprocess.run()`
 - tmux is required for seamless sub-terminal interactive sessions
-- `.cli` command list is a static PATH snapshot; new commands need `/scan` or restart
 - No persistent session recovery — PTY state is lost on crash
