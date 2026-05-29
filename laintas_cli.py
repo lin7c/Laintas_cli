@@ -79,6 +79,7 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.application import Application
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.completion import Completer, Completion, PathCompleter, WordCompleter
+from prompt_toolkit.document import Document
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import Layout, HSplit, Window, FormattedTextControl
 from prompt_toolkit.styles import Style
@@ -100,6 +101,7 @@ from agent_loop import (
     rename_terminal,
     register_agent, unregister_agent,
     get_agent, get_all_agents, get_current_agent,
+    get_pool_agents, get_deployed_agents, get_or_hire_pool_agent,
     switch_to_agent, set_current_agent_id,
     rename_agent, station_agent, unstation_agent,
     close_all_agents,
@@ -112,7 +114,15 @@ from agent_loop import (
 
 import tools as tools_mod    # noqa: E402 — load after agent_loop so registry inits once
 import skills as skills_mod  # noqa: E402
-import mcp_client as mcp_mod # noqa: E402
+
+# MCP client: lazy import (saves ~1.8s on startup)
+_mcp_mod = None
+def _get_mcp_mod():
+    global _mcp_mod
+    if _mcp_mod is None:
+        import mcp_client as _m
+        _mcp_mod = _m
+    return _mcp_mod
 
 # ── ANSI escape sequence stripping ─────────────────────────────────────
 _ANSI_RE = re.compile(r'\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[@-Z\\-~]|\x1b[()][AB12]|\x0d')
@@ -125,7 +135,7 @@ def _detect_backend() -> str:
     """Auto-detect the Helpwo backend URL. Prefers local if running."""
     local = "http://127.0.0.1:2913"
     try:
-        r = requests.get(f"{local}/api/agents", timeout=2)
+        r = requests.get(f"{local}/api/agents", timeout=1.5)
         if r.status_code in (200, 401):  # 401 = endpoint exists, just needs auth
             return local
     except requests.RequestException:
@@ -223,6 +233,135 @@ def pty_passthrough(command: str, timeout: int = 120) -> dict:
         "returncode": session.returncode,
         "success": session.returncode == 0,
     }
+
+
+# ── Commands that need real TTY passthrough (not marker-poll) ──
+
+_INTERACTIVE_COMMANDS = {
+    "vim", "vi", "nano", "pico", "emacs",
+    "less", "more",
+    "htop", "top",
+    "python", "python3", "ipython", "node", "irb", "ruby",
+    "mysql", "psql", "sqlite3",
+    "ssh", "telnet",
+    "tmux", "screen", "mc",
+}
+
+
+def _marker_poll_exec(session, command: str, timeout: int = 60, strip_ansi_codes: bool = True) -> dict:
+    """Execute a command through a persistent bash session via marker-poll.
+
+    Returns {stdout, stderr, returncode, success}.
+    Same mechanism as tools.py _bi_shell_exec marker-poll path.
+
+    When strip_ansi_codes=False, ANSI escape sequences are preserved in stdout
+    (needed for commands like `clear` whose output IS escape sequences).
+    """
+    if session is None or not session.is_alive():
+        return {"stdout": "", "stderr": "session not alive", "returncode": -1, "success": False}
+
+    import uuid as _uuid
+    import re as _re
+
+    marker_id = _uuid.uuid4().hex[:8]
+    start_marker = f"__CMD_BEGIN_{marker_id}__"
+    end_marker = f"__CMD_END_{marker_id}__"
+    wrapped = f"echo {start_marker}; {command} 2>&1; __laintas_rc=$?; echo {end_marker}:$__laintas_rc"
+
+    try:
+        old_len = len(session.raw_output)
+    except AttributeError:
+        old_len = len(session.full_output)
+
+    session.send_keys(wrapped + "\n")
+    poll_start = time.time()
+    cmd_output = ""
+    returncode = -1
+    new_content = ""
+
+    while time.time() - poll_start < timeout:
+        time.sleep(0.08)
+        session.read_output(timeout=0.1)
+        try:
+            raw = session.raw_output
+        except AttributeError:
+            raw = session.full_output
+        new_content = raw[old_len:] if old_len > 0 else raw
+
+        end_match = _re.search(rf'{_re.escape(end_marker)}:(\d+)', new_content)
+        if end_match:
+            returncode = int(end_match.group(1))
+            starts = list(_re.finditer(
+                rf'{_re.escape(start_marker)}(?=[\r\n]|$)', new_content))
+            if starts:
+                valid = [m for m in starts if m.end() < end_match.start()]
+                chosen = valid[-1] if valid else starts[-1]
+                body_start = chosen.end()
+                while body_start < len(new_content) and new_content[body_start] in '\r\n':
+                    body_start += 1
+                cmd_output = new_content[body_start:end_match.start()]
+                cmd_output = cmd_output.rstrip('\r\n').strip()
+            else:
+                parts = new_content.rsplit(start_marker, 1)
+                if len(parts) > 1:
+                    tail = parts[1].split(end_marker, 1)[0]
+                    cmd_output = tail.strip('\r\n').strip()
+            break
+        if not session.is_alive():
+            cmd_output = new_content
+            break
+
+    if returncode == -1 and not cmd_output:
+        cmd_output = new_content
+
+    if strip_ansi_codes:
+        cmd_output = strip_ansi(cmd_output)
+    return {
+        "stdout": cmd_output,
+        "stderr": "",
+        "returncode": returncode,
+        "success": returncode == 0,
+    }
+
+
+def _quick_pwd(session, timeout: float = 2.0) -> str:
+    """Run pwd via marker-poll and return the result."""
+    if session is None or not session.is_alive():
+        return os.getcwd()
+    try:
+        result = _marker_poll_exec(session, "pwd", timeout=int(timeout))
+        output = result.get("stdout", "").strip()
+        return output if output else os.getcwd()
+    except Exception:
+        return os.getcwd()
+
+
+def _sync_cwd_from_term0(session) -> None:
+    """Sync the parent process CWD to match term0's bash session CWD."""
+    if session is None or not session.is_alive():
+        return
+    try:
+        term0_cwd = _quick_pwd(session)
+        if term0_cwd and os.path.isdir(term0_cwd) and term0_cwd != os.getcwd():
+            os.chdir(term0_cwd)
+    except Exception:
+        pass
+
+
+def _ensure_term0_alive() -> None:
+    """Health-check term0's bash session. Respawn if dead."""
+    term0_info = get_terminal("term0")
+    if term0_info is None or term0_info.session is None or not term0_info.session.is_alive():
+        try:
+            _term0 = InteractiveSession(
+                DEFAULT_SHELL, timeout=0, stream_output=False, persistent=True)
+            _term0.start()
+            time.sleep(0.08)
+            if _term0.is_alive():
+                _term0.read_output(timeout=0.1)
+            register_terminal(_term0, DEFAULT_SHELL, 0, name="term0")
+        except Exception:
+            pass
 
 
 class SubTerminalSession:
@@ -411,6 +550,35 @@ class SubTerminalSession:
         return -1
 
 
+def _build_subterminal_cmd(agent_id: Optional[str] = None,
+                           agent_name: Optional[str] = None,
+                           agent_role: Optional[str] = None,
+                           terminal_name: Optional[str] = None,
+                           parent_terminal: Optional[str] = None,
+                           parent_agent_id: Optional[str] = None) -> str:
+    """Build the laintas-cli command string for spawning a sub-terminal.
+
+    All identity is passed via CLI flags so the child process can register
+    its agent with the right context.
+    """
+    parts = [shlex.quote(sys.executable),
+             shlex.quote(os.path.abspath(__file__)),
+             "--simple-prompt"]
+    if agent_id:
+        parts += ["--agent-id", shlex.quote(agent_id)]
+    if agent_name and agent_name != agent_id:
+        parts += ["--agent-name", shlex.quote(agent_name)]
+    if agent_role:
+        parts += ["--agent-role", shlex.quote(agent_role)]
+    if terminal_name:
+        parts += ["--terminal-name", shlex.quote(terminal_name)]
+    if parent_terminal:
+        parts += ["--parent-terminal", shlex.quote(parent_terminal)]
+    if parent_agent_id:
+        parts += ["--parent-agent-id", shlex.quote(parent_agent_id)]
+    return " ".join(parts)
+
+
 def _drain_fd(fd: int, chunks: list) -> None:
     """Read any remaining data from fd after child exits."""
     while True:
@@ -513,10 +681,11 @@ class InteractiveSession:
     drop-in replacement for the old execute_command_pty().
     """
 
-    def __init__(self, command: str, timeout: int = 120, stream_output: bool = False):
+    def __init__(self, command: str, timeout: int = 120, stream_output: bool = False, persistent: bool = False):
         self.command = command
         self.timeout = timeout
         self.stream_output = stream_output
+        self.persistent = persistent
 
         self.pid: int = -1
         self.master_fd: int = -1
@@ -579,7 +748,10 @@ class InteractiveSession:
                 termios.tcsetwinsize(0, s)
             except (termios.error, OSError):
                 pass
-            os.execve(DEFAULT_SHELL, [DEFAULT_SHELL, "-c", self.command], _child_env())
+            if self.persistent:
+                os.execve(DEFAULT_SHELL, [DEFAULT_SHELL], _child_env())
+            else:
+                os.execve(DEFAULT_SHELL, [DEFAULT_SHELL, "-c", self.command], _child_env())
             os._exit(127)
 
         # ── Parent ──
@@ -984,8 +1156,19 @@ class MetaCompleter(Completer):
             yield from self._cmd_completer.get_completions(document, complete_event)
             return
 
-        # After a command — path/file completion
-        yield from self._path.get_completions(document, complete_event)
+        # After a command — path/file completion.
+        # PathCompleter uses document.text_before_cursor (the full line) as the
+        # path prefix, which breaks for sentence input like "vim laint".  Create
+        # a sub-document that only contains the last whitespace-delimited word
+        # so that PathCompleter sees a bare path fragment.
+        text_before = document.text_before_cursor
+        last_space = text_before.rfind(" ")
+        if last_space != -1:
+            path_text = text_before[last_space + 1:]
+            sub_doc = Document(path_text, len(path_text))
+        else:
+            sub_doc = document
+        yield from self._path.get_completions(sub_doc, complete_event)
 
 
 def _build_prompt_style() -> Style:
@@ -1006,10 +1189,52 @@ def _build_keybindings() -> KeyBindings:
         if not event.current_buffer.text:
             event.app.exit(result="/exit")
 
+    @kb.add("tab")
+    def _(event):
+        """Tab: accept suggestion → cycle completions → start completion."""
+        buf = event.current_buffer
+        if buf.suggestion and buf.document.is_cursor_at_the_end and not buf.complete_state:
+            buf.insert_text(buf.suggestion.text)
+        elif buf.complete_state:
+            buf.complete_next()
+        else:
+            buf.start_completion()
+
+    @kb.add("c-f")
+    def _(event):
+        """Ctrl+F: accept auto-suggest ghost text (fish-style)."""
+        buf = event.current_buffer
+        if buf.suggestion:
+            buf.insert_text(buf.suggestion.text)
+
+    @kb.add("c-e")
+    def _(event):
+        """Ctrl+E: accept auto-suggest ghost text."""
+        buf = event.current_buffer
+        if buf.suggestion:
+            buf.insert_text(buf.suggestion.text)
+
     return kb
 
 
 _prompt_session: Optional[PromptSession] = None
+
+
+def _interrupt_prompt():
+    """Force prompt_toolkit to return from another thread.
+
+    Called by the poll thread when a remote message arrives while the main
+    loop is blocked on pt_prompt(). Forces the prompt to return with an empty
+    string so the main loop re-checks the injection queue immediately.
+    """
+    global _prompt_session
+    if _prompt_session is not None:
+        try:
+            app = _prompt_session.app
+            if app.is_running:
+                app.exit(result="")
+        except Exception:
+            pass
 
 
 def get_prompt_session() -> PromptSession:
@@ -1193,7 +1418,7 @@ def verify_session(session: dict) -> Optional[dict]:
     if user_id:
         try:
             resp = requests.get(f"{LAINTAS_BASE}/api/balance",
-                                headers={"X-User-Id": user_id}, timeout=8)
+                                headers={"X-User-Id": user_id}, timeout=5)
             if resp.status_code == 200:
                 return {"id": user_id, "name": "", "email": ""}
         except requests.RequestException:
@@ -1213,7 +1438,7 @@ def verify_session(session: dict) -> Optional[dict]:
     if req_args:
         try:
             resp = requests.get(f"{LAINTAS_BASE}/api/auth/get-session",
-                                timeout=8, **req_args)
+                                timeout=5, **req_args)
             if resp.status_code == 200:
                 data = resp.json()
                 if data and isinstance(data, dict):
@@ -1799,21 +2024,39 @@ def generate_cli_prop_template() -> str:
       {{agentName}} {{agentId}} {{currentPath}} {{depth}} {{nextDepth}}
       {{activeFile}} {{globalMemory}} {{persistentMemory}}
       {{planMode}} {{tools}} {{inbox}} {{children}} {{parent}}
+      {{terminalName}} {{parentTerminal}} {{deploymentStatus}}
+      {{workflowPhase}} {{rolePrompt}} {{confidenceGuidance}}
+      {{skillContext}} {{parallelResults}} {{behaviorDiagnostics}}
     """
     shell_info = "cmd.exe" if IS_WINDOWS else SHELL_NAME
 
     return f"""<role>
-You are {{{{agentName}}}} (id: {{{{agentId}}}}), an autonomous coding agent running inside a laintas-cli REPL.
+You are {{{{agentName}}}} (id: {{{{agentId}}}}, role: {{{{deploymentStatus}}}}), an autonomous coding agent running inside a laintas-cli REPL.
 You earn your keep by solving real engineering tasks: explore the codebase, edit files, run commands, verify the result, and report back tersely. You are not a chatbot — you act, then explain what you did.
 </role>
 
+<specialist_role>
+{{{{rolePrompt}}}}
+</specialist_role>
+
 <environment>
 - OS: {SYSTEM} | Shell: {shell_info} | CWD: {{{{currentPath}}}}
+- Terminal: {{{{terminalName}}}} | Status: {{{{deploymentStatus}}}}
+- Parent terminal: {{{{parentTerminal}}}} | Parent agent: {{{{parent}}}}
 - Recursion depth: {{{{depth}}}} (0 = user's terminal; ≥1 = sub-agent in a collapsed panel)
-- Parent agent: {{{{parent}}}} | Children: {{{{children}}}}
+- Children: {{{{children}}}}
 - Inbox (messages from other agents this iteration): {{{{inbox}}}}
 - Plan mode: {{{{planMode}}}}
+- Stationed execution: when deployed to term0, your shell commands (including cd, export, clear) run in a persistent bash session — side effects persist across commands. Use shell.exec("cd ..") normally; it will change the working directory just like the user typing it.
 </environment>
+
+<behavior_diagnostics>
+{{{{behaviorDiagnostics}}}}
+</behavior_diagnostics>
+
+<parallel_results>
+{{{{parallelResults}}}}
+</parallel_results>
 
 <persistent_memory>
 These memories survive across sessions. Treat them as authoritative context about the user and project.
@@ -1871,30 +2114,70 @@ For every non-trivial task, follow this loop:
 
 3. PLAN for multi-step work. If the task has >3 steps OR touches >2 files, create tasks via task.create before editing. One in_progress task at a time. If plan mode is active (see <environment>), explore only — no writes — until the user runs /plan approve.
 
-4. ACT in small, verifiable increments. Prefer fs.edit (exact string replacement) for code changes; fs.write only for new files or full rewrites. After edits, run the project's test/typecheck/lint command if one is obvious (package.json scripts, pytest, cargo test, etc.).
+4. ACT in small, verifiable increments. **Work incrementally — never try to do everything in one response.**
+   - **One tool call per concern.** Write one file, make one edit, run one command per tool call. Multiple tool calls per turn are fine (they run sequentially), but keep each one small and focused.
+   - **fs.write: ≤ 50 lines per call.** If a file needs more content, write the skeleton first, then use fs.edit to add sections one at a time. Example: write index.html with basic structure (head, empty body, empty script tag), then fs.edit to add the body content, then fs.edit to add the JavaScript.
+   - **fs.edit: replace small, unique snippets.** Don't try to replace entire blocks — find a small unique anchor string and replace just that section.
+   - **Self-check before writing:** If you're about to write more than 50 lines of content in a single fs.write call, STOP. Split it: write the skeleton now, add content in the next turn via fs.edit.
+   - Prefer fs.edit (exact string replacement) for code changes; fs.write only for new files or initial scaffolding. After edits, run the project's test/typecheck/lint command if one is obvious (package.json scripts, pytest, cargo test, etc.).
 
 5. VERIFY before claiming done. Read the file back, run the test, exit-code-check the build. Saying "done" without verification is the most common failure mode — avoid it.
 
 6. RECOVER from errors. If a command fails: read the error, decide if it's transient (retry once with a fix) or fundamental (change approach). Never re-run the identical failing command. Look at the inline `[error: ...]` hints the loop adds to terminal output — they classify the failure for you.
 
+**CRITICAL: fs.edit failure recovery.** If fs.edit fails with "old_string not found", DO NOT fall back to fs.write with the entire file content. This will exceed token limits and fail. Instead:
+   a. Use fs.read to see the current file content
+   b. Identify a smaller, unique substring that actually exists in the file
+   c. Use multiple smaller fs.edit calls to make incremental changes
+
 7. REMEMBER what's worth remembering. Use the `rules` field for project-local facts ("uses Vite", "tests live in __tests__/"). Use `/tool mem.save` for cross-session memories (user role, feedback, project constraints). Don't save derivable facts (git history, current file layout).
 </workflow>
 
+<workflow_phase>
+{{{{workflowPhase}}}}
+</workflow_phase>
+
+<skill_context>
+{{{{skillContext}}}}
+</skill_context>
+
 <output_rules>
-Every response is a single JSON object with these fields:
+Every response is a single JSON object with two fields:
 
   {{
-    "reply":   "Brief user-facing message. Markdown OK. Reference files as path:line.",
-    "command": "Exactly one shell command, /tool ..., or meta-command. May be empty if done.",
-    "rules":   "Memory mutation (see below) or empty string.",
-    "done":    true | false
+    "reply": "Brief user-facing text. Markdown OK. Reference files as path:line.",
+    "tool_calls": [
+      {{"name": "tool.name", "arguments": {{...}}}},
+      ...
+    ]
   }}
 
-Field rules:
-- `reply` is what the user sees on the terminal. 1–3 sentences for routine steps. Longer only when summarizing a finished task or asking a clarifying question. No filler ("Sure!", "I'll now…", "Let me know if you need anything else"). Don't restate what the command obviously does.
-- `command`: exactly one action per turn. Use shell pipes if you'd otherwise chain. If you have nothing to run (asking the user, or task finished), leave it `""`.
-- `rules` mutates project memory (.helpwo). Forms: `"text"` appends, `"~N: text"` modifies entry N, `"-N"` deletes entry N, `""` no-op.
-- `done: true` ONLY when the task is fully complete and verified, OR you're blocked waiting on the user. `done: false` whenever you ran a command whose output you need to inspect next iteration.
+- `reply`: 1-3 sentences for the user. Longer only when summarizing a finished task or asking a clarifying question. No filler ("Sure!", "I'll now..."). Don't restate what the command obviously does.
+- `tool_calls`: array of actions to execute, in order. **Empty array `[]` means the task is fully complete, OR you're blocked waiting on the user.** If your reply already answers the question or completes the task, return `tool_calls: []` — do NOT add a redundant verification command (e.g., running `pwd` after `cd` succeeded). Multiple tool calls ARE allowed (they run sequentially).
+
+{{{{confidenceGuidance}}}}
+
+**CRITICAL: Keep each tool call small to avoid token overflow.**
+- fs.write content: ≤ 50 lines. For larger files, write skeleton first, then add via fs.edit in subsequent turns.
+- fs.edit old_string/new_string: ≤ 20 lines each. Find small unique anchors.
+- If you find yourself about to generate a tool call with >100 lines of content, STOP and split it across multiple turns.
+- This keeps responses within token limits and makes debugging easier.
+
+Every entry in `tool_calls` has:
+  - `name`: a tool name from the catalog (e.g. "shell.exec", "fs.read", "agent.spawn")
+  - `arguments`: a JSON object with the tool's parameters (see <tools> for schemas)
+
+Quick reference of available tool names:
+  shell.exec — run any shell command (your primary action tool; wraps cd, git, pytest, npm, etc.)
+  fs.read, fs.edit, fs.write, fs.glob, fs.grep, fs.ls, fs.diff, fs.multi_edit
+  agent.spawn, agent.tell, agent.station, agent.abort, agent.wait, agent.hire, agent.list, agent.rename, agent.switch
+  terminal.send, terminal.terminate, terminal.create, terminal.list
+  session.close, session.keys
+  mem.save, mem.read, mem.delete, mem.list
+  task.create, task.update, task.list, task.get
+  plan.read, plan.update, plan.list
+  web.search, web.fetch
+  time.now, sleep
 
 JSON must parse. No prose outside the object. No code fences around it.
 </output_rules>
@@ -1916,7 +2199,7 @@ JSON must parse. No prose outside the object. No code fences around it.
 <recursive_orchestration>
 You can delegate sub-tasks two ways:
 
-- `/spawn task description` — in-process child agent. Cheap, shares process state, posts result to your inbox.
+- `agent.spawn` — in-process child agent. Cheap, shares process state, posts result to your inbox.
 - shell: `laintas-cli --execute "task description" --depth {{{{nextDepth}}}}` — full sub-process. Heavier, but isolated.
 
 Rule of thumb: spawn for parallel exploration ("read these 3 files in parallel"); execute for isolated long-running tasks. At depth ≥ 2 prefer doing the work yourself — deeper recursion costs more than it saves.
@@ -1926,22 +2209,32 @@ For parent-terminal side effects (cd, clear) at depth ≥ 1, use `parent(cmd)` f
 
 <examples>
 Task: "What does this project do?"
-{{"reply": "Reading the README to find out.", "command": "/tool fs.read {{\\"path\\": \\"README.md\\", \\"max_bytes\\": 4000}}", "rules": "", "done": false}}
+{{"reply": "Reading the README.", "tool_calls": [{{"name": "fs.read", "arguments": {{"path": "README.md", "max_bytes": 4000}}}}]}}
 
 Task (next iteration, after seeing README):
-{{"reply": "It's a Python CLI that turns a backend LLM into a terminal coding agent. Entrypoint is `laintas_cli.py:1`; the loop lives in `agent_loop.py:1018`.", "command": "", "rules": "Entrypoint=laintas_cli.py; loop=agent_loop.run_agent_loop", "done": true}}
+{{"reply": "It's a Python CLI that turns a backend LLM into a terminal coding agent. Entrypoint is `laintas_cli.py:1`; the loop lives in `agent_loop.py:1018`.", "tool_calls": []}}
 
 Task: "Fix the typo on line 42 of utils.py"
-{{"reply": "Replacing `recieve` with `receive` in utils.py:42.", "command": "/tool fs.edit {{\\"path\\": \\"utils.py\\", \\"old_string\\": \\"recieve\\", \\"new_string\\": \\"receive\\"}}", "rules": "", "done": false}}
+{{"reply": "Replacing `recieve` with `receive` in utils.py:42.", "tool_calls": [{{"name": "fs.edit", "arguments": {{"path": "utils.py", "old_string": "recieve", "new_string": "receive"}}}}]}}
 
 Task: "Run the tests"
-{{"reply": "Running pytest.", "command": "pytest -x --tb=short", "rules": "", "done": false}}
+{{"reply": "Running pytest.", "tool_calls": [{{"name": "shell.exec", "arguments": {{"command": "pytest -x --tb=short"}}}}]}}
 
 Task complete after the test passes:
-{{"reply": "All 23 tests pass. The typo fix didn't break anything.", "command": "", "rules": "", "done": true}}
+{{"reply": "All 23 tests pass. The typo fix didn't break anything.", "tool_calls": []}}
 
 Task: needs clarification
-{{"reply": "Which `config.json` did you mean — the one at the repo root or in `src/`? Both exist.", "command": "", "rules": "", "done": true}}
+{{"reply": "Which `config.json` did you mean — the one at the repo root or in `src/`? Both exist.", "tool_calls": []}}
+
+Task: "Create an HTML page with a timeline"
+Step 1 — write skeleton:
+{{"reply": "Creating index.html skeleton.", "tool_calls": [{{"name": "fs.write", "arguments": {{"path": "index.html", "content": "<!DOCTYPE html>\n<html>\n<head><title>Timeline</title></head>\n<body>\n<!-- content here -->\n</body>\n</html>"}}}}]}}
+
+Step 2 (next turn) — add body content via edit:
+{{"reply": "Adding timeline content.", "tool_calls": [{{"name": "fs.edit", "arguments": {{"path": "index.html", "old_string": "<!-- content here -->", "new_string": "<h1>Timeline</h1>\n<div class=\"item\">...</div>"}}}}]}}
+
+Step 3 (next turn) — add styles via edit:
+{{"reply": "Adding styles.", "tool_calls": [{{"name": "fs.edit", "arguments": {{"path": "index.html", "old_string": "</head>", "new_string": "<style>.item {{ margin: 1em; }}</style>\n</head>"}}}}]}}
 </examples>
 """
 # ── File Helpers ───────────────────────────────────────────────────────
@@ -2108,6 +2401,38 @@ def _try_parse_partial_json(text: str) -> Optional[dict]:
         return None
 
 
+def _legacy_command_to_tool_calls(command: str) -> list:
+    """Convert old-style {command: "..."} responses to new tool_calls format.
+
+    Only kept for the rare model regression where it emits a top-level
+    `command` field instead of `tool_calls`. Slash-prefixed meta-commands are
+    REPL-only and never appear in AI output, so we don't translate them here.
+    """
+    cmd = (command or "").strip()
+    if not cmd:
+        return []
+    import re as _re_lctc
+
+    # /tool <name> <json_params> — ad-hoc tool dispatch syntax
+    m = _re_lctc.match(r'^/tool\s+(\S+)(?:\s+(.+))?$', cmd)
+    if m:
+        t_name = m.group(1)
+        raw = (m.group(2) or "").strip()
+        try:
+            t_args = json.loads(raw) if raw else {}
+        except (ValueError, TypeError):
+            t_args = {"raw": raw}
+        return [{"name": t_name, "arguments": t_args if isinstance(t_args, dict) else {"value": t_args}}]
+
+    # wait(N) / sleep(N)
+    m = _re_lctc.match(r'^(?:wait|sleep)\((\d+(?:\.\d+)?)\)\s*$', cmd)
+    if m:
+        return [{"name": "sleep", "arguments": {"seconds": float(m.group(1))}}]
+
+    # Plain shell command (most common fallback)
+    return [{"name": "shell.exec", "arguments": {"command": cmd}}]
+
+
 def call_backend_stream(
     session: dict,
     message: str,
@@ -2156,6 +2481,7 @@ def call_backend_stream(
         accumulated = ""
         billing_info: dict = {}
         got_any_event = False
+        _diag_events: list = []  # diagnostic: capture non-content fields
         prev_reply_for_chunks = ""
         prev_command_for_chunks = ""
         for line in response.iter_lines(decode_unicode=True):
@@ -2170,70 +2496,139 @@ def call_backend_stream(
                 continue
             got_any_event = True
             if evt.get("error"):
-                return {"reply": f"Server Error: {evt['error']}", "command": "", "rules": "", "done": True, "error": True}
+                return {"reply": f"Server Error: {evt['error']}", "tool_calls": [], "done": True, "error": True}
             if "_billing" in evt:
                 billing_info = evt["_billing"]
                 continue
+            # Capture diagnostic info: any top-level keys beyond choices
+            for k in evt.keys():
+                if k not in ("choices", "id", "object", "created", "model", "system_fingerprint") and k not in _diag_events:
+                    _diag_events.append(k)
             delta_content = (
                 evt.get("choices", [{}])[0].get("delta", {}).get("content")
                 if isinstance(evt.get("choices"), list)
                 else None
             )
+            # Also check for OpenAI-style native tool_calls in delta
+            _delta = evt.get("choices", [{}])[0].get("delta", {}) if isinstance(evt.get("choices"), list) else {}
+            if _delta.get("tool_calls"):
+                # Native function calling — these are real tool calls being dropped!
+                _diag_events.append(f"TOOL_CALLS_IN_DELTA:{json.dumps(_delta['tool_calls'], ensure_ascii=False)[:200]}")
             if delta_content:
                 accumulated += delta_content
                 if on_chunk is not None:
                     parsed = _try_parse_partial_json(accumulated)
                     if parsed is not None:
                         cur_reply = parsed.get("reply", "") or ""
-                        cur_cmd = parsed.get("command", "") or ""
+                        cur_tool_calls = parsed.get("tool_calls") or []
                         if cur_reply != prev_reply_for_chunks:
                             delta_r = cur_reply[len(prev_reply_for_chunks):] if cur_reply.startswith(prev_reply_for_chunks) else cur_reply
                             try: on_chunk("reply", delta_r)
                             except Exception: pass
                             prev_reply_for_chunks = cur_reply
-                        if cur_cmd != prev_command_for_chunks:
-                            try: on_chunk("command", cur_cmd)
+                        if cur_tool_calls:
+                            first = cur_tool_calls[0] if isinstance(cur_tool_calls, list) and cur_tool_calls else None
+                            if isinstance(first, dict):
+                                _fn = first.get("name", "")
+                                _fa = first.get("arguments", {}) or {}
+                                # Mirror _salient_arg in agent_loop.py — keep in sync.
+                                if not isinstance(_fa, dict):
+                                    _salient_preview = ""
+                                elif _fn == "shell.exec":
+                                    _salient_preview = _fa.get("command", "") or ""
+                                elif _fn == "terminal.send":
+                                    _salient_preview = f'{_fa.get("name","?")}: {_fa.get("command","")}'
+                                elif _fn in ("fs.read", "fs.write", "fs.edit", "fs.multi_edit", "fs.diff"):
+                                    _salient_preview = _fa.get("path", "") or ""
+                                elif _fn == "fs.grep":
+                                    _salient_preview = f'{_fa.get("pattern","")} in {_fa.get("path","")}'
+                                elif _fn == "fs.glob":
+                                    _salient_preview = _fa.get("pattern", "") or ""
+                                elif _fn == "web.fetch":
+                                    _salient_preview = _fa.get("url", "") or ""
+                                elif _fn == "web.search":
+                                    _salient_preview = _fa.get("query", "") or ""
+                                else:
+                                    try:
+                                        _salient_preview = json.dumps(_fa, ensure_ascii=False)[:60]
+                                    except (TypeError, ValueError):
+                                        _salient_preview = ""
+                                preview = f"{_fn} {_salient_preview}".strip()
+                                if len(cur_tool_calls) > 1:
+                                    preview = f"{preview} (+{len(cur_tool_calls)-1} more)"
+                            else:
+                                preview = str(first)
+                        else:
+                            preview = ""
+                        if preview != prev_command_for_chunks:
+                            try: on_chunk("command", preview)
                             except Exception: pass
-                            prev_command_for_chunks = cur_cmd
+                            prev_command_for_chunks = preview
 
         if not got_any_event:
-            return {"reply": "No response from AI", "command": "", "rules": "", "done": True, "error": True}
+            return {"reply": "No response from AI", "tool_calls": [], "done": True, "error": True}
 
         # Extract the JSON object from accumulated text. Model may wrap in ```json fences or prose.
         parsed = _extract_json_object(accumulated)
         if parsed is None:
+            # Model returned pure prose instead of JSON.
+            # Wrap the prose as a reply so it still displays, and flag for nudge.
+            raw_text = accumulated.strip() or "(no response)"
             return {
-                "reply": accumulated.strip() or "(no parseable response)",
-                "command": "",
-                "memory": "",
-                "done": True,
+                "reply": raw_text,
+                "tool_calls": [],
+                "done": False,  # not done — nudge will continue the loop
                 "error": False,
+                "_parse_failed": True,
                 "_billing": billing_info,
+                "_diag_events": _diag_events,
             }
 
+        # Normalize tool_calls from response
+        tool_calls = parsed.get("tool_calls") or []
+
+        # Backward compat: old-style "command" field -> wrap as tool_call
         command = parsed.get("command", "") or ""
-        send_keys = parsed.get("send_keys", "")
-        close_session = parsed.get("close_session", False)
-        if not command and close_session:
-            command = "/session close"
-        elif not command and send_keys:
-            command = f"/keys {send_keys}"
+        if command and not tool_calls:
+            tool_calls = _legacy_command_to_tool_calls(command)
+
+        # Also handle old close_session/send_keys fields
+        if not tool_calls:
+            if parsed.get("close_session"):
+                tool_calls = [{"name": "session.close", "arguments": {}}]
+            elif parsed.get("send_keys"):
+                tool_calls = [{"name": "session.keys", "arguments": {"keys": parsed["send_keys"]}}]
+
+        # Normalize: ensure each entry has {name, arguments}
+        normalized = []
+        for tc in tool_calls:
+            if not isinstance(tc, dict):
+                continue
+            name = tc.get("name", tc.get("function", "") if isinstance(tc.get("function"), dict) else "")
+            name = name or ""
+            args = tc.get("arguments", tc.get("parameters", {}))
+            # Support OpenAI-style: {"function": {"name": "...", "arguments": {...}}}
+            if isinstance(tc.get("function"), dict) and not name:
+                name = tc["function"].get("name", "")
+                args = tc["function"].get("arguments", {})
+            if name:
+                normalized.append({"name": name, "arguments": args if isinstance(args, dict) else {}})
+        tool_calls = normalized
 
         return {
             "reply": parsed.get("reply", "") or "",
-            "command": command,
-            "memory": parsed.get("rules", parsed.get("memory", "")) or "",
-            "done": bool(parsed.get("done", False)),
+            "tool_calls": tool_calls,
+            "done": len(tool_calls) == 0,
             "error": False,
             "_billing": billing_info,
         }
 
     except requests.Timeout:
-        return {"reply": "Request timed out. Please try again.", "command": "", "rules": "", "done": True, "error": True}
+        return {"reply": "Request timed out. Please try again.", "tool_calls": [], "done": True, "error": True}
     except requests.ConnectionError:
-        return {"reply": f"Cannot connect to backend ({backend_url}). Check your network.", "command": "", "rules": "", "done": True, "error": True}
+        return {"reply": f"Cannot connect to backend ({backend_url}). Check your network.", "tool_calls": [], "done": True, "error": True}
     except Exception as e:
-        return {"reply": f"Error: {e}", "command": "", "rules": "", "done": True, "error": True}
+        return {"reply": f"Error: {e}", "tool_calls": [], "done": True, "error": True}
 
 
 # ── Agent Registration with Helpwo Backend ─────────────────────────────
@@ -2303,7 +2698,7 @@ class AgentRegistry:
                 json=payload,
                 headers=headers,
                 cookies=cookies,
-                timeout=8,
+                timeout=5,
             )
             if resp.status_code == 200:
                 data = resp.json()
@@ -3200,7 +3595,7 @@ def show_terminal_manager(primary_session=None) -> None:
 
     for term in get_all_terminals():
         items.append((term.name, term.command, term.session,
-                      term.created_at, term.session.is_alive()))
+                      term.created_at, term.session is not None and term.session.is_alive()))
 
     if not items:
         console.print("[dim]No active sub-terminal sessions. "
@@ -3333,7 +3728,7 @@ def show_terminal_manager(primary_session=None) -> None:
                           0.0, True))
         for term in get_all_terminals():
             items.append((term.name, term.command, term.session,
-                          term.created_at, term.session.is_alive()))
+                          term.created_at, term.session is not None and term.session.is_alive()))
         if not items:
             console.print("\n[dim]No more terminals.[/dim]")
             break
@@ -3773,6 +4168,86 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
                           "  [bold]/plan status[/bold]       — Show current plan\n"
                           "  [bold]/plan list[/bold]         — List saved plans")
 
+    elif action == "/workflow":
+        import workflow_engine as _we
+        sub = parts[1] if len(parts) > 1 else "status"
+        if sub == "start":
+            if len(parts) < 4:
+                console.print("[yellow]Usage: /workflow start <name> \"<description>\"[/yellow]")
+                templates = _we.list_workflow_templates()
+                console.print(f"[dim]Available: {', '.join(templates)}[/dim]")
+            else:
+                wf_name = parts[2]
+                wf_desc = " ".join(parts[3:])
+                wf = _we.start_workflow(wf_name, wf_desc)
+                if wf is None:
+                    console.print(f"[red]Unknown workflow: {wf_name}[/red]")
+                    console.print(f"[dim]Available: {', '.join(_we.list_workflow_templates())}[/dim]")
+                else:
+                    current = wf.current
+                    cur_name = current.name if current else "?"
+                    console.print(Panel(
+                        f"[bold]Workflow Started: [green]{wf_name}[/green][/bold]\n\n"
+                        f"Task: {wf_desc}\n"
+                        f"Phases: {len(wf.phases)}\n"
+                        f"Progress: {wf.progress_str}\n\n"
+                        f"[dim]Current phase: [bold]{cur_name}[/bold][/dim]",
+                        title="Workflow",
+                        border_style="green",
+                    ))
+        elif sub == "status":
+            wf = _we.get_active_workflow()
+            if wf is None:
+                console.print("[dim]No active workflow.[/dim]")
+                console.print(f"[dim]Start one with: /workflow start <name> \"description\"[/dim]")
+                console.print(f"[dim]Available: {', '.join(_we.list_workflow_templates())}[/dim]")
+            else:
+                current = wf.current
+                phase_info = ""
+                if current:
+                    phase_info = f"\nCurrent: [bold]{current.name}[/bold] — {current.description}"
+                    if current.allowed_tools:
+                        phase_info += f"\nAllowed tools: {', '.join(current.allowed_tools)}"
+                    if current.spawn_agents:
+                        phase_info += f"\nAuto-spawn roles: {', '.join(current.spawn_agents)}"
+                console.print(Panel(
+                    f"[bold]{wf.name}[/bold] — {wf.description}\n\n"
+                    f"Progress: {wf.progress_str}{phase_info}",
+                    title="Active Workflow",
+                    border_style="cyan",
+                ))
+        elif sub == "advance":
+            summary = " ".join(parts[2:]) if len(parts) > 2 else ""
+            new_phase = _we.advance_phase(summary)
+            wf = _we.get_active_workflow()
+            if new_phase is None:
+                if wf and wf.completed:
+                    console.print(f"[green]Workflow '{wf.name}' completed![/green]")
+                else:
+                    console.print("[yellow]No active workflow or already completed.[/yellow]")
+            else:
+                console.print(f"[green]Advanced to phase: [bold]{new_phase.name}[/bold] — {new_phase.description}[/green]")
+        elif sub == "end":
+            summary = " ".join(parts[2:]) if len(parts) > 2 else ""
+            wf = _we.get_active_workflow()
+            if wf:
+                _we.end_workflow(summary)
+                console.print(f"[dim]Workflow '{wf.name}' ended.[/dim]")
+            else:
+                console.print("[dim]No active workflow.[/dim]")
+        elif sub == "list":
+            templates = _we.list_workflow_templates()
+            console.print("[bold]Available workflow templates:[/bold]")
+            for t in templates:
+                console.print(f"  [cyan]{t}[/cyan]")
+        else:
+            console.print("Usage:\n"
+                          "  [bold]/workflow start <name> \"<desc>\"[/bold] — Start a workflow\n"
+                          "  [bold]/workflow status[/bold]                — Show current workflow\n"
+                          "  [bold]/workflow advance [summary][/bold]    — Advance to next phase\n"
+                          "  [bold]/workflow end [summary][/bold]        — End workflow\n"
+                          "  [bold]/workflow list[/bold]                  — List available workflows")
+
     elif action == "/debug":
         if len(parts) > 1:
             sub = parts[1].lower()
@@ -3842,25 +4317,110 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
             show_debug_browser_interactive()
 
     elif action in ("/station", "/st"):
-        if len(parts) < 2:
-            name = "main"
+        # Syntax:
+        #   /station                        — current agent → this REPL
+        #   /station <agent_id>             — that agent → this REPL
+        #   /station <terminal>             — current agent → sub-terminal
+        #   /station <agent_id> <terminal>  — that agent → sub-terminal
+        # Single-arg form: looked up as agent first; if no such agent exists,
+        # treated as a terminal name. Use the two-arg form to disambiguate
+        # when names collide.
+        agent_id_arg: Optional[str] = None
+        if len(parts) == 1:
+            name = "term0"  # default: deploy current agent in this REPL
+        elif len(parts) == 2:
+            candidate = parts[1]
+            if get_agent(candidate) is not None:
+                # exists as an agent → treat as agent_id, deploy in this REPL
+                agent_id_arg = candidate
+                name = "term0"
+            else:
+                # not an agent → treat as a terminal name
+                name = candidate
         else:
-            name = parts[1]
+            agent_id_arg = parts[1]
+            name = parts[2]
 
+        # Normalize aliases for the parent REPL
+        if name.lower() in ("current", "here", "term0"):
+            name = "term0"
+
+        # Resolve target agent
+        if agent_id_arg:
+            target_agent = get_agent(agent_id_arg)
+            if target_agent is None:
+                console.print(f"[red]Agent '{agent_id_arg}' not found. Use /hire to create one.[/red]")
+                return False
+        else:
+            target_agent = get_current_agent()
+            if target_agent is None:
+                console.print("[red]No current agent. /hire one first.[/red]")
+                return False
+
+        # If the agent is already deployed somewhere else, refuse so the user is explicit
+        existing_home = getattr(target_agent, "home_terminal", None)
+        if existing_home and existing_home != name:
+            console.print(f"[yellow]Agent {target_agent.id} is already deployed to '{existing_home}'. "
+                          f"Use /terminate {existing_home} first.[/yellow]")
+            return False
+
+        # Special case: deploy to the parent REPL (term0). Term0 should
+        # already have a real persistent bash session created at startup.
+        # If it doesn't (crashed or not created), recreate it.
+        if name == "term0":
+            term0_info = get_terminal("term0")
+            if (term0_info is None
+                    or term0_info.session is None
+                    or not term0_info.session.is_alive()):
+                if not IS_WINDOWS:
+                    try:
+                        _term0 = InteractiveSession(
+                            DEFAULT_SHELL, timeout=0, stream_output=False,
+                            persistent=True)
+                        _term0.start()
+                        time.sleep(0.08)
+                        if _term0.is_alive():
+                            _term0.read_output(timeout=0.1)
+                        register_terminal(_term0, DEFAULT_SHELL, 0, name="term0")
+                    except Exception:
+                        register_terminal(None, "parent-repl", 0, name="term0")
+                else:
+                    register_terminal(None, "parent-repl", 0, name="term0")
+            target_agent.home_terminal = "term0"
+            target_agent.stationed_terminal = "term0"
+            if target_agent.role != "primary":
+                target_agent.role = "deployed"
+            switch_to_agent(target_agent.id)
+            console.print(f"[green]Stationed [bold]{target_agent.id}[/bold] in this REPL (term0)[/green]")
+            console.print("  [dim]Its shell commands dispatch like user input. /agents to switch back.[/dim]")
+            return False
+
+        # Sub-terminal path: inspect existing terminal
         existing = get_terminal(name)
-        if existing and existing.session and not existing.session.is_alive():
+        if existing and existing.session and existing.session.is_alive():
+            # Re-using an existing live terminal — just attach the agent,
+            # don't respawn anything. The agent's shell.exec will route via
+            # send_keys + marker-poll into that terminal's PTY.
+            station_agent(target_agent.id, name)
+            console.print(f"[green]Stationed [bold]{target_agent.id}[/bold] → terminal [bold]{name}[/bold] (existing)[/green]")
+            return False
+        if existing:
             unregister_terminal(name)
-            existing = None
-        if existing is None:
-            register_terminal(None, name, 0, name=name)
 
-        current = get_current_agent()
-        if current:
-            station_agent(current.id, name)
-            label = "current terminal" if name == "main" else f"terminal [bold]{name}[/bold]"
-            console.print(f"[green]Stationed [bold]{current.name}[/bold] in {label}[/green]")
-        else:
-            console.print(f"[green]Created terminal [bold]{name}[/bold] (no agent stationed)[/green]")
+        # Spawn a fresh bash sub-terminal as the agent's execution target.
+        # Plain shell (not sub-laintas-cli) — /station is for command
+        # execution; /t is for spawning sub-agent laintas-cli terminals.
+        shell_cmd = os.environ.get("SHELL", "/bin/bash")
+        sub = SubTerminalSession(shell_cmd)
+        sub.start()
+        time.sleep(0.1)
+        if sub.is_alive():
+            sub.read_output(timeout=0.1)
+        register_terminal(sub, shell_cmd, 0, name=name)
+
+        station_agent(target_agent.id, name)
+        console.print(f"[green]Stationed [bold]{target_agent.id}[/bold] → terminal [bold]{name}[/bold] (bash)[/green]")
+        console.print(f"  [dim]Enter with /t {name}[/dim]")
 
     elif action == "/terminate":
         if len(parts) < 2:
@@ -3868,11 +4428,16 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
         else:
             name = parts[1]
             term = get_terminal(name)
+            returned: list[str] = []
             if term:
                 for aid in list(term.stationed_agent_ids):
                     unstation_agent(aid)
+                    returned.append(aid)
             if unregister_terminal(name):
-                console.print(f"[green]Terminated [bold]{name}[/bold][/green]")
+                if returned:
+                    console.print(f"[green]Terminated [bold]{name}[/bold]; returned {', '.join(returned)} to pool[/green]")
+                else:
+                    console.print(f"[green]Terminated [bold]{name}[/bold][/green]")
             else:
                 console.print(f"[red]Terminal '{name}' not found.[/red]")
 
@@ -3885,8 +4450,8 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
             term = get_terminal(name)
             if term is None:
                 console.print(f"[red]Terminal '{name}' not found.[/red]")
-            elif not term.session.is_alive():
-                console.print(f"[yellow]Terminal '{name}' is dead.[/yellow]")
+            elif term.session is None or not term.session.is_alive():
+                console.print(f"[yellow]Terminal '{name}' has no active session.[/yellow]")
             else:
                 term.session.send_keys(cmd + "\n")
                 time.sleep(0.3)
@@ -3897,9 +4462,10 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
                     console.print(Panel(output[-2000:], title=f"{name} output"))
 
     elif action == "/hire":
-        agent_info = register_agent(depth=0)
-        console.print(f"[green]Hired [bold]{agent_info.id}[/bold][/green]")
-        console.print(f"  Switch with [bold]/agents {agent_info.id}[/bold]")
+        agent_info = register_agent(depth=0, role="pool")
+        agent_info.parent_terminal = "term0"
+        console.print(f"[green]Hired [bold]{agent_info.id}[/bold] → added to pool[/green]")
+        console.print(f"  [dim]Deploy with /station {agent_info.id} <terminal>  |  Switch with /agents {agent_info.id}[/dim]")
 
     elif action == "/agents":
         if len(parts) == 1:
@@ -3908,12 +4474,50 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
             if not agents:
                 console.print("[dim]No agents.[/dim]")
             else:
+                # Categorize by role
+                buckets = {"primary": [], "pool": [], "deployed": [], "subagent": [], "other": []}
                 for a in agents:
-                    marker = " [bold cyan]<- current[/bold cyan]" if (current and a.id == current.id) else ""
-                    st = f" [dim]stationed: {a.stationed_terminal}[/dim]" if a.stationed_terminal else ""
+                    role = getattr(a, "role", "pool")
+                    if role in buckets:
+                        buckets[role].append(a)
+                    else:
+                        buckets["other"].append(a)
+
+                def _render(a):
+                    marker = " [bold cyan]← current[/bold cyan]" if (current and a.id == current.id) else ""
                     status_str = f" [dim]({a.status})[/dim]" if a.status != "idle" else ""
                     inbox_str = f" [dim yellow]inbox={a.inbox.qsize()}[/dim yellow]" if a.inbox.qsize() else ""
-                    console.print(f"  [bold]{a.id}[/bold]: {a.name}{st}{status_str}{inbox_str}{marker}")
+                    name_part = f" {a.name}" if a.name and a.name != a.id else ""
+                    return marker, status_str, inbox_str, name_part
+
+                if buckets["primary"]:
+                    console.print("[bold]── Primary ──[/bold]")
+                    for a in buckets["primary"]:
+                        marker, st_s, inb, np = _render(a)
+                        console.print(f"  [bold]{a.id}[/bold]{np}{st_s}{inb}{marker}")
+                if buckets["pool"]:
+                    console.print(f"[bold]── Pool ({len(buckets['pool'])} idle) ──[/bold]")
+                    for a in buckets["pool"]:
+                        marker, st_s, inb, np = _render(a)
+                        console.print(f"  [bold]{a.id}[/bold]{np}{st_s}{inb}{marker}")
+                if buckets["deployed"]:
+                    console.print(f"[bold]── Deployed ({len(buckets['deployed'])}) ──[/bold]")
+                    for a in buckets["deployed"]:
+                        marker, st_s, inb, np = _render(a)
+                        home = getattr(a, "home_terminal", None) or a.stationed_terminal or "?"
+                        parent_term = getattr(a, "parent_terminal", None) or "?"
+                        console.print(f"  [bold]{a.id}[/bold]{np} → [cyan]{home}[/cyan] [dim](parent={parent_term})[/dim]{st_s}{inb}{marker}")
+                if buckets["subagent"]:
+                    console.print(f"[bold]── Subagents ({len(buckets['subagent'])}) ──[/bold]")
+                    for a in buckets["subagent"]:
+                        marker, st_s, inb, np = _render(a)
+                        parent = a.parent_id or "?"
+                        console.print(f"  [bold]{a.id}[/bold]{np} [dim](depth={a.depth}, parent={parent})[/dim]{st_s}{inb}{marker}")
+                if buckets["other"]:
+                    console.print("[bold]── Other ──[/bold]")
+                    for a in buckets["other"]:
+                        marker, st_s, inb, np = _render(a)
+                        console.print(f"  [bold]{a.id}[/bold]{np}{st_s}{inb}{marker}")
         elif len(parts) == 2 and parts[1].lower() == "tree":
             console.print(build_agents_tree())
         elif len(parts) == 2:
@@ -4060,16 +4664,16 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
             console.print("[yellow]Usage: /skill {list|reload|new <name>|dir}[/yellow]")
 
     elif action == "/mcp":
-        if not mcp_mod.MCP_AVAILABLE:
-            console.print(f"[yellow]mcp SDK not installed: {mcp_mod.MCP_IMPORT_ERROR}[/yellow]")
+        if not _get_mcp_mod().MCP_AVAILABLE:
+            console.print(f"[yellow]mcp SDK not installed: {_get_mcp_mod().MCP_IMPORT_ERROR}[/yellow]")
             console.print("[dim]Install with:  pip install mcp[/dim]")
             return False
         sub = parts[1] if len(parts) > 1 else "list"
-        mgr = mcp_mod.get_manager()
+        mgr = _get_mcp_mod().get_manager()
         if sub == "list":
             cfg = mgr.load_config().get("servers", {})
             if not cfg:
-                console.print(f"[dim]No servers in {mcp_mod.CONFIG_PATH}[/dim]")
+                console.print(f"[dim]No servers in {_get_mcp_mod().CONFIG_PATH}[/dim]")
                 console.print("[dim]Create one with: /mcp init[/dim]")
             else:
                 for name, sc in cfg.items():
@@ -4120,13 +4724,13 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
                 style = "green" if ok else "yellow"
                 console.print(f"[{style}]{n}: {m}[/{style}]")
         elif sub == "init":
-            ok, msg = mcp_mod.MCPManager.write_template_config()
+            ok, msg = _get_mcp_mod().MCPManager.write_template_config()
             style = "green" if ok else "red"
             console.print(f"[{style}]{msg}[/{style}]")
             if ok:
                 console.print("[dim]Edit the file, enable a server, then /mcp reload[/dim]")
         elif sub == "config":
-            console.print(str(mcp_mod.CONFIG_PATH))
+            console.print(str(_get_mcp_mod().CONFIG_PATH))
         else:
             console.print("[yellow]Usage: /mcp {list|connect <n>|disconnect <n>|reload|tools <n>|init|config}[/yellow]")
 
@@ -4135,18 +4739,18 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
             # /t <name> or /term <name> — create sub-terminal (no agent stationed)
             name = parts[1]
             existing = get_terminal(name)
-            if existing and not existing.session.is_alive():
+            if existing and existing.session and not existing.session.is_alive():
                 unregister_terminal(name)
                 existing = None
             if existing is not None:
                 console.print(f"[yellow]Terminal '{name}' already exists. /t to view, /terminate {name} to remove.[/yellow]")
             else:
-                lain_cmd = f"{sys.executable} {os.path.abspath(__file__)} --simple-prompt"
+                lain_cmd = f"{sys.executable} {os.path.abspath(__file__)} --depth 1"
                 sub = SubTerminalSession(lain_cmd)
                 sub.start()
-                time.sleep(0.3)
+                time.sleep(0.1)
                 if sub.is_alive():
-                    sub.read_output(timeout=0.3)
+                    sub.read_output(timeout=0.1)
                 register_terminal(sub, "laintas-cli", 0, name=name)
                 console.print(f"[green]Created sub-terminal [bold]{name}[/bold] (no agent stationed)[/green]")
         else:
@@ -4160,6 +4764,38 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
                 enter_session(interactive_session)
             else:
                 show_terminal_manager(interactive_session)
+
+    elif action == "/reload":
+        reload_default_files()
+
+    elif action == "/config":
+        # Built-in config command (doesn't require .extra_command.py)
+        parts_lower = [p.lower() for p in parts]
+        if len(parts) == 1:
+            # /config — show all
+            for key, val in sorted(get_runtime_config().items()):
+                console.print(f"  [cyan]{key}[/cyan] = {val}")
+        elif len(parts) == 2 and parts[1] == "reset":
+            reset_runtime_config()
+            console.print("[green]Runtime config reset to defaults.[/green]")
+        elif len(parts) == 2:
+            # /config <key> — show one
+            key = parts[1]
+            val = get_runtime_config(key)
+            if val is None:
+                console.print(f"[red]Unknown config key: {key}[/red]")
+            else:
+                console.print(f"  [cyan]{key}[/cyan] = {val}")
+        elif len(parts) == 3:
+            # /config <key> <value>
+            key = parts[1]
+            try:
+                set_runtime_config(key, parts[2])
+                console.print(f"[green]{key} = {get_runtime_config(key)}[/green]")
+            except (ValueError, KeyError) as e:
+                console.print(f"[red]{e}[/red]")
+        else:
+            console.print("[yellow]Usage: /config [key [value]] | /config reset[/yellow]")
 
     else:
         # Try .extra_command.py custom handler first
@@ -4374,6 +5010,11 @@ def show_help():
     table.add_row("/agents [name]", "List/switch agents, /agents name <n> to rename")
     table.add_row("/t, /term [name]", "List sub-terminals, or create new one (/t <name>)")
     table.add_row("/back", "Detach from sub-terminal without closing it")
+    table.add_row("/plan", "Structured planning (/plan enter, approve, exit, status, list)")
+    table.add_row("/workflow", "Multi-phase workflows (/workflow start, status, advance, end, list)")
+    table.add_row("/skill", "Skill management (/skill list, reload, new <name>, dir)")
+    table.add_row("/config", "Runtime config (/config, /config <key> <value>, /config reset)")
+    table.add_row("/tools", "List registered AI tools")
     table.add_row("/clear", "Clear screen")
     table.add_row("/exit", "Log out and exit (clears cached session)")
     table.add_row("/quit, /q", "Detach from sub-terminal (/q) or exit without logging out (/quit)")
@@ -4402,6 +5043,7 @@ def get_loop_deps() -> LoopDeps:
             console=console,
             Markdown=Markdown,
             pty_passthrough=pty_passthrough,
+            build_subterminal_cmd=_build_subterminal_cmd,
         )
     return _loop_deps
 
@@ -4438,14 +5080,16 @@ def show_banner(agent_name: str, session: dict = None):
 
 
 def _simple_prompt(cwd: str) -> str:
-    """Plain input() prompt for PTY subprocess environments.
+    """Plain input() prompt for non-TTY environments (piped stdin, --execute mode).
 
-    prompt_toolkit requires a real terminal and won't work inside a PTY.
-    Use this when running as a sub-agent of another laintas-cli instance.
+    Only used when stdin is NOT a real terminal. Sub-terminals created via
+    SubTerminalSession (fork+pty) have a real PTY slave as stdin, so they
+    use the full prompt_toolkit (pt_prompt) with arrow key support.
     """
     try:
         print(f"{cwd}\n$ ", end="", flush=True)
-        return sys.stdin.readline().strip()
+        raw = sys.stdin.buffer.readline()
+        return raw.decode("utf-8", errors="replace").strip()
     except (KeyboardInterrupt, EOFError):
         return ""
 
@@ -4500,6 +5144,9 @@ def _inject_input(text: str, done: threading.Event):
             os.write(_wakeup_w, b'\x00')
         except (BlockingIOError, OSError):
             pass
+    # If the main loop is blocked on prompt_toolkit, interrupt it so the
+    # queued message is picked up immediately instead of waiting for user input.
+    _interrupt_prompt()
 
 
 def _get_input(cwd: str):
@@ -4585,6 +5232,19 @@ def main():
     parser.add_argument("--monitor-only", action="store_true", default=False,
                         help="Start as a remote executor only — register, heartbeat, "
                              "and poll HelpwoAI for tasks. No local REPL.")
+    parser.add_argument("--agent-id", type=str, default=None,
+                        help="Pre-assigned agent id (used by sub-terminals)")
+    parser.add_argument("--agent-name", type=str, default=None,
+                        help="Pre-assigned agent display name (used by sub-terminals)")
+    parser.add_argument("--agent-role", type=str, default=None,
+                        choices=["pool", "deployed", "primary", "subagent"],
+                        help="Role for the pre-assigned agent (used by sub-terminals)")
+    parser.add_argument("--terminal-name", type=str, default=None,
+                        help="Name of the terminal this sub-process represents")
+    parser.add_argument("--parent-terminal", type=str, default=None,
+                        help="Name of the parent terminal that spawned this sub-process")
+    parser.add_argument("--parent-agent-id", type=str, default=None,
+                        help="Agent id of the parent process that spawned this sub-process")
     args = parser.parse_args()
 
     # Apply environment overrides
@@ -4593,10 +5253,8 @@ def main():
     if args.laintas:
         os.environ["LAINTAS_BASE"] = args.laintas
 
-    # Child terminals (depth > 0): use plain console to avoid Rich markup in PTY
-    global console
-    if args.depth > 0:
-        console = Console(force_terminal=False, no_color=True, width=120, highlighter=None)
+    # All REPL instances use full-color console — sub-terminals are full
+    # laintas-cli instances and should look identical to the main terminal.
 
     # Ensure .cli.prop and .helpwo exist in cwd
     ensure_files_exist()
@@ -4648,9 +5306,30 @@ def main():
     # PTY session managed at REPL level (must be before shutdown for nonlocal)
     interactive_session = None
 
-    # Register the primary agent
-    primary = register_agent(name="primary", depth=0)
-    set_current_agent_id("primary")
+    # Register the primary agent.
+    # If launched as a sub-terminal with an explicit identity, register that
+    # agent (role=deployed) and tag it with the parent context. Otherwise
+    # register the conventional "primary" REPL agent.
+    if args.agent_id:
+        sub_role = args.agent_role or "deployed"
+        sub = register_agent(name=args.agent_id,
+                             depth=args.depth,
+                             parent_id=args.parent_agent_id,
+                             role=sub_role,
+                             load_existing=True)
+        if args.agent_name and args.agent_name != args.agent_id:
+            sub.name = args.agent_name
+        sub.parent_terminal = args.parent_terminal or "term0"
+        if args.terminal_name:
+            sub.home_terminal = args.terminal_name
+            sub.stationed_terminal = args.terminal_name
+        set_current_agent_id(args.agent_id)
+    else:
+        primary = register_agent(name="primary", depth=0, role="primary",
+                                 load_existing=True)
+        primary.home_terminal = "term0"
+        primary.parent_terminal = None
+        set_current_agent_id("primary")
 
     # Load user skills from ~/.laintas_cli_skills. Failures are surfaced
     # but never block startup.
@@ -4666,12 +5345,12 @@ def main():
     # Connect MCP servers (if any configured + mcp SDK installed). Best-effort.
     if args.depth == 0:
         try:
-            if not mcp_mod.MCP_AVAILABLE:
-                if mcp_mod.CONFIG_PATH.exists():
-                    console.print(f"[dim yellow]mcp config present but SDK missing: {mcp_mod.MCP_IMPORT_ERROR}[/dim yellow]")
+            if not _get_mcp_mod().MCP_AVAILABLE:
+                if _get_mcp_mod().CONFIG_PATH.exists():
+                    console.print(f"[dim yellow]mcp config present but SDK missing: {_get_mcp_mod().MCP_IMPORT_ERROR}[/dim yellow]")
                     console.print("[dim]Install with: pip install mcp[/dim]")
             else:
-                _mcp_results = mcp_mod.get_manager().connect_all_enabled()
+                _mcp_results = _get_mcp_mod().get_manager().connect_all_enabled()
                 for n, ok, m in _mcp_results:
                     if n == "(none)":
                         continue
@@ -4686,7 +5365,7 @@ def main():
         close_all_terminals()
         close_all_agents()
         try:
-            mcp_mod.get_manager().shutdown()
+            _get_mcp_mod().get_manager().shutdown()
         except Exception:
             pass
         nonlocal interactive_session
@@ -4697,6 +5376,25 @@ def main():
 
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
+
+    # ── Create term0: a real persistent bash session ──
+    # All system commands and stationed-agent shell.exec route through this
+    # via marker-poll, identical to how named sub-terminals work.
+    # Created for ALL interactive REPL instances (depth 0 and depth > 0),
+    # so sub-terminals have the same capabilities as the main terminal.
+    _term0_session = None
+    if not IS_WINDOWS:
+        try:
+            _term0_session = InteractiveSession(
+                DEFAULT_SHELL, timeout=0, stream_output=False, persistent=True)
+            _term0_session.start()
+            time.sleep(0.08)
+            if _term0_session.is_alive():
+                _term0_session.read_output(timeout=0.1)
+            register_terminal(_term0_session, DEFAULT_SHELL, 0, name="term0")
+        except Exception as _e:
+            console.print(f"[dim yellow]term0 bash session init failed: {_e}[/dim yellow]")
+            _term0_session = None
 
     # ── Monitor-only mode (no interactive REPL) ──
     # Runs purely as a remote executor: heartbeat + /poll loop already
@@ -4727,6 +5425,9 @@ def main():
     # Main interactive loop
 
     while True:
+        # ── term0 health check ──
+        if not IS_WINDOWS:
+            _ensure_term0_alive()
         try:
             item = _get_input(str(os.getcwd()))
         except (KeyboardInterrupt, EOFError):
@@ -4740,8 +5441,10 @@ def main():
             injected_done = None
 
         if not user_input:
-            if injected_done is not None:
-                injected_done.set()
+            # Don't set injected_done here — the empty input might be from
+            # a prompt interruption by a remote message. If a remote message
+            # is queued, the next iteration will pick it up and process it
+            # before setting injected_done.
             continue
 
         # Ctrl+D → exit
@@ -4772,10 +5475,8 @@ def main():
         # ── Session-aware routing ──────────────────────────────────
         # If an interactive session is active, forward user input to it,
         # then ask the AI to decide the next step based on the output.
-        # Child terminals (depth > 0): always route through AI, never
-        # forward to sub-sessions — the child laintas IS the terminal.
 
-        if args.depth == 0 and interactive_session and interactive_session.is_alive():
+        if interactive_session and interactive_session.is_alive():
             console.print(f"[dim yellow]> {user_input}[/dim yellow]")
             chat_history.append({"role": "user", "content": user_input})
             if agent_registry.agent_id:
@@ -4849,9 +5550,9 @@ def main():
             agent_registry._push_events([{"type": "user", "content": user_input}])
 
         # Route first word against PATH/builtins → system command or AI
-        # Child terminals (depth > 0): always route through AI — the parent
-        # controls this terminal and expects intelligent processing.
-        if args.depth == 0 and is_system_command(user_input):
+        # All REPL instances (depth 0 and depth > 0) execute system commands
+        # directly. Natural language goes to AI.
+        if is_system_command(user_input):
             console.print(f"\n[dim yellow]$ {user_input}[/dim yellow]")
             if agent_registry.agent_id:
                 agent_registry._push_events([{"type": "system", "kind": "command", "content": user_input}])
@@ -4861,17 +5562,33 @@ def main():
                 interactive_session.close()
                 interactive_session = None
 
-            # `cd` must mutate the parent process CWD — a PTY subshell can't.
+            # Route through term0's persistent bash via marker-poll,
+            # same mechanism as named sub-terminals. Interactive programs
+            # (vim, python, etc.) fall through to pty_passthrough for
+            # real-time user interaction.
             _first = extract_first_word(user_input)
-            if _first == "cd":
-                _arg = user_input.strip()[2:].strip() or os.path.expanduser("~")
-                try:
-                    os.chdir(os.path.expanduser(_arg))
-                    result = {"stdout": "", "stderr": "", "returncode": 0, "success": True}
-                except OSError as _e:
-                    msg = f"cd: {_e}\n"
-                    console.print(f"[red]{msg.strip()}[/red]")
-                    result = {"stdout": "", "stderr": msg, "returncode": 1, "success": False}
+            term0_info = get_terminal("term0")
+            _use_term0 = (not IS_WINDOWS
+                          and _first not in _INTERACTIVE_COMMANDS
+                          and term0_info
+                          and term0_info.session
+                          and term0_info.session.is_alive())
+
+            if _use_term0:
+                result = _marker_poll_exec(term0_info.session, user_input, strip_ansi_codes=False)
+                _sync_cwd_from_term0(term0_info.session)
+                # Display output — marker-poll captures it but doesn't echo to
+                # the user's terminal (unlike pty_passthrough which echoes
+                # directly). Print so the user sees command output.
+                _stdout = result.get("stdout", "")
+                if _stdout:
+                    try:
+                        sys.stdout.write(_stdout)
+                        if not _stdout.endswith("\n"):
+                            sys.stdout.write("\n")
+                        sys.stdout.flush()
+                    except (BrokenPipeError, OSError):
+                        pass
             else:
                 # Drain any queued terminal query responses before passthrough
                 if not IS_WINDOWS:
@@ -4926,13 +5643,18 @@ def main():
                 if agent_registry.agent_id:
                     agent_registry._push_events(events)
 
-            # Child terminals (depth > 0): don't carry sessions across iterations.
-            # Each input goes through a fresh AI loop — the child laintas IS the terminal.
-            _existing = interactive_session if args.depth == 0 else None
             response = run_agent_loop(get_loop_deps(), user_input, session, agent_state, chat_history,
                                       events_cb=local_events_cb,
-                                      existing_session=_existing)
-            interactive_session = response.get("session") if args.depth == 0 else None
+                                      existing_session=interactive_session)
+            interactive_session = response.get("session")
+
+            # Sync CWD after AI loop — the AI may have run shell.exec("cd ...")
+            # which changed term0's bash CWD. Sync so the next prompt shows
+            # the correct directory.
+            if not IS_WINDOWS:
+                _t0 = get_terminal("term0")
+                if _t0 and _t0.session and _t0.session.is_alive():
+                    _sync_cwd_from_term0(_t0.session)
 
         # Save AI reply to chat history
         if response.get("msg"):

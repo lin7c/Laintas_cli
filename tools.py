@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import time
 import traceback
 from dataclasses import dataclass, field
@@ -39,6 +40,26 @@ class ToolCtx:
     session: dict = field(default_factory=dict)
     events_cb: Optional[Callable] = None
     cwd: str = ""
+    # ── Loop-local context (populated by agent_loop at dispatch time) ──
+    interactive_session: Any = None
+    stationed_terminal: Any = None    # SubTerminalSession of the agent's stationed terminal
+    get_terminal: Optional[Callable] = None
+    get_all_terminals: Optional[Callable] = None
+    register_terminal: Optional[Callable] = None
+    unregister_terminal: Optional[Callable] = None
+    get_agent: Optional[Callable] = None
+    get_all_agents: Optional[Callable] = None
+    get_current_agent: Optional[Callable] = None
+    station_agent: Optional[Callable] = None
+    unstation_agent: Optional[Callable] = None
+    send_to_agent: Optional[Callable] = None
+    wait_for_agent: Optional[Callable] = None
+    abort_agent: Optional[Callable] = None
+    spawn_subagent: Optional[Callable] = None
+    rename_agent: Optional[Callable] = None
+    switch_to_agent: Optional[Callable] = None
+    register_agent_fn: Optional[Callable] = None
+    depth: int = 0
 
 
 @dataclass
@@ -189,6 +210,26 @@ class ToolRegistry:
             lines.append("")  # blank line between groups
 
         return "\n".join(lines).rstrip()
+
+    def describe_short_reminder(self) -> str:
+        """One-line tool reminder for follow-up turns (saves prompt tokens).
+
+        After turn 1, the model has already seen the full catalog and the
+        examples; we only need to remind it of available names. If it tries
+        an unknown name, the dispatch loop re-injects the full catalog.
+        """
+        names = sorted(self._tools.keys())
+        n = len(names)
+        # Show the most-used names verbatim; truncate the rest into a count.
+        head = names[:18]
+        tail_count = max(0, n - len(head))
+        head_str = ", ".join(head)
+        tail_str = f", … (+{tail_count} more — emit any name; unknown will re-show catalog)" if tail_count else ""
+        return (
+            f"## Tools available ({n})\n"
+            f"Names: {head_str}{tail_str}\n"
+            f"Emit JSON: {{\"reply\": \"...\", \"tool_calls\": [{{\"name\": \"...\", \"arguments\": {{...}}}}]}}"
+        )
 
 
 # Module-level singleton — every consumer hits this.
@@ -350,7 +391,9 @@ def _bi_task_create(params: dict, ctx: ToolCtx) -> dict:
     if not subject:
         return {"ok": False, "error": "missing 'subject'"}
     task = _task_mgr.create_task(subject, description,
-                                  metadata=params.get("metadata"))
+                                  metadata=params.get("metadata"),
+                                  session_only=params.get("session_only", False),
+                                  parent_task_id=params.get("parent_task_id"))
     return {"ok": True, "result": task}
 
 
@@ -362,7 +405,8 @@ def _bi_task_update(params: dict, ctx: ToolCtx) -> dict:
         return {"ok": False, "error": "missing 'id'"}
     kwargs = {}
     for k in ("status", "subject", "description", "metadata",
-              "addBlocks", "addBlockedBy", "removeBlocks", "removeBlockedBy"):
+              "addBlocks", "addBlockedBy", "removeBlocks", "removeBlockedBy",
+              "progress", "notes", "addSubtask"):
         if k in params:
             kwargs[k] = params[k]
     ok, msg, task = _task_mgr.update_task(str(task_id), **kwargs)
@@ -591,67 +635,6 @@ def _bi_fs_diff(params: dict, ctx: ToolCtx) -> dict:
     body = "".join(diff)
     return {"ok": True, "result": body or "(no differences)",
             "changed": bool(body), "a": a_abs}
-
-
-def _bi_shell_exec(params: dict, ctx: ToolCtx) -> dict:
-    """Execute a shell command via subprocess and return stdout/stderr/exit.
-
-    For one-shot non-interactive commands that don't need a PTY (grep, jq,
-    python -c, etc.). For interactive or long-running work prefer a normal
-    shell command in `command` so the loop's PTY/streaming path handles it.
-
-    params:
-      command:  shell command string (required)
-      cwd:      working directory (default = ctx.cwd or process cwd)
-      timeout:  seconds (default 30, max 300)
-      stdin:    optional stdin payload
-    """
-    import subprocess as _sp
-    cmd = params.get("command")
-    if not cmd:
-        return {"ok": False, "error": "missing 'command'"}
-    cwd = params.get("cwd") or ctx.cwd or os.getcwd()
-    timeout = max(1, min(int(params.get("timeout", 30) or 30), 300))
-    stdin = params.get("stdin")
-
-    # Local policy check — same engine used elsewhere, but we degrade
-    # gracefully if the module isn't importable in this context.
-    try:
-        import policy as _policy
-        decision = _policy.evaluate(cmd, cwd, agent_id=ctx.agent_id)
-        if decision.action == "deny":
-            return {"ok": False, "error": f"Blocked by policy: {decision.reason}",
-                    "policy": "deny"}
-    except Exception:
-        pass
-
-    try:
-        t0 = time.time()
-        proc = _sp.run(
-            cmd, shell=True, cwd=cwd, capture_output=True, text=True,
-            timeout=timeout, input=stdin,
-        )
-        duration_ms = int((time.time() - t0) * 1000)
-    except _sp.TimeoutExpired:
-        return {"ok": False, "error": f"timeout after {timeout}s", "timeout": True}
-    except Exception as e:
-        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
-
-    # Cap each stream to keep loop context bounded.
-    cap = 8192
-    so = proc.stdout or ""
-    se = proc.stderr or ""
-    so_trim = (so[:cap] + f"\n...(truncated {len(so) - cap} bytes)") if len(so) > cap else so
-    se_trim = (se[:cap] + f"\n...(truncated {len(se) - cap} bytes)") if len(se) > cap else se
-
-    return {
-        "ok": proc.returncode == 0,
-        "result": so_trim,
-        "stderr": se_trim,
-        "exit_code": proc.returncode,
-        "duration_ms": duration_ms,
-        "cwd": cwd,
-    }
 
 
 def _bi_fs_grep(params: dict, ctx: ToolCtx) -> dict:
@@ -1020,6 +1003,487 @@ def _bi_web_fetch(params: dict, ctx: ToolCtx) -> dict:
     }
 
 
+# ── Agent / Terminal / Session tools (replace meta-commands) ──────────
+
+def _bi_agent_spawn(params: dict, ctx: ToolCtx) -> dict:
+    """Spawn an in-process child agent to handle a sub-task.
+
+    Supports:
+    - role: specialized agent role (explorer, architect, reviewer, etc.)
+    - tasks: list of tasks for parallel spawning
+    - wait: block until all children complete (parallel mode)
+    """
+    # ── Parallel mode: tasks list ──
+    tasks_list = params.get("tasks")
+    if tasks_list and isinstance(tasks_list, list):
+        if ctx.spawn_subagent is None or ctx.deps is None:
+            return {"ok": False, "error": "spawn not available in this context"}
+        parent_id = ctx.agent_id
+        if parent_id is None:
+            return {"ok": False, "error": "no agent_id in context"}
+
+        # Import the parallel spawner from agent_loop
+        import agent_loop as _al
+        child_ids = _al.spawn_subagents_parallel(
+            parent_id=parent_id,
+            tasks=tasks_list,
+            deps=ctx.deps,
+            session=ctx.session,
+            events_cb=ctx.events_cb,
+        )
+        if not child_ids:
+            return {"ok": False, "error": f"parallel spawn failed (parent '{parent_id}' not found)"}
+
+        # If wait=true, block until all children complete
+        if params.get("wait", False):
+            results = []
+            for cid in child_ids:
+                info = _al.wait_for_agent(cid, timeout=params.get("timeout", 120.0))
+                if info:
+                    results.append(f"[{cid}] {info.status}: {info.last_reply[:200] if info.last_reply else '(no reply)'}")
+                else:
+                    results.append(f"[{cid}] timeout or not found")
+            return {"ok": True,
+                    "result": f"Spawned {len(child_ids)} agents in parallel. Results:\n" + "\n".join(results),
+                    "child_ids": child_ids}
+
+        task_desc = ", ".join(t.get("role", t.get("task", "?")[:30]) for t in tasks_list)
+        return {"ok": True,
+                "result": f"Spawned {len(child_ids)} agents in parallel: [{task_desc}]. "
+                          f"IDs: {', '.join(child_ids)}. Check inbox for results.",
+                "child_ids": child_ids}
+
+    # ── Single agent mode ──
+    task = params.get("task", "").strip()
+    if not task:
+        return {"ok": False, "error": "missing 'task' (or 'tasks' for parallel mode)"}
+    name = params.get("name") or None
+    role = params.get("role") or None
+    if ctx.spawn_subagent is None or ctx.deps is None:
+        return {"ok": False, "error": "spawn not available in this context"}
+    parent_id = ctx.agent_id
+    if parent_id is None:
+        return {"ok": False, "error": "no agent_id in context"}
+    child_id = ctx.spawn_subagent(
+        parent_id=parent_id, task=task, deps=ctx.deps,
+        name=name, session=ctx.session, events_cb=ctx.events_cb,
+        role=role,
+    )
+    if child_id is None:
+        return {"ok": False, "error": f"spawn failed (parent '{parent_id}' not found)"}
+    role_note = f" (role: {role})" if role else ""
+    return {"ok": True, "result": f"Spawned child agent '{child_id}'{role_note} for task: {task[:120]}", "child_id": child_id}
+
+
+def _bi_agent_tell(params: dict, ctx: ToolCtx) -> dict:
+    """Send a message to another agent's inbox."""
+    target_id = (params.get("agent_id") or "").strip()
+    if not target_id:
+        return {"ok": False, "error": "missing 'agent_id'"}
+    msg = params.get("message", "")
+    if not msg:
+        return {"ok": False, "error": "missing 'message'"}
+    if ctx.send_to_agent is None:
+        return {"ok": False, "error": "send_to_agent not available"}
+    if isinstance(msg, dict):
+        body = dict(msg)
+    else:
+        body = {"kind": "msg", "text": str(msg)}
+    body.setdefault("from", ctx.agent_id or "unknown")
+    ok = ctx.send_to_agent(target_id, body)
+    if not ok:
+        return {"ok": False, "error": f"agent '{target_id}' not found or inbox full"}
+    return {"ok": True, "result": f"Sent to {target_id}"}
+
+
+def _bi_agent_station(params: dict, ctx: ToolCtx) -> dict:
+    """Station the current agent at a named terminal (bash sub-shell)."""
+    name = (params.get("name") or "main").strip() or "main"
+    target_agent = None
+    if ctx.get_current_agent is not None:
+        target_agent = ctx.get_current_agent()
+    if target_agent is None:
+        return {"ok": False, "error": "no current agent to station"}
+
+    if ctx.get_terminal is not None and ctx.register_terminal is not None:
+        existing = ctx.get_terminal(name)
+        if existing and existing.session and existing.session.is_alive():
+            # Re-use existing live terminal — just attach the agent
+            if ctx.station_agent is not None:
+                ctx.station_agent(target_agent.id, name)
+            return {"ok": True, "result": f"Stationed {target_agent.id} in existing terminal {name}"}
+        if existing and ctx.unregister_terminal:
+            ctx.unregister_terminal(name)
+
+        # Spawn a fresh bash sub-terminal — agents operate via marker-poll
+        shell_cmd = os.environ.get("SHELL", "/bin/bash")
+        sub = ctx.deps.SubTerminalSession(shell_cmd)
+        sub.start()
+        time.sleep(0.1)
+        if sub.is_alive():
+            sub.read_output(timeout=0.1)
+        ctx.register_terminal(sub, shell_cmd, ctx.depth, name=name)
+    if ctx.station_agent is not None:
+        ctx.station_agent(target_agent.id, name)
+    return {"ok": True, "result": f"Stationed {target_agent.id} in terminal {name}"}
+
+
+def _bi_agent_abort(params: dict, ctx: ToolCtx) -> dict:
+    """Abort another agent's execution."""
+    target_id = (params.get("agent_id") or "").strip()
+    if not target_id:
+        return {"ok": False, "error": "missing 'agent_id'"}
+    if ctx.abort_agent is None:
+        return {"ok": False, "error": "abort not available"}
+    ok = ctx.abort_agent(target_id)
+    if not ok:
+        return {"ok": False, "error": f"agent '{target_id}' not found"}
+    return {"ok": True, "result": f"Aborted {target_id}"}
+
+
+def _bi_agent_wait(params: dict, ctx: ToolCtx) -> dict:
+    """Wait for another agent to finish."""
+    target_id = (params.get("agent_id") or "").strip()
+    if not target_id:
+        return {"ok": False, "error": "missing 'agent_id'"}
+    timeout = float(params.get("timeout", 300))
+    if ctx.wait_for_agent is None:
+        return {"ok": False, "error": "wait not available"}
+    info = ctx.wait_for_agent(target_id, timeout)
+    if info is None:
+        return {"ok": False, "error": f"agent '{target_id}' not found or timed out"}
+    return {"ok": True, "result": f"Agent {target_id}: {info.status}", "status": info.status}
+
+
+def _bi_agent_hire(params: dict, ctx: ToolCtx) -> dict:
+    """Register a new agent slot."""
+    if ctx.register_agent_fn is None:
+        return {"ok": False, "error": "hire not available"}
+    info = ctx.register_agent_fn(depth=ctx.depth)
+    return {"ok": True, "result": f"Hired {info.id}", "agent_id": info.id}
+
+
+def _bi_agent_list(params: dict, ctx: ToolCtx) -> dict:
+    """List all agents."""
+    if ctx.get_all_agents is None:
+        return {"ok": False, "error": "agent listing not available"}
+    agents = ctx.get_all_agents()
+    current = ctx.get_current_agent() if ctx.get_current_agent else None
+    lines = []
+    for a in agents:
+        marker = " <-- self" if (current and a.id == current.id) else ""
+        st = f" [stationed: {a.stationed_terminal}]" if a.stationed_terminal else ""
+        st += f" [{a.status}]" if a.status != "idle" else ""
+        lines.append(f"  {a.id}: {a.name}{st}{marker}")
+    return {"ok": True, "result": "\n".join(lines) if lines else "(no agents)"}
+
+
+def _bi_agent_rename(params: dict, ctx: ToolCtx) -> dict:
+    """Rename the current agent."""
+    new_name = (params.get("name") or "").strip()
+    if not new_name:
+        return {"ok": False, "error": "missing 'name'"}
+    if ctx.rename_agent is None or ctx.get_current_agent is None:
+        return {"ok": False, "error": "rename not available"}
+    current = ctx.get_current_agent()
+    if current and ctx.rename_agent(current.id, new_name):
+        return {"ok": True, "result": f"Renamed to {new_name}"}
+    return {"ok": False, "error": "no current agent to rename"}
+
+
+def _bi_agent_switch(params: dict, ctx: ToolCtx) -> dict:
+    """Switch to a different agent identity."""
+    target_id = (params.get("agent_id") or "").strip()
+    if not target_id:
+        return {"ok": False, "error": "missing 'agent_id'"}
+    if ctx.switch_to_agent is None:
+        return {"ok": False, "error": "switch not available"}
+    if ctx.switch_to_agent(target_id):
+        agent = ctx.get_agent(target_id) if ctx.get_agent else None
+        label = agent.name if agent else target_id
+        return {"ok": True, "result": f"Switched to {label}"}
+    return {"ok": False, "error": f"agent '{target_id}' not found"}
+
+
+def _bi_terminal_send(params: dict, ctx: ToolCtx) -> dict:
+    """Send a command/keystrokes to a named terminal."""
+    target = (params.get("name") or "").strip()
+    cmd = (params.get("command") or "").strip()
+    if not target:
+        return {"ok": False, "error": "missing 'name'"}
+    if not cmd:
+        return {"ok": False, "error": "missing 'command'"}
+    if ctx.get_terminal is None:
+        return {"ok": False, "error": "terminal access not available"}
+    term = ctx.get_terminal(target)
+    if term is None:
+        return {"ok": False, "error": f"terminal '{target}' not found"}
+    if not (term.session and term.session.is_alive()):
+        return {"ok": False, "error": f"terminal '{target}' is dead"}
+    term.session.send_keys(cmd + "\n")
+    time.sleep(0.3)
+    term.session.read_output(timeout=0.5)
+    try:
+        output = ctx.deps.strip_ansi(term.session.full_output) if ctx.deps else term.session.full_output
+    except Exception:
+        output = term.session.full_output
+    return {"ok": True, "result": output.strip() or "(no output)", "terminal": target}
+
+
+def _bi_terminal_terminate(params: dict, ctx: ToolCtx) -> dict:
+    """Terminate a named terminal."""
+    target = (params.get("name") or "").strip()
+    if not target:
+        return {"ok": False, "error": "missing 'name'"}
+    if ctx.unregister_terminal is None:
+        return {"ok": False, "error": "terminate not available"}
+    if ctx.get_terminal is not None:
+        term = ctx.get_terminal(target)
+        if term and ctx.unstation_agent is not None:
+            for aid in list(term.stationed_agent_ids):
+                ctx.unstation_agent(aid)
+    if ctx.unregister_terminal(target):
+        return {"ok": True, "result": f"Terminated {target}"}
+    return {"ok": False, "error": f"terminal '{target}' not found"}
+
+
+def _bi_terminal_create(params: dict, ctx: ToolCtx) -> dict:
+    """Create a new named sub-terminal (no agent stationed)."""
+    name = (params.get("name") or "").strip()
+    if not name:
+        return {"ok": False, "error": "missing 'name'"}
+    if ctx.register_terminal is None or ctx.deps is None:
+        return {"ok": False, "error": "terminal creation not available"}
+    if ctx.get_terminal is not None:
+        existing = ctx.get_terminal(name)
+        if existing and existing.session and not existing.session.is_alive() and ctx.unregister_terminal:
+            ctx.unregister_terminal(name)
+            existing = None
+        if existing is not None:
+            return {"ok": False, "error": f"terminal '{name}' already exists"}
+
+    lain_cmd = f"{sys.executable} {os.path.abspath(__file__)} --depth {ctx.depth + 1}"
+    sub = ctx.deps.SubTerminalSession(lain_cmd)
+    sub.start()
+    time.sleep(0.15)
+    if sub.is_alive():
+        sub.read_output(timeout=0.1)
+    ctx.register_terminal(sub, "laintas-cli", ctx.depth, name=name)
+    return {"ok": True, "result": f"Created sub-terminal {name}", "terminal": name}
+
+
+def _bi_terminal_list(params: dict, ctx: ToolCtx) -> dict:
+    """List all named terminals."""
+    if ctx.get_all_terminals is None:
+        return {"ok": False, "error": "terminal listing not available"}
+    terminals = ctx.get_all_terminals()
+    if not terminals:
+        return {"ok": True, "result": "(no terminals)"}
+    lines = []
+    for t in terminals:
+        alive = t.session and t.session.is_alive()
+        status = "alive" if alive else "dead"
+        stationed = f" [stationed: {', '.join(t.stationed_agent_ids)}]" if t.stationed_agent_ids else ""
+        lines.append(f"  {t.name} ({t.command}) [{status}]{stationed}")
+    return {"ok": True, "result": "\n".join(lines)}
+
+
+def _bi_session_close(params: dict, ctx: ToolCtx) -> dict:
+    """Close the current interactive PTY session."""
+    if ctx.interactive_session is None:
+        return {"ok": True, "result": "No active session to close"}
+    session = ctx.interactive_session
+    session.close()
+    try:
+        output = ctx.deps.strip_ansi(session.full_output) if ctx.deps else session.full_output
+    except Exception:
+        output = session.full_output
+    ctx.interactive_session = None
+    return {"ok": True, "result": output.strip() or "(no output)", "command": session.command[:120]}
+
+
+def _bi_session_keys(params: dict, ctx: ToolCtx) -> dict:
+    """Send keystrokes to the current interactive PTY session."""
+    keys = (params.get("keys") or "").strip()
+    if not keys:
+        return {"ok": False, "error": "missing 'keys'"}
+    if ctx.interactive_session is None:
+        return {"ok": False, "error": "no active session — run a long-lived command first"}
+    session = ctx.interactive_session
+    session.send_keys(keys)
+    time.sleep(0.3)
+    new_output = session.read_output(timeout=0.5)
+    try:
+        full = ctx.deps.strip_ansi(session.full_output) if ctx.deps else session.full_output
+    except Exception:
+        full = session.full_output
+    return {"ok": True, "result": full.strip() or "(no output)",
+            "new_output": (new_output or "").strip()[:500],
+            "alive": session.is_alive()}
+
+
+def _bi_sleep(params: dict, ctx: ToolCtx) -> dict:
+    """Sleep for N seconds (e.g. after starting a server)."""
+    secs = float(params.get("seconds", 1))
+    secs = max(0.1, min(secs, 30))
+    time.sleep(secs)
+    return {"ok": True, "result": f"Slept {secs:.1f}s"}
+
+
+# ── Shell execution tool ──────────────────────────────────────────────
+
+def _bi_shell_exec(params: dict, ctx: ToolCtx) -> dict:
+    """Execute a shell command.
+
+    Priority order:
+      1. cd/clear → run in parent process (side effects stick).
+      2. ctx.stationed_terminal → marker-poll inside the agent's stationed PTY.
+      3. ctx.interactive_session → marker-poll inside an ad-hoc one-shot PTY.
+      4. subprocess.run fallback.
+
+    Policy is enforced by the dispatch loop, not here (single source of truth).
+    """
+    command = (params.get("command") or "").strip()
+    if not command:
+        return {"ok": False, "error": "missing 'command'"}
+
+    cwd = params.get("cwd") or ctx.cwd or os.getcwd()
+    timeout = int(params.get("timeout", 60))
+
+    # cd / clear short-circuit: only when there's no live PTY session to
+    # route through. When stationed to a bash terminal, cd MUST go through
+    # marker-poll so bash's own cwd changes (mutating parent cwd would
+    # diverge from the stationed shell's state). Also, this short-circuit
+    # only matches bare `cd <path>` / `clear` — never compound commands
+    # like `cd /tmp && pwd` (those need real shell parsing).
+    has_live_session = (
+        (ctx.stationed_terminal is not None and
+         getattr(ctx.stationed_terminal, "is_alive", lambda: False)())
+        or
+        (ctx.interactive_session is not None and
+         getattr(ctx.interactive_session, "is_alive", lambda: False)())
+    )
+    if not has_live_session:
+        stripped = command.strip()
+        _is_bare_cd = stripped == "cd" or (
+            stripped.startswith("cd ")
+            and not any(op in stripped for op in ("&&", "||", ";", "|", ">", "<", "`", "$("))
+        )
+        _is_bare_clear = stripped == "clear" or (
+            stripped.startswith("clear ")
+            and not any(op in stripped for op in ("&&", "||", ";", "|"))
+        )
+        if _is_bare_cd:
+            path = stripped[3:].strip() if stripped.startswith("cd ") else os.path.expanduser("~")
+            try:
+                os.chdir(path)
+                return {"ok": True, "result": f"cd → {os.getcwd()}", "returncode": 0}
+            except Exception as e:
+                return {"ok": False, "error": f"cd error: {e}", "returncode": -1}
+        if _is_bare_clear:
+            import sys as _sys
+            _sys.stdout.write("\033[2J\033[H")
+            _sys.stdout.flush()
+            return {"ok": True, "result": "", "returncode": 0}
+
+    # Marker-poll inside an existing PTY session.
+    # Used by stationed terminals (preferred) or one-shot interactive sessions.
+    session = ctx.stationed_terminal or ctx.interactive_session
+    if session is not None:
+        import uuid as _uuid
+        import re as _re
+        try:
+            marker_id = _uuid.uuid4().hex[:8]
+            start_marker = f"__CMD_BEGIN_{marker_id}__"
+            end_marker = f"__CMD_END_{marker_id}__"
+            wrapped = f"echo {start_marker}; {command} 2>&1; __laintas_rc=$?; echo {end_marker}:$__laintas_rc"
+            try:
+                old_len = len(session.raw_output)
+            except AttributeError:
+                old_len = len(session.full_output)
+            session.send_keys(wrapped + "\n")
+            poll_start = time.time()
+            cmd_output = ""
+            returncode = -1
+            poll_budget = max(timeout, 10.0)
+            while time.time() - poll_start < poll_budget:
+                time.sleep(0.08)
+                session.read_output(timeout=0.1)
+                try:
+                    raw = session.raw_output
+                except AttributeError:
+                    raw = session.full_output
+                new_content = raw[old_len:] if old_len > 0 else raw
+                # The end marker is preceded by an echoed `:$rc` literal in the
+                # input line (variable name, not expanded). The real output
+                # has `:<digits>` after expansion. Match digits to skip the
+                # echoed input line.
+                end_match = _re.search(
+                    rf'{_re.escape(end_marker)}:(\d+)', new_content
+                )
+                if end_match:
+                    returncode = int(end_match.group(1))
+                    # The echoed input line has the start_marker followed by `;`.
+                    # The real output has it followed by \r, \n, or \r\n.
+                    # We look for the marker followed by a line break or end of
+                    # buffer, falling back to the last occurrence to skip the
+                    # echoed input.
+                    starts = list(_re.finditer(
+                        rf'{_re.escape(start_marker)}(?=[\r\n]|$)', new_content
+                    ))
+                    if starts:
+                        # Prefer occurrence that comes before end_match
+                        valid = [m for m in starts if m.end() < end_match.start()]
+                        chosen = valid[-1] if valid else starts[-1]
+                        # Skip any trailing whitespace/CR/LF after the marker
+                        body_start = chosen.end()
+                        while body_start < len(new_content) and new_content[body_start] in '\r\n':
+                            body_start += 1
+                        cmd_output = new_content[body_start:end_match.start()]
+                        # Strip trailing CR/LF before end marker
+                        cmd_output = cmd_output.rstrip('\r\n').strip()
+                    else:
+                        # Fallback: split on start_marker, take everything
+                        # between the LAST start and the end marker
+                        parts = new_content.rsplit(start_marker, 1)
+                        if len(parts) > 1:
+                            tail = parts[1].split(end_marker, 1)[0]
+                            cmd_output = tail.strip('\r\n').strip()
+                    break
+                if not session.is_alive():
+                    cmd_output = new_content
+                    break
+            # Only use the full buffer as fallback when we never found the
+            # markers (returncode == -1). When markers were found and the
+            # extracted output is legitimately empty (e.g., `cd /tmp` has no
+            # stdout), keep cmd_output empty.
+            if returncode == -1 and not cmd_output:
+                cmd_output = new_content if 'new_content' in locals() else ""
+            if ctx.deps:
+                cmd_output = ctx.deps.strip_ansi(cmd_output)
+            return {"ok": returncode == 0, "result": cmd_output.strip() or "(no output)",
+                    "returncode": returncode,
+                    "via": "stationed" if ctx.stationed_terminal else "interactive"}
+        except Exception:
+            pass  # Fall through to subprocess
+
+    # Direct subprocess execution
+    try:
+        import subprocess as _sp
+        result = _sp.run(
+            command, shell=True, capture_output=True, text=True,
+            timeout=timeout, cwd=cwd,
+        )
+        output = (result.stdout + result.stderr).strip()
+        return {"ok": result.returncode == 0, "result": output or "(no output)",
+                "returncode": result.returncode, "via": "subprocess"}
+    except _sp.TimeoutExpired:
+        return {"ok": False, "error": f"Command timed out ({timeout}s): {command[:120]}",
+                "returncode": -1}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}", "returncode": -1}
+
+
 def register_builtin_tools() -> None:
     """Idempotent — safe to call multiple times."""
     builtins = [
@@ -1278,7 +1742,9 @@ def register_builtin_tools() -> None:
             name="task.create",
             description="Create a new task for structured work tracking. "
                         "Tasks have status (pending→in_progress→completed), "
-                        "dependencies (blocks/blockedBy), and metadata.",
+                        "dependencies (blocks/blockedBy), progress (0-100), "
+                        "notes, and metadata. Use session_only=true for ephemeral "
+                        "tasks that won't persist across sessions.",
             schema={
                 "type": "object",
                 "properties": {
@@ -1287,6 +1753,10 @@ def register_builtin_tools() -> None:
                                     "description": "Detailed description of what needs to be done"},
                     "metadata": {"type": "object", "default": {},
                                  "description": "Arbitrary metadata (tags, priority, etc.)"},
+                    "session_only": {"type": "boolean", "default": False,
+                                     "description": "If true, task exists only in this session"},
+                    "parent_task_id": {"type": "string",
+                                       "description": "Auto-link as blockedBy this parent task"},
                 },
                 "required": ["subject"],
             },
@@ -1294,7 +1764,9 @@ def register_builtin_tools() -> None:
         ),
         Tool(
             name="task.update",
-            description="Update a task's status, description, dependencies, or metadata.",
+            description="Update a task's status, description, dependencies, progress, "
+                        "notes, or metadata. Use addSubtask to create a child task "
+                        "with automatic dependency linking.",
             schema={
                 "type": "object",
                 "properties": {
@@ -1303,6 +1775,15 @@ def register_builtin_tools() -> None:
                               "description": "New status"},
                     "subject": {"type": "string", "description": "New title"},
                     "description": {"type": "string", "description": "New description"},
+                    "progress": {"type": "integer", "minimum": 0, "maximum": 100,
+                                 "description": "Progress percentage (0-100)"},
+                    "notes": {"type": "string",
+                              "description": "Append a progress note (timestamped)"},
+                    "addSubtask": {
+                        "type": ["string", "object"],
+                        "description": "Create a child task linked to this one. "
+                                       "String = subject, or {subject, description}",
+                    },
                     "addBlocks": {"type": "array", "items": {"type": "string"},
                                  "description": "Task IDs that this task blocks"},
                     "addBlockedBy": {"type": "array", "items": {"type": "string"},
@@ -1369,6 +1850,205 @@ def register_builtin_tools() -> None:
             description="List all saved plans.",
             schema={"type": "object", "properties": {}},
             invoke=_bi_plan_list,
+        ),
+        # ── Agent tools ─────────────────────────────────────────────
+        Tool(
+            name="agent.spawn",
+            description="Spawn an in-process child agent to handle a sub-task. "
+                        "The child runs in its own thread and posts results to your inbox. "
+                        "Supports specialized roles (explorer, architect, reviewer, "
+                        "silent-failure-hunter, simplifier, tester) and parallel spawning "
+                        "via the 'tasks' parameter.",
+            schema={
+                "type": "object",
+                "properties": {
+                    "task": {"type": "string", "description": "The task for the child agent"},
+                    "name": {"type": "string", "description": "Optional short name for the child"},
+                    "role": {"type": "string",
+                             "description": "Specialized role: explorer, architect, reviewer, "
+                                            "silent-failure-hunter, simplifier, tester"},
+                    "tasks": {
+                        "type": "array",
+                        "description": "Parallel spawn: list of {task, role, name} objects",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "task": {"type": "string"},
+                                "role": {"type": "string"},
+                                "name": {"type": "string"},
+                            },
+                            "required": ["task"],
+                        },
+                    },
+                    "wait": {"type": "boolean", "default": False,
+                             "description": "Block until all children complete (parallel mode)"},
+                    "timeout": {"type": "number", "default": 120,
+                                "description": "Seconds to wait for each child (with wait=true)"},
+                },
+                "required": [],
+            },
+            invoke=_bi_agent_spawn,
+        ),
+        Tool(
+            name="agent.tell",
+            description="Send a message to another agent's inbox.",
+            schema={
+                "type": "object",
+                "properties": {
+                    "agent_id": {"type": "string", "description": "Target agent ID"},
+                    "message": {"type": "string", "description": "Message content (JSON or text)"},
+                },
+                "required": ["agent_id", "message"],
+            },
+            invoke=_bi_agent_tell,
+        ),
+        Tool(
+            name="agent.station",
+            description="Station yourself at a named terminal so your commands run there.",
+            schema={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "default": "main", "description": "Terminal name"},
+                },
+            },
+            invoke=_bi_agent_station,
+        ),
+        Tool(
+            name="agent.abort",
+            description="Abort another agent's execution.",
+            schema={
+                "type": "object",
+                "properties": {
+                    "agent_id": {"type": "string", "description": "Target agent ID"},
+                },
+                "required": ["agent_id"],
+            },
+            invoke=_bi_agent_abort,
+        ),
+        Tool(
+            name="agent.wait",
+            description="Wait for another agent to finish (blocking, max 300s).",
+            schema={
+                "type": "object",
+                "properties": {
+                    "agent_id": {"type": "string", "description": "Target agent ID"},
+                    "timeout": {"type": "number", "default": 300, "description": "Max seconds to wait"},
+                },
+                "required": ["agent_id"],
+            },
+            invoke=_bi_agent_wait,
+        ),
+        Tool(
+            name="agent.hire",
+            description="Register a new agent slot. Returns the new agent's ID.",
+            schema={"type": "object", "properties": {}},
+            invoke=_bi_agent_hire,
+        ),
+        Tool(
+            name="agent.list",
+            description="List all agents and their statuses.",
+            schema={"type": "object", "properties": {}},
+            invoke=_bi_agent_list,
+        ),
+        Tool(
+            name="agent.rename",
+            description="Rename the current agent.",
+            schema={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "New name"},
+                },
+                "required": ["name"],
+            },
+            invoke=_bi_agent_rename,
+        ),
+        Tool(
+            name="agent.switch",
+            description="Switch to a different agent identity.",
+            schema={
+                "type": "object",
+                "properties": {
+                    "agent_id": {"type": "string", "description": "Target agent ID"},
+                },
+                "required": ["agent_id"],
+            },
+            invoke=_bi_agent_switch,
+        ),
+        # ── Terminal tools ──────────────────────────────────────────
+        Tool(
+            name="terminal.send",
+            description="Send a command/keystrokes to a named sub-terminal.",
+            schema={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Terminal name"},
+                    "command": {"type": "string", "description": "Command or keystrokes to send"},
+                },
+                "required": ["name", "command"],
+            },
+            invoke=_bi_terminal_send,
+        ),
+        Tool(
+            name="terminal.terminate",
+            description="Terminate and destroy a named sub-terminal.",
+            schema={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Terminal name"},
+                },
+                "required": ["name"],
+            },
+            invoke=_bi_terminal_terminate,
+        ),
+        Tool(
+            name="terminal.create",
+            description="Create a new named sub-terminal running a laintas-cli instance.",
+            schema={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Terminal name"},
+                },
+                "required": ["name"],
+            },
+            invoke=_bi_terminal_create,
+        ),
+        Tool(
+            name="terminal.list",
+            description="List all named sub-terminals and their statuses.",
+            schema={"type": "object", "properties": {}},
+            invoke=_bi_terminal_list,
+        ),
+        # ── Session tools ───────────────────────────────────────────
+        Tool(
+            name="session.close",
+            description="Close the current one-off interactive PTY session and capture its output.",
+            schema={"type": "object", "properties": {}},
+            invoke=_bi_session_close,
+        ),
+        Tool(
+            name="session.keys",
+            description="Send keystrokes to the current interactive PTY session.",
+            schema={
+                "type": "object",
+                "properties": {
+                    "keys": {"type": "string", "description": "Keystroke sequence to send"},
+                },
+                "required": ["keys"],
+            },
+            invoke=_bi_session_keys,
+        ),
+        # ── Utility tools ───────────────────────────────────────────
+        Tool(
+            name="sleep",
+            description="Sleep for N seconds (e.g., after starting a dev server). Cap: 30s.",
+            schema={
+                "type": "object",
+                "properties": {
+                    "seconds": {"type": "number", "default": 1, "description": "Seconds to sleep"},
+                },
+                "required": ["seconds"],
+            },
+            invoke=_bi_sleep,
         ),
     ]
     for t in builtins:

@@ -20,6 +20,10 @@ import policy as policy_mod  # Security policy engine
 import memory_system         # Cross-session persistent memory
 import hooks as hooks_mod    # Extensible hook system
 import plan_mode             # Structured planning before execution
+import agent_persistence     # Cross-session agent state persistence
+import agent_roles           # Specialized agent roles (explorer, reviewer, etc.)
+import workflow_engine        # Structured multi-phase workflow engine
+import task_manager          # Structured task tracking (session + persisted)
 
 # Path to laintas_cli.py for spawning child terminals
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -28,20 +32,20 @@ _LAINTAS_CLI = os.path.join(_SCRIPT_DIR, "laintas_cli.py")
 
 # ── Constants ──────────────────────────────────────────────────────────
 MAX_LOOPS = 10
-MAX_TOKENS = 2000
+MAX_TOKENS = 8192
 MAX_DEBUG_ENTRIES = 50
 
 # Mutable defaults — these are the "factory" values; runtime overrides stored in _runtime_config
 _DEFAULT_CONFIG = {
     "max_loops": 30,
-    "max_tokens": 2000,
+    "max_tokens": 8192,
     "max_debug_entries": 50,
     "loop_delay": 1.5,           # seconds between loop iterations
     "output_truncate": 3000,      # chars — lastOutput tail truncation
     "poll_timeout": 10.0,         # seconds — wait for first command output
     "terminal_tail_lines": 20,    # lines — sub-terminal snapshot
     "heartbeat_interval": 30,     # seconds — agent heartbeat
-    "staleness_limit": 3,         # consecutive no-command steps before auto-exit
+    "staleness_limit": 3,         # consecutive no-tool steps before auto-exit
 }
 
 _runtime_config: dict[str, object] = {}
@@ -86,7 +90,6 @@ class DebugEntry:
     response_raw: dict = field(default_factory=dict)
     reply: str = ""
     command: str = ""
-    memory: str = ""
     done: bool = False
     exec_command: str = ""
     exec_stdout: str = ""
@@ -177,10 +180,11 @@ def unregister_terminal(name: str) -> bool:
     info = _terminal_registry.pop(name, None)
     if info is None:
         return False
-    try:
-        info.session.close()
-    except Exception:
-        pass
+    if info.session is not None:
+        try:
+            info.session.close()
+        except Exception:
+            pass
     return True
 
 
@@ -239,6 +243,10 @@ class AgentInfo:
     status: str = "idle"                      # idle / running / done / aborted / error
     last_reply: str = ""
     abort_event: Any = field(default_factory=threading.Event)
+    # ── Pool architecture fields ───────────────────────────────────────
+    role: str = "pool"                        # pool | deployed | primary | subagent
+    parent_terminal: Optional[str] = None     # terminal that spawned this agent
+    home_terminal: Optional[str] = None       # terminal this agent is deployed to
 
 _agent_registry: dict[str, AgentInfo] = {}
 _agent_counter: int = 0
@@ -250,8 +258,15 @@ _registry_lock = threading.RLock()
 
 
 def register_agent(name: str = None, depth: int = 0,
-                   parent_id: Optional[str] = None) -> AgentInfo:
-    """Create and register a new AI agent. Returns the AgentInfo."""
+                   parent_id: Optional[str] = None,
+                   role: str = "pool",
+                   load_existing: bool = False) -> AgentInfo:
+    """Create and register a new AI agent. Returns the AgentInfo.
+
+    If load_existing=True and a persisted state file exists for the given
+    name, restore chat_history/state/role from disk so the agent picks up
+    where it left off.
+    """
     global _agent_registry, _agent_counter
     with _registry_lock:
         _agent_counter += 1
@@ -266,7 +281,15 @@ def register_agent(name: str = None, depth: int = 0,
             created_at=time.time(),
             depth=depth,
             parent_id=parent_id,
+            role=role,
         )
+        if load_existing:
+            data = agent_persistence.load_agent_state(agent_id)
+            if data is not None:
+                agent_persistence.apply_persisted_state(info, data)
+                # Caller-supplied role wins if explicitly different from "pool"
+                if role and role != "pool":
+                    info.role = role
         _agent_registry[agent_id] = info
         if parent_id and parent_id in _agent_registry:
             parent = _agent_registry[parent_id]
@@ -300,6 +323,52 @@ def get_agent(agent_id: str) -> Optional[AgentInfo]:
 def get_all_agents() -> list:
     with _registry_lock:
         return sorted(_agent_registry.values(), key=lambda a: a.created_at)
+
+
+def get_pool_agents() -> list:
+    """Return idle pool agents (role='pool', no home_terminal)."""
+    with _registry_lock:
+        return sorted(
+            (a for a in _agent_registry.values()
+             if getattr(a, "role", "pool") == "pool"
+             and not getattr(a, "home_terminal", None)),
+            key=lambda a: a.created_at,
+        )
+
+
+def get_deployed_agents() -> list:
+    """Return all deployed agents (role='deployed')."""
+    with _registry_lock:
+        return sorted(
+            (a for a in _agent_registry.values()
+             if getattr(a, "role", "pool") == "deployed"),
+            key=lambda a: a.created_at,
+        )
+
+
+def get_or_hire_pool_agent() -> AgentInfo:
+    """Return the first available pool agent; auto-hire one if pool is empty."""
+    pool = get_pool_agents()
+    if pool:
+        return pool[0]
+    return register_agent(depth=0, role="pool")
+
+
+def _format_deployment(a: Optional["AgentInfo"]) -> str:
+    """Human-readable deployment status for prompts and /agents output."""
+    if a is None:
+        return "unknown"
+    role = getattr(a, "role", "pool")
+    home = getattr(a, "home_terminal", None) or a.stationed_terminal
+    if role == "primary":
+        return "primary"
+    if role == "deployed":
+        return f"deployed→{home or '?'}"
+    if role == "pool":
+        return "pool (idle)"
+    if role == "subagent":
+        return f"subagent (depth {a.depth})"
+    return role
 
 
 def get_current_agent() -> Optional[AgentInfo]:
@@ -348,11 +417,18 @@ def station_agent(agent_id: str, terminal_name: str) -> bool:
                 old_term.stationed_agent_ids.remove(agent_id)
             old_term.stationed_agent_id = old_term.stationed_agent_ids[0] if old_term.stationed_agent_ids else None
         agent.stationed_terminal = terminal_name
+        agent.home_terminal = terminal_name
+        if agent.role != "primary":
+            agent.role = "deployed"
         if term:
             if agent_id not in term.stationed_agent_ids:
                 term.stationed_agent_ids.append(agent_id)
             term.stationed_agent_id = term.stationed_agent_ids[0]  # keep first as legacy
-        return True
+    try:
+        agent_persistence.save_agent_state(agent)
+    except Exception:
+        pass
+    return True
 
 
 def unstation_agent(agent_id: str) -> None:
@@ -365,6 +441,17 @@ def unstation_agent(agent_id: str) -> None:
                     term.stationed_agent_ids.remove(agent_id)
                 term.stationed_agent_id = term.stationed_agent_ids[0] if term.stationed_agent_ids else None
             agent.stationed_terminal = None
+            agent.home_terminal = None
+            if agent.role == "deployed":
+                agent.role = "pool"
+                agent.status = "idle"
+        else:
+            agent = None
+    if agent is not None:
+        try:
+            agent_persistence.save_agent_state(agent)
+        except Exception:
+            pass
 
 
 def close_all_agents() -> None:
@@ -459,7 +546,8 @@ def wait_for_agent(agent_id: str, timeout: float = 30.0) -> Optional[AgentInfo]:
 def spawn_subagent(parent_id: str, task: str, deps,
                    name: Optional[str] = None,
                    session: Optional[dict] = None,
-                   events_cb=None) -> Optional[str]:
+                   events_cb=None,
+                   role: Optional[str] = None) -> Optional[str]:
     """Start an in-process child agent in its own thread.
 
     The child:
@@ -468,14 +556,39 @@ def spawn_subagent(parent_id: str, task: str, deps,
       - reports back to the parent via a 'child-done' / 'child-error' message
         delivered to the parent's inbox
 
+    If `role` is provided (e.g. "explorer", "reviewer"), the child agent
+    gets a specialized system prompt and tool whitelist via AgentRole.
+
     Returns the child's agent_id, or None if the parent doesn't exist.
     """
     parent = get_agent(parent_id)
     if parent is None:
         return None
+
+    # Auto-generate name from role if not provided
+    if not name and role:
+        role_instance = agent_roles.get_role(role)
+        name = f"{role}-{parent.depth + 1}-{_agent_counter + 1}" if role_instance else name
+
     child = register_agent(name=name, depth=parent.depth + 1,
-                           parent_id=parent_id)
+                           parent_id=parent_id, role="subagent")
+    child.parent_terminal = (
+        getattr(parent, "home_terminal", None)
+        or getattr(parent, "parent_terminal", None)
+        or "term0"
+    )
     child.status = "running"
+
+    # Inject role into child state so run_agent_loop picks it up
+    if role:
+        child.state["_role_name"] = role
+        role_obj = agent_roles.get_role(role)
+        if role_obj:
+            # Prepend role description to the task for context
+            task = (
+                f"[Role: {role_obj.name} — {role_obj.description}]\n\n"
+                f"{task}"
+            )
 
     def _runner():
         try:
@@ -492,6 +605,7 @@ def spawn_subagent(parent_id: str, task: str, deps,
                 "from": child.id,
                 "kind": "child-done",
                 "status": child.status,
+                "role": role or "general",
                 "summary": child.last_reply or "(no reply)",
             })
         except Exception as e:
@@ -499,6 +613,7 @@ def spawn_subagent(parent_id: str, task: str, deps,
             send_to_agent(parent_id, {
                 "from": child.id,
                 "kind": "child-error",
+                "role": role or "general",
                 "error": repr(e),
             })
 
@@ -507,6 +622,30 @@ def spawn_subagent(parent_id: str, task: str, deps,
     child.thread = t
     t.start()
     return child.id
+
+
+def spawn_subagents_parallel(parent_id: str, tasks: list[dict], deps,
+                              session: Optional[dict] = None,
+                              events_cb=None) -> list[str]:
+    """Start multiple sub-agents in parallel.
+
+    tasks: [{"task": "...", "role": "explorer", "name": "explorer-1"}, ...]
+    Returns list of child agent IDs.
+    """
+    child_ids = []
+    for t in tasks:
+        cid = spawn_subagent(
+            parent_id=parent_id,
+            task=t.get("task", ""),
+            deps=deps,
+            name=t.get("name"),
+            session=session,
+            events_cb=events_cb,
+            role=t.get("role"),
+        )
+        if cid:
+            child_ids.append(cid)
+    return child_ids
 
 
 def build_agents_tree() -> str:
@@ -560,11 +699,12 @@ class LoopDeps:
     console: Any  # rich.console.Console
     Markdown: type  # rich.markdown.Markdown
     pty_passthrough: Optional[Callable[..., dict]] = None
+    build_subterminal_cmd: Optional[Callable[..., str]] = None
 
 
 # ── Structured Memory System (.helpwo) ──────────────────────────────────
 # .helpwo stores a JSON array of entries: [{"id": N, "content": "...", "created": "...", "updated": "..."}]
-# AI can append, modify (~N:), or delete (-N) entries via the "memory" field.
+# AI reads/writes these via the mem.* tools (mem.read, mem.save, mem.delete, mem.list).
 
 _MEMORY_FILE = ".helpwo"
 
@@ -586,69 +726,6 @@ def _read_memory(deps: LoopDeps) -> list[dict]:
         return [{"id": 1, "content": text, "created": datetime.now().isoformat(), "updated": datetime.now().isoformat()}]
     return []
 
-
-def _write_memory(deps: LoopDeps, entries: list[dict]) -> None:
-    """Write entries to .helpwo as pretty-printed JSON."""
-    deps.write_file(_MEMORY_FILE, json.dumps(entries, ensure_ascii=False, indent=2))
-
-
-def _format_memory(entries: list[dict]) -> str:
-    """Format entries for prompt display."""
-    if not entries:
-        return "(empty)"
-    return "\n".join(f"  [{e['id']}] {e['content']}" for e in entries)
-
-
-def _apply_memory(deps: LoopDeps, instruction: str) -> str:
-    """Apply a CRUD instruction to .helpwo memory.
-
-    Instruction formats:
-      "text"        → append new entry (auto-assigned id)
-      "~N: text"    → update (modify) entry with id N
-      "-N"          → delete entry with id N
-    Returns a description of what was done.
-    """
-    entries = _read_memory(deps)
-    stripped = instruction.strip()
-    if not stripped:
-        return ""
-
-    # -- Delete: "-N" --
-    m = re.match(r'^-(\d+)$', stripped)
-    if m:
-        eid = int(m.group(1))
-        before = len(entries)
-        entries = [e for e in entries if e.get("id") != eid]
-        if len(entries) < before:
-            for i, e in enumerate(entries, 1):
-                e["id"] = i
-            _write_memory(deps, entries)
-            return f"Deleted memory entry [{eid}]"
-        return f"Entry [{eid}] not found"
-
-    # -- Modify: "~N: new text" --
-    m = re.match(r'^~(\d+)\s*:\s*(.+)$', stripped)
-    if m:
-        eid = int(m.group(1))
-        new_content = m.group(2).strip()
-        for e in entries:
-            if e.get("id") == eid:
-                e["content"] = new_content
-                e["updated"] = datetime.now().isoformat()
-                _write_memory(deps, entries)
-                return f"Modified memory entry [{eid}]"
-        return f"Entry [{eid}] not found"
-
-    # -- Append: plain text --
-    max_id = max((e.get("id", 0) for e in entries), default=0)
-    entries.append({
-        "id": max_id + 1,
-        "content": stripped,
-        "created": datetime.now().isoformat(),
-        "updated": datetime.now().isoformat(),
-    })
-    _write_memory(deps, entries)
-    return f"Added memory entry [{max_id + 1}]"
 
 
 # ── Context Builders (3 clean sections) ──────────────────────────────────
@@ -1013,9 +1090,17 @@ def get_terminals_snapshot() -> str:
 def _detect_loop_warnings(state: dict, original_input: str) -> list[str]:
     """Detect stuck / repetitive behaviour and return human-readable warnings.
 
-    Surfaces the AI's own pattern back to it so it can break out: identical
-    commands run >=3 times, >=N consecutive errors, or excessive read-only
-    exploration without any acting verb.
+    Enhanced behavior diagnostics — surfaces the AI's own patterns so it can
+    self-correct. Returns list of warning strings for <warnings> block.
+
+    Checks:
+    1. Same exact command 3+ consecutive times
+    2. 3+ consecutive failures
+    3. 7+ read-only steps without edit/build/run
+    4. Exploration drift: 5+ steps with no file writes AND no tool variety
+    5. Tool stagnation: same tool 5+ consecutive times with similar args
+    6. Context amnesia: re-reading files already in _files_seen
+    7. Goal drift: shortTermMemory mentions actions unrelated to original task
     """
     history = state.get("terminalHistory", [])
     warnings: list[str] = []
@@ -1027,8 +1112,8 @@ def _detect_loop_warnings(state: dict, original_input: str) -> list[str]:
     last_cmds = [(h.get("command") or "").strip() for h in history[-3:]]
     if last_cmds[0] and last_cmds[0] == last_cmds[1] == last_cmds[2]:
         warnings.append(
-            f"You have run `{last_cmds[0][:80]}` 3 times in a row. "
-            f"This usually means you're stuck — change approach or set done=true."
+            f"You have run `{last_cmds[0][:80]}` 3 times in a row with the same result. "
+            f"The task is done. Return tool_calls: [] and state your final answer in reply."
         )
 
     # 2. 3+ consecutive failures (any commands)
@@ -1049,6 +1134,7 @@ def _detect_loop_warnings(state: dict, original_input: str) -> list[str]:
     # 3. Many read-only steps with no edit action — pure exploration drift
     READ_ONLY = {"ls", "cat", "head", "tail", "grep", "find", "pwd", "which",
                  "type", "file", "stat", "wc", "tree", "echo"}
+    WRITE_TOOLS = {"fs.write", "fs.edit", "fs.multi_edit", "shell.exec"}
     if len(history) >= 8:
         last8 = history[-8:]
         readonly_count = 0
@@ -1069,6 +1155,69 @@ def _detect_loop_warnings(state: dict, original_input: str) -> list[str]:
                 "action. Either start acting on what you've learned, or set "
                 "done=true and report findings."
             )
+
+    # 4. Exploration drift: 5+ steps with no file writes AND low tool variety
+    if len(history) >= 5:
+        last5 = history[-5:]
+        has_write = False
+        tool_names = set()
+        for h in last5:
+            tool = h.get("tool", "")
+            cmd = (h.get("command") or "").strip()
+            if tool in WRITE_TOOLS or any(cmd.startswith(f"/tool {w}") for w in WRITE_TOOLS):
+                has_write = True
+            if tool:
+                tool_names.add(tool)
+        if not has_write and len(tool_names) <= 2 and len(history) >= 5:
+            warnings.append(
+                f"Exploration drift: {len(history)} steps with no writes and only "
+                f"{len(tool_names)} tool type(s). Broaden your approach or start "
+                f"making changes based on what you've learned."
+            )
+
+    # 5. Tool stagnation: same tool 5+ consecutive times with similar args
+    if len(history) >= 5:
+        last5_tools = [(h.get("tool", ""), (h.get("command") or "")[:60]) for h in history[-5:]]
+        if (all(t[0] == last5_tools[0][0] for t in last5_tools)
+                and last5_tools[0][0]
+                and len(set(t[1] for t in last5_tools)) <= 2):
+            warnings.append(
+                f"Tool stagnation: you've used `{last5_tools[0][0]}` 5 times "
+                f"with very similar arguments. Try a different tool or approach."
+            )
+
+    # 6. Context amnesia: re-reading files already in _files_seen
+    files_seen = state.get("_files_seen", [])
+    if files_seen and len(history) >= 2:
+        last_entry = history[-1]
+        cmd = (last_entry.get("command") or "").strip()
+        # Check if this is a read of a known file
+        for fp in files_seen[-20:]:  # check recent files
+            if fp and fp in cmd and any(cmd.startswith(p) for p in
+                    ("fs.read", "/tool fs.read", "cat ", "head ", "tail ")):
+                warnings.append(
+                    f"Context amnesia: you're re-reading `{fp}` which you already "
+                    f"examined earlier. Refer to your previous output instead of "
+                    f"re-reading."
+                )
+                break
+
+    # 7. Goal drift: shortTermMemory mentions actions unrelated to task
+    if original_input and len(history) >= 10:
+        task_keywords = set(re.findall(r'\w+', original_input.lower()))
+        task_keywords -= {"the", "a", "an", "is", "to", "and", "or", "in", "of",
+                          "for", "with", "on", "at", "by", "it", "this", "that"}
+        if len(task_keywords) >= 3:
+            recent_memory = state.get("shortTermMemory", "")[-500:]
+            memory_words = set(re.findall(r'\w+', recent_memory.lower()))
+            overlap = task_keywords & memory_words
+            # If less than 20% of task keywords appear in recent memory, possible drift
+            if len(overlap) < max(2, len(task_keywords) * 0.2):
+                warnings.append(
+                    f"Possible goal drift: recent actions seem unrelated to the "
+                    f"original task '{original_input[:60]}'. "
+                    f"Refocus on the original objective."
+                )
 
     return warnings
 
@@ -1133,6 +1282,11 @@ def _build_user_message(original_input: str, state: dict, memory_entries: list,
     output), then progressively older / more-derived context (history,
     memory, sibling terminals). This is the inverse of the old layout where
     the task was buried at the bottom.
+
+    Enhanced with:
+    - <workflow_phase> section (when a workflow is active)
+    - <behavior_diagnostics> section (enhanced loop warnings)
+    - <role_identity> section (for sub-agents with specialized roles)
     """
     terminal_section = _build_terminal_section(state)
     conversation_section = _build_conversation_section(chat_history)
@@ -1151,6 +1305,47 @@ def _build_user_message(original_input: str, state: dict, memory_entries: list,
     if files_seen:
         files_block = f"\n<files_seen>\n  {', '.join(files_seen[-15:])}\n</files_seen>\n"
 
+    # Workflow phase section
+    workflow_block = ""
+    wf = workflow_engine.get_active_workflow()
+    if wf and not wf.completed:
+        current = wf.current
+        if current:
+            workflow_block = (
+                f"\n<workflow_phase>\n"
+                f"  workflow: {wf.name} — {wf.description}\n"
+                f"  progress: {wf.progress_str}\n"
+                f"  current: {current.name} — {current.description}\n"
+            )
+            # Show auto-spawn hint if phase has spawn_agents
+            if current.spawn_agents:
+                workflow_block += f"  hint: consider spawning {', '.join(current.spawn_agents)} agent(s)\n"
+            if current.requires_user_input:
+                workflow_block += "  ⚠️  This phase requires user confirmation before advancing.\n"
+            workflow_block += "</workflow_phase>\n"
+
+    # Role identity section (for sub-agents)
+    role_block = ""
+    role_name = state.get("_role_name")
+    if role_name:
+        role_obj = agent_roles.get_role(role_name)
+        if role_obj:
+            role_block = (
+                f"\n<role_identity>\n"
+                f"  You are operating as: {role_obj.name} ({role_obj.description})\n"
+            )
+            if role_obj.allowed_tools:
+                role_block += f"  Allowed tools: {', '.join(role_obj.allowed_tools)}\n"
+            if role_obj.confidence_threshold > 0:
+                role_block += f"  Confidence threshold: only report findings >= {role_obj.confidence_threshold}/100\n"
+            role_block += "</role_identity>\n"
+
+    # Active tasks section
+    tasks_snapshot = task_manager.get_active_tasks_snapshot()
+    tasks_block = ""
+    if tasks_snapshot:
+        tasks_block = f"\n<active_tasks>\n{tasks_snapshot}\n</active_tasks>\n"
+
     return f"""<task>
 {original_input}
 </task>
@@ -1158,7 +1353,7 @@ def _build_user_message(original_input: str, state: dict, memory_entries: list,
 <progress>
 step {loop+1}/{max_loops} — {n_steps} command(s) executed so far
 </progress>
-{warnings_block}{files_block}
+{warnings_block}{files_block}{workflow_block}{role_block}{tasks_block}
 <recent_terminal_output>
 {terminal_section}
 </recent_terminal_output>
@@ -1222,8 +1417,22 @@ def _load_loop_commands():
 
 
 def _execute_parent_command(cmd: str) -> str:
-    """Execute a command in the parent process context so side effects
-    (cd, clear, etc.) apply to the parent terminal, not a child PTY."""
+    """Execute a command in the parent process context.
+
+    Prefer term0's persistent bash session (marker-poll) so cd, export,
+    aliases all persist. Fall back to subprocess.run if term0 is dead.
+    This function is only called from _process_parent_cmd_marker for the
+    parent() loop command at depth 0.
+    """
+    # Try term0's marker-poll path
+    term0_info = get_terminal("term0")
+    if (term0_info and term0_info.session
+            and getattr(term0_info.session, 'is_alive', lambda: False)()):
+        try:
+            return _marker_poll_simple(term0_info.session, cmd)
+        except Exception:
+            pass
+    # Fallback: subprocess.run (cd won't persist, but it's a last resort)
     stripped = cmd.strip()
     if stripped in ("cd",) or stripped.startswith("cd "):
         path = stripped[3:].strip() if stripped.startswith("cd ") else os.path.expanduser("~")
@@ -1246,6 +1455,107 @@ def _execute_parent_command(cmd: str) -> str:
         return f"Parent command timed out: {cmd}"
     except Exception as e:
         return f"Parent command error: {e}"
+
+
+def _marker_poll_simple(session, command: str, timeout: float = 30) -> str:
+    """Run a command through a persistent bash via marker-poll. Returns output string.
+
+    Lightweight version of tools.py's _bi_shell_exec marker-poll.
+    Also syncs CWD to the parent process after execution.
+    """
+    import uuid as _uuid
+    import re as _re
+
+    marker_id = _uuid.uuid4().hex[:8]
+    start_marker = f"__CMD_BEGIN_{marker_id}__"
+    end_marker = f"__CMD_END_{marker_id}__"
+    wrapped = f"echo {start_marker}; {command} 2>&1; __laintas_rc=$?; echo {end_marker}:$__laintas_rc"
+
+    try:
+        old_len = len(session.raw_output)
+    except AttributeError:
+        old_len = len(session.full_output)
+
+    session.send_keys(wrapped + "\n")
+    poll_start = time.time()
+    cmd_output = ""
+
+    while time.time() - poll_start < timeout:
+        time.sleep(0.08)
+        session.read_output(timeout=0.1)
+        try:
+            raw = session.raw_output
+        except AttributeError:
+            raw = session.full_output
+        new_content = raw[old_len:] if old_len > 0 else raw
+
+        end_match = _re.search(rf'{_re.escape(end_marker)}:(\d+)', new_content)
+        if end_match:
+            starts = list(_re.finditer(
+                rf'{_re.escape(start_marker)}(?=[\r\n]|$)', new_content))
+            if starts:
+                valid = [m for m in starts if m.end() < end_match.start()]
+                chosen = valid[-1] if valid else starts[-1]
+                body_start = chosen.end()
+                while body_start < len(new_content) and new_content[body_start] in '\r\n':
+                    body_start += 1
+                cmd_output = new_content[body_start:end_match.start()]
+                cmd_output = cmd_output.rstrip('\r\n').strip()
+            # Sync CWD after command
+            try:
+                _sync_cwd_from_session(session)
+            except Exception:
+                pass
+            return cmd_output or "(no output)"
+        if not session.is_alive():
+            break
+
+    return cmd_output or "(no output)"
+
+
+def _sync_cwd_from_session(session) -> None:
+    """Sync parent process CWD from a persistent bash session via marker-poll pwd."""
+    import uuid as _uuid
+    import re as _re
+
+    marker_id = _uuid.uuid4().hex[:8]
+    start_marker = f"__CMD_BEGIN_{marker_id}__"
+    end_marker = f"__CMD_END_{marker_id}__"
+    wrapped = f"echo {start_marker}; pwd; echo {end_marker}"
+
+    try:
+        old_len = len(session.raw_output)
+    except AttributeError:
+        old_len = len(session.full_output)
+
+    session.send_keys(wrapped + "\n")
+    poll_start = time.time()
+
+    while time.time() - poll_start < 2.0:
+        time.sleep(0.1)
+        session.read_output(timeout=0.1)
+        try:
+            raw = session.raw_output
+        except AttributeError:
+            raw = session.full_output
+        new_content = raw[old_len:] if old_len > 0 else raw
+
+        end_match = _re.search(rf'{_re.escape(end_marker)}', new_content)
+        if end_match:
+            starts = list(_re.finditer(
+                rf'{_re.escape(start_marker)}(?=[\r\n]|$)', new_content))
+            if starts:
+                valid = [m for m in starts if m.end() < end_match.start()]
+                chosen = valid[-1] if valid else starts[-1]
+                body_start = chosen.end()
+                while body_start < len(new_content) and new_content[body_start] in '\r\n':
+                    body_start += 1
+                pwd_result = new_content[body_start:end_match.start()].strip().rstrip('\r\n')
+                if pwd_result and os.path.isdir(pwd_result) and pwd_result != os.getcwd():
+                    os.chdir(pwd_result)
+            break
+        if not session.is_alive():
+            break
 
 
 def _check_policy(command: str, agent_id: str = None,
@@ -1283,6 +1593,47 @@ def _process_parent_cmd_marker(cmd_output: str) -> tuple:
     cleaned = _re.sub(r'__PARENT_CMD__:[^\n]*\n?', '', cmd_output).strip()
     result = _execute_parent_command(cmd)
     return cleaned, result
+
+
+def _salient_arg(name: str, arguments: dict) -> str:
+    """Pick the most user-meaningful argument from a tool call.
+
+    Used for: terminalHistory entry labels (so file-tracking regex matches),
+    REPL streaming preview (so the user sees `git diff` not `shell.exec`),
+    and per-call hook context.
+    """
+    if not isinstance(arguments, dict):
+        return name
+    if name == "shell.exec":
+        return arguments.get("command", "") or ""
+    if name == "terminal.send":
+        return f'{arguments.get("name", "?")}: {arguments.get("command", "")}'
+    if name in ("fs.read", "fs.write", "fs.edit", "fs.multi_edit", "fs.diff"):
+        return arguments.get("path", "") or ""
+    if name == "fs.grep":
+        return f'{arguments.get("pattern", "")} in {arguments.get("path", "")}'
+    if name == "fs.glob":
+        return arguments.get("pattern", "") or ""
+    if name == "fs.ls":
+        return arguments.get("path", ".") or "."
+    if name == "agent.spawn":
+        return (arguments.get("task") or "")[:80]
+    if name == "agent.tell":
+        return f'{arguments.get("agent_id", "?")}: {(arguments.get("message") or "")[:60]}'
+    if name in ("agent.wait", "agent.abort", "agent.switch"):
+        return arguments.get("agent_id", "") or ""
+    if name in ("web.fetch",):
+        return arguments.get("url", "") or ""
+    if name == "web.search":
+        return arguments.get("query", "") or ""
+    if name == "mem.save":
+        return (arguments.get("content") or arguments.get("name", ""))[:80]
+    if name == "sleep":
+        return f'{arguments.get("seconds", 1)}s'
+    try:
+        return f'{name} {json.dumps(arguments, ensure_ascii=False)[:60]}'
+    except (TypeError, ValueError):
+        return name
 
 
 def _format_tool_result_for_loop(tool_name: str, result: dict, max_chars: int) -> str:
@@ -1346,6 +1697,121 @@ def _format_tool_result_for_loop(tool_name: str, result: dict, max_chars: int) -
     return text
 
 
+def _render_tool_catalog(state: dict, loop: int) -> str:
+    """Full catalog on turn 1 (or after an unknown-tool error); short reminder
+    afterwards. Saves ~5KB × max_loops per task on follow-up turns."""
+    if loop == 0 or state.get("_force_full_catalog_next"):
+        state["_force_full_catalog_next"] = False
+        return tools_mod.get_registry().describe_for_prompt()
+    return tools_mod.get_registry().describe_short_reminder()
+
+
+def _render_tool_catalog_enhanced(state: dict, loop: int, depth: int = 0) -> str:
+    """Layered tool catalog rendering:
+    - Tools allowed by current workflow phase / role: full description
+    - Other tools: name only
+    - Role catalog appended when at depth > 0
+
+    Falls back to the standard catalog when no workflow/role is active.
+    """
+    role_name = state.get("_role_name")
+    wf_active = workflow_engine.get_active_workflow() is not None
+
+    # If neither workflow nor role is active, use the standard catalog
+    if not wf_active and not role_name:
+        base = _render_tool_catalog(state, loop)
+        # Append role catalog for sub-agents
+        if depth > 0:
+            role_section = agent_roles.describe_roles_for_prompt()
+            if role_section:
+                base += f"\n\n{role_section}"
+        return base
+
+    # Build layered rendering
+    registry = tools_mod.get_registry()
+    all_tools = registry.list()
+
+    # Determine allowed tools from workflow + role
+    allowed = None  # None means all allowed
+    if wf_active:
+        current_phase = workflow_engine.get_active_workflow().current
+        if current_phase and current_phase.allowed_tools:
+            allowed = set(current_phase.allowed_tools)
+    if role_name:
+        role = agent_roles.get_role(role_name)
+        if role and role.allowed_tools:
+            role_tools = set(role.allowed_tools)
+            allowed = role_tools if allowed is None else allowed & role_tools
+
+    if allowed is None:
+        # No restrictions — full catalog
+        base = _render_tool_catalog(state, loop)
+    else:
+        # Layered: allowed tools get full description, others get name-only
+        lines = []
+        if loop == 0 or state.get("_force_full_catalog_next"):
+            state["_force_full_catalog_next"] = False
+            allowed_lines = []
+            other_lines = []
+            for t in all_tools:
+                if t.name in allowed:
+                    allowed_lines.append(f"  {t.name}: {t.description[:120]}")
+                else:
+                    other_lines.append(t.name)
+            lines.append("=== ALLOWED TOOLS (this phase/role) ===")
+            lines.extend(allowed_lines)
+            if other_lines:
+                lines.append(f"\n=== OTHER TOOLS (blocked) ===")
+                lines.append(f"  {', '.join(other_lines[:30])}")
+        else:
+            allowed_names = [t.name for t in all_tools if t.name in allowed]
+            lines.append(f"Allowed tools: {', '.join(allowed_names)}")
+        base = "\n".join(lines)
+
+    # Append role catalog for sub-agents
+    if depth > 0:
+        role_section = agent_roles.describe_roles_for_prompt()
+        if role_section:
+            base += f"\n\n{role_section}"
+
+    return base
+
+
+def _format_parallel_results(inbox_msgs: list) -> str:
+    """Aggregate child-done / child-error messages into a structured block.
+
+    Returns a formatted string for {{parallelResults}}, or empty if none.
+    """
+    if not inbox_msgs:
+        return ""
+
+    results = []
+    for msg in inbox_msgs:
+        if not isinstance(msg, dict):
+            continue
+        kind = msg.get("kind", "")
+        if kind not in ("child-done", "child-error"):
+            continue
+        from_agent = msg.get("from", "unknown")
+        status = msg.get("status", "unknown")
+        if kind == "child-done":
+            summary = msg.get("summary", "(no summary)")
+            results.append(
+                f"[{from_agent}] ✅ {status}\n{summary[:500]}"
+            )
+        else:
+            error = msg.get("error", "(no error)")
+            results.append(
+                f"[{from_agent}] ❌ error: {error[:300]}"
+            )
+
+    if not results:
+        return ""
+
+    header = f"## Sub-Agent Results ({len(results)} agent(s) completed)"
+    return f"{header}\n\n" + "\n\n---\n\n".join(results)
+
+
 def run_agent_loop(
     deps: LoopDeps,
     original_input: str,
@@ -1398,6 +1864,10 @@ def run_agent_loop(
         deps.display_sub_terminal_preview = lambda *a, **kw: None
 
     max_loops = int(get_runtime_config("max_loops"))
+    # Workflow phase may override max_loops (e.g. implementation phase gets more)
+    _wf_max = workflow_engine.get_phase_max_loops()
+    if _wf_max > 0:
+        max_loops = _wf_max
     # Phase 2: lookup own AgentInfo once for the lifetime of this loop call.
     # Sub-agent threads MUST pass agent_id explicitly — relying on the global
     # _current_agent_id is racy when multiple agents run concurrently.
@@ -1465,6 +1935,18 @@ def run_agent_loop(
             children_str = "(none)"
             parent_str = "(none)"
 
+        # Terminal / deployment context
+        terminal_name_str = (
+            getattr(current_agent, "home_terminal", None)
+            or (current_agent.stationed_terminal if current_agent else None)
+            or "(none)"
+        )
+        parent_terminal_str = (
+            getattr(current_agent, "parent_terminal", None)
+            if current_agent else None
+        ) or "(none)"
+        deployment_status_str = _format_deployment(current_agent)
+
         system_prompt = prompt_template \
             .replace("{{globalMemory}}", global_memory_str) \
             .replace("{{persistentMemory}}", memory_system.get_memory_context()) \
@@ -1478,7 +1960,45 @@ def run_agent_loop(
             .replace("{{inbox}}", inbox_str) \
             .replace("{{children}}", children_str) \
             .replace("{{parent}}", parent_str) \
-            .replace("{{tools}}", tools_mod.get_registry().describe_for_prompt())
+            .replace("{{terminalName}}", terminal_name_str) \
+            .replace("{{parentTerminal}}", parent_terminal_str) \
+            .replace("{{deploymentStatus}}", deployment_status_str) \
+            .replace("{{tools}}", _render_tool_catalog_enhanced(state, loop, depth))
+
+        # ── Extended template variables (from agent_roles, workflow_engine, etc.) ──
+
+        # {{workflowPhase}} — active workflow phase guidance
+        workflow_section = workflow_engine.render_workflow_section()
+        system_prompt = system_prompt.replace("{{workflowPhase}}", workflow_section)
+
+        # {{rolePrompt}} — specialized role system prompt (for sub-agents)
+        role_name = state.get("_role_name")
+        role_prompt = agent_roles.get_role_system_prompt(role_name) if role_name else ""
+        system_prompt = system_prompt.replace("{{rolePrompt}}", role_prompt)
+
+        # {{confidenceGuidance}} — confidence scoring instructions (for reviewer roles)
+        if role_name and agent_roles.get_role(role_name) and agent_roles.get_role(role_name).confidence_threshold > 0:
+            threshold = agent_roles.get_role(role_name).confidence_threshold
+            confidence_guidance = (
+                f"## Confidence Filtering\n"
+                f"You are operating as a specialized reviewer. Rate each finding "
+                f"0-100 confidence. Only report findings with confidence >= {threshold}. "
+                f"Quality over quantity — do not report low-confidence issues."
+            )
+        else:
+            confidence_guidance = ""
+        system_prompt = system_prompt.replace("{{confidenceGuidance}}", confidence_guidance)
+
+        # {{skillContext}} — activated skill bodies (placeholder; skills.py handles)
+        system_prompt = system_prompt.replace("{{skillContext}}",
+                                               state.get("_skill_context", ""))
+
+        # {{parallelResults}} — aggregated sub-agent results from inbox
+        parallel_results_str = _format_parallel_results(inbox_msgs)
+        system_prompt = system_prompt.replace("{{parallelResults}}", parallel_results_str)
+
+        # {{behaviorDiagnostics}} — empty placeholder (filled in user message)
+        system_prompt = system_prompt.replace("{{behaviorDiagnostics}}", "")
 
         # 5. Build user message via the structured-section helper.
         terminal_section = _build_terminal_section(state)
@@ -1604,9 +2124,9 @@ def run_agent_loop(
         # ── Debug: capture AI response ──
         debug_entry.response_raw = response
         debug_entry.reply = response.get("reply", "") or ""
-        debug_entry.command = (response.get("command") or "").strip()
-        debug_entry.memory = (response.get("memory") or "").strip()
-        debug_entry.done = response.get("done", False)
+        tool_calls = response.get("tool_calls") or []
+        debug_entry.command = ", ".join(tc.get("name", "?") for tc in tool_calls) if tool_calls else ""
+        debug_entry.done = response.get("done", len(tool_calls) == 0)
         debug_entry.error = response.get("error", False)
         debug_entry.billing = response.get("_billing", {})
 
@@ -1618,16 +2138,56 @@ def run_agent_loop(
             break
 
         reply = response.get("reply") or ""
-        command = (response.get("command") or "").strip()
-        memory = (response.get("memory") or "").strip()
-        done = response.get("done", False)
+        done = response.get("done", len(tool_calls) == 0)
         billing = response.get("_billing", {})
 
+        # ── JSON repair: model produced something that looked like JSON but
+        # didn't parse. Nudge it once or twice instead of giving up. ──
+        if response.get("_repair_needed"):
+            attempts = state.get("_repair_count", 0)
+            if attempts < 2:
+                state["_repair_count"] = attempts + 1
+                raw_excerpt = (response.get("_raw") or "")[:200]
+                state["shortTermMemory"] += (
+                    f"\n  ⚠ Malformed JSON (attempt {attempts+1}/2). "
+                    f"Raw start: {raw_excerpt!r}"
+                )
+                if events_cb is not None:
+                    deps.console.print(
+                        f"[yellow]Response was not valid JSON — retrying (attempt {attempts+1}/2)[/yellow]")
+                # Skip dispatch this turn; next iteration's user_input will
+                # carry an inline error reminder built by _build_user_message
+                # (which reads state['_repair_count']).
+                add_debug_log(debug_entry)
+                if loop < max_loops - 1:
+                    try:
+                        time.sleep(0.5)
+                    except KeyboardInterrupt:
+                        break
+                memory_entries = _read_memory(deps)
+                user_input = _build_user_message(
+                    original_input, state, memory_entries, chat_history, loop, max_loops,
+                )
+                # Append repair nudge to user_input directly so the model sees it
+                user_input += (
+                    f"\n\n<json_error>Your previous response did not parse as valid JSON. "
+                    f"Emit exactly ONE JSON object: "
+                    f'{{\"reply\": \"...\", \"tool_calls\": [{{\"name\": \"...\", \"arguments\": {{...}}}}]}}.'
+                    f" No prose outside the object. No code fences. "
+                    f"Raw start of last attempt: {raw_excerpt!r}</json_error>"
+                )
+                continue
+            else:
+                state["shortTermMemory"] += "\n  -Error: JSON repair gave up after 2 attempts"
+                add_debug_log(debug_entry)
+                break
+        else:
+            state["_repair_count"] = 0
+
         # ── Detect "silent failure": model generated tokens but backend
-        # extracted nothing into reply/command/memory. This means the model's
-        # output didn't match the expected JSON schema. Retrying wastes tokens
-        # — bail out immediately with a useful message.
-        if not reply and not command and not memory and not done:
+        # extracted nothing. This means the model's output didn't match the
+        # expected JSON schema. Bail out immediately with a useful message.
+        if not reply and not tool_calls:
             completion_tokens = (billing or {}).get("completionTokens", 0)
             if completion_tokens > 0:
                 msg = (
@@ -1650,6 +2210,28 @@ def run_agent_loop(
             state["lastReply"] = reply
             if events_cb is not None:
                 pending_events.append({"type": "ai", "content": reply})
+                # Flush immediately — don't wait for tool_calls or done
+                events_cb(pending_events)
+                pending_events.clear()
+
+        # ── Handle JSON parse failure: nudge the model ──
+        # When model outputs pure prose instead of JSON, show a subtle hint
+        # and inject a reminder into the next turn.
+        _nudge_needed = False
+        if response.get("_parse_failed"):
+            _nudge_needed = True
+            _parse_fail_count = state.get("_parse_fail_count", 0) + 1
+            state["_parse_fail_count"] = _parse_fail_count
+            if events_cb is not None:
+                if _parse_fail_count == 1:
+                    deps.console.print(f"[dim yellow](formatting issue — asking AI to retry)[/dim yellow]")
+                elif _parse_fail_count >= 3:
+                    deps.console.print(f"[yellow]AI failed to use JSON format {_parse_fail_count} times. Consider rephrasing your request.[/yellow]")
+                    # Reset counter to avoid spamming
+                    state["_parse_fail_count"] = 0
+        else:
+            # Reset counter on successful parse
+            state["_parse_fail_count"] = 0
 
         # 7. Show billing if available (only in interactive mode)
         if billing:
@@ -1660,685 +2242,278 @@ def run_agent_loop(
                 if events_cb is not None:
                     deps.console.print(f"[dim]({billing_text})[/dim]")
                     pending_events.append({"type": "system", "kind": "billing", "content": billing_text})
-
-        # 8. Write memory to .helpwo (append / modify / delete)
-        if memory:
-            mem_result = _apply_memory(deps, memory)
-            if events_cb is not None:
-                deps.console.print(f"[dim cyan]{mem_result}[/dim cyan]")
-                pending_events.append({"type": "system", "kind": "memory", "content": mem_result[:200]})
-
-        # 9. Handle command dispatch (close_session/send_keys normalized to /session close, /keys)
-
-        # ── Pre-check: .loop_command.py custom handler ──
-        # Called BEFORE the if-elif chain so that when the handler returns None
-        # (passes), the command falls through to the stationed/unstationed split.
-        loop_result = None
-        loop_exception = None
-        if command:
-            loop_handler = _load_loop_commands()
-            if loop_handler:
-                ctx = {
-                    "deps": deps, "state": state, "debug_entry": debug_entry,
-                    "chat_history": chat_history,
-                    "interactive_session_ref": [interactive_session],
-                    "events_cb": events_cb, "pending_events_ref": [pending_events],
-                    "get_terminal": get_terminal, "get_all_terminals": get_all_terminals,
-                    "register_terminal": register_terminal,
-                    "unregister_terminal": unregister_terminal,
-                    "close_all_terminals": close_all_terminals,
-                    "get_agent": get_agent, "get_all_agents": get_all_agents,
-                    "get_current_agent": get_current_agent,
-                    "switch_to_agent": switch_to_agent,
-                    "station_agent": station_agent, "unstation_agent": unstation_agent,
-                    "get_config": get_runtime_config,
-                    "set_config": set_runtime_config,
-                    "list_config": list_runtime_config,
-                    "reset_config": reset_runtime_config,
-                    "depth": depth,
-                }
-                try:
-                    loop_result = loop_handler(command, ctx)
-                except Exception as e:
-                    loop_exception = e
-
-        if loop_result is not None:
-            state["lastOutput"] = loop_result
-            debug_entry.exec_command = command
-            if events_cb is not None:
-                pending_events.append({"type": "system", "kind": "command", "content": command})
-        elif loop_exception is not None:
-            if events_cb is not None:
-                deps.console.print(f"[red].loop_command.py error: {loop_exception}[/red]")
-            state["lastOutput"] = f".loop_command.py error: {loop_exception}"
-        elif command:
-            # ── Meta-command: /session close ────────────────────────────
-            if re.match(r'^/session\s+close\s*$', command):
-                if interactive_session is not None:
-                    deps.console.print(f"[dim yellow]Closing session: {interactive_session.command[:60]}[/dim yellow]")
-                    if events_cb is not None:
-                        pending_events.append({"type": "system", "kind": "close_session", "content": interactive_session.command[:200]})
-                    interactive_session.close()
-                    cmd_output = deps.strip_ansi(interactive_session.full_output)
-                    debug_entry.exec_command = command
-                    debug_entry.exec_stdout = cmd_output
-                    debug_entry.exec_returncode = interactive_session.returncode
-                    state["lastOutput"] = cmd_output.strip() or "(no output)"
-                    if events_cb is not None:
-                        pending_events.append({"type": "system", "kind": "output", "content": cmd_output[:2000]})
-                        events_cb(pending_events)
-                        pending_events.clear()
-                    deps.display_command_output(interactive_session.command, interactive_session.returncode, cmd_output, depth=depth + 1)
-                    interactive_session = None
-                else:
-                    deps.console.print("[yellow]Warning: no active session to close[/yellow]")
-                    state["lastOutput"] = "Warning: no active session to close"
-                    debug_entry.exec_command = command
-                    debug_entry.exec_returncode = -1
-
-            # ── Meta-command: /keys <text> ─────────────────────────────
-            elif (_meta_keys := re.match(r'^/keys\s+(.*)$', command)):
-                keys = _meta_keys.group(1)
-                if interactive_session is not None:
-                    _ks = keys[:60]
-                    _suf = "" if len(keys) <= 60 else "..."
-                    deps.console.print(f"[dim yellow]> {_ks}{_suf}[/dim yellow]")
-                    if events_cb is not None:
-                        pending_events.append({"type": "system", "kind": "send_keys", "content": keys[:200]})
-                    interactive_session.send_keys(keys)
-                    time.sleep(0.3)
-                    new_output = interactive_session.read_output(timeout=0.5)
-                    cmd_output = deps.strip_ansi(interactive_session.full_output)
-                    debug_entry.exec_command = command
-                    debug_entry.exec_stdout = cmd_output
-                    debug_entry.exec_returncode = interactive_session.returncode
-                    debug_entry.session_command = interactive_session.command
-                    state["lastOutput"] = cmd_output.strip() or "(no output)"
-                    if events_cb is not None:
-                        pending_events.append({"type": "system", "kind": "output", "content": cmd_output[:2000]})
-                        events_cb(pending_events)
-                        pending_events.clear()
-                    if not interactive_session.is_alive():
-                        deps.display_command_output(interactive_session.command, interactive_session.returncode, cmd_output, depth=depth + 1)
-                        interactive_session = None
-                    else:
-                        deps.display_command_output(interactive_session.command, -1, new_output, depth=depth + 1)
-                else:
-                    deps.console.print("[yellow]Warning: /keys ignored (no active interactive session)[/yellow]")
-                    state["lastOutput"] = "Warning: /keys ignored (no active interactive session)"
-                    debug_entry.exec_command = command
-                    debug_entry.exec_returncode = -1
-
-            # ── Meta-command: /station [name] ────────────────────────────
-            elif (_meta_station := re.match(r'^/(?:station|st)(?:\s+(\S+))?\s*$', command)):
-                if _meta_station and _meta_station.group(1):
-                    name = _meta_station.group(1)
-                else:
-                    name = "main"
-
-                existing_term = get_terminal(name)
-                if existing_term and existing_term.session and not existing_term.session.is_alive():
-                    unregister_terminal(name)
-                    existing_term = None
-                if existing_term is None:
-                    register_terminal(None, name, depth, name=name)
-
-                current_agent = get_current_agent()
-                if current_agent:
-                    station_agent(current_agent.id, name)
-                label = "current terminal" if name == "main" else f"terminal {name}"
-                state["lastOutput"] = f"Stationed in {label}"
-                debug_entry.exec_command = command
-                debug_entry.exec_returncode = 0
-                if events_cb is not None:
-                    deps.console.print(
-                        f"[dim green]Stationed in {label}[/dim green]")
-                    pending_events.append({"type": "system", "kind": "command", "content": command})
                     events_cb(pending_events)
                     pending_events.clear()
 
-            # ── Meta-command: /terminate <name> ─────────────────────────
-            elif (_meta_terminate := re.match(r'^/terminate\s+(\S+)\s*$', command)):
-                target = _meta_terminate.group(1)
-                term = get_terminal(target)
-                if term:
-                    for aid in list(term.stationed_agent_ids):
-                        unstation_agent(aid)
-                if unregister_terminal(target):
-                    if events_cb is not None:
-                        deps.console.print(
-                            f"[dim yellow]- Terminated [bold]{target}[/bold][/dim yellow]")
-                    state["lastOutput"] = f"Terminated {target}"
+        # 8. Dispatch tool_calls through the unified tool registry.
+        # Per-call: pre_tool hook → (shell-flavored) policy + pre_command → loop_command override
+        # → registry.invoke → post_tool hook → (shell-flavored) post_command + display
+        # → __PARENT_CMD__ marker scan → terminalHistory row (one per call).
+        MAX_TC_PER_TURN = 8
+        if len(tool_calls) > MAX_TC_PER_TURN:
+            _truncated_n = len(tool_calls)
+            tool_calls = tool_calls[:MAX_TC_PER_TURN]
+            state["shortTermMemory"] += (
+                f"\n  ⚠ Emitted {_truncated_n} tool calls; only first {MAX_TC_PER_TURN} ran. "
+                f"Be more selective next turn."
+            )
+
+        formatted_outputs: list[str] = []
+        per_call_rows: list[dict] = []
+
+        if tool_calls:
+            # Resolve stationed terminal for this agent (if any)
+            _stationed_session = None
+            if current_agent and getattr(current_agent, "stationed_terminal", None):
+                _stationed_term_info = get_terminal(current_agent.stationed_terminal)
+                if _stationed_term_info and _stationed_term_info.session and _stationed_term_info.session.is_alive():
+                    _stationed_session = _stationed_term_info.session
+
+            for idx, tc in enumerate(tool_calls):
+                name = tc.get("name", "")
+                arguments = tc.get("arguments", {}) or {}
+                if not name:
+                    continue
+                if not isinstance(arguments, dict):
+                    arguments = {"value": arguments}
+
+                call_id = f"call_{loop+1:02d}_{idx+1:02d}"
+                salient = _salient_arg(name, arguments)
+                is_shell_flavored = name in ("shell.exec", "terminal.send")
+
+                # ── Role / Workflow tool filtering ──
+                _role_name = state.get("_role_name")
+                if not agent_roles.is_tool_allowed_for_role(name, _role_name):
+                    result = {"ok": False,
+                              "error": f"BLOCKED: tool '{name}' not allowed for role '{_role_name}'",
+                              "tool": name, "returncode": -1}
+                    formatted_outputs.append(
+                        _format_tool_result_for_loop(name, result, int(get_runtime_config("output_truncate") or 3000)))
+                    per_call_rows.append({
+                        "command": salient, "output": result.get("error", ""),
+                        "returncode": -1, "tool": name, "call_id": call_id,
+                    })
+                    continue
+                if not workflow_engine.is_tool_allowed_in_workflow(name):
+                    result = {"ok": False,
+                              "error": f"BLOCKED: tool '{name}' not allowed in current workflow phase",
+                              "tool": name, "returncode": -1}
+                    formatted_outputs.append(
+                        _format_tool_result_for_loop(name, result, int(get_runtime_config("output_truncate") or 3000)))
+                    per_call_rows.append({
+                        "command": salient, "output": result.get("error", ""),
+                        "returncode": -1, "tool": name, "call_id": call_id,
+                    })
+                    continue
+
+                # ── pre_tool hook (universal, can block) ──
+                pre_tool_allowed, _ = hooks_mod.trigger("pre_tool", {
+                    "tool": name, "args": arguments, "agent_id": agent_id,
+                    "depth": depth, "call_id": call_id, "loop": loop + 1,
+                })
+                if not pre_tool_allowed:
+                    result = {"ok": False, "error": "blocked by pre_tool hook",
+                              "tool": name, "returncode": -1}
                 else:
-                    state["lastOutput"] = f"Warning: terminal '{target}' not found"
-                debug_entry.exec_command = command
-                debug_entry.exec_returncode = 0
-                if events_cb is not None:
-                    pending_events.append({"type": "system", "kind": "close_session", "content": target})
-                    events_cb(pending_events)
-                    pending_events.clear()
+                    # ── Shell-flavored: policy + pre_command + .loop_command.py ──
+                    skip_invoke = False
+                    if is_shell_flavored:
+                        policy_ok, policy_reason, policy_approval = _check_policy(
+                            salient, agent_id=agent_id, events_cb=events_cb, deps=deps)
+                        if not policy_ok:
+                            result = {"ok": False, "error": f"BLOCKED: {policy_reason}",
+                                      "tool": name, "returncode": -1, "policy": "deny"}
+                            skip_invoke = True
+                        elif policy_approval:
+                            state["shortTermMemory"] += f"\n  ⚠ Policy: {policy_reason}"
 
-            # ── Meta-command: /send <name> <cmd> ────────────────────────
-            elif (_meta_send := re.match(r'^/send\s+(\S+)\s+(.+)$', command)):
-                target = _meta_send.group(1)
-                keys = _meta_send.group(2)
-                term = get_terminal(target)
-                if term is None:
-                    state["lastOutput"] = f"Error: terminal '{target}' not found"
-                    if events_cb is not None:
-                        deps.console.print(f"[yellow]Warning: terminal '{target}' not found[/yellow]")
-                elif not (term.session and term.session.is_alive()):
-                    state["lastOutput"] = f"Warning: terminal '{target}' is dead"
-                    if events_cb is not None:
-                        deps.console.print(f"[yellow]Warning: terminal '{target}' is dead[/yellow]")
-                else:
-                    _ks = keys[:60]
-                    _suf = "" if len(keys) <= 60 else "..."
-                    if events_cb is not None:
-                        deps.console.print(f"[dim yellow]> /send {target} {_ks}{_suf}[/dim yellow]")
-                    term.session.send_keys(keys + "\n")
-                    time.sleep(0.3)
-                    term.session.read_output(timeout=0.5)
-                    cmd_output = deps.strip_ansi(term.session.full_output)
-                    state["lastOutput"] = cmd_output.strip() or "(no output)"
-                    debug_entry.exec_stdout = cmd_output
-                    debug_entry.exec_returncode = term.session.returncode
-                    debug_entry.session_command = f"{target}: {keys}"
-                    if events_cb is not None:
-                        pending_events.append({"type": "system", "kind": "send_keys", "content": keys[:200]})
-                        pending_events.append({"type": "system", "kind": "output", "content": cmd_output[:2000]})
-                        events_cb(pending_events)
-                        pending_events.clear()
-                    if not (term.session and term.session.is_alive()):
-                        if events_cb is not None:
-                            deps.console.print(f"[dim yellow]Terminal [bold]{target}[/bold] exited[/dim yellow]")
-                debug_entry.exec_command = command
-                debug_entry.exec_returncode = -1
+                        if not skip_invoke:
+                            cmd_allowed, _ = hooks_mod.trigger("pre_command", {
+                                "command": salient, "depth": depth, "agent_id": agent_id,
+                                "tool": name, "call_id": call_id,
+                            })
+                            if not cmd_allowed:
+                                result = {"ok": False, "error": "BLOCKED by pre_command hook",
+                                          "tool": name, "returncode": -1}
+                                skip_invoke = True
 
-            # ── Meta-command: /hire ─────────────────────────────────────
-            elif re.match(r'^/hire\s*$', command):
-                agent_info = register_agent(depth=depth)
-                if events_cb is not None:
-                    deps.console.print(
-                        f"[dim green]+ Hired [bold]{agent_info.id}[/bold][/dim green]")
-                state["lastOutput"] = f"Hired {agent_info.id}"
-                debug_entry.exec_command = command
-                debug_entry.exec_returncode = 0
-                if events_cb is not None:
-                    pending_events.append({"type": "system", "kind": "command", "content": command})
-                    events_cb(pending_events)
-                    pending_events.clear()
+                        # .loop_command.py user override (only for shell.exec)
+                        if not skip_invoke and name == "shell.exec":
+                            loop_handler = _load_loop_commands()
+                            if loop_handler:
+                                _loop_ctx = {
+                                    "deps": deps, "state": state, "debug_entry": debug_entry,
+                                    "chat_history": chat_history,
+                                    "interactive_session_ref": [interactive_session],
+                                    "events_cb": events_cb, "pending_events_ref": [pending_events],
+                                    "get_terminal": get_terminal, "get_all_terminals": get_all_terminals,
+                                    "register_terminal": register_terminal,
+                                    "unregister_terminal": unregister_terminal,
+                                    "close_all_terminals": close_all_terminals,
+                                    "get_agent": get_agent, "get_all_agents": get_all_agents,
+                                    "get_current_agent": get_current_agent,
+                                    "switch_to_agent": switch_to_agent,
+                                    "station_agent": station_agent, "unstation_agent": unstation_agent,
+                                    "get_config": get_runtime_config,
+                                    "set_config": set_runtime_config,
+                                    "list_config": list_runtime_config,
+                                    "reset_config": reset_runtime_config,
+                                    "depth": depth,
+                                }
+                                try:
+                                    _override = loop_handler(salient, _loop_ctx)
+                                except Exception as e:
+                                    _override = None
+                                    if events_cb is not None:
+                                        deps.console.print(f"[red].loop_command.py error: {e}[/red]")
+                                if isinstance(_override, str):
+                                    result = {"ok": True, "result": _override,
+                                              "tool": name, "returncode": 0,
+                                              "via": "loop_command"}
+                                    skip_invoke = True
 
-            # ── Meta-command: /agents [name|name <n>|tree] ──────────────
-            elif (_meta_agents := re.match(r'^/agents(?:\s+(.+))?$', command)):
-                rest = (_meta_agents.group(1) or "").strip()
-                if not rest:
-                    agents = get_all_agents()
-                    current = self_info or get_current_agent()
-                    lines = ["Available agents:"]
-                    for a in agents:
-                        marker = " <-- self" if (current and a.id == current.id) else ""
-                        st = f" [stationed: {a.stationed_terminal}]" if a.stationed_terminal else ""
-                        st += f" [{a.status}]" if a.status != "idle" else ""
-                        lines.append(f"  {a.id}: {a.name}{st}{marker}")
-                    state["lastOutput"] = "\n".join(lines)
-                    if events_cb is not None:
-                        deps.console.print("\n".join(lines))
-                elif rest == "tree":
-                    tree = build_agents_tree()
-                    state["lastOutput"] = tree
-                    if events_cb is not None:
-                        deps.console.print(tree)
-                elif rest.startswith("name "):
-                    new_name = rest[5:].strip()
-                    current = self_info or get_current_agent()
-                    if current and rename_agent(current.id, new_name):
-                        state["lastOutput"] = f"Agent renamed to {new_name}"
-                        if events_cb is not None:
-                            deps.console.print(f"[green]Agent renamed to [bold]{new_name}[/bold][/green]")
-                    else:
-                        state["lastOutput"] = "No current agent to rename"
-                else:
-                    if switch_to_agent(rest):
-                        agent = get_agent(rest)
-                        state["lastOutput"] = f"Switched to {agent.name} ({agent.id})"
-                        if events_cb is not None:
-                            deps.console.print(
-                                f"[green]Switched to [bold]{agent.name}[/bold][/green]")
-                    else:
-                        state["lastOutput"] = f"Agent '{rest}' not found"
-                debug_entry.exec_command = command
-                debug_entry.exec_returncode = 0
+                    if not skip_invoke:
+                        # Build ToolCtx with all loop context, including stationed
+                        tool_ctx = tools_mod.ToolCtx(
+                            deps=deps, agent_id=agent_id, session=session,
+                            events_cb=events_cb, cwd=os.getcwd(),
+                            interactive_session=interactive_session,
+                            stationed_terminal=_stationed_session,
+                            get_terminal=get_terminal,
+                            get_all_terminals=get_all_terminals,
+                            register_terminal=register_terminal,
+                            unregister_terminal=unregister_terminal,
+                            get_agent=get_agent, get_all_agents=get_all_agents,
+                            get_current_agent=get_current_agent,
+                            station_agent=station_agent,
+                            unstation_agent=unstation_agent,
+                            send_to_agent=send_to_agent,
+                            wait_for_agent=wait_for_agent,
+                            abort_agent=abort_agent,
+                            spawn_subagent=spawn_subagent,
+                            rename_agent=rename_agent,
+                            switch_to_agent=switch_to_agent,
+                            register_agent_fn=register_agent,
+                            depth=depth,
+                        )
 
-            # ── Meta-command: /spawn [name:] <task> ─────────────────────
-            # In-process sub-agent. Parent continues; child runs in its own
-            # thread and posts {kind:"child-done"|"child-error"} to parent inbox.
-            elif (_meta_spawn := re.match(r'^/spawn\s+(?:(\S+):\s+)?(.+)$', command)):
-                child_name = _meta_spawn.group(1)
-                task = _meta_spawn.group(2).strip()
-                parent_id = (self_info.id if self_info else
-                             (get_current_agent().id if get_current_agent() else None))
-                if parent_id is None:
-                    state["lastOutput"] = "Error: /spawn requires a parent agent context"
-                else:
-                    child_id = spawn_subagent(
-                        parent_id=parent_id, task=task, deps=deps,
-                        name=child_name, session=session, events_cb=events_cb,
-                    )
-                    if child_id is None:
-                        state["lastOutput"] = f"Error: spawn failed (parent '{parent_id}' not found)"
-                    else:
-                        msg = f"Spawned child agent '{child_id}' (parent={parent_id}, task={task[:60]})"
-                        state["lastOutput"] = msg
-                        if events_cb is not None:
-                            deps.console.print(f"[dim green]{msg}[/dim green]")
-                            pending_events.append({"type": "system", "kind": "spawn",
-                                                    "content": child_id,
-                                                    "meta": {"parent": parent_id, "task": task[:200]}})
-                            events_cb(pending_events)
-                            pending_events.clear()
-                debug_entry.exec_command = command
-                debug_entry.exec_returncode = 0
+                        result = tools_mod.get_registry().invoke(name, arguments, tool_ctx)
 
-            # ── Meta-command: /tell <agent_id> <message...> ─────────────
-            elif (_meta_tell := re.match(r'^/tell\s+(\S+)\s+(.+)$', command)):
-                target_id = _meta_tell.group(1)
-                payload = _meta_tell.group(2)
-                # Try parse as JSON for structured payloads; else wrap as text.
-                try:
-                    body = json.loads(payload)
-                    if not isinstance(body, dict):
-                        body = {"kind": "msg", "text": payload}
-                except (ValueError, TypeError):
-                    body = {"kind": "msg", "text": payload}
-                body.setdefault("from", self_info.id if self_info else "unknown")
-                ok = send_to_agent(target_id, body)
-                state["lastOutput"] = (f"Sent to {target_id}: {payload[:120]}"
-                                       if ok else
-                                       f"Error: agent '{target_id}' not found or inbox full")
-                if events_cb is not None and ok:
-                    pending_events.append({"type": "system", "kind": "tell",
-                                            "content": target_id,
-                                            "meta": {"payload": payload[:500]}})
-                debug_entry.exec_command = command
-                debug_entry.exec_returncode = 0 if ok else -1
+                        # Sync back interactive_session (tools may create/close sessions)
+                        if tool_ctx.interactive_session != interactive_session:
+                            interactive_session = tool_ctx.interactive_session
 
-            # ── Meta-command: /wait <agent_id> [timeout] ────────────────
-            # Blocks this agent's loop until target finishes. Default 30s cap.
-            elif (_meta_wait_a := re.match(r'^/wait\s+(\S+)(?:\s+(\d+(?:\.\d+)?))?\s*$', command)):
-                target_id = _meta_wait_a.group(1)
-                t_raw = _meta_wait_a.group(2)
-                try:
-                    t = float(t_raw) if t_raw else 30.0
-                except ValueError:
-                    t = 30.0
-                t = max(0.5, min(t, 300.0))   # clamp 0.5s–5min
-                if events_cb is not None:
-                    deps.console.print(f"[dim]⏳ waiting for {target_id} (≤{t}s)…[/dim]")
-                final = wait_for_agent(target_id, timeout=t)
-                if final is None:
-                    state["lastOutput"] = f"Timeout / not found: {target_id}"
-                    debug_entry.exec_returncode = -1
-                else:
-                    state["lastOutput"] = (f"Agent {target_id} {final.status}: "
-                                            f"{(final.last_reply or '(no reply)')[:500]}")
-                    debug_entry.exec_returncode = 0
-                debug_entry.exec_command = command
+                        # __PARENT_CMD__ marker handling for shell.exec via session
+                        if name == "shell.exec" and result.get("via") in ("stationed", "interactive"):
+                            _cleaned, _parent_result = _process_parent_cmd_marker(result.get("result", "") or "")
+                            if _parent_result is not None:
+                                result["result"] = (_cleaned or "").rstrip() + f"\n[parent] {_parent_result}"
 
-            # ── Meta-command: /abort <agent_id> ─────────────────────────
-            elif (_meta_abort := re.match(r'^/abort\s+(\S+)\s*$', command)):
-                target_id = _meta_abort.group(1)
-                ok = abort_agent(target_id)
-                state["lastOutput"] = (f"Abort signal sent to {target_id}"
-                                        if ok else
-                                        f"Error: agent '{target_id}' not found")
-                if events_cb is not None and ok:
-                    pending_events.append({"type": "system", "kind": "abort",
-                                            "content": target_id})
-                debug_entry.exec_command = command
-                debug_entry.exec_returncode = 0 if ok else -1
-
-            # ── Meta-command: /tool <name> <json_params> ────────────────
-            # Dispatches to the global tool registry (builtins + skills + MCP).
-            # JSON params are optional; missing/invalid → invoke with {}.
-            elif (_meta_tool := re.match(r'^/tool\s+(\S+)(?:\s+(.+))?$', command)):
-                tool_name = _meta_tool.group(1)
-                raw_params = (_meta_tool.group(2) or "").strip()
-                try:
-                    params = json.loads(raw_params) if raw_params else {}
-                    if not isinstance(params, dict):
-                        params = {"value": params}
-                except (ValueError, TypeError):
-                    params = {"raw": raw_params}
-                ctx = tools_mod.ToolCtx(
-                    deps=deps,
-                    agent_id=(self_info.id if self_info else None),
-                    session=session,
-                    events_cb=events_cb,
-                    cwd=os.getcwd(),
-                )
-                # Human-readable status hint: "reading foo.py", "editing bar.py", etc.
-                _action_map = {
-                    "fs.read": "reading", "fs.edit": "editing", "fs.write": "writing",
-                    "fs.multi_edit": "editing", "fs.diff": "diffing", "fs.glob": "globbing",
-                    "fs.grep": "grepping", "fs.ls": "listing", "shell.exec": "running",
-                    "web.fetch": "fetching", "web.search": "searching",
-                }
-                _verb = _action_map.get(tool_name, "invoking")
-                _hint = params.get("path") or params.get("pattern") or params.get("query") or params.get("command") or tool_name
-                if isinstance(_hint, str) and len(_hint) > 60: _hint = _hint[:57] + "..."
-                _status_msg = f"[bold cyan]{_verb}[/bold cyan] [dim]{_hint}[/dim]"
-                _t0 = time.time()
-                if events_cb is not None:
-                    try:
-                        with deps.console.status(_status_msg, spinner="dots"):
-                            result = tools_mod.get_registry().invoke(tool_name, params, ctx)
-                    except Exception:
-                        result = tools_mod.get_registry().invoke(tool_name, params, ctx)
-                else:
-                    result = tools_mod.get_registry().invoke(tool_name, params, ctx)
-                _dur_ms = int((time.time() - _t0) * 1000)
+                # ── Format result for AI prompt ──
                 truncate = int(get_runtime_config("output_truncate") or 3000)
-                pretty_for_ai = _format_tool_result_for_loop(tool_name, result, truncate)
-                # Keep the full structured result for the debug log so devs
-                # can inspect what the tool actually returned.
+                formatted = _format_tool_result_for_loop(name, result, truncate)
+                formatted_outputs.append(formatted)
+
+                # If the tool name wasn't recognized, re-show the full catalog
+                # on the next turn so the model can self-correct.
+                _err = (result.get("error") or "") if isinstance(result, dict) else ""
+                if "not found" in _err and "tool" in _err.lower():
+                    state["_force_full_catalog_next"] = True
+
+                _rc = result.get("returncode", 0 if result.get("ok") else -1)
+
+                # ── post_tool hook (universal) ──
+                hooks_mod.trigger("post_tool", {
+                    "tool": name, "ok": result.get("ok", False),
+                    "call_id": call_id, "loop": loop + 1,
+                    "returncode": _rc,
+                })
+                # ── post_command hook (shell-flavored only, per-call) ──
+                if is_shell_flavored:
+                    hooks_mod.trigger("post_command", {
+                        "command": salient, "output": formatted[:1000],
+                        "returncode": _rc, "loop": loop + 1, "done": False,
+                        "tool": name, "call_id": call_id,
+                    })
+
+                # ── Per-call terminalHistory row ──
+                per_call_rows.append({
+                    "command": salient,
+                    "output": formatted,
+                    "returncode": _rc,
+                    "tool": name,
+                    "call_id": call_id,
+                })
+
+                # Track files this call read/touched
+                _track_files_in_command(salient, state.setdefault("_files_seen", []))
+
+                # Echo into chat_history as a knowledge entry (interactive mode only;
+                # gives the model a structured record of past tool calls without
+                # bloating execute-mode history).
+                if events_cb is not None:
+                    chat_history.append({
+                        "role": "knowledge",
+                        "content": f"[{call_id}] {name}({salient[:60]}) → {formatted[:400]}",
+                    })
+
+                # ── Debug + events ──
+                debug_entry.exec_command = f"/tool {name}"
+                debug_entry.exec_returncode = _rc
                 try:
-                    pretty_raw = json.dumps(result, ensure_ascii=False, indent=2, default=str)
+                    debug_entry.exec_stdout = json.dumps(result, ensure_ascii=False, default=str)[:2000]
                 except (TypeError, ValueError):
-                    pretty_raw = str(result)
-                state["lastOutput"] = pretty_for_ai
+                    debug_entry.exec_stdout = str(result)[:2000]
+                if not hasattr(debug_entry, "tool_calls_log"):
+                    debug_entry.tool_calls_log = []
+                debug_entry.tool_calls_log.append({
+                    "name": name, "call_id": call_id,
+                    "ok": result.get("ok", False), "via": result.get("via", "registry"),
+                })
+
                 if events_cb is not None:
                     ok_mark = "[green]✓[/green]" if result.get("ok") else "[red]✗[/red]"
-                    _meta = ""
-                    if isinstance(result.get("result"), dict):
-                        _r = result["result"]
-                        if "lines_returned" in _r:
-                            _meta = f" ({_r['lines_returned']} lines)"
-                        elif "matches" in _r:
-                            _meta = f" ({len(_r.get('matches') or [])} matches)"
+                    _hint = salient[:80] if salient else name
                     deps.console.print(
-                        f"  {ok_mark} [dim cyan]{tool_name}[/dim cyan] [dim]{_hint}{_meta} · {_dur_ms}ms[/dim]")
+                        f"  {ok_mark} [dim cyan]{name}[/dim cyan] [dim]{_hint}[/dim]")
                     pending_events.append({"type": "system", "kind": "tool",
-                                            "content": tool_name,
-                                            "meta": {"params": raw_params[:500],
-                                                     "ok": result.get("ok", False)}})
+                                            "content": name,
+                                            "meta": {"ok": result.get("ok", False),
+                                                     "call_id": call_id,
+                                                     "salient": salient[:200]}})
                     pending_events.append({"type": "system", "kind": "output",
-                                            "content": pretty_for_ai[:2000]})
-                    events_cb(pending_events)
-                    pending_events.clear()
-                debug_entry.exec_command = command
-                debug_entry.exec_returncode = 0 if result.get("ok") else -1
-                debug_entry.exec_stdout = pretty_raw[:2000]
-
-            # ── Meta-command: /term <name> (create sub-terminal, no agent) ─
-            elif (_meta_term := re.match(r'^/term\s+(\S+)\s*$', command)):
-                name = _meta_term.group(1)
-                existing = get_terminal(name)
-                if existing and existing.session and not existing.session.is_alive():
-                    unregister_terminal(name)
-                    existing = None
-                if existing is not None:
-                    state["lastOutput"] = f"Terminal '{name}' already exists."
-                else:
-                    lain_cmd = f"{sys.executable} {_LAINTAS_CLI} --simple-prompt"
-                    sub = deps.SubTerminalSession(lain_cmd)
-                    sub.start()
-                    time.sleep(0.3)
-                    if sub.is_alive():
-                        sub.read_output(timeout=0.3)
-                    register_terminal(sub, "laintas-cli", depth, name=name)
-                    state["lastOutput"] = f"Created sub-terminal {name} (no agent stationed)"
-                debug_entry.exec_command = command
-                debug_entry.exec_returncode = 0
-                if events_cb is not None:
-                    pending_events.append({"type": "system", "kind": "command", "content": command})
+                                            "content": formatted[:2000]})
                     events_cb(pending_events)
                     pending_events.clear()
 
-            # ── Meta-command: /term, /t (list terminals) ───────────────
-            elif re.match(r'^/(?:term|t)\s*$', command):
-                state["lastOutput"] = get_terminals_snapshot() or "(no sub-terminals)"
-                debug_entry.exec_command = command
-                debug_entry.exec_returncode = 0
-                if events_cb is not None:
-                    pending_events.append({"type": "system", "kind": "command", "content": command})
-                    events_cb(pending_events)
-                    pending_events.clear()
-
-            # ── Meta-command: wait(N) / sleep(N) ────────────────────────
-            elif (_meta_wait := re.match(r'^(?:wait|sleep)\((\d+(?:\.\d+)?)\)\s*$', command)):
-                duration = float(_meta_wait.group(1))
-                deps.console.print(f"[dim]⏳ {duration}s ...[/dim]")
-                if events_cb is not None:
-                    pending_events.append({"type": "system", "kind": "command", "content": command})
-                time.sleep(duration)
-                # Update state with latest sub-terminal output if any
-                if interactive_session is not None and interactive_session.is_alive():
-                    state["lastOutput"] = interactive_session.full_output
-                else:
-                    state["lastOutput"] = f"Waited {duration}s"
-                debug_entry.exec_command = command
-                debug_entry.exec_returncode = 0
-            else:
-                # ── Normal command: stationed or sub-terminal ──
-                current_agent = get_current_agent()
-                stationed_name = current_agent.stationed_terminal if current_agent else None
-                stationed_term = get_terminal(stationed_name) if stationed_name else None
-
-                # ── Hooks: pre_command (can block execution) ──────────────────
-                hook_allowed, hook_msgs = hooks_mod.trigger("pre_command", {
-                    "command": command,
-                    "depth": depth,
-                    "agent_id": agent_id,
-                    "stationed": bool(stationed_term and stationed_term.session and stationed_term.session.is_alive()),
-                })
-                if not hook_allowed:
-                    state["lastOutput"] = "BLOCKED by pre_command hook"
-                    debug_entry.exec_command = command
-                    debug_entry.exec_returncode = -1
-                    debug_entry.exec_stdout = state["lastOutput"]
-
-                # ── Security policy check (applies to both stationed and unstationed) ──
-                policy_ok, policy_reason, policy_approval = _check_policy(
-                    command, agent_id=agent_id, events_cb=events_cb, deps=deps)
-                if not policy_ok:
-                    state["lastOutput"] = f"BLOCKED: {policy_reason}"
-                    debug_entry.exec_command = command
-                    debug_entry.exec_returncode = -1
-                    debug_entry.exec_stdout = state["lastOutput"]
-                    if events_cb is not None:
-                        pending_events.append({"type": "system", "kind": "output",
-                                               "content": state["lastOutput"][:2000]})
-                        events_cb(pending_events)
-                        pending_events.clear()
-                elif policy_approval:
-                    state["shortTermMemory"] += f"\n  ⚠ Policy: {policy_reason}"
-
-                if not hook_allowed or not policy_ok:
-                    pass  # skip execution, let state update + debug log handle it
-                elif stationed_term and depth == 0:
-                    # ── Stationed at depth 0: execute in the parent terminal,
-                    # exactly like user-typed input. cd/clear must stay in
-                    # _execute_parent_command (pty_passthrough runs them in a
-                    # child shell, so cwd changes wouldn't stick).
-                    if events_cb is not None:
-                        deps.console.print(f"[dim]> [{stationed_name}] {command[:80]}[/dim]")
-                        pending_events.append({"type": "system", "kind": "command", "content": command})
-
-                    stripped = command.strip()
-                    is_parent_state = (stripped == "cd" or stripped.startswith("cd ")
-                                       or stripped == "clear" or stripped.startswith("clear "))
-                    if is_parent_state or deps.pty_passthrough is None:
-                        result = _execute_parent_command(command)
-                        returncode = 0
-                    else:
-                        pt_result = deps.pty_passthrough(command)
-                        result = pt_result.get("stdout", "") or ""
-                        returncode = pt_result.get("returncode", 0)
-
-                    state["lastOutput"] = result
-                    debug_entry.exec_command = command
-                    debug_entry.exec_returncode = returncode
-
-                    if events_cb is not None:
-                        pending_events.append({"type": "system", "kind": "output", "content": result[:2000]})
-                        events_cb(pending_events)
-                        pending_events.clear()
-
-                elif stationed_term and stationed_term.session and stationed_term.session.is_alive():
-                    # ── Stationed at depth > 0: send_keys + marker in persistent shell ──
-                    if events_cb is not None:
-                        deps.console.print(f"[dim]> [{stationed_name}] {command[:80]}[/dim]")
-                        pending_events.append({"type": "system", "kind": "command", "content": command})
-
-                    session = stationed_term.session
-                    marker_id = uuid.uuid4().hex[:8]
-                    start_marker = f"__CMD_BEGIN_{marker_id}__"
-                    end_marker = f"__CMD_END_{marker_id}__"
-
-                    # Wrap command: capture stderr and return code between markers
-                    wrapped = f"echo {start_marker}; {command} 2>&1; __laintas_rc=$?; echo {end_marker}:$__laintas_rc"
-
-                    # Track output length before sending
-                    try:
-                        old_len = len(session.raw_output)
-                    except Exception:
-                        old_len = len(session.full_output)
-
-                    session.send_keys(wrapped + "\n")
-
-                    # Poll for end marker
-                    cmd_output = ""
-                    returncode = -1
-                    poll_start = time.time()
-                    poll_timeout = float(get_runtime_config("poll_timeout"))
-
-                    while time.time() - poll_start < poll_timeout:
-                        time.sleep(0.3)
-                        session.read_output(timeout=0.3)
-
-                        try:
-                            raw = session.raw_output
-                        except Exception:
-                            raw = session.full_output
-
-                        new_content = raw[old_len:] if old_len > 0 else raw
-
-                        # Look for end marker with return code (must be on its own line)
-                        end_match = re.search(
-                            rf'(?:^|\r?\n){re.escape(end_marker)}:(\d+)',
-                            new_content, re.MULTILINE
-                        )
-                        if end_match:
-                            returncode = int(end_match.group(1))
-                            # Extract output between start marker and end marker
-                            start_match = re.search(
-                                rf'(?:^|\r?\n){re.escape(start_marker)}\s*\r?\n',
-                                new_content, re.MULTILINE
-                            )
-                            if start_match:
-                                cmd_output = new_content[start_match.end():end_match.start()].strip()
-                            else:
-                                # Fallback: split on marker text
-                                parts = new_content.split(start_marker, 1)
-                                if len(parts) > 1:
-                                    cmd_output = parts[1].split(end_marker, 1)[0].strip()
-                            break
-
-                        if not session.is_alive():
+                    # Display panels for shell.exec (mirror old UX)
+                    if name == "shell.exec":
+                        if result.get("via") in ("stationed", "interactive"):
                             try:
-                                cmd_output = session.raw_output[old_len:] if old_len > 0 else session.raw_output
+                                _alive = (_stationed_session.is_alive() if _stationed_session
+                                          else (interactive_session.is_alive() if interactive_session else False))
+                                deps.display_sub_terminal_preview(
+                                    salient, formatted[:2000],
+                                    depth=depth + 1, alive=_alive)
                             except Exception:
-                                cmd_output = session.full_output[old_len:] if old_len > 0 else session.full_output
-                            break
+                                pass
+                        elif result.get("via") in ("subprocess", "parent", "loop_command"):
+                            try:
+                                deps.display_command_output(salient, _rc, formatted, depth=depth + 1)
+                            except Exception:
+                                pass
 
-                    if not cmd_output:
-                        # Timeout — command may still be running (e.g., claude, vim)
-                        try:
-                            tail = session.raw_output[old_len:] if old_len > 0 else session.raw_output
-                        except Exception:
-                            tail = session.full_output[old_len:] if old_len > 0 else session.full_output
-                        cmd_output = tail
+        # Concat all per-call outputs into lastOutput so the next prompt's fallback
+        # rendering and shortTermMemory see every result, not just the last.
+        if formatted_outputs:
+            state["lastOutput"] = ("\n---\n".join(formatted_outputs))[: int(get_runtime_config("output_truncate") or 3000) * 2]
 
-                    clean_output = deps.strip_ansi(cmd_output).strip()
-                    state["lastOutput"] = clean_output or "(command running...)"
-                    debug_entry.exec_command = command
-                    debug_entry.session_command = command
-                    debug_entry.exec_stdout = deps.strip_ansi(cmd_output)
-                    debug_entry.exec_returncode = returncode
-
-                    if events_cb is not None:
-                        pending_events.append({"type": "system", "kind": "output", "content": state["lastOutput"][:2000]})
-                        events_cb(pending_events)
-                        pending_events.clear()
-
-                else:
-                    # ── Unstationed: spawn one-off sub-terminal ──
-                    if interactive_session is not None:
-                        if events_cb is not None:
-                            deps.console.print(f"[dim yellow]Closing previous session: {interactive_session.command[:60]}[/dim yellow]")
-                            pending_events.append({"type": "system", "kind": "close_session", "content": interactive_session.command[:200]})
-                        interactive_session.close()
-                        interactive_session = None
-
-                    if events_cb is not None:
-                        _sub_msg = f"[dim]→ {command[:80]} [sub-terminal][/dim]"
-                        deps.console.print(_sub_msg)
-                        pending_events.append({"type": "system", "kind": "command", "content": command})
-
-                    if depth == 0:
-                        terminal_cmd = f"{sys.executable} {_LAINTAS_CLI} --execute {shlex.quote(command)} --depth 1"
-                    else:
-                        terminal_cmd = command
-
-                    sub = deps.SubTerminalSession(terminal_cmd)
-                    sub.start()
-                    interactive_session = sub
-
-                    cmd_output = ""
-                    poll_start = time.time()
-                    while time.time() - poll_start < float(get_runtime_config("poll_timeout")):
-                        time.sleep(0.3)
-                        chunk = sub.read_output(timeout=0.3)
-                        if chunk:
-                            cmd_output = sub.full_output
-                            if len(cmd_output.strip()) > 50:
-                                break
-                        if not sub.is_alive():
-                            cmd_output = sub.full_output
-                            break
-
-                    cleaned, parent_result = _process_parent_cmd_marker(cmd_output)
-                    cmd_output = deps.strip_ansi(cleaned)
-                    state["lastOutput"] = parent_result if parent_result else (cmd_output.strip() or "(no output)")
-                    debug_entry.exec_command = command
-                    debug_entry.session_command = command
-                    debug_entry.exec_stdout = cmd_output
-                    debug_entry.exec_returncode = sub.returncode if sub.returncode is not None else -1
-
-                    if events_cb is not None:
-                        pending_events.append({"type": "system", "kind": "output", "content": cmd_output[:2000]})
-                        events_cb(pending_events)
-                        pending_events.clear()
-
-                    if events_cb is not None:
-                        deps.display_sub_terminal_preview(command, cmd_output, depth=depth + 1, alive=sub.is_alive())
-
-        # 10. Update state
-        action_desc = command if command else ""
+        # 10. Update state — append per-call rows (or one no-op row if no tool_calls)
+        tool_names_for_log = [r["tool"] for r in per_call_rows]
+        action_desc_short = ", ".join(tool_names_for_log) if tool_names_for_log else ""
         state["shortTermMemory"] += \
-            f"\n  Step {loop+1}: {reply} | cmd: {action_desc} | result: {state['lastOutput'][:200]}"
-        state["terminalHistory"].append({
-            "command": action_desc,
-            "output": state['lastOutput'],
-            "returncode": getattr(debug_entry, "exec_returncode", None),
-        })
-
-        # Track files the AI has read/touched so the prompt can surface them
-        # and the AI doesn't re-read needlessly.
-        if action_desc:
-            seen = state.setdefault("_files_seen", [])
-            _track_files_in_command(action_desc, seen)
+            f"\n  Step {loop+1}: {reply} | tools: {action_desc_short} | result: {state.get('lastOutput','')[:200]}"
+        state["terminalHistory"].extend(per_call_rows)
 
         # ── Error analysis: detect patterns + suggest recovery ──
         last_output = state.get("lastOutput", "")
@@ -2349,7 +2524,7 @@ def run_agent_loop(
                 f"\n  🔍 Error detected [{error_info['category']}]: {error_info['suggestion']}"
             # ── Hooks: on_error ──
             hooks_mod.trigger("on_error", {
-                "command": action_desc,
+                "command": action_desc_short,
                 "output": last_output[:500],
                 "returncode": last_rc,
                 "category": error_info["category"],
@@ -2366,16 +2541,6 @@ def run_agent_loop(
         fail_hint = _maybe_retry_suggestion(state)
         if fail_hint:
             state["shortTermMemory"] += fail_hint
-
-        # ── Hooks: post_command (after each execution step) ──
-        if action_desc:
-            hooks_mod.trigger("post_command", {
-                "command": action_desc,
-                "output": state.get("lastOutput", "")[:1000],
-                "returncode": debug_entry.exec_returncode if hasattr(debug_entry, 'exec_returncode') else -1,
-                "loop": loop + 1,
-                "done": done,
-            })
 
         # ── Debug: persist this loop's entry ──
         add_debug_log(debug_entry)
@@ -2403,22 +2568,25 @@ def run_agent_loop(
             break
 
         # ── Staleness tracking: auto-exit when AI stops producing output ──
-        # Count steps where the AI produced NO reply AND NO command as idle.
-        # A conversational reply (text without a command) is real work and
-        # resets the counter, same as a command would.
-        if not command and not reply:
+        # Count steps where the AI produced NO reply AND NO tool_calls as idle.
+        # A conversational reply (text without tool calls) is real work and
+        # resets the counter, same as a tool call would.
+        if not tool_calls and not reply:
             stale_count += 1
             if stale_count >= staleness_limit:
                 if events_cb is not None and deps is not None:
                     deps.console.print(f"[dim]Task appears complete ({stale_count} idle steps). Exiting.[/dim]")
                     # Show raw response on idle exit so users can diagnose backend issues
-                    if not command and not reply:
+                    if not tool_calls and not reply:
                         raw = debug_entry.response_raw
                         if raw:
                             deps.console.print(f"[dim yellow]Last backend response: {json.dumps(raw, ensure_ascii=False, default=str)[:500]}[/dim yellow]")
+                if events_cb is not None and pending_events:
+                    events_cb(pending_events)
+                    pending_events.clear()
                 break
         else:
-            stale_count = 0  # reset on any output (command or conversational reply)
+            stale_count = 0  # reset on any output (tool call or conversational reply)
 
         # 11. Delay between steps (interruptible)
         if loop < max_loops - 1:
@@ -2434,10 +2602,36 @@ def run_agent_loop(
             original_input, state, memory_entries, chat_history, loop, max_loops,
         )
 
+        # ── Inject nudge if model failed to use JSON format ──
+        if _nudge_needed:
+            user_input += (
+                "\n\n<json_reminder>IMPORTANT: Your previous response was plain text. "
+                "You MUST respond with a valid JSON object in this exact format:\n"
+                '```json\n{\n  "reply": "your text response here",\n  "tool_calls": [\n    '
+                '{"name": "tool.name", "arguments": {...}}\n  ]\n}\n```\n'
+                "If you have no actions to take, return: {\"reply\": \"your text\", \"tool_calls\": []}\n"
+                "Do NOT output plain text or prose. ONLY output valid JSON.</json_reminder>"
+            )
+
     # Clean up session only when NOT managed by REPL (existing_session=None)
     # When REPL manages the session, it handles lifecycle externally.
     if existing_session is None and interactive_session is not None:
         interactive_session.close()
+
+    # Safety flush: push any remaining pending events (e.g. if loop exited
+    # via staleness, interrupt, or max_loops without reaching the done-block flush)
+    if events_cb is not None and pending_events:
+        events_cb(pending_events)
+        pending_events.clear()
+
+    # Persist agent state so a future session can restore the chat history.
+    if self_info is not None:
+        try:
+            self_info.chat_history = chat_history
+            self_info.state = state
+            agent_persistence.save_agent_state(self_info)
+        except Exception:
+            pass
 
     if step_replies:
         return {"success": done, "msg": "\n\n".join(step_replies), "state": state,

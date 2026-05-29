@@ -6,7 +6,7 @@ Laintas CLI is an autonomous AI agent for the terminal. Users type natural-langu
 
 **Version:** 0.1.0
 **Python:** >= 3.10
-**Files:** `laintas_cli.py` (~3118 lines) + `agent_loop.py` (~755 lines)
+**Files:** 12 Python modules (~11,500 lines total) — see CLAUDE.md for the full module table
 
 ---
 

@@ -28,6 +28,8 @@ from typing import Optional
 CONFIG_PATH = Path.home() / ".laintas_cli_policy.json"
 AUDIT_PATH = Path.home() / ".laintas_cli_audit.log"
 
+IS_WINDOWS = os.name == "nt"
+
 # ── Default safe policy ──────────────────────────────────────────────────
 _DEFAULT_CONFIG = {
     "mode": "audit",  # "audit" | "enforce" | "disabled"
@@ -103,13 +105,71 @@ _DEFAULT_CONFIG = {
         r"^chmod\s+-R\s+777\s+/", r"^chmod\s+777\s+/",
         r"^chown\s+-R\s+\S+\s+/", r"^chown\s+\S+\s+/",
         r"^sudo\s+rm\s+-rf\s+/", r"^sudo\s+su\b",
-        r"^wget\s+.*\|\s*(?:ba)?sh", r"^curl\s+.*\|\s*(?:ba)?sh",
     ],
-    "allowedRoots": ["/root/laintas_cli", "/tmp", "/home", "/root/Helpwo"],
     "maxCommandLength": 10000,
     "blockSudo": True,
 }
 
+# ── Windows-specific command rules ───────────────────────────────────────
+_WINDOWS_DEFAULT_CONFIG = {
+    "allow": [
+        r"^dir(\s|$)", r"^type\s", r"^cd(\s|$)",
+        r"^echo\s", r"^echo\.", r"^echo$",
+        r"^findstr\s", r"^where\s", r"^assoc\s", r"^ftype\s",
+        r"^ver$", r"^date\s*/t", r"^time\s*/t",
+        r"^vol$", r"^label\s", r"^path$",
+        r"^setlocal", r"^endlocal", r"^set\s",
+        r"^title\s", r"^color\s", r"^cls$",
+        r"^more\s", r"^sort\s", r"^find\s+/[ivc]",
+        r"^fc\s", r"^comp\s", r"^tree\s",
+        r"^systeminfo", r"^hostname$", r"^whoami\s",
+        r"^tasklist", r"^driverquery",
+        r"^ipconfig", r"^nslookup\s", r"^ping\s",
+        r"^tracert\s", r"^pathping\s", r"^arp\s",
+        r"^netstat\s", r"^getmac", r"^nbtstat\s",
+        r"^wmic\s+\w+\s+list", r"^wmic\s+\w+\s+get",
+        r"^taskkill\s*/f\s*/im\s+notepad",
+        r"^powershell\s+get-", r"^powershell\s+\?",
+        r"^pwsh\s+get-", r"^pwsh\s+\?",
+        r"^dotnet\s+--", r"^wsl\s+--list",
+    ],
+    "needs_approval": [
+        r"^del\s", r"^erase\s",
+        r"^move\s", r"^copy\s", r"^xcopy\s", r"^robocopy\s",
+        r"^attrib\s", r"^icacls\s", r"^takeown\s",
+        r"^rmdir\s", r"^rd\s",
+        r"^mklink\s",
+        r"^schtasks\s",
+        r"^reg\s+add", r"^reg\s+delete", r"^reg\s+import", r"^reg\s+export",
+        r"^sc\s+(?:stop|start|delete|create|config)",
+        r"^net\s+(?:user|localgroup|group|share|start|stop|accounts)",
+        r"^netsh\s",
+        r"^powershell\s", r"^pwsh\s",
+        r"^cmd\s*/c",
+        r"^wsl\s",
+        r"^msiexec\s", r"^winget\s+install", r"^winget\s+uninstall",
+        r"^choco\s+install", r"^choco\s+uninstall",
+        r"^scoop\s+install", r"^scoop\s+uninstall",
+        r"^Set-ExecutionPolicy",
+        r"^Invoke-WebRequest", r"^Start-BitsTransfer",
+        r"^bcdedit\s", r"^sfc\s", r"^dism\s",
+        r"^taskkill\s",
+    ],
+    "deny": [
+        r"^format\s+[a-zA-Z]:", r"^diskpart\b",
+        r"^bcdedit\s+/set\s+safeboot",
+        r"^bcdedit\s+/delete",
+        r"^reg\s+delete\s+HKLM\\SYSTEM\\CurrentControlSet",
+        r"^sfc\s+/scannow\s+/offbootdir",
+        r"^dism\s+/cleanup-image\s+/restorehealth\s+/source",
+        r"^powershell\s+-[^\s]*e[^\s]*\s",
+        r"^netsh\s+advfirewall\s+set\s+.*state\s+off",
+        r"^wevtutil\s+cl\s",
+        r"^rd\s+/s\s+/q\s+[cC]:\\(?:Windows|Program\s+Files|Users|Boot)",
+        r"^del\s+/[^\s]*s[^\s]*\s+[cC]:\\(?:Windows|Program\s+Files|Users|Boot)",
+        r"^rmdir\s+/s\s+[cC]:\\(?:Windows|Program\s+Files|Users|Boot)",
+    ],
+}
 
 class PolicyDecision:
     __slots__ = ("action", "rule", "reason")
@@ -150,12 +210,58 @@ def _load_config(force: bool = False) -> dict:
         for key, val in _DEFAULT_CONFIG.items():
             if key not in cfg:
                 cfg[key] = val
+        # Platform-specific allowedRoots for new configs
+        if "allowedRoots" not in cfg:
+            if IS_WINDOWS:
+                cfg["allowedRoots"] = []  # path checking unreliable on Windows; deny/approval rules handle security
+            else:
+                cfg["allowedRoots"] = ["/root/laintas_cli", "/tmp", "/home", "/root/Helpwo"]
+        # Migrate old configs: move rules that changed category
+        cfg = _migrate_config(cfg)
         _config = cfg
         if CONFIG_PATH.exists():
             _config_mtime = CONFIG_PATH.stat().st_mtime
     except (OSError, json.JSONDecodeError) as e:
         _config = dict(_DEFAULT_CONFIG)
+        if IS_WINDOWS:
+            _config["allowedRoots"] = []
+        else:
+            _config["allowedRoots"] = ["/root/laintas_cli", "/tmp", "/home", "/root/Helpwo"]
     return _config
+
+
+def _migrate_config(cfg: dict) -> dict:
+    """Migrate old config rules to new positions.
+
+    When rules are reclassified (e.g. deny → needs_approval), old saved configs
+    still carry them in the wrong list. This function strips deprecated patterns
+    and re-adds them to the correct list.
+    """
+    # v2026-05-27: download pipe-to-shell moved from deny to needs_approval
+    _deny_to_approval = [
+        r"^wget\s+.*\|\s*(?:ba)?sh",
+        r"^curl\s+.*\|\s*(?:ba)?sh",
+    ]
+    deny_list = cfg.get("deny", [])
+    approval_list = cfg.get("needs_approval", [])
+    changed = False
+    for rule in _deny_to_approval:
+        if rule in deny_list:
+            deny_list = [r for r in deny_list if r != rule]
+            changed = True
+        if rule not in approval_list:
+            approval_list.append(rule)
+            changed = True
+    if changed:
+        cfg["deny"] = deny_list
+        cfg["needs_approval"] = approval_list
+        # Persist the migration
+        try:
+            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+        except OSError:
+            pass
+    return cfg
 
 
 def _write_default_config() -> None:
@@ -201,6 +307,22 @@ def evaluate(command: str, cwd: str = None,
 
     stripped = command.strip()
 
+    # ── Select platform-specific rule sets ─────────────────────────────
+    if IS_WINDOWS:
+        _plat = _WINDOWS_DEFAULT_CONFIG
+    else:
+        _plat = {"allow": [], "needs_approval": [], "deny": []}
+
+    # Merge user rules with platform defaults (ensures security rules survive config upgrades)
+    def _merged_rules(key):
+        seen = set()
+        merged = []
+        for r in cfg.get(key, []) + _plat.get(key, []):
+            if r not in seen:
+                seen.add(r)
+                merged.append(r)
+        return merged
+
     # ── Basic sanity checks (always enforced) ──────────────────────────
     max_len = cfg.get("maxCommandLength", 10000)
     if len(stripped) > max_len:
@@ -218,7 +340,7 @@ def evaluate(command: str, cwd: str = None,
             return PolicyDecision("needs_approval", "sudo", "sudo commands require approval")
 
     # ── Check deny list first (takes precedence) ───────────────────────
-    deny_rules = _compile_rules(cfg.get("deny", []))
+    deny_rules = _compile_rules(_merged_rules("deny"))
     for rule in deny_rules:
         if rule.search(stripped):
             reason = f"Matched deny rule: {rule.pattern}"
@@ -230,7 +352,7 @@ def evaluate(command: str, cwd: str = None,
                 return PolicyDecision("deny", rule.pattern, reason)
 
     # ── Check needs_approval list ──────────────────────────────────────
-    approval_rules = _compile_rules(cfg.get("needs_approval", []))
+    approval_rules = _compile_rules(_merged_rules("needs_approval"))
     for rule in approval_rules:
         if rule.search(stripped):
             reason = f"Matched approval rule: {rule.pattern}"
@@ -240,12 +362,22 @@ def evaluate(command: str, cwd: str = None,
             # In audit mode, approval rules are advisory (allow with warning)
 
     # ── Path boundary check for write operations ────────────────────────
-    path_decision = _check_paths(stripped, cwd, cfg.get("allowedRoots", []))
+    # Dynamically add CWD to allowed roots (user working in a directory implies intent to write there)
+    allowed_roots = list(cfg.get("allowedRoots", []))
+    if cwd:
+        cwd_str = str(cwd)
+        if cwd_str not in allowed_roots:
+            allowed_roots.append(cwd_str)
+
+    path_decision = _check_paths(stripped, cwd, allowed_roots)
     if path_decision is not None:
         _write_audit(_audit_entry(command, path_decision.action,
                                   path_decision.reason, cwd, req_id, agent_id))
-        if mode in ("enforce", "audit"):
+        # In enforce mode: ask user for approval (needs_approval)
+        # In audit mode: allow with warning (don't block)
+        if mode == "enforce":
             return path_decision
+        # audit mode: log but allow
 
     # ── Allow by default ───────────────────────────────────────────────
     _write_audit(_audit_entry(command, "allow", "default allow",
@@ -259,7 +391,7 @@ def _check_paths(command: str, cwd: str | None,
 
     Extracts file paths from well-known commands that write to disk:
     rm, mv, cp, touch, mkdir, cat >, > redirect, dd of=, ln, chmod, chown.
-    Returns PolicyDecision('deny') if any path escapes, None if ok.
+    Returns PolicyDecision('needs_approval') if any path escapes, None if ok.
     """
     if not allowed_roots:
         return None
@@ -285,7 +417,7 @@ def _check_paths(command: str, cwd: str | None,
                 pass
         if not ok:
             return PolicyDecision(
-                "deny",
+                "needs_approval",
                 "",
                 f"Path '{p}' resolves to '{resolved}' outside allowedRoots",
             )
@@ -297,6 +429,7 @@ def _extract_paths(command: str) -> list:
 
     Handles: standalone paths, paths after common command prefixes,
     redirect targets (> file, >> file), and pipe destinations.
+    Supports both POSIX (/foo/bar) and Windows (C:\\foo, \\\\server\\share) paths.
     """
     import shlex as _shlex
     paths = []
@@ -307,21 +440,46 @@ def _extract_paths(command: str) -> list:
 
     write_cmds = {"rm", "mv", "cp", "touch", "mkdir", "rmdir",
                   "chmod", "chown", "chgrp", "ln", "dd",
-                  "cat", "tee", "tar", "zip", "gzip", "bzip2",
-                  "install", "rsync", "scp"}
+                  "tee", "zip", "gzip", "bzip2",
+                  "install", "rsync", "scp",
+                  # Windows write commands
+                  "del", "erase", "move", "copy", "xcopy", "robocopy",
+                  "attrib", "icacls", "takeown", "mklink", "rd"}
 
-    skip_next = False
     for i, tok in enumerate(tokens):
-        if skip_next:
-            skip_next = False
-            continue
         # Flag arguments (don't treat as paths)
         if tok.startswith("-"):
+            continue
+        # Short /letter flags: /s, /f, /q — never real paths on any platform
+        if len(tok) == 2 and tok[0] == "/" and tok[1].isalpha():
+            continue
+        # Windows compound flags: /s+e, /quiet, /force — skip on Windows
+        if IS_WINDOWS and len(tok) > 2 and tok[0] == "/" and tok[1].isalpha() and "\\" not in tok:
             continue
         # Redirect: >file or >>file (handled as separate token by shlex)
         if tok in (">", ">>", "2>", "&>"):
             continue
-        # Command that takes path arguments
+
+        is_path = False
+
+        # POSIX path: starts with / and looks like a real path (not a flag)
+        if tok.startswith("/") and ("/" in tok[1:] or len(tok) > 2):
+            is_path = True
+        # Windows path: contains backslash (C:\foo, \\server\share, .\foo)
+        elif IS_WINDOWS and "\\" in tok:
+            is_path = True
+        # Windows drive letter: C:\ or C:foo
+        elif IS_WINDOWS and len(tok) >= 2 and tok[0].isalpha() and tok[1] == ":":
+            is_path = True
+
+        if is_path and not tok.startswith("$"):
+            # Only extract paths from write commands (cat is read-only; cat > is handled by redirect)
+            cmd = tokens[0].rsplit("/", 1)[-1] if tokens else ""
+            if cmd in write_cmds:
+                paths.append(tok)
+            continue
+
+        # Command that takes path arguments (fallback for relative paths)
         cmd = tokens[0].rsplit("/", 1)[-1] if tokens else ""
         if cmd in write_cmds and i > 0:
             if not tok.startswith("-") and not tok.startswith("$"):

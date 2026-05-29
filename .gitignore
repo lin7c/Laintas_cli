@@ -14,3 +14,7 @@ build/**/tmp/
 laintas_cli_download/node_modules/
 laintas_cli_download/dist/
 
+# Generated architecture visualization (optional to commit)
+architecture-zh.html
+concepts-zh.html
+
