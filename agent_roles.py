@@ -8,7 +8,7 @@ Each role defines:
   - A confidence_threshold for review-type roles (0-100)
 
 Roles are looked up by name when agent.spawn is called with a `role` param.
-The role's system_prompt is appended to .cli.prop via {{rolePrompt}}.
+The role's system_prompt is appended to .laintas/cli.prop via {{rolePrompt}}.
 """
 
 from __future__ import annotations

@@ -16,7 +16,7 @@ python laintas_cli.py --execute "task"   # Non-interactive single task
 python laintas_cli.py --backend URL      # Override LAINTAS_BACKEND
 ```
 
-There is no test suite, no linter config, and no Makefile — iterate by running the CLI directly. After editing files, force-reload the dev session by typing `/reload` inside the REPL (deletes `.cli.prop`, `.extra_command.py`, `.loop_command.py` and restarts).
+There is no test suite, no linter config, and no Makefile — iterate by running the CLI directly. After editing files, force-reload the dev session by typing `/reload` inside the REPL (deletes `.laintas/` project files and restarts).
 
 ## Package Builds
 
@@ -39,19 +39,19 @@ The project has grown from two core modules to ten, organized in layers:
 
 **Tools & extensibility layer (Phase 3):**
 - **`tools.py`** (~1400 lines) — `ToolRegistry` singleton: structured `Tool` dataclass (name, JSONSchema params, invoke callable) + `ToolCtx`. Built-in tools registered at import time. All modules share one registry.
-- **`skills.py`** (~200 lines) — Loads user-installed skill directories from `~/.laintas_cli_skills/`. Each skill is a `skill.py` that exposes `get_tools() -> list[Tool]`. Tags tools with `source="skill:<name>"`.
-- **`mcp_client.py`** (~370 lines) — Bridges async `mcp` SDK to the sync Tool registry. Runs a dedicated asyncio thread, one child subprocess per configured MCP server, registers tools as `source="mcp:<server>"`. Config lives in `~/.laintas_cli_mcp.json`.
+- **`skills.py`** (~200 lines) — Loads user-installed skill directories from `~/.laintas/skills/`. Each skill is a `skill.py` that exposes `get_tools() -> list[Tool]`. Tags tools with `source="skill:<name>"`.
+- **`mcp_client.py`** (~370 lines) — Bridges async `mcp` SDK to the sync Tool registry. Runs a dedicated asyncio thread, one child subprocess per configured MCP server, registers tools as `source="mcp:<server>"`. Config lives in `~/.laintas/mcp.json`.
 
 **Cross-cutting subsystems:**
-- **`policy.py`** (~370 lines) — Security policy engine: evaluates every command as allow/needs_approval/deny via regex rules. Config in `~/.laintas_cli_policy.json` (mtime-cached, zero-restart updates). Audit log in `~/.laintas_cli_audit.log`. Three modes: audit, enforce, disabled.
-- **`memory_system.py`** (~290 lines) — Cross-session persistent memory mirroring Claude Code's architecture: 4 types (user/feedback/project/reference), stored as markdown files with frontmatter in `~/.laintas_cli_memory/`, indexed by `MEMORY.md`.
-- **`hooks.py`** (~270 lines) — Event-driven hook system: pre_command, post_command, pre_tool, post_tool, on_session_start/end, on_error, on_memory_change. Config in `~/.laintas_cli_hooks.json`; Python hooks in `~/.laintas_cli_hooks.py` (mtime-cached).
-- **`plan_mode.py`** (~260 lines) — Structured planning: `/plan enter` → AI explores & designs → writes plan to `~/.laintas_cli_plans/<name>.md` → `/plan approve` → execution.
-- **`task_manager.py`** (~180 lines) — Persistent task tracking in `~/.laintas_cli_tasks.json` with status workflow (pending→in_progress→completed) and dependency links.
+- **`policy.py`** (~370 lines) — Security policy engine: evaluates every command as allow/needs_approval/deny via regex rules. Config in `~/.laintas/policy.json` (mtime-cached, zero-restart updates). Audit log in `~/.laintas/audit.log`. Three modes: audit, enforce, disabled.
+- **`memory_system.py`** (~290 lines) — Cross-session persistent memory mirroring Claude Code's architecture: 4 types (user/feedback/project/reference), stored as markdown files with frontmatter in `~/.laintas/memory/`, indexed by `MEMORY.md`.
+- **`hooks.py`** (~270 lines) — Event-driven hook system: pre_command, post_command, pre_tool, post_tool, on_session_start/end, on_error, on_memory_change. Config in `~/.laintas/hooks.json`; Python hooks in `~/.laintas/hooks.py` (mtime-cached).
+- **`plan_mode.py`** (~260 lines) — Structured planning: `/plan enter` → AI explores & designs → writes plan to `~/.laintas/plans/<name>.md` → `/plan approve` → execution.
+- **`task_manager.py`** (~180 lines) — Persistent task tracking in `~/.laintas/tasks.json` with status workflow (pending→in_progress→completed) and dependency links.
 
 ### Input Routing (REPL classifies every line)
 
-1. Starts with `/` → meta command. Built-ins first (`/help`, `/login`, `/term`, `/debug`, `/name`, `/memory`, `/prop`, `/scan`, `/cwd`, `/clear`, `/exit`); unhandled `/` commands fall through to `.extra_command.py:handle_extra_command`.
+1. Starts with `/` → meta command. Built-ins first (`/help`, `/login`, `/term`, `/debug`, `/name`, `/memory`, `/prop`, `/scan`, `/cwd`, `/clear`, `/exit`); unhandled `/` commands fall through to `.laintas/commands.py:handle_extra_command`.
 2. First whitespace token resolves via `shutil.which(...)` or matches a shell/cmd builtin → direct PTY passthrough, no AI. `cd` is special-cased at the REPL to mutate parent CWD (PTY subshell can't).
 3. Otherwise → `run_agent_loop()` (natural language).
 
@@ -59,16 +59,16 @@ Routing uses live `shutil.which()` lookups plus a fixed builtin set (`_POSIX_SHE
 
 ### Auto-Generated Working-Directory Files
 
-On first run in any cwd the CLI creates these (all listed in `.gitignore`, never check them in):
+On first run in any cwd the CLI creates a `.laintas/` subdirectory (listed in `.gitignore`, never check it in):
 
 | File | Purpose |
 |---|---|
-| `.cli.prop` | AI system prompt template (Jinja-ish `{{var}}` substitution — see `generate_cli_prop_template`) |
-| `.helpwo` | Persisted AI memory / project rules |
-| `.extra_command.py` | User-extensible `handle_extra_command(action, parts, ctx)` for custom `/cmds` |
-| `.loop_command.py` | User-extensible `handle_loop_command(command, ctx)` — return str to inject synthetic output, None to execute normally |
+| `.laintas/cli.prop` | AI system prompt template (Jinja-ish `{{var}}` substitution — see `generate_cli_prop_template`) |
+| `.laintas/memory.json` | Persisted AI memory / project rules |
+| `.laintas/commands.py` | User-extensible `handle_extra_command(action, parts, ctx)` for custom `/cmds` |
+| `.laintas/loop.py` | User-extensible `handle_loop_command(command, ctx)` — return str to inject synthetic output, None to execute normally |
 
-Both `.extra_command.py` and `.loop_command.py` are **mtime-cached** — edits take effect mid-session without restart. When adding behavior that the user should be able to override or extend, prefer wiring it through one of these hooks over hardcoding in `laintas_cli.py`.
+Both `.laintas/commands.py` and `.laintas/loop.py` are **mtime-cached** — edits take effect mid-session without restart. When adding behavior that the user should be able to override or extend, prefer wiring it through one of these hooks over hardcoding in `laintas_cli.py`.
 
 ### PTY Model
 
@@ -100,28 +100,35 @@ All tunable parameters are accessible via `get_runtime_config()`/`set_runtime_co
 
 ### Backend API
 
-`call_backend_stream` POSTs to `{backend}/api/chat/stream` and consumes SSE, returning `{reply, command, memory, done}`. Auth is cookie-or-Bearer (cached in `~/.laintas_cli_session.json`, chmod 600). Backend defaults to laintas.com; override with `LAINTAS_BACKEND` env or `--backend`.
+`call_backend_stream` POSTs to `{backend}/api/chat/stream` and consumes SSE, returning `{reply, command, memory, done}`. Auth is cookie-or-Bearer (cached in `~/.laintas/session.json`, chmod 600). Backend defaults to laintas.com; override with `LAINTAS_BACKEND` env or `--backend`.
 
 `AgentRegistry` is the remote-control surface — `/api/agents/register`, `/api/agents/heartbeat`, `/api/agents/<id>/poll`, `/api/agents/<id>/events`. The HelpwoAI integration plan extends this with `reqId`-tagged events and structured `kind` payloads.
 
-### User-Configurable Dotfiles (home directory)
+### User-Configurable Files (all under `~/.laintas/`)
 
-These config files are mtime-cached (edits take effect without restart) and auto-created with safe defaults on first access:
+All configuration lives in a single `~/.laintas/` directory (override with `LAINTAS_HOME` env var). Config files are mtime-cached (edits take effect without restart) and auto-created with safe defaults on first access:
 
 | File | Module | Purpose |
 |---|---|---|
-| `~/.laintas_cli_policy.json` | `policy.py` | Command allow/approve/deny regex rules |
-| `~/.laintas_cli_hooks.json` | `hooks.py` | Shell-command-based hook definitions |
-| `~/.laintas_cli_hooks.py` | `hooks.py` | Python function hooks (mtime-cached) |
-| `~/.laintas_cli_mcp.json` | `mcp_client.py` | MCP server configurations |
-| `~/.laintas_cli_memory/` | `memory_system.py` | Cross-session persistent memory files |
-| `~/.laintas_cli_plans/` | `plan_mode.py` | Saved execution plans |
-| `~/.laintas_cli_tasks.json` | `task_manager.py` | Structured task list |
-| `~/.laintas_cli_audit.log` | `policy.py` | JSONL audit trail of command decisions |
+| `~/.laintas/policy.json` | `policy.py` | Command allow/approve/deny regex rules |
+| `~/.laintas/hooks.json` | `hooks.py` | Shell-command-based hook definitions |
+| `~/.laintas/hooks.py` | `hooks.py` | Python function hooks (mtime-cached) |
+| `~/.laintas/mcp.json` | `mcp_client.py` | MCP server configurations |
+| `~/.laintas/memory/` | `memory_system.py` | Cross-session persistent memory files |
+| `~/.laintas/plans/` | `plan_mode.py` | Saved execution plans |
+| `~/.laintas/tasks.json` | `task_manager.py` | Structured task list |
+| `~/.laintas/audit.log` | `policy.py` | JSONL audit trail of command decisions |
+| `~/.laintas/session.json` | `laintas_cli.py` | Authentication session (chmod 600) |
+| `~/.laintas/config.json` | `laintas_cli.py` | Global settings (agentName, backendUrl) |
+| `~/.laintas/history` | `laintas_cli.py` | REPL command history |
+| `~/.laintas/agents/` | `agent_persistence.py` | Per-agent state and chat history |
+| `~/.laintas/skills/` | `skills.py` | User-installed skill directories |
+
+All paths are centralized in `paths.py`. On first launch, `migrate.py` auto-migrates any old `~/.laintas_cli_*` files to the new layout.
 
 ## Conventions
 
-- Working directory commits should never include the auto-generated dotfiles (`.cli.prop`, `.helpwo`, `.extra_command.py`, `.loop_command.py`) — `.gitignore` already excludes them.
+- Working directory commits should never include the `.laintas/` project directory — `.gitignore` already excludes it.
 - Runtime-tunable knobs live in `agent_loop._runtime_config`. To add one: extend the `_DEFAULT_CONFIG` dict, and it becomes settable via `/config <key> <value>` automatically.
 - Debug captures: wrap any agent-touching change with a `DebugEntry` write so it shows up in `/debug` TUI.
 - When adding remote-protocol features, follow `HELPWO_INTEGRATION_PLAN.md`: every event must carry `reqId`, and each request has **exactly one** `final` event.

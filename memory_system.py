@@ -5,7 +5,7 @@ Mirrors Claude Code's memory architecture:
   - 4 memory types: user, feedback, project, reference
   - Each memory is a .md file with YAML-style frontmatter
   - MEMORY.md is the index (one-liner per entry, no frontmatter)
-  - Stored in ~/.laintas_cli_memory/
+  - Stored in ~/.laintas/memory/
 
 Memory files are loaded into the agent's context at each loop iteration,
 giving the AI persistent knowledge across sessions.
@@ -22,8 +22,10 @@ from pathlib import Path
 from typing import Optional
 
 
-MEMORY_DIR = Path.home() / ".laintas_cli_memory"
-MEMORY_INDEX = MEMORY_DIR / "MEMORY.md"
+import paths
+
+MEMORY_DIR = paths.MEMORY_DIR
+MEMORY_INDEX = paths.MEMORY_INDEX
 
 # Valid memory types and their descriptions
 MEMORY_TYPES = {

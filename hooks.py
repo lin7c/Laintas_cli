@@ -1,7 +1,7 @@
 """
 Hooks system for laintas_cli — extensibility without modifying core code.
 
-Replaces and extends the static .extra_command.py / .loop_command.py pattern
+Replaces and extends the static .laintas/commands.py / .laintas/loop.py pattern
 with a richer event-driven hook system.
 
 Hook types:
@@ -12,13 +12,13 @@ Hook types:
   - on_session_start: when REPL starts
   - on_session_end: when REPL exits
   - on_error: when agent loop encounters an error
-  - on_memory_change: when .helpwo is modified
+  - on_memory_change: when .laintas/memory.json is modified
 
-Config: ~/.laintas_cli_hooks.json
+Config: ~/.laintas/hooks.json
 Each hook specifies: type, command (shell), and optional condition (Python expression).
-Hooks can be Python functions in ~/.laintas_cli_hooks.py (loaded dynamically).
+Hooks can be Python functions in ~/.laintas/hooks.py (loaded dynamically).
 
-Like .extra_command.py, the Python hooks file is mtime-cached for zero-restart updates.
+Like .laintas/commands.py, the Python hooks file is mtime-cached for zero-restart updates.
 """
 
 from __future__ import annotations
@@ -36,8 +36,10 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 
-CONFIG_PATH = Path.home() / ".laintas_cli_hooks.json"
-PYTHON_HOOKS_PATH = Path.home() / ".laintas_cli_hooks.py"
+import paths
+
+CONFIG_PATH = paths.HOOKS_FILE
+PYTHON_HOOKS_PATH = paths.PYTHON_HOOKS_FILE
 
 # ── Module-level cache ────────────────────────────────────────────────────
 _hooks_config: list[dict] | None = None
@@ -113,7 +115,7 @@ def _write_default_config() -> None:
 
 
 def _load_python_hooks() -> dict:
-    """Load ~/.laintas_cli_hooks.py dynamically. mtime-cached."""
+    """Load ~/.laintas/hooks.py dynamically. mtime-cached."""
     global _python_hooks, _python_hooks_mtime
     if not PYTHON_HOOKS_PATH.exists():
         return {}

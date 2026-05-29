@@ -28,9 +28,12 @@ mkdir -p "$PKG_DIR/usr/lib/laintas_cli" \
          "$PKG_DIR/usr/share/doc/laintas-cli"
 
 # ── Copy source files ────────────────────────────────────────────────────
-cp "$PROJECT_DIR/laintas_cli.py"   "$PKG_DIR/usr/lib/laintas_cli/"
-cp "$PROJECT_DIR/agent_loop.py"   "$PKG_DIR/usr/lib/laintas_cli/"
-cp "$PROJECT_DIR/requirements.txt" "$PKG_DIR/usr/lib/laintas_cli/"
+for f in laintas_cli.py agent_loop.py tools.py skills.py mcp_client.py \
+         policy.py memory_system.py hooks.py plan_mode.py task_manager.py \
+         agent_persistence.py agent_roles.py workflow_engine.py \
+         paths.py migrate.py requirements.txt; do
+    cp "$PROJECT_DIR/$f" "$PKG_DIR/usr/lib/laintas_cli/"
+done
 
 # ── Launcher script ──────────────────────────────────────────────────────
 cat > "$PKG_DIR/usr/bin/laintas-cli" << 'LAUNCHER'

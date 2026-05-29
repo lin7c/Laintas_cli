@@ -18,6 +18,10 @@ setup(
         "plan_mode",
         "task_manager",
         "agent_persistence",
+        "agent_roles",
+        "workflow_engine",
+        "paths",
+        "migrate",
     ],
     install_requires=[
         "requests>=2.28.0",

@@ -1,7 +1,7 @@
 """
 Structured task tracking system for laintas_cli.
 
-Persists tasks to ~/.laintas_cli_tasks.json. Tasks follow a status workflow:
+Persists tasks to ~/.laintas/tasks.json. Tasks follow a status workflow:
   pending → in_progress → completed (or deleted)
 
 Tasks can have dependencies (blocks/blockedBy) to enforce ordering.
@@ -29,7 +29,9 @@ from pathlib import Path
 from typing import Optional
 
 
-TASKS_PATH = Path.home() / ".laintas_cli_tasks.json"
+import paths
+
+TASKS_PATH = paths.TASKS_FILE
 _lock = threading.RLock()
 
 # Valid status transitions

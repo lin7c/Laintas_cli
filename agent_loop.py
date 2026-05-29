@@ -24,6 +24,7 @@ import agent_persistence     # Cross-session agent state persistence
 import agent_roles           # Specialized agent roles (explorer, reviewer, etc.)
 import workflow_engine        # Structured multi-phase workflow engine
 import task_manager          # Structured task tracking (session + persisted)
+import paths                 # Centralized path management
 
 # Path to laintas_cli.py for spawning child terminals
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -702,15 +703,15 @@ class LoopDeps:
     build_subterminal_cmd: Optional[Callable[..., str]] = None
 
 
-# ── Structured Memory System (.helpwo) ──────────────────────────────────
-# .helpwo stores a JSON array of entries: [{"id": N, "content": "...", "created": "...", "updated": "..."}]
+# ── Structured Memory System (.laintas/memory.json) ───────────────────────
+# Project memory stores a JSON array of entries: [{"id": N, "content": "...", "created": "...", "updated": "..."}]
 # AI reads/writes these via the mem.* tools (mem.read, mem.save, mem.delete, mem.list).
 
-_MEMORY_FILE = ".helpwo"
+_MEMORY_FILE = ".laintas/memory.json"
 
 
 def _read_memory(deps: LoopDeps) -> list[dict]:
-    """Read and parse .helpwo as a JSON array of entries. Returns [] on failure."""
+    """Read and parse .laintas/memory.json as a JSON array of entries. Returns [] on failure."""
     raw = deps.read_file(_MEMORY_FILE)
     if not raw or not raw.strip():
         return []
@@ -1388,17 +1389,17 @@ _loop_cmd_mtime_cache = 0
 
 
 def clear_loop_command_cache():
-    """Clear .loop_command.py cache so it reloads on next use."""
+    """Clear .laintas/loop.py cache so it reloads on next use."""
     global _loop_cmd_handler_cache, _loop_cmd_mtime_cache
     _loop_cmd_handler_cache = None
     _loop_cmd_mtime_cache = 0
 
 
 def _load_loop_commands():
-    """Load .loop_command.py and return handle_loop_command() if defined."""
+    """Load .laintas/loop.py and return handle_loop_command() if defined."""
     global _loop_cmd_handler_cache, _loop_cmd_mtime_cache
     try:
-        path = os.path.join(os.getcwd(), ".loop_command.py")
+        path = str(paths.project_file(paths.CWD_LOOP))
         mtime = os.path.getmtime(path)
         if _loop_cmd_handler_cache is not None and mtime == _loop_cmd_mtime_cache:
             return _loop_cmd_handler_cache
@@ -1889,7 +1890,7 @@ def run_agent_loop(
         if inbox_msgs:
             state["_inbox"] = inbox_msgs   # JSONified into prompt below
 
-        # 1. Read .helpwo memory (structured)
+        # 1. Read .laintas/memory.json (project memory)
         memory_entries = _read_memory(deps)
 
         # 2. Build global memory string for system prompt
@@ -1901,8 +1902,8 @@ def run_agent_loop(
         else:
             global_memory_str = "(empty)"
 
-        # 3. Read .cli.prop system prompt
-        prompt_template = deps.read_file(".cli.prop") or ""
+        # 3. Read .laintas/cli.prop system prompt
+        prompt_template = deps.read_file(str(paths.project_file(paths.CWD_CLI_PROP))) or ""
         if not prompt_template:
             prompt_template = deps.generate_prompt()
 
@@ -2315,7 +2316,7 @@ def run_agent_loop(
                     result = {"ok": False, "error": "blocked by pre_tool hook",
                               "tool": name, "returncode": -1}
                 else:
-                    # ── Shell-flavored: policy + pre_command + .loop_command.py ──
+                    # ── Shell-flavored: policy + pre_command + .laintas/loop.py ──
                     skip_invoke = False
                     if is_shell_flavored:
                         policy_ok, policy_reason, policy_approval = _check_policy(
@@ -2337,7 +2338,7 @@ def run_agent_loop(
                                           "tool": name, "returncode": -1}
                                 skip_invoke = True
 
-                        # .loop_command.py user override (only for shell.exec)
+                        # .laintas/loop.py user override (only for shell.exec)
                         if not skip_invoke and name == "shell.exec":
                             loop_handler = _load_loop_commands()
                             if loop_handler:
@@ -2365,7 +2366,7 @@ def run_agent_loop(
                                 except Exception as e:
                                     _override = None
                                     if events_cb is not None:
-                                        deps.console.print(f"[red].loop_command.py error: {e}[/red]")
+                                        deps.console.print(f"[red].laintas/loop.py error: {e}[/red]")
                                 if isinstance(_override, str):
                                     result = {"ok": True, "result": _override,
                                               "tool": name, "returncode": 0,

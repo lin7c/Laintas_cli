@@ -7,10 +7,10 @@ Three-tier decision model:
   - needs_approval: pause and wait for user confirmation
   - deny: block execution entirely
 
-Config: ~/.laintas_cli_policy.json (auto-created with safe defaults on first load)
-Audit log: ~/.laintas_cli_audit.log (JSONL, one line per decision)
+Config: ~/.laintas/policy.json (auto-created with safe defaults on first load)
+Audit log: ~/.laintas/audit.log (JSONL, one line per decision)
 
-Reloads config on mtime change, like .extra_command.py — zero-restart updates.
+Reloads config on mtime change, like .laintas/commands.py — zero-restart updates.
 """
 
 from __future__ import annotations
@@ -25,8 +25,10 @@ from pathlib import Path
 from typing import Optional
 
 
-CONFIG_PATH = Path.home() / ".laintas_cli_policy.json"
-AUDIT_PATH = Path.home() / ".laintas_cli_audit.log"
+import paths
+
+CONFIG_PATH = paths.POLICY_FILE
+AUDIT_PATH = paths.AUDIT_FILE
 
 IS_WINDOWS = os.name == "nt"
 

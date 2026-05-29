@@ -8,7 +8,7 @@ The plan is saved to disk, reviewed by the user, and then executed.
 Workflow:
   1. /plan enter "task description" → AI enters plan mode
   2. AI explores codebase, analyzes, designs
-  3. AI writes structured plan to ~/.laintas_cli_plans/<name>.md
+  3. AI writes structured plan to ~/.laintas/plans/<name>.md
   4. /plan approve → exits plan mode, begins execution
   5. AI executes the plan step by step
 
@@ -25,8 +25,10 @@ from pathlib import Path
 from typing import Optional
 
 
-PLANS_DIR = Path.home() / ".laintas_cli_plans"
-_STATE_PATH = PLANS_DIR / "_state.json"
+import paths
+
+PLANS_DIR = paths.PLANS_DIR
+_STATE_PATH = paths.PLANS_STATE
 
 _lock = threading.RLock()
 

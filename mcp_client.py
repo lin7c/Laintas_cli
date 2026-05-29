@@ -28,7 +28,7 @@ If the `mcp` package isn't installed, this module still imports cleanly
 — every operation returns a friendly "MCP SDK not installed" error so
 the CLI keeps working without it.
 
-Config file: ~/.laintas_cli_mcp.json
+Config file: ~/.laintas/mcp.json
 {
   "servers": {
     "filesystem": {
@@ -73,7 +73,9 @@ except Exception as _e:
     MCP_IMPORT_ERROR = f"{type(_e).__name__}: {_e}"
 
 
-CONFIG_PATH = Path(os.path.expanduser("~/.laintas_cli_mcp.json"))
+import paths
+
+CONFIG_PATH = paths.MCP_FILE
 DEFAULT_CALL_TIMEOUT = 30.0     # seconds — per tool call
 CONNECT_TIMEOUT = 15.0          # seconds — per server initialize
 LIST_TOOLS_TIMEOUT = 10.0

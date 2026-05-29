@@ -10,7 +10,7 @@ Progressive Loading (inspired by Claude Code's skill system):
   3. **On-demand**: Reference docs loaded when skill tools request them
 
 Directory layout:
-    ~/.laintas_cli_skills/
+    ~/.laintas/skills/
         weather/
             skill.py         # must define get_tools()
             SKILL.md         # optional: frontmatter + instructions
@@ -82,7 +82,9 @@ from typing import Optional
 from tools import Tool, get_registry
 
 
-SKILLS_DIR = Path(os.path.expanduser("~/.laintas_cli_skills"))
+import paths
+
+SKILLS_DIR = paths.SKILLS_DIR
 
 
 def ensure_skills_dir() -> Path:

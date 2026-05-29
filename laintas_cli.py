@@ -114,6 +114,8 @@ from agent_loop import (
 
 import tools as tools_mod    # noqa: E402 — load after agent_loop so registry inits once
 import skills as skills_mod  # noqa: E402
+import paths                 # Centralized path management
+import migrate as migrate_mod  # Auto-migration from old layout
 
 # MCP client: lazy import (saves ~1.8s on startup)
 _mcp_mod = None
@@ -144,8 +146,8 @@ def _detect_backend() -> str:
 
 BACKEND_URL = os.environ.get("LAINTAS_BACKEND") or _detect_backend()
 LAINTAS_BASE = os.environ.get("LAINTAS_BASE", "https://laintas.com")
-SESSION_FILE = Path.home() / ".laintas_cli_session.json"
-CONFIG_FILE = Path.home() / ".laintas_cli_config.json"
+SESSION_FILE = paths.SESSION_FILE
+CONFIG_FILE = paths.CONFIG_FILE
 HEARTBEAT_INTERVAL = 30
 
 # ── PTY-based Command Execution ──────────────────────────────────────────
@@ -1241,7 +1243,7 @@ def get_prompt_session() -> PromptSession:
     """Get or create the persistent prompt_toolkit session."""
     global _prompt_session
     if _prompt_session is None:
-        hist_file = Path.home() / ".laintas_cli_history"
+        hist_file = paths.HISTORY_FILE
         _prompt_session = PromptSession(
             history=FileHistory(str(hist_file)),
             completer=MetaCompleter(),
@@ -1369,7 +1371,7 @@ else:
 # ── Session Management ─────────────────────────────────────────────────
 
 def load_session() -> Optional[dict]:
-    """Load saved session token from ~/.laintas_cli_session.json."""
+    """Load saved session token from ~/.laintas/session.json."""
     if SESSION_FILE.exists():
         try:
             return json.loads(SESSION_FILE.read_text())
@@ -1379,7 +1381,7 @@ def load_session() -> Optional[dict]:
 
 
 def save_session(session: dict) -> None:
-    """Save session token to ~/.laintas_cli_session.json."""
+    """Save session token to ~/.laintas/session.json."""
     SESSION_FILE.write_text(json.dumps(session, indent=2))
     SESSION_FILE.chmod(0o600)
 
@@ -1710,9 +1712,9 @@ def ensure_auth() -> Optional[dict]:
     sys.exit(1)
 
 
-# ── CLI Prompt Template (.cli.prop) ────────────────────────────────────
+# ── CLI Prompt Template (.laintas/cli.prop) ──────────────────────────────
 
-EXTRA_COMMAND_TEMPLATE = '''# .extra_command.py — define custom slash commands for the REPL
+EXTRA_COMMAND_TEMPLATE = '''# .laintas/commands.py — define custom slash commands for the REPL
 # context keys: session, interactive_session, agent_registry, console,
 #   get_terminal, get_all_terminals, unregister_terminal, register_terminal,
 #   rename_terminal, get_agent, get_all_agents, get_current_agent,
@@ -1812,7 +1814,7 @@ import sys
 
 
 def handle_loop_command(command, ctx):
-    \"\"\"Handle custom loop commands defined in .loop_command.py.\"\"\"
+    \"\"\"Handle custom loop commands defined in .laintas/loop.py.\"\"\"
 
     # parent(<shell command>) \\u2014 execute in parent terminal context (side effects like cd/clear)
     m = re.match(r'^parent\\((.+)\\)\\s*$', command)
@@ -2014,7 +2016,7 @@ def _forget(keep_n, ctx):
 
 
 def generate_cli_prop_template() -> str:
-    """Generate the .cli.prop system prompt template for the current OS.
+    """Generate the .laintas/cli.prop system prompt template for the current OS.
 
     The template uses XML-style sections (Anthropic's recommended pattern —
     Claude attends to them better than ALL-CAPS brackets) and teaches the
@@ -2064,7 +2066,7 @@ These memories survive across sessions. Treat them as authoritative context abou
 </persistent_memory>
 
 <project_rules>
-Project-local rules stored in .helpwo. They override defaults; follow them strictly.
+Project-local rules stored in .laintas/memory.json. They override defaults; follow them strictly.
 {{{{globalMemory}}}}
 </project_rules>
 
@@ -2259,38 +2261,46 @@ def append_file(path: str, content: str) -> None:
 
 
 def ensure_files_exist() -> None:
-    """Create .cli.prop, .helpwo, .extra_command.py and .loop_command.py if they don't exist in cwd."""
-    cli_prop_path = Path.cwd() / ".cli.prop"
-    helpwo_path = Path.cwd() / ".helpwo"
-    extra_cmd_path = Path.cwd() / ".extra_command.py"
-    loop_cmd_path = Path.cwd() / ".loop_command.py"
+    """Create .laintas/ project directory with cli.prop, memory.json, commands.py, loop.py."""
+    proj = paths.ensure_project_dir()
+
+    cli_prop_path = paths.project_file(paths.CWD_CLI_PROP)
+    memory_path = paths.project_file(paths.CWD_MEMORY)
+    commands_path = paths.project_file(paths.CWD_COMMANDS)
+    loop_path = paths.project_file(paths.CWD_LOOP)
 
     if not cli_prop_path.exists():
         template = generate_cli_prop_template()
         cli_prop_path.write_text(template, encoding="utf-8")
         console.print(f"[dim]Created {cli_prop_path}[/dim]")
 
-    if not helpwo_path.exists():
-        helpwo_path.write_text("", encoding="utf-8")
-        console.print(f"[dim]Created {helpwo_path}[/dim]")
+    if not memory_path.exists():
+        memory_path.write_text("", encoding="utf-8")
+        console.print(f"[dim]Created {memory_path}[/dim]")
 
-    if not extra_cmd_path.exists():
-        extra_cmd_path.write_text(EXTRA_COMMAND_TEMPLATE, encoding="utf-8")
-        console.print(f"[dim]Created {extra_cmd_path}[/dim]")
+    if not commands_path.exists():
+        commands_path.write_text(EXTRA_COMMAND_TEMPLATE, encoding="utf-8")
+        console.print(f"[dim]Created {commands_path}[/dim]")
 
-    if not loop_cmd_path.exists():
-        loop_cmd_path.write_text(LOOP_COMMAND_TEMPLATE, encoding="utf-8")
-        console.print(f"[dim]Created {loop_cmd_path}[/dim]")
+    if not loop_path.exists():
+        loop_path.write_text(LOOP_COMMAND_TEMPLATE, encoding="utf-8")
+        console.print(f"[dim]Created {loop_path}[/dim]")
 
 
 def reload_default_files() -> None:
-    """Delete all default files and restart laintas_cli."""
-    cwd = Path.cwd()
-    for name in (".cli.prop", ".helpwo", ".extra_command.py", ".loop_command.py"):
-        f = cwd / name
+    """Delete all project files in .laintas/ and restart laintas_cli."""
+    proj = paths.project_dir()
+    for name in paths._ALL_CWD_FILES:
+        f = proj / name
         if f.exists():
             f.unlink()
             console.print(f"[dim]Deleted {f}[/dim]")
+    # Remove .laintas/ directory if empty
+    try:
+        if proj.exists() and not any(proj.iterdir()):
+            proj.rmdir()
+    except OSError:
+        pass
     console.print("[yellow]Restarting laintas_cli...[/yellow]")
     os.execv(sys.argv[0], sys.argv)
 
@@ -3965,9 +3975,9 @@ _extra_cmd_mtime_cache = 0
 
 
 def _load_extra_commands():
-    """Load .extra_command.py and return handle_extra_command() if defined."""
+    """Load .laintas/commands.py and return handle_extra_command() if defined."""
     global _extra_cmd_handler_cache, _extra_cmd_mtime_cache
-    path = Path.cwd() / ".extra_command.py"
+    path = paths.project_file(paths.CWD_COMMANDS)
     try:
         mtime = path.stat().st_mtime
         if _extra_cmd_handler_cache is not None and mtime == _extra_cmd_mtime_cache:
@@ -4077,27 +4087,27 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
             console.print("       /agents name <new-name>  (rename current agent)")
 
     elif action == "/memory":
-        raw = read_file(".helpwo")
+        raw = read_file(str(paths.project_file(paths.CWD_MEMORY)))
         if raw and raw.strip():
             try:
                 entries = json.loads(raw)
                 if isinstance(entries, list) and entries:
                     lines = [f"[bold]{e['id']}.[/bold] {e['content']}" for e in entries]
                     text = "\n".join(lines)
-                    console.print(Panel(text, title=f".helpwo Memory ({len(entries)} entries)"))
+                    console.print(Panel(text, title=f".laintas/memory.json ({len(entries)} entries)"))
                 else:
-                    console.print(Panel(raw.strip(), title=".helpwo Memory"))
+                    console.print(Panel(raw.strip(), title=".laintas/memory.json"))
             except json.JSONDecodeError:
-                console.print(Panel(raw.strip(), title=".helpwo Memory"))
+                console.print(Panel(raw.strip(), title=".laintas/memory.json"))
         else:
             console.print("[dim]No memory yet. The AI will record learnings here.[/dim]")
 
     elif action == "/prop":
-        prop = read_file(".cli.prop")
+        prop = read_file(str(paths.project_file(paths.CWD_CLI_PROP)))
         if prop:
-            console.print(Panel(prop[:2000], title=".cli.prop Prompt Template"))
+            console.print(Panel(prop[:2000], title=".laintas/cli.prop Prompt Template"))
         else:
-            console.print("[dim]No .cli.prop found.[/dim]")
+            console.print("[dim]No .laintas/cli.prop found.[/dim]")
 
     elif action == "/scan":
         user_cmds = list_path_commands()
@@ -4769,7 +4779,7 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
         reload_default_files()
 
     elif action == "/config":
-        # Built-in config command (doesn't require .extra_command.py)
+        # Built-in config command (doesn't require .laintas/commands.py)
         parts_lower = [p.lower() for p in parts]
         if len(parts) == 1:
             # /config — show all
@@ -4798,7 +4808,7 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
             console.print("[yellow]Usage: /config [key [value]] | /config reset[/yellow]")
 
     else:
-        # Try .extra_command.py custom handler first
+        # Try .laintas/commands.py custom handler first
         handler = _load_extra_commands()
         if handler:
             ctx = {
@@ -4824,7 +4834,7 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
                 if handler(action, parts, ctx):
                     return False
             except Exception as e:
-                console.print(f"[red].extra_command.py error: {e}[/red]")
+                console.print(f"[red].laintas/commands.py error: {e}[/red]")
         console.print(f"[red]Unknown command: {action}[/red]")
         console.print("Type [bold]/help[/bold] for available commands.")
 
@@ -4839,8 +4849,8 @@ _COMMANDS = [
     ("/help",      "Show this help"),
     ("/login",     "Re-authenticate with laintas.com (opens browser)"),
     ("/name",      "Set current agent name"),
-    ("/memory",    "View .helpwo memory file"),
-    ("/prop",      "View .cli.prop prompt template"),
+    ("/memory",    "View .laintas/memory.json"),
+    ("/prop",      "View .laintas/cli.prop prompt template"),
     ("/scan",      "Scan and list all available system commands from PATH"),
     ("/debug",     "Browse debug entries (/debug), view detail (/debug <N>)"),
     ("/cwd",       "Show current working directory"),
@@ -4998,8 +5008,8 @@ def show_help():
     table.add_row("/help", "Show this help")
     table.add_row("/login", "Re-authenticate with laintas.com (opens browser)")
     table.add_row("/name [name]", "Set current agent name")
-    table.add_row("/memory", "View .helpwo memory file")
-    table.add_row("/prop", "View .cli.prop prompt template")
+    table.add_row("/memory", "View .laintas/memory.json")
+    table.add_row("/prop", "View .laintas/cli.prop prompt template")
     table.add_row("/scan", "Scan and list all available system commands from PATH")
     table.add_row("/debug", "Browse debug entries (/debug), view detail (/debug <N>), save to file (/debug <N> <file>), clear (/debug clear)")
     table.add_row("/cwd", "Show current working directory")
@@ -5256,7 +5266,13 @@ def main():
     # All REPL instances use full-color console — sub-terminals are full
     # laintas-cli instances and should look identical to the main terminal.
 
-    # Ensure .cli.prop and .helpwo exist in cwd
+    # Initialize unified home directory and auto-migrate old layout
+    paths.ensure_home()
+    if migrate_mod.needs_migration():
+        console.print("[dim]Migrating to new directory layout (~/.laintas/)...[/dim]")
+        migrate_mod.migrate_all(verbose=True)
+
+    # Ensure .laintas/ project files exist in cwd
     ensure_files_exist()
 
     # Load or create config
@@ -5331,7 +5347,7 @@ def main():
         primary.parent_terminal = None
         set_current_agent_id("primary")
 
-    # Load user skills from ~/.laintas_cli_skills. Failures are surfaced
+    # Load user skills from ~/.laintas/skills. Failures are surfaced
     # but never block startup.
     try:
         _skill_results = skills_mod.load_all()

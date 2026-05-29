@@ -26,6 +26,8 @@ import traceback
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
+import paths
+
 
 # ── Public dataclasses ─────────────────────────────────────────────────
 
@@ -249,7 +251,7 @@ def _bi_mem_read(params: dict, ctx: ToolCtx) -> dict:
     deps = ctx.deps
     if deps is None or not hasattr(deps, "read_file"):
         return {"ok": False, "error": "no deps.read_file available"}
-    content = deps.read_file(".helpwo") or ""
+    content = deps.read_file(str(paths.project_file(paths.CWD_MEMORY))) or ""
     return {"ok": True, "result": content}
 
 
@@ -1489,7 +1491,7 @@ def register_builtin_tools() -> None:
     builtins = [
         Tool(
             name="mem.read",
-            description="Read the agent's persistent .helpwo memory file in full.",
+            description="Read the agent's persistent .laintas/memory.json file in full.",
             schema={"type": "object", "properties": {}},
             invoke=_bi_mem_read,
         ),

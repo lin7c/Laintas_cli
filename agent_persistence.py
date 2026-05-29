@@ -1,6 +1,6 @@
 """Agent state persistence — survives across sessions.
 
-Each agent is serialized to `~/.laintas_cli_agents/<agent_id>.json` after every
+Each agent is serialized to `~/.laintas/agents/<agent_id>.json` after every
 significant state change (chat turn, station/unstation, terminate). Sub-terminal
 processes load their assigned agent's state at startup, so re-stationing a
 previously-deployed agent restores its conversation history.
@@ -34,7 +34,9 @@ if TYPE_CHECKING:
     from agent_loop import AgentInfo
 
 
-AGENTS_DIR = Path.home() / ".laintas_cli_agents"
+import paths
+
+AGENTS_DIR = paths.AGENTS_DIR
 _MAX_HISTORY_TURNS = 200  # truncate older turns to keep files manageable
 
 
