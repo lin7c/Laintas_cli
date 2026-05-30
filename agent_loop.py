@@ -47,7 +47,33 @@ _DEFAULT_CONFIG = {
     "terminal_tail_lines": 20,    # lines — sub-terminal snapshot
     "heartbeat_interval": 30,     # seconds — agent heartbeat
     "staleness_limit": 3,         # consecutive no-tool steps before auto-exit
+    "repetition_threshold": 3,    # consecutive no-progress steps before force-exit (mirrors TokenBudgetTracker)
+    "warning_force_limit": 3,     # consecutive same-warning fires before force-exit (circuit breaker)
+    "output_similarity": 0.85,    # Jaccard threshold for "same" output (0.0-1.0)
+    "microcompact_keep": 6,       # recent entries to keep full output in microcompact
 }
+
+# ── Transition Labels (mirrors Claude Code State.transition) ─────────
+# Every exit from the agent loop carries a named reason string for
+# telemetry, debugging, and programmatic inspection.
+# Continue reasons (loop will iterate again):
+TRANSITION_NEXT_TURN = "next_turn"                      # normal progression
+TRANSITION_REPAIR_RETRY = "repair_retry"                # JSON repair nudge
+TRANSITION_PARSE_RETRY = "parse_retry"                  # parse-failure nudge
+
+# Exit reasons (loop will terminate):
+TRANSITION_COMPLETED = "completed"                      # model set done=true
+TRANSITION_END_TURN = "end_turn"                        # no tool_calls, model finished
+TRANSITION_MAX_LOOPS = "max_loops"                      # for-range exhausted
+TRANSITION_STALENESS = "staleness"                      # too many idle steps
+TRANSITION_ABORTED = "aborted"                          # abort_event from control plane
+TRANSITION_INTERRUPTED = "interrupted"                  # Ctrl+C from user
+TRANSITION_BACKEND_ERROR = "backend_error"              # response.error == true
+TRANSITION_SILENT_FAILURE = "silent_failure"            # tokens generated but no fields extracted
+TRANSITION_REPAIR_GAVE_UP = "repair_gave_up"            # JSON repair exhausted (2 attempts)
+TRANSITION_REPETITION = "repetition"                    # output similarity threshold hit
+TRANSITION_WARNING_FORCE = "warning_force_exit"         # warning circuit breaker tripped
+TRANSITION_PARSE_GAVE_UP = "parse_gave_up"              # parse failure counter exhausted
 
 _runtime_config: dict[str, object] = {}
 
@@ -75,6 +101,24 @@ def list_runtime_config() -> dict:
 def reset_runtime_config():
     """Clear all runtime overrides."""
     _runtime_config.clear()
+
+
+# ── Soft-Interrupt & Supplementary Input ──────────────────────────────
+# Ctrl+C during the agent loop sets _user_interrupt for graceful stop.
+# Users can type supplementary messages while the AI works — they're
+# queued and injected into the conversation at the next iteration boundary.
+_user_interrupt = threading.Event()
+_user_message_queue: queue.Queue = queue.Queue()
+
+
+def get_user_interrupt_event() -> threading.Event:
+    """Return the module-level interrupt event (for external callers)."""
+    return _user_interrupt
+
+
+def get_user_message_queue() -> queue.Queue:
+    """Return the module-level message queue (for external callers)."""
+    return _user_message_queue
 
 
 # ── Debug System ───────────────────────────────────────────────────────
@@ -736,6 +780,7 @@ _MAX_HISTORY_ENTRIES = 8       # compress when terminalHistory exceeds this
 _COMPRESSION_KEEP_RECENT = 4   # always keep this many recent entries uncompressed
 _MAX_RETRIES = 2               # automatic retries for transient failures
 _CONSECUTIVE_FAILURE_LIMIT = 3  # warn AI after this many consecutive failures
+_TOOL_RESULT_BUDGET = 50_000   # chars — max per-entry output before disk persist (mirrors Claude Code's 50k cap)
 
 # ── Error pattern recognition ──────────────────────────────────────────
 # Maps regex patterns to (category, suggestion) tuples.
@@ -885,7 +930,21 @@ def _summarize_old_entries(old_entries: list) -> dict:
             err_snip = err.get("output_snippet", "")[:240].replace("\n", " ⏎ ")
             lines.append(f"  {step_label} ✗ {cmd_short}{rc_tag}{run_tag} → {err_snip}")
         else:
-            lines.append(f"  {step_label} ✓ {cmd_short}{rc_tag}{run_tag}")
+            # Preserve first 150 chars of successful output — prevents amnesia
+            # that causes the model to re-read files it already examined.
+            # Mirrors Claude Code's approach of retaining key signal in compressed
+            # history so the model doesn't repeat exploratory steps.
+            out_snip = ""
+            if output and output.strip():
+                _out_lines = [l.strip() for l in output.split('\n') if l.strip()]
+                if _out_lines:
+                    out_snip = _out_lines[0][:150]
+                    if len(_out_lines[0]) > 150:
+                        out_snip += "…"
+            if out_snip:
+                lines.append(f"  {step_label} ✓ {cmd_short}{rc_tag}{run_tag} → {out_snip}")
+            else:
+                lines.append(f"  {step_label} ✓ {cmd_short}{rc_tag}{run_tag}")
 
         i = j
 
@@ -940,6 +999,34 @@ def _compress_terminal_history(history: list) -> str:
     return '\n'.join(lines)
 
 
+def _microcompact_history(history: list, keep_recent: int = 6) -> list:
+    """Strip output from old tool results — zero-cost context window recovery.
+
+    Mirrors Claude Code's microcompact layer: deletes the bulky output field
+    from entries older than `keep_recent`, keeping only command + returncode +
+    tool metadata. This is zero LLM cost and recovers significant context.
+
+    Called at the start of each iteration so old entries are always stripped
+    before the prompt is built.
+    """
+    if len(history) <= keep_recent:
+        return history
+    result = []
+    for i, entry in enumerate(history):
+        if i < len(history) - keep_recent:
+            stripped = {
+                "command": entry.get("command", ""),
+                "returncode": entry.get("returncode"),
+                "tool": entry.get("tool", ""),
+                "call_id": entry.get("call_id", ""),
+                "output": "(output cleared by microcompact)",
+            }
+            result.append(stripped)
+        else:
+            result.append(entry)
+    return result
+
+
 def _compress_conversation(chat_history: list, max_messages: int = 20) -> list:
     """Compress conversation history by summarizing oldest messages.
 
@@ -989,6 +1076,27 @@ def _build_terminal_section(state: dict) -> str:
         output = entry.get('output', '')
         rc = entry.get('returncode')
         cmd_label = entry.get('command', '')[:120]
+
+        # ── Tool Result Budget: cap oversized outputs (zero LLM cost layer) ──
+        # Mirrors Claude Code's per-message 50k char cap: persist oversized
+        # output to disk and show only the tail.
+        if len(output) > _TOOL_RESULT_BUDGET:
+            try:
+                import tempfile as _tempfile
+                _oversize_path = os.path.join(
+                    _tempfile.gettempdir(),
+                    f"laintas_oversize_{uuid.uuid4().hex[:8]}.txt"
+                )
+                with open(_oversize_path, 'w') as _f:
+                    _f.write(output)
+                output = (
+                    f"[Output too large ({len(output)} chars). "
+                    f"Full output saved to: {_oversize_path}]\n"
+                    f"... (showing last {_MAX_TERMINAL_LINES} lines) ...\n"
+                    + '\n'.join(output.split('\n')[-_MAX_TERMINAL_LINES:])
+                )
+            except OSError:
+                output = output[-_TOOL_RESULT_BUDGET:]
 
         # Inline error classification — saves the AI a turn of analysis.
         err = _analyze_error(output, rc if rc is not None else -1)
@@ -1088,11 +1196,82 @@ def get_terminals_snapshot() -> str:
 
 # ── AI Agent Loop ──────────────────────────────────────────────────────
 
-def _detect_loop_warnings(state: dict, original_input: str) -> list[str]:
-    """Detect stuck / repetitive behaviour and return human-readable warnings.
 
-    Enhanced behavior diagnostics — surfaces the AI's own patterns so it can
-    self-correct. Returns list of warning strings for <warnings> block.
+def _command_fingerprint(cmd: str) -> str:
+    """Extract semantic intent from a command, normalizing variable parts.
+
+    Two commands with the same fingerprint perform the same operation even if
+    their arguments differ slightly (different paths, numbers, strings).
+    Mirrors community "grounded" tool hash window for near-duplicate detection.
+
+    Examples:
+        "cat /src/foo.py"        → "cat <PATH>"
+        "cat /src/bar.py"        → "cat <PATH>"
+        "grep -n 'error' log"    → "grep <N> <STR> <PATH>"
+        "fs.read {'path':'/a'}"  → "fs.read <JSON>"
+    """
+    if not cmd:
+        return ""
+    c = re.sub(r'^/tool\s+', '', cmd.strip())
+    c = re.sub(r'\{[^}]+\}', '<JSON>', c)         # JSON payloads
+    c = re.sub(r"'[^']*'", '<STR>', c)             # single-quoted strings
+    c = re.sub(r'"[^"]*"', '<STR>', c)             # double-quoted strings
+    c = re.sub(r'\S*[/.]\S*', '<PATH>', c)         # file paths
+    c = re.sub(r'\b\d+\b', '<N>', c)               # bare numbers
+    c = re.sub(r'\s+', ' ', c).strip()
+    return c
+
+
+def _output_fingerprint(text: str) -> str:
+    """Normalize command output for similarity detection.
+
+    Strips ANSI, timestamps, hex addresses, numbers, paths, and collapses
+    whitespace. Two outputs with the same fingerprint are semantically
+    identical modulo variable data. Mirrors Claude Code's TokenBudgetTracker
+    approach of detecting diminishing returns.
+    """
+    if not text:
+        return ""
+    fp = re.sub(r'\x1b\[[0-9;?]*[a-zA-Z]', '', text)   # ANSI escape codes
+    fp = re.sub(r'\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}[^\s]*', '<TS>', fp)
+    fp = re.sub(r'0x[0-9a-fA-F]+', '<HEX>', fp)
+    fp = re.sub(r'\b\d+\b', '<N>', fp)
+    fp = re.sub(r'/[^\s]+', '<PATH>', fp)
+    fp = re.sub(r'\s+', ' ', fp).strip()
+    return fp
+
+
+def _output_similarity(a: str, b: str) -> float:
+    """Token-level Jaccard similarity between two fingerprints.
+
+    Returns 0.0 (completely different) to 1.0 (identical).
+    Uses word-token overlap as a fast proxy for semantic similarity.
+    """
+    if not a and not b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    tokens_a = set(a.split())
+    tokens_b = set(b.split())
+    if not tokens_a and not tokens_b:
+        return 1.0
+    if not tokens_a or not tokens_b:
+        return 0.0
+    intersection = tokens_a & tokens_b
+    union = tokens_a | tokens_b
+    return len(intersection) / len(union)
+
+
+def _detect_loop_warnings_typed(state: dict, original_input: str) -> list[tuple[str, str]]:
+    """Detect stuck/repetitive behaviour — returns (key, message) tuples.
+
+    The key is a stable identifier for the warning type (used by the circuit
+    breaker to track per-type streaks). The message is the human-readable
+    warning text for the <warnings> block.
+
+    Mirrors Claude Code's approach of classifying each diagnostic signal
+    so that repeated signals of the same type can escalate from advisory
+    to enforcement.
 
     Checks:
     1. Same exact command 3+ consecutive times
@@ -1102,9 +1281,10 @@ def _detect_loop_warnings(state: dict, original_input: str) -> list[str]:
     5. Tool stagnation: same tool 5+ consecutive times with similar args
     6. Context amnesia: re-reading files already in _files_seen
     7. Goal drift: shortTermMemory mentions actions unrelated to original task
+    8. Near-repeat commands: fuzzy fingerprint matching (4+ same pattern)
     """
     history = state.get("terminalHistory", [])
-    warnings: list[str] = []
+    warnings: list[tuple[str, str]] = []
 
     if len(history) < 3:
         return warnings
@@ -1112,10 +1292,10 @@ def _detect_loop_warnings(state: dict, original_input: str) -> list[str]:
     # 1. Same exact command 3+ consecutive times
     last_cmds = [(h.get("command") or "").strip() for h in history[-3:]]
     if last_cmds[0] and last_cmds[0] == last_cmds[1] == last_cmds[2]:
-        warnings.append(
+        warnings.append(("same_command_repeat",
             f"You have run `{last_cmds[0][:80]}` 3 times in a row with the same result. "
             f"The task is done. Return tool_calls: [] and state your final answer in reply."
-        )
+        ))
 
     # 2. 3+ consecutive failures (any commands)
     recent = history[-3:]
@@ -1126,11 +1306,11 @@ def _detect_loop_warnings(state: dict, original_input: str) -> list[str]:
         if err.get("category") not in ("none", None):
             fail_count += 1
     if fail_count >= 3:
-        warnings.append(
+        warnings.append(("consecutive_failures",
             f"The last {fail_count} commands all failed. "
             f"Re-read the error output above and change strategy — "
             f"do not repeat with the same parameters."
-        )
+        ))
 
     # 3. Many read-only steps with no edit action — pure exploration drift
     READ_ONLY = {"ls", "cat", "head", "tail", "grep", "find", "pwd", "which",
@@ -1144,18 +1324,17 @@ def _detect_loop_warnings(state: dict, original_input: str) -> list[str]:
             if not cmd:
                 continue
             first_token = cmd.split()[0] if cmd.split() else ""
-            # /tool fs.read / fs.grep / fs.glob / fs.ls also count as read-only
             if first_token in READ_ONLY or cmd.startswith(("/tool fs.read",
                                                           "/tool fs.grep",
                                                           "/tool fs.glob",
                                                           "/tool fs.ls")):
                 readonly_count += 1
         if readonly_count >= 7:
-            warnings.append(
+            warnings.append(("readonly_drift",
                 "You have done 7+ read-only steps without any edit/build/run "
                 "action. Either start acting on what you've learned, or set "
                 "done=true and report findings."
-            )
+            ))
 
     # 4. Exploration drift: 5+ steps with no file writes AND low tool variety
     if len(history) >= 5:
@@ -1170,11 +1349,11 @@ def _detect_loop_warnings(state: dict, original_input: str) -> list[str]:
             if tool:
                 tool_names.add(tool)
         if not has_write and len(tool_names) <= 2 and len(history) >= 5:
-            warnings.append(
+            warnings.append(("exploration_drift",
                 f"Exploration drift: {len(history)} steps with no writes and only "
                 f"{len(tool_names)} tool type(s). Broaden your approach or start "
                 f"making changes based on what you've learned."
-            )
+            ))
 
     # 5. Tool stagnation: same tool 5+ consecutive times with similar args
     if len(history) >= 5:
@@ -1182,25 +1361,24 @@ def _detect_loop_warnings(state: dict, original_input: str) -> list[str]:
         if (all(t[0] == last5_tools[0][0] for t in last5_tools)
                 and last5_tools[0][0]
                 and len(set(t[1] for t in last5_tools)) <= 2):
-            warnings.append(
+            warnings.append(("tool_stagnation",
                 f"Tool stagnation: you've used `{last5_tools[0][0]}` 5 times "
                 f"with very similar arguments. Try a different tool or approach."
-            )
+            ))
 
     # 6. Context amnesia: re-reading files already in _files_seen
     files_seen = state.get("_files_seen", [])
     if files_seen and len(history) >= 2:
         last_entry = history[-1]
         cmd = (last_entry.get("command") or "").strip()
-        # Check if this is a read of a known file
-        for fp in files_seen[-20:]:  # check recent files
+        for fp in files_seen[-20:]:
             if fp and fp in cmd and any(cmd.startswith(p) for p in
                     ("fs.read", "/tool fs.read", "cat ", "head ", "tail ")):
-                warnings.append(
+                warnings.append(("context_amnesia",
                     f"Context amnesia: you're re-reading `{fp}` which you already "
                     f"examined earlier. Refer to your previous output instead of "
                     f"re-reading."
-                )
+                ))
                 break
 
     # 7. Goal drift: shortTermMemory mentions actions unrelated to task
@@ -1212,15 +1390,37 @@ def _detect_loop_warnings(state: dict, original_input: str) -> list[str]:
             recent_memory = state.get("shortTermMemory", "")[-500:]
             memory_words = set(re.findall(r'\w+', recent_memory.lower()))
             overlap = task_keywords & memory_words
-            # If less than 20% of task keywords appear in recent memory, possible drift
             if len(overlap) < max(2, len(task_keywords) * 0.2):
-                warnings.append(
+                warnings.append(("goal_drift",
                     f"Possible goal drift: recent actions seem unrelated to the "
                     f"original task '{original_input[:60]}'. "
                     f"Refocus on the original objective."
-                )
+                ))
+
+    # 8. Near-repeat commands: fuzzy fingerprint matching
+    # Mirrors community "grounded" tool hash window: if the last 4 commands
+    # all have the same semantic fingerprint, the agent is varying arguments
+    # but not changing strategy.
+    if len(history) >= 4:
+        last4_fps = [_command_fingerprint((h.get("command") or "").strip()) for h in history[-4:]]
+        non_empty = [fp for fp in last4_fps if fp]
+        if len(non_empty) >= 4 and len(set(non_empty)) == 1:
+            warnings.append(("near_repeat_command",
+                f"Near-repeat detected: last 4 commands have the same semantic pattern "
+                f"`{non_empty[0][:60]}`. You're varying arguments but not changing strategy. "
+                f"Try a fundamentally different approach or report your findings."
+            ))
 
     return warnings
+
+
+def _detect_loop_warnings(state: dict, original_input: str) -> list[str]:
+    """Detect stuck / repetitive behaviour and return human-readable warnings.
+
+    Delegates to _detect_loop_warnings_typed() and strips the type keys.
+    The typed version is used by the circuit breaker for streak tracking.
+    """
+    return [msg for _key, msg in _detect_loop_warnings_typed(state, original_input)]
 
 
 def _track_files_in_command(cmd: str, seen: list) -> None:
@@ -1824,6 +2024,8 @@ def run_agent_loop(
     depth: int = 0,            # 0=user terminal, 1+=sub-agent
     agent_id: str = None,      # Phase 2: explicit agent identity (thread-safe;
                                # falls back to get_current_agent() if None)
+    interrupt_event: threading.Event = None,   # soft-interrupt signal (Ctrl+C)
+    message_queue: queue.Queue = None,         # supplementary user messages
 ) -> dict:
     """Run the autonomous agent loop (mirrors AutonomousKernel.ts).
 
@@ -1835,7 +2037,16 @@ def run_agent_loop(
 
     depth=0: user's terminal — output streams directly (stream_output=True)
     depth>=1: sub-agent — output captured and shown in indented panels
+
+    interrupt_event: if provided, checked at multiple points to gracefully
+    stop the loop (set by REPL's SIGINT handler on Ctrl+C).
+
+    message_queue: if provided, drained between iterations — supplementary
+    messages from the user are injected into the conversation context.
     """
+    # Resolve interrupt event: use provided or fall back to module-level
+    _interrupt = interrupt_event if interrupt_event is not None else _user_interrupt
+    _msg_queue = message_queue if message_queue is not None else _user_message_queue
     state = dict(state)  # copy
     state.setdefault("shortTermMemory", "")
     state.setdefault("lastReply", "")
@@ -1847,6 +2058,7 @@ def run_agent_loop(
     user_input = original_input
     pending_events: list[dict] = []
     done = False
+    _exit_reason = TRANSITION_MAX_LOOPS  # default: assume exhaustion unless overridden by a break
     reply = ""
     interactive_session = existing_session  # InteractiveSession | SubTerminalSession | None
 
@@ -1874,6 +2086,14 @@ def run_agent_loop(
     # _current_agent_id is racy when multiple agents run concurrently.
     staleness_limit = int(get_runtime_config("staleness_limit"))
     stale_count = 0
+    # ── Output similarity tracking (mirrors TokenBudgetTracker) ──
+    _output_fingerprints: list[str] = []   # rolling window of recent output fingerprints
+    _no_progress_count = 0                 # consecutive steps with high similarity
+    _repetition_threshold = int(get_runtime_config("repetition_threshold"))
+    # ── Warning circuit breaker (mirrors Claude Code's thrashing detection) ──
+    _warning_streaks: dict[str, int] = {}  # warning_type -> consecutive count
+    _warning_force_limit = int(get_runtime_config("warning_force_limit"))
+    _force_exit = False                    # set by circuit breaker to break out of nested logic
     self_info = get_agent(agent_id) if agent_id else None
     for loop in range(max_loops):
         _loop_id = next_debug_loop()
@@ -1883,15 +2103,46 @@ def run_agent_loop(
             if self_info.abort_event.is_set():
                 state["lastReply"] = "(aborted by control plane)"
                 self_info.status = "aborted"
+                _exit_reason = TRANSITION_ABORTED
                 break
             inbox_msgs = drain_inbox(self_info.id)
         else:
             inbox_msgs = []
+
+        # ── Soft-interrupt check (Ctrl+C from user) ──────────────────
+        if _interrupt.is_set():
+            state["lastReply"] = "(interrupted by user)"
+            deps.console.print("\n[yellow]⚡ Interrupted by user (Ctrl+C).[/yellow]")
+            _exit_reason = TRANSITION_INTERRUPTED
+            break
+
+        # ── Drain supplementary user messages ─────────────────────────
+        _supplementary = []
+        while not _msg_queue.empty():
+            try:
+                msg = _msg_queue.get_nowait()
+                _supplementary.append(msg)
+            except queue.Empty:
+                break
+        if _supplementary:
+            supp_text = "\n".join(_supplementary)
+            deps.console.print(f"\n[cyan]📝 补充信息: {supp_text}[/cyan]")
+            chat_history.append({"role": "user", "content": f"[Supplementary instruction from user]: {supp_text}"})
+            state["shortTermMemory"] += f"\n  - User supplementary: {supp_text}"
+            stale_count = 0  # reset since user provided new input
+
         if inbox_msgs:
             state["_inbox"] = inbox_msgs   # JSONified into prompt below
 
         # 1. Read .laintas/memory.json (project memory)
         memory_entries = _read_memory(deps)
+
+        # ── Microcompact: strip old tool outputs to save context window ──
+        # Mirrors Claude Code's microcompact layer: zero-cost context recovery.
+        _micro_keep = int(get_runtime_config("microcompact_keep"))
+        state["terminalHistory"] = _microcompact_history(
+            state["terminalHistory"], keep_recent=_micro_keep
+        )
 
         # 2. Build global memory string for system prompt
         if memory_entries:
@@ -2060,6 +2311,9 @@ def run_agent_loop(
 
                 with Live(_render(), console=deps.console, refresh_per_second=12, transient=False) as live:
                     def _on_chunk(field, value):
+                        # Check for soft-interrupt during streaming
+                        if _interrupt.is_set():
+                            raise InterruptedError("user interrupt during streaming")
                         if field == "reply":
                             stream_state["reply"] += value
                         elif field == "command":
@@ -2077,9 +2331,10 @@ def run_agent_loop(
                             history=chat_history,
                             on_chunk=_on_chunk,
                             lang=lang,
+                            interrupt_event=_interrupt,
                         )
                     except TypeError:
-                        # Backend doesn't support on_chunk — fall back
+                        # Backend doesn't support on_chunk/interrupt_event — fall back
                         response = deps.call_backend(
                             session=session,
                             message=user_input,
@@ -2098,6 +2353,7 @@ def run_agent_loop(
                             current_path=os.getcwd(),
                             history=chat_history,
                             lang=lang,
+                            interrupt_event=_interrupt,
                         )
                     except TypeError:
                         response = deps.call_backend(
@@ -2113,14 +2369,36 @@ def run_agent_loop(
             _reply_already_rendered = bool(stream_state.get("reply"))
         else:
             _reply_already_rendered = False
-            response = deps.call_backend(
-                session=session,
-                message=user_input,
-                system_prompt=system_prompt,
-                current_path=os.getcwd(),
-                history=chat_history,
-                lang=lang,
-            )
+            try:
+                response = deps.call_backend(
+                    session=session,
+                    message=user_input,
+                    system_prompt=system_prompt,
+                    current_path=os.getcwd(),
+                    history=chat_history,
+                    lang=lang,
+                    interrupt_event=_interrupt,
+                )
+            except TypeError:
+                response = deps.call_backend(
+                    session=session,
+                    message=user_input,
+                    system_prompt=system_prompt,
+                    current_path=os.getcwd(),
+                    history=chat_history,
+                    lang=lang,
+                )
+
+        # ── Handle soft-interrupt during backend call ──
+        if response.get("_interrupted"):
+            _partial_reply = response.get("reply", "") or ""
+            if _partial_reply and _partial_reply != "(interrupted)":
+                deps.console.print(f"\n[dim]Partial response preserved: {_partial_reply[:300]}[/dim]")
+                chat_history.append({"role": "assistant", "content": _partial_reply + "\n\n[interrupted by user]"})
+            reply = _partial_reply
+            add_debug_log(debug_entry)
+            _exit_reason = TRANSITION_INTERRUPTED
+            break
 
         # ── Debug: capture AI response ──
         debug_entry.response_raw = response
@@ -2136,6 +2414,7 @@ def run_agent_loop(
                 deps.console.print(f"[red]{response['reply']}[/red]")
             state["shortTermMemory"] += f"\n  -Error: {response['reply']}"
             add_debug_log(debug_entry)
+            _exit_reason = TRANSITION_BACKEND_ERROR
             break
 
         reply = response.get("reply") or ""
@@ -2164,6 +2443,7 @@ def run_agent_loop(
                     try:
                         time.sleep(0.5)
                     except KeyboardInterrupt:
+                        _exit_reason = TRANSITION_INTERRUPTED
                         break
                 memory_entries = _read_memory(deps)
                 user_input = _build_user_message(
@@ -2181,6 +2461,7 @@ def run_agent_loop(
             else:
                 state["shortTermMemory"] += "\n  -Error: JSON repair gave up after 2 attempts"
                 add_debug_log(debug_entry)
+                _exit_reason = TRANSITION_REPAIR_GAVE_UP
                 break
         else:
             state["_repair_count"] = 0
@@ -2201,6 +2482,7 @@ def run_agent_loop(
                     deps.console.print(f"[yellow]{msg}[/yellow]")
                 state["shortTermMemory"] += f"\n  -Error: {msg}"
                 add_debug_log(debug_entry)
+                _exit_reason = TRANSITION_SILENT_FAILURE
                 break
 
         # 6. Print AI reply (only in interactive mode)
@@ -2271,6 +2553,11 @@ def run_agent_loop(
                     _stationed_session = _stationed_term_info.session
 
             for idx, tc in enumerate(tool_calls):
+                # ── Soft-interrupt check before each tool call ──
+                if _interrupt.is_set():
+                    deps.console.print(f"\n[yellow]⚡ Interrupted — skipping remaining {len(tool_calls) - idx} tool call(s).[/yellow]")
+                    break
+
                 name = tc.get("name", "")
                 arguments = tc.get("arguments", {}) or {}
                 if not name:
@@ -2516,6 +2803,81 @@ def run_agent_loop(
             f"\n  Step {loop+1}: {reply} | tools: {action_desc_short} | result: {state.get('lastOutput','')[:200]}"
         state["terminalHistory"].extend(per_call_rows)
 
+        # ── Output similarity: track fingerprints for repetition detection ──
+        # Mirrors Claude Code's TokenBudgetTracker: detects when consecutive
+        # steps produce highly similar output (diminishing returns).
+        _current_output = state.get("lastOutput", "")
+        _current_fp = _output_fingerprint(_current_output)
+        _output_fingerprints.append(_current_fp)
+        if len(_output_fingerprints) > 5:
+            _output_fingerprints = _output_fingerprints[-5:]
+        _sim_threshold = float(get_runtime_config("output_similarity"))
+        if len(_output_fingerprints) >= 2:
+            _sim = _output_similarity(_output_fingerprints[-2], _output_fingerprints[-1])
+            if _sim > _sim_threshold and _current_output.strip():
+                _no_progress_count += 1
+            else:
+                _no_progress_count = 0
+        # Also count reply-only steps (no tools) as potential no-progress
+        if not tool_calls and reply:
+            _reply_fp = _output_fingerprint(reply)
+            if len(_output_fingerprints) >= 2:
+                _prev_fp = _output_fingerprints[-2] if _output_fingerprints[-2] else ""
+                _reply_sim = _output_similarity(_prev_fp, _reply_fp)
+                if _reply_sim > _sim_threshold:
+                    _no_progress_count += 1
+
+        # ── Repetition circuit breaker (mirrors TokenBudgetTracker stop decision) ──
+        if _no_progress_count >= _repetition_threshold:
+            _exit_reason = TRANSITION_REPETITION
+            if events_cb is not None:
+                deps.console.print(
+                    f"[yellow]⚠ Output repetition detected: last {_no_progress_count} steps "
+                    f"produced highly similar output. Exiting to prevent infinite loop.[/yellow]"
+                )
+            state["shortTermMemory"] += (
+                f"\n  ⚠ Loop exited: {_no_progress_count} consecutive steps with "
+                f"near-identical output. Task may be stuck."
+            )
+            if events_cb is not None and pending_events:
+                events_cb(pending_events)
+                pending_events.clear()
+            break
+
+        # ── Warning circuit breaker: escalate repeated warnings to force-exit ──
+        # Mirrors Claude Code's thrashing detection: when the same diagnostic
+        # signal fires 3+ consecutive times, escalate from advisory to enforcement.
+        _current_warning_keys = [k for k, _m in _detect_loop_warnings_typed(state, original_input)]
+        _new_streaks: dict[str, int] = {}
+        for wk in _current_warning_keys:
+            _prev_count = _warning_streaks.get(wk, 0)
+            _new_streaks[wk] = _prev_count + 1
+            if _new_streaks[wk] >= _warning_force_limit:
+                _exit_reason = TRANSITION_WARNING_FORCE
+                if events_cb is not None:
+                    deps.console.print(
+                        f"[red]⚠ Warning '{wk}' fired {_new_streaks[wk]} consecutive times. "
+                        f"Force-exiting to prevent infinite loop.[/red]"
+                    )
+                state["shortTermMemory"] += (
+                    f"\n  ⚠ Loop force-exited: warning '{wk}' persisted for "
+                    f"{_new_streaks[wk]} consecutive iterations."
+                )
+                if events_cb is not None and pending_events:
+                    events_cb(pending_events)
+                    pending_events.clear()
+                _warning_streaks = _new_streaks
+                _force_exit = True
+                break
+        # Warnings that didn't fire this iteration reset their streaks
+        for wk in list(_warning_streaks.keys()):
+            if wk not in _current_warning_keys:
+                _new_streaks[wk] = 0
+        _warning_streaks = _new_streaks
+        if _force_exit:
+            _force_exit = False
+            break
+
         # ── Error analysis: detect patterns + suggest recovery ──
         last_output = state.get("lastOutput", "")
         last_rc = debug_entry.exec_returncode if hasattr(debug_entry, 'exec_returncode') else -1
@@ -2566,6 +2928,7 @@ def run_agent_loop(
             if events_cb is not None and pending_events:
                 events_cb(pending_events)
                 pending_events.clear()
+            _exit_reason = TRANSITION_COMPLETED
             break
 
         # ── Staleness tracking: auto-exit when AI stops producing output ──
@@ -2585,16 +2948,19 @@ def run_agent_loop(
                 if events_cb is not None and pending_events:
                     events_cb(pending_events)
                     pending_events.clear()
+                _exit_reason = TRANSITION_STALENESS
                 break
         else:
             stale_count = 0  # reset on any output (tool call or conversational reply)
 
         # 11. Delay between steps (interruptible)
         if loop < max_loops - 1:
-            try:
-                time.sleep(float(get_runtime_config("loop_delay")))
-            except KeyboardInterrupt:
-                deps.console.print("\n[yellow]Agent loop interrupted.[/yellow]")
+            # Use interrupt event.wait() instead of time.sleep() so we can
+            # wake up immediately on Ctrl+C rather than waiting for sleep to end.
+            _delay = float(get_runtime_config("loop_delay"))
+            if _interrupt.wait(timeout=_delay):
+                deps.console.print("\n[yellow]⚡ Agent loop interrupted during delay.[/yellow]")
+                _exit_reason = TRANSITION_INTERRUPTED
                 break
 
         # 12. Prepare next input — rebuild via the structured-section helper.
@@ -2613,6 +2979,36 @@ def run_agent_loop(
                 "If you have no actions to take, return: {\"reply\": \"your text\", \"tool_calls\": []}\n"
                 "Do NOT output plain text or prose. ONLY output valid JSON.</json_reminder>"
             )
+    else:
+        # ── for-loop exhausted without break (max_loops reached) ──
+        # The `else` clause of a for-loop runs only when the loop completes
+        # all iterations without a `break`. This is the max_loops exhaustion
+        # case. Mirrors Claude Code's maxTurns with explicit recovery message.
+        _exit_reason = TRANSITION_MAX_LOOPS
+        _exhaustion_msg = (
+            f"Turn limit reached ({max_loops}/{max_loops}). "
+            f"Use /continue to resume."
+        )
+        if events_cb is not None:
+            deps.console.print(f"[yellow]⚠️ {_exhaustion_msg}[/yellow]")
+        state["shortTermMemory"] += f"\n  ⚠️ {_exhaustion_msg}"
+        state["_max_loops_exhausted"] = True
+        state["_exhaustion_loop_count"] = max_loops
+        if not reply:
+            reply = _exhaustion_msg
+
+    # ── Telemetry: log exit reason to debug ──
+    _last_debug_entries = get_debug_logs()
+    if _last_debug_entries:
+        _last_debug_entries[-1].loop_exit_reason = _exit_reason
+
+    # ── Partial response preservation on interrupt ─────────────────────
+    # If the user interrupted, preserve any partial AI response so context
+    # isn't lost. The next interaction will have this in chat_history.
+    if _interrupt.is_set() and reply:
+        if reply.strip() and reply.strip() != "(interrupted by user)":
+            chat_history.append({"role": "assistant", "content": reply + "\n\n[interrupted by user]"})
+            deps.console.print(f"\n[dim]💬 Partial response preserved ({len(reply)} chars)[/dim]")
 
     # Clean up session only when NOT managed by REPL (existing_session=None)
     # When REPL manages the session, it handles lifecycle externally.
@@ -2636,6 +3032,6 @@ def run_agent_loop(
 
     if step_replies:
         return {"success": done, "msg": "\n\n".join(step_replies), "state": state,
-                "session": interactive_session}
+                "session": interactive_session, "exit_reason": _exit_reason}
     return {"success": done, "msg": reply, "state": state,
-            "session": interactive_session}
+            "session": interactive_session, "exit_reason": _exit_reason}

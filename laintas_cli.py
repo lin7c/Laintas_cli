@@ -109,6 +109,7 @@ from agent_loop import (
     abort_agent, wait_for_agent, build_agents_tree,
     get_runtime_config, set_runtime_config,
     list_runtime_config, reset_runtime_config,
+    get_user_interrupt_event, get_user_message_queue,
     clear_loop_command_cache,
 )
 
@@ -2451,9 +2452,14 @@ def call_backend_stream(
     history: list = None,
     lang: str = "EN",
     on_chunk: Optional[Callable[[str, str], None]] = None,
+    interrupt_event: Optional[threading.Event] = None,
 ) -> dict:
     """Call Helpwo backend /api/chat/stream, same as Helpwo frontend.
-    Returns parsed {reply, command, memory, done, _billing} dict."""
+    Returns parsed {reply, command, memory, done, _billing} dict.
+
+    If interrupt_event is provided, it is checked between SSE chunks so the
+    request can be aborted gracefully on Ctrl+C.
+    """
     backend_url = os.environ.get("LAINTAS_BACKEND", BACKEND_URL)
 
     payload = {
@@ -2495,6 +2501,16 @@ def call_backend_stream(
         prev_reply_for_chunks = ""
         prev_command_for_chunks = ""
         for line in response.iter_lines(decode_unicode=True):
+            # Check for soft-interrupt between SSE chunks
+            if interrupt_event is not None and interrupt_event.is_set():
+                response.close()
+                return {
+                    "reply": accumulated or "(interrupted)",
+                    "tool_calls": [],
+                    "done": True,
+                    "error": False,
+                    "_interrupted": True,
+                }
             if not line or not line.startswith("data: "):
                 continue
             data_str = line[6:].strip()
@@ -2637,6 +2653,20 @@ def call_backend_stream(
         return {"reply": "Request timed out. Please try again.", "tool_calls": [], "done": True, "error": True}
     except requests.ConnectionError:
         return {"reply": f"Cannot connect to backend ({backend_url}). Check your network.", "tool_calls": [], "done": True, "error": True}
+    except InterruptedError:
+        # Soft-interrupt from _on_chunk callback during streaming
+        _partial = ""
+        try:
+            _partial = accumulated
+        except NameError:
+            pass
+        return {
+            "reply": _partial or "(interrupted)",
+            "tool_calls": [],
+            "done": True,
+            "error": False,
+            "_interrupted": True,
+        }
     except Exception as e:
         return {"reply": f"Error: {e}", "tool_calls": [], "done": True, "error": True}
 
@@ -4807,6 +4837,53 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
         else:
             console.print("[yellow]Usage: /config [key [value]] | /config reset[/yellow]")
 
+    elif action == "/continue":
+        # Resume agent loop after max_loops exhaustion.
+        # Mirrors Claude Code's /continue: resets the turn counter and
+        # re-invokes the agent loop with preserved state.
+        _prev_state = getattr(handle_meta_command, '_last_agent_state', None)
+        _prev_chat = getattr(handle_meta_command, '_last_chat_history', None)
+        _prev_input = getattr(handle_meta_command, '_last_original_input', None)
+        _prev_deps = getattr(handle_meta_command, '_last_deps', None)
+        _prev_session = getattr(handle_meta_command, '_last_session', None)
+        _prev_events_cb = getattr(handle_meta_command, '_last_events_cb', None)
+        _prev_existing_session = getattr(handle_meta_command, '_last_existing_session', None)
+
+        if _prev_state is None or _prev_input is None:
+            console.print("[yellow]No previous agent loop to continue. "
+                         "Run a task first, then use /continue if it hits the turn limit.[/yellow]")
+            return False
+
+        if not _prev_state.get("_max_loops_exhausted"):
+            console.print("[yellow]The previous agent loop did not hit the turn limit. "
+                         "There is nothing to continue.[/yellow]")
+            return False
+
+        # Reset exhaustion flag and counter
+        _prev_state.pop("_max_loops_exhausted", None)
+        _prev_state.pop("_exhaustion_loop_count", None)
+
+        console.print("[green]Resuming agent loop with fresh turn counter...[/green]")
+
+        response = _run_agent_loop_with_interrupt(
+            _prev_deps, _prev_input, _prev_session, _prev_state,
+            _prev_chat or [],
+            events_cb=_prev_events_cb,
+            existing_session=_prev_existing_session,
+        )
+
+        # Update stored state for potential further /continue
+        handle_meta_command._last_agent_state = response.get("state", _prev_state)
+        handle_meta_command._last_chat_history = _prev_chat
+
+        if response.get("msg"):
+            console.print(deps.Markdown(response["msg"]) if hasattr(deps, 'Markdown') else response["msg"])
+            (_prev_chat if _prev_chat is not None else []).append(
+                {"role": "assistant", "content": response["msg"]}
+            )
+
+        return False
+
     else:
         # Try .laintas/commands.py custom handler first
         handler = _load_extra_commands()
@@ -4875,6 +4952,7 @@ _COMMANDS = [
     ("/mcp",       "Manage MCP servers"),
     ("/config",    "View or set runtime configuration"),
     ("/reload",    "Reload default files and restart"),
+    ("/continue",  "Resume agent loop after max_loops exhaustion"),
 ]
 
 
@@ -5190,6 +5268,125 @@ def _get_input(cwd: str):
                 pass  # spurious wakeup — fall through to prompt
 
     return pt_prompt(cwd)
+
+
+# ── Background stdin reader for supplementary input during agent loop ──
+# When the agent loop is running, the user can type additional instructions.
+# A background thread reads stdin lines and queues them for injection at
+# the next iteration boundary of the agent loop.
+_bg_reader_thread: Optional[threading.Thread] = None
+_bg_reader_stop = threading.Event()
+
+
+def _start_bg_input_reader(target_queue: queue.Queue):
+    """Start a background thread that reads stdin for supplementary messages.
+
+    Only active during run_agent_loop() — the normal REPL prompt uses
+    prompt_toolkit which owns stdin. The background reader uses select()
+    on Unix and a polling fallback on Windows.
+
+    target_queue: the queue to put supplementary messages into (should be
+    the same queue that run_agent_loop() drains between iterations).
+    """
+    global _bg_reader_thread, _bg_reader_stop
+    if _bg_reader_thread is not None and _bg_reader_thread.is_alive():
+        return  # already running
+    _bg_reader_stop.clear()
+
+    def _reader():
+        while not _bg_reader_stop.is_set():
+            try:
+                if not IS_WINDOWS and hasattr(sys.stdin, 'fileno'):
+                    try:
+                        r, _, _ = select.select([sys.stdin], [], [], 0.5)
+                        if not r:
+                            continue
+                    except (select.error, ValueError, OSError):
+                        time.sleep(0.5)
+                        continue
+                line = sys.stdin.readline()
+                if not line:
+                    break  # EOF
+                line = line.strip()
+                if line:
+                    target_queue.put(line)
+                    console.print(f"[dim cyan]📝 Queued: {line[:80]}[/dim cyan]")
+            except Exception:
+                break
+
+    _bg_reader_thread = threading.Thread(
+        target=_reader, daemon=True, name="bg-input-reader")
+    _bg_reader_thread.start()
+
+
+def _stop_bg_input_reader():
+    """Stop the background input reader thread."""
+    global _bg_reader_thread
+    _bg_reader_stop.set()
+    if _bg_reader_thread is not None:
+        _bg_reader_thread.join(timeout=1.5)
+        _bg_reader_thread = None
+
+
+def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
+                                   chat_history, events_cb=None,
+                                   existing_session=None):
+    """Run agent loop with soft-interrupt (Ctrl+C) and supplementary input support.
+
+    Wraps run_agent_loop() with:
+    1. Temporary SIGINT handler: first Ctrl+C → soft interrupt, second → force exit.
+    2. Background stdin reader: user can type supplementary messages during execution.
+    3. Module-level interrupt event reset before/after each call.
+
+    Returns the same dict as run_agent_loop().
+    """
+    _interrupt_event = get_user_interrupt_event()
+    _msg_queue = get_user_message_queue()
+
+    # Reset interrupt state from any previous call
+    _interrupt_event.clear()
+    # Drain stale supplementary messages
+    while not _msg_queue.empty():
+        try:
+            _msg_queue.get_nowait()
+        except queue.Empty:
+            break
+
+    # Save original SIGINT handler (the shutdown function)
+    _old_sigint = signal.getsignal(signal.SIGINT)
+
+    def _soft_interrupt(signum, frame):
+        if _interrupt_event.is_set():
+            # Double Ctrl+C → force exit (escape hatch)
+            console.print("\n[red]Force exit.[/red]")
+            _stop_bg_input_reader()
+            # Restore and call original handler
+            signal.signal(signal.SIGINT, _old_sigint)
+            _old_sigint(signum, frame)
+            return
+        _interrupt_event.set()
+        console.print("\n[dim]⚡ Interrupting... (press Ctrl+C again to force exit)[/dim]")
+
+    signal.signal(signal.SIGINT, _soft_interrupt)
+
+    # Start background stdin reader for supplementary input
+    _start_bg_input_reader(_msg_queue)
+
+    try:
+        response = run_agent_loop(
+            deps, user_input, session, agent_state, chat_history,
+            events_cb=events_cb,
+            existing_session=existing_session,
+            interrupt_event=_interrupt_event,
+            message_queue=_msg_queue,
+        )
+    finally:
+        # Restore original SIGINT handler
+        signal.signal(signal.SIGINT, _old_sigint)
+        _interrupt_event.clear()
+        _stop_bg_input_reader()
+
+    return response
 
 
 def run_execute_mode(task: str, session: dict, depth: int) -> int:
@@ -5517,7 +5714,7 @@ def main():
                                f"Final output:\n{interactive_session.full_output[:3000]}\n\n"
                                f"Original user input: {user_input}\n"
                                f"What should we do next?")
-                    response = run_agent_loop(get_loop_deps(), context, session, agent_state, chat_history,
+                    response = _run_agent_loop_with_interrupt(get_loop_deps(), context, session, agent_state, chat_history,
                                               events_cb=local_events_cb,
                                               existing_session=interactive_session)
                     interactive_session = response.get("session")
@@ -5537,7 +5734,7 @@ def main():
                                f"Program output:\n{new_output[:2000]}\n\n"
                                f"Full session output so far: {len(interactive_session.full_output)} bytes.\n"
                                f"Decide: send more keys, start a different command, or close the session.")
-                    response = run_agent_loop(get_loop_deps(), context, session, agent_state, chat_history,
+                    response = _run_agent_loop_with_interrupt(get_loop_deps(), context, session, agent_state, chat_history,
                                               events_cb=local_events_cb,
                                               existing_session=interactive_session)
                     interactive_session = response.get("session")
@@ -5547,10 +5744,17 @@ def main():
             # Save reply
             if response.get("msg"):
                 chat_history.append({"role": "assistant", "content": response["msg"]})
+            # ── Cross-interaction state preservation ──
+            _prev = response.get("state", {})
+            _preserved_history = (_prev.get("terminalHistory") or [])[-5:]
+            _preserved_files = (_prev.get("_files_seen") or [])[-15:]
+            _preserved_stm = (_prev.get("shortTermMemory") or "")[-1000:]
             agent_state = {
-                "shortTermMemory": "",
+                "shortTermMemory": _preserved_stm,
                 "lastReply": "",
-                "lastOutput": response.get("state", {}).get("lastOutput", ""),
+                "lastOutput": _prev.get("lastOutput", ""),
+                "terminalHistory": _preserved_history,
+                "_files_seen": _preserved_files,
             }
             if injected_done is not None:
                 injected_done.set()
@@ -5659,10 +5863,19 @@ def main():
                 if agent_registry.agent_id:
                     agent_registry._push_events(events)
 
-            response = run_agent_loop(get_loop_deps(), user_input, session, agent_state, chat_history,
+            response = _run_agent_loop_with_interrupt(get_loop_deps(), user_input, session, agent_state, chat_history,
                                       events_cb=local_events_cb,
                                       existing_session=interactive_session)
             interactive_session = response.get("session")
+
+            # ── Store context for /continue ──
+            handle_meta_command._last_agent_state = response.get("state", agent_state)
+            handle_meta_command._last_chat_history = chat_history
+            handle_meta_command._last_original_input = user_input
+            handle_meta_command._last_deps = get_loop_deps()
+            handle_meta_command._last_session = session
+            handle_meta_command._last_events_cb = local_events_cb
+            handle_meta_command._last_existing_session = interactive_session
 
             # Sync CWD after AI loop — the AI may have run shell.exec("cd ...")
             # which changed term0's bash CWD. Sync so the next prompt shows
@@ -5676,11 +5889,19 @@ def main():
         if response.get("msg"):
             chat_history.append({"role": "assistant", "content": response["msg"]})
 
-        # Reset agent state for next interaction
+        # ── Cross-interaction state preservation ──
+        # Mirrors Claude Code's approach: preserve recent context across REPL
+        # interactions so the model doesn't lose track of what it was doing.
+        _prev = response.get("state", {})
+        _preserved_history = (_prev.get("terminalHistory") or [])[-5:]
+        _preserved_files = (_prev.get("_files_seen") or [])[-15:]
+        _preserved_stm = (_prev.get("shortTermMemory") or "")[-1000:]
         agent_state = {
-            "shortTermMemory": "",
+            "shortTermMemory": _preserved_stm,
             "lastReply": "",
-            "lastOutput": response.get("state", {}).get("lastOutput", ""),
+            "lastOutput": _prev.get("lastOutput", ""),
+            "terminalHistory": _preserved_history,
+            "_files_seen": _preserved_files,
         }
 
         if injected_done is not None:
