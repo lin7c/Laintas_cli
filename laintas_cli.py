@@ -2678,6 +2678,7 @@ class AgentRegistry:
 
     def __init__(self):
         self.agent_id: Optional[str] = None
+        self.agent_secret: str = ""
         self.agent_name: str = ""
         self._heartbeat_thread: Optional[threading.Thread] = None
         self._message_poll_thread: Optional[threading.Thread] = None
@@ -2743,6 +2744,7 @@ class AgentRegistry:
             if resp.status_code == 200:
                 data = resp.json()
                 self.agent_id = data.get("agentId", "")
+                self.agent_secret = data.get("agentSecret", "")
                 if not quiet:
                     console.print(Panel(
                         f"[green]Agent linked to Helpwo AGENTS[/green]\n"
@@ -2841,6 +2843,7 @@ class AgentRegistry:
             requests.post(
                 f"{backend_url}/api/agents/{self.agent_id}/events",
                 json={
+                    "agentSecret": self.agent_secret,
                     "events": events,
                     "state": {"cwd": os.getcwd(), "status": "running"},
                 },
@@ -2876,6 +2879,7 @@ class AgentRegistry:
             try:
                 payload = {
                     "agentId": self.agent_id,
+                    "agentSecret": self.agent_secret,
                     "cwd": os.getcwd(),
                     "shell": SHELL_NAME,
                 }
@@ -2945,6 +2949,7 @@ class AgentRegistry:
             try:
                 resp = requests.get(
                     f"{backend_url}/api/agents/{self.agent_id}/poll",
+                    params={"agentSecret": self.agent_secret},
                     headers=headers,
                     cookies=cookies,
                     timeout=5,
@@ -3427,7 +3432,7 @@ class AgentRegistry:
         try:
             requests.post(
                 f"{backend_url}/api/agents/unregister",
-                json={"agentId": self.agent_id},
+                json={"agentId": self.agent_id, "agentSecret": self.agent_secret},
                 headers=headers,
                 cookies=cookies,
                 timeout=5,
@@ -3435,6 +3440,7 @@ class AgentRegistry:
         except requests.RequestException:
             pass
         self.agent_id = None
+        self.agent_secret = ""
 
 
 # ── Debug Display ───────────────────────────────────────────────────────
