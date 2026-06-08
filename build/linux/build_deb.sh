@@ -10,13 +10,13 @@
 #
 # Usage:
 #   ./build/linux/build_deb.sh
-#   ./build/linux/build_deb.sh 0.1.0   # specify version
+#   ./build/linux/build_deb.sh 0.1.1   # specify version
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
-VERSION="${1:-0.1.0}"
+VERSION="${1:-0.1.1}"
 BUILD_DIR="$PROJECT_DIR/build/linux/tmp"
 PKG_DIR="$BUILD_DIR/pkg"
 OUTPUT_DIR="$PROJECT_DIR/build/linux"
