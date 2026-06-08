@@ -3801,7 +3801,7 @@ def show_debug_detail(index: int) -> None:
             lines.append(f"[bold]Reply:[/bold]\n{e.reply[:1500]}")
         if e.command:
             lines.append(f"[bold]Command:[/bold] {e.command}")
-        if e.memory:
+        if getattr(e, "memory", None):
             lines.append(f"[bold]Memory:[/bold] {e.memory[:500]}")
         lines.append(f"[bold]Done:[/bold] {e.done}")
         if e.billing:
