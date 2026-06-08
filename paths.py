@@ -59,6 +59,7 @@ PLANS_DIR     = LAINTAS_HOME / "plans"
 PLANS_STATE   = PLANS_DIR / "_state.json"
 AGENTS_DIR    = LAINTAS_HOME / "agents"
 SKILLS_DIR    = LAINTAS_HOME / "skills"
+SESSIONS_DIR  = LAINTAS_HOME / "sessions"
 
 
 # ── Per-Project Directory (cwd-scoped) ───────────────────────────────────
@@ -112,7 +113,7 @@ def ensure_home() -> None:
         os.chmod(str(LAINTAS_HOME), 0o700)
     except OSError:
         pass
-    for d in (MEMORY_DIR, PLANS_DIR, AGENTS_DIR, SKILLS_DIR):
+    for d in (MEMORY_DIR, PLANS_DIR, AGENTS_DIR, SKILLS_DIR, SESSIONS_DIR):
         d.mkdir(parents=True, exist_ok=True)
 
 

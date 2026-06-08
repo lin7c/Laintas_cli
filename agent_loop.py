@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """AI Agent Loop for laintas_cli — extracted from laintas_cli.py."""
 
+import hashlib
 import os
 import re
 import json
@@ -48,9 +49,13 @@ _DEFAULT_CONFIG = {
     "heartbeat_interval": 30,     # seconds — agent heartbeat
     "staleness_limit": 3,         # consecutive no-tool steps before auto-exit
     "repetition_threshold": 3,    # consecutive no-progress steps before force-exit (mirrors TokenBudgetTracker)
-    "warning_force_limit": 3,     # consecutive same-warning fires before force-exit (circuit breaker)
+    "warning_force_limit": 5,     # consecutive same-warning fires before force-exit (circuit breaker)
     "output_similarity": 0.85,    # Jaccard threshold for "same" output (0.0-1.0)
     "microcompact_keep": 6,       # recent entries to keep full output in microcompact
+    "history_max_messages": 20,    # chat messages sent to backend after local compaction
+    "message_truncate": 1200,      # chars per history message sent to backend
+    "short_memory_max_chars": 2000, # session memory budget, line-aware
+    "show_billing": False,          # show cost/balance after each reply
 }
 
 # ── Transition Labels (mirrors Claude Code State.transition) ─────────
@@ -155,6 +160,8 @@ class TerminalInfo:
     created_by: str  # "depth=0"
     stationed_agent_id: Optional[str] = None  # deprecated, use stationed_agent_ids
     stationed_agent_ids: list = field(default_factory=list)
+    trigger_pattern: Optional[str] = None    # regex; None = no trigger
+    trigger_agent_id: Optional[str] = None  # inbox target; fixed at registration time
 
 
 _debug_logs: list[DebugEntry] = []
@@ -195,7 +202,8 @@ def get_debug_logs() -> list:
 
 # ── Terminal Registry ──────────────────────────────────────────────────
 
-def register_terminal(session, command: str, depth: int, name: str = None) -> str:
+def register_terminal(session, command: str, depth: int, name: str = None,
+                      trigger: str = None, trigger_agent_id: str = None) -> str:
     """Register a persistent sub-terminal. Auto-generates name as 'term<N>' if none given.
     If the name already exists, closes the old terminal and replaces it.
     Returns the assigned name.
@@ -209,14 +217,19 @@ def register_terminal(session, command: str, depth: int, name: str = None) -> st
             _terminal_registry[name].session.close()
         except Exception:
             pass
+        _trigger_scan_cursors.pop(name, None)
     info = TerminalInfo(
         name=name,
         command=command,
         session=session,
         created_at=time.time(),
         created_by=f"depth={depth}",
+        trigger_pattern=trigger or None,
+        trigger_agent_id=trigger_agent_id or None,
     )
     _terminal_registry[name] = info
+    if trigger:
+        start_trigger_scanner()
     return name
 
 
@@ -251,6 +264,7 @@ def close_all_terminals() -> None:
         except Exception:
             pass
     _terminal_registry.clear()
+    _trigger_scan_cursors.clear()
 
 
 def rename_terminal(old_name: str, new_name: str) -> bool:
@@ -263,9 +277,180 @@ def rename_terminal(old_name: str, new_name: str) -> bool:
             _terminal_registry[new_name].session.close()
         except Exception:
             pass
+    old_cursor = _trigger_scan_cursors.pop(old_name, None)
+    if old_cursor is not None:
+        _trigger_scan_cursors[new_name] = old_cursor
     info.name = new_name
     _terminal_registry[new_name] = info
     return True
+
+
+def set_terminal_trigger(name: str, pattern: str, agent_id: str) -> bool:
+    """Set or clear the trigger on an existing terminal.
+
+    Pass an empty pattern to clear. Returns False if the terminal doesn't exist.
+    """
+    info = _terminal_registry.get(name)
+    if info is None:
+        return False
+    if pattern:
+        info.trigger_pattern = pattern
+        info.trigger_agent_id = agent_id or None
+        _trigger_scan_cursors.setdefault(name, len(info.session.full_output) if info.session else 0)
+        start_trigger_scanner()
+    else:
+        info.trigger_pattern = None
+        info.trigger_agent_id = None
+        _trigger_scan_cursors.pop(name, None)
+    return True
+
+
+# ── Trigger Scanner ────────────────────────────────────────────────────
+
+_trigger_scan_cursors: dict = {}          # terminal name → chars already scanned
+_trigger_scanner_stop = threading.Event()
+_trigger_scanner_thread: Optional[threading.Thread] = None
+
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]|\x1b[^[\\]")
+
+
+def _strip_ansi(text: str) -> str:
+    return _ANSI_ESCAPE_RE.sub("", text)
+
+
+def _trigger_scanner_loop() -> None:
+    while not _trigger_scanner_stop.wait(0.5):
+        for info in list(_terminal_registry.values()):
+            if not info.trigger_pattern or not info.session:
+                continue
+            try:
+                # Drain PTY fd for non-tmux sessions (no-op for tmux)
+                info.session.read_output(timeout=0)
+                full = info.session.full_output
+                cursor = _trigger_scan_cursors.get(info.name, 0)
+                new_text = full[cursor:]
+                if not new_text:
+                    continue
+                _trigger_scan_cursors[info.name] = len(full)
+                try:
+                    pat = re.compile(info.trigger_pattern, re.IGNORECASE)
+                except re.error:
+                    continue
+                for line in _strip_ansi(new_text).splitlines():
+                    m = pat.search(line)
+                    if m and info.trigger_agent_id:
+                        send_to_agent(info.trigger_agent_id, {
+                            "type": "watch.trigger",
+                            "terminal": info.name,
+                            "line": line.strip(),
+                            "match": m.group(0),
+                            "pattern": info.trigger_pattern,
+                        })
+            except Exception:
+                pass
+
+
+def start_trigger_scanner() -> None:
+    global _trigger_scanner_thread
+    if _trigger_scanner_thread and _trigger_scanner_thread.is_alive():
+        return
+    _trigger_scanner_stop.clear()
+    _trigger_scanner_thread = threading.Thread(
+        target=_trigger_scanner_loop, daemon=True, name="trigger-scanner"
+    )
+    _trigger_scanner_thread.start()
+
+
+def stop_trigger_scanner() -> None:
+    _trigger_scanner_stop.set()
+
+
+# ── Session Snapshot ───────────────────────────────────────────────────
+
+_SESSION_TURNS_TO_SAVE = 8     # recent chat turns included in snapshot
+_SESSION_MEMORY_MAX   = 2000   # chars of shortTermMemory saved
+_SESSION_CONTENT_MAX  = 300    # chars per turn content in snapshot
+
+
+def _session_key(cwd: str) -> str:
+    return hashlib.sha256(cwd.encode()).hexdigest()[:16]
+
+
+def save_session_snapshot(state: dict, chat_history: list, cwd: str) -> None:
+    """Persist shortTermMemory + recent turns to ~/.laintas/sessions/<hash>.json.
+
+    Only saves when the session has at least 2 user turns (not trivial one-off
+    queries). Silently skips on any I/O error.
+    """
+    try:
+        user_turns = [m for m in chat_history if m.get("role") == "user"]
+        if len(user_turns) < 2:
+            return
+        mem = str(state.get("shortTermMemory") or "").strip()
+        if len(mem) > _SESSION_MEMORY_MAX:
+            mem = mem[-_SESSION_MEMORY_MAX:]
+
+        # Keep last N non-knowledge turns, trimmed
+        regular = [m for m in chat_history if m.get("role") != "knowledge"]
+        recent = regular[-_SESSION_TURNS_TO_SAVE:]
+        turns = []
+        for m in recent:
+            content = str(m.get("content") or "")
+            if len(content) > _SESSION_CONTENT_MAX:
+                content = content[:_SESSION_CONTENT_MAX] + "…"
+            turns.append({"role": m.get("role", "user"), "content": content})
+
+        payload = {
+            "cwd": cwd,
+            "timestamp": time.time(),
+            "shortTermMemory": mem,
+            "recent_turns": turns,
+        }
+        dest = paths.SESSIONS_DIR / f"{_session_key(cwd)}.json"
+        paths.SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+        dest.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def load_session_snapshot(cwd: str) -> Optional[dict]:
+    """Load the last snapshot for this cwd, or None if none/too old/corrupt."""
+    try:
+        dest = paths.SESSIONS_DIR / f"{_session_key(cwd)}.json"
+        if not dest.exists():
+            return None
+        data = json.loads(dest.read_text(encoding="utf-8"))
+        # Discard snapshots older than 7 days
+        if time.time() - data.get("timestamp", 0) > 7 * 86400:
+            return None
+        return data
+    except Exception:
+        return None
+
+
+def format_snapshot_for_prompt(snapshot: dict) -> str:
+    """Render a session snapshot as the `{{lastSession}}` prompt section."""
+    if not snapshot:
+        return ""
+    ts = snapshot.get("timestamp", 0)
+    try:
+        date_str = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        date_str = "unknown"
+
+    parts = [f"Continuing session from {date_str}:"]
+    mem = (snapshot.get("shortTermMemory") or "").strip()
+    if mem:
+        parts.append(mem)
+    turns = snapshot.get("recent_turns") or []
+    if turns:
+        parts.append("\nRecent exchanges:")
+        for t in turns:
+            label = "User" if t.get("role") == "user" else "You"
+            content = (t.get("content") or "").strip()
+            if content:
+                parts.append(f"{label}: {content}")
+    return "\n".join(parts)
 
 
 # ── Agent Registry ──────────────────────────────────────────────────────
@@ -1053,6 +1238,98 @@ def _compress_conversation(chat_history: list, max_messages: int = 20) -> list:
     return knowledge + recent
 
 
+def _stringify_message_content(content) -> str:
+    """Normalize chat message content into compact plain text."""
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict):
+                parts.append(str(item.get("text", item)))
+            else:
+                parts.append(str(item))
+        return " ".join(parts)
+    return str(content)
+
+
+def _trim_text(text: str, limit: int) -> str:
+    """Trim text with a clear marker, preserving the most recent tail."""
+    text = str(text or "")
+    if limit <= 0 or len(text) <= limit:
+        return text
+    marker = f"[trimmed {len(text) - limit} chars]\n"
+    return marker + text[-limit:]
+
+
+def _trim_short_term_memory(text: str, limit: int | None = None) -> str:
+    """Line-aware session memory trimming.
+
+    Avoids slicing through the middle of a memory bullet whenever possible.
+    """
+    limit = int(limit if limit is not None else get_runtime_config("short_memory_max_chars") or 2000)
+    text = str(text or "").strip()
+    if len(text) <= limit:
+        return text
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    kept = []
+    total = 0
+    for ln in reversed(lines):
+        add = len(ln) + 1
+        if kept and total + add > limit:
+            break
+        kept.append(ln)
+        total += add
+    kept.reverse()
+    if not kept:
+        return _trim_text(text, limit)
+    omitted = max(0, len(lines) - len(kept))
+    prefix = f"... ({omitted} older memory line(s) trimmed)\n" if omitted else ""
+    return prefix + "\n".join(kept)
+
+
+def _append_short_memory(state: dict, text: str) -> None:
+    """Append one session-memory line and keep the buffer bounded."""
+    state["shortTermMemory"] = _trim_short_term_memory(
+        f"{state.get('shortTermMemory', '')}{text}"
+    )
+
+
+def _prepare_history_for_backend(chat_history: list) -> list:
+    """Return bounded chat history for backend payload.
+
+    The full local chat_history can grow indefinitely. The prompt already
+    includes a structured conversation section, so this payload must be
+    compacted too; otherwise old turns are duplicated and can blow context.
+    """
+    if not chat_history:
+        return []
+    max_messages = int(get_runtime_config("history_max_messages") or 20)
+    msg_limit = int(get_runtime_config("message_truncate") or 1200)
+    compacted = _compress_conversation(chat_history, max_messages=max_messages)
+    result = []
+    for msg in compacted[-(max_messages + 1):]:
+        role = msg.get("role", "user")
+        if role == "knowledge":
+            role = "assistant"
+        content = _trim_text(_stringify_message_content(msg.get("content", "")), msg_limit)
+        if content.strip():
+            result.append({"role": role, "content": content})
+    return result
+
+
+def prepare_state_for_repl(state: dict) -> dict:
+    """Bound agent state before carrying it into the next REPL interaction."""
+    state = state or {}
+    output_limit = int(get_runtime_config("output_truncate") or 3000) * 2
+    history = list(state.get("terminalHistory") or [])[-12:]
+    return {
+        "shortTermMemory": _trim_short_term_memory(state.get("shortTermMemory", "")),
+        "lastReply": "",
+        "lastOutput": _trim_text(state.get("lastOutput", ""), output_limit),
+        "terminalHistory": _microcompact_history(history, keep_recent=5),
+        "_files_seen": (state.get("_files_seen") or [])[-20:],
+    }
+
+
 def _build_terminal_section(state: dict) -> str:
     """Section 1: recent terminal outputs with automatic compression.
 
@@ -1200,24 +1477,27 @@ def get_terminals_snapshot() -> str:
 def _command_fingerprint(cmd: str) -> str:
     """Extract semantic intent from a command, normalizing variable parts.
 
-    Two commands with the same fingerprint perform the same operation even if
-    their arguments differ slightly (different paths, numbers, strings).
-    Mirrors community "grounded" tool hash window for near-duplicate detection.
+    Two commands with the same fingerprint perform the same operation on the
+    same target even if minor arguments differ. Intentionally preserves the
+    filename (last path component) so that reading different files does NOT
+    produce the same fingerprint — only truly repeating the identical target
+    should trigger the near-repeat warning.
 
     Examples:
-        "cat /src/foo.py"        → "cat <PATH>"
-        "cat /src/bar.py"        → "cat <PATH>"
-        "grep -n 'error' log"    → "grep <N> <STR> <PATH>"
+        "cat /src/foo.py"        → "cat foo.py"
+        "cat /src/bar.py"        → "cat bar.py"   ← different, no false alarm
+        "grep -n 'error' log.py" → "grep <N> <STR> log.py"
         "fs.read {'path':'/a'}"  → "fs.read <JSON>"
     """
     if not cmd:
         return ""
     c = re.sub(r'^/tool\s+', '', cmd.strip())
-    c = re.sub(r'\{[^}]+\}', '<JSON>', c)         # JSON payloads
-    c = re.sub(r"'[^']*'", '<STR>', c)             # single-quoted strings
-    c = re.sub(r'"[^"]*"', '<STR>', c)             # double-quoted strings
-    c = re.sub(r'\S*[/.]\S*', '<PATH>', c)         # file paths
-    c = re.sub(r'\b\d+\b', '<N>', c)               # bare numbers
+    c = re.sub(r'\{[^}]+\}', '<JSON>', c)              # JSON payloads → opaque
+    c = re.sub(r"'[^']*'", '<STR>', c)                  # single-quoted strings
+    c = re.sub(r'"[^"]*"', '<STR>', c)                  # double-quoted strings
+    # Keep filename, strip directory prefix: /some/long/dir/file.py → file.py
+    c = re.sub(r'(?:\S*/)+(\S+)', r'\1', c)
+    c = re.sub(r'\b\d+\b', '<N>', c)                    # bare numbers
     c = re.sub(r'\s+', ' ', c).strip()
     return c
 
@@ -2052,6 +2332,11 @@ def run_agent_loop(
     state.setdefault("lastReply", "")
     state.setdefault("lastOutput", "")
     state.setdefault("terminalHistory", [])
+    state["shortTermMemory"] = _trim_short_term_memory(state.get("shortTermMemory", ""))
+    state["lastOutput"] = _trim_text(
+        state.get("lastOutput", ""),
+        int(get_runtime_config("output_truncate") or 3000) * 2,
+    )
     chat_history = chat_history or []
 
     step_replies = []
@@ -2128,7 +2413,7 @@ def run_agent_loop(
             supp_text = "\n".join(_supplementary)
             deps.console.print(f"\n[cyan]📝 补充信息: {supp_text}[/cyan]")
             chat_history.append({"role": "user", "content": f"[Supplementary instruction from user]: {supp_text}"})
-            state["shortTermMemory"] += f"\n  - User supplementary: {supp_text}"
+            _append_short_memory(state, f"\n  - User supplementary: {supp_text}")
             stale_count = 0  # reset since user provided new input
 
         if inbox_msgs:
@@ -2252,11 +2537,18 @@ def run_agent_loop(
         # {{behaviorDiagnostics}} — empty placeholder (filled in user message)
         system_prompt = system_prompt.replace("{{behaviorDiagnostics}}", "")
 
+        # {{lastSession}} — snapshot from the previous session in this cwd
+        last_session_text = format_snapshot_for_prompt(
+            state.get("_last_session_snapshot")
+        ) if state.get("_last_session_snapshot") else ""
+        system_prompt = system_prompt.replace("{{lastSession}}", last_session_text)
+
         # 5. Build user message via the structured-section helper.
         terminal_section = _build_terminal_section(state)
         memory_section = _build_memory_section(memory_entries, state, chat_history)
         conversation_section = _build_conversation_section(chat_history)
         terminals_snapshot = get_terminals_snapshot()
+        history_for_backend = _prepare_history_for_backend(chat_history)
         user_input = _build_user_message(
             original_input, state, memory_entries, chat_history, loop, max_loops,
         )
@@ -2277,7 +2569,7 @@ def run_agent_loop(
             request_body={
                 "message": user_input[:2000],
                 "currentPath": os.getcwd(),
-                "history": chat_history[-20:] if chat_history else [],
+                "history": history_for_backend,
                 "promptLen": len(system_prompt),
                 "promptPreview": system_prompt[:500],
                 "memorySection": memory_section[:500],
@@ -2328,7 +2620,7 @@ def run_agent_loop(
                             message=user_input,
                             system_prompt=system_prompt,
                             current_path=os.getcwd(),
-                            history=chat_history,
+                            history=history_for_backend,
                             on_chunk=_on_chunk,
                             lang=lang,
                             interrupt_event=_interrupt,
@@ -2340,7 +2632,7 @@ def run_agent_loop(
                             message=user_input,
                             system_prompt=system_prompt,
                             current_path=os.getcwd(),
-                            history=chat_history,
+                            history=history_for_backend,
                             lang=lang,
                         )
             except ImportError:
@@ -2351,7 +2643,7 @@ def run_agent_loop(
                             message=user_input,
                             system_prompt=system_prompt,
                             current_path=os.getcwd(),
-                            history=chat_history,
+                            history=history_for_backend,
                             lang=lang,
                             interrupt_event=_interrupt,
                         )
@@ -2361,7 +2653,7 @@ def run_agent_loop(
                             message=user_input,
                             system_prompt=system_prompt,
                             current_path=os.getcwd(),
-                            history=chat_history,
+                            history=history_for_backend,
                             lang=lang,
                         )
             # Mark that the streaming Live already rendered the reply — avoid
@@ -2375,7 +2667,7 @@ def run_agent_loop(
                     message=user_input,
                     system_prompt=system_prompt,
                     current_path=os.getcwd(),
-                    history=chat_history,
+                    history=history_for_backend,
                     lang=lang,
                     interrupt_event=_interrupt,
                 )
@@ -2385,7 +2677,7 @@ def run_agent_loop(
                     message=user_input,
                     system_prompt=system_prompt,
                     current_path=os.getcwd(),
-                    history=chat_history,
+                    history=history_for_backend,
                     lang=lang,
                 )
 
@@ -2412,7 +2704,7 @@ def run_agent_loop(
         if response.get("error"):
             if events_cb is not None:
                 deps.console.print(f"[red]{response['reply']}[/red]")
-            state["shortTermMemory"] += f"\n  -Error: {response['reply']}"
+            _append_short_memory(state, f"\n  -Error: {response['reply']}")
             add_debug_log(debug_entry)
             _exit_reason = TRANSITION_BACKEND_ERROR
             break
@@ -2428,10 +2720,10 @@ def run_agent_loop(
             if attempts < 2:
                 state["_repair_count"] = attempts + 1
                 raw_excerpt = (response.get("_raw") or "")[:200]
-                state["shortTermMemory"] += (
+                _append_short_memory(state, (
                     f"\n  ⚠ Malformed JSON (attempt {attempts+1}/2). "
                     f"Raw start: {raw_excerpt!r}"
-                )
+                ))
                 if events_cb is not None:
                     deps.console.print(
                         f"[yellow]Response was not valid JSON — retrying (attempt {attempts+1}/2)[/yellow]")
@@ -2459,7 +2751,7 @@ def run_agent_loop(
                 )
                 continue
             else:
-                state["shortTermMemory"] += "\n  -Error: JSON repair gave up after 2 attempts"
+                _append_short_memory(state, "\n  -Error: JSON repair gave up after 2 attempts")
                 add_debug_log(debug_entry)
                 _exit_reason = TRANSITION_REPAIR_GAVE_UP
                 break
@@ -2478,12 +2770,23 @@ def run_agent_loop(
                     f"(e.g. plain text instead of `{{\"reply\": ...}}`). "
                     f"Try rephrasing or shortening the prompt."
                 )
-                if events_cb is not None:
-                    deps.console.print(f"[yellow]{msg}[/yellow]")
-                state["shortTermMemory"] += f"\n  -Error: {msg}"
-                add_debug_log(debug_entry)
-                _exit_reason = TRANSITION_SILENT_FAILURE
-                break
+                silent_count = state.get("_silent_fail_count", 0) + 1
+                state["_silent_fail_count"] = silent_count
+                if silent_count <= 2:
+                    response["_parse_failed"] = True
+                    done = False
+                    if events_cb is not None:
+                        deps.console.print("[dim yellow](empty structured response — asking AI to retry JSON)[/dim yellow]")
+                    _append_short_memory(state, f"\n  -Format retry {silent_count}/2: {msg}")
+                else:
+                    if events_cb is not None:
+                        deps.console.print(f"[yellow]{msg}[/yellow]")
+                    _append_short_memory(state, f"\n  -Error: {msg}")
+                    add_debug_log(debug_entry)
+                    _exit_reason = TRANSITION_SILENT_FAILURE
+                    break
+        elif reply or tool_calls:
+            state["_silent_fail_count"] = 0
 
         # 6. Print AI reply (only in interactive mode)
         if reply:
@@ -2503,21 +2806,24 @@ def run_agent_loop(
         _nudge_needed = False
         if response.get("_parse_failed"):
             _nudge_needed = True
+            _prose_only = response.get("_prose_only", False)
             _parse_fail_count = state.get("_parse_fail_count", 0) + 1
             state["_parse_fail_count"] = _parse_fail_count
-            if events_cb is not None:
+            # Suppress the user-visible warning for pure-prose responses — the content
+            # is correct, the model just forgot the JSON wrapper. Only warn when the
+            # model was clearly attempting (and garbling) JSON.
+            if events_cb is not None and not _prose_only:
                 if _parse_fail_count == 1:
                     deps.console.print(f"[dim yellow](formatting issue — asking AI to retry)[/dim yellow]")
                 elif _parse_fail_count >= 3:
                     deps.console.print(f"[yellow]AI failed to use JSON format {_parse_fail_count} times. Consider rephrasing your request.[/yellow]")
-                    # Reset counter to avoid spamming
                     state["_parse_fail_count"] = 0
         else:
             # Reset counter on successful parse
             state["_parse_fail_count"] = 0
 
-        # 7. Show billing if available (only in interactive mode)
-        if billing:
+        # 7. Show billing if available (opt-in via /config show_billing true)
+        if billing and get_runtime_config("show_billing"):
             cost = billing.get("costCents", 0)
             balance = billing.get("balanceCents", 0)
             if cost > 0:
@@ -2536,10 +2842,10 @@ def run_agent_loop(
         if len(tool_calls) > MAX_TC_PER_TURN:
             _truncated_n = len(tool_calls)
             tool_calls = tool_calls[:MAX_TC_PER_TURN]
-            state["shortTermMemory"] += (
+            _append_short_memory(state, (
                 f"\n  ⚠ Emitted {_truncated_n} tool calls; only first {MAX_TC_PER_TURN} ran. "
                 f"Be more selective next turn."
-            )
+            ))
 
         formatted_outputs: list[str] = []
         per_call_rows: list[dict] = []
@@ -2613,7 +2919,7 @@ def run_agent_loop(
                                       "tool": name, "returncode": -1, "policy": "deny"}
                             skip_invoke = True
                         elif policy_approval:
-                            state["shortTermMemory"] += f"\n  ⚠ Policy: {policy_reason}"
+                            _append_short_memory(state, f"\n  ⚠ Policy: {policy_reason}")
 
                         if not skip_invoke:
                             cmd_allowed, _ = hooks_mod.trigger("pre_command", {
@@ -2671,6 +2977,7 @@ def run_agent_loop(
                             get_all_terminals=get_all_terminals,
                             register_terminal=register_terminal,
                             unregister_terminal=unregister_terminal,
+                            set_terminal_trigger=set_terminal_trigger,
                             get_agent=get_agent, get_all_agents=get_all_agents,
                             get_current_agent=get_current_agent,
                             station_agent=station_agent,
@@ -2799,8 +3106,13 @@ def run_agent_loop(
         # 10. Update state — append per-call rows (or one no-op row if no tool_calls)
         tool_names_for_log = [r["tool"] for r in per_call_rows]
         action_desc_short = ", ".join(tool_names_for_log) if tool_names_for_log else ""
-        state["shortTermMemory"] += \
-            f"\n  Step {loop+1}: {reply} | tools: {action_desc_short} | result: {state.get('lastOutput','')[:200]}"
+        # Skip recording format-failed steps: the plain-text apology would pollute
+        # shortTermMemory and reinforce the wrong response pattern on the next retry.
+        if not _nudge_needed:
+            _append_short_memory(
+                state,
+                f"\n  Step {loop+1}: {reply} | tools: {action_desc_short} | result: {state.get('lastOutput','')[:200]}"
+            )
         state["terminalHistory"].extend(per_call_rows)
 
         # ── Output similarity: track fingerprints for repetition detection ──
@@ -2835,10 +3147,10 @@ def run_agent_loop(
                     f"[yellow]⚠ Output repetition detected: last {_no_progress_count} steps "
                     f"produced highly similar output. Exiting to prevent infinite loop.[/yellow]"
                 )
-            state["shortTermMemory"] += (
+            _append_short_memory(state, (
                 f"\n  ⚠ Loop exited: {_no_progress_count} consecutive steps with "
                 f"near-identical output. Task may be stuck."
-            )
+            ))
             if events_cb is not None and pending_events:
                 events_cb(pending_events)
                 pending_events.clear()
@@ -2859,10 +3171,10 @@ def run_agent_loop(
                         f"[red]⚠ Warning '{wk}' fired {_new_streaks[wk]} consecutive times. "
                         f"Force-exiting to prevent infinite loop.[/red]"
                     )
-                state["shortTermMemory"] += (
+                _append_short_memory(state, (
                     f"\n  ⚠ Loop force-exited: warning '{wk}' persisted for "
                     f"{_new_streaks[wk]} consecutive iterations."
-                )
+                ))
                 if events_cb is not None and pending_events:
                     events_cb(pending_events)
                     pending_events.clear()
@@ -2883,8 +3195,10 @@ def run_agent_loop(
         last_rc = debug_entry.exec_returncode if hasattr(debug_entry, 'exec_returncode') else -1
         error_info = _analyze_error(last_output, last_rc)
         if error_info["category"] != "none":
-            state["shortTermMemory"] += \
+            _append_short_memory(
+                state,
                 f"\n  🔍 Error detected [{error_info['category']}]: {error_info['suggestion']}"
+            )
             # ── Hooks: on_error ──
             hooks_mod.trigger("on_error", {
                 "command": action_desc_short,
@@ -2895,15 +3209,14 @@ def run_agent_loop(
             })
             if error_info["retryable"] and state.get("_retry_count", 0) < _MAX_RETRIES:
                 state["_retry_count"] = state.get("_retry_count", 0) + 1
-                state["shortTermMemory"] += \
-                    f" (auto-retry {state['_retry_count']}/{_MAX_RETRIES})"
+                _append_short_memory(state, f" (auto-retry {state['_retry_count']}/{_MAX_RETRIES})")
         else:
             state["_retry_count"] = 0  # reset on success
 
         # ── Consecutive failure warning ──
         fail_hint = _maybe_retry_suggestion(state)
         if fail_hint:
-            state["shortTermMemory"] += fail_hint
+            _append_short_memory(state, fail_hint)
 
         # ── Debug: persist this loop's entry ──
         add_debug_log(debug_entry)
@@ -2970,15 +3283,17 @@ def run_agent_loop(
         )
 
         # ── Inject nudge if model failed to use JSON format ──
+        # Prepend (not append) so the format reminder leads the context window
+        # and is not buried under accumulated shortTermMemory content.
         if _nudge_needed:
-            user_input += (
-                "\n\n<json_reminder>IMPORTANT: Your previous response was plain text. "
-                "You MUST respond with a valid JSON object in this exact format:\n"
-                '```json\n{\n  "reply": "your text response here",\n  "tool_calls": [\n    '
-                '{"name": "tool.name", "arguments": {...}}\n  ]\n}\n```\n'
-                "If you have no actions to take, return: {\"reply\": \"your text\", \"tool_calls\": []}\n"
-                "Do NOT output plain text or prose. ONLY output valid JSON.</json_reminder>"
+            json_reminder = (
+                "[SYSTEM: Output must be a JSON object. "
+                "Format: "
+                '{"reply": "...", "tool_calls": []} '
+                "— begin with { end with }]"
+                "\n\n"
             )
+            user_input = json_reminder + user_input
     else:
         # ── for-loop exhausted without break (max_loops reached) ──
         # The `else` clause of a for-loop runs only when the loop completes
@@ -2991,7 +3306,7 @@ def run_agent_loop(
         )
         if events_cb is not None:
             deps.console.print(f"[yellow]⚠️ {_exhaustion_msg}[/yellow]")
-        state["shortTermMemory"] += f"\n  ⚠️ {_exhaustion_msg}"
+        _append_short_memory(state, f"\n  ⚠️ {_exhaustion_msg}")
         state["_max_loops_exhausted"] = True
         state["_exhaustion_loop_count"] = max_loops
         if not reply:

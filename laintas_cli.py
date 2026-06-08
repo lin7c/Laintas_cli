@@ -109,8 +109,11 @@ from agent_loop import (
     abort_agent, wait_for_agent, build_agents_tree,
     get_runtime_config, set_runtime_config,
     list_runtime_config, reset_runtime_config,
+    prepare_state_for_repl,
     get_user_interrupt_event, get_user_message_queue,
     clear_loop_command_cache,
+    stop_trigger_scanner,
+    save_session_snapshot, load_session_snapshot,
 )
 
 import tools as tools_mod    # noqa: E402 — load after agent_loop so registry inits once
@@ -2220,7 +2223,7 @@ def generate_cli_prop_template() -> str:
 
     Variables substituted at run time (see agent_loop.run_agent_loop):
       {{agentName}} {{agentId}} {{currentPath}} {{depth}} {{nextDepth}}
-      {{activeFile}} {{globalMemory}} {{persistentMemory}}
+      {{activeFile}} {{globalMemory}} {{persistentMemory}} {{lastSession}}
       {{planMode}} {{tools}} {{inbox}} {{children}} {{parent}}
       {{terminalName}} {{parentTerminal}} {{deploymentStatus}}
       {{workflowPhase}} {{rolePrompt}} {{confidenceGuidance}}
@@ -2230,7 +2233,7 @@ def generate_cli_prop_template() -> str:
 
     return f"""<role>
 You are {{{{agentName}}}} (id: {{{{agentId}}}}, role: {{{{deploymentStatus}}}}), an autonomous coding agent running inside a laintas-cli REPL.
-You earn your keep by solving real engineering tasks: explore the codebase, edit files, run commands, verify the result, and report back tersely. You are not a chatbot — you act, then explain what you did.
+You earn your keep by solving real engineering tasks: explore the codebase, edit files, run commands, verify the result, and report back tersely. Prefer action over explanation once the task is clear — but **confirm intent before touching any file or running any command when the request is conversational, vague, or missing a concrete target**.
 </role>
 
 <specialist_role>
@@ -2256,6 +2259,10 @@ You earn your keep by solving real engineering tasks: explore the codebase, edit
 {{{{parallelResults}}}}
 </parallel_results>
 
+<last_session>
+{{{{lastSession}}}}
+</last_session>
+
 <persistent_memory>
 These memories survive across sessions. Treat them as authoritative context about the user and project.
 {{{{persistentMemory}}}}
@@ -2267,7 +2274,7 @@ Project-local rules stored in .laintas/memory.json. They override defaults; foll
 </project_rules>
 
 <tools>
-You have two ways to act, both expressed in the `command` field of your JSON response:
+You have two ways to act, both expressed as entries in the `tool_calls` array of your JSON response:
 
 (A) Shell command — any executable on PATH, with pipes/redirects/substitution. Examples:
     ls -la src/
@@ -2286,7 +2293,7 @@ build tools, package managers, git, version control, anything PTY-driven.
 Catalog:
 {{{{tools}}}}
 
-Meta-commands (also valid in `command`):
+Meta-commands (use `shell.exec` with the meta-command string when needed):
 - /station [name]               station this agent (depth=0 commands run directly, like user input)
 - /send <name> <keys>          send keystrokes / commands to a named terminal
 - /terminate <name>            close and destroy a terminal
@@ -2306,14 +2313,23 @@ Meta-commands (also valid in `command`):
 <workflow>
 For every non-trivial task, follow this loop:
 
-1. UNDERSTAND. Re-state the user's goal in one sentence (in your `reply`). If ambiguous, ask in `reply` and set `done: true` — do not guess.
+1. UNDERSTAND — and ask first when needed.
+   Re-state the user's goal in one sentence. **If any of the following are true, ask one clarifying question and return `tool_calls: []` — do NOT start exploring:**
+   - The input is conversational or expressive (feedback, complaint, question about behaviour)
+   - No concrete file, command, or task target is named
+   - The request is short (≲10 words) and could mean multiple things
+   - You would have to guess which part of the codebase to touch
+   One focused question is better than wrong action. Do not start exploring "to understand" — exploration is action and changes the user's perception of what you're doing.
 
-2. EXPLORE before changing. For unfamiliar code use fs.glob → fs.grep → fs.read (offset/limit if large). Cite findings as `path:line` so the user can jump.
+2. EXPLORE before changing — but report before acting.
+   For unfamiliar code use fs.glob → fs.grep → fs.read (offset/limit if large). Cite findings as `path:line`.
+   **After exploration, stop and summarise what you found before making any edit or running any write/destructive command.** Return `tool_calls: []` with a summary and your proposed next step, then wait for the user to confirm. Skip this pause only when the user has already explicitly approved the action in this same conversation turn.
 
-3. PLAN for multi-step work. If the task has >3 steps OR touches >2 files, create tasks via task.create before editing. One in_progress task at a time. If plan mode is active (see <environment>), explore only — no writes — until the user runs /plan approve.
+3. PLAN before acting. For any non-trivial task, write a brief plan (3–5 bullets) in your `reply` before touching anything. If there are multiple valid approaches, offer 2–3 labelled options and let the user pick — don't silently choose one. For tasks with >3 steps or touching >2 files, also create tasks via task.create. One in_progress task at a time. If plan mode is active, explore only until the user runs /plan approve.
 
 4. ACT in small, verifiable increments. **Work incrementally — never try to do everything in one response.**
    - **One tool call per concern.** Write one file, make one edit, run one command per tool call. Multiple tool calls per turn are fine (they run sequentially), but keep each one small and focused.
+   - **Before destructive or hard-to-reverse commands** (rm, overwrite, deploy, bulk rename, db migrations): state in `reply` what you are about to run and why, then execute. This gives the user a chance to redirect if the summary looks wrong.
    - **fs.write: ≤ 50 lines per call.** If a file needs more content, write the skeleton first, then use fs.edit to add sections one at a time. Example: write index.html with basic structure (head, empty body, empty script tag), then fs.edit to add the body content, then fs.edit to add the JavaScript.
    - **fs.edit: replace small, unique snippets.** Don't try to replace entire blocks — find a small unique anchor string and replace just that section.
    - **Self-check before writing:** If you're about to write more than 50 lines of content in a single fs.write call, STOP. Split it: write the skeleton now, add content in the next turn via fs.edit.
@@ -2328,7 +2344,11 @@ For every non-trivial task, follow this loop:
    b. Identify a smaller, unique substring that actually exists in the file
    c. Use multiple smaller fs.edit calls to make incremental changes
 
-7. REMEMBER what's worth remembering. Use the `rules` field for project-local facts ("uses Vite", "tests live in __tests__/"). Use `/tool mem.save` for cross-session memories (user role, feedback, project constraints). Don't save derivable facts (git history, current file layout).
+7. REMEMBER what's worth remembering. Use the `rules` field for project-local facts ("uses Vite", "tests live in __tests__/"). Use `/tool mem.save` for cross-session memories — **save immediately** when:
+   - The user corrects you ("no", "wrong", "don't do that", "I prefer")
+   - A non-obvious project constraint or decision is established
+   - The user reveals their role, expertise level, or workflow preference
+   Don't save derivable facts (git history, current file layout). The `<last_session>` block above gives you continuity from the previous session in this directory.
 </workflow>
 
 <workflow_phase>
@@ -2795,20 +2815,36 @@ def call_backend_stream(
         # Extract the JSON object from accumulated text. Model may wrap in ```json fences or prose.
         parsed = _extract_json_object(accumulated)
         if parsed is None:
-            # Model returned pure prose instead of JSON.
-            # Wrap the prose as a reply so it still displays, and flag for nudge.
             raw_text = accumulated.strip() or "(no response)"
+            # Pure prose (no '{'): content is valid but JSON wrapper is missing.
+            # Continue the loop so the model gets a nudge and can still call tools,
+            # but mark _prose_only so the nudge is silent (no user-visible warning).
+            # Only show the warning when the model was clearly attempting JSON (has '{').
             return {
                 "reply": raw_text,
                 "tool_calls": [],
-                "done": False,  # not done — nudge will continue the loop
+                "done": False,
+                "error": False,
+                "_parse_failed": True,
+                "_prose_only": "{" not in accumulated,
+                "_billing": billing_info,
+                "_diag_events": _diag_events,
+            }
+
+        # Normalize tool_calls from response
+        recognized_fields = ("reply", "tool_calls", "command", "close_session", "send_keys")
+        if not any(k in parsed for k in recognized_fields):
+            raw_text = accumulated.strip() or json.dumps(parsed, ensure_ascii=False)
+            return {
+                "reply": raw_text,
+                "tool_calls": [],
+                "done": False,
                 "error": False,
                 "_parse_failed": True,
                 "_billing": billing_info,
                 "_diag_events": _diag_events,
             }
 
-        # Normalize tool_calls from response
         tool_calls = parsed.get("tool_calls") or []
 
         # Backward compat: old-style "command" field -> wrap as tool_call
@@ -4241,6 +4277,7 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
         return False
 
     if action == "/exit":
+        stop_trigger_scanner()
         close_all_terminals()
         agent_registry.unregister()
         clear_session()
@@ -4254,6 +4291,7 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
             sys.stdout.flush()
             console.print("[green]Detaching...[/green]")
             return False
+        stop_trigger_scanner()
         close_all_terminals()
         agent_registry.unregister()
         console.print("[green]Goodbye![/green]")
@@ -5766,11 +5804,17 @@ def main():
 
     # Register as remote agent (only if authenticated)
     agent_registry = AgentRegistry()
+    _session_start_cwd = os.getcwd()
     agent_state = {
         "shortTermMemory": "",
         "lastReply": "",
         "lastOutput": "",
     }
+    # Load last session snapshot for this directory (depth-0 only)
+    if args.depth == 0:
+        _snapshot = load_session_snapshot(_session_start_cwd)
+        if _snapshot:
+            agent_state["_last_session_snapshot"] = _snapshot
     chat_history = []
 
     if session.get("userId"):
@@ -5842,6 +5886,9 @@ def main():
     # Setup graceful shutdown
     def shutdown(signum=None, frame=None):
         console.print("\n[yellow]Shutting down...[/yellow]")
+        if args.depth == 0:
+            save_session_snapshot(agent_state, chat_history, _session_start_cwd)
+        stop_trigger_scanner()
         close_all_terminals()
         close_all_agents()
         try:
@@ -5929,6 +5976,9 @@ def main():
 
         # Ctrl+D → exit
         if user_input == "/exit":
+            if args.depth == 0:
+                save_session_snapshot(agent_state, chat_history, _session_start_cwd)
+            stop_trigger_scanner()
             close_all_terminals()
             if interactive_session:
                 interactive_session.close()
@@ -6012,17 +6062,7 @@ def main():
             if response.get("msg"):
                 chat_history.append({"role": "assistant", "content": response["msg"]})
             # ── Cross-interaction state preservation ──
-            _prev = response.get("state", {})
-            _preserved_history = (_prev.get("terminalHistory") or [])[-5:]
-            _preserved_files = (_prev.get("_files_seen") or [])[-15:]
-            _preserved_stm = (_prev.get("shortTermMemory") or "")[-1000:]
-            agent_state = {
-                "shortTermMemory": _preserved_stm,
-                "lastReply": "",
-                "lastOutput": _prev.get("lastOutput", ""),
-                "terminalHistory": _preserved_history,
-                "_files_seen": _preserved_files,
-            }
+            agent_state = prepare_state_for_repl(response.get("state", {}))
             if injected_done is not None:
                 injected_done.set()
             continue
@@ -6159,17 +6199,7 @@ def main():
         # ── Cross-interaction state preservation ──
         # Mirrors Claude Code's approach: preserve recent context across REPL
         # interactions so the model doesn't lose track of what it was doing.
-        _prev = response.get("state", {})
-        _preserved_history = (_prev.get("terminalHistory") or [])[-5:]
-        _preserved_files = (_prev.get("_files_seen") or [])[-15:]
-        _preserved_stm = (_prev.get("shortTermMemory") or "")[-1000:]
-        agent_state = {
-            "shortTermMemory": _preserved_stm,
-            "lastReply": "",
-            "lastOutput": _prev.get("lastOutput", ""),
-            "terminalHistory": _preserved_history,
-            "_files_seen": _preserved_files,
-        }
+        agent_state = prepare_state_for_repl(response.get("state", {}))
 
         if injected_done is not None:
             injected_done.set()

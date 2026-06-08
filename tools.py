@@ -61,6 +61,7 @@ class ToolCtx:
     rename_agent: Optional[Callable] = None
     switch_to_agent: Optional[Callable] = None
     register_agent_fn: Optional[Callable] = None
+    set_terminal_trigger: Optional[Callable] = None
     depth: int = 0
 
 
@@ -1342,8 +1343,69 @@ def _bi_terminal_list(params: dict, ctx: ToolCtx) -> dict:
         alive = t.session and t.session.is_alive()
         status = "alive" if alive else "dead"
         stationed = f" [stationed: {', '.join(t.stationed_agent_ids)}]" if t.stationed_agent_ids else ""
-        lines.append(f"  {t.name} ({t.command}) [{status}]{stationed}")
+        trigger = f" [trigger: {t.trigger_pattern!r}]" if t.trigger_pattern else ""
+        lines.append(f"  {t.name} ({t.command}) [{status}]{stationed}{trigger}")
     return {"ok": True, "result": "\n".join(lines)}
+
+
+def _bi_terminal_exec(params: dict, ctx: ToolCtx) -> dict:
+    """Run an arbitrary command in a background sub-terminal, optionally with a trigger."""
+    import sys as _sys
+    import os as _os
+    name = (params.get("name") or "").strip()
+    command = (params.get("command") or "").strip()
+    trigger = (params.get("trigger") or "").strip()
+    if not name:
+        return {"ok": False, "error": "missing 'name'"}
+    if not command:
+        return {"ok": False, "error": "missing 'command'"}
+    if ctx.register_terminal is None or ctx.deps is None:
+        return {"ok": False, "error": "terminal creation not available"}
+    if ctx.get_terminal is not None:
+        existing = ctx.get_terminal(name)
+        if existing and existing.session and existing.session.is_alive():
+            return {"ok": False, "error": f"terminal '{name}' already exists and is alive; terminate it first"}
+        if existing and ctx.unregister_terminal:
+            ctx.unregister_terminal(name)
+    sub = ctx.deps.SubTerminalSession(command)
+    sub.start()
+    time.sleep(0.2)
+    if sub.is_alive():
+        sub.read_output(timeout=0.1)
+    ctx.register_terminal(
+        sub, command, ctx.depth, name=name,
+        trigger=trigger or None,
+        trigger_agent_id=ctx.agent_id if trigger else None,
+    )
+    msg = f"Started sub-terminal '{name}': {command}"
+    if trigger:
+        msg += f"\nTrigger active — pattern {trigger!r} will push events to your inbox."
+    return {"ok": True, "result": msg, "terminal": name}
+
+
+def _bi_terminal_watch(params: dict, ctx: ToolCtx) -> dict:
+    """Set or clear a trigger on an existing terminal.
+
+    When pattern is non-empty, any new output line matching the regex pushes
+    a watch.trigger event into the agent's inbox. Pass an empty pattern to
+    remove the trigger.
+    """
+    name = (params.get("name") or "").strip()
+    pattern = (params.get("pattern") or "")
+    if not name:
+        return {"ok": False, "error": "missing 'name'"}
+    if ctx.set_terminal_trigger is None:
+        return {"ok": False, "error": "trigger control not available"}
+    if ctx.get_terminal is not None:
+        term = ctx.get_terminal(name)
+        if term is None:
+            return {"ok": False, "error": f"terminal '{name}' not found"}
+    ok = ctx.set_terminal_trigger(name, pattern.strip(), ctx.agent_id)
+    if not ok:
+        return {"ok": False, "error": f"terminal '{name}' not found"}
+    if pattern.strip():
+        return {"ok": True, "result": f"Trigger set on '{name}': {pattern.strip()!r}"}
+    return {"ok": True, "result": f"Trigger cleared on '{name}'"}
 
 
 def _bi_session_close(params: dict, ctx: ToolCtx) -> dict:
@@ -2075,6 +2137,44 @@ def register_builtin_tools() -> None:
             description="List all named sub-terminals and their statuses.",
             schema={"type": "object", "properties": {}},
             invoke=_bi_terminal_list,
+        ),
+        Tool(
+            name="terminal.exec",
+            description=(
+                "Run an arbitrary shell command in a background sub-terminal. "
+                "Optionally set a trigger regex: any new output line matching the "
+                "pattern will push a watch.trigger event to the agent's inbox."
+            ),
+            schema={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Unique terminal name"},
+                    "command": {"type": "string", "description": "Shell command to run"},
+                    "trigger": {
+                        "type": "string",
+                        "description": "Optional regex — matching output lines fire inbox events",
+                    },
+                },
+                "required": ["name", "command"],
+            },
+            invoke=_bi_terminal_exec,
+        ),
+        Tool(
+            name="terminal.watch",
+            description=(
+                "Set or clear a trigger on an existing sub-terminal. "
+                "When pattern is non-empty, matching output lines push watch.trigger "
+                "events to the agent's inbox. Empty pattern clears the trigger."
+            ),
+            schema={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Terminal name"},
+                    "pattern": {"type": "string", "description": "Regex to match (empty = clear)"},
+                },
+                "required": ["name", "pattern"],
+            },
+            invoke=_bi_terminal_watch,
         ),
         # ── Session tools ───────────────────────────────────────────
         Tool(
