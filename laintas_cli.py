@@ -1408,6 +1408,201 @@ def save_config(config: dict) -> None:
     CONFIG_FILE.chmod(0o600)
 
 
+def get_selected_model() -> str:
+    """Return the configured model name, if any."""
+    val = load_config().get("model", "")
+    return str(val).strip() if val else ""
+
+
+def set_selected_model(model: str) -> None:
+    """Persist the selected backend model name."""
+    config = load_config()
+    model = model.strip()
+    if model:
+        config["model"] = model
+    else:
+        config.pop("model", None)
+    save_config(config)
+
+
+def _normalize_model_entry(item) -> dict:
+    """Normalize common model-list response shapes into displayable rows."""
+    if isinstance(item, str):
+        return {"id": item, "name": item, "description": ""}
+    if not isinstance(item, dict):
+        return {"id": str(item), "name": str(item), "description": ""}
+    model_id = (
+        item.get("id") or item.get("model") or item.get("name") or
+        item.get("value") or item.get("slug") or ""
+    )
+    name = item.get("name") or item.get("displayName") or item.get("label") or model_id
+    desc = item.get("description") or item.get("desc") or item.get("provider") or ""
+    return {"id": str(model_id), "name": str(name), "description": str(desc)}
+
+
+def _extract_model_entries(data) -> list[dict]:
+    """Extract model rows from backend model-list response shapes."""
+    if isinstance(data, dict) and isinstance(data.get("providers"), list):
+        rows = []
+        for provider in data["providers"]:
+            if not isinstance(provider, dict):
+                continue
+            provider_id = str(provider.get("id") or "")
+            provider_label = str(provider.get("label") or provider_id)
+            for model in provider.get("models") or []:
+                row = _normalize_model_entry(model)
+                if row.get("id"):
+                    row["provider"] = provider_id
+                    row["description"] = row.get("description") or provider_label
+                    rows.append(row)
+        return rows
+
+    raw_models = data
+    if isinstance(data, dict):
+        raw_models = (
+            data.get("models") or data.get("data") or data.get("items") or
+            data.get("result") or []
+        )
+    if isinstance(raw_models, dict):
+        raw_models = list(raw_models.values())
+    if not isinstance(raw_models, list):
+        return []
+    return [_normalize_model_entry(item) for item in raw_models]
+
+
+def fetch_available_models(session: dict) -> tuple[list[dict], str]:
+    """Fetch available models from the backend.
+
+    Returns (models, endpoint). Tries the current endpoint first and keeps a
+    few fallbacks for older backend builds.
+    """
+    backend_url = os.environ.get("LAINTAS_BACKEND", BACKEND_URL)
+    headers = get_auth_headers(session)
+    cookies = get_auth_cookies(session)
+    endpoints = (
+        "/api/models",
+        "/api/chat/models",
+        "/api/ai/models",
+        "/api/model",
+    )
+
+    last_error = ""
+    for endpoint in endpoints:
+        try:
+            resp = requests.get(
+                f"{backend_url}{endpoint}",
+                headers=headers,
+                cookies=cookies,
+                timeout=20,
+            )
+        except requests.RequestException as e:
+            last_error = str(e)
+            continue
+
+        if resp.status_code == 404:
+            last_error = f"HTTP 404 from {endpoint}"
+            continue
+        if resp.status_code != 200:
+            last_error = f"HTTP {resp.status_code}: {resp.text[:200]}"
+            continue
+
+        try:
+            data = resp.json()
+        except ValueError:
+            last_error = f"Non-JSON response from {endpoint}: {resp.text[:200]}"
+            continue
+
+        models = _extract_model_entries(data)
+        if not models and not (
+            isinstance(data, dict) and (
+                "models" in data or "data" in data or "items" in data or
+                "result" in data or "providers" in data
+            )
+        ):
+            last_error = f"Unexpected response shape from {endpoint}"
+            continue
+        models = [m for m in models if m.get("id")]
+        return models, endpoint
+
+    raise RuntimeError(last_error or "No model endpoint responded")
+
+
+def show_model_selector(models: list[dict], current: str = "") -> Optional[str]:
+    """Interactive model selector. Returns selected model id or None."""
+    if not models:
+        return None
+    selected = [0]
+    if current:
+        for i, model in enumerate(models):
+            if model.get("id") == current:
+                selected[0] = i
+                break
+
+    def _build_lines():
+        lines = []
+        lines.append(("bold cyan", "Models — choose with ↑↓ and Enter\n"))
+        lines.append(("dim", "─" * 72 + "\n"))
+
+        import shutil
+        term_h = shutil.get_terminal_size().lines
+        list_h = max(4, term_h - 5)
+        start = 0
+        if len(models) > list_h:
+            half = list_h // 2
+            start = max(0, min(selected[0] - half, len(models) - list_h))
+        end = min(start + list_h, len(models))
+
+        if start > 0:
+            lines.append(("dim", f"  ... {start} more above ...\n"))
+
+        for idx in range(start, end):
+            model = models[idx]
+            model_id = model.get("id", "")
+            provider = model.get("description") or model.get("provider") or ""
+            prefix = "▶" if idx == selected[0] else " "
+            current_mark = " *" if current and model_id == current else "  "
+            style = "class:selected" if idx == selected[0] else ""
+            lines.append((style, f" {prefix}{current_mark} [cyan]{model_id:30}[/cyan] {provider}\n"))
+
+        if end < len(models):
+            lines.append(("dim", f"  ... {len(models) - end} more below ...\n"))
+
+        lines.append(("", "\n"))
+        lines.append(("dim", " ↑↓ navigate  ↵ select  Esc/q cancel"))
+        return lines
+
+    kb = KeyBindings()
+
+    @kb.add("up")
+    def _(event):
+        selected[0] = max(0, selected[0] - 1)
+
+    @kb.add("down")
+    def _(event):
+        selected[0] = min(len(models) - 1, selected[0] + 1)
+
+    @kb.add("enter")
+    def _(event):
+        event.app.exit(result=models[selected[0]].get("id"))
+
+    @kb.add("escape")
+    @kb.add("q")
+    @kb.add("c-c")
+    def _(event):
+        event.app.exit(result=None)
+
+    layout = Layout(HSplit([Window(content=FormattedTextControl(_build_lines))]))
+    style = Style.from_dict({"selected": "reverse"})
+    app = Application(
+        layout=layout,
+        key_bindings=kb,
+        style=style,
+        full_screen=True,
+        refresh_interval=0.05,
+    )
+    return app.run()
+
+
 # ── Authentication ──────────────────────────────────────────────────────
 
 def verify_session(session: dict) -> Optional[dict]:
@@ -2470,6 +2665,9 @@ def call_backend_stream(
         "lang": lang,
         "maxTokens": int(get_runtime_config("max_tokens")),
     }
+    selected_model = get_selected_model()
+    if selected_model:
+        payload["model"] = selected_model
 
     headers = get_auth_headers(session)
     cookies = get_auth_cookies(session)
@@ -4095,6 +4293,67 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
             agent_registry.register(session)
             console.print(f"[green]Logged in as {new_session.get('userEmail') or new_session.get('userName') or new_session['userId']}[/green]")
 
+    elif action == "/model":
+        if len(parts) >= 2 and parts[1].lower() in ("reset", "clear", "default"):
+            set_selected_model("")
+            console.print("[green]Model reset. Backend default will be used.[/green]")
+        elif len(parts) >= 2:
+            model = " ".join(parts[1:]).strip()
+            set_selected_model(model)
+            console.print(f"[green]Model set to: [bold]{model}[/bold][/green]")
+        else:
+            current = get_selected_model()
+            try:
+                models, endpoint = fetch_available_models(session)
+            except Exception as e:
+                console.print(f"[red]Failed to fetch models: {e}[/red]")
+                console.print(f"Current model: [bold]{current or 'backend default'}[/bold]")
+                console.print("Usage: /model <model-id>  or  /model reset")
+            else:
+                if models and sys.stdin.isatty():
+                    selected = show_model_selector(models, current)
+                    if selected:
+                        set_selected_model(selected)
+                        console.print(f"[green]Model set to: [bold]{selected}[/bold][/green]")
+                    else:
+                        console.print("[dim]Model selection cancelled.[/dim]")
+                else:
+                    table = Table(title=f"Available Models ({endpoint})")
+                    table.add_column("#", style="dim")
+                    table.add_column("Current", style="green")
+                    table.add_column("Model ID", style="cyan")
+                    table.add_column("Name")
+                    table.add_column("Provider")
+                    for idx, m in enumerate(models, start=1):
+                        marker = "*" if current and m["id"] == current else ""
+                        table.add_row(
+                            str(idx),
+                            marker,
+                            m["id"],
+                            m.get("name", ""),
+                            m.get("description", ""),
+                        )
+                    if not models:
+                        table.add_row("", "", "(none)", "", "")
+                    console.print(table)
+                    console.print(f"Current model: [bold]{current or 'backend default'}[/bold]")
+                    if models:
+                        choice = input("Choose model number or id (Enter to cancel): ").strip()
+                        if choice:
+                            selected = ""
+                            if choice.isdigit():
+                                idx = int(choice)
+                                if 1 <= idx <= len(models):
+                                    selected = models[idx - 1]["id"]
+                            else:
+                                selected = next((m["id"] for m in models if m["id"] == choice), choice)
+                            if selected:
+                                set_selected_model(selected)
+                                console.print(f"[green]Model set to: [bold]{selected}[/bold][/green]")
+                            else:
+                                console.print(f"[red]Invalid model selection: {choice}[/red]")
+                console.print("Set directly with [bold]/model <model-id>[/bold], reset with [bold]/model reset[/bold].")
+
     elif action == "/name":
         # ── /name term<N> <new-name> — rename a terminal ──
         if len(parts) >= 3 and parts[1].startswith("term"):
@@ -4931,6 +5190,7 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
 _COMMANDS = [
     ("/help",      "Show this help"),
     ("/login",     "Re-authenticate with laintas.com (opens browser)"),
+    ("/model",     "List or set the backend AI model"),
     ("/name",      "Set current agent name"),
     ("/memory",    "View .laintas/memory.json"),
     ("/prop",      "View .laintas/cli.prop prompt template"),
@@ -5091,6 +5351,7 @@ def show_help():
     table.add_row("<natural language>", "Not a recognized command → AI agent loop")
     table.add_row("/help", "Show this help")
     table.add_row("/login", "Re-authenticate with laintas.com (opens browser)")
+    table.add_row("/model [id|reset]", "List available backend models, set model, or reset to backend default")
     table.add_row("/name [name]", "Set current agent name")
     table.add_row("/memory", "View .laintas/memory.json")
     table.add_row("/prop", "View .laintas/cli.prop prompt template")

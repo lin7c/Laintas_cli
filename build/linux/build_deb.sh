@@ -51,7 +51,7 @@ fi
 
 # Check for dependencies; install if pip is available and deps are missing
 check_deps() {
-    python3 -c "import requests, rich, prompt_toolkit" 2>/dev/null
+    python3 -c "import requests, certifi, rich, prompt_toolkit" 2>/dev/null
 }
 
 if ! check_deps; then

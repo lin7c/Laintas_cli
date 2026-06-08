@@ -835,13 +835,15 @@ except ImportError:
 
 
 def _bi_web_search(params: dict, ctx: ToolCtx) -> dict:
-    """Search the web using DuckDuckGo HTML (no API key needed).
+    """Search the web using HTML search pages (no API key needed).
 
     Returns list of {title, url, snippet} results.
     """
     import urllib.request
     import urllib.parse
     import urllib.error
+    import html as _html
+    import re as _re_html
 
     query = params.get("query", "").strip()
     if not query:
@@ -849,69 +851,123 @@ def _bi_web_search(params: dict, ctx: ToolCtx) -> dict:
 
     max_results = min(max(int(params.get("max_results", 10)), 1), 20)
 
-    try:
-        # DuckDuckGo HTML search (non-JS, no API key)
-        url = "https://html.duckduckgo.com/html/?" + urllib.parse.urlencode({"q": query})
+    def _fetch_html(url: str, referer: str = "") -> str:
         req = urllib.request.Request(url, headers={
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                          "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
         })
+        if referer:
+            req.add_header("Referer", referer)
         with urllib.request.urlopen(req, timeout=_WEB_FETCH_TIMEOUT) as resp:
-            html = resp.read().decode("utf-8", errors="replace")
-    except urllib.error.URLError as e:
-        return {"ok": False, "error": f"Search request failed: {e}"}
-    except Exception as e:
-        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+            content_type = resp.headers.get("Content-Type", "")
+            raw = resp.read(2_000_000)
+        charset = "utf-8"
+        if "charset=" in content_type:
+            charset = content_type.split("charset=")[-1].split(";")[0].strip() or "utf-8"
+        return raw.decode(charset, errors="replace")
 
-    # Parse DuckDuckGo HTML results
-    results = []
-    # Each result is in a div with class "result"
-    # Title is in <a class="result__a">
-    # Snippet is in <a class="result__snippet">
-    # URL is in <a class="result__url">
+    def _clean(text: str) -> str:
+        text = _re_html.sub(r'<script[^>]*>.*?</script>', '', text,
+                            flags=_re_html.DOTALL | _re_html.IGNORECASE)
+        text = _re_html.sub(r'<style[^>]*>.*?</style>', '', text,
+                            flags=_re_html.DOTALL | _re_html.IGNORECASE)
+        text = _re_html.sub(r'<[^>]+>', '', text)
+        text = _html.unescape(text)
+        return _re_html.sub(r'\s+', ' ', text).strip()
 
-    # Simple regex-based extraction
-    import re as _re_html
-    # Split on result boundaries
-    blocks = _re_html.split(r'<div[^>]*class="[^"]*result[^"]*"[^>]*>', html)
+    def _dedupe(results: list[dict]) -> list[dict]:
+        seen = set()
+        out = []
+        for item in results:
+            url = item.get("url", "").strip()
+            title = item.get("title", "").strip()
+            if not url or not title or url in seen:
+                continue
+            seen.add(url)
+            out.append(item)
+            if len(out) >= max_results:
+                break
+        return out
 
-    for block in blocks:
-        if len(results) >= max_results:
-            break
+    def _parse_duckduckgo(html: str) -> list[dict]:
+        results = []
+        blocks = _re_html.split(r'<div[^>]*class="[^"]*result[^"]*"[^>]*>', html)
+        for block in blocks:
+            title_m = _re_html.search(
+                r'<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]*)"[^>]*>(.*?)</a>',
+                block, _re_html.DOTALL)
+            if not title_m:
+                continue
+            href = _html.unescape(title_m.group(1))
+            parsed = urllib.parse.urlparse(href)
+            qs = urllib.parse.parse_qs(parsed.query)
+            if "uddg" in qs and qs["uddg"]:
+                href = qs["uddg"][0]
+            snippet_m = _re_html.search(
+                r'<[^>]*class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</(?:a|div)>',
+                block, _re_html.DOTALL)
+            results.append({
+                "title": _clean(title_m.group(2)),
+                "url": href,
+                "snippet": _clean(snippet_m.group(1))[:500] if snippet_m else "",
+            })
+        return _dedupe(results)
 
-        # Extract title + link
-        title_m = _re_html.search(
-            r'<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]*)"[^>]*>(.*?)</a>',
-            block, _re_html.DOTALL)
-        if not title_m:
-            continue
+    def _parse_bing(html: str) -> list[dict]:
+        results = []
+        blocks = _re_html.split(r'<li[^>]*class="[^"]*b_algo[^"]*"[^>]*>', html)
+        for block in blocks:
+            title_m = _re_html.search(
+                r'<h2[^>]*>\s*<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>\s*</h2>',
+                block, _re_html.DOTALL)
+            if not title_m:
+                continue
+            snippet_m = _re_html.search(
+                r'<p[^>]*>(.*?)</p>',
+                block, _re_html.DOTALL)
+            results.append({
+                "title": _clean(title_m.group(2)),
+                "url": _html.unescape(title_m.group(1)),
+                "snippet": _clean(snippet_m.group(1))[:500] if snippet_m else "",
+            })
+        return _dedupe(results)
 
-        href = title_m.group(1)
-        title = _re_html.sub(r'<[^>]+>', '', title_m.group(2)).strip()
-        title = _re_html.sub(r'&[a-z]+;', lambda m: {
-            '&amp;': '&', '&lt;': '<', '&gt;': '>',
-            '&quot;': '"', '&#x27;': "'", '&apos;': "'",
-        }.get(m.group(0), m.group(0)), title)
+    engine = str(params.get("engine") or os.environ.get("LAINTAS_SEARCH_ENGINE") or "auto").lower()
+    engines = {
+        "duckduckgo": [("duckduckgo", _parse_duckduckgo,
+                       "https://html.duckduckgo.com/html/?" + urllib.parse.urlencode({"q": query}), "")],
+        "ddg": [("duckduckgo", _parse_duckduckgo,
+                 "https://html.duckduckgo.com/html/?" + urllib.parse.urlencode({"q": query}), "")],
+        "bing": [("bing", _parse_bing,
+                  "https://cn.bing.com/search?" + urllib.parse.urlencode({"q": query, "mkt": "zh-CN"}), "https://cn.bing.com/")],
+        "bing-cn": [("bing", _parse_bing,
+                     "https://cn.bing.com/search?" + urllib.parse.urlencode({"q": query, "mkt": "zh-CN"}), "https://cn.bing.com/")],
+    }
+    search_plan = engines.get(engine)
+    if search_plan is None:
+        search_plan = engines["duckduckgo"] + engines["bing"]
 
-        # Extract snippet
-        snippet_m = _re_html.search(
-            r'<[^>]*class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</(?:a|div)>',
-            block, _re_html.DOTALL)
-        snippet = ""
-        if snippet_m:
-            snippet = _re_html.sub(r'<[^>]+>', '', snippet_m.group(1)).strip()
-            snippet = _re_html.sub(r'&[a-z]+;', lambda m: {
-                '&amp;': '&', '&lt;': '<', '&gt;': '>',
-                '&quot;': '"', '&#x27;': "'", '&apos;': "'",
-            }.get(m.group(0), m.group(0)), snippet)
+    errors = []
+    for engine_name, parser, url, referer in search_plan:
+        try:
+            html = _fetch_html(url, referer=referer)
+            results = parser(html)
+            if results:
+                return {
+                    "ok": True,
+                    "result": results,
+                    "query": query,
+                    "count": len(results),
+                    "engine": engine_name,
+                }
+            errors.append(f"{engine_name}: no results parsed")
+        except urllib.error.URLError as e:
+            errors.append(f"{engine_name}: {e}")
+        except Exception as e:
+            errors.append(f"{engine_name}: {type(e).__name__}: {e}")
 
-        results.append({
-            "title": title,
-            "url": href,
-            "snippet": snippet[:500],
-        })
-
-    return {"ok": True, "result": results, "query": query, "count": len(results)}
+    return {"ok": False, "error": "Search request failed; " + " | ".join(errors), "query": query}
 
 
 def _bi_web_fetch(params: dict, ctx: ToolCtx) -> dict:

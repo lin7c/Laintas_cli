@@ -2,6 +2,8 @@
 # PyInstaller spec for laintas_cli.exe
 # Build: pyinstaller build/windows/laintas_cli.spec
 
+from PyInstaller.utils.hooks import collect_data_files
+
 a = Analysis(
     ['../../laintas_cli.py'],
     pathex=[],
@@ -21,9 +23,10 @@ a = Analysis(
         ('../../workflow_engine.py', '.'),
         ('../../paths.py', '.'),
         ('../../migrate.py', '.'),
-    ],
+    ] + collect_data_files('certifi'),
     hiddenimports=[
         'requests',
+        'certifi',
         'rich',
         'rich.console',
         'rich.panel',
@@ -53,7 +56,7 @@ a = Analysis(
     ],
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[],
+    runtime_hooks=['hook_ssl.py'],
     excludes=[
         'tkinter',
         'matplotlib',

@@ -25,6 +25,7 @@ setup(
     ],
     install_requires=[
         "requests>=2.28.0",
+        "certifi>=2024.0.0",
         "rich>=13.0.0",
         "prompt_toolkit>=3.0.0",
     ],
