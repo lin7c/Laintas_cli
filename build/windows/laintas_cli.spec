@@ -23,6 +23,7 @@ a = Analysis(
         ('../../workflow_engine.py', '.'),
         ('../../paths.py', '.'),
         ('../../migrate.py', '.'),
+        ('../../cloud_provider.py', '.'),
     ] + collect_data_files('certifi'),
     hiddenimports=[
         'requests',

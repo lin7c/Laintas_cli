@@ -2,7 +2,7 @@ from setuptools import setup
 
 setup(
     name="laintas-cli",
-    version="0.1.1",
+    version="0.1.2",
     description="Laintas CLI - Autonomous AI agent for your terminal",
     author="Laintas",
     url="https://github.com/lin7c/laintas_cli_pre",
@@ -22,6 +22,7 @@ setup(
         "workflow_engine",
         "paths",
         "migrate",
+        "cloud_provider",
     ],
     install_requires=[
         "requests>=2.28.0",

@@ -178,9 +178,10 @@ def execute_command_pty(command: str, timeout: int = 120) -> dict:
 def pty_passthrough(command: str, timeout: int = 120) -> dict:
     """Run a command with full terminal passthrough.
 
-    The child process takes over the terminal — stdin is forwarded to the
-    child and child output goes directly to stdout, exactly like running
-    the command in a normal shell. Returns when the child exits.
+    Forks and execs the command so the child directly inherits the real
+    terminal — no new PTY is created. This is identical to running the
+    command from bash: interactive apps (codex, claude, vim, etc.) get the
+    same terminal environment the user sees.
 
     Returns {stdout, stderr, returncode, success}.
     On Windows falls back to subprocess.run.
@@ -188,60 +189,50 @@ def pty_passthrough(command: str, timeout: int = 120) -> dict:
     if IS_WINDOWS:
         return _execute_windows(command, timeout)
 
-    import tty
-
-    # stream_output=False: the I/O loop below writes directly to the terminal
-    # via os.write(). If stream_output=True, _drain_remaining() would write
-    # a second time (bash prompt + exit sequences) through sys.stdout, which
-    # corrupts Rich's console state after the command returns.
-    session = InteractiveSession(command, timeout=timeout, stream_output=False)
-    session.start()
-
     fd = sys.stdin.fileno()
     old_tcattr = termios.tcgetattr(fd)
     old_sigint = signal.getsignal(signal.SIGINT)
+    old_sigquit = signal.getsignal(signal.SIGQUIT)
 
+    pid = os.fork()
+    if pid == 0:
+        # Child: restore default signal handlers and exec directly into the
+        # current terminal (no new PTY — stdin/stdout/stderr are inherited).
+        try:
+            signal.signal(signal.SIGINT, signal.SIG_DFL)
+            signal.signal(signal.SIGQUIT, signal.SIG_DFL)
+            os.execve(DEFAULT_SHELL, [DEFAULT_SHELL, "-c", command], _child_env())
+        except Exception:
+            pass
+        os._exit(127)
+
+    # Parent: let SIGINT reach the child's process group, just wait.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGQUIT, signal.SIG_IGN)
+
+    returncode = -1
     try:
-        signal.signal(signal.SIGINT, signal.SIG_IGN)
-        tty.setraw(fd)
-
-        while session.is_alive():
-            try:
-                r, _, _ = select.select([fd, session.master_fd], [], [], 0.1)
-            except (select.error, ValueError):
-                break
-
-            if fd in r:
-                try:
-                    data = os.read(fd, 4096)
-                    if data:
-                        os.write(session.master_fd, data)
-                    else:
-                        break
-                except OSError:
-                    break
-
-            if session.master_fd in r:
-                try:
-                    data = os.read(session.master_fd, 4096)
-                    if data:
-                        os.write(sys.stdout.fileno(), data)
-                        sys.stdout.flush()
-                except OSError:
-                    break
+        _, status = os.waitpid(pid, 0)
+        if os.WIFEXITED(status):
+            returncode = os.WEXITSTATUS(status)
+        elif os.WIFSIGNALED(status):
+            returncode = -os.WTERMSIG(status)
+    except ChildProcessError:
+        pass
     finally:
         signal.signal(signal.SIGINT, old_sigint)
+        signal.signal(signal.SIGQUIT, old_sigquit)
+        # Restore terminal settings the child may have left in a dirty state.
         try:
             termios.tcsetattr(fd, termios.TCSADRAIN, old_tcattr)
         except (termios.error, OSError):
             pass
-        session.close()
 
     return {
-        "stdout": session.full_output,
+        "stdout": "",
         "stderr": "",
-        "returncode": session.returncode,
-        "success": session.returncode == 0,
+        "returncode": returncode,
+        "success": returncode == 0,
     }
 
 
@@ -777,6 +768,11 @@ class InteractiveSession:
         if self.master_fd < 0:
             return
         decoded = _decode_send_keys(text)
+        # Terminals send CR (0x0d) when Enter is pressed, not LF (0x0a).
+        # In cooked mode the line discipline's ICRNL converts CR→LF for the
+        # process; in raw mode (prompt_toolkit, vim, codex, …) the process
+        # receives CR directly and expects that as the Enter key.
+        decoded = decoded.replace('\n', '\r')
         try:
             os.write(self.master_fd, decoded.encode("utf-8"))
         except OSError:
@@ -1421,6 +1417,23 @@ def set_selected_model(model: str) -> None:
     save_config(config)
 
 
+def get_selected_provider() -> str:
+    """Return the configured provider id, if any."""
+    val = load_config().get("provider", "")
+    return str(val).strip() if val else ""
+
+
+def set_selected_provider(provider: str) -> None:
+    """Persist the selected provider id."""
+    config = load_config()
+    provider = provider.strip()
+    if provider:
+        config["provider"] = provider
+    else:
+        config.pop("provider", None)
+    save_config(config)
+
+
 def _normalize_model_entry(item) -> dict:
     """Normalize common model-list response shapes into displayable rows."""
     if isinstance(item, str):
@@ -1579,7 +1592,7 @@ def show_model_selector(models: list[dict], current: str = "") -> Optional[str]:
 
     @kb.add("enter")
     def _(event):
-        event.app.exit(result=models[selected[0]].get("id"))
+        event.app.exit(result=models[selected[0]])
 
     @kb.add("escape")
     @kb.add("q")
@@ -2681,6 +2694,9 @@ def call_backend_stream(
     selected_model = get_selected_model()
     if selected_model:
         payload["model"] = selected_model
+    selected_provider = get_selected_provider()
+    if selected_provider:
+        payload["provider"] = selected_provider
 
     headers = get_auth_headers(session)
     cookies = get_auth_cookies(session)
@@ -2733,6 +2749,9 @@ def call_backend_stream(
                 continue
             got_any_event = True
             if evt.get("error"):
+                if accumulated:
+                    # Backend post-processing failed but content was already streamed — use it.
+                    break
                 return {"reply": f"Server Error: {evt['error']}", "tool_calls": [], "done": True, "error": True}
             if "_billing" in evt:
                 billing_info = evt["_billing"]
@@ -2741,13 +2760,14 @@ def call_backend_stream(
             for k in evt.keys():
                 if k not in ("choices", "id", "object", "created", "model", "system_fingerprint") and k not in _diag_events:
                     _diag_events.append(k)
+            _choices = evt.get("choices")
             delta_content = (
-                evt.get("choices", [{}])[0].get("delta", {}).get("content")
-                if isinstance(evt.get("choices"), list)
+                _choices[0].get("delta", {}).get("content")
+                if isinstance(_choices, list) and _choices
                 else None
             )
             # Also check for OpenAI-style native tool_calls in delta
-            _delta = evt.get("choices", [{}])[0].get("delta", {}) if isinstance(evt.get("choices"), list) else {}
+            _delta = _choices[0].get("delta", {}) if isinstance(_choices, list) and _choices else {}
             if _delta.get("tool_calls"):
                 # Native function calling — these are real tool calls being dropped!
                 _diag_events.append(f"TOOL_CALLS_IN_DELTA:{json.dumps(_delta['tool_calls'], ensure_ascii=False)[:200]}")
@@ -4128,6 +4148,7 @@ def enter_session(session, display_name: str = "", display_cmd: str = "") -> Non
 
     # Save terminal state
     old_tcattr = termios.tcgetattr(fd)
+    old_flags = fcntl.fcntl(fd, fcntl.F_GETFL)
     old_sigquit = signal.getsignal(signal.SIGQUIT)
     old_sigwinch = signal.getsignal(signal.SIGWINCH)
 
@@ -4186,6 +4207,11 @@ def enter_session(session, display_name: str = "", display_cmd: str = "") -> Non
     partial_buf = b''
 
     try:
+        # Ensure stdin is in blocking mode — prompt_toolkit may leave O_NONBLOCK
+        # set after app.run() exits, which makes select() report fd as always
+        # readable and os.read() raise EAGAIN, causing the I/O loop to exit
+        # immediately (resulting in read-only "observe" behavior).
+        fcntl.fcntl(fd, fcntl.F_SETFL, old_flags & ~os.O_NONBLOCK)
         tty.setraw(fd)
 
         while session.is_alive() and not detached:
@@ -4197,6 +4223,10 @@ def enter_session(session, display_name: str = "", display_cmd: str = "") -> Non
             if fd in r:
                 try:
                     data = os.read(fd, 4096)
+                except BlockingIOError:
+                    # Transient EAGAIN — shouldn't happen after clearing
+                    # O_NONBLOCK, but guard anyway.
+                    continue
                 except OSError:
                     break
                 if not data:
@@ -4247,6 +4277,10 @@ def enter_session(session, display_name: str = "", display_cmd: str = "") -> Non
         try:
             termios.tcsetattr(fd, termios.TCSANOW, old_tcattr)
         except termios.error:
+            pass
+        try:
+            fcntl.fcntl(fd, fcntl.F_SETFL, old_flags)
+        except OSError:
             pass
         signal.signal(signal.SIGQUIT, old_sigquit)
         signal.signal(signal.SIGWINCH, old_sigwinch)
@@ -4351,6 +4385,7 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
     elif action == "/model":
         if len(parts) >= 2 and parts[1].lower() in ("reset", "clear", "default"):
             set_selected_model("")
+            set_selected_provider("")
             console.print("[green]Model reset. Backend default will be used.[/green]")
         elif len(parts) >= 2:
             model = " ".join(parts[1:]).strip()
@@ -4358,6 +4393,7 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
             console.print(f"[green]Model set to: [bold]{model}[/bold][/green]")
         else:
             current = get_selected_model()
+            current_provider = get_selected_provider()
             try:
                 models, endpoint = fetch_available_models(session)
             except Exception as e:
@@ -4368,8 +4404,14 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
                 if models and sys.stdin.isatty():
                     selected = show_model_selector(models, current)
                     if selected:
-                        set_selected_model(selected)
-                        console.print(f"[green]Model set to: [bold]{selected}[/bold][/green]")
+                        model_id = selected.get("id", "") if isinstance(selected, dict) else selected
+                        provider_id = selected.get("provider", "") if isinstance(selected, dict) else ""
+                        set_selected_model(model_id)
+                        set_selected_provider(provider_id)
+                        info = f"[bold]{model_id}[/bold]"
+                        if provider_id:
+                            info += f" ([dim]{provider_id}[/dim])"
+                        console.print(f"[green]Model set to: {info}[/green]")
                     else:
                         console.print("[dim]Model selection cancelled.[/dim]")
                 else:
@@ -4391,20 +4433,24 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
                     if not models:
                         table.add_row("", "", "(none)", "", "")
                     console.print(table)
-                    console.print(f"Current model: [bold]{current or 'backend default'}[/bold]")
+                    console.print(f"Current model: [bold]{current or 'backend default'}[/bold]" +
+                                  (f" ([dim]{current_provider}[/dim])" if current_provider else ""))
                     if models:
                         choice = input("Choose model number or id (Enter to cancel): ").strip()
                         if choice:
-                            selected = ""
+                            chosen = None
                             if choice.isdigit():
                                 idx = int(choice)
                                 if 1 <= idx <= len(models):
-                                    selected = models[idx - 1]["id"]
+                                    chosen = models[idx - 1]
                             else:
-                                selected = next((m["id"] for m in models if m["id"] == choice), choice)
-                            if selected:
-                                set_selected_model(selected)
-                                console.print(f"[green]Model set to: [bold]{selected}[/bold][/green]")
+                                chosen = next((m for m in models if m["id"] == choice), None)
+                                if chosen is None:
+                                    chosen = {"id": choice, "provider": ""}
+                            if chosen:
+                                set_selected_model(chosen["id"])
+                                set_selected_provider(chosen.get("provider", ""))
+                                console.print(f"[green]Model set to: [bold]{chosen['id']}[/bold][/green]")
                             else:
                                 console.print(f"[red]Invalid model selection: {choice}[/red]")
                 console.print("Set directly with [bold]/model <model-id>[/bold], reset with [bold]/model reset[/bold].")

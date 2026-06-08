@@ -1279,7 +1279,10 @@ def _bi_terminal_send(params: dict, ctx: ToolCtx) -> dict:
         return {"ok": False, "error": f"terminal '{target}' not found"}
     if not (term.session and term.session.is_alive()):
         return {"ok": False, "error": f"terminal '{target}' is dead"}
-    term.session.send_keys(cmd + "\n")
+    # Use CR (\r) as the Enter keystroke — that's what a real keyboard sends,
+    # and what raw-mode apps (prompt_toolkit, codex, claude, vim, …) expect.
+    # Cooked-mode shells (bash) also accept CR via the ICRNL line discipline.
+    term.session.send_keys(cmd + "\r")
     time.sleep(0.3)
     term.session.read_output(timeout=0.5)
     try:
