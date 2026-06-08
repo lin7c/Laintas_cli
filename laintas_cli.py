@@ -190,7 +190,11 @@ def pty_passthrough(command: str, timeout: int = 120) -> dict:
 
     import tty
 
-    session = InteractiveSession(command, timeout=timeout, stream_output=True)
+    # stream_output=False: the I/O loop below writes directly to the terminal
+    # via os.write(). If stream_output=True, _drain_remaining() would write
+    # a second time (bash prompt + exit sequences) through sys.stdout, which
+    # corrupts Rich's console state after the command returns.
+    session = InteractiveSession(command, timeout=timeout, stream_output=False)
     session.start()
 
     fd = sys.stdin.fileno()
@@ -241,17 +245,6 @@ def pty_passthrough(command: str, timeout: int = 120) -> dict:
     }
 
 
-# ── Commands that need real TTY passthrough (not marker-poll) ──
-
-_INTERACTIVE_COMMANDS = {
-    "vim", "vi", "nano", "pico", "emacs",
-    "less", "more",
-    "htop", "top",
-    "python", "python3", "ipython", "node", "irb", "ruby",
-    "mysql", "psql", "sqlite3",
-    "ssh", "telnet",
-    "tmux", "screen", "mc",
-}
 
 
 def _marker_poll_exec(session, command: str, timeout: int = 60, strip_ansi_codes: bool = True) -> dict:
@@ -3869,17 +3862,18 @@ def show_terminal_manager(primary_session=None) -> None:
     """
     items: list = []  # [(display_name, command, session, created_at, is_alive)]
 
-    if primary_session is not None and primary_session.is_alive():
-        items.append(("term0 (primary)", primary_session.command, primary_session,
-                      0.0, True))
-
+    # term0 is the shell laintas_cli runs on — "entering" it just drops to a
+    # raw bash that requires `exit` to return, which is confusing and useless.
+    # Show named sub-terminals only.
     for term in get_all_terminals():
+        if term.name == "term0":
+            continue
         items.append((term.name, term.command, term.session,
                       term.created_at, term.session is not None and term.session.is_alive()))
 
     if not items:
-        console.print("[dim]No active sub-terminal sessions. "
-                      "Run an AI task that spawns a command to create one.[/dim]")
+        console.print("[dim]No sub-terminals. Use /t <name> to create one, "
+                      "or let the AI spawn a command.[/dim]")
         return
 
     selected = [0]
@@ -4135,26 +4129,43 @@ def enter_session(session, display_name: str = "", display_cmd: str = "") -> Non
     # Save terminal state
     old_tcattr = termios.tcgetattr(fd)
     old_sigquit = signal.getsignal(signal.SIGQUIT)
+    old_sigwinch = signal.getsignal(signal.SIGWINCH)
 
-    # Clear screen and show header
+    def _get_winsize():
+        """Return (rows, cols, xpix, ypix) of the outer terminal."""
+        import struct
+        try:
+            ws = fcntl.ioctl(sys.stdout.fileno(), termios.TIOCGWINSZ,
+                             struct.pack('HHHH', 0, 0, 0, 0))
+            return struct.unpack('HHHH', ws)
+        except (OSError, struct.error):
+            return (24, 80, 0, 0)
+
+    def _sync_winsize():
+        """Push the outer terminal size into the sub-terminal PTY."""
+        import struct
+        try:
+            ws = _get_winsize()
+            fcntl.ioctl(mfd, termios.TIOCSWINSZ, struct.pack('HHHH', *ws))
+        except (OSError, struct.error):
+            pass
+
+    # Sync window size before entering so programs render correctly
+    _sync_winsize()
+
+    # Clear screen and show a minimal header (no pending-output replay —
+    # stale ANSI absolute-position sequences cause cursor misalignment).
     sys.stdout.write("\033[2J\033[H")
-    sys.stdout.write(f"● Entered: {cmd_display}\n")
-    sys.stdout.write("  /back or /q to detach  |  Ctrl+\\ to force detach\n")
-    sys.stdout.write("─" * 60 + "\n\n")
+    sys.stdout.write(f"\033[2m● {cmd_display}  │  /back or /q detach  │  Ctrl+\\ force-detach\033[0m\n")
+    sys.stdout.write("─" * 60 + "\n")
     sys.stdout.flush()
 
-    # Show pending output (current terminal state, last 100 lines)
-    session.read_output(timeout=0.1)
+    # Trigger the sub-terminal to redraw its current content
     try:
-        pending = session.raw_output
-    except Exception:
-        pending = session.full_output
-    if pending:
-        lines = pending.split('\n')
-        if len(lines) > 100:
-            pending = '\n'.join(lines[-100:])
-        sys.stdout.write(pending)
-        sys.stdout.flush()
+        import os as _os
+        _os.write(mfd, b'\x0c')   # Ctrl+L — most shells/apps redraw on this
+    except OSError:
+        pass
 
     detached = False
     session_died = False
@@ -4163,7 +4174,12 @@ def enter_session(session, display_name: str = "", display_cmd: str = "") -> Non
         nonlocal detached
         detached = True
 
+    def _on_sigwinch(signum, frame):
+        """Forward terminal resize to the sub-terminal PTY."""
+        _sync_winsize()
+
     signal.signal(signal.SIGQUIT, _on_sigquit)
+    signal.signal(signal.SIGWINCH, _on_sigwinch)
 
     # Detach marker: emitted by laintas-cli when user types /back
     DETACH_MARKER = b'\x1b]777;LAINTAS_DETACH\x07'
@@ -4233,6 +4249,7 @@ def enter_session(session, display_name: str = "", display_cmd: str = "") -> Non
         except termios.error:
             pass
         signal.signal(signal.SIGQUIT, old_sigquit)
+        signal.signal(signal.SIGWINCH, old_sigwinch)
 
     if session_died:
         console.print(f"\n[dim]● Sub-terminal exited. Returned to term0[/dim]")
@@ -5104,7 +5121,8 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
                 console.print("[dim]No active sub-terminal sessions. "
                               "Use /station or let the AI spawn a command.[/dim]")
             elif not terminals and has_primary:
-                enter_session(interactive_session)
+                # Only term0 exists — entering it is redundant (already in REPL).
+                console.print("[dim]No sub-terminals. You are already in term0 (primary).[/dim]")
             else:
                 show_terminal_manager(interactive_session)
 
@@ -6089,49 +6107,24 @@ def main():
                 interactive_session.close()
                 interactive_session = None
 
-            # Route through term0's persistent bash via marker-poll,
-            # same mechanism as named sub-terminals. Interactive programs
-            # (vim, python, etc.) fall through to pty_passthrough for
-            # real-time user interaction.
-            _first = extract_first_word(user_input)
-            term0_info = get_terminal("term0")
-            _use_term0 = (not IS_WINDOWS
-                          and _first not in _INTERACTIVE_COMMANDS
-                          and term0_info
-                          and term0_info.session
-                          and term0_info.session.is_alive())
+            # All user-typed system commands get full PTY passthrough.
+            # The child takes over the terminal until it exits — works for
+            # one-shot commands (ls, git) and interactive programs (vim,
+            # claude, codex) without any per-command whitelist.
+            # Drain any queued terminal query responses before passthrough
+            if not IS_WINDOWS:
+                _fl = fcntl.fcntl(sys.stdin.fileno(), fcntl.F_GETFL)
+                fcntl.fcntl(sys.stdin.fileno(), fcntl.F_SETFL, _fl | os.O_NONBLOCK)
+                try:
+                    while True:
+                        if not sys.stdin.buffer.read(4096):
+                            break
+                except (BlockingIOError, OSError):
+                    pass
+                finally:
+                    fcntl.fcntl(sys.stdin.fileno(), fcntl.F_SETFL, _fl)
 
-            if _use_term0:
-                result = _marker_poll_exec(term0_info.session, user_input, strip_ansi_codes=False)
-                _sync_cwd_from_term0(term0_info.session)
-                # Display output — marker-poll captures it but doesn't echo to
-                # the user's terminal (unlike pty_passthrough which echoes
-                # directly). Print so the user sees command output.
-                _stdout = result.get("stdout", "")
-                if _stdout:
-                    try:
-                        sys.stdout.write(_stdout)
-                        if not _stdout.endswith("\n"):
-                            sys.stdout.write("\n")
-                        sys.stdout.flush()
-                    except (BrokenPipeError, OSError):
-                        pass
-            else:
-                # Drain any queued terminal query responses before passthrough
-                if not IS_WINDOWS:
-                    _fl = fcntl.fcntl(sys.stdin.fileno(), fcntl.F_GETFL)
-                    fcntl.fcntl(sys.stdin.fileno(), fcntl.F_SETFL, _fl | os.O_NONBLOCK)
-                    try:
-                        while True:
-                            if not sys.stdin.buffer.read(4096):
-                                break
-                    except (BlockingIOError, OSError):
-                        pass
-                    finally:
-                        fcntl.fcntl(sys.stdin.fileno(), fcntl.F_SETFL, _fl)
-
-                # Full terminal passthrough — user interacts directly with the command
-                result = pty_passthrough(user_input)
+            result = pty_passthrough(user_input)
 
             # ── Debug: log command execution ──
             loop_id = next_debug_loop()
