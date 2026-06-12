@@ -26,6 +26,7 @@ import agent_roles           # Specialized agent roles (explorer, reviewer, etc.
 import workflow_engine        # Structured multi-phase workflow engine
 import task_manager          # Structured task tracking (session + persisted)
 import paths                 # Centralized path management
+import skills as skills_mod   # Progressive skill metadata + context loading
 
 # Path to laintas_cli.py for spawning child terminals
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -46,6 +47,7 @@ _DEFAULT_CONFIG = {
     "output_truncate": 3000,      # chars — lastOutput tail truncation
     "poll_timeout": 10.0,         # seconds — wait for first command output
     "terminal_tail_lines": 20,    # lines — sub-terminal snapshot
+    "disable_remote_terminal": False,  # block browser-opened PTY shells when True
     "heartbeat_interval": 30,     # seconds — agent heartbeat
     "staleness_limit": 3,         # consecutive no-tool steps before auto-exit
     "repetition_threshold": 3,    # consecutive no-progress steps before force-exit (mirrors TokenBudgetTracker)
@@ -1316,6 +1318,25 @@ def _prepare_history_for_backend(chat_history: list) -> list:
     return result
 
 
+def _history_without_current_turn(chat_history: list, original_input: str) -> list:
+    """Return history excluding the current user turn when the REPL pre-appended it.
+
+    The backend legacy protocol receives both `history` and the current `message`.
+    If the current user input is also the last history item, the model sees the
+    same task twice and may repeat answers or repeat action selection.
+    """
+    if not chat_history:
+        return []
+    last = chat_history[-1]
+    if (
+        last.get("role") == "user"
+        and _stringify_message_content(last.get("content", "")).strip()
+        == str(original_input or "").strip()
+    ):
+        return chat_history[:-1]
+    return chat_history
+
+
 def prepare_state_for_repl(state: dict) -> dict:
     """Bound agent state before carrying it into the next REPL interaction."""
     state = state or {}
@@ -2382,6 +2403,9 @@ def run_agent_loop(
     self_info = get_agent(agent_id) if agent_id else None
     for loop in range(max_loops):
         _loop_id = next_debug_loop()
+        history_context = _history_without_current_turn(chat_history, original_input)
+        skill_context = skills_mod.get_activated_skills_context()
+        skill_catalog = skills_mod.describe_skills_for_prompt()
 
         # ── Phase 2: abort check + inbox drain ────────────────────────
         if self_info is not None:
@@ -2500,7 +2524,8 @@ def run_agent_loop(
             .replace("{{terminalName}}", terminal_name_str) \
             .replace("{{parentTerminal}}", parent_terminal_str) \
             .replace("{{deploymentStatus}}", deployment_status_str) \
-            .replace("{{tools}}", _render_tool_catalog_enhanced(state, loop, depth))
+            .replace("{{tools}}", _render_tool_catalog_enhanced(state, loop, depth)) \
+            .replace("{{skills}}", skill_catalog)
 
         # ── Extended template variables (from agent_roles, workflow_engine, etc.) ──
 
@@ -2527,8 +2552,7 @@ def run_agent_loop(
         system_prompt = system_prompt.replace("{{confidenceGuidance}}", confidence_guidance)
 
         # {{skillContext}} — activated skill bodies (placeholder; skills.py handles)
-        system_prompt = system_prompt.replace("{{skillContext}}",
-                                               state.get("_skill_context", ""))
+        system_prompt = system_prompt.replace("{{skillContext}}", skill_context)
 
         # {{parallelResults}} — aggregated sub-agent results from inbox
         parallel_results_str = _format_parallel_results(inbox_msgs)
@@ -2543,14 +2567,17 @@ def run_agent_loop(
         ) if state.get("_last_session_snapshot") else ""
         system_prompt = system_prompt.replace("{{lastSession}}", last_session_text)
 
+        # Inject current date/time so the AI always knows when it is.
+        system_prompt += f"\n\n[CURRENT DATE & TIME]\n{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} (local)"
+
         # 5. Build user message via the structured-section helper.
         terminal_section = _build_terminal_section(state)
-        memory_section = _build_memory_section(memory_entries, state, chat_history)
-        conversation_section = _build_conversation_section(chat_history)
+        memory_section = _build_memory_section(memory_entries, state, history_context)
+        conversation_section = _build_conversation_section(history_context)
         terminals_snapshot = get_terminals_snapshot()
-        history_for_backend = _prepare_history_for_backend(chat_history)
+        history_for_backend = _prepare_history_for_backend(history_context)
         user_input = _build_user_message(
-            original_input, state, memory_entries, chat_history, loop, max_loops,
+            original_input, state, memory_entries, history_context, loop, max_loops,
         )
 
         # ── Debug: create entry before API call ──
@@ -2570,6 +2597,7 @@ def run_agent_loop(
                 "message": user_input[:2000],
                 "currentPath": os.getcwd(),
                 "history": history_for_backend,
+                "loadedSkills": [s["name"] for s in skills_mod.list_skills() if s.get("loaded")],
                 "promptLen": len(system_prompt),
                 "promptPreview": system_prompt[:500],
                 "memorySection": memory_section[:500],
@@ -2608,6 +2636,9 @@ def run_agent_loop(
                             raise InterruptedError("user interrupt during streaming")
                         if field == "reply":
                             stream_state["reply"] += value
+                            # Push each chunk to Helpwo UI for live streaming display
+                            if events_cb is not None:
+                                events_cb([{"type": "ai_stream", "content": value}])
                         elif field == "command":
                             stream_state["command"] = value
                         stream_state["started"] = True
@@ -2738,8 +2769,9 @@ def run_agent_loop(
                         _exit_reason = TRANSITION_INTERRUPTED
                         break
                 memory_entries = _read_memory(deps)
+                history_context = _history_without_current_turn(chat_history, original_input)
                 user_input = _build_user_message(
-                    original_input, state, memory_entries, chat_history, loop, max_loops,
+                    original_input, state, memory_entries, history_context, loop, max_loops,
                 )
                 # Append repair nudge to user_input directly so the model sees it
                 user_input += (
@@ -2788,14 +2820,23 @@ def run_agent_loop(
         elif reply or tool_calls:
             state["_silent_fail_count"] = 0
 
-        # 6. Print AI reply (only in interactive mode)
-        if reply:
+        # 6. Print AI reply (only in interactive mode). If the response failed
+        # structural parsing, do not surface the malformed text as a normal
+        # answer; the next turn gets a format nudge instead.
+        display_reply = "" if response.get("_parse_failed") else reply
+        if display_reply:
             if events_cb is not None and not _reply_already_rendered:
-                deps.console.print(deps.Markdown(reply))
-            step_replies.append(reply)
-            state["lastReply"] = reply
+                deps.console.print(deps.Markdown(display_reply))
+            step_replies.append(display_reply)
+            state["lastReply"] = display_reply
             if events_cb is not None:
-                pending_events.append({"type": "ai", "content": reply})
+                if _reply_already_rendered:
+                    # Streaming chunks already sent; signal end-of-stream so
+                    # the UI can finalise the current line and redraw the prompt.
+                    pending_events.append({"type": "ai_end"})
+                else:
+                    # Non-streaming path: send the complete reply in one event.
+                    pending_events.append({"type": "ai", "content": display_reply})
                 # Flush immediately — don't wait for tool_calls or done
                 events_cb(pending_events)
                 pending_events.clear()
@@ -3278,8 +3319,9 @@ def run_agent_loop(
 
         # 12. Prepare next input — rebuild via the structured-section helper.
         memory_entries = _read_memory(deps)  # re-read in case AI wrote memory
+        history_context = _history_without_current_turn(chat_history, original_input)
         user_input = _build_user_message(
-            original_input, state, memory_entries, chat_history, loop, max_loops,
+            original_input, state, memory_entries, history_context, loop, max_loops,
         )
 
         # ── Inject nudge if model failed to use JSON format ──

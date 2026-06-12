@@ -287,6 +287,31 @@ def _bi_mem_list(params: dict, ctx: ToolCtx) -> dict:
     return {"ok": True, "result": entries, "count": len(entries)}
 
 
+def _bi_skill_list(params: dict, ctx: ToolCtx) -> dict:
+    """List skills available for explicit progressive loading."""
+    import skills as _skills
+    items = _skills.list_skills()
+    return {"ok": True, "result": items, "count": len(items)}
+
+
+def _bi_skill_load(params: dict, ctx: ToolCtx) -> dict:
+    """Load a skill body into subsequent prompt context."""
+    import skills as _skills
+    name = (params.get("name") or "").strip()
+    if not name:
+        return {"ok": False, "error": "missing 'name'"}
+    ok, msg = _skills.load_skill(name)
+    if not ok:
+        return {"ok": False, "error": msg}
+    loaded = next((s for s in _skills.list_skills() if s["name"] == name), None)
+    return {
+        "ok": True,
+        "result": msg,
+        "skill": loaded or {"name": name, "loaded": True},
+        "instruction": "The skill is now loaded. Continue the task using its instructions from the next model turn.",
+    }
+
+
 def _bi_fs_read(params: dict, ctx: ToolCtx) -> dict:
     """Read a file as UTF-8 with optional line range and cat-style numbering.
 
@@ -1658,6 +1683,26 @@ def register_builtin_tools() -> None:
                 },
             },
             invoke=_bi_mem_list,
+        ),
+        Tool(
+            name="skill.list",
+            description="List available skills with short descriptions and loaded status. "
+                        "Use this when deciding whether specialized instructions are available.",
+            schema={"type": "object", "properties": {}},
+            invoke=_bi_skill_list,
+        ),
+        Tool(
+            name="skill.load",
+            description="Load a named skill's full instructions into subsequent context. "
+                        "Call before starting specialized work when the skill catalog has a relevant skill.",
+            schema={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Skill name from the catalog"},
+                },
+                "required": ["name"],
+            },
+            invoke=_bi_skill_load,
         ),
         Tool(
             name="fs.read",

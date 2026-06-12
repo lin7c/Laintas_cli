@@ -1,12 +1,12 @@
-"""Skill loader for laintas_cli — Phase 3b + progressive loading.
+"""Skill loader for laintas_cli — explicit progressive loading.
 
-A "skill" is a directory under SKILLS_DIR that exposes tools via skill.py
-and optionally provides a SKILL.md with metadata, trigger patterns, and
-reference documents.
+A "skill" is a directory under SKILLS_DIR that exposes optional tools via
+skill.py and optionally provides a SKILL.md with metadata and reference
+documents.
 
-Progressive Loading (inspired by Claude Code's skill system):
-  1. **Startup**: Only scan SKILL.md frontmatter (name, description, triggers)
-  2. **Runtime**: When user input matches trigger patterns, load skill body + tools
+Progressive Loading:
+  1. **Startup**: Only scan SKILL.md frontmatter (name, description)
+  2. **Runtime**: AI calls skill.load(name) when the catalog shows a relevant skill
   3. **On-demand**: Reference docs loaded when skill tools request them
 
 Directory layout:
@@ -27,13 +27,7 @@ SKILL.md example:
 
     ---
     name: weather
-    description: This skill should be used when the user asks about weather,
-        forecasts, or temperature for any city.
-    triggers:
-      - weather
-      - forecast
-      - temperature
-      - "what's it like in"
+    description: Use this when working with weather, forecasts, or temperature.
     version: 1.0.0
     ---
 
@@ -73,6 +67,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import re
+import shutil
 import sys
 import traceback
 from dataclasses import dataclass, field
@@ -85,6 +80,7 @@ from tools import Tool, get_registry
 import paths
 
 SKILLS_DIR = paths.SKILLS_DIR
+BUNDLED_SKILLS_DIR = Path(__file__).resolve().parent / "default_skills"
 
 
 def ensure_skills_dir() -> Path:
@@ -92,12 +88,35 @@ def ensure_skills_dir() -> Path:
     return SKILLS_DIR
 
 
+def ensure_bundled_skills_installed() -> list[str]:
+    """Copy bundled documentation skills into the user skills dir if missing.
+
+    Existing user skills win; this only seeds defaults for fresh installs.
+    """
+    ensure_skills_dir()
+    installed: list[str] = []
+    if not BUNDLED_SKILLS_DIR.is_dir():
+        return installed
+    for src in sorted(BUNDLED_SKILLS_DIR.iterdir()):
+        if not src.is_dir():
+            continue
+        dst = SKILLS_DIR / src.name
+        if dst.exists():
+            continue
+        try:
+            shutil.copytree(src, dst)
+            installed.append(src.name)
+        except OSError:
+            continue
+    return installed
+
+
 # ── Skill Metadata & State ──────────────────────────────────────────────
 
 @dataclass
 class SkillMetadata:
     """Lightweight metadata parsed from SKILL.md frontmatter at startup.
-    Always loaded — used for trigger matching and catalog display."""
+    Always loaded — used for catalog display and explicit skill.load."""
     name: str
     description: str = ""
     trigger_patterns: list[str] = field(default_factory=list)
@@ -107,7 +126,7 @@ class SkillMetadata:
 
 @dataclass
 class SkillState:
-    """Full state of a loaded skill. Created on demand when triggered."""
+    """Full state of a loaded skill. Created on demand by skill.load."""
     metadata: SkillMetadata
     body: str = ""                    # SKILL.md body (after frontmatter)
     loaded: bool = False              # whether tools have been registered
@@ -133,9 +152,6 @@ def _parse_frontmatter(text: str) -> tuple[dict, str]:
       ---
       name: foo
       description: bar
-      triggers:
-        - pattern1
-        - pattern2
       version: 1.0
       ---
       Body text here...
@@ -223,6 +239,7 @@ def scan_metadata() -> dict[str, SkillMetadata]:
     """
     global _skill_metadata, _scan_done
     ensure_skills_dir()
+    ensure_bundled_skills_installed()
     _skill_metadata.clear()
 
     if not SKILLS_DIR.exists():
@@ -238,6 +255,17 @@ def scan_metadata() -> dict[str, SkillMetadata]:
         meta, _ = _parse_skill_md(child)
         _skill_metadata[meta.name] = meta
 
+    # Bundled defaults are also usable in-place. User-installed skills with the
+    # same metadata name take precedence because they were scanned first.
+    if BUNDLED_SKILLS_DIR.is_dir():
+        for child in sorted(BUNDLED_SKILLS_DIR.iterdir()):
+            if not child.is_dir():
+                continue
+            if not (child / "skill.py").is_file() and not (child / "SKILL.md").is_file():
+                continue
+            meta, _ = _parse_skill_md(child)
+            _skill_metadata.setdefault(meta.name, meta)
+
     _scan_done = True
     return _skill_metadata
 
@@ -249,50 +277,28 @@ def get_all_metadata() -> dict[str, SkillMetadata]:
     return _skill_metadata
 
 
-# ── Trigger Matching ────────────────────────────────────────────────────
-
-def match_triggers(user_input: str) -> list[str]:
-    """Check user input against all skill trigger patterns.
-
-    Returns list of skill names whose triggers match.
-    """
+def load_skill(name: str) -> tuple[bool, str]:
+    """Public wrapper for explicitly loading a skill by name."""
     if not _scan_done:
         scan_metadata()
-
-    matched = []
-    input_lower = user_input.lower()
-
-    for name, meta in _skill_metadata.items():
-        if not meta.trigger_patterns:
-            continue
-        for pattern in meta.trigger_patterns:
-            try:
-                if re.search(pattern, input_lower, re.IGNORECASE):
-                    matched.append(name)
-                    break
-            except re.error:
-                # Fall back to substring match if regex is invalid
-                if pattern.lower() in input_lower:
-                    matched.append(name)
-                    break
-
-    return matched
+    return _load_skill_full(name)
 
 
-def check_and_activate(user_input: str) -> list[str]:
-    """Check triggers and activate matching skills.
-
-    Returns list of newly activated skill names.
-    """
-    matched = match_triggers(user_input)
-    activated = []
-    for name in matched:
-        if name in _skill_states and _skill_states[name].loaded:
-            continue  # already loaded
-        ok, msg = _load_skill_full(name)
-        if ok:
-            activated.append(name)
-    return activated
+def list_skills() -> list[dict]:
+    """Return lightweight skill catalog for tools/UI."""
+    if not _scan_done:
+        scan_metadata()
+    out = []
+    for name, meta in sorted(_skill_metadata.items()):
+        state = _skill_states.get(name)
+        out.append({
+            "name": name,
+            "description": meta.description,
+            "version": meta.version,
+            "loaded": bool(state and state.loaded),
+            "path": meta.dir_path,
+        })
+    return out
 
 
 # ── Full Loading (On-Demand) ────────────────────────────────────────────
@@ -409,12 +415,12 @@ def load_reference(skill_name: str, ref_name: str) -> Optional[str]:
 # ── Backward-Compatible API ─────────────────────────────────────────────
 
 def list_skill_dirs() -> list[Path]:
-    """Return every immediate subdirectory of SKILLS_DIR that has skill.py."""
+    """Return every immediate subdirectory of SKILLS_DIR that has a skill file."""
     if not SKILLS_DIR.exists():
         return []
     out = []
     for child in sorted(SKILLS_DIR.iterdir()):
-        if child.is_dir() and (child / "skill.py").is_file():
+        if child.is_dir() and ((child / "skill.py").is_file() or (child / "SKILL.md").is_file()):
             out.append(child)
     return out
 
@@ -436,20 +442,15 @@ def _load_one(skill_dir: Path) -> tuple[bool, str]:
 def load_all() -> list[tuple[str, bool, str]]:
     """Load every skill under SKILLS_DIR. Returns [(name, ok, msg), ...].
 
-    In progressive mode, this only scans metadata. Tools are loaded on demand.
-    For backward compatibility, skills WITHOUT trigger patterns are loaded fully.
+    In explicit progressive mode, this only scans metadata. Skill bodies and
+    skill tools are loaded only when the AI calls skill.load.
     """
     ensure_skills_dir()
+    ensure_bundled_skills_installed()
     scan_metadata()
     results: list[tuple[str, bool, str]] = []
     for name, meta in _skill_metadata.items():
-        if not meta.trigger_patterns:
-            # No triggers = always active, load fully
-            ok, msg = _load_skill_full(name)
-            results.append((name, ok, msg))
-        else:
-            # Has triggers = load on demand
-            results.append((name, True, f"{name}: metadata loaded, tools deferred until triggered"))
+        results.append((name, True, f"{name}: metadata loaded, use skill.load to activate"))
     return results
 
 
@@ -517,20 +518,19 @@ def get_activated_skills_context() -> str:
 def describe_skills_for_prompt() -> str:
     """Render a compact skill catalog for the system prompt.
 
-    Shows all scanned skills with their descriptions and trigger status.
+    Shows all scanned skills with their descriptions and loaded status.
     """
     if not _scan_done:
         scan_metadata()
     if not _skill_metadata:
         return ""
 
-    lines = ["Available skills:"]
+    lines = ["Available skills. Load a relevant skill with `skill.load` before relying on its instructions:"]
     for name, meta in sorted(_skill_metadata.items()):
         state = _skill_states.get(name)
-        status = "✅ active" if (state and state.loaded) else "⏳ standby"
-        triggers = f" triggers=[{', '.join(meta.trigger_patterns[:5])}]" if meta.trigger_patterns else ""
+        status = "loaded" if (state and state.loaded) else "available"
         desc = meta.description[:100] if meta.description else "(no description)"
-        lines.append(f"  - {name} [{status}]: {desc}{triggers}")
+        lines.append(f"  - {name} [{status}]: {desc}")
     return "\n".join(lines)
 
 
@@ -563,16 +563,13 @@ def get_tools():
 _SKILL_MD_TEMPLATE = """---
 name: {name}
 description: Describe what this skill does and when it should be used.
-triggers:
-  - trigger_keyword_1
-  - trigger_keyword_2
 version: 0.1.0
 ---
 
 # {name} Skill
 
 Describe how to use this skill. This text is loaded into context when
-the skill is triggered.
+the AI calls `skill.load`.
 
 ## References
 

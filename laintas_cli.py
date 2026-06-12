@@ -1619,19 +1619,7 @@ def verify_session(session: dict) -> Optional[dict]:
     cookies = session.get("cookies", {})
     headers = session.get("headers", {})
     token = session.get("token", "")
-    user_id = session.get("userId", "")
-
-    # Method 1: X-User-Id header (local dev / trusted proxy bypass)
-    if user_id:
-        try:
-            resp = requests.get(f"{LAINTAS_BASE}/api/balance",
-                                headers={"X-User-Id": user_id}, timeout=5)
-            if resp.status_code == 200:
-                return {"id": user_id, "name": "", "email": ""}
-        except requests.RequestException:
-            pass
-
-    # Method 2 & 3: call get-session to get full user info
+    # Call get-session to get full user info.
     req_args = None
     # Try __Secure- prefixed cookie first (laintas.com uses cross-subdomain cookies)
     for cookie_name in ["__Secure-better-auth.session_token", "better-auth.session_token"]:
@@ -2238,6 +2226,91 @@ def generate_cli_prop_template() -> str:
     shell_info = "cmd.exe" if IS_WINDOWS else SHELL_NAME
 
     return f"""<role>
+You are {{{{agentName}}}} (id: {{{{agentId}}}}, role: {{{{deploymentStatus}}}}), an autonomous coding agent running in laintas-cli.
+Solve real engineering tasks by reading the repo, using tools, editing files, running commands, verifying results, and reporting briefly.
+</role>
+
+<environment>
+- OS: {SYSTEM} | Shell: {shell_info} | CWD: {{{{currentPath}}}}
+- Terminal: {{{{terminalName}}}} | Parent terminal: {{{{parentTerminal}}}}
+- Depth: {{{{depth}}}} | Parent agent: {{{{parent}}}} | Children: {{{{children}}}}
+- Inbox: {{{{inbox}}}}
+- Plan mode: {{{{planMode}}}}
+- Current date/time is appended by the runtime.
+</environment>
+
+<memory>
+Persistent memory:
+{{{{persistentMemory}}}}
+
+Project rules:
+{{{{globalMemory}}}}
+
+Last session:
+{{{{lastSession}}}}
+</memory>
+
+<skills>
+{{{{skills}}}}
+
+If a skill looks relevant, call `skill.load` with its name before doing specialized work.
+Do not assume unloaded skill instructions. After loading, continue using the instructions below.
+
+Loaded skill instructions:
+{{{{skillContext}}}}
+</skills>
+
+<tools>
+Return actions only inside the JSON `tool_calls` array.
+Use `shell.exec` for shell commands and meta-commands. Use structured tools for file, memory, task, plan, web, agent, terminal, time, and sleep operations.
+Never write XML, HTML, pseudo-tags, or text wrappers such as `<tool_calls>...</tool_calls>`.
+To list skills, emit:
+{{"reply":"Listing available skills.","tool_calls":[{{"name":"skill.list","arguments":{{}}}}]}}
+To load a skill, emit:
+{{"reply":"Loading the relevant skill.","tool_calls":[{{"name":"skill.load","arguments":{{"name":"react-project"}}}}]}}
+Catalog:
+{{{{tools}}}}
+</tools>
+
+<workflow>
+- If the user asks a clear read/edit/build/test/investigate task, act with tools. Do not ask for permission to do exactly what was asked.
+- Ask one concise clarifying question only when the target or intent is genuinely ambiguous, destructive, or impossible to infer safely.
+- For unfamiliar code: search/list, read the relevant region, then edit. Never patch from memory.
+- Keep each action small and verifiable. Prefer exact edits over rewrites.
+- After a tool failure, read the error and change approach; do not retry identical arguments.
+- Verify before claiming completion when verification is practical.
+- Save durable user/project preferences with memory tools when the user corrects you or establishes a non-obvious rule.
+{{{{workflowPhase}}}}
+{{{{rolePrompt}}}}
+{{{{confidenceGuidance}}}}
+</workflow>
+
+<output_rules>
+Every response must be exactly one JSON object:
+{{
+  "reply": "Brief user-facing text. Markdown OK. Cite files as path:line.",
+  "tool_calls": [
+    {{"name": "tool.name", "arguments": {{}}}}
+  ]
+}}
+
+- No prose outside JSON. No code fences.
+- Never output `<tool_calls>`, `<invoke>`, `/tool ...` text, or any XML-like tool syntax.
+- `reply` is normally 1-3 sentences.
+- `tool_calls: []` means answered, complete, or blocked waiting for the user.
+- Multiple tool calls are allowed when they are independent or sequentially safe.
+</output_rules>
+
+<tone>
+Direct, terse, and useful. Match the user's language. Do not add filler or final checklists.
+</tone>
+
+<safety>
+Do not bypass policy. Do not invent paths, APIs, files, or results. Do not commit, push, deploy, publish, or run destructive commands without explicit user request.
+</safety>
+"""
+
+    return f"""<role>
 You are {{{{agentName}}}} (id: {{{{agentId}}}}, role: {{{{deploymentStatus}}}}), an autonomous coding agent running inside a laintas-cli REPL.
 You earn your keep by solving real engineering tasks: explore the codebase, edit files, run commands, verify the result, and report back tersely. Prefer action over explanation once the task is clear — but **confirm intent before touching any file or running any command when the request is conversational, vague, or missing a concrete target**.
 </role>
@@ -2539,9 +2612,6 @@ def get_auth_headers(session: dict) -> dict:
     headers = {"Content-Type": "application/json"}
     if session.get("headers", {}).get("Authorization"):
         headers["Authorization"] = session["headers"]["Authorization"]
-    # Include X-User-Id for local auth server bypass
-    if session.get("userId"):
-        headers["X-User-Id"] = session["userId"]
     return headers
 
 
@@ -2585,6 +2655,38 @@ def _extract_json_object(text: str) -> Optional[dict]:
                 except json.JSONDecodeError:
                     return None
     return None
+
+
+def _extract_tagged_tool_calls(text: str) -> Optional[list]:
+    """Best-effort compatibility for malformed `<tool_calls>...</tool_calls>` output.
+
+    The prompt forbids this syntax, but older/model-regressed turns may emit it.
+    Convert it to the canonical tool_calls list so the loop can continue.
+    """
+    if not text:
+        return None
+    m = re.search(r"<tool_calls>\s*(.*?)\s*</tool_calls>", text, re.I | re.S)
+    if not m:
+        return None
+    raw = m.group(1).strip()
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(parsed, dict):
+        parsed = [parsed]
+    if not isinstance(parsed, list):
+        return None
+    out = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        if not name:
+            continue
+        args = item.get("arguments") or {}
+        out.append({"name": name, "arguments": args if isinstance(args, dict) else {"value": args}})
+    return out or None
 
 
 def _try_parse_partial_json(text: str) -> Optional[dict]:
@@ -2828,6 +2930,15 @@ def call_backend_stream(
         # Extract the JSON object from accumulated text. Model may wrap in ```json fences or prose.
         parsed = _extract_json_object(accumulated)
         if parsed is None:
+            tagged_tool_calls = _extract_tagged_tool_calls(accumulated)
+            if tagged_tool_calls:
+                return {
+                    "reply": "",
+                    "tool_calls": tagged_tool_calls,
+                    "done": False,
+                    "_billing": billing_info,
+                    "_diag_events": _diag_events + ["parsed_tagged_tool_calls"],
+                }
             raw_text = accumulated.strip() or "(no response)"
             # Pure prose (no '{'): content is valid but JSON wrapper is missing.
             # Continue the loop so the model gets a nudge and can still call tools,
@@ -2847,6 +2958,15 @@ def call_backend_stream(
         # Normalize tool_calls from response
         recognized_fields = ("reply", "tool_calls", "command", "close_session", "send_keys")
         if not any(k in parsed for k in recognized_fields):
+            tagged_tool_calls = _extract_tagged_tool_calls(accumulated)
+            if tagged_tool_calls:
+                return {
+                    "reply": "",
+                    "tool_calls": tagged_tool_calls,
+                    "done": False,
+                    "_billing": billing_info,
+                    "_diag_events": _diag_events + ["parsed_tagged_tool_calls"],
+                }
             raw_text = accumulated.strip() or json.dumps(parsed, ensure_ascii=False)
             return {
                 "reply": raw_text,
@@ -2919,6 +3039,142 @@ def call_backend_stream(
 
 
 # ── Agent Registration with Helpwo Backend ─────────────────────────────
+
+class TerminalSession:
+    """A real PTY shell bridged to the browser over a WebSocket relay.
+
+    Two threads share one sync WebSocket (the documented one-reader /
+    one-writer pattern): the reader thread pumps PTY output up, the main
+    thread pumps browser input + resizes down into the PTY. Frames are JSON
+    text; payload bytes are base64 so arbitrary/binary output survives intact:
+      host → browser : {"t":"o","d":<b64>}  output    {"t":"exit"}
+      browser → host : {"t":"i","d":<b64>}  input     {"t":"resize","cols","rows"}
+    """
+
+    def __init__(self, backend_url, agent_id, agent_secret, session_id, cols, rows):
+        self.backend_url = backend_url
+        self.agent_id = agent_id
+        self.agent_secret = agent_secret
+        self.session_id = session_id
+        self.cols = cols
+        self.rows = rows
+        self.fd = None
+        self.pid = None
+        self._ws = None
+        self._closed = threading.Event()
+
+    def _ws_url(self):
+        base = self.backend_url.replace("https://", "wss://").replace("http://", "ws://")
+        return (f"{base}/api/agents/{self.agent_id}/term"
+                f"?sessionId={self.session_id}&role=host&agentSecret={self.agent_secret}")
+
+    def _set_winsize(self, cols, rows):
+        import fcntl, termios, struct
+        if self.fd is None:
+            return
+        try:
+            fcntl.ioctl(self.fd, termios.TIOCSWINSZ,
+                        struct.pack("HHHH", rows, cols, 0, 0))
+        except OSError:
+            pass
+
+    def start(self):
+        threading.Thread(target=self._run, daemon=True,
+                         name=f"laintas-term-{self.session_id}").start()
+
+    def _run(self):
+        import pty
+        from websockets.sync.client import connect
+
+        shell = os.environ.get("SHELL") or "/bin/bash"
+        self.pid, self.fd = pty.fork()
+        if self.pid == 0:
+            # Child: become the shell with a sane terminal identity.
+            os.environ["TERM"] = "xterm-256color"
+            try:
+                os.execvp(shell, [shell, "-l"] if os.path.basename(shell) in ("bash", "zsh", "sh") else [shell])
+            except Exception:
+                os._exit(127)
+            return
+
+        # Parent: size the PTY, then connect the relay.
+        self._set_winsize(self.cols, self.rows)
+        try:
+            self._ws = connect(self._ws_url(), open_timeout=10, max_size=None)
+        except Exception as e:
+            console.print(f"[red]Terminal relay connect failed: {e}[/red]")
+            self._cleanup()
+            return
+
+        threading.Thread(target=self._pump_output, daemon=True,
+                         name=f"laintas-term-out-{self.session_id}").start()
+        try:
+            self._read_input_loop()
+        finally:
+            self._cleanup()
+
+    def _read_input_loop(self):
+        """Main thread: browser → PTY (input + resize)."""
+        import base64
+        for message in self._ws:  # iterates until the socket closes
+            try:
+                msg = json.loads(message)
+            except (ValueError, TypeError):
+                continue
+            t = msg.get("t")
+            if t == "i":
+                try:
+                    os.write(self.fd, base64.b64decode(msg.get("d", "")))
+                except OSError:
+                    break
+            elif t == "resize":
+                try:
+                    self._set_winsize(int(msg["cols"]), int(msg["rows"]))
+                except (KeyError, ValueError, TypeError):
+                    pass
+
+    def _pump_output(self):
+        """Reader thread: PTY → browser. Sole writer of the WebSocket."""
+        import base64
+        while not self._closed.is_set():
+            try:
+                data = os.read(self.fd, 65536)
+            except OSError:
+                break
+            if not data:
+                break  # shell exited / PTY closed
+            try:
+                self._ws.send(json.dumps({"t": "o", "d": base64.b64encode(data).decode("ascii")}))
+            except Exception:
+                break
+        # Tell the browser the shell ended, then close the relay.
+        try:
+            self._ws.send(json.dumps({"t": "exit"}))
+        except Exception:
+            pass
+        self._cleanup()
+
+    def _cleanup(self):
+        if self._closed.is_set():
+            return
+        self._closed.set()
+        if self.fd is not None:
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+        if self.pid:
+            try:
+                os.kill(self.pid, signal.SIGHUP)
+                os.waitpid(self.pid, os.WNOHANG)
+            except OSError:
+                pass
+        if self._ws is not None:
+            try:
+                self._ws.close()
+            except Exception:
+                pass
+
 
 class AgentRegistry:
     """Manages remote agent registration with Helpwo backend."""
@@ -3061,7 +3317,7 @@ class AgentRegistry:
                 continue
 
             batch = list(first)
-            deadline = time.time() + 0.2
+            deadline = time.time() + 0.1
             while len(batch) < 50:
                 remaining = deadline - time.time()
                 if remaining <= 0:
@@ -3240,6 +3496,8 @@ class AgentRegistry:
                 self._handle_chat(req_id, payload, agent_state_cb, chat_history_cb)
             elif kind == "delegate":
                 self._handle_delegate(req_id, payload, agent_state_cb, chat_history_cb)
+            elif kind == "term-open":
+                self._handle_term_open(req_id, payload)
             elif kind == "abort":
                 self._handle_abort(req_id, payload)
             elif kind == "approval-response":
@@ -3412,6 +3670,39 @@ class AgentRegistry:
         except Exception as e:
             self._push_final(req_id, "fail", f"query error: {e}")
 
+    def _handle_term_open(self, req_id: str, payload: dict):
+        """Spawn a real PTY shell and dial into the backend terminal relay.
+
+        Gives the Helpwo browser a live shell (vim/htop/colors/Ctrl-C all
+        work) — same trust level as remote_exec, which already runs arbitrary
+        commands. Set runtime config `disable_remote_terminal` to turn it off.
+        """
+        if IS_WINDOWS:
+            return  # PTY relay is Unix-only for now
+        if get_runtime_config("disable_remote_terminal"):
+            console.print("[yellow]Remote terminal request ignored (disable_remote_terminal is set).[/yellow]")
+            return
+        session_id = (payload.get("sessionId") or "").strip()
+        if not session_id:
+            return
+        try:
+            cols = max(1, int(payload.get("cols") or 80))
+            rows = max(1, int(payload.get("rows") or 24))
+        except (TypeError, ValueError):
+            cols, rows = 80, 24
+
+        backend_url = os.environ.get("LAINTAS_BACKEND", BACKEND_URL)
+        console.print(Panel(
+            f"[bold cyan]Browser opened a terminal[/bold cyan]\n[dim]session {session_id} · {cols}×{rows}[/dim]",
+            title="Remote Terminal", border_style="cyan",
+        ))
+        try:
+            term = TerminalSession(backend_url, self.agent_id, self.agent_secret,
+                                   session_id, cols, rows)
+            term.start()
+        except Exception as e:
+            console.print(f"[red]Failed to open remote terminal: {e}[/red]")
+
     def _handle_delegate(self, req_id: str, payload: dict,
                          agent_state_cb, chat_history_cb):
         """Launch a local agent loop for a delegated task.
@@ -3429,9 +3720,25 @@ class AgentRegistry:
         old_max = get_runtime_config("max_loops")
         set_runtime_config("max_loops", min(max_loops_val, 20))
 
+        # Context briefing from the caller (HelpwoAI conversation summary).
+        # Injected ahead of the goal so the delegated loop knows WHY it was
+        # asked, while the goal stays the authoritative task.
+        context = str(payload.get("context") or "").strip()
+        loop_input = goal
+        if context:
+            loop_input = (
+                "[BRIEFING FROM HELPWO — background from the caller's conversation]\n"
+                + context[:6000]
+                + "\n[END BRIEFING] The briefing is background only. "
+                  "Your task is ONLY the goal below.\n\n"
+                + goal
+            )
+
         console.print(Panel(
             f"[bold magenta]delegate[/bold magenta] {goal[:200]}\n"
-            f"[dim]maxLoops={max_loops_val}[/dim]",
+            f"[dim]maxLoops={max_loops_val}"
+            + (f", context={len(context)} chars" if context else "")
+            + "[/dim]",
             title=f"Incoming delegate ({req_id})",
             border_style="magenta",
         ))
@@ -3455,7 +3762,11 @@ class AgentRegistry:
         )
 
         session = self._session or {}
-        chat_history = chat_history_cb() if callable(chat_history_cb) else []
+        # Isolation: a delegated loop should see only its goal + the caller's
+        # briefing — NOT whatever conversation happens to sit in this CLI's
+        # local REPL. Mirrors how local Helpwo sub-agents are isolated from
+        # their parent's history. (chat kind still uses the local history.)
+        chat_history = []
 
         def _delegate_events(events):
             """Push loop events to backend with reqId."""
@@ -3474,7 +3785,7 @@ class AgentRegistry:
                 nonlocal result
                 try:
                     result = run_agent_loop(
-                        deps=deps, original_input=goal,
+                        deps=deps, original_input=loop_input,
                         session=session, state={},
                         chat_history=chat_history,
                         events_cb=_delegate_events,
@@ -5034,20 +5345,22 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
     elif action == "/skill":
         sub = parts[1] if len(parts) > 1 else "list"
         if sub == "list":
-            dirs = skills_mod.list_skill_dirs()
-            if not dirs:
+            metas = skills_mod.get_all_metadata()
+            if not metas:
                 console.print(f"[dim]No skills in {skills_mod.SKILLS_DIR}[/dim]")
                 console.print("[dim]Create one with: /skill new <name>[/dim]")
             else:
                 groups = tools_mod.get_registry().list_by_source()
-                for sd in dirs:
-                    src = f"skill:{sd.name}"
+                for name, meta in sorted(metas.items()):
+                    src = f"skill:{name}"
                     tools = groups.get(src, [])
-                    console.print(f"[bold]{sd.name}[/bold] [dim]({sd})[/dim]")
+                    console.print(f"[bold]{name}[/bold] [dim]({meta.dir_path})[/dim]")
+                    if meta.description:
+                        console.print(f"  [dim]{meta.description}[/dim]")
                     for t in tools:
                         console.print(f"  [cyan]{t.name}[/cyan] — {t.description}")
                     if not tools:
-                        console.print("  [yellow](not loaded — run /skill reload)[/yellow]")
+                        console.print("  [yellow](standby/documentation-only)[/yellow]")
         elif sub == "reload":
             results = skills_mod.reload_all()
             for name, ok, msg in results:
@@ -6153,24 +6466,59 @@ def main():
                 interactive_session.close()
                 interactive_session = None
 
-            # All user-typed system commands get full PTY passthrough.
-            # The child takes over the terminal until it exits — works for
-            # one-shot commands (ls, git) and interactive programs (vim,
-            # claude, codex) without any per-command whitelist.
-            # Drain any queued terminal query responses before passthrough
-            if not IS_WINDOWS:
-                _fl = fcntl.fcntl(sys.stdin.fileno(), fcntl.F_GETFL)
-                fcntl.fcntl(sys.stdin.fileno(), fcntl.F_SETFL, _fl | os.O_NONBLOCK)
-                try:
-                    while True:
-                        if not sys.stdin.buffer.read(4096):
-                            break
-                except (BlockingIOError, OSError):
-                    pass
-                finally:
-                    fcntl.fcntl(sys.stdin.fileno(), fcntl.F_SETFL, _fl)
+            # Remote-injected commands (from Helpwo Activity terminal): use
+            # subprocess capture so stdout can be forwarded to the event stream.
+            # pty_passthrough directly inherits the local tty and returns
+            # stdout="" — nothing to forward.  Local commands keep pty_passthrough
+            # so interactive programs (vim, claude) still work normally.
+            if injected_done is not None and agent_registry.agent_id:
+                import subprocess as _sub
+                _cd_m = re.match(r'^\s*cd(?:\s+(.+))?\s*$', user_input)
+                if _cd_m:
+                    # cd is a shell builtin — handle it in the Python process too
+                    _cd_target = (_cd_m.group(1) or "").strip() or os.path.expanduser("~")
+                    try:
+                        os.chdir(os.path.expanduser(_cd_target))
+                        _cap_out = f"{os.getcwd()}"
+                    except OSError as _e:
+                        _cap_out = f"cd: {_e}"
+                    result = {"stdout": _cap_out, "stderr": "", "returncode": 0, "success": True}
+                else:
+                    try:
+                        _proc = _sub.run(
+                            user_input, shell=True, capture_output=True, text=True,
+                            timeout=60, cwd=os.getcwd(),
+                        )
+                        _cap_out = (_proc.stdout + _proc.stderr).strip()
+                        result = {
+                            "stdout": _proc.stdout, "stderr": _proc.stderr,
+                            "returncode": _proc.returncode, "success": _proc.returncode == 0,
+                        }
+                    except _sub.TimeoutExpired:
+                        _cap_out = "Command timed out after 60s."
+                        result = {"stdout": "", "stderr": "", "returncode": -1, "success": False}
+                agent_registry._push_events([{"type": "system", "kind": "output", "content": _cap_out[:4000]}])
+            else:
+                # Local user: full PTY passthrough (interactive programs get real tty).
+                # Drain any queued terminal query responses before passthrough.
+                if not IS_WINDOWS:
+                    _fl = fcntl.fcntl(sys.stdin.fileno(), fcntl.F_GETFL)
+                    fcntl.fcntl(sys.stdin.fileno(), fcntl.F_SETFL, _fl | os.O_NONBLOCK)
+                    try:
+                        while True:
+                            if not sys.stdin.buffer.read(4096):
+                                break
+                    except (BlockingIOError, OSError):
+                        pass
+                    finally:
+                        fcntl.fcntl(sys.stdin.fileno(), fcntl.F_SETFL, _fl)
 
-            result = pty_passthrough(user_input)
+                result = pty_passthrough(user_input)
+
+                if agent_registry.agent_id:
+                    output_preview = result.get("stdout", "")[:2000]
+                    if output_preview:
+                        agent_registry._push_events([{"type": "system", "kind": "output", "content": output_preview}])
 
             # ── Debug: log command execution ──
             loop_id = next_debug_loop()
@@ -6184,10 +6532,6 @@ def main():
                 exec_returncode=result.get("returncode", -1),
                 done=True,
             ))
-
-            if agent_registry.agent_id:
-                output_preview = result.get("stdout", "")[:2000]
-                agent_registry._push_events([{"type": "system", "kind": "output", "content": output_preview}])
 
             agent_state["lastOutput"] = result.get("stdout", "")
             response = {
