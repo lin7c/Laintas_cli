@@ -661,10 +661,16 @@ def run_hwo_ui(root_agent_name: str,
             _totals["total"], _totals["visible"], scroll_top[0], _totals["visible"]
         )
 
+    _PREFIX_NORMAL = "  > "         # 4 chars
+    _PREFIX_SAVE   = "  save as: "  # 11 chars
+
     def _get_prefix():
         if mode[0] == "save":
-            return [("class:input.prefix", "  save as: ")]
-        return [("class:input.prefix", "  > ")]
+            return [("class:input.prefix", _PREFIX_SAVE)]
+        return [("class:input.prefix", _PREFIX_NORMAL)]
+
+    def _prefix_width() -> int:
+        return len(_PREFIX_SAVE) if mode[0] == "save" else len(_PREFIX_NORMAL)
 
     def _get_status():
         return _render_status(
@@ -685,7 +691,7 @@ def run_hwo_ui(root_agent_name: str,
                         height=1)
     input_buf  = Buffer(name="hwo_input", multiline=False)
     prefix_win = Window(content=FormattedTextControl(_get_prefix, focusable=False),
-                        width=12, dont_extend_width=True)
+                        width=_prefix_width, dont_extend_width=True)
     input_win  = Window(content=BufferControl(buffer=input_buf),
                         height=1, dont_extend_height=True)
 
