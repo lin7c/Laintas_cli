@@ -120,6 +120,7 @@ import tools as tools_mod    # noqa: E402 — load after agent_loop so registry 
 import skills as skills_mod  # noqa: E402
 import paths                 # Centralized path management
 import migrate as migrate_mod  # Auto-migration from old layout
+import hwo_ui as hwo_ui_mod  # /hwo orchestration UI
 
 # MCP client: lazy import (saves ~1.8s on startup)
 _mcp_mod = None
@@ -5564,6 +5565,12 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
 
         return False
 
+    elif action == "/hwo":
+        # Visual agent-orchestration builder TUI
+        current = get_current_agent()
+        root_name = current.name if current else "primary"
+        hwo_ui_mod.run_hwo_ui(root_name)
+
     else:
         # Try .laintas/commands.py custom handler first
         handler = _load_extra_commands()
@@ -5780,6 +5787,7 @@ def show_help():
     table.add_row("/agents [name]", "List/switch agents, /agents name <n> to rename")
     table.add_row("/t, /term [name]", "List sub-terminals, or create new one (/t <name>)")
     table.add_row("/back", "Detach from sub-terminal without closing it")
+    table.add_row("/hwo", "Visual agent-orchestration builder (HWO TUI)")
     table.add_row("/plan", "Structured planning (/plan enter, approve, exit, status, list)")
     table.add_row("/workflow", "Multi-phase workflows (/workflow start, status, advance, end, list)")
     table.add_row("/skill", "Skill management (/skill list, reload, new <name>, dir)")
