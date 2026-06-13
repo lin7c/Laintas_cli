@@ -1159,6 +1159,353 @@ def _bi_agent_spawn(params: dict, ctx: ToolCtx) -> dict:
     return {"ok": True, "result": f"Spawned child agent '{child_id}'{role_note} for task: {task[:120]}", "child_id": child_id}
 
 
+def _bi_spawn(params: dict, ctx: ToolCtx) -> dict:
+    """Blocking single spawn — mirrors Helpwo spawn tool."""
+    import agent_loop as _al
+    import threading
+
+    goal = (params.get("goal") or "").strip()
+    if not goal:
+        return {"ok": False, "error": "missing 'goal'"}
+    context = (params.get("context") or "").strip()
+
+    parent_id = ctx.agent_id
+    if parent_id and not _al.can_spawn(parent_id):
+        return {"ok": False, "error": "Cannot spawn: maximum agent depth reached."}
+
+    parent = _al.get_agent(parent_id) if parent_id else None
+    depth = (parent.depth + 1) if parent else 0
+
+    child = _al.register_agent(depth=depth, parent_id=parent_id, role="subagent")
+    spawn_ctx = context or ""
+
+    done_evt = threading.Event()
+    result_holder = {}
+
+    def _runner(ok: bool):
+        if not ok:
+            result_holder.update({"ok": False, "result": f"[{child.id}] cancelled while queued."})
+            done_evt.set()
+            return
+        try:
+            r = _al.run_agent_loop(
+                ctx.deps, goal, ctx.session, child.state, child.chat_history,
+                depth=child.depth, agent_id=child.id,
+            )
+            reply = (r.get("state") or {}).get("lastReply", "") if isinstance(r, dict) else ""
+            _al.mark_agent_finished(child.id, result=reply)
+            result_holder.update({"ok": True, "result": f"[{child.id}] {reply or '(done)'}"})
+        except Exception as e:
+            _al.mark_agent_finished(child.id, error=repr(e))
+            result_holder.update({"ok": False, "result": repr(e)})
+        finally:
+            done_evt.set()
+
+    if parent_id:
+        _al.enter_waiting(parent_id)
+    try:
+        t = threading.Thread(
+            target=lambda: _al.schedule_agent(child.id, _runner),
+            daemon=True, name=f"spawn-{child.id}",
+        )
+        t.start()
+        done_evt.wait(timeout=300)
+    finally:
+        if parent_id:
+            _al.exit_waiting(parent_id)
+
+    if not result_holder:
+        _al.mark_agent_finished(child.id, error="timeout")
+        return {"ok": False, "error": f"spawn timed out: {goal[:80]}"}
+    return result_holder
+
+
+def _bi_spawn_parallel(params: dict, ctx: ToolCtx) -> dict:
+    """Fan-out + join — mirrors Helpwo spawn_parallel."""
+    import agent_loop as _al
+    import threading
+
+    tasks = params.get("tasks") or []
+    if not tasks:
+        return {"ok": False, "error": "spawn_parallel requires at least one task"}
+    if len(tasks) > 6:
+        return {"ok": False, "error": "spawn_parallel: maximum 6 tasks"}
+
+    parent_id = ctx.agent_id
+    if parent_id and not _al.can_spawn(parent_id):
+        return {"ok": False, "error": "Cannot spawn: maximum agent depth reached."}
+
+    parent = _al.get_agent(parent_id) if parent_id else None
+    depth = (parent.depth + 1) if parent else 0
+    group_id = f"group-{int(time.time() * 1000)}"
+
+    children = []
+    for t in tasks:
+        child = _al.register_agent(depth=depth, parent_id=parent_id, role="subagent")
+        child.group_id = group_id
+        children.append((child, t))
+
+    results = [None] * len(children)
+    done_events = [threading.Event() for _ in children]
+
+    def _make_runner(idx, child, task):
+        goal = (task.get("goal") or "").strip()
+        hint = (task.get("hint") or "").strip()
+        spawn_ctx = hint or ""
+
+        def _runner(ok: bool):
+            if not ok:
+                results[idx] = {"ok": False, "result": f"[{child.id}] cancelled."}
+                done_events[idx].set()
+                return
+            try:
+                r = _al.run_agent_loop(
+                    ctx.deps, goal, ctx.session, child.state, child.chat_history,
+                    depth=child.depth, agent_id=child.id,
+                )
+                reply = (r.get("state") or {}).get("lastReply", "") if isinstance(r, dict) else ""
+                _al.mark_agent_finished(child.id, result=reply)
+                results[idx] = {"ok": True, "result": reply or "(done)"}
+            except Exception as e:
+                _al.mark_agent_finished(child.id, error=repr(e))
+                results[idx] = {"ok": False, "result": repr(e)}
+            finally:
+                done_events[idx].set()
+        return _runner
+
+    if parent_id:
+        _al.enter_waiting(parent_id)
+    try:
+        threads = []
+        for i, (child, task) in enumerate(children):
+            runner = _make_runner(i, child, task)
+            t = threading.Thread(
+                target=lambda r=runner: _al.schedule_agent(child.id, r),
+                daemon=True, name=f"par-{child.id}",
+            )
+            threads.append(t)
+            t.start()
+        for evt in done_events:
+            evt.wait(timeout=600)
+    finally:
+        if parent_id:
+            _al.exit_waiting(parent_id)
+
+    ok = all(r and r.get("ok") for r in results)
+    succeeded = sum(1 for r in results if r and r.get("ok"))
+    lines = [f"═══ Parallel Results ({len(children)} agents) ═══"]
+    for i, ((child, task), r) in enumerate(zip(children, results)):
+        icon = "✓" if (r and r.get("ok")) else "✗"
+        goal = (task.get("goal") or "")[:80]
+        msg = (r.get("result") or "(timeout)") if r else "(timeout)"
+        lines.append(f"\n─── [{icon}] {child.id} ───\nGoal: {goal}\nResult: {msg[:400]}")
+    lines.append(f"\n═══ Summary: {succeeded}/{len(children)} succeeded ═══")
+
+    return {"ok": ok, "result": "\n".join(lines)}
+
+
+def _bi_spawn_chain(params: dict, ctx: ToolCtx) -> dict:
+    """Sequential pipeline with handoff — mirrors Helpwo spawn_chain."""
+    import agent_loop as _al
+    import threading
+
+    steps = params.get("steps") or []
+    if len(steps) < 2:
+        return {"ok": False, "error": "spawn_chain requires at least 2 steps"}
+    if len(steps) > 6:
+        return {"ok": False, "error": "spawn_chain: maximum 6 steps"}
+
+    parent_id = ctx.agent_id
+    if parent_id and not _al.can_spawn(parent_id):
+        return {"ok": False, "error": "Cannot spawn: maximum agent depth reached."}
+
+    parent = _al.get_agent(parent_id) if parent_id else None
+    depth = (parent.depth + 1) if parent else 0
+    chain_id = f"chain-{int(time.time() * 1000)}"
+
+    # Register all steps upfront so they're visible immediately
+    children = []
+    for i, step in enumerate(steps):
+        child = _al.register_agent(depth=depth, parent_id=parent_id, role="subagent")
+        child.chain_id = chain_id
+        child.chain_step_index = i
+        if i > 0:
+            child.status = "queued"   # visually show as queued
+        children.append((child, step))
+
+    summaries = []
+
+    if parent_id:
+        _al.enter_waiting(parent_id)
+    try:
+        handoff = ""
+        for i, (child, step) in enumerate(children):
+            goal = (step.get("goal") or "").strip()
+            hint = (step.get("hint") or "").strip()
+            is_last = i == len(steps) - 1
+
+            pipeline_note = (
+                f"[PIPELINE STEP {i+1}/{len(steps)}] You are one step of a sequential pipeline. "
+            )
+            if not is_last:
+                pipeline_note += (
+                    "The next step depends on your output. End with a handoff document:\n"
+                    "## Done\n## Key findings\n## Files touched\n## Notes for next step\n## Open issues"
+                )
+            else:
+                pipeline_note += "You are the LAST step — your final message is the deliverable."
+
+            sections = [pipeline_note]
+            if handoff:
+                sections.append(f"[HANDOFF FROM PREVIOUS STEP]\n{handoff}")
+            if hint:
+                sections.append(f"[STEP HINT] {hint}")
+
+            spawn_ctx = "\n\n".join(sections)
+
+            done_evt = threading.Event()
+            result_holder = {}
+
+            def _runner(ok, child=child, goal=goal, spawn_ctx=spawn_ctx):
+                if not ok:
+                    result_holder.update({"ok": False, "result": "Cancelled while queued."})
+                    done_evt.set()
+                    return
+                try:
+                    full_goal = f"{spawn_ctx}\n\n{goal}"
+                    r = _al.run_agent_loop(
+                        ctx.deps, full_goal, ctx.session, child.state, child.chat_history,
+                        depth=child.depth, agent_id=child.id,
+                    )
+                    reply = (r.get("state") or {}).get("lastReply", "") if isinstance(r, dict) else ""
+                    _al.mark_agent_finished(child.id, result=reply)
+                    result_holder.update({"ok": True, "result": reply or "(done)"})
+                except Exception as e:
+                    _al.mark_agent_finished(child.id, error=repr(e))
+                    result_holder.update({"ok": False, "result": repr(e)})
+                finally:
+                    done_evt.set()
+
+            t = threading.Thread(
+                target=lambda r=_runner: _al.schedule_agent(child.id, r),
+                daemon=True, name=f"chain-{child.id}",
+            )
+            t.start()
+            done_evt.wait(timeout=300)
+
+            if not result_holder:
+                _al.mark_agent_finished(child.id, error="timeout")
+                # abort remaining
+                for j, (c2, _) in enumerate(children):
+                    if j > i:
+                        _al.mark_agent_finished(c2.id, error=f"Chain aborted at step {i+1}")
+                return {"ok": False, "result": f"Chain {chain_id} timed out at step {i+1}"}
+
+            if not result_holder.get("ok"):
+                for j, (c2, _) in enumerate(children):
+                    if j > i:
+                        _al.mark_agent_finished(c2.id, error=f"Chain aborted: step {i+1} failed")
+                done_steps = "\n".join(summaries)
+                return {
+                    "ok": False,
+                    "result": (
+                        f"═══ Chain {chain_id} FAILED at step {i+1}/{len(steps)} ═══\n"
+                        f"Goal: {goal[:120]}\nError: {result_holder['result'][:400]}"
+                        + (f"\n\nCompleted:\n{done_steps}" if done_steps else "")
+                    ),
+                }
+
+            handoff = result_holder["result"]
+            summaries.append(f"  ✓ Step {i+1}: {goal[:80]}")
+
+    finally:
+        if parent_id:
+            _al.exit_waiting(parent_id)
+
+    return {
+        "ok": True,
+        "result": (
+            f"═══ Chain {chain_id} completed ({len(steps)} steps) ═══\n"
+            + "\n".join(summaries)
+            + f"\n\n─── Final step output ───\n{handoff}"
+        ),
+    }
+
+
+def _bi_await_spawns(params: dict, ctx: ToolCtx) -> dict:
+    """Wait for sub-agents to finish and collect results."""
+    import agent_loop as _al
+
+    parent_id = ctx.agent_id
+    agent_ids = params.get("agent_ids")
+
+    if agent_ids:
+        target_ids = list(agent_ids)
+    elif parent_id:
+        parent = _al.get_agent(parent_id)
+        target_ids = list(parent.child_ids) if parent else []
+    else:
+        return {"ok": False, "error": "No agent_ids specified and no current agent"}
+
+    if not target_ids:
+        return {"ok": True, "result": "No agents to wait for."}
+
+    STALL_S = 120
+    HARD_CAP_S = 20 * 60
+    start = time.time()
+
+    if parent_id:
+        _al.enter_waiting(parent_id)
+    try:
+        while True:
+            agents = [_al.get_agent(aid) for aid in target_ids]
+            agents = [a for a in agents if a is not None]
+            if all(a.status in ("done", "error", "aborted") for a in agents):
+                break
+            elapsed = time.time() - start
+            if elapsed > HARD_CAP_S:
+                break
+            time.sleep(0.5)
+    finally:
+        if parent_id:
+            _al.exit_waiting(parent_id)
+
+    agents = [_al.get_agent(aid) for aid in target_ids if _al.get_agent(aid)]
+    lines = [f"═══ Sub-agent Results ({len(agents)} agents) ═══"]
+    for a in agents:
+        icon = "✓" if a.status == "done" else "✗"
+        lines.append(f"\n─── [{icon}] {a.id} ───")
+        lines.append(f"Goal: {a.name} [status={a.status}]")
+        if a.result:
+            lines.append(f"Result: {a.result[:400]}")
+        if a.error:
+            lines.append(f"Error: {a.error[:200]}")
+    ok = all(a.status == "done" for a in agents)
+    succeeded = sum(1 for a in agents if a.status == "done")
+    lines.append(f"\n═══ Summary: {succeeded}/{len(agents)} succeeded ═══")
+    return {"ok": ok, "result": "\n".join(lines)}
+
+
+def _bi_hwo(params: dict, ctx: ToolCtx) -> dict:
+    """Compile or run a .hwo workflow file."""
+    import hwo_runner
+    action = (params.get("action") or "run").lower()
+    path = (params.get("path") or "").strip()
+    if not path:
+        return {"ok": False, "error": "missing 'path'"}
+
+    if action == "compile":
+        r = hwo_runner.compile_hwo_file(path)
+    else:
+        r = hwo_runner.run_hwo_file(
+            path=path,
+            deps=ctx.deps,
+            session=ctx.session,
+            parent_id=ctx.agent_id,
+        )
+    return {"ok": r.get("ok", False), "result": r.get("msg", "")}
+
+
 def _bi_agent_tell(params: dict, ctx: ToolCtx) -> dict:
     """Send a message to another agent's inbox."""
     target_id = (params.get("agent_id") or "").strip()
@@ -2141,6 +2488,121 @@ def register_builtin_tools() -> None:
                 "required": ["agent_id"],
             },
             invoke=_bi_agent_switch,
+        ),
+        # ── HWO spawn primitives ────────────────────────────────────
+        Tool(
+            name="spawn",
+            description=(
+                "Spawn a sub-agent for a delegated task and WAIT for it to complete (blocking). "
+                "If the concurrency cap is reached the sub-agent queues and starts when a slot frees. "
+                "Give COMPLETE instructions in goal: file paths, conventions, constraints. "
+                "10-loop limit per sub-agent."
+            ),
+            schema={
+                "type": "object",
+                "properties": {
+                    "goal": {"type": "string", "description": "Natural-language task. Give the sub-agent everything it needs."},
+                    "context": {"type": "string", "description": "Extra context injected into the sub-agent's system prompt."},
+                },
+                "required": ["goal"],
+            },
+            invoke=_bi_spawn,
+        ),
+        Tool(
+            name="spawn_parallel",
+            description=(
+                "Spawn multiple sub-agents in PARALLEL and wait for ALL to finish. "
+                "Returns a combined structured report. Max 6 agents per batch. "
+                "Each member must work on DIFFERENT files — decompose by file boundaries. "
+                "Agents beyond the concurrency cap queue automatically."
+            ),
+            schema={
+                "type": "object",
+                "properties": {
+                    "tasks": {
+                        "type": "array",
+                        "description": "Tasks to run in parallel. Each agent gets one task. Max 6.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "goal": {"type": "string", "description": "Complete task description for this agent."},
+                                "hint": {"type": "string", "description": "Task-specific extra context."},
+                            },
+                            "required": ["goal"],
+                        },
+                        "minItems": 1,
+                        "maxItems": 6,
+                    },
+                },
+                "required": ["tasks"],
+            },
+            invoke=_bi_spawn_parallel,
+        ),
+        Tool(
+            name="spawn_chain",
+            description=(
+                "Run a SEQUENTIAL pipeline of sub-agents (2-6 steps) with automatic handoff. "
+                "Each step receives a handoff document from the previous step. "
+                "Use for dependent work: analyze → implement → verify. "
+                "If a step fails the chain aborts. Returns the final step output + per-step summary."
+            ),
+            schema={
+                "type": "object",
+                "properties": {
+                    "steps": {
+                        "type": "array",
+                        "description": "Pipeline steps, executed in order. 2-6 steps.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "goal": {"type": "string", "description": "Complete task description for this step."},
+                                "hint": {"type": "string", "description": "Step-specific extra context."},
+                            },
+                            "required": ["goal"],
+                        },
+                        "minItems": 2,
+                        "maxItems": 6,
+                    },
+                },
+                "required": ["steps"],
+            },
+            invoke=_bi_spawn_chain,
+        ),
+        Tool(
+            name="await_spawns",
+            description=(
+                "Wait for spawned sub-agents to finish and collect their results. "
+                "If agent_ids is omitted, waits for ALL children of the current agent."
+            ),
+            schema={
+                "type": "object",
+                "properties": {
+                    "agent_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Specific agent IDs to wait for. Omit to await all children.",
+                    },
+                },
+            },
+            invoke=_bi_await_spawns,
+        ),
+        Tool(
+            name="hwo",
+            description="Compile or run a Helpwo workflow file (.hwo).",
+            schema={
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["run", "compile"],
+                        "default": "run",
+                        "description": "Whether to execute or only parse/validate the workflow.",
+                    },
+                    "path": {"type": "string", "description": "Path to a .hwo workflow file."},
+                },
+                "required": ["path"],
+            },
+            invoke=_bi_hwo,
         ),
         # ── Terminal tools ──────────────────────────────────────────
         Tool(

@@ -5566,10 +5566,28 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
         return False
 
     elif action == "/hwo":
-        # Visual agent-orchestration builder TUI
-        current = get_current_agent()
-        root_name = current.name if current else "primary"
-        hwo_ui_mod.run_hwo_ui(root_name)
+        sub = parts[1].lower() if len(parts) > 1 else ""
+        if sub in ("run", "compile") and len(parts) >= 3:
+            # /hwo run <path.hwo>  or  /hwo compile <path.hwo>
+            import hwo_runner
+            path = " ".join(parts[2:])
+            if sub == "compile":
+                r = hwo_runner.compile_hwo_file(path)
+            else:
+                current = get_current_agent()
+                r = hwo_runner.run_hwo_file(
+                    path=path,
+                    deps=get_loop_deps(),
+                    session=session,
+                    parent_id=current.id if current else None,
+                )
+            style = "[green]" if r.get("ok") else "[red]"
+            console.print(f"{style}{r.get('msg', '')}[/]")
+        else:
+            # Visual agent-orchestration builder TUI
+            current = get_current_agent()
+            root_name = current.name if current else "primary"
+            hwo_ui_mod.run_hwo_ui(root_name)
 
     else:
         # Try .laintas/commands.py custom handler first

@@ -472,21 +472,31 @@ class AgentInfo:
     child_ids: list = field(default_factory=list)
     inbox: Any = field(default_factory=lambda: queue.Queue(maxsize=1000))
     thread: Optional[Any] = None              # threading.Thread, None for primary
-    status: str = "idle"                      # idle / running / done / aborted / error
+    status: str = "idle"                      # idle / running / waiting / done / aborted / error / queued
     last_reply: str = ""
     abort_event: Any = field(default_factory=threading.Event)
     # ── Pool architecture fields ───────────────────────────────────────
     role: str = "pool"                        # pool | deployed | primary | subagent
     parent_terminal: Optional[str] = None     # terminal that spawned this agent
     home_terminal: Optional[str] = None       # terminal this agent is deployed to
+    # ── HWO scheduling fields ──────────────────────────────────────────
+    chain_id: Optional[str] = None            # serial pipeline this agent belongs to
+    chain_step_index: int = -1                # 0-based position in chain (-1 = not in chain)
+    group_id: Optional[str] = None            # parallel group this agent belongs to
+    result: str = ""                          # final result text (set by mark_agent_finished)
+    error: str = ""                           # error text if status=error
+
 
 _agent_registry: dict[str, AgentInfo] = {}
 _agent_counter: int = 0
 _current_agent_id: Optional[str] = None
-# Phase 2: protect registry + parent/child link mutations from concurrent
-# spawn/abort/send across threads. RLock so a method that takes the lock
-# may call another locked method without deadlocking.
+# RLock so a method that takes the lock may call another locked method.
 _registry_lock = threading.RLock()
+
+# ── HWO concurrency scheduler ──────────────────────────────────────────
+_max_concurrent: int = 8                         # hard cap on running agents
+_running_count: int = 0                          # agents currently in 'running' state
+_wait_queue: list = []                           # FIFO: (agent_id, start_fn) pairs
 
 
 def register_agent(name: str = None, depth: int = 0,
@@ -532,19 +542,129 @@ def register_agent(name: str = None, depth: int = 0,
 
 def unregister_agent(agent_id: str) -> bool:
     """Remove an agent. Returns True if it existed."""
-    global _current_agent_id
+    global _current_agent_id, _running_count
     with _registry_lock:
         if _current_agent_id == agent_id:
             _current_agent_id = None
         info = _agent_registry.pop(agent_id, None)
         if info is None:
             return False
+        # Release concurrency slot if it held one
+        if info.status == "running":
+            _running_count = max(0, _running_count - 1)
         # Unlink from parent's child_ids
         if info.parent_id and info.parent_id in _agent_registry:
             parent = _agent_registry[info.parent_id]
             if agent_id in parent.child_ids:
                 parent.child_ids.remove(agent_id)
+    _pump_queue()   # a slot may have freed
+    return True
+
+
+# ── HWO concurrency scheduler ──────────────────────────────────────────
+
+def can_spawn(parent_id: Optional[str] = None, max_depth: int = 3) -> bool:
+    """Return True if spawning another child agent is allowed (depth check)."""
+    if parent_id is None:
         return True
+    with _registry_lock:
+        info = _agent_registry.get(parent_id)
+        if info is None:
+            return True
+        return info.depth < max_depth
+
+
+def set_agent_status(agent_id: str, status: str) -> None:
+    with _registry_lock:
+        info = _agent_registry.get(agent_id)
+        if info:
+            info.status = status
+
+
+def mark_agent_running(agent_id: str) -> None:
+    global _running_count
+    with _registry_lock:
+        info = _agent_registry.get(agent_id)
+        if info:
+            info.status = "running"
+            _running_count += 1
+
+
+def mark_agent_finished(agent_id: str, result: str = "", error: str = "") -> None:
+    """Mark agent terminal; release its concurrency slot; pump the queue."""
+    global _running_count
+    with _registry_lock:
+        info = _agent_registry.get(agent_id)
+        if info is None:
+            return
+        held_slot = info.status == "running"
+        info.status = "error" if error else "done"
+        info.result = result
+        info.error = error
+        if held_slot:
+            _running_count = max(0, _running_count - 1)
+    _pump_queue()
+
+
+def enter_waiting(agent_id: str) -> None:
+    """Parent enters 'waiting' state — releases its concurrency slot so children can run."""
+    global _running_count
+    with _registry_lock:
+        info = _agent_registry.get(agent_id)
+        if info is None or info.status != "running":
+            return
+        info.status = "waiting"
+        _running_count = max(0, _running_count - 1)
+    _pump_queue()
+
+
+def exit_waiting(agent_id: str) -> None:
+    """Parent resumes after children complete — re-takes a slot (may briefly exceed cap)."""
+    global _running_count
+    with _registry_lock:
+        info = _agent_registry.get(agent_id)
+        if info is None or info.status != "waiting":
+            return
+        info.status = "running"
+        _running_count += 1
+
+
+def schedule_agent(agent_id: str, start_fn) -> None:
+    """Run start_fn(ok) when a concurrency slot is available.
+
+    If the cap is reached the agent is marked 'queued' and started FIFO
+    when a slot frees.  start_fn(False) fires if the agent is evicted
+    while queued so callers don't hang.
+    """
+    global _running_count
+    with _registry_lock:
+        can_run = _running_count < _max_concurrent
+        if can_run:
+            mark_agent_running(agent_id)
+    if can_run:
+        start_fn(True)
+    else:
+        set_agent_status(agent_id, "queued")
+        with _registry_lock:
+            _wait_queue.append((agent_id, start_fn))
+
+
+def _pump_queue() -> None:
+    """Start as many queued agents as available slots allow."""
+    global _running_count
+    while True:
+        with _registry_lock:
+            if not _wait_queue or _running_count >= _max_concurrent:
+                break
+            agent_id, start_fn = _wait_queue.pop(0)
+            info = _agent_registry.get(agent_id)
+            if info is None or info.status != "queued":
+                # evicted/cancelled — unblock caller with ok=False
+                threading.Thread(target=start_fn, args=(False,), daemon=True).start()
+                continue
+            info.status = "running"
+            _running_count += 1
+        threading.Thread(target=start_fn, args=(True,), daemon=True).start()
 
 
 def get_agent(agent_id: str) -> Optional[AgentInfo]:
@@ -779,22 +899,32 @@ def spawn_subagent(parent_id: str, task: str, deps,
                    name: Optional[str] = None,
                    session: Optional[dict] = None,
                    events_cb=None,
-                   role: Optional[str] = None) -> Optional[str]:
-    """Start an in-process child agent in its own thread.
+                   role: Optional[str] = None,
+                   chain_id: Optional[str] = None,
+                   chain_step_index: int = -1,
+                   group_id: Optional[str] = None,
+                   spawn_context: str = "") -> Optional[str]:
+    """Start an in-process child agent via the HWO scheduler.
 
     The child:
       - inherits depth = parent.depth + 1
       - has its own chat_history, state, inbox, abort_event
-      - reports back to the parent via a 'child-done' / 'child-error' message
-        delivered to the parent's inbox
-
-    If `role` is provided (e.g. "explorer", "reviewer"), the child agent
-    gets a specialized system prompt and tool whitelist via AgentRole.
+      - goes through schedule_agent() — queues if concurrency cap is reached
+      - reports back to the parent via 'child-done' / 'child-error' in inbox
 
     Returns the child's agent_id, or None if the parent doesn't exist.
     """
     parent = get_agent(parent_id)
     if parent is None:
+        return None
+
+    if not can_spawn(parent_id):
+        send_to_agent(parent_id, {
+            "from": "scheduler",
+            "kind": "child-error",
+            "role": role or "general",
+            "error": "Cannot spawn: maximum agent depth (3) reached.",
+        })
         return None
 
     # Auto-generate name from role if not provided
@@ -809,39 +939,54 @@ def spawn_subagent(parent_id: str, task: str, deps,
         or getattr(parent, "parent_terminal", None)
         or "term0"
     )
-    child.status = "running"
+    child.chain_id = chain_id
+    child.chain_step_index = chain_step_index
+    child.group_id = group_id
 
     # Inject role into child state so run_agent_loop picks it up
+    effective_task = task
     if role:
         child.state["_role_name"] = role
         role_obj = agent_roles.get_role(role)
         if role_obj:
-            # Prepend role description to the task for context
-            task = (
+            effective_task = (
                 f"[Role: {role_obj.name} — {role_obj.description}]\n\n"
                 f"{task}"
             )
+    if spawn_context:
+        effective_task = f"{spawn_context}\n\n{effective_task}"
 
-    def _runner():
+    def _runner(ok: bool):
+        if not ok:
+            child.status = "aborted"
+            send_to_agent(parent_id, {
+                "from": child.id,
+                "kind": "child-error",
+                "role": role or "general",
+                "error": "Cancelled while queued.",
+            })
+            return
         try:
             result = run_agent_loop(
-                deps, task, session or {}, child.state,
+                deps, effective_task, session or {}, child.state,
                 child.chat_history,
                 events_cb=events_cb,
                 depth=child.depth,
                 agent_id=child.id,
             )
-            child.last_reply = (result.get("state") or {}).get("lastReply", "") if isinstance(result, dict) else ""
-            child.status = "aborted" if child.abort_event.is_set() else "done"
+            reply = (result.get("state") or {}).get("lastReply", "") if isinstance(result, dict) else ""
+            child.last_reply = reply
+            status = "aborted" if child.abort_event.is_set() else "done"
+            mark_agent_finished(child.id, result=reply)
             send_to_agent(parent_id, {
                 "from": child.id,
                 "kind": "child-done",
-                "status": child.status,
+                "status": status,
                 "role": role or "general",
-                "summary": child.last_reply or "(no reply)",
+                "summary": reply or "(no reply)",
             })
         except Exception as e:
-            child.status = "error"
+            mark_agent_finished(child.id, error=repr(e))
             send_to_agent(parent_id, {
                 "from": child.id,
                 "kind": "child-error",
@@ -849,8 +994,8 @@ def spawn_subagent(parent_id: str, task: str, deps,
                 "error": repr(e),
             })
 
-    t = threading.Thread(target=_runner, daemon=True,
-                         name=f"laintas-agent-{child.id}")
+    t = threading.Thread(target=lambda: schedule_agent(child.id, _runner),
+                         daemon=True, name=f"laintas-sched-{child.id}")
     child.thread = t
     t.start()
     return child.id
