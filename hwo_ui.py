@@ -166,6 +166,25 @@ class HwoSession:
         agent.tasks[idx].text = text
         return None
 
+    def append_task_to(self, agent_name: str, text: str) -> Optional[str]:
+        """Append a task directly to a named agent."""
+        agent = self.find_agent(agent_name)
+        if agent is None:
+            return f"Agent '{agent_name}' not found"
+        agent.tasks.append(HwoTask(text=text, status="pending"))
+        return None
+
+    def append_child_to(self, parent_name: str, child_name: str) -> Optional[str]:
+        """Append a sub-agent directly to a named agent."""
+        parent = self.find_agent(parent_name)
+        if parent is None:
+            return f"Agent '{parent_name}' not found"
+        for child in parent.children:
+            if child.name == child_name:
+                return f"Agent '{child_name}' already exists under #{parent_name}#"
+        parent.children.append(HwoAgent(name=child_name, parent=parent))
+        return None
+
     def all_tasks(self) -> list:
         result = []
         for node in self.nodes:
@@ -465,6 +484,27 @@ def run_hwo_ui(root_agent_name: str) -> None:
                 err = session.replace_task(name, idx1, new_text)
             else:
                 err = session.delete_task(name, idx1)
+            if err:
+                error_msg[0] = err
+            return
+
+        # #Name#->#Sub# — append sub-agent to named agent
+        m = re.fullmatch(r'#([^#]+)#->\s*#([^#]+)#\s*', text)
+        if m:
+            parent_name, child_name = m.group(1).strip(), m.group(2).strip()
+            err = session.append_child_to(parent_name, child_name)
+            if err:
+                error_msg[0] = err
+            return
+
+        # #Name#->text — append task to named agent
+        m = re.fullmatch(r'#([^#]+)#->(.+)', text)
+        if m:
+            agent_name, task_text = m.group(1).strip(), m.group(2).strip()
+            if not task_text:
+                error_msg[0] = "Task text cannot be empty"
+                return
+            err = session.append_task_to(agent_name, task_text)
             if err:
                 error_msg[0] = err
             return
