@@ -5567,14 +5567,14 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
 
     elif action == "/hwo":
         sub = parts[1].lower() if len(parts) > 1 else ""
+        current = get_current_agent()
         if sub in ("run", "compile") and len(parts) >= 3:
-            # /hwo run <path.hwo>  or  /hwo compile <path.hwo>
+            # /hwo run <path>  or  /hwo compile <path>
             import hwo_runner
             path = " ".join(parts[2:])
             if sub == "compile":
                 r = hwo_runner.compile_hwo_file(path)
             else:
-                current = get_current_agent()
                 r = hwo_runner.run_hwo_file(
                     path=path,
                     deps=get_loop_deps(),
@@ -5583,9 +5583,23 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
                 )
             style = "[green]" if r.get("ok") else "[red]"
             console.print(f"{style}{r.get('msg', '')}[/]")
+        elif len(parts) >= 2 and sub not in ("run", "compile"):
+            # /hwo <file>  — load .hwo into TUI
+            file_path = " ".join(parts[1:])
+            loaded, err = hwo_ui_mod.load_hwo_file(file_path)
+            if err:
+                console.print(f"[red]hwo: {err}[/]")
+            else:
+                root_name = current.name if current else "primary"
+                hwo_ui_mod.run_hwo_ui(
+                    root_name,
+                    deps=get_loop_deps(),
+                    session_data=session,
+                    parent_id=current.id if current else None,
+                    initial_session=loaded,
+                )
         else:
-            # Visual agent-orchestration builder TUI
-            current = get_current_agent()
+            # /hwo  — blank TUI
             root_name = current.name if current else "primary"
             hwo_ui_mod.run_hwo_ui(
                 root_name,

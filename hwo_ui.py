@@ -220,16 +220,80 @@ def _session_to_hwo(session: HwoSession) -> str:
     for node in session.nodes:
         if isinstance(node, HwoSeparator):
             if node.kind == "parallel":
-                lines.append("// parallel //")
+                lines.append("//")
                 in_parallel = True
             else:
-                lines.append("// end //")
+                lines.append("//")
                 lines.append("")
                 in_parallel = False
         elif isinstance(node, HwoAgent):
             _emit(node, depth=1 if in_parallel else 0)
 
     return "\n".join(lines) + "\n"
+
+
+# ── .hwo file loader ─────────────────────────────────────────────────────
+
+def _runner_agent_to_ui(ra, parent: Optional[HwoAgent] = None) -> HwoAgent:
+    """Recursively convert a hwo_runner.HwoAgent → hwo_ui.HwoAgent."""
+    ua = HwoAgent(name=ra.name, parent=parent)
+    for item in ra.body:
+        k = getattr(item, "kind", "")
+        if k == "task":
+            ua.tasks.append(HwoTask(text=item.text))
+        elif k == "agent":
+            ua.children.append(_runner_agent_to_ui(item, parent=ua))
+        elif k == "parallel":
+            # Parallel inside an agent body — flatten as plain children
+            for sub in item.body:
+                ua.children.append(_runner_agent_to_ui(sub, parent=ua))
+    return ua
+
+
+def load_hwo_file(path: str, root_name: str = "primary") -> tuple:
+    """Parse a .hwo file into an HwoSession.
+
+    Returns (HwoSession, None) on success, (None, error_str) on failure.
+    """
+    try:
+        source = Path(path).read_text(encoding="utf-8")
+    except OSError as e:
+        return None, str(e)
+
+    try:
+        import hwo_runner
+        steps = hwo_runner.parse_hwo(source)
+    except Exception as e:
+        return None, f"Parse error: {e}"
+
+    session = HwoSession(root_name=root_name)
+
+    for item in steps:
+        k = getattr(item, "kind", "")
+        if k == "parallel":
+            session.nodes.append(HwoSeparator(kind="parallel"))
+            session._parallel_open = True
+            for sub in item.body:
+                if getattr(sub, "kind", "") == "agent":
+                    ua = _runner_agent_to_ui(sub)
+                    session.nodes.append(ua)
+                    session._last_agent = ua
+                # non-agent items in parallel body are silently skipped
+            session.nodes.append(HwoSeparator(kind="end"))
+            session._parallel_open = False
+        elif k == "agent":
+            ua = _runner_agent_to_ui(item)
+            session.nodes.append(ua)
+            session._last_agent = ua
+        elif k == "task":
+            # Bare top-level task — attach to last agent or create one
+            if session._last_agent is None:
+                ua = HwoAgent(name="main")
+                session.nodes.append(ua)
+                session._last_agent = ua
+            session._last_agent.tasks.append(HwoTask(text=item.text))
+
+    return session, None
 
 
 # ── Renderer ───────────────────────────────────────────────────────────────
@@ -411,10 +475,12 @@ _STYLE = Style.from_dict({
 def run_hwo_ui(root_agent_name: str,
                deps=None,
                session_data: Optional[dict] = None,
-               parent_id: Optional[str] = None) -> None:
+               parent_id: Optional[str] = None,
+               initial_session: Optional[HwoSession] = None) -> None:
     import re
 
-    session    = HwoSession(root_name=root_agent_name)
+    session    = initial_session if initial_session is not None \
+                 else HwoSession(root_name=root_agent_name)
     tick       = [0]
     executing  = [False]
     error_msg  = [""]
