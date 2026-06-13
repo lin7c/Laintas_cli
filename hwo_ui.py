@@ -1,300 +1,275 @@
 """HWO — /hwo command: visual agent-orchestration builder TUI.
 
 Input grammar (typed at the bottom prompt):
-  #name#          — create an agent node (auto-opens its body scope)
-  -> text         — add a serial task/step to the current agent
-  text            — same as -> text (plain text inside agent body)
-  //              — open a parallel block  (when not inside one)
-  //              — close the parallel block (when inside one)
-  {               — enter the last agent's body (push scope deeper)
-  }               — exit current agent body (pop scope back up)
-  q / Esc / Ctrl-C — exit the UI
+  #name#        — create an agent node
+  -> text        — add a task to the current agent
+  text           — same as -> text
+  //             — insert ─── parallel ─── separator (first call)
+  //             — insert ─── end ───      separator (second call)
+  r key          — start executing all pending tasks
+  q / Esc / Ctrl-C — exit
 
-HWO rules mirrored from the runtime:
-  - Parallel blocks may only contain #agent# nodes, not plain text.
-  - //  opens,  //  closes.  Everything in between runs concurrently.
-  - Agents outside a // block run serially top-to-bottom.
-  - -> separates serial steps inside an agent body.
+Execution states per task:
+  □  pending  (before r is pressed)
+  ◰◳◲◱ running (spinning rectangle, 4-frame loop)
+  ✓  done
+  ✗  error
 """
 
 from __future__ import annotations
 
-import re
-import time
+import random
 import threading
+import time
 from dataclasses import dataclass, field
-from typing import Optional, Union
+from typing import Optional
 
 from prompt_toolkit.application import Application
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import Layout, HSplit, VSplit, Window, FormattedTextControl
 from prompt_toolkit.layout.controls import BufferControl
-from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.styles import Style
 
-# ── Spin frames (rotating rectangle) ─────────────────────────────────────
+# ── Animation frames ──────────────────────────────────────────────────────
 _SPIN  = ["◰", "◳", "◲", "◱"]
-_DONE  = "■"
-_ERROR = "✗"
 _IDLE  = "□"
+_DONE  = "✓"
+_ERROR = "✗"
 
 
-# ── HWO data model ────────────────────────────────────────────────────────
+# ── Data model ────────────────────────────────────────────────────────────
 
 @dataclass
 class HwoTask:
-    kind: str = "task"
-    text: str = ""
+    text: str
     status: str = "pending"   # pending | running | done | error
 
 
 @dataclass
-class HwoParallel:
-    kind: str = "parallel"
-    agents: list["HwoAgent"] = field(default_factory=list)
+class HwoSeparator:
+    kind: str                  # "parallel" | "end"
 
 
 @dataclass
 class HwoAgent:
-    kind: str = "agent"
-    name: str = ""
-    body: list[Union[HwoTask, "HwoAgent", HwoParallel]] = field(default_factory=list)
+    name: str
+    tasks: list[HwoTask] = field(default_factory=list)
 
-
-# ── Session / scope state ─────────────────────────────────────────────────
 
 @dataclass
 class HwoSession:
-    root_name: str                                      # top-level agent (e.g. "primary")
-    root_body: list[Union[HwoTask, HwoAgent, HwoParallel]] = field(default_factory=list)
-
-    # mutable editor state (not part of HWO data model)
-    _scope_stack: list[list] = field(default_factory=list)   # stack of body lists
-    _name_stack: list[str] = field(default_factory=list)     # agent names for breadcrumb
-    _parallel_stack: list[HwoParallel] = field(default_factory=list)  # open // blocks
-    _last_agent: Optional[HwoAgent] = field(default=None)    # most recently added agent
-
-    def __post_init__(self):
-        # scope_stack[0] always points to root_body
-        self._scope_stack = [self.root_body]
-
-    # ── helpers ───────────────────────────────────────────────────────────
-
-    @property
-    def _current_list(self) -> list:
-        return self._scope_stack[-1]
-
-    @property
-    def in_parallel(self) -> bool:
-        return bool(self._parallel_stack)
-
-    @property
-    def depth(self) -> int:
-        return len(self._scope_stack) - 1
+    root_name: str
+    nodes: list = field(default_factory=list)   # HwoAgent | HwoSeparator
+    _parallel_open: bool = False
+    _last_agent: Optional[HwoAgent] = None
 
     def add_agent(self, name: str) -> HwoAgent:
         agent = HwoAgent(name=name)
-        if self.in_parallel:
-            self._parallel_stack[-1].agents.append(agent)
-        else:
-            self._current_list.append(agent)
+        self.nodes.append(agent)
         self._last_agent = agent
         return agent
 
     def add_task(self, text: str) -> Optional[HwoTask]:
-        if self.in_parallel:
-            return None        # plain text not allowed inside // block
-        task = HwoTask(text=text, status="running")
-        self._current_list.append(task)
+        if self._last_agent is None:
+            return None
+        task = HwoTask(text=text, status="pending")
+        self._last_agent.tasks.append(task)
         return task
 
-    def enter_agent(self) -> bool:
-        """Push into the last-added agent's body scope."""
-        if self._last_agent is None:
-            return False
-        self._scope_stack.append(self._last_agent.body)
-        self._name_stack.append(self._last_agent.name)
-        self._last_agent = None
-        return True
+    def toggle_parallel(self) -> HwoSeparator:
+        if not self._parallel_open:
+            sep = HwoSeparator(kind="parallel")
+            self._parallel_open = True
+        else:
+            sep = HwoSeparator(kind="end")
+            self._parallel_open = False
+        self.nodes.append(sep)
+        return sep
 
-    def exit_scope(self) -> bool:
-        """Pop one scope level (mirrors `}`)."""
-        if len(self._scope_stack) <= 1:
-            return False
-        self._scope_stack.pop()
-        if self._name_stack:
-            self._name_stack.pop()
-        return True
+    def all_tasks(self) -> list[HwoTask]:
+        result = []
+        for node in self.nodes:
+            if isinstance(node, HwoAgent):
+                result.extend(node.tasks)
+        return result
 
-    def open_parallel(self) -> HwoParallel:
-        block = HwoParallel()
-        self._current_list.append(block)
-        self._parallel_stack.append(block)
-        return block
-
-    def close_parallel(self) -> bool:
-        if not self._parallel_stack:
-            return False
-        self._parallel_stack.pop()
-        return True
+    def has_pending(self) -> bool:
+        return any(t.status == "pending" for t in self.all_tasks())
 
 
 # ── Renderer ──────────────────────────────────────────────────────────────
 
-def _spin(tick: int, offset: int = 0) -> str:
+def _spin_char(tick: int, offset: int = 0) -> str:
     return _SPIN[(tick + offset) % len(_SPIN)]
 
 
-def _render_body(
-    items: list,
-    tick: int,
-    base_indent: int,
-    out: list,
-) -> None:
-    pad = "  " * base_indent
-
-    for item in items:
-        if item.kind == "task":
-            if item.status == "running":
-                mark = _spin(tick, offset=base_indent)
-                style = "class:task.run"
-            elif item.status == "done":
-                mark, style = _DONE, "class:task.done"
-            elif item.status == "error":
-                mark, style = _ERROR, "class:task.err"
-            else:
-                mark, style = _IDLE, "class:task.pend"
-            out.append((style, f"{pad}{mark} → "))
-            out.append(("class:task.text", f"{item.text}\n"))
-
-        elif item.kind == "agent":
-            spin = _spin(tick, offset=base_indent + 1)
-            out.append(("class:agent.spin", f"{pad}{spin} "))
-            out.append(("class:agent.name", f"#{item.name}#"))
-            out.append(("class:agent.brace", " {\n"))
-            _render_body(item.body, tick, base_indent + 1, out)
-            if not item.body:
-                out.append(("class:dim", f"{'  ' * (base_indent + 1)}(empty)\n"))
-            out.append(("class:agent.brace", f"{pad}}}\n"))
-
-        elif item.kind == "parallel":
-            out.append(("class:parallel", f"{pad}//\n"))
-            for agent in item.agents:
-                spin = _spin(tick, offset=base_indent + 1)
-                inner = "  " * (base_indent + 1)
-                out.append(("class:agent.spin", f"{inner}{spin} "))
-                out.append(("class:agent.name", f"#{agent.name}#"))
-                out.append(("class:agent.brace", " {\n"))
-                _render_body(agent.body, tick, base_indent + 2, out)
-                if not agent.body:
-                    out.append(("class:dim", f"{'  ' * (base_indent + 2)}(empty)\n"))
-                out.append(("class:agent.brace", f"{inner}}}\n"))
-            if not item.agents:
-                out.append(("class:dim", f"{'  ' * (base_indent + 1)}(add #agent# nodes here)\n"))
-            out.append(("class:parallel", f"{pad}//\n"))
-
-        out.append(("", "\n"))
+def _task_mark(task: HwoTask, tick: int, executing: bool, offset: int = 0) -> tuple:
+    if task.status == "running":
+        return (_spin_char(tick, offset), "class:task.run")
+    if task.status == "done":
+        return (_DONE, "class:task.done")
+    if task.status == "error":
+        return (_ERROR, "class:task.err")
+    # pending
+    return (_IDLE, "class:task.pend")
 
 
-def _render(session: HwoSession, tick: int) -> list:
-    out: list = []
+def _render(session: HwoSession, tick: int, executing: bool, error_msg: str) -> list:
+    out = []
+
+    def push(style, text):
+        out.append((style, text))
 
     # ── header ────────────────────────────────────────────────────────────
-    out.append(("class:header", "  HWO  ·  Agent: "))
-    out.append(("class:header.name", session.root_name))
+    push("class:header", "  HWO  ·  Agent: ")
+    push("class:header.name", session.root_name)
+    if executing:
+        push("class:running", "  [running]")
+    push("class:header", "\n\n")
 
-    # scope breadcrumb
-    if session._name_stack:
-        crumbs = " > ".join(f"#{n}#" for n in session._name_stack)
-        out.append(("class:dim", f"  [{crumbs}]"))
+    if not session.nodes:
+        push("class:dim", "  #agent-name#   — create an agent\n")
+        push("class:dim", "  -> task text   — add a task\n")
+        push("class:dim", "  //             — parallel / end separator\n")
+        push("class:dim", "  r              — execute\n")
+        return out
 
-    # parallel indicator
-    if session.in_parallel:
-        out.append(("class:parallel", "  [// parallel //]"))
+    in_parallel = False
 
-    out.append(("class:header", "\n\n"))
+    for node in session.nodes:
+        if isinstance(node, HwoSeparator):
+            in_parallel = (node.kind == "parallel")
+            label = " parallel " if node.kind == "parallel" else " end "
+            push("class:separator", f"  {'─' * 6}{label}{'─' * 6}\n\n")
+            continue
 
-    # ── tree body ─────────────────────────────────────────────────────────
-    if not session.root_body:
-        out.append(("class:dim", "  #agent-name#      — create an agent\n"))
-        out.append(("class:dim", "  -> task text      — add a serial step\n"))
-        out.append(("class:dim", "  //                — open/close parallel block\n"))
-        out.append(("class:dim", "  { / }             — enter / exit agent body\n"))
-    else:
-        _render_body(session.root_body, tick, base_indent=1, out=out)
+        # HwoAgent
+        indent = "    " if in_parallel else "  "
+        spin = _spin_char(tick, offset=1)
+        push("class:agent.spin", f"{indent}{spin} ")
+        push("class:agent.name", f"#{node.name}#")
+        push("class:agent", "\n")
+
+        if node.tasks:
+            for i, task in enumerate(node.tasks):
+                mark, style = _task_mark(task, tick, executing, offset=i + 2)
+                task_indent = indent + "    "
+                push(style, f"{task_indent}{mark} → ")
+                push("class:task.text", f"{task.text}\n")
+        else:
+            push("class:dim", f"{indent}    (no tasks)\n")
+
+        push("", "\n")
 
     return out
 
 
-def _render_status(session: HwoSession, error_msg: str) -> list:
-    items = []
+def _render_status(error_msg: str, executing: bool, session: HwoSession) -> list:
     if error_msg:
-        items.append(("class:task.err", f"  ✗ {error_msg}"))
-    else:
-        depth_info = f"depth={session.depth}" if session.depth > 0 else ""
-        par_info = "PARALLEL" if session.in_parallel else ""
-        meta = "  ".join(filter(None, [depth_info, par_info]))
-        items.append(("class:help", f"  → task │ #agent# │ // │ {{ }} │ q=quit"
-                       + (f"  [{meta}]" if meta else "")))
-    return items
+        return [("class:task.err", f"  ✗ {error_msg}")]
+    if executing:
+        done   = sum(1 for t in session.all_tasks() if t.status == "done")
+        total  = len(session.all_tasks())
+        errors = sum(1 for t in session.all_tasks() if t.status == "error")
+        parts  = f"{done}/{total} done"
+        if errors:
+            parts += f"  {errors} failed"
+        return [("class:running", f"  executing … {parts}  │  q=quit")]
+    return [("class:help", "  → task  │  #agent#  │  //  │  r=run  │  q=quit")]
 
 
-# ── Styles ────────────────────────────────────────────────────────────────
+# ── Style ─────────────────────────────────────────────────────────────────
 
 _STYLE = Style.from_dict({
     "header":       "bold cyan",
     "header.name":  "bold white",
+    "running":      "bold yellow",
     "agent.spin":   "yellow",
     "agent.name":   "bold magenta",
-    "agent.brace":  "dim cyan",
+    "agent":        "",
     "task.run":     "cyan",
     "task.done":    "green",
     "task.err":     "red",
     "task.pend":    "dim",
     "task.text":    "white",
-    "parallel":     "bold blue",
+    "separator":    "bold blue",
     "dim":          "dim",
     "help":         "dim italic",
     "input.prefix": "bold green",
-    "separator":    "dim",
 })
 
 
-# ── Main TUI ──────────────────────────────────────────────────────────────
+# ── Execution simulator ───────────────────────────────────────────────────
+
+def _simulate_execution(session: HwoSession, app, stop_evt: threading.Event) -> None:
+    """Mark pending tasks running then done/error with small delays."""
+    tasks = [t for t in session.all_tasks() if t.status == "pending"]
+    for task in tasks:
+        task.status = "running"
+    try:
+        app.invalidate()
+    except Exception:
+        return
+
+    for task in tasks:
+        if stop_evt.is_set():
+            break
+        delay = random.uniform(0.8, 2.2)
+        deadline = time.time() + delay
+        while time.time() < deadline:
+            if stop_evt.is_set():
+                return
+            time.sleep(0.05)
+        task.status = "done" if random.random() > 0.15 else "error"
+        try:
+            app.invalidate()
+        except Exception:
+            return
+
+
+# ── TUI entry point ───────────────────────────────────────────────────────
 
 def run_hwo_ui(root_agent_name: str) -> None:
     """Launch the /hwo full-screen orchestration builder."""
-    session = HwoSession(root_name=root_agent_name)
-    tick = [0]
+    session   = HwoSession(root_name=root_agent_name)
+    tick      = [0]
+    executing = [False]
     error_msg = [""]
+    stop_evt  = threading.Event()
 
-    # ── tree view ─────────────────────────────────────────────────────────
+    # ── tree panel ────────────────────────────────────────────────────────
     tree_ctrl = FormattedTextControl(
-        lambda: _render(session, tick[0]), focusable=False
+        lambda: _render(session, tick[0], executing[0], error_msg[0]),
+        focusable=False,
     )
     tree_win = Window(content=tree_ctrl)
 
-    # ── separator ─────────────────────────────────────────────────────────
-    sep_ctrl = FormattedTextControl(lambda: [("class:separator", "─" * 80)])
-    sep_win = Window(content=sep_ctrl, height=1)
-
-    # ── status / help line ────────────────────────────────────────────────
-    status_ctrl = FormattedTextControl(
-        lambda: _render_status(session, error_msg[0]), focusable=False
+    sep_win = Window(
+        content=FormattedTextControl(lambda: [("class:separator", "─" * 80)]),
+        height=1,
     )
-    status_win = Window(content=status_ctrl, height=1)
 
-    # ── input field ───────────────────────────────────────────────────────
+    status_win = Window(
+        content=FormattedTextControl(
+            lambda: _render_status(error_msg[0], executing[0], session)
+        ),
+        height=1,
+    )
+
+    # ── input row ─────────────────────────────────────────────────────────
     input_buf = Buffer(name="hwo_input", multiline=False)
-
-    prefix_ctrl = FormattedTextControl(
-        lambda: [("class:input.prefix", "  > ")], focusable=False
+    prefix_win = Window(
+        content=FormattedTextControl(
+            lambda: [("class:input.prefix", "  > ")], focusable=False
+        ),
+        width=4, dont_extend_width=True,
     )
-    prefix_win = Window(content=prefix_ctrl, width=4, dont_extend_width=True)
-    input_win  = Window(content=BufferControl(buffer=input_buf),
-                        height=1, dont_extend_height=True)
-    input_row  = VSplit([prefix_win, input_win])
+    input_win = Window(
+        content=BufferControl(buffer=input_buf),
+        height=1, dont_extend_height=True,
+    )
+    input_row = VSplit([prefix_win, input_win])
 
     layout = Layout(
         HSplit([tree_win, sep_win, status_win, input_row]),
@@ -305,33 +280,19 @@ def run_hwo_ui(root_agent_name: str) -> None:
     kb = KeyBindings()
 
     def _process(raw: str) -> None:
+        import re
         text = raw.strip()
         error_msg[0] = ""
         if not text:
             return
 
-        # Enter agent body
-        if text == "{":
-            if not session.enter_agent():
-                error_msg[0] = "No agent to enter — create one first with #name#"
-            return
-
-        # Exit scope
-        if text == "}":
-            if not session.exit_scope():
-                error_msg[0] = "Already at root scope"
-            return
-
-        # Parallel toggle
+        # parallel toggle
         if re.fullmatch(r'/+', text):
-            if session.in_parallel:
-                session.close_parallel()
-            else:
-                session.open_parallel()
+            session.toggle_parallel()
             return
 
-        # Agent node
-        m = re.fullmatch(r'#([^#{}]+)#\s*', text)
+        # agent
+        m = re.fullmatch(r'#([^#]+)#\s*', text)
         if m:
             name = m.group(1).strip()
             if not name:
@@ -340,14 +301,11 @@ def run_hwo_ui(root_agent_name: str) -> None:
             session.add_agent(name)
             return
 
-        # Task / serial step (-> prefix optional)
+        # task (-> prefix optional)
         m2 = re.match(r'^->\s*(.+)$', text, re.DOTALL)
         task_text = m2.group(1).strip() if m2 else text
-        if session.in_parallel:
-            error_msg[0] = "Inside // — only #agent# nodes allowed, not tasks"
-            return
-        # Allow tasks at root scope too (HWO supports top-level serial text)
-        session.add_task(task_text)
+        if session.add_task(task_text) is None:
+            error_msg[0] = "Create an #agent# first"
 
     @kb.add("enter")
     def _(event):
@@ -355,16 +313,36 @@ def run_hwo_ui(root_agent_name: str) -> None:
         input_buf.reset()
         _process(raw)
 
+    @kb.add("r")
+    def _(event):
+        if executing[0]:
+            return
+        if not session.has_pending():
+            error_msg[0] = "No pending tasks to run"
+            return
+        error_msg[0] = ""
+        executing[0] = True
+        app_ref = event.app
+
+        def _exec():
+            _simulate_execution(session, app_ref, stop_evt)
+            executing[0] = False
+            try:
+                app_ref.invalidate()
+            except Exception:
+                pass
+
+        threading.Thread(target=_exec, daemon=True).start()
+
     @kb.add("q")
     @kb.add("escape")
     @kb.add("c-c")
     @kb.add("c-d")
     def _(event):
+        stop_evt.set()
         event.app.exit()
 
-    # ── tick thread (drives spinner animation) ────────────────────────────
-    stop_evt = threading.Event()
-
+    # ── tick thread ───────────────────────────────────────────────────────
     def _ticker(app):
         while not stop_evt.is_set():
             time.sleep(0.18)
@@ -385,6 +363,7 @@ def run_hwo_ui(root_agent_name: str) -> None:
 
     ticker = threading.Thread(target=_ticker, args=(app,), daemon=True)
     ticker.start()
+    stop_evt.clear()
 
     try:
         app.run()
