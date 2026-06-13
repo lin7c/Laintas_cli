@@ -5587,7 +5587,12 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
             # Visual agent-orchestration builder TUI
             current = get_current_agent()
             root_name = current.name if current else "primary"
-            hwo_ui_mod.run_hwo_ui(root_name)
+            hwo_ui_mod.run_hwo_ui(
+                root_name,
+                deps=get_loop_deps(),
+                session_data=session,
+                parent_id=current.id if current else None,
+            )
 
     else:
         # Try .laintas/commands.py custom handler first
