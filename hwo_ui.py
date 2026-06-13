@@ -166,6 +166,24 @@ class HwoSession:
         agent.tasks[idx].text = text
         return None
 
+    def find_agent_by_path(self, path: list) -> Optional["HwoAgent"]:
+        """Navigate a path like ['agent1','agent2'] through the hierarchy."""
+        if not path:
+            return None
+        current = None
+        for node in self.nodes:
+            if isinstance(node, HwoAgent) and node.name == path[0]:
+                current = node
+                break
+        if current is None:
+            return None
+        for name in path[1:]:
+            nxt = next((c for c in current.children if c.name == name), None)
+            if nxt is None:
+                return None
+            current = nxt
+        return current
+
     def append_task_to(self, agent_name: str, text: str) -> Optional[str]:
         """Append a task directly to a named agent."""
         agent = self.find_agent(agent_name)
@@ -486,6 +504,31 @@ def run_hwo_ui(root_agent_name: str) -> None:
                 err = session.delete_task(name, idx1)
             if err:
                 error_msg[0] = err
+            return
+
+        # #a#/#b#/...->#child#  or  #a#/#b#/...->task
+        # Path must contain at least one slash (multi-segment).
+        m = re.fullmatch(r'(#[^#]+#(?:/#[^#]+#)+)->(.*)', text)
+        if m:
+            path_str, action = m.group(1), m.group(2).strip()
+            path = [p for p in re.findall(r'#([^#]+)#', path_str)]
+            target = session.find_agent_by_path(path)
+            if target is None:
+                error_msg[0] = f"Path '{path_str}' not found"
+                return
+            # action is #child# or task text
+            child_m = re.fullmatch(r'\s*#([^#]+)#\s*', action)
+            if child_m:
+                child_name = child_m.group(1).strip()
+                for existing in target.children:
+                    if existing.name == child_name:
+                        error_msg[0] = f"Agent '{child_name}' already exists under #{target.name}#"
+                        return
+                target.children.append(HwoAgent(name=child_name, parent=target))
+            elif action:
+                target.tasks.append(HwoTask(text=action, status="pending"))
+            else:
+                error_msg[0] = "Specify a task or #sub-agent# after ->"
             return
 
         # #Name#->#Sub# — append sub-agent to named agent
