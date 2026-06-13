@@ -231,7 +231,7 @@ function DownloadCard({ current, t, isDark }) {
         <a
           href={
             current.id === 'windows' ? '/releases/latest/laintas_cli.exe' :
-            current.id === 'linux' ? '/releases/latest/laintas-cli_0.1.3_amd64.deb' :
+            current.id === 'linux' ? '/releases/latest/laintas-cli_0.1.4_amd64.deb' :
             `/releases/latest/laintas_cli.${current.ext}`
           }
             className="inline-flex items-center gap-2.5 px-8 py-3.5 rounded-xl text-base font-semibold transition-all duration-200"
@@ -321,7 +321,7 @@ function ScriptInstall({ t, isDark, current }) {
   const installCmd = current.id === 'windows'
     ? 'curl -LO https://helpwo.laintas.com/releases/latest/laintas_cli.exe'
     : current.id === 'linux'
-    ? 'curl -LO https://helpwo.laintas.com/releases/latest/laintas-cli_0.1.3_amd64.deb && sudo dpkg -i laintas-cli_0.1.3_amd64.deb'
+    ? 'curl -LO https://helpwo.laintas.com/releases/latest/laintas-cli_0.1.4_amd64.deb && sudo dpkg -i laintas-cli_0.1.4_amd64.deb'
     : 'curl -fsSL https://cli.laintas.com/install.sh | bash';
 
   const handleCopy = () => {

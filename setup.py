@@ -2,7 +2,7 @@ from setuptools import setup
 
 setup(
     name="laintas-cli",
-    version="0.1.2",
+    version="0.1.4",
     description="Laintas CLI - Autonomous AI agent for your terminal",
     author="Laintas",
     url="https://github.com/lin7c/laintas_cli_pre",
