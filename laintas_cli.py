@@ -36,6 +36,13 @@ from urllib.parse import urlparse, parse_qs
 SYSTEM = platform.system()  # "Linux", "Windows", "Darwin"
 IS_WINDOWS = SYSTEM == "Windows"
 
+# Resolved once, at import time, while cwd is still the launch directory.
+# sys.argv[0] is often relative (e.g. "laintas_cli.py") — os.execv() resolves
+# a relative path against the CURRENT cwd, not the launch cwd, so /reload
+# would break after a real `cd` moved the process elsewhere. Capturing the
+# absolute path now makes restart correct regardless of later cwd changes.
+_LAUNCH_SCRIPT_PATH = os.path.abspath(sys.argv[0]) if sys.argv else __file__
+
 # Windows cmd.exe internal commands — not on PATH but always available
 _WINDOWS_CMD_BUILTINS = {
     # Navigation
@@ -353,6 +360,84 @@ def _ensure_term0_alive() -> None:
             register_terminal(_term0, DEFAULT_SHELL, 0, name="term0")
         except Exception:
             pass
+
+
+# ── Interactive-terminal whitelist ──────────────────────────────────────
+# Commands whose first word is in this set need a real PTY (pty_passthrough)
+# instead of term0/marker-poll, because they take over the whole screen and
+# need raw keystrokes (vim, claude) or block waiting on a live remote tty
+# (ssh). Everything else routes through term0 so cd/export/pushd persist
+# across commands (term0's bash state IS the parent shell's state).
+_DEFAULT_INTERACTIVE_COMMANDS = {
+    "vim", "vi", "nano", "pico", "emacs",
+    "less", "more", "man",
+    "htop", "top",
+    "python", "python3", "ipython", "node", "irb", "ruby",
+    "mysql", "psql", "sqlite3",
+    "ssh", "telnet",
+    "tmux", "screen", "mc",
+    "claude", "codex",
+}
+
+_interactive_commands_cache: Optional[set] = None
+_interactive_commands_mtime: float = 0.0
+
+
+def get_interactive_commands() -> set:
+    """Merge built-in defaults with user add/remove overrides.
+
+    Persisted in ~/.laintas/interactive_commands.json, mtime-cached so /bash
+    add/remove takes effect immediately without restarting — same pattern as
+    policy.py/hooks.py.
+    """
+    global _interactive_commands_cache, _interactive_commands_mtime
+    path = paths.INTERACTIVE_COMMANDS_FILE
+    try:
+        mtime = path.stat().st_mtime if path.exists() else 0.0
+    except OSError:
+        mtime = 0.0
+    if _interactive_commands_cache is not None and mtime == _interactive_commands_mtime:
+        return _interactive_commands_cache
+
+    added, removed = [], []
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            added = data.get("add", [])
+            removed = data.get("remove", [])
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    result = (set(_DEFAULT_INTERACTIVE_COMMANDS) | set(added)) - set(removed)
+    _interactive_commands_cache = result
+    _interactive_commands_mtime = mtime
+    return result
+
+
+def _modify_interactive_commands(command: str, add: bool) -> None:
+    """Persist a /bash add|remove override to ~/.laintas/interactive_commands.json."""
+    path = paths.INTERACTIVE_COMMANDS_FILE
+    data = {"add": [], "remove": []}
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            pass
+    data.setdefault("add", [])
+    data.setdefault("remove", [])
+    if add:
+        data["remove"] = [c for c in data["remove"] if c != command]
+        if command not in data["add"] and command not in _DEFAULT_INTERACTIVE_COMMANDS:
+            data["add"].append(command)
+    else:
+        data["add"] = [c for c in data["add"] if c != command]
+        if command not in data["remove"] and command in _DEFAULT_INTERACTIVE_COMMANDS:
+            data["remove"].append(command)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        pass
 
 
 class SubTerminalSession:
@@ -1088,6 +1173,26 @@ def display_sub_terminal_preview(command: str, output: str, depth: int = 0, aliv
     status = "[dim yellow]RUNNING[/dim yellow]" if alive else "[dim red]EXITED[/dim red]"
     title = f"[bold]{command[:80]}[/bold]  {status}"
     panel = Panel(f"[dim]{preview}[/dim]", title=title, border_style="dim yellow" if alive else "dim red")
+    if depth > 0:
+        console.print(Padding(panel, (0, 0, 0, depth * 4)))
+    else:
+        console.print(panel)
+
+
+def display_file_diff(path: str, diff_text: str, depth: int = 0) -> None:
+    """Display a compact unified diff preview for file edits."""
+    diff_lines = diff_text.splitlines() if diff_text else []
+    line_count = len(diff_lines)
+    preview_limit = 80
+    truncated = line_count > preview_limit
+    preview = "\n".join(diff_lines[:preview_limit]) if diff_lines else "(no differences)"
+    if truncated:
+        preview += f"\n[dim]... ({line_count - preview_limit} more lines)[/dim]"
+
+    summary = f"[dim]{line_count} diff lines[/dim]"
+    body = f"[dim]{preview}[/dim]\n\n{summary}"
+    panel = Panel(body, title=f"[bold]{path[:80]}[/bold]  [cyan]DIFF[/cyan]",
+                  border_style="cyan" if depth == 0 else "dim cyan")
     if depth > 0:
         console.print(Padding(panel, (0, 0, 0, depth * 4)))
     else:
@@ -2217,12 +2322,18 @@ def generate_cli_prop_template() -> str:
     agent the full surface: shell, /tool dispatch, /term, /spawn, memory.
 
     Variables substituted at run time (see agent_loop.run_agent_loop):
-      {{agentName}} {{agentId}} {{currentPath}} {{depth}} {{nextDepth}}
-      {{activeFile}} {{globalMemory}} {{persistentMemory}} {{lastSession}}
-      {{planMode}} {{tools}} {{inbox}} {{children}} {{parent}}
+      {{agentName}} {{agentId}} {{currentPath}} {{depth}}
+      {{globalMemory}} {{persistentMemory}} {{lastSession}}
+      {{planMode}} {{tools}} {{inbox}} {{parallelResults}} {{children}} {{parent}}
       {{terminalName}} {{parentTerminal}} {{deploymentStatus}}
       {{workflowPhase}} {{rolePrompt}} {{confidenceGuidance}}
-      {{skillContext}} {{parallelResults}} {{behaviorDiagnostics}}
+      {{skillContext}}
+
+    {{nextDepth}}, {{activeFile}}, and {{behaviorDiagnostics}} are still computed
+    and .replace()'d by run_agent_loop for backward compatibility, but are not
+    referenced by this template — {{activeFile}} only ever resolves to the literal
+    string "None" and {{behaviorDiagnostics}} is always "", so neither carries
+    real signal yet. Add them back here if/when they're wired to real values.
     """
     shell_info = "cmd.exe" if IS_WINDOWS else SHELL_NAME
 
@@ -2236,6 +2347,7 @@ Solve real engineering tasks by reading the repo, using tools, editing files, ru
 - Terminal: {{{{terminalName}}}} | Parent terminal: {{{{parentTerminal}}}}
 - Depth: {{{{depth}}}} | Parent agent: {{{{parent}}}} | Children: {{{{children}}}}
 - Inbox: {{{{inbox}}}}
+{{{{parallelResults}}}}
 - Plan mode: {{{{planMode}}}}
 - Current date/time is appended by the runtime.
 </environment>
@@ -2264,6 +2376,9 @@ Loaded skill instructions:
 <tools>
 Return actions only inside the JSON `tool_calls` array.
 Use `shell.exec` for shell commands and meta-commands. Use structured tools for file, memory, task, plan, web, agent, terminal, time, and sleep operations.
+For `shell.exec`, the `arguments.command` value must be the raw shell command only, for example:
+{{"reply":"Inspecting the project layout.","tool_calls":[{{"name":"shell.exec","arguments":{{"command":"ls -la"}}}}]}}
+Never include the tool name inside `arguments.command`. Wrong: `shell.exec ls -la`. Right: `ls -la`.
 Never write XML, HTML, pseudo-tags, or text wrappers such as `<tool_calls>...</tool_calls>`.
 To list skills, emit:
 {{"reply":"Listing available skills.","tool_calls":[{{"name":"skill.list","arguments":{{}}}}]}}
@@ -2275,11 +2390,14 @@ Catalog:
 
 <workflow>
 - If the user asks a clear read/edit/build/test/investigate task, act with tools. Do not ask for permission to do exactly what was asked.
-- Ask one concise clarifying question only when the target or intent is genuinely ambiguous, destructive, or impossible to infer safely.
+- Ask one concise clarifying question only when the target or intent is genuinely ambiguous, destructive, impossible to infer safely, or blocked on information you cannot discover yourself.
+- If there are multiple reasonable approaches with materially different tradeoffs, stop and present 2-3 labeled options. State the consequence of each option briefly, then wait for the user's choice.
 - For unfamiliar code: search/list, read the relevant region, then edit. Never patch from memory.
+- Keep scope tight. Do not add unrelated features, refactors, abstractions, or cleanup beyond the task.
 - Keep each action small and verifiable. Prefer exact edits over rewrites.
 - After a tool failure, read the error and change approach; do not retry identical arguments.
-- Verify before claiming completion when verification is practical.
+- After meaningful file edits, inspect the diff before claiming completion when practical.
+- Verify before claiming completion when verification is practical. Do not claim success from code inspection alone when you can run a direct check.
 - Save durable user/project preferences with memory tools when the user corrects you or establishes a non-obvious rule.
 {{{{workflowPhase}}}}
 {{{{rolePrompt}}}}
@@ -2303,238 +2421,14 @@ Every response must be exactly one JSON object:
 </output_rules>
 
 <tone>
-Direct, terse, and useful. Match the user's language. Do not add filler or final checklists.
+Direct, terse, and useful. Match the user's language for all user-visible replies; keep code identifiers and technical terms in their original form. Do not add filler or final checklists.
 </tone>
 
 <safety>
-Do not bypass policy. Do not invent paths, APIs, files, or results. Do not commit, push, deploy, publish, or run destructive commands without explicit user request.
+Do not bypass policy. Do not invent paths, APIs, files, or results. Do not commit, push, deploy, publish, or run destructive commands without explicit user request. Do not use destructive actions as a shortcut around an obstacle; investigate unexpected files, branches, locks, or configuration before removing or overwriting anything. Avoid introducing command injection, XSS, SQL injection, or other common security vulnerabilities in code you modify.
 </safety>
 """
 
-    return f"""<role>
-You are {{{{agentName}}}} (id: {{{{agentId}}}}, role: {{{{deploymentStatus}}}}), an autonomous coding agent running inside a laintas-cli REPL.
-You earn your keep by solving real engineering tasks: explore the codebase, edit files, run commands, verify the result, and report back tersely. Prefer action over explanation once the task is clear — but **confirm intent before touching any file or running any command when the request is conversational, vague, or missing a concrete target**.
-</role>
-
-<specialist_role>
-{{{{rolePrompt}}}}
-</specialist_role>
-
-<environment>
-- OS: {SYSTEM} | Shell: {shell_info} | CWD: {{{{currentPath}}}}
-- Terminal: {{{{terminalName}}}} | Status: {{{{deploymentStatus}}}}
-- Parent terminal: {{{{parentTerminal}}}} | Parent agent: {{{{parent}}}}
-- Recursion depth: {{{{depth}}}} (0 = user's terminal; ≥1 = sub-agent in a collapsed panel)
-- Children: {{{{children}}}}
-- Inbox (messages from other agents this iteration): {{{{inbox}}}}
-- Plan mode: {{{{planMode}}}}
-- Stationed execution: when deployed to term0, your shell commands (including cd, export, clear) run in a persistent bash session — side effects persist across commands. Use shell.exec("cd ..") normally; it will change the working directory just like the user typing it.
-</environment>
-
-<behavior_diagnostics>
-{{{{behaviorDiagnostics}}}}
-</behavior_diagnostics>
-
-<parallel_results>
-{{{{parallelResults}}}}
-</parallel_results>
-
-<last_session>
-{{{{lastSession}}}}
-</last_session>
-
-<persistent_memory>
-These memories survive across sessions. Treat them as authoritative context about the user and project.
-{{{{persistentMemory}}}}
-</persistent_memory>
-
-<project_rules>
-Project-local rules stored in .laintas/memory.json. They override defaults; follow them strictly.
-{{{{globalMemory}}}}
-</project_rules>
-
-<tools>
-You have two ways to act, both expressed as entries in the `tool_calls` array of your JSON response:
-
-(A) Shell command — any executable on PATH, with pipes/redirects/substitution. Examples:
-    ls -la src/
-    grep -rn "TODO" --include="*.py" .
-    python -c "import json; print(json.load(open('package.json'))['version'])"
-
-(B) Structured tool — use this form for filesystem, memory, plan, task, and web operations.
-    /tool <name> <json-params>
-
-    Example: /tool fs.read {{"path": "src/app.py", "max_bytes": 4000}}
-
-The structured tools below are preferred over raw shell when both work, because they return
-clean JSON the loop can use directly, and they don't spawn a PTY. Use shell for: pipelines,
-build tools, package managers, git, version control, anything PTY-driven.
-
-Catalog:
-{{{{tools}}}}
-
-Meta-commands (use `shell.exec` with the meta-command string when needed):
-- /station [name]               station this agent (depth=0 commands run directly, like user input)
-- /send <name> <keys>          send keystrokes / commands to a named terminal
-- /terminate <name>            close and destroy a terminal
-- /t [name]                    list sub-terminals, or /t <name> to create one (no agent stationed)
-- /term <name>                 same as /t <name> — spawn a sub-terminal without stationing
-- /spawn [name:] <task>        fork an in-process child agent (parent keeps running)
-- /tell <agent_id> <message>   send a JSON or text message to another agent's inbox
-- /wait <agent_id> [secs]      block until child agent finishes (cap 300s)
-- /abort <agent_id>            signal another agent to stop
-- /hire                        create a new sibling agent slot
-- /agents [name|tree|name X]   inspect or switch agent identity
-- /session close               close the current one-off PTY session
-- /keys <text>                 send keys to the current one-off PTY session
-- wait(N)                      sleep N seconds (e.g. wait(3) after starting a dev server)
-</tools>
-
-<workflow>
-For every non-trivial task, follow this loop:
-
-1. UNDERSTAND — and ask first when needed.
-   Re-state the user's goal in one sentence. **If any of the following are true, ask one clarifying question and return `tool_calls: []` — do NOT start exploring:**
-   - The input is conversational or expressive (feedback, complaint, question about behaviour)
-   - No concrete file, command, or task target is named
-   - The request is short (≲10 words) and could mean multiple things
-   - You would have to guess which part of the codebase to touch
-   One focused question is better than wrong action. Do not start exploring "to understand" — exploration is action and changes the user's perception of what you're doing.
-
-2. EXPLORE before changing — but report before acting.
-   For unfamiliar code use fs.glob → fs.grep → fs.read (offset/limit if large). Cite findings as `path:line`.
-   **After exploration, stop and summarise what you found before making any edit or running any write/destructive command.** Return `tool_calls: []` with a summary and your proposed next step, then wait for the user to confirm. Skip this pause only when the user has already explicitly approved the action in this same conversation turn.
-
-3. PLAN before acting. For any non-trivial task, write a brief plan (3–5 bullets) in your `reply` before touching anything. If there are multiple valid approaches, offer 2–3 labelled options and let the user pick — don't silently choose one. For tasks with >3 steps or touching >2 files, also create tasks via task.create. One in_progress task at a time. If plan mode is active, explore only until the user runs /plan approve.
-
-4. ACT in small, verifiable increments. **Work incrementally — never try to do everything in one response.**
-   - **One tool call per concern.** Write one file, make one edit, run one command per tool call. Multiple tool calls per turn are fine (they run sequentially), but keep each one small and focused.
-   - **Before destructive or hard-to-reverse commands** (rm, overwrite, deploy, bulk rename, db migrations): state in `reply` what you are about to run and why, then execute. This gives the user a chance to redirect if the summary looks wrong.
-   - **fs.write: ≤ 50 lines per call.** If a file needs more content, write the skeleton first, then use fs.edit to add sections one at a time. Example: write index.html with basic structure (head, empty body, empty script tag), then fs.edit to add the body content, then fs.edit to add the JavaScript.
-   - **fs.edit: replace small, unique snippets.** Don't try to replace entire blocks — find a small unique anchor string and replace just that section.
-   - **Self-check before writing:** If you're about to write more than 50 lines of content in a single fs.write call, STOP. Split it: write the skeleton now, add content in the next turn via fs.edit.
-   - Prefer fs.edit (exact string replacement) for code changes; fs.write only for new files or initial scaffolding. After edits, run the project's test/typecheck/lint command if one is obvious (package.json scripts, pytest, cargo test, etc.).
-
-5. VERIFY before claiming done. Read the file back, run the test, exit-code-check the build. Saying "done" without verification is the most common failure mode — avoid it.
-
-6. RECOVER from errors. If a command fails: read the error, decide if it's transient (retry once with a fix) or fundamental (change approach). Never re-run the identical failing command. Look at the inline `[error: ...]` hints the loop adds to terminal output — they classify the failure for you.
-
-**CRITICAL: fs.edit failure recovery.** If fs.edit fails with "old_string not found", DO NOT fall back to fs.write with the entire file content. This will exceed token limits and fail. Instead:
-   a. Use fs.read to see the current file content
-   b. Identify a smaller, unique substring that actually exists in the file
-   c. Use multiple smaller fs.edit calls to make incremental changes
-
-7. REMEMBER what's worth remembering. Use the `rules` field for project-local facts ("uses Vite", "tests live in __tests__/"). Use `/tool mem.save` for cross-session memories — **save immediately** when:
-   - The user corrects you ("no", "wrong", "don't do that", "I prefer")
-   - A non-obvious project constraint or decision is established
-   - The user reveals their role, expertise level, or workflow preference
-   Don't save derivable facts (git history, current file layout). The `<last_session>` block above gives you continuity from the previous session in this directory.
-</workflow>
-
-<workflow_phase>
-{{{{workflowPhase}}}}
-</workflow_phase>
-
-<skill_context>
-{{{{skillContext}}}}
-</skill_context>
-
-<output_rules>
-Every response is a single JSON object with two fields:
-
-  {{
-    "reply": "Brief user-facing text. Markdown OK. Reference files as path:line.",
-    "tool_calls": [
-      {{"name": "tool.name", "arguments": {{...}}}},
-      ...
-    ]
-  }}
-
-- `reply`: 1-3 sentences for the user. Longer only when summarizing a finished task or asking a clarifying question. No filler ("Sure!", "I'll now..."). Don't restate what the command obviously does.
-- `tool_calls`: array of actions to execute, in order. **Empty array `[]` means the task is fully complete, OR you're blocked waiting on the user.** If your reply already answers the question or completes the task, return `tool_calls: []` — do NOT add a redundant verification command (e.g., running `pwd` after `cd` succeeded). Multiple tool calls ARE allowed (they run sequentially).
-
-{{{{confidenceGuidance}}}}
-
-**CRITICAL: Keep each tool call small to avoid token overflow.**
-- fs.write content: ≤ 50 lines. For larger files, write skeleton first, then add via fs.edit in subsequent turns.
-- fs.edit old_string/new_string: ≤ 20 lines each. Find small unique anchors.
-- If you find yourself about to generate a tool call with >100 lines of content, STOP and split it across multiple turns.
-- This keeps responses within token limits and makes debugging easier.
-
-Every entry in `tool_calls` has:
-  - `name`: a tool name from the catalog (e.g. "shell.exec", "fs.read", "agent.spawn")
-  - `arguments`: a JSON object with the tool's parameters (see <tools> for schemas)
-
-Quick reference of available tool names:
-  shell.exec — run any shell command (your primary action tool; wraps cd, git, pytest, npm, etc.)
-  fs.read, fs.edit, fs.write, fs.glob, fs.grep, fs.ls, fs.diff, fs.multi_edit
-  agent.spawn, agent.tell, agent.station, agent.abort, agent.wait, agent.hire, agent.list, agent.rename, agent.switch
-  terminal.send, terminal.terminate, terminal.create, terminal.list
-  session.close, session.keys
-  mem.save, mem.read, mem.delete, mem.list
-  task.create, task.update, task.list, task.get
-  plan.read, plan.update, plan.list
-  web.search, web.fetch
-  time.now, sleep
-
-JSON must parse. No prose outside the object. No code fences around it.
-</output_rules>
-
-<tone>
-- Terse. Direct. No preamble, no flattery, no "Great question!". No final summary if a diff or test result already shows what changed.
-- Cite code as `path:line` (e.g. `agent_loop.py:1042`). Never use placeholder file paths.
-- Use markdown lists/code blocks in `reply` when they help, not as decoration.
-- Match the user's language for replies (English if uncertain). Code identifiers stay English regardless.
-</tone>
-
-<safety>
-- Destructive commands (`rm -rf`, `mkfs`, `dd of=/dev/...`, `chmod 777 /`) are blocked by the local policy engine. Do not try to bypass it. If a user explicitly asks for a destructive action, run the policy-approved equivalent (e.g. `rm` on specific files).
-- Never invent file paths, package names, or APIs. If unsure, read first.
-- Do not commit, push, or publish without an explicit request from the user.
-- Do not run `curl ... | sh` or pipe untrusted input into a shell.
-</safety>
-
-<recursive_orchestration>
-You can delegate sub-tasks two ways:
-
-- `agent.spawn` — in-process child agent. Cheap, shares process state, posts result to your inbox.
-- shell: `laintas-cli --execute "task description" --depth {{{{nextDepth}}}}` — full sub-process. Heavier, but isolated.
-
-Rule of thumb: spawn for parallel exploration ("read these 3 files in parallel"); execute for isolated long-running tasks. At depth ≥ 2 prefer doing the work yourself — deeper recursion costs more than it saves.
-
-For parent-terminal side effects (cd, clear) at depth ≥ 1, use `parent(cmd)` form.
-</recursive_orchestration>
-
-<examples>
-Task: "What does this project do?"
-{{"reply": "Reading the README.", "tool_calls": [{{"name": "fs.read", "arguments": {{"path": "README.md", "max_bytes": 4000}}}}]}}
-
-Task (next iteration, after seeing README):
-{{"reply": "It's a Python CLI that turns a backend LLM into a terminal coding agent. Entrypoint is `laintas_cli.py:1`; the loop lives in `agent_loop.py:1018`.", "tool_calls": []}}
-
-Task: "Fix the typo on line 42 of utils.py"
-{{"reply": "Replacing `recieve` with `receive` in utils.py:42.", "tool_calls": [{{"name": "fs.edit", "arguments": {{"path": "utils.py", "old_string": "recieve", "new_string": "receive"}}}}]}}
-
-Task: "Run the tests"
-{{"reply": "Running pytest.", "tool_calls": [{{"name": "shell.exec", "arguments": {{"command": "pytest -x --tb=short"}}}}]}}
-
-Task complete after the test passes:
-{{"reply": "All 23 tests pass. The typo fix didn't break anything.", "tool_calls": []}}
-
-Task: needs clarification
-{{"reply": "Which `config.json` did you mean — the one at the repo root or in `src/`? Both exist.", "tool_calls": []}}
-
-Task: "Create an HTML page with a timeline"
-Step 1 — write skeleton:
-{{"reply": "Creating index.html skeleton.", "tool_calls": [{{"name": "fs.write", "arguments": {{"path": "index.html", "content": "<!DOCTYPE html>\n<html>\n<head><title>Timeline</title></head>\n<body>\n<!-- content here -->\n</body>\n</html>"}}}}]}}
-
-Step 2 (next turn) — add body content via edit:
-{{"reply": "Adding timeline content.", "tool_calls": [{{"name": "fs.edit", "arguments": {{"path": "index.html", "old_string": "<!-- content here -->", "new_string": "<h1>Timeline</h1>\n<div class=\"item\">...</div>"}}}}]}}
-
-Step 3 (next turn) — add styles via edit:
-{{"reply": "Adding styles.", "tool_calls": [{{"name": "fs.edit", "arguments": {{"path": "index.html", "old_string": "</head>", "new_string": "<style>.item {{ margin: 1em; }}</style>\n</head>"}}}}]}}
-</examples>
-"""
 # ── File Helpers ───────────────────────────────────────────────────────
 
 def read_file(path: str) -> Optional[str]:
@@ -2598,7 +2492,7 @@ def reload_default_files() -> None:
     except OSError:
         pass
     console.print("[yellow]Restarting laintas_cli...[/yellow]")
-    os.execv(sys.argv[0], sys.argv)
+    os.execv(_LAUNCH_SCRIPT_PATH, [_LAUNCH_SCRIPT_PATH] + sys.argv[1:])
 
 
 # ── Backend API ────────────────────────────────────────────────────────
@@ -3758,8 +3652,13 @@ class AgentRegistry:
             SubTerminalSession=SubTerminalSession,
             display_command_output=display_command_output,
             display_sub_terminal_preview=display_sub_terminal_preview,
+            display_file_diff=display_file_diff,
             console=console, Markdown=Markdown,
             pty_passthrough=pty_passthrough,
+            request_command_approval=lambda cmd, reason: self._request_approval(
+                req_id, cmd, os.getcwd()) == "approve",
+            request_file_write_approval=lambda path, diff, reason: self._request_approval(
+                req_id, f"WRITE {path} — {reason}", os.getcwd()) == "approve",
         )
 
         session = self._session or {}
@@ -4126,8 +4025,6 @@ def show_debug_detail(index: int) -> None:
             lines.append(f"[bold]Reply:[/bold]\n{e.reply[:1500]}")
         if e.command:
             lines.append(f"[bold]Command:[/bold] {e.command}")
-        if getattr(e, "memory", None):
-            lines.append(f"[bold]Memory:[/bold] {e.memory[:500]}")
         lines.append(f"[bold]Done:[/bold] {e.done}")
         if e.billing:
             cost = e.billing.get("costCents", 0)
@@ -4831,6 +4728,50 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
     elif action == "/cwd":
         console.print(f"Working directory: [bold]{os.getcwd()}[/bold]")
 
+    elif action == "/bash":
+        if len(parts) < 2:
+            wl = ", ".join(sorted(get_interactive_commands()))
+            console.print(Panel(
+                "[bold]/bash <command>[/bold]        run <command> directly via term0's real bash "
+                "(marker-poll + cwd sync), bypassing the interactive whitelist below\n"
+                "[bold]/bash list[/bold]              show the interactive-terminal whitelist\n"
+                "[bold]/bash add <command>[/bold]     force <command> through full PTY passthrough "
+                "(vim-style — use for full-screen/raw-keystroke programs)\n"
+                "[bold]/bash remove <command>[/bold]  let <command> use term0/marker-poll instead\n\n"
+                f"[dim]Current whitelist: {wl}[/dim]",
+                title="/bash", border_style="cyan",
+            ))
+        elif parts[1] == "list":
+            wl = sorted(get_interactive_commands())
+            console.print(Panel("\n".join(wl) or "(empty)",
+                                title="Interactive-terminal whitelist", border_style="cyan"))
+        elif parts[1] == "add":
+            if len(parts) < 3:
+                console.print("[yellow]Usage: /bash add <command>[/yellow]")
+            else:
+                _modify_interactive_commands(parts[2], add=True)
+                console.print(f"[green]'{parts[2]}' now uses full PTY passthrough (native terminal).[/green]")
+        elif parts[1] == "remove":
+            if len(parts) < 3:
+                console.print("[yellow]Usage: /bash remove <command>[/yellow]")
+            else:
+                _modify_interactive_commands(parts[2], add=False)
+                console.print(f"[green]'{parts[2]}' now routes through term0/marker-poll.[/green]")
+        else:
+            raw_cmd = " ".join(parts[1:])
+            if not IS_WINDOWS:
+                _ensure_term0_alive()
+            _t0 = get_terminal("term0")
+            if IS_WINDOWS or _t0 is None or _t0.session is None or not _t0.session.is_alive():
+                console.print("[red]term0 session unavailable (Windows has no persistent bash).[/red]")
+            else:
+                result = _marker_poll_exec(_t0.session, raw_cmd, strip_ansi_codes=False)
+                _sync_cwd_from_term0(_t0.session)
+                stdout = result.get("stdout", "")
+                if stdout:
+                    console.print(stdout)
+                console.print(f"[dim]cwd → {os.getcwd()}[/dim]")
+
     elif action == "/clear":
         console.clear()
 
@@ -4996,8 +4937,6 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
                                 lines.append(f"\n[AI Reply]\n{e.reply[:1500]}")
                             if e.command:
                                 lines.append(f"\n[Command]\n{e.command}")
-                            if e.memory:
-                                lines.append(f"\n[Memory]\n{e.memory[:500]}")
                             lines.append(f"\n[Done] {e.done}")
                             if e.error:
                                 lines.append("\n[Error] true")
@@ -5558,7 +5497,7 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
         handle_meta_command._last_chat_history = _prev_chat
 
         if response.get("msg"):
-            console.print(deps.Markdown(response["msg"]) if hasattr(deps, 'Markdown') else response["msg"])
+            console.print(_prev_deps.Markdown(response["msg"]) if hasattr(_prev_deps, 'Markdown') else response["msg"])
             (_prev_chat if _prev_chat is not None else []).append(
                 {"role": "assistant", "content": response["msg"]}
             )
@@ -5817,6 +5756,7 @@ def show_help():
     table.add_row("/scan", "Scan and list all available system commands from PATH")
     table.add_row("/debug", "Browse debug entries (/debug), view detail (/debug <N>), save to file (/debug <N> <file>), clear (/debug clear)")
     table.add_row("/cwd", "Show current working directory")
+    table.add_row("/bash <cmd>", "Run <cmd> via term0's real bash, bypassing whitelist; /bash list|add|remove manages it")
     table.add_row("/station [name]", "Station agent in a persistent shell (current terminal, or named)")
     table.add_row("/terminate <name>", "Close and destroy a terminal")
     table.add_row("/send <name> <cmd>", "Send a command to a named terminal")
@@ -5855,10 +5795,13 @@ def get_loop_deps() -> LoopDeps:
             SubTerminalSession=SubTerminalSession,
             display_command_output=display_command_output,
             display_sub_terminal_preview=display_sub_terminal_preview,
+            display_file_diff=display_file_diff,
             console=console,
             Markdown=Markdown,
             pty_passthrough=pty_passthrough,
             build_subterminal_cmd=_build_subterminal_cmd,
+            request_command_approval=request_command_approval,
+            request_file_write_approval=request_file_write_approval,
         )
     return _loop_deps
 
@@ -6053,6 +5996,55 @@ def _stop_bg_input_reader():
     if _bg_reader_thread is not None:
         _bg_reader_thread.join(timeout=1.5)
         _bg_reader_thread = None
+
+
+def _blocking_approval_prompt(title: str, body: str, question: str) -> bool:
+    """Pause the background stdin reader and block on a real y/n prompt.
+
+    Used by both request_command_approval and request_file_write_approval —
+    the agent loop's main thread owns this call, and the bg reader (which
+    also reads stdin for supplementary messages during the loop) must be
+    stopped first or the two would race for the same input line.
+
+    Fails closed (returns False) when stdin isn't a real TTY — e.g. --execute
+    mode with piped input, or any other headless context with no user to ask.
+    """
+    if not sys.stdin.isatty():
+        console.print(
+            f"[yellow]Approval required but no interactive TTY available — denying.[/yellow]")
+        return False
+
+    _stop_bg_input_reader()
+    try:
+        console.print(Panel(body, title=f"[yellow]{title}[/yellow]", border_style="yellow"))
+        try:
+            answer = input(f"{question} [y/N]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            answer = "n"
+        return answer in ("y", "yes")
+    finally:
+        _start_bg_input_reader(get_user_message_queue())
+
+
+def request_command_approval(command: str, reason: str) -> bool:
+    """Block and ask the user to approve a command that matched a needs_approval
+    policy rule. Wired as LoopDeps.request_command_approval for the local REPL."""
+    return _blocking_approval_prompt(
+        "Approval required",
+        f"[bold]{command}[/bold]\n[dim]{reason}[/dim]",
+        "Run this command?",
+    )
+
+
+def request_file_write_approval(path: str, diff_preview: str, reason: str) -> bool:
+    """Block and ask the user to approve a file write/edit before it's applied.
+    Wired as LoopDeps.request_file_write_approval for the local REPL."""
+    display_file_diff(path, diff_preview)
+    return _blocking_approval_prompt(
+        "Approval required",
+        f"[bold]{path}[/bold]\n[dim]{reason}[/dim]",
+        "Apply this change?",
+    )
 
 
 def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
@@ -6544,21 +6536,52 @@ def main():
                         result = {"stdout": "", "stderr": "", "returncode": -1, "success": False}
                 agent_registry._push_events([{"type": "system", "kind": "output", "content": _cap_out[:4000]}])
             else:
-                # Local user: full PTY passthrough (interactive programs get real tty).
-                # Drain any queued terminal query responses before passthrough.
-                if not IS_WINDOWS:
-                    _fl = fcntl.fcntl(sys.stdin.fileno(), fcntl.F_GETFL)
-                    fcntl.fcntl(sys.stdin.fileno(), fcntl.F_SETFL, _fl | os.O_NONBLOCK)
-                    try:
-                        while True:
-                            if not sys.stdin.buffer.read(4096):
-                                break
-                    except (BlockingIOError, OSError):
-                        pass
-                    finally:
-                        fcntl.fcntl(sys.stdin.fileno(), fcntl.F_SETFL, _fl)
+                # Local user: ordinary commands route through term0's persistent
+                # bash (marker-poll + cwd sync) so cd/export/pushd actually persist
+                # across commands — term0's bash state IS what "current directory"
+                # means here. Commands in the interactive whitelist (vim, claude,
+                # ssh, ...) get full PTY passthrough so they keep native terminal
+                # control (raw keystrokes, resize, full-screen redraw).
+                _first = extract_first_word(user_input)
+                _term0_info = get_terminal("term0")
+                _use_term0 = (
+                    not IS_WINDOWS
+                    and _first not in get_interactive_commands()
+                    and _term0_info is not None
+                    and _term0_info.session is not None
+                    and _term0_info.session.is_alive()
+                )
 
-                result = pty_passthrough(user_input)
+                if _use_term0:
+                    result = _marker_poll_exec(_term0_info.session, user_input, strip_ansi_codes=False)
+                    _sync_cwd_from_term0(_term0_info.session)
+                    # marker-poll captures output but doesn't echo to the user's
+                    # terminal (unlike pty_passthrough, which echoes directly) —
+                    # print so the user sees command output.
+                    _stdout = result.get("stdout", "")
+                    if _stdout:
+                        try:
+                            sys.stdout.write(_stdout)
+                            if not _stdout.endswith("\n"):
+                                sys.stdout.write("\n")
+                            sys.stdout.flush()
+                        except (BrokenPipeError, OSError):
+                            pass
+                else:
+                    # Drain any queued terminal query responses before passthrough.
+                    if not IS_WINDOWS:
+                        _fl = fcntl.fcntl(sys.stdin.fileno(), fcntl.F_GETFL)
+                        fcntl.fcntl(sys.stdin.fileno(), fcntl.F_SETFL, _fl | os.O_NONBLOCK)
+                        try:
+                            while True:
+                                if not sys.stdin.buffer.read(4096):
+                                    break
+                        except (BlockingIOError, OSError):
+                            pass
+                        finally:
+                            fcntl.fcntl(sys.stdin.fileno(), fcntl.F_SETFL, _fl)
+
+                    result = pty_passthrough(user_input)
 
                 if agent_registry.agent_id:
                     output_preview = result.get("stdout", "")[:2000]

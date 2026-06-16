@@ -23,6 +23,8 @@ setup(
         "paths",
         "migrate",
         "cloud_provider",
+        "hwo_runner",
+        "hwo_ui",
     ],
     install_requires=[
         "requests>=2.28.0",

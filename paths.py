@@ -51,6 +51,7 @@ HOOKS_FILE        = LAINTAS_HOME / "hooks.json"
 PYTHON_HOOKS_FILE = LAINTAS_HOME / "hooks.py"
 MCP_FILE          = LAINTAS_HOME / "mcp.json"
 TASKS_FILE        = LAINTAS_HOME / "tasks.json"
+INTERACTIVE_COMMANDS_FILE = LAINTAS_HOME / "interactive_commands.json"
 
 # Subdirectories
 MEMORY_DIR    = LAINTAS_HOME / "memory"

@@ -110,6 +110,14 @@ _DEFAULT_CONFIG = {
     ],
     "maxCommandLength": 10000,
     "blockSudo": True,
+    # ── File-write rules (fs.write / fs.edit / fs.multi_edit) ──────────
+    # Sensitive paths are always blocked regardless of mode (except "disabled").
+    "denyFileWrite": [
+        r"\.env(?:\.\w+)?$", r"/\.ssh/", r"(?:^|/)id_rsa(?:\.pub)?$",
+        r"(?:^|/)id_ed25519(?:\.pub)?$", r"\.pem$", r"\.key$",
+        r"(?:^|/)credentials\.json$", r"/\.git/config$", r"\.netrc$",
+        r"/\.aws/credentials$",
+    ],
 }
 
 # ── Windows-specific command rules ───────────────────────────────────────
@@ -495,6 +503,72 @@ def _extract_paths(command: str) -> list:
                 paths.append(tok)
 
     return paths
+
+
+def evaluate_file_write(path: str, cwd: str | None = None,
+                        req_id: str | None = None, agent_id: str | None = None) -> PolicyDecision:
+    """Evaluate a file-write target (fs.write / fs.edit / fs.multi_edit) against policy.
+
+    Path-based counterpart to evaluate(): same three-tier model, but matches
+    against the resolved target path instead of a shell command string.
+      - denyFileWrite patterns always block (except in "disabled" mode).
+      - paths outside allowedRoots need approval in "enforce" mode, warn-and-allow
+        in "audit" mode (mirrors the command path-boundary check in evaluate()).
+      - "enforce" mode requires approval for every write, matching mainstream
+        editor-agent behavior (diff preview + confirm before applying).
+    """
+    cfg = _load_config()
+    mode = cfg.get("mode", "audit")
+
+    try:
+        abs_path = str(Path(path).resolve())
+    except OSError:
+        abs_path = path
+    label = f"write {abs_path}"
+
+    if mode != "disabled":
+        deny_patterns = list(dict.fromkeys(
+            cfg.get("denyFileWrite", []) + _DEFAULT_CONFIG["denyFileWrite"]))
+        for pattern in deny_patterns:
+            try:
+                hit = re.search(pattern, abs_path)
+            except re.error:
+                continue
+            if hit:
+                reason = f"Matched denyFileWrite rule: {pattern}"
+                _write_audit(_audit_entry(label, "deny", reason, cwd, req_id, agent_id))
+                return PolicyDecision("deny", pattern, reason)
+
+    # ── Path boundary: writes outside allowedRoots ──────────────────────
+    allowed_roots = list(cfg.get("allowedRoots", []))
+    cwd_str = str(cwd or os.getcwd())
+    if cwd_str not in allowed_roots:
+        allowed_roots.append(cwd_str)
+
+    if allowed_roots:
+        in_bounds = False
+        for root in allowed_roots:
+            try:
+                Path(abs_path).relative_to(Path(root).resolve())
+                in_bounds = True
+                break
+            except (ValueError, OSError):
+                continue
+        if not in_bounds:
+            reason = f"'{abs_path}' is outside allowedRoots"
+            _write_audit(_audit_entry(label, "needs_approval", reason, cwd, req_id, agent_id))
+            if mode == "enforce":
+                return PolicyDecision("needs_approval", "", reason)
+            # audit mode: log but allow (mirrors evaluate()'s command path check)
+
+    # ── Enforce mode: every write needs explicit approval ───────────────
+    if mode == "enforce":
+        reason = "enforce mode requires approval for all file writes"
+        _write_audit(_audit_entry(label, "needs_approval", reason, cwd, req_id, agent_id))
+        return PolicyDecision("needs_approval", "", reason)
+
+    _write_audit(_audit_entry(label, "allow", "default allow", cwd, req_id, agent_id))
+    return PolicyDecision("allow")
 
 
 def needs_approval(command: str, cwd: str = None) -> bool:

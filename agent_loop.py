@@ -1073,10 +1073,13 @@ class LoopDeps:
     SubTerminalSession: type
     display_command_output: Callable[..., None]
     display_sub_terminal_preview: Callable[..., None]
+    display_file_diff: Callable[..., None]
     console: Any  # rich.console.Console
     Markdown: type  # rich.markdown.Markdown
     pty_passthrough: Optional[Callable[..., dict]] = None
     build_subterminal_cmd: Optional[Callable[..., str]] = None
+    request_command_approval: Optional[Callable[[str, str], bool]] = None
+    request_file_write_approval: Optional[Callable[[str, str, str], bool]] = None
 
 
 # ── Structured Memory System (.laintas/memory.json) ───────────────────────
@@ -1654,6 +1657,11 @@ def _command_fingerprint(cmd: str) -> str:
         "cat /src/bar.py"        → "cat bar.py"   ← different, no false alarm
         "grep -n 'error' log.py" → "grep <N> <STR> log.py"
         "fs.read {'path':'/a'}"  → "fs.read <JSON>"
+        "foo.css@600"            → "foo.css@600"  ← offset kept, not collapsed
+        "foo.css@1200"           → "foo.css@1200" ← so chunked reads of the
+                                                      same file at different
+                                                      offsets don't fingerprint
+                                                      identically
     """
     if not cmd:
         return ""
@@ -1663,7 +1671,10 @@ def _command_fingerprint(cmd: str) -> str:
     c = re.sub(r'"[^"]*"', '<STR>', c)                  # double-quoted strings
     # Keep filename, strip directory prefix: /some/long/dir/file.py → file.py
     c = re.sub(r'(?:\S*/)+(\S+)', r'\1', c)
-    c = re.sub(r'\b\d+\b', '<N>', c)                    # bare numbers
+    # Bare numbers → <N>, except an fs.read offset suffix ("file@600"): that
+    # digit is exactly what distinguishes one chunk of a large file from
+    # another, so collapsing it would make every chunk fingerprint the same.
+    c = re.sub(r'(?<!@)\b\d+\b', '<N>', c)
     c = re.sub(r'\s+', ' ', c).strip()
     return c
 
@@ -1722,12 +1733,9 @@ def _detect_loop_warnings_typed(state: dict, original_input: str) -> list[tuple[
     Checks:
     1. Same exact command 3+ consecutive times
     2. 3+ consecutive failures
-    3. 7+ read-only steps without edit/build/run
-    4. Exploration drift: 5+ steps with no file writes AND no tool variety
-    5. Tool stagnation: same tool 5+ consecutive times with similar args
-    6. Context amnesia: re-reading files already in _files_seen
-    7. Goal drift: shortTermMemory mentions actions unrelated to original task
-    8. Near-repeat commands: fuzzy fingerprint matching (4+ same pattern)
+    3. Tool stagnation: same tool 5+ consecutive times with similar args
+    4. Context amnesia: re-reading files already in _files_seen
+    5. Near-repeat commands: fuzzy fingerprint matching (4+ same pattern)
     """
     history = state.get("terminalHistory", [])
     warnings: list[tuple[str, str]] = []
@@ -1758,50 +1766,7 @@ def _detect_loop_warnings_typed(state: dict, original_input: str) -> list[tuple[
             f"do not repeat with the same parameters."
         ))
 
-    # 3. Many read-only steps with no edit action — pure exploration drift
-    READ_ONLY = {"ls", "cat", "head", "tail", "grep", "find", "pwd", "which",
-                 "type", "file", "stat", "wc", "tree", "echo"}
-    WRITE_TOOLS = {"fs.write", "fs.edit", "fs.multi_edit", "shell.exec"}
-    if len(history) >= 8:
-        last8 = history[-8:]
-        readonly_count = 0
-        for h in last8:
-            cmd = (h.get("command") or "").strip()
-            if not cmd:
-                continue
-            first_token = cmd.split()[0] if cmd.split() else ""
-            if first_token in READ_ONLY or cmd.startswith(("/tool fs.read",
-                                                          "/tool fs.grep",
-                                                          "/tool fs.glob",
-                                                          "/tool fs.ls")):
-                readonly_count += 1
-        if readonly_count >= 7:
-            warnings.append(("readonly_drift",
-                "You have done 7+ read-only steps without any edit/build/run "
-                "action. Either start acting on what you've learned, or set "
-                "done=true and report findings."
-            ))
-
-    # 4. Exploration drift: 5+ steps with no file writes AND low tool variety
-    if len(history) >= 5:
-        last5 = history[-5:]
-        has_write = False
-        tool_names = set()
-        for h in last5:
-            tool = h.get("tool", "")
-            cmd = (h.get("command") or "").strip()
-            if tool in WRITE_TOOLS or any(cmd.startswith(f"/tool {w}") for w in WRITE_TOOLS):
-                has_write = True
-            if tool:
-                tool_names.add(tool)
-        if not has_write and len(tool_names) <= 2 and len(history) >= 5:
-            warnings.append(("exploration_drift",
-                f"Exploration drift: {len(history)} steps with no writes and only "
-                f"{len(tool_names)} tool type(s). Broaden your approach or start "
-                f"making changes based on what you've learned."
-            ))
-
-    # 5. Tool stagnation: same tool 5+ consecutive times with similar args
+    # 3. Tool stagnation: same tool 5+ consecutive times with similar args
     if len(history) >= 5:
         last5_tools = [(h.get("tool", ""), (h.get("command") or "")[:60]) for h in history[-5:]]
         if (all(t[0] == last5_tools[0][0] for t in last5_tools)
@@ -1812,38 +1777,27 @@ def _detect_loop_warnings_typed(state: dict, original_input: str) -> list[tuple[
                 f"with very similar arguments. Try a different tool or approach."
             ))
 
-    # 6. Context amnesia: re-reading files already in _files_seen
-    files_seen = state.get("_files_seen", [])
-    if files_seen and len(history) >= 2:
+    # 4. Context amnesia: re-reading files already in _files_seen
+    # Exact-string match (not "file already in _files_seen") so that chunked
+    # fs.read calls on the same file at a *different* offset — recorded as
+    # "path@offset" by _salient_arg — are correctly treated as new content,
+    # not a repeat; only an identical "path" or "path@same_offset" recurring
+    # later counts as truly re-reading something already seen.
+    if len(history) >= 2:
         last_entry = history[-1]
+        last_tool = last_entry.get("tool", "")
         cmd = (last_entry.get("command") or "").strip()
-        for fp in files_seen[-20:]:
-            if fp and fp in cmd and any(cmd.startswith(p) for p in
-                    ("fs.read", "/tool fs.read", "cat ", "head ", "tail ")):
+        if cmd and (last_tool == "fs.read" or
+                    any(cmd.startswith(p) for p in ("cat ", "head ", "tail "))):
+            prior = [(h.get("command") or "").strip() for h in history[:-1][-20:]]
+            if cmd in prior:
                 warnings.append(("context_amnesia",
-                    f"Context amnesia: you're re-reading `{fp}` which you already "
+                    f"Context amnesia: you're re-reading `{cmd}` which you already "
                     f"examined earlier. Refer to your previous output instead of "
                     f"re-reading."
                 ))
-                break
 
-    # 7. Goal drift: shortTermMemory mentions actions unrelated to task
-    if original_input and len(history) >= 10:
-        task_keywords = set(re.findall(r'\w+', original_input.lower()))
-        task_keywords -= {"the", "a", "an", "is", "to", "and", "or", "in", "of",
-                          "for", "with", "on", "at", "by", "it", "this", "that"}
-        if len(task_keywords) >= 3:
-            recent_memory = state.get("shortTermMemory", "")[-500:]
-            memory_words = set(re.findall(r'\w+', recent_memory.lower()))
-            overlap = task_keywords & memory_words
-            if len(overlap) < max(2, len(task_keywords) * 0.2):
-                warnings.append(("goal_drift",
-                    f"Possible goal drift: recent actions seem unrelated to the "
-                    f"original task '{original_input[:60]}'. "
-                    f"Refocus on the original objective."
-                ))
-
-    # 8. Near-repeat commands: fuzzy fingerprint matching
+    # 5. Near-repeat commands: fuzzy fingerprint matching
     # Mirrors community "grounded" tool hash window: if the last 4 commands
     # all have the same semantic fingerprint, the agent is varying arguments
     # but not changing strategy.
@@ -1869,42 +1823,41 @@ def _detect_loop_warnings(state: dict, original_input: str) -> list[str]:
     return [msg for _key, msg in _detect_loop_warnings_typed(state, original_input)]
 
 
-def _track_files_in_command(cmd: str, seen: list) -> None:
+_FS_PATH_TOOLS = {"fs.read", "fs.write", "fs.edit", "fs.multi_edit", "fs.diff"}
+
+
+def _track_files_in_command(name: str, cmd: str, seen: list) -> None:
     """Extract file paths the command appears to read/write and append to `seen`.
 
     Dedupes (keeps insertion order) and caps at 30 entries. Recognises:
-      - /tool fs.read|edit|write|multi_edit {"path": "..."}
-      - cat / head / tail / less / vim / nano / cp / mv <path>
-      - fs.grep / fs.glob have variable file targets — skipped (too noisy)
+      - fs.read/fs.write/fs.edit/fs.multi_edit/fs.diff: `cmd` is _salient_arg's
+        bare-path form ("path", or "path@offset" for chunked fs.read) —
+        dispatched on `name` rather than guessing from the string, since a
+        bare path can't be told apart from an fs.glob pattern or fs.ls
+        directory by shape alone.
+      - cat / head / tail / less / vim / nano / cp / mv <path> (shell.exec)
+      - fs.grep / fs.glob / fs.ls have variable/non-file targets — skipped
+        (too noisy, or not a file)
     """
     if not cmd:
         return
 
     found: list[str] = []
 
-    # /tool fs.<verb> {"path": "..."}
-    m = re.search(r'/tool\s+fs\.(?:read|edit|write|multi_edit)\s+(\{.*\})', cmd)
-    if m:
-        try:
-            payload = json.loads(m.group(1))
-            p = payload.get("path")
-            if isinstance(p, str) and p:
-                found.append(p)
-        except (json.JSONDecodeError, AttributeError):
-            pass
-
-    # Bare shell file commands
-    parts = cmd.split()
-    if parts:
-        first = parts[0].rsplit("/", 1)[-1]
-        if first in ("cat", "head", "tail", "less", "vim", "nano", "view",
-                     "cp", "mv", "touch", "stat", "file", "wc"):
-            for tok in parts[1:]:
-                if tok.startswith("-"):
-                    continue
-                if "/" in tok or "." in tok or tok.isidentifier():
-                    found.append(tok)
-                    break  # only the first path arg
+    if name in _FS_PATH_TOOLS:
+        found.append(cmd.split("@", 1)[0])
+    elif name == "shell.exec":
+        parts = cmd.split()
+        if parts:
+            first = parts[0].rsplit("/", 1)[-1]
+            if first in ("cat", "head", "tail", "less", "vim", "nano", "view",
+                         "cp", "mv", "touch", "stat", "file", "wc"):
+                for tok in parts[1:]:
+                    if tok.startswith("-"):
+                        continue
+                    if "/" in tok or "." in tok or tok.isidentifier():
+                        found.append(tok)
+                        break  # only the first path arg
 
     for p in found:
         if p in seen:
@@ -2212,6 +2165,13 @@ def _check_policy(command: str, agent_id: str = None,
 
     Returns (allowed: bool, reason: str, needs_approval: bool).
     Side-effect: logs audit entry, prints warning/error via deps.console.
+
+    decision.action == "needs_approval" only ever happens in policy "enforce"
+    mode (see policy.evaluate) — in "audit" mode it's advisory and never
+    reaches here. When it does, this blocks on deps.request_command_approval
+    if one is wired (interactive REPL, or remote delegate via _request_approval);
+    with no approval channel available, it fails closed rather than silently
+    auto-allowing a command the user explicitly asked to gate.
     """
     decision = policy_mod.evaluate(command, os.getcwd(),
                                    req_id=req_id, agent_id=agent_id)
@@ -2224,7 +2184,16 @@ def _check_policy(command: str, agent_id: str = None,
         msg = f"[bold yellow]APPROVAL REQUIRED:[/bold yellow] {decision.reason}"
         if events_cb is not None and deps is not None:
             deps.console.print(msg)
-        return True, decision.reason, True
+        approve_fn = getattr(deps, "request_command_approval", None) if deps is not None else None
+        if callable(approve_fn):
+            try:
+                approved = approve_fn(command, decision.reason)
+            except Exception:
+                approved = False
+            if not approved:
+                return False, f"User denied: {decision.reason}", True
+            return True, decision.reason, True
+        return False, f"{decision.reason} (approval required but no approval channel available)", True
     return True, "", False
 
 
@@ -2255,7 +2224,20 @@ def _salient_arg(name: str, arguments: dict) -> str:
         return arguments.get("command", "") or ""
     if name == "terminal.send":
         return f'{arguments.get("name", "?")}: {arguments.get("command", "")}'
-    if name in ("fs.read", "fs.write", "fs.edit", "fs.multi_edit", "fs.diff"):
+    if name == "fs.read":
+        # Include offset when set: fs.read is the standard way to page
+        # through large files in chunks (offset/limit), and dropping the
+        # offset here made every chunk of the same file look like an
+        # identical, literally-repeated command to the repetition/near-repeat
+        # detectors below -- which then told the AI the task was "done" or
+        # that it was "spinning in circles" while it was legitimately still
+        # reading through one large file.
+        path = arguments.get("path", "") or ""
+        offset = arguments.get("offset")
+        if offset and offset != 1:
+            return f"{path}@{offset}"
+        return path
+    if name in ("fs.write", "fs.edit", "fs.multi_edit", "fs.diff"):
         return arguments.get("path", "") or ""
     if name == "fs.grep":
         return f'{arguments.get("pattern", "")} in {arguments.get("path", "")}'
@@ -2281,6 +2263,21 @@ def _salient_arg(name: str, arguments: dict) -> str:
         return f'{name} {json.dumps(arguments, ensure_ascii=False)[:60]}'
     except (TypeError, ValueError):
         return name
+
+
+def _policy_command_arg(name: str, arguments: dict) -> str:
+    """Raw command text for policy evaluation — unprefixed, unlike _salient_arg's display label.
+
+    Policy rules are regexes anchored with ^, so a display label like
+    "termname: rm -rf /" (terminal.send's salient form) would silently defeat
+    every anchored deny/needs_approval rule. Policy must always see the bare
+    command exactly as it will run.
+    """
+    if not isinstance(arguments, dict):
+        return ""
+    if name in ("shell.exec", "terminal.exec", "terminal.send"):
+        return arguments.get("command", "") or ""
+    return ""
 
 
 def _format_tool_result_for_loop(tool_name: str, result: dict, max_chars: int) -> str:
@@ -2526,6 +2523,7 @@ def run_agent_loop(
         deps.console = _QuietConsole()
         deps.display_command_output = lambda *a, **kw: None
         deps.display_sub_terminal_preview = lambda *a, **kw: None
+        deps.display_file_diff = lambda *a, **kw: None
 
     max_loops = int(get_runtime_config("max_loops"))
     # Workflow phase may override max_loops (e.g. implementation phase gets more)
@@ -2607,8 +2605,11 @@ def run_agent_loop(
         else:
             global_memory_str = "(empty)"
 
-        # 3. Read .laintas/cli.prop system prompt
-        prompt_template = deps.read_file(str(paths.project_file(paths.CWD_CLI_PROP))) or ""
+        # 3. Read .laintas/cli.prop system prompt — an HWO (prompt.md) prefix override
+        # (stashed in this agent's own state by hwo_runner._run_agent/_run_task) wins.
+        prompt_template = (state.get('_prompt_override') or "").strip()
+        if not prompt_template:
+            prompt_template = deps.read_file(str(paths.project_file(paths.CWD_CLI_PROP))) or ""
         if not prompt_template:
             prompt_template = deps.generate_prompt()
 
@@ -3059,7 +3060,7 @@ def run_agent_loop(
 
                 call_id = f"call_{loop+1:02d}_{idx+1:02d}"
                 salient = _salient_arg(name, arguments)
-                is_shell_flavored = name in ("shell.exec", "terminal.send")
+                is_shell_flavored = name in ("shell.exec", "terminal.send", "terminal.exec")
 
                 # ── Role / Workflow tool filtering ──
                 _role_name = state.get("_role_name")
@@ -3098,8 +3099,9 @@ def run_agent_loop(
                     # ── Shell-flavored: policy + pre_command + .laintas/loop.py ──
                     skip_invoke = False
                     if is_shell_flavored:
+                        policy_cmd = _policy_command_arg(name, arguments) or salient
                         policy_ok, policy_reason, policy_approval = _check_policy(
-                            salient, agent_id=agent_id, events_cb=events_cb, deps=deps)
+                            policy_cmd, agent_id=agent_id, events_cb=events_cb, deps=deps)
                         if not policy_ok:
                             result = {"ok": False, "error": f"BLOCKED: {policy_reason}",
                                       "tool": name, "returncode": -1, "policy": "deny"}
@@ -3227,7 +3229,7 @@ def run_agent_loop(
                 })
 
                 # Track files this call read/touched
-                _track_files_in_command(salient, state.setdefault("_files_seen", []))
+                _track_files_in_command(name, salient, state.setdefault("_files_seen", []))
 
                 # Echo into chat_history as a knowledge entry (interactive mode only;
                 # gives the model a structured record of past tool calls without
@@ -3283,6 +3285,13 @@ def run_agent_loop(
                                 deps.display_command_output(salient, _rc, formatted, depth=depth + 1)
                             except Exception:
                                 pass
+                    elif name in ("fs.write", "fs.edit", "fs.multi_edit") and result.get("diff"):
+                        try:
+                            deps.display_file_diff(result.get("path") or salient or name,
+                                                   result.get("diff", ""),
+                                                   depth=depth + 1)
+                        except Exception:
+                            pass
 
         # Concat all per-call outputs into lastOutput so the next prompt's fallback
         # rendering and shortTermMemory see every result, not just the last.

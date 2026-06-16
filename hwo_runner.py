@@ -11,6 +11,7 @@ Mirrors hwo.ts from the Helpwo project:
 
 from __future__ import annotations
 
+import queue
 import threading
 import time
 import uuid
@@ -32,6 +33,7 @@ class HwoAgent:
     kind: str = "agent"
     name: str = ""
     body: list = field(default_factory=list)   # list[HwoStep]
+    prompt_file: Optional[str] = None           # optional (file.md) prefix override
 
 
 @dataclass
@@ -84,6 +86,9 @@ class HwoParser:
             if self._at_parallel_marker():
                 steps.append(self._parse_parallel())
                 continue
+            if self._peek() == '(' and self._looks_like_prompt_prefix():
+                steps.append(self._parse_agent())
+                continue
             if self._peek() == '#':
                 steps.append(self._parse_agent())
                 continue
@@ -104,6 +109,20 @@ class HwoParser:
 
     def _parse_agent(self) -> HwoAgent:
         start = self.i
+
+        # Optional (prompt.md) prefix — sets a custom system prompt for this agent
+        prompt_file = None
+        if self._peek() == '(':
+            self._expect('(')
+            file_start = self.i
+            while not self._eof() and self._peek() != ')':
+                self.i += 1
+            if self._eof():
+                raise HwoParseError('Unclosed prompt prefix, expected )', start)
+            prompt_file = self.source[file_start:self.i].strip() or None
+            self._expect(')')
+            self._skip_ws()
+
         self._expect('#')
         name_start = self.i
         while not self._eof() and self._peek() != '#':
@@ -126,7 +145,7 @@ class HwoParser:
                 f'Unclosed body for agent "{name}", expected }}', self.i
             )
         self._expect('}')
-        return HwoAgent(name=name, body=body)
+        return HwoAgent(name=name, body=body, prompt_file=prompt_file)
 
     def _read_text(self, stop=None) -> str:
         start = self.i
@@ -140,6 +159,8 @@ class HwoParser:
             if stop == 'brace' and self._peek() == '}':
                 break
             if self._peek() == '#' and self._looks_like_agent():
+                break
+            if self._peek() == '(' and self._looks_like_prompt_prefix():
                 break
             self.i += 1
         return self.source[start:self.i]
@@ -155,6 +176,11 @@ class HwoParser:
         import re
         rest = self.source[self.i:]
         return bool(re.match(r'^#[^#{}\n\r]+#\s*\{', rest))
+
+    def _looks_like_prompt_prefix(self) -> bool:
+        import re
+        rest = self.source[self.i:]
+        return bool(re.match(r'^\([^)]+\)\s*#[^#{}\n\r]+#\s*\{', rest))
 
     def _at_parallel_marker(self) -> bool:
         if not self._starts('//'):
@@ -263,6 +289,160 @@ def _append_context(acc: str, label: str, output: str) -> str:
     return ('…' + joined[-MAX_STEP_CONTEXT:]) if len(joined) > MAX_STEP_CONTEXT else joined
 
 
+# ── Workflow manifest (mirrors buildWorkflowManifest/generateTeamManifest) ──
+#
+# Pre-scans the parsed AST once per `hwo run` so every spawned agent can be
+# told its own identity and how to reach its teammates. Without this, agents
+# are registered into the global registry with no idea any siblings exist.
+
+def _collect_agent_names(items: list) -> list:
+    names = []
+    for item in items:
+        if item.kind == 'agent':
+            names.append(item.name)
+        elif item.kind == 'parallel':
+            for child in item.body:
+                if child.kind == 'agent':
+                    names.append(child.name)
+    return names
+
+
+def build_workflow_manifest(steps: list) -> dict:
+    """Map every agent name to {name, prompt_file, parent_name, child_names, sibling_names}."""
+    manifest: dict = {}
+
+    def walk(items, parent_name, siblings):
+        agents_in_scope = _collect_agent_names(items)
+        for item in items:
+            if item.kind == 'agent':
+                sibling_names = [n for n in agents_in_scope if n != item.name]
+                manifest[item.name] = {
+                    "name": item.name,
+                    "prompt_file": item.prompt_file,
+                    "parent_name": parent_name,
+                    "child_names": _collect_agent_names(item.body),
+                    "sibling_names": sibling_names,
+                }
+                walk(item.body, item.name, sibling_names)
+            elif item.kind == 'parallel':
+                # Parallel members are siblings of each other, sharing the same parent
+                parallel_names = _collect_agent_names(item.body)
+                for child in item.body:
+                    if child.kind == 'agent':
+                        sib = [n for n in parallel_names if n != child.name]
+                        manifest[child.name] = {
+                            "name": child.name,
+                            "prompt_file": child.prompt_file,
+                            "parent_name": parent_name,
+                            "child_names": _collect_agent_names(child.body),
+                            "sibling_names": sib,
+                        }
+                        walk(child.body, child.name, sib)
+
+    walk(steps, None, [])
+    return manifest
+
+
+def generate_team_manifest(agent_name: str, manifest: dict) -> str:
+    """Per-agent note: who am I, who's my parent/siblings/children, how to message them."""
+    node = manifest.get(agent_name)
+    if not node:
+        return ""
+
+    def _tag(name: str) -> str:
+        n = manifest.get(name)
+        return f"#{name}# ({n['prompt_file']})" if n and n.get('prompt_file') else f"#{name}#"
+
+    lines = ["[TEAM MANIFEST — members of this workflow]"]
+    self_prompt = f" (prompt: {node['prompt_file']})" if node.get('prompt_file') else ""
+    lines.append(f"You are #{agent_name}#{self_prompt}")
+
+    if node.get('parent_name'):
+        lines.append(f"Parent: {_tag(node['parent_name'])}")
+    else:
+        lines.append("You are the top-level agent in this workflow (no parent).")
+
+    if node.get('sibling_names'):
+        lines.append(f"Siblings: {', '.join(_tag(n) for n in node['sibling_names'])}")
+
+    if node.get('child_names'):
+        lines.append(f"Children: {', '.join(_tag(n) for n in node['child_names'])}")
+
+    lines.append("")
+    lines.append("Communication tools:")
+    lines.append("  - agent_send(to, message)        -> send a message to a sibling or parent")
+    lines.append("  - agent_receive(from, timeout?)  -> wait for a message from a specific member (default timeout 60s)")
+    lines.append("  - agent_return(value)            -> report the final result to the parent and end this task")
+
+    return "\n".join(lines)
+
+
+def _load_prompt_file(path: str) -> str:
+    """Resolve a (prompt.md) prefix: relative to cwd, else treat as given."""
+    try:
+        p = Path(path)
+        if not p.is_absolute():
+            p = Path.cwd() / path
+        return p.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
+# ── HWO peer-to-peer mailbox ─────────────────────────────────────────────
+#
+# Deliberately NOT the general AgentInfo.inbox queue: that inbox is drained
+# every iteration by run_agent_loop's own bookkeeping (to build {{inbox}} /
+# {{parallelResults}}), so an agent-to-agent message sitting there could be
+# silently consumed as generic inbox text before agent_receive ever sees it.
+# A dedicated, name-keyed mailbox (mirrors hwo.ts's WorkflowMailbox) avoids
+# that race entirely.
+
+_hwo_mailboxes: dict = {}
+_hwo_mailbox_lock = threading.Lock()
+
+
+def _get_hwo_mailbox(name: str) -> "queue.Queue":
+    with _hwo_mailbox_lock:
+        q = _hwo_mailboxes.get(name)
+        if q is None:
+            q = queue.Queue(maxsize=200)
+            _hwo_mailboxes[name] = q
+        return q
+
+
+def hwo_send(to: str, from_: str, text: str) -> bool:
+    try:
+        _get_hwo_mailbox(to).put_nowait({"from": from_, "text": text, "ts": time.time()})
+        return True
+    except queue.Full:
+        return False
+
+
+def hwo_receive(name: str, from_: Optional[str], timeout: float) -> Optional[dict]:
+    """Block up to `timeout` seconds for a message from `from_` (or anyone if None)."""
+    mailbox = _get_hwo_mailbox(name)
+    deadline = time.time() + max(0.0, timeout)
+    pending = []
+    try:
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return None
+            try:
+                msg = mailbox.get(timeout=min(remaining, 2.0))
+            except queue.Empty:
+                continue
+            if from_ is None or msg.get("from") == from_:
+                return msg
+            pending.append(msg)
+    finally:
+        for m in pending:
+            try:
+                mailbox.put_nowait(m)
+            except queue.Full:
+                pass
+
+
 # ── Execution context ─────────────────────────────────────────────────────
 
 @dataclass
@@ -273,6 +453,8 @@ class HwoCtx:
     name_path: list = field(default_factory=list)   # ancestor name path for naming
     inherited_context: str = ""        # parent's accumulated step context
     abort_event: Optional[object] = None
+    workflow_manifest: Optional[dict] = None   # name -> {parent_name, sibling_names, child_names, prompt_file}
+    prompt_override: Optional[str] = None      # resolved (prompt.md) content, inherited down the tree
 
 
 # ── Execution ─────────────────────────────────────────────────────────────
@@ -326,6 +508,8 @@ def _run_task(text: str, ctx: HwoCtx, inherited: str = "") -> dict:
     child = register_agent(
         name=None, depth=depth, parent_id=parent_id, role="subagent"
     )
+    if ctx.prompt_override:
+        child.state['_prompt_override'] = ctx.prompt_override
 
     spawn_ctx = (
         "[HWO] Execute this workflow step exactly. Do not reinterpret the workflow; "
@@ -334,8 +518,12 @@ def _run_task(text: str, ctx: HwoCtx, inherited: str = "") -> dict:
     if inherited:
         spawn_ctx += (
             f"\n\n[WORKFLOW CONTEXT — earlier step results]\n{inherited}\n"
-            "[END CONTEXT] Your goal is ONLY the step text."
+            "[END CONTEXT] Your goal is ONLY the step text below."
         )
+    # NOTE: spawn_ctx used to be built and then discarded — run_agent_loop was
+    # called with bare `text`, so the [HWO] note and inherited context never
+    # reached the model. Fixed: fold it into the actual input.
+    full_input = f"{spawn_ctx}\n\n[STEP TEXT]\n{text}"
 
     done_event = threading.Event()
     result_holder = {}
@@ -347,10 +535,13 @@ def _run_task(text: str, ctx: HwoCtx, inherited: str = "") -> dict:
             return
         try:
             r = run_agent_loop(
-                ctx.deps, text, ctx.session, child.state, child.chat_history,
+                ctx.deps, full_input, ctx.session, child.state, child.chat_history,
                 depth=child.depth, agent_id=child.id,
             )
             reply = (r.get("state") or {}).get("lastReply", "") if isinstance(r, dict) else ""
+            hwo_return = child.state.pop('_hwo_return', None)
+            if hwo_return is not None:
+                reply = hwo_return
             mark_agent_finished(child.id, result=reply)
             result_holder.update({"ok": True, "msg": reply or "(done)"})
         except Exception as e:
@@ -379,7 +570,20 @@ def _run_task(text: str, ctx: HwoCtx, inherited: str = "") -> dict:
 
 
 def _run_agent(agent_step: HwoAgent, ctx: HwoCtx, inherited: str = "") -> dict:
-    """Spawn a child agent, run its body as a sub-sequence, wait for it."""
+    """Spawn a child agent, run its body, wait for it.
+
+    Identity matters here: `register_agent(name=agent_step.name, ...)` makes
+    this agent's registry id EQUAL to its declared name (e.g. "alice"), which
+    is what makes it addressable by agent_send/agent_receive. If the body
+    were handed off to the generic run_sequence -> _run_task path, each plain
+    task line would spawn its OWN anonymous grandchild ("AI-7") to actually
+    run the LLM loop — and THAT anonymous id, not "alice", would be the one
+    calling tools, breaking name-based addressing. So when the body is flat
+    (task lines only, no nested agents/parallel — the common case), we run
+    those steps directly under this agent's own identity instead of
+    recursing. Bodies that DO contain nested structure still recurse via
+    run_sequence, where each nested #agent# gets its own proper identity.
+    """
     import agent_loop as _al
     from agent_loop import (
         register_agent, mark_agent_finished, enter_waiting, exit_waiting,
@@ -398,8 +602,23 @@ def _run_agent(agent_step: HwoAgent, ctx: HwoCtx, inherited: str = "") -> dict:
         name=agent_step.name, depth=depth, parent_id=parent_id, role="subagent"
     )
 
+    # Resolve this agent's system prompt override: its own (file) prefix wins,
+    # else it inherits whatever override (if any) its parent was running under.
+    prompt_override = ctx.prompt_override
+    if agent_step.prompt_file:
+        loaded = _load_prompt_file(agent_step.prompt_file)
+        if loaded.strip():
+            prompt_override = loaded
+    if prompt_override:
+        child.state['_prompt_override'] = prompt_override
+
+    team_manifest = generate_team_manifest(agent_step.name, ctx.workflow_manifest) if ctx.workflow_manifest else ""
+    body_context = f"{team_manifest}\n\n{inherited}" if (team_manifest and inherited) else (team_manifest or inherited)
+
     done_event = threading.Event()
     result_holder = {}
+
+    only_tasks = bool(agent_step.body) and all(s.kind == 'task' for s in agent_step.body)
 
     def _runner(ok: bool):
         if not ok:
@@ -407,21 +626,54 @@ def _run_agent(agent_step: HwoAgent, ctx: HwoCtx, inherited: str = "") -> dict:
             done_event.set()
             return
         try:
-            sub_ctx = HwoCtx(
-                deps=ctx.deps,
-                session=ctx.session,
-                parent_id=child.id,
-                name_path=[*ctx.name_path, agent_step.name],
-                inherited_context=inherited,
-                abort_event=ctx.abort_event,
-            )
-            result = run_sequence(agent_step.body, sub_ctx)
-            msg = result.get("msg", "")
-            if result.get("ok"):
+            if only_tasks:
+                context = body_context
+                reply = ""
+                for step in agent_step.body:
+                    spawn_ctx = (
+                        "[HWO] Execute this workflow step exactly. Do not reinterpret the "
+                        "workflow; the HWO runner controls ordering and parallelism."
+                    )
+                    if context:
+                        spawn_ctx += (
+                            f"\n\n[WORKFLOW CONTEXT — earlier step results]\n{context}\n"
+                            "[END CONTEXT] Your goal is ONLY the step text below."
+                        )
+                    full_input = f"{spawn_ctx}\n\n[STEP TEXT]\n{step.text}"
+                    r = run_agent_loop(
+                        ctx.deps, full_input, ctx.session, child.state, child.chat_history,
+                        depth=child.depth, agent_id=child.id,
+                    )
+                    reply = (r.get("state") or {}).get("lastReply", "") if isinstance(r, dict) else ""
+                    hwo_return = child.state.pop('_hwo_return', None)
+                    if hwo_return is not None:
+                        reply = hwo_return
+                        break
+                    context = _append_context(context, step.text.replace('\n', ' ')[:80], reply or "")
+                msg = reply or "(done)"
                 mark_agent_finished(child.id, result=msg)
+                result_holder.update({"ok": True, "msg": msg})
             else:
-                mark_agent_finished(child.id, error=msg)
-            result_holder.update(result)
+                sub_ctx = HwoCtx(
+                    deps=ctx.deps,
+                    session=ctx.session,
+                    parent_id=child.id,
+                    name_path=[*ctx.name_path, agent_step.name],
+                    inherited_context=body_context,
+                    abort_event=ctx.abort_event,
+                    workflow_manifest=ctx.workflow_manifest,
+                    prompt_override=prompt_override,
+                )
+                result = run_sequence(agent_step.body, sub_ctx)
+                msg = result.get("msg", "")
+                hwo_return = child.state.pop('_hwo_return', None)
+                if hwo_return is not None:
+                    msg = hwo_return
+                if result.get("ok"):
+                    mark_agent_finished(child.id, result=msg)
+                else:
+                    mark_agent_finished(child.id, error=msg)
+                result_holder.update({**result, "msg": msg})
         except Exception as e:
             mark_agent_finished(child.id, error=repr(e))
             result_holder.update({"ok": False, "msg": repr(e)})
@@ -517,6 +769,7 @@ def run_hwo_file(
         return {"ok": False, "msg": "hwo: validation errors:\n" + "\n".join(errors)}
 
     summary = "\n".join(summarize_steps(steps))
+    manifest = build_workflow_manifest(steps)
 
     ctx = HwoCtx(
         deps=deps,
@@ -524,6 +777,7 @@ def run_hwo_file(
         parent_id=parent_id,
         inherited_context=caller_context,
         abort_event=abort_event,
+        workflow_manifest=manifest,
     )
     result = run_sequence(steps, ctx)
     status = "completed" if result.get("ok") else "failed"

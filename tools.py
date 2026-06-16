@@ -20,9 +20,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 import traceback
+import difflib
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -243,6 +245,18 @@ def get_registry() -> ToolRegistry:
     return _registry
 
 
+def _make_unified_diff(old_text: str, new_text: str, label_a: str, label_b: str,
+                       context: int = 3) -> str:
+    diff = difflib.unified_diff(
+        old_text.splitlines(keepends=True),
+        new_text.splitlines(keepends=True),
+        fromfile=label_a,
+        tofile=label_b,
+        n=context,
+    )
+    return "".join(diff)
+
+
 # ── Built-in tools ─────────────────────────────────────────────────────
 # Kept intentionally minimal — duplicating existing meta-commands (/spawn,
 # /term, /keys) here would be confusing. Built-ins fill gaps the meta-command
@@ -373,6 +387,35 @@ def _bi_fs_read(params: dict, ctx: ToolCtx) -> dict:
     }
 
 
+def _check_file_write_policy(abs_path: str, ctx: ToolCtx, diff_preview: str) -> Optional[dict]:
+    """Run a write target through policy.evaluate_file_write() before any bytes hit disk.
+
+    Returns an {"ok": False, ...} dict to block the write, or None to proceed.
+    "needs_approval" blocks only if a request_file_write_approval callback is
+    wired on ctx.deps (interactive REPL, or remote delegate via _request_approval);
+    without one (headless/automated contexts with no human to ask), it proceeds —
+    the decision is still audited, it just can't be confirmed live.
+    """
+    if _policy_mod is None:
+        return None
+    try:
+        decision = _policy_mod.evaluate_file_write(abs_path, ctx.cwd, agent_id=ctx.agent_id)
+    except Exception:
+        return None
+    if decision.action == "deny":
+        return {"ok": False, "error": f"Blocked by policy: {decision.reason}", "path": abs_path}
+    if decision.action == "needs_approval":
+        approve_fn = getattr(ctx.deps, "request_file_write_approval", None) if ctx.deps is not None else None
+        if callable(approve_fn):
+            try:
+                approved = approve_fn(abs_path, diff_preview, decision.reason)
+            except Exception:
+                approved = False
+            if not approved:
+                return {"ok": False, "error": f"User denied write: {decision.reason}", "path": abs_path}
+    return None
+
+
 def _bi_fs_write(params: dict, ctx: ToolCtx) -> dict:
     path = params.get("path")
     content = params.get("content", "")
@@ -380,12 +423,42 @@ def _bi_fs_write(params: dict, ctx: ToolCtx) -> dict:
         return {"ok": False, "error": "missing 'path'"}
     abs_path = os.path.abspath(os.path.join(ctx.cwd or os.getcwd(), path)) \
         if not os.path.isabs(path) else path
+    old_content = ""
+    existed = False
+    try:
+        with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
+            old_content = f.read()
+        existed = True
+    except FileNotFoundError:
+        old_content = ""
+    except OSError as e:
+        return {"ok": False, "error": str(e)}
+
+    diff = _make_unified_diff(
+        old_content,
+        content,
+        abs_path if existed else f"{abs_path} (new)",
+        abs_path,
+    )
+
+    blocked = _check_file_write_policy(abs_path, ctx, diff or "(no differences)")
+    if blocked is not None:
+        return blocked
+
     try:
         with open(abs_path, "w", encoding="utf-8") as f:
             f.write(content)
-        return {"ok": True, "result": f"wrote {len(content)} bytes", "path": abs_path}
     except OSError as e:
         return {"ok": False, "error": str(e)}
+
+    action = "updated" if existed else "created"
+    return {
+        "ok": True,
+        "result": f"{action} {abs_path} ({len(content)} bytes)",
+        "path": abs_path,
+        "changed": old_content != content,
+        "diff": diff or "(no differences)",
+    }
 
 
 def _bi_fs_ls(params: dict, ctx: ToolCtx) -> dict:
@@ -541,6 +614,12 @@ def _bi_fs_edit(params: dict, ctx: ToolCtx) -> dict:
 
     new_content = content.replace(old, new) if replace_all else content.replace(old, new, 1)
 
+    diff = _make_unified_diff(content, new_content, abs_path, abs_path)
+
+    blocked = _check_file_write_policy(abs_path, ctx, diff or "(no differences)")
+    if blocked is not None:
+        return blocked
+
     try:
         with open(abs_path, "w", encoding="utf-8") as f:
             f.write(new_content)
@@ -552,6 +631,8 @@ def _bi_fs_edit(params: dict, ctx: ToolCtx) -> dict:
         "result": f"Replaced {count} occurrence(s) in {abs_path}",
         "path": abs_path,
         "replacements": count,
+        "changed": content != new_content,
+        "diff": diff or "(no differences)",
     }
 
 
@@ -602,6 +683,12 @@ def _bi_fs_multi_edit(params: dict, ctx: ToolCtx) -> dict:
         working = working.replace(old, new) if replace_all else working.replace(old, new, 1)
         applied.append({"index": i + 1, "replacements": count if replace_all else 1})
 
+    diff = _make_unified_diff(content, working, abs_path, abs_path)
+
+    blocked = _check_file_write_policy(abs_path, ctx, diff or "(no differences)")
+    if blocked is not None:
+        return blocked
+
     try:
         with open(abs_path, "w", encoding="utf-8") as f:
             f.write(working)
@@ -609,7 +696,8 @@ def _bi_fs_multi_edit(params: dict, ctx: ToolCtx) -> dict:
         return {"ok": False, "error": str(e)}
 
     return {"ok": True, "result": f"Applied {len(applied)} edits to {abs_path}",
-            "path": abs_path, "edits_applied": applied}
+            "path": abs_path, "edits_applied": applied,
+            "changed": content != working, "diff": diff or "(no differences)"}
 
 
 def _bi_fs_diff(params: dict, ctx: ToolCtx) -> dict:
@@ -623,8 +711,6 @@ def _bi_fs_diff(params: dict, ctx: ToolCtx) -> dict:
       label_a:  display label for A (default = path)
       label_b:  display label for B (default = path or "<inline>")
     """
-    import difflib
-
     a = params.get("a")
     if not a:
         return {"ok": False, "error": "missing 'a'"}
@@ -655,12 +741,7 @@ def _bi_fs_diff(params: dict, ctx: ToolCtx) -> dict:
     label_a = params.get("label_a") or a
     label_b = params.get("label_b") or (b if b else "<inline>")
 
-    diff = difflib.unified_diff(
-        a_text.splitlines(keepends=True),
-        b_text_resolved.splitlines(keepends=True),
-        fromfile=label_a, tofile=label_b, n=n,
-    )
-    body = "".join(diff)
+    body = _make_unified_diff(a_text, b_text_resolved, label_a, label_b, context=n)
     return {"ok": True, "result": body or "(no differences)",
             "changed": bool(body), "a": a_abs}
 
@@ -848,6 +929,11 @@ try:
     import plan_mode as _plan_mod
 except ImportError:
     _plan_mod = None
+
+try:
+    import policy as _policy_mod
+except ImportError:
+    _policy_mod = None
 
 # Try to import html2text for better content extraction (optional)
 try:
@@ -1506,6 +1592,94 @@ def _bi_hwo(params: dict, ctx: ToolCtx) -> dict:
     return {"ok": r.get("ok", False), "result": r.get("msg", "")}
 
 
+def _hwo_is_sibling_or_ancestor(caller_id: str, target_id: str) -> bool:
+    """True if target is a sibling of caller (shares a parent) or an ancestor."""
+    import agent_loop as _al
+    if not caller_id or not target_id or caller_id == target_id:
+        return False
+    caller = _al.get_agent(caller_id)
+    if caller is None:
+        return False
+    if caller.parent_id == target_id:
+        return True  # target is caller's direct parent
+    if caller.parent_id is not None:
+        parent = _al.get_agent(caller.parent_id)
+        if parent and target_id in parent.child_ids:
+            return True  # same parent -> sibling
+    cur = caller
+    while cur and cur.parent_id:
+        if cur.parent_id == target_id:
+            return True
+        cur = _al.get_agent(cur.parent_id)
+    return False
+
+
+def _bi_hwo_agent_send(params: dict, ctx: ToolCtx) -> dict:
+    """Send a message to a sibling or parent agent within the current HWO workflow."""
+    import agent_loop as _al
+    import hwo_runner
+
+    to = (params.get("to") or "").strip()
+    message = params.get("message", "")
+    if not to:
+        return {"ok": False, "error": "missing 'to'"}
+    if message == "":
+        return {"ok": False, "error": "missing 'message'"}
+    caller_id = ctx.agent_id
+    if not caller_id:
+        return {"ok": False, "error": "no current agent"}
+    if _al.get_agent(to) is None:
+        return {"ok": False, "error": f"no such agent '{to}' — check the [TEAM MANIFEST] for valid names"}
+    if not _hwo_is_sibling_or_ancestor(caller_id, to):
+        return {
+            "ok": False,
+            "error": f"'{to}' is not a sibling or ancestor of '{caller_id}' — "
+                     "agent_send only reaches siblings or your parent, never descendants.",
+        }
+    ok = hwo_runner.hwo_send(to=to, from_=caller_id, text=str(message))
+    if not ok:
+        return {"ok": False, "error": f"mailbox for '{to}' is full"}
+    return {"ok": True, "result": f"Sent to #{to}#."}
+
+
+def _bi_hwo_agent_receive(params: dict, ctx: ToolCtx) -> dict:
+    """Block until a message arrives from a specific HWO teammate (or anyone)."""
+    import hwo_runner
+
+    from_ = (params.get("from") or "").strip() or None
+    try:
+        timeout = float(params.get("timeout", 60) or 60)
+    except (TypeError, ValueError):
+        timeout = 60.0
+    timeout = max(0.0, min(timeout, 300.0))
+    caller_id = ctx.agent_id
+    if not caller_id:
+        return {"ok": False, "error": "no current agent"}
+
+    msg = hwo_runner.hwo_receive(caller_id, from_, timeout)
+    if msg is None:
+        who = f"#{from_}#" if from_ else "any sender"
+        return {"ok": False, "error": f"agent_receive timed out after {timeout:.0f}s waiting for {who}."}
+    return {"ok": True, "result": f"[{msg.get('from')}] {msg.get('text', '')}"}
+
+
+def _bi_hwo_agent_return(params: dict, ctx: ToolCtx) -> dict:
+    """Record an explicit HWO return value that overrides this step's natural reply."""
+    value = params.get("value", "")
+    if value == "":
+        return {"ok": False, "error": "missing 'value'"}
+    if ctx.get_agent is None or ctx.agent_id is None:
+        return {"ok": False, "error": "agent_return is only meaningful inside an HWO workflow"}
+    info = ctx.get_agent(ctx.agent_id)
+    if info is None:
+        return {"ok": False, "error": "current agent not found in registry"}
+    info.state['_hwo_return'] = str(value)
+    return {
+        "ok": True,
+        "result": "Return value recorded. Give a brief final reply now and make no more tool calls this turn.",
+    }
+
+
 def _bi_agent_tell(params: dict, ctx: ToolCtx) -> dict:
     """Send a message to another agent's inbox."""
     target_id = (params.get("agent_id") or "").strip()
@@ -1841,6 +2015,15 @@ def _bi_shell_exec(params: dict, ctx: ToolCtx) -> dict:
     command = (params.get("command") or "").strip()
     if not command:
         return {"ok": False, "error": "missing 'command'"}
+
+    # Models sometimes echo the tool name into the command payload
+    # (for example `shell.exec ls -la`). Strip that wrapper so the tool
+    # executes the intended shell command instead of trying to invoke a
+    # nonexistent `shell.exec` binary.
+    if command.startswith("shell.exec "):
+        command = command[len("shell.exec "):].strip()
+    elif command == "shell.exec":
+        return {"ok": False, "error": "missing shell command after 'shell.exec'"}
 
     cwd = params.get("cwd") or ctx.cwd or os.getcwd()
     timeout = int(params.get("timeout", 60))
@@ -2588,7 +2771,19 @@ def register_builtin_tools() -> None:
         ),
         Tool(
             name="hwo",
-            description="Compile or run a Helpwo workflow file (.hwo).",
+            description=(
+                "Compile or run a .hwo multi-agent workflow file. Syntax: "
+                "(prompt.md)#agent_name#{ steps } for a named sub-agent with an optional "
+                "custom system prompt; // #a#{...} #b#{...} // for a parallel block (agent "
+                "entries only, max 6); '->' between plain-text steps for serial order (a "
+                "no-op separator — steps run in order either way); ``` ... ``` for comments. "
+                "Nesting is supported: an agent's body may contain tasks, nested agents, and "
+                "parallel blocks. Without a (prompt.md) prefix, an agent inherits the prompt "
+                "override (if any) of whichever agent spawned it, else the normal CLI prompt. "
+                "Agents can message siblings/parent with agent_send/agent_receive and short-"
+                "circuit their own result with agent_return. action=compile parses and "
+                "validates without executing."
+            ),
             schema={
                 "type": "object",
                 "properties": {
@@ -2603,6 +2798,55 @@ def register_builtin_tools() -> None:
                 "required": ["path"],
             },
             invoke=_bi_hwo,
+        ),
+        Tool(
+            name="agent_send",
+            description=(
+                "Send a message to a sibling or parent agent within the current HWO workflow, "
+                "addressed by name (see your [TEAM MANIFEST]). Cannot reach descendants."
+            ),
+            schema={
+                "type": "object",
+                "properties": {
+                    "to": {"type": "string", "description": "Recipient agent name (sibling or parent)."},
+                    "message": {"type": "string", "description": "Message text to send."},
+                },
+                "required": ["to", "message"],
+            },
+            invoke=_bi_hwo_agent_send,
+        ),
+        Tool(
+            name="agent_receive",
+            description=(
+                "Block until a message arrives from a specific HWO teammate (or anyone, if "
+                "'from' is omitted). Default timeout 60s, max 300s."
+            ),
+            schema={
+                "type": "object",
+                "properties": {
+                    "from": {"type": "string", "description": "Only accept a message from this agent name. Omit to accept from anyone."},
+                    "timeout": {"type": "number", "default": 60, "description": "Seconds to wait before giving up."},
+                },
+            },
+            invoke=_bi_hwo_agent_receive,
+        ),
+        Tool(
+            name="agent_return",
+            description=(
+                "Record an explicit return value for this HWO step, overriding its natural "
+                "reply. Use this to report a result to your parent without leaking it into "
+                "[WORKFLOW CONTEXT] for later siblings — e.g. a private vote or decision that "
+                "only the parent should see. After calling this, give a brief final reply and "
+                "make no more tool calls."
+            ),
+            schema={
+                "type": "object",
+                "properties": {
+                    "value": {"type": "string", "description": "The value to report back to the parent."},
+                },
+                "required": ["value"],
+            },
+            invoke=_bi_hwo_agent_return,
         ),
         # ── Terminal tools ──────────────────────────────────────────
         Tool(

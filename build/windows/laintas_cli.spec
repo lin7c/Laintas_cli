@@ -24,6 +24,8 @@ a = Analysis(
         ('../../paths.py', '.'),
         ('../../migrate.py', '.'),
         ('../../cloud_provider.py', '.'),
+        ('../../hwo_runner.py', '.'),
+        ('../../hwo_ui.py', '.'),
     ] + collect_data_files('certifi'),
     hiddenimports=[
         'requests',

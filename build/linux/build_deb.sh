@@ -31,7 +31,8 @@ mkdir -p "$PKG_DIR/usr/lib/laintas_cli" \
 for f in laintas_cli.py agent_loop.py tools.py skills.py mcp_client.py \
          policy.py memory_system.py hooks.py plan_mode.py task_manager.py \
          agent_persistence.py agent_roles.py workflow_engine.py \
-         paths.py migrate.py cloud_provider.py requirements.txt; do
+         paths.py migrate.py cloud_provider.py hwo_runner.py hwo_ui.py \
+         requirements.txt; do
     cp "$PROJECT_DIR/$f" "$PKG_DIR/usr/lib/laintas_cli/"
 done
 
