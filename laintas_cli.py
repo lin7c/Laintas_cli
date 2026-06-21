@@ -3101,6 +3101,28 @@ class AgentRegistry:
         self._pending_approvals: dict[str, tuple[threading.Event, dict]] = {}
         self._active_req_lock = threading.RLock()
 
+        # ── WebRTC peer-to-peer file channel (lazy) ─────────────────────
+        self._webrtc = None  # WebrtcManager | False(unavailable) | None(not yet)
+
+    def _ensure_webrtc(self):
+        """Lazily create the WebRTC manager. Returns it, or None if aiortc is
+        unavailable (file ops then fall back to the relay path)."""
+        if self._webrtc is None:
+            try:
+                from webrtc_channel import WebrtcManager
+                if not WebrtcManager.available():
+                    console.print(f"[dim]WebRTC disabled (aiortc not importable: "
+                                  f"{WebrtcManager.import_error()})[/dim]")
+                    self._webrtc = False
+                else:
+                    self._webrtc = WebrtcManager(
+                        lambda sid, typ, meta: self._push(sid, typ, "", meta),
+                    )
+            except Exception as e:
+                console.print(f"[dim]WebRTC unavailable: {e}[/dim]")
+                self._webrtc = False
+        return self._webrtc or None
+
     def register(self, session: dict, name: str = None, quiet: bool = False) -> bool:
         """Register this CLI as a remote agent with Helpwo backend."""
         self._session = session
@@ -3397,6 +3419,16 @@ class AgentRegistry:
                 self._handle_abort(req_id, payload)
             elif kind == "approval-response":
                 self._handle_approval_response(req_id, payload)
+            elif kind == "rtc-offer":
+                self._handle_rtc_offer(req_id, payload)
+            elif kind == "rtc-ice":
+                # Non-trickle in Layer 1: candidates are embedded in the SDP,
+                # so standalone ICE messages are ignored for now.
+                pass
+            elif kind == "rtc-close":
+                mgr = self._webrtc or None
+                if mgr:
+                    mgr.handle_close(req_id)
             else:
                 self._push_final(req_id, "fail", f"unknown kind '{kind}'")
         except Exception as e:
@@ -3405,6 +3437,21 @@ class AgentRegistry:
                 self._push_final(req_id, "fail", f"handler exception: {e}")
         finally:
             self._processing_message.clear()
+
+    def _handle_rtc_offer(self, req_id: str, payload: dict):
+        """Accept a WebRTC offer from the browser and answer it, establishing a
+        peer-to-peer DataChannel so file transfers bypass the relay server.
+        Does NOT push a 'final' — the answer/error is delivered as its own event
+        (rtc-answer / rtc-error / rtc-unavailable) keyed to this reqId."""
+        mgr = self._ensure_webrtc()
+        if mgr is None:
+            self._push(req_id, "rtc-unavailable", "", {"reason": "aiortc not installed on host"})
+            return
+        sdp = payload.get("sdp")
+        if not sdp:
+            self._push(req_id, "rtc-error", "", {"error": "missing sdp"})
+            return
+        mgr.handle_offer(req_id, sdp)
 
     def _handle_chat(self, req_id: str, payload: dict, agent_state_cb, chat_history_cb):
         """Inject a remote chat message into the main REPL loop.

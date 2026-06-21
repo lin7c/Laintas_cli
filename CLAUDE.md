@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Authoritative References
 
 - `PROJECT.md` — full architecture spec (components, data flow, runtime config table, file artifacts). Read this before non-trivial changes.
-- `HELPWO_INTEGRATION_PLAN.md` — in-progress protocol (2026-05-19) for turning the CLI into a remote executor for HelpwoAI. The HelpwoAI side is already shipped; the CLI side is the work item. New `_poll_loop` kinds (`exec`/`query`/`delegate`/`abort`/`approval-response`) and `reqId`-tagged events are the contract.
+- The HelpwoAI remote-executor protocol (originally specified in `HELPWO_INTEGRATION_PLAN.md`, deleted at `7e7324d` as "superseded" once it shipped) is fully implemented: `laintas_cli.py` handles `kind` values `exec`/`query`/`delegate`/`abort`/`approval-response`/`chat` with `reqId`-tagged events (see the request dispatcher and `needs-approval`/`approval-response` flow around `laintas_cli.py:3254-3733`). Treat this as done, not in-progress — there is no separate plan doc to consult.
 
 ## Run / Develop
 

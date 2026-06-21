@@ -1443,6 +1443,24 @@ def _append_short_memory(state: dict, text: str) -> None:
     )
 
 
+def _summarize_reply_for_memory(reply: str, limit: int = 120) -> str:
+    """Condense a step's user-facing reply for session memory.
+
+    The full reply must NOT be echoed back verbatim: session memory is replayed
+    into the prompt every iteration, so storing whole replies turns prior
+    openings into few-shot examples the model imitates, producing replies that
+    all start with the same sentence. We keep only a short, single-line gist
+    (first line, truncated) tagged as a summary so it reads as a log entry, not
+    a template to copy.
+    """
+    text = " ".join(str(reply or "").split())  # collapse newlines/whitespace
+    if not text:
+        return "(no reply)"
+    if len(text) > limit:
+        text = text[:limit].rstrip() + "…"
+    return text
+
+
 def _prepare_history_for_backend(chat_history: list) -> list:
     """Return bounded chat history for backend payload.
 
@@ -3306,33 +3324,39 @@ def run_agent_loop(
         if not _nudge_needed:
             _append_short_memory(
                 state,
-                f"\n  Step {loop+1}: {reply} | tools: {action_desc_short} | result: {state.get('lastOutput','')[:200]}"
+                f"\n  Step {loop+1}: {_summarize_reply_for_memory(reply)} | tools: {action_desc_short} | result: {state.get('lastOutput','')[:200]}"
             )
         state["terminalHistory"].extend(per_call_rows)
 
         # ── Output similarity: track fingerprints for repetition detection ──
         # Mirrors Claude Code's TokenBudgetTracker: detects when consecutive
         # steps produce highly similar output (diminishing returns).
-        _current_output = state.get("lastOutput", "")
-        _current_fp = _output_fingerprint(_current_output)
-        _output_fingerprints.append(_current_fp)
-        if len(_output_fingerprints) > 5:
-            _output_fingerprints = _output_fingerprints[-5:]
+        # Pick this step's signal. lastOutput is "sticky": it only refreshes when
+        # a step produces fresh tool output (see the `if formatted_outputs:` guard
+        # above), so on reply-only / empty-output steps it carries over unchanged.
+        # Comparing that stale value yields a spurious similarity of 1.0 and trips
+        # the breaker even though nothing repeated. So compare only a fresh signal:
+        # new tool output when present, else the reply text (catches a model stuck
+        # repeating the same sentence with no tools). Fully idle steps (no output,
+        # no reply) carry no signal and are left to stale_count below.
         _sim_threshold = float(get_runtime_config("output_similarity"))
-        if len(_output_fingerprints) >= 2:
-            _sim = _output_similarity(_output_fingerprints[-2], _output_fingerprints[-1])
-            if _sim > _sim_threshold and _current_output.strip():
-                _no_progress_count += 1
-            else:
-                _no_progress_count = 0
-        # Also count reply-only steps (no tools) as potential no-progress
-        if not tool_calls and reply:
-            _reply_fp = _output_fingerprint(reply)
-            if len(_output_fingerprints) >= 2:
-                _prev_fp = _output_fingerprints[-2] if _output_fingerprints[-2] else ""
-                _reply_sim = _output_similarity(_prev_fp, _reply_fp)
-                if _reply_sim > _sim_threshold:
+        if formatted_outputs:
+            _step_signal = state.get("lastOutput", "")
+        elif reply:
+            _step_signal = reply
+        else:
+            _step_signal = None
+        if _step_signal and _step_signal.strip():
+            _current_fp = _output_fingerprint(_step_signal)
+            if _output_fingerprints:
+                _sim = _output_similarity(_output_fingerprints[-1], _current_fp)
+                if _sim > _sim_threshold and _current_fp:
                     _no_progress_count += 1
+                else:
+                    _no_progress_count = 0
+            _output_fingerprints.append(_current_fp)
+            if len(_output_fingerprints) > 5:
+                _output_fingerprints = _output_fingerprints[-5:]
 
         # ── Repetition circuit breaker (mirrors TokenBudgetTracker stop decision) ──
         if _no_progress_count >= _repetition_threshold:

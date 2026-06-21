@@ -3,6 +3,11 @@ certifi>=2024.0.0
 rich>=13.0.0
 prompt_toolkit>=3.0.0
 
+# Enables the WebRTC peer-to-peer file channel (browser ↔ this host) so file
+# transfers bypass the Helpwo relay server. Optional: the CLI runs without it
+# and file ops fall back to the server-relayed base64-over-exec path.
+aiortc>=1.14
+
 # Optional — enables /mcp commands and MCP-server tools.
 # laintas-cli starts and runs without this; the /mcp command will tell
 # you it's missing and how to install. Comment out if you don't need MCP.

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
 BASE_URL="https://cli.laintas.com"
 TMP_DIR=$(mktemp -d)
@@ -24,43 +24,23 @@ if [ "$INSTALL_MODE" = "linux" ]; then
 
     # Download tarball
     echo "  Downloading…"
-    curl -fsSL "$BASE_URL/laintas-cli.tar.gz" -o "$TMP_DIR/laintas-cli.tar.gz"
+    curl -fsSL "$BASE_URL/releases/latest/laintas-cli_linux.tar.gz" -o "$TMP_DIR/laintas-cli_linux.tar.gz"
 
     # Extract
-    echo "  Installing to /usr/local/"
-    cd /
-    if [ "$(id -u)" -eq 0 ]; then
-        tar xzf "$TMP_DIR/laintas-cli.tar.gz" -C /
-    else
-        sudo tar xzf "$TMP_DIR/laintas-cli.tar.gz" -C /
-    fi
+    echo "  Extracting package…"
+    tar xzf "$TMP_DIR/laintas-cli_linux.tar.gz" -C "$TMP_DIR"
 
-    # Create workspace
-    WORKSPACE="$HOME/laintas_workspace"
-    if [ ! -d "$WORKSPACE" ]; then
-        mkdir -p "$WORKSPACE"
-        echo "  Workspace: $WORKSPACE"
-    fi
-
-    # Install Python deps
-    echo "  Installing Python dependencies…"
-    if command -v pip3 &>/dev/null; then
-        pip3 install -r /usr/lib/laintas_cli/requirements.txt --quiet 2>/dev/null || echo "  (pip install skipped, deps will install on first run)"
-    elif command -v pip &>/dev/null; then
-        pip install -r /usr/lib/laintas_cli/requirements.txt --quiet 2>/dev/null || echo "  (pip install skipped, deps will install on first run)"
-    else
-        echo "  WARNING: pip not found. Install python3-pip first:"
-        echo "    sudo apt install python3-pip"
-    fi
+    echo "  Installing to /usr/local/bin…"
+    "$TMP_DIR/laintas-cli/install.sh"
 
     printf '\n  Done! Run `laintas-cli` to start.\n\n'
 
 elif [ "$INSTALL_MODE" = "windows" ]; then
     echo "  Detected: Windows (Git Bash / MSYS2)"
-    echo "  Downloading Windows installer…"
-    curl -fsSL "$BASE_URL/releases/latest/laintas_cli_setup.exe" -o "$TMP_DIR/laintas_cli_setup.exe"
-    echo "  Launching installer…"
-    "$TMP_DIR/laintas_cli_setup.exe"
+    echo "  Downloading Windows executable…"
+    curl -fsSL "$BASE_URL/releases/latest/laintas_cli.exe" -o "$TMP_DIR/laintas_cli.exe"
+    echo "  Launching executable…"
+    "$TMP_DIR/laintas_cli.exe"
 fi
 
 echo "── ────────────────────────────────────────────────────────────"

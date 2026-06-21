@@ -1,0 +1,15 @@
+#agents# {
+  -> create a flie Hello
+}
+#Agent1# {
+  -> #agent2
+}
+// parallel //
+  #agent1# {
+    -> print Hello content
+  }
+  #agent2# {
+    -> create flie END
+  }
+// end //
+
