@@ -1,93 +1,82 @@
 #!/usr/bin/env bash
-# build_deb.sh — Build laintas-cli .deb package using fpm
+# build_deb.sh — Build self-contained laintas-cli .deb package
+#
+# Pipeline:
+#   1. PyInstaller produces a single-file binary (bundles Python + deps).
+#   2. fpm wraps the binary + launcher into a .deb.
 #
 # Prerequisites:
-#   sudo apt install ruby ruby-dev
+#   sudo apt install ruby ruby-dev python3-venv binutils
 #   sudo gem install fpm
-#
-#   Or on macOS:
-#   brew install fpm
+#   (PyInstaller is installed inside the project's venv on demand.)
 #
 # Usage:
-#   ./build/linux/build_deb.sh
-#   ./build/linux/build_deb.sh 0.1.1   # specify version
-
+#   ./build/linux/build_deb.sh [version]
+#
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
-VERSION="${1:-0.1.1}"
-BUILD_DIR="$PROJECT_DIR/build/linux/tmp"
-PKG_DIR="$BUILD_DIR/pkg"
-OUTPUT_DIR="$PROJECT_DIR/build/linux"
+VERSION="${1:-$(date +%Y.%m.%d)}"
+OUTPUT_DIR="$PROJECT_DIR/dist"
+PKG_DIR="$(mktemp -d)"
+trap 'rm -rf "$PKG_DIR"' EXIT
 
-# ── Clean ────────────────────────────────────────────────────────────────
-rm -rf "$BUILD_DIR"
-mkdir -p "$PKG_DIR/usr/lib/laintas_cli" \
-         "$PKG_DIR/usr/bin" \
-         "$PKG_DIR/usr/share/doc/laintas-cli"
+echo "Project:  $PROJECT_DIR"
+echo "Version:  $VERSION"
+echo "Staging:  $PKG_DIR"
 
-# ── Copy source files ────────────────────────────────────────────────────
-for f in laintas_cli.py agent_loop.py tools.py skills.py mcp_client.py \
-         policy.py memory_system.py hooks.py plan_mode.py task_manager.py \
-         agent_persistence.py agent_roles.py workflow_engine.py \
-         paths.py migrate.py cloud_provider.py hwo_runner.py hwo_ui.py \
-         requirements.txt; do
-    cp "$PROJECT_DIR/$f" "$PKG_DIR/usr/lib/laintas_cli/"
-done
+mkdir -p "$OUTPUT_DIR"
 
-# ── Launcher script ──────────────────────────────────────────────────────
-cat > "$PKG_DIR/usr/bin/laintas-cli" << 'LAUNCHER'
-#!/usr/bin/env bash
-# laintas-cli launcher — ensures deps, then runs the agent
-
-INSTALL_DIR="/usr/lib/laintas_cli"
-WORKSPACE="${LAINTAS_WORKSPACE:-$HOME/laintas_workspace}"
-
-# Create workspace on first run
-if [ ! -d "$WORKSPACE" ]; then
-    mkdir -p "$WORKSPACE"
-    echo "Created workspace: $WORKSPACE"
+# ── 1. Ensure a venv with PyInstaller ─────────────────────────────────
+VENV_DIR="$PROJECT_DIR/venv"
+if [ ! -x "$VENV_DIR/bin/python" ]; then
+    echo "Creating venv at $VENV_DIR"
+    python3 -m venv "$VENV_DIR"
 fi
 
-# Check for dependencies; install if pip is available and deps are missing
-check_deps() {
-    python3 -c "import requests, certifi, rich, prompt_toolkit" 2>/dev/null
-}
-
-if ! check_deps; then
-    echo "[laintas-cli] Installing Python dependencies..."
-    if command -v pip3 &>/dev/null; then
-        pip3 install -r "$INSTALL_DIR/requirements.txt" --quiet
-    elif command -v pip &>/dev/null; then
-        pip install -r "$INSTALL_DIR/requirements.txt" --quiet
-    else
-        echo "ERROR: pip not found. Install pip and re-run:"
-        echo "  sudo apt install python3-pip"
-        exit 1
-    fi
+# shellcheck disable=SC1091
+source "$VENV_DIR/bin/activate"
+python -m pip install --upgrade pip >/dev/null
+if [ -f "$PROJECT_DIR/requirements.txt" ]; then
+    pip install -r "$PROJECT_DIR/requirements.txt" >/dev/null
 fi
+pip install --upgrade pyinstaller >/dev/null
 
-cd "$WORKSPACE"
-exec python3 "$INSTALL_DIR/laintas_cli.py" "$@"
-LAUNCHER
-chmod 755 "$PKG_DIR/usr/bin/laintas-cli"
+# ── 2. Build single-file binary with PyInstaller ──────────────────────
+cd "$PROJECT_DIR"
+rm -rf build/linux/build build/linux/dist
+pyinstaller \
+    --clean \
+    --noconfirm \
+    --distpath build/linux/dist \
+    --workpath build/linux/build \
+    build/linux/laintas_cli.spec
 
-# ── Build .deb with fpm ──────────────────────────────────────────────────
-echo "Building laintas-cli v${VERSION}..."
+BINARY="$PROJECT_DIR/build/linux/dist/laintas-cli"
+if [ ! -f "$BINARY" ]; then
+    echo "PyInstaller did not produce $BINARY" >&2
+    exit 1
+fi
+chmod 755 "$BINARY"
+
+# ── 3. Stage the .deb tree ────────────────────────────────────────────
+mkdir -p "$PKG_DIR/usr/bin"
+install -m 755 "$BINARY" "$PKG_DIR/usr/bin/laintas-cli"
+
+# ── 4. Build .deb with fpm ────────────────────────────────────────────
+echo "Building laintas-cli v${VERSION} .deb..."
 
 fpm \
     -s dir \
     -t deb \
     -n laintas-cli \
     -v "$VERSION" \
-    --description "Laintas CLI - Autonomous AI agent for your terminal" \
-    --url "https://github.com/lin7c/laintas_cli_pre" \
-    --maintainer "Laintas" \
-    --license "MIT" \
+    --description "Laintas CLI - Autonomous AI agent for your terminal (self-contained build)" \
+    --url "https://laintas.com" \
+    --maintainer "Laintas <support@laintas.com>" \
+    --license "Proprietary" \
     --architecture amd64 \
-    --depends "python3 >= 3.10" \
-    --depends "python3-pip" \
     --after-install "$SCRIPT_DIR/postinst.sh" \
     --before-remove "$SCRIPT_DIR/prerm.sh" \
     -C "$PKG_DIR" \

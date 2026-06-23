@@ -5,6 +5,7 @@ Same agent loop as Helpwo, but executes real system commands.
 
 Usage:
     laintas-cli                    # Start interactive session in cwd
+    laintas-cli --resume           # Resume saved conversation for cwd
     laintas-cli --name my-server   # Set agent name
     laintas-cli --backend URL      # Custom backend URL
 """
@@ -115,12 +116,13 @@ from agent_loop import (
     spawn_subagent, send_to_agent, recv_from_inbox, drain_inbox,
     abort_agent, wait_for_agent, build_agents_tree,
     get_runtime_config, set_runtime_config,
-    list_runtime_config, reset_runtime_config,
+    list_runtime_config, reset_runtime_config, apply_max_config,
     prepare_state_for_repl,
     get_user_interrupt_event, get_user_message_queue,
     clear_loop_command_cache,
     stop_trigger_scanner,
     save_session_snapshot, load_session_snapshot,
+    save_resume_state, load_resume_state, save_resume_checkpoint, list_resume_states,
 )
 
 import tools as tools_mod    # noqa: E402 — load after agent_loop so registry inits once
@@ -1209,7 +1211,7 @@ class MetaCompleter(Completer):
         "/scan", "/debug", "/cwd",
         "/station", "/terminate", "/send", "/hire", "/agents",
         "/t", "/term",
-        "/clear", "/exit", "/quit",
+        "/clear", "/resume", "/max", "/exit", "/quit",
     ]
 
     def __init__(self):
@@ -2392,7 +2394,8 @@ Catalog:
 - If the user asks a clear read/edit/build/test/investigate task, act with tools. Do not ask for permission to do exactly what was asked.
 - Ask one concise clarifying question only when the target or intent is genuinely ambiguous, destructive, impossible to infer safely, or blocked on information you cannot discover yourself.
 - If there are multiple reasonable approaches with materially different tradeoffs, stop and present 2-3 labeled options. State the consequence of each option briefly, then wait for the user's choice.
-- For unfamiliar code: search/list, read the relevant region, then edit. Never patch from memory.
+- For unfamiliar code: locate with `fs.grep`/`fs.glob`, then read narrowly with `fs.read` offset/limit. Read a whole file only when you will rewrite it. Do not copy files into /tmp scratch to re-read in pieces — read the source directly, and once you have enough to act, act.
+- Writing a large file (more than ~300 lines): write it in chunks — `fs.write` the first part, then append the rest with `fs.edit`. A whole-file write in one response can exceed the output token limit, get cut off, and be lost. If a response was truncated, switch to chunked writing; do not retry the same oversized write.
 - Keep scope tight. Do not add unrelated features, refactors, abstractions, or cleanup beyond the task.
 - Keep each action small and verifiable. Prefer exact edits over rewrites.
 - After a tool failure, read the error and change approach; do not retry identical arguments.
@@ -2416,7 +2419,9 @@ Every response must be exactly one JSON object:
 - No prose outside JSON. No code fences.
 - Never output `<tool_calls>`, `<invoke>`, `/tool ...` text, or any XML-like tool syntax.
 - `reply` is normally 1-3 sentences.
-- `tool_calls: []` means answered, complete, or blocked waiting for the user.
+- Completion is an explicit act: call `task.complete` with a `summary` when — and only when — the task is fully finished. Do NOT stop just to narrate progress; if more work remains, include the next tool call in the SAME turn and keep going.
+- If you have nothing concrete to run this turn but the task is NOT finished (still reasoning or planning), call `task.continue` so the loop keeps going. Never end mid-task with an empty `tool_calls` list.
+- `tool_calls: []` (no action this turn) is only for asking the user something or handing back a final answer. It does not by itself mean the task is done.
 - Multiple tool calls are allowed when they are independent or sequentially safe.
 </output_rules>
 
@@ -2430,6 +2435,178 @@ Do not bypass policy. Do not invent paths, APIs, files, or results. Do not commi
 """
 
 # ── File Helpers ───────────────────────────────────────────────────────
+
+def _format_time_ago(ts: float) -> str:
+    """Render a timestamp as a coarse 'N min/hours/days ago' string."""
+    try:
+        delta = max(0, int(time.time() - (ts or 0)))
+    except (TypeError, ValueError):
+        return "unknown"
+    if delta < 60:
+        return "just now"
+    if delta < 3600:
+        return f"{delta // 60} min ago"
+    if delta < 86400:
+        return f"{delta // 3600} hour(s) ago"
+    return f"{delta // 86400} day(s) ago"
+
+
+def _resume_turn_count(blob: Optional[dict]) -> int:
+    """Count user turns in a resume blob for user-facing status text."""
+    if not blob:
+        return 0
+    return len([m for m in (blob.get("chat_history") or []) if m.get("role") == "user"])
+
+
+def _restore_resume_blob(blob: dict, chat_history: list) -> dict:
+    """Restore full-fidelity conversation state from a per-cwd resume blob."""
+    chat_history.clear()
+    chat_history.extend(blob.get("chat_history") or [])
+    return prepare_state_for_repl(blob.get("state") or {})
+
+
+def _resume_choices(cwd: str) -> list:
+    """Selectable resume states for this cwd, preferring `/q` checkpoints over autosave."""
+    states = list_resume_states(cwd)
+    checkpoints = [s for s in states if s.get("kind") == "checkpoint"]
+    return checkpoints or states
+
+
+def _resolve_resume_selector(choices: list, selector: str) -> Optional[dict]:
+    """Non-interactive resume selection by 'latest'/'last' or 1-based index.
+
+    Returns the chosen blob, or None (printing a reason) when the selector is
+    empty/invalid. Used by `--resume`/`--continue` and `/resume <N>`.
+    """
+    if not choices:
+        return None
+    selector = (selector or "").strip().lower()
+    if selector in ("", "latest", "last"):
+        return choices[0]
+    if selector.isdigit():
+        idx = int(selector) - 1
+        if 0 <= idx < len(choices):
+            return choices[idx]
+        console.print(f"[red]Invalid resume number: {selector}[/red]")
+        return None
+    console.print(f"[red]Invalid resume selector: {selector}[/red]")
+    return None
+
+
+def _choose_resume_blob(cwd: str, selector: str = "") -> Optional[dict]:
+    """Resolve a saved resume state non-interactively (CLI-flag entry point)."""
+    return _resolve_resume_selector(_resume_choices(cwd), selector)
+
+
+def show_resume_picker(cwd: str) -> Optional[dict]:
+    """Full-screen `/t`-style picker for saved resume sessions.
+
+    Arrow keys to navigate, Enter to resume the highlighted session, d for a
+    details preview, x to delete a checkpoint, q/Esc to cancel. Returns the
+    chosen blob, or None if cancelled.
+    """
+    choices = _resume_choices(cwd)
+    if not choices:
+        console.print("[yellow]No saved session to resume in this directory.[/yellow]")
+        return None
+
+    selected = [0]
+
+    def _build_lines():
+        lines = []
+        lines.append(("bold cyan", "Resume Session\n"))
+        lines.append(("dim", "↑↓ navigate  ↵ resume  d details  x delete  q cancel\n\n"))
+        for i, item in enumerate(choices):
+            prefix = "▶" if i == selected[0] else " "
+            kind = item.get("kind", "session")
+            badge = "[magenta]◆ checkpoint[/magenta]" if kind == "checkpoint" else "[blue]○ autosave[/blue]"
+            turns = item.get("turn_count") or _resume_turn_count(item)
+            ago = _format_time_ago(item.get("timestamp", 0))
+            title = str(item.get("title") or "Untitled session")[:60].replace("\n", " ")
+            style = "class:selected" if i == selected[0] else ""
+            lines.append((style, f" {prefix} {badge}  [dim]{ago}[/dim]  "
+                                 f"{turns} turn(s)  [bold]{title}[/bold]\n"))
+        lines.append(("", "\n"))
+        lines.append(("dim", f"{len(choices)} saved session(s).  "
+                      "Enter=resume  d=details  x=delete  q=cancel"))
+        return lines
+
+    kb = KeyBindings()
+
+    @kb.add("up")
+    def _(event):
+        selected[0] = max(0, selected[0] - 1)
+
+    @kb.add("down")
+    def _(event):
+        selected[0] = min(len(choices) - 1, selected[0] + 1)
+
+    @kb.add("enter")
+    def _(event):
+        event.app.exit(result=("resume", selected[0]))
+
+    @kb.add("d")
+    def _(event):
+        event.app.exit(result=("details", selected[0]))
+
+    @kb.add("x")
+    def _(event):
+        event.app.exit(result=("delete", selected[0]))
+
+    @kb.add("q")
+    @kb.add("escape")
+    @kb.add("c-c")
+    def _(event):
+        event.app.exit(result=("quit", -1))
+
+    style = Style.from_dict({"selected": "reverse"})
+    window = Window(content=FormattedTextControl(_build_lines), always_hide_cursor=True)
+    app = Application(
+        layout=Layout(HSplit([window])), key_bindings=kb, style=style,
+        full_screen=True, refresh_interval=0.5,
+    )
+
+    while choices:
+        action, idx = app.run()
+        if action == "quit":
+            return None
+        if idx < 0 or idx >= len(choices):
+            continue
+        item = choices[idx]
+        if action == "resume":
+            return item
+        if action == "details":
+            _show_resume_detail(item)
+            input("\n[dim]Press Enter to continue...[/dim]")
+        elif action == "delete":
+            try:
+                Path(item["_path"]).unlink(missing_ok=True)
+            except (OSError, KeyError):
+                pass
+            del choices[idx]
+            console.print(f"\n[green]Deleted saved session.[/green]")
+            if not choices:
+                console.print("[dim]No more saved sessions.[/dim]")
+                return None
+            selected[0] = min(selected[0], len(choices) - 1)
+    return None
+
+
+def _show_resume_detail(item: dict) -> None:
+    """Print a rich summary of one resume blob for the picker's details view."""
+    console.print()
+    console.print(f"[bold cyan]{item.get('title') or 'Untitled session'}[/bold cyan]")
+    console.print(f"[dim]Type:[/dim] {item.get('kind', 'session')}   "
+                  f"[dim]When:[/dim] {_format_time_ago(item.get('timestamp', 0))}   "
+                  f"[dim]Turns:[/dim] {item.get('turn_count') or _resume_turn_count(item)}")
+    history = item.get("chat_history") or []
+    console.print(f"[dim]Messages:[/dim] {len(history)}\n")
+    for msg in history[-6:]:
+        role = msg.get("role", "?")
+        text = str(msg.get("content") or "").replace("\n", " ")[:100]
+        color = "green" if role == "user" else "blue"
+        console.print(f"  [{color}]{role:>9}[/{color}]  [dim]{text}[/dim]")
+
 
 def read_file(path: str) -> Optional[str]:
     """Read a file, return None if not found."""
@@ -2510,6 +2687,91 @@ def get_auth_headers(session: dict) -> dict:
     return headers
 
 
+def _repair_json_candidate(candidate: str) -> str:
+    """Best-effort repair of the most common model JSON defects.
+
+    `json.loads` is strict, but models reliably make two harmless mistakes that
+    a coding agent triggers constantly:
+      1. Literal control characters (newlines/tabs/carriage returns) inside
+         string values — e.g. a multi-line code block or shell command dropped
+         into `reply`/`command` without escaping to \\n. JSON forbids raw
+         control chars in strings.
+      2. Trailing commas before } or ].
+    Both are losslessly fixable. We walk the text tracking string state so we
+    only escape control chars *inside* strings (structural whitespace between
+    tokens is left alone), then strip trailing commas. Unescaped inner quotes
+    are NOT handled (ambiguous) and still fall through to a retry nudge.
+    """
+    out = []
+    in_str = False
+    esc = False
+    for c in candidate:
+        if in_str:
+            if esc:
+                out.append(c)
+                esc = False
+            elif c == "\\":
+                out.append(c)
+                esc = True
+            elif c == '"':
+                out.append(c)
+                in_str = False
+            elif c == "\n":
+                out.append("\\n")
+            elif c == "\r":
+                out.append("\\r")
+            elif c == "\t":
+                out.append("\\t")
+            else:
+                out.append(c)
+        else:
+            if c == '"':
+                in_str = True
+            out.append(c)
+    repaired = "".join(out)
+    # Strip trailing commas: ",}" / ",]" (with optional whitespace).
+    repaired = re.sub(r",(\s*[}\]])", r"\1", repaired)
+    return repaired
+
+
+def _native_to_tool_calls(frags: dict) -> list:
+    """Reassemble OpenAI-native streamed tool_calls into laintas tool_calls.
+
+    Some providers emit tool calls through the function-calling channel
+    (`delta.tool_calls`) instead of inside the JSON body. Those fragments stream
+    incrementally, keyed by `index`; each carries a partial `function.name` and a
+    slice of `function.arguments`. We reassemble per index and parse the
+    arguments JSON. Without this they are dropped and the model's action never
+    runs — the model then re-requests the same read/edit forever.
+    """
+    out = []
+    for idx in sorted(frags):
+        slot = frags[idx]
+        name = (slot.get("name") or "").strip()
+        # Some providers leave a bare name (e.g. "exec") but encode the
+        # fully-qualified tool in the id, e.g. "functions.shell.exec:0".
+        m = re.match(r"functions\.(.+?)(?::\d+)?$", slot.get("id") or "")
+        if m and "." in m.group(1):
+            name = m.group(1)
+        if not name:
+            continue
+        args_raw = (slot.get("arguments") or "").strip()
+        if not args_raw:
+            args = {}
+        else:
+            try:
+                args = json.loads(args_raw)
+            except json.JSONDecodeError:
+                try:
+                    args = json.loads(_repair_json_candidate(args_raw))
+                except json.JSONDecodeError:
+                    args = {}
+        if not isinstance(args, dict):
+            args = {"value": args}
+        out.append({"name": name, "arguments": args})
+    return out
+
+
 def _extract_json_object(text: str) -> Optional[dict]:
     """Extract the first top-level JSON object from text. Handles code fences,
     leading prose, and trailing prose. Returns None if no object parses."""
@@ -2548,7 +2810,13 @@ def _extract_json_object(text: str) -> Optional[dict]:
                 try:
                     return json.loads(candidate)
                 except json.JSONDecodeError:
-                    return None
+                    # Strict parse failed — try repairing the common, harmless
+                    # defects (raw control chars in strings, trailing commas)
+                    # before giving up and forcing a retry nudge.
+                    try:
+                        return json.loads(_repair_json_candidate(candidate))
+                    except json.JSONDecodeError:
+                        return None
     return None
 
 
@@ -2724,6 +2992,7 @@ def call_backend_stream(
         _diag_events: list = []  # diagnostic: capture non-content fields
         prev_reply_for_chunks = ""
         prev_command_for_chunks = ""
+        native_tc_frags: dict = {}  # index -> {id,name,arguments} for native tool_calls
         for line in response.iter_lines(decode_unicode=True):
             # Check for soft-interrupt between SSE chunks
             if interrupt_event is not None and interrupt_event.is_set():
@@ -2763,11 +3032,22 @@ def call_backend_stream(
                 if isinstance(_choices, list) and _choices
                 else None
             )
-            # Also check for OpenAI-style native tool_calls in delta
+            # OpenAI-style native tool_calls in delta: reassemble streamed
+            # fragments (keyed by index) instead of dropping them.
             _delta = _choices[0].get("delta", {}) if isinstance(_choices, list) and _choices else {}
             if _delta.get("tool_calls"):
-                # Native function calling — these are real tool calls being dropped!
-                _diag_events.append(f"TOOL_CALLS_IN_DELTA:{json.dumps(_delta['tool_calls'], ensure_ascii=False)[:200]}")
+                for _frag in _delta["tool_calls"]:
+                    if not isinstance(_frag, dict):
+                        continue
+                    _i = _frag.get("index", 0)
+                    _slot = native_tc_frags.setdefault(_i, {"id": "", "name": "", "arguments": ""})
+                    if _frag.get("id"):
+                        _slot["id"] = _frag["id"]
+                    _fn = _frag.get("function") or {}
+                    if _fn.get("name"):
+                        _slot["name"] = _fn["name"]
+                    if _fn.get("arguments"):
+                        _slot["arguments"] += _fn["arguments"]
             if delta_content:
                 accumulated += delta_content
                 if on_chunk is not None:
@@ -2822,6 +3102,17 @@ def call_backend_stream(
         if not got_any_event:
             return {"reply": "No response from AI", "tool_calls": [], "done": True, "error": True}
 
+        # Native function-calls emitted out-of-band (delta.tool_calls), if any.
+        native_calls = _native_to_tool_calls(native_tc_frags)
+
+        # Output-truncation signal: the model ran right up against the token
+        # ceiling. When a big single-response write (e.g. a whole-file fs.write)
+        # exceeds max_tokens, the JSON never closes and parsing fails — but the
+        # cause is length, not formatting, so it needs a different nudge.
+        _completion_tokens = int((billing_info or {}).get("completionTokens", 0) or 0)
+        _max_tokens = int(get_runtime_config("max_tokens") or 0)
+        _hit_ceiling = _max_tokens > 0 and _completion_tokens >= _max_tokens * 0.95
+
         # Extract the JSON object from accumulated text. Model may wrap in ```json fences or prose.
         parsed = _extract_json_object(accumulated)
         if parsed is None:
@@ -2833,6 +3124,16 @@ def call_backend_stream(
                     "done": False,
                     "_billing": billing_info,
                     "_diag_events": _diag_events + ["parsed_tagged_tool_calls"],
+                }
+            if native_calls:
+                # No parseable JSON body, but the model called tools via the
+                # native channel — run them. Keep pure-prose preamble as reply.
+                return {
+                    "reply": accumulated.strip() if "{" not in accumulated else "",
+                    "tool_calls": native_calls,
+                    "done": False,
+                    "_billing": billing_info,
+                    "_diag_events": _diag_events + ["parsed_native_tool_calls"],
                 }
             raw_text = accumulated.strip() or "(no response)"
             # Pure prose (no '{'): content is valid but JSON wrapper is missing.
@@ -2846,6 +3147,7 @@ def call_backend_stream(
                 "error": False,
                 "_parse_failed": True,
                 "_prose_only": "{" not in accumulated,
+                "_truncated": _hit_ceiling and "{" in accumulated,
                 "_billing": billing_info,
                 "_diag_events": _diag_events,
             }
@@ -2861,6 +3163,14 @@ def call_backend_stream(
                     "done": False,
                     "_billing": billing_info,
                     "_diag_events": _diag_events + ["parsed_tagged_tool_calls"],
+                }
+            if native_calls:
+                return {
+                    "reply": "",
+                    "tool_calls": native_calls,
+                    "done": False,
+                    "_billing": billing_info,
+                    "_diag_events": _diag_events + ["parsed_native_tool_calls"],
                 }
             raw_text = accumulated.strip() or json.dumps(parsed, ensure_ascii=False)
             return {
@@ -2879,6 +3189,11 @@ def call_backend_stream(
         command = parsed.get("command", "") or ""
         if command and not tool_calls:
             tool_calls = _legacy_command_to_tool_calls(command)
+
+        # Model put a reply/text in the JSON body but emitted the actual tool
+        # calls via the native channel — merge those in so they execute.
+        if not tool_calls and native_calls:
+            tool_calls = native_calls
 
         # Also handle old close_session/send_keys fields
         if not tool_calls:
@@ -4969,7 +5284,7 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
                     if not entries:
                         console.print("[yellow]No debug entries to save.[/yellow]")
                     else:
-                        filepath = Path(filename)
+                        filepath = Path(filename).expanduser()
                         lines = []
                         for i, e in enumerate(entries, 1):
                             lines.append(f"{'='*60}")
@@ -5005,8 +5320,13 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
                                     raw_json = str(e.response_raw)
                                 lines.append(f"\n[Raw Response]\n{raw_json[:2000]}")
                             lines.append("")
-                        filepath.write_text('\n'.join(lines), encoding='utf-8')
-                        console.print(f"[green]Saved {n} debug entries to {filepath.absolute()}[/green]")
+                        try:
+                            filepath.parent.mkdir(parents=True, exist_ok=True)
+                            filepath.write_text('\n'.join(lines), encoding='utf-8')
+                        except OSError as exc:
+                            console.print(f"[red]Could not save debug entries to {filepath}: {exc}[/red]")
+                        else:
+                            console.print(f"[green]Saved {n} debug entries to {filepath.absolute()}[/green]")
                 except (ValueError, IndexError) as exc:
                     console.print(f"[red]Error: {exc}[/red]")
                     console.print("Usage: [bold]/debug <N> <filename>[/bold]")
@@ -5504,6 +5824,15 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
         else:
             console.print("[yellow]Usage: /config [key [value]] | /config reset[/yellow]")
 
+    elif action == "/max":
+        # Crank every capacity knob to its ceiling and lift every auto-exit
+        # circuit breaker. Process-global → applies to all agents. /config reset reverts.
+        applied = apply_max_config()
+        console.print("[green]⚡ MAX mode — all limits lifted (applies to every agent):[/green]")
+        for k, v in applied.items():
+            console.print(f"  [cyan]{k}[/cyan] = {v}")
+        console.print("[dim]Note: max_tokens may be capped lower by the provider. Revert with /config reset.[/dim]")
+
     elif action == "/continue":
         # Resume agent loop after max_loops exhaustion.
         # Mirrors Claude Code's /continue: resets the turn counter and
@@ -5662,7 +5991,9 @@ _COMMANDS = [
     ("/skill",     "Manage skills"),
     ("/mcp",       "Manage MCP servers"),
     ("/config",    "View or set runtime configuration"),
+    ("/max",       "Lift all limits — max tokens/loops, disable circuit breakers (all agents)"),
     ("/reload",    "Reload default files and restart"),
+    ("/resume",    "Choose a /q checkpoint to resume (/resume, /resume <N>)"),
     ("/continue",  "Resume agent loop after max_loops exhaustion"),
 ]
 
@@ -5817,6 +6148,7 @@ def show_help():
     table.add_row("/skill", "Skill management (/skill list, reload, new <name>, dir)")
     table.add_row("/config", "Runtime config (/config, /config <key> <value>, /config reset)")
     table.add_row("/tools", "List registered AI tools")
+    table.add_row("/resume [N]", "Choose a /q checkpoint to resume; launch with --resume or --continue for latest")
     table.add_row("/clear", "Clear screen")
     table.add_row("/exit", "Log out and exit (clears cached session)")
     table.add_row("/quit, /q", "Detach from sub-terminal (/q) or exit without logging out (/quit)")
@@ -6205,6 +6537,10 @@ def main():
     parser.add_argument("--monitor-only", action="store_true", default=False,
                         help="Start as a remote executor only — register, heartbeat, "
                              "and poll HelpwoAI for tasks. No local REPL.")
+    parser.add_argument("--resume", action="store_true", default=False,
+                        help="Resume the saved conversation for this directory on startup")
+    parser.add_argument("--continue", dest="continue_session", action="store_true", default=False,
+                        help="Alias for --resume, matching Claude Code-style continuation")
     parser.add_argument("--agent-id", type=str, default=None,
                         help="Pre-assigned agent id (used by sub-terminals)")
     parser.add_argument("--agent-name", type=str, default=None,
@@ -6271,12 +6607,35 @@ def main():
         "lastReply": "",
         "lastOutput": "",
     }
+    chat_history = []
     # Load last session snapshot for this directory (depth-0 only)
     if args.depth == 0:
         _snapshot = load_session_snapshot(_session_start_cwd)
         if _snapshot:
             agent_state["_last_session_snapshot"] = _snapshot
-    chat_history = []
+        # Full-fidelity resume blob: explicit restore by flag or slash command.
+        # Without a flag, just hint so a fresh session stays fresh.
+        _resume_blob = load_resume_state(_session_start_cwd)
+        if _resume_blob and _resume_blob.get("chat_history"):
+            _n_turns = _resume_turn_count(_resume_blob)
+            _ago = _format_time_ago(_resume_blob.get("timestamp", 0))
+            if args.resume or args.continue_session:
+                _selected_resume = _choose_resume_blob(_session_start_cwd, "latest")
+                if _selected_resume:
+                    agent_state = _restore_resume_blob(_selected_resume, chat_history)
+                    console.print(
+                        f"[green]Resumed previous session in this directory "
+                        f"({_resume_turn_count(_selected_resume)} turn(s), "
+                        f"{_format_time_ago(_selected_resume.get('timestamp', 0))}).[/green]"
+                    )
+            else:
+                console.print(
+                    f"[dim]Previous session in this directory "
+                    f"({_n_turns} turn(s), {_ago}). Type [bold]/resume[/bold] "
+                    f"or start with [bold]--resume[/bold] to continue.[/dim]"
+                )
+        elif args.resume or args.continue_session:
+            console.print("[yellow]No saved session for this directory.[/yellow]")
 
     if session.get("userId"):
         agent_registry.register(session, name=agent_name, quiet=(args.depth > 0))
@@ -6349,6 +6708,7 @@ def main():
         console.print("\n[yellow]Shutting down...[/yellow]")
         if args.depth == 0:
             save_session_snapshot(agent_state, chat_history, _session_start_cwd)
+            save_resume_state(agent_state, chat_history, _session_start_cwd)
         stop_trigger_scanner()
         close_all_terminals()
         close_all_agents()
@@ -6439,6 +6799,7 @@ def main():
         if user_input == "/exit":
             if args.depth == 0:
                 save_session_snapshot(agent_state, chat_history, _session_start_cwd)
+                save_resume_state(agent_state, chat_history, _session_start_cwd)
             stop_trigger_scanner()
             close_all_terminals()
             if interactive_session:
@@ -6450,10 +6811,55 @@ def main():
                 injected_done.set()
             return
 
+        # /resume — restore this directory's saved conversation (full-fidelity).
+        # Like mainstream agent CLIs, this does not consume/delete the saved
+        # session; it remains available for future launches until overwritten.
+        if user_input.startswith("/resume") and args.depth == 0:
+            _resume_parts = user_input.strip().split(maxsplit=1)
+            _selector = _resume_parts[1] if len(_resume_parts) > 1 else ""
+            _choices = _resume_choices(_session_start_cwd)
+            if not _choices:
+                _blob = None
+                console.print("[yellow]No saved session to resume in this directory.[/yellow]")
+            elif _selector:
+                # /resume <N> | latest — non-interactive direct pick.
+                _blob = _resolve_resume_selector(_choices, _selector)
+            elif len(_choices) == 1 or not sys.stdin.isatty():
+                _blob = _choices[0]
+            else:
+                # /resume — open the full-screen picker (None if cancelled).
+                _blob = show_resume_picker(_session_start_cwd)
+            if _blob and not _blob.get("chat_history"):
+                console.print("[yellow]Saved session has no conversation to resume.[/yellow]")
+            elif _blob:
+                agent_state = _restore_resume_blob(_blob, chat_history)
+                _n = _resume_turn_count(_blob)
+                _ago = _format_time_ago(_blob.get("timestamp", 0))
+                console.print(
+                    f"[green]Resumed previous session in this directory "
+                    f"({_n} turn(s), {_ago}).[/green]"
+                )
+            if injected_done is not None:
+                injected_done.set()
+            continue
+
+        if args.depth == 0 and user_input.strip().split()[0].lower() in ("/q", "/quit"):
+            save_session_snapshot(agent_state, chat_history, _session_start_cwd)
+            _checkpoint = save_resume_checkpoint(agent_state, chat_history, _session_start_cwd)
+            if _checkpoint:
+                console.print(
+                    f"[dim]Saved resume checkpoint: "
+                    f"{_format_time_ago(_checkpoint.get('timestamp', 0))} · "
+                    f"{_checkpoint.get('title', 'Untitled session')}[/dim]"
+                )
+
         # Check for meta commands
         if user_input.startswith("/"):
             should_exit = handle_meta_command(user_input, agent_registry, session, interactive_session)
             if should_exit:
+                if args.depth == 0:
+                    save_session_snapshot(agent_state, chat_history, _session_start_cwd)
+                    save_resume_state(agent_state, chat_history, _session_start_cwd)
                 if interactive_session:
                     interactive_session.close()
                 if injected_done is not None:
@@ -6524,6 +6930,8 @@ def main():
                 chat_history.append({"role": "assistant", "content": response["msg"]})
             # ── Cross-interaction state preservation ──
             agent_state = prepare_state_for_repl(response.get("state", {}))
+            if args.depth == 0:
+                save_resume_state(agent_state, chat_history, _session_start_cwd)
             if injected_done is not None:
                 injected_done.set()
             continue
@@ -6698,6 +7106,8 @@ def main():
         # Mirrors Claude Code's approach: preserve recent context across REPL
         # interactions so the model doesn't lose track of what it was doing.
         agent_state = prepare_state_for_repl(response.get("state", {}))
+        if args.depth == 0:
+            save_resume_state(agent_state, chat_history, _session_start_cwd)
 
         if injected_done is not None:
             injected_done.set()

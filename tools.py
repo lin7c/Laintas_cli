@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 import traceback
@@ -705,6 +706,7 @@ def _bi_fs_diff(params: dict, ctx: ToolCtx) -> dict:
 
     params:
       a:        path to file A (required)
+      path:     git working-tree diff for this path (compatibility alias)
       b:        path to file B (optional)
       b_text:   raw text to compare against A (alternative to b)
       context:  context lines (default 3)
@@ -712,10 +714,37 @@ def _bi_fs_diff(params: dict, ctx: ToolCtx) -> dict:
       label_b:  display label for B (default = path or "<inline>")
     """
     a = params.get("a")
-    if not a:
-        return {"ok": False, "error": "missing 'a'"}
+    compat_path = params.get("path")
     b = params.get("b")
     b_text = params.get("b_text")
+    if not a and compat_path:
+        if b or b_text is not None:
+            a = compat_path
+        else:
+            base = ctx.cwd or os.getcwd()
+            try:
+                proc = subprocess.run(
+                    ["git", "diff", "--", compat_path],
+                    cwd=base,
+                    text=True,
+                    capture_output=True,
+                    timeout=10,
+                )
+            except (OSError, subprocess.SubprocessError) as e:
+                return {"ok": False, "error": f"git diff failed: {e}"}
+            if proc.returncode != 0:
+                err = (proc.stderr or proc.stdout or "").strip()
+                return {"ok": False, "error": err or f"git diff exited {proc.returncode}"}
+            body = proc.stdout
+            return {
+                "ok": True,
+                "result": body or "(no differences)",
+                "changed": bool(body),
+                "path": os.path.abspath(os.path.join(base, compat_path)) if not os.path.isabs(compat_path) else compat_path,
+                "mode": "git",
+            }
+    if not a:
+        return {"ok": False, "error": "missing 'a'"}
     if not b and b_text is None:
         return {"ok": False, "error": "provide either 'b' or 'b_text'"}
 
@@ -1999,6 +2028,35 @@ def _bi_sleep(params: dict, ctx: ToolCtx) -> dict:
     return {"ok": True, "result": f"Slept {secs:.1f}s"}
 
 
+def _bi_task_continue(params: dict, ctx: ToolCtx) -> dict:
+    """No-op continuation signal.
+
+    Its only purpose is to BE a tool call: the agent loop keeps looping whenever
+    a turn contains any tool call, so calling this lets the model keep working on
+    a turn where it has nothing concrete to run yet (still reasoning, planning a
+    next step) WITHOUT ending on an empty tool-call turn — which the loop
+    otherwise reads as "done / handing back to the user".
+    """
+    return {"ok": True, "result": "(continuing)"}
+
+
+def _bi_task_complete(params: dict, ctx: ToolCtx) -> dict:
+    """Affirmatively signal the user's task is finished.
+
+    The agent loop watches for the `_task_complete` marker in the result and
+    ends the loop normally. This is the canonical completion signal — in
+    autonomous/execute mode it is the only way to finish, because the loop no
+    longer infers "done" from a turn that simply lacks a tool call.
+    """
+    summary = (params.get("summary") or "").strip()
+    return {
+        "ok": True,
+        "result": summary or "Task marked complete.",
+        "_task_complete": True,
+        "summary": summary,
+    }
+
+
 # ── Shell execution tool ──────────────────────────────────────────────
 
 def _bi_shell_exec(params: dict, ctx: ToolCtx) -> dict:
@@ -2334,11 +2392,14 @@ def register_builtin_tools() -> None:
             name="fs.diff",
             description="Compute a unified diff between two files, or between a file and an "
                         "inline text payload. Use to preview changes before fs.edit, or to "
-                        "explain what changed between two file revisions.",
+                        "explain what changed between two file revisions. To inspect git "
+                        "working-tree changes for one file, pass {\"path\":\"...\"}.",
             schema={
                 "type": "object",
                 "properties": {
                     "a": {"type": "string", "description": "path to file A"},
+                    "path": {"type": "string",
+                             "description": "compatibility alias: git diff for this path when b/b_text are omitted"},
                     "b": {"type": "string", "description": "path to file B (alt to b_text)"},
                     "b_text": {"type": "string",
                                 "description": "inline text to compare against A"},
@@ -2346,7 +2407,7 @@ def register_builtin_tools() -> None:
                     "label_a": {"type": "string"},
                     "label_b": {"type": "string"},
                 },
-                "required": ["a"],
+                "required": [],
             },
             invoke=_bi_fs_diff,
         ),
@@ -2961,6 +3022,35 @@ def register_builtin_tools() -> None:
                 "required": ["seconds"],
             },
             invoke=_bi_sleep,
+        ),
+        Tool(
+            name="task.continue",
+            description=(
+                "Keep working when you have nothing concrete to run THIS turn but "
+                "the task is not finished (still reasoning or planning the next "
+                "step). Call this instead of returning an empty tool_calls list — "
+                "an empty list ends the turn and hands control back to the user. "
+                "No arguments, no side effects."
+            ),
+            schema={"type": "object", "properties": {}},
+            invoke=_bi_task_continue,
+        ),
+        Tool(
+            name="task.complete",
+            description=(
+                "Affirmatively signal the user's task is fully finished. Call "
+                "this — and ONLY this — when there is no remaining work and no "
+                "further tool call is needed. In autonomous/execute mode this is "
+                "the only way to end normally: simply not calling a tool does NOT "
+                "mean done. Put your final result summary in `summary`."
+            ),
+            schema={
+                "type": "object",
+                "properties": {
+                    "summary": {"type": "string", "description": "Final result summary for the user."},
+                },
+            },
+            invoke=_bi_task_complete,
         ),
     ]
     for t in builtins:

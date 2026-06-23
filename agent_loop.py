@@ -110,6 +110,40 @@ def reset_runtime_config():
     _runtime_config.clear()
 
 
+# Ceiling values for `/max`: crank every capacity knob up and lift every
+# auto-exit circuit breaker. Cosmetic/safety toggles (disable_remote_terminal,
+# show_billing, heartbeat_interval) are intentionally left alone.
+_MAX_CONFIG = {
+    "max_loops": 100000,            # effectively unbounded iterations
+    "max_tokens": 32000,            # max response budget (provider may cap lower)
+    "max_debug_entries": 1000,
+    "loop_delay": 0.0,              # no pause between iterations
+    "output_truncate": 200000,      # keep almost all tool output
+    "poll_timeout": 120.0,
+    "terminal_tail_lines": 500,
+    "staleness_limit": 100000,      # never auto-exit on idle
+    "repetition_threshold": 100000, # disable repetition circuit breaker
+    "warning_force_limit": 100000,  # disable warning circuit breaker
+    "output_similarity": 1.0,       # only byte-identical output counts as repeat
+    "microcompact_keep": 200,       # keep far more full outputs
+    "history_max_messages": 500,
+    "message_truncate": 100000,
+    "short_memory_max_chars": 200000,
+}
+
+
+def apply_max_config() -> dict:
+    """Set every capacity knob to its ceiling and lift every circuit breaker.
+
+    Process-global, so it takes effect for ALL agents (primary and sub-agents
+    all read the same _runtime_config). Revert with `/config reset`.
+    Returns the resulting {key: value} map.
+    """
+    for k, v in _MAX_CONFIG.items():
+        _runtime_config[k] = v
+    return {k: get_runtime_config(k) for k in _MAX_CONFIG}
+
+
 # ── Soft-Interrupt & Supplementary Input ──────────────────────────────
 # Ctrl+C during the agent loop sets _user_interrupt for graceful stop.
 # Users can type supplementary messages while the AI works — they're
@@ -411,6 +445,136 @@ def save_session_snapshot(state: dict, chat_history: list, cwd: str) -> None:
         dest = paths.SESSIONS_DIR / f"{_session_key(cwd)}.json"
         paths.SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
         dest.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+_RESUME_MAX_TURNS = 80   # full-fidelity turns kept for /resume
+_RESUME_MAX_CHECKPOINTS = 20
+
+
+def _build_resume_payload(state: dict, chat_history: list, cwd: str, kind: str) -> Optional[dict]:
+    user_turns = [m for m in (chat_history or []) if m.get("role") == "user"]
+    if not user_turns:
+        return None
+    history = list(chat_history or [])[-_RESUME_MAX_TURNS:]
+    last_user = str(user_turns[-1].get("content") or "").strip()
+    title = re.sub(r"\s+", " ", last_user)[:80] or "Untitled session"
+    return {
+        "id": uuid.uuid4().hex[:12],
+        "kind": kind,
+        "cwd": cwd,
+        "timestamp": time.time(),
+        "title": title,
+        "turn_count": len(user_turns),
+        "chat_history": history,
+        "state": prepare_state_for_repl(state or {}),
+    }
+
+
+def _resume_latest_path(cwd: str):
+    return paths.SESSIONS_DIR / f"{_session_key(cwd)}_resume.json"
+
+
+def _resume_checkpoint_pattern(cwd: str) -> str:
+    return f"{_session_key(cwd)}_resume_*.json"
+
+
+def _prune_resume_checkpoints(cwd: str) -> None:
+    try:
+        files = sorted(
+            paths.SESSIONS_DIR.glob(_resume_checkpoint_pattern(cwd)),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for path in files[_RESUME_MAX_CHECKPOINTS:]:
+            path.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def save_resume_state(state: dict, chat_history: list, cwd: str) -> None:
+    """Persist full-fidelity chat_history + working state for `/resume` (per-cwd).
+
+    Unlike save_session_snapshot (a lossy summary feeding the {{lastSession}}
+    prompt section), this keeps the actual conversation and bounded working
+    state so a later launch in the same directory can continue an unfinished
+    task verbatim. Keyed by cwd so a task in dir A is never restored in dir B.
+    Skips trivial sessions (no user turn). Best-effort; silent on I/O error.
+    """
+    try:
+        payload = _build_resume_payload(state, chat_history, cwd, "autosave")
+        if payload is None:
+            return
+        paths.SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+        _resume_latest_path(cwd).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def save_resume_checkpoint(state: dict, chat_history: list, cwd: str) -> Optional[dict]:
+    """Save a selectable resume checkpoint for this cwd, intended for `/q`."""
+    try:
+        payload = _build_resume_payload(state, chat_history, cwd, "checkpoint")
+        if payload is None:
+            return None
+        paths.SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+        dest = paths.SESSIONS_DIR / f"{_session_key(cwd)}_resume_{payload['id']}.json"
+        dest.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        _resume_latest_path(cwd).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        _prune_resume_checkpoints(cwd)
+        return payload
+    except Exception:
+        return None
+
+
+def list_resume_states(cwd: str) -> list:
+    """Return selectable resume states for this cwd, newest first."""
+    states = []
+    seen_ids = set()
+    try:
+        files = list(paths.SESSIONS_DIR.glob(_resume_checkpoint_pattern(cwd)))
+        latest = _resume_latest_path(cwd)
+        if latest.exists():
+            files.append(latest)
+        for path in files:
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if data.get("cwd") != cwd:
+                    continue
+                if time.time() - data.get("timestamp", 0) > 7 * 86400:
+                    continue
+                rid = data.get("id") or path.stem
+                if rid in seen_ids:
+                    continue
+                seen_ids.add(rid)
+                data["_path"] = str(path)
+                states.append(data)
+            except Exception:
+                continue
+    except Exception:
+        return []
+    states.sort(key=lambda item: item.get("timestamp", 0), reverse=True)
+    return states
+
+
+def load_resume_state(cwd: str) -> Optional[dict]:
+    """Load the full-fidelity resume blob for this cwd, or None if none/old/corrupt."""
+    try:
+        states = list_resume_states(cwd)
+        if not states:
+            return None
+        return states[0]
+    except Exception:
+        return None
+
+
+def clear_resume_state(cwd: str) -> None:
+    """Delete this cwd's resume blob (after a successful /resume consumes it)."""
+    try:
+        _resume_latest_path(cwd).unlink(missing_ok=True)
+        for path in paths.SESSIONS_DIR.glob(_resume_checkpoint_pattern(cwd)):
+            path.unlink(missing_ok=True)
     except Exception:
         pass
 
@@ -1332,6 +1496,33 @@ def _compress_terminal_history(history: list) -> str:
         lines.append(output if output.strip() else "(no output)")
 
     return '\n'.join(lines)
+
+
+def _trim_carried_outputs(history: list, tail_chars: int = 600) -> list:
+    """Shrink output bodies of history inherited from a previous task.
+
+    terminalHistory persists across REPL turns, so a fresh, unrelated user task
+    inherits the previous task's full command outputs — e.g. a 12k-char file
+    dump riding along in the prompt of an unrelated question and re-sent every
+    loop. Trimming each carried output to a short tail keeps enough continuity
+    signal for genuine follow-up questions while removing the bulk. Applied once
+    at task entry; outputs produced within the current task stay verbatim
+    (subject to the normal per-iteration budgets).
+    """
+    if not history:
+        return history
+    result = []
+    for entry in history:
+        out = entry.get("output", "")
+        if isinstance(out, str) and len(out) > tail_chars:
+            trimmed = dict(entry)
+            trimmed["output"] = (
+                "...(carried from previous task, trimmed)...\n" + out[-tail_chars:]
+            )
+            result.append(trimmed)
+        else:
+            result.append(entry)
+    return result
 
 
 def _microcompact_history(history: list, keep_recent: int = 6) -> list:
@@ -2513,6 +2704,12 @@ def run_agent_loop(
     state.setdefault("lastReply", "")
     state.setdefault("lastOutput", "")
     state.setdefault("terminalHistory", [])
+    # New top-level task: shrink command outputs inherited from the previous
+    # task so a stale large dump doesn't ride along in every prompt of an
+    # unrelated question. Follow-ups keep a short tail for continuity. depth==0
+    # only — sub-agents get a purpose-built initial state, nothing to inherit.
+    if depth == 0 and state.get("terminalHistory"):
+        state["terminalHistory"] = _trim_carried_outputs(state["terminalHistory"])
     state["shortTermMemory"] = _trim_short_term_memory(state.get("shortTermMemory", ""))
     state["lastOutput"] = _trim_text(
         state.get("lastOutput", ""),
@@ -2907,6 +3104,23 @@ def run_agent_loop(
         reply = response.get("reply") or ""
         done = response.get("done", len(tool_calls) == 0)
         billing = response.get("_billing", {})
+        _prose_final = False
+
+        # ── Prose-only final answer ──
+        # The model emitted pure prose with NO JSON braces at all (_prose_only)
+        # and no tool calls. That is not a garbled tool attempt — it is the
+        # model's final conversational answer (a result report or a question
+        # back to the user). Previously this was treated as a parse failure: the
+        # reply was suppressed (display_reply="") and the loop kept re-prompting,
+        # regenerating the same answer every iteration while the user saw only a
+        # spinner and paid for each ~13k-token call. So accept it: clear the
+        # failure flag (surface the reply, skip the nudge); the completion
+        # decision below treats it as a terminal answer. Garbled JSON attempts
+        # (_parse_failed WITHOUT _prose_only, i.e. output did contain braces)
+        # still fall through to the repair path.
+        if response.get("_prose_only") and not tool_calls and reply:
+            response.pop("_parse_failed", None)
+            _prose_final = True
 
         # ── JSON repair: model produced something that looked like JSON but
         # didn't parse. Nudge it once or twice instead of giving up. ──
@@ -3012,12 +3226,28 @@ def run_agent_loop(
         if response.get("_parse_failed"):
             _nudge_needed = True
             _prose_only = response.get("_prose_only", False)
+            _truncated = response.get("_truncated", False)
             _parse_fail_count = state.get("_parse_fail_count", 0) + 1
             state["_parse_fail_count"] = _parse_fail_count
+            if _truncated:
+                # The failure is length, not formatting: the response hit the
+                # token ceiling mid-output (typically a whole-file write). Tell
+                # the model to chunk instead of uselessly retrying the same
+                # oversized write. The session-memory note carries into the next
+                # prompt so the model sees the hint.
+                _append_short_memory(state, (
+                    "\n  ⚠ Your last response was cut off at the output token "
+                    "limit — it was too long to finish. Do NOT rewrite the whole "
+                    "file in one call. Write it in chunks: fs.write the first "
+                    "part, then append the rest with fs.edit."
+                ))
+                if events_cb is not None:
+                    deps.console.print(
+                        "[yellow]⚠ Response truncated at token limit — asking AI to write in smaller chunks.[/yellow]")
             # Suppress the user-visible warning for pure-prose responses — the content
             # is correct, the model just forgot the JSON wrapper. Only warn when the
             # model was clearly attempting (and garbling) JSON.
-            if events_cb is not None and not _prose_only:
+            elif events_cb is not None and not _prose_only:
                 if _parse_fail_count == 1:
                     deps.console.print(f"[dim yellow](formatting issue — asking AI to retry)[/dim yellow]")
                 elif _parse_fail_count >= 3:
@@ -3054,6 +3284,8 @@ def run_agent_loop(
 
         formatted_outputs: list[str] = []
         per_call_rows: list[dict] = []
+        _explicit_complete = False    # set when task.complete is invoked
+        _complete_summary = ""
 
         if tool_calls:
             # Resolve stationed terminal for this agent (if any)
@@ -3210,6 +3442,13 @@ def run_agent_loop(
                             if _parent_result is not None:
                                 result["result"] = (_cleaned or "").rstrip() + f"\n[parent] {_parent_result}"
 
+                # ── Affirmative completion signal ──
+                # task.complete returns the _task_complete marker; that is the
+                # canonical "task finished" signal (see completion decision below).
+                if isinstance(result, dict) and result.get("_task_complete"):
+                    _explicit_complete = True
+                    _complete_summary = result.get("summary") or _complete_summary
+
                 # ── Format result for AI prompt ──
                 truncate = int(get_runtime_config("output_truncate") or 3000)
                 formatted = _format_tool_result_for_loop(name, result, truncate)
@@ -3315,6 +3554,47 @@ def run_agent_loop(
         # rendering and shortTermMemory see every result, not just the last.
         if formatted_outputs:
             state["lastOutput"] = ("\n---\n".join(formatted_outputs))[: int(get_runtime_config("output_truncate") or 3000) * 2]
+
+        # ── Completion decision (affirmative, not inferred from empty tool_calls) ──
+        # Historically `done` defaulted to `len(tool_calls)==0`, so ANY turn the
+        # model spent narrating (no tool call) ended the loop — abandoning
+        # multi-step tasks the moment the model paused to explain itself. Mainstream
+        # agents make completion an explicit act instead. So:
+        #   - task.complete (_explicit_complete) or a pure-prose final answer
+        #     (_prose_final) or an explicit done:true always end the loop.
+        #   - Interactive mode: an empty-tool-call turn yields to the user, who
+        #     drives the next turn — treat as done.
+        #   - Autonomous/execute mode: no user to re-prompt, so an empty-tool-call
+        #     turn is NOT done. Nudge toward task.complete and keep looping, with a
+        #     small counter so a model that never calls it can't burn every loop.
+        if _explicit_complete:
+            done = True
+            if _complete_summary and not reply:
+                reply = _complete_summary
+            state["_no_action_count"] = 0
+        elif _prose_final or response.get("done") is True:
+            done = True
+            state["_no_action_count"] = 0
+        elif tool_calls:
+            done = False
+            state["_no_action_count"] = 0
+        else:
+            # No tool call and no affirmative completion signal.
+            if events_cb is not None:
+                done = True   # interactive: hand control back to the user
+                state["_no_action_count"] = 0
+            else:
+                _no_action = state.get("_no_action_count", 0) + 1
+                state["_no_action_count"] = _no_action
+                if _no_action >= 3:
+                    done = True   # stop nudging; accept the reply as final
+                else:
+                    done = False
+                    _append_short_memory(state, (
+                        "\n  ⚠ Turn ended with no tool call and no task.complete. "
+                        "If the task is finished, call task.complete with a summary; "
+                        "otherwise keep working."
+                    ))
 
         # 10. Update state — append per-call rows (or one no-op row if no tool_calls)
         tool_names_for_log = [r["tool"] for r in per_call_rows]
@@ -3438,6 +3718,11 @@ def run_agent_loop(
             _append_short_memory(state, fail_hint)
 
         # ── Debug: persist this loop's entry ──
+        # The initial debug value mirrors the raw backend response, but tools
+        # such as task.complete can change the loop's final completion decision
+        # after dispatch. Keep exported /debug logs aligned with the actual
+        # loop result so successful task.complete turns do not show Done False.
+        debug_entry.done = done
         add_debug_log(debug_entry)
 
         if done:
