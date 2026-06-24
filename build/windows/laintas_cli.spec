@@ -87,8 +87,11 @@ exe = EXE(
     icon=str(PROJECT_DIR / 'build' / 'windows' / 'icon.ico'),
     debug=False,
     bootloader_ignore_signals=False,
-    strip=True,
-    upx=True,
+    # Do NOT strip or UPX-compress on Windows: UPX corrupts the bundled
+    # python311.dll, causing "Failed to load Python DLL" at runtime, and
+    # strip is unsupported/harmful for the Windows PE.
+    strip=False,
+    upx=False,
     upx_exclude=[],
     runtime_tmpdir=None,
     console=True,           # CLI tool — needs console window
