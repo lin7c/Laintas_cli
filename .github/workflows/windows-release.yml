@@ -68,8 +68,8 @@ jobs:
         env:
           AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
         run: |
-          if ($env:AZURE_CLIENT_ID) { "enabled=true" } else { "enabled=false" } |
-            Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          $enabled = if ($env:AZURE_CLIENT_ID) { "enabled=true" } else { "enabled=false" }
+          $enabled | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           if (-not $env:AZURE_CLIENT_ID) {
             Write-Host "::warning::Azure Trusted Signing secrets not set — producing an UNSIGNED exe (will trigger SmartScreen)."
           }
