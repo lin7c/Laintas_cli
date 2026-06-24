@@ -40,6 +40,8 @@ SOURCE_FILES=(
   skills.py
   task_manager.py
   tools.py
+  updater.py
+  version.py
   workflow_engine.py
 )
 
@@ -144,5 +146,42 @@ done
 
 echo "Refreshing Windows executable from checked-in artifact..."
 cp "$PROJECT_DIR/build/windows/laintas_cli.exe" "$RELEASE_DIR/laintas_cli.exe"
+
+echo "Publishing loose source files + manifest for partial self-update (/v update)..."
+# The self-updater downloads only the .py files whose sha256 changed. To make
+# that possible we publish each module individually under src/ plus a manifest
+# that lists version + per-file sha256.
+SRC_DIR="$RELEASE_DIR/src"
+rm -rf "$SRC_DIR"
+mkdir -p "$SRC_DIR"
+for file in "${SOURCE_FILES[@]}"; do
+  case "$file" in *.py) cp "$PROJECT_DIR/$file" "$SRC_DIR/";; esac
+done
+
+VERSION="$(python3 -c "import sys; sys.path.insert(0, '$PROJECT_DIR'); from version import __version__; print(__version__)")"
+python3 - "$PROJECT_DIR" "$SRC_DIR/manifest.json" "$VERSION" "${SOURCE_FILES[@]}" <<'PY'
+import hashlib, json, os, sys, datetime
+project_dir, out_path, version, *files = sys.argv[1:]
+manifest = {
+    "version": version,
+    "released": datetime.date.today().isoformat(),
+    "files": {},
+}
+for name in files:
+    if not name.endswith(".py"):
+        continue
+    p = os.path.join(project_dir, name)
+    data = open(p, "rb").read()
+    manifest["files"][name] = {
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "size": len(data),
+    }
+with open(out_path, "w") as fh:
+    json.dump(manifest, fh, indent=2)
+print(f"  manifest: v{version}, {len(manifest['files'])} files")
+PY
+# The manifest is also expected at the release-dir root (the updater reads
+# releases/<channel>/manifest.json).
+cp "$SRC_DIR/manifest.json" "$RELEASE_DIR/manifest.json"
 
 echo "Release assets updated in $RELEASE_DIR"

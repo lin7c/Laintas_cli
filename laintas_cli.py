@@ -99,6 +99,11 @@ from prompt_toolkit.layout.controls import BufferControl
 
 console = Console()
 
+try:
+    from version import __version__
+except Exception:
+    __version__ = "0.0.0"
+
 # ── Agent Loop (extracted module) ─────────────────────────────────────
 from agent_loop import (
     MAX_LOOPS, MAX_TOKENS, MAX_DEBUG_ENTRIES,
@@ -4984,6 +4989,77 @@ def _load_extra_commands():
         return None
 
 
+def handle_version_command(parts: list) -> None:
+    """Handle `/v` (show version + check) and `/v update` (self-update)."""
+    import updater
+
+    sub = parts[1].lower() if len(parts) > 1 else ""
+    force = any(p in ("--force", "-f") for p in parts[2:])
+
+    if sub not in ("", "update", "check"):
+        console.print("[yellow]Usage: /v  |  /v check  |  /v update [--force][/yellow]")
+        return
+
+    console.print(f"[bold]laintas-cli[/bold] [cyan]v{updater.LOCAL_VERSION}[/cyan] "
+                  f"([dim]{'binary' if updater.is_frozen() else 'source'} install[/dim])")
+
+    # `/v` and `/v check` both just check; `/v update` also applies.
+    try:
+        manifest = updater.fetch_manifest()
+    except Exception as e:
+        console.print(f"[red]Could not reach the update server: {e}[/red]")
+        return
+
+    remote_ver = manifest.get("version", "?")
+    channel_dir = os.environ.get("LAINTAS_UPDATE_CHANNEL", "latest")
+    available = updater.is_newer(remote_ver, updater.LOCAL_VERSION)
+
+    if available:
+        console.print(f"[green]Update available:[/green] v{remote_ver}")
+        if manifest.get("notes"):
+            console.print(f"  [dim]{manifest['notes']}[/dim]")
+    else:
+        console.print(f"[dim]Latest is v{remote_ver} — you are up to date.[/dim]")
+
+    if sub != "update":
+        if available:
+            console.print("[dim]Run [bold]/v update[/bold] to install it.[/dim]")
+        return
+
+    if not available and not force:
+        console.print("[dim]Nothing to update. Use [bold]/v update --force[/bold] to re-apply the latest.[/dim]")
+        return
+
+    # ── apply ──
+    if updater.is_frozen():
+        console.print("[yellow]Binary install — replacing the whole executable "
+                      "(partial update only applies to source installs).[/yellow]")
+        new_path = updater.apply_frozen_update(manifest, channel_dir, console.print)
+        if new_path:
+            console.print(f"[green]Updated binary at {new_path}. Restarting...[/green]")
+            stop_trigger_scanner()
+            close_all_terminals()
+            os.execv(_LAUNCH_SCRIPT_PATH, [_LAUNCH_SCRIPT_PATH] + sys.argv[1:])
+        return
+
+    changed = updater.plan_changed_files(manifest)
+    if not changed:
+        console.print("[green]All files already match the latest — nothing to download.[/green]")
+        return
+
+    console.print(f"[bold]Downloading {len(changed)} changed file(s):[/bold]")
+    ok = updater.apply_source_update(manifest, changed, channel_dir, console.print)
+    if not ok:
+        console.print("[red]Update failed — no changes applied.[/red]")
+        return
+
+    console.print(f"[green]Updated to v{remote_ver} "
+                  f"({len(changed)} file(s) replaced). Restarting...[/green]")
+    stop_trigger_scanner()
+    close_all_terminals()
+    os.execv(_LAUNCH_SCRIPT_PATH, [_LAUNCH_SCRIPT_PATH] + sys.argv[1:])
+
+
 def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, interactive_session=None) -> bool:
     """Handle meta commands. Returns True if should exit."""
     parts = cmd.strip().split()
@@ -6020,6 +6096,13 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
                 parent_id=current.id if current else None,
             )
 
+    elif action in ("/v", "/version", "/update"):
+        # /v, /version → show version + check; /update is an alias for /v update
+        if action == "/update":
+            handle_version_command(["/v", "update"] + parts[1:])
+        else:
+            handle_version_command(parts)
+
     else:
         # Try .laintas/commands.py custom handler first
         handler = _load_extra_commands()
@@ -6090,6 +6173,7 @@ _COMMANDS = [
     ("/config",    "View or set runtime configuration"),
     ("/max",       "Lift all limits — max tokens/loops, disable circuit breakers (all agents)"),
     ("/reload",    "Reload default files and restart"),
+    ("/v",         "Show version; /v update to self-update (partial download)"),
     ("/resume",    "Choose a /q checkpoint to resume (/resume, /resume <N>)"),
     ("/continue",  "Resume agent loop after max_loops exhaustion"),
 ]
@@ -6246,6 +6330,7 @@ def show_help():
     table.add_row("/config", "Runtime config (/config, /config <key> <value>, /config reset)")
     table.add_row("/tools", "List registered AI tools")
     table.add_row("/resume [N]", "Choose a /q checkpoint to resume; launch with --resume or --continue for latest")
+    table.add_row("/v, /version", "Show version & check for updates; /v update to self-update (downloads only changed files)")
     table.add_row("/clear", "Clear screen")
     table.add_row("/exit", "Log out and exit (clears cached session)")
     table.add_row("/quit, /q", "Detach from sub-terminal (/q) or exit without logging out (/quit)")
@@ -6300,7 +6385,7 @@ def show_banner(agent_name: str, session: dict = None):
         elif uid:
             account_line = f"Account: {uid}\n"
     console.print(Panel(
-        f"[bold]Laintas CLI[/bold] — {agent_name}\n"
+        f"[bold]Laintas CLI[/bold] [dim]v{__version__}[/dim] — {agent_name}\n"
         f"{account_line}"
         f"OS: {SYSTEM} | Shell: {shell_info}\n"
         f"Working: {os.getcwd()}\n"
@@ -6622,6 +6707,8 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(description="Laintas CLI — Autonomous AI agent")
+    parser.add_argument("--version", "-V", action="version",
+                        version=f"laintas-cli {__version__}")
     parser.add_argument("--name", type=str, help="Set agent name (shows in Helpwo AGNETS)")
     parser.add_argument("--backend", type=str, help="Backend URL", default=None)
     parser.add_argument("--laintas", type=str, help="Laintas.com base URL", default=None)

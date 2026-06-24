@@ -20,6 +20,12 @@ at it.
 
 ### Cutting a new version
 
+0. **Bump `version.py`** (`__version__`). This is the single source of truth —
+   `setup.py`, the startup banner, `--version`, and the self-updater (`/v`) all
+   read it, and `build_download_assets.sh` writes it into the release
+   `manifest.json`. The self-updater only offers an update when the published
+   `manifest.json` version is **newer** than the user's `version.py`, so a
+   release that doesn't bump this is invisible to `/v update`.
 1. Build/refresh artifacts into `latest/` (steps below), and let CI rebuild the
    Windows exe into `latest/`.
 2. Snapshot to the new version dir:
@@ -53,6 +59,22 @@ The download page serves these from `laintas_cli_download/{public,dist}/releases
 There is also a `.deb` (`laintas-cli_0.1.x_amd64.deb`) built separately via
 `build/linux/build_deb.sh` (needs `fpm`); it is listed in `SHA256SUMS.txt` but is
 not part of the routine "rebuild all 4" flow.
+
+### Self-update artifacts (`/v update`)
+
+`build_download_assets.sh` additionally publishes, under each release dir:
+
+- `manifest.json` — `{version, released, files:{<name>:{sha256,size}}}`. The
+  `/v` command fetches `releases/<channel>/manifest.json` (channel defaults to
+  `latest`) to decide whether a newer version exists.
+- `src/<module>.py` — every `.py` module published individually, so the updater
+  downloads **only the files whose sha256 changed** (partial update for source
+  installs). Frozen-binary installs can't be patched per-file, so `/v update`
+  falls back to replacing the whole binary from the platform tarball/exe.
+
+Both are written into `public/releases/latest/` (and copied to `dist/` by
+`npm run build`); commit them alongside the other artifacts (`git add` the
+`public/` copies; the `src/` dir and `manifest.json` are plain tracked files).
 
 ### Why Windows can only be built by CI
 
@@ -168,6 +190,53 @@ Sanity-check the fix is actually in the artifacts:
 unzip -p laintas_cli_download/public/releases/latest/laintas-cli_source.zip \
   laintas-cli-source/laintas_cli.py | grep -c <your-new-symbol>
 ```
+
+## Windows code signing (Azure Trusted Signing)
+
+An **unsigned** `.exe` is why Windows/SmartScreen flags the download as "high
+risk / unknown publisher", and why Defender heuristics false-positive on the
+PyInstaller bootloader. Two things address this:
+
+1. **Version metadata (done, free).** `build/windows/laintas_cli.spec` generates
+   a `VERSIONINFO` resource from `version.py` (CompanyName/ProductName/
+   FileVersion). It doesn't remove the warning but improves trust scoring and
+   makes Explorer → Properties → Details look legitimate. The generated
+   `build/windows/version_info.txt` is gitignored (rebuilt each run).
+
+2. **Authenticode signing (the real fix).** The CI workflow
+   (`windows-release.yml`) signs `dist/laintas_cli.exe` via
+   **azure/trusted-signing-action** *before* it is copied/zipped/checksummed.
+   The step is **gated on secrets** — until they are set the build still
+   succeeds but emits an unsigned exe (with a `::warning::`).
+
+### One-time Azure setup
+
+1. Azure Portal → create a **Trusted Signing account** (formerly Azure Code
+   Signing). Note the **region endpoint** (e.g. `https://eus.codesigning.azure.net`).
+2. Create a **Certificate profile** (Public Trust). Complete the identity
+   validation (org or individual) — this can take a few days for org validation.
+3. Create an **App registration** (service principal) and a client secret; grant
+   it the **Trusted Signing Certificate Profile Signer** role on the account.
+4. Add these GitHub repo secrets (Settings → Secrets and variables → Actions):
+
+   | Secret | Value |
+   |---|---|
+   | `AZURE_TENANT_ID` | directory (tenant) id |
+   | `AZURE_CLIENT_ID` | app registration (client) id |
+   | `AZURE_CLIENT_SECRET` | client secret |
+   | `AZURE_TS_ENDPOINT` | region endpoint URL |
+   | `AZURE_TS_ACCOUNT` | Trusted Signing account name |
+   | `AZURE_TS_PROFILE` | certificate profile name |
+
+Once the secrets exist, the next push that triggers the workflow produces a
+signed exe. The workflow verifies the signature (`Get-AuthenticodeSignature`)
+and fails if it isn't `Valid`. Consider also signing the NSIS installer if you
+start shipping it (`installer.nsi` is not built in CI today).
+
+> SmartScreen reputation: Trusted Signing is OV-class, so the warning fades as
+> downloads accrue under the stable publisher identity (it doesn't reset per
+> build the way unsigned hashes do). An EV cert would clear it instantly but
+> needs a hardware token that doesn't fit cloud CI.
 
 ## Gotchas learned the hard way
 

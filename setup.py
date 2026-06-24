@@ -1,13 +1,28 @@
+import os
+
 from setuptools import setup
+
+# Single source of truth — read version.py directly so the packaged version
+# always matches what `/v` reports at runtime.
+_version = "0.0.0"
+try:
+    _vns = {}
+    with open(os.path.join(os.path.dirname(__file__), "version.py")) as _vf:
+        exec(_vf.read(), _vns)
+    _version = _vns.get("__version__", _version)
+except Exception:
+    pass
 
 setup(
     name="laintas-cli",
-    version="0.1.4",
+    version=_version,
     description="Laintas CLI - Autonomous AI agent for your terminal",
     author="Laintas",
     url="https://github.com/lin7c/laintas_cli_pre",
     py_modules=[
         "laintas_cli",
+        "version",
+        "updater",
         "agent_loop",
         "tools",
         "skills",

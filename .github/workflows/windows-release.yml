@@ -50,8 +50,57 @@ jobs:
 
       - name: Build laintas_cli.exe
         shell: pwsh
+        run: pyinstaller --noconfirm build/windows/laintas_cli.spec
+
+      # ── Code signing (Azure Trusted Signing) ──────────────────────────────
+      # Signing MUST happen before the exe is copied/zipped/checksummed, because
+      # it rewrites the file (and thus its SHA256). The step is gated on the
+      # signing secrets being present, so the build still succeeds (unsigned)
+      # until Azure Trusted Signing is configured. To enable, add these repo
+      # secrets (Settings → Secrets and variables → Actions):
+      #   AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET  (service principal)
+      #   AZURE_TS_ENDPOINT        e.g. https://eus.codesigning.azure.net
+      #   AZURE_TS_ACCOUNT         Trusted Signing account name
+      #   AZURE_TS_PROFILE         certificate profile name
+      - name: Detect signing config
+        id: signcfg
+        shell: pwsh
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
         run: |
-          pyinstaller --noconfirm build/windows/laintas_cli.spec
+          if ($env:AZURE_CLIENT_ID) { "enabled=true" } else { "enabled=false" } |
+            Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          if (-not $env:AZURE_CLIENT_ID) {
+            Write-Host "::warning::Azure Trusted Signing secrets not set — producing an UNSIGNED exe (will trigger SmartScreen)."
+          }
+
+      - name: Sign laintas_cli.exe (Azure Trusted Signing)
+        if: steps.signcfg.outputs.enabled == 'true'
+        uses: azure/trusted-signing-action@v0
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ secrets.AZURE_TS_ENDPOINT }}
+          trusted-signing-account-name: ${{ secrets.AZURE_TS_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_TS_PROFILE }}
+          files-folder: ${{ github.workspace }}/dist
+          files-folder-filter: exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Verify signature
+        if: steps.signcfg.outputs.enabled == 'true'
+        shell: pwsh
+        run: |
+          $sig = Get-AuthenticodeSignature dist/laintas_cli.exe
+          Write-Host "Signature status: $($sig.Status)"
+          if ($sig.Status -ne 'Valid') { throw "Signature invalid: $($sig.Status)" }
+
+      - name: Distribute signed exe
+        shell: pwsh
+        run: |
           Copy-Item dist/laintas_cli.exe build/windows/laintas_cli.exe -Force
           Copy-Item dist/laintas_cli.exe laintas_cli_download/public/releases/latest/laintas_cli.exe -Force
           Copy-Item dist/laintas_cli.exe laintas_cli_download/dist/releases/latest/laintas_cli.exe -Force
