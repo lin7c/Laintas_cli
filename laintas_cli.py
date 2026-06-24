@@ -1761,6 +1761,46 @@ def verify_session(session: dict) -> Optional[dict]:
     return None
 
 
+def resolve_session_from_token(token: str, resp_cookies=None) -> Optional[dict]:
+    """Turn a raw token (and optional response cookies) into a verified session.
+
+    Better Auth's get-session needs a *signed* cookie value or a Bearer token.
+    The JSON `token` from sign-in / cli-exchange is unsigned, so a single guess
+    at the cookie name is fragile. Try, in order:
+      1. the signed cookie returned in the HTTP response (most reliable),
+      2. the token as __Secure- / non-prefixed session cookie,
+      3. the token as an Authorization: Bearer header.
+    Returns a verified session dict (with userId/userName/userEmail) or None.
+    """
+    token = (token or "").strip()
+    if not token:
+        return None
+
+    candidates = []
+    # 1. Signed cookie straight from the response, if the server set one.
+    if resp_cookies:
+        for cookie_name in ("__Secure-better-auth.session_token", "better-auth.session_token"):
+            signed = resp_cookies.get(cookie_name, "")
+            if signed:
+                candidates.append({"cookies": {cookie_name: signed}, "headers": {}})
+    # 2. The raw token as each cookie name.
+    candidates.append({"cookies": {"__Secure-better-auth.session_token": token}, "headers": {}})
+    candidates.append({"cookies": {"better-auth.session_token": token}, "headers": {}})
+    # 3. The raw token as a Bearer header.
+    candidates.append({"cookies": {}, "headers": {"Authorization": f"Bearer {token}"}})
+
+    for candidate in candidates:
+        candidate["token"] = token
+        user_info = verify_session(candidate)
+        if user_info:
+            candidate["userId"] = user_info["id"]
+            candidate["userName"] = user_info.get("name", "")
+            candidate["userEmail"] = user_info.get("email", "")
+            return candidate
+
+    return None
+
+
 def solve_captcha_challenge() -> Optional[str]:
     """Return an ALTCHA-compatible captcha response for local CLI login."""
     try:
@@ -1884,34 +1924,12 @@ def login_interactive() -> Optional[dict]:
     if not token.strip():
         return None
 
-    session = {
-        "cookies": {"__Secure-better-auth.session_token": token.strip()},
-        "headers": {},
-    }
-    user_info = verify_session(session)
-    if not user_info:
-        session["cookies"] = {"better-auth.session_token": token.strip()}
-        user_info = verify_session(session)
-    if user_info:
-        session["userId"] = user_info["id"]
-        session["userName"] = user_info.get("name", "")
-        session["userEmail"] = user_info.get("email", "")
+    session = resolve_session_from_token(token)
+    if session:
         save_session(session)
-        console.print(f"[green]Logged in as {user_info['id']}[/green]")
-        return session
-
-    # Try Authorization header
-    session = {
-        "cookies": {},
-        "headers": {"Authorization": f"Bearer {token.strip()}"},
-    }
-    user_info = verify_session(session)
-    if user_info:
-        session["userId"] = user_info["id"]
-        session["userName"] = user_info.get("name", "")
-        session["userEmail"] = user_info.get("email", "")
-        save_session(session)
-        console.print(f"[green]Logged in as {user_info['id']}[/green]")
+        display = (session.get("userEmail") or session.get("userName")
+                   or session.get("userId"))
+        console.print(f"[green]Logged in as {display}[/green]")
         return session
 
     console.print("[red]Invalid session token.[/red]")
@@ -1992,18 +2010,13 @@ def login_via_browser() -> Optional[dict]:
                 data = resp.json()
                 token = data.get("token", "")
                 if token:
-                    session = {
-                        "token": token,
-                        "cookies": {"__Secure-better-auth.session_token": token},
-                        "headers": {},
-                    }
-                    user_info = verify_session(session)
-                    if user_info:
-                        session["userId"] = user_info["id"]
-                        session["userName"] = user_info.get("name", "")
-                        session["userEmail"] = user_info.get("email", "")
+                    # The cli-exchange token is unsigned; let resolve_session_from_token
+                    # try the signed response cookie, both cookie names, and Bearer.
+                    session = resolve_session_from_token(token, resp.cookies)
+                    if session:
                         save_session(session)
-                        display = user_info.get("email") or user_info.get("name") or user_info["id"]
+                        display = (session.get("userEmail") or session.get("userName")
+                                   or session.get("userId"))
                         console.print(f"[green]Logged in as {display}[/green]")
                         return session
                     else:
