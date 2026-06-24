@@ -4,9 +4,44 @@ How to package and publish Laintas CLI to the download page. Written for agents
 and humans picking up the release process. Read this before touching anything
 under `build/` or `laintas_cli_download/releases/`.
 
+## Versioned download paths (read this first)
+
+Downloads are served through **Cloudflare** with `cache-control: max-age=14400`
+(4 h). The file URLs used to be stable (`/releases/latest/laintas_cli.exe`), so
+after a rebuild the CDN kept serving the **cached old binary** until the cache
+expired — `npm run build` and even deploying the origin did not help, because
+`cf-cache-status: HIT` on the canonical URL.
+
+Fix: the site now downloads from **versioned, immutable paths**
+`/releases/v<MAJOR.MINOR>/…` (current: **v1.1**). A new version is a new URL, so
+the CDN never serves a stale file. `latest/` still exists as a rolling **staging**
+copy (CI and the build script write there), but the live site does **not** point
+at it.
+
+### Cutting a new version
+
+1. Build/refresh artifacts into `latest/` (steps below), and let CI rebuild the
+   Windows exe into `latest/`.
+2. Snapshot to the new version dir:
+   `cp -r laintas_cli_download/public/releases/latest laintas_cli_download/public/releases/v1.2`
+3. Bump every reference (single sed across the known files):
+   ```bash
+   cd laintas_cli_download
+   grep -rl 'releases/v1.1' src public/install.sh | xargs sed -i 's#releases/v1.1#releases/v1.2#g'
+   ```
+   (touches `src/components/DownloadSection.jsx`, `src/pages/DownloadPage.jsx`,
+   `src/contexts/LanguageContext.jsx`, `public/install.sh`)
+4. `npm run build` (regenerates `dist/`, including `dist/releases/v1.2/`).
+5. Commit (force-add the gitignored `dist/` files) and deploy.
+6. **One-time** after deploy: purge the Cloudflare cache for the site **HTML**
+   (`https://cli.laintas.com/` / `index.html`) so users get the new `index.html`
+   that points at the new version. The versioned binaries themselves never need
+   purging. Hashed JS/CSS bundles (`assets/index-*.js`) are auto-busted by Vite.
+
 ## The 4 download-page artifacts
 
-The download page serves these from `laintas_cli_download/{public,dist}/releases/latest/`:
+The download page serves these from `laintas_cli_download/{public,dist}/releases/v<ver>/`
+(staging copy in `…/releases/latest/`):
 
 | Artifact | Platform | Built by | Contains |
 |---|---|---|---|

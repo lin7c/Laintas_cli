@@ -115,7 +115,7 @@ const translations = {
         },
       ],
       shellLabel: 'PowerShell 下载命令：',
-      shellCmd: 'Invoke-WebRequest -Uri https://cli.laintas.com/releases/latest/laintas_cli.exe -OutFile .\\laintas_cli.exe',
+      shellCmd: 'Invoke-WebRequest -Uri https://cli.laintas.com/releases/v1.1/laintas_cli.exe -OutFile .\\laintas_cli.exe',
       troubleshootTitle: '常见问题',
       troubleshootItems: [
         { problem: 'Windows Defender / SmartScreen 提示', solution: '确认来源后选择“仍要运行”，或将文件放到白名单目录。' },
@@ -279,7 +279,7 @@ const translations = {
         },
       ],
       shellLabel: 'PowerShell download command:',
-      shellCmd: 'Invoke-WebRequest -Uri https://cli.laintas.com/releases/latest/laintas_cli.exe -OutFile .\\laintas_cli.exe',
+      shellCmd: 'Invoke-WebRequest -Uri https://cli.laintas.com/releases/v1.1/laintas_cli.exe -OutFile .\\laintas_cli.exe',
       troubleshootTitle: 'Troubleshooting',
       troubleshootItems: [
         { problem: 'Windows Defender / SmartScreen warning', solution: 'Verify the file source, then choose Run anyway or allow-list the directory.' },
