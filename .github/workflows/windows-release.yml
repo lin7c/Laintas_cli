@@ -30,11 +30,23 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install build dependencies
+      - name: Show Python
         shell: pwsh
         run: |
-          python -m pip install --disable-pip-version-check --upgrade pip
-          python -m pip install --disable-pip-version-check --prefer-binary requests certifi rich prompt-toolkit pyinstaller
+          python --version
+          python -m pip --version
+
+      - name: Upgrade pip
+        shell: pwsh
+        run: python -m pip install --disable-pip-version-check --upgrade pip
+
+      - name: Install runtime dependencies
+        shell: pwsh
+        run: python -m pip install --disable-pip-version-check --prefer-binary requests certifi rich prompt-toolkit
+
+      - name: Install PyInstaller
+        shell: pwsh
+        run: python -m pip install --disable-pip-version-check --prefer-binary pyinstaller
 
       - name: Build laintas_cli.exe
         shell: pwsh
