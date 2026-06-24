@@ -134,6 +134,7 @@ from agent_loop import (
 
 import tools as tools_mod    # noqa: E402 — load after agent_loop so registry inits once
 import skills as skills_mod  # noqa: E402
+import task_manager          # noqa: E402 — resume blob rehydrates the task plan
 import paths                 # Centralized path management
 import migrate as migrate_mod  # Auto-migration from old layout
 import hwo_ui as hwo_ui_mod  # /hwo orchestration UI
@@ -2487,6 +2488,8 @@ The catalog below documents each tool's purpose and parameters:
 </tools>
 
 <workflow>
+- Plan with tasks. For any multi-step task (≈3+ steps or non-trivial), at the FIRST turn call `task.create` to record the goal and break it into sub-tasks, then `task.update` the one you start to `in_progress`. Keep exactly one task `in_progress`; mark each `task.update ... completed` as you finish it. The task list is your durable plan — it survives context compression and is how you resume. The `<active_tasks>` block shows it every turn.
+- Resuming / "continue": when the user says only "continue" (`继续`, etc.), do NOT treat that as the task. Read `<active_tasks>` and resume the `in_progress` item; if none, work the `<objective>`. Only ask the user if both are empty.
 - If the user asks a clear read/edit/build/test/investigate task, act with tools. Do not ask for permission to do exactly what was asked.
 - Ask one concise clarifying question only when the target or intent is genuinely ambiguous, destructive, impossible to infer safely, or blocked on information you cannot discover yourself.
 - If there are multiple reasonable approaches with materially different tradeoffs, stop and present 2-3 labeled options. State the consequence of each option briefly, then wait for the user's choice.
@@ -2546,9 +2549,25 @@ def _resume_turn_count(blob: Optional[dict]) -> int:
 
 
 def _restore_resume_blob(blob: dict, chat_history: list) -> dict:
-    """Restore full-fidelity conversation state from a per-cwd resume blob."""
+    """Restore full-fidelity conversation state from a per-cwd resume blob.
+
+    Restores conversation + working state + the task plan, mirroring how
+    Codex/Claude bring back a session: the transcript, the older-turn summary
+    (so long sessions don't lose early goals), and the open todo/plan list.
+    """
     chat_history.clear()
+    # Prepend a digest of turns that were dropped past the resume window so the
+    # early goals/instructions aren't lost on a long session.
+    older = (blob.get("older_summary") or "").strip()
+    if older:
+        chat_history.append({"role": "knowledge", "content": f"[resumed session context]\n{older}"})
     chat_history.extend(blob.get("chat_history") or [])
+    # Rehydrate the plan (in_progress + pending tasks) as session tasks so
+    # <active_tasks> shows it immediately and "continue" can resume it.
+    try:
+        task_manager.import_session_tasks(blob.get("tasks") or [])
+    except Exception:
+        pass
     return prepare_state_for_repl(blob.get("state") or {})
 
 

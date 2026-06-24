@@ -440,6 +440,7 @@ def save_session_snapshot(state: dict, chat_history: list, cwd: str) -> None:
             "cwd": cwd,
             "timestamp": time.time(),
             "shortTermMemory": mem,
+            "objective": str(state.get("objective") or "").strip(),
             "recent_turns": turns,
         }
         dest = paths.SESSIONS_DIR / f"{_session_key(cwd)}.json"
@@ -453,11 +454,42 @@ _RESUME_MAX_TURNS = 80   # full-fidelity turns kept for /resume
 _RESUME_MAX_CHECKPOINTS = 20
 
 
+def _summarize_dropped_turns(dropped: list) -> str:
+    """Cheap, deterministic summary of turns dropped past _RESUME_MAX_TURNS.
+
+    Long sessions exceed the full-fidelity window; rather than silently losing
+    the early context (like the original goal and intermediate user asks), we
+    keep a no-LLM digest of the highest-signal items — the user's own
+    instructions — so /resume can prepend them. Mirrors the intent of Claude's
+    compaction summary without an extra API call.
+    """
+    if not dropped:
+        return ""
+    user_asks = []
+    for m in dropped:
+        if m.get("role") != "user":
+            continue
+        text = " ".join(str(m.get("content") or "").split())
+        if not text:
+            continue
+        user_asks.append(text[:160] + ("…" if len(text) > 160 else ""))
+    if not user_asks:
+        return ""
+    shown = user_asks[-12:]
+    omitted = len(user_asks) - len(shown)
+    head = f"Earlier in this session ({len(dropped)} older turn(s) omitted), the user asked:"
+    bullets = "\n".join(f"  - {a}" for a in shown)
+    prefix = f"  - … ({omitted} earlier ask(s) omitted)\n" if omitted > 0 else ""
+    return f"{head}\n{prefix}{bullets}"
+
+
 def _build_resume_payload(state: dict, chat_history: list, cwd: str, kind: str) -> Optional[dict]:
     user_turns = [m for m in (chat_history or []) if m.get("role") == "user"]
     if not user_turns:
         return None
-    history = list(chat_history or [])[-_RESUME_MAX_TURNS:]
+    all_history = list(chat_history or [])
+    history = all_history[-_RESUME_MAX_TURNS:]
+    dropped = all_history[:-_RESUME_MAX_TURNS] if len(all_history) > _RESUME_MAX_TURNS else []
     last_user = str(user_turns[-1].get("content") or "").strip()
     title = re.sub(r"\s+", " ", last_user)[:80] or "Untitled session"
     return {
@@ -468,6 +500,8 @@ def _build_resume_payload(state: dict, chat_history: list, cwd: str, kind: str) 
         "title": title,
         "turn_count": len(user_turns),
         "chat_history": history,
+        "older_summary": _summarize_dropped_turns(dropped),
+        "tasks": task_manager.export_active_tasks(),
         "state": prepare_state_for_repl(state or {}),
     }
 
@@ -1304,18 +1338,43 @@ _ERROR_PATTERNS = [
      "Syntax error in command. Check quoting, escaping, and special characters."),
     (r"(?:ModuleNotFoundError|ImportError|No module named)", "missing_module",
      "Python module not found. Install it with pip install."),
-    (r"(?:fatal:|error:|FAILED)", "error",
+    # Catch-all: a diagnostic prefix at the START of a line. Anchored + made
+    # case-SENSITIVE (via (?-i:...)) on purpose — an unanchored, case-insensitive
+    # `error|failed` substring matches incidental prose and source code
+    # ("Failed to load…", `except termios.error:`), which used to flip succeeded
+    # steps to "failed". This pattern only *classifies* an already-failed step.
+    (r"(?m)^(?-i:fatal:|error:|FAILED\b)", "error",
      "An error was reported in the output. Review the error message above."),
 ]
 
 
+def _step_failed(returncode) -> bool:
+    """Authoritative failure decision for a command/tool step.
+
+    A step failed iff its exit status says so: any nonzero code, or the `-1`
+    tool-failure sentinel (set when a tool returns ok=False — see the dispatch
+    `result.get("returncode", 0 if ok else -1)`). `0` is success; `None` means
+    "no exec / not applicable" (reply-only or legacy rows) and is NOT a failure.
+
+    Failure must NEVER be inferred from output text: successful output routinely
+    contains the words "error:"/"failed" (source files, grep hits, build logs),
+    and substring-matching them used to flip a succeeded step to "failed".
+    """
+    return returncode is not None and returncode != 0
+
+
 def _analyze_error(output: str, returncode: int) -> dict:
-    """Classify a command failure and suggest fixes.
+    """Classify an *already-failed* command/tool step and suggest a fix.
+
+    The failure decision belongs to _step_failed() (exit-status driven). This
+    only runs the text patterns to *label* a failure — so a succeeded step
+    (rc 0 / None) is always "none" regardless of what its output contains.
 
     Returns {category, suggestion, retryable, output_snippet}.
     """
-    if returncode == 0 and not output.strip():
-        return {"category": "none", "suggestion": "", "retryable": False, "output_snippet": ""}
+    none = {"category": "none", "suggestion": "", "retryable": False, "output_snippet": ""}
+    if not _step_failed(returncode):
+        return none
 
     snippet = output[:500] if output else "(no output)"
 
@@ -1329,16 +1388,22 @@ def _analyze_error(output: str, returncode: int) -> dict:
                 "output_snippet": snippet,
             }
 
-    # Non-zero exit but no recognized pattern
-    if returncode != 0 and returncode is not None and returncode != -1:
+    # Failed, but no pattern matched. Positive exit code → report the code;
+    # the -1 tool sentinel → generic failure (the tool's own error text is in
+    # `output`/`snippet`).
+    if returncode not in (None, -1):
         return {
             "category": "unknown_failure",
             "suggestion": f"Command exited with code {returncode}. Review output for details.",
             "retryable": False,
             "output_snippet": snippet,
         }
-
-    return {"category": "none", "suggestion": "", "retryable": False, "output_snippet": snippet}
+    return {
+        "category": "failed",
+        "suggestion": "The tool reported a failure. Review the output above.",
+        "retryable": False,
+        "output_snippet": snippet,
+    }
 
 
 def _maybe_retry_suggestion(state: dict) -> str:
@@ -1353,12 +1418,12 @@ def _maybe_retry_suggestion(state: dict) -> str:
     recent = history[-_CONSECUTIVE_FAILURE_LIMIT:]
     failures = 0
     for entry in recent:
-        output = entry.get("output", "")
         cmd = entry.get("command", "")
         if not cmd:
             continue
-        analysis = _analyze_error(output, -1)
-        if analysis["category"] != "none":
+        # Authoritative: count only steps whose exit status says they failed —
+        # not steps whose output merely mentions "error"/"failed".
+        if _step_failed(entry.get("returncode")):
             failures += 1
 
     if failures >= _CONSECUTIVE_FAILURE_LIMIT:
@@ -1403,9 +1468,10 @@ def _summarize_old_entries(old_entries: list) -> dict:
                 break
         run_len = j - i
 
-        # Identify error vs success
-        err = _analyze_error(output, rc if rc is not None else -1)
-        is_error = err.get("category") not in ("none", None)
+        # Identify error vs success from the authoritative exit status; only
+        # then classify the failure for a richer snippet.
+        is_error = _step_failed(rc)
+        err = _analyze_error(output, rc) if is_error else None
         if is_error:
             error_steps += run_len
 
@@ -1485,8 +1551,8 @@ def _compress_terminal_history(history: list) -> str:
         cmd_label = (entry.get("command", "") or "")[:120]
         rc = entry.get("returncode")
         rc_tag = f" rc={rc}" if rc not in (None, -1) else ""
-        err = _analyze_error(output, rc if rc is not None else -1)
-        err_tag = f"  [error:{err['category']}]" if err.get("category") not in ("none", None) else ""
+        err = _analyze_error(output, rc) if _step_failed(rc) else None
+        err_tag = f"  [error:{err['category']}]" if err else ""
 
         out_lines = output.split('\n')
         if len(out_lines) > _MAX_TERMINAL_LINES:
@@ -1634,6 +1700,26 @@ def _append_short_memory(state: dict, text: str) -> None:
     )
 
 
+# Continuation tokens: a user line that means "resume the existing objective",
+# NOT a new task. We must not overwrite the pinned objective with these, and the
+# prompt routes them to the active task list. Kept multilingual + intentionally
+# short so a real instruction that merely starts with "continue …" is unaffected.
+_CONTINUATION_INPUTS = {
+    "继续", "接着", "接着做", "继续做", "go on", "continue", "keep going",
+    "proceed", "resume", "next", "go ahead", "carry on", "go", "ok", "好",
+    "好的", "嗯", "go on please", "请继续", "继续吧",
+}
+
+
+def _is_continuation_input(text: str) -> bool:
+    """True when the user line is a bare 'continue' nudge rather than a new goal.
+
+    Empty input also counts (the user just hit enter to let the agent proceed).
+    """
+    t = (text or "").strip().lower().rstrip("。.!！~")
+    return t == "" or t in _CONTINUATION_INPUTS
+
+
 def _summarize_reply_for_memory(reply: str, limit: int = 120) -> str:
     """Condense a step's user-facing reply for session memory.
 
@@ -1705,6 +1791,9 @@ def prepare_state_for_repl(state: dict) -> dict:
         "lastOutput": _trim_text(state.get("lastOutput", ""), output_limit),
         "terminalHistory": _microcompact_history(history, keep_recent=5),
         "_files_seen": (state.get("_files_seen") or [])[-20:],
+        # Carry the pinned objective across REPL turns so a later "continue"
+        # still has the goal (this whitelist is the turn-to-turn hand-off).
+        "objective": (state.get("objective") or "").strip(),
     }
 
 
@@ -1754,9 +1843,10 @@ def _build_terminal_section(state: dict) -> str:
                 output = output[-_TOOL_RESULT_BUDGET:]
 
         # Inline error classification — saves the AI a turn of analysis.
-        err = _analyze_error(output, rc if rc is not None else -1)
+        # Authoritative: only an exit-status failure is an error (not output text).
         err_tag = ""
-        if err.get("category") not in ("none", None):
+        if _step_failed(rc):
+            err = _analyze_error(output, rc)
             err_tag = f"  [error:{err['category']}]"
 
         rc_tag = ""
@@ -1964,9 +2054,8 @@ def _detect_loop_warnings_typed(state: dict, original_input: str) -> list[tuple[
     recent = history[-3:]
     fail_count = 0
     for h in recent:
-        err = _analyze_error(h.get("output", ""),
-                             h.get("returncode") if h.get("returncode") is not None else -1)
-        if err.get("category") not in ("none", None):
+        # Authoritative exit-status failure, not an output-text mention.
+        if _step_failed(h.get("returncode")):
             fail_count += 1
     if fail_count >= 3:
         warnings.append(("consecutive_failures",
@@ -2155,10 +2244,31 @@ def _build_user_message(original_input: str, state: dict, memory_entries: list,
     if tasks_snapshot:
         tasks_block = f"\n<active_tasks>\n{tasks_snapshot}\n</active_tasks>\n"
 
+    # Pinned objective — always present, never FIFO-evicted, so the goal
+    # survives compression and a bare "continue".
+    objective = (state.get("objective") or "").strip()
+    objective_block = ""
+    if objective and objective != str(original_input or "").strip():
+        objective_block = f"\n<objective>\n{objective}\n</objective>\n"
+
+    # Continuation guidance: a bare "continue"/empty line is NOT a new goal —
+    # route the model to its own plan / the pinned objective instead of letting
+    # it treat "继续" as the task.
+    continuation_block = ""
+    if _is_continuation_input(original_input):
+        continuation_block = (
+            "\n<continuation>\n"
+            "The user asked to continue — this is not a new task. Resume the "
+            "in_progress item in <active_tasks>; if none is in progress, pick up "
+            "the <objective> above (create/advance tasks for it). Only ask the "
+            "user if both are genuinely empty.\n"
+            "</continuation>\n"
+        )
+
     return f"""<task>
 {original_input}
 </task>
-
+{objective_block}{continuation_block}
 <progress>
 step {loop+1}/{max_loops} — {n_steps} command(s) executed so far
 </progress>
@@ -2716,6 +2826,28 @@ def run_agent_loop(
         int(get_runtime_config("output_truncate") or 3000) * 2,
     )
     chat_history = chat_history or []
+
+    # ── Pin the objective (durable goal anchor) ────────────────────────────
+    # The user's goal must survive context compression and a bare "continue".
+    # shortTermMemory FIFO-evicts the oldest line (the goal); chat history is
+    # windowed. So a substantive top-level instruction is pinned here (persisted
+    # in the session snapshot) and rendered every turn as <objective>. A
+    # "continue"/empty line keeps the existing objective instead of erasing it.
+    # As a safety net (so even a forgotten task.create can't lose the goal) the
+    # first substantive task auto-seeds a session task that anchors "continue".
+    if depth == 0:
+        _orig = (original_input or "").strip()
+        if _orig and not _is_continuation_input(_orig):
+            if state.get("objective") != _orig:
+                state["objective"] = _orig
+                # Auto-seed a task for the new goal so a later "continue" has an
+                # anchor — unless real work is already in progress (don't barge
+                # into an active task; stale pending clutter must not block it).
+                try:
+                    if not task_manager.list_tasks(status="in_progress"):
+                        task_manager.create_session_task(_orig[:120], _orig)
+                except Exception:
+                    pass
 
     step_replies = []
     user_input = original_input

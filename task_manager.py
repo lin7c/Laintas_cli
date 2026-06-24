@@ -296,22 +296,27 @@ def get_available_tasks() -> list[dict]:
 
 
 def get_active_tasks_snapshot() -> str:
-    """Render a compact summary of in_progress tasks for prompt injection.
+    """Render a compact summary of the open task list for prompt injection.
 
-    Returns empty string if no active tasks.
+    Includes both in_progress (shown first) and pending tasks so the model's
+    own plan — and any auto-seeded objective task — stays visible every turn and
+    can anchor a "continue" request. Returns empty string if nothing is open.
     """
     all_tasks = _load() + list(_session_tasks)
-    active = [t for t in all_tasks if t.get("status") == "in_progress"]
-    if not active:
+    in_progress = [t for t in all_tasks if t.get("status") == "in_progress"]
+    pending = [t for t in all_tasks if t.get("status") == "pending"]
+    ordered = in_progress + pending
+    if not ordered:
         return ""
 
-    lines = ["Active tasks:"]
-    for t in active[:10]:  # cap at 10
+    lines = ["Active tasks (the plan — resume from here on 'continue'):"]
+    for t in ordered[:10]:  # cap at 10
+        status_mark = "▶" if t.get("status") == "in_progress" else "○"
         progress = t.get("progress", 0)
         progress_str = f" ({progress}%)" if progress > 0 else ""
         blocked_by = t.get("blockedBy", [])
         blocked_str = f" [blocked by: {', '.join(blocked_by)}]" if blocked_by else ""
-        lines.append(f"  [{t['id']}] {t['subject']}{progress_str}{blocked_str}")
+        lines.append(f"  {status_mark} [{t['id']}] {t['subject']}{progress_str}{blocked_str}")
         # Show last 2 notes if any
         notes = t.get("notes", [])
         for note in notes[-2:]:
@@ -324,4 +329,55 @@ def clear_session_tasks() -> None:
     global _session_tasks
     with _lock:
         _session_tasks.clear()
+
+
+def export_active_tasks() -> list[dict]:
+    """Export the open plan (in_progress + pending tasks, persisted + session).
+
+    Used to snapshot the working plan into a /resume blob so it survives a
+    restart — mirrors how Claude restores todos / Codex restores its plan.
+    Returns deep-ish copies so callers can serialize without mutating state.
+    """
+    with _lock:
+        all_tasks = _load() + list(_session_tasks)
+    out = []
+    for t in all_tasks:
+        if t.get("status") in ("in_progress", "pending"):
+            out.append(dict(t))
+    return out
+
+
+def import_session_tasks(tasks: list[dict]) -> int:
+    """Rehydrate a plan from a /resume blob as session tasks.
+
+    Replaces the current session task list with the saved one (the resume blob
+    is the source of truth for the resumed session). Persisted tasks are left
+    untouched; an imported task that duplicates a still-open persisted task by
+    subject is skipped so the plan isn't shown twice. Returns the count loaded.
+    """
+    global _session_tasks
+    if not isinstance(tasks, list):
+        return 0
+    with _lock:
+        persisted_open = {
+            (t.get("subject") or "").strip()
+            for t in _load()
+            if t.get("status") in ("in_progress", "pending")
+        }
+        restored = []
+        for t in tasks:
+            if not isinstance(t, dict) or not t.get("subject"):
+                continue
+            if (t.get("subject") or "").strip() in persisted_open:
+                continue
+            task = dict(t)
+            task["session_only"] = True
+            task.setdefault("status", "pending")
+            task.setdefault("blocks", [])
+            task.setdefault("blockedBy", [])
+            task.setdefault("notes", [])
+            task.setdefault("progress", 0)
+            restored.append(task)
+        _session_tasks = restored
+        return len(restored)
 
