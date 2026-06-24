@@ -2007,26 +2007,46 @@ def login_via_browser() -> Optional[dict]:
                 timeout=10,
             )
             if resp.status_code == 200:
-                data = resp.json()
+                try:
+                    data = resp.json()
+                except ValueError:
+                    data = {}
                 token = data.get("token", "")
                 if token:
-                    # The cli-exchange token is unsigned; let resolve_session_from_token
-                    # try the signed response cookie, both cookie names, and Bearer.
+                    # First try to verify via get-session (signed cookie / both
+                    # cookie names / Bearer).
                     session = resolve_session_from_token(token, resp.cookies)
-                    if session:
-                        save_session(session)
-                        display = (session.get("userEmail") or session.get("userName")
-                                   or session.get("userId"))
-                        console.print(f"[green]Logged in as {display}[/green]")
-                        return session
-                    else:
-                        console.print("[red]Token verification failed.[/red]")
-                        return None
+                    if not session:
+                        # Fall back to TRUSTING the exchange response, exactly like
+                        # the username login path does. get-session sometimes won't
+                        # echo a session back over a fresh request even though the
+                        # cookie is valid for backend API calls. Prefer the signed
+                        # Set-Cookie if the server sent one.
+                        user = data.get("user") or {}
+                        signed = (resp.cookies.get("__Secure-better-auth.session_token")
+                                  or resp.cookies.get("better-auth.session_token")
+                                  or token)
+                        session = {
+                            "token": token,
+                            "cookies": {"__Secure-better-auth.session_token": signed},
+                            "headers": {},
+                            "userId": user.get("id", ""),
+                            "userName": user.get("name", ""),
+                            "userEmail": user.get("email", ""),
+                        }
+                    save_session(session)
+                    display = (session.get("userEmail") or session.get("userName")
+                               or session.get("userId") or "Laintas user")
+                    console.print(f"[green]Logged in as {display}[/green]")
+                    return session
                 else:
-                    console.print("[red]Server returned empty token.[/red]")
+                    # No token — surface what the server actually returned so the
+                    # contract mismatch is diagnosable (without leaking secrets).
+                    console.print("[red]Remote login failed: exchange returned no token.[/red]")
+                    console.print(f"[dim]Response keys: {sorted(data.keys()) if isinstance(data, dict) else type(data).__name__}[/dim]")
                     return None
             else:
-                console.print(f"[red]Code exchange failed: {resp.text[:200]}[/red]")
+                console.print(f"[red]Code exchange failed (HTTP {resp.status_code}): {resp.text[:200]}[/red]")
                 return None
         except requests.RequestException as e:
             console.print(f"[red]Cannot reach {LAINTAS_BASE} for token exchange: {e}[/red]")
@@ -7114,6 +7134,24 @@ def main():
                             fcntl.fcntl(sys.stdin.fileno(), fcntl.F_SETFL, _fl)
 
                     result = pty_passthrough(user_input)
+                    # On Windows pty_passthrough() captures output via
+                    # subprocess instead of echoing to the terminal (no PTY),
+                    # so print it here or the user sees nothing for `dir`, etc.
+                    if IS_WINDOWS:
+                        _win_out = result.get("stdout", "")
+                        _win_err = result.get("stderr", "")
+                        try:
+                            if _win_out:
+                                sys.stdout.write(_win_out)
+                                if not _win_out.endswith("\n"):
+                                    sys.stdout.write("\n")
+                            if _win_err:
+                                sys.stderr.write(_win_err)
+                                if not _win_err.endswith("\n"):
+                                    sys.stderr.write("\n")
+                            sys.stdout.flush()
+                        except (BrokenPipeError, OSError):
+                            pass
 
                 if agent_registry.agent_id:
                     output_preview = result.get("stdout", "")[:2000]

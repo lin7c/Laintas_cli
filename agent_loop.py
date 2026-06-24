@@ -2971,6 +2971,10 @@ def run_agent_loop(
             # Streaming render: use rich.live.Live to render the reply as it arrives
             # via on_chunk. Falls back to spinner if backend doesn't accept on_chunk.
             stream_state = {"reply": "", "command": "", "started": False}
+            # rich.Live's in-place redraw is unreliable on the Windows console
+            # (it reprints each frame, duplicating lines). Stream with a plain
+            # spinner there and print the final reply once instead.
+            _use_live = not sys.platform.startswith("win")
             try:
                 from rich.live import Live
                 from rich.spinner import Spinner
@@ -2990,24 +2994,28 @@ def run_agent_loop(
                         parts.append(Text(f"→ {cmd_preview}", style="dim cyan"))
                     return Group(*parts)
 
-                with Live(_render(), console=deps.console, refresh_per_second=12, transient=False) as live:
-                    def _on_chunk(field, value):
-                        # Check for soft-interrupt during streaming
-                        if _interrupt.is_set():
-                            raise InterruptedError("user interrupt during streaming")
-                        if field == "reply":
-                            stream_state["reply"] += value
-                            # Push each chunk to Helpwo UI for live streaming display
-                            if events_cb is not None:
-                                events_cb([{"type": "ai_stream", "content": value}])
-                        elif field == "command":
-                            stream_state["command"] = value
-                        stream_state["started"] = True
-                        try: live.update(_render())
+                _live_holder = {"live": None}
+
+                def _on_chunk(field, value):
+                    # Check for soft-interrupt during streaming
+                    if _interrupt.is_set():
+                        raise InterruptedError("user interrupt during streaming")
+                    if field == "reply":
+                        stream_state["reply"] += value
+                        # Push each chunk to Helpwo UI for live streaming display
+                        if events_cb is not None:
+                            events_cb([{"type": "ai_stream", "content": value}])
+                    elif field == "command":
+                        stream_state["command"] = value
+                    stream_state["started"] = True
+                    _lv = _live_holder["live"]
+                    if _lv is not None:
+                        try: _lv.update(_render())
                         except Exception: pass
 
+                def _do_stream_call():
                     try:
-                        response = deps.call_backend(
+                        return deps.call_backend(
                             session=session,
                             message=user_input,
                             system_prompt=system_prompt,
@@ -3019,7 +3027,7 @@ def run_agent_loop(
                         )
                     except TypeError:
                         # Backend doesn't support on_chunk/interrupt_event — fall back
-                        response = deps.call_backend(
+                        return deps.call_backend(
                             session=session,
                             message=user_input,
                             system_prompt=system_prompt,
@@ -3027,6 +3035,16 @@ def run_agent_loop(
                             history=history_for_backend,
                             lang=lang,
                         )
+
+                if _use_live:
+                    with Live(_render(), console=deps.console, refresh_per_second=12,
+                              transient=False) as live:
+                        _live_holder["live"] = live
+                        response = _do_stream_call()
+                else:
+                    with deps.console.status("[bold green]AI thinking...[/bold green]",
+                                             spinner="dots"):
+                        response = _do_stream_call()
             except ImportError:
                 with deps.console.status("[bold green]AI thinking...[/bold green]", spinner="dots"):
                     try:
@@ -3050,7 +3068,7 @@ def run_agent_loop(
                         )
             # Mark that the streaming Live already rendered the reply — avoid
             # re-printing it below.
-            _reply_already_rendered = bool(stream_state.get("reply"))
+            _reply_already_rendered = _use_live and bool(stream_state.get("reply"))
         else:
             _reply_already_rendered = False
             try:
