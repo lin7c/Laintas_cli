@@ -53,7 +53,8 @@ _DEFAULT_CONFIG = {
     "repetition_threshold": 3,    # consecutive no-progress steps before force-exit (mirrors TokenBudgetTracker)
     "warning_force_limit": 5,     # consecutive same-warning fires before force-exit (circuit breaker)
     "output_similarity": 0.85,    # Jaccard threshold for "same" output (0.0-1.0)
-    "microcompact_keep": 6,       # recent entries to keep full output in microcompact
+    "microcompact_keep": 8,       # recent entries to keep full output in microcompact
+    "microcompact_read_budget": 24000,  # chars of older file-read content kept verbatim (deduped, newest-first) instead of wiped — prevents re-read amnesia
     "history_max_messages": 20,    # chat messages sent to backend after local compaction
     "message_truncate": 1200,      # chars per history message sent to backend
     "short_memory_max_chars": 2000, # session memory budget, line-aware
@@ -126,6 +127,7 @@ _MAX_CONFIG = {
     "warning_force_limit": 100000,  # disable warning circuit breaker
     "output_similarity": 1.0,       # only byte-identical output counts as repeat
     "microcompact_keep": 200,       # keep far more full outputs
+    "microcompact_read_budget": 2000000,  # effectively keep all file-read content
     "history_max_messages": 500,
     "message_truncate": 100000,
     "short_memory_max_chars": 200000,
@@ -1534,17 +1536,37 @@ def _compress_terminal_history(history: list) -> str:
 
     old_entries = history[:-_COMPRESSION_KEEP_RECENT]
     recent_entries = history[-_COMPRESSION_KEEP_RECENT:]
-    digest = _summarize_old_entries(old_entries)
+
+    # Microcompact flagged the deduplicated, latest content of each file the
+    # model read with `_kept`. Render those verbatim (so the model never needs
+    # to re-read) and digest only the rest into one-liners.
+    kept_reads = [e for e in old_entries if e.get("_kept")]
+    other_old = [e for e in old_entries if not e.get("_kept")]
+    digest = _summarize_old_entries(other_old)
 
     lines = [
-        f"[DIGEST — Steps 1-{digest['total_old']} "
+        f"[DIGEST — {digest['total_old']} older step(s) "
         f"(errors:{digest['error_steps']})]"
     ]
     if digest["files_touched"]:
         lines.append(f"  files seen: {', '.join(digest['files_touched'])}")
     lines.extend(digest["lines"])
+
+    if kept_reads:
+        lines.append("")
+        lines.append("[RETAINED FILE CONTENT — already read this session; do NOT re-read these]")
+        for e in kept_reads:
+            cmd_label = (e.get("command", "") or "")[:120]
+            out = e.get("output", "") or ""
+            out_lines = out.split('\n')
+            if len(out_lines) > _MAX_TERMINAL_LINES:
+                out = (f"...(showing last {_MAX_TERMINAL_LINES} lines)...\n"
+                       + '\n'.join(out_lines[-_MAX_TERMINAL_LINES:]))
+            lines.append(f"--- {cmd_label} ---")
+            lines.append(out if out.strip() else "(no output)")
+
     lines.append("")
-    lines.append(f"[RECENT — Steps {len(old_entries) + 1}-{len(history)}]")
+    lines.append(f"[RECENT — last {len(recent_entries)} step(s)]")
 
     for idx, entry in enumerate(recent_entries, len(old_entries) + 1):
         output = entry.get("output", "")
@@ -1591,31 +1613,84 @@ def _trim_carried_outputs(history: list, tail_chars: int = 600) -> list:
     return result
 
 
-def _microcompact_history(history: list, keep_recent: int = 6) -> list:
-    """Strip output from old tool results — zero-cost context window recovery.
+def _is_file_read_entry(entry: dict) -> bool:
+    """A terminalHistory row that fetched file content (fs.read or cat/head/tail).
 
-    Mirrors Claude Code's microcompact layer: deletes the bulky output field
-    from entries older than `keep_recent`, keeping only command + returncode +
-    tool metadata. This is zero LLM cost and recovers significant context.
+    These are dedup-able by their `command` (recorded as `path` / `path@offset`
+    by _salient_arg) and worth retaining verbatim — re-fetching the same bytes is
+    the dominant amnesia cost. fs.grep is NOT a content fetch (it's a query)."""
+    if entry.get("tool") == "fs.read":
+        return True
+    cmd = (entry.get("command") or "").strip()
+    return any(cmd.startswith(p) for p in ("cat ", "head ", "tail "))
 
-    Called at the start of each iteration so old entries are always stripped
-    before the prompt is built.
+
+def _microcompact_history(history: list, keep_recent: int = 6,
+                          read_budget: Optional[int] = None) -> list:
+    """Content-aware microcompact — recover context without inducing re-reads.
+
+    The naive version wiped the output of every row older than `keep_recent`,
+    which deleted file content the model had read; it then re-read the same
+    file (amnesia). Instead we spend a char budget on the *deduplicated, latest*
+    content of each file the model read (newest-first), and wipe only the truly
+    low-value rows: shell/grep output, and reads superseded by a later identical
+    read. Kept reads are flagged `_kept` so the render layer shows them verbatim
+    rather than digesting them to one line.
+
+    Net effect: the prompt always carries the current content of every distinct
+    file section the model has read (up to budget), so it stops re-reading.
     """
     if len(history) <= keep_recent:
         return history
+    if read_budget is None:
+        try:
+            read_budget = int(get_runtime_config("microcompact_read_budget") or 0)
+        except Exception:
+            read_budget = 0
+
+    n = len(history)
+    old_upto = n - keep_recent  # indices [0, old_upto) are "old"
+
+    # Latest index of each distinct successful file-read among OLD entries.
+    latest_read_idx: dict[str, int] = {}
+    for i in range(old_upto):
+        e = history[i]
+        if _is_file_read_entry(e) and e.get("returncode") in (0, None):
+            cmd = (e.get("command") or "").strip()
+            if cmd:
+                latest_read_idx[cmd] = i  # last occurrence wins
+    latest_indices = set(latest_read_idx.values())
+
+    # Keep latest-read content newest-first until the char budget is spent.
+    keep_content: set[int] = set()
+    budget = read_budget
+    for idx in sorted(latest_indices, reverse=True):
+        out = history[idx].get("output")
+        if not isinstance(out, str):
+            continue
+        if keep_content and budget - len(out) < 0:
+            continue  # over budget — let this (older) read be re-fetched if needed
+        keep_content.add(idx)
+        budget -= len(out)
+
     result = []
     for i, entry in enumerate(history):
-        if i < len(history) - keep_recent:
-            stripped = {
+        if i >= old_upto:
+            result.append(entry)                      # recent window: verbatim
+        elif i in keep_content:
+            kept = dict(entry)
+            kept["_kept"] = True                      # render verbatim, don't digest
+            result.append(kept)
+        else:
+            superseded = _is_file_read_entry(entry) and i not in latest_indices
+            result.append({
                 "command": entry.get("command", ""),
                 "returncode": entry.get("returncode"),
                 "tool": entry.get("tool", ""),
                 "call_id": entry.get("call_id", ""),
-                "output": "(output cleared by microcompact)",
-            }
-            result.append(stripped)
-        else:
-            result.append(entry)
+                "output": "(superseded by a later identical read)" if superseded
+                          else "(output cleared by microcompact)",
+            })
     return result
 
 
@@ -2087,12 +2162,20 @@ def _detect_loop_warnings_typed(state: dict, original_input: str) -> list[tuple[
         cmd = (last_entry.get("command") or "").strip()
         if cmd and (last_tool == "fs.read" or
                     any(cmd.startswith(p) for p in ("cat ", "head ", "tail "))):
-            prior = [(h.get("command") or "").strip() for h in history[:-1][-20:]]
-            if cmd in prior:
+            # Only warn when the earlier read's CONTENT is still in context — then
+            # "refer to it above" is actionable. If microcompact evicted it (over
+            # budget), re-reading is the only option; scolding would be futile, so
+            # stay silent. A wiped row has a placeholder output, not real content.
+            def _has_live_content(h):
+                if (h.get("command") or "").strip() != cmd:
+                    return False
+                out = h.get("output")
+                return isinstance(out, str) and not out.startswith(
+                    ("(output cleared", "(superseded"))
+            if any(_has_live_content(h) for h in history[:-1][-20:]):
                 warnings.append(("context_amnesia",
-                    f"Context amnesia: you're re-reading `{cmd}` which you already "
-                    f"examined earlier. Refer to your previous output instead of "
-                    f"re-reading."
+                    f"You already have the content of `{cmd}` above (see RETAINED "
+                    f"FILE CONTENT / recent steps). Refer to it instead of re-reading."
                 ))
 
     # 5. Near-repeat commands: fuzzy fingerprint matching
