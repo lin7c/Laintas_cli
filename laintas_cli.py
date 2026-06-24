@@ -2884,6 +2884,27 @@ def _native_to_tool_calls(frags: dict, name_map: Optional[dict] = None) -> list:
     return out
 
 
+def _looks_like_json_attempt(text: str) -> bool:
+    """Did the model TRY to emit the JSON envelope, vs write plain prose?
+
+    Used to decide whether a non-parseable, tool-call-free response is a
+    malformed-JSON failure (retry) or a legitimate prose answer (surface it).
+    A stray '{' inside prose — code snippets, set notation, syntax like
+    `#agent_name#{ ... }` — must NOT count as an attempt; otherwise an ordinary
+    text answer that merely mentions a brace gets flagged "_parse_failed" and
+    the loop fires a bogus "asking AI to retry". Only count it when the text
+    actually opens with a JSON object (optionally after a ``` fence) or carries
+    the envelope's distinctive `tool_calls` key."""
+    s = (text or "").strip()
+    if not s:
+        return False
+    if s.startswith("```"):
+        s = re.sub(r"^```(?:json)?\s*", "", s).lstrip()
+    if s.startswith("{"):
+        return True
+    return '"tool_calls"' in s or "'tool_calls'" in s
+
+
 def _extract_json_object(text: str) -> Optional[dict]:
     """Extract the first top-level JSON object from text. Handles code fences,
     leading prose, and trailing prose. Returns None if no object parses."""
@@ -3193,8 +3214,10 @@ def call_backend_stream(
                 if on_chunk is not None:
                     parsed = _try_parse_partial_json(accumulated)
                     # Native mode: model streams plain prose as `content` (no
-                    # JSON envelope). Stream it straight through as the reply.
-                    if parsed is None and "{" not in accumulated:
+                    # JSON envelope). Stream it straight through as the reply —
+                    # unless it genuinely looks like a JSON attempt (don't leak
+                    # raw JSON); a stray '{' in prose must not stop streaming.
+                    if parsed is None and not _looks_like_json_attempt(accumulated):
                         try: on_chunk("reply", delta_content)
                         except Exception: pass
                         prev_reply_for_chunks = accumulated.strip()
@@ -3275,25 +3298,27 @@ def call_backend_stream(
                 # No parseable JSON body, but the model called tools via the
                 # native channel — run them. Keep pure-prose preamble as reply.
                 return {
-                    "reply": accumulated.strip() if "{" not in accumulated else "",
+                    "reply": "" if _looks_like_json_attempt(accumulated) else accumulated.strip(),
                     "tool_calls": native_calls,
                     "done": False,
                     "_billing": billing_info,
                     "_diag_events": _diag_events + ["parsed_native_tool_calls"],
                 }
             raw_text = accumulated.strip() or "(no response)"
-            # Pure prose (no '{'): content is valid but JSON wrapper is missing.
-            # Continue the loop so the model gets a nudge and can still call tools,
-            # but mark _prose_only so the nudge is silent (no user-visible warning).
-            # Only show the warning when the model was clearly attempting JSON (has '{').
+            # No tool calls and no parseable JSON. Distinguish a genuine malformed
+            # JSON-envelope attempt (retry) from a plain prose answer (surface it).
+            # In native-tool mode a tool-call-free reply IS the model's prose
+            # answer; only treat it as a failure when it actually tried JSON —
+            # NOT merely because the prose contains a '{' (e.g. `#name#{ ... }`).
+            _json_attempt = _looks_like_json_attempt(accumulated)
             return {
                 "reply": raw_text,
                 "tool_calls": [],
                 "done": False,
                 "error": False,
-                "_parse_failed": True,
-                "_prose_only": "{" not in accumulated,
-                "_truncated": _hit_ceiling and "{" in accumulated,
+                "_parse_failed": _json_attempt,
+                "_prose_only": not _json_attempt,
+                "_truncated": _hit_ceiling and _json_attempt,
                 "_billing": billing_info,
                 "_diag_events": _diag_events,
             }
@@ -3319,12 +3344,18 @@ def call_backend_stream(
                     "_diag_events": _diag_events + ["parsed_native_tool_calls"],
                 }
             raw_text = accumulated.strip() or json.dumps(parsed, ensure_ascii=False)
+            # An object parsed but it has no envelope fields. Same distinction as
+            # above: a genuine (malformed) JSON attempt is a failure to retry; a
+            # prose answer that merely embedded a small JSON object (e.g. an
+            # example like {"city": "Tokyo"}) is a real answer — surface it.
+            _json_attempt = _looks_like_json_attempt(accumulated)
             return {
                 "reply": raw_text,
                 "tool_calls": [],
                 "done": False,
                 "error": False,
-                "_parse_failed": True,
+                "_parse_failed": _json_attempt,
+                "_prose_only": not _json_attempt,
                 "_billing": billing_info,
                 "_diag_events": _diag_events,
             }
