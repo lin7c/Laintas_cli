@@ -2,30 +2,33 @@
 # PyInstaller spec for laintas_cli.exe
 # Build: pyinstaller build/windows/laintas_cli.spec
 
+from pathlib import Path
 from PyInstaller.utils.hooks import collect_data_files
 
+PROJECT_DIR = Path(__file__).resolve().parents[2]
+
 a = Analysis(
-    ['../../laintas_cli.py'],
+    [str(PROJECT_DIR / 'laintas_cli.py')],
     pathex=[],
     binaries=[],
     datas=[
-        ('../../agent_loop.py', '.'),
-        ('../../tools.py', '.'),
-        ('../../skills.py', '.'),
-        ('../../mcp_client.py', '.'),
-        ('../../policy.py', '.'),
-        ('../../memory_system.py', '.'),
-        ('../../hooks.py', '.'),
-        ('../../plan_mode.py', '.'),
-        ('../../task_manager.py', '.'),
-        ('../../agent_persistence.py', '.'),
-        ('../../agent_roles.py', '.'),
-        ('../../workflow_engine.py', '.'),
-        ('../../paths.py', '.'),
-        ('../../migrate.py', '.'),
-        ('../../cloud_provider.py', '.'),
-        ('../../hwo_runner.py', '.'),
-        ('../../hwo_ui.py', '.'),
+        (str(PROJECT_DIR / 'agent_loop.py'), '.'),
+        (str(PROJECT_DIR / 'tools.py'), '.'),
+        (str(PROJECT_DIR / 'skills.py'), '.'),
+        (str(PROJECT_DIR / 'mcp_client.py'), '.'),
+        (str(PROJECT_DIR / 'policy.py'), '.'),
+        (str(PROJECT_DIR / 'memory_system.py'), '.'),
+        (str(PROJECT_DIR / 'hooks.py'), '.'),
+        (str(PROJECT_DIR / 'plan_mode.py'), '.'),
+        (str(PROJECT_DIR / 'task_manager.py'), '.'),
+        (str(PROJECT_DIR / 'agent_persistence.py'), '.'),
+        (str(PROJECT_DIR / 'agent_roles.py'), '.'),
+        (str(PROJECT_DIR / 'workflow_engine.py'), '.'),
+        (str(PROJECT_DIR / 'paths.py'), '.'),
+        (str(PROJECT_DIR / 'migrate.py'), '.'),
+        (str(PROJECT_DIR / 'cloud_provider.py'), '.'),
+        (str(PROJECT_DIR / 'hwo_runner.py'), '.'),
+        (str(PROJECT_DIR / 'hwo_ui.py'), '.'),
     ] + collect_data_files('certifi'),
     hiddenimports=[
         'requests',
@@ -59,7 +62,7 @@ a = Analysis(
     ],
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=['hook_ssl.py'],
+    runtime_hooks=[str(PROJECT_DIR / 'build' / 'windows' / 'hook_ssl.py')],
     excludes=[
         'tkinter',
         'matplotlib',

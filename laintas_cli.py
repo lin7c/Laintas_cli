@@ -19,6 +19,8 @@ import uuid
 import errno
 import queue
 import shlex
+import base64
+import hashlib
 import signal
 import socket
 import tempfile
@@ -1759,6 +1761,57 @@ def verify_session(session: dict) -> Optional[dict]:
     return None
 
 
+def solve_captcha_challenge() -> Optional[str]:
+    """Return an ALTCHA-compatible captcha response for local CLI login."""
+    try:
+        resp = requests.get(f"{LAINTAS_BASE}/api/captcha-challenge", timeout=10)
+        if resp.status_code != 200:
+            return None
+        challenge = resp.json()
+    except (requests.RequestException, ValueError):
+        return None
+
+    algorithm = str(challenge.get("algorithm", "")).upper()
+    target = str(challenge.get("challenge", ""))
+    salt = str(challenge.get("salt", ""))
+    try:
+        maxnumber = int(challenge.get("maxnumber", 0))
+    except (TypeError, ValueError):
+        return None
+
+    if algorithm != "SHA-256" or not target or not salt or maxnumber < 0:
+        return None
+
+    started = time.time()
+    for number in range(maxnumber + 1):
+        digest = hashlib.sha256(f"{salt}{number}".encode("utf-8")).hexdigest()
+        if digest == target:
+            payload = {
+                "algorithm": challenge.get("algorithm", "SHA-256"),
+                "challenge": target,
+                "number": number,
+                "salt": salt,
+                "signature": challenge.get("signature", ""),
+                "took": int((time.time() - started) * 1000),
+            }
+            raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+            return base64.b64encode(raw).decode("ascii")
+
+    return None
+
+
+def build_login_payload(username: str, password: str, captcha_response: str) -> dict:
+    """Build a login payload compatible with current and older captcha checks."""
+    return {
+        "username": username.strip(),
+        "password": password,
+        # The backend has used both names across versions. Keep both so old
+        # Windows builds and the current web auth middleware can agree.
+        "captchaResponse": captcha_response,
+        "captcha": captcha_response,
+    }
+
+
 def login_interactive() -> Optional[dict]:
     """Interactive login flow — username+password via Better Auth. Returns session dict or None."""
     console.print(Panel(
@@ -1779,10 +1832,19 @@ def login_interactive() -> Optional[dict]:
         return None
 
     try:
+        captcha_response = solve_captcha_challenge()
+        if not captcha_response:
+            console.print("[red]Login failed: could not fetch or solve captcha challenge.[/red]")
+            console.print("[dim]Try remote login [1], or paste a browser session token below.[/dim]")
+            raise RuntimeError("captcha unavailable")
+
+        headers = {"Content-Type": "application/json", "Origin": f"{LAINTAS_BASE}"}
+        headers["X-Captcha-Response"] = captcha_response
+
         resp = requests.post(
             f"{LAINTAS_BASE}/api/auth/sign-in/username",
-            json={"username": username.strip(), "password": password},
-            headers={"Content-Type": "application/json", "Origin": f"{LAINTAS_BASE}"},
+            json=build_login_payload(username, password, captcha_response),
+            headers=headers,
             timeout=10,
         )
         if resp.status_code == 200:
@@ -1811,6 +1873,8 @@ def login_interactive() -> Optional[dict]:
             except Exception:
                 msg = resp.text[:200]
             console.print(f"[red]Login failed: {msg}[/red]")
+    except RuntimeError:
+        pass
     except requests.RequestException as e:
         console.print(f"[yellow]Cannot reach {LAINTAS_BASE}: {e}[/yellow]")
 
