@@ -1,0 +1,90 @@
+{
+  "version": "1.2.0",
+  "released": "2026-06-24",
+  "files": {
+    "agent_loop.py": {
+      "sha256": "eeb22afa2708bba1b4dc5eb2493d4062acbdff8209a6f4bebfea614ec5819f86",
+      "size": 175332
+    },
+    "agent_persistence.py": {
+      "sha256": "7ac56d3786f67b92766fcf4bea126bbe4e7ca7e19bf6c5d7ac25a56728a080af",
+      "size": 5220
+    },
+    "agent_roles.py": {
+      "sha256": "86727209031460f373315053f522bab6d72ad68f497c692d032989a54b0fcfc2",
+      "size": 16703
+    },
+    "cloud_provider.py": {
+      "sha256": "b9826a7fec41c335c94b43d463fdbce225bddbab08003189a19e8e2628102235",
+      "size": 16881
+    },
+    "hooks.py": {
+      "sha256": "76f7cb6f4ec55d1502b08fe05c8b6a67f36bb03d90aef6ea223229c4e0f9a5fe",
+      "size": 8825
+    },
+    "hwo_runner.py": {
+      "sha256": "bd4100f6167b4f9565042d3dd593bbb60635e090ce345025acdbb80b2c27e317",
+      "size": 30063
+    },
+    "hwo_ui.py": {
+      "sha256": "7adac040aa80c4c77127a42a86bdee8e6bcb7c0897617736cd12f4f56776cd02",
+      "size": 31166
+    },
+    "laintas_cli.py": {
+      "sha256": "9a8c962cb8717d816c67923496cbf2930054c0f045d87b42bf67103e3482dd27",
+      "size": 308338
+    },
+    "mcp_client.py": {
+      "sha256": "2fbc89534db1ce3c8b2f38046be858792f386cb9ad9d7c934201d8c3fdb0b8dd",
+      "size": 14124
+    },
+    "memory_system.py": {
+      "sha256": "7c0ffd6d9c6faeeddff6bd365ed99aef43d8e13ed64ab082672d3df7a321f4bc",
+      "size": 9109
+    },
+    "migrate.py": {
+      "sha256": "5f5e4eeb9a05577fa68a625a6d4eb7bcc0ea3dda4065aeba08e9e60d349444c6",
+      "size": 6657
+    },
+    "paths.py": {
+      "sha256": "46bd7b17cb95e91c6fc80b5c6686b17a6a39d19a15e2e961b61f8532110c7ded",
+      "size": 5111
+    },
+    "plan_mode.py": {
+      "sha256": "a67dbe482115a5e2b7c8e0c0257be8b90b37470fcc8c00b312f25428e500f6b2",
+      "size": 7235
+    },
+    "policy.py": {
+      "sha256": "b24eea75c8437dba6cfd08f30898045c16f62f0e60db1837cb2fd28493849a53",
+      "size": 24875
+    },
+    "setup.py": {
+      "sha256": "dce46080870748ae72ca8e717cfdaa31cabdf7e2f7e5913e94389a8a34f5e1e1",
+      "size": 1796
+    },
+    "skills.py": {
+      "sha256": "877ae32bf1f100ff63cd9f827eb65b67b8d1cea0fcebb81c761369060f0a1146",
+      "size": 18860
+    },
+    "task_manager.py": {
+      "sha256": "8461320f740697dcc561effb1dcf9705bb4ae6d3b9051cef513982107c8373e8",
+      "size": 13360
+    },
+    "tools.py": {
+      "sha256": "3558c206b53597bf9f269435a04a627925ed1d50bfc4493691e3fd16681dcb42",
+      "size": 127960
+    },
+    "updater.py": {
+      "sha256": "58445db7cb50a4f9b8a21c38fc8ecfbcf52af26368021bc7995766b02465cdfc",
+      "size": 10524
+    },
+    "version.py": {
+      "sha256": "f273addcad0c0f339a9eb8b860c5d846197954c2b6c91b81cec59067f13c3f25",
+      "size": 297
+    },
+    "workflow_engine.py": {
+      "sha256": "b3edea81ed2144cb74215d88ca67b84f6592fb4c7758c92cb629d3e4a3bcf977",
+      "size": 18152
+    }
+  }
+}
