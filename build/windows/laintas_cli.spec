@@ -5,7 +5,9 @@
 from pathlib import Path
 from PyInstaller.utils.hooks import collect_data_files
 
-PROJECT_DIR = Path(__file__).resolve().parents[2]
+# PyInstaller executes spec files without a __file__; it injects SPECPATH
+# (the directory containing this spec) into the namespace instead.
+PROJECT_DIR = Path(SPECPATH).resolve().parents[1]
 
 a = Analysis(
     [str(PROJECT_DIR / 'laintas_cli.py')],
