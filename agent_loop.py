@@ -3409,8 +3409,8 @@ def run_agent_loop(
 
         # 7. Show billing if available (opt-in via /config show_billing true)
         if billing and get_runtime_config("show_billing"):
-            cost = billing.get("costCents", 0)
-            balance = billing.get("balanceCents", 0)
+            cost = billing.get("costCents") or 0
+            balance = billing.get("balanceCents") or 0
             if cost > 0:
                 billing_text = f"${cost / 100:.2f} · balance ${balance / 100:.2f}"
                 if events_cb is not None:

@@ -4566,8 +4566,8 @@ def show_debug_detail(index: int) -> None:
             lines.append(f"[bold]Command:[/bold] {e.command}")
         lines.append(f"[bold]Done:[/bold] {e.done}")
         if e.billing:
-            cost = e.billing.get("costCents", 0)
-            balance = e.billing.get("balanceCents", 0)
+            cost = e.billing.get("costCents") or 0
+            balance = e.billing.get("balanceCents") or 0
             lines.append(f"[bold]Billing:[/bold] ${cost / 100:.2f} (balance ${balance / 100:.2f})")
         if e.error:
             lines.append("[red]Error occurred[/red]")
@@ -5551,8 +5551,8 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
                             if e.error:
                                 lines.append("\n[Error] true")
                             if e.billing:
-                                cost = e.billing.get("costCents", 0)
-                                balance = e.billing.get("balanceCents", 0)
+                                cost = e.billing.get("costCents") or 0
+                                balance = e.billing.get("balanceCents") or 0
                                 lines.append(f"\n[Billing] ${cost / 100:.2f} (balance ${balance / 100:.2f})")
                             if e.exec_command:
                                 lines.append(f"\n[Executed] {e.exec_command}")
