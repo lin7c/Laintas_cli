@@ -29,6 +29,8 @@ The .deb launcher (`/usr/bin/laintas-cli`) lazy-installs `requirements.txt` via 
 
 A companion React/Vite download site lives in `laintas_cli_download/` (separate build, not part of the Python package).
 
+**To publish a release to the download page, read `build/RELEASE.md`** — it documents the full flow for the 4 download artifacts (Linux/macOS/source built locally via `build/release/build_download_assets.sh`; the Windows `.exe` is **CI-only**, rebuilt on `windows-latest` when `laintas_cli.py`/`build/windows/**` is pushed to `main`).
+
 ## Architecture (read PROJECT.md for full detail)
 
 The project has grown from two core modules to ten, organized in layers:
