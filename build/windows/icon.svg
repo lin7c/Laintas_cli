@@ -1,0 +1,5 @@
+<svg width="256" height="256" viewBox="0 0 256 256" xmlns="http://www.w3.org/2000/svg">
+  <!-- Laintas CLI app icon: dark rounded square + gold "L" monogram -->
+  <rect x="0" y="0" width="256" height="256" rx="56" ry="56" fill="#1a1a17"/>
+  <path d="M84 60 h36 v100 h72 v36 h-108 z" fill="#c9953e"/>
+</svg>

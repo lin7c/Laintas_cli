@@ -84,6 +84,7 @@ exe = EXE(
     a.datas,
     [],
     name='laintas_cli',
+    icon=str(PROJECT_DIR / 'build' / 'windows' / 'icon.ico'),
     debug=False,
     bootloader_ignore_signals=False,
     strip=True,

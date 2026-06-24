@@ -28,6 +28,8 @@ SetCompressor /SOLID lzma
 ; Modern UI pages
 ;──────────────────────────────────────────────────────────────────────────
 !define MUI_ABORTWARNING
+!define MUI_ICON "icon.ico"
+!define MUI_UNICON "icon.ico"
 
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_LICENSE "license.txt"
