@@ -34,7 +34,7 @@ jobs:
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt pyinstaller
+          python -m pip install requests certifi rich prompt_toolkit pyinstaller
 
       - name: Build laintas_cli.exe
         shell: pwsh
