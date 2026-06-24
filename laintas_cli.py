@@ -2478,17 +2478,11 @@ Loaded skill instructions:
 </skills>
 
 <tools>
-Return actions only inside the JSON `tool_calls` array.
+You have function-calling tools. Invoke them through the native tool interface — do NOT write tool calls as JSON or as text inside your reply.
 Use `shell.exec` for shell commands and meta-commands. Use structured tools for file, memory, task, plan, web, agent, terminal, time, and sleep operations.
-For `shell.exec`, the `arguments.command` value must be the raw shell command only, for example:
-{{"reply":"Inspecting the project layout.","tool_calls":[{{"name":"shell.exec","arguments":{{"command":"ls -la"}}}}]}}
-Never include the tool name inside `arguments.command`. Wrong: `shell.exec ls -la`. Right: `ls -la`.
-Never write XML, HTML, pseudo-tags, or text wrappers such as `<tool_calls>...</tool_calls>`.
-To list skills, emit:
-{{"reply":"Listing available skills.","tool_calls":[{{"name":"skill.list","arguments":{{}}}}]}}
-To load a skill, emit:
-{{"reply":"Loading the relevant skill.","tool_calls":[{{"name":"skill.load","arguments":{{"name":"react-project"}}}}]}}
-Catalog:
+For `shell.exec`, the `command` argument must be the raw shell command only — never prefix it with the tool name (right: `ls -la`; wrong: `shell.exec ls -la`).
+Call `skill.list` to list available skills, and `skill.load` (with `name`) to load one before specialized work.
+The catalog below documents each tool's purpose and parameters:
 {{{{tools}}}}
 </tools>
 
@@ -2510,21 +2504,12 @@ Catalog:
 </workflow>
 
 <output_rules>
-Every response must be exactly one JSON object:
-{{
-  "reply": "Brief user-facing text. Markdown OK. Cite files as path:line.",
-  "tool_calls": [
-    {{"name": "tool.name", "arguments": {{}}}}
-  ]
-}}
-
-- No prose outside JSON. No code fences.
-- Never output `<tool_calls>`, `<invoke>`, `/tool ...` text, or any XML-like tool syntax.
-- `reply` is normally 1-3 sentences.
+- Put user-facing text in your reply: plain text or Markdown, normally 1-3 sentences, cite files as path:line. Perform every action with native tool calls — never embed `tool_calls`, `/tool ...`, `<tool_calls>`, `<invoke>`, or any XML-like tool syntax in the reply text.
 - Completion is an explicit act: call `task.complete` with a `summary` when — and only when — the task is fully finished. Do NOT stop just to narrate progress; if more work remains, include the next tool call in the SAME turn and keep going.
-- If you have nothing concrete to run this turn but the task is NOT finished (still reasoning or planning), call `task.continue` so the loop keeps going. Never end mid-task with an empty `tool_calls` list.
-- `tool_calls: []` (no action this turn) is only for asking the user something or handing back a final answer. It does not by itself mean the task is done.
+- If you have nothing concrete to run this turn but the task is NOT finished (still reasoning or planning), call `task.continue` so the loop keeps going. Never end mid-task with no tool call.
+- Ending your turn with no tool call is only for asking the user something or handing back a final answer. It does not by itself mean the task is done.
 - Multiple tool calls are allowed when they are independent or sequentially safe.
+- Fallback only if native tool calls are genuinely unavailable to you: emit a single JSON object {{"reply": "...", "tool_calls": [{{"name": "tool.name", "arguments": {{}}}}]}} and nothing else.
 </output_rules>
 
 <tone>
@@ -2836,7 +2821,7 @@ def _repair_json_candidate(candidate: str) -> str:
     return repaired
 
 
-def _native_to_tool_calls(frags: dict) -> list:
+def _native_to_tool_calls(frags: dict, name_map: Optional[dict] = None) -> list:
     """Reassemble OpenAI-native streamed tool_calls into laintas tool_calls.
 
     Some providers emit tool calls through the function-calling channel
@@ -2845,7 +2830,11 @@ def _native_to_tool_calls(frags: dict) -> list:
     slice of `function.arguments`. We reassemble per index and parse the
     arguments JSON. Without this they are dropped and the model's action never
     runs — the model then re-requests the same read/edit forever.
+
+    `name_map` un-mangles provider-safe names (e.g. `fs_write` → `fs.write`)
+    back to canonical tool names — see ToolRegistry.to_openai_tools.
     """
+    name_map = name_map or {}
     out = []
     for idx in sorted(frags):
         slot = frags[idx]
@@ -2855,6 +2844,8 @@ def _native_to_tool_calls(frags: dict) -> list:
         m = re.match(r"functions\.(.+?)(?::\d+)?$", slot.get("id") or "")
         if m and "." in m.group(1):
             name = m.group(1)
+        # Un-mangle provider-safe names back to canonical (fs_write → fs.write).
+        name = name_map.get(name, name)
         if not name:
             continue
         args_raw = (slot.get("arguments") or "").strip()
@@ -3065,6 +3056,20 @@ def call_backend_stream(
     if selected_provider:
         payload["provider"] = selected_provider
 
+    # Native function-calling: advertise the tool registry as OpenAI-style
+    # `tools` schemas so the model emits grammar-constrained `delta.tool_calls`
+    # instead of hand-serialized JSON in its reply text. `tool_name_map`
+    # un-mangles provider-safe names on the way back. The backend already
+    # forwards `tools`/`tool_choice` to the provider and streams tool_calls.
+    tool_name_map: dict = {}
+    try:
+        _openai_tools, tool_name_map = tools_mod.get_registry().to_openai_tools()
+        if _openai_tools:
+            payload["tools"] = _openai_tools
+            payload["tool_choice"] = "auto"
+    except Exception:
+        tool_name_map = {}
+
     headers = get_auth_headers(session)
     cookies = get_auth_cookies(session)
 
@@ -3150,10 +3155,30 @@ def call_backend_stream(
                         _slot["name"] = _fn["name"]
                     if _fn.get("arguments"):
                         _slot["arguments"] += _fn["arguments"]
+                # Native mode: surface the tool name as a command preview as it
+                # streams (un-mangled), so the UI shows what's about to run.
+                if on_chunk is not None and native_tc_frags:
+                    _first_idx = min(native_tc_frags)
+                    _nm = (native_tc_frags[_first_idx].get("name") or "").strip()
+                    _nm = tool_name_map.get(_nm, _nm)
+                    if _nm:
+                        _np = _nm
+                        if len(native_tc_frags) > 1:
+                            _np = f"{_nm} (+{len(native_tc_frags)-1} more)"
+                        if _np != prev_command_for_chunks:
+                            try: on_chunk("command", _np)
+                            except Exception: pass
+                            prev_command_for_chunks = _np
             if delta_content:
                 accumulated += delta_content
                 if on_chunk is not None:
                     parsed = _try_parse_partial_json(accumulated)
+                    # Native mode: model streams plain prose as `content` (no
+                    # JSON envelope). Stream it straight through as the reply.
+                    if parsed is None and "{" not in accumulated:
+                        try: on_chunk("reply", delta_content)
+                        except Exception: pass
+                        prev_reply_for_chunks = accumulated.strip()
                     if parsed is not None:
                         cur_reply = parsed.get("reply", "") or ""
                         cur_tool_calls = parsed.get("tool_calls") or []
@@ -3205,7 +3230,7 @@ def call_backend_stream(
             return {"reply": "No response from AI", "tool_calls": [], "done": True, "error": True}
 
         # Native function-calls emitted out-of-band (delta.tool_calls), if any.
-        native_calls = _native_to_tool_calls(native_tc_frags)
+        native_calls = _native_to_tool_calls(native_tc_frags, tool_name_map)
 
         # Output-truncation signal: the model ran right up against the token
         # ceiling. When a big single-response write (e.g. a whole-file fs.write)

@@ -183,26 +183,6 @@ class ToolRegistry:
                         else:
                             opt_parts.append(f"{pname}?:{ptype}")
 
-                # Build a minimal valid example invocation.
-                example_params: dict = {}
-                for pname in required:
-                    pinfo = props.get(pname, {}) if isinstance(props.get(pname), dict) else {}
-                    ptype = pinfo.get("type", "string")
-                    if ptype == "integer" or ptype == "number":
-                        example_params[pname] = 0
-                    elif ptype == "boolean":
-                        example_params[pname] = False
-                    elif ptype == "array":
-                        example_params[pname] = []
-                    elif ptype == "object":
-                        example_params[pname] = {}
-                    else:
-                        example_params[pname] = "<...>"
-                try:
-                    example_json = json.dumps(example_params, ensure_ascii=False)
-                except (TypeError, ValueError):
-                    example_json = "{}"
-
                 desc = (t.description or "").strip().replace("\n", " ")
                 if len(desc) > 240:
                     desc = desc[:237] + "..."
@@ -212,7 +192,6 @@ class ToolRegistry:
                     lines.append(f"    required: {', '.join(req_parts)}")
                 if opt_parts:
                     lines.append(f"    optional: {', '.join(opt_parts)}")
-                lines.append(f"    usage: /tool {t.name} {example_json}")
             lines.append("")  # blank line between groups
 
         return "\n".join(lines).rstrip()
@@ -234,8 +213,53 @@ class ToolRegistry:
         return (
             f"## Tools available ({n})\n"
             f"Names: {head_str}{tail_str}\n"
-            f"Emit JSON: {{\"reply\": \"...\", \"tool_calls\": [{{\"name\": \"...\", \"arguments\": {{...}}}}]}}"
+            f"Call them via the native function-calling interface."
         )
+
+    def to_openai_tools(self) -> tuple[list[dict], dict[str, str]]:
+        """Render the toolset as OpenAI-style function-calling schemas.
+
+        Returns ``(tools, name_map)`` where ``tools`` is a list of
+        ``{"type":"function","function":{name, description, parameters}}`` and
+        ``name_map`` maps each emitted (mangled) name back to the original tool
+        name.
+
+        Tool names use ``.`` separators (e.g. ``fs.write``), but some providers
+        (notably DeepSeek) reject function names containing ``.`` with a
+        Provider Error. We mangle ``.`` → ``_`` on the way out and keep an
+        explicit reverse map so native ``tool_calls`` can be un-mangled on the
+        way back — we never rely on a global ``_`` → ``.`` rule, since names
+        like ``agent_send`` and ``fs.multi_edit`` would make that ambiguous.
+        """
+        tools: list[dict] = []
+        name_map: dict[str, str] = {}
+        used: set[str] = set()
+        for t in self.list():
+            mangled = t.name.replace(".", "_")
+            # Guarantee uniqueness within this request even if a future name
+            # set collides after mangling.
+            if mangled in used:
+                i = 2
+                while f"{mangled}_{i}" in used:
+                    i += 1
+                mangled = f"{mangled}_{i}"
+            used.add(mangled)
+            name_map[mangled] = t.name
+            params = t.schema if isinstance(t.schema, dict) and t.schema else {
+                "type": "object", "properties": {},
+            }
+            desc = (t.description or "").strip()
+            if len(desc) > 1024:
+                desc = desc[:1021] + "..."
+            tools.append({
+                "type": "function",
+                "function": {
+                    "name": mangled,
+                    "description": desc,
+                    "parameters": params,
+                },
+            })
+        return tools, name_map
 
 
 # Module-level singleton — every consumer hits this.
