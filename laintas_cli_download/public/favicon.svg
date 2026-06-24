@@ -1,10 +1,5 @@
-<svg width="160" height="160" xmlns="http://www.w3.org/2000/svg">
- <g id="Layer_1">
-  <title>Layer 1</title>
-  <path fill="#fff" stroke="#000" d="m-31.84002,-176.6075l1.49502,0m-1.49502,0l0.74751,-0.5l0.74751,0.5l-0.74751,0.5l-0.74751,-0.5z" id="svg_8"/>
-  <rect fill="#fff" stroke="#000" x="21" y="35.5" width="118" height="84" id="svg_5"/>
-  <line id="svg_1" y2="80" x2="60" y1="60" x1="30" stroke="#000" fill="none"/>
-  <line id="svg_2" y2="80" x2="60" y1="90" x1="30" stroke="#000" fill="none"/>
-  <line id="svg_3" y2="99" x2="101" y1="99" x1="50" stroke="#000" fill="none"/>
- </g>
+<svg width="256" height="256" viewBox="0 0 256 256" xmlns="http://www.w3.org/2000/svg">
+  <!-- Laintas brand mark: dark rounded square + gold "L" monogram -->
+  <rect x="0" y="0" width="256" height="256" rx="56" ry="56" fill="#1a1a17"/>
+  <path d="M84 60 h36 v100 h72 v36 h-108 z" fill="#c9953e"/>
 </svg>
