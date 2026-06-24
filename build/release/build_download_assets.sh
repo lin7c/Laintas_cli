@@ -50,38 +50,21 @@ rm -f \
   "$RELEASE_DIR/laintas-cli_source.zip" \
   "$RELEASE_DIR/laintas_cli.exe"
 
-echo "Building Linux standalone binary with PyInstaller..."
-"$VENV_PYINSTALLER" \
-  --noconfirm \
-  --onefile \
-  --name laintas-cli \
-  --distpath "$PYI_DIST_DIR" \
-  --workpath "$PYI_BUILD_DIR" \
-  --specpath "$TMP_DIR" \
-  --collect-data certifi \
-  --runtime-hook "$PROJECT_DIR/build/windows/hook_ssl.py" \
-  --hidden-import requests \
-  --hidden-import certifi \
-  --hidden-import rich.console \
-  --hidden-import rich.panel \
-  --hidden-import rich.markdown \
-  --hidden-import rich.table \
-  --hidden-import rich.live \
-  --hidden-import rich.spinner \
-  --hidden-import rich.text \
-  --hidden-import rich.padding \
-  --hidden-import prompt_toolkit.application \
-  --hidden-import prompt_toolkit.history \
-  --hidden-import prompt_toolkit.completion \
-  --hidden-import prompt_toolkit.key_binding \
-  --hidden-import prompt_toolkit.layout \
-  --hidden-import prompt_toolkit.styles \
-  --hidden-import prompt_toolkit.auto_suggest \
-  "$PROJECT_DIR/laintas_cli.py"
+echo "Building Linux standalone binary in old-glibc container..."
+# IMPORTANT: do NOT build the Linux binary with the host's PyInstaller — the
+# build host's glibc (2.39) is newer than most servers, producing a binary that
+# dies with "GLIBC_2.x not found" on older boxes. Build in a glibc-2.28 container
+# instead (see build/linux/build_linux_compat.sh).
+bash "$PROJECT_DIR/build/linux/build_linux_compat.sh"
+COMPAT_BINARY="$PROJECT_DIR/build/linux/dist-compat/laintas-cli"
+if [ ! -x "$COMPAT_BINARY" ]; then
+  echo "Container build did not produce $COMPAT_BINARY"
+  exit 1
+fi
 
 LINUX_PACKAGE_DIR="$TMP_DIR/laintas-cli"
 mkdir -p "$LINUX_PACKAGE_DIR"
-cp "$PYI_DIST_DIR/laintas-cli" "$LINUX_PACKAGE_DIR/laintas-cli"
+cp "$COMPAT_BINARY" "$LINUX_PACKAGE_DIR/laintas-cli"
 chmod 755 "$LINUX_PACKAGE_DIR/laintas-cli"
 cat > "$LINUX_PACKAGE_DIR/install.sh" <<'EOF'
 #!/usr/bin/env bash

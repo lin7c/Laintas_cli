@@ -26,6 +26,12 @@ docker run --rm \
   "$IMAGE" \
   bash -euo pipefail -c '
     python -c "import ssl; print(\"ssl OK:\", ssl.OPENSSL_VERSION)"
+    # PyInstaller needs objdump (binutils); slim images omit it. buster is EOL so
+    # apt sources moved to archive.debian.org.
+    sed -i "s|deb.debian.org|archive.debian.org|g; s|security.debian.org|archive.debian.org|g; /buster-updates/d" /etc/apt/sources.list 2>/dev/null || true
+    apt-get -o Acquire::Check-Valid-Until=false update >/dev/null 2>&1 || apt-get update >/dev/null 2>&1 || true
+    apt-get install -y --no-install-recommends binutils >/dev/null 2>&1
+    command -v objdump >/dev/null || { echo "objdump still missing"; exit 1; }
     python -m pip install --upgrade pip >/dev/null
     python -m pip install --prefer-binary pyinstaller requests certifi rich prompt_toolkit >/dev/null
     rm -rf /tmp/b /tmp/d

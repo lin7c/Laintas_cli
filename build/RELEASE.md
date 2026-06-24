@@ -33,7 +33,7 @@ This is the exact sequence used for the remote-login fix release.
 
 ### 1. Build the 3 local artifacts
 
-Requires the venv with PyInstaller (`venv/bin/pyinstaller`).
+Requires Docker (for the Linux binary) and the venv.
 
 ```bash
 bash build/release/build_download_assets.sh
@@ -42,10 +42,21 @@ bash build/release/build_download_assets.sh
 This rebuilds `laintas-cli_linux.tar.gz`, `laintas-cli_macos.tar.gz`, and
 `laintas-cli_source.zip` into `laintas_cli_download/public/releases/latest/`,
 and copies the (stale) checked-in `.exe` over the release `.exe` — that's fine,
-CI overwrites it in step 4.
+CI overwrites it in step 4. Takes a few minutes; run it in the background.
 
-The Linux binary is ~90 MB; takes a few minutes. Run it in the background and
-wait on the output file rather than blocking.
+> **glibc: the Linux binary MUST be built in an old-glibc container.**
+> PyInstaller binaries are only *forward* compatible across glibc — build on the
+> oldest glibc you want to support. The build host here is glibc 2.39; a binary
+> built directly on it dies on older servers with
+> `Failed to load Python shared library ... GLIBC_2.38 not found`.
+> `build_download_assets.sh` therefore delegates the Linux build to
+> `build/linux/build_linux_compat.sh`, which builds inside `python:3.11-slim-buster`
+> (Debian 10, **glibc 2.28**) — covers CentOS 8/Anolis/Aliyun Linux 3/Ubuntu 20.04+.
+> Official python images ship a shared libpython + ssl, so no compiling; the slim
+> image only needs `binutils` (the script apt-installs it from archive.debian.org
+> since buster is EOL). To support even older boxes (CentOS 7, glibc 2.17) use
+> `build/linux/build_in_manylinux.sh` instead (slower: compiles CPython
+> `--enable-shared`).
 
 ### 2. Sync to `dist/` and regenerate checksums
 
