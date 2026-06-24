@@ -2,6 +2,13 @@ name: Build Windows release
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "laintas_cli.py"
+      - "build/windows/**"
+      - ".github/workflows/windows-release.yml"
 
 permissions:
   contents: write
