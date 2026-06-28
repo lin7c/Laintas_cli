@@ -37,10 +37,9 @@ docker run --rm \
         websockets aiortc >/dev/null
     rm -rf /tmp/b /tmp/d
     # Use the spec file (reads package_manifest.json for datas/hiddenimports).
-    # The spec uses SPECPATH-relative paths, so we point it at the spec directly.
     python -m PyInstaller \
       --noconfirm \
-      --distpath /tmp/d --workpath /tmp/b --specpath /src/build/linux \
+      --distpath /tmp/d --workpath /tmp/b \
       /src/build/linux/laintas_cli.spec
     cp /tmp/d/laintas-cli /out/laintas-cli
     chmod 755 /out/laintas-cli
