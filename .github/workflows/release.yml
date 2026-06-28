@@ -245,12 +245,14 @@ jobs:
           New-Item -ItemType Directory -Path $tmp -Force | Out-Null
           Copy-Item dist/laintas_cli.exe (Join-Path $tmp "laintas_cli.exe") -Force
           Compress-Archive -Path (Join-Path $tmp "laintas_cli.exe") -DestinationPath laintas-cli_windows.zip -Force
+          # Copy exe to workspace root so upload-artifact doesn't keep the dist/ prefix.
+          Copy-Item dist/laintas_cli.exe laintas_cli.exe -Force
 
       - uses: actions/upload-artifact@v4
         with:
           name: windows
           path: |
-            dist/laintas_cli.exe
+            laintas_cli.exe
             laintas-cli_windows.zip
 
   # ──────────────────────────────────────────────────────────────────────
