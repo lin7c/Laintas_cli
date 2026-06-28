@@ -356,14 +356,12 @@ jobs:
             release/laintas-cli_windows.zip \
             "release/laintas-cli_${{ steps.ver.outputs.version }}_amd64.deb" \
             release/SHA256SUMS.txt \
-            release/manifest.json
-          # Upload individual src/*.py for self-updater
-          cd release/src && gh release upload "${{ steps.ver.outputs.tag }}" *.py --clobber || true
-          for d in */ ; do
-            [ -d "$d" ] && gh release upload "${{ steps.ver.outputs.tag }}" "$d"* --clobber || true
-          done
+            release/manifest.json \
+            release/src_manifest.zip
 
       - name: Smoke test — version check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           echo "Release ${{ steps.ver.outputs.tag }} created."
           echo "Artifacts:"
