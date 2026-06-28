@@ -118,6 +118,29 @@ _DEFAULT_CONFIG = {
         r"(?:^|/)credentials\.json$", r"/\.git/config$", r"\.netrc$",
         r"/\.aws/credentials$",
     ],
+    # ── Browser-action rules (browser.* tools) ──────────────────────────
+    # Read-only browser tools (snapshot, query, get_url, get_title,
+    # screenshot, wait_for, scroll, go_back, go_forward) are always allowed.
+    # Actions listed here need user approval in "enforce" mode (advisory
+    # in "audit" mode, same as shell-command approval rules).
+    "browserApprovalActions": [
+        "navigate", "click", "type", "evaluate", "select", "press_key",
+    ],
+    # URLs that are always denied for browser.navigate (applies in all modes
+    # except "disabled"). Empty by default — add patterns like:
+    #   r"^https?://localhost", r"^https?://127\.0\.0\.1",
+    #   r"^https?://10\.", r"^https?://192\.168\.",
+    "browserDenyUrlPatterns": [],
+    # JavaScript patterns that are always denied for browser.evaluate
+    # (applies in all modes except "disabled"). Blocks code exfiltration
+    # and persistence vectors by default.
+    "browserDenyJsPatterns": [
+        r"\brequire\s*\(", r"\bimport\s*\(",
+        r"\bfetch\s*\(", r"\bXMLHttpRequest\b",
+        r"\beval\s*\(", r"\bFunction\s*\(",
+        r"\blocalStorage\b", r"\bsessionStorage\b",
+        r"document\.cookie", r"\bnavigator\.clipboard\b",
+    ],
 }
 
 # ── Windows-specific command rules ───────────────────────────────────────
@@ -568,6 +591,95 @@ def evaluate_file_write(path: str, cwd: str | None = None,
         return PolicyDecision("needs_approval", "", reason)
 
     _write_audit(_audit_entry(label, "allow", "default allow", cwd, req_id, agent_id))
+    return PolicyDecision("allow")
+
+
+def evaluate_browser_action(action: str, params: dict,
+                            req_id: str = None,
+                            agent_id: str = None) -> PolicyDecision:
+    """Evaluate a browser.* tool action against the security policy.
+
+    Counterpart to evaluate() / evaluate_file_write(), but for headless-browser
+    automation.  Same three-tier model:
+      - allow: proceed immediately
+      - needs_approval: ask the user (in enforce mode)
+      - deny: block entirely
+
+    Read-only actions (snapshot, query, get_url, get_title, screenshot,
+    wait_for, scroll, go_back, go_forward) are always allowed.
+    Actions in browserApprovalActions need approval in enforce mode.
+    URL and JS deny patterns always block (except in disabled mode).
+    """
+    cfg = _load_config()
+    mode = cfg.get("mode", "audit")
+
+    if mode == "disabled":
+        return PolicyDecision("allow")
+
+    label = f"browser.{action}"
+
+    # ── Deny: URL patterns for navigate/open ────────────────────────────
+    url = params.get("url", "")
+    if url and action in ("navigate", "open"):
+        deny_url = list(dict.fromkeys(
+            cfg.get("browserDenyUrlPatterns", []) +
+            _DEFAULT_CONFIG["browserDenyUrlPatterns"]))
+        for pattern in deny_url:
+            try:
+                if re.search(pattern, url):
+                    reason = f"URL matched deny pattern: {pattern}"
+                    _write_audit(_audit_entry(label, "deny", reason, None, req_id, agent_id))
+                    return PolicyDecision("deny", pattern, reason)
+            except re.error:
+                continue
+
+    # ── Deny: JS patterns for evaluate ──────────────────────────────────
+    script = params.get("script", "")
+    if script and action == "evaluate":
+        deny_js = list(dict.fromkeys(
+            cfg.get("browserDenyJsPatterns", []) +
+            _DEFAULT_CONFIG["browserDenyJsPatterns"]))
+        for pattern in deny_js:
+            try:
+                if re.search(pattern, script):
+                    reason = f"JS matched deny pattern: {pattern}"
+                    _write_audit(_audit_entry(label, "deny", reason, None, req_id, agent_id))
+                    return PolicyDecision("deny", pattern, reason)
+            except re.error:
+                continue
+
+    # ── Approval actions ────────────────────────────────────────────────
+    approval_actions = list(dict.fromkeys(
+        cfg.get("browserApprovalActions", []) +
+        _DEFAULT_CONFIG["browserApprovalActions"]))
+
+    if action in approval_actions:
+        # Build a human-readable summary for the approval prompt.
+        if action == "navigate":
+            summary = f"Navigate to {url}"
+        elif action == "click":
+            summary = f"Click element: {params.get('selector', '')}"
+        elif action == "type":
+            text = params.get("text", "")
+            summary = f"Type {len(text)} chars into {params.get('selector', '')}"
+        elif action == "evaluate":
+            script_preview = script[:200]
+            summary = f"Evaluate JS: {script_preview}"
+        elif action == "select":
+            summary = f"Select '{params.get('value', params.get('label', ''))}' in {params.get('selector', '')}"
+        elif action == "press_key":
+            summary = f"Press key: {params.get('key', '')}"
+        else:
+            summary = f"browser.{action}"
+
+        reason = f"browser.{action} needs approval ({summary})"
+        _write_audit(_audit_entry(label, "needs_approval", reason, None, req_id, agent_id))
+        if mode == "enforce":
+            return PolicyDecision("needs_approval", "", reason)
+        # audit mode: log but allow
+
+    # ── Allow by default ────────────────────────────────────────────────
+    _write_audit(_audit_entry(label, "allow", "default allow", None, req_id, agent_id))
     return PolicyDecision("allow")
 
 

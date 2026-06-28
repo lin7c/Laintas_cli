@@ -1,21 +1,22 @@
 # -*- mode: python ; coding: utf-8 -*-
 # PyInstaller spec for laintas_cli.exe
 # Build: pyinstaller build/windows/laintas_cli.spec
+#
+# datas/hiddenimports are derived from package_manifest.json. On Windows the
+# VNC live-view deps (websockets, playwright) are deliberately NOT in
+# frozen_deps.windows — browser_session.py still ships (top-level import must
+# succeed) but its lazy imports degrade cleanly. See build/HEADLESS_BROWSER_PACKAGING.md.
 
+import json
 import re
 from pathlib import Path
-from PyInstaller.utils.hooks import collect_data_files
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 # PyInstaller executes spec files without a __file__; it injects SPECPATH
 # (the directory containing this spec) into the namespace instead.
 PROJECT_DIR = Path(SPECPATH).resolve().parents[1]
 
 # ── Windows version/publisher resource ────────────────────────────────────
-# An unsigned exe with NO version metadata is the worst case for SmartScreen and
-# AV heuristics. Code signing is the real fix, but embedding a proper VERSIONINFO
-# (CompanyName / ProductName / FileVersion) is free and measurably improves trust
-# scoring + makes the file look legitimate in Explorer's Properties → Details.
-# The version is read from version.py so it stays in sync with `/v` / setup.py.
 _vtxt = (PROJECT_DIR / 'version.py').read_text(encoding='utf-8')
 _m = re.search(r'__version__\s*=\s*["\']([^"\']+)["\']', _vtxt)
 _VER = _m.group(1) if _m else '0.0.0'
@@ -52,59 +53,32 @@ _VERSION_FILE = str(PROJECT_DIR / 'build' / 'windows' / 'version_info.txt')
 with open(_VERSION_FILE, 'w', encoding='utf-8') as _vf:
     _vf.write(_VERSION_RES)
 
+# ── Load package_manifest.json ────────────────────────────────────────────
+with open(PROJECT_DIR / 'package_manifest.json', encoding='utf-8') as _f:
+    _PM = json.load(_f)
+
+_datas = [(str(PROJECT_DIR / (m + '.py')), '.') for m in _PM['modules']]
+for _pkg in _PM['packages'] + _PM['data_dirs']:
+    _datas.append((str(PROJECT_DIR / _pkg), _pkg))
+_datas += collect_data_files('certifi')
+
+# hiddenimports: all modules + sub-packages + windows frozen_deps (no
+# websockets/playwright — browser_session degrades gracefully without them).
+_hidden = list(_PM['modules']) + list(_PM['packages']) + list(_PM['frozen_deps']['windows'])
+for _dep in ('aiortc', 'av', 'cffi'):
+    try:
+        _hidden += collect_submodules(_dep)
+    except Exception:
+        pass
+_hidden += ['json', 'shlex', 'subprocess', 'platform', 'socket', 'urllib',
+            'pathlib', 'datetime', 'uuid']
+
 a = Analysis(
     [str(PROJECT_DIR / 'laintas_cli.py')],
     pathex=[],
     binaries=[],
-    datas=[
-        (str(PROJECT_DIR / 'agent_loop.py'), '.'),
-        (str(PROJECT_DIR / 'tools.py'), '.'),
-        (str(PROJECT_DIR / 'skills.py'), '.'),
-        (str(PROJECT_DIR / 'mcp_client.py'), '.'),
-        (str(PROJECT_DIR / 'policy.py'), '.'),
-        (str(PROJECT_DIR / 'memory_system.py'), '.'),
-        (str(PROJECT_DIR / 'hooks.py'), '.'),
-        (str(PROJECT_DIR / 'plan_mode.py'), '.'),
-        (str(PROJECT_DIR / 'task_manager.py'), '.'),
-        (str(PROJECT_DIR / 'agent_persistence.py'), '.'),
-        (str(PROJECT_DIR / 'agent_roles.py'), '.'),
-        (str(PROJECT_DIR / 'workflow_engine.py'), '.'),
-        (str(PROJECT_DIR / 'paths.py'), '.'),
-        (str(PROJECT_DIR / 'migrate.py'), '.'),
-        (str(PROJECT_DIR / 'cloud_provider.py'), '.'),
-        (str(PROJECT_DIR / 'hwo_runner.py'), '.'),
-        (str(PROJECT_DIR / 'hwo_ui.py'), '.'),
-    ] + collect_data_files('certifi'),
-    hiddenimports=[
-        'requests',
-        'certifi',
-        'rich',
-        'rich.console',
-        'rich.panel',
-        'rich.markdown',
-        'rich.table',
-        'rich.live',
-        'rich.spinner',
-        'rich.text',
-        'rich.padding',
-        'prompt_toolkit',
-        'prompt_toolkit.application',
-        'prompt_toolkit.history',
-        'prompt_toolkit.completion',
-        'prompt_toolkit.key_binding',
-        'prompt_toolkit.layout',
-        'prompt_toolkit.styles',
-        'prompt_toolkit.auto_suggest',
-        'json',
-        'shlex',
-        'subprocess',
-        'platform',
-        'socket',
-        'urllib',
-        'pathlib',
-        'datetime',
-        'uuid',
-    ],
+    datas=_datas,
+    hiddenimports=_hidden,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[str(PROJECT_DIR / 'build' / 'windows' / 'hook_ssl.py')],

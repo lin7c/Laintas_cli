@@ -17,7 +17,12 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
-VERSION="${1:-$(date +%Y.%m.%d)}"
+# Version comes from version.py (single source of truth) unless overridden.
+if [ -n "${1:-}" ]; then
+  VERSION="$1"
+else
+  VERSION="$(python3 -c "import sys; sys.path.insert(0, '$PROJECT_DIR'); from version import __version__ as v; print(v)")"
+fi
 OUTPUT_DIR="$PROJECT_DIR/dist"
 PKG_DIR="$(mktemp -d)"
 trap 'rm -rf "$PKG_DIR"' EXIT

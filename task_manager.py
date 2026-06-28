@@ -1,7 +1,8 @@
 """
 Structured task tracking system for laintas_cli.
 
-Persists tasks to ~/.laintas/tasks.json. Tasks follow a status workflow:
+Persists tasks to $CWD/.laintas/tasks.json (project-level) or
+~/.laintas/tasks.json (global, when cwd=None). Tasks follow a status workflow:
   pending → in_progress → completed (or deleted)
 
 Tasks can have dependencies (blocks/blockedBy) to enforce ordering.
@@ -36,7 +37,7 @@ _lock = threading.RLock()
 
 # Valid status transitions
 _STATUS_FLOW = {
-    "pending": {"in_progress", "deleted"},
+    "pending": {"in_progress", "completed", "deleted"},
     "in_progress": {"completed", "pending", "deleted"},
     "completed": {"in_progress", "deleted"},  # can re-open
     "deleted": set(),  # terminal state
@@ -48,25 +49,34 @@ _session_tasks: list[dict] = []
 _session_id_counter: int = 0
 
 
-def _load() -> list[dict]:
-    """Load all tasks from disk. Returns [] on any error."""
-    if not TASKS_PATH.exists():
+def _project_path(cwd: str) -> Path:
+    """Return the project-level tasks.json path for a given cwd."""
+    return Path(cwd) / ".laintas" / "tasks.json"
+
+
+def _load(cwd: str = None) -> list[dict]:
+    """Load tasks from disk. cwd selects project-level file; None uses global."""
+    path = _project_path(cwd) if cwd else TASKS_PATH
+    if not path.exists():
         return []
     try:
-        with open(TASKS_PATH, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         return data if isinstance(data, list) else []
     except (OSError, json.JSONDecodeError):
         return []
 
 
-def _save(tasks: list[dict]) -> None:
-    """Atomically write tasks to disk."""
-    tmp = TASKS_PATH.with_suffix(".tmp")
+def _save(tasks: list[dict], cwd: str = None) -> None:
+    """Atomically write tasks to disk. cwd selects project-level file."""
+    path = _project_path(cwd) if cwd else TASKS_PATH
+    if cwd:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
     try:
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(tasks, f, ensure_ascii=False, indent=2)
-        tmp.replace(TASKS_PATH)
+        tmp.replace(path)
     except OSError:
         pass
 
@@ -85,11 +95,13 @@ def _next_id(tasks: list[dict]) -> str:
 def create_task(subject: str, description: str = "",
                 metadata: dict = None,
                 session_only: bool = False,
-                parent_task_id: str = None) -> dict:
+                parent_task_id: str = None,
+                *, cwd: str = None) -> dict:
     """Create a new task. Returns the task dict.
 
     If session_only=True, the task lives only in memory (not persisted).
     If parent_task_id is set, the new task is auto-linked as blockedBy parent.
+    cwd selects the project-level tasks file (None = global ~/.laintas/).
     """
     global _session_id_counter
     with _lock:
@@ -117,7 +129,7 @@ def create_task(subject: str, description: str = "",
             _session_tasks.append(task)
             return dict(task)
 
-        tasks = _load()
+        tasks = _load(cwd=cwd)
         task_id = _next_id(tasks)
         task = {
             "id": task_id,
@@ -141,7 +153,7 @@ def create_task(subject: str, description: str = "",
                         t.setdefault("blocks", []).append(task_id)
                     break
         tasks.append(task)
-        _save(tasks)
+        _save(tasks, cwd=cwd)
         return dict(task)
 
 
@@ -152,12 +164,13 @@ def create_session_task(subject: str, description: str = "",
                        session_only=True, parent_task_id=parent_task_id)
 
 
-def update_task(task_id: str, **kwargs) -> tuple[bool, str, Optional[dict]]:
+def update_task(task_id: str, *, cwd: str = None, **kwargs) -> tuple[bool, str, Optional[dict]]:
     """Update a task's fields. Validates status transitions.
 
     Accepted kwargs: status, subject, description, metadata,
                      addBlocks, addBlockedBy, removeBlocks, removeBlockedBy,
                      progress, notes, addSubtask.
+    cwd selects the project-level tasks file for persisted tasks.
     Returns (ok, message, updated_task).
     """
     with _lock:
@@ -173,7 +186,7 @@ def update_task(task_id: str, **kwargs) -> tuple[bool, str, Optional[dict]]:
                 break
 
         if target is None:
-            tasks = _load()
+            tasks = _load(cwd=cwd)
             for t in tasks:
                 if str(t.get("id")) == task_id_str:
                     target = t
@@ -226,7 +239,7 @@ def update_task(task_id: str, **kwargs) -> tuple[bool, str, Optional[dict]]:
                 subject = str(subtask_info)
                 desc = ""
             subtask = create_task(subject, desc, parent_task_id=task_id_str,
-                                   session_only=is_session)
+                                   session_only=is_session, cwd=cwd)
             target.setdefault("blocks", []).append(subtask["id"])
 
         # Dependency management
@@ -245,18 +258,18 @@ def update_task(task_id: str, **kwargs) -> tuple[bool, str, Optional[dict]]:
         target["updated"] = datetime.now(timezone.utc).isoformat()
 
         if not is_session:
-            _save(tasks)
+            _save(tasks, cwd=cwd)
 
         return True, f"Updated task {task_id}", dict(target)
 
 
-def get_task(task_id: str) -> Optional[dict]:
+def get_task(task_id: str, *, cwd: str = None) -> Optional[dict]:
     """Get a single task by ID (checks both persisted and session tasks)."""
     task_id_str = str(task_id)
     for t in _session_tasks:
         if str(t.get("id")) == task_id_str:
             return dict(t)
-    tasks = _load()
+    tasks = _load(cwd=cwd)
     for t in tasks:
         if str(t.get("id")) == task_id_str:
             return dict(t)
@@ -264,9 +277,9 @@ def get_task(task_id: str) -> Optional[dict]:
 
 
 def list_tasks(status: str = None, blocked_by: str = None,
-               include_session: bool = True) -> list[dict]:
+               include_session: bool = True, *, cwd: str = None) -> list[dict]:
     """List tasks, optionally filtered by status or dependency."""
-    tasks = _load()
+    tasks = _load(cwd=cwd)
     if include_session:
         tasks = tasks + list(_session_tasks)
     if status:
@@ -279,9 +292,9 @@ def list_tasks(status: str = None, blocked_by: str = None,
     return tasks
 
 
-def get_available_tasks() -> list[dict]:
+def get_available_tasks(*, cwd: str = None) -> list[dict]:
     """Get tasks ready to work on: pending, not blocked by any incomplete task."""
-    all_tasks = _load() + list(_session_tasks)
+    all_tasks = _load(cwd=cwd) + list(_session_tasks)
     incomplete_ids = {t["id"] for t in all_tasks if t.get("status") not in ("completed", "deleted")}
 
     available = []
@@ -295,14 +308,14 @@ def get_available_tasks() -> list[dict]:
     return available
 
 
-def get_active_tasks_snapshot() -> str:
+def get_active_tasks_snapshot(*, cwd: str = None) -> str:
     """Render a compact summary of the open task list for prompt injection.
 
     Includes both in_progress (shown first) and pending tasks so the model's
-    own plan — and any auto-seeded objective task — stays visible every turn and
-    can anchor a "continue" request. Returns empty string if nothing is open.
+    own plan stays visible every turn and can anchor a "continue" request.
+    Returns empty string if nothing is open.
     """
-    all_tasks = _load() + list(_session_tasks)
+    all_tasks = _load(cwd=cwd) + list(_session_tasks)
     in_progress = [t for t in all_tasks if t.get("status") == "in_progress"]
     pending = [t for t in all_tasks if t.get("status") == "pending"]
     ordered = in_progress + pending
@@ -331,7 +344,7 @@ def clear_session_tasks() -> None:
         _session_tasks.clear()
 
 
-def export_active_tasks() -> list[dict]:
+def export_active_tasks(*, cwd: str = None) -> list[dict]:
     """Export the open plan (in_progress + pending tasks, persisted + session).
 
     Used to snapshot the working plan into a /resume blob so it survives a
@@ -339,7 +352,7 @@ def export_active_tasks() -> list[dict]:
     Returns deep-ish copies so callers can serialize without mutating state.
     """
     with _lock:
-        all_tasks = _load() + list(_session_tasks)
+        all_tasks = _load(cwd=cwd) + list(_session_tasks)
     out = []
     for t in all_tasks:
         if t.get("status") in ("in_progress", "pending"):
@@ -347,7 +360,7 @@ def export_active_tasks() -> list[dict]:
     return out
 
 
-def import_session_tasks(tasks: list[dict]) -> int:
+def import_session_tasks(tasks: list[dict], *, cwd: str = None) -> int:
     """Rehydrate a plan from a /resume blob as session tasks.
 
     Replaces the current session task list with the saved one (the resume blob
@@ -361,7 +374,7 @@ def import_session_tasks(tasks: list[dict]) -> int:
     with _lock:
         persisted_open = {
             (t.get("subject") or "").strip()
-            for t in _load()
+            for t in _load(cwd=cwd)
             if t.get("status") in ("in_progress", "pending")
         }
         restored = []

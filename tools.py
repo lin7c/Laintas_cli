@@ -216,13 +216,12 @@ class ToolRegistry:
             f"Call them via the native function-calling interface."
         )
 
-    def to_openai_tools(self) -> tuple[list[dict], dict[str, str]]:
+    def to_openai_tools(self, unified: bool = False) -> tuple[list[dict], dict[str, str]]:
         """Render the toolset as OpenAI-style function-calling schemas.
 
         Returns ``(tools, name_map)`` where ``tools`` is a list of
         ``{"type":"function","function":{name, description, parameters}}`` and
-        ``name_map`` maps each emitted (mangled) name back to the original tool
-        name.
+        ``name_map`` maps each emitted wire name back to the original tool name.
 
         Tool names use ``.`` separators (e.g. ``fs.write``), but some providers
         (notably DeepSeek) reject function names containing ``.`` with a
@@ -230,21 +229,39 @@ class ToolRegistry:
         explicit reverse map so native ``tool_calls`` can be un-mangled on the
         way back — we never rely on a global ``_`` → ``.`` rule, since names
         like ``agent_send`` and ``fs.multi_edit`` would make that ambiguous.
+
+        When ``unified`` is True, tools that exist in the shared
+        ``agent_tools`` catalog are emitted under their canonical flat name
+        (``fs.read`` → ``read``) so every agent product speaks one taxonomy;
+        the reverse map still points back to this registry's internal name, so
+        dispatch is unchanged. Tools with no catalog alias (CLI-specific
+        extensions) fall back to the mangled name.
         """
+        _canon = None
+        if unified:
+            try:
+                from agent_tools import load as _load_catalog
+                _canon = _load_catalog()
+            except Exception:
+                _canon = None  # vendored catalog missing → graceful fallback
         tools: list[dict] = []
         name_map: dict[str, str] = {}
         used: set[str] = set()
         for t in self.list():
-            mangled = t.name.replace(".", "_")
+            wire = None
+            if _canon is not None:
+                wire = _canon.canonical(t.name, "laintas_cli")
+            if not wire:
+                wire = t.name.replace(".", "_")
             # Guarantee uniqueness within this request even if a future name
             # set collides after mangling.
-            if mangled in used:
+            if wire in used:
                 i = 2
-                while f"{mangled}_{i}" in used:
+                while f"{wire}_{i}" in used:
                     i += 1
-                mangled = f"{mangled}_{i}"
-            used.add(mangled)
-            name_map[mangled] = t.name
+                wire = f"{wire}_{i}"
+            used.add(wire)
+            name_map[wire] = t.name
             params = t.schema if isinstance(t.schema, dict) and t.schema else {
                 "type": "object", "properties": {},
             }
@@ -254,7 +271,7 @@ class ToolRegistry:
             tools.append({
                 "type": "function",
                 "function": {
-                    "name": mangled,
+                    "name": wire,
                     "description": desc,
                     "parameters": params,
                 },
@@ -280,6 +297,76 @@ def _make_unified_diff(old_text: str, new_text: str, label_a: str, label_b: str,
         n=context,
     )
     return "".join(diff)
+
+
+def _run_diagnostics(abs_path: str) -> Optional[str]:
+    """Run the best-available native checker for ``abs_path`` and return its
+    findings (or None when clean / no checker / unavailable). The agent-appropriate
+    slice of LSP: after an edit, tell the model if it just introduced a
+    syntax/lint error. Checker selection = shared vendored registry
+    (diagnostics_adapter); execution stays here. Never raises."""
+    try:
+        from diagnostics_adapter import pick_checker, timeout_seconds, max_output_chars
+    except Exception:
+        return None
+    try:
+        cmd = pick_checker(abs_path)
+        if not cmd:
+            return None
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True,
+            timeout=timeout_seconds(), cwd=os.path.dirname(abs_path) or None,
+        )
+        if proc.returncode == 0:
+            return None
+        out = ((proc.stdout or "") + ("\n" if proc.stdout and proc.stderr else "") + (proc.stderr or "")).strip()
+        if not out:
+            return None
+        cap = max_output_chars()
+        if len(out) > cap:
+            out = out[:cap] + "\n…(truncated)"
+        return out
+    except Exception:
+        return None
+
+
+def _attach_diagnostics(result: dict, abs_path: str) -> dict:
+    """Append post-edit checker findings to a successful edit/write result so the
+    model immediately sees errors it introduced. No-op when clean/unavailable."""
+    if not isinstance(result, dict) or not result.get("ok"):
+        return result
+    diag = _run_diagnostics(abs_path)
+    if diag:
+        result["diagnostics"] = diag
+        base = result.get("result") or ""
+        result["result"] = f"{base}\n\n[DIAGNOSTICS — errors detected in your edit; fix them]\n{diag}"
+    return result
+
+
+def _run_formatter(abs_path: str) -> bool:
+    """Run the best-available in-place code formatter for ``abs_path`` (shared
+    vendored registry: format_adapter). No-op (returns False) when disabled, no
+    formatter is installed, or on any error. Applied to full-file WRITES only —
+    surgical edits stay byte-precise. Never raises."""
+    try:
+        from agent_loop import get_runtime_config as _grc
+        if not _grc("auto_format"):
+            return False
+    except Exception:
+        pass
+    try:
+        from format_adapter import pick_formatter, timeout_seconds
+    except Exception:
+        return False
+    try:
+        cmd = pick_formatter(abs_path)
+        if not cmd:
+            return False
+        subprocess.run(cmd, capture_output=True, text=True,
+                       timeout=timeout_seconds(), cwd=os.path.dirname(abs_path) or None)
+        return True
+    except Exception:
+        return False
 
 
 # ── Built-in tools ─────────────────────────────────────────────────────
@@ -348,6 +435,22 @@ def _bi_skill_load(params: dict, ctx: ToolCtx) -> dict:
         "result": msg,
         "skill": loaded or {"name": name, "loaded": True},
         "instruction": "The skill is now loaded. Continue the task using its instructions from the next model turn.",
+    }
+
+
+def _bi_skill_unload(params: dict, ctx: ToolCtx) -> dict:
+    """Unload a previously loaded skill, freeing its tools and context."""
+    import skills as _skills
+    name = (params.get("name") or "").strip()
+    if not name:
+        return {"ok": False, "error": "missing 'name'"}
+    ok, msg = _skills.unload_skill(name)
+    if not ok:
+        return {"ok": False, "error": msg}
+    return {
+        "ok": True,
+        "result": msg,
+        "instruction": "The skill is now unloaded; its instructions and tools are no longer available from the next turn.",
     }
 
 
@@ -477,13 +580,22 @@ def _bi_fs_write(params: dict, ctx: ToolCtx) -> dict:
         return {"ok": False, "error": str(e)}
 
     action = "updated" if existed else "created"
-    return {
+    if _run_formatter(abs_path):
+        try:
+            with open(abs_path, "r", encoding="utf-8") as _ff:
+                _formatted = _ff.read()
+            if _formatted != content:
+                diff = _make_unified_diff(old_content, _formatted, abs_path, abs_path)
+                content = _formatted
+        except OSError:
+            pass
+    return _attach_diagnostics({
         "ok": True,
         "result": f"{action} {abs_path} ({len(content)} bytes)",
         "path": abs_path,
         "changed": old_content != content,
         "diff": diff or "(no differences)",
-    }
+    }, abs_path)
 
 
 def _bi_fs_ls(params: dict, ctx: ToolCtx) -> dict:
@@ -519,7 +631,8 @@ def _bi_task_create(params: dict, ctx: ToolCtx) -> dict:
     task = _task_mgr.create_task(subject, description,
                                   metadata=params.get("metadata"),
                                   session_only=params.get("session_only", False),
-                                  parent_task_id=params.get("parent_task_id"))
+                                  parent_task_id=params.get("parent_task_id"),
+                                  cwd=ctx.cwd or None)
     return {"ok": True, "result": task}
 
 
@@ -535,7 +648,7 @@ def _bi_task_update(params: dict, ctx: ToolCtx) -> dict:
               "progress", "notes", "addSubtask"):
         if k in params:
             kwargs[k] = params[k]
-    ok, msg, task = _task_mgr.update_task(str(task_id), **kwargs)
+    ok, msg, task = _task_mgr.update_task(str(task_id), cwd=ctx.cwd or None, **kwargs)
     return {"ok": ok, "result": task if ok else None, "error": "" if ok else msg}
 
 
@@ -545,9 +658,9 @@ def _bi_task_list(params: dict, ctx: ToolCtx) -> dict:
     status = params.get("status") or None
     available = params.get("available", False)
     if available:
-        tasks = _task_mgr.get_available_tasks()
+        tasks = _task_mgr.get_available_tasks(cwd=ctx.cwd or None)
     else:
-        tasks = _task_mgr.list_tasks(status=status)
+        tasks = _task_mgr.list_tasks(status=status, cwd=ctx.cwd or None)
     return {"ok": True, "result": tasks, "count": len(tasks)}
 
 
@@ -557,7 +670,7 @@ def _bi_task_get(params: dict, ctx: ToolCtx) -> dict:
     task_id = params.get("id", "")
     if not task_id:
         return {"ok": False, "error": "missing 'id'"}
-    task = _task_mgr.get_task(str(task_id))
+    task = _task_mgr.get_task(str(task_id), cwd=ctx.cwd or None)
     if task is None:
         return {"ok": False, "error": f"Task '{task_id}' not found"}
     return {"ok": True, "result": task}
@@ -617,9 +730,32 @@ def _bi_fs_edit(params: dict, ctx: ToolCtx) -> dict:
         return {"ok": False, "error": str(e)}
 
     count = content.count(old)
+    _fuzzy_strategy = None
     if count == 0:
-        return {"ok": False, "error": "old_string not found in file",
-                "hint": "Check exact whitespace and indentation"}
+        # Exact match failed — try opencode's fuzzy replacers (shared, vendored)
+        # so an edit still lands when old_string differs only in whitespace or
+        # indentation (the #1 cause of edit failures). Only the matching is
+        # shared; the file I/O stays here.
+        try:
+            from patch_adapter import apply_edit as _apply_edit
+            _fuzzy_new, _fuzzy_strategy = _apply_edit(content, old, new, replace_all)
+        except Exception:
+            _fuzzy_new, _fuzzy_strategy = None, None
+        if _fuzzy_new is None:
+            return {"ok": False, "error": "old_string not found in file",
+                    "hint": "Check exact whitespace and indentation"}
+        new_content = _fuzzy_new
+        diff = _make_unified_diff(content, new_content, abs_path, abs_path)
+        blocked = _check_file_write_policy(abs_path, ctx, diff or "(no differences)")
+        if blocked is not None:
+            return blocked
+        try:
+            with open(abs_path, "w", encoding="utf-8") as f:
+                f.write(new_content)
+        except OSError as e:
+            return {"ok": False, "error": str(e)}
+        return _attach_diagnostics({"ok": True, "result": f"Edited {path} (fuzzy match: {_fuzzy_strategy})",
+                "diff": diff, "tool": "fs.edit", "fuzzy": _fuzzy_strategy}, abs_path)
 
     if count > 1 and not replace_all:
         # Find line numbers for the first 3 occurrences
@@ -651,14 +787,14 @@ def _bi_fs_edit(params: dict, ctx: ToolCtx) -> dict:
     except OSError as e:
         return {"ok": False, "error": str(e)}
 
-    return {
+    return _attach_diagnostics({
         "ok": True,
         "result": f"Replaced {count} occurrence(s) in {abs_path}",
         "path": abs_path,
         "replacements": count,
         "changed": content != new_content,
         "diff": diff or "(no differences)",
-    }
+    }, abs_path)
 
 
 def _bi_fs_multi_edit(params: dict, ctx: ToolCtx) -> dict:
@@ -720,9 +856,9 @@ def _bi_fs_multi_edit(params: dict, ctx: ToolCtx) -> dict:
     except OSError as e:
         return {"ok": False, "error": str(e)}
 
-    return {"ok": True, "result": f"Applied {len(applied)} edits to {abs_path}",
+    return _attach_diagnostics({"ok": True, "result": f"Applied {len(applied)} edits to {abs_path}",
             "path": abs_path, "edits_applied": applied,
-            "changed": content != working, "diff": diff or "(no differences)"}
+            "changed": content != working, "diff": diff or "(no differences)"}, abs_path)
 
 
 def _bi_fs_diff(params: dict, ctx: ToolCtx) -> dict:
@@ -2244,6 +2380,921 @@ def _bi_shell_exec(params: dict, ctx: ToolCtx) -> dict:
         return {"ok": False, "error": f"{type(e).__name__}: {e}", "returncode": -1}
 
 
+# ── Browser live-view debug tools (P1) ──────────────────────────────────
+
+def _bi_browser_debug_open(params: dict, ctx: ToolCtx) -> dict:
+    """Open a headless-browser live-view session for debugging.
+
+    Spawns Xvfb + Chrome + x11vnc on the host and starts a background WS
+    bridge to the backend /vnc relay.  Returns connection details.  The WS
+    relay will show connected=False until the backend deploys /vnc — that's
+    expected; the host stack (Chrome + CDP + VNC) is up regardless.
+    """
+    try:
+        import browser_session as _bs
+    except ImportError:
+        return {"ok": False, "error": "browser_session module not available"}
+
+    url = params.get("url", "about:blank").strip() or "about:blank"
+    name = params.get("name") or None
+    width = int(params.get("width", 1280) or 1280)
+    height = int(params.get("height", 800) or 800)
+
+    backend = os.environ.get("LAINTAS_BACKEND", "http://localhost:8000")
+    agent_id = ctx.agent_id or "debug"
+    session_id = f"browser-{int(__import__('time').time() * 1000)}"
+
+    sess = _bs.BrowserSession(
+        backend_url=backend,
+        agent_id=agent_id,
+        agent_secret="debug",
+        session_id=session_id,
+        url=url,
+        width=width,
+        height=height,
+    )
+    try:
+        sess.start()
+    except Exception as e:
+        sess.close()
+        return {"ok": False, "error": f"start failed: {e}"}
+
+    registered = _bs.register_browser_session(sess, name=name)
+
+    # Probe CDP to prove Chrome is really up.
+    cdp_ver = "?"
+    try:
+        import urllib.request as _ur
+        with _ur.urlopen(f"{sess.cdp_endpoint()}/json/version", timeout=3) as r:
+            import json as _json
+            ver = _json.loads(r.read().decode("utf-8", "replace"))
+        cdp_ver = ver.get("Browser", "?")
+    except Exception:
+        pass
+
+    return {
+        "ok": True,
+        "result": (
+            f"Browser session '{registered}' is up.\n"
+            f"  url      : {sess.url}\n"
+            f"  display  :{sess.display_n}\n"
+            f"  cdp      : {sess.cdp_endpoint()}\n"
+            f"  cdp ver  : {cdp_ver}\n"
+            f"  vnc      : 127.0.0.1:{sess.rfb_port}\n"
+            f"  ws relay : {'connected' if sess.ws_connected() else 'retrying (backend /vnc not deployed)'}\n"
+            f"  chrome   : pid {sess._chrome.pid if sess._chrome else '-'}"
+        ),
+        "name": registered,
+        "cdp_endpoint": sess.cdp_endpoint(),
+        "rfb_port": sess.rfb_port,
+        "display": sess.display_n,
+    }
+
+
+def _bi_browser_debug_close(params: dict, ctx: ToolCtx) -> dict:
+    """Close a headless-browser session by name."""
+    try:
+        import browser_session as _bs
+    except ImportError:
+        return {"ok": False, "error": "browser_session module not available"}
+
+    name = params.get("name", "").strip()
+    if not name:
+        return {"ok": False, "error": "missing 'name'"}
+    ok = _bs.unregister_browser_session(name)
+    return {"ok": ok, "result": f"closed '{name}'" if ok else f"no session named '{name}'"}
+
+
+def _bi_browser_debug_list(params: dict, ctx: ToolCtx) -> dict:
+    """List active browser sessions."""
+    try:
+        import browser_session as _bs
+    except ImportError:
+        return {"ok": False, "error": "browser_session module not available"}
+
+    sessions = _bs.get_all_browser_sessions()
+    if not sessions:
+        return {"ok": True, "result": "no active browser sessions"}
+
+    lines = []
+    with _bs._browser_lock:
+        for nm, sess in _bs._browser_sessions.items():
+            lines.append(
+                f"  {nm}: url={sess.url} display=:{sess.display_n} "
+                f"cdp={sess.cdp_endpoint()} vnc=:{sess.rfb_port} "
+                f"alive={sess.is_alive()} ws={sess.ws_connected()}"
+            )
+    return {"ok": True, "result": f"{len(sessions)} session(s):\n" + "\n".join(lines)}
+
+
+# ── Browser automation tools (P2) ───────────────────────────────────────
+
+def _browser_resolve_session(params: dict):
+    """Resolve a BrowserSession from params['session'], most recent session,
+    or auto-create a default about:blank session when none exists."""
+    try:
+        import browser_session as _bs
+    except ImportError:
+        return None, "browser_session module not available"
+
+    name = params.get("session", "").strip()
+    if name:
+        sess = _bs.get_browser_session(name)
+        if sess is None:
+            return None, f"no browser session named '{name}'"
+        if not sess.is_alive():
+            return None, f"browser session '{name}' is not alive"
+        return sess, name
+
+    with _bs._browser_lock:
+        if _bs._browser_sessions:
+            name = list(_bs._browser_sessions.keys())[-1]
+            sess = _bs._browser_sessions[name]
+            if not sess.is_alive():
+                return None, f"browser session '{name}' is not alive"
+            return sess, name
+
+    backend = os.environ.get("LAINTAS_BACKEND", "http://localhost:8000")
+    session_id = f"browser-{int(time.time() * 1000)}"
+    width = int(params.get("width", 1280) or 1280)
+    height = int(params.get("height", 800) or 800)
+    sess = _bs.BrowserSession(
+        backend_url=backend, agent_id="debug", agent_secret="debug",
+        session_id=session_id, url="about:blank", width=width, height=height,
+    )
+    try:
+        sess.start()
+    except Exception as e:
+        sess.close()
+        return None, f"failed to auto-create browser session: {e}"
+    name = _bs.register_browser_session(sess, name="default")
+    return sess, name
+
+
+def _browser_check_action(action: str, params: dict, ctx: ToolCtx):
+    """Check browser-action policy and request approval if needed.
+
+    Returns None if the action may proceed, or a dict {ok:False, error:...}
+    to short-circuit the tool call.
+    """
+    try:
+        import policy as _policy
+    except ImportError:
+        return None  # no policy module → allow
+
+    decision = _policy.evaluate_browser_action(
+        action, params, agent_id=ctx.agent_id)
+    if decision.action == "deny":
+        return {"ok": False, "error": f"blocked by policy: {decision.reason}"}
+    if decision.action == "needs_approval":
+        # Build a human-readable command string for the approval prompt.
+        url = params.get("url", "")
+        selector = params.get("selector", "")
+        if action == "navigate":
+            cmd = f"browser.navigate {url}"
+        elif action == "click":
+            cmd = f"browser.click {selector}"
+        elif action == "type":
+            cmd = f"browser.type {selector}"
+        elif action == "evaluate":
+            cmd = f"browser.evaluate {params.get('script', '')[:200]}"
+        elif action == "select":
+            cmd = f"browser.select {selector}"
+        elif action == "press_key":
+            cmd = f"browser.press_key {params.get('key', '')}"
+        else:
+            cmd = f"browser.{action}"
+
+        approve_fn = getattr(ctx.deps, "request_command_approval", None) if ctx.deps else None
+        if approve_fn is None:
+            # No approval callback available (e.g., running outside agent loop).
+            # In enforce mode this means we can't ask → block.
+            return {"ok": False, "error": f"action requires approval but no approval callback is available: {cmd}"}
+        approved = approve_fn(cmd, decision.reason)
+        if not approved:
+            return {"ok": False, "error": f"action not approved: {cmd}"}
+    return None
+
+
+def _browser_resolve_selector(params: dict):
+    """Resolve 'ref' or 'selector' parameter to a CSS selector string.
+
+    Returns (selector_string, None) on success, or (None, error_msg) on failure.
+    If 'ref' is provided, it takes priority over 'selector'.
+    """
+    ref = params.get("ref")
+    if ref is not None:
+        try:
+            n = int(ref)
+            if n < 1:
+                return None, f"invalid ref value (must be >= 1): {ref}"
+            return f'[data-laintas-ref="{n}"]', None
+        except (ValueError, TypeError):
+            return None, f"invalid ref value (must be a number): {ref}"
+    selector = params.get("selector", "").strip()
+    if not selector:
+        return None, "missing 'selector' or 'ref' — call browser.snapshot first to get ref numbers"
+    return selector, None
+
+
+def _browser_antibot_delay():
+    """Sleep a random anti-bot delay before browser actions."""
+    try:
+        from agent_loop import get_runtime_config
+        lo = float(get_runtime_config("browser_action_delay_min"))
+        hi = float(get_runtime_config("browser_action_delay_max"))
+        if hi > 0 and hi > lo:
+            import random
+            import time
+            time.sleep(random.uniform(lo, hi))
+    except Exception:
+        pass
+
+
+def _browser_auto_snapshot(sess, max_chars: int = 2000) -> str:
+    """Generate a compact page snapshot for auto-return after actions."""
+    try:
+        try:
+            from agent_loop import get_runtime_config
+            wait_s = float(get_runtime_config("browser_post_action_wait") or 0)
+            if wait_s > 0:
+                time.sleep(min(wait_s, 5.0))
+        except Exception:
+            pass
+        page = sess.get_page()
+        url = page.url
+        title = page.title()
+        text = page.inner_text("body")
+        if len(text) > max_chars:
+            text = text[:max_chars] + f"\n... (truncated, {len(text)} total chars)"
+        result = f"url: {url}\ntitle: {title}\n\n{text}"
+        try:
+            refs = sess.inject_refs()
+            if refs:
+                ref_lines = []
+                for r in refs[:30]:
+                    parts = [f"[{r['ref']}] <{r['tag']}>"]
+                    if r.get("text"):
+                        parts.append(f"text={r['text'][:60]}")
+                    if r.get("href"):
+                        parts.append(f"href={r['href'][:60]}")
+                    if r.get("placeholder"):
+                        parts.append(f"placeholder={r['placeholder'][:60]}")
+                    if r.get("role"):
+                        parts.append(f"role={r['role']}")
+                    if r.get("type"):
+                        parts.append(f"type={r['type']}")
+                    if r.get("value"):
+                        parts.append(f"value={r['value'][:60]}")
+                    ref_lines.append(" | ".join(parts))
+                result += "\n\n── Interactive elements (ref) ──\n" + "\n".join(ref_lines)
+        except Exception:
+            pass
+        return result
+    except Exception as e:
+        return f"(snapshot failed: {e})"
+
+
+def _browser_should_auto_snapshot() -> bool:
+    try:
+        from agent_loop import get_runtime_config
+        return bool(get_runtime_config("browser_auto_snapshot"))
+    except Exception:
+        return True
+
+
+def _bi_browser_open(params: dict, ctx: ToolCtx) -> dict:
+    """Open a new headless-browser session with live-view relay."""
+    blocked = _browser_check_action("navigate", params, ctx)
+    if blocked:
+        return blocked
+    try:
+        import browser_session as _bs
+    except ImportError:
+        return {"ok": False, "error": "browser_session module not available"}
+
+    url = params.get("url", "about:blank").strip() or "about:blank"
+    name = params.get("name") or None
+    width = int(params.get("width", 1280) or 1280)
+    height = int(params.get("height", 800) or 800)
+
+    backend = os.environ.get("LAINTAS_BACKEND", "http://localhost:8000")
+    agent_id = ctx.agent_id or "debug"
+    session_id = f"browser-{int(__import__('time').time() * 1000)}"
+
+    sess = _bs.BrowserSession(
+        backend_url=backend, agent_id=agent_id, agent_secret="debug",
+        session_id=session_id, url=url, width=width, height=height,
+    )
+    try:
+        sess.start()
+    except Exception as e:
+        sess.close()
+        return {"ok": False, "error": f"start failed: {e}"}
+
+    registered = _bs.register_browser_session(sess, name=name)
+    return {
+        "ok": True,
+        "result": (
+            f"Browser session '{registered}' is up.\n"
+            f"  url      : {sess.url}\n"
+            f"  display  :{sess.display_n}\n"
+            f"  cdp      : {sess.cdp_endpoint()}\n"
+            f"  vnc      : 127.0.0.1:{sess.rfb_port}\n"
+            f"  ws relay : {'connected' if sess.ws_connected() else 'retrying (backend /vnc not deployed)'}"
+        ),
+        "name": registered,
+        "cdp_endpoint": sess.cdp_endpoint(),
+        "rfb_port": sess.rfb_port,
+    }
+
+
+def _bi_browser_close(params: dict, ctx: ToolCtx) -> dict:
+    """Close a browser session by name."""
+    try:
+        import browser_session as _bs
+    except ImportError:
+        return {"ok": False, "error": "browser_session module not available"}
+    name = params.get("name", params.get("session", "")).strip()
+    if not name:
+        # Close the most recent session.
+        with _bs._browser_lock:
+            if not _bs._browser_sessions:
+                return {"ok": False, "error": "no active browser session"}
+            name = list(_bs._browser_sessions.keys())[-1]
+    ok = _bs.unregister_browser_session(name)
+    return {"ok": ok, "result": f"closed '{name}'" if ok else f"no session named '{name}'"}
+
+
+def _bi_browser_navigate(params: dict, ctx: ToolCtx) -> dict:
+    """Navigate to a URL."""
+    blocked = _browser_check_action("navigate", params, ctx)
+    if blocked:
+        return blocked
+    sess, err = _browser_resolve_session(params)
+    if sess is None:
+        return {"ok": False, "error": err}
+    url = params.get("url", "").strip()
+    if not url:
+        return {"ok": False, "error": "missing 'url'"}
+    wait_until = params.get("wait_until", "domcontentloaded")
+    timeout = int(params.get("timeout", 30) or 30) * 1000
+    _browser_antibot_delay()
+    try:
+        page = sess.get_page()
+        page.goto(url, wait_until=wait_until, timeout=timeout)
+        title = page.title()
+        result = f"navigated to {url}\ntitle: {title}"
+        if _browser_should_auto_snapshot():
+            result += "\n\n" + _browser_auto_snapshot(sess)
+        return {"ok": True, "result": result, "title": title, "url": page.url}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+def _bi_browser_click(params: dict, ctx: ToolCtx) -> dict:
+    """Click an element by CSS selector or ref number."""
+    blocked = _browser_check_action("click", params, ctx)
+    if blocked:
+        return blocked
+    sess, err = _browser_resolve_session(params)
+    if sess is None:
+        return {"ok": False, "error": err}
+    selector, serr = _browser_resolve_selector(params)
+    if selector is None:
+        return {"ok": False, "error": serr}
+    timeout = int(params.get("timeout", 10) or 10) * 1000
+    _browser_antibot_delay()
+    try:
+        page = sess.get_page()
+        el = page.wait_for_selector(selector, state="visible", timeout=timeout)
+        if el is None:
+            return {"ok": False, "error": f"element not found: {selector}"}
+        el.click()
+        result = f"clicked: {selector}"
+        if _browser_should_auto_snapshot():
+            result += "\n\n" + _browser_auto_snapshot(sess)
+        return {"ok": True, "result": result}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+def _bi_browser_type(params: dict, ctx: ToolCtx) -> dict:
+    """Type text into an element identified by CSS selector or ref number."""
+    blocked = _browser_check_action("type", params, ctx)
+    if blocked:
+        return blocked
+    sess, err = _browser_resolve_session(params)
+    if sess is None:
+        return {"ok": False, "error": err}
+    selector, serr = _browser_resolve_selector(params)
+    if selector is None:
+        return {"ok": False, "error": serr}
+    text = params.get("text", "")
+    if not text:
+        return {"ok": False, "error": "missing 'text'"}
+    delay = int(params.get("delay", 0) or 0)
+    clear = params.get("clear", True)
+    timeout = int(params.get("timeout", 10) or 10) * 1000
+    _browser_antibot_delay()
+    try:
+        page = sess.get_page()
+        el = page.wait_for_selector(selector, state="visible", timeout=timeout)
+        if el is None:
+            return {"ok": False, "error": f"element not found: {selector}"}
+        if clear:
+            el.fill("")
+        if delay > 0:
+            el.type(text, delay=delay)
+        else:
+            el.type(text)
+        result = f"typed {len(text)} chars into {selector}"
+        if _browser_should_auto_snapshot():
+            result += "\n\n" + _browser_auto_snapshot(sess)
+        return {"ok": True, "result": result}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+def _bi_browser_screenshot(params: dict, ctx: ToolCtx) -> dict:
+    """Take a screenshot and save to a file. Returns the file path."""
+    sess, err = _browser_resolve_session(params)
+    if sess is None:
+        return {"ok": False, "error": err}
+    full_page = params.get("full_page", False)
+    path = params.get("path", "").strip()
+    if not path:
+        import tempfile as _tf
+        path = _tf.mktemp(prefix="browser-shot-", suffix=".png")
+    try:
+        page = sess.get_page()
+        page.screenshot(path=path, full_page=full_page)
+        import os as _os
+        size = _os.path.getsize(path)
+        return {"ok": True, "result": f"screenshot saved: {path} ({size} bytes)", "path": path}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+def _bi_browser_query(params: dict, ctx: ToolCtx) -> dict:
+    """Query DOM elements by CSS selector and return their text/attributes."""
+    sess, err = _browser_resolve_session(params)
+    if sess is None:
+        return {"ok": False, "error": err}
+    selector = params.get("selector", "").strip()
+    if not selector:
+        return {"ok": False, "error": "missing 'selector'"}
+    limit = int(params.get("limit", 20) or 20)
+    attribute = params.get("attribute", "").strip()
+    try:
+        page = sess.get_page()
+        elements = page.query_selector_all(selector)
+        if not elements:
+            return {"ok": True, "result": f"no elements matched: {selector}", "count": 0}
+        results = []
+        for el in elements[:limit]:
+            entry = {"tag": el.evaluate("e => e.tagName.toLowerCase()")}
+            if attribute:
+                val = el.get_attribute(attribute)
+                entry[attribute] = val or ""
+            else:
+                for attr in ("href", "src", "value", "placeholder", "type", "id", "class", "name", "role", "aria-label"):
+                    val = el.get_attribute(attr)
+                    if val:
+                        entry[attr] = val
+            entry["text"] = (el.inner_text() or "").strip()[:500]
+            results.append(entry)
+        lines = []
+        for r in results:
+            parts = [f"  {r['tag']}"]
+            for k, v in r.items():
+                if k == "tag":
+                    continue
+                if v:
+                    parts.append(f"{k}={v[:120]}")
+            lines.append(" | ".join(parts))
+        return {"ok": True, "result": f"{len(results)} element(s):\n" + "\n".join(lines),
+                "count": len(results), "elements": results}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+def _bi_browser_snapshot(params: dict, ctx: ToolCtx) -> dict:
+    """Return a text snapshot of the page: URL, title, visible text, and
+    numbered refs for interactive elements."""
+    sess, err = _browser_resolve_session(params)
+    if sess is None:
+        return {"ok": False, "error": err}
+    max_chars = int(params.get("max_chars", 5000) or 5000)
+    try:
+        page = sess.get_page()
+        text = page.inner_text("body")
+        url = page.url
+        title = page.title()
+        if len(text) > max_chars:
+            text = text[:max_chars] + f"\n... (truncated, {len(text)} total chars)"
+        result = f"url: {url}\ntitle: {title}\n\n{text}"
+        refs = []
+        try:
+            refs = sess.inject_refs()
+            if refs:
+                ref_lines = []
+                for r in refs:
+                    parts = [f"[{r['ref']}] <{r['tag']}>"]
+                    if r.get("text"):
+                        parts.append(f"text={r['text'][:80]}")
+                    if r.get("href"):
+                        parts.append(f"href={r['href'][:80]}")
+                    if r.get("placeholder"):
+                        parts.append(f"placeholder={r['placeholder'][:80]}")
+                    if r.get("role"):
+                        parts.append(f"role={r['role']}")
+                    if r.get("type"):
+                        parts.append(f"type={r['type']}")
+                    if r.get("value"):
+                        parts.append(f"value={r['value'][:80]}")
+                    if r.get("aria_label"):
+                        parts.append(f"aria-label={r['aria_label'][:80]}")
+                    ref_lines.append(" | ".join(parts))
+                result += "\n\n── Interactive elements (use ref number in browser.click/type/select) ──\n"
+                result += "\n".join(ref_lines)
+        except Exception:
+            pass
+        return {"ok": True, "result": result, "url": url, "title": title, "refs": refs}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+def _bi_browser_scroll(params: dict, ctx: ToolCtx) -> dict:
+    """Scroll the page by coordinates or scroll an element into view."""
+    sess, err = _browser_resolve_session(params)
+    if sess is None:
+        return {"ok": False, "error": err}
+    selector = params.get("selector", "").strip()
+    x = params.get("x")
+    y = params.get("y")
+    try:
+        page = sess.get_page()
+        if selector:
+            el = page.query_selector(selector)
+            if el is None:
+                return {"ok": False, "error": f"element not found: {selector}"}
+            el.scroll_into_view_if_needed()
+            return {"ok": True, "result": f"scrolled '{selector}' into view"}
+        dx = int(x) if x is not None else 0
+        dy = int(y) if y is not None else 0
+        page.mouse.wheel(dx, dy)
+        return {"ok": True, "result": f"scrolled by ({dx}, {dy})"}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+def _bi_browser_evaluate(params: dict, ctx: ToolCtx) -> dict:
+    """Evaluate a JavaScript expression on the page and return the result."""
+    blocked = _browser_check_action("evaluate", params, ctx)
+    if blocked:
+        return blocked
+    sess, err = _browser_resolve_session(params)
+    if sess is None:
+        return {"ok": False, "error": err}
+    script = params.get("script", "").strip()
+    if not script:
+        return {"ok": False, "error": "missing 'script'"}
+    try:
+        page = sess.get_page()
+        result = page.evaluate(script)
+        return {"ok": True, "result": str(result)[:5000], "value": result}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+def _bi_browser_press_key(params: dict, ctx: ToolCtx) -> dict:
+    """Press a keyboard key (e.g., Enter, Tab, Escape, ArrowDown)."""
+    blocked = _browser_check_action("press_key", params, ctx)
+    if blocked:
+        return blocked
+    sess, err = _browser_resolve_session(params)
+    if sess is None:
+        return {"ok": False, "error": err}
+    key = params.get("key", "").strip()
+    if not key:
+        return {"ok": False, "error": "missing 'key'"}
+    _browser_antibot_delay()
+    try:
+        page = sess.get_page()
+        page.keyboard.press(key)
+        result = f"pressed: {key}"
+        if _browser_should_auto_snapshot():
+            result += "\n\n" + _browser_auto_snapshot(sess)
+        return {"ok": True, "result": result}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+def _bi_browser_get_url(params: dict, ctx: ToolCtx) -> dict:
+    """Get the current page URL."""
+    sess, err = _browser_resolve_session(params)
+    if sess is None:
+        return {"ok": False, "error": err}
+    try:
+        page = sess.get_page()
+        url = page.url
+        return {"ok": True, "result": url, "url": url}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+def _bi_browser_get_title(params: dict, ctx: ToolCtx) -> dict:
+    """Get the current page title."""
+    sess, err = _browser_resolve_session(params)
+    if sess is None:
+        return {"ok": False, "error": err}
+    try:
+        page = sess.get_page()
+        title = page.title()
+        return {"ok": True, "result": title, "title": title}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+def _bi_browser_wait_for(params: dict, ctx: ToolCtx) -> dict:
+    """Wait for an element to reach a state (visible/hidden/attached/detached)."""
+    sess, err = _browser_resolve_session(params)
+    if sess is None:
+        return {"ok": False, "error": err}
+    selector = params.get("selector", "").strip()
+    if not selector:
+        return {"ok": False, "error": "missing 'selector'"}
+    state = params.get("state", "visible")
+    timeout = int(params.get("timeout", 15) or 15) * 1000
+    try:
+        page = sess.get_page()
+        el = page.wait_for_selector(selector, state=state, timeout=timeout)
+        if state in ("hidden", "detached"):
+            return {"ok": True, "result": f"element '{selector}' is now {state}"}
+        if el is None:
+            return {"ok": False, "error": f"element not found: {selector}"}
+        return {"ok": True, "result": f"element '{selector}' is {state}"}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+def _bi_browser_select(params: dict, ctx: ToolCtx) -> dict:
+    """Select an option in a <select> element by value or label."""
+    blocked = _browser_check_action("select", params, ctx)
+    if blocked:
+        return blocked
+    sess, err = _browser_resolve_session(params)
+    if sess is None:
+        return {"ok": False, "error": err}
+    selector, serr = _browser_resolve_selector(params)
+    if selector is None:
+        return {"ok": False, "error": serr}
+    value = params.get("value", "").strip()
+    label = params.get("label", "").strip()
+    if not value and not label:
+        return {"ok": False, "error": "missing 'value' or 'label'"}
+    _browser_antibot_delay()
+    try:
+        page = sess.get_page()
+        el = page.query_selector(selector)
+        if el is None:
+            return {"ok": False, "error": f"select element not found: {selector}"}
+        if label:
+            selected = el.select_option(label=label)
+        else:
+            selected = el.select_option(value=value)
+        result = f"selected '{selected}' in {selector}"
+        if _browser_should_auto_snapshot():
+            result += "\n\n" + _browser_auto_snapshot(sess)
+        return {"ok": True, "result": result}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+def _bi_browser_go_back(params: dict, ctx: ToolCtx) -> dict:
+    """Navigate back in browser history."""
+    sess, err = _browser_resolve_session(params)
+    if sess is None:
+        return {"ok": False, "error": err}
+    _browser_antibot_delay()
+    try:
+        page = sess.get_page()
+        page.go_back(wait_until="domcontentloaded", timeout=15000)
+        result = f"went back, now at: {page.url}"
+        if _browser_should_auto_snapshot():
+            result += "\n\n" + _browser_auto_snapshot(sess)
+        return {"ok": True, "result": result, "url": page.url}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+def _bi_browser_go_forward(params: dict, ctx: ToolCtx) -> dict:
+    """Navigate forward in browser history."""
+    sess, err = _browser_resolve_session(params)
+    if sess is None:
+        return {"ok": False, "error": err}
+    _browser_antibot_delay()
+    try:
+        page = sess.get_page()
+        page.go_forward(wait_until="domcontentloaded", timeout=15000)
+        result = f"went forward, now at: {page.url}"
+        if _browser_should_auto_snapshot():
+            result += "\n\n" + _browser_auto_snapshot(sess)
+        return {"ok": True, "result": result, "url": page.url}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+# ── Browser testing: runtime-error capture + assertion ──────────────────────
+def _bi_browser_get_console(params: dict, ctx: ToolCtx) -> dict:
+    """Return console messages captured from the page (optional level filter)."""
+    sess, err = _browser_resolve_session(params)
+    if sess is None:
+        return {"ok": False, "error": err}
+    level = (params.get("level") or "all").strip()
+    msgs = sess.get_console(level)
+    if not msgs:
+        return {"ok": True, "result": "(no console messages)", "count": 0}
+    shown = msgs[-200:]
+    lines = [f"  [{m['type']}] {m['text']}" + (f"  ({m['location']})" if m.get('location') else "") for m in shown]
+    return {"ok": True, "result": f"{len(msgs)} console message(s):\n" + "\n".join(lines),
+            "count": len(msgs), "messages": shown}
+
+
+def _bi_browser_get_errors(params: dict, ctx: ToolCtx) -> dict:
+    """Runtime-problems digest: uncaught JS exceptions + console.error +
+    failed/4xx-5xx network requests. The key 'did the page break' test signal."""
+    sess, err = _browser_resolve_session(params)
+    if sess is None:
+        return {"ok": False, "error": err}
+    page_errs = sess.get_page_errors()
+    console_errs = sess.get_console("error")
+    net_errs = sess.get_network_errors()
+    total = len(page_errs) + len(console_errs) + len(net_errs)
+    if total == 0:
+        return {"ok": True, "clean": True, "count": 0,
+                "result": "No runtime errors captured (no JS exceptions, console errors, or failed/4xx-5xx requests)."}
+    lines = []
+    if page_errs:
+        lines.append(f"JS exceptions ({len(page_errs)}):")
+        lines += [f"  - {e['message']}" for e in page_errs[-20:]]
+    if console_errs:
+        lines.append(f"console.error ({len(console_errs)}):")
+        lines += [f"  - {e['text']}" + (f"  ({e['location']})" if e.get('location') else "") for e in console_errs[-20:]]
+    if net_errs:
+        lines.append(f"network failures ({len(net_errs)}):")
+        lines += [f"  - {e.get('status','FAIL')} {e['method']} {e['url']}" + (f" ({e.get('failure')})" if e.get('failure') else "") for e in net_errs[-20:]]
+    return {"ok": True, "clean": False, "count": total,
+            "result": f"{total} runtime problem(s):\n" + "\n".join(lines),
+            "page_errors": page_errs, "console_errors": console_errs, "network_errors": net_errs}
+
+
+def _expect_result(passed: bool, expectation: str, actual: str) -> dict:
+    return {"ok": True, "pass": bool(passed),
+            "result": ("PASS" if passed else "FAIL") + f": expected {expectation}; {actual}",
+            "expectation": expectation, "actual": actual}
+
+
+def _bi_browser_expect(params: dict, ctx: ToolCtx) -> dict:
+    """Assert a condition about the page; returns ok=True with pass=True/False.
+    Conditions: url_contains / title_contains (page-level), or selector + one of
+    text / state(visible|hidden) / count (default: element exists)."""
+    sess, err = _browser_resolve_session(params)
+    if sess is None:
+        return {"ok": False, "error": err}
+    try:
+        page = sess.get_page()
+        url_c = params.get("url_contains")
+        if url_c is not None:
+            return _expect_result(url_c in (page.url or ""), f"url contains {url_c!r}", f"url is {page.url!r}")
+        title_c = params.get("title_contains")
+        if title_c is not None:
+            t = page.title() or ""
+            return _expect_result(title_c in t, f"title contains {title_c!r}", f"title is {t!r}")
+        selector, serr = _browser_resolve_selector(params)
+        if serr:
+            return {"ok": False, "error": serr}
+        if not selector:
+            return {"ok": False, "error": "expect needs selector + a condition (text/state/count), or url_contains/title_contains"}
+        els = page.query_selector_all(selector)
+        if params.get("count") is not None:
+            want = int(params["count"])
+            return _expect_result(len(els) == want, f"{selector} count == {want}", f"found {len(els)}")
+        state = params.get("state")
+        if state in ("visible", "hidden"):
+            visible = bool(els) and els[0].is_visible()
+            ok = visible if state == "visible" else (not visible)
+            return _expect_result(ok, f"{selector} is {state}", f"visible={visible}, matched={len(els)}")
+        text = params.get("text")
+        if text is not None:
+            if not els:
+                return _expect_result(False, f"{selector} text contains {text!r}", "selector not found")
+            actual = (els[0].inner_text() or "")
+            return _expect_result(text in actual, f"{selector} text contains {text!r}", f"text is {actual.strip()[:200]!r}")
+        return _expect_result(len(els) > 0, f"{selector} exists", f"matched {len(els)}")
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+# Steps a test flow may run, mapped to the existing single-action handlers.
+# Each step is {"action": <name>, ...params}; params pass straight through.
+_TEST_FLOW_ACTIONS = {
+    "navigate": _bi_browser_navigate,
+    "click": _bi_browser_click,
+    "type": _bi_browser_type,
+    "select": _bi_browser_select,
+    "press_key": _bi_browser_press_key,
+    "scroll": _bi_browser_scroll,
+    "wait_for": _bi_browser_wait_for,
+    "evaluate": _bi_browser_evaluate,
+    "expect": _bi_browser_expect,
+}
+
+
+def _bi_browser_test_flow(params: dict, ctx: ToolCtx) -> dict:
+    """Run a multi-step browser test and return a pass/fail report.
+
+    Each step is {"action": navigate|click|type|select|press_key|scroll|
+    wait_for|evaluate|expect, ...params}. A step fails when its handler returns
+    ok=False, or (for 'expect') pass=False. Execution stops at the first failed
+    step, a screenshot is captured, and — when check_errors is set — captured
+    runtime errors (JS exceptions / console.error / failed requests) also fail
+    the flow. Returns a structured report with per-step results."""
+    sess, err = _browser_resolve_session(params)
+    if sess is None:
+        return {"ok": False, "error": err}
+    steps = params.get("steps")
+    if not isinstance(steps, list) or not steps:
+        return {"ok": False, "error": "test_flow needs a non-empty 'steps' array"}
+    session_name = params.get("session")
+    check_errors = params.get("check_errors", True)
+    shot_on_fail = params.get("screenshot_on_failure", True)
+    if params.get("clear_captures", True):
+        try:
+            sess.clear_captures()
+        except Exception:
+            pass
+
+    results = []
+    failed_at = None
+    for i, step in enumerate(steps):
+        if not isinstance(step, dict):
+            failed_at = i
+            results.append({"step": i, "action": None, "pass": False, "detail": "step is not an object"})
+            break
+        action = (step.get("action") or "").strip()
+        handler = _TEST_FLOW_ACTIONS.get(action)
+        if handler is None:
+            failed_at = i
+            results.append({"step": i, "action": action, "pass": False,
+                            "detail": f"unknown action {action!r}; valid: {', '.join(sorted(_TEST_FLOW_ACTIONS))}"})
+            break
+        sp = {k: v for k, v in step.items() if k != "action"}
+        if session_name and "session" not in sp:
+            sp["session"] = session_name
+        try:
+            r = handler(sp, ctx)
+        except Exception as e:
+            r = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        ok = bool(r.get("ok"))
+        passed = ok and (r.get("pass", True) is not False)
+        detail = r.get("result") or r.get("error") or ""
+        results.append({"step": i, "action": action, "pass": passed, "detail": detail})
+        if not passed:
+            failed_at = i
+            break
+
+    # Runtime-error gate: only when the steps themselves all passed.
+    error_digest = None
+    if check_errors and failed_at is None:
+        ed = _bi_browser_get_errors({"session": session_name} if session_name else {}, ctx)
+        if ed.get("ok") and not ed.get("clean", True):
+            error_digest = ed.get("result")
+            results.append({"step": len(steps), "action": "check_errors", "pass": False, "detail": error_digest})
+            failed_at = len(steps)
+
+    passed_all = failed_at is None
+    shot_path = None
+    if not passed_all and shot_on_fail:
+        s = _bi_browser_screenshot({"session": session_name} if session_name else {}, ctx)
+        if s.get("ok"):
+            shot_path = s.get("path")
+
+    ran = len(results)
+    n_pass = sum(1 for r in results if r["pass"])
+    summary = ("PASS" if passed_all else "FAIL") + f": {n_pass}/{ran} step(s) passed"
+    lines = [summary]
+    for r in results:
+        mark = "✓" if r["pass"] else "✗"
+        lines.append(f"  {mark} [{r['step']}] {r['action']}: {str(r['detail'])[:300]}")
+    if shot_path:
+        lines.append(f"  failure screenshot: {shot_path}")
+    return {"ok": True, "pass": passed_all, "failed_at": failed_at,
+            "result": "\n".join(lines), "steps": results,
+            "screenshot": shot_path, "errors": error_digest}
+
+
 def register_builtin_tools() -> None:
     """Idempotent — safe to call multiple times."""
     builtins = [
@@ -2315,6 +3366,20 @@ def register_builtin_tools() -> None:
                 "required": ["name"],
             },
             invoke=_bi_skill_load,
+        ),
+        Tool(
+            name="skill.unload",
+            description="Unload a previously loaded skill: drop its tools and stop injecting its "
+                        "instructions. Call when you are done with that specialized work to free "
+                        "context. The skill stays available and can be re-loaded later.",
+            schema={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Skill name to unload"},
+                },
+                "required": ["name"],
+            },
+            invoke=_bi_skill_unload,
         ),
         Tool(
             name="fs.read",
@@ -2524,14 +3589,15 @@ def register_builtin_tools() -> None:
         Tool(
             name="task.create",
             description="Create a new task for structured work tracking. "
-                        "Tasks have status (pending→in_progress→completed), "
+                        "Decompose the user's goal into specific, actionable tasks "
+                        "with clear names. Tasks have status (pending→in_progress→completed), "
                         "dependencies (blocks/blockedBy), progress (0-100), "
                         "notes, and metadata. Use session_only=true for ephemeral "
                         "tasks that won't persist across sessions.",
             schema={
                 "type": "object",
                 "properties": {
-                    "subject": {"type": "string", "description": "Brief, actionable title"},
+                    "subject": {"type": "string", "description": "Brief, actionable title — describe the actual work, not the user's raw request (e.g., 'Refactor auth module', NOT 'help me refactor')"},
                     "description": {"type": "string", "default": "",
                                     "description": "Detailed description of what needs to be done"},
                     "metadata": {"type": "object", "default": {},
@@ -3075,6 +4141,356 @@ def register_builtin_tools() -> None:
                 },
             },
             invoke=_bi_task_complete,
+        ),
+        # ── Browser live-view debug tools (P1) ───────────────────────
+        Tool(
+            name="browser._debug_open",
+            description=(
+                "[DEBUG/P1] Open a headless-browser live-view session. "
+                "Spawns Xvfb+Chrome+x11vnc on the host and bridges to the "
+                "backend /vnc relay. Returns CDP endpoint, VNC port, and "
+                "display number. The WS relay shows 'retrying' until the "
+                "backend deploys /vnc — that's expected; Chrome+CDP+VNC "
+                "are up regardless."
+            ),
+            schema={
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "default": "about:blank",
+                            "description": "initial URL to navigate to"},
+                    "name": {"type": "string", "description": "session name (auto-named if omitted)"},
+                    "width": {"type": "integer", "default": 1280},
+                    "height": {"type": "integer", "default": 800},
+                },
+                "required": ["url"],
+            },
+            invoke=_bi_browser_debug_open,
+        ),
+        Tool(
+            name="browser._debug_close",
+            description="[DEBUG/P1] Close a headless-browser session by name.",
+            schema={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "session name to close"},
+                },
+                "required": ["name"],
+            },
+            invoke=_bi_browser_debug_close,
+        ),
+        Tool(
+            name="browser._debug_list",
+            description="[DEBUG/P1] List active browser sessions and their status.",
+            schema={"type": "object", "properties": {}},
+            invoke=_bi_browser_debug_list,
+        ),
+        # ── Browser automation tools (P2) ───────────────────────────
+        Tool(
+            name="browser.open",
+            description=(
+                "Open a new headless-browser session with live-view relay. "
+                "Spawns Xvfb+Chrome+x11vnc and bridges to the backend /vnc. "
+                "Returns session name, CDP endpoint, and VNC port. "
+                "Use browser.navigate/click/type/etc. to interact afterwards."
+            ),
+            schema={
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "default": "about:blank",
+                            "description": "initial URL"},
+                    "name": {"type": "string", "description": "session name (auto-named if omitted)"},
+                    "width": {"type": "integer", "default": 1280},
+                    "height": {"type": "integer", "default": 800},
+                },
+                "required": ["url"],
+            },
+            invoke=_bi_browser_open,
+        ),
+        Tool(
+            name="browser.close",
+            description="Close a browser session and tear down its Chrome/Xvfb/x11vnc stack.",
+            schema={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "session name (closes most recent if omitted)"},
+                    "session": {"type": "string", "description": "alias for 'name'"},
+                },
+            },
+            invoke=_bi_browser_close,
+        ),
+        Tool(
+            name="browser.navigate",
+            description="Navigate the browser to a URL. Returns the page title.",
+            schema={
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "URL to navigate to"},
+                    "session": {"type": "string", "description": "session name (uses most recent if omitted)"},
+                    "wait_until": {"type": "string", "enum": ["load", "domcontentloaded", "networkidle"],
+                                    "default": "domcontentloaded"},
+                    "timeout": {"type": "integer", "default": 30, "description": "navigation timeout in seconds"},
+                },
+                "required": ["url"],
+            },
+            invoke=_bi_browser_navigate,
+        ),
+        Tool(
+            name="browser.click",
+            description="Click an element identified by CSS selector or by ref from browser.snapshot.",
+            schema={
+                "type": "object",
+                "properties": {
+                    "selector": {"type": "string", "description": "CSS selector for the element to click"},
+                    "ref": {"type": ["integer", "string"], "description": "interactive element ref number from browser.snapshot"},
+                    "session": {"type": "string", "description": "session name (uses most recent if omitted)"},
+                    "timeout": {"type": "integer", "default": 10, "description": "wait timeout in seconds"},
+                },
+            },
+            invoke=_bi_browser_click,
+        ),
+        Tool(
+            name="browser.type",
+            description="Type text into an input element identified by CSS selector or by ref from browser.snapshot. "
+                        "Optionally clears the field first (default: yes).",
+            schema={
+                "type": "object",
+                "properties": {
+                    "selector": {"type": "string", "description": "CSS selector for the input element"},
+                    "ref": {"type": ["integer", "string"], "description": "interactive element ref number from browser.snapshot"},
+                    "text": {"type": "string", "description": "text to type"},
+                    "session": {"type": "string", "description": "session name (uses most recent if omitted)"},
+                    "delay": {"type": "integer", "default": 0, "description": "delay between keystrokes (ms)"},
+                    "clear": {"type": "boolean", "default": True, "description": "clear the field before typing"},
+                    "timeout": {"type": "integer", "default": 10, "description": "wait timeout in seconds"},
+                },
+                "required": ["text"],
+            },
+            invoke=_bi_browser_type,
+        ),
+        Tool(
+            name="browser.screenshot",
+            description="Take a screenshot and save to a file. Returns the file path. "
+                        "The AI cannot see the image — use browser.snapshot for text content.",
+            schema={
+                "type": "object",
+                "properties": {
+                    "session": {"type": "string", "description": "session name (uses most recent if omitted)"},
+                    "full_page": {"type": "boolean", "default": False, "description": "capture full scrollable page"},
+                    "path": {"type": "string", "description": "output file path (auto-generated if omitted)"},
+                },
+            },
+            invoke=_bi_browser_screenshot,
+        ),
+        Tool(
+            name="browser.query",
+            description="Query DOM elements by CSS selector. Returns tag, text, and key "
+                        "attributes (href, src, value, placeholder, etc.) for each match. "
+                        "Use this to understand page structure before clicking/typing.",
+            schema={
+                "type": "object",
+                "properties": {
+                    "selector": {"type": "string", "description": "CSS selector"},
+                    "session": {"type": "string", "description": "session name (uses most recent if omitted)"},
+                    "limit": {"type": "integer", "default": 20, "description": "max elements to return"},
+                    "attribute": {"type": "string", "description": "return only this attribute (omit for all)"},
+                },
+                "required": ["selector"],
+            },
+            invoke=_bi_browser_query,
+        ),
+        Tool(
+            name="browser.snapshot",
+            description="Return a text snapshot of the page: URL, title, visible body text, and "
+                        "numbered refs for interactive elements. Use refs with browser.click/type/select.",
+            schema={
+                "type": "object",
+                "properties": {
+                    "session": {"type": "string", "description": "session name (uses most recent if omitted)"},
+                    "max_chars": {"type": "integer", "default": 5000, "description": "max text length"},
+                },
+            },
+            invoke=_bi_browser_snapshot,
+        ),
+        Tool(
+            name="browser.scroll",
+            description="Scroll the page by (x, y) pixels or scroll an element into view by selector.",
+            schema={
+                "type": "object",
+                "properties": {
+                    "session": {"type": "string", "description": "session name (uses most recent if omitted)"},
+                    "x": {"type": "integer", "default": 0, "description": "horizontal scroll delta"},
+                    "y": {"type": "integer", "default": 0, "description": "vertical scroll delta"},
+                    "selector": {"type": "string", "description": "if set, scroll this element into view instead"},
+                },
+            },
+            invoke=_bi_browser_scroll,
+        ),
+        Tool(
+            name="browser.evaluate",
+            description="Evaluate a JavaScript expression on the page and return the result. "
+                        "Use for custom DOM queries or actions not covered by other browser.* tools.",
+            schema={
+                "type": "object",
+                "properties": {
+                    "script": {"type": "string", "description": "JavaScript to evaluate"},
+                    "session": {"type": "string", "description": "session name (uses most recent if omitted)"},
+                },
+                "required": ["script"],
+            },
+            invoke=_bi_browser_evaluate,
+        ),
+        Tool(
+            name="browser.press_key",
+            description="Press a keyboard key (e.g., Enter, Tab, Escape, ArrowDown, Control+c).",
+            schema={
+                "type": "object",
+                "properties": {
+                    "key": {"type": "string", "description": "key name (e.g., Enter, Tab, Escape)"},
+                    "session": {"type": "string", "description": "session name (uses most recent if omitted)"},
+                },
+                "required": ["key"],
+            },
+            invoke=_bi_browser_press_key,
+        ),
+        Tool(
+            name="browser.get_url",
+            description="Get the current page URL.",
+            schema={
+                "type": "object",
+                "properties": {
+                    "session": {"type": "string", "description": "session name (uses most recent if omitted)"},
+                },
+            },
+            invoke=_bi_browser_get_url,
+        ),
+        Tool(
+            name="browser.get_title",
+            description="Get the current page title.",
+            schema={
+                "type": "object",
+                "properties": {
+                    "session": {"type": "string", "description": "session name (uses most recent if omitted)"},
+                },
+            },
+            invoke=_bi_browser_get_title,
+        ),
+        Tool(
+            name="browser.wait_for",
+            description="Wait for an element to reach a state (visible/hidden/attached/detached). "
+                        "Useful for waiting for dynamic content to load.",
+            schema={
+                "type": "object",
+                "properties": {
+                    "selector": {"type": "string", "description": "CSS selector"},
+                    "session": {"type": "string", "description": "session name (uses most recent if omitted)"},
+                    "state": {"type": "string", "enum": ["visible", "hidden", "attached", "detached"],
+                              "default": "visible"},
+                    "timeout": {"type": "integer", "default": 15, "description": "wait timeout in seconds"},
+                },
+                "required": ["selector"],
+            },
+            invoke=_bi_browser_wait_for,
+        ),
+        Tool(
+            name="browser.select",
+            description="Select an option in a <select> dropdown by value or label, using CSS selector or ref.",
+            schema={
+                "type": "object",
+                "properties": {
+                    "selector": {"type": "string", "description": "CSS selector for the <select> element"},
+                    "ref": {"type": ["integer", "string"], "description": "interactive element ref number from browser.snapshot"},
+                    "value": {"type": "string", "description": "option value to select"},
+                    "label": {"type": "string", "description": "option label to select (use if no value)"},
+                    "session": {"type": "string", "description": "session name (uses most recent if omitted)"},
+                },
+            },
+            invoke=_bi_browser_select,
+        ),
+        Tool(
+            name="browser.go_back",
+            description="Navigate back in browser history.",
+            schema={
+                "type": "object",
+                "properties": {
+                    "session": {"type": "string", "description": "session name (uses most recent if omitted)"},
+                },
+            },
+            invoke=_bi_browser_go_back,
+        ),
+        Tool(
+            name="browser.go_forward",
+            description="Navigate forward in browser history.",
+            schema={
+                "type": "object",
+                "properties": {
+                    "session": {"type": "string", "description": "session name (uses most recent if omitted)"},
+                },
+            },
+            invoke=_bi_browser_go_forward,
+        ),
+        Tool(
+            name="browser.get_errors",
+            description="Runtime-error digest for testing: uncaught JS exceptions + console.error "
+                        "messages + failed/4xx-5xx network requests captured since the page loaded. "
+                        "Returns clean=true when none. Call after navigating/interacting to verify "
+                        "the page didn't break.",
+            schema={"type": "object", "properties": {
+                "session": {"type": "string", "description": "session name (most recent if omitted)"},
+            }},
+            invoke=_bi_browser_get_errors,
+        ),
+        Tool(
+            name="browser.get_console",
+            description="Console messages captured from the page. Optional level filter "
+                        "(error/warning/log/info/debug); omit or 'all' for everything.",
+            schema={"type": "object", "properties": {
+                "session": {"type": "string", "description": "session name (most recent if omitted)"},
+                "level": {"type": "string", "enum": ["all", "error", "warning", "log", "info", "debug"], "default": "all"},
+            }},
+            invoke=_bi_browser_get_console,
+        ),
+        Tool(
+            name="browser.expect",
+            description="Assert a condition about the page for testing. Returns pass=true/false. "
+                        "Use selector + one of: text (element text contains), state (visible|hidden), "
+                        "count (number of matches); or page-level url_contains / title_contains. "
+                        "With selector and no condition, asserts the element exists.",
+            schema={"type": "object", "properties": {
+                "session": {"type": "string", "description": "session name (most recent if omitted)"},
+                "selector": {"type": "string", "description": "CSS selector to assert about"},
+                "ref": {"type": "integer", "description": "element ref number (alternative to selector)"},
+                "text": {"type": "string", "description": "assert the element's text contains this"},
+                "state": {"type": "string", "enum": ["visible", "hidden"], "description": "assert visibility"},
+                "count": {"type": "integer", "description": "assert this many elements match"},
+                "url_contains": {"type": "string", "description": "assert the page URL contains this"},
+                "title_contains": {"type": "string", "description": "assert the page title contains this"},
+            }},
+            invoke=_bi_browser_expect,
+        ),
+        Tool(
+            name="browser.test_flow",
+            description="Run a multi-step website test and get a pass/fail report. "
+                        "Give 'steps': an ordered array of {action, ...params} where action is one of "
+                        "navigate|click|type|select|press_key|scroll|wait_for|evaluate|expect "
+                        "(same params as the matching browser.* tool; use 'expect' steps for assertions). "
+                        "Stops at the first failed step, auto-captures a screenshot, and (unless "
+                        "check_errors=false) fails the flow on captured runtime errors. Returns "
+                        "pass=true/false, failed_at, per-step results, and the screenshot path.",
+            schema={"type": "object", "properties": {
+                "session": {"type": "string", "description": "session name (most recent if omitted); applied to every step"},
+                "steps": {"type": "array", "description": "ordered test steps",
+                          "items": {"type": "object", "properties": {
+                              "action": {"type": "string",
+                                         "enum": ["navigate", "click", "type", "select", "press_key",
+                                                  "scroll", "wait_for", "evaluate", "expect"]},
+                          }, "required": ["action"]}},
+                "check_errors": {"type": "boolean", "default": True,
+                                 "description": "after steps pass, fail the flow if runtime errors were captured"},
+                "screenshot_on_failure": {"type": "boolean", "default": True},
+                "clear_captures": {"type": "boolean", "default": True,
+                                   "description": "clear captured console/errors before running (default true)"},
+            }, "required": ["steps"]},
+            invoke=_bi_browser_test_flow,
         ),
     ]
     for t in builtins:

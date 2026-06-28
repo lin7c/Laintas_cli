@@ -7,6 +7,13 @@ __pycache__/
 *.bak
 build/**/*.deb
 build/**/tmp/
+build/linux/build/
+build/linux/dist/
+build/linux/dist-compat/
+build/linux/dist-manylinux/
+dist/
+dist/
+dist/
 
 # laintas_cli_download (React/Vite)
 laintas_cli_download/node_modules/

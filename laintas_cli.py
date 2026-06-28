@@ -138,6 +138,7 @@ import task_manager          # noqa: E402 — resume blob rehydrates the task pl
 import paths                 # Centralized path management
 import migrate as migrate_mod  # Auto-migration from old layout
 import hwo_ui as hwo_ui_mod  # /hwo orchestration UI
+import browser_session as browser_mod  # headless-browser live-view stack
 
 # MCP client: lazy import (saves ~1.8s on startup)
 _mcp_mod = None
@@ -1216,7 +1217,7 @@ class MetaCompleter(Completer):
 
     META_COMMANDS = [
         "/help", "/login", "/name", "/memory", "/prop",
-        "/scan", "/debug", "/cwd",
+        "/scan", "/debug", "/cwd", "/task",
         "/station", "/terminate", "/send", "/hire", "/agents",
         "/t", "/term",
         "/clear", "/resume", "/max", "/exit", "/quit",
@@ -2471,56 +2472,43 @@ Last session:
 <skills>
 {{{{skills}}}}
 
-If a skill looks relevant, call `skill.load` with its name before doing specialized work.
+If a skill looks relevant, call `skill_load` with its name before doing specialized work.
 Do not assume unloaded skill instructions. After loading, continue using the instructions below.
+When done with that specialized work, call `skill_unload` with its name to free context; skills can be re-loaded later.
 
 Loaded skill instructions:
 {{{{skillContext}}}}
 </skills>
 
 <tools>
-You have function-calling tools. Invoke them through the native tool interface — do NOT write tool calls as JSON or as text inside your reply.
-Use `shell.exec` for shell commands and meta-commands. Use structured tools for file, memory, task, plan, web, agent, terminal, time, and sleep operations.
-For `shell.exec`, the `command` argument must be the raw shell command only — never prefix it with the tool name (right: `ls -la`; wrong: `shell.exec ls -la`).
-Call `skill.list` to list available skills, and `skill.load` (with `name`) to load one before specialized work.
+Use `shell` for shell commands and meta-commands; use structured tools for file, memory, task, plan, web, agent, terminal, and time operations.
+How to use the shared core tools (reading/editing/verifying files, shell, memory, tasks, web) is in the injected <core_tool_usage> block; general operating discipline (act-first, batching, failure handling, scope, safety, verification, skills) is in the injected <agent_conduct> block — follow both.
+Tools beyond that core (sub-terminals, parallel agent orchestration, plan files, …) have their detailed usage in skills: call `skill_list` to see them and `skill_load` (with `name`) to load one before that specialized work.
 The catalog below documents each tool's purpose and parameters:
 {{{{tools}}}}
 </tools>
 
 <workflow>
-- Plan with tasks. For any multi-step task (≈3+ steps or non-trivial), at the FIRST turn call `task.create` to record the goal and break it into sub-tasks, then `task.update` the one you start to `in_progress`. Keep exactly one task `in_progress`; mark each `task.update ... completed` as you finish it. The task list is your durable plan — it survives context compression and is how you resume. The `<active_tasks>` block shows it every turn.
-- Resuming / "continue": when the user says only "continue" (`继续`, etc.), do NOT treat that as the task. Read `<active_tasks>` and resume the `in_progress` item; if none, work the `<objective>`. Only ask the user if both are empty.
+- Plan with tasks. For any multi-step task (≈3+ steps), at the FIRST turn call `task_create` to decompose into sub-tasks. Use clear, specific task names that describe the actual work (e.g., "Refactor auth module", "Extract API client"), NOT the user's raw request. Keep exactly one task `in_progress`; mark `task_update ... completed` as you finish each. The task list is your durable plan — it survives context compression and is how you resume. The `<active_tasks>` block shows it every turn.
+- Resuming: if the user's input is a resume/continue request (e.g., "继续", "continue", "继续项目", or empty line), do NOT create a new task. Read `<active_tasks>` and resume the `in_progress` item; if none, check `<objective>`. Only ask the user if both are empty.
 - If the user asks a clear read/edit/build/test/investigate task, act with tools. Do not ask for permission to do exactly what was asked.
 - Ask one concise clarifying question only when the target or intent is genuinely ambiguous, destructive, impossible to infer safely, or blocked on information you cannot discover yourself.
 - If there are multiple reasonable approaches with materially different tradeoffs, stop and present 2-3 labeled options. State the consequence of each option briefly, then wait for the user's choice.
-- For unfamiliar code: locate with `fs.grep`/`fs.glob`, then read narrowly with `fs.read` offset/limit. Read a whole file only when you will rewrite it. Do not copy files into /tmp scratch to re-read in pieces — read the source directly, and once you have enough to act, act.
-- Writing a large file (more than ~300 lines): write it in chunks — `fs.write` the first part, then append the rest with `fs.edit`. A whole-file write in one response can exceed the output token limit, get cut off, and be lost. If a response was truncated, switch to chunked writing; do not retry the same oversized write.
-- Keep scope tight. Do not add unrelated features, refactors, abstractions, or cleanup beyond the task.
-- Keep each action small and verifiable. Prefer exact edits over rewrites.
-- After a tool failure, read the error and change approach; do not retry identical arguments.
-- After meaningful file edits, inspect the diff before claiming completion when practical.
-- Verify before claiming completion when verification is practical. Do not claim success from code inspection alone when you can run a direct check.
-- Save durable user/project preferences with memory tools when the user corrects you or establishes a non-obvious rule.
 {{{{workflowPhase}}}}
 {{{{rolePrompt}}}}
 {{{{confidenceGuidance}}}}
 </workflow>
 
 <output_rules>
-- Put user-facing text in your reply: plain text or Markdown, normally 1-3 sentences, cite files as path:line. Perform every action with native tool calls — never embed `tool_calls`, `/tool ...`, `<tool_calls>`, `<invoke>`, or any XML-like tool syntax in the reply text.
-- Completion is an explicit act: call `task.complete` with a `summary` when — and only when — the task is fully finished. Do NOT stop just to narrate progress; if more work remains, include the next tool call in the SAME turn and keep going.
-- If you have nothing concrete to run this turn but the task is NOT finished (still reasoning or planning), call `task.continue` so the loop keeps going. Never end mid-task with no tool call.
+(General act-first / no-transitional-narration / batching / language rules are in the injected <agent_conduct> block. The rules below are laintas loop-control specifics.)
+- Your reply is OPTIONAL. Leave it empty on ordinary execution steps and just emit the tool call(s). Write user-facing text ONLY when: (a) you are giving the final answer/result, (b) you must ask the user a clarifying question, or (c) a non-obvious decision needs a one-line rationale. When you do write, cite files as path:line.
+- Completion is an explicit act: call `task_complete` with a `summary` when — and only when — the task is fully finished. Do NOT stop just to narrate progress; if more work remains, include the next tool call in the SAME turn and keep going.
+- If you have nothing concrete to run this turn but the task is NOT finished (still reasoning or planning), call `task_continue` so the loop keeps going. Never end mid-task with no tool call.
 - Ending your turn with no tool call is only for asking the user something or handing back a final answer. It does not by itself mean the task is done.
-- Multiple tool calls are allowed when they are independent or sequentially safe.
-- Fallback only if native tool calls are genuinely unavailable to you: emit a single JSON object {{"reply": "...", "tool_calls": [{{"name": "tool.name", "arguments": {{}}}}]}} and nothing else.
 </output_rules>
 
-<tone>
-Direct, terse, and useful. Match the user's language for all user-visible replies; keep code identifiers and technical terms in their original form. Do not add filler or final checklists.
-</tone>
-
 <safety>
-Do not bypass policy. Do not invent paths, APIs, files, or results. Do not commit, push, deploy, publish, or run destructive commands without explicit user request. Do not use destructive actions as a shortcut around an obstacle; investigate unexpected files, branches, locks, or configuration before removing or overwriting anything. Avoid introducing command injection, XSS, SQL injection, or other common security vulnerabilities in code you modify.
+Do not bypass policy.py decisions. Do not invent paths, APIs, files, or results. (General safety — reversibility/blast-radius, destructive-action confirmation, investigate-before-overwrite, no-vulnerabilities — is in the injected <agent_conduct> block.)
 </safety>
 """
 
@@ -2565,7 +2553,8 @@ def _restore_resume_blob(blob: dict, chat_history: list) -> dict:
     # Rehydrate the plan (in_progress + pending tasks) as session tasks so
     # <active_tasks> shows it immediately and "continue" can resume it.
     try:
-        task_manager.import_session_tasks(blob.get("tasks") or [])
+        task_manager.import_session_tasks(blob.get("tasks") or [],
+                                          cwd=blob.get("cwd"))
     except Exception:
         pass
     return prepare_state_for_repl(blob.get("state") or {})
@@ -2884,75 +2873,6 @@ def _native_to_tool_calls(frags: dict, name_map: Optional[dict] = None) -> list:
     return out
 
 
-def _looks_like_json_attempt(text: str) -> bool:
-    """Did the model TRY to emit the JSON envelope, vs write plain prose?
-
-    Used to decide whether a non-parseable, tool-call-free response is a
-    malformed-JSON failure (retry) or a legitimate prose answer (surface it).
-    A stray '{' inside prose — code snippets, set notation, syntax like
-    `#agent_name#{ ... }` — must NOT count as an attempt; otherwise an ordinary
-    text answer that merely mentions a brace gets flagged "_parse_failed" and
-    the loop fires a bogus "asking AI to retry". Only count it when the text
-    actually opens with a JSON object (optionally after a ``` fence) or carries
-    the envelope's distinctive `tool_calls` key."""
-    s = (text or "").strip()
-    if not s:
-        return False
-    if s.startswith("```"):
-        s = re.sub(r"^```(?:json)?\s*", "", s).lstrip()
-    if s.startswith("{"):
-        return True
-    return '"tool_calls"' in s or "'tool_calls'" in s
-
-
-def _extract_json_object(text: str) -> Optional[dict]:
-    """Extract the first top-level JSON object from text. Handles code fences,
-    leading prose, and trailing prose. Returns None if no object parses."""
-    if not text:
-        return None
-    s = text.strip()
-    # Strip ```json ... ``` or ``` ... ``` fences if present
-    if s.startswith("```"):
-        s = re.sub(r"^```(?:json)?\s*", "", s)
-        s = re.sub(r"\s*```\s*$", "", s)
-    # Find the first '{' and walk to its matching '}', respecting strings.
-    start = s.find("{")
-    if start < 0:
-        return None
-    depth = 0
-    in_str = False
-    esc = False
-    for i in range(start, len(s)):
-        c = s[i]
-        if in_str:
-            if esc:
-                esc = False
-            elif c == "\\":
-                esc = True
-            elif c == '"':
-                in_str = False
-            continue
-        if c == '"':
-            in_str = True
-        elif c == "{":
-            depth += 1
-        elif c == "}":
-            depth -= 1
-            if depth == 0:
-                candidate = s[start:i + 1]
-                try:
-                    return json.loads(candidate)
-                except json.JSONDecodeError:
-                    # Strict parse failed — try repairing the common, harmless
-                    # defects (raw control chars in strings, trailing commas)
-                    # before giving up and forcing a retry nudge.
-                    try:
-                        return json.loads(_repair_json_candidate(candidate))
-                    except json.JSONDecodeError:
-                        return None
-    return None
-
-
 def _extract_tagged_tool_calls(text: str) -> Optional[list]:
     """Best-effort compatibility for malformed `<tool_calls>...</tool_calls>` output.
 
@@ -2985,84 +2905,6 @@ def _extract_tagged_tool_calls(text: str) -> Optional[list]:
     return out or None
 
 
-def _try_parse_partial_json(text: str) -> Optional[dict]:
-    """Try to parse an in-progress JSON object by closing unfinished structures.
-    Used for incremental rendering during SSE streaming."""
-    if not text:
-        return None
-    s = text.strip()
-    if s.startswith("```"):
-        s = re.sub(r"^```(?:json)?\s*", "", s)
-    start = s.find("{")
-    if start < 0:
-        return None
-    s = s[start:]
-    # Quickly attempt a clean parse
-    try:
-        return json.loads(s)
-    except json.JSONDecodeError:
-        pass
-    # Walk and close open strings + braces
-    depth = 0
-    in_str = False
-    esc = False
-    for c in s:
-        if in_str:
-            if esc:
-                esc = False
-            elif c == "\\":
-                esc = True
-            elif c == '"':
-                in_str = False
-        else:
-            if c == '"':
-                in_str = True
-            elif c == "{":
-                depth += 1
-            elif c == "}":
-                depth -= 1
-    closed = s
-    if in_str:
-        closed += '"'
-    closed += "}" * max(depth, 0)
-    try:
-        return json.loads(closed)
-    except json.JSONDecodeError:
-        return None
-
-
-def _legacy_command_to_tool_calls(command: str) -> list:
-    """Convert old-style {command: "..."} responses to new tool_calls format.
-
-    Only kept for the rare model regression where it emits a top-level
-    `command` field instead of `tool_calls`. Slash-prefixed meta-commands are
-    REPL-only and never appear in AI output, so we don't translate them here.
-    """
-    cmd = (command or "").strip()
-    if not cmd:
-        return []
-    import re as _re_lctc
-
-    # /tool <name> <json_params> — ad-hoc tool dispatch syntax
-    m = _re_lctc.match(r'^/tool\s+(\S+)(?:\s+(.+))?$', cmd)
-    if m:
-        t_name = m.group(1)
-        raw = (m.group(2) or "").strip()
-        try:
-            t_args = json.loads(raw) if raw else {}
-        except (ValueError, TypeError):
-            t_args = {"raw": raw}
-        return [{"name": t_name, "arguments": t_args if isinstance(t_args, dict) else {"value": t_args}}]
-
-    # wait(N) / sleep(N)
-    m = _re_lctc.match(r'^(?:wait|sleep)\((\d+(?:\.\d+)?)\)\s*$', cmd)
-    if m:
-        return [{"name": "sleep", "arguments": {"seconds": float(m.group(1))}}]
-
-    # Plain shell command (most common fallback)
-    return [{"name": "shell.exec", "arguments": {"command": cmd}}]
-
-
 def call_backend_stream(
     session: dict,
     message: str,
@@ -3072,12 +2914,21 @@ def call_backend_stream(
     lang: str = "EN",
     on_chunk: Optional[Callable[[str, str], None]] = None,
     interrupt_event: Optional[threading.Event] = None,
+    messages: Optional[list] = None,
+    tools_enabled: bool = True,
 ) -> dict:
     """Call Helpwo backend /api/chat/stream, same as Helpwo frontend.
     Returns parsed {reply, command, memory, done, _billing} dict.
 
     If interrupt_event is provided, it is checked between SSE chunks so the
     request can be aborted gracefully on Ctrl+C.
+
+    If `messages` is provided (native message-thread mode), it is sent as the
+    OpenAI-format `messages` array and the backend uses it verbatim (prepending
+    systemPrompt as the system message). The legacy `message`/`history` fields
+    are then ignored by the backend, so the model resumes a real conversation
+    thread (assistant tool_calls + role:tool results) instead of a re-synthesized
+    state-dump user turn.
     """
     backend_url = os.environ.get("LAINTAS_BACKEND", BACKEND_URL)
 
@@ -3088,7 +2939,13 @@ def call_backend_stream(
         "systemPrompt": system_prompt,
         "lang": lang,
         "maxTokens": int(get_runtime_config("max_tokens")),
+        # Core-tool usage ("how to read/edit/verify files", etc.) is the
+        # gateway's single source of truth — it appends the canonical guide to
+        # the system message. The base prompt below intentionally omits it.
+        "injectToolGuide": True,
     }
+    if messages:
+        payload["messages"] = messages
     selected_model = get_selected_model()
     if selected_model:
         payload["model"] = selected_model
@@ -3101,14 +2958,21 @@ def call_backend_stream(
     # instead of hand-serialized JSON in its reply text. `tool_name_map`
     # un-mangles provider-safe names on the way back. The backend already
     # forwards `tools`/`tool_choice` to the provider and streams tool_calls.
+    # Summary/compaction calls pass tools_enabled=False: a tool-less, text-only
+    # completion (no tool schemas, no core-tool guide) so the model just writes
+    # the requested summary instead of trying to act.
     tool_name_map: dict = {}
-    try:
-        _openai_tools, tool_name_map = tools_mod.get_registry().to_openai_tools()
-        if _openai_tools:
-            payload["tools"] = _openai_tools
-            payload["tool_choice"] = "auto"
-    except Exception:
-        tool_name_map = {}
+    if not tools_enabled:
+        payload["injectToolGuide"] = False
+    else:
+        try:
+            _unified_catalog = bool(get_runtime_config("use_unified_catalog"))
+            _openai_tools, tool_name_map = tools_mod.get_registry().to_openai_tools(unified=_unified_catalog)
+            if _openai_tools:
+                payload["tools"] = _openai_tools
+                payload["tool_choice"] = "auto"
+        except Exception:
+            tool_name_map = {}
 
     headers = get_auth_headers(session)
     cookies = get_auth_cookies(session)
@@ -3136,6 +3000,7 @@ def call_backend_stream(
         accumulated = ""
         billing_info: dict = {}
         got_any_event = False
+        finish_reason: Optional[str] = None  # last non-null choices[0].finish_reason
         _diag_events: list = []  # diagnostic: capture non-content fields
         prev_reply_for_chunks = ""
         prev_command_for_chunks = ""
@@ -3174,6 +3039,13 @@ def call_backend_stream(
                 if k not in ("choices", "id", "object", "created", "model", "system_fingerprint") and k not in _diag_events:
                     _diag_events.append(k)
             _choices = evt.get("choices")
+            # Capture the OpenAI-native finish_reason (provider passes it through
+            # verbatim — "stop" / "tool_calls" / "length"). Authoritative signal
+            # for whether the turn ended vs. expects tool results back.
+            if isinstance(_choices, list) and _choices:
+                _fr = _choices[0].get("finish_reason")
+                if _fr:
+                    finish_reason = _fr
             delta_content = (
                 _choices[0].get("delta", {}).get("content")
                 if isinstance(_choices, list) and _choices
@@ -3212,61 +3084,12 @@ def call_backend_stream(
             if delta_content:
                 accumulated += delta_content
                 if on_chunk is not None:
-                    parsed = _try_parse_partial_json(accumulated)
-                    # Native mode: model streams plain prose as `content` (no
-                    # JSON envelope). Stream it straight through as the reply —
-                    # unless it genuinely looks like a JSON attempt (don't leak
-                    # raw JSON); a stray '{' in prose must not stop streaming.
-                    if parsed is None and not _looks_like_json_attempt(accumulated):
-                        try: on_chunk("reply", delta_content)
-                        except Exception: pass
-                        prev_reply_for_chunks = accumulated.strip()
-                    if parsed is not None:
-                        cur_reply = parsed.get("reply", "") or ""
-                        cur_tool_calls = parsed.get("tool_calls") or []
-                        if cur_reply != prev_reply_for_chunks:
-                            delta_r = cur_reply[len(prev_reply_for_chunks):] if cur_reply.startswith(prev_reply_for_chunks) else cur_reply
-                            try: on_chunk("reply", delta_r)
-                            except Exception: pass
-                            prev_reply_for_chunks = cur_reply
-                        if cur_tool_calls:
-                            first = cur_tool_calls[0] if isinstance(cur_tool_calls, list) and cur_tool_calls else None
-                            if isinstance(first, dict):
-                                _fn = first.get("name", "")
-                                _fa = first.get("arguments", {}) or {}
-                                # Mirror _salient_arg in agent_loop.py — keep in sync.
-                                if not isinstance(_fa, dict):
-                                    _salient_preview = ""
-                                elif _fn == "shell.exec":
-                                    _salient_preview = _fa.get("command", "") or ""
-                                elif _fn == "terminal.send":
-                                    _salient_preview = f'{_fa.get("name","?")}: {_fa.get("command","")}'
-                                elif _fn in ("fs.read", "fs.write", "fs.edit", "fs.multi_edit", "fs.diff"):
-                                    _salient_preview = _fa.get("path", "") or ""
-                                elif _fn == "fs.grep":
-                                    _salient_preview = f'{_fa.get("pattern","")} in {_fa.get("path","")}'
-                                elif _fn == "fs.glob":
-                                    _salient_preview = _fa.get("pattern", "") or ""
-                                elif _fn == "web.fetch":
-                                    _salient_preview = _fa.get("url", "") or ""
-                                elif _fn == "web.search":
-                                    _salient_preview = _fa.get("query", "") or ""
-                                else:
-                                    try:
-                                        _salient_preview = json.dumps(_fa, ensure_ascii=False)[:60]
-                                    except (TypeError, ValueError):
-                                        _salient_preview = ""
-                                preview = f"{_fn} {_salient_preview}".strip()
-                                if len(cur_tool_calls) > 1:
-                                    preview = f"{preview} (+{len(cur_tool_calls)-1} more)"
-                            else:
-                                preview = str(first)
-                        else:
-                            preview = ""
-                        if preview != prev_command_for_chunks:
-                            try: on_chunk("command", preview)
-                            except Exception: pass
-                            prev_command_for_chunks = preview
+                    # Content is plain prose — stream it straight through as the
+                    # reply. Tool calls arrive natively via delta.tool_calls
+                    # (handled above), never by parsing content.
+                    try: on_chunk("reply", delta_content)
+                    except Exception: pass
+                    prev_reply_for_chunks = accumulated.strip()
 
         if not got_any_event:
             return {"reply": "No response from AI", "tool_calls": [], "done": True, "error": True}
@@ -3278,129 +3101,59 @@ def call_backend_stream(
         # ceiling. When a big single-response write (e.g. a whole-file fs.write)
         # exceeds max_tokens, the JSON never closes and parsing fails — but the
         # cause is length, not formatting, so it needs a different nudge.
+        # finish_reason == "length" is the provider's own truncation signal.
         _completion_tokens = int((billing_info or {}).get("completionTokens", 0) or 0)
         _max_tokens = int(get_runtime_config("max_tokens") or 0)
         _hit_ceiling = _max_tokens > 0 and _completion_tokens >= _max_tokens * 0.95
+        _truncated_turn = _hit_ceiling or finish_reason == "length"
 
-        # Extract the JSON object from accumulated text. Model may wrap in ```json fences or prose.
-        parsed = _extract_json_object(accumulated)
-        if parsed is None:
-            tagged_tool_calls = _extract_tagged_tool_calls(accumulated)
-            if tagged_tool_calls:
-                return {
-                    "reply": "",
-                    "tool_calls": tagged_tool_calls,
-                    "done": False,
-                    "_billing": billing_info,
-                    "_diag_events": _diag_events + ["parsed_tagged_tool_calls"],
-                }
-            if native_calls:
-                # No parseable JSON body, but the model called tools via the
-                # native channel — run them. Keep pure-prose preamble as reply.
-                return {
-                    "reply": "" if _looks_like_json_attempt(accumulated) else accumulated.strip(),
-                    "tool_calls": native_calls,
-                    "done": False,
-                    "_billing": billing_info,
-                    "_diag_events": _diag_events + ["parsed_native_tool_calls"],
-                }
-            raw_text = accumulated.strip() or "(no response)"
-            # No tool calls and no parseable JSON. Distinguish a genuine malformed
-            # JSON-envelope attempt (retry) from a plain prose answer (surface it).
-            # In native-tool mode a tool-call-free reply IS the model's prose
-            # answer; only treat it as a failure when it actually tried JSON —
-            # NOT merely because the prose contains a '{' (e.g. `#name#{ ... }`).
-            _json_attempt = _looks_like_json_attempt(accumulated)
+        raw_text = accumulated.strip()
+        # Content is always prose now (tool calls come natively); surface it.
+        prose_reply = raw_text
+
+        # ── 1. NATIVE PATH (primary) ───────────────────────────────────────
+        # Model invoked tools through the OpenAI function-calling channel
+        # (delta.tool_calls). This is the normal end-to-end mode: the backend
+        # passes the provider's native tool_calls straight through.
+        if native_calls:
             return {
-                "reply": raw_text,
-                "tool_calls": [],
+                "reply": prose_reply,
+                "tool_calls": native_calls,
+                "finish_reason": finish_reason or "tool_calls",
                 "done": False,
                 "error": False,
-                "_parse_failed": _json_attempt,
-                "_prose_only": not _json_attempt,
-                "_truncated": _hit_ceiling and _json_attempt,
                 "_billing": billing_info,
-                "_diag_events": _diag_events,
+                "_diag_events": _diag_events + ["parsed_native_tool_calls"],
             }
 
-        # Normalize tool_calls from response
-        recognized_fields = ("reply", "tool_calls", "command", "close_session", "send_keys")
-        if not any(k in parsed for k in recognized_fields):
-            tagged_tool_calls = _extract_tagged_tool_calls(accumulated)
-            if tagged_tool_calls:
-                return {
-                    "reply": "",
-                    "tool_calls": tagged_tool_calls,
-                    "done": False,
-                    "_billing": billing_info,
-                    "_diag_events": _diag_events + ["parsed_tagged_tool_calls"],
-                }
-            if native_calls:
-                return {
-                    "reply": "",
-                    "tool_calls": native_calls,
-                    "done": False,
-                    "_billing": billing_info,
-                    "_diag_events": _diag_events + ["parsed_native_tool_calls"],
-                }
-            raw_text = accumulated.strip() or json.dumps(parsed, ensure_ascii=False)
-            # An object parsed but it has no envelope fields. Same distinction as
-            # above: a genuine (malformed) JSON attempt is a failure to retry; a
-            # prose answer that merely embedded a small JSON object (e.g. an
-            # example like {"city": "Tokyo"}) is a real answer — surface it.
-            _json_attempt = _looks_like_json_attempt(accumulated)
+        # ── 2. Tagged-tool-call compat ─────────────────────────────────────
+        # Older/regressed models may emit <tool_calls>...</tool_calls> as text
+        # instead of using the native channel. Convert so the loop continues.
+        tagged_tool_calls = _extract_tagged_tool_calls(accumulated)
+        if tagged_tool_calls:
             return {
-                "reply": raw_text,
-                "tool_calls": [],
+                "reply": "",
+                "tool_calls": tagged_tool_calls,
+                "finish_reason": finish_reason or "tool_calls",
                 "done": False,
                 "error": False,
-                "_parse_failed": _json_attempt,
-                "_prose_only": not _json_attempt,
                 "_billing": billing_info,
-                "_diag_events": _diag_events,
+                "_diag_events": _diag_events + ["parsed_tagged_tool_calls"],
             }
 
-        tool_calls = parsed.get("tool_calls") or []
-
-        # Backward compat: old-style "command" field -> wrap as tool_call
-        command = parsed.get("command", "") or ""
-        if command and not tool_calls:
-            tool_calls = _legacy_command_to_tool_calls(command)
-
-        # Model put a reply/text in the JSON body but emitted the actual tool
-        # calls via the native channel — merge those in so they execute.
-        if not tool_calls and native_calls:
-            tool_calls = native_calls
-
-        # Also handle old close_session/send_keys fields
-        if not tool_calls:
-            if parsed.get("close_session"):
-                tool_calls = [{"name": "session.close", "arguments": {}}]
-            elif parsed.get("send_keys"):
-                tool_calls = [{"name": "session.keys", "arguments": {"keys": parsed["send_keys"]}}]
-
-        # Normalize: ensure each entry has {name, arguments}
-        normalized = []
-        for tc in tool_calls:
-            if not isinstance(tc, dict):
-                continue
-            name = tc.get("name", tc.get("function", "") if isinstance(tc.get("function"), dict) else "")
-            name = name or ""
-            args = tc.get("arguments", tc.get("parameters", {}))
-            # Support OpenAI-style: {"function": {"name": "...", "arguments": {...}}}
-            if isinstance(tc.get("function"), dict) and not name:
-                name = tc["function"].get("name", "")
-                args = tc["function"].get("arguments", {})
-            if name:
-                normalized.append({"name": name, "arguments": args if isinstance(args, dict) else {}})
-        tool_calls = normalized
-
+        # ── 3. PROSE FINAL ─────────────────────────────────────────────────
+        # No tool calls anywhere: a tool-call-free turn IS the model's final
+        # answer (or a question back to the user). The content is plain prose —
+        # there is no JSON-envelope protocol to parse or to fail on.
         return {
-            "reply": parsed.get("reply", "") or "",
-            "tool_calls": tool_calls,
-            "done": len(tool_calls) == 0,
+            "reply": raw_text or "(no response)",
+            "tool_calls": [],
+            "finish_reason": finish_reason or "stop",
+            "done": False,
             "error": False,
+            "_truncated": _truncated_turn,
             "_billing": billing_info,
+            "_diag_events": _diag_events,
         }
 
     except requests.Timeout:
@@ -4777,6 +4530,153 @@ def show_terminal_manager(primary_session=None) -> None:
         selected[0] = min(selected[0], len(items) - 1)
 
 
+def _show_skill_detail(name: str) -> None:
+    """Show detailed information about a skill (mirrors _show_terminal_detail)."""
+    meta = skills_mod.get_all_metadata().get(name)
+    state_list = [s for s in skills_mod.list_skills() if s["name"] == name]
+    loaded = bool(state_list and state_list[0].get("loaded"))
+    tools = tools_mod.get_registry().list_by_source().get(f"skill:{name}", [])
+
+    lines = [
+        f"[bold]Name:[/bold] {name}",
+        f"[bold]Status:[/bold] {'[green]Loaded[/green]' if loaded else '[dim]Available[/dim]'}",
+        f"[bold]Version:[/bold] {getattr(meta, 'version', '') or 'N/A'}",
+        f"[bold]Path:[/bold] {getattr(meta, 'dir_path', '') or 'N/A'}",
+        f"[bold]Description:[/bold] {getattr(meta, 'description', '') or '(none)'}",
+    ]
+    if tools:
+        lines.append(f"[bold]Tools ({len(tools)}):[/bold]")
+        for t in tools:
+            lines.append(f"  [cyan]{t.name}[/cyan] — {t.description}")
+    else:
+        lines.append("[bold]Tools:[/bold] [dim](documentation-only / not loaded)[/dim]")
+    console.print(Panel("\n".join(lines), title=f"Skill: {name}"))
+
+
+def show_skill_manager() -> None:
+    """Interactive skill manager — same style as the terminal manager.
+
+    Lists every scanned skill with its loaded status; navigate with the arrow
+    keys and load/unload/reload/inspect without leaving the page.
+    ↑↓ navigate, ↵/space toggle load, l load, u unload, r reload all,
+    d details, n hint for new, q back.
+    """
+    def _collect():
+        groups = tools_mod.get_registry().list_by_source()
+        out = []
+        for s in skills_mod.list_skills():
+            n = s["name"]
+            out.append((n, s.get("description", ""), bool(s.get("loaded")),
+                        len(groups.get(f"skill:{n}", []))))
+        return out
+
+    items = _collect()
+    if not items:
+        console.print(f"[dim]No skills in {skills_mod.SKILLS_DIR}[/dim]")
+        console.print("[dim]Create one with: /skill new <name>[/dim]")
+        return
+
+    selected = [0]
+    status = [""]
+
+    def _build_lines():
+        lines = []
+        lines.append(("bold cyan", "Skill Manager\n"))
+        lines.append(("dim", "↑↓ navigate  ↵/space toggle  l load  u unload  "
+                             "r reload  d details  q back\n\n"))
+        for i, (name, desc, loaded, ntools) in enumerate(items):
+            prefix = "▶" if i == selected[0] else " "
+            badge = "[green]● loaded[/green]" if loaded else "[dim]○ available[/dim]"
+            tool_str = f" [dim]({ntools} tool{'s' if ntools != 1 else ''})[/dim]" if ntools else ""
+            desc_preview = (desc or "").replace("\n", " ")[:56]
+            style = "class:selected" if i == selected[0] else ""
+            lines.append((style, f" {prefix} [bold]{name}[/bold]  {badge}{tool_str}  "
+                                 f"[dim]{desc_preview}[/dim]\n"))
+        lines.append(("", "\n"))
+        loaded_n = sum(1 for _, _, ld, _ in items if ld)
+        lines.append(("dim", f"{len(items)} skill(s), {loaded_n} loaded.  "
+                             "↵/space=toggle  l=load  u=unload  r=reload  d=details  q=back"))
+        if status[0]:
+            lines.append(("", "\n"))
+            lines.append(("yellow", status[0]))
+        return lines
+
+    kb = KeyBindings()
+
+    @kb.add("up")
+    def _(event):
+        selected[0] = max(0, selected[0] - 1)
+
+    @kb.add("down")
+    def _(event):
+        selected[0] = min(len(items) - 1, selected[0] + 1)
+
+    @kb.add("enter")
+    @kb.add("space")
+    def _(event):
+        event.app.exit(result=("toggle", selected[0]))
+
+    @kb.add("l")
+    def _(event):
+        event.app.exit(result=("load", selected[0]))
+
+    @kb.add("u")
+    def _(event):
+        event.app.exit(result=("unload", selected[0]))
+
+    @kb.add("r")
+    def _(event):
+        event.app.exit(result=("reload", selected[0]))
+
+    @kb.add("d")
+    def _(event):
+        event.app.exit(result=("details", selected[0]))
+
+    @kb.add("q")
+    @kb.add("escape")
+    @kb.add("c-c")
+    def _(event):
+        event.app.exit(result=("quit", -1))
+
+    style = Style.from_dict({"selected": "reverse"})
+    text_control = FormattedTextControl(_build_lines)
+    window = Window(content=text_control, always_hide_cursor=False)
+    layout = Layout(HSplit([window]))
+    app = Application(layout=layout, key_bindings=kb, style=style,
+                      full_screen=True, refresh_interval=0.5)
+
+    while True:
+        action, idx = app.run()
+
+        if action == "quit":
+            break
+        if idx < 0 or idx >= len(items):
+            continue
+        name, desc, loaded, ntools = items[idx]
+
+        if action == "details":
+            _show_skill_detail(name)
+            input("\n[dim]Press Enter to continue...[/dim]")
+        elif action == "reload":
+            results = skills_mod.reload_all()
+            status[0] = f"Reloaded: {len(results)} skill(s) re-scanned from disk."
+        elif action in ("toggle", "load", "unload"):
+            want_load = action == "load" or (action == "toggle" and not loaded)
+            if action == "unload" or (action == "toggle" and loaded):
+                want_load = False
+            if want_load:
+                ok, msg = skills_mod.load_skill(name)
+            else:
+                ok, msg = skills_mod.unload_skill(name)
+            status[0] = ("[green]" if ok else "[red]") + msg + ("[/green]" if ok else "[/red]")
+
+        # Rebuild after any mutation
+        items[:] = _collect()
+        if not items:
+            break
+        selected[0] = min(selected[0], len(items) - 1)
+
+
 # ── Meta Commands ──────────────────────────────────────────────────────
 
 def observe_session(session, display_name: str = "", display_cmd: str = "") -> None:
@@ -5114,6 +5014,7 @@ def handle_version_command(parts: list) -> None:
             console.print(f"[green]Updated binary at {new_path}. Restarting...[/green]")
             stop_trigger_scanner()
             close_all_terminals()
+            browser_mod.close_all_browser_sessions()
             os.execv(_LAUNCH_SCRIPT_PATH, [_LAUNCH_SCRIPT_PATH] + sys.argv[1:])
         return
 
@@ -5132,6 +5033,7 @@ def handle_version_command(parts: list) -> None:
                   f"({len(changed)} file(s) replaced). Restarting...[/green]")
     stop_trigger_scanner()
     close_all_terminals()
+    browser_mod.close_all_browser_sessions()
     os.execv(_LAUNCH_SCRIPT_PATH, [_LAUNCH_SCRIPT_PATH] + sys.argv[1:])
 
 
@@ -5149,6 +5051,7 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
     if action == "/exit":
         stop_trigger_scanner()
         close_all_terminals()
+        browser_mod.close_all_browser_sessions()
         agent_registry.unregister()
         clear_session()
         console.print("[green]Logged out. Goodbye![/green]")
@@ -5163,6 +5066,7 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
             return False
         stop_trigger_scanner()
         close_all_terminals()
+        browser_mod.close_all_browser_sessions()
         agent_registry.unregister()
         console.print("[green]Goodbye![/green]")
         return True
@@ -5436,6 +5340,88 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
                           "  [bold]/plan exit[/bold]         — Exit without approving\n"
                           "  [bold]/plan status[/bold]       — Show current plan\n"
                           "  [bold]/plan list[/bold]         — List saved plans")
+
+    elif action == "/task":
+        sub = parts[1].lower() if len(parts) > 1 else ""
+        _cwd = os.getcwd()
+
+        if sub in ("", "list"):
+            _tasks = [t for t in task_manager.list_tasks(cwd=_cwd)
+                      if t.get("status") != "deleted"]
+            if not _tasks:
+                console.print("[dim]No tasks. Use [bold]/task add <subject>[/bold] to create one.[/dim]")
+            else:
+                _n_pending = sum(1 for t in _tasks if t.get("status") == "pending")
+                _n_progress = sum(1 for t in _tasks if t.get("status") == "in_progress")
+                _n_done = sum(1 for t in _tasks if t.get("status") == "completed")
+                console.print(f"\n[bold]Tasks[/bold] · {_cwd}    "
+                               f"[cyan]{_n_pending} pending[/cyan] · "
+                               f"[yellow]{_n_progress} in_progress[/yellow] · "
+                               f"[green]{_n_done} done[/green]\n")
+                _t = Table(show_header=True, header_style="dim", show_lines=False)
+                _t.add_column("", width=2)
+                _t.add_column("ID", width=5)
+                _t.add_column("Subject")
+                _t.add_column("Prog", width=5, justify="right")
+                for _tk in _tasks:
+                    st = _tk.get("status", "pending")
+                    mark = "▶" if st == "in_progress" else ("✓" if st == "completed" else "○")
+                    style = "yellow" if st == "in_progress" else ("green" if st == "completed" else "cyan")
+                    prog = _tk.get("progress", 0)
+                    prog_str = f"{prog}%" if prog > 0 else ""
+                    blocked = _tk.get("blockedBy", [])
+                    subj = _tk["subject"]
+                    if blocked:
+                        subj += f" [dim][blocked: {', '.join(blocked)}][/dim]"
+                    _t.add_row(f"[{style}]{mark}[/{style}]", _tk["id"], subj, prog_str)
+                console.print(_t)
+                console.print()
+
+        elif sub == "add":
+            if len(parts) < 3:
+                console.print("[yellow]Usage: /task add <subject>[/yellow]")
+            else:
+                subject = " ".join(parts[2:])
+                _tk = task_manager.create_task(subject, cwd=_cwd)
+                console.print(f"[green]Created task [bold]{_tk['id']}[/bold]: {subject}[/green]")
+
+        elif sub == "start":
+            if len(parts) < 3:
+                console.print("[yellow]Usage: /task start <id>[/yellow]")
+            else:
+                ok, msg, _tk = task_manager.update_task(parts[2], cwd=_cwd, status="in_progress")
+                if ok:
+                    console.print(f"[yellow]Started task [bold]{_tk['id']}[/bold]: {_tk['subject']}[/yellow]")
+                else:
+                    console.print(f"[red]{msg}[/red]")
+
+        elif sub == "done":
+            if len(parts) < 3:
+                console.print("[yellow]Usage: /task done <id>[/yellow]")
+            else:
+                ok, msg, _tk = task_manager.update_task(parts[2], cwd=_cwd, status="completed", progress=100)
+                if ok:
+                    console.print(f"[green]Completed task [bold]{_tk['id']}[/bold]: {_tk['subject']}[/green]")
+                else:
+                    console.print(f"[red]{msg}[/red]")
+
+        elif sub == "del":
+            if len(parts) < 3:
+                console.print("[yellow]Usage: /task del <id>[/yellow]")
+            else:
+                ok, msg, _tk = task_manager.update_task(parts[2], cwd=_cwd, status="deleted")
+                if ok:
+                    console.print(f"[dim]Deleted task [bold]{_tk['id']}[/bold]: {_tk['subject']}[/dim]")
+                else:
+                    console.print(f"[red]{msg}[/red]")
+
+        else:
+            console.print("[yellow]Usage: [bold]/task[/bold] [list|add|start|done|del][/yellow]\n"
+                          "  [bold]/task[/bold]               — list all tasks\n"
+                          "  [bold]/task add <subject>[/bold] — create a task\n"
+                          "  [bold]/task start <id>[/bold]    — mark as in_progress\n"
+                          "  [bold]/task done <id>[/bold]     — mark as completed\n"
+                          "  [bold]/task del <id>[/bold]      — delete a task")
 
     elif action == "/workflow":
         import workflow_engine as _we
@@ -5898,8 +5884,11 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
                 console.print(repr(result))
 
     elif action == "/skill":
-        sub = parts[1] if len(parts) > 1 else "list"
-        if sub == "list":
+        # No subcommand → open the interactive manager (same style as /term).
+        sub = parts[1] if len(parts) > 1 else "manager"
+        if sub == "manager":
+            show_skill_manager()
+        elif sub == "list":
             metas = skills_mod.get_all_metadata()
             if not metas:
                 console.print(f"[dim]No skills in {skills_mod.SKILLS_DIR}[/dim]")
@@ -5916,6 +5905,13 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
                         console.print(f"  [cyan]{t.name}[/cyan] — {t.description}")
                     if not tools:
                         console.print("  [yellow](standby/documentation-only)[/yellow]")
+        elif sub in ("load", "unload"):
+            if len(parts) < 3:
+                console.print(f"[yellow]Usage: /skill {sub} <name>[/yellow]")
+            else:
+                fn = skills_mod.load_skill if sub == "load" else skills_mod.unload_skill
+                ok, msg = fn(parts[2])
+                console.print(f"[{'green' if ok else 'red'}]{msg}[/{'green' if ok else 'red'}]")
         elif sub == "reload":
             results = skills_mod.reload_all()
             for name, ok, msg in results:
@@ -5935,7 +5931,7 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
         elif sub == "dir":
             console.print(str(skills_mod.SKILLS_DIR))
         else:
-            console.print("[yellow]Usage: /skill {list|reload|new <name>|dir}[/yellow]")
+            console.print("[yellow]Usage: /skill [manager|list|load <name>|unload <name>|reload|new <name>|dir][/yellow]")
 
     elif action == "/mcp":
         if not _get_mcp_mod().MCP_AVAILABLE:
@@ -6042,6 +6038,35 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
 
     elif action == "/reload":
         reload_default_files()
+
+    elif action in ("/undo", "/snapshot", "/snapshots"):
+        import snapshot as _snap
+        cwd = os.getcwd()
+        if action == "/snapshots":
+            cps = _snap.list_for(cwd)
+            if not cps:
+                console.print("[dim]No checkpoints for this repository "
+                              "(not a git repo, or none taken yet).[/dim]")
+            else:
+                console.print(f"[bold]Checkpoints[/bold] ({len(cps)}, newest last):")
+                for i, c in enumerate(cps):
+                    ago = _format_time_ago(c.get("ts", 0))
+                    console.print(f"  [cyan]{c['sha'][:10]}[/cyan]  {c.get('label','') or '(no label)'}  [dim]{ago}[/dim]")
+                console.print("[dim]Use /undo to restore the latest, or /undo <sha> for a specific one.[/dim]")
+        elif action == "/snapshot":
+            label = " ".join(parts[1:]) if len(parts) > 1 else "manual"
+            cp = _snap.create(cwd, label)
+            if cp:
+                console.print(f"[green]Checkpoint saved: {cp['sha'][:10]} ({label})[/green]")
+            else:
+                console.print("[yellow]Could not snapshot (not a git repository?).[/yellow]")
+        else:  # /undo
+            sha = parts[1] if len(parts) > 1 else None
+            ok, msg = _snap.restore(cwd, sha)
+            console.print((f"[green]{msg}[/green]" if ok else f"[yellow]{msg}[/yellow]"))
+            if ok:
+                console.print("[dim]Files created since the checkpoint were kept. "
+                              "A pre-undo checkpoint was saved (undo the undo with /undo).[/dim]")
 
     elif action == "/config":
         # Built-in config command (doesn't require .laintas/commands.py)
@@ -6243,14 +6268,18 @@ _COMMANDS = [
     ("/abort",     "Signal abort to an agent"),
     ("/tools",     "List registered tools by source"),
     ("/tool",      "Invoke a tool directly"),
-    ("/skill",     "Manage skills"),
+    ("/skill",     "Open the interactive skill manager (load/unload/reload)"),
     ("/mcp",       "Manage MCP servers"),
     ("/config",    "View or set runtime configuration"),
     ("/max",       "Lift all limits — max tokens/loops, disable circuit breakers (all agents)"),
     ("/reload",    "Reload default files and restart"),
+    ("/undo",      "Restore the working tree to the last git checkpoint (undo the session's edits)"),
+    ("/snapshot",  "Manually git-checkpoint the working tree (/snapshot [label])"),
+    ("/snapshots", "List git checkpoints taken this/previous sessions"),
     ("/v",         "Show version; /v update to self-update (partial download)"),
     ("/resume",    "Choose a /q checkpoint to resume (/resume, /resume <N>)"),
     ("/continue",  "Resume agent loop after max_loops exhaustion"),
+    ("/task",      "Task tracking — create, list, start, complete, delete"),
 ]
 
 
@@ -6400,8 +6429,9 @@ def show_help():
     table.add_row("/back", "Detach from sub-terminal without closing it")
     table.add_row("/hwo", "Visual agent-orchestration builder (HWO TUI)")
     table.add_row("/plan", "Structured planning (/plan enter, approve, exit, status, list)")
+    table.add_row("/task", "Task tracking (/task add, start, done, del)")
     table.add_row("/workflow", "Multi-phase workflows (/workflow start, status, advance, end, list)")
-    table.add_row("/skill", "Skill management (/skill list, reload, new <name>, dir)")
+    table.add_row("/skill", "Interactive skill manager (no-arg); /skill load|unload <name>|list|reload|new <name>|dir")
     table.add_row("/config", "Runtime config (/config, /config <key> <value>, /config reset)")
     table.add_row("/tools", "List registered AI tools")
     table.add_row("/resume [N]", "Choose a /q checkpoint to resume; launch with --resume or --continue for latest")
@@ -6971,6 +7001,7 @@ def main():
         stop_trigger_scanner()
         close_all_terminals()
         close_all_agents()
+        browser_mod.close_all_browser_sessions()
         try:
             _get_mcp_mod().get_manager().shutdown()
         except Exception:
@@ -7061,6 +7092,7 @@ def main():
                 save_resume_state(agent_state, chat_history, _session_start_cwd)
             stop_trigger_scanner()
             close_all_terminals()
+            browser_mod.close_all_browser_sessions()
             if interactive_session:
                 interactive_session.close()
             agent_registry.unregister()

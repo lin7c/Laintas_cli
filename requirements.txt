@@ -1,7 +1,17 @@
+# Core runtime dependencies (also declared in setup.py install_requires).
+# Install just these for a minimal CLI:  pip install .
 requests>=2.28.0
 certifi>=2024.0.0
 rich>=13.0.0
 prompt_toolkit>=3.0.0
+
+# Optional extras — install via pip install .[<extra>]  (e.g. .[browser,webrtc])
+#   [browser]  websockets, playwright  — headless-browser live-view + CDP tools
+#   [webrtc]   aiortc                  — P2P file channel (bypasses relay)
+#   [mcp]      mcp                     — MCP server tools (/mcp)
+#   [all]      all of the above
+#
+# The lines below are for `pip install -r requirements.txt` (dev convenience).
 
 # Enables the WebRTC peer-to-peer file channel (browser ↔ this host) so file
 # transfers bypass the Helpwo relay server. Optional: the CLI runs without it
@@ -12,3 +22,16 @@ aiortc>=1.14
 # laintas-cli starts and runs without this; the /mcp command will tell
 # you it's missing and how to install. Comment out if you don't need MCP.
 mcp>=1.0
+
+# Optional — enables the headless-browser live-view stack (browser.* tools).
+# The CLI runs without this; browser._debug_open will report the missing dep.
+# Requires system packages: Xvfb, x11vnc, google-chrome (or chromium).
+#   apt install xvfb x11vnc   (Linux only — no Xvfb on Windows)
+# websockets is the WS↔RFB bridge to the backend /vnc relay.
+websockets>=12.0
+
+# Optional (P2+) — enables full browser automation (click, type, screenshot,
+# DOM query) via Playwright. browser._debug_open works without this (uses raw
+# CDP), but the browser.* tool family requires it.
+#   pip install playwright && playwright install chromium
+playwright>=1.40

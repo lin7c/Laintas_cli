@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# build_download_assets.sh — build the 3 local download artifacts + self-update
+# manifest. Windows exe is NOT rebuilt here (CI-only); we copy the checked-in one.
+#
+# Reads package_manifest.json as the single source of truth for which modules
+# and packages to ship. See build/HEADLESS_BROWSER_PACKAGING.md.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -8,6 +13,7 @@ TMP_DIR="$(mktemp -d)"
 PYI_DIST_DIR="$TMP_DIR/pyinstaller-dist"
 PYI_BUILD_DIR="$TMP_DIR/pyinstaller-build"
 VENV_PYINSTALLER="$PROJECT_DIR/venv/bin/pyinstaller"
+MANIFEST="$PROJECT_DIR/package_manifest.json"
 
 cleanup() {
   rm -rf "$TMP_DIR"
@@ -19,31 +25,33 @@ if [ ! -x "$VENV_PYINSTALLER" ]; then
   exit 1
 fi
 
-SOURCE_FILES=(
-  agent_loop.py
-  agent_persistence.py
-  agent_roles.py
-  cloud_provider.py
-  hooks.py
-  hwo_runner.py
-  hwo_ui.py
-  laintas_cli.py
-  mcp_client.py
-  memory_system.py
-  migrate.py
-  paths.py
-  plan_mode.py
-  policy.py
-  PROJECT.md
-  requirements.txt
-  setup.py
-  skills.py
-  task_manager.py
-  tools.py
-  updater.py
-  version.py
-  workflow_engine.py
-)
+if [ ! -f "$MANIFEST" ]; then
+  echo "Missing $MANIFEST"
+  exit 1
+fi
+
+# ── Derive file lists from package_manifest.json ────────────────────────
+# Flat .py modules + non-py extra_files → top-level files to bundle.
+mapfile -t TOP_FILES < <(python3 -c "
+import json, sys
+m = json.load(open('$MANIFEST'))
+for x in m['modules']:
+    print(x + '.py')
+for x in m['extra_files']:
+    print(x)
+")
+# Sub-packages (directories) + data_dirs to bundle recursively.
+mapfile -t PKG_DIRS < <(python3 -c "
+import json
+m = json.load(open('$MANIFEST'))
+for x in m['packages'] + m['data_dirs']:
+    print(x)
+")
+
+echo "Top-level files (${#TOP_FILES[@]}):"
+printf '  %s\n' "${TOP_FILES[@]}"
+echo "Package/data dirs (${#PKG_DIRS[@]}):"
+printf '  %s\n' "${PKG_DIRS[@]}"
 
 mkdir -p "$RELEASE_DIR"
 rm -f \
@@ -92,12 +100,21 @@ EOF
 chmod 755 "$LINUX_PACKAGE_DIR/install.sh"
 tar -C "$TMP_DIR" -czf "$RELEASE_DIR/laintas-cli_linux.tar.gz" laintas-cli
 
+# ── Helper: copy a full bundle (top files + pkg dirs) into a dest dir ──
+copy_bundle() {
+  local dest="$1"
+  for file in "${TOP_FILES[@]}"; do
+    cp "$PROJECT_DIR/$file" "$dest/"
+  done
+  for d in "${PKG_DIRS[@]}"; do
+    cp -r "$PROJECT_DIR/$d" "$dest/"
+  done
+}
+
 echo "Building macOS source bundle..."
 MAC_PACKAGE_DIR="$TMP_DIR/laintas-cli-macos/laintas-cli"
 mkdir -p "$MAC_PACKAGE_DIR"
-for file in "${SOURCE_FILES[@]}"; do
-  cp "$PROJECT_DIR/$file" "$MAC_PACKAGE_DIR/"
-done
+copy_bundle "$MAC_PACKAGE_DIR"
 cat > "$MAC_PACKAGE_DIR/install.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -113,7 +130,10 @@ fi
 
 if [ "$(id -u)" -eq 0 ]; then
   mkdir -p "$INSTALL_DIR"
-  cp "$SCRIPT_DIR"/*.py "$INSTALL_DIR/"
+  cp -r "$SCRIPT_DIR"/*.py "$INSTALL_DIR/"
+  cp -r "$SCRIPT_DIR"/agent_tools "$SCRIPT_DIR"/context_policy \
+        "$SCRIPT_DIR"/diagnostics_adapter "$SCRIPT_DIR"/format_adapter \
+        "$SCRIPT_DIR"/patch_adapter "$SCRIPT_DIR"/default_skills "$INSTALL_DIR/" 2>/dev/null || true
   cp "$SCRIPT_DIR"/requirements.txt "$INSTALL_DIR/"
   cat > "$BIN_PATH" <<'LAUNCHER'
 #!/usr/bin/env bash
@@ -122,13 +142,16 @@ LAUNCHER
   chmod 755 "$BIN_PATH"
 else
   sudo mkdir -p "$INSTALL_DIR"
-  sudo cp "$SCRIPT_DIR"/*.py "$INSTALL_DIR/"
+  sudo cp -r "$SCRIPT_DIR"/*.py "$INSTALL_DIR/"
+  sudo cp -r "$SCRIPT_DIR"/agent_tools "$SCRIPT_DIR"/context_policy \
+           "$SCRIPT_DIR"/diagnostics_adapter "$SCRIPT_DIR"/format_adapter \
+           "$SCRIPT_DIR"/patch_adapter "$SCRIPT_DIR"/default_skills "$INSTALL_DIR/" 2>/dev/null || true
   sudo cp "$SCRIPT_DIR"/requirements.txt "$INSTALL_DIR/"
   printf '%s\n' '#!/usr/bin/env bash' 'exec python3 /usr/local/lib/laintas_cli/laintas_cli.py "$@"' | sudo tee "$BIN_PATH" >/dev/null
   sudo chmod 755 "$BIN_PATH"
 fi
 
-python3 -m pip install -r "$SCRIPT_DIR/requirements.txt"
+python3 -m pip install -r "$SCRIPT_DIR"/requirements.txt
 
 echo "Installed to $BIN_PATH"
 echo "Run: laintas-cli"
@@ -139,9 +162,7 @@ tar -C "$TMP_DIR/laintas-cli-macos" -czf "$RELEASE_DIR/laintas-cli_macos.tar.gz"
 echo "Building source zip..."
 SOURCE_PACKAGE_DIR="$TMP_DIR/laintas-cli-source"
 mkdir -p "$SOURCE_PACKAGE_DIR"
-for file in "${SOURCE_FILES[@]}"; do
-  cp "$PROJECT_DIR/$file" "$SOURCE_PACKAGE_DIR/"
-done
+copy_bundle "$SOURCE_PACKAGE_DIR"
 (cd "$TMP_DIR" && zip -qr "$RELEASE_DIR/laintas-cli_source.zip" laintas-cli-source)
 
 echo "Refreshing Windows executable from checked-in artifact..."
@@ -150,32 +171,64 @@ cp "$PROJECT_DIR/build/windows/laintas_cli.exe" "$RELEASE_DIR/laintas_cli.exe"
 echo "Publishing loose source files + manifest for partial self-update (/v update)..."
 # The self-updater downloads only the .py files whose sha256 changed. To make
 # that possible we publish each module individually under src/ plus a manifest
-# that lists version + per-file sha256.
+# that lists version + per-file sha256. Sub-package .py files are published
+# under src/<pkg>/<module>.py to preserve their import path.
 SRC_DIR="$RELEASE_DIR/src"
 rm -rf "$SRC_DIR"
 mkdir -p "$SRC_DIR"
-for file in "${SOURCE_FILES[@]}"; do
+
+# Top-level .py modules
+for file in "${TOP_FILES[@]}"; do
   case "$file" in *.py) cp "$PROJECT_DIR/$file" "$SRC_DIR/";; esac
+done
+# Sub-package .py + their data files (.json)
+for d in "${PKG_DIRS[@]}"; do
+  if [ -d "$PROJECT_DIR/$d" ]; then
+    mkdir -p "$SRC_DIR/$d"
+    cp "$PROJECT_DIR"/$d/*.py "$SRC_DIR/$d/" 2>/dev/null || true
+    cp "$PROJECT_DIR"/$d/*.json "$SRC_DIR/$d/" 2>/dev/null || true
+  fi
 done
 
 VERSION="$(python3 -c "import sys; sys.path.insert(0, '$PROJECT_DIR'); from version import __version__; print(__version__)")"
-python3 - "$PROJECT_DIR" "$SRC_DIR/manifest.json" "$VERSION" "${SOURCE_FILES[@]}" <<'PY'
+python3 - "$PROJECT_DIR" "$SRC_DIR/manifest.json" "$VERSION" "${TOP_FILES[@]}" "${PKG_DIRS[@]}" <<'PY'
 import hashlib, json, os, sys, datetime
-project_dir, out_path, version, *files = sys.argv[1:]
+project_dir, out_path, version, *items = sys.argv[1:]
 manifest = {
     "version": version,
     "released": datetime.date.today().isoformat(),
     "files": {},
 }
-for name in files:
-    if not name.endswith(".py"):
-        continue
-    p = os.path.join(project_dir, name)
-    data = open(p, "rb").read()
-    manifest["files"][name] = {
+
+def add_file(rel, abs_path):
+    data = open(abs_path, "rb").read()
+    manifest["files"][rel] = {
         "sha256": hashlib.sha256(data).hexdigest(),
         "size": len(data),
     }
+
+# Top-level entries: items may be .py modules or non-py extra_files.
+# Only .py (and .json/.txt) are tracked for partial update; binaries are not.
+for name in items:
+    p = os.path.join(project_dir, name)
+    if not os.path.isfile(p):
+        continue
+    if name.endswith((".py", ".json", ".txt")):
+        add_file(name, p)
+
+# Walk sub-packages and data dirs for .py + .json (relative path pkg/file).
+for name in items:
+    d = os.path.join(project_dir, name)
+    if not os.path.isdir(d):
+        continue
+    for root, dirs, files in os.walk(d):
+        dirs[:] = [x for x in dirs if x != "__pycache__"]
+        for f in files:
+            if f.endswith((".py", ".json")):
+                abs_p = os.path.join(root, f)
+                rel = os.path.relpath(abs_p, project_dir)
+                add_file(rel, abs_p)
+
 with open(out_path, "w") as fh:
     json.dump(manifest, fh, indent=2)
 print(f"  manifest: v{version}, {len(manifest['files'])} files")

@@ -33,31 +33,15 @@ docker run --rm \
     apt-get install -y --no-install-recommends binutils >/dev/null 2>&1
     command -v objdump >/dev/null || { echo "objdump still missing"; exit 1; }
     python -m pip install --upgrade pip >/dev/null
-    python -m pip install --prefer-binary pyinstaller requests certifi rich prompt_toolkit >/dev/null
+    python -m pip install --prefer-binary pyinstaller requests certifi rich prompt_toolkit \
+        websockets aiortc >/dev/null
     rm -rf /tmp/b /tmp/d
+    # Use the spec file (reads package_manifest.json for datas/hiddenimports).
+    # The spec uses SPECPATH-relative paths, so we point it at the spec directly.
     python -m PyInstaller \
-      --noconfirm --onefile --name laintas-cli \
-      --distpath /tmp/d --workpath /tmp/b --specpath /tmp \
-      --collect-data certifi \
-      --runtime-hook /src/build/windows/hook_ssl.py \
-      --hidden-import requests \
-      --hidden-import certifi \
-      --hidden-import rich.console \
-      --hidden-import rich.panel \
-      --hidden-import rich.markdown \
-      --hidden-import rich.table \
-      --hidden-import rich.live \
-      --hidden-import rich.spinner \
-      --hidden-import rich.text \
-      --hidden-import rich.padding \
-      --hidden-import prompt_toolkit.application \
-      --hidden-import prompt_toolkit.history \
-      --hidden-import prompt_toolkit.completion \
-      --hidden-import prompt_toolkit.key_binding \
-      --hidden-import prompt_toolkit.layout \
-      --hidden-import prompt_toolkit.styles \
-      --hidden-import prompt_toolkit.auto_suggest \
-      /src/laintas_cli.py
+      --noconfirm \
+      --distpath /tmp/d --workpath /tmp/b --specpath /src/build/linux \
+      /src/build/linux/laintas_cli.spec
     cp /tmp/d/laintas-cli /out/laintas-cli
     chmod 755 /out/laintas-cli
     echo "== done =="

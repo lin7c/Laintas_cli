@@ -27,6 +27,10 @@ import workflow_engine        # Structured multi-phase workflow engine
 import task_manager          # Structured task tracking (session + persisted)
 import paths                 # Centralized path management
 import skills as skills_mod   # Progressive skill metadata + context loading
+try:
+    import context_policy as ctxpol  # Vendored shared compaction policy (opencode-derived)
+except Exception:  # pragma: no cover — graceful if the vendored package is missing
+    ctxpol = None
 
 # Path to laintas_cli.py for spawning child terminals
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -59,6 +63,15 @@ _DEFAULT_CONFIG = {
     "message_truncate": 1200,      # chars per history message sent to backend
     "short_memory_max_chars": 2000, # session memory budget, line-aware
     "show_billing": False,          # show cost/balance after each reply
+    "use_message_thread": True,     # native OpenAI message thread (assistant tool_calls + role:tool results) — reads stay in context like opencode/Helpwo, no re-read amnesia. Compacted by _compact_thread_messages.
+    "use_unified_catalog": True,    # emit shared agent_tools canonical tool names (fs.read->read) to the model — unified taxonomy is the default; set False to fall back to legacy dotted names
+    "model_context_window": 64000,  # model's context window (tokens) used to budget thread compaction (prune + summarize)
+    "auto_format": True,            # run the best-available code formatter in place after a full-file write (no-op if none installed); surgical edits stay byte-precise
+    "auto_snapshot": True,          # at the start of each top-level task, git-checkpoint the working tree so the session can be undone with /undo (no-op outside a git repo)
+    "browser_action_delay_min": 0.3,   # min seconds of anti-bot delay before browser actions
+    "browser_action_delay_max": 1.5,   # max seconds of anti-bot delay before browser actions
+    "browser_post_action_wait": 0.5,   # seconds to wait for SPA DOM updates before auto-snapshot
+    "browser_auto_snapshot": True,     # return page snapshot after state-changing browser actions
 }
 
 # ── Transition Labels (mirrors Claude Code State.transition) ─────────
@@ -503,7 +516,7 @@ def _build_resume_payload(state: dict, chat_history: list, cwd: str, kind: str) 
         "turn_count": len(user_turns),
         "chat_history": history,
         "older_summary": _summarize_dropped_turns(dropped),
-        "tasks": task_manager.export_active_tasks(),
+        "tasks": task_manager.export_active_tasks(cwd=cwd),
         "state": prepare_state_for_repl(state or {}),
     }
 
@@ -1625,6 +1638,8 @@ def _is_file_read_entry(entry: dict) -> bool:
     return any(cmd.startswith(p) for p in ("cat ", "head ", "tail "))
 
 
+
+
 def _microcompact_history(history: list, keep_recent: int = 6,
                           read_budget: Optional[int] = None) -> list:
     """Content-aware microcompact — recover context without inducing re-reads.
@@ -1692,6 +1707,151 @@ def _microcompact_history(history: list, keep_recent: int = 6,
                           else "(output cleared by microcompact)",
             })
     return result
+
+
+def _serialize_turns_for_summary(messages: list) -> str:
+    """Flatten chat messages into plain text for the compaction summarizer."""
+    parts = []
+    for m in messages:
+        role = m.get("role", "user")
+        label = "User" if role == "user" else ("Assistant" if role in ("assistant", "knowledge") else role)
+        content = _stringify_message_content(m.get("content", "")).strip()
+        if content:
+            parts.append(f"[{label}]: {content}")
+    return "\n".join(parts)
+
+
+def _llm_summarize(deps, session, current_path: str, head_text: str,
+                   prev_summary: Optional[str], lang: str) -> Optional[str]:
+    """Summarize the conversation HEAD into opencode's structured running summary.
+
+    Makes one tool-less backend completion using the shared summary prompt
+    (vendored `context_policy.summary_prompt`), incrementally merging
+    `prev_summary`. Returns the summary text, or None on any failure so the
+    caller can fall back to the cheap heuristic. Never raises.
+    """
+    if ctxpol is None or not head_text.strip():
+        return None
+    try:
+        sys_prompt = ctxpol.summary_prompt(lang, previous_summary=prev_summary)
+        resp = deps.call_backend(
+            session=session,
+            message=head_text,
+            system_prompt=sys_prompt,
+            current_path=current_path,
+            history=[],
+            lang=lang,
+            tools_enabled=False,
+        )
+        text = (resp or {}).get("reply", "") if isinstance(resp, dict) else ""
+        text = (text or "").strip()
+        return text or None
+    except Exception:
+        return None
+
+
+def _thread_tokens(messages: list) -> int:
+    """Cheap token estimate for a slice of the native message thread."""
+    try:
+        blob = json.dumps(messages, ensure_ascii=False)
+    except (TypeError, ValueError):
+        blob = str(messages)
+    return ctxpol.estimate_tokens(blob) if ctxpol is not None else (len(blob) + 3) // 4
+
+
+def _serialize_thread_msg(m: dict) -> str:
+    """Flatten one thread message into plain text for the compaction summarizer."""
+    role = m.get("role")
+    content = m.get("content") or ""
+    if not isinstance(content, str):
+        content = str(content)
+    if role == "tool":
+        if ctxpol is not None:
+            content = ctxpol.truncate_tool_output(content)
+        return f"[Tool {m.get('name', 'result')}]: {content}"
+    if role == "assistant":
+        calls = ", ".join((tc.get("function", {}) or {}).get("name", "")
+                          for tc in (m.get("tool_calls") or []))
+        parts = []
+        if content.strip():
+            parts.append(f"[Assistant]: {content.strip()}")
+        if calls:
+            parts.append(f"[Assistant tool call(s)]: {calls}")
+        return "\n".join(parts)
+    if role == "user":
+        return f"[User]: {content}" if content.strip() else ""
+    return ""
+
+
+def _compact_thread_messages(thread_messages: list, deps, session, lang: str, state: dict) -> bool:
+    """opencode-style compaction of the native message thread, IN PLACE.
+
+    When the thread exceeds the model's usable window: (1) PRUNE — truncate old
+    `role:tool` outputs to the policy char cap, protecting the recent tail and
+    protected tools; (2) if still over, SUMMARIZE the head via one tool-less LLM
+    call and replace it with a structured running summary (incrementally merged).
+    Always keeps thread_messages[0] (the task) and never splits an assistant
+    tool_call from its paired role:tool result. Returns True if it changed the
+    thread. Never raises — compaction must not break the loop.
+    """
+    if ctxpol is None or len(thread_messages) < 4:
+        return False
+    try:
+        window = int(get_runtime_config("model_context_window") or 64000)
+        max_out = int(get_runtime_config("max_tokens") or 8192)
+        usable = ctxpol.usable_tokens(window, max_out)
+        if usable <= 0 or _thread_tokens(thread_messages) <= usable:
+            return False
+
+        # Recent tail to preserve verbatim (token-budgeted, from the end).
+        keep_recent = ctxpol.keep_recent_tokens(usable)
+        acc = 0
+        protect_from = len(thread_messages)
+        for i in range(len(thread_messages) - 1, 0, -1):
+            acc += _thread_tokens([thread_messages[i]])
+            protect_from = i
+            if acc > keep_recent:
+                break
+
+        changed = False
+        # 1) Prune old tool outputs (outside the recent tail, not protected).
+        for i in range(1, protect_from):
+            m = thread_messages[i]
+            if m.get("role") != "tool":
+                continue
+            if ctxpol.is_protected_tool(m.get("name", "")):
+                continue
+            c = m.get("content")
+            if isinstance(c, str):
+                t = ctxpol.truncate_tool_output(c)
+                if t != c:
+                    m["content"] = t
+                    changed = True
+        if _thread_tokens(thread_messages) <= usable:
+            return changed
+
+        # 2) Summarize the head. Start the tail on a clean boundary — never on a
+        #    bare role:tool (its assistant tool_call would be summarized away).
+        tail_start = protect_from
+        while tail_start < len(thread_messages) and thread_messages[tail_start].get("role") == "tool":
+            tail_start += 1
+        if tail_start <= 1 or tail_start >= len(thread_messages):
+            return changed
+        head = thread_messages[1:tail_start]
+        head_text = "\n".join(s for s in (_serialize_thread_msg(m) for m in head) if s)
+        if not head_text.strip():
+            return changed
+        summary = _llm_summarize(deps, session, os.getcwd(), head_text,
+                                 state.get("_thread_summary"), lang)
+        if not summary:
+            return changed
+        state["_thread_summary"] = summary
+        summary_msg = {"role": "user",
+                       "content": f"[CONVERSATION SUMMARY — earlier turns compacted]\n{summary}"}
+        thread_messages[:] = [thread_messages[0], summary_msg] + thread_messages[tail_start:]
+        return True
+    except Exception:
+        return False
 
 
 def _compress_conversation(chat_history: list, max_messages: int = 20) -> list:
@@ -1774,25 +1934,6 @@ def _append_short_memory(state: dict, text: str) -> None:
         f"{state.get('shortTermMemory', '')}{text}"
     )
 
-
-# Continuation tokens: a user line that means "resume the existing objective",
-# NOT a new task. We must not overwrite the pinned objective with these, and the
-# prompt routes them to the active task list. Kept multilingual + intentionally
-# short so a real instruction that merely starts with "continue …" is unaffected.
-_CONTINUATION_INPUTS = {
-    "继续", "接着", "接着做", "继续做", "go on", "continue", "keep going",
-    "proceed", "resume", "next", "go ahead", "carry on", "go", "ok", "好",
-    "好的", "嗯", "go on please", "请继续", "继续吧",
-}
-
-
-def _is_continuation_input(text: str) -> bool:
-    """True when the user line is a bare 'continue' nudge rather than a new goal.
-
-    Empty input also counts (the user just hit enter to let the agent proceed).
-    """
-    t = (text or "").strip().lower().rstrip("。.!！~")
-    return t == "" or t in _CONTINUATION_INPUTS
 
 
 def _summarize_reply_for_memory(reply: str, limit: int = 120) -> str:
@@ -2254,8 +2395,78 @@ def _track_files_in_command(name: str, cmd: str, seen: list) -> None:
         del seen[: len(seen) - 30]
 
 
+# ── Native message-thread construction (opencode-aligned) ──────────────
+# Instead of re-synthesizing a fresh "user state-dump" message every turn, the
+# loop maintains a real OpenAI message thread:
+#   user -> assistant(content + tool_calls) -> tool(result per call) -> ...
+# The backend (build_payload) passes a `messages` array straight through to the
+# provider. The single hard invariant — enforced here — mirrors opencode
+# (message-v2.ts): EVERY assistant tool_call id must have a matching role:"tool"
+# result, or OpenAI/DeepSeek/Anthropic reject the request with a dangling
+# tool_use error. The tool_call id is just an in-request correlation key; we
+# control both sides, so a deterministic per-call id (call_LL_II from the
+# dispatch loop) is sufficient and need not match the provider's original id.
+
+def _openai_tool_call(call_id: str, name: str, arguments) -> dict:
+    """Render one laintas tool call as an OpenAI-format assistant.tool_calls entry.
+
+    `arguments` may be a dict (serialized to a JSON string, as the OpenAI schema
+    requires) or an already-serialized string (passed through)."""
+    if isinstance(arguments, str):
+        args_str = arguments
+    else:
+        try:
+            args_str = json.dumps(arguments if isinstance(arguments, dict) else {}, ensure_ascii=False)
+        except (TypeError, ValueError):
+            args_str = "{}"
+    return {
+        "id": call_id,
+        "type": "function",
+        "function": {"name": name or "", "arguments": args_str},
+    }
+
+
+def _thread_messages_for_turn(reply: str, executed: list) -> list:
+    """Build the OpenAI message(s) recording one assistant turn.
+
+    `executed` is the list of tool calls placed in the assistant message, each a
+    dict {id, name, arguments, output}. The caller MUST include an entry — with
+    an `output` — for EVERY tool_call it surfaces, synthesizing a placeholder
+    result for any call that was skipped/interrupted/blocked. That is the pairing
+    invariant; this builder then emits exactly one role:"tool" message per entry,
+    so it can never produce a dangling tool_use.
+
+    Returns:
+      - [assistant(content, tool_calls), tool, tool, ...] when there are calls
+      - [assistant(content)] for a reply-only turn
+      - [] when there is neither a reply nor any tool call (nothing to record)
+    """
+    msgs: list = []
+    if executed:
+        assistant = {
+            "role": "assistant",
+            # OpenAI allows null content alongside tool_calls; keep prose if any.
+            "content": reply or None,
+            "tool_calls": [
+                _openai_tool_call(e.get("id") or f"call_{i}", e.get("name", ""), e.get("arguments", {}))
+                for i, e in enumerate(executed)
+            ],
+        }
+        msgs.append(assistant)
+        for i, e in enumerate(executed):
+            msgs.append({
+                "role": "tool",
+                "tool_call_id": e.get("id") or f"call_{i}",
+                "content": "" if e.get("output") is None else str(e.get("output")),
+            })
+    elif reply:
+        msgs.append({"role": "assistant", "content": reply})
+    return msgs
+
+
 def _build_user_message(original_input: str, state: dict, memory_entries: list,
-                        chat_history: list, loop: int, max_loops: int) -> str:
+                        chat_history: list, loop: int, max_loops: int,
+                        thread_mode: bool = False, first_turn: bool = True) -> str:
     """Compose the user-message body for one agent iteration.
 
     Section order matters for LLM attention. Recent recommendations and our
@@ -2322,7 +2533,7 @@ def _build_user_message(original_input: str, state: dict, memory_entries: list,
             role_block += "</role_identity>\n"
 
     # Active tasks section
-    tasks_snapshot = task_manager.get_active_tasks_snapshot()
+    tasks_snapshot = task_manager.get_active_tasks_snapshot(cwd=os.getcwd())
     tasks_block = ""
     if tasks_snapshot:
         tasks_block = f"\n<active_tasks>\n{tasks_snapshot}\n</active_tasks>\n"
@@ -2334,19 +2545,38 @@ def _build_user_message(original_input: str, state: dict, memory_entries: list,
     if objective and objective != str(original_input or "").strip():
         objective_block = f"\n<objective>\n{objective}\n</objective>\n"
 
-    # Continuation guidance: a bare "continue"/empty line is NOT a new goal —
-    # route the model to its own plan / the pinned objective instead of letting
-    # it treat "继续" as the task.
+    # Continuation guidance: only for empty input (user hit Enter to proceed).
+    # Non-empty inputs like "继续" / "继续项目" are judged by the AI from context.
     continuation_block = ""
-    if _is_continuation_input(original_input):
+    if not (original_input or "").strip():
         continuation_block = (
             "\n<continuation>\n"
-            "The user asked to continue — this is not a new task. Resume the "
-            "in_progress item in <active_tasks>; if none is in progress, pick up "
-            "the <objective> above (create/advance tasks for it). Only ask the "
-            "user if both are genuinely empty.\n"
+            "The user sent an empty line — proceed with current work. "
+            "Resume the in_progress item in <active_tasks>; if none, "
+            "check <objective>. Only ask the user if both are empty.\n"
             "</continuation>\n"
         )
+
+    # In thread mode the assistant/tool turns ARE the conversation and the tool
+    # results ARE the terminal output — re-injecting them here would duplicate
+    # the thread. So those two sections are dropped, and <task> is sent only on
+    # the first turn (afterwards the original task already lives in the thread as
+    # the first user message). This message becomes a per-turn, transient
+    # "live state" injection (objective/tasks/warnings/memory) — see Stage C.
+    if thread_mode:
+        task_block = f"<task>\n{original_input}\n</task>\n" if first_turn else ""
+        return f"""{task_block}{objective_block}{continuation_block}
+<progress>
+step {loop+1}/{max_loops} — {n_steps} command(s) executed so far
+</progress>
+{warnings_block}{files_block}{workflow_block}{role_block}{tasks_block}
+<session_memory>
+{memory_section}
+</session_memory>
+
+<sub_terminals>
+{terminals_snapshot or "(none)"}
+</sub_terminals>"""
 
     return f"""<task>
 {original_input}
@@ -2636,8 +2866,18 @@ def _salient_arg(name: str, arguments: dict) -> str:
         # reading through one large file.
         path = arguments.get("path", "") or ""
         offset = arguments.get("offset")
-        if offset and offset != 1:
+        limit = arguments.get("limit")
+        # Show the read window as path@offset+lines so the user (and the
+        # repeat/cache keys) can tell a 30-line peek from a full read of the
+        # same offset. Keep the path before the first '@' so the file-tracking
+        # split in _track_files_in_command stays correct.
+        has_offset = bool(offset and offset != 1)
+        if has_offset and limit:
+            return f"{path}@{offset}+{limit}"
+        if has_offset:
             return f"{path}@{offset}"
+        if limit:
+            return f"{path}@1+{limit}"
         return path
     if name in ("fs.write", "fs.edit", "fs.multi_edit", "fs.diff"):
         return arguments.get("path", "") or ""
@@ -2901,8 +3141,18 @@ def run_agent_loop(
     # task so a stale large dump doesn't ride along in every prompt of an
     # unrelated question. Follow-ups keep a short tail for continuity. depth==0
     # only — sub-agents get a purpose-built initial state, nothing to inherit.
-    if depth == 0 and state.get("terminalHistory"):
-        state["terminalHistory"] = _trim_carried_outputs(state["terminalHistory"])
+    if depth == 0:
+        # Snapshot the working tree at task start so the session's edits can be
+        # reverted with /undo (git-backed, non-destructive; no-op outside a repo).
+        if get_runtime_config("auto_snapshot") and not state.get("_snapshot_done"):
+            try:
+                import snapshot as _snap
+                if _snap.create(os.getcwd(), f"task: {(original_input or '').strip()[:60]}"):
+                    state["_snapshot_done"] = True
+            except Exception:
+                pass
+        if state.get("terminalHistory"):
+            state["terminalHistory"] = _trim_carried_outputs(state["terminalHistory"])
     state["shortTermMemory"] = _trim_short_term_memory(state.get("shortTermMemory", ""))
     state["lastOutput"] = _trim_text(
         state.get("lastOutput", ""),
@@ -2911,29 +3161,21 @@ def run_agent_loop(
     chat_history = chat_history or []
 
     # ── Pin the objective (durable goal anchor) ────────────────────────────
-    # The user's goal must survive context compression and a bare "continue".
-    # shortTermMemory FIFO-evicts the oldest line (the goal); chat history is
-    # windowed. So a substantive top-level instruction is pinned here (persisted
-    # in the session snapshot) and rendered every turn as <objective>. A
-    # "continue"/empty line keeps the existing objective instead of erasing it.
-    # As a safety net (so even a forgotten task.create can't lose the goal) the
-    # first substantive task auto-seeds a session task that anchors "continue".
+    # The user's goal is pinned here (persisted in the session snapshot) and
+    # rendered every turn as <objective> when it differs from the current input.
+    # The AI creates tasks via task.create — no auto-seeding.
     if depth == 0:
         _orig = (original_input or "").strip()
-        if _orig and not _is_continuation_input(_orig):
-            if state.get("objective") != _orig:
-                state["objective"] = _orig
-                # Auto-seed a task for the new goal so a later "continue" has an
-                # anchor — unless real work is already in progress (don't barge
-                # into an active task; stale pending clutter must not block it).
-                try:
-                    if not task_manager.list_tasks(status="in_progress"):
-                        task_manager.create_session_task(_orig[:120], _orig)
-                except Exception:
-                    pass
+        if _orig:
+            state["objective"] = _orig
 
     step_replies = []
     user_input = original_input
+    # Native message thread (Stage B): committed turns as OpenAI messages
+    # (user -> assistant(tool_calls) -> tool(result) -> ...). Opt-in via config;
+    # when off, the loop keeps re-synthesizing a state-dump user message.
+    thread_messages: list = []
+    _thread_mode = bool(get_runtime_config("use_message_thread"))
     pending_events: list[dict] = []
     done = False
     _exit_reason = TRANSITION_MAX_LOOPS  # default: assume exhaustion unless overridden by a break
@@ -3152,9 +3394,45 @@ def run_agent_loop(
         conversation_section = _build_conversation_section(history_context)
         terminals_snapshot = get_terminals_snapshot()
         history_for_backend = _prepare_history_for_backend(history_context)
-        user_input = _build_user_message(
-            original_input, state, memory_entries, history_context, loop, max_loops,
-        )
+        if _thread_mode:
+            # Stage C — separate the PERMANENT thread from TRANSIENT live state:
+            #  • Permanent (thread_messages): the raw task + assistant/tool turns.
+            #    Persisted once; grows only with real conversation.
+            #  • Transient live-state: objective/active_tasks/warnings/memory,
+            #    rebuilt every turn and appended ONLY for this request (never
+            #    committed), so stale task snapshots can't accumulate. It sits
+            #    last for best attention — opencode's reminders pattern.
+            if not thread_messages:
+                thread_messages.append({"role": "user", "content": original_input})
+            # opencode-style overflow handling: prune old tool outputs, then
+            # summarize the head if the thread still exceeds the window. Keeps the
+            # reads in context (no re-read amnesia) while bounding the thread size.
+            # (`lang` is assigned later in the loop, so derive it here.)
+            _compact_thread_messages(thread_messages, deps, session,
+                                     _detect_lang(original_input), state)
+            _live_state = _build_user_message(
+                original_input, state, memory_entries, history_context, loop, max_loops,
+                thread_mode=True, first_turn=False,
+            )
+            user_input = _live_state  # for debug display
+            _thread_to_send = thread_messages + (
+                [{"role": "user", "content": _live_state}] if _live_state.strip() else []
+            )
+            # Last-step wrap-up (opencode MAX_STEPS_PROMPT): on the final allowed
+            # iteration, tell the model to stop calling tools and answer now, so it
+            # isn't cut off mid-action at the loop cap. Ephemeral — not committed.
+            if loop == max_loops - 1:
+                _thread_to_send = _thread_to_send + [{
+                    "role": "user",
+                    "content": "<final_step>This is your last step — do NOT call more tools. "
+                               "Give your final answer or summary now.</final_step>",
+                }]
+        else:
+            _live_state = None
+            user_input = _build_user_message(
+                original_input, state, memory_entries, history_context, loop, max_loops,
+            )
+            _thread_to_send = None
 
         # ── Debug: create entry before API call ──
         debug_entry = DebugEntry(
@@ -3239,6 +3517,7 @@ def run_agent_loop(
                             on_chunk=_on_chunk,
                             lang=lang,
                             interrupt_event=_interrupt,
+                            messages=_thread_to_send,
                         )
                     except TypeError:
                         # Backend doesn't support on_chunk/interrupt_event — fall back
@@ -3271,6 +3550,7 @@ def run_agent_loop(
                             history=history_for_backend,
                             lang=lang,
                             interrupt_event=_interrupt,
+                            messages=_thread_to_send,
                         )
                     except TypeError:
                         response = deps.call_backend(
@@ -3295,6 +3575,7 @@ def run_agent_loop(
                     history=history_for_backend,
                     lang=lang,
                     interrupt_event=_interrupt,
+                    messages=_thread_to_send,
                 )
             except TypeError:
                 response = deps.call_backend(
@@ -3339,79 +3620,22 @@ def run_agent_loop(
         billing = response.get("_billing", {})
         _prose_final = False
 
-        # ── Prose-only final answer ──
-        # The model emitted pure prose with NO JSON braces at all (_prose_only)
-        # and no tool calls. That is not a garbled tool attempt — it is the
-        # model's final conversational answer (a result report or a question
-        # back to the user). Previously this was treated as a parse failure: the
-        # reply was suppressed (display_reply="") and the loop kept re-prompting,
-        # regenerating the same answer every iteration while the user saw only a
-        # spinner and paid for each ~13k-token call. So accept it: clear the
-        # failure flag (surface the reply, skip the nudge); the completion
-        # decision below treats it as a terminal answer. Garbled JSON attempts
-        # (_parse_failed WITHOUT _prose_only, i.e. output did contain braces)
-        # still fall through to the repair path.
-        if response.get("_prose_only") and not tool_calls and reply:
-            response.pop("_parse_failed", None)
+        # ── Prose final answer ──
+        # A turn with no tool calls but a reply IS the model's final answer (a
+        # result report or a question back to the user). The completion decision
+        # below treats it as terminal.
+        if not tool_calls and reply:
             _prose_final = True
 
-        # ── JSON repair: model produced something that looked like JSON but
-        # didn't parse. Nudge it once or twice instead of giving up. ──
-        if response.get("_repair_needed"):
-            attempts = state.get("_repair_count", 0)
-            if attempts < 2:
-                state["_repair_count"] = attempts + 1
-                raw_excerpt = (response.get("_raw") or "")[:200]
-                _append_short_memory(state, (
-                    f"\n  ⚠ Malformed JSON (attempt {attempts+1}/2). "
-                    f"Raw start: {raw_excerpt!r}"
-                ))
-                if events_cb is not None:
-                    deps.console.print(
-                        f"[yellow]Response was not valid JSON — retrying (attempt {attempts+1}/2)[/yellow]")
-                # Skip dispatch this turn; next iteration's user_input will
-                # carry an inline error reminder built by _build_user_message
-                # (which reads state['_repair_count']).
-                add_debug_log(debug_entry)
-                if loop < max_loops - 1:
-                    try:
-                        time.sleep(0.5)
-                    except KeyboardInterrupt:
-                        _exit_reason = TRANSITION_INTERRUPTED
-                        break
-                memory_entries = _read_memory(deps)
-                history_context = _history_without_current_turn(chat_history, original_input)
-                user_input = _build_user_message(
-                    original_input, state, memory_entries, history_context, loop, max_loops,
-                )
-                # Append repair nudge to user_input directly so the model sees it
-                user_input += (
-                    f"\n\n<json_error>Your previous response did not parse as valid JSON. "
-                    f"Emit exactly ONE JSON object: "
-                    f'{{\"reply\": \"...\", \"tool_calls\": [{{\"name\": \"...\", \"arguments\": {{...}}}}]}}.'
-                    f" No prose outside the object. No code fences. "
-                    f"Raw start of last attempt: {raw_excerpt!r}</json_error>"
-                )
-                continue
-            else:
-                _append_short_memory(state, "\n  -Error: JSON repair gave up after 2 attempts")
-                add_debug_log(debug_entry)
-                _exit_reason = TRANSITION_REPAIR_GAVE_UP
-                break
-        else:
-            state["_repair_count"] = 0
-
-        # ── Detect "silent failure": model generated tokens but backend
-        # extracted nothing. This means the model's output didn't match the
-        # expected JSON schema. Bail out immediately with a useful message.
+        # ── Detect "silent failure": model billed tokens but produced no usable
+        # content (no reply text, no tool call). Retry a couple of times, then
+        # bail with a useful message. ──
         if not reply and not tool_calls:
             completion_tokens = (billing or {}).get("completionTokens", 0)
             if completion_tokens > 0:
                 msg = (
-                    f"AI generated {completion_tokens} tokens but backend extracted no fields. "
-                    f"The model likely produced output that didn't match the JSON schema "
-                    f"(e.g. plain text instead of `{{\"reply\": ...}}`). "
-                    f"Try rephrasing or shortening the prompt."
+                    f"AI generated {completion_tokens} tokens but produced no reply "
+                    f"text and no tool call. Try rephrasing or shortening the prompt."
                 )
                 silent_count = state.get("_silent_fail_count", 0) + 1
                 state["_silent_fail_count"] = silent_count
@@ -3419,8 +3643,8 @@ def run_agent_loop(
                     response["_parse_failed"] = True
                     done = False
                     if events_cb is not None:
-                        deps.console.print("[dim yellow](empty structured response — asking AI to retry JSON)[/dim yellow]")
-                    _append_short_memory(state, f"\n  -Format retry {silent_count}/2: {msg}")
+                        deps.console.print("[dim yellow](empty response — asking AI to retry)[/dim yellow]")
+                    _append_short_memory(state, f"\n  -Empty-response retry {silent_count}/2: {msg}")
                 else:
                     if events_cb is not None:
                         deps.console.print(f"[yellow]{msg}[/yellow]")
@@ -3455,40 +3679,23 @@ def run_agent_loop(
         # ── Handle JSON parse failure: nudge the model ──
         # When model outputs pure prose instead of JSON, show a subtle hint
         # and inject a reminder into the next turn.
-        _nudge_needed = False
-        if response.get("_parse_failed"):
-            _nudge_needed = True
-            _prose_only = response.get("_prose_only", False)
-            _truncated = response.get("_truncated", False)
-            _parse_fail_count = state.get("_parse_fail_count", 0) + 1
-            state["_parse_fail_count"] = _parse_fail_count
-            if _truncated:
-                # The failure is length, not formatting: the response hit the
-                # token ceiling mid-output (typically a whole-file write). Tell
-                # the model to chunk instead of uselessly retrying the same
-                # oversized write. The session-memory note carries into the next
-                # prompt so the model sees the hint.
-                _append_short_memory(state, (
-                    "\n  ⚠ Your last response was cut off at the output token "
-                    "limit — it was too long to finish. Do NOT rewrite the whole "
-                    "file in one call. Write it in chunks: fs.write the first "
-                    "part, then append the rest with fs.edit."
-                ))
-                if events_cb is not None:
-                    deps.console.print(
-                        "[yellow]⚠ Response truncated at token limit — asking AI to write in smaller chunks.[/yellow]")
-            # Suppress the user-visible warning for pure-prose responses — the content
-            # is correct, the model just forgot the JSON wrapper. Only warn when the
-            # model was clearly attempting (and garbling) JSON.
-            elif events_cb is not None and not _prose_only:
-                if _parse_fail_count == 1:
-                    deps.console.print(f"[dim yellow](formatting issue — asking AI to retry)[/dim yellow]")
-                elif _parse_fail_count >= 3:
-                    deps.console.print(f"[yellow]AI failed to use JSON format {_parse_fail_count} times. Consider rephrasing your request.[/yellow]")
-                    state["_parse_fail_count"] = 0
-        else:
-            # Reset counter on successful parse
-            state["_parse_fail_count"] = 0
+        # ── Truncation: the response hit the output-token ceiling mid-generation
+        # (typically one oversized write). Tell the model to chunk instead of
+        # retrying the same too-long write. The note carries into the next turn. ──
+        if response.get("_truncated"):
+            _append_short_memory(state, (
+                "\n  ⚠ Your last response was cut off at the output token "
+                "limit — it was too long to finish. Do NOT rewrite the whole "
+                "file in one call. Write it in chunks: write the first "
+                "part, then append the rest with edit."
+            ))
+            if events_cb is not None:
+                deps.console.print(
+                    "[yellow]⚠ Response truncated at token limit — asking AI to write in smaller chunks.[/yellow]")
+
+        # A retry is needed only on a genuine empty response (silent failure
+        # above set _parse_failed); it already printed its own hint.
+        _nudge_needed = bool(response.get("_parse_failed"))
 
         # 7. Show billing if available (opt-in via /config show_billing true)
         if billing and get_runtime_config("show_billing"):
@@ -3540,6 +3747,17 @@ def run_agent_loop(
                     continue
                 if not isinstance(arguments, dict):
                     arguments = {"value": arguments}
+
+                # User/model-facing display name: show the unified canonical
+                # name the model actually used (fs.read -> read) while dispatch
+                # keeps the internal name. Only when the unified catalog is on.
+                display_name = name
+                if get_runtime_config("use_unified_catalog"):
+                    try:
+                        from agent_tools import load as _load_catalog
+                        display_name = _load_catalog().canonical(name, "laintas_cli") or name
+                    except Exception:
+                        display_name = name
 
                 call_id = f"call_{loop+1:02d}_{idx+1:02d}"
                 salient = _salient_arg(name, arguments)
@@ -3727,7 +3945,7 @@ def run_agent_loop(
                 if events_cb is not None:
                     chat_history.append({
                         "role": "knowledge",
-                        "content": f"[{call_id}] {name}({salient[:60]}) → {formatted[:400]}",
+                        "content": f"[{call_id}] {display_name}({salient[:60]}) → {formatted[:400]}",
                     })
 
                 # ── Debug + events ──
@@ -3746,11 +3964,11 @@ def run_agent_loop(
 
                 if events_cb is not None:
                     ok_mark = "[green]✓[/green]" if result.get("ok") else "[red]✗[/red]"
-                    _hint = salient[:80] if salient else name
+                    _hint = salient[:80] if salient else display_name
                     deps.console.print(
-                        f"  {ok_mark} [dim cyan]{name}[/dim cyan] [dim]{_hint}[/dim]")
+                        f"  {ok_mark} [dim cyan]{display_name}[/dim cyan] [dim]{_hint}[/dim]")
                     pending_events.append({"type": "system", "kind": "tool",
-                                            "content": name,
+                                            "content": display_name,
                                             "meta": {"ok": result.get("ok", False),
                                                      "call_id": call_id,
                                                      "salient": salient[:200]}})
@@ -3795,11 +4013,14 @@ def run_agent_loop(
         # agents make completion an explicit act instead. So:
         #   - task.complete (_explicit_complete) or a pure-prose final answer
         #     (_prose_final) or an explicit done:true always end the loop.
+        #   - finish_reason == "stop" with no tool call is the native signal that
+        #     the model deliberately ended its turn — trust it (both modes).
         #   - Interactive mode: an empty-tool-call turn yields to the user, who
         #     drives the next turn — treat as done.
-        #   - Autonomous/execute mode: no user to re-prompt, so an empty-tool-call
-        #     turn is NOT done. Nudge toward task.complete and keep looping, with a
-        #     small counter so a model that never calls it can't burn every loop.
+        #   - Autonomous/execute mode with no finish_reason (or "length"): the
+        #     model may not be finished. Nudge toward task.complete and keep
+        #     looping, with a small counter so it can't burn every loop.
+        _finish_reason = response.get("finish_reason")
         if _explicit_complete:
             done = True
             if _complete_summary and not reply:
@@ -3812,11 +4033,20 @@ def run_agent_loop(
             done = False
             state["_no_action_count"] = 0
         else:
-            # No tool call and no affirmative completion signal.
+            # No tool call this turn.
             if events_cb is not None:
                 done = True   # interactive: hand control back to the user
                 state["_no_action_count"] = 0
+            elif _finish_reason == "stop" and not response.get("_parse_failed"):
+                # Native: the model explicitly ended its turn with a final answer
+                # and no tool call. Trust finish_reason instead of nudging.
+                # (A botched JSON-envelope attempt that also stopped is NOT a
+                # clean finish — let it fall through to the nudge/retry path.)
+                done = True
+                state["_no_action_count"] = 0
             else:
+                # finish_reason missing or "length" (truncated): the model may
+                # not be finished. Nudge toward task.complete and keep looping.
                 _no_action = state.get("_no_action_count", 0) + 1
                 state["_no_action_count"] = _no_action
                 if _no_action >= 3:
@@ -3835,11 +4065,41 @@ def run_agent_loop(
         # Skip recording format-failed steps: the plain-text apology would pollute
         # shortTermMemory and reinforce the wrong response pattern on the next retry.
         if not _nudge_needed:
+            # Record the ACTION and its RESULT only — never the model's own reply
+            # prose. Echoing the reply back into shortTermMemory (which is rendered
+            # into the next prompt) makes the model read its own "让我继续…" lines
+            # as step history and few-shot-mimic them, amplifying filler. Keep step
+            # memory to what's actually useful for resuming: what ran, what happened.
+            _step_note = action_desc_short or "(no tool call)"
             _append_short_memory(
                 state,
-                f"\n  Step {loop+1}: {_summarize_reply_for_memory(reply)} | tools: {action_desc_short} | result: {state.get('lastOutput','')[:200]}"
+                f"\n  Step {loop+1}: {_step_note} | result: {state.get('lastOutput','')[:200]}"
             )
         state["terminalHistory"].extend(per_call_rows)
+
+        # ── Commit this turn to the native message thread (Stage B) ──
+        # Only on a successful (non-nudge) turn, so failed/retry turns never
+        # pollute the thread. Build one `executed` entry per surfaced tool_call,
+        # pairing the model's full arguments with the dispatch result by the
+        # deterministic call_id; any call that was skipped (interrupt break)
+        # gets a synthetic result so no tool_call is left without a tool message.
+        if _thread_mode and not _nudge_needed:
+            # The raw task is already persisted (first turn) and the live-state is
+            # ephemeral (never committed). So commit ONLY this assistant turn and
+            # its tool results — keeping the permanent thread clean.
+            _rows_by_id = {r.get("call_id"): r for r in per_call_rows}
+            executed = []
+            for _idx, _tc in enumerate(tool_calls):
+                _cid = f"call_{loop+1:02d}_{_idx+1:02d}"
+                _row = _rows_by_id.get(_cid)
+                _out = _row.get("output") if _row else "[not executed: interrupted before dispatch]"
+                executed.append({
+                    "id": _cid,
+                    "name": _tc.get("name", ""),
+                    "arguments": _tc.get("arguments", {}),
+                    "output": _out,
+                })
+            thread_messages.extend(_thread_messages_for_turn(reply, executed))
 
         # ── Output similarity: track fingerprints for repetition detection ──
         # Mirrors Claude Code's TokenBudgetTracker: detects when consecutive
@@ -4020,18 +4280,16 @@ def run_agent_loop(
             original_input, state, memory_entries, history_context, loop, max_loops,
         )
 
-        # ── Inject nudge if model failed to use JSON format ──
-        # Prepend (not append) so the format reminder leads the context window
-        # and is not buried under accumulated shortTermMemory content.
+        # ── Inject nudge if the model produced an empty turn ──
+        # Prepend (not append) so the reminder leads the context window and is
+        # not buried under accumulated shortTermMemory content.
         if _nudge_needed:
-            json_reminder = (
-                "[SYSTEM: Output must be a JSON object. "
-                "Format: "
-                '{"reply": "...", "tool_calls": []} '
-                "— begin with { end with }]"
+            empty_reminder = (
+                "[SYSTEM: Your previous turn produced no reply and no tool call. "
+                "Either call a tool to make progress, or write your final answer.]"
                 "\n\n"
             )
-            user_input = json_reminder + user_input
+            user_input = empty_reminder + user_input
     else:
         # ── for-loop exhausted without break (max_loops reached) ──
         # The `else` clause of a for-loop runs only when the loop completes

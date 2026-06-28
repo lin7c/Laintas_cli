@@ -1,13 +1,20 @@
+import json
 import os
 
 from setuptools import setup
 
-# Single source of truth — read version.py directly so the packaged version
-# always matches what `/v` reports at runtime.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+
+# Single source of truth — package_manifest.json drives setup.py, both
+# PyInstaller specs, and build_download_assets.sh. Edit the JSON, not here.
+with open(os.path.join(_HERE, "package_manifest.json"), encoding="utf-8") as _f:
+    _pm = json.load(_f)
+
+# version.py is the runtime version source (read by updater.py / `/v` too).
 _version = "0.0.0"
 try:
     _vns = {}
-    with open(os.path.join(os.path.dirname(__file__), "version.py")) as _vf:
+    with open(os.path.join(_HERE, "version.py")) as _vf:
         exec(_vf.read(), _vns)
     _version = _vns.get("__version__", _version)
 except Exception:
@@ -18,35 +25,13 @@ setup(
     version=_version,
     description="Laintas CLI - Autonomous AI agent for your terminal",
     author="Laintas",
-    url="https://github.com/lin7c/laintas_cli_pre",
-    py_modules=[
-        "laintas_cli",
-        "version",
-        "updater",
-        "agent_loop",
-        "tools",
-        "skills",
-        "mcp_client",
-        "policy",
-        "memory_system",
-        "hooks",
-        "plan_mode",
-        "task_manager",
-        "agent_persistence",
-        "agent_roles",
-        "workflow_engine",
-        "paths",
-        "migrate",
-        "cloud_provider",
-        "hwo_runner",
-        "hwo_ui",
-    ],
-    install_requires=[
-        "requests>=2.28.0",
-        "certifi>=2024.0.0",
-        "rich>=13.0.0",
-        "prompt_toolkit>=3.0.0",
-    ],
+    url="https://github.com/lin7c/Laintas_cli",
+    packages=_pm["packages"],
+    py_modules=_pm["modules"],
+    package_data=_pm["package_data"],
+    include_package_data=True,
+    install_requires=_pm["core_requires"],
+    extras_require=_pm["extras_require"],
     entry_points={
         "console_scripts": [
             "laintas-cli=laintas_cli:main",
@@ -54,7 +39,7 @@ setup(
     },
     python_requires=">=3.10",
     classifiers=[
-        "Development Status :: 3 - Alpha",
+        "Development Status :: 4 - Beta",
         "Environment :: Console",
         "Intended Audience :: Developers",
         "License :: OSI Approved :: MIT License",

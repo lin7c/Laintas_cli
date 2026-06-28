@@ -284,6 +284,34 @@ def load_skill(name: str) -> tuple[bool, str]:
     return _load_skill_full(name)
 
 
+def unload_skill(name: str) -> tuple[bool, str]:
+    """Unload a previously-loaded skill (the inverse of ``load_skill``).
+
+    Drops the tools the skill registered (source ``skill:<name>``), clears its
+    loaded flag so its body stops being injected via ``{{skillContext}}``, and
+    forgets the imported module so a later ``load_skill`` re-imports a fresh
+    copy. Metadata stays scanned, so the skill remains listable and reloadable.
+    Returns ``(ok, message)``.
+    """
+    if not _scan_done:
+        scan_metadata()
+    state = _skill_states.get(name)
+    if state is None or not state.loaded:
+        return False, f"{name}: not loaded"
+
+    removed = 0
+    try:
+        removed = get_registry().unregister_source(f"skill:{name}")
+    except Exception:
+        pass
+    state.tools.clear()
+    # Drop the imported skill.py module so re-loading picks up edits/fresh state.
+    sys.modules.pop(f"laintas_skill_{name}", None)
+    state.module = None
+    state.loaded = False
+    return True, f"{name}: unloaded ({removed} tool(s) removed)"
+
+
 def list_skills() -> list[dict]:
     """Return lightweight skill catalog for tools/UI."""
     if not _scan_done:
