@@ -28,6 +28,7 @@ import workflow_engine        # Structured multi-phase workflow engine
 import task_manager          # Structured task tracking (session + persisted)
 import paths                 # Centralized path management
 import skills as skills_mod   # Progressive skill metadata + context loading
+import event_log              # Durable prompt admission + turn event log
 try:
     import context_policy as ctxpol  # Vendored shared compaction policy (opencode-derived)
 except Exception:  # pragma: no cover — graceful if the vendored package is missing
@@ -80,13 +81,72 @@ _DEFAULT_CONFIG = {
     "browser_auto_snapshot": True,     # return page snapshot after state-changing browser actions
 }
 
-# ── Transition Labels (mirrors Claude Code State.transition) ─────────
+# ── Typed Error Classes ───────────────────────────────────────────────
+# Inspired by opencode's RunError union: each error type carries structured
+# context instead of a bare string. Used in the critical paths (backend call,
+# tool dispatch, context management). The agent loop catches these to choose
+# the right recovery strategy instead of blanket-swallowing all exceptions.
+
+class AgentLoopError(Exception):
+    """Base for all typed agent-loop errors."""
+    def __init__(self, message: str = "", **context):
+        super().__init__(message)
+        self.message = message
+        self.context = context
+
+    def __str__(self):
+        if self.context:
+            ctx = ", ".join(f"{k}={v}" for k, v in self.context.items())
+            return f"{self.message} ({ctx})" if self.message else ctx
+        return self.message
+
+
+class BackendError(AgentLoopError):
+    """Backend returned an error response (HTTP error, server error)."""
+
+
+class ContextOverflowError(AgentLoopError):
+    """Provider context window exceeded — triggers reactive compaction."""
+
+
+class ToolError(AgentLoopError):
+    """Tool invocation failed (validation, execution, or policy block)."""
+
+
+class InterruptError(AgentLoopError):
+    """User or control-plane interrupted the loop."""
+
+
+class ParseError(AgentLoopError):
+    """Model response could not be parsed into structured fields."""
+
+
+# ── Diagnostic logging (uses debug ring buffer when available) ─────────
+_debug_log: list[dict] = []
+
+def _diag(message: str, **context) -> None:
+    """Log a diagnostic event to the in-memory debug ring buffer.
+    
+    Non-fatal errors that were previously silently swallowed now leave a
+    trace here, visible via /debug without polluting the console.
+    """
+    _debug_log.append({
+        "ts": datetime.now().strftime("%H:%M:%S.%f")[:-3],
+        "msg": message,
+        "ctx": context,
+    })
+    if len(_debug_log) > 200:
+        _debug_log.pop(0)
+
+
+# ── Transition Labels ─────────────────────────────────────────────
 # Every exit from the agent loop carries a named reason string for
 # telemetry, debugging, and programmatic inspection.
 # Continue reasons (loop will iterate again):
 TRANSITION_NEXT_TURN = "next_turn"                      # normal progression
 TRANSITION_REPAIR_RETRY = "repair_retry"                # JSON repair nudge
 TRANSITION_PARSE_RETRY = "parse_retry"                  # parse-failure nudge
+TRANSITION_OVERFLOW_RETRY = "overflow_retry"            # context overflow → compact + retry
 
 # Exit reasons (loop will terminate):
 TRANSITION_COMPLETED = "completed"                      # model set done=true
@@ -508,8 +568,7 @@ def _summarize_dropped_turns(dropped: list) -> str:
     Long sessions exceed the full-fidelity window; rather than silently losing
     the early context (like the original goal and intermediate user asks), we
     keep a no-LLM digest of the highest-signal items — the user's own
-    instructions — so /resume can prepend them. Mirrors the intent of Claude's
-    compaction summary without an extra API call.
+    instructions — so /resume can prepend them without an extra API call.
     """
     if not dropped:
         return ""
@@ -1383,7 +1442,7 @@ _MAX_HISTORY_ENTRIES = 8       # compress when terminalHistory exceeds this
 _COMPRESSION_KEEP_RECENT = 4   # always keep this many recent entries uncompressed
 _MAX_RETRIES = 2               # automatic retries for transient failures
 _CONSECUTIVE_FAILURE_LIMIT = 3  # warn AI after this many consecutive failures
-_TOOL_RESULT_BUDGET = 50_000   # chars — max per-entry output before disk persist (mirrors Claude Code's 50k cap)
+_TOOL_RESULT_BUDGET = 50_000   # chars — max per-entry output before disk persist
 
 # ── Error pattern recognition ──────────────────────────────────────────
 # Maps regex patterns to (category, suggestion) tuples.
@@ -1567,8 +1626,8 @@ def _summarize_old_entries(old_entries: list) -> dict:
         else:
             # Preserve first 150 chars of successful output — prevents amnesia
             # that causes the model to re-read files it already examined.
-            # Mirrors Claude Code's approach of retaining key signal in compressed
-            # history so the model doesn't repeat exploratory steps.
+            # Retain key signal in compressed history so the model doesn't
+            # repeat exploratory steps.
             out_snip = ""
             if output and output.strip():
                 _out_lines = [l.strip() for l in output.split('\n') if l.strip()]
@@ -1776,6 +1835,28 @@ def _serialize_turns_for_summary(messages: list) -> str:
     return "\n".join(parts)
 
 
+_OVERFLOW_RE = re.compile(
+    r"context.{0,5}length|maximum.{0,5}context|too many tokens|"
+    r"input.*?too long|prompt.*?too long|"
+    r"tokens?.*?exceed|exceed.{0,10}context|"
+    r"reduce.{0,10}prompt|context_window_exceeded|"
+    r"maximum.{0,10}number.{0,10}tokens|"
+    r"total.{0,10}tokens.{0,10}exceed",
+    re.IGNORECASE,
+)
+
+
+def _is_context_overflow(error_text: str) -> bool:
+    """Detect provider context-overflow errors from the response error text.
+
+    Matches messages from OpenAI, DeepSeek, Anthropic, Gemini, and Bedrock
+    (e.g. "context length exceeded", "maximum context length", "too many tokens").
+    """
+    if not error_text:
+        return False
+    return bool(_OVERFLOW_RE.search(str(error_text)))
+
+
 def _llm_summarize(deps, session, current_path: str, head_text: str,
                    prev_summary: Optional[str], lang: str) -> Optional[str]:
     """Summarize the conversation HEAD into opencode's structured running summary.
@@ -1838,7 +1919,8 @@ def _serialize_thread_msg(m: dict) -> str:
     return ""
 
 
-def _compact_thread_messages(thread_messages: list, deps, session, lang: str, state: dict) -> bool:
+def _compact_thread_messages(thread_messages: list, deps, session, lang: str, state: dict,
+                             *, force: bool = False) -> bool:
     """opencode-style compaction of the native message thread, IN PLACE.
 
     When the thread exceeds the model's usable window: (1) PRUNE — truncate old
@@ -1848,6 +1930,10 @@ def _compact_thread_messages(thread_messages: list, deps, session, lang: str, st
     Always keeps thread_messages[0] (the task) and never splits an assistant
     tool_call from its paired role:tool result. Returns True if it changed the
     thread. Never raises — compaction must not break the loop.
+
+    When ``force=True`` (reactive overflow recovery), skips the token-count gate
+    and always proceeds to prune + summarize — used after a provider
+    context-overflow error to shrink the thread before retrying the turn.
     """
     if ctxpol is None or len(thread_messages) < 4:
         return False
@@ -1855,7 +1941,7 @@ def _compact_thread_messages(thread_messages: list, deps, session, lang: str, st
         window = int(get_runtime_config("model_context_window") or 64000)
         max_out = int(get_runtime_config("max_tokens") or 8192)
         usable = ctxpol.usable_tokens(window, max_out)
-        if usable <= 0 or _thread_tokens(thread_messages) <= usable:
+        if not force and (usable <= 0 or _thread_tokens(thread_messages) <= usable):
             return False
 
         # Recent tail to preserve verbatim (token-budgeted, from the end).
@@ -1882,7 +1968,7 @@ def _compact_thread_messages(thread_messages: list, deps, session, lang: str, st
                 if t != c:
                     m["content"] = t
                     changed = True
-        if _thread_tokens(thread_messages) <= usable:
+        if not force and _thread_tokens(thread_messages) <= usable:
             return changed
 
         # 2) Summarize the head. Start the tail on a clean boundary — never on a
@@ -2103,8 +2189,7 @@ def _build_terminal_section(state: dict) -> str:
         cmd_label = entry.get('command', '')[:120]
 
         # ── Tool Result Budget: cap oversized outputs (zero LLM cost layer) ──
-        # Mirrors Claude Code's per-message 50k char cap: persist oversized
-        # output to disk and show only the tail.
+        # Persist oversized output to disk and show only the tail.
         if len(output) > _TOOL_RESULT_BUDGET:
             try:
                 import tempfile as _tempfile
@@ -2264,8 +2349,7 @@ def _output_fingerprint(text: str) -> str:
 
     Strips ANSI, timestamps, hex addresses, numbers, paths, and collapses
     whitespace. Two outputs with the same fingerprint are semantically
-    identical modulo variable data. Mirrors Claude Code's TokenBudgetTracker
-    approach of detecting diminishing returns.
+    identical modulo variable data. Used for detecting diminishing returns.
     """
     if not text:
         return ""
@@ -2306,9 +2390,8 @@ def _detect_loop_warnings_typed(state: dict, original_input: str) -> list[tuple[
     breaker to track per-type streaks). The message is the human-readable
     warning text for the <warnings> block.
 
-    Mirrors Claude Code's approach of classifying each diagnostic signal
-    so that repeated signals of the same type can escalate from advisory
-    to enforcement.
+    Classifies each diagnostic signal so that repeated signals of the
+    same type can escalate from advisory to enforcement.
 
     Checks:
     1. Same exact command 3+ consecutive times
@@ -2529,6 +2612,23 @@ def _thread_messages_for_turn(reply: str, executed: list) -> list:
     return msgs
 
 
+# Inputs that signal the user wants to resume prior work. An empty line (Enter)
+# plus a small set of continue/resume phrases. Other inputs — even a casual
+# "你好" — must NOT trigger auto-resume of an in_progress task.
+_CONTINUE_PREFIXES = (
+    "继续", "接着", "continue", "resume", "proceed", "go on",
+    "go ahead", "keep going", "carry on",
+)
+
+
+def _is_continue_request(text: str) -> bool:
+    """True if the user is asking to resume prior work (empty or continue phrase)."""
+    t = (text or "").strip().lower()
+    if not t:
+        return True
+    return any(t.startswith(p) for p in _CONTINUE_PREFIXES)
+
+
 def _build_user_message(original_input: str, state: dict, memory_entries: list,
                         chat_history: list, loop: int, max_loops: int,
                         thread_mode: bool = False, first_turn: bool = True) -> str:
@@ -2610,13 +2710,15 @@ def _build_user_message(original_input: str, state: dict, memory_entries: list,
     if objective and objective != str(original_input or "").strip():
         objective_block = f"\n<objective>\n{objective}\n</objective>\n"
 
-    # Continuation guidance: only for empty input (user hit Enter to proceed).
-    # Non-empty inputs like "继续" / "继续项目" are judged by the AI from context.
+    # Continuation guidance: fires only when the user is actually asking to
+    # resume — an empty line (Enter) or an explicit continue/resume phrase.
+    # A casual new input like "你好" must NOT trigger auto-resume; the AI just
+    # answers it, and <active_tasks> is shown as reference only.
     continuation_block = ""
-    if not (original_input or "").strip():
+    if _is_continue_request(original_input):
         continuation_block = (
             "\n<continuation>\n"
-            "The user sent an empty line — proceed with current work. "
+            "The user wants to resume prior work. "
             "Resume the in_progress item in <active_tasks>; if none, "
             "check <objective>. Only ask the user if both are empty.\n"
             "</continuation>\n"
@@ -3216,8 +3318,7 @@ def run_agent_loop(
                 import snapshot as _snap
                 if _snap.create(os.getcwd(), f"task: {(original_input or '').strip()[:60]}"):
                     state["_snapshot_done"] = True
-            except Exception:
-                pass
+            except Exception as _e: _diag("snapshot_create_failed", error=str(_e))
         if state.get("terminalHistory"):
             state["terminalHistory"] = _trim_carried_outputs(state["terminalHistory"])
     state["shortTermMemory"] = _trim_short_term_memory(state.get("shortTermMemory", ""))
@@ -3284,11 +3385,18 @@ def run_agent_loop(
     _output_fingerprints: list[str] = []   # rolling window of recent output fingerprints
     _no_progress_count = 0                 # consecutive steps with high similarity
     _repetition_threshold = int(get_runtime_config("repetition_threshold"))
-    # ── Warning circuit breaker (mirrors Claude Code's thrashing detection) ──
+    # ── Warning circuit breaker ─────────────────────────────────────
     _warning_streaks: dict[str, int] = {}  # warning_type -> consecutive count
     _warning_force_limit = int(get_runtime_config("warning_force_limit"))
     _force_exit = False                    # set by circuit breaker to break out of nested logic
     self_info = get_agent(agent_id) if agent_id else None
+    # ── Durable prompt admission (opencode pattern) ──
+    # Write the prompt to the event log BEFORE execution starts, so a crash
+    # never loses what the user asked. Recovery can detect an incomplete task.
+    event_log.append("prompt_admitted",
+                     text=(original_input or "")[:500],
+                     cwd=os.getcwd(),
+                     agent_id=agent_id or "")
     for loop in range(max_loops):
         _loop_id = next_debug_loop()
         history_context = _history_without_current_turn(chat_history, original_input)
@@ -3338,7 +3446,7 @@ def run_agent_loop(
         memory_entries = _read_memory(deps)
 
         # ── Microcompact: strip old tool outputs to save context window ──
-        # Mirrors Claude Code's microcompact layer: zero-cost context recovery.
+        # Microcompact: zero-cost context recovery.
         _micro_keep = int(get_runtime_config("microcompact_keep"))
         state["terminalHistory"] = _microcompact_history(
             state["terminalHistory"], keep_recent=_micro_keep
@@ -3555,12 +3663,12 @@ def run_agent_loop(
                     if stream_state["reply"]:
                         parts.append(deps.Markdown(stream_state["reply"]))
                     else:
-                        parts.append(Spinner("dots", text=Text("AI thinking...", style="bold green")))
+                        parts.append(Spinner("dots", text=Text("thinking…", style="#7aa2f7")))
                     if stream_state["command"]:
                         cmd_preview = stream_state["command"]
                         if len(cmd_preview) > 120:
                             cmd_preview = cmd_preview[:117] + "..."
-                        parts.append(Text(f"→ {cmd_preview}", style="dim cyan"))
+                        parts.append(Text(f"→ {cmd_preview}", style="#5a7bbf"))
                     return Group(*parts)
 
                 _live_holder = {"live": None}
@@ -3580,7 +3688,7 @@ def run_agent_loop(
                     _lv = _live_holder["live"]
                     if _lv is not None:
                         try: _lv.update(_render())
-                        except Exception: pass
+                        except Exception as _e: _diag("live_render_failed", error=str(_e))
 
                 def _do_stream_call():
                     try:
@@ -3612,11 +3720,11 @@ def run_agent_loop(
                         _live_holder["live"] = live
                         response = _do_stream_call()
                 else:
-                    with deps.console.status("[bold green]AI thinking...[/bold green]",
+                    with deps.console.status("[#7aa2f7]thinking…[/#7aa2f7]",
                                              spinner="dots"):
                         response = _do_stream_call()
             except ImportError:
-                with deps.console.status("[bold green]AI thinking...[/bold green]", spinner="dots"):
+                with deps.console.status("[#7aa2f7]thinking…[/#7aa2f7]", spinner="dots"):
                     try:
                         response = deps.call_backend(
                             session=session,
@@ -3684,9 +3792,24 @@ def run_agent_loop(
         debug_entry.billing = response.get("_billing", {})
 
         if response.get("error"):
+            _err_text = response.get("reply", "") or ""
+            # ── Reactive overflow recovery (opencode compactAfterOverflow) ──
+            # If the provider returned a context-overflow error, force-compaction
+            # the thread and retry the turn ONCE. Our cheap token estimate may
+            # disagree with the provider's real count, so we trust the error.
+            if (_is_context_overflow(_err_text)
+                    and _thread_mode
+                    and not state.get("_overflow_compacted")
+                    and len(thread_messages) > 3):
+                state["_overflow_compacted"] = True
+                if events_cb is not None:
+                    deps.console.print("[dim yellow](context overflow — compacting and retrying)[/dim yellow]")
+                _compact_thread_messages(thread_messages, deps, session, lang, state, force=True)
+                add_debug_log(debug_entry)
+                continue
             if events_cb is not None:
-                deps.console.print(f"[red]{response['reply']}[/red]")
-            _append_short_memory(state, f"\n  -Error: {response['reply']}")
+                deps.console.print(f"[red]{_err_text}[/red]")
+            _append_short_memory(state, f"\n  -Error: {_err_text}")
             add_debug_log(debug_entry)
             _exit_reason = TRANSITION_BACKEND_ERROR
             break
@@ -3731,15 +3854,32 @@ def run_agent_loop(
         elif reply or tool_calls:
             state["_silent_fail_count"] = 0
 
+        # ── Durable event: record AI response (crash recovery trail) ──
+        event_log.append("ai_response",
+                         reply=(reply or "")[:200],
+                         tool_count=len(tool_calls),
+                         loop=loop + 1)
+
         # 6. Print AI reply (only in interactive mode). If the response failed
         # structural parsing, do not surface the malformed text as a normal
         # answer; the next turn gets a format nudge instead.
         display_reply = "" if response.get("_parse_failed") else reply
         if display_reply:
             if events_cb is not None and not _reply_already_rendered:
-                deps.console.print(deps.Markdown(display_reply))
+                _stripped = display_reply.strip()
+                # Short, single-line replies render inline (dim, marker) instead
+                # of a full Markdown block — keeps the transcript tight when the
+                # AI just acknowledges or narrates briefly.
+                if "\n" not in _stripped and len(_stripped) <= 100:
+                    deps.console.print(f"[accent]·[/accent] [dim]{_stripped}[/dim]")
+                else:
+                    deps.console.print(deps.Markdown(display_reply))
             step_replies.append(display_reply)
             state["lastReply"] = display_reply
+            event_log.append("ai_response",
+                             reply=(reply or "")[:200],
+                             tool_calls=[tc.get("name", "?") for tc in (tool_calls or [])],
+                             loop=loop + 1)
             if events_cb is not None:
                 if _reply_already_rendered:
                     # Streaming chunks already sent; signal end-of-stream so
@@ -4062,25 +4202,27 @@ def run_agent_loop(
                                 deps.display_sub_terminal_preview(
                                     salient, formatted[:2000],
                                     depth=depth + 1, alive=_alive)
-                            except Exception:
-                                pass
+                            except Exception as _e: _diag("display_sub_terminal_failed", tool=name, error=str(_e))
                         elif result.get("via") in ("subprocess", "parent", "loop_command"):
                             try:
                                 deps.display_command_output(salient, _rc, formatted, depth=depth + 1)
-                            except Exception:
-                                pass
+                            except Exception as _e: _diag("display_command_output_failed", tool=name, error=str(_e))
                     elif name in ("fs.write", "fs.edit", "fs.multi_edit") and result.get("diff"):
                         try:
                             deps.display_file_diff(result.get("path") or salient or name,
                                                    result.get("diff", ""),
                                                    depth=depth + 1)
-                        except Exception:
-                            pass
+                        except Exception as _e: _diag("display_file_diff_failed", tool=name, error=str(_e))
 
         # Concat all per-call outputs into lastOutput so the next prompt's fallback
         # rendering and shortTermMemory see every result, not just the last.
         if formatted_outputs:
             state["lastOutput"] = ("\n---\n".join(formatted_outputs))[: int(get_runtime_config("output_truncate") or 3000) * 2]
+            for _row in per_call_rows:
+                event_log.append("tool_result",
+                                 name=_row.get("tool", ""),
+                                 ok=_row.get("returncode", -1) == 0,
+                                 loop=loop + 1)
 
         # ── Completion decision (affirmative, not inferred from empty tool_calls) ──
         # Historically `done` defaulted to `len(tool_calls)==0`, so ANY turn the
@@ -4180,8 +4322,8 @@ def run_agent_loop(
             thread_messages.extend(_thread_messages_for_turn(reply, executed))
 
         # ── Output similarity: track fingerprints for repetition detection ──
-        # Mirrors Claude Code's TokenBudgetTracker: detects when consecutive
-        # steps produce highly similar output (diminishing returns).
+        # Detects when consecutive steps produce highly similar output
+        # (diminishing returns).
         # Pick this step's signal. lastOutput is "sticky": it only refreshes when
         # a step produces fresh tool output (see the `if formatted_outputs:` guard
         # above), so on reply-only / empty-output steps it carries over unchanged.
@@ -4227,8 +4369,8 @@ def run_agent_loop(
             break
 
         # ── Warning circuit breaker: escalate repeated warnings to force-exit ──
-        # Mirrors Claude Code's thrashing detection: when the same diagnostic
-        # signal fires 3+ consecutive times, escalate from advisory to enforcement.
+        # When the same diagnostic signal fires 3+ consecutive times,
+        # escalate from advisory to enforcement.
         _current_warning_keys = [k for k, _m in _detect_loop_warnings_typed(state, original_input)]
         _new_streaks: dict[str, int] = {}
         for wk in _current_warning_keys:
@@ -4372,7 +4514,7 @@ def run_agent_loop(
         # ── for-loop exhausted without break (max_loops reached) ──
         # The `else` clause of a for-loop runs only when the loop completes
         # all iterations without a `break`. This is the max_loops exhaustion
-        # case. Mirrors Claude Code's maxTurns with explicit recovery message.
+        # case. Max turns exhaustion with explicit recovery message.licit recovery message.
         _exit_reason = TRANSITION_MAX_LOOPS
         _exhaustion_msg = (
             f"Turn limit reached ({max_loops}/{max_loops}). "
@@ -4387,6 +4529,7 @@ def run_agent_loop(
             reply = _exhaustion_msg
 
     # ── Telemetry: log exit reason to debug ──
+    event_log.append("turn_ended", reason=_exit_reason, loops=loop + 1)
     _last_debug_entries = get_debug_logs()
     if _last_debug_entries:
         _last_debug_entries[-1].loop_exit_reason = _exit_reason

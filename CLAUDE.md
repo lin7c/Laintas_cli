@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance for AI coding assistants when working with code in this repository.
 
 ## Authoritative References
 
@@ -46,7 +46,7 @@ The project has grown from two core modules to ten, organized in layers:
 
 **Cross-cutting subsystems:**
 - **`policy.py`** (~370 lines) — Security policy engine: evaluates every command as allow/needs_approval/deny via regex rules. Config in `~/.laintas/policy.json` (mtime-cached, zero-restart updates). Audit log in `~/.laintas/audit.log`. Three modes: audit, enforce, disabled.
-- **`memory_system.py`** (~290 lines) — Cross-session persistent memory mirroring Claude Code's architecture: 4 types (user/feedback/project/reference), stored as markdown files with frontmatter in `~/.laintas/memory/`, indexed by `MEMORY.md`.
+- **`memory_system.py`** (~290 lines) — Cross-session persistent memory: 4 types (user/feedback/project/reference), stored as markdown files with frontmatter in `~/.laintas/memory/`, indexed by `MEMORY.md`.
 - **`hooks.py`** (~270 lines) — Event-driven hook system: pre_command, post_command, pre_tool, post_tool, on_session_start/end, on_error, on_memory_change. Config in `~/.laintas/hooks.json`; Python hooks in `~/.laintas/hooks.py` (mtime-cached).
 - **`plan_mode.py`** (~260 lines) — Structured planning: `/plan enter` → AI explores & designs → writes plan to `~/.laintas/plans/<name>.md` → `/plan approve` → execution.
 - **`task_manager.py`** (~180 lines) — Persistent task tracking in `~/.laintas/tasks.json` with status workflow (pending→in_progress→completed) and dependency links.

@@ -322,7 +322,7 @@ def get_active_tasks_snapshot(*, cwd: str = None) -> str:
     if not ordered:
         return ""
 
-    lines = ["Active tasks (the plan — resume from here on 'continue'):"]
+    lines = ["Open tasks (reference only — do not auto-resume; wait for the user to ask):"]
     for t in ordered[:10]:  # cap at 10
         status_mark = "▶" if t.get("status") == "in_progress" else "○"
         progress = t.get("progress", 0)

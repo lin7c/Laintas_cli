@@ -1,6 +1,6 @@
 """Structured multi-phase workflow engine for laintas_cli.
 
-Inspired by Claude Code's feature-dev 7-phase workflow, this engine manages
+A structured multi-phase workflow engine that manages
 structured workflows with distinct phases, each having its own system prompt
 injection, allowed tools, user confirmation requirements, and auto-spawned
 agent roles.

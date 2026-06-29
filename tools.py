@@ -78,6 +78,46 @@ class Tool:
     source: str = "builtin"
 
 
+# ── Input validation ───────────────────────────────────────────────────
+
+def _validate_params(params: dict, schema: dict) -> Optional[str]:
+    """Validate ``params`` against a JSONSchema. Returns an error string or None.
+
+    Uses ``jsonschema`` when available for full draft-07 validation; falls back
+    to a lightweight required + type check so the gate works even without the
+    dependency. Never raises — validation errors are returned as strings.
+    """
+    if not isinstance(params, dict):
+        return f"expected object, got {type(params).__name__}"
+    try:
+        import jsonschema
+        jsonschema.validate(params, schema)
+        return None
+    except ImportError:
+        pass
+    except jsonschema.ValidationError as e:
+        path = ".".join(str(p) for p in e.absolute_path) or "(root)"
+        return f"param '{path}': {e.message}"
+    except Exception:
+        pass
+    # Lightweight fallback: check required + basic types
+    required = schema.get("required") or []
+    for r in required:
+        if r not in params:
+            return f"missing required param '{r}'"
+    props = schema.get("properties") or {}
+    _py_types = {"string": str, "integer": int, "number": (int, float),
+                 "boolean": bool, "array": list, "object": dict}
+    for k, v in params.items():
+        if k not in props:
+            continue
+        ptype = (props[k] or {}).get("type")
+        if ptype and ptype in _py_types:
+            if not isinstance(v, _py_types[ptype]):
+                return f"param '{k}': expected {ptype}, got {type(v).__name__}"
+    return None
+
+
 # ── Registry ───────────────────────────────────────────────────────────
 
 class ToolRegistry:
@@ -115,11 +155,19 @@ class ToolRegistry:
     def invoke(self, name: str, params: dict, ctx: ToolCtx) -> dict:
         """Look up and invoke a tool. Catches exceptions; never raises.
 
-        Returns shape: {ok: bool, result?: any, error?: str, tool: name}.
+        Validates params against the tool's JSONSchema before calling the
+        tool's invoke callable. Returns shape:
+        {ok: bool, result?: any, error?: str, tool: name}.
         """
         tool = self._tools.get(name)
         if tool is None:
             return {"ok": False, "error": f"tool '{name}' not found", "tool": name}
+        # ── Input validation (opencode Schema.Struct gate) ──
+        schema = tool.schema
+        if schema and isinstance(schema, dict) and schema.get("properties") is not None:
+            _vErr = _validate_params(params or {}, schema)
+            if _vErr:
+                return {"ok": False, "tool": name, "error": _vErr, "_validation_error": True}
         try:
             out = tool.invoke(params or {}, ctx)
             if not isinstance(out, dict):
@@ -470,7 +518,7 @@ def _bi_fs_read(params: dict, ctx: ToolCtx) -> dict:
       max_bytes:  hard byte cap on returned payload (default 200_000)
       line_numbers: prepend each line with "N→ " (default True)
 
-    Behaviour mirrors Claude Code's Read tool: prefer offset/limit over
+    Prefer offset/limit over
     max_bytes for large files; line numbers make follow-up fs.edit calls
     trivial because the AI can refer to exact lines.
     """
@@ -711,7 +759,7 @@ def _bi_plan_list(params: dict, ctx: ToolCtx) -> dict:
 
 
 def _bi_fs_edit(params: dict, ctx: ToolCtx) -> dict:
-    """Exact string replacement in a file (like Claude Code's Edit tool).
+    """Exact string replacement in a file.
 
     Finds old_string in the file and replaces it with new_string.
     If old_string is not unique, requires replace_all: true.

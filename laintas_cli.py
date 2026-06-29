@@ -84,6 +84,8 @@ from rich.table import Table
 from rich.live import Live
 from rich.spinner import Spinner
 from rich.text import Text
+from rich.theme import Theme
+from rich import box
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.application import Application
@@ -97,7 +99,23 @@ from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.layout.controls import BufferControl
 
-console = Console()
+# ── Central UI theme ──────────────────────────────────────────────────
+# Minimal palette: one accent, muted secondaries, semantic status colors.
+# Use these names instead of inline literals so the whole UI restyles here.
+LAINTAS_THEME = Theme({
+    "accent":   "#7aa2f7",          # primary brand-ish accent (soft blue)
+    "accent.dim": "#5a7bbf",
+    "success":  "#9ece6a",
+    "error":    "bold #f7768e",
+    "warning":  "#e0af68",
+    "muted":    "#6b7280",
+    "agent":    "#bb9af7",          # agent / orchestration (soft violet)
+    "path":     "bold #7aa2f7",
+    "glyph":    "#7aa2f7",
+    "rule":     "#3b4261",
+})
+
+console = Console(theme=LAINTAS_THEME)
 
 try:
     from version import __version__
@@ -1107,108 +1125,112 @@ class InteractiveSession:
 
 # ── Collapsed Output Display ─────────────────────────────────────────~~~
 
+def _fmt_elapsed(elapsed: float) -> str:
+    if elapsed <= 0:
+        return ""
+    if elapsed < 1:
+        return f"{elapsed * 1000:.0f}ms"
+    if elapsed < 60:
+        return f"{elapsed:.1f}s"
+    m, s = divmod(int(elapsed), 60)
+    return f"{m}m{s}s"
+
+
+def _emit_block(title: str, status_label: str, status_style: str,
+                meta: str, preview_lines: list, depth: int,
+                line_style: str = "muted") -> None:
+    """Render a borderless, minimal output block.
+
+    A status-colored left bar marks the header; preview lines are dimmed and
+    indented. No box — keeps the transcript clean and scannable.
+    """
+    pad = "  " * depth
+    bar = "[%s]▍[/%s]" % (status_style, status_style)
+    head = f"{pad}{bar} [bold]{title[:80]}[/bold]"
+    if status_label:
+        head += f"  [{status_style}]{status_label}[/{status_style}]"
+    if meta:
+        head += f"  [muted]{meta}[/muted]"
+    console.print(head)
+    inner = pad + "  "
+    for ln in preview_lines:
+        console.print(f"{inner}[{line_style}]{ln}[/{line_style}]")
+
+
 def display_command_output(command: str, returncode: int, output: str, depth: int = 0, elapsed: float = 0.0) -> None:
-    """Display command output in a collapsed Rich Panel.
+    """Display command output as a compact, borderless block.
 
-    Shows a compact summary: command name, exit status, elapsed time,
-    preview of output, and size info. Full output is stored in agent state
-    for AI context and viewable via /debug.
-
-    depth=0: user's terminal, full width panel
-    depth>=1: sub-agent tool, indented panel with dimmed border
+    Shows command, exit status, elapsed time and a short preview. Full output
+    is stored in agent state and viewable via /debug.
     """
     lines = output.split("\n") if output else []
     line_count = len(lines)
     byte_count = len(output.encode("utf-8", errors="replace"))
 
     if returncode == 0:
-        status_text = "OK"
-        base_style = "green"
+        status_label, status_style = "OK", "success"
     elif returncode == -1:
-        status_text = "RUNNING"
-        base_style = "yellow"
+        status_label, status_style = "RUNNING", "warning"
     else:
-        status_text = f"EXIT {returncode}"
-        base_style = "red"
+        status_label, status_style = f"EXIT {returncode}", "error"
 
-    # At depth>=1, dim the border to distinguish from user's terminal output
-    border_style = base_style if depth == 0 else f"dim {base_style}"
+    t = _fmt_elapsed(elapsed)
+    status_label = f"{status_label} · {t}" if t else status_label
 
-    # Build compact title with optional elapsed time
-    time_part = ""
-    if elapsed > 0:
-        if elapsed < 1:
-            time_part = f" {elapsed * 1000:.0f}ms"
-        elif elapsed < 60:
-            time_part = f" {elapsed:.1f}s"
-        else:
-            m, s = divmod(int(elapsed), 60)
-            time_part = f" {m}m{s}s"
-    title = f"[bold]{command[:80]}[/bold]  [{border_style}]{status_text}{time_part}[/{border_style}]"
-
-    preview = output[:200]
-
+    preview = output.strip()[:200].split("\n")
+    preview = [p for p in preview if p.strip()][:3]
     if line_count == 0 and byte_count == 0:
-        summary = "[dim](no output)[/dim]"
+        meta = "no output"
+        preview = []
     else:
-        summary = f"[dim]{line_count} lines, {byte_count} bytes  |  use /debug to view full output[/dim]"
+        meta = f"{line_count}L {byte_count}B · /debug"
 
-    body = f"[dim]{preview}[/dim]\n\n{summary}"
-
-    panel = Panel(body, title=title, border_style=border_style)
-    if depth > 0:
-        console.print(Padding(panel, (0, 0, 0, depth * 4)))
-    else:
-        console.print(panel)
+    _emit_block(command, status_label, status_style, meta, preview, depth)
 
 
 def display_sub_terminal_preview(command: str, output: str, depth: int = 0, alive: bool = True) -> None:
-    """Show a compact preview of sub-terminal output — last 8 lines (tail).
-
-    For interactive programs (claude, vim, etc.), the most recent output
-    is at the bottom, so we show the tail. ANSI escape sequences are
-    stripped for readability.
-    """
+    """Show a compact, borderless preview of sub-terminal output (tail)."""
     clean = strip_ansi(output) if output else ""
     all_lines = [l for l in clean.split("\n") if l.strip()] if clean else []
     total_lines = len(all_lines)
 
-    if total_lines > 8:
-        preview_lines = all_lines[-8:]
-        preview = "\n".join(preview_lines)
-        preview = f"[dim]... ({total_lines} lines total)[/dim]\n{preview}"
+    if total_lines > 6:
+        preview = all_lines[-6:]
+        meta = f"running · {total_lines}L" if alive else f"exited · {total_lines}L"
     elif all_lines:
-        preview = "\n".join(all_lines)
+        preview = all_lines
+        meta = "running" if alive else "exited"
     else:
-        preview = "(no output yet)"
+        preview = []
+        meta = "running · no output" if alive else "exited"
 
-    status = "[dim yellow]RUNNING[/dim yellow]" if alive else "[dim red]EXITED[/dim red]"
-    title = f"[bold]{command[:80]}[/bold]  {status}"
-    panel = Panel(f"[dim]{preview}[/dim]", title=title, border_style="dim yellow" if alive else "dim red")
-    if depth > 0:
-        console.print(Padding(panel, (0, 0, 0, depth * 4)))
-    else:
-        console.print(panel)
+    status_label = "RUNNING" if alive else "EXITED"
+    status_style = "warning" if alive else "muted"
+    _emit_block(command, status_label, status_style, meta, preview, depth)
 
 
 def display_file_diff(path: str, diff_text: str, depth: int = 0) -> None:
-    """Display a compact unified diff preview for file edits."""
+    """Display a compact, borderless unified diff preview (+/- colorized)."""
     diff_lines = diff_text.splitlines() if diff_text else []
     line_count = len(diff_lines)
-    preview_limit = 80
-    truncated = line_count > preview_limit
-    preview = "\n".join(diff_lines[:preview_limit]) if diff_lines else "(no differences)"
-    if truncated:
-        preview += f"\n[dim]... ({line_count - preview_limit} more lines)[/dim]"
+    preview_limit = 40
+    shown = diff_lines[:preview_limit]
 
-    summary = f"[dim]{line_count} diff lines[/dim]"
-    body = f"[dim]{preview}[/dim]\n\n{summary}"
-    panel = Panel(body, title=f"[bold]{path[:80]}[/bold]  [cyan]DIFF[/cyan]",
-                  border_style="cyan" if depth == 0 else "dim cyan")
-    if depth > 0:
-        console.print(Padding(panel, (0, 0, 0, depth * 4)))
-    else:
-        console.print(panel)
+    pad = "  " * depth
+    console.print(f"{pad}[accent]▍[/accent] [bold]{path[:80]}[/bold]  "
+                  f"[accent]DIFF[/accent]  [muted]{line_count}L[/muted]")
+    inner = pad + "  "
+    for ln in shown:
+        if ln.startswith("+") and not ln.startswith("+++"):
+            console.print(f"{inner}[success]{ln}[/success]")
+        elif ln.startswith("-") and not ln.startswith("---"):
+            console.print(f"{inner}[error]{ln}[/error]")
+        elif ln.startswith("@@"):
+            console.print(f"{inner}[accent.dim]{ln}[/accent.dim]")
+        else:
+            console.print(f"{inner}[muted]{ln}[/muted]")
+    if line_count > preview_limit:
+        console.print(f"{inner}[muted]… {line_count - preview_limit} more lines[/muted]")
 
 
 # ── prompt_toolkit Input Setup ──────────────────────────────────────────
@@ -1287,8 +1309,8 @@ class MetaCompleter(Completer):
 def _build_prompt_style() -> Style:
     """Build prompt_toolkit Style for the prompt."""
     return Style.from_dict({
-        "prompt-path": "bold #4e9aed",
-        "separator": "#666666",
+        "prompt-path": "bold #7aa2f7",
+        "separator": "#bb9af7",
     })
 
 
@@ -1370,11 +1392,12 @@ def get_prompt_session() -> PromptSession:
 def pt_prompt(cwd: str) -> str:
     """Read user input with prompt_toolkit (PTY-based terminal input)."""
     session = get_prompt_session()
-    # Build the prompt line with styled path
-    prompt_html = f"<prompt-path>{cwd}</prompt-path>\n<separator>$</separator> "
+    disp = _shorten_path(cwd, max_len=60)
     try:
         user_input = session.prompt(
-            [("class:prompt-path", cwd), ("", "\n$ ")],
+            [("class:prompt-path", disp),
+             ("", "\n"),
+             ("class:separator", "❯ ")],
             style=_build_prompt_style(),
             multiline=False,
         )
@@ -2469,8 +2492,7 @@ def _forget(keep_n, ctx):
 def generate_cli_prop_template() -> str:
     """Generate the .laintas/cli.prop system prompt template for the current OS.
 
-    The template uses XML-style sections (Anthropic's recommended pattern —
-    Claude attends to them better than ALL-CAPS brackets) and teaches the
+    The template uses XML-style sections and teaches the
     agent the full surface: shell, /tool dispatch, /term, /spawn, memory.
 
     Variables substituted at run time (see agent_loop.run_agent_loop):
@@ -3024,16 +3046,71 @@ def call_backend_stream(
     cookies = get_auth_cookies(session)
 
     try:
-        response = requests.post(
-            f"{backend_url}/api/chat/stream",
-            json=payload,
-            headers=headers,
-            cookies=cookies,
-            stream=True,
-            timeout=120,
-        )
+        # ── Retry loop for transient failures (opencode retry.ts pattern) ──
+        # Retries on: Timeout, ConnectionError, HTTP 429, HTTP 5xx.
+        # Does NOT retry on: 4xx (except 429), context-overflow (handled by
+        # reactive compaction in agent_loop), or InterruptedError.
+        # Honors `retry-after` header; exponential backoff: 2s, 4s, 8s, cap 30s.
+        _MAX_RETRIES = 3
+        _RETRY_BASE = 2.0
+        _RETRY_CAP = 30.0
+        response = None
+        for _attempt in range(_MAX_RETRIES + 1):
+            if interrupt_event is not None and interrupt_event.is_set():
+                raise InterruptedError("interrupted before request")
+            try:
+                response = requests.post(
+                    f"{backend_url}/api/chat/stream",
+                    json=payload,
+                    headers=headers,
+                    cookies=cookies,
+                    stream=True,
+                    timeout=120,
+                )
+            except requests.Timeout:
+                if _attempt < _MAX_RETRIES:
+                    _delay = min(_RETRY_BASE * (2 ** _attempt), _RETRY_CAP)
+                    if interrupt_event is not None:
+                        if interrupt_event.wait(timeout=_delay):
+                            raise InterruptedError("interrupted during retry delay")
+                    else:
+                        time.sleep(_delay)
+                    continue
+                return {"reply": "Request timed out after retries. Please try again.", "tool_calls": [], "done": True, "error": True}
+            except requests.ConnectionError:
+                if _attempt < _MAX_RETRIES:
+                    _delay = min(_RETRY_BASE * (2 ** _attempt), _RETRY_CAP)
+                    if interrupt_event is not None:
+                        if interrupt_event.wait(timeout=_delay):
+                            raise InterruptedError("interrupted during retry delay")
+                    else:
+                        time.sleep(_delay)
+                    continue
+                return {"reply": f"Cannot connect to backend ({backend_url}). Check your network.", "tool_calls": [], "done": True, "error": True}
 
-        if response.status_code != 200:
+            if response.status_code == 200:
+                break
+
+            # Check if retryable (429 or 5xx)
+            _retryable = response.status_code == 429 or response.status_code >= 500
+            if _retryable and _attempt < _MAX_RETRIES:
+                _delay = _RETRY_BASE * (2 ** _attempt)
+                # Honor retry-after header (seconds or HTTP-date)
+                _ra = response.headers.get("retry-after")
+                if _ra:
+                    try:
+                        _delay = float(_ra)
+                    except ValueError:
+                        pass
+                _delay = min(_delay, _RETRY_CAP)
+                if interrupt_event is not None:
+                    if interrupt_event.wait(timeout=_delay):
+                        raise InterruptedError("interrupted during retry delay")
+                else:
+                    time.sleep(_delay)
+                continue
+
+            # Non-retryable error — return immediately
             try:
                 err_data = response.json()
                 return {"reply": f"Server Error: {err_data.get('detail', response.text[:200])}", "command": "", "rules": "", "done": True, "error": True}
@@ -6185,8 +6262,8 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
 
     elif action == "/continue":
         # Resume agent loop after max_loops exhaustion.
-        # Mirrors Claude Code's /continue: resets the turn counter and
-        # re-invokes the agent loop with preserved state.
+        # Resets the turn counter and re-invokes the agent loop with
+        # preserved state.
         _prev_state = getattr(handle_meta_command, '_last_agent_state', None)
         _prev_chat = getattr(handle_meta_command, '_last_chat_history', None)
         _prev_input = getattr(handle_meta_command, '_last_original_input', None)
@@ -6480,45 +6557,62 @@ def show_command_palette():
     return app.run()
 
 
+_HELP_GROUPS = [
+    ("Basics", [
+        ("ls, git, …", "PATH commands run directly"),
+        ("<text>", "plain text → AI agent loop"),
+        ("/help", "show this help"),
+        ("/clear", "clear screen"),
+        ("/cwd", "show working directory"),
+    ]),
+    ("Account & Session", [
+        ("/login", "re-authenticate (opens browser)"),
+        ("/resume [N]", "resume a /q checkpoint"),
+        ("/exit", "log out and exit"),
+        ("/quit, /q", "detach sub-terminal / exit"),
+        ("/v, /version", "version & self-update"),
+    ]),
+    ("Agents & Terminals", [
+        ("/name [name]", "set current agent name"),
+        ("/hire", "create a new AI agent"),
+        ("/agents [name]", "list / switch / rename agents"),
+        ("/t, /term [name]", "list or create sub-terminals"),
+        ("/station [name]", "station agent in a shell"),
+        ("/send <n> <cmd>", "send command to a terminal"),
+        ("/terminate <n>", "close a terminal"),
+        ("/back", "detach without closing"),
+    ]),
+    ("Planning & Tasks", [
+        ("/hwo", "visual orchestration builder"),
+        ("/plan", "structured planning"),
+        ("/task", "task tracking"),
+        ("/workflow", "multi-phase workflows"),
+    ]),
+    ("Config & Tools", [
+        ("/model [id]", "list / set backend model"),
+        ("/config", "runtime config"),
+        ("/tools", "list AI tools"),
+        ("/skill", "manage skills"),
+        ("/bash <cmd>", "run via term0 bash"),
+        ("/memory", "view memory.json"),
+        ("/prop", "view cli.prop template"),
+        ("/scan", "list PATH commands"),
+        ("/debug", "browse debug entries"),
+    ]),
+]
+
+
 def show_help():
-    """Display help."""
-    table = Table(title="laintas_cli Commands")
-    table.add_column("Command", style="cyan")
-    table.add_column("Description")
-
-    table.add_row("ls, cat, mkdir, git, ...", "Commands found on PATH → executed directly")
-    table.add_row("<natural language>", "Not a recognized command → AI agent loop")
-    table.add_row("/help", "Show this help")
-    table.add_row("/login", "Re-authenticate with accounts.laintas.com (opens browser)")
-    table.add_row("/model [id|reset]", "List available backend models, set model, or reset to backend default")
-    table.add_row("/name [name]", "Set current agent name")
-    table.add_row("/memory", "View .laintas/memory.json")
-    table.add_row("/prop", "View .laintas/cli.prop prompt template")
-    table.add_row("/scan", "Scan and list all available system commands from PATH")
-    table.add_row("/debug", "Browse debug entries (/debug), view detail (/debug <N>), save to file (/debug <N> <file>), clear (/debug clear)")
-    table.add_row("/cwd", "Show current working directory")
-    table.add_row("/bash <cmd>", "Run <cmd> via term0's real bash, bypassing whitelist; /bash list|add|remove manages it")
-    table.add_row("/station [name]", "Station agent in a persistent shell (current terminal, or named)")
-    table.add_row("/terminate <name>", "Close and destroy a terminal")
-    table.add_row("/send <name> <cmd>", "Send a command to a named terminal")
-    table.add_row("/hire", "Create a new AI agent (AI-1, AI-2...)")
-    table.add_row("/agents [name]", "List/switch agents, /agents name <n> to rename")
-    table.add_row("/t, /term [name]", "List sub-terminals, or create new one (/t <name>)")
-    table.add_row("/back", "Detach from sub-terminal without closing it")
-    table.add_row("/hwo", "Visual agent-orchestration builder (HWO TUI)")
-    table.add_row("/plan", "Structured planning (/plan enter, approve, exit, status, list)")
-    table.add_row("/task", "Task tracking (/task add, start, done, del)")
-    table.add_row("/workflow", "Multi-phase workflows (/workflow start, status, advance, end, list)")
-    table.add_row("/skill", "Interactive skill manager (no-arg); /skill load|unload <name>|list|reload|new <name>|dir")
-    table.add_row("/config", "Runtime config (/config, /config <key> <value>, /config reset)")
-    table.add_row("/tools", "List registered AI tools")
-    table.add_row("/resume [N]", "Choose a /q checkpoint to resume; launch with --resume or --continue for latest")
-    table.add_row("/v, /version", "Show version & check for updates; /v update to self-update (downloads only changed files)")
-    table.add_row("/clear", "Clear screen")
-    table.add_row("/exit", "Log out and exit (clears cached session)")
-    table.add_row("/quit, /q", "Detach from sub-terminal (/q) or exit without logging out (/quit)")
-
-    console.print(table)
+    """Display grouped, minimal command help."""
+    from rich.markup import escape
+    console.print()
+    for title, rows in _HELP_GROUPS:
+        console.print(f"  [accent]{title}[/accent]")
+        cmd_w = max(len(c) for c, _ in rows)
+        for cmd, desc in rows:
+            padded = escape(cmd.ljust(cmd_w))
+            console.print(f"    [accent.dim]{padded}[/accent.dim]  [muted]{escape(desc)}[/muted]")
+        console.print()
 
 
 # ── LoopDeps factory (lazy init after all functions defined) ─────────
@@ -6552,33 +6646,54 @@ def get_loop_deps() -> LoopDeps:
 
 # ── Main ───────────────────────────────────────────────────────────────
 
+_LOGO_LINES = [
+    " ╷    ╭─╮  ┬  ╷ ╷ ┌┬┐  ╭─╮  ╭─╮",
+    " │    ├─┤  │  │╲│  │   ├─┤  ╰─╮",
+    " ╰──  ╵ ╵  ┴  ╵ ╵  ┴   ╵ ╵  ╰─╯",
+]
+
+
+def _shorten_path(p: str, max_len: int = 48) -> str:
+    home = os.path.expanduser("~")
+    if p.startswith(home):
+        p = "~" + p[len(home):]
+    if len(p) > max_len:
+        p = "…" + p[-(max_len - 1):]
+    return p
+
+
 def show_banner(agent_name: str, session: dict = None):
-    """Display startup banner."""
+    """Display a minimal, art-font startup banner."""
     shell_info = "cmd.exe" if IS_WINDOWS else SHELL_NAME
-    # Build account line
-    account_line = ""
+
+    for line in _LOGO_LINES:
+        console.print(f"[accent]{line}[/accent]")
+    console.print(
+        f"  [muted]cli[/muted] [accent.dim]v{__version__}[/accent.dim]"
+        f"  [muted]·[/muted]  [agent]{agent_name}[/agent]"
+    )
+    console.print()
+
+    rows = []
     if session:
-        name = session.get("userName", "")
-        email = session.get("userEmail", "")
-        uid = session.get("userId", "")
-        if email:
-            account_line = f"Account: {email}\n"
-        elif name:
-            account_line = f"Account: {name} ({uid})\n"
-        elif uid:
-            account_line = f"Account: {uid}\n"
-    console.print(Panel(
-        f"[bold]Laintas CLI[/bold] [dim]v{__version__}[/dim] — {agent_name}\n"
-        f"{account_line}"
-        f"OS: {SYSTEM} | Shell: {shell_info}\n"
-        f"Working: {os.getcwd()}\n"
-        f"Backend: {os.environ.get('LAINTAS_BACKEND', BACKEND_URL)}\n\n"
-        f"Commands from PATH → executed directly.\n"
-        "Natural language → AI agent loop.\n"
-        "Type [bold]/help[/bold] for commands.",
-        title="laintas_cli",
-        border_style="blue",
-    ))
+        acct = (session.get("userEmail") or session.get("userName")
+                or session.get("userId") or "")
+        if acct:
+            rows.append(("account", acct))
+    rows.append(("system", f"{SYSTEM} · {shell_info}"))
+    rows.append(("cwd", _shorten_path(os.getcwd())))
+    rows.append(("backend", os.environ.get("LAINTAS_BACKEND", BACKEND_URL)))
+
+    label_w = max(len(k) for k, _ in rows)
+    for k, v in rows:
+        console.print(f"  [muted]{k.rjust(label_w)}[/muted]  [accent.dim]│[/accent.dim] {v}")
+
+    console.print()
+    console.print(
+        "  [muted]PATH commands run directly · plain text → AI · "
+        "[/muted][accent]/help[/accent][muted] for commands[/muted]"
+    )
+    console.print()
 
 
 def _simple_prompt(cwd: str) -> str:
@@ -6924,7 +7039,7 @@ def main():
     parser.add_argument("--resume", action="store_true", default=False,
                         help="Resume the saved conversation for this directory on startup")
     parser.add_argument("--continue", dest="continue_session", action="store_true", default=False,
-                        help="Alias for --resume, matching Claude Code-style continuation")
+                        help="Alias for --resume (session continuation)")
     parser.add_argument("--agent-id", type=str, default=None,
                         help="Pre-assigned agent id (used by sub-terminals)")
     parser.add_argument("--agent-name", type=str, default=None,
@@ -7507,8 +7622,8 @@ def main():
             chat_history.append({"role": "assistant", "content": response["msg"]})
 
         # ── Cross-interaction state preservation ──
-        # Mirrors Claude Code's approach: preserve recent context across REPL
-        # interactions so the model doesn't lose track of what it was doing.
+        # Preserve recent context across REPL interactions so the model
+        # doesn't lose track of what it was doing.
         agent_state = prepare_state_for_repl(response.get("state", {}))
         if args.depth == 0:
             save_resume_state(agent_state, chat_history, _session_start_cwd)

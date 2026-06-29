@@ -1,7 +1,7 @@
 """
 Plan Mode for laintas_cli — structured planning before execution.
 
-Inspired by Claude Code's Plan Mode: before executing complex tasks, the AI
+Plan Mode: before executing complex tasks, the AI
 enters a planning phase where it explores, designs, and documents an approach.
 The plan is saved to disk, reviewed by the user, and then executed.
 

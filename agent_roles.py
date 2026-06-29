@@ -1,5 +1,5 @@
-"""Specialized agent roles for laintas_cli — inspired by Claude Code's
-code-explorer, code-architect, code-reviewer pattern.
+"""Specialized agent roles for laintas_cli — code-explorer, code-architect,
+code-reviewer pattern.
 
 Each role defines:
   - An expert persona system prompt that gets injected into the child agent

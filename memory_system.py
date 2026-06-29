@@ -1,7 +1,7 @@
 """
 Cross-session persistent memory system for laintas_cli.
 
-Mirrors Claude Code's memory architecture:
+Memory architecture:
   - 4 memory types: user, feedback, project, reference
   - Each memory is a .md file with YAML-style frontmatter
   - MEMORY.md is the index (one-liner per entry, no frontmatter)

@@ -70,8 +70,8 @@ class Catalog:
         """OpenAI-style ``tools`` array using canonical flat names.
 
         ``allowed`` (canonical names) restricts the set — this is the
-        per-context allow-list pattern (Claude Code subagents / Helpwo skill
-        allowedTools): scope by selection, never by renaming.
+        per-context allow-list pattern (subagent / skill allowedTools):
+        scope by selection, never by renaming.
         """
         allow = set(allowed) if allowed is not None else None
         out = []
