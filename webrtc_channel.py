@@ -20,6 +20,7 @@ so the answer SDP already carries the candidates — no separate ICE messages.
 import asyncio
 import json
 import os
+import socket
 import threading
 from typing import Callable
 
@@ -54,6 +55,7 @@ class WebrtcManager:
         self._ice = ice_servers or _DEFAULT_ICE
         self._pcs: dict = {}
         self._puts: dict = {}  # channel -> in-progress upload {f, path, written}
+        self._vnc: dict = {}   # channel -> live VNC bridge {sock, task, name}
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(
             target=self._run_loop, daemon=True, name="laintas-webrtc",
@@ -99,6 +101,10 @@ class WebrtcManager:
                 except Exception:
                     pass
 
+            @channel.on("close")
+            def on_close():
+                self._close_vnc(channel)
+
         @pc.on("connectionstatechange")
         async def on_state():
             if pc.connectionState in ("failed", "closed", "disconnected"):
@@ -117,6 +123,17 @@ class WebrtcManager:
             await self._close(session_id)
 
     def _on_message(self, channel, message):
+        # Binary frames on a VNC channel are RFB input bytes (noVNC → x11vnc).
+        if isinstance(message, (bytes, bytearray)):
+            v = self._vnc.get(channel)
+            if v is not None:
+                sock = v.get("sock")
+                if sock is not None:
+                    try:
+                        sock.sendall(message)
+                    except OSError:
+                        pass
+                return
         # Binary frames are file-upload chunks for an in-progress 'put'.
         if isinstance(message, (bytes, bytearray)):
             st = self._puts.get(channel)
@@ -146,6 +163,10 @@ class WebrtcManager:
             self._finish_put(channel, data)
         elif t == "exec":
             asyncio.ensure_future(self._serve_exec(channel, data))
+        elif t == "vnc-open":
+            asyncio.ensure_future(self._open_vnc(channel, data))
+        elif t == "vnc-close":
+            self._close_vnc(channel)
 
     # ── Metadata RPC: exec a short shell command (ls/find/mkdir/mv/rm/stat) ──
     # Used by the browser RemoteProvider so directory listing + metadata also
@@ -230,6 +251,67 @@ class WebrtcManager:
             channel.send(json.dumps({"t": "put-ack", "id": rid, "ok": False, "error": st["error"]}))
         else:
             channel.send(json.dumps({"t": "put-ack", "id": rid, "ok": True, "written": st["written"]}))
+
+    # ── VNC bridge: x11vnc RFB socket ⇄ DataChannel ─────────────────────
+    # Renders a remote browser session's screen P2P, bypassing the relay.
+    # Control frames are JSON strings; framebuffer/input bytes are raw binary.
+    async def _open_vnc(self, channel, msg: dict):
+        name = msg.get("name") or "default"
+        try:
+            import browser_session as _bs
+            sess = _bs.get_browser_session(name)
+        except Exception as e:
+            channel.send(json.dumps({"t": "vnc-error", "error": f"registry: {e}"}))
+            return
+        rfb_port = getattr(sess, "rfb_port", 0) if sess is not None else 0
+        if not rfb_port:
+            channel.send(json.dumps({"t": "vnc-error", "error": f"no session '{name}'"}))
+            return
+        try:
+            sock = socket.create_connection(("127.0.0.1", rfb_port), timeout=5)
+            sock.setblocking(False)
+        except OSError as e:
+            channel.send(json.dumps({"t": "vnc-error", "error": f"rfb connect: {e}"}))
+            return
+        task = asyncio.ensure_future(self._pump_rfb_to_channel(channel, sock))
+        self._vnc[channel] = {"sock": sock, "task": task, "name": name}
+        channel.send(json.dumps({"t": "vnc-ready"}))
+
+    async def _pump_rfb_to_channel(self, channel, sock):
+        """x11vnc → noVNC. Raw RFB bytes as binary frames, with backpressure."""
+        loop = asyncio.get_event_loop()
+        try:
+            while True:
+                data = await loop.sock_recv(sock, 65536)
+                if not data:
+                    break
+                # Let the SCTP buffer drain so a slow viewer doesn't OOM us.
+                while channel.bufferedAmount > 1_000_000:
+                    await asyncio.sleep(0.02)
+                channel.send(data)
+        except (OSError, asyncio.CancelledError):
+            pass
+        except Exception:
+            pass
+        finally:
+            try:
+                channel.send(json.dumps({"t": "vnc-exit"}))
+            except Exception:
+                pass
+
+    def _close_vnc(self, channel):
+        v = self._vnc.pop(channel, None)
+        if not v:
+            return
+        task = v.get("task")
+        if task is not None:
+            task.cancel()
+        sock = v.get("sock")
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
 
     async def _close(self, session_id: str):
         pc = self._pcs.pop(session_id, None)

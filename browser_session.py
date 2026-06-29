@@ -62,6 +62,86 @@ def find_chrome() -> Optional[str]:
     return None
 
 
+def _ip_is_blocked(ip_str: str) -> bool:
+    """True if an IP is loopback / private / link-local / reserved — i.e. the
+    host's own network position should not be reachable from a page we browse
+    (blocks SSRF to cloud metadata 169.254.169.254, internal services, etc.)."""
+    import ipaddress
+    try:
+        ip = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return True  # un-parseable → refuse
+    return (ip.is_loopback or ip.is_private or ip.is_link_local
+            or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
+
+
+def validate_browse_url(raw: str) -> str:
+    """Normalize and security-check a URL the remote Chrome will navigate to.
+    Returns an absolute http(s) URL or raises ValueError. Refuses non-http(s)
+    schemes and any host that resolves to a loopback/private/link-local address
+    so a driven page cannot pivot into the host's internal network or metadata."""
+    from urllib.parse import urlparse
+    s = (raw or "").strip()
+    if not s:
+        raise ValueError("a URL is required")
+    if "://" not in s:
+        s = "https://" + s
+    u = urlparse(s)
+    if u.scheme not in ("http", "https"):
+        raise ValueError(f"only http(s) URLs may be browsed (got '{u.scheme}')")
+    host = u.hostname
+    if not host:
+        raise ValueError(f"not a valid URL: {raw!r}")
+    # Resolve and check every address the host maps to (defeats DNS-based SSRF).
+    try:
+        infos = socket.getaddrinfo(host, u.port or (443 if u.scheme == "https" else 80),
+                                   proto=socket.IPPROTO_TCP)
+    except OSError as e:
+        raise ValueError(f"cannot resolve host {host!r}: {e}")
+    for info in infos:
+        ip = info[4][0]
+        if _ip_is_blocked(ip):
+            raise ValueError(
+                f"refusing to browse {host!r}: resolves to non-public address {ip} "
+                f"(loopback/private/link-local/metadata are blocked)")
+    return u.geturl()
+
+
+def _chown_tree(path: str, uid: int, gid: int) -> None:
+    """Recursively chown a directory so a dropped-privilege Chrome can use it."""
+    os.chown(path, uid, gid)
+    for root, dirs, files in os.walk(path):
+        for name in dirs + files:
+            try:
+                os.chown(os.path.join(root, name), uid, gid)
+            except OSError:
+                pass
+
+
+def _unpriv_user():
+    """Pick a non-root user to run Chrome as, so the setuid sandbox can stay on
+    even in a root container. Returns (uid, gid, name, home) or None if none is
+    suitable / not running as root / not Unix."""
+    if IS_WINDOWS or os.geteuid() != 0:
+        return None
+    try:
+        import pwd
+    except ImportError:
+        return None
+    # Prefer a dedicated browser user; fall back to common low-priv accounts.
+    for name in (os.environ.get("LAINTAS_CHROME_USER", ""), "chrome", "chromium", "nobody"):
+        if not name:
+            continue
+        try:
+            pw = pwd.getpwnam(name)
+        except KeyError:
+            continue
+        if pw.pw_uid == 0:
+            continue
+        return (pw.pw_uid, pw.pw_gid, pw.pw_name, pw.pw_dir or "/tmp")
+    return None
+
+
 def _check_host_deps() -> Optional[str]:
     """Return an error message string if a required binary is missing, else None."""
     if IS_WINDOWS:
@@ -176,7 +256,12 @@ class BrowserSession:
         self.agent_id = agent_id
         self.agent_secret = agent_secret
         self.session_id = session_id
-        self.url = url
+        # Security-check the opening URL (SSRF / scheme guard). about:blank and
+        # other non-navigational defaults pass through untouched.
+        if url and url not in ("about:blank",) and not url.startswith("about:"):
+            self.url = validate_browse_url(url)
+        else:
+            self.url = url
         self.width = width
         self.height = height
 
@@ -440,12 +525,11 @@ class BrowserSession:
         if not _wait_for_port("127.0.0.1", self.rfb_port, timeout=5):
             raise RuntimeError(f"x11vnc RFB port {self.rfb_port} did not open")
 
-        # Background WS bridge — retried, so a missing backend /vnc doesn't
-        # take down the host stack.
-        self._ws_thread = threading.Thread(
-            target=self._ws_bridge_loop, daemon=True,
-            name=f"hwo-vnc-{self.session_id}")
-        self._ws_thread.start()
+        # The screen is now served by x11vnc on 127.0.0.1:rfb_port. The browser
+        # attaches to it peer-to-peer over WebRTC (webrtc_channel.py's VNC
+        # bridge) — RFB bytes never touch the backend. No relay WS is started;
+        # the legacy _ws_bridge_loop is retained only for optional fallback and
+        # is intentionally not spawned here.
 
     def close(self) -> None:
         if self._closed.is_set():
@@ -524,7 +608,9 @@ class BrowserSession:
             "--disable-background-timer-throttling",
             "--disable-backgrounding-occluded-windows",
             "--disable-renderer-backgrounding",
-            "--disable-features=TranslateUI,IsolateOrigins,site-per-process",
+            # Keep Site Isolation ON (do NOT disable IsolateOrigins/site-per-process)
+            # — it is a key cross-site / Spectre defense for untrusted pages.
+            "--disable-features=TranslateUI",
             "--disable-dev-shm-usage",
             "--disable-gpu",
             f"--window-size={self.width},{self.height}",
@@ -532,16 +618,43 @@ class BrowserSession:
             # Prefer pages to start at a real size even without a WM.
             f"--window-position=0,0",
         ]
-        # Root containers can't use the setuid sandbox.
+
+        # Privilege handling: a page we browse is untrusted, so we want Chrome's
+        # setuid sandbox ON. The sandbox refuses to run as root, so when we are
+        # root we drop to a non-root user (preexec setuid) and keep the sandbox.
+        # Only if no such user exists do we fall back to --no-sandbox.
+        unpriv = _unpriv_user()
+        preexec = None
+        run_env = dict(os.environ, DISPLAY=f":{self.display_n}")
         if os.geteuid() == 0:
-            args.append("--no-sandbox")
+            if unpriv is not None:
+                uid, gid, uname, uhome = unpriv
+                # The dropped user must own the profile dir and reach the X socket.
+                try:
+                    _chown_tree(self.user_data_dir, uid, gid)
+                except OSError:
+                    pass
+                run_env["HOME"] = uhome
+                run_env["USER"] = uname
+
+                def _drop():
+                    os.setgid(gid)
+                    try:
+                        os.setgroups([gid])
+                    except OSError:
+                        pass
+                    os.setuid(uid)
+                preexec = _drop
+            else:
+                # No unprivileged user available — sandbox cannot run as root.
+                args.append("--no-sandbox")
+
         args.append(self.url)
 
-        env = dict(os.environ, DISPLAY=f":{self.display_n}")
         self._chrome = subprocess.Popen(
             args, stdout=subprocess.DEVNULL,
             stderr=open(self._log("chrome"), "wb"),
-            env=env, start_new_session=True,
+            env=run_env, start_new_session=True, preexec_fn=preexec,
         )
 
     def _start_x11vnc(self) -> None:

@@ -17,6 +17,7 @@ import os
 import re
 import json
 import time
+import hashlib
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -26,6 +27,7 @@ import paths
 
 MEMORY_DIR = paths.MEMORY_DIR
 MEMORY_INDEX = paths.MEMORY_INDEX
+LOCAL_USER_SCOPE = "local-user"
 
 # Valid memory types and their descriptions
 MEMORY_TYPES = {
@@ -120,10 +122,47 @@ def _format_frontmatter(meta: dict, body: str) -> str:
     if 'type' in meta:
         lines.append("metadata:")
         lines.append(f"  type: {meta['type']}")
+    if meta.get('product'):
+        lines.append(f"product: {meta['product']}")
+    if meta.get('scope'):
+        lines.append(f"scope: {meta['scope']}")
+    if meta.get('scope_id'):
+        lines.append(f"scope_id: {meta['scope_id']}")
+    if meta.get('importance') is not None:
+        lines.append(f"importance: {meta['importance']}")
     lines.append("---")
     lines.append("")
     lines.append(body)
     return '\n'.join(lines)
+
+
+def _project_scope_id(cwd: str = None) -> str:
+    start = Path(os.path.realpath(cwd or os.getcwd()))
+    root = start
+    for candidate in (start, *start.parents):
+        if (candidate / ".laintas").is_dir() or (candidate / ".git").exists():
+            root = candidate
+            break
+    return hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:16]
+
+
+def _resolve_scope(mem_type: str, scope: str = None,
+                   scope_id: str = None) -> tuple[str, str]:
+    resolved = scope or ("user" if mem_type in ("user", "feedback") else "project")
+    if resolved not in ("user", "project"):
+        raise ValueError("scope must be 'user' or 'project'")
+    if resolved == "user":
+        return resolved, scope_id or LOCAL_USER_SCOPE
+    return resolved, scope_id or _project_scope_id()
+
+
+def _visible_in_current_scope(meta: dict) -> bool:
+    scope = meta.get("scope")
+    if scope == "user":
+        return meta.get("scope_id", LOCAL_USER_SCOPE) == LOCAL_USER_SCOPE
+    if scope == "project":
+        return meta.get("scope_id") == _project_scope_id()
+    return False
 
 
 def list_memories(mem_type: str = None) -> list[dict]:
@@ -138,14 +177,30 @@ def list_memories(mem_type: str = None) -> list[dict]:
             continue
         try:
             content = f.read_text(encoding="utf-8")
-            meta, _ = _parse_frontmatter(content)
+            meta, body = _parse_frontmatter(content)
             entry_type = meta.get("type") or meta.get("metadata", {}).get("type", "unknown")
+            if not meta.get("scope") or not meta.get("scope_id"):
+                # Compatibility migration: bind legacy project/reference facts
+                # to the current project on first use; user/feedback stays global.
+                scope, scope_id = _resolve_scope(entry_type)
+                meta.update({
+                    "product": "laintas_cli",
+                    "scope": scope,
+                    "scope_id": scope_id,
+                    "importance": meta.get("importance", "0.5"),
+                })
+                f.write_text(_format_frontmatter(meta, body), encoding="utf-8")
             if mem_type and entry_type != mem_type:
+                continue
+            if not _visible_in_current_scope(meta):
                 continue
             results.append({
                 "name": meta.get("name", f.stem),
                 "description": meta.get("description", ""),
                 "type": entry_type,
+                "scope": meta.get("scope"),
+                "scope_id": meta.get("scope_id"),
+                "importance": float(meta.get("importance", 0.5) or 0.5),
                 "path": str(f),
                 "mtime": f.stat().st_mtime,
             })
@@ -169,7 +224,9 @@ def read_memory(name: str) -> Optional[dict]:
 
 
 def write_memory(name: str, mem_type: str, description: str,
-                 body: str, overwrite: bool = True) -> tuple[bool, str]:
+                 body: str, overwrite: bool = True,
+                 scope: str = None, scope_id: str = None,
+                 importance: float = 0.5) -> tuple[bool, str]:
     """Create or update a memory file. Updates MEMORY.md index.
 
     Returns (ok, message).
@@ -183,10 +240,20 @@ def write_memory(name: str, mem_type: str, description: str,
     if f.exists() and not overwrite:
         return False, f"Memory '{name}' already exists. Use overwrite=True."
 
+    try:
+        resolved_scope, resolved_scope_id = _resolve_scope(mem_type, scope, scope_id)
+        resolved_importance = max(0.0, min(1.0, float(importance)))
+    except (TypeError, ValueError) as exc:
+        return False, str(exc)
+
     meta = {
         "name": name,
         "description": description,
         "type": mem_type,
+        "product": "laintas_cli",
+        "scope": resolved_scope,
+        "scope_id": resolved_scope_id,
+        "importance": resolved_importance,
     }
     content = _format_frontmatter(meta, body)
     try:
@@ -194,7 +261,7 @@ def write_memory(name: str, mem_type: str, description: str,
     except OSError as e:
         return False, str(e)
 
-    _update_index(name, description, mem_type)
+    _update_index(name, description, mem_type, resolved_scope)
     return True, str(f)
 
 
@@ -214,11 +281,12 @@ def delete_memory(name: str) -> tuple[bool, str]:
         return False, str(e)
 
 
-def _update_index(name: str, description: str, mem_type: str) -> None:
+def _update_index(name: str, description: str, mem_type: str,
+                  scope: str = "user") -> None:
     """Add or update an entry in MEMORY.md."""
     ensure_memory_dir()
     lines = MEMORY_INDEX.read_text(encoding="utf-8").split('\n')
-    new_entry = f"- [{name}]({name}.md) — {description} [{mem_type}]"
+    new_entry = f"- [{name}]({name}.md) — {description} [{mem_type}; {scope}]"
 
     # Replace existing entry if present
     replaced = False
@@ -267,7 +335,11 @@ def load_all_for_prompt(max_per_type: int = 5) -> str:
     }
 
     for mem_type, label in type_labels.items():
-        entries = by_type.get(mem_type, [])[:max_per_type]
+        entries = sorted(
+            by_type.get(mem_type, []),
+            key=lambda entry: (entry.get("importance", 0.5), entry.get("mtime", 0)),
+            reverse=True,
+        )[:max_per_type]
         if not entries:
             continue
         lines = [f"[{label}]"]
@@ -275,7 +347,9 @@ def load_all_for_prompt(max_per_type: int = 5) -> str:
             data = read_memory(entry["name"])
             if data:
                 body_preview = data["body"][:300]
-                lines.append(f"  {entry['name']}: {body_preview}")
+                lines.append(
+                    f"  {entry['name']} [{entry.get('scope')}:{entry.get('scope_id')}]: {body_preview}"
+                )
         sections.append('\n'.join(lines))
 
     return '\n\n'.join(sections) if sections else ""

@@ -45,213 +45,37 @@ class HwoParallel:
 HwoStep = Union[HwoTask, HwoAgent, HwoParallel]
 
 
-# ── Parser (ported from hwo.ts HwoParser) ────────────────────────────────
+# ── Parser + validation: shared grammar (vendored from agent_gateway/hwo) ──
+# The HWO *language* (source -> AST + validation) is the single source of truth
+# in agent_gateway/hwo, vendored here as hwo_adapter. We keep the dataclass AST
+# above for the executor + hwo_ui, converting from the adapter's JSON AST.
+from hwo_adapter import (  # noqa: E402
+    HWO_COMM_TOOLS,
+    HwoParseError,
+    parse as parse_ast,
+    validate as validate_ast,
+)
 
-class HwoParseError(Exception):
-    def __init__(self, message: str, index: int):
-        super().__init__(f"{message} at position {index}")
-        self.index = index
 
-
-class HwoParser:
-    def __init__(self, source: str):
-        self.source = source
-        self.i = 0
-
-    def parse(self) -> list:
-        steps = self._parse_sequence()
-        self._skip_ws()
-        if not self._eof():
-            snippet = self.source[self.i:self.i + 16]
-            raise HwoParseError(f'Unexpected token "{snippet}"', self.i)
-        return steps
-
-    def _parse_sequence(self, stop=None) -> list:
-        """stop: None | 'brace' | 'parallel'"""
-        steps = []
-        while not self._eof():
-            self._skip_ws()
-            if self._eof():
-                break
-            if stop == 'brace' and self._peek() == '}':
-                break
-            if stop == 'parallel' and self._at_parallel_marker():
-                break
-            if self._starts('```'):
-                self._skip_comment_block()
-                continue
-            if self._starts('->'):
-                self.i += 2
-                continue
-            if self._at_parallel_marker():
-                steps.append(self._parse_parallel())
-                continue
-            if self._peek() == '(' and self._looks_like_prompt_prefix():
-                steps.append(self._parse_agent())
-                continue
-            if self._peek() == '#':
-                steps.append(self._parse_agent())
-                continue
-            text = self._read_text(stop).strip()
-            if text:
-                steps.append(HwoTask(text=text))
-        return steps
-
-    def _parse_parallel(self) -> HwoParallel:
-        self._expect('//')
-        body = self._parse_sequence('parallel')
-        if not self._at_parallel_marker():
-            raise HwoParseError(
-                'Unclosed parallel block, expected // to close', self.i
-            )
-        self._expect('//')
-        return HwoParallel(body=body)
-
-    def _parse_agent(self) -> HwoAgent:
-        start = self.i
-
-        # Optional (prompt.md) prefix — sets a custom system prompt for this agent
-        prompt_file = None
-        if self._peek() == '(':
-            self._expect('(')
-            file_start = self.i
-            while not self._eof() and self._peek() != ')':
-                self.i += 1
-            if self._eof():
-                raise HwoParseError('Unclosed prompt prefix, expected )', start)
-            prompt_file = self.source[file_start:self.i].strip() or None
-            self._expect(')')
-            self._skip_ws()
-
-        self._expect('#')
-        name_start = self.i
-        while not self._eof() and self._peek() != '#':
-            self.i += 1
-        if self._eof():
-            raise HwoParseError('Unclosed agent name, expected #', start)
-        name = self.source[name_start:self.i].strip()
-        if not name:
-            raise HwoParseError('Empty agent name', start)
-        self._expect('#')
-        self._skip_ws()
-        if self._peek() != '{':
-            raise HwoParseError(
-                f'Agent "{name}" must be followed by {{', self.i
-            )
-        self._expect('{')
-        body = self._parse_sequence('brace')
-        if self._peek() != '}':
-            raise HwoParseError(
-                f'Unclosed body for agent "{name}", expected }}', self.i
-            )
-        self._expect('}')
-        return HwoAgent(name=name, body=body, prompt_file=prompt_file)
-
-    def _read_text(self, stop=None) -> str:
-        start = self.i
-        while not self._eof():
-            if self._starts('```'):
-                break
-            if self._starts('->'):
-                break
-            if self._at_parallel_marker():
-                break
-            if stop == 'brace' and self._peek() == '}':
-                break
-            if self._peek() == '#' and self._looks_like_agent():
-                break
-            if self._peek() == '(' and self._looks_like_prompt_prefix():
-                break
-            self.i += 1
-        return self.source[start:self.i]
-
-    def _skip_comment_block(self) -> None:
-        self._expect('```')
-        end = self.source.find('```', self.i)
-        if end == -1:
-            raise HwoParseError('Unclosed comment block, expected ```', self.i)
-        self.i = end + 3
-
-    def _looks_like_agent(self) -> bool:
-        import re
-        rest = self.source[self.i:]
-        return bool(re.match(r'^#[^#{}\n\r]+#\s*\{', rest))
-
-    def _looks_like_prompt_prefix(self) -> bool:
-        import re
-        rest = self.source[self.i:]
-        return bool(re.match(r'^\([^)]+\)\s*#[^#{}\n\r]+#\s*\{', rest))
-
-    def _at_parallel_marker(self) -> bool:
-        if not self._starts('//'):
-            return False
-        if self.i == 0:
-            return True
-        prev = self.source[self.i - 1]
-        return prev in ('\n', ' ', '\t', '\r', '{', '}')
-
-    def _skip_ws(self) -> None:
-        while not self._eof() and self.source[self.i] in ' \t\n\r':
-            self.i += 1
-
-    def _starts(self, text: str) -> bool:
-        return self.source.startswith(text, self.i)
-
-    def _expect(self, text: str) -> None:
-        if not self._starts(text):
-            raise HwoParseError(f'Expected "{text}"', self.i)
-        self.i += len(text)
-
-    def _peek(self) -> str:
-        return self.source[self.i] if self.i < len(self.source) else ''
-
-    def _eof(self) -> bool:
-        return self.i >= len(self.source)
+def _to_node(d: dict) -> HwoStep:
+    """Convert a shared JSON-AST node into the local dataclass model."""
+    t = d["type"]
+    if t == "task":
+        return HwoTask(text=d["text"])
+    if t == "agent":
+        return HwoAgent(
+            name=d["name"],
+            prompt_file=d.get("promptFile"),
+            body=[_to_node(c) for c in d["body"]],
+        )
+    if t == "parallel":
+        return HwoParallel(body=[_to_node(c) for c in d["body"]])
+    raise HwoParseError(f"Unknown HWO node type: {t!r}", 0)
 
 
 def parse_hwo(source: str) -> list:
-    return HwoParser(source).parse()
-
-
-# ── Validation (mirrors hwo.ts validateParallelBlocks + validateUniqueNames) ─
-
-def validate_parallel_blocks(steps: list) -> list:
-    errors = []
-    def walk(items, path):
-        for item in items:
-            if item.kind == 'parallel':
-                for child in item.body:
-                    if child.kind != 'agent':
-                        errors.append(
-                            f"{path}: parallel blocks may only contain #agent# {{...}} entries."
-                        )
-                walk(item.body, f"{path}//")
-            elif item.kind == 'agent':
-                walk(item.body, f"{path}#{item.name}#")
-    walk(steps, 'root')
-    return errors
-
-
-def validate_unique_names(steps: list) -> list:
-    errors = []
-    def walk_scope(items, scope_path):
-        seen = set()
-        def visit(lst):
-            for item in lst:
-                if item.kind == 'agent':
-                    if item.name in seen:
-                        errors.append(
-                            f"{scope_path}: duplicate agent name \"#{item.name}#\" — "
-                            "sibling agents must have unique names in the same scope."
-                        )
-                    else:
-                        seen.add(item.name)
-                    walk_scope(item.body, f"{scope_path} > #{item.name}#")
-                elif item.kind == 'parallel':
-                    visit(item.body)
-        visit(items)
-    walk_scope(steps, 'root')
-    return errors
+    """Parse `source` into the local dataclass AST (executor + hwo_ui)."""
+    return [_to_node(d) for d in parse_ast(source)]
 
 
 def summarize_steps(steps: list, indent: int = 0) -> list:
@@ -369,10 +193,7 @@ def generate_team_manifest(agent_name: str, manifest: dict) -> str:
         lines.append(f"Children: {', '.join(_tag(n) for n in node['child_names'])}")
 
     lines.append("")
-    lines.append("Communication tools:")
-    lines.append("  - agent_send(to, message)        -> send a message to a sibling or parent")
-    lines.append("  - agent_receive(from, timeout?)  -> wait for a message from a specific member (default timeout 60s)")
-    lines.append("  - agent_return(value)            -> report the final result to the parent and end this task")
+    lines.append(HWO_COMM_TOOLS)
 
     return "\n".join(lines)
 
@@ -760,13 +581,15 @@ def run_hwo_file(
         return {"ok": False, "msg": f"hwo: cannot read '{path}': {e}"}
 
     try:
-        steps = parse_hwo(source)
+        ast = parse_ast(source)
     except HwoParseError as e:
         return {"ok": False, "msg": f"hwo: parse error — {e}"}
 
-    errors = validate_parallel_blocks(steps) + validate_unique_names(steps)
+    errors = validate_ast(ast)
     if errors:
         return {"ok": False, "msg": "hwo: validation errors:\n" + "\n".join(errors)}
+
+    steps = [_to_node(d) for d in ast]
 
     summary = "\n".join(summarize_steps(steps))
     manifest = build_workflow_manifest(steps)
@@ -796,13 +619,15 @@ def compile_hwo_file(path: str) -> dict:
         return {"ok": False, "msg": f"hwo: cannot read '{path}': {e}"}
 
     try:
-        steps = parse_hwo(source)
+        ast = parse_ast(source)
     except HwoParseError as e:
         return {"ok": False, "msg": f"hwo: parse error — {e}"}
 
-    errors = validate_parallel_blocks(steps) + validate_unique_names(steps)
+    errors = validate_ast(ast)
     if errors:
         return {"ok": False, "msg": "hwo: validation errors:\n" + "\n".join(errors)}
+
+    steps = [_to_node(d) for d in ast]
 
     summary = "\n".join(summarize_steps(steps))
     return {"ok": True, "msg": f"HWO compile OK\n{summary}", "summary": summary}

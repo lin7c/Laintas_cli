@@ -2,6 +2,7 @@
 """AI Agent Loop for laintas_cli — extracted from laintas_cli.py."""
 
 import hashlib
+import copy
 import os
 import re
 import json
@@ -51,7 +52,12 @@ _DEFAULT_CONFIG = {
     "output_truncate": 3000,      # chars — lastOutput tail truncation
     "poll_timeout": 10.0,         # seconds — wait for first command output
     "terminal_tail_lines": 20,    # lines — sub-terminal snapshot
-    "disable_remote_terminal": False,  # block browser-opened PTY shells when True
+    # A browser terminal is a full interactive shell. Keep it opt-in even when
+    # remote agent registration is enabled.
+    "disable_remote_terminal": True,
+    # Every remote command/delegation requires an explicit Helpwo approval by
+    # default. Advanced users may opt out locally, never from the remote UI.
+    "allow_remote_exec_without_approval": False,
     "heartbeat_interval": 30,     # seconds — agent heartbeat
     "staleness_limit": 3,         # consecutive no-tool steps before auto-exit
     "repetition_threshold": 3,    # consecutive no-progress steps before force-exit (mirrors TokenBudgetTracker)
@@ -427,6 +433,33 @@ def _session_key(cwd: str) -> str:
     return hashlib.sha256(cwd.encode()).hexdigest()[:16]
 
 
+def _normalize_session_id(value: object = None) -> str:
+    """Return a filesystem-safe logical session id."""
+    raw = str(value or "").strip()
+    safe = re.sub(r"[^A-Za-z0-9_-]", "-", raw)[:64]
+    return safe or uuid.uuid4().hex[:16]
+
+
+def _ensure_session_id(state: dict) -> str:
+    session_id = _normalize_session_id((state or {}).get("_session_id"))
+    state["_session_id"] = session_id
+    return session_id
+
+
+def _atomic_write_json(dest, payload: dict) -> None:
+    """Atomically replace one JSON file so an interrupted save stays readable."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_name(f".{dest.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(str(tmp), str(dest))
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def save_session_snapshot(state: dict, chat_history: list, cwd: str) -> None:
     """Persist shortTermMemory + recent turns to ~/.laintas/sessions/<hash>.json.
 
@@ -507,8 +540,10 @@ def _build_resume_payload(state: dict, chat_history: list, cwd: str, kind: str) 
     dropped = all_history[:-_RESUME_MAX_TURNS] if len(all_history) > _RESUME_MAX_TURNS else []
     last_user = str(user_turns[-1].get("content") or "").strip()
     title = re.sub(r"\s+", " ", last_user)[:80] or "Untitled session"
+    session_id = _ensure_session_id(state)
     return {
-        "id": uuid.uuid4().hex[:12],
+        "id": session_id if kind == "autosave" else uuid.uuid4().hex[:12],
+        "session_id": session_id,
         "kind": kind,
         "cwd": cwd,
         "timestamp": time.time(),
@@ -523,6 +558,14 @@ def _build_resume_payload(state: dict, chat_history: list, cwd: str, kind: str) 
 
 def _resume_latest_path(cwd: str):
     return paths.SESSIONS_DIR / f"{_session_key(cwd)}_resume.json"
+
+
+def _resume_session_path(cwd: str, session_id: str):
+    return paths.SESSIONS_DIR / f"{_session_key(cwd)}_session_{_normalize_session_id(session_id)}.json"
+
+
+def _resume_session_pattern(cwd: str) -> str:
+    return f"{_session_key(cwd)}_session_*.json"
 
 
 def _resume_checkpoint_pattern(cwd: str) -> str:
@@ -556,7 +599,10 @@ def save_resume_state(state: dict, chat_history: list, cwd: str) -> None:
         if payload is None:
             return
         paths.SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
-        _resume_latest_path(cwd).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        # The per-session file is authoritative. The legacy per-cwd file remains
+        # a latest-session index for backward-compatible /resume behavior.
+        _atomic_write_json(_resume_session_path(cwd, payload["session_id"]), payload)
+        _atomic_write_json(_resume_latest_path(cwd), payload)
     except Exception:
         pass
 
@@ -569,8 +615,9 @@ def save_resume_checkpoint(state: dict, chat_history: list, cwd: str) -> Optiona
             return None
         paths.SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
         dest = paths.SESSIONS_DIR / f"{_session_key(cwd)}_resume_{payload['id']}.json"
-        dest.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        _resume_latest_path(cwd).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        _atomic_write_json(dest, payload)
+        _atomic_write_json(_resume_session_path(cwd, payload["session_id"]), payload)
+        _atomic_write_json(_resume_latest_path(cwd), payload)
         _prune_resume_checkpoints(cwd)
         return payload
     except Exception:
@@ -583,6 +630,7 @@ def list_resume_states(cwd: str) -> list:
     seen_ids = set()
     try:
         files = list(paths.SESSIONS_DIR.glob(_resume_checkpoint_pattern(cwd)))
+        files.extend(paths.SESSIONS_DIR.glob(_resume_session_pattern(cwd)))
         latest = _resume_latest_path(cwd)
         if latest.exists():
             files.append(latest)
@@ -607,9 +655,16 @@ def list_resume_states(cwd: str) -> list:
     return states
 
 
-def load_resume_state(cwd: str) -> Optional[dict]:
-    """Load the full-fidelity resume blob for this cwd, or None if none/old/corrupt."""
+def load_resume_state(cwd: str, session_id: str = None) -> Optional[dict]:
+    """Load a full-fidelity resume blob by logical id, or the latest for cwd."""
     try:
+        if session_id:
+            path = _resume_session_path(cwd, session_id)
+            if path.exists():
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if data.get("cwd") == cwd and time.time() - data.get("timestamp", 0) <= 7 * 86400:
+                    return data
+            return None
         states = list_resume_states(cwd)
         if not states:
             return None
@@ -2001,6 +2056,10 @@ def prepare_state_for_repl(state: dict) -> dict:
     state = state or {}
     output_limit = int(get_runtime_config("output_truncate") or 3000) * 2
     history = list(state.get("terminalHistory") or [])[-12:]
+    session_id = _ensure_session_id(state)
+    thread_messages = state.get("_thread_messages") or []
+    if not isinstance(thread_messages, list):
+        thread_messages = []
     return {
         "shortTermMemory": _trim_short_term_memory(state.get("shortTermMemory", "")),
         "lastReply": "",
@@ -2010,6 +2069,12 @@ def prepare_state_for_repl(state: dict) -> dict:
         # Carry the pinned objective across REPL turns so a later "continue"
         # still has the goal (this whitelist is the turn-to-turn hand-off).
         "objective": (state.get("objective") or "").strip(),
+        # The native message thread is the authoritative cross-turn transcript.
+        # Keep its structured assistant tool_calls + role:tool results intact.
+        "_session_id": session_id,
+        "_thread_messages": copy.deepcopy(thread_messages),
+        "_thread_summary": str(state.get("_thread_summary") or ""),
+        "_thread_call_seq": int(state.get("_thread_call_seq") or 0),
     }
 
 
@@ -3111,6 +3176,7 @@ def run_agent_loop(
                                # falls back to get_current_agent() if None)
     interrupt_event: threading.Event = None,   # soft-interrupt signal (Ctrl+C)
     message_queue: queue.Queue = None,         # supplementary user messages
+    continue_thread: bool = False,             # resume the same top-level turn (/continue)
 ) -> dict:
     """Run the autonomous agent loop (mirrors AutonomousKernel.ts).
 
@@ -3133,6 +3199,7 @@ def run_agent_loop(
     _interrupt = interrupt_event if interrupt_event is not None else _user_interrupt
     _msg_queue = message_queue if message_queue is not None else _user_message_queue
     state = dict(state)  # copy
+    _ensure_session_id(state)
     state.setdefault("shortTermMemory", "")
     state.setdefault("lastReply", "")
     state.setdefault("lastOutput", "")
@@ -3174,8 +3241,14 @@ def run_agent_loop(
     # Native message thread (Stage B): committed turns as OpenAI messages
     # (user -> assistant(tool_calls) -> tool(result) -> ...). Opt-in via config;
     # when off, the loop keeps re-synthesizing a state-dump user message.
-    thread_messages: list = []
     _thread_mode = bool(get_runtime_config("use_message_thread"))
+    _stored_thread = state.get("_thread_messages") or []
+    thread_messages: list = copy.deepcopy(_stored_thread) if isinstance(_stored_thread, list) else []
+    thread_messages = [m for m in thread_messages if isinstance(m, dict) and m.get("role")]
+    _stored_call_count = sum(len(m.get("tool_calls") or []) for m in thread_messages)
+    _thread_call_seq = max(int(state.get("_thread_call_seq") or 0), _stored_call_count)
+    if _thread_mode and original_input and (not thread_messages or not continue_thread):
+        thread_messages.append({"role": "user", "content": original_input})
     pending_events: list[dict] = []
     done = False
     _exit_reason = TRANSITION_MAX_LOOPS  # default: assume exhaustion unless overridden by a break
@@ -3251,7 +3324,10 @@ def run_agent_loop(
         if _supplementary:
             supp_text = "\n".join(_supplementary)
             deps.console.print(f"\n[cyan]📝 补充信息: {supp_text}[/cyan]")
-            chat_history.append({"role": "user", "content": f"[Supplementary instruction from user]: {supp_text}"})
+            supp_message = f"[Supplementary instruction from user]: {supp_text}"
+            chat_history.append({"role": "user", "content": supp_message})
+            if _thread_mode:
+                thread_messages.append({"role": "user", "content": supp_message})
             _append_short_memory(state, f"\n  - User supplementary: {supp_text}")
             stale_count = 0  # reset since user provided new input
 
@@ -4090,8 +4166,10 @@ def run_agent_loop(
             _rows_by_id = {r.get("call_id"): r for r in per_call_rows}
             executed = []
             for _idx, _tc in enumerate(tool_calls):
-                _cid = f"call_{loop+1:02d}_{_idx+1:02d}"
-                _row = _rows_by_id.get(_cid)
+                _row_cid = f"call_{loop+1:02d}_{_idx+1:02d}"
+                _row = _rows_by_id.get(_row_cid)
+                _thread_call_seq += 1
+                _cid = f"call_{state['_session_id'][:8]}_{_thread_call_seq:06d}"
                 _out = _row.get("output") if _row else "[not executed: interrupted before dispatch]"
                 executed.append({
                     "id": _cid,
@@ -4331,6 +4409,12 @@ def run_agent_loop(
     if events_cb is not None and pending_events:
         events_cb(pending_events)
         pending_events.clear()
+
+    if _thread_mode:
+        # Carry the authoritative structured transcript into the next top-level
+        # interaction and into the resume file. This includes tool-call pairs.
+        state["_thread_messages"] = copy.deepcopy(thread_messages)
+        state["_thread_call_seq"] = _thread_call_seq
 
     # Persist agent state so a future session can restore the chat history.
     if self_info is not None:

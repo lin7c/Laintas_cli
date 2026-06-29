@@ -1,0 +1,2797 @@
+diff --git a/agent_loop.py b/agent_loop.py
+index c82d929..3e8471a 100644
+--- a/agent_loop.py
++++ b/agent_loop.py
+@@ -503,7 +503,7 @@ def _build_resume_payload(state: dict, chat_history: list, cwd: str, kind: str)
+         "turn_count": len(user_turns),
+         "chat_history": history,
+         "older_summary": _summarize_dropped_turns(dropped),
+-        "tasks": task_manager.export_active_tasks(),
++        "tasks": [],
+         "state": prepare_state_for_repl(state or {}),
+     }
+ 
+@@ -565,7 +565,13 @@ def save_resume_checkpoint(state: dict, chat_history: list, cwd: str) -> Optiona
+ 
+ 
+ def list_resume_states(cwd: str) -> list:
+-    """Return selectable resume states for this cwd, newest first."""
++    """Return selectable resume states for this cwd.
++
++    Sort order: longest history (turn_count) first, then most recent.
++    A pure "newest mtime" sort can shadow a rich multi-turn blob with a
++    per-turn autosave that only contains the latest 1 turn, so the auto
++    resume path lands on the wrong file. turn_count breaks that tie.
++    """
+     states = []
+     seen_ids = set()
+     try:
+@@ -590,7 +596,8 @@ def list_resume_states(cwd: str) -> list:
+                 continue
+     except Exception:
+         return []
+-    states.sort(key=lambda item: item.get("timestamp", 0), reverse=True)
++    # Primary: longest history first. Tiebreaker: most recent timestamp.
++    states.sort(key=lambda item: (item.get("turn_count", 0), item.get("timestamp", 0)), reverse=True)
+     return states
+ 
+ 
+@@ -1537,9 +1544,9 @@ def _compress_terminal_history(history: list) -> str:
+     old_entries = history[:-_COMPRESSION_KEEP_RECENT]
+     recent_entries = history[-_COMPRESSION_KEEP_RECENT:]
+ 
+-    # Microcompact flagged the deduplicated, latest content of each file the
+-    # model read with `_kept`. Render those verbatim (so the model never needs
+-    # to re-read) and digest only the rest into one-liners.
++    # Microcompact flagged the deduplicated, latest output of each distinct
++    # lookup (file read or search) with `_kept`. Render those verbatim (so the
++    # model never needs to re-read or re-grep) and digest only the rest.
+     kept_reads = [e for e in old_entries if e.get("_kept")]
+     other_old = [e for e in old_entries if not e.get("_kept")]
+     digest = _summarize_old_entries(other_old)
+@@ -1554,7 +1561,7 @@ def _compress_terminal_history(history: list) -> str:
+ 
+     if kept_reads:
+         lines.append("")
+-        lines.append("[RETAINED FILE CONTENT — already read this session; do NOT re-read these]")
++        lines.append("[RETAINED LOOKUPS — already read/searched this session; do NOT re-read or re-grep these]")
+         for e in kept_reads:
+             cmd_label = (e.get("command", "") or "")[:120]
+             out = e.get("output", "") or ""
+@@ -1613,16 +1620,26 @@ def _trim_carried_outputs(history: list, tail_chars: int = 600) -> list:
+     return result
+ 
+ 
+-def _is_file_read_entry(entry: dict) -> bool:
+-    """A terminalHistory row that fetched file content (fs.read or cat/head/tail).
++def _is_retainable_lookup(entry: dict) -> bool:
++    """A terminalHistory row whose output is acquired knowledge worth retaining
++    verbatim across microcompact, deduped by its `command`.
++
++    Two kinds, both dedup-able by the `command` recorded by _salient_arg:
++      - file-content fetches: fs.read / cat / head / tail (key = path / path@offset)
++      - search results:       fs.grep / grep / rg          (key = pattern in path)
+ 
+-    These are dedup-able by their `command` (recorded as `path` / `path@offset`
+-    by _salient_arg) and worth retaining verbatim — re-fetching the same bytes is
+-    the dominant amnesia cost. fs.grep is NOT a content fetch (it's a query)."""
+-    if entry.get("tool") == "fs.read":
++    Re-acquiring either is the dominant amnesia cost: re-reading the same bytes
++    in edit-heavy tasks, and — just as expensive in exploration-heavy tasks —
++    re-grepping the same pattern. An earlier version retained only reads on the
++    theory that "grep is a query, not content"; in practice a grep result IS the
++    model's discovery map, and wiping it forces it to re-search the same concept
++    with reworded patterns. So searches are retained too."""
++    if entry.get("stale"):
++        return False
++    if entry.get("tool") in ("fs.read", "fs.grep"):
+         return True
+     cmd = (entry.get("command") or "").strip()
+-    return any(cmd.startswith(p) for p in ("cat ", "head ", "tail "))
++    return any(cmd.startswith(p) for p in ("cat ", "head ", "tail ", "grep ", "rg "))
+ 
+ 
+ def _microcompact_history(history: list, keep_recent: int = 6,
+@@ -1630,15 +1647,17 @@ def _microcompact_history(history: list, keep_recent: int = 6,
+     """Content-aware microcompact — recover context without inducing re-reads.
+ 
+     The naive version wiped the output of every row older than `keep_recent`,
+-    which deleted file content the model had read; it then re-read the same
+-    file (amnesia). Instead we spend a char budget on the *deduplicated, latest*
+-    content of each file the model read (newest-first), and wipe only the truly
+-    low-value rows: shell/grep output, and reads superseded by a later identical
+-    read. Kept reads are flagged `_kept` so the render layer shows them verbatim
+-    rather than digesting them to one line.
++    which deleted information the model had already acquired; it then re-acquired
++    it (amnesia) — re-reading a file, or re-grepping the same pattern. Instead we
++    spend a char budget on the *deduplicated, latest* output of each distinct
++    lookup the model performed (file reads AND searches, newest-first), and wipe
++    only the truly low-value rows: plain shell output and lookups superseded by a
++    later identical one. Kept rows are flagged `_kept` so the render layer shows
++    them verbatim rather than digesting them to one line.
+ 
+     Net effect: the prompt always carries the current content of every distinct
+-    file section the model has read (up to budget), so it stops re-reading.
++    file section read AND every distinct search result (up to budget), so the
++    model stops re-reading files and re-grepping the same concept.
+     """
+     if len(history) <= keep_recent:
+         return history
+@@ -1651,11 +1670,12 @@ def _microcompact_history(history: list, keep_recent: int = 6,
+     n = len(history)
+     old_upto = n - keep_recent  # indices [0, old_upto) are "old"
+ 
+-    # Latest index of each distinct successful file-read among OLD entries.
++    # Latest index of each distinct successful lookup (file-read or search)
++    # among OLD entries.
+     latest_read_idx: dict[str, int] = {}
+     for i in range(old_upto):
+         e = history[i]
+-        if _is_file_read_entry(e) and e.get("returncode") in (0, None):
++        if _is_retainable_lookup(e) and e.get("returncode") in (0, None):
+             cmd = (e.get("command") or "").strip()
+             if cmd:
+                 latest_read_idx[cmd] = i  # last occurrence wins
+@@ -1682,13 +1702,13 @@ def _microcompact_history(history: list, keep_recent: int = 6,
+             kept["_kept"] = True                      # render verbatim, don't digest
+             result.append(kept)
+         else:
+-            superseded = _is_file_read_entry(entry) and i not in latest_indices
++            superseded = _is_retainable_lookup(entry) and i not in latest_indices
+             result.append({
+                 "command": entry.get("command", ""),
+                 "returncode": entry.get("returncode"),
+                 "tool": entry.get("tool", ""),
+                 "call_id": entry.get("call_id", ""),
+-                "output": "(superseded by a later identical read)" if superseded
++                "output": "(superseded by a later identical lookup)" if superseded
+                           else "(output cleared by microcompact)",
+             })
+     return result
+@@ -1775,26 +1795,6 @@ def _append_short_memory(state: dict, text: str) -> None:
+     )
+ 
+ 
+-# Continuation tokens: a user line that means "resume the existing objective",
+-# NOT a new task. We must not overwrite the pinned objective with these, and the
+-# prompt routes them to the active task list. Kept multilingual + intentionally
+-# short so a real instruction that merely starts with "continue …" is unaffected.
+-_CONTINUATION_INPUTS = {
+-    "继续", "接着", "接着做", "继续做", "go on", "continue", "keep going",
+-    "proceed", "resume", "next", "go ahead", "carry on", "go", "ok", "好",
+-    "好的", "嗯", "go on please", "请继续", "继续吧",
+-}
+-
+-
+-def _is_continuation_input(text: str) -> bool:
+-    """True when the user line is a bare 'continue' nudge rather than a new goal.
+-
+-    Empty input also counts (the user just hit enter to let the agent proceed).
+-    """
+-    t = (text or "").strip().lower().rstrip("。.!！~")
+-    return t == "" or t in _CONTINUATION_INPUTS
+-
+-
+ def _summarize_reply_for_memory(reply: str, limit: int = 120) -> str:
+     """Condense a step's user-facing reply for session memory.
+ 
+@@ -1866,6 +1866,8 @@ def prepare_state_for_repl(state: dict) -> dict:
+         "lastOutput": _trim_text(state.get("lastOutput", ""), output_limit),
+         "terminalHistory": _microcompact_history(history, keep_recent=5),
+         "_files_seen": (state.get("_files_seen") or [])[-20:],
++        "_file_versions": dict(state.get("_file_versions") or {}),
++        "_undo_journal": list(state.get("_undo_journal") or [])[-50:],
+         # Carry the pinned objective across REPL turns so a later "continue"
+         # still has the goal (this whitelist is the turn-to-turn hand-off).
+         "objective": (state.get("objective") or "").strip(),
+@@ -1951,7 +1953,10 @@ def _build_memory_section(global_entries: list, state: dict, chat_history: list)
+                 parts.append(f"  {line}")
+ 
+     # Learned knowledge (chat_history KNOWLEDGE entries)
+-    knowledge = [m for m in (chat_history or []) if m.get('role') == 'knowledge']
++    knowledge = [
++        m for m in (chat_history or [])
++        if m.get('role') == 'knowledge' and not m.get("stale")
++    ]
+     if knowledge:
+         parts.append("[Learned Knowledge]")
+         for k in knowledge[-5:]:  # last 5 entries max
+@@ -1968,7 +1973,7 @@ def _build_conversation_section(chat_history: list) -> str:
+         return "(no history)"
+     # Compress old messages into summary knowledge entries
+     compressed = _compress_conversation(chat_history)
+-    recent = compressed[-20:]
++    recent = [m for m in compressed if not m.get("stale")][-20:]
+     lines = []
+     for m in recent:
+         role = m.get('role', '?')
+@@ -2175,7 +2180,7 @@ def _detect_loop_warnings_typed(state: dict, original_input: str) -> list[tuple[
+             if any(_has_live_content(h) for h in history[:-1][-20:]):
+                 warnings.append(("context_amnesia",
+                     f"You already have the content of `{cmd}` above (see RETAINED "
+-                    f"FILE CONTENT / recent steps). Refer to it instead of re-reading."
++                    f"LOOKUPS / recent steps). Refer to it instead of re-reading."
+                 ))
+ 
+     # 5. Near-repeat commands: fuzzy fingerprint matching
+@@ -2205,6 +2210,196 @@ def _detect_loop_warnings(state: dict, original_input: str) -> list[str]:
+ 
+ 
+ _FS_PATH_TOOLS = {"fs.read", "fs.write", "fs.edit", "fs.multi_edit", "fs.diff"}
++_UNDOABLE_WRITE_TOOLS = {"fs.write", "fs.edit", "fs.multi_edit"}
++_FILE_MUTATION_TOOLS = _UNDOABLE_WRITE_TOOLS | {"fs.undo"}
++
++
++def _abs_tool_path(path: str, cwd: str | None = None) -> str:
++    """Resolve a tool path the same way filesystem tools do."""
++    if not path:
++        return ""
++    return os.path.abspath(os.path.join(cwd or os.getcwd(), path)) \
++        if not os.path.isabs(path) else path
++
++
++def _file_version_map(state: dict) -> dict:
++    versions = state.setdefault("_file_versions", {})
++    if not isinstance(versions, dict):
++        versions = {}
++        state["_file_versions"] = versions
++    return versions
++
++
++def _undo_journal(state: dict) -> list:
++    journal = state.setdefault("_undo_journal", [])
++    if not isinstance(journal, list):
++        journal = []
++        state["_undo_journal"] = journal
++    return journal
++
++
++def _hash_text(text: str) -> str:
++    return hashlib.sha256(text.encode("utf-8", errors="surrogatepass")).hexdigest()
++
++
++def _read_file_snapshot(path: str) -> dict:
++    try:
++        with open(path, "r", encoding="utf-8", errors="replace") as f:
++            content = f.read()
++        return {"exists": True, "content": content, "hash": _hash_text(content)}
++    except FileNotFoundError:
++        return {"exists": False, "content": "", "hash": None}
++    except OSError as e:
++        return {"exists": False, "content": "", "hash": None, "error": str(e)}
++
++
++def _append_undo_entry(
++    state: dict,
++    *,
++    path: str,
++    tool: str,
++    call_id: str,
++    before: dict,
++    after: dict,
++    before_version: int,
++    after_version: int,
++    diff: str,
++) -> dict:
++    journal = _undo_journal(state)
++    entry = {
++        "id": f"undo_{len(journal) + 1:04d}",
++        "path": path,
++        "tool": tool,
++        "call_id": call_id,
++        "timestamp": time.time(),
++        "before_exists": bool(before.get("exists")),
++        "before_content": before.get("content", ""),
++        "before_hash": before.get("hash"),
++        "after_hash": after.get("hash"),
++        "before_version": before_version,
++        "after_version": after_version,
++        "diff": diff or "",
++        "summary": f"{tool} {path}",
++        "undone": False,
++    }
++    journal.append(entry)
++    if len(journal) > 50:
++        del journal[: len(journal) - 50]
++    return entry
++
++
++def _mark_stale_reads(rows: list[dict], path: str, new_version: int) -> None:
++    """Invalidate cached fs.read output for a file after a successful write."""
++    if not path:
++        return
++    stale_msg = (
++        f"(stale: {path} was modified after this read; "
++        "use a newer fs.read result before editing this region)"
++    )
++    for row in rows:
++        if row.get("tool") != "fs.read":
++            continue
++        row_path = row.get("file_path") or _abs_tool_path(
++            row.get("command", "").split("@", 1)[0]
++        )
++        if row_path != path:
++            continue
++        row_version = int(row.get("file_version") or 0)
++        if row_version < new_version:
++            row["stale"] = True
++            row["stale_version"] = new_version
++            row["output"] = stale_msg
++            row.pop("_kept", None)
++
++
++def _mark_stale_knowledge(chat_history: list, path: str, new_version: int) -> None:
++    """Invalidate chat_history knowledge entries that quoted old fs.read output."""
++    if not path:
++        return
++    for msg in chat_history or []:
++        if msg.get("role") != "knowledge" or msg.get("tool") != "fs.read":
++            continue
++        msg_path = msg.get("file_path") or _abs_tool_path(str(msg.get("path") or ""))
++        if msg_path != path:
++            continue
++        msg_version = int(msg.get("file_version") or 0)
++        if msg_version < new_version:
++            msg["stale"] = True
++            msg["stale_version"] = new_version
++            msg["content"] = (
++                f"[stale fs.read] {path} was modified after this read; "
++                "use a newer read/refresh for file content."
++            )
++
++
++def _diff_refresh_windows(diff: str, total_limit: int = 120) -> list[tuple[int, int]]:
++    """Return compact post-edit read windows from unified diff hunks."""
++    if not diff:
++        return []
++    windows: list[tuple[int, int]] = []
++    used = 0
++    for line in diff.splitlines():
++        m = re.match(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", line)
++        if not m:
++            continue
++        new_start = max(1, int(m.group(1)))
++        new_count = int(m.group(2) or "1")
++        start = max(1, new_start - 20)
++        limit = max(40, min(80, new_count + 40))
++        if used + limit > total_limit:
++            limit = max(20, total_limit - used)
++        if limit <= 0:
++            break
++        windows.append((start, limit))
++        used += limit
++        if used >= total_limit:
++            break
++    return windows
++
++
++def _read_numbered_window(path: str, offset: int, limit: int) -> dict:
++    """Read a small numbered source window for post-edit memory refresh."""
++    selected = []
++    total_lines = 0
++    start_idx = max(1, offset) - 1
++    try:
++        with open(path, "r", encoding="utf-8", errors="replace") as f:
++            for i, line in enumerate(f):
++                total_lines = i + 1
++                if start_idx <= i < start_idx + limit:
++                    selected.append(line.rstrip("\n"))
++    except OSError as e:
++        return {"ok": False, "error": str(e)}
++
++    end_idx = min(start_idx + len(selected), total_lines)
++    width = len(str(end_idx if end_idx > 0 else total_lines))
++    body = "\n".join(
++        f"{(start_idx + i + 1):>{width}}→{ln}" for i, ln in enumerate(selected)
++    )
++    return {
++        "ok": True,
++        "result": body,
++        "offset": offset,
++        "limit": limit,
++        "lines_returned": len(selected),
++        "total_lines": total_lines,
++        "truncated": (start_idx + len(selected)) < total_lines,
++    }
++
++
++def _file_memory_row_for_read(name: str, arguments: dict, result: dict, state: dict) -> dict:
++    if name != "fs.read" or not result.get("ok"):
++        return {}
++    path = _abs_tool_path(str(result.get("path") or arguments.get("path") or ""))
++    if not path:
++        return {}
++    versions = _file_version_map(state)
++    return {
++        "file_path": path,
++        "read_offset": int(result.get("offset") or arguments.get("offset") or 1),
++        "read_limit": int(arguments.get("limit") or result.get("lines_returned") or 0),
++        "file_version": int(versions.get(path, 0) or 0),
++    }
+ 
+ 
+ def _track_files_in_command(name: str, cmd: str, seen: list) -> None:
+@@ -2322,7 +2517,9 @@ def _build_user_message(original_input: str, state: dict, memory_entries: list,
+             role_block += "</role_identity>\n"
+ 
+     # Active tasks section
+-    tasks_snapshot = task_manager.get_active_tasks_snapshot()
++    tasks_snapshot = task_manager.get_active_tasks_snapshot(
++        current_objective=(state.get("objective") or "").strip()
++    )
+     tasks_block = ""
+     if tasks_snapshot:
+         tasks_block = f"\n<active_tasks>\n{tasks_snapshot}\n</active_tasks>\n"
+@@ -2334,24 +2531,12 @@ def _build_user_message(original_input: str, state: dict, memory_entries: list,
+     if objective and objective != str(original_input or "").strip():
+         objective_block = f"\n<objective>\n{objective}\n</objective>\n"
+ 
+-    # Continuation guidance: a bare "continue"/empty line is NOT a new goal —
+-    # route the model to its own plan / the pinned objective instead of letting
+-    # it treat "继续" as the task.
+-    continuation_block = ""
+-    if _is_continuation_input(original_input):
+-        continuation_block = (
+-            "\n<continuation>\n"
+-            "The user asked to continue — this is not a new task. Resume the "
+-            "in_progress item in <active_tasks>; if none is in progress, pick up "
+-            "the <objective> above (create/advance tasks for it). Only ask the "
+-            "user if both are genuinely empty.\n"
+-            "</continuation>\n"
+-        )
++    task_text = str(original_input or "")
+ 
+     return f"""<task>
+-{original_input}
++{task_text}
+ </task>
+-{objective_block}{continuation_block}
++{objective_block}
+ <progress>
+ step {loop+1}/{max_loops} — {n_steps} command(s) executed so far
+ </progress>
+@@ -2373,18 +2558,6 @@ step {loop+1}/{max_loops} — {n_steps} command(s) executed so far
+ </sub_terminals>"""
+ 
+ 
+-def _detect_lang(text: str) -> str:
+-    """Detect the user's language from input text. Returns a language code."""
+-    import re
+-    if re.search(r'[一-鿿㐀-䶿豈-﫿]', text):
+-        return "ZH"
+-    if re.search(r'[぀-ゟ゠-ヿ]', text):
+-        return "JA"
+-    if re.search(r'[가-힯ᄀ-ᇿ]', text):
+-        return "KO"
+-    return "EN"
+-
+-
+ _loop_cmd_handler_cache = None
+ _loop_cmd_mtime_cache = 0
+ 
+@@ -2641,6 +2814,8 @@ def _salient_arg(name: str, arguments: dict) -> str:
+         return path
+     if name in ("fs.write", "fs.edit", "fs.multi_edit", "fs.diff"):
+         return arguments.get("path", "") or ""
++    if name == "fs.undo":
++        return arguments.get("path", "") or arguments.get("id", "") or ""
+     if name == "fs.grep":
+         return f'{arguments.get("pattern", "")} in {arguments.get("path", "")}'
+     if name == "fs.glob":
+@@ -2717,6 +2892,7 @@ def _format_tool_result_for_loop(tool_name: str, result: dict, max_chars: int) -
+         "truncated", "byte_truncated", "lines_returned", "total_lines",
+         "matches", "files_scanned", "replacements", "exit_code",
+         "duration_ms", "count", "path", "url", "size",
++        "undo_id", "forced", "deleted",
+     )
+     meta_bits = []
+     for k in meta_keys:
+@@ -2897,6 +3073,8 @@ def run_agent_loop(
+     state.setdefault("lastReply", "")
+     state.setdefault("lastOutput", "")
+     state.setdefault("terminalHistory", [])
++    state.setdefault("_file_versions", {})
++    state.setdefault("_undo_journal", [])
+     # New top-level task: shrink command outputs inherited from the previous
+     # task so a stale large dump doesn't ride along in every prompt of an
+     # unrelated question. Follow-ups keep a short tail for continuity. depth==0
+@@ -2911,24 +3089,30 @@ def run_agent_loop(
+     chat_history = chat_history or []
+ 
+     # ── Pin the objective (durable goal anchor) ────────────────────────────
+-    # The user's goal must survive context compression and a bare "continue".
++    # The user's goal must survive context compression and short follow-up turns.
+     # shortTermMemory FIFO-evicts the oldest line (the goal); chat history is
+     # windowed. So a substantive top-level instruction is pinned here (persisted
+     # in the session snapshot) and rendered every turn as <objective>. A
+-    # "continue"/empty line keeps the existing objective instead of erasing it.
+-    # As a safety net (so even a forgotten task.create can't lose the goal) the
+-    # first substantive task auto-seeds a session task that anchors "continue".
++    # We do not classify natural-language user input with runtime rules here:
++    # the first non-empty objective is pinned, and later turns are left for the
++    # model to interpret from <task>, <objective>, and <active_tasks>.
+     if depth == 0:
+         _orig = (original_input or "").strip()
+-        if _orig and not _is_continuation_input(_orig):
+-            if state.get("objective") != _orig:
++        if _orig:
++            if not state.get("objective"):
+                 state["objective"] = _orig
+-                # Auto-seed a task for the new goal so a later "continue" has an
+-                # anchor — unless real work is already in progress (don't barge
+-                # into an active task; stale pending clutter must not block it).
++                # Auto-seed a task for the first goal so later follow-ups have
++                # an anchor — unless real work is already in progress (don't
++                # barge into an active task; stale pending clutter must not
++                # block it).
+                 try:
+                     if not task_manager.list_tasks(status="in_progress"):
+-                        task_manager.create_session_task(_orig[:120], _orig)
++                        # Create proper user/AI-named task name (up to 80 chars)
++                        short_obj = _orig.strip()
++                        if len(short_obj) > 80:
++                            short_obj = short_obj[:77] + "..."
++                        short_obj = short_obj if short_obj else "Untitled task"
++                        task_manager.create_session_task(short_obj, _orig)
+                 except Exception:
+                     pass
+ 
+@@ -3181,7 +3365,6 @@ def run_agent_loop(
+         )
+ 
+         # 5. Call backend (skip spinner in non-interactive/execute mode)
+-        lang = _detect_lang(original_input)
+         if events_cb is not None:
+             # Streaming render: use rich.live.Live to render the reply as it arrives
+             # via on_chunk. Falls back to spinner if backend doesn't accept on_chunk.
+@@ -3237,7 +3420,6 @@ def run_agent_loop(
+                             current_path=os.getcwd(),
+                             history=history_for_backend,
+                             on_chunk=_on_chunk,
+-                            lang=lang,
+                             interrupt_event=_interrupt,
+                         )
+                     except TypeError:
+@@ -3248,7 +3430,6 @@ def run_agent_loop(
+                             system_prompt=system_prompt,
+                             current_path=os.getcwd(),
+                             history=history_for_backend,
+-                            lang=lang,
+                         )
+ 
+                 if _use_live:
+@@ -3269,7 +3450,6 @@ def run_agent_loop(
+                             system_prompt=system_prompt,
+                             current_path=os.getcwd(),
+                             history=history_for_backend,
+-                            lang=lang,
+                             interrupt_event=_interrupt,
+                         )
+                     except TypeError:
+@@ -3279,7 +3459,6 @@ def run_agent_loop(
+                             system_prompt=system_prompt,
+                             current_path=os.getcwd(),
+                             history=history_for_backend,
+-                            lang=lang,
+                         )
+             # Mark that the streaming Live already rendered the reply — avoid
+             # re-printing it below.
+@@ -3293,7 +3472,6 @@ def run_agent_loop(
+                     system_prompt=system_prompt,
+                     current_path=os.getcwd(),
+                     history=history_for_backend,
+-                    lang=lang,
+                     interrupt_event=_interrupt,
+                 )
+             except TypeError:
+@@ -3303,7 +3481,6 @@ def run_agent_loop(
+                     system_prompt=system_prompt,
+                     current_path=os.getcwd(),
+                     history=history_for_backend,
+-                    lang=lang,
+                 )
+ 
+         # ── Handle soft-interrupt during backend call ──
+@@ -3544,6 +3721,9 @@ def run_agent_loop(
+                 call_id = f"call_{loop+1:02d}_{idx+1:02d}"
+                 salient = _salient_arg(name, arguments)
+                 is_shell_flavored = name in ("shell.exec", "terminal.send", "terminal.exec")
++                undo_before = None
++                undo_before_version = 0
++                undo_path = ""
+ 
+                 # ── Role / Workflow tool filtering ──
+                 _role_name = state.get("_role_name")
+@@ -3660,9 +3840,18 @@ def run_agent_loop(
+                             rename_agent=rename_agent,
+                             switch_to_agent=switch_to_agent,
+                             register_agent_fn=register_agent,
++                            state=state,
+                             depth=depth,
+                         )
+ 
++                        if name in _UNDOABLE_WRITE_TOOLS:
++                            undo_path = _abs_tool_path(str(arguments.get("path") or ""))
++                            if undo_path:
++                                undo_before = _read_file_snapshot(undo_path)
++                                undo_before_version = int(
++                                    _file_version_map(state).get(undo_path, 0) or 0
++                                )
++
+                         result = tools_mod.get_registry().invoke(name, arguments, tool_ctx)
+ 
+                         # Sync back interactive_session (tools may create/close sessions)
+@@ -3710,13 +3899,83 @@ def run_agent_loop(
+                     })
+ 
+                 # ── Per-call terminalHistory row ──
+-                per_call_rows.append({
++                row = {
+                     "command": salient,
+                     "output": formatted,
+                     "returncode": _rc,
+                     "tool": name,
+                     "call_id": call_id,
+-                })
++                }
++                row.update(_file_memory_row_for_read(name, arguments, result, state))
++                per_call_rows.append(row)
++
++                if (
++                    name in _FILE_MUTATION_TOOLS
++                    and result.get("ok")
++                    and result.get("changed")
++                    and result.get("path")
++                ):
++                    changed_path = _abs_tool_path(str(result.get("path")))
++                    versions = _file_version_map(state)
++                    new_version = int(versions.get(changed_path, 0) or 0) + 1
++                    versions[changed_path] = new_version
++                    if (
++                        name in _UNDOABLE_WRITE_TOOLS
++                        and undo_before is not None
++                        and changed_path == undo_path
++                    ):
++                        undo_after = _read_file_snapshot(changed_path)
++                        undo_entry = _append_undo_entry(
++                            state,
++                            path=changed_path,
++                            tool=name,
++                            call_id=call_id,
++                            before=undo_before,
++                            after=undo_after,
++                            before_version=undo_before_version,
++                            after_version=new_version,
++                            diff=result.get("diff", ""),
++                        )
++                        result["undo_id"] = undo_entry.get("id")
++                        formatted = _format_tool_result_for_loop(name, result, truncate)
++                        row["output"] = formatted
++                        formatted_outputs[-1] = formatted
++                    _mark_stale_reads(state.get("terminalHistory", []), changed_path, new_version)
++                    _mark_stale_reads(per_call_rows, changed_path, new_version)
++                    _mark_stale_knowledge(chat_history, changed_path, new_version)
++                    _track_files_in_command("fs.edit", changed_path, state.setdefault("_files_seen", []))
++
++                    for refresh_idx, (refresh_offset, refresh_limit) in enumerate(
++                        _diff_refresh_windows(result.get("diff", ""))
++                    ):
++                        refresh = _read_numbered_window(changed_path, refresh_offset, refresh_limit)
++                        if not refresh.get("ok"):
++                            continue
++                        refresh_salient = f"{changed_path}@{refresh_offset}"
++                        refresh_formatted = _format_tool_result_for_loop(
++                            "fs.read", {
++                                "ok": True,
++                                "result": refresh.get("result", ""),
++                                "path": changed_path,
++                                "offset": refresh_offset,
++                                "lines_returned": refresh.get("lines_returned"),
++                                "total_lines": refresh.get("total_lines"),
++                                "truncated": refresh.get("truncated"),
++                            },
++                            truncate,
++                        )
++                        per_call_rows.append({
++                            "command": refresh_salient,
++                            "output": refresh_formatted,
++                            "returncode": 0,
++                            "tool": "fs.read",
++                            "call_id": f"{call_id}_refresh_{refresh_idx + 1}",
++                            "file_path": changed_path,
++                            "read_offset": refresh_offset,
++                            "read_limit": refresh_limit,
++                            "file_version": new_version,
++                            "auto_refresh": True,
++                        })
+ 
+                 # Track files this call read/touched
+                 _track_files_in_command(name, salient, state.setdefault("_files_seen", []))
+@@ -3725,10 +3984,19 @@ def run_agent_loop(
+                 # gives the model a structured record of past tool calls without
+                 # bloating execute-mode history).
+                 if events_cb is not None:
+-                    chat_history.append({
++                    knowledge_entry = {
+                         "role": "knowledge",
+                         "content": f"[{call_id}] {name}({salient[:60]}) → {formatted[:400]}",
+-                    })
++                        "tool": name,
++                    }
++                    if row.get("file_path"):
++                        knowledge_entry.update({
++                            "file_path": row.get("file_path"),
++                            "file_version": row.get("file_version"),
++                            "read_offset": row.get("read_offset"),
++                            "read_limit": row.get("read_limit"),
++                        })
++                    chat_history.append(knowledge_entry)
+ 
+                 # ── Debug + events ──
+                 debug_entry.exec_command = f"/tool {name}"
+diff --git a/laintas_cli.py b/laintas_cli.py
+index cbd7500..5c009d3 100755
+--- a/laintas_cli.py
++++ b/laintas_cli.py
+@@ -1,4 +1,4 @@
+-#!/usr/bin/env python3
++#!/root/laintas_cli/venv/bin/python
+ """
+ laintas_cli — Autonomous AI agent for your terminal.
+ Same agent loop as Helpwo, but executes real system commands.
+@@ -464,9 +464,10 @@ class SubTerminalSession:
+     close, full_output, returncode, command).
+     """
+ 
+-    def __init__(self, command: str, timeout: int = 120):
++    def __init__(self, command: str, timeout: int = 120, persistent: bool = False):
+         self.command = command
+         self.timeout = timeout
++        self.persistent = persistent
+         self._use_tmux = "TMUX" in os.environ and not IS_WINDOWS
+         self._tmux_window: str = ""
+         self._pty: Optional[InteractiveSession] = None
+@@ -492,7 +493,10 @@ class SubTerminalSession:
+             )
+             self._alive = True
+         else:
+-            self._pty = InteractiveSession(self.command, timeout=self.timeout, stream_output=False)
++            self._pty = InteractiveSession(
++                self.command, timeout=self.timeout,
++                stream_output=False, persistent=self.persistent,
++            )
+             self._pty.start()
+             self._alive = self._pty.is_alive()
+ 
+@@ -1219,6 +1223,7 @@ class MetaCompleter(Completer):
+         "/scan", "/debug", "/cwd",
+         "/station", "/terminate", "/send", "/hire", "/agents",
+         "/t", "/term",
++        "/task",
+         "/clear", "/resume", "/max", "/exit", "/quit",
+     ]
+ 
+@@ -1384,14 +1389,12 @@ def pt_prompt(cwd: str) -> str:
+ 
+ 
+ # ── Dynamic Command Discovery ──────────────────────────────────────────
+-# Routing decision (system command vs natural language) is made at runtime
+-# via shutil.which() plus a fixed set of shell builtins. No persisted
+-# snapshot — newly-installed binaries are picked up immediately.
++# Used by /scan display only. Ordinary non-slash user input is sent to the AI;
++# the model decides whether shell.exec or another tool is appropriate.
+ 
+ import re
+-import shutil
+ 
+-# bash/sh/zsh builtins that aren't on PATH but should still route as commands.
++# bash/sh/zsh builtins that aren't on PATH but are useful for completion/scan.
+ _POSIX_SHELL_BUILTINS = {
+     "alias", "bg", "break", "builtin", "case", "cd", "command", "compgen",
+     "complete", "continue", "declare", "dirs", "disown", "echo", "enable",
+@@ -1408,24 +1411,6 @@ def _builtins_for_platform() -> set:
+     return _WINDOWS_CMD_BUILTINS if IS_WINDOWS else _POSIX_SHELL_BUILTINS
+ 
+ 
+-def extract_first_word(user_input: str) -> str:
+-    """Extract the first shell word from user input."""
+-    m = re.match(r'^\s*(\S+)', user_input)
+-    if not m:
+-        return ""
+-    return m.group(1).strip("'\"`;&|")
+-
+-
+-def is_system_command(user_input: str) -> bool:
+-    """True if the first word is a shell builtin or resolvable on PATH."""
+-    first = extract_first_word(user_input)
+-    if not first:
+-        return False
+-    if first in _builtins_for_platform():
+-        return True
+-    return shutil.which(first) is not None
+-
+-
+ def list_path_commands() -> list:
+     """Enumerate user-facing commands currently on PATH (for /scan display)."""
+     commands = set()
+@@ -2489,12 +2474,13 @@ The catalog below documents each tool's purpose and parameters:
+ 
+ <workflow>
+ - Plan with tasks. For any multi-step task (≈3+ steps or non-trivial), at the FIRST turn call `task.create` to record the goal and break it into sub-tasks, then `task.update` the one you start to `in_progress`. Keep exactly one task `in_progress`; mark each `task.update ... completed` as you finish it. The task list is your durable plan — it survives context compression and is how you resume. The `<active_tasks>` block shows it every turn.
+-- Resuming / "continue": when the user says only "continue" (`继续`, etc.), do NOT treat that as the task. Read `<active_tasks>` and resume the `in_progress` item; if none, work the `<objective>`. Only ask the user if both are empty.
++- Resuming or switching work: infer from the conversation whether the user's latest message is asking to continue the existing work, start the proposed work, or begin a new task. Use `<active_tasks>`, `<objective>`, and recent conversation context; do not rely on literal trigger phrases. Only ask the user if the intended task is genuinely ambiguous.
+ - If the user asks a clear read/edit/build/test/investigate task, act with tools. Do not ask for permission to do exactly what was asked.
+ - Ask one concise clarifying question only when the target or intent is genuinely ambiguous, destructive, impossible to infer safely, or blocked on information you cannot discover yourself.
+ - If there are multiple reasonable approaches with materially different tradeoffs, stop and present 2-3 labeled options. State the consequence of each option briefly, then wait for the user's choice.
+-- For unfamiliar code: locate with `fs.grep`/`fs.glob`, then read narrowly with `fs.read` offset/limit. Read a whole file only when you will rewrite it. Do not copy files into /tmp scratch to re-read in pieces — read the source directly, and once you have enough to act, act.
++- For unfamiliar code: locate with `fs.grep`/`fs.glob`, then choose an `fs.read` offset/limit that matches the task: narrow for a small local edit, broader when surrounding context matters, and whole-file only when you genuinely need it. After editing a file, rely on the newest post-edit read/refresh for that file before making further exact edits.
+ - Writing a large file (more than ~300 lines): write it in chunks — `fs.write` the first part, then append the rest with `fs.edit`. A whole-file write in one response can exceed the output token limit, get cut off, and be lost. If a response was truncated, switch to chunked writing; do not retry the same oversized write.
++- If the user asks to undo/revert your last file change, use `fs.undo`/`fs.undo_list` before attempting manual reverse edits.
+ - Keep scope tight. Do not add unrelated features, refactors, abstractions, or cleanup beyond the task.
+ - Keep each action small and verifiable. Prefer exact edits over rewrites.
+ - After a tool failure, read the error and change approach; do not retry identical arguments.
+@@ -2604,6 +2590,159 @@ def _choose_resume_blob(cwd: str, selector: str = "") -> Optional[dict]:
+     return _resolve_resume_selector(_resume_choices(cwd), selector)
+ 
+ 
++def _show_task_detail(t: dict) -> None:
++    """Print a rich summary of one task for the task picker's details view."""
++    _badge = {"in_progress": "[yellow]in progress[/yellow]",
++              "pending": "[blue]pending[/blue]",
++              "completed": "[green]done[/green]"}.get(t.get("status", ""), t.get("status", "?"))
++    console.print()
++    console.print(f"[bold cyan]#{t.get('id')}  {t.get('subject', '')}[/bold cyan]"
++                  f"{'  [magenta](session)[/magenta]' if t.get('session_only') else ''}")
++    console.print(f"[dim]Status:[/dim] {_badge}   [dim]Progress:[/dim] {t.get('progress', 0)}%   "
++                  f"[dim]Updated:[/dim] {_format_time_ago_iso(t.get('updated'))}")
++    if t.get("description"):
++        console.print(f"\n{t['description']}")
++    deps = t.get("blockedBy", [])
++    if deps:
++        console.print(f"[dim]Blocked by:[/dim] {', '.join(deps)}")
++    for note in t.get("notes", [])[-8:]:
++        console.print(f"  [dim]↳ {note}[/dim]")
++
++
++def _format_time_ago_iso(iso: str) -> str:
++    """Best-effort 'time ago' from an ISO timestamp string (tasks store ISO)."""
++    if not iso:
++        return "?"
++    try:
++        from datetime import datetime as _dt
++        ts = _dt.fromisoformat(iso).timestamp()
++        return _format_time_ago(ts)
++    except (ValueError, TypeError):
++        return str(iso)[:19]
++
++
++def show_task_picker() -> None:
++    """Full-screen `/t`-style task manager: view + CRUD the task list.
++
++    ↑↓ navigate, ↵ details, n new, e edit subject, s advance status,
++    x delete, q/Esc cancel. All edits persist via task_manager.
++    """
++    selected = [0]
++
++    def _tasks():
++        order = {"in_progress": 0, "pending": 1, "completed": 2}
++        visible = [t for t in task_manager.list_tasks() if t.get("status") != "deleted"]
++        visible.sort(key=lambda t: (order.get(t.get("status"), 3), str(t.get("id"))))
++        return visible
++
++    tasks = _tasks()
++
++    def _build_lines():
++        lines = []
++        lines.append(("bold cyan", "Task Manager\n"))
++        lines.append(("dim", "↑↓ navigate  ↵ details  n new  e edit  s status  x delete  q cancel\n\n"))
++        if not tasks:
++            lines.append(("dim", "  (no tasks) — press n to add one\n"))
++        for i, t in enumerate(tasks):
++            prefix = "▶" if i == selected[0] else " "
++            badge = {"in_progress": "[yellow]▶ in progress[/yellow]",
++                     "pending":     "[blue]○ pending[/blue]",
++                     "completed":   "[green]✓ done[/green]"}.get(
++                         t.get("status", "pending"), f"[dim]{t.get('status')}[/dim]")
++            prog = t.get("progress", 0)
++            prog_str = f" [dim]{prog}%[/dim]" if prog else ""
++            sess = " [magenta](session)[/magenta]" if t.get("session_only") else ""
++            subj = str(t.get("subject", ""))[:60].replace("\n", " ")
++            style = "class:selected" if i == selected[0] else ""
++            lines.append((style, f" {prefix} [dim]#{t.get('id')}[/dim] {badge}{prog_str}  "
++                                 f"[bold]{subj}[/bold]{sess}\n"))
++        lines.append(("", "\n"))
++        lines.append(("dim", f"{len(tasks)} task(s).  ↵=details n=new e=edit s=status x=delete q=cancel"))
++        return lines
++
++    kb = KeyBindings()
++
++    @kb.add("up")
++    def _(event):
++        selected[0] = max(0, selected[0] - 1)
++
++    @kb.add("down")
++    def _(event):
++        selected[0] = min(max(0, len(tasks) - 1), selected[0] + 1)
++
++    @kb.add("enter")
++    def _(event):
++        event.app.exit(result=("details", selected[0]))
++
++    @kb.add("n")
++    def _(event):
++        event.app.exit(result=("new", -1))
++
++    @kb.add("e")
++    def _(event):
++        event.app.exit(result=("edit", selected[0]))
++
++    @kb.add("s")
++    def _(event):
++        event.app.exit(result=("status", selected[0]))
++
++    @kb.add("x")
++    def _(event):
++        event.app.exit(result=("delete", selected[0]))
++
++    @kb.add("q")
++    @kb.add("escape")
++    @kb.add("c-c")
++    def _(event):
++        event.app.exit(result=("quit", -1))
++
++    style = Style.from_dict({"selected": "reverse"})
++    window = Window(content=FormattedTextControl(_build_lines), always_hide_cursor=True)
++    app = Application(
++        layout=Layout(HSplit([window])), key_bindings=kb, style=style,
++        full_screen=True, refresh_interval=0.5,
++    )
++
++    while True:
++        action, idx = app.run()
++        if action == "quit":
++            return
++        if action == "new":
++            console.print()
++            subject = input("New task subject (empty to cancel): ").strip()
++            if subject:
++                task_manager.create_task(subject)
++                console.print(f"[green]Created: {subject}[/green]")
++            tasks = _tasks()
++            selected[0] = min(selected[0], max(0, len(tasks) - 1))
++            continue
++        if not tasks or idx < 0 or idx >= len(tasks):
++            continue
++        t = tasks[idx]
++        tid = str(t.get("id"))
++        if action == "details":
++            _show_task_detail(t)
++            input("\nPress Enter to continue...")
++        elif action == "edit":
++            console.print()
++            new_subj = input(f"New subject [{t.get('subject')}] (empty to cancel): ").strip()
++            if new_subj:
++                task_manager.update_task(tid, subject=new_subj)
++                console.print("[green]Updated.[/green]")
++        elif action == "status":
++            cur = t.get("status", "pending")
++            nxt = {"pending": "in_progress", "in_progress": "completed",
++                   "completed": "in_progress"}.get(cur, "in_progress")
++            ok, msg, _ = task_manager.update_task(tid, status=nxt)
++            if not ok:
++                console.print(f"[yellow]{msg}[/yellow]")
++        elif action == "delete":
++            ok, msg = task_manager.delete_task(tid)
++            console.print(f"[green]{msg}[/green]" if ok else f"[yellow]{msg}[/yellow]")
++        tasks = _tasks()
++        selected[0] = min(selected[0], max(0, len(tasks) - 1))
++
++
+ def show_resume_picker(cwd: str) -> Optional[dict]:
+     """Full-screen `/t`-style picker for saved resume sessions.
+ 
+@@ -2706,12 +2845,37 @@ def _show_resume_detail(item: dict) -> None:
+                   f"[dim]When:[/dim] {_format_time_ago(item.get('timestamp', 0))}   "
+                   f"[dim]Turns:[/dim] {item.get('turn_count') or _resume_turn_count(item)}")
+     history = item.get("chat_history") or []
+-    console.print(f"[dim]Messages:[/dim] {len(history)}\n")
+-    for msg in history[-6:]:
++    console.print(f"[dim]Transcript:[/dim] ({len(history)} messages)\n")
++    _render_resume_transcript(history)
++
++
++def _render_resume_transcript(chat_history: list, limit: int = 100) -> None:
++    """Re-render a restored chat_history as a transcript view for /resume.
++
++    Mirrors the look of the live REPL: knowledge digests (prepended by
++    _restore_resume_blob from older_summary) get a dim panel, user turns
++    get a green-bordered panel, assistant turns get a blue-bordered
++    Markdown panel. Long assistant messages are truncated to `limit` chars
++    so a long session does not flood the terminal.
++    """
++    if not chat_history:
++        return
++    for msg in chat_history:
+         role = msg.get("role", "?")
+-        text = str(msg.get("content") or "").replace("\n", " ")[:100]
+-        color = "green" if role == "user" else "blue"
+-        console.print(f"  [{color}]{role:>9}[/{color}]  [dim]{text}[/dim]")
++        content = str(msg.get("content") or "")
++        if role == "knowledge":
++            console.print(Panel(content.strip(), title="[dim]resumed context[/dim]",
++                                border_style="dim", padding=(0, 1)))
++        elif role == "user":
++            console.print(Panel(content, title="[green]You[/green]",
++                                border_style="green", padding=(0, 1)))
++        elif role == "assistant":
++            display = content if len(content) <= limit else content[:limit] + "\n\n…(truncated)"
++            console.print(Panel(Markdown(display), title="[blue]Assistant[/blue]",
++                                border_style="blue", padding=(0, 1)))
++        else:
++            console.print(Panel(content, title=f"[dim]{role}[/dim]",
++                                border_style="dim", padding=(0, 1)))
+ 
+ 
+ def read_file(path: str) -> Optional[str]:
+@@ -3069,7 +3233,7 @@ def call_backend_stream(
+     system_prompt: str,
+     current_path: str,
+     history: list = None,
+-    lang: str = "EN",
++    lang: str = "",
+     on_chunk: Optional[Callable[[str, str], None]] = None,
+     interrupt_event: Optional[threading.Event] = None,
+ ) -> dict:
+@@ -3086,9 +3250,10 @@ def call_backend_stream(
+         "history": history or [],
+         "currentPath": current_path,
+         "systemPrompt": system_prompt,
+-        "lang": lang,
+         "maxTokens": int(get_runtime_config("max_tokens")),
+     }
++    if lang:
++        payload["lang"] = lang
+     selected_model = get_selected_model()
+     if selected_model:
+         payload["model"] = selected_model
+@@ -5384,6 +5549,75 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict,
+ 
+     elif action == "/clear":
+         console.clear()
++        # Preserve KNOWLEDGE entries (role=="knowledge"); drop the rest.
++        # handle_meta_command has no chat_history parameter — the live REPL list
++        # is stashed on the function as _last_chat_history after a task runs
++        # (set at the main-loop site, same stash /continue reads). Mutate it in
++        # place so the forget actually applies to the list the agent loop uses.
++        _chat = getattr(handle_meta_command, '_last_chat_history', None)
++        if _chat:
++            _kept = [m for m in _chat if isinstance(m, dict) and m.get("role") == "knowledge"]
++            _removed = len(_chat) - len(_kept)
++            _chat[:] = _kept
++            if _kept:
++                console.print(f"[dim]Cleared {_removed} entries; kept {len(_kept)} knowledge entries.[/dim]")
++            else:
++                console.print("[dim]Cleared.[/dim]")
++
++    elif action == "/task":
++        # Manual task management. No args → full-screen /t-style picker.
++        # Subcommands for quick CLI use: list / add / done / start / rm / purge.
++        sub = parts[1].lower() if len(parts) > 1 else ""
++        rest = cmd.strip().split(maxsplit=2)
++        if not sub:
++            show_task_picker()
++        elif sub == "list":
++            _tasks = [t for t in task_manager.list_tasks() if t.get("status") != "deleted"]
++            if not _tasks:
++                console.print("[dim]No tasks. Add one with /task add <subject>.[/dim]")
++            else:
++                _tbl = Table(show_header=True, header_style="bold cyan", box=None)
++                _tbl.add_column("ID", style="dim"); _tbl.add_column("Status")
++                _tbl.add_column("%", justify="right"); _tbl.add_column("Subject")
++                _sty = {"in_progress": "[yellow]▶ in progress[/yellow]",
++                        "pending": "[blue]○ pending[/blue]",
++                        "completed": "[green]✓ done[/green]"}
++                for t in _tasks:
++                    _tbl.add_row(str(t.get("id")), _sty.get(t.get("status"), t.get("status", "?")),
++                                 str(t.get("progress", 0)), str(t.get("subject", ""))[:70])
++                console.print(_tbl)
++        elif sub == "add":
++            subject = rest[2].strip() if len(rest) > 2 else ""
++            if not subject:
++                console.print("[yellow]Usage: /task add <subject>[/yellow]")
++            else:
++                _t = task_manager.create_task(subject)
++                console.print(f"[green]Created task #{_t['id']}: {subject}[/green]")
++        elif sub in ("done", "start", "rm", "del"):
++            tid = parts[2] if len(parts) > 2 else ""
++            if not tid:
++                console.print(f"[yellow]Usage: /task {sub} <id>[/yellow]")
++            elif sub == "rm" or sub == "del":
++                ok, msg = task_manager.delete_task(tid)
++                console.print(f"[green]{msg}[/green]" if ok else f"[yellow]{msg}[/yellow]")
++            else:
++                cur = task_manager.get_task(tid)
++                if cur is None:
++                    console.print(f"[yellow]Task '{tid}' not found[/yellow]")
++                elif sub == "start":
++                    ok, msg, _ = task_manager.update_task(tid, status="in_progress")
++                    console.print(f"[green]#{tid} → in progress[/green]" if ok else f"[yellow]{msg}[/yellow]")
++                else:  # done — route through in_progress if still pending
++                    if cur.get("status") == "pending":
++                        task_manager.update_task(tid, status="in_progress")
++                    ok, msg, _ = task_manager.update_task(tid, status="completed")
++                    console.print(f"[green]#{tid} → done[/green]" if ok else f"[yellow]{msg}[/yellow]")
++        elif sub == "purge":
++            n = task_manager.purge_tasks()
++            console.print(f"[green]Purged {n} completed/deleted task(s).[/green]")
++        else:
++            console.print("[yellow]/task [list|add <subject>|start <id>|done <id>|rm <id>|purge]  "
++                          "(no args = picker)[/yellow]")
+ 
+     elif action == "/plan":
+         import plan_mode as _pm
+@@ -6250,6 +6484,7 @@ _COMMANDS = [
+     ("/reload",    "Reload default files and restart"),
+     ("/v",         "Show version; /v update to self-update (partial download)"),
+     ("/resume",    "Choose a /q checkpoint to resume (/resume, /resume <N>)"),
++    ("/task",      "Manage tasks (picker; or /task list|add|done|rm|purge)"),
+     ("/continue",  "Resume agent loop after max_loops exhaustion"),
+ ]
+ 
+@@ -6379,8 +6614,7 @@ def show_help():
+     table.add_column("Command", style="cyan")
+     table.add_column("Description")
+ 
+-    table.add_row("ls, cat, mkdir, git, ...", "Commands found on PATH → executed directly")
+-    table.add_row("<natural language>", "Not a recognized command → AI agent loop")
++    table.add_row("<message>", "Send to AI; it decides whether tools or shell commands are needed")
+     table.add_row("/help", "Show this help")
+     table.add_row("/login", "Re-authenticate with laintas.com (opens browser)")
+     table.add_row("/model [id|reset]", "List available backend models, set model, or reset to backend default")
+@@ -6407,6 +6641,7 @@ def show_help():
+     table.add_row("/resume [N]", "Choose a /q checkpoint to resume; launch with --resume or --continue for latest")
+     table.add_row("/v, /version", "Show version & check for updates; /v update to self-update (downloads only changed files)")
+     table.add_row("/clear", "Clear screen")
++    table.add_row("/task [sub]", "Manage tasks: picker (no args), or list/add/done/rm/purge")
+     table.add_row("/exit", "Log out and exit (clears cached session)")
+     table.add_row("/quit, /q", "Detach from sub-terminal (/q) or exit without logging out (/quit)")
+ 
+@@ -6465,8 +6700,8 @@ def show_banner(agent_name: str, session: dict = None):
+         f"OS: {SYSTEM} | Shell: {shell_info}\n"
+         f"Working: {os.getcwd()}\n"
+         f"Backend: {os.environ.get('LAINTAS_BACKEND', BACKEND_URL)}\n\n"
+-        f"Commands from PATH → executed directly.\n"
+-        "Natural language → AI agent loop.\n"
++        f"Slash commands → CLI controls.\n"
++        "Other input → AI agent loop.\n"
+         "Type [bold]/help[/bold] for commands.",
+         title="laintas_cli",
+         border_style="blue",
+@@ -6868,33 +7103,27 @@ def main():
+     }
+     chat_history = []
+     # Load last session snapshot for this directory (depth-0 only)
++    # Disabled auto-loading of last session snapshot to prevent task sharing between sessions
+     if args.depth == 0:
+-        _snapshot = load_session_snapshot(_session_start_cwd)
+-        if _snapshot:
+-            agent_state["_last_session_snapshot"] = _snapshot
++        # _snapshot = load_session_snapshot(_session_start_cwd)
++        # if _snapshot:
++        #     agent_state["_last_session_snapshot"] = _snapshot
+         # Full-fidelity resume blob: explicit restore by flag or slash command.
+         # Without a flag, just hint so a fresh session stays fresh.
+-        _resume_blob = load_resume_state(_session_start_cwd)
+-        if _resume_blob and _resume_blob.get("chat_history"):
+-            _n_turns = _resume_turn_count(_resume_blob)
+-            _ago = _format_time_ago(_resume_blob.get("timestamp", 0))
+-            if args.resume or args.continue_session:
++        if args.resume or args.continue_session:
++            _resume_blob = load_resume_state(_session_start_cwd)
++            if _resume_blob and _resume_blob.get("chat_history"):
+                 _selected_resume = _choose_resume_blob(_session_start_cwd, "latest")
+                 if _selected_resume:
+                     agent_state = _restore_resume_blob(_selected_resume, chat_history)
++                    _n_turns = _resume_turn_count(_selected_resume)
++                    _ago = _format_time_ago(_selected_resume.get('timestamp', 0))
+                     console.print(
+                         f"[green]Resumed previous session in this directory "
+-                        f"({_resume_turn_count(_selected_resume)} turn(s), "
+-                        f"{_format_time_ago(_selected_resume.get('timestamp', 0))}).[/green]"
++                        f"({_n_turns} turn(s), {_ago}).[/green]"
+                     )
+             else:
+-                console.print(
+-                    f"[dim]Previous session in this directory "
+-                    f"({_n_turns} turn(s), {_ago}). Type [bold]/resume[/bold] "
+-                    f"or start with [bold]--resume[/bold] to continue.[/dim]"
+-                )
+-        elif args.resume or args.continue_session:
+-            console.print("[yellow]No saved session for this directory.[/yellow]")
++                console.print("[yellow]No saved session for this directory.[/yellow]")
+ 
+     if session.get("userId"):
+         agent_registry.register(session, name=agent_name, quiet=(args.depth > 0))
+@@ -7092,6 +7321,7 @@ def main():
+                 console.print("[yellow]Saved session has no conversation to resume.[/yellow]")
+             elif _blob:
+                 agent_state = _restore_resume_blob(_blob, chat_history)
++                _render_resume_transcript(chat_history)
+                 _n = _resume_turn_count(_blob)
+                 _ago = _format_time_ago(_blob.get("timestamp", 0))
+                 console.print(
+@@ -7204,176 +7434,42 @@ def main():
+         if agent_registry.agent_id:
+             agent_registry._push_events([{"type": "user", "content": user_input}])
+ 
+-        # Route first word against PATH/builtins → system command or AI
+-        # All REPL instances (depth 0 and depth > 0) execute system commands
+-        # directly. Natural language goes to AI.
+-        if is_system_command(user_input):
+-            console.print(f"\n[dim yellow]$ {user_input}[/dim yellow]")
+-            if agent_registry.agent_id:
+-                agent_registry._push_events([{"type": "system", "kind": "command", "content": user_input}])
+-
+-            # Close previous AI-managed interactive session if any
+-            if interactive_session is not None:
+-                interactive_session.close()
+-                interactive_session = None
+-
+-            # Remote-injected commands (from Helpwo Activity terminal): use
+-            # subprocess capture so stdout can be forwarded to the event stream.
+-            # pty_passthrough directly inherits the local tty and returns
+-            # stdout="" — nothing to forward.  Local commands keep pty_passthrough
+-            # so interactive programs (vim, claude) still work normally.
+-            if injected_done is not None and agent_registry.agent_id:
+-                import subprocess as _sub
+-                _cd_m = re.match(r'^\s*cd(?:\s+(.+))?\s*$', user_input)
+-                if _cd_m:
+-                    # cd is a shell builtin — handle it in the Python process too
+-                    _cd_target = (_cd_m.group(1) or "").strip() or os.path.expanduser("~")
+-                    try:
+-                        os.chdir(os.path.expanduser(_cd_target))
+-                        _cap_out = f"{os.getcwd()}"
+-                    except OSError as _e:
+-                        _cap_out = f"cd: {_e}"
+-                    result = {"stdout": _cap_out, "stderr": "", "returncode": 0, "success": True}
+-                else:
+-                    try:
+-                        _proc = _sub.run(
+-                            user_input, shell=True, capture_output=True, text=True,
+-                            timeout=60, cwd=os.getcwd(),
+-                        )
+-                        _cap_out = (_proc.stdout + _proc.stderr).strip()
+-                        result = {
+-                            "stdout": _proc.stdout, "stderr": _proc.stderr,
+-                            "returncode": _proc.returncode, "success": _proc.returncode == 0,
+-                        }
+-                    except _sub.TimeoutExpired:
+-                        _cap_out = "Command timed out after 60s."
+-                        result = {"stdout": "", "stderr": "", "returncode": -1, "success": False}
+-                agent_registry._push_events([{"type": "system", "kind": "output", "content": _cap_out[:4000]}])
+-            else:
+-                # Local user: ordinary commands route through term0's persistent
+-                # bash (marker-poll + cwd sync) so cd/export/pushd actually persist
+-                # across commands — term0's bash state IS what "current directory"
+-                # means here. Commands in the interactive whitelist (vim, claude,
+-                # ssh, ...) get full PTY passthrough so they keep native terminal
+-                # control (raw keystrokes, resize, full-screen redraw).
+-                _first = extract_first_word(user_input)
+-                _term0_info = get_terminal("term0")
+-                _use_term0 = (
+-                    not IS_WINDOWS
+-                    and _first not in get_interactive_commands()
+-                    and _term0_info is not None
+-                    and _term0_info.session is not None
+-                    and _term0_info.session.is_alive()
+-                )
+-
+-                if _use_term0:
+-                    result = _marker_poll_exec(_term0_info.session, user_input, strip_ansi_codes=False)
+-                    _sync_cwd_from_term0(_term0_info.session)
+-                    # marker-poll captures output but doesn't echo to the user's
+-                    # terminal (unlike pty_passthrough, which echoes directly) —
+-                    # print so the user sees command output.
+-                    _stdout = result.get("stdout", "")
+-                    if _stdout:
+-                        try:
+-                            sys.stdout.write(_stdout)
+-                            if not _stdout.endswith("\n"):
+-                                sys.stdout.write("\n")
+-                            sys.stdout.flush()
+-                        except (BrokenPipeError, OSError):
+-                            pass
+-                else:
+-                    # Drain any queued terminal query responses before passthrough.
+-                    if not IS_WINDOWS:
+-                        _fl = fcntl.fcntl(sys.stdin.fileno(), fcntl.F_GETFL)
+-                        fcntl.fcntl(sys.stdin.fileno(), fcntl.F_SETFL, _fl | os.O_NONBLOCK)
+-                        try:
+-                            while True:
+-                                if not sys.stdin.buffer.read(4096):
+-                                    break
+-                        except (BlockingIOError, OSError):
+-                            pass
+-                        finally:
+-                            fcntl.fcntl(sys.stdin.fileno(), fcntl.F_SETFL, _fl)
+-
+-                    result = pty_passthrough(user_input)
+-                    # On Windows pty_passthrough() captures output via
+-                    # subprocess instead of echoing to the terminal (no PTY),
+-                    # so print it here or the user sees nothing for `dir`, etc.
+-                    if IS_WINDOWS:
+-                        _win_out = result.get("stdout", "")
+-                        _win_err = result.get("stderr", "")
+-                        try:
+-                            if _win_out:
+-                                sys.stdout.write(_win_out)
+-                                if not _win_out.endswith("\n"):
+-                                    sys.stdout.write("\n")
+-                            if _win_err:
+-                                sys.stderr.write(_win_err)
+-                                if not _win_err.endswith("\n"):
+-                                    sys.stderr.write("\n")
+-                            sys.stdout.flush()
+-                        except (BrokenPipeError, OSError):
+-                            pass
+-
+-                if agent_registry.agent_id:
+-                    output_preview = result.get("stdout", "")[:2000]
+-                    if output_preview:
+-                        agent_registry._push_events([{"type": "system", "kind": "output", "content": output_preview}])
+-
+-            # ── Debug: log command execution ──
+-            loop_id = next_debug_loop()
+-            add_debug_log(DebugEntry(
+-                timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+-                loop=loop_id,
+-                user_input=user_input[:2000],
+-                current_path=os.getcwd(),
+-                exec_command=user_input,
+-                exec_stdout=result.get("stdout", "")[:2000],
+-                exec_returncode=result.get("returncode", -1),
+-                done=True,
+-            ))
++        # Ordinary non-slash input always goes to the AI. The model decides
++        # whether to answer directly, call shell.exec, edit files, or use another
++        # tool; the REPL no longer classifies user text as shell-vs-language.
++        if not session.get("userId"):
++            console.print("[yellow]Not authenticated. Use /login first.[/yellow]")
++            if injected_done is not None:
++                injected_done.set()
++            continue
++        console.print("[dim]Asking AI...[/dim]")
+ 
+-            agent_state["lastOutput"] = result.get("stdout", "")
+-            response = {
+-                "success": result.get("success", False),
+-                "msg": "",
+-                "state": agent_state,
+-                "session": None,
+-            }
+-        else:
+-            if not session.get("userId"):
+-                console.print("[yellow]Not authenticated. Use /login first.[/yellow]")
+-                if injected_done is not None:
+-                    injected_done.set()
+-                continue
+-            console.print("[dim]Not a system command, asking AI...[/dim]")
+-
+-            # Build event callback for real-time streaming
+-            def local_events_cb(events: list):
+-                if agent_registry.agent_id:
+-                    agent_registry._push_events(events)
+-
+-            response = _run_agent_loop_with_interrupt(get_loop_deps(), user_input, session, agent_state, chat_history,
+-                                      events_cb=local_events_cb,
+-                                      existing_session=interactive_session)
+-            interactive_session = response.get("session")
+-
+-            # ── Store context for /continue ──
+-            handle_meta_command._last_agent_state = response.get("state", agent_state)
+-            handle_meta_command._last_chat_history = chat_history
+-            handle_meta_command._last_original_input = user_input
+-            handle_meta_command._last_deps = get_loop_deps()
+-            handle_meta_command._last_session = session
+-            handle_meta_command._last_events_cb = local_events_cb
+-            handle_meta_command._last_existing_session = interactive_session
+-
+-            # Sync CWD after AI loop — the AI may have run shell.exec("cd ...")
+-            # which changed term0's bash CWD. Sync so the next prompt shows
+-            # the correct directory.
+-            if not IS_WINDOWS:
+-                _t0 = get_terminal("term0")
+-                if _t0 and _t0.session and _t0.session.is_alive():
+-                    _sync_cwd_from_term0(_t0.session)
++        # Build event callback for real-time streaming
++        def local_events_cb(events: list):
++            if agent_registry.agent_id:
++                agent_registry._push_events(events)
++
++        response = _run_agent_loop_with_interrupt(get_loop_deps(), user_input, session, agent_state, chat_history,
++                                  events_cb=local_events_cb,
++                                  existing_session=interactive_session)
++        interactive_session = response.get("session")
++
++        # ── Store context for /continue ──
++        handle_meta_command._last_agent_state = response.get("state", agent_state)
++        handle_meta_command._last_chat_history = chat_history
++        handle_meta_command._last_original_input = user_input
++        handle_meta_command._last_deps = get_loop_deps()
++        handle_meta_command._last_session = session
++        handle_meta_command._last_events_cb = local_events_cb
++        handle_meta_command._last_existing_session = interactive_session
++
++        # Sync CWD after AI loop — the AI may have run shell.exec("cd ...")
++        # which changed term0's bash CWD. Sync so the next prompt shows
++        # the correct directory.
++        if not IS_WINDOWS:
++            _t0 = get_terminal("term0")
++            if _t0 and _t0.session and _t0.session.is_alive():
++                _sync_cwd_from_term0(_t0.session)
+ 
+         # Save AI reply to chat history
+         if response.get("msg"):
+diff --git a/laintas_cli_download/public/releases/latest/src/agent_loop.py b/laintas_cli_download/public/releases/latest/src/agent_loop.py
+index 2fd4653..2cba736 100644
+--- a/laintas_cli_download/public/releases/latest/src/agent_loop.py
++++ b/laintas_cli_download/public/releases/latest/src/agent_loop.py
+@@ -53,7 +53,8 @@ _DEFAULT_CONFIG = {
+     "repetition_threshold": 3,    # consecutive no-progress steps before force-exit (mirrors TokenBudgetTracker)
+     "warning_force_limit": 5,     # consecutive same-warning fires before force-exit (circuit breaker)
+     "output_similarity": 0.85,    # Jaccard threshold for "same" output (0.0-1.0)
+-    "microcompact_keep": 6,       # recent entries to keep full output in microcompact
++    "microcompact_keep": 8,       # recent entries to keep full output in microcompact
++    "microcompact_read_budget": 24000,  # chars of older file-read content kept verbatim (deduped, newest-first) instead of wiped — prevents re-read amnesia
+     "history_max_messages": 20,    # chat messages sent to backend after local compaction
+     "message_truncate": 1200,      # chars per history message sent to backend
+     "short_memory_max_chars": 2000, # session memory budget, line-aware
+@@ -126,6 +127,7 @@ _MAX_CONFIG = {
+     "warning_force_limit": 100000,  # disable warning circuit breaker
+     "output_similarity": 1.0,       # only byte-identical output counts as repeat
+     "microcompact_keep": 200,       # keep far more full outputs
++    "microcompact_read_budget": 2000000,  # effectively keep all file-read content
+     "history_max_messages": 500,
+     "message_truncate": 100000,
+     "short_memory_max_chars": 200000,
+@@ -563,7 +565,13 @@ def save_resume_checkpoint(state: dict, chat_history: list, cwd: str) -> Optiona
+ 
+ 
+ def list_resume_states(cwd: str) -> list:
+-    """Return selectable resume states for this cwd, newest first."""
++    """Return selectable resume states for this cwd.
++
++    Sort order: longest history (turn_count) first, then most recent.
++    A pure "newest mtime" sort can shadow a rich multi-turn blob with a
++    per-turn autosave that only contains the latest 1 turn, so the auto
++    resume path lands on the wrong file. turn_count breaks that tie.
++    """
+     states = []
+     seen_ids = set()
+     try:
+@@ -588,7 +596,8 @@ def list_resume_states(cwd: str) -> list:
+                 continue
+     except Exception:
+         return []
+-    states.sort(key=lambda item: item.get("timestamp", 0), reverse=True)
++    # Primary: longest history first. Tiebreaker: most recent timestamp.
++    states.sort(key=lambda item: (item.get("turn_count", 0), item.get("timestamp", 0)), reverse=True)
+     return states
+ 
+ 
+@@ -1534,17 +1543,37 @@ def _compress_terminal_history(history: list) -> str:
+ 
+     old_entries = history[:-_COMPRESSION_KEEP_RECENT]
+     recent_entries = history[-_COMPRESSION_KEEP_RECENT:]
+-    digest = _summarize_old_entries(old_entries)
++
++    # Microcompact flagged the deduplicated, latest content of each file the
++    # model read with `_kept`. Render those verbatim (so the model never needs
++    # to re-read) and digest only the rest into one-liners.
++    kept_reads = [e for e in old_entries if e.get("_kept")]
++    other_old = [e for e in old_entries if not e.get("_kept")]
++    digest = _summarize_old_entries(other_old)
+ 
+     lines = [
+-        f"[DIGEST — Steps 1-{digest['total_old']} "
++        f"[DIGEST — {digest['total_old']} older step(s) "
+         f"(errors:{digest['error_steps']})]"
+     ]
+     if digest["files_touched"]:
+         lines.append(f"  files seen: {', '.join(digest['files_touched'])}")
+     lines.extend(digest["lines"])
++
++    if kept_reads:
++        lines.append("")
++        lines.append("[RETAINED FILE CONTENT — already read this session; do NOT re-read these]")
++        for e in kept_reads:
++            cmd_label = (e.get("command", "") or "")[:120]
++            out = e.get("output", "") or ""
++            out_lines = out.split('\n')
++            if len(out_lines) > _MAX_TERMINAL_LINES:
++                out = (f"...(showing last {_MAX_TERMINAL_LINES} lines)...\n"
++                       + '\n'.join(out_lines[-_MAX_TERMINAL_LINES:]))
++            lines.append(f"--- {cmd_label} ---")
++            lines.append(out if out.strip() else "(no output)")
++
+     lines.append("")
+-    lines.append(f"[RECENT — Steps {len(old_entries) + 1}-{len(history)}]")
++    lines.append(f"[RECENT — last {len(recent_entries)} step(s)]")
+ 
+     for idx, entry in enumerate(recent_entries, len(old_entries) + 1):
+         output = entry.get("output", "")
+@@ -1591,31 +1620,84 @@ def _trim_carried_outputs(history: list, tail_chars: int = 600) -> list:
+     return result
+ 
+ 
+-def _microcompact_history(history: list, keep_recent: int = 6) -> list:
+-    """Strip output from old tool results — zero-cost context window recovery.
++def _is_file_read_entry(entry: dict) -> bool:
++    """A terminalHistory row that fetched file content (fs.read or cat/head/tail).
++
++    These are dedup-able by their `command` (recorded as `path` / `path@offset`
++    by _salient_arg) and worth retaining verbatim — re-fetching the same bytes is
++    the dominant amnesia cost. fs.grep is NOT a content fetch (it's a query)."""
++    if entry.get("tool") == "fs.read":
++        return True
++    cmd = (entry.get("command") or "").strip()
++    return any(cmd.startswith(p) for p in ("cat ", "head ", "tail "))
++
++
++def _microcompact_history(history: list, keep_recent: int = 6,
++                          read_budget: Optional[int] = None) -> list:
++    """Content-aware microcompact — recover context without inducing re-reads.
+ 
+-    Mirrors Claude Code's microcompact layer: deletes the bulky output field
+-    from entries older than `keep_recent`, keeping only command + returncode +
+-    tool metadata. This is zero LLM cost and recovers significant context.
++    The naive version wiped the output of every row older than `keep_recent`,
++    which deleted file content the model had read; it then re-read the same
++    file (amnesia). Instead we spend a char budget on the *deduplicated, latest*
++    content of each file the model read (newest-first), and wipe only the truly
++    low-value rows: shell/grep output, and reads superseded by a later identical
++    read. Kept reads are flagged `_kept` so the render layer shows them verbatim
++    rather than digesting them to one line.
+ 
+-    Called at the start of each iteration so old entries are always stripped
+-    before the prompt is built.
++    Net effect: the prompt always carries the current content of every distinct
++    file section the model has read (up to budget), so it stops re-reading.
+     """
+     if len(history) <= keep_recent:
+         return history
++    if read_budget is None:
++        try:
++            read_budget = int(get_runtime_config("microcompact_read_budget") or 0)
++        except Exception:
++            read_budget = 0
++
++    n = len(history)
++    old_upto = n - keep_recent  # indices [0, old_upto) are "old"
++
++    # Latest index of each distinct successful file-read among OLD entries.
++    latest_read_idx: dict[str, int] = {}
++    for i in range(old_upto):
++        e = history[i]
++        if _is_file_read_entry(e) and e.get("returncode") in (0, None):
++            cmd = (e.get("command") or "").strip()
++            if cmd:
++                latest_read_idx[cmd] = i  # last occurrence wins
++    latest_indices = set(latest_read_idx.values())
++
++    # Keep latest-read content newest-first until the char budget is spent.
++    keep_content: set[int] = set()
++    budget = read_budget
++    for idx in sorted(latest_indices, reverse=True):
++        out = history[idx].get("output")
++        if not isinstance(out, str):
++            continue
++        if keep_content and budget - len(out) < 0:
++            continue  # over budget — let this (older) read be re-fetched if needed
++        keep_content.add(idx)
++        budget -= len(out)
++
+     result = []
+     for i, entry in enumerate(history):
+-        if i < len(history) - keep_recent:
+-            stripped = {
++        if i >= old_upto:
++            result.append(entry)                      # recent window: verbatim
++        elif i in keep_content:
++            kept = dict(entry)
++            kept["_kept"] = True                      # render verbatim, don't digest
++            result.append(kept)
++        else:
++            superseded = _is_file_read_entry(entry) and i not in latest_indices
++            result.append({
+                 "command": entry.get("command", ""),
+                 "returncode": entry.get("returncode"),
+                 "tool": entry.get("tool", ""),
+                 "call_id": entry.get("call_id", ""),
+-                "output": "(output cleared by microcompact)",
+-            }
+-            result.append(stripped)
+-        else:
+-            result.append(entry)
++                "output": "(superseded by a later identical read)" if superseded
++                          else "(output cleared by microcompact)",
++            })
+     return result
+ 
+ 
+@@ -2087,12 +2169,20 @@ def _detect_loop_warnings_typed(state: dict, original_input: str) -> list[tuple[
+         cmd = (last_entry.get("command") or "").strip()
+         if cmd and (last_tool == "fs.read" or
+                     any(cmd.startswith(p) for p in ("cat ", "head ", "tail "))):
+-            prior = [(h.get("command") or "").strip() for h in history[:-1][-20:]]
+-            if cmd in prior:
++            # Only warn when the earlier read's CONTENT is still in context — then
++            # "refer to it above" is actionable. If microcompact evicted it (over
++            # budget), re-reading is the only option; scolding would be futile, so
++            # stay silent. A wiped row has a placeholder output, not real content.
++            def _has_live_content(h):
++                if (h.get("command") or "").strip() != cmd:
++                    return False
++                out = h.get("output")
++                return isinstance(out, str) and not out.startswith(
++                    ("(output cleared", "(superseded"))
++            if any(_has_live_content(h) for h in history[:-1][-20:]):
+                 warnings.append(("context_amnesia",
+-                    f"Context amnesia: you're re-reading `{cmd}` which you already "
+-                    f"examined earlier. Refer to your previous output instead of "
+-                    f"re-reading."
++                    f"You already have the content of `{cmd}` above (see RETAINED "
++                    f"FILE CONTENT / recent steps). Refer to it instead of re-reading."
+                 ))
+ 
+     # 5. Near-repeat commands: fuzzy fingerprint matching
+@@ -3409,8 +3499,8 @@ def run_agent_loop(
+ 
+         # 7. Show billing if available (opt-in via /config show_billing true)
+         if billing and get_runtime_config("show_billing"):
+-            cost = billing.get("costCents", 0)
+-            balance = billing.get("balanceCents", 0)
++            cost = billing.get("costCents") or 0
++            balance = billing.get("balanceCents") or 0
+             if cost > 0:
+                 billing_text = f"${cost / 100:.2f} · balance ${balance / 100:.2f}"
+                 if events_cb is not None:
+diff --git a/laintas_cli_download/public/releases/latest/src/laintas_cli.py b/laintas_cli_download/public/releases/latest/src/laintas_cli.py
+index 5f640ca..ff171ef 100755
+--- a/laintas_cli_download/public/releases/latest/src/laintas_cli.py
++++ b/laintas_cli_download/public/releases/latest/src/laintas_cli.py
+@@ -464,9 +464,10 @@ class SubTerminalSession:
+     close, full_output, returncode, command).
+     """
+ 
+-    def __init__(self, command: str, timeout: int = 120):
++    def __init__(self, command: str, timeout: int = 120, persistent: bool = False):
+         self.command = command
+         self.timeout = timeout
++        self.persistent = persistent
+         self._use_tmux = "TMUX" in os.environ and not IS_WINDOWS
+         self._tmux_window: str = ""
+         self._pty: Optional[InteractiveSession] = None
+@@ -492,7 +493,10 @@ class SubTerminalSession:
+             )
+             self._alive = True
+         else:
+-            self._pty = InteractiveSession(self.command, timeout=self.timeout, stream_output=False)
++            self._pty = InteractiveSession(
++                self.command, timeout=self.timeout,
++                stream_output=False, persistent=self.persistent,
++            )
+             self._pty.start()
+             self._alive = self._pty.is_alive()
+ 
+@@ -2884,6 +2888,27 @@ def _native_to_tool_calls(frags: dict, name_map: Optional[dict] = None) -> list:
+     return out
+ 
+ 
++def _looks_like_json_attempt(text: str) -> bool:
++    """Did the model TRY to emit the JSON envelope, vs write plain prose?
++
++    Used to decide whether a non-parseable, tool-call-free response is a
++    malformed-JSON failure (retry) or a legitimate prose answer (surface it).
++    A stray '{' inside prose — code snippets, set notation, syntax like
++    `#agent_name#{ ... }` — must NOT count as an attempt; otherwise an ordinary
++    text answer that merely mentions a brace gets flagged "_parse_failed" and
++    the loop fires a bogus "asking AI to retry". Only count it when the text
++    actually opens with a JSON object (optionally after a ``` fence) or carries
++    the envelope's distinctive `tool_calls` key."""
++    s = (text or "").strip()
++    if not s:
++        return False
++    if s.startswith("```"):
++        s = re.sub(r"^```(?:json)?\s*", "", s).lstrip()
++    if s.startswith("{"):
++        return True
++    return '"tool_calls"' in s or "'tool_calls'" in s
++
++
+ def _extract_json_object(text: str) -> Optional[dict]:
+     """Extract the first top-level JSON object from text. Handles code fences,
+     leading prose, and trailing prose. Returns None if no object parses."""
+@@ -3193,8 +3218,10 @@ def call_backend_stream(
+                 if on_chunk is not None:
+                     parsed = _try_parse_partial_json(accumulated)
+                     # Native mode: model streams plain prose as `content` (no
+-                    # JSON envelope). Stream it straight through as the reply.
+-                    if parsed is None and "{" not in accumulated:
++                    # JSON envelope). Stream it straight through as the reply —
++                    # unless it genuinely looks like a JSON attempt (don't leak
++                    # raw JSON); a stray '{' in prose must not stop streaming.
++                    if parsed is None and not _looks_like_json_attempt(accumulated):
+                         try: on_chunk("reply", delta_content)
+                         except Exception: pass
+                         prev_reply_for_chunks = accumulated.strip()
+@@ -3275,25 +3302,27 @@ def call_backend_stream(
+                 # No parseable JSON body, but the model called tools via the
+                 # native channel — run them. Keep pure-prose preamble as reply.
+                 return {
+-                    "reply": accumulated.strip() if "{" not in accumulated else "",
++                    "reply": "" if _looks_like_json_attempt(accumulated) else accumulated.strip(),
+                     "tool_calls": native_calls,
+                     "done": False,
+                     "_billing": billing_info,
+                     "_diag_events": _diag_events + ["parsed_native_tool_calls"],
+                 }
+             raw_text = accumulated.strip() or "(no response)"
+-            # Pure prose (no '{'): content is valid but JSON wrapper is missing.
+-            # Continue the loop so the model gets a nudge and can still call tools,
+-            # but mark _prose_only so the nudge is silent (no user-visible warning).
+-            # Only show the warning when the model was clearly attempting JSON (has '{').
++            # No tool calls and no parseable JSON. Distinguish a genuine malformed
++            # JSON-envelope attempt (retry) from a plain prose answer (surface it).
++            # In native-tool mode a tool-call-free reply IS the model's prose
++            # answer; only treat it as a failure when it actually tried JSON —
++            # NOT merely because the prose contains a '{' (e.g. `#name#{ ... }`).
++            _json_attempt = _looks_like_json_attempt(accumulated)
+             return {
+                 "reply": raw_text,
+                 "tool_calls": [],
+                 "done": False,
+                 "error": False,
+-                "_parse_failed": True,
+-                "_prose_only": "{" not in accumulated,
+-                "_truncated": _hit_ceiling and "{" in accumulated,
++                "_parse_failed": _json_attempt,
++                "_prose_only": not _json_attempt,
++                "_truncated": _hit_ceiling and _json_attempt,
+                 "_billing": billing_info,
+                 "_diag_events": _diag_events,
+             }
+@@ -3319,12 +3348,18 @@ def call_backend_stream(
+                     "_diag_events": _diag_events + ["parsed_native_tool_calls"],
+                 }
+             raw_text = accumulated.strip() or json.dumps(parsed, ensure_ascii=False)
++            # An object parsed but it has no envelope fields. Same distinction as
++            # above: a genuine (malformed) JSON attempt is a failure to retry; a
++            # prose answer that merely embedded a small JSON object (e.g. an
++            # example like {"city": "Tokyo"}) is a real answer — surface it.
++            _json_attempt = _looks_like_json_attempt(accumulated)
+             return {
+                 "reply": raw_text,
+                 "tool_calls": [],
+                 "done": False,
+                 "error": False,
+-                "_parse_failed": True,
++                "_parse_failed": _json_attempt,
++                "_prose_only": not _json_attempt,
+                 "_billing": billing_info,
+                 "_diag_events": _diag_events,
+             }
+@@ -4535,8 +4570,8 @@ def show_debug_detail(index: int) -> None:
+             lines.append(f"[bold]Command:[/bold] {e.command}")
+         lines.append(f"[bold]Done:[/bold] {e.done}")
+         if e.billing:
+-            cost = e.billing.get("costCents", 0)
+-            balance = e.billing.get("balanceCents", 0)
++            cost = e.billing.get("costCents") or 0
++            balance = e.billing.get("balanceCents") or 0
+             lines.append(f"[bold]Billing:[/bold] ${cost / 100:.2f} (balance ${balance / 100:.2f})")
+         if e.error:
+             lines.append("[red]Error occurred[/red]")
+@@ -5520,8 +5555,8 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict,
+                             if e.error:
+                                 lines.append("\n[Error] true")
+                             if e.billing:
+-                                cost = e.billing.get("costCents", 0)
+-                                balance = e.billing.get("balanceCents", 0)
++                                cost = e.billing.get("costCents") or 0
++                                balance = e.billing.get("balanceCents") or 0
+                                 lines.append(f"\n[Billing] ${cost / 100:.2f} (balance ${balance / 100:.2f})")
+                             if e.exec_command:
+                                 lines.append(f"\n[Executed] {e.exec_command}")
+diff --git a/laintas_cli_download/public/releases/latest/src/skills.py b/laintas_cli_download/public/releases/latest/src/skills.py
+index 90033ef..ae394c0 100644
+--- a/laintas_cli_download/public/releases/latest/src/skills.py
++++ b/laintas_cli_download/public/releases/latest/src/skills.py
+@@ -284,6 +284,43 @@ def load_skill(name: str) -> tuple[bool, str]:
+     return _load_skill_full(name)
+ 
+ 
++def unload_skill(name: str) -> tuple[bool, str]:
++    """Unload a previously loaded skill: unregister its tools, drop the
++    imported module, clear references, and mark the state as not loaded.
++    """
++    if not _scan_done:
++        scan_metadata()
++
++    state = _skill_states.get(name)
++    if state is None or not state.loaded:
++        return False, f"skill '{name}' is not loaded"
++
++    # Unregister every tool this skill contributed to the global registry.
++    registry = get_registry()
++    removed = registry.unregister_source(f"skill:{name}")
++
++    # Drop the dynamically imported module from sys.modules.
++    mod_name = f"laintas_skill_{name}"
++    sys.modules.pop(mod_name, None)
++
++    # Try to remove the skill dir from sys.path if it was added by us.
++    meta = _skill_metadata.get(name)
++    if meta is not None:
++        skill_dir = str(Path(meta.dir_path))
++        try:
++            sys.path.remove(skill_dir)
++        except ValueError:
++            pass
++
++    # Reset state but keep metadata + body for a possible re-load.
++    state.loaded = False
++    state.module = None
++    state.tools = []
++    state.references = {}
++
++    return True, f"{name}: unloaded ({removed} tool(s) removed)"
++
++
+ def list_skills() -> list[dict]:
+     """Return lightweight skill catalog for tools/UI."""
+     if not _scan_done:
+diff --git a/laintas_cli_download/public/releases/latest/src/tools.py b/laintas_cli_download/public/releases/latest/src/tools.py
+index 4da62ad..67246e3 100644
+--- a/laintas_cli_download/public/releases/latest/src/tools.py
++++ b/laintas_cli_download/public/releases/latest/src/tools.py
+@@ -351,6 +351,21 @@ def _bi_skill_load(params: dict, ctx: ToolCtx) -> dict:
+     }
+ 
+ 
++def _bi_skill_unload(params: dict, ctx: ToolCtx) -> dict:
++    """Unload a previously loaded skill: removes its tools from the
++    registry, drops the imported module, and clears the loaded state.
++    Safe to call on a not-loaded skill (returns an error message).
++    """
++    import skills as _skills
++    name = (params.get("name") or "").strip()
++    if not name:
++        return {"ok": False, "error": "missing 'name'"}
++    ok, msg = _skills.unload_skill(name)
++    if not ok:
++        return {"ok": False, "error": msg}
++    return {"ok": True, "result": msg}
++
++
+ def _bi_fs_read(params: dict, ctx: ToolCtx) -> dict:
+     """Read a file as UTF-8 with optional line range and cat-style numbering.
+ 
+@@ -1923,12 +1938,15 @@ def _bi_terminal_create(params: dict, ctx: ToolCtx) -> dict:
+         if existing is not None:
+             return {"ok": False, "error": f"terminal '{name}' already exists"}
+ 
+-    lain_cmd = f"{sys.executable} {os.path.abspath(__file__)} --depth {ctx.depth + 1}"
+-    sub = ctx.deps.SubTerminalSession(lain_cmd)
++    # Spawn a persistent interactive bash as a raw sub-terminal.
++    # persistent=True → exec bare DEFAULT_SHELL (no -c) so bash stays alive
++    # across many terminal.send_keys calls. Without this, bash -c "..." runs
++    # once and the PTY's master fd gets EOF, marking the session dead.
++    sub = ctx.deps.SubTerminalSession("bash -i", persistent=True)
+     sub.start()
+-    time.sleep(0.15)
++    time.sleep(0.2)
+     if sub.is_alive():
+-        sub.read_output(timeout=0.1)
++        sub.read_output(timeout=0.2)
+     ctx.register_terminal(sub, "laintas-cli", ctx.depth, name=name)
+     return {"ok": True, "result": f"Created sub-terminal {name}", "terminal": name}
+ 
+@@ -2316,6 +2334,20 @@ def register_builtin_tools() -> None:
+             },
+             invoke=_bi_skill_load,
+         ),
++        Tool(
++            name="skill.unload",
++            description="Unload a previously loaded skill: removes its tools from the "
++                        "registry, drops the imported module, and clears the loaded state. "
++                        "Use this to free context / tool slots when a skill is no longer needed.",
++            schema={
++                "type": "object",
++                "properties": {
++                    "name": {"type": "string", "description": "Skill name to unload"},
++                },
++                "required": ["name"],
++            },
++            invoke=_bi_skill_unload,
++        ),
+         Tool(
+             name="fs.read",
+             description="Read a file as UTF-8 text. Use offset/limit for large files. "
+diff --git a/policy.py b/policy.py
+index 2e28cb4..ee1bad0 100644
+--- a/policy.py
++++ b/policy.py
+@@ -383,8 +383,11 @@ def evaluate(command: str, cwd: str = None,
+     if path_decision is not None:
+         _write_audit(_audit_entry(command, path_decision.action,
+                                   path_decision.reason, cwd, req_id, agent_id))
+-        # In enforce mode: ask user for approval (needs_approval)
+-        # In audit mode: allow with warning (don't block)
++        # Sensitive-file writes (denyFileWrite) always block, even in audit mode
++        # — same precedence as the command deny-list and evaluate_file_write().
++        if path_decision.action == "deny" and mode != "disabled":
++            return path_decision
++        # Boundary approvals: enforce asks for approval; audit logs but allows.
+         if mode == "enforce":
+             return path_decision
+         # audit mode: log but allow
+@@ -400,23 +403,47 @@ def _check_paths(command: str, cwd: str | None,
+     """Check if a write operation targets paths outside allowedRoots.
+ 
+     Extracts file paths from well-known commands that write to disk:
+-    rm, mv, cp, touch, mkdir, cat >, > redirect, dd of=, ln, chmod, chown.
+-    Returns PolicyDecision('needs_approval') if any path escapes, None if ok.
++    rm, mv, cp, touch, mkdir, cat >, > redirect, dd of=, ln, chmod, chown,
++    sed -i / perl -i, plus no-space redirects.
++    Two tiers, mirroring evaluate_file_write() so the shell channel can't be
++    used to dodge the fs.* file-write policy:
++      - denyFileWrite patterns (.env, .ssh, *.pem, credentials …) → deny
++      - paths outside allowedRoots → needs_approval
++    Returns the first matching PolicyDecision, or None if all paths are clean.
+     """
+-    if not allowed_roots:
++    paths = _extract_paths(command)
++    if not paths:
+         return None
+ 
+     cwd_path = Path(cwd or os.getcwd()).resolve()
+     allowed = [Path(r).resolve() for r in allowed_roots]
+ 
+-    # Extract paths from the command
+-    paths = _extract_paths(command)
++    cfg = _load_config()
++    deny_patterns = list(dict.fromkeys(
++        cfg.get("denyFileWrite", []) + _DEFAULT_CONFIG["denyFileWrite"]))
++
+     for p in paths:
+         try:
+             resolved = (cwd_path / p).resolve()
+         except (ValueError, OSError):
+             continue
+-        # Check if resolved path is inside any allowed root
++        rp = str(resolved)
++
++        # Tier 1: sensitive-file patterns always block — same protection the
++        # fs.* path gets, so `echo k > ~/.ssh/authorized_keys` is no longer a
++        # hole that `fs.edit` would have closed.
++        for pat in deny_patterns:
++            try:
++                if re.search(pat, rp):
++                    return PolicyDecision(
++                        "deny", pat,
++                        f"Path '{p}' matches denyFileWrite rule: {pat}")
++            except re.error:
++                continue
++
++        # Tier 2: writes outside allowedRoots need approval.
++        if not allowed:
++            continue
+         ok = False
+         for root in allowed:
+             try:
+@@ -502,7 +529,31 @@ def _extract_paths(command: str) -> list:
+             if not tok.startswith("/dev/"):
+                 paths.append(tok)
+ 
+-    return paths
++    # Redirect targets, robust form: shlex keeps no-space redirects like
++    # `>/etc/x`, `2>>log`, `&>out` as a single token, which the loop above
++    # misses. Match them directly on the raw command string.
++    for m in re.finditer(r'(?:\d*>>?|&>>?)\s*([^\s|&;<>]+)', command):
++        tgt = m.group(1)
++        if tgt and not tgt.startswith(("/dev/", "$", "&")):
++            paths.append(tgt)
++
++    # In-place editors (`sed -i`, `perl -i`) write their file arguments. The
++    # first non-flag token is the script/expression; the rest are target files.
++    base = tokens[0].rsplit("/", 1)[-1] if tokens else ""
++    if base in ("sed", "perl") and any(t == "-i" or t.startswith("-i") for t in tokens[1:]):
++        non_flag = [t for t in tokens[1:] if not t.startswith("-")]
++        for t in non_flag[1:]:  # skip the script/expression arg
++            if not t.startswith("$"):
++                paths.append(t)
++
++    # Dedup while preserving order.
++    seen = set()
++    deduped = []
++    for p in paths:
++        if p not in seen:
++            seen.add(p)
++            deduped.append(p)
++    return deduped
+ 
+ 
+ def evaluate_file_write(path: str, cwd: str | None = None,
+@@ -514,8 +565,12 @@ def evaluate_file_write(path: str, cwd: str | None = None,
+       - denyFileWrite patterns always block (except in "disabled" mode).
+       - paths outside allowedRoots need approval in "enforce" mode, warn-and-allow
+         in "audit" mode (mirrors the command path-boundary check in evaluate()).
+-      - "enforce" mode requires approval for every write, matching mainstream
+-        editor-agent behavior (diff preview + confirm before applying).
++      - writes INSIDE allowedRoots (incl. cwd) are allowed without per-write
++        approval: allowedRoots IS the trust boundary, exactly like the command
++        allow-list in evaluate(). A blanket "approve every write" gate here is
++        self-defeating in an autonomous loop (nobody to approve) and merely
++        pushes edits onto the unaudited shell channel (python/sed heredocs),
++        which is both slower and a security hole — so it is intentionally absent.
+     """
+     cfg = _load_config()
+     mode = cfg.get("mode", "audit")
+@@ -561,13 +616,9 @@ def evaluate_file_write(path: str, cwd: str | None = None,
+                 return PolicyDecision("needs_approval", "", reason)
+             # audit mode: log but allow (mirrors evaluate()'s command path check)
+ 
+-    # ── Enforce mode: every write needs explicit approval ───────────────
+-    if mode == "enforce":
+-        reason = "enforce mode requires approval for all file writes"
+-        _write_audit(_audit_entry(label, "needs_approval", reason, cwd, req_id, agent_id))
+-        return PolicyDecision("needs_approval", "", reason)
+-
+-    _write_audit(_audit_entry(label, "allow", "default allow", cwd, req_id, agent_id))
++    # In-bounds write (within allowedRoots/cwd): trusted, allow without approval.
++    # Out-of-bounds writes already returned needs_approval (enforce) above.
++    _write_audit(_audit_entry(label, "allow", "in-bounds write", cwd, req_id, agent_id))
+     return PolicyDecision("allow")
+ 
+ 
+diff --git a/skills.py b/skills.py
+index 90033ef..ae394c0 100644
+--- a/skills.py
++++ b/skills.py
+@@ -284,6 +284,43 @@ def load_skill(name: str) -> tuple[bool, str]:
+     return _load_skill_full(name)
+ 
+ 
++def unload_skill(name: str) -> tuple[bool, str]:
++    """Unload a previously loaded skill: unregister its tools, drop the
++    imported module, clear references, and mark the state as not loaded.
++    """
++    if not _scan_done:
++        scan_metadata()
++
++    state = _skill_states.get(name)
++    if state is None or not state.loaded:
++        return False, f"skill '{name}' is not loaded"
++
++    # Unregister every tool this skill contributed to the global registry.
++    registry = get_registry()
++    removed = registry.unregister_source(f"skill:{name}")
++
++    # Drop the dynamically imported module from sys.modules.
++    mod_name = f"laintas_skill_{name}"
++    sys.modules.pop(mod_name, None)
++
++    # Try to remove the skill dir from sys.path if it was added by us.
++    meta = _skill_metadata.get(name)
++    if meta is not None:
++        skill_dir = str(Path(meta.dir_path))
++        try:
++            sys.path.remove(skill_dir)
++        except ValueError:
++            pass
++
++    # Reset state but keep metadata + body for a possible re-load.
++    state.loaded = False
++    state.module = None
++    state.tools = []
++    state.references = {}
++
++    return True, f"{name}: unloaded ({removed} tool(s) removed)"
++
++
+ def list_skills() -> list[dict]:
+     """Return lightweight skill catalog for tools/UI."""
+     if not _scan_done:
+diff --git a/task_manager.py b/task_manager.py
+index 2e1d7a4..6bf10c5 100644
+--- a/task_manager.py
++++ b/task_manager.py
+@@ -152,6 +152,13 @@ def create_session_task(subject: str, description: str = "",
+                        session_only=True, parent_task_id=parent_task_id)
+ 
+ 
++def clear_session_tasks() -> None:
++    """Clear all session-only tasks and reset the session ID counter."""
++    global _session_id_counter
++    with _lock:
++        _session_tasks.clear()
++        _session_id_counter = 0
++
+ def update_task(task_id: str, **kwargs) -> tuple[bool, str, Optional[dict]]:
+     """Update a task's fields. Validates status transitions.
+ 
+@@ -263,6 +270,51 @@ def get_task(task_id: str) -> Optional[dict]:
+     return None
+ 
+ 
++def _unlink_dep(tasks: list[dict], tid: str) -> None:
++    """Remove `tid` from every other task's blocks/blockedBy lists (in place)."""
++    for t in tasks:
++        for op in ("blocks", "blockedBy"):
++            if tid in t.get(op, []):
++                t[op] = [x for x in t[op] if x != tid]
++
++
++def delete_task(task_id: str) -> tuple[bool, str]:
++    """Hard-delete a task (persisted or session). Unlike status='deleted' this
++    removes the record entirely and unlinks it from other tasks' dependencies.
++    Returns (ok, message)."""
++    with _lock:
++        tid = str(task_id)
++        for i, t in enumerate(_session_tasks):
++            if str(t.get("id")) == tid:
++                _session_tasks.pop(i)
++                _unlink_dep(_session_tasks, tid)
++                return True, f"Deleted session task {tid}"
++        tasks = _load()
++        for i, t in enumerate(tasks):
++            if str(t.get("id")) == tid:
++                tasks.pop(i)
++                _unlink_dep(tasks, tid)
++                _save(tasks)
++                return True, f"Deleted task {tid}"
++        return False, f"Task '{tid}' not found"
++
++
++def purge_tasks(statuses: tuple = ("completed", "deleted")) -> int:
++    """Hard-remove every persisted + session task whose status is in `statuses`.
++    Returns the count removed. Useful for clearing a stale task pile."""
++    with _lock:
++        removed = 0
++        keep_sess = [t for t in _session_tasks if t.get("status") not in statuses]
++        removed += len(_session_tasks) - len(keep_sess)
++        _session_tasks[:] = keep_sess
++        tasks = _load()
++        keep = [t for t in tasks if t.get("status") not in statuses]
++        removed += len(tasks) - len(keep)
++        if len(keep) != len(tasks):
++            _save(keep)
++        return removed
++
++
+ def list_tasks(status: str = None, blocked_by: str = None,
+                include_session: bool = True) -> list[dict]:
+     """List tasks, optionally filtered by status or dependency."""
+@@ -295,32 +347,65 @@ def get_available_tasks() -> list[dict]:
+     return available
+ 
+ 
+-def get_active_tasks_snapshot() -> str:
+-    """Render a compact summary of the open task list for prompt injection.
+-
+-    Includes both in_progress (shown first) and pending tasks so the model's
+-    own plan — and any auto-seeded objective task — stays visible every turn and
+-    can anchor a "continue" request. Returns empty string if nothing is open.
+-    """
+-    all_tasks = _load() + list(_session_tasks)
+-    in_progress = [t for t in all_tasks if t.get("status") == "in_progress"]
+-    pending = [t for t in all_tasks if t.get("status") == "pending"]
+-    ordered = in_progress + pending
+-    if not ordered:
+-        return ""
+-
+-    lines = ["Active tasks (the plan — resume from here on 'continue'):"]
+-    for t in ordered[:10]:  # cap at 10
++def _render_task_lines(tasks: list[dict], limit: int) -> list[str]:
++    lines = []
++    for t in tasks[:limit]:
+         status_mark = "▶" if t.get("status") == "in_progress" else "○"
+         progress = t.get("progress", 0)
+         progress_str = f" ({progress}%)" if progress > 0 else ""
+         blocked_by = t.get("blockedBy", [])
+         blocked_str = f" [blocked by: {', '.join(blocked_by)}]" if blocked_by else ""
+-        lines.append(f"  {status_mark} [{t['id']}] {t['subject']}{progress_str}{blocked_str}")
+-        # Show last 2 notes if any
++        scope = "session" if t.get("session_only") else "persisted"
++        lines.append(f"  {status_mark} [{scope}:{t['id']}] {t['subject']}{progress_str}{blocked_str}")
+         notes = t.get("notes", [])
+         for note in notes[-2:]:
+             lines.append(f"    ↳ {note[:100]}")
++    return lines
++
++
++def get_active_tasks_snapshot(current_objective: str = "") -> str:
++    """Render a compact summary of the open task list for prompt injection.
++
++    Separates current session plan from persisted project backlog. Runtime code
++    does not infer which pending task matches the user's words; only explicit
++    in_progress tasks are treated as current focus. The model decides how to use
++    pending/background tasks from the prompt context.
++    """
++    all_tasks = _load() + list(_session_tasks)
++    open_tasks = [t for t in all_tasks if t.get("status") in ("in_progress", "pending")]
++    if not open_tasks:
++        return ""
++
++    def _sort_key(t: dict):
++        return (0 if t.get("status") == "in_progress" else 1, str(t.get("id", "")))
++
++    session_tasks = [t for t in open_tasks if t.get("session_only")]
++    persisted_tasks = [t for t in open_tasks if not t.get("session_only")]
++
++    current_session = [t for t in session_tasks if t.get("status") == "in_progress"]
++    current_session.sort(key=_sort_key)
++    other_session = [t for t in session_tasks if t not in current_session]
++    other_session.sort(key=_sort_key)
++    persisted_tasks.sort(key=_sort_key)
++
++    lines = ["Active tasks:"]
++    if current_objective:
++        lines.append(f"Current objective: {current_objective[:160]}")
++    if current_session:
++        lines.append("Current session plan (explicit in-progress focus):")
++        lines.extend(_render_task_lines(current_session, 6))
++    elif session_tasks:
++        lines.append("Current session plan: (no explicit in-progress task)")
++    else:
++        lines.append("Current session plan: (empty)")
++
++    if other_session:
++        lines.append("Other session tasks (not the current focus):")
++        lines.extend(_render_task_lines(other_session, 3))
++
++    if persisted_tasks:
++        lines.append("Persisted project backlog (background; do not treat as current unless asked):")
++        lines.extend(_render_task_lines(persisted_tasks, 3))
+     return "\n".join(lines)
+ 
+ 
+@@ -339,7 +424,7 @@ def export_active_tasks() -> list[dict]:
+     Returns deep-ish copies so callers can serialize without mutating state.
+     """
+     with _lock:
+-        all_tasks = _load() + list(_session_tasks)
++        all_tasks = list(_session_tasks)
+     out = []
+     for t in all_tasks:
+         if t.get("status") in ("in_progress", "pending"):
+@@ -380,4 +465,3 @@ def import_session_tasks(tasks: list[dict]) -> int:
+             restored.append(task)
+         _session_tasks = restored
+         return len(restored)
+-
+diff --git a/tools.py b/tools.py
+index 4da62ad..50fba4d 100644
+--- a/tools.py
++++ b/tools.py
+@@ -19,6 +19,7 @@ and return a job id, or stream via events_cb.
+ from __future__ import annotations
+ 
+ import json
++import hashlib
+ import os
+ import re
+ import subprocess
+@@ -65,9 +66,111 @@ class ToolCtx:
+     switch_to_agent: Optional[Callable] = None
+     register_agent_fn: Optional[Callable] = None
+     set_terminal_trigger: Optional[Callable] = None
++    state: Optional[dict] = None
+     depth: int = 0
+ 
+ 
++
++# ── File Content Cache ────────────────────────────────────────────────
++
++@dataclass
++class CacheEntry:
++    __slots__ = ('content', 'mtime', 'size', 'cached_at')
++    content: str
++    mtime: float
++    size: int
++    cached_at: float
++
++
++class FileContentCache:
++    """
++    File read cache for reducing redundant disk I/O and LLM token waste.
++    Uses mtime + size fast validation with TTL expiration.
++    
++    Strategy:
++    1. Fast path: mtime and size unchanged → return cached content
++    2. TTL: auto-expire after 5 minutes to prevent stale cache
++    3. Write-through: any write operation invalidates cache immediately
++    """
++    
++    def __init__(self, ttl_seconds: int = 300):  # 5 minutes default
++        self._cache: dict = {}
++        self._ttl = ttl_seconds
++    
++    def _get_abs_path(self, path: str, cwd: str) -> str:
++        """Normalize path to absolute for cache key."""
++        if os.path.isabs(path):
++            return os.path.normpath(path)
++        return os.path.normpath(os.path.abspath(os.path.join(cwd, path)))
++    
++    def get(self, path: str, cwd: str):
++        """
++        Try to get file content from cache.
++        
++        Returns: (content, was_cached) or None if cache miss
++        """
++        abs_path = self._get_abs_path(path, cwd)
++        
++        if abs_path not in self._cache:
++            return None
++        
++        entry = self._cache[abs_path]
++        
++        # TTL expiration check
++        if time.time() - entry.cached_at > self._ttl:
++            del self._cache[abs_path]
++            return None
++        
++        # Check if file still exists and metadata matches
++        try:
++            stat = os.stat(abs_path)
++        except FileNotFoundError:
++            del self._cache[abs_path]
++            return None
++        
++        # Fast validation: mtime and size both unchanged → content is valid
++        if stat.st_mtime == entry.mtime and stat.st_size == entry.size:
++            return (entry.content, True)
++        
++        # Metadata changed, cache is stale
++        del self._cache[abs_path]
++        return None
++    
++    def put(self, path: str, cwd: str, content: str):
++        """Store file content in cache."""
++        abs_path = self._get_abs_path(path, cwd)
++        try:
++            stat = os.stat(abs_path)
++            self._cache[abs_path] = CacheEntry(
++                content=content,
++                mtime=stat.st_mtime,
++                size=stat.st_size,
++                cached_at=time.time()
++            )
++        except FileNotFoundError:
++            # File was deleted after read? Don't cache
++            pass
++    
++    def invalidate(self, path: str, cwd: str):
++        """Invalidate cache for a file (call after writes)."""
++        abs_path = self._get_abs_path(path, cwd)
++        if abs_path in self._cache:
++            del self._cache[abs_path]
++    
++    def clear(self):
++        """Clear entire cache (for testing)."""
++        self._cache.clear()
++
++
++# Module-level singleton cache instance
++_file_cache = FileContentCache(ttl_seconds=300)
++
++
++def get_file_cache() -> FileContentCache:
++    """Get the global file cache instance."""
++    return _file_cache
++
++
+ @dataclass
+ class Tool:
+     name: str
+@@ -282,6 +385,10 @@ def _make_unified_diff(old_text: str, new_text: str, label_a: str, label_b: str,
+     return "".join(diff)
+ 
+ 
++def _sha256_text(text: str) -> str:
++    return hashlib.sha256(text.encode("utf-8", errors="surrogatepass")).hexdigest()
++
++
+ # ── Built-in tools ─────────────────────────────────────────────────────
+ # Kept intentionally minimal — duplicating existing meta-commands (/spawn,
+ # /term, /keys) here would be confusing. Built-ins fill gaps the meta-command
+@@ -351,6 +458,21 @@ def _bi_skill_load(params: dict, ctx: ToolCtx) -> dict:
+     }
+ 
+ 
++def _bi_skill_unload(params: dict, ctx: ToolCtx) -> dict:
++    """Unload a previously loaded skill: removes its tools from the
++    registry, drops the imported module, and clears the loaded state.
++    Safe to call on a not-loaded skill (returns an error message).
++    """
++    import skills as _skills
++    name = (params.get("name") or "").strip()
++    if not name:
++        return {"ok": False, "error": "missing 'name'"}
++    ok, msg = _skills.unload_skill(name)
++    if not ok:
++        return {"ok": False, "error": msg}
++    return {"ok": True, "result": msg}
++
++
+ def _bi_fs_read(params: dict, ctx: ToolCtx) -> dict:
+     """Read a file as UTF-8 with optional line range and cat-style numbering.
+ 
+@@ -376,30 +498,103 @@ def _bi_fs_read(params: dict, ctx: ToolCtx) -> dict:
+     max_bytes = int(params.get("max_bytes", 200_000) or 200_000)
+     line_numbers = bool(params.get("line_numbers", True))
+ 
++    # ── CACHE CHECK ───────────────────────────────────
++    # Only use cache for full-file reads (offset=1, limit>=2000)
++    if offset == 1 and limit >= 2000:
++        cache_result = _file_cache.get(path, ctx.cwd or os.getcwd())
++        if cache_result is not None:
++            full_content, from_cache = cache_result
++            # Apply offset/limit to cached content
++            lines = full_content.split("\n")
++            total_lines = len(lines)
++            start_idx = offset - 1
++            selected_lines = lines[start_idx:start_idx + limit]
++            
++            end_idx = min(start_idx + limit, total_lines)
++            line_truncated = end_idx < total_lines
++            
++            if line_numbers:
++                width = len(str(end_idx if end_idx > 0 else total_lines))
++                body = "\n".join(
++                    f"{(start_idx + i + 1):>{width}}→{ln}" for i, ln in enumerate(selected_lines)
++                )
++            else:
++                body = "\n".join(selected_lines)
++            
++            byte_truncated = False
++            encoded = body.encode("utf-8")
++            if len(encoded) > max_bytes:
++                body = encoded[:max_bytes].decode("utf-8", errors="ignore")
++                byte_truncated = True
++            
++            return {
++                "ok": True,
++                "result": body,
++                "path": abs_path,
++                "offset": offset,
++                "lines_returned": len(selected_lines),
++                "total_lines": total_lines,
++                "truncated": byte_truncated or line_truncated,
++                "byte_truncated": byte_truncated,
++                "from_cache": True,
++                "cache_note": "File unchanged since last read"
++            }
++    # ── END CACHE CHECK ────────────────────────────────
++
++    # Re-parse params since we extracted them early for cache check
++    offset = max(1, int(params.get("offset", 1) or 1))
++
++
++    # Apply offset/limit to the WHOLE file, then cap the RETURNED payload at
++    # max_bytes. The old version read only the first max_bytes of the file and
++    # applied offset within that window, so every line past ~max_bytes/avg-line
++    # was unreachable: reading offset 6820 of a 7438-line file returned "" with a
++    # bogus total_lines (5046), which made the model re-read empty forever and
++    # trip the repetition breaker. Stream line-by-line so a window deep in a big
++    # file doesn't force the whole file into memory, while total_lines stays true.
++    start_idx = offset - 1
++    selected = []
++    total_lines = 0
+     try:
+-        with open(abs_path, "rb") as f:
+-            raw = f.read(max_bytes + 1)
++        with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
++            for i, line in enumerate(f):
++                total_lines = i + 1
++                if start_idx <= i < start_idx + limit:
++                    selected.append(line.rstrip("\n"))
+     except OSError as e:
+         return {"ok": False, "error": str(e)}
+ 
+-    byte_truncated = len(raw) > max_bytes
+-    text = raw[:max_bytes].decode("utf-8", errors="replace")
+-    all_lines = text.split("\n")
+-    total_lines = len(all_lines)
+-
+-    start_idx = offset - 1
+     end_idx = min(start_idx + limit, total_lines)
+-    selected = all_lines[start_idx:end_idx]
+-
+     line_truncated = end_idx < total_lines
+     if line_numbers:
+-        width = len(str(end_idx))
++        width = len(str(end_idx if end_idx > 0 else total_lines))
+         body = "\n".join(
+             f"{(start_idx + i + 1):>{width}}→{ln}" for i, ln in enumerate(selected)
+         )
+     else:
+         body = "\n".join(selected)
+ 
++    # max_bytes caps the returned payload, not how much of the file we scanned.
++    byte_truncated = False
++    encoded = body.encode("utf-8")
++    if len(encoded) > max_bytes:
++        body = encoded[:max_bytes].decode("utf-8", errors="ignore")
++        byte_truncated = True
++
++    # ── CACHE STORAGE ───────────────────────────────────
++    # Cache full-file reads for future use
++    if offset == 1 and not byte_truncated and not line_truncated:
++        # Reconstruct content without line numbers for cache
++        if line_numbers:
++            # Strip line numbers from each line
++            cache_content = "\n".join(
++                ln.split("→", 1)[1] if "→" in ln else ln for ln in body.split("\n")
++            )
++        else:
++            cache_content = body
++        _file_cache.put(path, ctx.cwd or os.getcwd(), cache_content)
++    # ─────────────────────────────────────────────────────
++
+     return {
+         "ok": True,
+         "result": body,
+@@ -476,6 +671,10 @@ def _bi_fs_write(params: dict, ctx: ToolCtx) -> dict:
+     except OSError as e:
+         return {"ok": False, "error": str(e)}
+ 
++    # ── INVALIDATE CACHE ───────────────────
++    _file_cache.invalidate(path, ctx.cwd or os.getcwd())
++    # ───────────────────────────────────────
++
+     action = "updated" if existed else "created"
+     return {
+         "ok": True,
+@@ -651,6 +850,10 @@ def _bi_fs_edit(params: dict, ctx: ToolCtx) -> dict:
+     except OSError as e:
+         return {"ok": False, "error": str(e)}
+ 
++    # ── INVALIDATE CACHE ───────────────────
++    _file_cache.invalidate(path, ctx.cwd or os.getcwd())
++    # ───────────────────────────────────────
++
+     return {
+         "ok": True,
+         "result": f"Replaced {count} occurrence(s) in {abs_path}",
+@@ -720,11 +923,154 @@ def _bi_fs_multi_edit(params: dict, ctx: ToolCtx) -> dict:
+     except OSError as e:
+         return {"ok": False, "error": str(e)}
+ 
++    # ── INVALIDATE CACHE ───────────────────
++    _file_cache.invalidate(file_path, ctx.cwd or os.getcwd())
++    # ───────────────────────────────────────
++
+     return {"ok": True, "result": f"Applied {len(applied)} edits to {abs_path}",
+             "path": abs_path, "edits_applied": applied,
+             "changed": content != working, "diff": diff or "(no differences)"}
+ 
+ 
++def _undo_journal(ctx: ToolCtx) -> list:
++    state = ctx.state if isinstance(ctx.state, dict) else {}
++    journal = state.setdefault("_undo_journal", [])
++    if not isinstance(journal, list):
++        journal = []
++        state["_undo_journal"] = journal
++    return journal
++
++
++def _bi_fs_undo_list(params: dict, ctx: ToolCtx) -> dict:
++    """List available undo journal entries for this session."""
++    path_filter = params.get("path")
++    abs_filter = None
++    if path_filter:
++        abs_filter = os.path.abspath(os.path.join(ctx.cwd or os.getcwd(), path_filter)) \
++            if not os.path.isabs(path_filter) else path_filter
++    entries = []
++    for entry in reversed(_undo_journal(ctx)):
++        if abs_filter and entry.get("path") != abs_filter:
++            continue
++        entries.append({
++            "id": entry.get("id"),
++            "path": entry.get("path"),
++            "tool": entry.get("tool"),
++            "call_id": entry.get("call_id"),
++            "timestamp": entry.get("timestamp"),
++            "before_version": entry.get("before_version"),
++            "after_version": entry.get("after_version"),
++            "undone": bool(entry.get("undone")),
++            "summary": entry.get("summary"),
++        })
++    return {"ok": True, "result": entries, "count": len(entries)}
++
++
++def _bi_fs_undo(params: dict, ctx: ToolCtx) -> dict:
++    """Restore the pre-edit content from the session undo journal."""
++    journal = _undo_journal(ctx)
++    undo_id = (params.get("id") or "").strip()
++    path_filter = params.get("path")
++    force = bool(params.get("force", False))
++    abs_filter = None
++    if path_filter:
++        abs_filter = os.path.abspath(os.path.join(ctx.cwd or os.getcwd(), path_filter)) \
++            if not os.path.isabs(path_filter) else path_filter
++
++    target = None
++    for entry in reversed(journal):
++        if entry.get("undone"):
++            continue
++        if undo_id and entry.get("id") != undo_id:
++            continue
++        if abs_filter and entry.get("path") != abs_filter:
++            continue
++        target = entry
++        break
++    if target is None:
++        return {"ok": False, "error": "no matching undo entry"}
++
++    path = target.get("path")
++    if not path:
++        return {"ok": False, "error": "undo entry has no path"}
++
++    current_exists = os.path.exists(path)
++    try:
++        if current_exists:
++            with open(path, "r", encoding="utf-8", errors="replace") as f:
++                current = f.read()
++        else:
++            current = ""
++    except OSError as e:
++        return {"ok": False, "error": str(e), "path": path}
++
++    current_hash = _sha256_text(current) if current_exists else None
++    expected_after_hash = target.get("after_hash")
++    state = ctx.state if isinstance(ctx.state, dict) else {}
++    versions = state.get("_file_versions") if isinstance(state.get("_file_versions"), dict) else {}
++    current_version = int(versions.get(path, 0) or 0)
++    expected_after_version = int(target.get("after_version") or 0)
++
++    conflicts = []
++    if expected_after_hash and current_hash != expected_after_hash:
++        conflicts.append("content hash differs from the recorded post-edit file")
++    if expected_after_version and current_version != expected_after_version:
++        conflicts.append(
++            f"file version is {current_version}, expected {expected_after_version}"
++        )
++    if conflicts and not force:
++        return {
++            "ok": False,
++            "error": "refusing undo because the file changed after the recorded edit",
++            "conflicts": conflicts,
++            "path": path,
++            "undo_id": target.get("id"),
++            "hint": "Inspect the file or call fs.undo with force:true to overwrite later changes.",
++        }
++
++    before_exists = bool(target.get("before_exists", True))
++    before_content = target.get("before_content") or ""
++    diff = _make_unified_diff(
++        current,
++        before_content if before_exists else "",
++        path,
++        path if before_exists else f"{path} (deleted by undo)",
++    )
++
++    blocked = _check_file_write_policy(path, ctx, diff or "(no differences)")
++    if blocked is not None:
++        return blocked
++
++    try:
++        if before_exists:
++            with open(path, "w", encoding="utf-8") as f:
++                f.write(before_content)
++        else:
++            if current_exists:
++                os.remove(path)
++    except OSError as e:
++        return {"ok": False, "error": str(e), "path": path}
++
++    # ── INVALIDATE CACHE ───────────────────
++    _file_cache.invalidate(path, ctx.cwd or os.getcwd())
++    # ───────────────────────────────────────
++
++    target["undone"] = True
++    target["undone_at"] = time.time()
++    target["undo_forced"] = force
++    return {
++        "ok": True,
++        "result": f"Undid {target.get('id')} for {path}",
++        "path": path,
++        "changed": True,
++        "diff": diff or "(no differences)",
++        "undo": True,
++        "undo_id": target.get("id"),
++        "forced": force,
++        "deleted": not before_exists,
++    }
++
++
+ def _bi_fs_diff(params: dict, ctx: ToolCtx) -> dict:
+     """Compute a unified diff between two files or between a file and a string.
+ 
+@@ -1923,12 +2269,15 @@ def _bi_terminal_create(params: dict, ctx: ToolCtx) -> dict:
+         if existing is not None:
+             return {"ok": False, "error": f"terminal '{name}' already exists"}
+ 
+-    lain_cmd = f"{sys.executable} {os.path.abspath(__file__)} --depth {ctx.depth + 1}"
+-    sub = ctx.deps.SubTerminalSession(lain_cmd)
++    # Spawn a persistent interactive bash as a raw sub-terminal.
++    # persistent=True → exec bare DEFAULT_SHELL (no -c) so bash stays alive
++    # across many terminal.send_keys calls. Without this, bash -c "..." runs
++    # once and the PTY's master fd gets EOF, marking the session dead.
++    sub = ctx.deps.SubTerminalSession("bash -i", persistent=True)
+     sub.start()
+-    time.sleep(0.15)
++    time.sleep(0.2)
+     if sub.is_alive():
+-        sub.read_output(timeout=0.1)
++        sub.read_output(timeout=0.2)
+     ctx.register_terminal(sub, "laintas-cli", ctx.depth, name=name)
+     return {"ok": True, "result": f"Created sub-terminal {name}", "terminal": name}
+ 
+@@ -2316,6 +2665,20 @@ def register_builtin_tools() -> None:
+             },
+             invoke=_bi_skill_load,
+         ),
++        Tool(
++            name="skill.unload",
++            description="Unload a previously loaded skill: removes its tools from the "
++                        "registry, drops the imported module, and clears the loaded state. "
++                        "Use this to free context / tool slots when a skill is no longer needed.",
++            schema={
++                "type": "object",
++                "properties": {
++                    "name": {"type": "string", "description": "Skill name to unload"},
++                },
++                "required": ["name"],
++            },
++            invoke=_bi_skill_unload,
++        ),
+         Tool(
+             name="fs.read",
+             description="Read a file as UTF-8 text. Use offset/limit for large files. "
+@@ -2412,6 +2775,33 @@ def register_builtin_tools() -> None:
+             },
+             invoke=_bi_fs_multi_edit,
+         ),
++        Tool(
++            name="fs.undo_list",
++            description="List session undo entries for file writes/edits. Use before fs.undo when the target is ambiguous.",
++            schema={
++                "type": "object",
++                "properties": {
++                    "path": {"type": "string", "description": "optional path filter"},
++                },
++                "required": [],
++            },
++            invoke=_bi_fs_undo_list,
++        ),
++        Tool(
++            name="fs.undo",
++            description="Undo a previous fs.write/fs.edit/fs.multi_edit change using the session undo journal. "
++                        "By default refuses if the file changed after that edit; force:true overwrites later changes.",
++            schema={
++                "type": "object",
++                "properties": {
++                    "id": {"type": "string", "description": "undo id; omit for latest matching entry"},
++                    "path": {"type": "string", "description": "optional path filter"},
++                    "force": {"type": "boolean", "default": False},
++                },
++                "required": [],
++            },
++            invoke=_bi_fs_undo,
++        ),
+         Tool(
+             name="fs.diff",
+             description="Compute a unified diff between two files, or between a file and an "

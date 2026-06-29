@@ -33,7 +33,7 @@ from typing import Callable, Optional
 from dataclasses import dataclass, field
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, urlencode
 
 # ── OS Detection (must come before Unix-specific imports) ────────────────
 SYSTEM = platform.system()  # "Linux", "Windows", "Darwin"
@@ -169,6 +169,7 @@ def _detect_backend() -> str:
 
 BACKEND_URL = os.environ.get("LAINTAS_BACKEND") or _detect_backend()
 LAINTAS_BASE = os.environ.get("LAINTAS_BASE", "https://laintas.com")
+ACCOUNTS_BASE = os.environ.get("LAINTAS_ACCOUNTS_BASE", "https://accounts.laintas.com")
 SESSION_FILE = paths.SESSION_FILE
 CONFIG_FILE = paths.CONFIG_FILE
 HEARTBEAT_INTERVAL = 30
@@ -1738,8 +1739,13 @@ def verify_session(session: dict) -> Optional[dict]:
     token = session.get("token", "")
     # Call get-session to get full user info.
     req_args = None
-    # Try __Secure- prefixed cookie first (laintas.com uses cross-subdomain cookies)
-    for cookie_name in ["__Secure-better-auth.session_token", "better-auth.session_token"]:
+    # Current SSO cookie first, then legacy names for a smooth migration.
+    for cookie_name in [
+        "__Secure-laintas-v2.session_token",
+        "laintas-v2.session_token",
+        "__Secure-better-auth.session_token",
+        "better-auth.session_token",
+    ]:
         tok = cookies.get(cookie_name, "")
         if tok:
             req_args = {"cookies": {cookie_name: tok}}
@@ -1786,11 +1792,18 @@ def resolve_session_from_token(token: str, resp_cookies=None) -> Optional[dict]:
     candidates = []
     # 1. Signed cookie straight from the response, if the server set one.
     if resp_cookies:
-        for cookie_name in ("__Secure-better-auth.session_token", "better-auth.session_token"):
+        for cookie_name in (
+            "__Secure-laintas-v2.session_token",
+            "laintas-v2.session_token",
+            "__Secure-better-auth.session_token",
+            "better-auth.session_token",
+        ):
             signed = resp_cookies.get(cookie_name, "")
             if signed:
                 candidates.append({"cookies": {cookie_name: signed}, "headers": {}})
     # 2. The raw token as each cookie name.
+    candidates.append({"cookies": {"__Secure-laintas-v2.session_token": token}, "headers": {}})
+    candidates.append({"cookies": {"laintas-v2.session_token": token}, "headers": {}})
     candidates.append({"cookies": {"__Secure-better-auth.session_token": token}, "headers": {}})
     candidates.append({"cookies": {"better-auth.session_token": token}, "headers": {}})
     # 3. The raw token as a Bearer header.
@@ -1811,7 +1824,7 @@ def resolve_session_from_token(token: str, resp_cookies=None) -> Optional[dict]:
 def solve_captcha_challenge() -> Optional[str]:
     """Return an ALTCHA-compatible captcha response for local CLI login."""
     try:
-        resp = requests.get(f"{LAINTAS_BASE}/api/captcha-challenge", timeout=10)
+        resp = requests.get(f"{ACCOUNTS_BASE}/api/captcha-challenge", timeout=10)
         if resp.status_code != 200:
             return None
         challenge = resp.json()
@@ -1864,7 +1877,7 @@ def login_interactive() -> Optional[dict]:
     console.print(Panel(
         "[bold]Login to Laintas[/bold]\n\n"
         "Enter your laintas.com username and password.\n"
-        f"Don't have an account? Visit [link={LAINTAS_BASE}/login]{LAINTAS_BASE}/login[/link] to sign up.",
+        f"Don't have an account? Visit [link={ACCOUNTS_BASE}/register]{ACCOUNTS_BASE}/register[/link] to sign up.",
         title="Laintas Auth"
     ))
 
@@ -1885,11 +1898,11 @@ def login_interactive() -> Optional[dict]:
             console.print("[dim]Try remote login [1], or paste a browser session token below.[/dim]")
             raise RuntimeError("captcha unavailable")
 
-        headers = {"Content-Type": "application/json", "Origin": f"{LAINTAS_BASE}"}
+        headers = {"Content-Type": "application/json", "Origin": f"{ACCOUNTS_BASE}"}
         headers["X-Captcha-Response"] = captcha_response
 
         resp = requests.post(
-            f"{LAINTAS_BASE}/api/auth/sign-in/username",
+            f"{ACCOUNTS_BASE}/api/auth/sign-in/username",
             json=build_login_payload(username, password, captcha_response),
             headers=headers,
             timeout=10,
@@ -1901,13 +1914,15 @@ def login_interactive() -> Optional[dict]:
             user_id = user.get("id", "")
             if token:
                 # Get the actual signed cookie from response (token in JSON is unsigned)
-                cookie_val = resp.cookies.get("__Secure-better-auth.session_token", "")
+                cookie_val = (resp.cookies.get("__Secure-laintas-v2.session_token", "")
+                              or resp.cookies.get("laintas-v2.session_token", "")
+                              or resp.cookies.get("__Secure-better-auth.session_token", ""))
                 session = {
                     "token": token,
                     "userId": user_id,
                     "userName": user.get("name", ""),
                     "userEmail": user.get("email", ""),
-                    "cookies": {"__Secure-better-auth.session_token": cookie_val} if cookie_val else {"better-auth.session_token": token},
+                    "cookies": {"__Secure-laintas-v2.session_token": cookie_val} if cookie_val else {"laintas-v2.session_token": token},
                     "headers": {},
                 }
                 save_session(session)
@@ -1923,7 +1938,7 @@ def login_interactive() -> Optional[dict]:
     except RuntimeError:
         pass
     except requests.RequestException as e:
-        console.print(f"[yellow]Cannot reach {LAINTAS_BASE}: {e}[/yellow]")
+        console.print(f"[yellow]Cannot reach {ACCOUNTS_BASE}: {e}[/yellow]")
 
     # ── Method 2: Paste session token (fallback) ──
     console.print("\n[dim]Or paste a session token from your browser cookies.[/dim]")
@@ -1944,33 +1959,46 @@ def login_interactive() -> Optional[dict]:
 
 
 def login_via_browser() -> Optional[dict]:
-    """Open browser to laintas.com for authentication.
-
-    Starts a local HTTP callback server, opens the user's browser to
-    laintas.com/login (or /register). After the user authenticates,
-    laintas.com redirects back to localhost with the session token.
-
-    Returns a session dict on success, None on failure/timeout.
-    """
+    """Authenticate through accounts.laintas.com using OAuth Code + PKCE."""
     # Find a free port
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.bind(("127.0.0.1", 0))
     port = s.getsockname()[1]
     s.close()
 
+    verifier = base64.urlsafe_b64encode(os.urandom(32)).decode("ascii").rstrip("=")
+    challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(verifier.encode("ascii")).digest()
+    ).decode("ascii").rstrip("=")
+    state = base64.urlsafe_b64encode(os.urandom(24)).decode("ascii").rstrip("=")
+    callback_url = f"http://127.0.0.1:{port}/callback"
     result = {"code": None, "error": None}
 
     class CallbackHandler(BaseHTTPRequestHandler):
         def do_GET(self):
             parsed = urlparse(self.path)
             params = parse_qs(parsed.query)
+            if parsed.path != "/callback":
+                self._respond(404, "<h1>Not Found</h1>")
+                return
+            if params.get("state", [None])[0] != state:
+                result["error"] = "OAuth state validation failed"
+                self._respond(400, "<h1>Login Failed</h1><p>Invalid OAuth state.</p>")
+                threading.Thread(target=self.server.shutdown, daemon=True).start()
+                return
+            oauth_error = params.get("error", [None])[0]
+            if oauth_error:
+                result["error"] = f"Authorization failed: {oauth_error}"
+                self._respond(403, "<h1>Login Cancelled</h1><p>Authorization was not completed.</p>")
+                threading.Thread(target=self.server.shutdown, daemon=True).start()
+                return
             code = params.get("code", [None])[0]
             if code:
                 result["code"] = code
                 self._respond(200, "<h1>Login Successful</h1><p>You can close this tab and return to the terminal.</p>")
             else:
-                result["error"] = "No authorization code in callback"
-                self._respond(400, "<h1>Error</h1><p>No authorization code received from laintas.com.</p>")
+                result["error"] = "No authorization code in OAuth callback"
+                self._respond(400, "<h1>Error</h1><p>No authorization code was received.</p>")
             threading.Thread(target=self.server.shutdown, daemon=True).start()
 
         def _respond(self, http_code, body):
@@ -1982,8 +2010,15 @@ def login_via_browser() -> Optional[dict]:
         def log_message(self, format, *args):
             pass
 
-    callback_url = f"http://localhost:{port}/callback"
-    login_url = f"{LAINTAS_BASE}/login?redirect={callback_url}"
+    login_url = f"{ACCOUNTS_BASE}/api/auth/oauth2/authorize?{urlencode({
+        'client_id': 'laintas-cli',
+        'redirect_uri': callback_url,
+        'response_type': 'code',
+        'scope': 'openid profile email',
+        'state': state,
+        'code_challenge': challenge,
+        'code_challenge_method': 'S256',
+    })}"
 
     console.print(Panel(
         f"[bold]Opening browser for login[/bold]\n\n"
@@ -2006,57 +2041,68 @@ def login_via_browser() -> Optional[dict]:
         server.server_close()
 
     if result["code"]:
-        # Exchange the one-time code for the actual session token
+        # Exchange the OAuth code, then mint a standard short-lived CLI session.
         try:
             resp = requests.post(
-                f"{LAINTAS_BASE}/api/auth/cli-exchange",
-                json={"code": result["code"]},
+                f"{ACCOUNTS_BASE}/api/auth/oauth2/token",
+                data={
+                    "grant_type": "authorization_code",
+                    "code": result["code"],
+                    "code_verifier": verifier,
+                    "redirect_uri": callback_url,
+                    "client_id": "laintas-cli",
+                },
                 timeout=10,
             )
             if resp.status_code == 200:
                 try:
-                    data = resp.json()
+                    oauth_data = resp.json()
                 except ValueError:
-                    data = {}
-                token = data.get("token", "")
-                if token:
-                    # First try to verify via get-session (signed cookie / both
-                    # cookie names / Bearer).
-                    session = resolve_session_from_token(token, resp.cookies)
-                    if not session:
-                        # Fall back to TRUSTING the exchange response, exactly like
-                        # the username login path does. get-session sometimes won't
-                        # echo a session back over a fresh request even though the
-                        # cookie is valid for backend API calls. Prefer the signed
-                        # Set-Cookie if the server sent one.
-                        user = data.get("user") or {}
-                        signed = (resp.cookies.get("__Secure-better-auth.session_token")
-                                  or resp.cookies.get("better-auth.session_token")
-                                  or token)
-                        session = {
-                            "token": token,
-                            "cookies": {"__Secure-better-auth.session_token": signed},
-                            "headers": {},
-                            "userId": user.get("id", ""),
-                            "userName": user.get("name", ""),
-                            "userEmail": user.get("email", ""),
-                        }
-                    save_session(session)
-                    display = (session.get("userEmail") or session.get("userName")
-                               or session.get("userId") or "Laintas user")
-                    console.print(f"[green]Logged in as {display}[/green]")
-                    return session
-                else:
-                    # No token — surface what the server actually returned so the
-                    # contract mismatch is diagnosable (without leaking secrets).
-                    console.print("[red]Remote login failed: exchange returned no token.[/red]")
-                    console.print(f"[dim]Response keys: {sorted(data.keys()) if isinstance(data, dict) else type(data).__name__}[/dim]")
+                    oauth_data = {}
+                access_token = oauth_data.get("access_token", "")
+                if not access_token:
+                    console.print("[red]OAuth exchange returned no access token.[/red]")
                     return None
+
+                session_resp = requests.post(
+                    f"{ACCOUNTS_BASE}/api/sso/cli-session",
+                    headers={"Authorization": f"Bearer {access_token}"},
+                    json={"idToken": oauth_data.get("id_token", "")},
+                    timeout=10,
+                )
+                if session_resp.status_code != 200:
+                    console.print(f"[red]CLI session exchange failed (HTTP {session_resp.status_code}).[/red]")
+                    return None
+                data = session_resp.json()
+                token = data.get("token", "")
+                user = data.get("user") or {}
+                signed = (session_resp.cookies.get("__Secure-laintas-v2.session_token")
+                          or session_resp.cookies.get("laintas-v2.session_token")
+                          or "")
+                if not token or not signed:
+                    console.print("[red]CLI session exchange returned an incomplete session.[/red]")
+                    return None
+                session = {
+                    "token": token,
+                    "cookies": {"__Secure-laintas-v2.session_token": signed},
+                    "headers": {},
+                    "userId": user.get("id", ""),
+                    "userName": user.get("name", ""),
+                    "userEmail": user.get("email", ""),
+                }
+                if not verify_session(session):
+                    console.print("[red]The new CLI session could not be verified.[/red]")
+                    return None
+                save_session(session)
+                display = (session.get("userEmail") or session.get("userName")
+                           or session.get("userId") or "Laintas user")
+                console.print(f"[green]Logged in as {display}[/green]")
+                return session
             else:
-                console.print(f"[red]Code exchange failed (HTTP {resp.status_code}): {resp.text[:200]}[/red]")
+                console.print(f"[red]OAuth code exchange failed (HTTP {resp.status_code}).[/red]")
                 return None
         except requests.RequestException as e:
-            console.print(f"[red]Cannot reach {LAINTAS_BASE} for token exchange: {e}[/red]")
+            console.print(f"[red]Cannot reach {ACCOUNTS_BASE} for token exchange: {e}[/red]")
             return None
 
     if result["error"]:
@@ -2091,7 +2137,7 @@ def ensure_auth() -> Optional[dict]:
     console.print()
     console.print(Panel(
         "[bold]Login to Laintas[/bold]\n\n"
-        "[1] [bold]Remote login[/bold] — opens browser to laintas.com\n"
+        "[1] [bold]Remote login[/bold] — opens accounts.laintas.com\n"
         "    (works from any device, no password typing)\n\n"
         "[2] [bold]Local login[/bold] — username + password in terminal\n"
         "    (no browser needed)",
@@ -3206,7 +3252,7 @@ class TerminalSession:
     def _ws_url(self):
         base = self.backend_url.replace("https://", "wss://").replace("http://", "ws://")
         return (f"{base}/api/agents/{self.agent_id}/term"
-                f"?sessionId={self.session_id}&role=host&agentSecret={self.agent_secret}")
+                f"?sessionId={self.session_id}&role=host")
 
     def _set_winsize(self, cols, rows):
         import fcntl, termios, struct
@@ -3240,7 +3286,12 @@ class TerminalSession:
         # Parent: size the PTY, then connect the relay.
         self._set_winsize(self.cols, self.rows)
         try:
-            self._ws = connect(self._ws_url(), open_timeout=10, max_size=None)
+            self._ws = connect(
+                self._ws_url(),
+                additional_headers={"Authorization": f"Agent {self.agent_secret}"},
+                open_timeout=10,
+                max_size=64 * 1024,
+            )
         except Exception as e:
             console.print(f"[red]Terminal relay connect failed: {e}[/red]")
             self._cleanup()
@@ -3278,7 +3329,8 @@ class TerminalSession:
         import base64
         while not self._closed.is_set():
             try:
-                data = os.read(self.fd, 65536)
+                # 32 KiB stays below the relay's 64 KiB JSON/base64 frame cap.
+                data = os.read(self.fd, 32768)
             except OSError:
                 break
             if not data:
@@ -3329,6 +3381,8 @@ class AgentRegistry:
         self._session: Optional[dict] = None
         self._processing_message = threading.Event()
         self._pending_responses: list = []  # thread-safe queue for responses to send
+        self._registration_lock = threading.Lock()
+        self._last_reregister = 0.0
 
         # ── Async event bus (Phase 1) ───────────────────────────────────
         # _event_q holds batches of events (each item is a list[dict]).
@@ -3367,6 +3421,25 @@ class AgentRegistry:
                 console.print(f"[dim]WebRTC unavailable: {e}[/dim]")
                 self._webrtc = False
         return self._webrtc or None
+
+    def _agent_auth_headers(self) -> dict:
+        """Bearer-style CLI credential; never place this secret in a URL."""
+        return {"Authorization": f"Agent {self.agent_secret}"}
+
+    def _recover_registration(self) -> None:
+        """Re-register after a server-side credential rotation or state loss."""
+        if not self._session or time.time() - self._last_reregister < 10:
+            return
+        if not self._registration_lock.acquire(blocking=False):
+            return
+        try:
+            if time.time() - self._last_reregister < 10:
+                return
+            self._last_reregister = time.time()
+            if self.register(self._session, self.agent_name or None, quiet=True):
+                console.print("[green]Remote agent credentials refreshed.[/green]")
+        finally:
+            self._registration_lock.release()
 
     def register(self, session: dict, name: str = None, quiet: bool = False) -> bool:
         """Register this CLI as a remote agent with Helpwo backend."""
@@ -3502,18 +3575,15 @@ class AgentRegistry:
         if not self.agent_id or not events:
             return
         backend_url = os.environ.get("LAINTAS_BACKEND", BACKEND_URL)
-        headers = get_auth_headers(self._session) if self._session else {}
-        cookies = get_auth_cookies(self._session) if self._session else {}
+        headers = self._agent_auth_headers()
         try:
             requests.post(
                 f"{backend_url}/api/agents/{self.agent_id}/events",
                 json={
-                    "agentSecret": self.agent_secret,
                     "events": events,
                     "state": {"cwd": os.getcwd(), "status": "running"},
                 },
                 headers=headers,
-                cookies=cookies,
                 timeout=5,
             )
         except requests.RequestException:
@@ -3530,8 +3600,6 @@ class AgentRegistry:
     def _heartbeat_loop(self):
         """Send heartbeat every HEARTBEAT_INTERVAL seconds with extended state."""
         backend_url = os.environ.get("LAINTAS_BACKEND", BACKEND_URL)
-        headers = get_auth_headers(self._session) if self._session else {}
-        cookies = get_auth_cookies(self._session) if self._session else {}
 
         # Try to import psutil for metrics (optional dependency)
         try:
@@ -3544,7 +3612,6 @@ class AgentRegistry:
             try:
                 payload = {
                     "agentId": self.agent_id,
-                    "agentSecret": self.agent_secret,
                     "cwd": os.getcwd(),
                     "shell": SHELL_NAME,
                 }
@@ -3575,13 +3642,14 @@ class AgentRegistry:
                     except Exception:
                         pass
 
-                requests.post(
+                response = requests.post(
                     f"{backend_url}/api/agents/heartbeat",
                     json=payload,
-                    headers=headers,
-                    cookies=cookies,
+                    headers=self._agent_auth_headers(),
                     timeout=5,
                 )
+                if response.status_code in (403, 404):
+                    self._recover_registration()
             except requests.RequestException:
                 pass  # heartbeat failures are silent
 
@@ -3607,16 +3675,12 @@ class AgentRegistry:
     def _poll_loop(self, agent_state_cb, chat_history_cb):
         """Poll backend for incoming messages every 2 seconds."""
         backend_url = os.environ.get("LAINTAS_BACKEND", BACKEND_URL)
-        headers = get_auth_headers(self._session) if self._session else {}
-        cookies = get_auth_cookies(self._session) if self._session else {}
 
         while self._running and self.agent_id:
             try:
                 resp = requests.get(
                     f"{backend_url}/api/agents/{self.agent_id}/poll",
-                    params={"agentSecret": self.agent_secret},
-                    headers=headers,
-                    cookies=cookies,
+                    headers=self._agent_auth_headers(),
                     timeout=5,
                 )
                 if resp.status_code == 200:
@@ -3626,6 +3690,8 @@ class AgentRegistry:
                         self._handle_remote_message(
                             msg, agent_state_cb, chat_history_cb,
                         )
+                elif resp.status_code in (403, 404):
+                    self._recover_registration()
             except requests.RequestException:
                 pass  # poll failures are silent, retry next cycle
 
@@ -3748,7 +3814,8 @@ class AgentRegistry:
             self._push_final(req_id, "fail", f"Blocked by policy: {decision.reason}")
             console.print(f"[red]BLOCKED remote exec: {cmd[:100]} — {decision.reason}[/red]")
             return
-        if decision.action == "needs_approval":
+        if (decision.action == "needs_approval"
+                or not get_runtime_config("allow_remote_exec_without_approval")):
             approval = self._request_approval(req_id, cmd, cwd, timeout=300)
             if approval != "approve":
                 self._push_final(req_id, "aborted",
@@ -3835,7 +3902,10 @@ class AgentRegistry:
             elif what == "files":
                 data = os.listdir(os.getcwd())
             elif what == "env":
-                data = dict(os.environ)
+                # Never export the process environment wholesale: it commonly
+                # contains API keys, session tokens and cloud credentials.
+                safe_names = ("LANG", "LC_ALL", "SHELL", "TERM", "COLORTERM")
+                data = {name: os.environ[name] for name in safe_names if name in os.environ}
             elif what == "processes":
                 # Stub: psutil dependency deferred to Phase B1.
                 data = []
@@ -3862,7 +3932,8 @@ class AgentRegistry:
 
         Gives the Helpwo browser a live shell (vim/htop/colors/Ctrl-C all
         work) — same trust level as remote_exec, which already runs arbitrary
-        commands. Set runtime config `disable_remote_terminal` to turn it off.
+        commands. It is disabled by default and can only be enabled in the
+        CLI's local runtime configuration.
         """
         if IS_WINDOWS:
             return  # PTY relay is Unix-only for now
@@ -3901,6 +3972,14 @@ class AgentRegistry:
         if not goal:
             self._push_final(req_id, "fail", "missing 'goal' in delegate payload")
             return
+
+        if not get_runtime_config("allow_remote_exec_without_approval"):
+            approval = self._request_approval(
+                req_id, f"DELEGATE: {goal[:500]}", os.getcwd(), timeout=300,
+            )
+            if approval != "approve":
+                self._push_final(req_id, "aborted", f"User {approval}: delegation")
+                return
 
         max_loops_val = int(payload.get("maxLoops", get_runtime_config("max_loops")))
         # Temporarily override max_loops for this delegation
@@ -4176,15 +4255,13 @@ class AgentRegistry:
             return
 
         backend_url = os.environ.get("LAINTAS_BACKEND", BACKEND_URL)
-        headers = get_auth_headers(self._session) if self._session else {}
-        cookies = get_auth_cookies(self._session) if self._session else {}
+        headers = self._agent_auth_headers()
 
         try:
             requests.post(
                 f"{backend_url}/api/agents/unregister",
-                json={"agentId": self.agent_id, "agentSecret": self.agent_secret},
+                json={"agentId": self.agent_id},
                 headers=headers,
-                cookies=cookies,
                 timeout=5,
             )
         except requests.RequestException:
@@ -5085,7 +5162,7 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
         console.print()
         console.print(Panel(
             "[bold]Login to Laintas[/bold]\n\n"
-            "[1] [bold]Remote login[/bold] — opens browser to laintas.com\n"
+            "[1] [bold]Remote login[/bold] — opens accounts.laintas.com\n"
             "    (works from any device, no password typing)\n\n"
             "[2] [bold]Local login[/bold] — username + password in terminal\n"
             "    (no browser needed)",
@@ -6139,6 +6216,7 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
             _prev_chat or [],
             events_cb=_prev_events_cb,
             existing_session=_prev_existing_session,
+            continue_thread=True,
         )
 
         # Update stored state for potential further /continue
@@ -6243,7 +6321,7 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
 
 _COMMANDS = [
     ("/help",      "Show this help"),
-    ("/login",     "Re-authenticate with laintas.com (opens browser)"),
+    ("/login",     "Re-authenticate with accounts.laintas.com (opens browser)"),
     ("/model",     "List or set the backend AI model"),
     ("/name",      "Set current agent name"),
     ("/memory",    "View .laintas/memory.json"),
@@ -6411,7 +6489,7 @@ def show_help():
     table.add_row("ls, cat, mkdir, git, ...", "Commands found on PATH → executed directly")
     table.add_row("<natural language>", "Not a recognized command → AI agent loop")
     table.add_row("/help", "Show this help")
-    table.add_row("/login", "Re-authenticate with laintas.com (opens browser)")
+    table.add_row("/login", "Re-authenticate with accounts.laintas.com (opens browser)")
     table.add_row("/model [id|reset]", "List available backend models, set model, or reset to backend default")
     table.add_row("/name [name]", "Set current agent name")
     table.add_row("/memory", "View .laintas/memory.json")
@@ -6715,7 +6793,8 @@ def request_file_write_approval(path: str, diff_preview: str, reason: str) -> bo
 
 def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
                                    chat_history, events_cb=None,
-                                   existing_session=None):
+                                   existing_session=None,
+                                   continue_thread=False):
     """Run agent loop with soft-interrupt (Ctrl+C) and supplementary input support.
 
     Wraps run_agent_loop() with:
@@ -6764,6 +6843,7 @@ def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
             existing_session=existing_session,
             interrupt_event=_interrupt_event,
             message_queue=_msg_queue,
+            continue_thread=continue_thread,
         )
     finally:
         # Restore original SIGINT handler
@@ -6774,7 +6854,7 @@ def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
     return response
 
 
-def run_execute_mode(task: str, session: dict, depth: int) -> int:
+def run_execute_mode(task: str, session: dict, depth: int, session_id: str = None) -> int:
     """Non-interactive single-task execution.
 
     Called when laintas-cli is invoked with --execute. Runs one agent loop,
@@ -6786,19 +6866,32 @@ def run_execute_mode(task: str, session: dict, depth: int) -> int:
         "lastReply": "",
         "lastOutput": "",
     }
+    chat_history = []
+    if session_id:
+        saved = load_resume_state(os.getcwd(), session_id=session_id)
+        if saved:
+            agent_state = _restore_resume_blob(saved, chat_history)
+        else:
+            agent_state["_session_id"] = session_id
+    chat_history.append({"role": "user", "content": task})
 
     response = run_agent_loop(
         get_loop_deps(),
         original_input=task,
         session=session,
         state=agent_state,
-        chat_history=[],
+        chat_history=chat_history,
         events_cb=None,
         existing_session=None,
         depth=depth,
     )
 
     result = response.get("msg", "")
+    if result:
+        chat_history.append({"role": "assistant", "content": result})
+    if session_id:
+        save_resume_state(prepare_state_for_repl(response.get("state", agent_state)),
+                          chat_history, os.getcwd())
     last_output = response.get("state", {}).get("lastOutput", "")
     if last_output:
         result += "\n" + last_output
@@ -6819,6 +6912,8 @@ def main():
     parser.add_argument("--laintas", type=str, help="Laintas.com base URL", default=None)
     parser.add_argument("--execute", "-e", type=str, default=None,
                         help="Execute a single task non-interactively and exit")
+    parser.add_argument("--session-id", type=str, default=None,
+                        help="Persist/resume --execute context under this logical session id")
     parser.add_argument("--depth", "-d", type=int, default=0,
                         help="Nesting depth (0=user terminal, 1+=sub-agent)")
     parser.add_argument("--simple-prompt", action="store_true", default=False,
@@ -6875,7 +6970,7 @@ def main():
         if not session.get("userId"):
             console.print("[red]Authentication required for --execute mode. Use /login first.[/red]")
             sys.exit(1)
-        sys.exit(run_execute_mode(args.execute, session, args.depth))
+        sys.exit(run_execute_mode(args.execute, session, args.depth, args.session_id))
 
     # ── Simple prompt (PTY subprocess mode) ──
     _use_simple_prompt = args.simple_prompt or not sys.stdin.isatty()
