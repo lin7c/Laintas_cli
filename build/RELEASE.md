@@ -13,7 +13,7 @@ expired — `npm run build` and even deploying the origin did not help, because
 `cf-cache-status: HIT` on the canonical URL.
 
 Fix: the site now downloads from **versioned, immutable paths**
-`/releases/v<MAJOR.MINOR>/…` (current: **v1.1**). A new version is a new URL, so
+`/releases/v<MAJOR.MINOR>/…` (current: **v1.4**). A new version is a new URL, so
 the CDN never serves a stale file. `latest/` still exists as a rolling **staging**
 copy (CI and the build script write there), but the live site does **not** point
 at it.
@@ -29,15 +29,15 @@ at it.
 1. Build/refresh artifacts into `latest/` (steps below), and let CI rebuild the
    Windows exe into `latest/`.
 2. Snapshot to the new version dir:
-   `cp -r laintas_cli_download/public/releases/latest laintas_cli_download/public/releases/v1.2`
+   `cp -r laintas_cli_download/public/releases/latest laintas_cli_download/public/releases/v1.5`
 3. Bump every reference (single sed across the known files):
    ```bash
    cd laintas_cli_download
-   grep -rl 'releases/v1.1' src public/install.sh | xargs sed -i 's#releases/v1.1#releases/v1.2#g'
+   grep -rl 'releases/v1.4' src public/install.sh | xargs sed -i 's#releases/v1.4#releases/v1.5#g'
    ```
    (touches `src/components/DownloadSection.jsx`, `src/pages/DownloadPage.jsx`,
    `src/contexts/LanguageContext.jsx`, `public/install.sh`)
-4. `npm run build` (regenerates `dist/`, including `dist/releases/v1.2/`).
+4. `npm run build` (regenerates `dist/`, including `dist/releases/v1.5/`).
 5. Commit (force-add the gitignored `dist/` files) and deploy.
 6. **One-time** after deploy: purge the Cloudflare cache for the site **HTML**
    (`https://cli.laintas.com/` / `index.html`) so users get the new `index.html`
