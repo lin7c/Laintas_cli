@@ -1,90 +1,166 @@
 {
-  "version": "1.2.0",
-  "released": "2026-06-24",
+  "version": "1.4.0",
+  "released": "2026-06-29",
   "files": {
-    "agent_loop.py": {
-      "sha256": "eeb22afa2708bba1b4dc5eb2493d4062acbdff8209a6f4bebfea614ec5819f86",
-      "size": 175332
+    "webrtc_channel.py": {
+      "sha256": "3fea983e0c2e65e8c216aa89b137f3b2d3a79cf91c8471ef7db2ba098d33f541",
+      "size": 13324
     },
-    "agent_persistence.py": {
-      "sha256": "7ac56d3786f67b92766fcf4bea126bbe4e7ca7e19bf6c5d7ac25a56728a080af",
-      "size": 5220
+    "tools.py": {
+      "sha256": "435b6856fe552fd900307b5e0158b859528ca55b9de50a2fa2dddc51e5dc9eb6",
+      "size": 192921
     },
-    "agent_roles.py": {
-      "sha256": "86727209031460f373315053f522bab6d72ad68f497c692d032989a54b0fcfc2",
-      "size": 16703
+    "updater.py": {
+      "sha256": "21ce8f4f740284e625b319cbc8c8cb426219e8d9a5a5d9d82ed88ef78b9282d5",
+      "size": 13110
+    },
+    "plan_mode.py": {
+      "sha256": "5c5fc63c5d38973c05da5f64a9cd96c573b007319e7bc1b697aa005366a6e8d7",
+      "size": 7209
     },
     "cloud_provider.py": {
       "sha256": "b9826a7fec41c335c94b43d463fdbce225bddbab08003189a19e8e2628102235",
       "size": 16881
     },
-    "hooks.py": {
-      "sha256": "76f7cb6f4ec55d1502b08fe05c8b6a67f36bb03d90aef6ea223229c4e0f9a5fe",
-      "size": 8825
+    "version.py": {
+      "sha256": "3ca79a19396491954c7615892c33fe69f40331ca16b4625f94cbd3b105495abf",
+      "size": 297
     },
-    "hwo_runner.py": {
-      "sha256": "bd4100f6167b4f9565042d3dd593bbb60635e090ce345025acdbb80b2c27e317",
-      "size": 30063
+    "snapshot.py": {
+      "sha256": "a3e700b5d2d8a0dc768549ade5adb73905ea34c571eae1bec92c4c3f7e2cf94d",
+      "size": 5910
     },
-    "hwo_ui.py": {
-      "sha256": "7adac040aa80c4c77127a42a86bdee8e6bcb7c0897617736cd12f4f56776cd02",
-      "size": 31166
+    "agent_roles.py": {
+      "sha256": "fb4b8f7de58c52b0dc5521fa47fd7fad1126a48c1ea9f6556b3f1bd2e8eb2d41",
+      "size": 16677
     },
-    "laintas_cli.py": {
-      "sha256": "9a8c962cb8717d816c67923496cbf2930054c0f045d87b42bf67103e3482dd27",
-      "size": 308338
+    "skills.py": {
+      "sha256": "23f1715d404cc61f84f993705b959a17fc0dd9e756cb8c17e35b5c072b1d7bac",
+      "size": 19908
     },
-    "mcp_client.py": {
-      "sha256": "2fbc89534db1ce3c8b2f38046be858792f386cb9ad9d7c934201d8c3fdb0b8dd",
-      "size": 14124
+    "setup.py": {
+      "sha256": "a4e8dd185043a14ecc1b12df2552e8a6af9bde39e37789ca8cb5424b38143f62",
+      "size": 1662
     },
-    "memory_system.py": {
-      "sha256": "7c0ffd6d9c6faeeddff6bd365ed99aef43d8e13ed64ab082672d3df7a321f4bc",
-      "size": 9109
+    "agent_persistence.py": {
+      "sha256": "7ac56d3786f67b92766fcf4bea126bbe4e7ca7e19bf6c5d7ac25a56728a080af",
+      "size": 5220
+    },
+    "browser_session.py": {
+      "sha256": "979790b27c5570a5c5b61ca48fce1c24e1ce4c5b21e3110fb72e3f1d8b17477f",
+      "size": 35120
+    },
+    "requirements.txt": {
+      "sha256": "9e503b94c0c007a9bcabefee3c6096135c68ae5562fbf33ac51639104cf7fc19",
+      "size": 1736
+    },
+    "workflow_engine.py": {
+      "sha256": "a3d22b40025362b1140dacfe69219d5270658ca3d8e77b6c6abacde6903d936b",
+      "size": 18130
     },
     "migrate.py": {
       "sha256": "5f5e4eeb9a05577fa68a625a6d4eb7bcc0ea3dda4065aeba08e9e60d349444c6",
       "size": 6657
     },
+    "hwo_ui.py": {
+      "sha256": "ea2c408e1ce1cac3dffca233c2dc8f53790e56fa10194919637fc0a5cf1685c7",
+      "size": 31212
+    },
+    "agent_loop.py": {
+      "sha256": "a1076fb8dd4b4f96c0291cf24c1bdb79d36379ca16e7a775286b95efb56af67b",
+      "size": 202597
+    },
+    "hwo_runner.py": {
+      "sha256": "9812f9142a5f12bb7a6127fc06384d957d38aab532ed6ed55e297eb0d3cca718",
+      "size": 23684
+    },
+    "mcp_client.py": {
+      "sha256": "2fbc89534db1ce3c8b2f38046be858792f386cb9ad9d7c934201d8c3fdb0b8dd",
+      "size": 14124
+    },
+    "task_manager.py": {
+      "sha256": "a7fa3e7db1695768fb093d6ffa2fb0ffb935f098672bb73b12ca80294f0b1f56",
+      "size": 14199
+    },
+    "memory_system.py": {
+      "sha256": "3a160f33a0e01eb3ef9935f18148bb04951d0e8c0b0add07a5d4bd0803073786",
+      "size": 12191
+    },
+    "laintas_cli.py": {
+      "sha256": "95e098ab29fac96dce6cddcabd978b2e4db715f4a5a5cf0f6dd1e943dd7d1f44",
+      "size": 319595
+    },
+    "hooks.py": {
+      "sha256": "76f7cb6f4ec55d1502b08fe05c8b6a67f36bb03d90aef6ea223229c4e0f9a5fe",
+      "size": 8825
+    },
     "paths.py": {
       "sha256": "46bd7b17cb95e91c6fc80b5c6686b17a6a39d19a15e2e961b61f8532110c7ded",
       "size": 5111
     },
-    "plan_mode.py": {
-      "sha256": "a67dbe482115a5e2b7c8e0c0257be8b90b37470fcc8c00b312f25428e500f6b2",
-      "size": 7235
-    },
     "policy.py": {
-      "sha256": "b24eea75c8437dba6cfd08f30898045c16f62f0e60db1837cb2fd28493849a53",
-      "size": 24875
+      "sha256": "b5215ec70499c334a33887d4c92c6a661ef88248ad5c44fc639f632daaa34ff4",
+      "size": 30337
     },
-    "setup.py": {
-      "sha256": "dce46080870748ae72ca8e717cfdaa31cabdf7e2f7e5913e94389a8a34f5e1e1",
-      "size": 1796
+    "agent_tools/__init__.py": {
+      "sha256": "46e4acefa09d7198f36f047b6cd602d815028d37b08879b38f2fc57f8c211961",
+      "size": 448
     },
-    "skills.py": {
-      "sha256": "877ae32bf1f100ff63cd9f827eb65b67b8d1cea0fcebb81c761369060f0a1146",
-      "size": 18860
+    "agent_tools/catalog.json": {
+      "sha256": "f362859ad849798a81a585366d38b2b2779a133bb19b2a56edcb52149153bac8",
+      "size": 11848
     },
-    "task_manager.py": {
-      "sha256": "8461320f740697dcc561effb1dcf9705bb4ae6d3b9051cef513982107c8373e8",
-      "size": 13360
+    "agent_tools/adapter.py": {
+      "sha256": "942886a13b8c4f4069b9b2fc8be979b56f30ef3f8812b20f98c84e4651d5b678",
+      "size": 4184
     },
-    "tools.py": {
-      "sha256": "3558c206b53597bf9f269435a04a627925ed1d50bfc4493691e3fd16681dcb42",
-      "size": 127960
+    "diagnostics_adapter/__init__.py": {
+      "sha256": "5306463b4f7c1338b75d8826b5954b6d0d6517d2842c87cf50a6b4e549042a51",
+      "size": 467
     },
-    "updater.py": {
-      "sha256": "58445db7cb50a4f9b8a21c38fc8ecfbcf52af26368021bc7995766b02465cdfc",
-      "size": 10524
+    "diagnostics_adapter/registry.json": {
+      "sha256": "e22fd9c7ff2172fbf5961d78e6219d52abb4b2b4304062dd446ddd69bb5bfbd0",
+      "size": 2097
     },
-    "version.py": {
-      "sha256": "f273addcad0c0f339a9eb8b860c5d846197954c2b6c91b81cec59067f13c3f25",
-      "size": 297
+    "diagnostics_adapter/adapter.py": {
+      "sha256": "b881d79c6347ed80b4425cc9c01f29fef7a2407c7316cd16efa374cf37a137c8",
+      "size": 1855
     },
-    "workflow_engine.py": {
-      "sha256": "b3edea81ed2144cb74215d88ca67b84f6592fb4c7758c92cb629d3e4a3bcf977",
-      "size": 18152
+    "patch_adapter/__init__.py": {
+      "sha256": "6b5d4cf69a3d97e64df5f1cd04f039016f22b2b29417ee6d1774ec317aa60793",
+      "size": 414
+    },
+    "patch_adapter/adapter.py": {
+      "sha256": "607448a9446d92fddd35d2810a2b8e901ca3a2e94e60a048c97373f7c8d0e308",
+      "size": 7559
+    },
+    "context_policy/summary_prompt.py": {
+      "sha256": "72643617f9afe909d39c5ee684905795feac1930b46420fe32ed34d25f4010c7",
+      "size": 4023
+    },
+    "context_policy/__init__.py": {
+      "sha256": "4f4367c14990eed32d0a296fdc65493caa77037d0e4ed830efbd0bc268c47c51",
+      "size": 878
+    },
+    "context_policy/policy.json": {
+      "sha256": "266487e0cd1237c3d0a3c67ff0902ccbbd136691fbba60d5cfe91b3f7af20c86",
+      "size": 2472
+    },
+    "context_policy/adapter.py": {
+      "sha256": "e46233ee36efe72a1951938f7fd6f65fa665199cc9806815286b4f0519ac3a49",
+      "size": 4681
+    },
+    "format_adapter/__init__.py": {
+      "sha256": "39dda9636a48f21fc7d75b19c6378dd164417ea512ae7bea214f0f21dc723557",
+      "size": 440
+    },
+    "format_adapter/registry.json": {
+      "sha256": "946c94a1162ae8894b789e90b089dc79b7e7c75396a37b90f937484c81759c77",
+      "size": 1892
+    },
+    "format_adapter/adapter.py": {
+      "sha256": "6e4dbbc7689afb6542f23e64c776bcb7406f4817dd4f9c5240689892d1595c8c",
+      "size": 1633
     }
   }
 }
