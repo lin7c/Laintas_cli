@@ -2033,7 +2033,7 @@ def login_via_browser() -> Optional[dict]:
         def log_message(self, format, *args):
             pass
 
-    login_url = f"{ACCOUNTS_BASE}/api/auth/oauth2/authorize?{urlencode({
+    _oauth_params = urlencode({
         'client_id': 'laintas-cli',
         'redirect_uri': callback_url,
         'response_type': 'code',
@@ -2041,7 +2041,8 @@ def login_via_browser() -> Optional[dict]:
         'state': state,
         'code_challenge': challenge,
         'code_challenge_method': 'S256',
-    })}"
+    })
+    login_url = f"{ACCOUNTS_BASE}/api/auth/oauth2/authorize?{_oauth_params}"
 
     console.print(Panel(
         f"[bold]Opening browser for login[/bold]\n\n"
