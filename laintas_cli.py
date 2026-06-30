@@ -2502,7 +2502,7 @@ def generate_cli_prop_template() -> str:
       {{planMode}} {{tools}} {{inbox}} {{parallelResults}} {{children}} {{parent}}
       {{terminalName}} {{parentTerminal}} {{deploymentStatus}}
       {{workflowPhase}} {{rolePrompt}} {{confidenceGuidance}}
-      {{skillContext}}
+      {{skillContext}} {{promptOpt}}
 
     {{nextDepth}}, {{activeFile}}, and {{behaviorDiagnostics}} are still computed
     and .replace()'d by run_agent_loop for backward compatibility, but are not
@@ -2579,6 +2579,7 @@ The catalog below documents each tool's purpose and parameters:
 <safety>
 Do not bypass policy.py decisions. Do not invent paths, APIs, files, or results. (General safety — reversibility/blast-radius, destructive-action confirmation, investigate-before-overwrite, no-vulnerabilities — is in the injected <agent_conduct> block.)
 </safety>
+{{{{promptOpt}}}}
 """
 
 # ── File Helpers ───────────────────────────────────────────────────────
@@ -5496,6 +5497,124 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
                           "  [bold]/plan status[/bold]       — Show current plan\n"
                           "  [bold]/plan list[/bold]         — List saved plans")
 
+    elif action == "/prompt":
+        import prompt_opt as _po
+        sub = parts[1].lower() if len(parts) > 1 else ""
+        if sub == "feedback" and len(parts) >= 3:
+            desc = " ".join(parts[2:])
+            entry = _po.capture_feedback(desc)
+            parent = get_current_agent()
+            if parent:
+                child_id = _po.spawn_optimizer(
+                    entry["id"], parent.id, get_loop_deps(), session)
+                if child_id:
+                    console.print(Panel(
+                        f"[bold]Feedback captured.[/bold] Optimizer spawned in background.\n\n"
+                        f"Feedback ID: [cyan]{entry['id']}[/cyan]\n"
+                        f"Optimizer agent: [cyan]{child_id}[/cyan]\n\n"
+                        f"[dim]The main task continues uninterrupted. The candidate will\n"
+                        f"arrive via inbox when ready. Run [bold]/prompt status[/bold] to check.[/dim]",
+                        title="Prompt Optimization", border_style="green"))
+                else:
+                    console.print(Panel(
+                        f"[bold]Feedback captured.[/bold] (ID: {entry['id']})\n\n"
+                        f"[yellow]Optimizer spawn failed — max depth may be reached.[/yellow]\n"
+                        f"[dim]Run [bold]/prompt optimize {entry['id']}[/bold] later from the REPL.[/dim]",
+                        title="Prompt Optimization", border_style="yellow"))
+            else:
+                console.print(Panel(
+                    f"[bold]Feedback captured.[/bold] (ID: {entry['id']})\n\n"
+                    f"[dim]No active agent to spawn the optimizer from. Run\n"
+                    f"[bold]/prompt optimize {entry['id']}[/bold] when an agent is active.[/dim]",
+                    title="Prompt Optimization", border_style="cyan"))
+        elif sub == "optimize" and len(parts) >= 3:
+            fid = parts[2]
+            parent = get_current_agent()
+            if not parent:
+                console.print("[red]No active agent. /hire one first.[/red]")
+            else:
+                child_id = _po.spawn_optimizer(fid, parent.id, get_loop_deps(), session)
+                if child_id:
+                    console.print(f"[green]Optimizer spawned: {child_id}[/green]")
+                else:
+                    console.print("[red]Spawn failed (max depth reached?)[/red]")
+        elif sub == "status":
+            cand = _po.read_candidate()
+            state = _po._current_opt or {}
+            if not state:
+                console.print("[dim]No active prompt optimization.[/dim]")
+            else:
+                status = state.get("status", "?")
+                cid = state.get("candidate_id") or "(none)"
+                fid = state.get("feedback_id") or "(none)"
+                console.print(Panel(
+                    f"Status: [bold]{status}[/bold]\n"
+                    f"Feedback: [cyan]{fid}[/cyan]\n"
+                    f"Candidate: [cyan]{cid}[/cyan]",
+                    title="Prompt Optimization Status", border_style="cyan"))
+        elif sub == "review":
+            cid = parts[2] if len(parts) >= 3 else None
+            cand = _po.read_candidate(cid)
+            if not cand:
+                console.print("[yellow]No candidate found. Run /prompt feedback first.[/yellow]")
+            else:
+                patch = cand.get("patch", "")
+                rationale = cand.get("body", "")[:500]
+                console.print(Panel(
+                    f"[bold]Candidate:[/bold] {cand.get('id', '?')}\n\n"
+                    f"[dim]Rationale:[/dim]\n{rationale}\n\n"
+                    f"[dim]Patch (to be appended to cli.prop):[/dim]\n{patch[:2000]}",
+                    title="Prompt Candidate Review", border_style="blue"))
+                console.print("\n[dim]Run [bold]/prompt apply[/bold] to activate, "
+                              "[bold]/prompt discard[/bold] to reject.[/dim]")
+        elif sub == "apply":
+            cid = parts[2] if len(parts) >= 3 else None
+            ok, msg = _po.apply_candidate(cid)
+            color = "green" if ok else "red"
+            console.print(f"[{color}]{msg}[/{color}]")
+        elif sub == "discard":
+            ok, msg = _po.discard_candidate()
+            color = "green" if ok else "red"
+            console.print(f"[{color}]{msg}[/{color}]")
+        elif sub == "list":
+            cands = _po.list_candidates()
+            if cands:
+                console.print("[bold]Prompt candidates:[/bold]")
+                for c in cands:
+                    console.print(f"  [cyan]{c['id']}[/cyan] "
+                                  f"[dim]{c['status']}[/dim] "
+                                  f"— {c.get('feedback', '')[:40]}")
+            else:
+                console.print("[dim]No candidates. Run /prompt feedback to start.[/dim]")
+        elif sub == "export" and len(parts) >= 3:
+            cid = parts[2]
+            out = parts[3] if len(parts) >= 4 else None
+            ok, res = _po.export_pack(cid, out)
+            color = "green" if ok else "red"
+            console.print(f"[{color}]{res}[/{color}]")
+        elif sub == "install" and len(parts) >= 3:
+            src = parts[2]
+            ok, msg, new_cid = _po.install_pack(src)
+            color = "green" if ok else "red"
+            console.print(f"[{color}]{msg}[/{color}]")
+        elif sub == "publish" and len(parts) >= 3:
+            cid = parts[2]
+            ok, msg = _po.publish_pack(cid, session)
+            color = "green" if ok else "yellow"
+            console.print(f"[{color}]{msg}[/{color}]")
+        else:
+            console.print("Usage:\n"
+                          "  [bold]/prompt feedback <desc>[/bold]  — Capture feedback & spawn optimizer\n"
+                          "  [bold]/prompt optimize <id>[/bold]    — Spawn optimizer for a feedback id\n"
+                          "  [bold]/prompt status[/bold]           — Show optimization status\n"
+                          "  [bold]/prompt review [id][/bold]      — Review candidate patch\n"
+                          "  [bold]/prompt apply [id][/bold]       — Apply candidate to cli.prop\n"
+                          "  [bold]/prompt discard[/bold]          — Strip applied patch\n"
+                          "  [bold]/prompt list[/bold]             — List candidates\n"
+                          "  [bold]/prompt export <id> [path][/bold] — Export portable pack\n"
+                          "  [bold]/prompt install <path|url>[/bold] — Import a shared pack\n"
+                          "  [bold]/prompt publish <id>[/bold]     — Publish to community")
+
     elif action == "/task":
         sub = parts[1].lower() if len(parts) > 1 else ""
         _cwd = os.getcwd()
@@ -6404,6 +6523,7 @@ _COMMANDS = [
     ("/name",      "Set current agent name"),
     ("/memory",    "View .laintas/memory.json"),
     ("/prop",      "View .laintas/cli.prop prompt template"),
+    ("/prompt",    "Prompt self-optimization (feedback/review/apply/publish)"),
     ("/scan",      "Scan and list all available system commands from PATH"),
     ("/debug",     "Browse debug entries (/debug), view detail (/debug <N>)"),
     ("/cwd",       "Show current working directory"),
@@ -6586,6 +6706,7 @@ _HELP_GROUPS = [
     ("Planning & Tasks", [
         ("/hwo", "visual orchestration builder"),
         ("/plan", "structured planning"),
+        ("/prompt", "prompt self-optimization"),
         ("/task", "task tracking"),
         ("/workflow", "multi-phase workflows"),
     ]),

@@ -23,6 +23,10 @@ Layout:
     │   └── *.md                         # Plan files
     ├── agents/                          # Agent state persistence
     │   └── <agent_id>.json              # Per-agent state
+    ├── prompts/                         # Prompt self-optimization
+    │   ├── feedback.jsonl              # User feedback entries (append-only)
+    │   ├── _state.json                  # Active optimization session state
+    │   └── candidates/                  # Draft prompt patches (<id>.md)
     └── skills/                          # User-installed skills
         └── <name>/                      # Skill directories
 
@@ -61,6 +65,14 @@ PLANS_STATE   = PLANS_DIR / "_state.json"
 AGENTS_DIR    = LAINTAS_HOME / "agents"
 SKILLS_DIR    = LAINTAS_HOME / "skills"
 SESSIONS_DIR  = LAINTAS_HOME / "sessions"
+
+# Prompt self-optimization: feedback log + candidate drafts + applied-patch state.
+# Lives under ~/.laintas/ (NOT per-cwd) so it survives /reload (which only wipes
+# the 4 files in _ALL_CWD_FILES under <cwd>/.laintas/).
+PROMPTS_DIR          = LAINTAS_HOME / "prompts"
+PROMPT_CANDIDATES_DIR = PROMPTS_DIR / "candidates"
+PROMPT_FEEDBACK_LOG  = PROMPTS_DIR / "feedback.jsonl"
+PROMPT_OPT_STATE     = PROMPTS_DIR / "_state.json"
 
 
 # ── Per-Project Directory (cwd-scoped) ───────────────────────────────────
@@ -114,7 +126,8 @@ def ensure_home() -> None:
         os.chmod(str(LAINTAS_HOME), 0o700)
     except OSError:
         pass
-    for d in (MEMORY_DIR, PLANS_DIR, AGENTS_DIR, SKILLS_DIR, SESSIONS_DIR):
+    for d in (MEMORY_DIR, PLANS_DIR, AGENTS_DIR, SKILLS_DIR, SESSIONS_DIR,
+              PROMPTS_DIR, PROMPT_CANDIDATES_DIR):
         d.mkdir(parents=True, exist_ok=True)
 
 

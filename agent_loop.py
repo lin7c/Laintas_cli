@@ -22,6 +22,7 @@ import policy as policy_mod  # Security policy engine
 import memory_system         # Cross-session persistent memory
 import hooks as hooks_mod    # Extensible hook system
 import plan_mode             # Structured planning before execution
+import prompt_opt            # Prompt self-optimization (feedback → patch → apply)
 import agent_persistence     # Cross-session agent state persistence
 import agent_roles           # Specialized agent roles (explorer, reviewer, etc.)
 import workflow_engine        # Structured multi-phase workflow engine
@@ -3514,6 +3515,7 @@ def run_agent_loop(
             .replace("{{globalMemory}}", global_memory_str) \
             .replace("{{persistentMemory}}", memory_system.get_memory_context()) \
             .replace("{{planMode}}", plan_mode.get_plan_prompt()) \
+            .replace("{{promptOpt}}", prompt_opt.get_prompt_opt_section()) \
             .replace("{{agentName}}", agent_name) \
             .replace("{{agentId}}", agent_id_str) \
             .replace("{{currentPath}}", os.getcwd()) \

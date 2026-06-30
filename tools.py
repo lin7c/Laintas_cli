@@ -758,6 +758,76 @@ def _bi_plan_list(params: dict, ctx: ToolCtx) -> dict:
     return {"ok": True, "result": plans, "count": len(plans)}
 
 
+def _bi_prompt_feedback(params: dict, ctx: ToolCtx) -> dict:
+    """Capture feedback and spawn a background optimizer sub-agent."""
+    if _prompt_opt_mod is None:
+        return {"ok": False, "error": "prompt_opt module not available"}
+    description = params.get("description", "")
+    if not description:
+        return {"ok": False, "error": "missing 'description'"}
+    entry = _prompt_opt_mod.capture_feedback(description)
+    # Try to spawn optimizer if we can reach agent_loop + current agent.
+    try:
+        from agent_loop import spawn_subagent
+        from laintas_cli import get_current_agent, get_loop_deps
+        parent = get_current_agent()
+        if parent:
+            child_id = _prompt_opt_mod.spawn_optimizer(
+                entry["id"], parent.id, get_loop_deps(), None)
+            return {"ok": True, "result": f"Feedback captured ({entry['id']}), "
+                    f"optimizer spawned: {child_id}", "feedback_id": entry["id"],
+                    "child_agent_id": child_id}
+    except Exception:
+        pass
+    return {"ok": True, "result": f"Feedback captured ({entry['id']}). "
+            "No optimizer spawned (no active agent).", "feedback_id": entry["id"]}
+
+
+def _bi_prompt_draft(params: dict, ctx: ToolCtx) -> dict:
+    """Write a candidate patch file. Used by the optimizer sub-agent."""
+    if _prompt_opt_mod is None:
+        return {"ok": False, "error": "prompt_opt module not available"}
+    feedback_id = params.get("feedback_id", "")
+    patch = params.get("patch", "")
+    rationale = params.get("rationale", "")
+    if not patch:
+        return {"ok": False, "error": "missing 'patch'"}
+    if not feedback_id:
+        return {"ok": False, "error": "missing 'feedback_id'"}
+    cand = _prompt_opt_mod.draft_candidate(feedback_id, patch, rationale)
+    return {"ok": True, "result": f"Candidate {cand['id']} drafted.",
+            "candidate_id": cand["id"]}
+
+
+def _bi_prompt_review(params: dict, ctx: ToolCtx) -> dict:
+    """Read a candidate (or the active one) for review."""
+    if _prompt_opt_mod is None:
+        return {"ok": False, "error": "prompt_opt module not available"}
+    cid = params.get("id") or None
+    cand = _prompt_opt_mod.read_candidate(cid)
+    if not cand:
+        return {"ok": False, "error": "No candidate found"}
+    return {"ok": True, "result": cand}
+
+
+def _bi_prompt_apply(params: dict, ctx: ToolCtx) -> dict:
+    """Apply a candidate patch to cli.prop."""
+    if _prompt_opt_mod is None:
+        return {"ok": False, "error": "prompt_opt module not available"}
+    cid = params.get("id") or None
+    force = params.get("force", False)
+    ok, msg = _prompt_opt_mod.apply_candidate(cid, force=force)
+    return {"ok": ok, "result": msg}
+
+
+def _bi_prompt_discard(params: dict, ctx: ToolCtx) -> dict:
+    """Strip the applied patch from cli.prop."""
+    if _prompt_opt_mod is None:
+        return {"ok": False, "error": "prompt_opt module not available"}
+    ok, msg = _prompt_opt_mod.discard_candidate()
+    return {"ok": ok, "result": msg}
+
+
 def _bi_fs_edit(params: dict, ctx: ToolCtx) -> dict:
     """Exact string replacement in a file.
 
@@ -1172,6 +1242,11 @@ try:
     import plan_mode as _plan_mod
 except ImportError:
     _plan_mod = None
+
+try:
+    import prompt_opt as _prompt_opt_mod
+except ImportError:
+    _prompt_opt_mod = None
 
 try:
     import policy as _policy_mod
@@ -3764,6 +3839,77 @@ def register_builtin_tools() -> None:
             description="List all saved plans.",
             schema={"type": "object", "properties": {}},
             invoke=_bi_plan_list,
+        ),
+        # ── Prompt optimization tools ──────────────────────────────
+        Tool(
+            name="prompt.feedback",
+            description="Capture user feedback about prompt behavior and spawn a "
+                        "background optimizer sub-agent to draft a patch. Use when "
+                        "the user reports a recurring behavioral issue that a prompt "
+                        "change could fix (e.g., 'you rarely reply', 'you don't verify').",
+            schema={
+                "type": "object",
+                "properties": {
+                    "description": {"type": "string",
+                        "description": "What the user observed and wants improved"},
+                },
+                "required": ["description"],
+            },
+            invoke=_bi_prompt_feedback,
+        ),
+        Tool(
+            name="prompt.draft",
+            description="Write a prompt-optimization candidate to disk. Used by the "
+                        "optimizer sub-agent after diagnosing a cli.prop deficiency. "
+                        "The patch is an additive <prompt_opt_patch> block — do NOT "
+                        "include the wrapper tags in the 'patch' parameter.",
+            schema={
+                "type": "object",
+                "properties": {
+                    "feedback_id": {"type": "string",
+                        "description": "The feedback id this patch addresses"},
+                    "patch": {"type": "string",
+                        "description": "Patch block contents (without <prompt_opt_patch> wrapper)"},
+                    "rationale": {"type": "string",
+                        "description": "1-3 sentences: what deficiency, how the patch fixes it"},
+                },
+                "required": ["feedback_id", "patch"],
+            },
+            invoke=_bi_prompt_draft,
+        ),
+        Tool(
+            name="prompt.review",
+            description="Read a prompt-optimization candidate (or the active one) "
+                        "to review its patch and rationale before applying.",
+            schema={
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "Candidate id (omit for active)"},
+                },
+            },
+            invoke=_bi_prompt_review,
+        ),
+        Tool(
+            name="prompt.apply",
+            description="Apply a candidate patch to cli.prop. Appends a "
+                        "<prompt_opt_patch> block (idempotent — strips existing first). "
+                        "Takes effect next loop iteration, no /reload needed.",
+            schema={
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "Candidate id (omit for active)"},
+                    "force": {"type": "boolean", "default": False,
+                        "description": "Override drift detection if cli.prop changed"},
+                },
+            },
+            invoke=_bi_prompt_apply,
+        ),
+        Tool(
+            name="prompt.discard",
+            description="Strip the applied <prompt_opt_patch> block from cli.prop. "
+                        "Fully reverts the optimization patch.",
+            schema={"type": "object", "properties": {}},
+            invoke=_bi_prompt_discard,
         ),
         # ── Agent tools ─────────────────────────────────────────────
         Tool(
