@@ -828,6 +828,92 @@ def _bi_prompt_discard(params: dict, ctx: ToolCtx) -> dict:
     return {"ok": ok, "result": msg}
 
 
+def _bi_prompt_structured_feedback(params: dict, ctx: ToolCtx) -> dict:
+    """Capture a structured failure report (v3 template) and spawn optimizer."""
+    if _prompt_opt_mod is None:
+        return {"ok": False, "error": "prompt_opt module not available"}
+    fields = {
+        "task": params.get("task", ""),
+        "expected": params.get("expected", ""),
+        "actual": params.get("actual", ""),
+        "category": params.get("category", ""),
+        "minimal_fix": params.get("minimal_fix", ""),
+        "regression_tests": params.get("regression_tests", ""),
+    }
+    if not fields["task"] and not fields["actual"]:
+        return {"ok": False, "error": "missing 'task' and 'actual' (at least one required)"}
+    if fields["category"] and fields["category"] not in _prompt_opt_mod.FAILURE_CATEGORIES:
+        return {"ok": False, "error": f"invalid category '{fields['category']}'. Valid: {_prompt_opt_mod.FAILURE_CATEGORIES}"}
+    entry = _prompt_opt_mod.capture_structured_failure(fields)
+    try:
+        from agent_loop import spawn_subagent
+        from laintas_cli import get_current_agent, get_loop_deps
+        parent = get_current_agent()
+        if parent:
+            child_id = _prompt_opt_mod.spawn_optimizer(
+                entry["id"], parent.id, get_loop_deps(), None)
+            return {"ok": True, "result": f"Structured feedback captured ({entry['id']}), "
+                    f"optimizer spawned: {child_id}", "feedback_id": entry["id"],
+                    "child_agent_id": child_id}
+    except Exception:
+        pass
+    return {"ok": True, "result": f"Structured feedback captured ({entry['id']}). "
+            "No optimizer spawned (no active agent).", "feedback_id": entry["id"]}
+
+
+def _bi_prompt_skill_patch(params: dict, ctx: ToolCtx) -> dict:
+    """Draft a skill patch candidate. Used by the optimizer sub-agent."""
+    if _prompt_opt_mod is None:
+        return {"ok": False, "error": "prompt_opt module not available"}
+    skill_name = params.get("skill_name", "")
+    skill_file = params.get("skill_file", "SKILL.md")
+    mode = params.get("mode", "append")
+    patch = params.get("patch", "")
+    rationale = params.get("rationale", "")
+    feedback_id = params.get("feedback_id", "")
+    old_string = params.get("old_string", "")
+    new_string = params.get("new_string", "")
+    if not skill_name:
+        return {"ok": False, "error": "missing 'skill_name'"}
+    if not feedback_id:
+        return {"ok": False, "error": "missing 'feedback_id'"}
+    if mode == "append" and not patch:
+        return {"ok": False, "error": "missing 'patch' (required for append mode)"}
+    if mode == "replace" and (not old_string or not new_string):
+        return {"ok": False, "error": "missing 'old_string' or 'new_string' (required for replace mode)"}
+    if mode not in ("append", "replace"):
+        return {"ok": False, "error": f"invalid mode '{mode}'. Use 'append' or 'replace'."}
+    cand = _prompt_opt_mod.draft_skill_patch(
+        skill_name=skill_name, skill_file=skill_file, mode=mode,
+        patch=patch, rationale=rationale, feedback_id=feedback_id,
+        old_string=old_string, new_string=new_string)
+    return {"ok": True, "result": f"Skill patch {cand['id']} drafted for "
+            f"{skill_name}/{skill_file}.", "candidate_id": cand["id"]}
+
+
+def _bi_prompt_skill_apply(params: dict, ctx: ToolCtx) -> dict:
+    """Apply a skill patch candidate."""
+    if _prompt_opt_mod is None:
+        return {"ok": False, "error": "prompt_opt module not available"}
+    cid = params.get("id")
+    if not cid:
+        return {"ok": False, "error": "missing 'id'"}
+    force = params.get("force", False)
+    ok, msg = _prompt_opt_mod.apply_skill_patch(cid, force=force)
+    return {"ok": ok, "result": msg}
+
+
+def _bi_prompt_skill_discard(params: dict, ctx: ToolCtx) -> dict:
+    """Discard a skill patch candidate (restore from backup)."""
+    if _prompt_opt_mod is None:
+        return {"ok": False, "error": "prompt_opt module not available"}
+    cid = params.get("id")
+    if not cid:
+        return {"ok": False, "error": "missing 'id'"}
+    ok, msg = _prompt_opt_mod.discard_skill_patch(cid)
+    return {"ok": ok, "result": msg}
+
+
 def _bi_fs_edit(params: dict, ctx: ToolCtx) -> dict:
     """Exact string replacement in a file.
 
@@ -3910,6 +3996,94 @@ def register_builtin_tools() -> None:
                         "Fully reverts the optimization patch.",
             schema={"type": "object", "properties": {}},
             invoke=_bi_prompt_discard,
+        ),
+        Tool(
+            name="prompt.structured_feedback",
+            description="Capture a structured failure report (v3 template) and "
+                        "spawn a background optimizer sub-agent. The optimizer "
+                        "triages whether the fix belongs in cli.prop or a skill "
+                        "based on the failure category. Use when the user reports "
+                        "a specific behavioral failure with a clear cause.",
+            schema={
+                "type": "object",
+                "properties": {
+                    "task": {"type": "string", "description": "What the user asked for"},
+                    "expected": {"type": "string", "description": "What should have happened"},
+                    "actual": {"type": "string", "description": "What actually happened"},
+                    "category": {"type": "string",
+                        "enum": ["Objective unclear", "Missing tool-use rule",
+                                 "Missing completion criteria", "Weak safety boundary",
+                                 "Bad output format", "Too much ambiguity",
+                                 "Model capability limitation",
+                                 "Tool/environment limitation"],
+                        "description": "Failure category (determines triage: cli.prop vs skill)"},
+                    "minimal_fix": {"type": "string", "description": "Proposed minimal fix"},
+                    "regression_tests": {"type": "string", "description": "Tests to rerun after fix"},
+                },
+                "required": ["task", "actual", "category"],
+            },
+            invoke=_bi_prompt_structured_feedback,
+        ),
+        Tool(
+            name="prompt.skill_patch",
+            description="Draft a skill-optimization patch. Used by the optimizer "
+                        "sub-agent after diagnosing that a skill's SKILL.md or "
+                        "skill.py is the root cause of a failure. Two modes: "
+                        "'append' adds a <skill_opt_patch> block to the file "
+                        "(best for SKILL.md instruction tweaks); 'replace' does "
+                        "an exact string replacement (best for skill.py code fixes "
+                        "or targeted SKILL.md edits). The user reviews and applies.",
+            schema={
+                "type": "object",
+                "properties": {
+                    "feedback_id": {"type": "string", "description": "The feedback id this patch addresses"},
+                    "skill_name": {"type": "string", "description": "Skill directory name"},
+                    "skill_file": {"type": "string", "default": "SKILL.md",
+                        "description": "File to patch: 'SKILL.md' or 'skill.py'"},
+                    "mode": {"type": "string", "enum": ["append", "replace"],
+                        "default": "append",
+                        "description": "append: add block to end; replace: string replacement"},
+                    "patch": {"type": "string",
+                        "description": "Content to append (append mode). Do NOT include <skill_opt_patch> wrapper."},
+                    "old_string": {"type": "string",
+                        "description": "String to find (replace mode). Must be unique in the file."},
+                    "new_string": {"type": "string",
+                        "description": "Replacement string (replace mode)"},
+                    "rationale": {"type": "string",
+                        "description": "1-3 sentences: which skill deficiency, how the patch fixes it"},
+                },
+                "required": ["feedback_id", "skill_name", "rationale"],
+            },
+            invoke=_bi_prompt_skill_patch,
+        ),
+        Tool(
+            name="prompt.skill_apply",
+            description="Apply a skill patch candidate. Backs up the original "
+                        "file, applies the patch, and hot-reloads the skill. "
+                        "Changes take effect immediately.",
+            schema={
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "Skill patch candidate id"},
+                    "force": {"type": "boolean", "default": False,
+                        "description": "Override drift detection if the skill file changed"},
+                },
+                "required": ["id"],
+            },
+            invoke=_bi_prompt_skill_apply,
+        ),
+        Tool(
+            name="prompt.skill_discard",
+            description="Discard an applied skill patch by restoring the "
+                        "original file from backup. Hot-reloads the skill.",
+            schema={
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "Skill patch candidate id"},
+                },
+                "required": ["id"],
+            },
+            invoke=_bi_prompt_skill_discard,
         ),
         # ── Agent tools ─────────────────────────────────────────────
         Tool(

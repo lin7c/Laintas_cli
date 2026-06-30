@@ -5579,13 +5579,18 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
         elif sub == "list":
             cands = _po.list_candidates()
             if cands:
-                console.print("[bold]Prompt candidates:[/bold]")
+                console.print("[bold]All candidates:[/bold]")
                 for c in cands:
+                    ctype = c.get("type", "cli_prop")
+                    extra = ""
+                    if ctype == "skill_patch":
+                        extra = f" [{c.get('skill_name', '')}/{c.get('skill_file', '')}]"
                     console.print(f"  [cyan]{c['id']}[/cyan] "
                                   f"[dim]{c['status']}[/dim] "
+                                  f"{ctype}{extra} "
                                   f"— {c.get('feedback', '')[:40]}")
             else:
-                console.print("[dim]No candidates. Run /prompt feedback to start.[/dim]")
+                console.print("[dim]No candidates. Run /prompt feedback or /prompt fail to start.[/dim]")
         elif sub == "export" and len(parts) >= 3:
             cid = parts[2]
             out = parts[3] if len(parts) >= 4 else None
@@ -5602,18 +5607,92 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
             ok, msg = _po.publish_pack(cid, session)
             color = "green" if ok else "yellow"
             console.print(f"[{color}]{msg}[/{color}]")
+        elif sub == "fail":
+            console.print(Panel(
+                _po.get_failure_template(),
+                title="Failure Report Template (v3)",
+                border_style="cyan"))
+            console.print(
+                "\n[dim]Describe the failure to the AI and it will fill in this "
+                "template via the [bold]prompt.structured_feedback[/bold] tool, "
+                "then spawn an optimizer that triages whether the fix belongs in "
+                "cli.prop or a skill.\n"
+                "Or use [bold]/prompt feedback <desc>[/bold] for plain-text "
+                "feedback.[/dim]")
+        elif sub == "skill":
+            sub2 = parts[2].lower() if len(parts) > 2 else ""
+            if sub2 == "list":
+                patches = _po.list_skill_patches()
+                if patches:
+                    console.print("[bold]Skill patches:[/bold]")
+                    for p in patches:
+                        console.print(
+                            f"  [cyan]{p['id']}[/cyan] "
+                            f"[dim]{p['status']}[/dim] "
+                            f"— {p.get('skill_name', '?')}/"
+                            f"{p.get('skill_file', '?')} "
+                            f"({p.get('mode', '?')})")
+                else:
+                    console.print("[dim]No skill patches. Run /prompt fail to start diagnosis.[/dim]")
+            elif sub2 == "review":
+                cid = parts[3] if len(parts) > 3 else None
+                patch = _po.read_skill_patch(cid)
+                if not patch:
+                    console.print("[yellow]No skill patch found. Run /prompt skill list for ids.[/yellow]")
+                else:
+                    mode = patch.get("mode", "?")
+                    if mode == "append":
+                        patch_preview = patch.get("patch", "")[:1500]
+                    else:
+                        patch_preview = (
+                            f"OLD:\n{patch.get('old_string', '')[:750]}\n\n"
+                            f"NEW:\n{patch.get('new_string', '')[:750]}"
+                        )
+                    console.print(Panel(
+                        f"[bold]Skill Patch:[/bold] {patch.get('id', '?')}\n"
+                        f"[bold]Skill:[/bold] {patch.get('skill_name', '?')}/{patch.get('skill_file', '?')}\n"
+                        f"[bold]Mode:[/bold] {mode}\n\n"
+                        f"[dim]Rationale:[/dim]\n{patch.get('body', '')[:400]}\n\n"
+                        f"[dim]Patch:[/dim]\n{patch_preview}",
+                        title="Skill Patch Review", border_style="blue"))
+                    console.print("\n[dim]Run [bold]/prompt skill apply <id>[/bold] to activate, "
+                                  "[bold]/prompt skill discard <id>[/bold] to reject.[/dim]")
+            elif sub2 == "apply":
+                cid = parts[3] if len(parts) > 3 else None
+                if not cid:
+                    console.print("[red]Usage: /prompt skill apply <id>[/red]")
+                else:
+                    ok, msg = _po.apply_skill_patch(cid)
+                    color = "green" if ok else "red"
+                    console.print(f"[{color}]{msg}[/{color}]")
+            elif sub2 == "discard":
+                cid = parts[3] if len(parts) > 3 else None
+                if not cid:
+                    console.print("[red]Usage: /prompt skill discard <id>[/red]")
+                else:
+                    ok, msg = _po.discard_skill_patch(cid)
+                    color = "green" if ok else "red"
+                    console.print(f"[{color}]{msg}[/{color}]")
+            else:
+                console.print("Usage:\n"
+                              "  [bold]/prompt skill list[/bold]            — List skill patches\n"
+                              "  [bold]/prompt skill review <id>[/bold]     — Review a skill patch\n"
+                              "  [bold]/prompt skill apply <id>[/bold]      — Apply a skill patch\n"
+                              "  [bold]/prompt skill discard <id>[/bold]    — Discard a skill patch")
         else:
             console.print("Usage:\n"
-                          "  [bold]/prompt feedback <desc>[/bold]  — Capture feedback & spawn optimizer\n"
-                          "  [bold]/prompt optimize <id>[/bold]    — Spawn optimizer for a feedback id\n"
-                          "  [bold]/prompt status[/bold]           — Show optimization status\n"
-                          "  [bold]/prompt review [id][/bold]      — Review candidate patch\n"
-                          "  [bold]/prompt apply [id][/bold]       — Apply candidate to cli.prop\n"
-                          "  [bold]/prompt discard[/bold]          — Strip applied patch\n"
-                          "  [bold]/prompt list[/bold]             — List candidates\n"
-                          "  [bold]/prompt export <id> [path][/bold] — Export portable pack\n"
-                          "  [bold]/prompt install <path|url>[/bold] — Import a shared pack\n"
-                          "  [bold]/prompt publish <id>[/bold]     — Publish to community")
+                          "  [bold]/prompt feedback <desc>[/bold]    — Capture feedback & spawn optimizer\n"
+                          "  [bold]/prompt fail[/bold]                — Show failure template (v3)\n"
+                          "  [bold]/prompt optimize <id>[/bold]       — Spawn optimizer for a feedback id\n"
+                          "  [bold]/prompt status[/bold]              — Show optimization status\n"
+                          "  [bold]/prompt review [id][/bold]         — Review cli.prop candidate patch\n"
+                          "  [bold]/prompt apply [id][/bold]          — Apply candidate to cli.prop\n"
+                          "  [bold]/prompt discard[/bold]             — Strip applied cli.prop patch\n"
+                          "  [bold]/prompt list[/bold]                — List all candidates (cli.prop + skill)\n"
+                          "  [bold]/prompt skill list|review|apply|discard <id>[/bold] — Manage skill patches\n"
+                          "  [bold]/prompt export <id> [path][/bold]  — Export portable pack\n"
+                          "  [bold]/prompt install <path|url>[/bold]  — Import a shared pack\n"
+                          "  [bold]/prompt publish <id>[/bold]        — Publish to community")
 
     elif action == "/task":
         sub = parts[1].lower() if len(parts) > 1 else ""

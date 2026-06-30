@@ -56,6 +56,62 @@ _current_opt: Optional[dict] = None
 PATCH_OPEN = "<prompt_opt_patch>"
 PATCH_CLOSE = "</prompt_opt_patch>"
 
+# Skill patch markers (additive blocks appended to SKILL.md, or string
+# replacement in skill.py). Same idempotent-strip pattern as PATCH_*.
+SKILL_PATCH_OPEN = "<skill_opt_patch>"
+SKILL_PATCH_CLOSE = "</skill_opt_patch>"
+SKILL_REPLACE_OLD_OPEN = "<skill_replace_old>"
+SKILL_REPLACE_OLD_CLOSE = "</skill_replace_old>"
+SKILL_REPLACE_NEW_OPEN = "<skill_replace_new>"
+SKILL_REPLACE_NEW_CLOSE = "</skill_replace_new>"
+
+# Structured failure-report categories (v3 template).
+FAILURE_CATEGORIES = [
+    "Objective unclear",
+    "Missing tool-use rule",
+    "Missing completion criteria",
+    "Weak safety boundary",
+    "Bad output format",
+    "Too much ambiguity",
+    "Model capability limitation",
+    "Tool/environment limitation",
+]
+
+# Display-only template (NOT injected into the system prompt).
+FAILURE_TEMPLATE = """\
+Prompt version: v3
+
+Failure case:
+用户任务：____
+期望行为：____
+实际行为：____
+
+Failure category:
+[ ] Objective unclear
+[ ] Missing tool-use rule
+[ ] Missing completion criteria
+[ ] Weak safety boundary
+[ ] Bad output format
+[ ] Too much ambiguity
+[ ] Model capability limitation
+[ ] Tool/environment limitation
+
+Minimal fix:
+____
+
+Regression tests to rerun:
+____
+"""
+
+# Category → likely fix target. Used by _build_triage_guidance().
+_CLI_PROP_CATEGORIES = {
+    "Objective unclear", "Missing completion criteria",
+    "Too much ambiguity", "Bad output format", "Weak safety boundary",
+}
+_SKILL_CATEGORIES = {
+    "Missing tool-use rule", "Tool/environment limitation",
+}
+
 
 # ── Directory / state helpers ────────────────────────────────────────────
 
@@ -131,6 +187,103 @@ def capture_feedback(description: str, context: Optional[dict] = None) -> dict:
     return entry
 
 
+def get_failure_template() -> str:
+    """Return the blank failure-report template for display (/prompt fail)."""
+    return FAILURE_TEMPLATE
+
+
+def capture_structured_failure(fields: dict) -> dict:
+    """Capture a structured failure report (v3 template fields).
+
+    fields should contain: task, expected, actual, category, minimal_fix,
+    regression_tests.  The entry is stored in feedback.jsonl alongside
+    plain-text entries; a 'category' key distinguishes structured entries.
+
+    Returns the entry dict (including its 'id').
+    """
+    ensure_prompts_dir()
+    fid = _now_id()
+    task = fields.get("task", "")
+    actual = fields.get("actual", "")
+    entry = {
+        "id": fid,
+        "task": task,
+        "expected": fields.get("expected", ""),
+        "actual": actual,
+        "category": fields.get("category", ""),
+        "minimal_fix": fields.get("minimal_fix", ""),
+        "regression_tests": fields.get("regression_tests", ""),
+        # Keep 'description' for backward-compat with list_feedback consumers.
+        "description": f"{task} | {actual}" if task or actual else "",
+        "context": {"structured": True},
+        "created": _now_iso(),
+    }
+    try:
+        with open(FEEDBACK_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+    try:
+        import memory_system
+        memory_system.write_memory(
+            name=f"prompt_opt_failure_{fid}",
+            mem_type="feedback",
+            description=f"Failure: {entry['category']} — {task[:60]}",
+            body=json.dumps(entry, ensure_ascii=False, indent=2),
+            importance=0.8,
+        )
+    except Exception:
+        pass
+
+    return entry
+
+
+def _format_structured_feedback(entry: dict) -> str:
+    """Format a structured feedback entry for the optimizer task string."""
+    return (
+        f"- Task: {entry.get('task', '')}\n"
+        f"- Expected: {entry.get('expected', '')}\n"
+        f"- Actual: {entry.get('actual', '')}\n"
+        f"- Category: {entry.get('category', '')}\n"
+        f"- Minimal fix: {entry.get('minimal_fix', '')}\n"
+        f"- Regression tests: {entry.get('regression_tests', '')}\n"
+    )
+
+
+def _build_triage_guidance(category: str) -> str:
+    """Build triage guidance text based on the failure category."""
+    if not category:
+        return (
+            "No failure category specified. Consider both cli.prop and skill "
+            "issues. Check if any loaded skill's instructions might be causing "
+            "the problem before assuming it's a cli.prop issue."
+        )
+    if category in _CLI_PROP_CATEGORIES:
+        return (
+            f"Category '{category}' → likely a cli.prop problem.\n"
+            "Diagnose which XML section of cli.prop is deficient and draft a "
+            "<prompt_opt_patch> block using 'prompt.draft'."
+        )
+    if category in _SKILL_CATEGORIES:
+        return (
+            f"Category '{category}' → likely a SKILL problem.\n"
+            "1. Use skill.list to enumerate all skills.\n"
+            "2. Load and read each relevant skill's SKILL.md (skill.load + fs.read).\n"
+            "3. Identify which skill's instructions or tool descriptions caused "
+            "the failure.\n"
+            "4. Draft a skill patch using 'prompt.skill_patch'.\n"
+            "Also check cli.prop in case the skill-routing rules there are deficient."
+        )
+    if category == "Model capability limitation":
+        return (
+            f"Category '{category}' → NOT fixable via prompt/skill changes.\n"
+            "Write a candidate with rationale explaining the limitation. "
+            "Do NOT draft a patch."
+        )
+    return f"Category '{category}' → unknown. Investigate both cli.prop and skills."
+
+
 def list_feedback(limit: int = 20) -> list[dict]:
     """Recent feedback entries, newest first."""
     if not FEEDBACK_LOG.exists():
@@ -162,17 +315,34 @@ def spawn_optimizer(feedback_id: str, parent_agent_id: str, deps,
     the parent's inbox and is surfaced via {{parallelResults}} on the next
     iteration.
 
+    If the feedback entry is structured (has a 'category' field), the task
+    includes triage logic that routes the diagnosis to cli.prop, a skill,
+    or marks it as a model-capability limitation.
+
     Returns the child agent_id, or None if spawn failed.
     """
     # Lazy import to avoid circular dependency at module load time.
     from agent_loop import spawn_subagent
 
-    feedback_desc = ""
+    # Read feedback entry (may be structured or plain text).
+    feedback_entry = None
     for entry in list_feedback(limit=50):
         if entry.get("id") == feedback_id:
-            feedback_desc = entry.get("description", "")
+            feedback_entry = entry
             break
 
+    if feedback_entry:
+        if feedback_entry.get("category"):
+            feedback_text = _format_structured_feedback(feedback_entry)
+            category = feedback_entry.get("category", "")
+        else:
+            feedback_text = feedback_entry.get("description", "")
+            category = ""
+    else:
+        feedback_text = f"(feedback id {feedback_id} not found)"
+        category = ""
+
+    # Read current cli.prop for reference.
     try:
         with open(paths.project_file(paths.CWD_CLI_PROP), "r",
                   encoding="utf-8") as f:
@@ -180,25 +350,47 @@ def spawn_optimizer(feedback_id: str, parent_agent_id: str, deps,
     except OSError:
         current_prop = "(cli.prop not found — will use default template)"
 
+    # Build skill catalog so the optimizer can inspect skills.
+    skill_catalog = "(no skills installed)"
+    try:
+        import skills as skills_mod
+        catalog = skills_mod.list_skills()
+        if catalog:
+            lines = []
+            for s in catalog:
+                status = "loaded" if s.get("loaded") else "available"
+                desc = (s.get("description") or "")[:80]
+                lines.append(f"  - {s['name']} [{status}]: {desc}")
+            skill_catalog = "\n".join(lines)
+    except Exception:
+        pass
+
+    triage = _build_triage_guidance(category)
+
     task = (
-        "You are a prompt-optimization sub-agent. Your job is to produce a "
-        "SMALL, ADDITIVE patch to the laintas-cli system prompt (cli.prop) "
-        "that addresses the user's feedback. Do NOT rewrite the whole template.\n\n"
-        f"## User Feedback\n{feedback_desc}\n\n"
+        "You are a prompt-optimization sub-agent. Your job is to diagnose the "
+        "root cause of a failure and produce a SMALL, ADDITIVE patch.\n\n"
+        f"## Failure Report\n{feedback_text}\n\n"
+        f"## Triage\n{triage}\n\n"
+        f"## Skill Catalog\n{skill_catalog}\n\n"
         f"## Current cli.prop (for reference)\n{current_prop[:4000]}\n\n"
         "## Instructions\n"
-        "1. Load the 'prompt-engineering' skill (skill_load) for patch guidelines.\n"
-        "2. Diagnose which section of cli.prop is deficient.\n"
-        "3. Draft a <prompt_opt_patch> block — a self-contained XML section that "
-        "will be APPENDED to cli.prop. It must:\n"
+        "1. Load the 'prompt-engineering' skill (skill.load) for patch guidelines.\n"
+        "2. Apply the triage logic above.\n"
+        "3. If cli.prop problem: diagnose the deficient XML section and draft a "
+        "patch using 'prompt.draft' (patch, rationale, feedback_id). The patch "
+        "must:\n"
         "   - Use XML-style tags consistent with the existing template.\n"
         "   - NOT redefine existing {{var}} slots or duplicate existing sections.\n"
         "   - Be as small as possible while addressing the feedback.\n"
         "   - Not introduce new unrecognized {{...}} placeholders.\n"
-        "4. Write the candidate using the 'prompt.draft' tool with: patch (the "
-        "block contents, WITHOUT the <prompt_opt_patch> wrapper), rationale, "
-        "and feedback_id.\n"
-        "5. Stop after drafting — do NOT apply it. The user will review and apply.\n"
+        "4. If skill problem: use skill.list and skill.load to inspect skills, "
+        "identify the deficient one, then draft a skill patch using "
+        "'prompt.skill_patch' (skill_name, skill_file, mode, patch, rationale, "
+        "feedback_id).\n"
+        "5. If model limitation: use 'prompt.draft' with an empty patch and "
+        "rationale explaining the limitation.\n"
+        "6. Stop after drafting — do NOT apply. The user will review and apply.\n"
     )
 
     child_id = spawn_subagent(
@@ -311,13 +503,19 @@ def list_candidates() -> list[dict]:
         try:
             raw = f.read_text(encoding="utf-8")
             meta = _parse_candidate(raw)
-            out.append({
+            entry = {
                 "id": meta.get("id", f.stem),
                 "status": meta.get("status", "draft"),
+                "type": meta.get("type", "cli_prop"),
                 "feedback": meta.get("feedback", ""),
                 "created": meta.get("created", ""),
                 "file": str(f),
-            })
+            }
+            if entry["type"] == "skill_patch":
+                entry["skill_name"] = meta.get("skill_name", "")
+                entry["skill_file"] = meta.get("skill_file", "")
+                entry["mode"] = meta.get("mode", "append")
+            out.append(entry)
         except OSError:
             pass
     return out
@@ -459,6 +657,313 @@ def _update_candidate_status(cid: str, status: str) -> None:
         p.write_text(raw, encoding="utf-8")
     except OSError:
         pass
+
+
+# ── Skill patch management ───────────────────────────────────────────────
+#
+# Skill patches modify a skill's SKILL.md or skill.py file. They use the
+# same candidates/ directory but carry type=skill_patch in frontmatter.
+# Two modes:
+#   append  — append a <skill_opt_patch> block to the file (idempotent, like
+#             cli.prop patches). Best for SKILL.md instruction tweaks.
+#   replace — find old_string, replace with new_string (exact, unique match).
+#             Best for skill.py code fixes or targeted SKILL.md edits.
+#
+# On apply: original file is backed up to candidates/<cid>.backup.
+# On discard: backup is restored and deleted. Hot-reload via skills.reload_all().
+
+
+def _resolve_skill_file(skill_name: str, skill_file: str) -> Optional[Path]:
+    """Resolve the full path to a skill file."""
+    try:
+        import skills as skills_mod
+        meta = skills_mod.get_all_metadata().get(skill_name)
+        if meta and meta.dir_path:
+            return Path(meta.dir_path) / skill_file
+    except Exception:
+        pass
+    return paths.SKILLS_DIR / skill_name / skill_file
+
+
+def draft_skill_patch(skill_name: str, skill_file: str, mode: str,
+                      patch: str, rationale: str, feedback_id: str,
+                      old_string: str = "",
+                      new_string: str = "") -> dict:
+    """Write a skill patch candidate. Called by the optimizer sub-agent.
+
+    Returns the candidate metadata dict.
+    """
+    ensure_prompts_dir()
+    cid = _now_id()
+
+    skill_path = _resolve_skill_file(skill_name, skill_file)
+    if skill_path and skill_path.exists():
+        try:
+            base_content = skill_path.read_text(encoding="utf-8")
+        except OSError:
+            base_content = ""
+    else:
+        base_content = ""
+    base_sha = hashlib.sha256(base_content.encode("utf-8")).hexdigest()[:16]
+
+    body_parts = [
+        f"# Skill Patch: {skill_name}/{skill_file}\n",
+        f"## Rationale\n{rationale}\n",
+    ]
+    if mode == "append":
+        body_parts.append(
+            f"## Patch (append mode)\n"
+            f"{SKILL_PATCH_OPEN}\n{patch}\n{SKILL_PATCH_CLOSE}\n"
+        )
+    elif mode == "replace":
+        body_parts.append(
+            f"## Patch (replace mode)\n"
+            f"{SKILL_REPLACE_OLD_OPEN}\n{old_string}\n{SKILL_REPLACE_OLD_CLOSE}\n"
+            f"{SKILL_REPLACE_NEW_OPEN}\n{new_string}\n{SKILL_REPLACE_NEW_CLOSE}\n"
+        )
+
+    candidate_raw = (
+        f"---\n"
+        f"id: {cid}\n"
+        f"created: {_now_iso()}\n"
+        f"status: draft\n"
+        f"type: skill_patch\n"
+        f"feedback: {feedback_id}\n"
+        f"skill_name: {skill_name}\n"
+        f"skill_file: {skill_file}\n"
+        f"mode: {mode}\n"
+        f"base_sha: {base_sha}\n"
+        f"---\n\n"
+        + "\n".join(body_parts)
+    )
+    _candidate_path(cid).write_text(candidate_raw, encoding="utf-8")
+
+    return {
+        "id": cid,
+        "status": "draft",
+        "type": "skill_patch",
+        "skill_name": skill_name,
+        "skill_file": skill_file,
+        "mode": mode,
+        "feedback": feedback_id,
+        "rationale": rationale,
+    }
+
+
+def read_skill_patch(cid: Optional[str] = None) -> Optional[dict]:
+    """Read a skill patch candidate by id."""
+    if not cid:
+        return None
+    p = _candidate_path(cid)
+    if not p.exists():
+        return None
+    try:
+        raw = p.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    meta = _parse_candidate(raw)
+    meta["id"] = cid
+
+    mode = meta.get("mode", "append")
+    body = meta.get("body", "")
+    if mode == "append":
+        m = re.search(
+            re.escape(SKILL_PATCH_OPEN) + r"(.*?)" + re.escape(SKILL_PATCH_CLOSE),
+            body, re.DOTALL,
+        )
+        meta["patch"] = m.group(1).strip() if m else ""
+    elif mode == "replace":
+        m_old = re.search(
+            re.escape(SKILL_REPLACE_OLD_OPEN) + r"(.*?)" + re.escape(SKILL_REPLACE_OLD_CLOSE),
+            body, re.DOTALL,
+        )
+        m_new = re.search(
+            re.escape(SKILL_REPLACE_NEW_OPEN) + r"(.*?)" + re.escape(SKILL_REPLACE_NEW_CLOSE),
+            body, re.DOTALL,
+        )
+        meta["old_string"] = m_old.group(1).strip() if m_old else ""
+        meta["new_string"] = m_new.group(1).strip() if m_new else ""
+
+    return meta
+
+
+def apply_skill_patch(cid: Optional[str] = None,
+                      force: bool = False) -> tuple[bool, str]:
+    """Apply a skill patch. Backs up original, modifies file, hot-reloads.
+
+    Returns (ok, message).
+    """
+    with _lock:
+        cand = read_skill_patch(cid)
+        if not cand:
+            return False, "No skill patch found."
+        if cand.get("type") != "skill_patch":
+            return False, f"Candidate {cid} is not a skill patch."
+
+        skill_name = cand.get("skill_name", "")
+        skill_file = cand.get("skill_file", "")
+        mode = cand.get("mode", "append")
+
+        if not skill_name or not skill_file:
+            return False, "Candidate missing skill_name or skill_file."
+
+        skill_path = _resolve_skill_file(skill_name, skill_file)
+        if not skill_path or not skill_path.exists():
+            return False, f"Skill file not found: {skill_name}/{skill_file}"
+
+        try:
+            original = skill_path.read_text(encoding="utf-8")
+        except OSError as e:
+            return False, f"Failed to read skill file: {e}"
+
+        # Drift detection
+        base_sha = cand.get("base_sha")
+        if base_sha and not force:
+            live_sha = hashlib.sha256(
+                original.encode("utf-8")).hexdigest()[:16]
+            if live_sha != base_sha:
+                return False, (
+                    f"Skill file has changed since this patch was drafted "
+                    f"(base sha {base_sha} -> live {live_sha}). "
+                    f"Re-review or use force=true."
+                )
+
+        # Compute new content
+        if mode == "append":
+            patch_content = cand.get("patch", "").strip()
+            if not patch_content:
+                return False, "Patch has no content."
+            cleaned = re.sub(
+                r"\n*<skill_opt_patch>.*?</skill_opt_patch>\s*",
+                "\n\n",
+                original,
+                flags=re.DOTALL,
+            ).rstrip() + "\n"
+            new_content = cleaned.rstrip("\n") + "\n\n" + \
+                f"{SKILL_PATCH_OPEN}\n{patch_content}\n{SKILL_PATCH_CLOSE}\n"
+        elif mode == "replace":
+            old_str = cand.get("old_string", "")
+            new_str = cand.get("new_string", "")
+            if not old_str:
+                return False, "Replace-mode patch has empty old_string."
+            if old_str not in original:
+                return False, (
+                    "old_string not found in skill file. The file may have "
+                    "changed, or the old_string doesn't match exactly."
+                )
+            count = original.count(old_str)
+            if count > 1:
+                return False, (
+                    f"old_string appears {count} times in skill file. "
+                    "Make it more specific (include surrounding context)."
+                )
+            new_content = original.replace(old_str, new_str, 1)
+        else:
+            return False, f"Unknown patch mode: {mode}"
+
+        # Write backup
+        backup_path = _candidate_path(cid).with_suffix(".backup")
+        try:
+            backup_path.write_text(original, encoding="utf-8")
+        except OSError as e:
+            return False, f"Failed to write backup: {e}"
+
+        # Write patched file
+        try:
+            skill_path.write_text(new_content, encoding="utf-8")
+        except OSError as e:
+            return False, f"Failed to write skill file: {e}"
+
+        _update_candidate_status(cid, "applied")
+
+        # Hot-reload the skill
+        try:
+            import skills as skills_mod
+            skills_mod.reload_all()
+        except Exception:
+            pass
+
+        return True, (
+            f"Skill patch {cid} applied to {skill_name}/{skill_file}. "
+            f"Skill reloaded. Changes take effect immediately."
+        )
+
+
+def discard_skill_patch(cid: Optional[str] = None) -> tuple[bool, str]:
+    """Revert a skill patch by restoring from backup.
+
+    Returns (ok, message).
+    """
+    with _lock:
+        if not cid:
+            return False, "Skill patch id required."
+
+        cand = read_skill_patch(cid)
+        if not cand:
+            return False, f"Skill patch {cid} not found."
+        if cand.get("type") != "skill_patch":
+            return False, f"Candidate {cid} is not a skill patch."
+
+        skill_name = cand.get("skill_name", "")
+        skill_file = cand.get("skill_file", "")
+        mode = cand.get("mode", "append")
+
+        skill_path = _resolve_skill_file(skill_name, skill_file)
+        if not skill_path or not skill_path.exists():
+            return False, f"Skill file not found: {skill_name}/{skill_file}"
+
+        backup_path = _candidate_path(cid).with_suffix(".backup")
+
+        if mode == "append" and not backup_path.exists():
+            # No backup — try stripping the <skill_opt_patch> block
+            try:
+                current = skill_path.read_text(encoding="utf-8")
+            except OSError as e:
+                return False, f"Failed to read skill file: {e}"
+            if SKILL_PATCH_OPEN not in current:
+                return True, "No patch block found (nothing to discard)."
+            cleaned = re.sub(
+                r"\n*<skill_opt_patch>.*?</skill_opt_patch>\s*",
+                "\n\n",
+                current,
+                flags=re.DOTALL,
+            ).rstrip() + "\n"
+            try:
+                skill_path.write_text(cleaned, encoding="utf-8")
+            except OSError as e:
+                return False, f"Failed to write skill file: {e}"
+        elif backup_path.exists():
+            try:
+                original = backup_path.read_text(encoding="utf-8")
+                skill_path.write_text(original, encoding="utf-8")
+                backup_path.unlink()
+            except OSError as e:
+                return False, f"Failed to restore from backup: {e}"
+        else:
+            return False, (
+                f"No backup found for patch {cid}. Cannot revert automatically. "
+                "The skill file may need manual restoration."
+            )
+
+        _update_candidate_status(cid, "discarded")
+
+        try:
+            import skills as skills_mod
+            skills_mod.reload_all()
+        except Exception:
+            pass
+
+        return True, (
+            f"Skill patch {cid} discarded. {skill_name}/{skill_file} restored. "
+            f"Skill reloaded."
+        )
+
+
+def list_skill_patches() -> list[dict]:
+    """All skill patch candidates, newest first."""
+    ensure_prompts_dir()
+    return [c for c in list_candidates()
+            if c.get("type") == "skill_patch"]
 
 
 # ── System prompt injection ({{promptOpt}} slot) ─────────────────────────
