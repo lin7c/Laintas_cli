@@ -28,6 +28,7 @@ import platform
 import webbrowser
 import threading
 import subprocess
+import difflib
 from pathlib import Path
 from typing import Callable, Optional
 from dataclasses import dataclass, field
@@ -93,11 +94,13 @@ from prompt_toolkit.history import FileHistory
 from prompt_toolkit.completion import Completer, Completion, PathCompleter, WordCompleter
 from prompt_toolkit.document import Document
 from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.keys import Keys
 from prompt_toolkit.layout import Layout, HSplit, Window, FormattedTextControl
 from prompt_toolkit.styles import Style
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.layout.controls import BufferControl
+from prompt_toolkit.lexers import Lexer
 
 # ── Central UI theme ──────────────────────────────────────────────────
 # Minimal palette: one accent, muted secondaries, semantic status colors.
@@ -116,6 +119,60 @@ LAINTAS_THEME = Theme({
 })
 
 console = Console(theme=LAINTAS_THEME)
+
+
+def _ptk_fragments(pairs):
+    """Expand a list of (base_style, text) pairs into prompt_toolkit fragments.
+
+    ``text`` may embed Rich markup (``[bold]``, ``[green]``, ``[dim]`` …).
+    prompt_toolkit's ``FormattedTextControl`` does not understand Rich markup —
+    left as-is it prints literally (e.g. a raw ``[bold][/bold]``). This resolves
+    the markup via Rich (honoring ``LAINTAS_THEME``) and emits proper
+    prompt_toolkit ``(style_str, text)`` fragments, folding each ``base_style``
+    (e.g. ``"class:selected"``) onto every produced segment.
+    """
+    from rich.text import Text as _RichText
+
+    out = []
+    for base_style, text in pairs:
+        base = base_style or ""
+        if "[" not in text:
+            out.append((base, text))
+            continue
+        try:
+            rt = _RichText.from_markup(text)
+        except Exception:
+            out.append((base, text))
+            continue
+        for seg in rt.render(console):
+            parts = []
+            if base:
+                parts.append(base)
+            st = seg.style
+            if st is not None:
+                if st.bold:
+                    parts.append("bold")
+                if st.dim:
+                    parts.append("dim")
+                if st.italic:
+                    parts.append("italic")
+                if st.underline:
+                    parts.append("underline")
+                if st.reverse:
+                    parts.append("reverse")
+                if st.color is not None:
+                    try:
+                        parts.append("#" + st.color.get_truecolor().hex.lstrip("#"))
+                    except Exception:
+                        pass
+                if st.bgcolor is not None:
+                    try:
+                        parts.append("bg:#" + st.bgcolor.get_truecolor().hex.lstrip("#"))
+                    except Exception:
+                        pass
+            out.append((" ".join(parts), seg.text))
+    return out
+
 
 try:
     from version import __version__
@@ -141,13 +198,15 @@ from agent_loop import (
     spawn_subagent, send_to_agent, recv_from_inbox, drain_inbox,
     abort_agent, wait_for_agent, build_agents_tree,
     get_runtime_config, set_runtime_config,
-    list_runtime_config, reset_runtime_config, apply_max_config,
+    list_runtime_config, describe_runtime_config,
+    reset_runtime_config, apply_max_config,
     prepare_state_for_repl,
     get_user_interrupt_event, get_user_message_queue,
     clear_loop_command_cache,
     stop_trigger_scanner,
     save_session_snapshot, load_session_snapshot,
     save_resume_state, load_resume_state, save_resume_checkpoint, list_resume_states,
+    delete_resume_state,
 )
 
 import tools as tools_mod    # noqa: E402 — load after agent_loop so registry inits once
@@ -157,6 +216,7 @@ import paths                 # Centralized path management
 import migrate as migrate_mod  # Auto-migration from old layout
 import hwo_ui as hwo_ui_mod  # /hwo orchestration UI
 import browser_session as browser_mod  # headless-browser live-view stack
+import session_store             # durable live current-session state
 
 # MCP client: lazy import (saves ~1.8s on startup)
 _mcp_mod = None
@@ -1235,16 +1295,91 @@ def display_file_diff(path: str, diff_text: str, depth: int = 0) -> None:
 
 # ── prompt_toolkit Input Setup ──────────────────────────────────────────
 
+@dataclass(frozen=True)
+class CommandSpec:
+    """Single source of truth for slash-command discovery and help."""
+
+    name: str
+    description: str
+    group: str
+    usage: str = ""
+    aliases: tuple[str, ...] = ()
+    palette: bool = True
+    subcommands: tuple[str, ...] = ()
+
+    @property
+    def all_names(self) -> tuple[str, ...]:
+        return (self.name, *self.aliases)
+
+
+COMMAND_SPECS: tuple[CommandSpec, ...] = (
+    CommandSpec("/help", "Show command help", "Basics", "/help [command]"),
+    CommandSpec("/clear", "Clear the screen", "Basics"),
+    CommandSpec("/cwd", "Show the working directory", "Basics"),
+    CommandSpec("/scan", "List user-facing PATH commands", "Basics"),
+    CommandSpec("/login", "Re-authenticate with Laintas", "Account & Session"),
+    CommandSpec("/resume", "Resume a saved session (picker; echo last N messages, default 20)", "Account & Session", "/resume [N|all|latest]"),
+    CommandSpec("/new", "Start a new live session", "Account & Session", "/new"),
+    CommandSpec("/exit", "Log out and exit", "Account & Session"),
+    CommandSpec("/quit", "Exit without logging out", "Account & Session", aliases=("/q",)),
+    CommandSpec("/back", "Detach from a sub-terminal", "Account & Session"),
+    CommandSpec("/version", "Show version or update", "Account & Session", "/version [check|update [--force]]", aliases=("/v", "/update"), subcommands=("check", "update")),
+    CommandSpec("/name", "Show or set the current agent name", "Agents & Terminals", "/name [new-name]"),
+    CommandSpec("/hire", "Create an idle agent", "Agents & Terminals"),
+    CommandSpec("/agents", "List, switch, or rename agents", "Agents & Terminals", "/agents [tree|agent-id|name <new-name>]", subcommands=("tree", "name")),
+    CommandSpec("/term", "List, create, or rename terminals", "Agents & Terminals", "/term [name|rename <old> <new>]", aliases=("/t",), subcommands=("rename",)),
+    CommandSpec("/station", "Deploy an agent to a terminal", "Agents & Terminals", "/station [agent-id] [terminal]", aliases=("/st",)),
+    CommandSpec("/terminate", "Close a terminal", "Agents & Terminals", "/terminate <name>"),
+    CommandSpec("/send", "Send input to a terminal", "Agents & Terminals", "/send <name> [--wait <seconds>] <command>"),
+    CommandSpec("/spawn", "Spawn a sub-agent", "Agents & Terminals", "/spawn [name:] <task>"),
+    CommandSpec("/tell", "Send a message to an agent", "Agents & Terminals", "/tell <agent-id> <message|json>"),
+    CommandSpec("/abort", "Abort an agent", "Agents & Terminals", "/abort <agent-id>"),
+    CommandSpec("/hwo", "Open or run an orchestration workflow", "Planning & Tasks", "/hwo [file|run <file>|compile <file>]", subcommands=("run", "compile")),
+    CommandSpec("/mode", "Show or switch plan/act mode", "Planning & Tasks", "/mode [plan <task>|act|approve]", subcommands=("plan", "act", "approve")),
+    CommandSpec("/plan", "Create, inspect, or approve plans", "Planning & Tasks", "/plan {enter|approve|exit|status|list}", subcommands=("enter", "approve", "exit", "status", "list")),
+    CommandSpec("/prompt", "Manage prompt optimization candidates", "Planning & Tasks", "/prompt <subcommand>", subcommands=("feedback", "fail", "optimize", "status", "review", "apply", "discard", "list", "skill", "export", "install", "publish")),
+    CommandSpec("/task", "Track project tasks", "Planning & Tasks", "/task [list|add|show|start|done|del|progress|note|subtask]", subcommands=("list", "add", "show", "start", "done", "del", "progress", "note", "subtask")),
+    CommandSpec("/workflow", "Run a multi-phase workflow", "Planning & Tasks", "/workflow {start|status|advance|approve|end|list}", subcommands=("start", "status", "advance", "approve", "end", "list")),
+    CommandSpec("/model", "List or select the backend model", "Config & Tools", "/model [id|reset]", subcommands=("reset", "clear", "default")),
+    CommandSpec("/config", "View or set runtime configuration", "Config & Tools", "/config [key [value]|reset]", subcommands=("reset",)),
+    CommandSpec("/policy", "Show or set security policy", "Config & Tools", "/policy [audit|enforce|disabled [--yes]|reset]", subcommands=("audit", "enforce", "disabled", "reset")),
+    CommandSpec("/max", "Lift runtime limits for this process", "Config & Tools"),
+    CommandSpec("/tools", "List registered tools", "Config & Tools"),
+    CommandSpec("/tool", "Invoke a tool directly", "Config & Tools", "/tool <name> [json-params]"),
+    CommandSpec("/skill", "Manage skills", "Config & Tools", "/skill [manager|list|load|unload|reload|new|dir]", subcommands=("manager", "list", "load", "unload", "reload", "new", "dir")),
+    CommandSpec("/mcp", "Manage MCP servers", "Config & Tools", "/mcp {list|connect|disconnect|reload|tools|init|config}", subcommands=("list", "connect", "disconnect", "reload", "tools", "init", "config")),
+    CommandSpec("/bash", "Run a command through term0", "Config & Tools", "/bash <command>|list|add <command>|remove <command>", subcommands=("list", "add", "remove")),
+    CommandSpec("/memory", "Inspect project and persistent memory", "Config & Tools", "/memory [project|persistent|show <id|name>]", subcommands=("project", "persistent", "global", "show")),
+    CommandSpec("/prop", "View .laintas/cli.prop prompt template", "Config & Tools"),
+    CommandSpec("/debug", "Browse or export debug entries", "Config & Tools", "/debug [clear|N|N <file> [--raw]]", subcommands=("clear",)),
+    CommandSpec("/detail", "Toggle full vs simplified progress rendering", "Config & Tools", "/detail [on|off]", subcommands=("on", "off")),
+    CommandSpec("/undo", "Restore a git checkpoint", "History", "/undo [sha]"),
+    CommandSpec("/snapshot", "Create a git checkpoint", "History", "/snapshot [label]"),
+    CommandSpec("/snapshots", "List git checkpoints", "History"),
+    CommandSpec("/continue", "Continue the current live session", "History"),
+    # Keep /reload discoverable, but its existing handler and behavior stay untouched.
+    CommandSpec("/reload", "Reload default files and restart", "History"),
+)
+
+
+def _slash_command_names() -> list[str]:
+    return sorted({name for spec in COMMAND_SPECS for name in spec.all_names})
+
+
+def _find_command_spec(name: str) -> Optional[CommandSpec]:
+    normalized = name if name.startswith("/") else f"/{name}"
+    normalized = normalized.lower()
+    return next(
+        (spec for spec in COMMAND_SPECS
+         if normalized in {item.lower() for item in spec.all_names}),
+        None,
+    )
+
+
 class MetaCompleter(Completer):
     """Context-aware completer: /-commands, shell commands from PATH, and paths."""
 
-    META_COMMANDS = [
-        "/help", "/login", "/name", "/memory", "/prop",
-        "/scan", "/debug", "/cwd", "/task",
-        "/station", "/terminate", "/send", "/hire", "/agents",
-        "/t", "/term",
-        "/clear", "/resume", "/max", "/exit", "/quit",
-    ]
+    META_COMMANDS = _slash_command_names()
 
     def __init__(self):
         self._path = PathCompleter(expanduser=True)
@@ -1278,6 +1413,16 @@ class MetaCompleter(Completer):
             return
         # /-command completion
         if text.startswith("/"):
+            if any(ch.isspace() for ch in text):
+                head, _, tail = text.partition(" ")
+                spec = _find_command_spec(head)
+                partial = tail.lstrip()
+                if spec and " " not in partial:
+                    for subcommand in spec.subcommands:
+                        if subcommand.startswith(partial.lower()):
+                            yield Completion(
+                                subcommand, start_position=-len(partial))
+                return
             for cmd in self.META_COMMANDS:
                 if cmd.startswith(text):
                     yield Completion(cmd, start_position=-len(text))
@@ -1311,12 +1456,152 @@ def _build_prompt_style() -> Style:
     return Style.from_dict({
         "prompt-path": "bold #7aa2f7",
         "separator": "#bb9af7",
+        "paste-placeholder": "bold #7aa2f7 bg:#2a2a37",
     })
+
+
+# ── Paste summarization ───────────────────────────────────────────────
+# Large pastes (many lines or a long single line) are collapsed into a
+# compact placeholder shown in the prompt buffer; the real content is kept
+# off-screen and substituted back when the line is submitted. Mirrors
+# opencode's pasteText/pasteInputText, adapted to prompt_toolkit.
+_paste_registry: dict = {}
+_paste_counter = 0
+
+
+def _reset_paste_registry() -> None:
+    """Clear pending placeholder→content mappings (called after each submit)."""
+    global _paste_registry, _paste_counter
+    _paste_registry = {}
+    _paste_counter = 0
+
+
+def _maybe_summarize_paste(data: str):
+    """Decide whether a pasted blob should be collapsed into a placeholder.
+
+    Returns (placeholder, line_count). When the paste is small or the feature
+    is disabled, placeholder is None and the caller should insert data as-is.
+    On summarization the placeholder→real-content mapping is registered.
+    """
+    global _paste_counter
+    if data is None:
+        return None, 0
+    normalized = data.replace("\r\n", "\n").replace("\r", "\n")
+    line_count = normalized.count("\n") + 1 if normalized else 0
+    try:
+        enabled = bool(get_runtime_config("paste_summary"))
+    except Exception:
+        enabled = True
+    if not enabled:
+        return None, line_count
+    try:
+        min_lines = int(get_runtime_config("paste_summary_min_lines"))
+    except Exception:
+        min_lines = 3
+    try:
+        min_chars = int(get_runtime_config("paste_summary_min_chars"))
+    except Exception:
+        min_chars = 150
+    if line_count >= min_lines or len(normalized) >= min_chars:
+        _paste_counter += 1
+        placeholder = f"[Pasted #{_paste_counter} ~{line_count} lines]"
+        _paste_registry[placeholder] = normalized
+        return placeholder, line_count
+    return None, line_count
+
+
+def _expand_pastes(text: str) -> str:
+    """Replace any registered placeholders in text with their real content."""
+    if not text or not _paste_registry:
+        return text
+    for placeholder, real in _paste_registry.items():
+        if placeholder in text:
+            text = text.replace(placeholder, real)
+    return text
+
+
+_PASTE_PLACEHOLDER_RE = re.compile(r"\[Pasted #\d+ ~\d+ lines\]")
+
+
+def _paste_span_at(text: str, pos: int):
+    """Return (start, end) of a placeholder covering/adjacent to pos, else None.
+
+    Used for whole-segment deletion: Backspace treats pos as the cursor
+    position (checks the span ending at pos), Delete checks the span
+    starting at pos.
+    """
+    if not text:
+        return None
+    for m in _PASTE_PLACEHOLDER_RE.finditer(text):
+        if m.start() <= pos <= m.end():
+            return m.start(), m.end()
+    return None
+
+
+class _PastePlaceholderLexer(Lexer):
+    """Colorize [Pasted #N ~L lines] placeholders in the input buffer."""
+
+    def lex_document(self, document):
+        placeholder_style = "class:paste-placeholder"
+
+        def get_line(lineno):
+            line = document.lines[lineno]
+            if not line:
+                return []
+            spans = list(_PASTE_PLACEHOLDER_RE.finditer(line))
+            if not spans:
+                return [("", line)]
+            fragments = []
+            idx = 0
+            for m in spans:
+                if m.start() > idx:
+                    fragments.append(("", line[idx:m.start()]))
+                fragments.append((placeholder_style, line[m.start():m.end()]))
+                idx = m.end()
+            if idx < len(line):
+                fragments.append(("", line[idx:]))
+            return fragments
+
+        return get_line
 
 
 def _build_keybindings() -> KeyBindings:
     """Build custom keybindings for the prompt."""
     kb = KeyBindings()
+
+    @kb.add(Keys.BracketedPaste)
+    def _(event):
+        """Collapse large pastes into a compact placeholder (expanded on submit)."""
+        placeholder, _lc = _maybe_summarize_paste(event.data)
+        if placeholder is not None:
+            event.current_buffer.insert_text(placeholder)
+        else:
+            data = event.data.replace("\r\n", "\n").replace("\r", "\n")
+            event.current_buffer.insert_text(data)
+
+    @kb.add("backspace")
+    def _(event):
+        """Backspace: delete a paste placeholder as one unit, else normal."""
+        buf = event.current_buffer
+        span = _paste_span_at(buf.text, buf.cursor_position)
+        if span is not None and span[1] == buf.cursor_position and span[0] != span[1]:
+            start, end = span
+            buf.text = buf.text[:start] + buf.text[end:]
+            buf.cursor_position = start
+        else:
+            buf.delete_before_cursor(count=event.arg)
+
+    @kb.add("delete")
+    def _(event):
+        """Delete: remove a paste placeholder as one unit, else normal."""
+        buf = event.current_buffer
+        span = _paste_span_at(buf.text, buf.cursor_position)
+        if span is not None and span[0] == buf.cursor_position and span[0] != span[1]:
+            start, end = span
+            buf.text = buf.text[:start] + buf.text[end:]
+            buf.cursor_position = start
+        else:
+            buf.delete(count=event.arg)
 
     @kb.add("c-d")
     def _(event):
@@ -1383,6 +1668,7 @@ def get_prompt_session() -> PromptSession:
             auto_suggest=AutoSuggestFromHistory(),
             style=_build_prompt_style(),
             key_bindings=_build_keybindings(),
+            lexer=_PastePlaceholderLexer(),
             enable_history_search=True,
             vi_mode=False,
         )
@@ -1401,10 +1687,14 @@ def pt_prompt(cwd: str) -> str:
             style=_build_prompt_style(),
             multiline=False,
         )
-        return user_input.strip() if user_input else ""
+        expanded = _expand_pastes(user_input) if user_input else user_input
+        _reset_paste_registry()
+        return expanded.strip() if expanded else ""
     except (KeyboardInterrupt, EOFError):
+        _reset_paste_registry()
         return ""
     except Exception:
+        _reset_paste_registry()
         return ""
 
 
@@ -1741,7 +2031,8 @@ def show_model_selector(models: list[dict], current: str = "") -> Optional[str]:
     def _(event):
         event.app.exit(result=None)
 
-    layout = Layout(HSplit([Window(content=FormattedTextControl(_build_lines))]))
+    layout = Layout(HSplit([Window(content=FormattedTextControl(
+        lambda: _ptk_fragments(_build_lines())))]))
     style = Style.from_dict({"selected": "reverse"})
     app = Application(
         layout=layout,
@@ -2559,7 +2850,7 @@ The catalog below documents each tool's purpose and parameters:
 
 <workflow>
 - Plan with tasks. For any multi-step task (≈3+ steps), at the FIRST turn call `task_create` to decompose into sub-tasks. Use clear, specific task names that describe the actual work (e.g., "Refactor auth module", "Extract API client"), NOT the user's raw request. Keep exactly one task `in_progress`; mark `task_update ... completed` as you finish each. The task list is your durable plan — it survives context compression and is how you resume. The `<active_tasks>` block shows it every turn.
-- Resuming: if the user's input is a resume/continue request (e.g., "继续", "continue", "继续项目", or empty line), do NOT create a new task. Read `<active_tasks>` and resume the `in_progress` item; if none, check `<objective>`. Only ask the user if both are empty.
+- Resuming: the session stays alive until `/q`. If the user asks to continue/resume prior work ("继续", "continue", "接着", etc.), call `session.continue` to resume the pinned `<objective>` and in_progress `<active_tasks>` — do NOT create a new task. The session's full context is already in your thread; just keep going.
 - If the user asks a clear read/edit/build/test/investigate task, act with tools. Do not ask for permission to do exactly what was asked.
 - Ask one concise clarifying question only when the target or intent is genuinely ambiguous, destructive, impossible to infer safely, or blocked on information you cannot discover yourself.
 - If there are multiple reasonable approaches with materially different tradeoffs, stop and present 2-3 labeled options. State the consequence of each option briefly, then wait for the user's choice.
@@ -2631,10 +2922,13 @@ def _restore_resume_blob(blob: dict, chat_history: list) -> dict:
 
 
 def _resume_choices(cwd: str) -> list:
-    """Selectable resume states for this cwd, preferring `/q` checkpoints over autosave."""
-    states = list_resume_states(cwd)
-    checkpoints = [s for s in states if s.get("kind") == "checkpoint"]
-    return checkpoints or states
+    """Selectable resume states for this cwd, newest first.
+
+    Returns all states (checkpoints + autosaves) so the user can resume from
+    any saved point. Previously this filtered to only checkpoints when present,
+    which hid newer autosaves created after a /q checkpoint.
+    """
+    return list_resume_states(cwd)
 
 
 def _resolve_resume_selector(choices: list, selector: str) -> Optional[dict]:
@@ -2725,7 +3019,8 @@ def show_resume_picker(cwd: str) -> Optional[dict]:
         event.app.exit(result=("quit", -1))
 
     style = Style.from_dict({"selected": "reverse"})
-    window = Window(content=FormattedTextControl(_build_lines), always_hide_cursor=True)
+    window = Window(content=FormattedTextControl(
+        lambda: _ptk_fragments(_build_lines())), always_hide_cursor=True)
     app = Application(
         layout=Layout(HSplit([window])), key_bindings=kb, style=style,
         full_screen=True, refresh_interval=0.5,
@@ -2742,12 +3037,10 @@ def show_resume_picker(cwd: str) -> Optional[dict]:
             return item
         if action == "details":
             _show_resume_detail(item)
+            _print_resume_transcript(item, 20)
             input("\n[dim]Press Enter to continue...[/dim]")
         elif action == "delete":
-            try:
-                Path(item["_path"]).unlink(missing_ok=True)
-            except (OSError, KeyError):
-                pass
+            delete_resume_state(cwd, item)
             del choices[idx]
             console.print(f"\n[green]Deleted saved session.[/green]")
             if not choices:
@@ -2771,6 +3064,52 @@ def _show_resume_detail(item: dict) -> None:
         text = str(msg.get("content") or "").replace("\n", " ")[:100]
         color = "green" if role == "user" else "blue"
         console.print(f"  [{color}]{role:>9}[/{color}]  [dim]{text}[/dim]")
+
+
+def _resume_role_style(role: str) -> str:
+    """Map a chat role to a rich color for transcript rendering."""
+    if role == "user":
+        return "green"
+    if role == "assistant":
+        return "blue"
+    if role == "knowledge":
+        return "yellow"
+    return "cyan"
+
+
+def _print_resume_transcript(blob: dict, limit: Optional[int]) -> None:
+    """Echo a resumed session's conversation (read-only).
+
+    ``limit`` is the number of most-recent messages to show; ``None`` shows the
+    whole transcript, and any value <= 0 prints nothing. Does not mutate the
+    passed blob or any live chat history. The dropped-turn digest
+    (``older_summary``) is shown only when the window reaches the start.
+    """
+    if limit is not None and limit <= 0:
+        return
+    history = blob.get("chat_history") or []
+    total = len(history)
+    if limit is None:
+        window = list(history)
+        at_start = True
+    else:
+        window = history[-limit:]
+        at_start = len(window) >= total
+    console.print()
+    console.print(
+        f"[dim]── conversation ── {len(window)}/{total} message(s) "
+        f"{'(all)' if at_start else '(most recent)'} ──[/dim]"
+    )
+    older = (blob.get("older_summary") or "").strip()
+    if at_start and older:
+        console.print(f"[dim yellow][earlier session context]\n{older}[/dim yellow]\n")
+    for msg in window:
+        role = str(msg.get("role", "?"))
+        content = str(msg.get("content") or "")
+        color = _resume_role_style(role)
+        console.print(f"[bold {color}]{role}[/bold {color}]")
+        console.print(content or "[dim](empty)[/dim]")
+        console.print()
 
 
 def read_file(path: str) -> Optional[str]:
@@ -4583,7 +4922,7 @@ def show_terminal_manager(primary_session=None) -> None:
         return lines
 
     def _get_text():
-        return _build_lines()
+        return _ptk_fragments(_build_lines())
 
     kb = KeyBindings()
 
@@ -4795,7 +5134,7 @@ def show_skill_manager() -> None:
         event.app.exit(result=("quit", -1))
 
     style = Style.from_dict({"selected": "reverse"})
-    text_control = FormattedTextControl(_build_lines)
+    text_control = FormattedTextControl(lambda: _ptk_fragments(_build_lines()))
     window = Window(content=text_control, always_hide_cursor=False)
     layout = Layout(HSplit([window]))
     app = Application(layout=layout, key_bindings=kb, style=style,
@@ -5193,18 +5532,238 @@ def handle_version_command(parts: list) -> None:
     os.execv(_LAUNCH_SCRIPT_PATH, [_LAUNCH_SCRIPT_PATH] + sys.argv[1:])
 
 
-def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, interactive_session=None) -> bool:
+class SlashCommandUsageError(ValueError):
+    """A recoverable slash-command parsing/usage error."""
+
+
+def _parse_slash_command(cmd: str) -> tuple[str, str, list[str]]:
+    """Return (action, raw_args, argv) without losing raw argument spacing."""
+    stripped = (cmd or "").strip()
+    if not stripped:
+        raise SlashCommandUsageError("Empty slash command. Run /help for available commands.")
+    match = re.match(r"^(\S+)(?:\s+(.*))?$", stripped, re.DOTALL)
+    if match is None:
+        raise SlashCommandUsageError("Could not parse command. Run /help for usage.")
+    action = match.group(1).lower()
+    raw_args = match.group(2) or ""
+    try:
+        args = shlex.split(raw_args, posix=not IS_WINDOWS) if raw_args else []
+    except ValueError as exc:
+        raise SlashCommandUsageError(
+            f"Invalid quoting: {exc}. Close the quote or escape it, then retry."
+        ) from exc
+    return action, raw_args, [action, *args]
+
+
+def _raw_tail_after_word(text: str) -> tuple[str, str]:
+    """Consume one whitespace-delimited identifier and preserve the raw tail."""
+    stripped = (text or "").lstrip()
+    if not stripped:
+        return "", ""
+    match = re.match(r"(\S+)(?:\s+(.*))?$", stripped, re.DOTALL)
+    if match is None:
+        return stripped, ""
+    return match.group(1), match.group(2) or ""
+
+
+def _decode_text_arg(text: str) -> str:
+    """Decode a single quoted argument; otherwise preserve the original text."""
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = shlex.split(raw, posix=not IS_WINDOWS)
+    except ValueError:
+        return raw
+    return parsed[0] if len(parsed) == 1 else raw
+
+
+def _json_arg_candidates(text: str) -> list[str]:
+    raw = (text or "").strip()
+    if not raw:
+        return []
+    decoded = _decode_text_arg(raw)
+    return list(dict.fromkeys([raw, decoded]))
+
+
+def _enqueue_user_input(text: str) -> bool:
+    try:
+        _inject_input(text, threading.Event())
+        return True
+    except (NameError, queue.Full):
+        return False
+
+
+_PROP_KNOWN_VARS = {
+    "agentName", "agentId", "currentPath", "activeFile", "depth",
+    "nextDepth", "globalMemory", "persistentMemory", "lastSession",
+    "planMode", "tools", "skills", "skillContext", "inbox",
+    "parallelResults", "children", "parent", "terminalName",
+    "parentTerminal", "deploymentStatus", "workflowPhase", "rolePrompt",
+    "confidenceGuidance", "behaviorDiagnostics", "promptOpt",
+}
+_PROP_REQUIRED_SECTIONS = ("role", "environment", "tools", "workflow", "safety")
+
+
+def _load_project_memory_entries() -> tuple[list[dict], list[str], str]:
+    path = paths.project_file(paths.CWD_MEMORY)
+    raw = read_file(str(path)) or ""
+    if not raw.strip():
+        return [], [], raw
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        return [], [f"Invalid JSON at line {exc.lineno}, column {exc.colno}: {exc.msg}"], raw
+    if not isinstance(data, list):
+        return [], ["Root value must be a JSON array."], raw
+    entries: list[dict] = []
+    errors: list[str] = []
+    for index, item in enumerate(data, 1):
+        if not isinstance(item, dict):
+            errors.append(f"Entry {index} must be an object, got {type(item).__name__}.")
+            continue
+        if "id" not in item or "content" not in item:
+            errors.append(f"Entry {index} must contain id and content fields.")
+            continue
+        if not isinstance(item.get("content"), str):
+            errors.append(f"Entry {index} content must be a string.")
+            continue
+        entries.append(item)
+    return entries, errors, raw
+
+
+def _print_long_panel(content: str, title: str, border_style: str = "cyan") -> None:
+    panel = Panel(content or "(empty)", title=title, border_style=border_style)
+    if len(content) > 2000 and sys.stdin.isatty() and console.is_terminal:
+        with console.pager(styles=True):
+            console.print(panel)
+    else:
+        console.print(panel)
+
+
+def _redact_sensitive_text(text: str) -> str:
+    patterns = (
+        (r"(?i)(authorization\s*:\s*bearer\s+)[^\s\"']+", r"\1[REDACTED]"),
+        (r"(?i)((?:api[_-]?key|token|secret|password|passwd|cookie)\s*[=:]\s*)[^\s,;]+", r"\1[REDACTED]"),
+        (r"(?i)(\"(?:api[_-]?key|token|secret|password|passwd|cookie)\"\s*:\s*\")[^\"]+", r"\1[REDACTED]"),
+    )
+    redacted = text
+    for pattern, replacement in patterns:
+        redacted = re.sub(pattern, replacement, redacted)
+    return redacted
+
+
+def _validate_prop_template(prop: str) -> tuple[list[str], list[str], list[str]]:
+    raw_variables = re.findall(r"\{\{(.*?)\}\}", prop, re.DOTALL)
+    variables = sorted({
+        value for value in raw_variables
+        if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", value)
+    })
+    errors: list[str] = []
+    warnings: list[str] = []
+    invalid_variables = sorted({
+        value for value in raw_variables
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", value)
+    })
+    if invalid_variables:
+        errors.append(
+            "Malformed placeholders: "
+            + ", ".join("{{" + value + "}}" for value in invalid_variables))
+    if prop.count("{{") != prop.count("}}"):
+        errors.append("Unbalanced placeholder braces")
+    unknown = sorted(set(variables) - _PROP_KNOWN_VARS)
+    if unknown:
+        errors.append(f"Unknown placeholders: {', '.join(unknown)}")
+    for section in _PROP_REQUIRED_SECTIONS:
+        opens = prop.count(f"<{section}>")
+        closes = prop.count(f"</{section}>")
+        if opens == 0 or closes == 0:
+            errors.append(f"Missing required <{section}>...</{section}> section")
+        elif opens != closes:
+            errors.append(f"Unbalanced <{section}> tags ({opens} open, {closes} close)")
+        elif opens > 1:
+            warnings.append(f"Required section <{section}> appears {opens} times")
+    patch_count = prop.count("<prompt_opt_patch>")
+    close_patch_count = prop.count("</prompt_opt_patch>")
+    if patch_count != close_patch_count:
+        errors.append("Unbalanced <prompt_opt_patch> tags")
+    elif patch_count > 1:
+        warnings.append(f"Multiple prompt optimization patches found ({patch_count})")
+    if len(prop.strip()) < 200:
+        warnings.append("Template is unusually short")
+    return variables, errors, warnings
+
+
+def _render_prop_effective(prop: str, redact: bool = True) -> str:
+    import memory_system
+    import plan_mode
+    import prompt_opt
+    import workflow_engine
+
+    current = get_current_agent()
+    entries, memory_errors, _ = _load_project_memory_entries()
+    global_memory = "\n".join(
+        f"[{entry.get('id')}] {entry.get('content', '')}" for entry in entries
+    ) or "(empty)"
+    if memory_errors:
+        global_memory = "(invalid project memory: " + "; ".join(memory_errors) + ")"
+    groups = tools_mod.get_registry().list_by_source()
+    tool_lines = [
+        f"- {tool.name}: {tool.description}"
+        for source in sorted(groups)
+        for tool in groups[source]
+    ]
+    children = []
+    if current:
+        children = [cid for cid in current.child_ids if get_agent(cid)]
+    values = {
+        "globalMemory": global_memory,
+        "persistentMemory": memory_system.get_memory_context(),
+        "planMode": plan_mode.get_plan_prompt(),
+        "promptOpt": prompt_opt.get_prompt_opt_section(),
+        "agentName": current.name if current else "Laintas CLI",
+        "agentId": current.id if current else "unknown",
+        "currentPath": os.getcwd(),
+        "activeFile": "None",
+        "depth": str(current.depth if current else 0),
+        "nextDepth": str((current.depth if current else 0) + 1),
+        "inbox": "(empty)",
+        "children": ", ".join(children) or "(none)",
+        "parent": current.parent_id if current and current.parent_id else "(none)",
+        "terminalName": (getattr(current, "home_terminal", None) if current else None) or "(none)",
+        "parentTerminal": (getattr(current, "parent_terminal", None) if current else None) or "(none)",
+        "deploymentStatus": getattr(current, "role", "primary") if current else "primary",
+        "tools": "\n".join(tool_lines) or "(none)",
+        "skills": skills_mod.describe_skills_for_prompt(),
+        "skillContext": skills_mod.get_activated_skills_context(),
+        "workflowPhase": workflow_engine.render_workflow_section(),
+        "rolePrompt": "",
+        "confidenceGuidance": "",
+        "parallelResults": "",
+        "behaviorDiagnostics": "",
+        "lastSession": "",
+    }
+    effective = prop
+    for name, value in values.items():
+        effective = effective.replace("{{" + name + "}}", str(value or ""))
+    return _redact_sensitive_text(effective) if redact else effective
+
+
+def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: dict, interactive_session=None) -> bool:
     """Handle meta commands. Returns True if should exit."""
-    parts = cmd.strip().split()
-    action = parts[0].lower()
+    action, raw_args, parts = _parse_slash_command(cmd)
 
     if action == "/":
         selected = show_command_palette()
         if selected:
-            return handle_meta_command(selected, agent_registry, session, interactive_session)
+            if not _enqueue_user_input(selected):
+                console.print("[red]Could not queue the selected command. Please run it directly.[/red]")
         return False
 
     if action == "/exit":
+        if raw_args:
+            console.print("[yellow]Usage: /exit[/yellow]")
+            return False
         stop_trigger_scanner()
         close_all_terminals()
         browser_mod.close_all_browser_sessions()
@@ -5214,6 +5773,9 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
         return True
 
     if action in ("/quit", "/q"):
+        if raw_args:
+            console.print(f"[yellow]Usage: {action}[/yellow]")
+            return False
         if _IN_SUB_TERMINAL:
             # Running inside a sub-terminal — detach like /back instead of quitting
             sys.stdout.write("\x1b]777;LAINTAS_DETACH\x07")
@@ -5228,6 +5790,12 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
         return True
 
     elif action == "/back":
+        if raw_args:
+            console.print("[yellow]Usage: /back[/yellow]")
+            return False
+        if not _IN_SUB_TERMINAL:
+            console.print("[dim]/back only detaches from a sub-terminal.[/dim]")
+            return False
         # Signal parent enter_session to detach without closing this terminal
         sys.stdout.write("\x1b]777;LAINTAS_DETACH\x07")
         sys.stdout.flush()
@@ -5235,7 +5803,13 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
         return False
 
     elif action == "/help":
-        show_help()
+        show_help(parts[1] if len(parts) > 1 else "")
+
+    elif action == "/resume":
+        console.print("[yellow]/resume is handled by the main REPL. Type it at the prompt to resume a saved session.[/yellow]")
+
+    elif action in ("/new", "/new-session", "/reset-session"):
+        console.print("[yellow]/new is handled by the main REPL. Type it at the prompt to start a new session.[/yellow]")
 
     elif action == "/login":
         console.print()
@@ -5267,14 +5841,15 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
             set_selected_provider("")
             console.print("[green]Model reset. Backend default will be used.[/green]")
         elif len(parts) >= 2:
-            model = " ".join(parts[1:]).strip()
+            model = _decode_text_arg(raw_args)
             set_selected_model(model)
             console.print(f"[green]Model set to: [bold]{model}[/bold][/green]")
         else:
             current = get_selected_model()
             current_provider = get_selected_provider()
             try:
-                models, endpoint = fetch_available_models(session)
+                with console.status("[dim]Fetching available models…[/dim]"):
+                    models, endpoint = fetch_available_models(session)
             except Exception as e:
                 console.print(f"[red]Failed to fetch models: {e}[/red]")
                 console.print(f"Current model: [bold]{current or 'backend default'}[/bold]")
@@ -5307,7 +5882,7 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
                             marker,
                             m["id"],
                             m.get("name", ""),
-                            m.get("description", ""),
+                            m.get("provider", ""),
                         )
                     if not models:
                         table.add_row("", "", "(none)", "", "")
@@ -5335,17 +5910,8 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
                 console.print("Set directly with [bold]/model <model-id>[/bold], reset with [bold]/model reset[/bold].")
 
     elif action == "/name":
-        # ── /name term<N> <new-name> — rename a terminal ──
-        if len(parts) >= 3 and parts[1].startswith("term"):
-            old_name = parts[1]
-            new_name = parts[2]
-            if rename_terminal(old_name, new_name):
-                console.print(f"[green]Terminal renamed: [bold]{old_name}[/bold] → [bold]{new_name}[/bold][/green]")
-            else:
-                console.print(f"[red]Terminal '{old_name}' not found.[/red]")
-        # ── /name <name> — set agent name ──
-        elif len(parts) > 1:
-            name = " ".join(parts[1:])
+        if raw_args:
+            name = _decode_text_arg(raw_args)
             config = load_config()
             config["agentName"] = name
             save_config(config)
@@ -5360,22 +5926,76 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
             console.print(f"Current agent name: [bold]{current}[/bold]")
             console.print("Usage: /name <new-name>")
             console.print("       /agents name <new-name>  (rename current agent)")
+            console.print("       /term rename <old> <new>  (rename a terminal)")
 
     elif action == "/memory":
-        raw = read_file(str(paths.project_file(paths.CWD_MEMORY)))
-        if raw and raw.strip():
-            try:
-                entries = json.loads(raw)
-                if isinstance(entries, list) and entries:
-                    lines = [f"[bold]{e['id']}.[/bold] {e['content']}" for e in entries]
-                    text = "\n".join(lines)
-                    console.print(Panel(text, title=f".laintas/memory.json ({len(entries)} entries)"))
+        import memory_system
+        sub = parts[1].lower() if len(parts) > 1 else ""
+        project_entries, project_errors, _ = _load_project_memory_entries()
+        persistent_entries = memory_system.list_memories()
+
+        if sub in ("", "project"):
+            if project_errors:
+                console.print(Panel(
+                    "\n".join(f"[red]- {error}[/red]" for error in project_errors)
+                    + f"\n\n[dim]Fix {paths.project_file(paths.CWD_MEMORY)} and retry /memory project.[/dim]",
+                    title="Project Memory: invalid", border_style="red",
+                ))
+            elif project_entries:
+                lines = [
+                    f"[bold]{entry.get('id')}.[/bold] {entry.get('content', '')}"
+                    for entry in project_entries
+                ]
+                console.print(Panel(
+                    "\n".join(lines),
+                    title=f"Project memory ({len(project_entries)} entries)",
+                    border_style="cyan",
+                ))
+            else:
+                console.print("[dim]Project memory is empty.[/dim]")
+            if sub == "":
+                console.print(
+                    f"[dim]Persistent memory: {len(persistent_entries)} visible entr"
+                    f"{'y' if len(persistent_entries) == 1 else 'ies'}. "
+                    "Use /memory persistent to list them.[/dim]")
+
+        elif sub in ("persistent", "global"):
+            if not persistent_entries:
+                console.print("[dim]No persistent memories are visible in this scope.[/dim]")
+            else:
+                table = Table(title="Persistent Memory", show_lines=False)
+                table.add_column("Name", style="cyan")
+                table.add_column("Type")
+                table.add_column("Scope", style="dim")
+                table.add_column("Description")
+                for entry in persistent_entries:
+                    table.add_row(
+                        entry.get("name", "?"), entry.get("type", "unknown"),
+                        entry.get("scope", "?"), entry.get("description", ""),
+                    )
+                console.print(table)
+                console.print("[dim]Read one with /memory show <name>.[/dim]")
+
+        elif sub == "show" and len(parts) >= 3:
+            selector = parts[2]
+            project = next(
+                (entry for entry in project_entries
+                 if str(entry.get("id")) == selector), None)
+            if project is not None:
+                _print_long_panel(
+                    project.get("content", ""), f"Project memory #{selector}")
+            else:
+                persistent = memory_system.read_memory(selector)
+                if persistent is None:
+                    console.print(f"[red]Memory '{selector}' not found.[/red]")
+                    console.print("[dim]Use /memory project or /memory persistent to list valid entries.[/dim]")
                 else:
-                    console.print(Panel(raw.strip(), title=".laintas/memory.json"))
-            except json.JSONDecodeError:
-                console.print(Panel(raw.strip(), title=".laintas/memory.json"))
+                    _print_long_panel(
+                        persistent.get("body", ""),
+                        f"Persistent memory: {selector}",
+                    )
         else:
-            console.print("[dim]No memory yet. The AI will record learnings here.[/dim]")
+            console.print("[yellow]Usage: /memory [project|persistent|show <id|name>][/yellow]")
 
     elif action == "/prop":
         prop = read_file(str(paths.project_file(paths.CWD_CLI_PROP)))
@@ -5399,6 +6019,7 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
         console.print(f"Working directory: [bold]{os.getcwd()}[/bold]")
 
     elif action == "/bash":
+        bash_sub = parts[1].lower() if len(parts) > 1 else ""
         if len(parts) < 2:
             wl = ", ".join(sorted(get_interactive_commands()))
             console.print(Panel(
@@ -5411,24 +6032,28 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
                 f"[dim]Current whitelist: {wl}[/dim]",
                 title="/bash", border_style="cyan",
             ))
-        elif parts[1] == "list":
+        elif bash_sub == "list":
             wl = sorted(get_interactive_commands())
             console.print(Panel("\n".join(wl) or "(empty)",
                                 title="Interactive-terminal whitelist", border_style="cyan"))
-        elif parts[1] == "add":
+        elif bash_sub == "add":
             if len(parts) < 3:
                 console.print("[yellow]Usage: /bash add <command>[/yellow]")
+            elif not re.fullmatch(r"[A-Za-z0-9._+/-]+", parts[2]):
+                console.print("[red]Command must be one executable token without shell operators.[/red]")
             else:
                 _modify_interactive_commands(parts[2], add=True)
                 console.print(f"[green]'{parts[2]}' now uses full PTY passthrough (native terminal).[/green]")
-        elif parts[1] == "remove":
+        elif bash_sub == "remove":
             if len(parts) < 3:
                 console.print("[yellow]Usage: /bash remove <command>[/yellow]")
+            elif not re.fullmatch(r"[A-Za-z0-9._+/-]+", parts[2]):
+                console.print("[red]Command must be one executable token without shell operators.[/red]")
             else:
                 _modify_interactive_commands(parts[2], add=False)
                 console.print(f"[green]'{parts[2]}' now routes through term0/marker-poll.[/green]")
         else:
-            raw_cmd = " ".join(parts[1:])
+            raw_cmd = raw_args
             if not IS_WINDOWS:
                 _ensure_term0_alive()
             _t0 = get_terminal("term0")
@@ -5440,15 +6065,166 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
                 stdout = result.get("stdout", "")
                 if stdout:
                     console.print(stdout)
-                console.print(f"[dim]cwd → {os.getcwd()}[/dim]")
+                returncode = result.get("returncode")
+                rc_text = f" · exit {returncode}" if returncode is not None else ""
+                console.print(f"[dim]cwd → {os.getcwd()}{rc_text}[/dim]")
 
     elif action == "/clear":
         console.clear()
 
+    elif action == "/mode":
+        import plan_mode as _pm_mode
+        import policy as _pol_mode
+        sub = parts[1].lower() if len(parts) > 1 else ""
+        _, mode_args_raw = _raw_tail_after_word(raw_args)
+
+        # Gather current state
+        _in_plan = _pm_mode.is_plan_mode()
+        _cur_plan = _pm_mode.get_current_plan()
+        _pol_cfg = _pol_mode.get_config()
+        _pol_mode_val = _pol_cfg.get("mode", "audit")
+
+        if sub == "plan":
+            task = _decode_text_arg(mode_args_raw)
+            if not task:
+                if not sys.stdin.isatty():
+                    console.print("[yellow]Usage: /mode plan <task description>[/yellow]")
+                    return False
+                _stop_bg_input_reader()
+                try:
+                    try:
+                        task = input("Describe the task to plan: ").strip()
+                    except (EOFError, KeyboardInterrupt):
+                        task = ""
+                finally:
+                    _start_bg_input_reader(get_user_message_queue())
+            if not task:
+                console.print("[dim]Cancelled.[/dim]")
+                return False
+            if _in_plan:
+                console.print(
+                    "[yellow]A plan is already active. Use /plan status, "
+                    "/plan approve, or /plan exit before starting another.[/yellow]")
+                return False
+            plan = _pm_mode.enter_plan_mode(task)
+            console.print(Panel(
+                f"[bold]Plan Mode: [green]ENTERED[/green][/bold]\n\n"
+                f"Task: {task}\n"
+                f"Plan file: {plan['file']}\n\n"
+                f"[dim]The AI will explore and design — no code will be executed.[/dim]\n"
+                f"[dim]When ready: [bold]/mode approve[/bold] or [bold]/plan approve[/bold][/dim]",
+                title="Plan Mode", border_style="green",
+            ))
+
+        elif sub == "act":
+            if _in_plan:
+                _pm_mode.exit_plan_mode(approve=False)
+                console.print("[green]Switched to ACT mode[/green] [dim](plan saved, not executed)[/dim]")
+            else:
+                console.print("[dim]Already in ACT mode.[/dim]")
+
+        elif sub == "approve":
+            if not _in_plan or not _cur_plan:
+                console.print("[yellow]No active plan to approve. Use /mode plan <task> first.[/yellow]")
+            else:
+                approved = _pm_mode.exit_plan_mode(approve=True)
+                followup = (
+                    f"Execute the approved plan at {approved['file']} for task: "
+                    f"{approved['task']}. Read the plan first, then implement and verify it."
+                )
+                queued = _enqueue_user_input(followup)
+                console.print(Panel(
+                    f"[bold]Plan [green]APPROVED[/green][/bold]\n\n"
+                    f"File: {_cur_plan['file']}\n\n"
+                    + ("[dim]Execution request queued.[/dim]" if queued else
+                       "[yellow]Could not queue execution; submit a task referencing this plan.[/yellow]"),
+                    title="Plan Approved", border_style="green",
+                ))
+
+        else:
+            # Show current mode
+            _mode_label = "[green]PLAN[/green]" if _in_plan else "[accent]ACT[/accent]"
+            console.print(Panel(
+                f"Agent mode:     {_mode_label}\n"
+                + (f"Current plan:   [dim]{_cur_plan['task'][:80]}[/dim]\n" if _cur_plan else "")
+                + f"Policy mode:    [accent]{_pol_mode_val}[/accent]\n"
+                + f"Auto-approve:   "
+                f"[{'green' if _session_approval_state['all_commands'] else 'dim'}]"
+                f"commands={'on' if _session_approval_state['all_commands'] else 'off'}"
+                f"[/{'green' if _session_approval_state['all_commands'] else 'dim'}]  "
+                f"[{'green' if _session_approval_state['all_writes'] else 'dim'}]"
+                f"writes={'on' if _session_approval_state['all_writes'] else 'off'}"
+                f"[/{'green' if _session_approval_state['all_writes'] else 'dim'}]\n\n"
+                f"[dim]Switch with:[/dim]  [bold]/mode plan <task>[/bold]  [bold]/mode act[/bold]  [bold]/mode approve[/bold]\n"
+                f"[dim]Policy:[/dim]       [bold]/policy audit|enforce|disabled[/bold]",
+                title="Current Mode", border_style="cyan",
+            ))
+
+    elif action == "/policy":
+        import policy as _pol_cmd
+        sub = parts[1].lower() if len(parts) > 1 else ""
+        _valid = {"audit", "enforce", "disabled"}
+        if sub in _valid:
+            if sub == "disabled" and "--yes" not in parts[2:]:
+                if not sys.stdin.isatty():
+                    console.print(
+                        "[red]Disabling policy in a non-interactive shell requires "
+                        "/policy disabled --yes.[/red]")
+                    return False
+                choice = _blocking_approval_prompt(
+                    "Disable security policy",
+                    "This bypasses policy checks and approval rules for commands.",
+                    "Disable policy?",
+                )
+                if choice != "yes":
+                    console.print("[dim]Policy change cancelled.[/dim]")
+                    return False
+            ok, msg = _pol_cmd.set_mode(sub)
+            style = "green" if ok else "red"
+            console.print(f"[{style}]{msg}[/{style}]")
+            if ok:
+                if sub == "enforce":
+                    console.print("[dim]Commands matching approval rules will now prompt before execution.[/dim]")
+                elif sub == "disabled":
+                    console.print("[yellow]⚠ All policy checks bypassed — commands run without approval.[/yellow]")
+                elif sub == "audit":
+                    console.print("[dim]Policy advisory only — deny rules still block, approvals are advisory.[/dim]")
+        elif sub == "reset":
+            _reset_session_approvals()
+            console.print("[green]Session auto-approvals cleared.[/green]")
+        else:
+            _cfg = _pol_cmd.get_config()
+            _mode = _cfg.get("mode", "audit")
+            _mode_style = {"audit": "cyan", "enforce": "yellow",
+                           "disabled": "red"}.get(_mode, "cyan")
+            _n_allow = len(_cfg.get("allow", []))
+            _n_deny = len(_cfg.get("deny", []))
+            _n_appr = len(_cfg.get("needs_approval", []))
+            console.print(Panel(
+                f"Mode:           [{_mode_style}]{_mode}[/{_mode_style}]\n"
+                f"Allow rules:    {_n_allow}\n"
+                f"Deny rules:     {_n_deny}\n"
+                f"Approval rules: {_n_appr}\n"
+                f"Config file:    [dim]{_pol_cmd.CONFIG_PATH}[/dim]\n\n"
+                f"[dim]Session auto-approve:[/dim]  "
+                f"commands={'[green]on[/green]' if _session_approval_state['all_commands'] else 'off'}  "
+                f"writes={'[green]on[/green]' if _session_approval_state['all_writes'] else 'off'}\n\n"
+                f"[dim]Set with:[/dim]  [bold]/policy audit[/bold]  [bold]/policy enforce[/bold]  [bold]/policy disabled[/bold]\n"
+                f"[dim]Reset session approvals:[/dim]  [bold]/policy reset[/bold]",
+                title="Security Policy", border_style="cyan",
+            ))
+
     elif action == "/plan":
         import plan_mode as _pm
-        if len(parts) >= 3 and parts[1] == "enter":
-            task = " ".join(parts[2:])
+        sub = parts[1].lower() if len(parts) > 1 else ""
+        _, plan_args_raw = _raw_tail_after_word(raw_args)
+        if sub == "enter" and plan_args_raw:
+            task = _decode_text_arg(plan_args_raw)
+            if _pm.is_plan_mode():
+                console.print(
+                    "[yellow]A plan is already active. Approve or exit it before "
+                    "starting another.[/yellow]")
+                return False
             plan = _pm.enter_plan_mode(task)
             console.print(Panel(
                 f"[bold]Plan Mode: [green]ENTERED[/green][/bold]\n\n"
@@ -5459,29 +6235,38 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
                 title="Plan Mode",
                 border_style="green",
             ))
-        elif len(parts) >= 2 and parts[1] == "approve":
+        elif sub == "approve":
             plan = _pm.exit_plan_mode(approve=True)
             if plan:
+                followup = (
+                    f"Execute the approved plan at {plan['file']} for task: "
+                    f"{plan['task']}. Read the plan first, then implement and verify it."
+                )
+                queued = _enqueue_user_input(followup)
                 console.print(Panel(
                     f"[bold]Plan [green]APPROVED[/green][/bold]\n\n"
                     f"File: {plan['file']}\n\n"
-                    f"[dim]AI will now execute the plan. Run /plan exit to leave without executing.[/dim]",
+                    + ("[dim]Execution request queued.[/dim]" if queued else
+                       "[yellow]Could not queue execution; submit a task referencing this plan.[/yellow]"),
                     title="Plan Approved",
                     border_style="green",
                 ))
             else:
                 console.print("[yellow]No active plan to approve.[/yellow]")
-        elif len(parts) >= 2 and parts[1] == "exit":
+        elif sub == "exit":
             plan = _pm.exit_plan_mode(approve=False)
-            console.print(f"[dim]Exited plan mode (plan saved).[/dim]")
-        elif len(parts) >= 2 and parts[1] == "status":
+            if plan:
+                console.print("[dim]Exited plan mode; the draft remains in the plans directory.[/dim]")
+            else:
+                console.print("[yellow]No active plan to exit.[/yellow]")
+        elif sub == "status":
             plan = _pm.get_current_plan()
             if plan:
                 content = _pm.read_plan() or "(empty)"
-                console.print(Panel(content[:2000], title=f"Plan: {plan['task'][:60]}"))
+                _print_long_panel(content, f"Plan: {plan['task'][:60]}")
             else:
                 console.print("[dim]Not in plan mode.[/dim]")
-        elif len(parts) >= 2 and parts[1] == "list":
+        elif sub == "list":
             plans = _pm.list_plans()
             if plans:
                 console.print(f"[bold]Saved Plans:[/bold]")
@@ -5500,8 +6285,9 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
     elif action == "/prompt":
         import prompt_opt as _po
         sub = parts[1].lower() if len(parts) > 1 else ""
+        _, prompt_args_raw = _raw_tail_after_word(raw_args)
         if sub == "feedback" and len(parts) >= 3:
-            desc = " ".join(parts[2:])
+            desc = _decode_text_arg(prompt_args_raw)
             entry = _po.capture_feedback(desc)
             parent = get_current_agent()
             if parent:
@@ -5539,8 +6325,8 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
                 else:
                     console.print("[red]Spawn failed (max depth reached?)[/red]")
         elif sub == "status":
-            cand = _po.read_candidate()
-            state = _po._current_opt or {}
+            state = _po.get_optimization_state(
+                parts[2] if len(parts) >= 3 else None)
             if not state:
                 console.print("[dim]No active prompt optimization.[/dim]")
             else:
@@ -5559,21 +6345,22 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
                 console.print("[yellow]No candidate found. Run /prompt feedback first.[/yellow]")
             else:
                 patch = cand.get("patch", "")
-                rationale = cand.get("body", "")[:500]
-                console.print(Panel(
+                rationale = cand.get("body", "")
+                _print_long_panel(
                     f"[bold]Candidate:[/bold] {cand.get('id', '?')}\n\n"
                     f"[dim]Rationale:[/dim]\n{rationale}\n\n"
-                    f"[dim]Patch (to be appended to cli.prop):[/dim]\n{patch[:2000]}",
-                    title="Prompt Candidate Review", border_style="blue"))
+                    f"[dim]Patch (to be appended to cli.prop):[/dim]\n{patch}",
+                    title="Prompt Candidate Review", border_style="blue")
                 console.print("\n[dim]Run [bold]/prompt apply[/bold] to activate, "
                               "[bold]/prompt discard[/bold] to reject.[/dim]")
         elif sub == "apply":
-            cid = parts[2] if len(parts) >= 3 else None
-            ok, msg = _po.apply_candidate(cid)
+            cid = next((item for item in parts[2:] if item != "--force"), None)
+            ok, msg = _po.apply_candidate(cid, force="--force" in parts[2:])
             color = "green" if ok else "red"
             console.print(f"[{color}]{msg}[/{color}]")
         elif sub == "discard":
-            ok, msg = _po.discard_candidate()
+            cid = parts[2] if len(parts) >= 3 else None
+            ok, msg = _po.discard_candidate(cid)
             color = "green" if ok else "red"
             console.print(f"[{color}]{msg}[/{color}]")
         elif sub == "list":
@@ -5608,17 +6395,77 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
             color = "green" if ok else "yellow"
             console.print(f"[{color}]{msg}[/{color}]")
         elif sub == "fail":
-            console.print(Panel(
-                _po.get_failure_template(),
-                title="Failure Report Template (v3)",
-                border_style="cyan"))
-            console.print(
-                "\n[dim]Describe the failure to the AI and it will fill in this "
-                "template via the [bold]prompt.structured_feedback[/bold] tool, "
-                "then spawn an optimizer that triages whether the fix belongs in "
-                "cli.prop or a skill.\n"
-                "Or use [bold]/prompt feedback <desc>[/bold] for plain-text "
-                "feedback.[/dim]")
+            fields = None
+            if prompt_args_raw:
+                try:
+                    fields = None
+                    last_error = None
+                    for candidate in _json_arg_candidates(prompt_args_raw):
+                        try:
+                            fields = json.loads(candidate)
+                            break
+                        except json.JSONDecodeError as exc:
+                            last_error = exc
+                    if fields is None and last_error is not None:
+                        raise last_error
+                except json.JSONDecodeError as exc:
+                    console.print(f"[red]Invalid failure-report JSON: {exc}[/red]")
+                    console.print("[dim]Use /prompt fail with no arguments for an interactive form.[/dim]")
+                    fields = None
+                if fields is not None and not isinstance(fields, dict):
+                    console.print("[red]Failure report must be a JSON object.[/red]")
+                    fields = None
+            elif sys.stdin.isatty():
+                _stop_bg_input_reader()
+                try:
+                    console.print(Panel(
+                        "Enter a concise failure report. Task and actual behavior are required.",
+                        title="Prompt Failure Report", border_style="cyan"))
+                    task_text = input("Task: ").strip()
+                    expected = input("Expected behavior: ").strip()
+                    actual = input("Actual behavior: ").strip()
+                    console.print("[dim]Categories: " + "; ".join(_po.FAILURE_CATEGORIES) + "[/dim]")
+                    category = input("Category (optional): ").strip()
+                    minimal_fix = input("Minimal fix (optional): ").strip()
+                    regression = input("Regression tests (optional): ").strip()
+                    fields = {
+                        "task": task_text, "expected": expected,
+                        "actual": actual, "category": category,
+                        "minimal_fix": minimal_fix,
+                        "regression_tests": regression,
+                    }
+                except (EOFError, KeyboardInterrupt):
+                    fields = None
+                finally:
+                    _start_bg_input_reader(get_user_message_queue())
+            else:
+                console.print(Panel(
+                    _po.get_failure_template(),
+                    title="Failure Report Template (v3)",
+                    border_style="cyan"))
+                console.print(
+                    "[dim]In a non-interactive shell pass a JSON object, for example: "
+                    "/prompt fail '{\"task\":\"...\",\"actual\":\"...\"}'[/dim]")
+
+            if fields is not None:
+                if not fields.get("task") and not fields.get("actual"):
+                    console.print("[red]Task or actual behavior is required; report not saved.[/red]")
+                elif (fields.get("category")
+                      and fields.get("category") not in _po.FAILURE_CATEGORIES):
+                    console.print(f"[red]Invalid category: {fields.get('category')}[/red]")
+                    console.print("[dim]Use one of: " + "; ".join(_po.FAILURE_CATEGORIES) + "[/dim]")
+                else:
+                    entry = _po.capture_structured_failure(fields)
+                    parent = get_current_agent()
+                    child_id = (_po.spawn_optimizer(
+                        entry["id"], parent.id, get_loop_deps(), session)
+                        if parent else None)
+                    console.print(Panel(
+                        f"Feedback ID: [cyan]{entry['id']}[/cyan]\n"
+                        + (f"Optimizer: [cyan]{child_id}[/cyan]" if child_id
+                           else "Optimizer not started (no active agent)."),
+                        title="Failure report saved", border_style="green",
+                    ))
         elif sub == "skill":
             sub2 = parts[2].lower() if len(parts) > 2 else ""
             if sub2 == "list":
@@ -5642,27 +6489,28 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
                 else:
                     mode = patch.get("mode", "?")
                     if mode == "append":
-                        patch_preview = patch.get("patch", "")[:1500]
+                        patch_preview = patch.get("patch", "")
                     else:
                         patch_preview = (
-                            f"OLD:\n{patch.get('old_string', '')[:750]}\n\n"
-                            f"NEW:\n{patch.get('new_string', '')[:750]}"
+                            f"OLD:\n{patch.get('old_string', '')}\n\n"
+                            f"NEW:\n{patch.get('new_string', '')}"
                         )
-                    console.print(Panel(
+                    _print_long_panel(
                         f"[bold]Skill Patch:[/bold] {patch.get('id', '?')}\n"
                         f"[bold]Skill:[/bold] {patch.get('skill_name', '?')}/{patch.get('skill_file', '?')}\n"
                         f"[bold]Mode:[/bold] {mode}\n\n"
-                        f"[dim]Rationale:[/dim]\n{patch.get('body', '')[:400]}\n\n"
+                        f"[dim]Rationale:[/dim]\n{patch.get('body', '')}\n\n"
                         f"[dim]Patch:[/dim]\n{patch_preview}",
-                        title="Skill Patch Review", border_style="blue"))
+                        title="Skill Patch Review", border_style="blue")
                     console.print("\n[dim]Run [bold]/prompt skill apply <id>[/bold] to activate, "
                                   "[bold]/prompt skill discard <id>[/bold] to reject.[/dim]")
             elif sub2 == "apply":
-                cid = parts[3] if len(parts) > 3 else None
+                cid = next((item for item in parts[3:] if item != "--force"), None)
                 if not cid:
                     console.print("[red]Usage: /prompt skill apply <id>[/red]")
                 else:
-                    ok, msg = _po.apply_skill_patch(cid)
+                    ok, msg = _po.apply_skill_patch(
+                        cid, force="--force" in parts[3:])
                     color = "green" if ok else "red"
                     console.print(f"[{color}]{msg}[/{color}]")
             elif sub2 == "discard":
@@ -5677,7 +6525,7 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
                 console.print("Usage:\n"
                               "  [bold]/prompt skill list[/bold]            — List skill patches\n"
                               "  [bold]/prompt skill review <id>[/bold]     — Review a skill patch\n"
-                              "  [bold]/prompt skill apply <id>[/bold]      — Apply a skill patch\n"
+                              "  [bold]/prompt skill apply <id> [--force][/bold] — Apply a skill patch\n"
                               "  [bold]/prompt skill discard <id>[/bold]    — Discard a skill patch")
         else:
             console.print("Usage:\n"
@@ -5686,8 +6534,8 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
                           "  [bold]/prompt optimize <id>[/bold]       — Spawn optimizer for a feedback id\n"
                           "  [bold]/prompt status[/bold]              — Show optimization status\n"
                           "  [bold]/prompt review [id][/bold]         — Review cli.prop candidate patch\n"
-                          "  [bold]/prompt apply [id][/bold]          — Apply candidate to cli.prop\n"
-                          "  [bold]/prompt discard[/bold]             — Strip applied cli.prop patch\n"
+                          "  [bold]/prompt apply [id] [--force][/bold] — Apply candidate to cli.prop\n"
+                          "  [bold]/prompt discard [id][/bold]        — Strip applied cli.prop patch\n"
                           "  [bold]/prompt list[/bold]                — List all candidates (cli.prop + skill)\n"
                           "  [bold]/prompt skill list|review|apply|discard <id>[/bold] — Manage skill patches\n"
                           "  [bold]/prompt export <id> [path][/bold]  — Export portable pack\n"
@@ -5696,6 +6544,7 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
 
     elif action == "/task":
         sub = parts[1].lower() if len(parts) > 1 else ""
+        _, task_args_raw = _raw_tail_after_word(raw_args)
         _cwd = os.getcwd()
 
         if sub in ("", "list"):
@@ -5716,14 +6565,22 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
                 _t.add_column("ID", width=5)
                 _t.add_column("Subject")
                 _t.add_column("Prog", width=5, justify="right")
+                _status_by_id = {
+                    str(item.get("id")): item.get("status", "pending")
+                    for item in _tasks
+                }
                 for _tk in _tasks:
                     st = _tk.get("status", "pending")
                     mark = "▶" if st == "in_progress" else ("✓" if st == "completed" else "○")
                     style = "yellow" if st == "in_progress" else ("green" if st == "completed" else "cyan")
                     prog = _tk.get("progress", 0)
                     prog_str = f"{prog}%" if prog > 0 else ""
-                    blocked = _tk.get("blockedBy", [])
-                    subj = _tk["subject"]
+                    blocked = [
+                        str(blocker) for blocker in _tk.get("blockedBy", [])
+                        if _status_by_id.get(str(blocker), "pending")
+                        not in ("completed", "deleted")
+                    ]
+                    subj = _tk.get("subject", "(untitled task)")
                     if blocked:
                         subj += f" [dim][blocked: {', '.join(blocked)}][/dim]"
                     _t.add_row(f"[{style}]{mark}[/{style}]", _tk["id"], subj, prog_str)
@@ -5731,12 +6588,32 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
                 console.print()
 
         elif sub == "add":
-            if len(parts) < 3:
+            subject = _decode_text_arg(task_args_raw)
+            if not subject:
                 console.print("[yellow]Usage: /task add <subject>[/yellow]")
             else:
-                subject = " ".join(parts[2:])
                 _tk = task_manager.create_task(subject, cwd=_cwd)
                 console.print(f"[green]Created task [bold]{_tk['id']}[/bold]: {subject}[/green]")
+
+        elif sub == "show":
+            if len(parts) < 3:
+                console.print("[yellow]Usage: /task show <id>[/yellow]")
+            else:
+                _tk = task_manager.get_task(parts[2], cwd=_cwd)
+                if _tk is None:
+                    console.print(f"[red]Task '{parts[2]}' not found.[/red]")
+                else:
+                    notes = "\n".join(_tk.get("notes", [])) or "(none)"
+                    console.print(Panel(
+                        f"Status: {_tk.get('status', 'pending')}\n"
+                        f"Progress: {_tk.get('progress', 0)}%\n"
+                        f"Blocked by: {', '.join(_tk.get('blockedBy', [])) or '(none)'}\n"
+                        f"Blocks: {', '.join(_tk.get('blocks', [])) or '(none)'}\n\n"
+                        f"{_tk.get('description', '') or '(no description)'}\n\n"
+                        f"[dim]Notes[/dim]\n{notes}",
+                        title=f"Task {_tk.get('id')}: {_tk.get('subject', '(untitled)')}",
+                        border_style="cyan",
+                    ))
 
         elif sub == "start":
             if len(parts) < 3:
@@ -5768,29 +6645,85 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
                 else:
                     console.print(f"[red]{msg}[/red]")
 
+        elif sub == "progress":
+            if len(parts) != 4:
+                console.print("[yellow]Usage: /task progress <id> <0-100>[/yellow]")
+            else:
+                ok, msg, _tk = task_manager.update_task(
+                    parts[2], cwd=_cwd, progress=parts[3])
+                if ok:
+                    console.print(
+                        f"[green]Task {_tk['id']} progress: {_tk.get('progress', 0)}%[/green]")
+                else:
+                    console.print(f"[red]{msg}[/red]")
+
+        elif sub == "note":
+            task_id, note_raw = _raw_tail_after_word(task_args_raw)
+            note = _decode_text_arg(note_raw)
+            if not task_id or not note:
+                console.print("[yellow]Usage: /task note <id> <text>[/yellow]")
+            else:
+                ok, msg, _tk = task_manager.update_task(
+                    task_id, cwd=_cwd, notes=note)
+                if ok:
+                    console.print(f"[green]Note added to task {_tk['id']}.[/green]")
+                else:
+                    console.print(f"[red]{msg}[/red]")
+
+        elif sub == "subtask":
+            parent_id, subject_raw = _raw_tail_after_word(task_args_raw)
+            subject = _decode_text_arg(subject_raw)
+            if not parent_id or not subject:
+                console.print("[yellow]Usage: /task subtask <parent-id> <subject>[/yellow]")
+            else:
+                ok, msg, _tk = task_manager.update_task(
+                    parent_id, cwd=_cwd, addSubtask=subject)
+                if ok:
+                    child_id = _tk.get("blocks", ["?"])[-1]
+                    console.print(
+                        f"[green]Created subtask {child_id} under task {_tk['id']}.[/green]")
+                else:
+                    console.print(f"[red]{msg}[/red]")
+
         else:
-            console.print("[yellow]Usage: [bold]/task[/bold] [list|add|start|done|del][/yellow]\n"
+            console.print("[yellow]Usage: [bold]/task[/bold] [list|add|show|start|done|del|progress|note|subtask][/yellow]\n"
                           "  [bold]/task[/bold]               — list all tasks\n"
                           "  [bold]/task add <subject>[/bold] — create a task\n"
+                          "  [bold]/task show <id>[/bold]      — show task details\n"
                           "  [bold]/task start <id>[/bold]    — mark as in_progress\n"
                           "  [bold]/task done <id>[/bold]     — mark as completed\n"
+                          "  [bold]/task progress <id> <n>[/bold] — update progress\n"
+                          "  [bold]/task note <id> <text>[/bold]  — append a note\n"
+                          "  [bold]/task subtask <id> <subject>[/bold] — create child task\n"
                           "  [bold]/task del <id>[/bold]      — delete a task")
 
     elif action == "/workflow":
         import workflow_engine as _we
-        sub = parts[1] if len(parts) > 1 else "status"
+        sub = parts[1].lower() if len(parts) > 1 else "status"
         if sub == "start":
-            if len(parts) < 4:
-                console.print("[yellow]Usage: /workflow start <name> \"<description>\"[/yellow]")
+            _, start_raw = _raw_tail_after_word(raw_args)
+            replace = False
+            first, rest = _raw_tail_after_word(start_raw)
+            if first == "--replace":
+                replace = True
+                first, rest = _raw_tail_after_word(rest)
+            wf_name = first
+            wf_desc = _decode_text_arg(rest)
+            if not wf_name or not wf_desc:
+                console.print("[yellow]Usage: /workflow start [--replace] <name> \"<description>\"[/yellow]")
                 templates = _we.list_workflow_templates()
                 console.print(f"[dim]Available: {', '.join(templates)}[/dim]")
             else:
-                wf_name = parts[2]
-                wf_desc = " ".join(parts[3:])
-                wf = _we.start_workflow(wf_name, wf_desc)
+                existing = _we.get_active_workflow()
+                wf = _we.start_workflow(wf_name, wf_desc, replace=replace)
                 if wf is None:
-                    console.print(f"[red]Unknown workflow: {wf_name}[/red]")
-                    console.print(f"[dim]Available: {', '.join(_we.list_workflow_templates())}[/dim]")
+                    if wf_name not in _we.list_workflow_templates():
+                        console.print(f"[red]Unknown workflow: {wf_name}[/red]")
+                        console.print(f"[dim]Available: {', '.join(_we.list_workflow_templates())}[/dim]")
+                    elif existing and not existing.completed:
+                        console.print(
+                            f"[yellow]Workflow '{existing.name}' is already active. "
+                            "End it first or pass --replace.[/yellow]")
                 else:
                     current = wf.current
                     cur_name = current.name if current else "?"
@@ -5818,25 +6751,56 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
                         phase_info += f"\nAllowed tools: {', '.join(current.allowed_tools)}"
                     if current.spawn_agents:
                         phase_info += f"\nAuto-spawn roles: {', '.join(current.spawn_agents)}"
+                    if current.exit_condition == "user_confirm":
+                        phase_info += "\nNext transition: explicit /workflow approve required"
+                history = []
+                for phase in wf.phases[:wf.current_phase]:
+                    summary = wf.phase_states.get(phase.name, {}).get("summary", "")
+                    history.append(f"  {phase.name}: {summary or '(completed)'}")
+                history_text = ("\n\nCompleted phases:\n" + "\n".join(history)) if history else ""
                 console.print(Panel(
                     f"[bold]{wf.name}[/bold] — {wf.description}\n\n"
-                    f"Progress: {wf.progress_str}{phase_info}",
+                    f"Progress: {wf.progress_str}{phase_info}{history_text}",
                     title="Active Workflow",
                     border_style="cyan",
                 ))
         elif sub == "advance":
-            summary = " ".join(parts[2:]) if len(parts) > 2 else ""
-            new_phase = _we.advance_phase(summary)
-            wf = _we.get_active_workflow()
-            if new_phase is None:
-                if wf and wf.completed:
-                    console.print(f"[green]Workflow '{wf.name}' completed![/green]")
-                else:
-                    console.print("[yellow]No active workflow or already completed.[/yellow]")
+            _, summary_raw = _raw_tail_after_word(raw_args)
+            summary = _decode_text_arg(summary_raw)
+            try:
+                new_phase = _we.advance_phase(summary, force=True)
+            except _we.WorkflowTransitionError as exc:
+                console.print(f"[yellow]{exc}[/yellow]")
             else:
-                console.print(f"[green]Advanced to phase: [bold]{new_phase.name}[/bold] — {new_phase.description}[/green]")
+                wf = _we.get_active_workflow()
+                if new_phase is None:
+                    if wf and wf.completed:
+                        console.print(f"[green]Workflow '{wf.name}' completed![/green]")
+                    else:
+                        console.print("[yellow]No active workflow or already completed.[/yellow]")
+                else:
+                    console.print(f"[green]Advanced to phase: [bold]{new_phase.name}[/bold] — {new_phase.description}[/green]")
+        elif sub == "approve":
+            _, summary_raw = _raw_tail_after_word(raw_args)
+            summary = _decode_text_arg(summary_raw)
+            wf = _we.get_active_workflow()
+            if wf is None or wf.completed:
+                console.print("[yellow]No active workflow to approve.[/yellow]")
+            else:
+                try:
+                    new_phase = _we.advance_phase(summary, user_confirmed=True)
+                except _we.WorkflowTransitionError as exc:
+                    console.print(f"[yellow]{exc}[/yellow]")
+                else:
+                    if new_phase is None:
+                        console.print(f"[green]Workflow '{wf.name}' completed.[/green]")
+                    else:
+                        console.print(
+                            f"[green]Approved; advanced to [bold]{new_phase.name}[/bold] "
+                            f"— {new_phase.description}[/green]")
         elif sub == "end":
-            summary = " ".join(parts[2:]) if len(parts) > 2 else ""
+            _, summary_raw = _raw_tail_after_word(raw_args)
+            summary = _decode_text_arg(summary_raw)
             wf = _we.get_active_workflow()
             if wf:
                 _we.end_workflow(summary)
@@ -5853,6 +6817,7 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
                           "  [bold]/workflow start <name> \"<desc>\"[/bold] — Start a workflow\n"
                           "  [bold]/workflow status[/bold]                — Show current workflow\n"
                           "  [bold]/workflow advance [summary][/bold]    — Advance to next phase\n"
+                          "  [bold]/workflow approve [summary][/bold]    — Confirm a gated phase\n"
                           "  [bold]/workflow end [summary][/bold]        — End workflow\n"
                           "  [bold]/workflow list[/bold]                  — List available workflows")
 
@@ -5866,7 +6831,10 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
                 # /debug <N> <filename> — save latest N entries to file
                 try:
                     n = int(sub)
+                    if n <= 0:
+                        raise ValueError("N must be greater than 0")
                     filename = parts[2]
+                    raw_export = "--raw" in parts[3:]
                     entries = get_debug_logs()[:n]
                     if not entries:
                         console.print("[yellow]No debug entries to save.[/yellow]")
@@ -5909,11 +6877,20 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
                             lines.append("")
                         try:
                             filepath.parent.mkdir(parents=True, exist_ok=True)
-                            filepath.write_text('\n'.join(lines), encoding='utf-8')
+                            export_text = '\n'.join(lines)
+                            if not raw_export:
+                                export_text = _redact_sensitive_text(export_text)
+                            filepath.write_text(export_text, encoding='utf-8')
                         except OSError as exc:
                             console.print(f"[red]Could not save debug entries to {filepath}: {exc}[/red]")
                         else:
-                            console.print(f"[green]Saved {n} debug entries to {filepath.absolute()}[/green]")
+                            console.print(
+                                f"[green]Saved {len(entries)} debug entr"
+                                f"{'y' if len(entries) == 1 else 'ies'} to {filepath.absolute()}[/green]")
+                            if raw_export:
+                                console.print("[yellow]Raw export may contain credentials or private content.[/yellow]")
+                            else:
+                                console.print("[dim]Common credential fields were redacted. Use --raw only when necessary.[/dim]")
                 except (ValueError, IndexError) as exc:
                     console.print(f"[red]Error: {exc}[/red]")
                     console.print("Usage: [bold]/debug <N> <filename>[/bold]")
@@ -5926,6 +6903,21 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
                     console.print("Use [bold]/debug[/bold] to browse entries. [bold]/debug <N> <file>[/bold] to save to file.")
         else:
             show_debug_browser_interactive()
+
+    elif action == "/detail":
+        # Toggle full vs simplified progress rendering. Off (default) shows a
+        # clean one-line-per-tool transcript; on restores full per-line output.
+        if len(parts) == 1:
+            _cur = bool(get_runtime_config("detail"))
+            console.print(f"[dim]Detail mode is [bold]{'on' if _cur else 'off'}[/bold]. "
+                          f"Use /detail on or /detail off to change.[/dim]")
+        else:
+            _sub = parts[1].lower()
+            if _sub in ("on", "off"):
+                set_runtime_config("detail", _sub == "on")
+                console.print(f"[green]Detail mode {_sub}.[/green]")
+            else:
+                console.print("[red]Usage: /detail [on|off][/red]")
 
     elif action in ("/station", "/st"):
         # Syntax:
@@ -6053,24 +7045,48 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
                 console.print(f"[red]Terminal '{name}' not found.[/red]")
 
     elif action == "/send":
-        if len(parts) < 3:
+        name, send_raw = _raw_tail_after_word(raw_args)
+        wait_seconds = 0.8
+        if send_raw.startswith("--wait"):
+            match = re.match(r"--wait(?:\s+([^\s]+))?\s+(.*)$", send_raw, re.DOTALL)
+            if match is None:
+                console.print("[yellow]Usage: /send <name> [--wait <seconds>] <command>[/yellow]")
+                return False
+            try:
+                wait_seconds = max(0.0, min(float(match.group(1) or "0.8"), 30.0))
+            except ValueError:
+                console.print("[red]--wait expects a number between 0 and 30 seconds.[/red]")
+                return False
+            send_raw = match.group(2)
+        cmd = send_raw
+        if not name or not cmd:
             console.print("[yellow]Usage: /send <name> <command>[/yellow]")
         else:
-            name = parts[1]
-            cmd = " ".join(parts[2:])
             term = get_terminal(name)
             if term is None:
                 console.print(f"[red]Terminal '{name}' not found.[/red]")
             elif term.session is None or not term.session.is_alive():
                 console.print(f"[yellow]Terminal '{name}' has no active session.[/yellow]")
             else:
+                old_len = len(term.session.full_output)
                 term.session.send_keys(cmd + "\n")
-                time.sleep(0.3)
-                term.session.read_output(timeout=0.5)
-                output = term.session.full_output
                 console.print(f"[dim]Sent to [bold]{name}[/bold]: {cmd[:80]}[/dim]")
+                if wait_seconds >= 0.3:
+                    console.print(
+                        f"[dim]Waiting up to {wait_seconds:g}s for new output…[/dim]")
+                deadline = time.time() + wait_seconds
+                while time.time() < deadline:
+                    remaining = deadline - time.time()
+                    term.session.read_output(timeout=min(0.2, max(0.01, remaining)))
+                output = term.session.full_output[old_len:]
                 if output.strip():
-                    console.print(Panel(output[-2000:], title=f"{name} output"))
+                    preview = output[-2000:]
+                    suffix = "" if len(output) <= 2000 else f"\n[dim]… {len(output) - 2000} earlier new chars omitted[/dim]"
+                    console.print(Panel(preview + suffix, title=f"{name} new output"))
+                elif wait_seconds == 0:
+                    console.print("[dim]Sent asynchronously; use /term to inspect later output.[/dim]")
+                else:
+                    console.print("[dim]No new output arrived within the wait window.[/dim]")
 
     elif action == "/hire":
         agent_info = register_agent(depth=0, role="pool")
@@ -6139,19 +7155,22 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
             else:
                 console.print(f"[red]Agent '{agent_id}' not found. Use /hire to create one.[/red]")
         elif len(parts) >= 3 and parts[1].lower() == "name":
-            new_name = " ".join(parts[2:])
+            _, new_name_raw = _raw_tail_after_word(raw_args)
+            new_name = _decode_text_arg(new_name_raw)
             current = get_current_agent()
             if current and rename_agent(current.id, new_name):
                 console.print(f"[green]Agent renamed to [bold]{new_name}[/bold][/green]")
             else:
                 console.print("[red]No current agent to rename.[/red]")
+        else:
+            console.print("[yellow]Usage: /agents [tree|agent-id|name <new-name>][/yellow]")
 
     elif action == "/spawn":
-        if len(parts) < 2:
+        if not raw_args:
             console.print("[yellow]Usage: /spawn [name:] <task...>[/yellow]")
         else:
             # Parse optional "name:" prefix
-            rest = " ".join(parts[1:])
+            rest = raw_args
             m = re.match(r'^(\S+):\s+(.+)$', rest)
             child_name = m.group(1) if m else None
             task = m.group(2) if m else rest
@@ -6172,17 +7191,25 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
                                   f"[dim](parent={parent.id}, task={task[:60]})[/dim]")
 
     elif action == "/tell":
-        if len(parts) < 3:
+        target_id, message_raw = _raw_tail_after_word(raw_args)
+        if not target_id or not message_raw:
             console.print("[yellow]Usage: /tell <agent_id> <message...>[/yellow]")
         else:
-            target_id = parts[1]
-            raw = " ".join(parts[2:])
-            try:
-                body = json.loads(raw)
-                if not isinstance(body, dict):
-                    body = {"kind": "msg", "text": raw}
-            except (ValueError, TypeError):
+            raw = message_raw.strip()
+            decoded = _decode_text_arg(message_raw)
+            for candidate in (raw, decoded):
+                try:
+                    body = json.loads(candidate)
+                    if not isinstance(body, dict):
+                        body = {"kind": "msg", "text": decoded}
+                    break
+                except (ValueError, TypeError):
+                    body = None
+            if body is None:
+                raw = decoded
                 body = {"kind": "msg", "text": raw}
+            else:
+                raw = decoded if raw != decoded and not raw.lstrip().startswith(("{", "[")) else raw
             body.setdefault("from", "user")
             if send_to_agent(target_id, body):
                 console.print(f"[green]→ {target_id}:[/green] {raw[:120]}")
@@ -6211,13 +7238,24 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
                     console.print(f"  [cyan]{t.name}[/cyan] — {t.description}")
 
     elif action == "/tool":
-        if len(parts) < 2:
+        tool_name, tool_params_raw = _raw_tail_after_word(raw_args)
+        if not tool_name:
             console.print("[yellow]Usage: /tool <name> [json_params][/yellow]")
         else:
-            tool_name = parts[1]
-            raw = " ".join(parts[2:]) if len(parts) > 2 else ""
+            raw = tool_params_raw.strip()
             try:
-                params = json.loads(raw) if raw else {}
+                params = {}
+                last_error = None
+                if raw:
+                    params = None
+                    for candidate in _json_arg_candidates(raw):
+                        try:
+                            params = json.loads(candidate)
+                            break
+                        except json.JSONDecodeError as exc:
+                            last_error = exc
+                    if params is None and last_error is not None:
+                        raise last_error
                 if not isinstance(params, dict):
                     params = {"value": params}
             except (ValueError, TypeError):
@@ -6238,7 +7276,7 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
 
     elif action == "/skill":
         # No subcommand → open the interactive manager (same style as /term).
-        sub = parts[1] if len(parts) > 1 else "manager"
+        sub = (parts[1].lower() if len(parts) > 1 else "manager")
         if sub == "manager":
             show_skill_manager()
         elif sub == "list":
@@ -6291,7 +7329,7 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
             console.print(f"[yellow]mcp SDK not installed: {_get_mcp_mod().MCP_IMPORT_ERROR}[/yellow]")
             console.print("[dim]Install with:  pip install mcp[/dim]")
             return False
-        sub = parts[1] if len(parts) > 1 else "list"
+        sub = (parts[1].lower() if len(parts) > 1 else "list")
         mgr = _get_mcp_mod().get_manager()
         if sub == "list":
             cfg = mgr.load_config().get("servers", {})
@@ -6358,9 +7396,28 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
             console.print("[yellow]Usage: /mcp {list|connect <n>|disconnect <n>|reload|tools <n>|init|config}[/yellow]")
 
     elif action in ("/t", "/term"):
-        if len(parts) >= 2:
+        if len(parts) >= 2 and parts[1].lower() == "rename":
+            if len(parts) != 4:
+                console.print("[yellow]Usage: /term rename <old> <new>[/yellow]")
+            elif not re.fullmatch(r"[A-Za-z0-9._-]+", parts[3]):
+                console.print("[red]Terminal names may contain only letters, numbers, dot, underscore, and hyphen.[/red]")
+            elif parts[2].lower() == "term0":
+                console.print("[red]The primary terminal term0 cannot be renamed.[/red]")
+            elif rename_terminal(parts[2], parts[3]):
+                console.print(
+                    f"[green]Terminal renamed: [bold]{parts[2]}[/bold] → "
+                    f"[bold]{parts[3]}[/bold][/green]")
+            else:
+                console.print(
+                    f"[red]Could not rename '{parts[2]}': source missing or target already exists.[/red]")
+        elif len(parts) == 2:
             # /t <name> or /term <name> — create sub-terminal (no agent stationed)
             name = parts[1]
+            if not re.fullmatch(r"[A-Za-z0-9._-]+", name) or name.lower() == "term0":
+                console.print(
+                    "[red]Invalid terminal name. Use letters, numbers, dot, "
+                    "underscore, or hyphen; term0 is reserved.[/red]")
+                return False
             existing = get_terminal(name)
             if existing and existing.session and not existing.session.is_alive():
                 unregister_terminal(name)
@@ -6376,6 +7433,8 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
                     sub.read_output(timeout=0.1)
                 register_terminal(sub, "laintas-cli", 0, name=name)
                 console.print(f"[green]Created sub-terminal [bold]{name}[/bold] (no agent stationed)[/green]")
+        elif len(parts) > 2:
+            console.print("[yellow]Usage: /term [name|rename <old> <new>][/yellow]")
         else:
             # /t or /term (no args) — list terminals browser
             terminals = get_all_terminals()
@@ -6390,7 +7449,10 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
                 show_terminal_manager(interactive_session)
 
     elif action == "/reload":
-        reload_default_files()
+        if raw_args:
+            console.print("[yellow]Usage: /reload[/yellow]")
+        else:
+            reload_default_files()
 
     elif action in ("/undo", "/snapshot", "/snapshots"):
         import snapshot as _snap
@@ -6407,7 +7469,7 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
                     console.print(f"  [cyan]{c['sha'][:10]}[/cyan]  {c.get('label','') or '(no label)'}  [dim]{ago}[/dim]")
                 console.print("[dim]Use /undo to restore the latest, or /undo <sha> for a specific one.[/dim]")
         elif action == "/snapshot":
-            label = " ".join(parts[1:]) if len(parts) > 1 else "manual"
+            label = _decode_text_arg(raw_args) if raw_args else "manual"
             cp = _snap.create(cwd, label)
             if cp:
                 console.print(f"[green]Checkpoint saved: {cp['sha'][:10]} ({label})[/green]")
@@ -6423,30 +7485,54 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
 
     elif action == "/config":
         # Built-in config command (doesn't require .laintas/commands.py)
-        parts_lower = [p.lower() for p in parts]
         if len(parts) == 1:
-            # /config — show all
-            for key, val in sorted(get_runtime_config().items()):
-                console.print(f"  [cyan]{key}[/cyan] = {val}")
-        elif len(parts) == 2 and parts[1] == "reset":
+            table = Table(title="Runtime Configuration", show_lines=False)
+            table.add_column("Key", style="cyan")
+            table.add_column("Value")
+            table.add_column("Type", style="dim")
+            table.add_column("Source", style="dim")
+            table.add_column("Description", style="dim")
+            for key, meta in sorted(describe_runtime_config().items()):
+                table.add_row(
+                    key, repr(meta["value"]), meta["type"],
+                    "override" if meta["overridden"] else "default",
+                    meta["description"],
+                )
+            console.print(table)
+            console.print("[dim]Set with /config <key> <value>; restore with /config reset.[/dim]")
+        elif len(parts) == 2 and parts[1].lower() == "reset":
             reset_runtime_config()
             console.print("[green]Runtime config reset to defaults.[/green]")
         elif len(parts) == 2:
             # /config <key> — show one
             key = parts[1]
-            val = get_runtime_config(key)
-            if val is None:
+            meta = describe_runtime_config().get(key)
+            if meta is None:
                 console.print(f"[red]Unknown config key: {key}[/red]")
+                console.print("[dim]Run /config to list valid keys.[/dim]")
             else:
-                console.print(f"  [cyan]{key}[/cyan] = {val}")
+                console.print(Panel(
+                    f"Value: [bold]{meta['value']!r}[/bold]\n"
+                    f"Default: {meta['default']!r}\n"
+                    f"Type: {meta['type']}\n"
+                    f"Source: {'override' if meta['overridden'] else 'default'}\n\n"
+                    f"[dim]{meta['description']}[/dim]",
+                    title=key, border_style="cyan",
+                ))
         elif len(parts) == 3:
             # /config <key> <value>
             key = parts[1]
             try:
-                set_runtime_config(key, parts[2])
-                console.print(f"[green]{key} = {get_runtime_config(key)}[/green]")
+                if not set_runtime_config(key, parts[2]):
+                    console.print(f"[red]Unknown config key: {key}[/red]")
+                    console.print("[dim]Run /config to list valid keys.[/dim]")
+                else:
+                    value = get_runtime_config(key)
+                    console.print(
+                        f"[green]{key} = {value!r} ({type(value).__name__})[/green]")
             except (ValueError, KeyError) as e:
                 console.print(f"[red]{e}[/red]")
+                console.print(f"[dim]Run /config {key} to inspect the expected type.[/dim]")
         else:
             console.print("[yellow]Usage: /config [key [value]] | /config reset[/yellow]")
 
@@ -6460,32 +7546,38 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
         console.print("[dim]Note: max_tokens may be capped lower by the provider. Revert with /config reset.[/dim]")
 
     elif action == "/continue":
-        # Resume agent loop after max_loops exhaustion.
-        # Resets the turn counter and re-invokes the agent loop with
-        # preserved state.
+        _current_live = getattr(handle_meta_command, '_current_live_session', None)
         _prev_state = getattr(handle_meta_command, '_last_agent_state', None)
         _prev_chat = getattr(handle_meta_command, '_last_chat_history', None)
         _prev_input = getattr(handle_meta_command, '_last_original_input', None)
-        _prev_deps = getattr(handle_meta_command, '_last_deps', None)
-        _prev_session = getattr(handle_meta_command, '_last_session', None)
+        _prev_deps = getattr(handle_meta_command, '_last_deps', None) or get_loop_deps()
+        _prev_session = getattr(handle_meta_command, '_last_session', None) or session
         _prev_events_cb = getattr(handle_meta_command, '_last_events_cb', None)
         _prev_existing_session = getattr(handle_meta_command, '_last_existing_session', None)
 
+        if _current_live:
+            _prev_state = _current_live.get("state") or _current_live.get("agent_state") or _prev_state
+            _prev_chat = _current_live.get("chat_history") or _prev_chat or []
+            _prev_input = (_current_live.get("objective") or _current_live.get("last_original_input")
+                           or _current_live.get("last_user_input") or _prev_input)
+
         if _prev_state is None or _prev_input is None:
-            console.print("[yellow]No previous agent loop to continue. "
-                         "Run a task first, then use /continue if it hits the turn limit.[/yellow]")
+            console.print("[yellow]No previous agent loop to continue.[/yellow]")
             return False
 
-        if not _prev_state.get("_max_loops_exhausted"):
-            console.print("[yellow]The previous agent loop did not hit the turn limit. "
-                         "There is nothing to continue.[/yellow]")
+        if _current_live and not _current_live.get("pending_continuation"):
+            console.print("[yellow]The current session has no pending continuation.[/yellow]")
             return False
 
-        # Reset exhaustion flag and counter
+        if not _prev_events_cb:
+            def _prev_events_cb(events: list):
+                if agent_registry.agent_id:
+                    agent_registry._push_events(events)
+
         _prev_state.pop("_max_loops_exhausted", None)
         _prev_state.pop("_exhaustion_loop_count", None)
 
-        console.print("[green]Resuming agent loop with fresh turn counter...[/green]")
+        console.print("[green]Continuing current session...[/green]")
 
         response = _run_agent_loop_with_interrupt(
             _prev_deps, _prev_input, _prev_session, _prev_state,
@@ -6495,15 +7587,33 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
             continue_thread=True,
         )
 
-        # Update stored state for potential further /continue
         handle_meta_command._last_agent_state = response.get("state", _prev_state)
         handle_meta_command._last_chat_history = _prev_chat
-
+        handle_meta_command._last_original_input = _prev_input
+        handle_meta_command._last_deps = _prev_deps
+        handle_meta_command._last_session = _prev_session
+        handle_meta_command._last_events_cb = _prev_events_cb
+        handle_meta_command._last_existing_session = response.get("session")
         if response.get("msg"):
             console.print(_prev_deps.Markdown(response["msg"]) if hasattr(_prev_deps, 'Markdown') else response["msg"])
             (_prev_chat if _prev_chat is not None else []).append(
                 {"role": "assistant", "content": response["msg"]}
             )
+        if _current_live:
+            try:
+                updated = session_store.sync_runtime(
+                    _current_live,
+                    prepare_state_for_repl(response.get("state", _prev_state)),
+                    _prev_chat or [],
+                    cwd=_current_live.get("cwd") or os.getcwd(),
+                    objective=_prev_input,
+                    last_user_input=_prev_input,
+                    exit_reason=response.get("exit_reason"),
+                    tasks=task_manager.export_active_tasks(cwd=_current_live.get("cwd") or os.getcwd()),
+                )
+                handle_meta_command._current_live_session = updated
+            except Exception:
+                pass
 
         return False
 
@@ -6551,9 +7661,16 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
             )
 
     elif action in ("/v", "/version", "/update"):
-        # /v, /version → show version + check; /update is an alias for /v update
+        # /v, /version → show version + check; /update is shorthand for /v update.
         if action == "/update":
-            handle_version_command(["/v", "update"] + parts[1:])
+            if not parts[1:]:
+                handle_version_command(["/v", "update"])
+            elif parts[1].lower() in ("--force", "-f"):
+                handle_version_command(["/v", "update"] + parts[1:])
+            elif len(parts) == 2 and parts[1].lower() == "check":
+                handle_version_command(["/v", "check"])
+            else:
+                console.print("[yellow]Usage: /update [--force]  |  /update check[/yellow]")
         else:
             handle_version_command(parts)
 
@@ -6563,6 +7680,7 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
         if handler:
             ctx = {
                 "session": session, "interactive_session": interactive_session,
+                "raw_line": cmd, "raw_args": raw_args,
                 "agent_registry": agent_registry, "console": console,
                 "get_terminal": get_terminal, "get_all_terminals": get_all_terminals,
                 "unregister_terminal": unregister_terminal, "register_terminal": register_terminal,
@@ -6592,49 +7710,46 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict, 
 
 
 # ── Command palette registry ───────────────────────────────────────────
-# (name, description) tuples for the interactive / command selector.
-# Keep this list in sync when adding new slash commands to handle_meta_command.
+# Generated from COMMAND_SPECS so help, completion, and palette cannot drift.
+
+def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict,
+                        interactive_session=None) -> bool:
+    """Exception-safe public slash-command dispatcher."""
+    try:
+        return _handle_meta_command_impl(
+            cmd, agent_registry, session, interactive_session)
+    except SlashCommandUsageError as exc:
+        console.print(f"[yellow]{exc}[/yellow]")
+    except KeyboardInterrupt:
+        console.print("[dim]Command cancelled.[/dim]")
+    except Exception as exc:
+        try:
+            action = (cmd or "").strip().split(maxsplit=1)[0]
+        except Exception:
+            action = "/"
+        console.print(
+            f"[red]{action or '/'} failed: {type(exc).__name__}: {exc}[/red]")
+        try:
+            add_debug_log(DebugEntry(
+                timestamp=datetime.now().isoformat(timespec="seconds"),
+                user_input=cmd,
+                current_path=os.getcwd(),
+                reply=f"{type(exc).__name__}: {exc}",
+                command=action,
+                error=True,
+            ))
+        except Exception:
+            pass
+        console.print(
+            f"[dim]The CLI is still running. Use /help {action} to check usage, "
+            "or /debug to inspect recent activity.[/dim]")
+    return False
+
 
 _COMMANDS = [
-    ("/help",      "Show this help"),
-    ("/login",     "Re-authenticate with accounts.laintas.com (opens browser)"),
-    ("/model",     "List or set the backend AI model"),
-    ("/name",      "Set current agent name"),
-    ("/memory",    "View .laintas/memory.json"),
-    ("/prop",      "View .laintas/cli.prop prompt template"),
-    ("/prompt",    "Prompt self-optimization (feedback/review/apply/publish)"),
-    ("/scan",      "Scan and list all available system commands from PATH"),
-    ("/debug",     "Browse debug entries (/debug), view detail (/debug <N>)"),
-    ("/cwd",       "Show current working directory"),
-    ("/clear",     "Clear screen"),
-    ("/exit",      "Log out and exit (clears cached session)"),
-    ("/quit",      "Exit without logging out (keeps cached session)"),
-    ("/q",         "Detach from sub-terminal (alias for /back in sub-term, /quit in REPL)"),
-    ("/back",      "Detach from sub-terminal without closing it"),
-    ("/station",   "Station agent in a persistent shell (current or named terminal)"),
-    ("/terminate", "Close and destroy a terminal"),
-    ("/send",      "Send a command to a named terminal"),
-    ("/hire",      "Create a new AI agent (AI-1, AI-2...)"),
-    ("/agents",    "List/switch agents, /agents name <n> to rename"),
-    ("/t",         "List sub-terminals (/t), or create new one (/t <name>)"),
-    ("/term",      "Same as /t <name> — create a laintas-cli sub-terminal"),
-    ("/spawn",     "Spawn a sub-agent with optional name"),
-    ("/tell",      "Send a message to another agent"),
-    ("/abort",     "Signal abort to an agent"),
-    ("/tools",     "List registered tools by source"),
-    ("/tool",      "Invoke a tool directly"),
-    ("/skill",     "Open the interactive skill manager (load/unload/reload)"),
-    ("/mcp",       "Manage MCP servers"),
-    ("/config",    "View or set runtime configuration"),
-    ("/max",       "Lift all limits — max tokens/loops, disable circuit breakers (all agents)"),
-    ("/reload",    "Reload default files and restart"),
-    ("/undo",      "Restore the working tree to the last git checkpoint (undo the session's edits)"),
-    ("/snapshot",  "Manually git-checkpoint the working tree (/snapshot [label])"),
-    ("/snapshots", "List git checkpoints taken this/previous sessions"),
-    ("/v",         "Show version; /v update to self-update (partial download)"),
-    ("/resume",    "Choose a /q checkpoint to resume (/resume, /resume <N>)"),
-    ("/continue",  "Resume agent loop after max_loops exhaustion"),
-    ("/task",      "Task tracking — create, list, start, complete, delete"),
+    (spec.name, spec.description)
+    for spec in COMMAND_SPECS
+    if spec.palette
 ]
 
 
@@ -6702,7 +7817,7 @@ def show_command_palette():
             lines.append(("dim", f"  ... {len(filtered) - end} more below ...\n"))
 
         lines.append(("", "\n"))
-        lines.append(("dim", f" {len(filtered)} commands  ↑↓ navigate  ↵ select  Esc/q cancel"))
+        lines.append(("dim", f" {len(filtered)} commands  ↑↓ navigate  ↵ select  Esc cancel"))
         return lines
 
     # ── Key bindings ──────────────────────────────────────────────
@@ -6727,7 +7842,6 @@ def show_command_palette():
             event.app.exit(result=filtered[selected[0]][0])
 
     @kb.add("escape")
-    @kb.add("q")
     @kb.add("c-c")
     def _(event):
         event.app.exit(result=None)
@@ -6736,7 +7850,7 @@ def show_command_palette():
     search_control = BufferControl(buffer=filter_buffer)
     search_window = Window(content=search_control, height=1)
 
-    list_control = FormattedTextControl(_build_lines)
+    list_control = FormattedTextControl(lambda: _ptk_fragments(_build_lines()))
     list_window = Window(content=list_control)
 
     layout = Layout(HSplit([search_window, list_window]))
@@ -6757,57 +7871,41 @@ def show_command_palette():
     return app.run()
 
 
-_HELP_GROUPS = [
-    ("Basics", [
-        ("ls, git, …", "PATH commands run directly"),
-        ("<text>", "plain text → AI agent loop"),
-        ("/help", "show this help"),
-        ("/clear", "clear screen"),
-        ("/cwd", "show working directory"),
-    ]),
-    ("Account & Session", [
-        ("/login", "re-authenticate (opens browser)"),
-        ("/resume [N]", "resume a /q checkpoint"),
-        ("/exit", "log out and exit"),
-        ("/quit, /q", "detach sub-terminal / exit"),
-        ("/v, /version", "version & self-update"),
-    ]),
-    ("Agents & Terminals", [
-        ("/name [name]", "set current agent name"),
-        ("/hire", "create a new AI agent"),
-        ("/agents [name]", "list / switch / rename agents"),
-        ("/t, /term [name]", "list or create sub-terminals"),
-        ("/station [name]", "station agent in a shell"),
-        ("/send <n> <cmd>", "send command to a terminal"),
-        ("/terminate <n>", "close a terminal"),
-        ("/back", "detach without closing"),
-    ]),
-    ("Planning & Tasks", [
-        ("/hwo", "visual orchestration builder"),
-        ("/plan", "structured planning"),
-        ("/prompt", "prompt self-optimization"),
-        ("/task", "task tracking"),
-        ("/workflow", "multi-phase workflows"),
-    ]),
-    ("Config & Tools", [
-        ("/model [id]", "list / set backend model"),
-        ("/config", "runtime config"),
-        ("/tools", "list AI tools"),
-        ("/skill", "manage skills"),
-        ("/bash <cmd>", "run via term0 bash"),
-        ("/memory", "view memory.json"),
-        ("/prop", "view cli.prop template"),
-        ("/scan", "list PATH commands"),
-        ("/debug", "browse debug entries"),
-    ]),
-]
-
-
-def show_help():
-    """Display grouped, minimal command help."""
+def show_help(command: str = ""):
+    """Display generated command help, optionally for one command."""
     from rich.markup import escape
+    if command:
+        spec = _find_command_spec(command)
+        if spec is None:
+            console.print(f"[red]Unknown command: {escape(command)}[/red]")
+            console.print("[dim]Run /help to list available commands.[/dim]")
+            return
+        aliases = ", ".join(spec.aliases) or "(none)"
+        usage = spec.usage or spec.name
+        console.print(Panel(
+            f"[bold]{escape(usage)}[/bold]\n\n"
+            f"{escape(spec.description)}\n\n"
+            f"[dim]Aliases: {escape(aliases)}[/dim]",
+            title=escape(spec.name), border_style="cyan",
+        ))
+        return
+
     console.print()
-    for title, rows in _HELP_GROUPS:
+    group_order = list(dict.fromkeys(spec.group for spec in COMMAND_SPECS))
+    for title in group_order:
+        rows = []
+        if title == "Basics":
+            rows.extend([
+                ("ls, git, …", "PATH commands run directly"),
+                ("<text>", "plain text → AI agent loop"),
+            ])
+        for spec in COMMAND_SPECS:
+            if spec.group != title:
+                continue
+            label = spec.usage or spec.name
+            if spec.aliases:
+                label += f"  ({', '.join(spec.aliases)})"
+            rows.append((label, spec.description))
         console.print(f"  [accent]{title}[/accent]")
         cmd_w = max(len(c) for c, _ in rows)
         for cmd, desc in rows:
@@ -6885,6 +7983,32 @@ def show_banner(agent_name: str, session: dict = None):
     rows.append(("cwd", _shorten_path(os.getcwd())))
     rows.append(("backend", os.environ.get("LAINTAS_BACKEND", BACKEND_URL)))
 
+    # ── Status row: policy mode + plan mode + open tasks ──
+    status_parts = []
+    try:
+        import policy as _pol
+        _mode = _pol.get_config().get("mode", "audit")
+        _mode_style = {"audit": "cyan", "enforce": "yellow",
+                       "disabled": "red"}.get(_mode, "cyan")
+        status_parts.append(f"policy: [{_mode_style}]{_mode}[/{_mode_style}]")
+    except Exception:
+        pass
+    try:
+        import plan_mode as _pm
+        if _pm.is_plan_mode():
+            status_parts.append("[green]PLAN MODE[/green]")
+    except Exception:
+        pass
+    try:
+        _open = [t for t in task_manager.list_tasks(cwd=os.getcwd())
+                 if t.get("status") in ("pending", "in_progress")]
+        if _open:
+            status_parts.append(f"tasks: [accent]{len(_open)} open[/accent]")
+    except Exception:
+        pass
+    if status_parts:
+        rows.append(("status", "  ".join(status_parts)))
+
     label_w = max(len(k) for k, _ in rows)
     for k, v in rows:
         console.print(f"  [muted]{k.rjust(label_w)}[/muted]  [accent.dim]│[/accent.dim] {v}")
@@ -6892,7 +8016,8 @@ def show_banner(agent_name: str, session: dict = None):
     console.print()
     console.print(
         "  [muted]PATH commands run directly · plain text → AI · "
-        "[/muted][accent]/help[/accent][muted] for commands[/muted]"
+        "[/muted][accent]/help[/accent][muted] for commands · "
+        "[/muted][accent]/mode[/accent][muted] plan · [/muted][accent]/policy[/accent][muted] approvals[/muted]"
     )
     console.print()
 
@@ -7058,53 +8183,352 @@ def _stop_bg_input_reader():
         _bg_reader_thread = None
 
 
-def _blocking_approval_prompt(title: str, body: str, question: str) -> bool:
-    """Pause the background stdin reader and block on a real y/n prompt.
+# ── Session-level approval state ─────────────────────────────────────────
+# Lets the user pick "always" at an approval prompt to auto-approve the rest
+# of the session — mirrors Claude Code / Cursor's "yes, and don't ask again".
+# Reset on /exit, /reload, or a fresh process start.
+_session_approval_state = {
+    "all_commands": False,   # approve all shell commands this session
+    "all_writes": False,     # approve all file writes this session
+}
+
+
+def _reset_session_approvals():
+    """Clear session-level auto-approve (called on /exit, /reload)."""
+    _session_approval_state["all_commands"] = False
+    _session_approval_state["all_writes"] = False
+
+
+def _arrow_approval_prompt(title: str, body_lines: list[str],
+                           options: list[str]) -> Optional[str]:
+    """Inline arrow-key approval selector.
+
+    Prints *body_lines* (command / diff / reason content) into the normal
+    conversation flow via ``console`` so they land in scrollback beneath the
+    AI output, then runs a *non-full-screen* prompt_toolkit selector for the
+    *options* only. This keeps the confirmation inline rather than taking over
+    the terminal on the alternate screen buffer. Returns the selected option
+    string, or None if cancelled (Esc / Ctrl+C).
+    """
+    from rich.markup import escape
+
+    def _line_markup(ln: str) -> str:
+        esc = escape(ln)
+        if ln.startswith("+") and not ln.startswith("+++"):
+            return f"[#9ece6a]{esc}[/#9ece6a]"
+        if ln.startswith("-") and not ln.startswith("---"):
+            return f"[#f7768e]{esc}[/#f7768e]"
+        if ln.startswith("@@"):
+            return f"[#7aa2f7]{esc}[/#7aa2f7]"
+        return f"[#c0c0c0]{esc}[/#c0c0c0]"
+
+    # Render the static context inline (title, separator, body) — this becomes
+    # part of the scrollback under the conversation.
+    console.print(f"[bold #e0af68]{escape(title)}[/bold #e0af68]")
+    console.print("[#6b7280]" + "─" * 60 + "[/#6b7280]")
+    for ln in body_lines:
+        console.print("  " + _line_markup(ln))
+    console.print("[#6b7280]" + "─" * 60 + "[/#6b7280]")
+    console.print("[#6b7280]↑↓ choose  y/n/a shortcut  ↵ confirm  Esc cancel[/#6b7280]")
+
+    # Fail-safe default: land on "No" when present, so a bare Enter denies
+    # rather than approves an approval gate. Falls back to first option.
+    _default_idx = next((i for i, o in enumerate(options)
+                         if o.strip().lower().startswith("no")), 0)
+    selected = [_default_idx]
+
+    def _build_lines():
+        lines = []
+        for i, opt in enumerate(options):
+            prefix = "▶" if i == selected[0] else " "
+            style = "class:selected" if i == selected[0] else "class:option"
+            nl = "\n" if i < len(options) - 1 else ""
+            lines.append((style, f" {prefix} {opt}{nl}"))
+        return lines
+
+    kb = KeyBindings()
+
+    @kb.add("up")
+    def _(event):
+        selected[0] = max(0, selected[0] - 1)
+
+    @kb.add("down")
+    def _(event):
+        selected[0] = min(len(options) - 1, selected[0] + 1)
+
+    @kb.add("enter")
+    def _(event):
+        event.app.exit(result=options[selected[0]])
+
+    def _exit_by_prefix(event, prefix: str):
+        # Match the old [y/N/a] muscle-memory: a letter key jumps straight to
+        # the matching option and confirms it, no navigation needed.
+        for opt in options:
+            if opt.strip().lower().startswith(prefix):
+                event.app.exit(result=opt)
+                return
+
+    @kb.add("y")
+    @kb.add("Y")
+    def _(event):
+        _exit_by_prefix(event, "y")
+
+    @kb.add("n")
+    @kb.add("N")
+    def _(event):
+        _exit_by_prefix(event, "n")
+
+    @kb.add("a")
+    @kb.add("A")
+    def _(event):
+        _exit_by_prefix(event, "a")
+
+    @kb.add("escape")
+    @kb.add("c-c")
+    def _(event):
+        event.app.exit(result=None)
+
+    style = Style.from_dict({
+        "option": "",
+        "selected": "reverse",
+    })
+    window = Window(content=FormattedTextControl(_build_lines),
+                    always_hide_cursor=True, height=len(options))
+    app = Application(
+        layout=Layout(HSplit([window])), key_bindings=kb, style=style,
+        full_screen=False, refresh_interval=0.5,
+    )
+    return app.run()
+
+
+def _blocking_approval_prompt(title: str, body: str, question: str,
+                              allow_always: bool = False) -> str:
+    """Pause the background stdin reader and block on an arrow-key prompt.
+
+    Returns "yes", "no", or "always". When *allow_always* is False the "always"
+    option is not offered and only "yes"/"no" can come back.
 
     Used by both request_command_approval and request_file_write_approval —
     the agent loop's main thread owns this call, and the bg reader (which
     also reads stdin for supplementary messages during the loop) must be
     stopped first or the two would race for the same input line.
 
-    Fails closed (returns False) when stdin isn't a real TTY — e.g. --execute
+    Fails closed (returns "no") when stdin isn't a real TTY — e.g. --execute
     mode with piped input, or any other headless context with no user to ask.
     """
     if not sys.stdin.isatty():
         console.print(
             f"[yellow]Approval required but no interactive TTY available — denying.[/yellow]")
-        return False
+        return "no"
+
+    # Split body into displayable lines. Callers pass plain text (no Rich
+    # markup) so diff content with literal brackets renders verbatim.
+    body_lines = body.split("\n")
+
+    options = ["Yes", "Always (this session)", "No"] if allow_always else ["Yes", "No"]
 
     _stop_bg_input_reader()
     try:
-        console.print(Panel(body, title=f"[yellow]{title}[/yellow]", border_style="yellow"))
-        try:
-            answer = input(f"{question} [y/N]: ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            answer = "n"
-        return answer in ("y", "yes")
+        choice = _arrow_approval_prompt(f"{title} — {question}", body_lines, options)
+    except (EOFError, KeyboardInterrupt):
+        choice = None
     finally:
         _start_bg_input_reader(get_user_message_queue())
+
+    if choice == "Always (this session)":
+        return "always"
+    if choice == "Yes":
+        return "yes"
+    return "no"
 
 
 def request_command_approval(command: str, reason: str) -> bool:
     """Block and ask the user to approve a command that matched a needs_approval
     policy rule. Wired as LoopDeps.request_command_approval for the local REPL."""
-    return _blocking_approval_prompt(
+    if _session_approval_state["all_commands"]:
+        return True
+    choice = _blocking_approval_prompt(
         "Approval required",
-        f"[bold]{command}[/bold]\n[dim]{reason}[/dim]",
+        f"{command}\n{reason}" if reason else command,
         "Run this command?",
+        allow_always=True,
     )
+    if choice == "always":
+        _session_approval_state["all_commands"] = True
+        console.print("[dim]↳ All commands auto-approved for this session.[/dim]")
+        return True
+    return choice == "yes"
 
 
 def request_file_write_approval(path: str, diff_preview: str, reason: str) -> bool:
     """Block and ask the user to approve a file write/edit before it's applied.
     Wired as LoopDeps.request_file_write_approval for the local REPL."""
-    display_file_diff(path, diff_preview)
-    return _blocking_approval_prompt(
+    if _session_approval_state["all_writes"]:
+        return True
+    # Build body: header + reason + full diff. The diff is embedded so it
+    # renders (and scrolls) inside the full-screen approval UI rather than
+    # being printed to scrollback beforehand.
+    _body_parts = [path]
+    if reason:
+        _body_parts.append(reason)
+    if diff_preview:
+        _body_parts.append("")
+        _body_parts.append(diff_preview.rstrip("\n"))
+    choice = _blocking_approval_prompt(
         "Approval required",
-        f"[bold]{path}[/bold]\n[dim]{reason}[/dim]",
+        "\n".join(_body_parts),
         "Apply this change?",
+        allow_always=True,
     )
+    if choice == "always":
+        _session_approval_state["all_writes"] = True
+        console.print("[dim]↳ All file writes auto-approved for this session.[/dim]")
+        return True
+    return choice == "yes"
+
+
+def _looks_complex(task: str) -> bool:
+    """Heuristic: should this task offer a plan-first menu?
+
+    Scores the input on signals that correlate with multi-step work:
+    action verbs, multi-clause sentences, and length. Returns True when
+    the score crosses a threshold — tuned to be conservative so simple
+    questions and one-liners go straight to the agent loop.
+    """
+    t = task.strip()
+    if len(t) < 25:
+        return False
+    score = 0
+    low = t.lower()
+
+    # Multi-step connector phrases
+    for phrase in (" and then ", " after that ", " step by step",
+                   " first ", " then ", " next ", " finally ", " multiple "):
+        if phrase in low:
+            score += 2
+
+    # Strong action verbs
+    for verb in ("implement", "refactor", "restructure", "migrate", "rewrite",
+                 "integrate", "architect", "build ", "create ", "add ",
+                 "set up", "wire up", "plumb", "overhaul"):
+        if verb in low:
+            score += 1
+
+    # Sentence count
+    sentences = [s for s in low.replace("!", ".").replace("?", ".").split(".") if len(s.strip()) > 10]
+    if len(sentences) >= 2:
+        score += 1
+    if len(sentences) >= 4:
+        score += 1
+
+    # Long input
+    if len(t) > 120:
+        score += 1
+    if len(t) > 300:
+        score += 1
+
+    return score >= 3
+
+
+def _maybe_offer_plan_mode(user_input: str) -> bool:
+    """Before running the agent loop, offer plan-first for complex tasks.
+
+    Returns True if the user chose plan mode (loop will be entered in plan
+    mode), False if they chose to act directly (or the prompt was skipped).
+    Only triggers in interactive TTY sessions and when not already in plan
+    mode.
+    """
+    if not sys.stdin.isatty():
+        return False
+    import plan_mode as _pm
+    if _pm.is_plan_mode():
+        return False
+    if not _looks_complex(user_input):
+        return False
+
+    _stop_bg_input_reader()
+    try:
+        console.print(Panel(
+            f"[dim]This looks like it might be a multi-step task.[/dim]\n"
+            f"[dim]Plan first to let the AI explore & design before executing, or act directly.[/dim]",
+            title="Approach?", border_style="accent", expand=False,
+        ))
+        try:
+            choice = input("  [p] Plan first   [a] Act directly   (default: a): ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            choice = ""
+    finally:
+        _start_bg_input_reader(get_user_message_queue())
+
+    if choice in ("p", "plan"):
+        plan = _pm.enter_plan_mode(user_input)
+        console.print(f"[green]Entered plan mode.[/green] [dim](plan file: {plan['file']})[/dim]")
+        return True
+    return False
+
+
+def _show_plan_approval_menu() -> bool:
+    """Rich interactive menu shown after the AI finishes planning.
+
+    Offers view / approve / edit / reject. Returns True if the user approved
+    (plan mode is exited with approve=True), False otherwise (plan mode is
+    either still active or exited without approval).
+    """
+    import plan_mode as _pm
+    if not _pm.is_plan_mode():
+        return False
+
+    plan = _pm.get_current_plan()
+    if not plan:
+        return False
+
+    plan_file = plan.get("file", "")
+    plan_task = plan.get("task", "")
+
+    while True:
+        console.print(Panel(
+            f"[bold]Task:[/bold] {plan_task[:120]}\n"
+            f"[bold]Plan file:[/bold] [dim]{plan_file}[/dim]",
+            title="[green]Plan Ready — Review & Approve[/green]",
+            border_style="green", expand=False,
+        ))
+        _stop_bg_input_reader()
+        try:
+            try:
+                choice = input(
+                    "  [a] Approve & execute   [v] View   [e] Edit   [r] Reject   (default: a): "
+                ).strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                choice = "r"
+        finally:
+            _start_bg_input_reader(get_user_message_queue())
+
+        if choice in ("", "a", "approve"):
+            _pm.exit_plan_mode(approve=True)
+            console.print("[green]✓ Plan approved. Executing...[/green]")
+            return True
+
+        if choice in ("v", "view"):
+            content = _pm.read_plan() or "(plan file is empty)"
+            console.print(Panel(content, title=f"[dim]{plan_file}[/dim]",
+                                border_style="dim", expand=False))
+            continue
+
+        if choice in ("e", "edit"):
+            editor = os.environ.get("EDITOR", "nano")
+            console.print(f"[dim]Opening {plan_file} in {editor}...[/dim]")
+            try:
+                subprocess.call([editor, plan_file])
+            except Exception as e:
+                console.print(f"[red]Failed to launch editor: {e}[/red]")
+            continue
+
+        if choice in ("r", "reject"):
+            _pm.exit_plan_mode(approve=False)
+            console.print("[yellow]Plan rejected. Exited plan mode.[/yellow]")
+            return False
+
+        console.print("[dim]Invalid choice. Try again.[/dim]")
 
 
 def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
@@ -7308,8 +8732,21 @@ def main():
         "lastOutput": "",
     }
     chat_history = []
+    current_live_session = None
     # Load last session snapshot for this directory (depth-0 only)
     if args.depth == 0:
+        current_live_session = session_store.load_current_session(_session_start_cwd)
+        if current_live_session:
+            agent_state = _restore_resume_blob(current_live_session, chat_history)
+            handle_meta_command._current_live_session = current_live_session
+            if current_live_session.get("pending_continuation"):
+                console.print(
+                    f"[dim]Continuing live session with pending task: "
+                    f"{str(current_live_session.get('objective') or current_live_session.get('last_user_input') or 'Untitled session')[:80]}[/dim]"
+                )
+        else:
+            current_live_session = session_store.create_session(_session_start_cwd, agent_state, chat_history)
+            handle_meta_command._current_live_session = current_live_session
         _snapshot = load_session_snapshot(_session_start_cwd)
         if _snapshot:
             agent_state["_last_session_snapshot"] = _snapshot
@@ -7322,13 +8759,18 @@ def main():
             if args.resume or args.continue_session:
                 _selected_resume = _choose_resume_blob(_session_start_cwd, "latest")
                 if _selected_resume:
+                    if current_live_session:
+                        session_store.close_session(current_live_session)
                     agent_state = _restore_resume_blob(_selected_resume, chat_history)
+                    current_live_session = session_store.create_session(_session_start_cwd, agent_state, chat_history)
+                    handle_meta_command._current_live_session = current_live_session
                     console.print(
                         f"[green]Resumed previous session in this directory "
                         f"({_resume_turn_count(_selected_resume)} turn(s), "
                         f"{_format_time_ago(_selected_resume.get('timestamp', 0))}).[/green]"
                     )
-            else:
+                    _print_resume_transcript(_selected_resume, 20)
+            elif not current_live_session or current_live_session.get("turn_count", 0) == 0:
                 console.print(
                     f"[dim]Previous session in this directory "
                     f"({_n_turns} turn(s), {_ago}). Type [bold]/resume[/bold] "
@@ -7409,6 +8851,12 @@ def main():
         if args.depth == 0:
             save_session_snapshot(agent_state, chat_history, _session_start_cwd)
             save_resume_state(agent_state, chat_history, _session_start_cwd)
+            if current_live_session:
+                session_store.sync_runtime(
+                    current_live_session, agent_state, chat_history,
+                    cwd=_session_start_cwd,
+                    tasks=task_manager.export_active_tasks(cwd=_session_start_cwd),
+                )
         stop_trigger_scanner()
         close_all_terminals()
         close_all_agents()
@@ -7501,6 +8949,14 @@ def main():
             if args.depth == 0:
                 save_session_snapshot(agent_state, chat_history, _session_start_cwd)
                 save_resume_state(agent_state, chat_history, _session_start_cwd)
+                if current_live_session:
+                    session_store.sync_runtime(
+                        current_live_session, agent_state, chat_history,
+                        cwd=_session_start_cwd,
+                        tasks=task_manager.export_active_tasks(cwd=_session_start_cwd),
+                    )
+                    session_store.close_session(current_live_session)
+                    handle_meta_command._current_live_session = None
             stop_trigger_scanner()
             close_all_terminals()
             browser_mod.close_all_browser_sessions()
@@ -7516,38 +8972,94 @@ def main():
         # /resume — restore this directory's saved conversation (full-fidelity).
         # Like mainstream agent CLIs, this does not consume/delete the saved
         # session; it remains available for future launches until overwritten.
-        if user_input.startswith("/resume") and args.depth == 0:
-            _resume_parts = user_input.strip().split(maxsplit=1)
-            _selector = _resume_parts[1] if len(_resume_parts) > 1 else ""
+        # /resume [N|all|latest] — the argument controls how many messages to
+        # echo after restoring (N, default 20; 0 = silent; "all" = full). When
+        # multiple sessions are saved, a full-screen picker chooses which one;
+        # "latest" skips the picker and restores the newest directly.
+        _resume_parts = user_input.strip().split(maxsplit=1)
+        if (_resume_parts and _resume_parts[0].lower() == "/resume"
+                and args.depth == 0):
+            _resume_arg = (_resume_parts[1].strip().lower()
+                           if len(_resume_parts) > 1 else "")
+            _echo_limit = 20
+            _pick_latest = False
+            if _resume_arg in ("latest", "last"):
+                _pick_latest = True
+            elif _resume_arg == "all":
+                _echo_limit = None
+            elif _resume_arg.isdigit():
+                _echo_limit = int(_resume_arg)
+            elif _resume_arg and _resume_arg not in ("-s", "--show"):
+                console.print(f"[red]Invalid /resume argument: {_resume_arg}[/red]")
+                console.print("[dim]Usage: /resume [N|all|latest]  "
+                              "(N = messages to echo, default 20, 0 = silent)[/dim]")
+                if injected_done is not None:
+                    injected_done.set()
+                continue
             _choices = _resume_choices(_session_start_cwd)
             if not _choices:
                 _blob = None
                 console.print("[yellow]No saved session to resume in this directory.[/yellow]")
-            elif _selector:
-                # /resume <N> | latest — non-interactive direct pick.
-                _blob = _resolve_resume_selector(_choices, _selector)
-            elif len(_choices) == 1 or not sys.stdin.isatty():
+            elif _pick_latest or len(_choices) == 1 or not sys.stdin.isatty():
+                # Direct restore of the newest session (no picker).
                 _blob = _choices[0]
             else:
-                # /resume — open the full-screen picker (None if cancelled).
+                # Multiple saved sessions — open the full-screen picker.
                 _blob = show_resume_picker(_session_start_cwd)
             if _blob and not _blob.get("chat_history"):
                 console.print("[yellow]Saved session has no conversation to resume.[/yellow]")
             elif _blob:
+                if current_live_session:
+                    session_store.close_session(current_live_session)
                 agent_state = _restore_resume_blob(_blob, chat_history)
+                current_live_session = session_store.create_session(_session_start_cwd, agent_state, chat_history)
+                handle_meta_command._current_live_session = current_live_session
                 _n = _resume_turn_count(_blob)
                 _ago = _format_time_ago(_blob.get("timestamp", 0))
                 console.print(
                     f"[green]Resumed previous session in this directory "
                     f"({_n} turn(s), {_ago}).[/green]"
                 )
+                _print_resume_transcript(_blob, _echo_limit)
             if injected_done is not None:
                 injected_done.set()
             continue
 
-        if args.depth == 0 and user_input.strip().split()[0].lower() in ("/q", "/quit"):
+        _new_parts = user_input.strip().split(maxsplit=1)
+        if (_new_parts and _new_parts[0].lower() in ("/new", "/new-session", "/reset-session")
+                and args.depth == 0):
+            if current_live_session:
+                session_store.close_session(current_live_session)
+            chat_history.clear()
+            agent_state = {
+                "shortTermMemory": "",
+                "lastReply": "",
+                "lastOutput": "",
+            }
+            try:
+                task_manager.clear_session_tasks()
+            except Exception:
+                pass
+            current_live_session = session_store.create_session(_session_start_cwd, agent_state, chat_history)
+            handle_meta_command._current_live_session = current_live_session
+            console.print("[green]Started a new session.[/green]")
+            if injected_done is not None:
+                injected_done.set()
+            continue
+
+        if (args.depth == 0
+                and len(user_input.strip().split()) == 1
+                and user_input.strip().split()[0].lower() in ("/q", "/quit")):
             save_session_snapshot(agent_state, chat_history, _session_start_cwd)
             _checkpoint = save_resume_checkpoint(agent_state, chat_history, _session_start_cwd)
+            if current_live_session:
+                session_store.sync_runtime(
+                    current_live_session, agent_state, chat_history,
+                    cwd=_session_start_cwd,
+                    tasks=task_manager.export_active_tasks(cwd=_session_start_cwd),
+                )
+                session_store.close_session(current_live_session)
+                handle_meta_command._current_live_session = None
             if _checkpoint:
                 console.print(
                     f"[dim]Saved resume checkpoint: "
@@ -7558,10 +9070,17 @@ def main():
         # Check for meta commands
         if user_input.startswith("/"):
             should_exit = handle_meta_command(user_input, agent_registry, session, interactive_session)
+            current_live_session = getattr(handle_meta_command, '_current_live_session', current_live_session)
             if should_exit:
                 if args.depth == 0:
                     save_session_snapshot(agent_state, chat_history, _session_start_cwd)
                     save_resume_state(agent_state, chat_history, _session_start_cwd)
+                    if current_live_session:
+                        session_store.sync_runtime(
+                            current_live_session, agent_state, chat_history,
+                            cwd=_session_start_cwd,
+                            tasks=task_manager.export_active_tasks(cwd=_session_start_cwd),
+                        )
                 if interactive_session:
                     interactive_session.close()
                 if injected_done is not None:
@@ -7571,7 +9090,6 @@ def main():
                 injected_done.set()
             continue
 
-        # ── Session-aware routing ──────────────────────────────────
         # If an interactive session is active, forward user input to it,
         # then ask the AI to decide the next step based on the output.
 
@@ -7633,12 +9151,31 @@ def main():
             # ── Cross-interaction state preservation ──
             agent_state = prepare_state_for_repl(response.get("state", {}))
             if args.depth == 0:
+                current_live_session = session_store.sync_runtime(
+                    current_live_session, agent_state, chat_history,
+                    cwd=_session_start_cwd,
+                    objective=agent_state.get("objective"),
+                    last_user_input=user_input,
+                    exit_reason=response.get("exit_reason"),
+                    tasks=task_manager.export_active_tasks(cwd=_session_start_cwd),
+                )
+                handle_meta_command._current_live_session = current_live_session
                 save_resume_state(agent_state, chat_history, _session_start_cwd)
             if injected_done is not None:
                 injected_done.set()
             continue
 
         # ── Normal input routing ───────────────────────────────────
+
+        if args.depth == 0 and current_live_session:
+            current_live_session = session_store.sync_runtime(
+                current_live_session, agent_state, chat_history,
+                cwd=_session_start_cwd,
+                objective=user_input if not agent_state.get("objective") else None,
+                last_user_input=user_input,
+                tasks=task_manager.export_active_tasks(cwd=_session_start_cwd),
+            )
+            handle_meta_command._current_live_session = current_live_session
 
         # Add to chat history
         chat_history.append({"role": "user", "content": user_input})
@@ -7791,6 +9328,9 @@ def main():
                 continue
             console.print("[dim]Not a system command, asking AI...[/dim]")
 
+            # Offer plan-first for complex tasks (only in interactive mode)
+            _maybe_offer_plan_mode(user_input)
+
             # Build event callback for real-time streaming
             def local_events_cb(events: list):
                 if agent_registry.agent_id:
@@ -7818,6 +9358,23 @@ def main():
                 if _t0 and _t0.session and _t0.session.is_alive():
                     _sync_cwd_from_term0(_t0.session)
 
+            # ── Plan approval menu ──
+            # If the agent ran in plan mode, offer a rich review menu.
+            # On approval, re-run the same task in act mode to execute.
+            if _show_plan_approval_menu():
+                console.print("[dim]Re-running task in ACT mode...[/dim]")
+                response = _run_agent_loop_with_interrupt(
+                    get_loop_deps(), user_input, session, agent_state, chat_history,
+                    events_cb=local_events_cb,
+                    existing_session=interactive_session)
+                interactive_session = response.get("session")
+                handle_meta_command._last_agent_state = response.get("state", agent_state)
+                handle_meta_command._last_existing_session = interactive_session
+                if not IS_WINDOWS:
+                    _t0 = get_terminal("term0")
+                    if _t0 and _t0.session and _t0.session.is_alive():
+                        _sync_cwd_from_term0(_t0.session)
+
         # Save AI reply to chat history
         if response.get("msg"):
             chat_history.append({"role": "assistant", "content": response["msg"]})
@@ -7827,6 +9384,15 @@ def main():
         # doesn't lose track of what it was doing.
         agent_state = prepare_state_for_repl(response.get("state", {}))
         if args.depth == 0:
+            current_live_session = session_store.sync_runtime(
+                current_live_session, agent_state, chat_history,
+                cwd=_session_start_cwd,
+                objective=agent_state.get("objective") if not is_system_command(user_input) else None,
+                last_user_input=user_input,
+                exit_reason=response.get("exit_reason") if not is_system_command(user_input) else None,
+                tasks=task_manager.export_active_tasks(cwd=_session_start_cwd),
+            )
+            handle_meta_command._current_live_session = current_live_session
             save_resume_state(agent_state, chat_history, _session_start_cwd)
 
         if injected_done is not None:

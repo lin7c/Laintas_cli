@@ -35,6 +35,7 @@ _lock = threading.RLock()
 # Current plan state (in-memory, synced to disk)
 _current_plan: Optional[dict] = None
 _plan_mode: bool = False
+_loaded_cwd: Optional[str] = None
 
 
 def ensure_plans_dir() -> Path:
@@ -48,25 +49,102 @@ def _load_state() -> dict:
         return {}
     try:
         with open(_STATE_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+        if isinstance(data, dict) and isinstance(data.get("projects"), dict):
+            return data["projects"].get(str(Path.cwd().resolve()), {})
+        # Backward compatibility with the original single-project state.
+        if isinstance(data, dict):
+            plan = data.get("current_plan") or {}
+            plan_cwd = plan.get("cwd") if isinstance(plan, dict) else None
+            if not plan_cwd or Path(plan_cwd).resolve() == Path.cwd().resolve():
+                return data
+        return {}
     except (OSError, json.JSONDecodeError):
         return {}
 
 
-def _save_state(state: dict) -> None:
+def _save_state(state: dict) -> bool:
     """Save plan mode state to disk."""
     ensure_plans_dir()
+    tmp = _STATE_PATH.with_suffix(".tmp")
     try:
-        with open(_STATE_PATH, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
+        all_state = {}
+        if _STATE_PATH.exists():
+            try:
+                loaded = json.loads(_STATE_PATH.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict) and isinstance(loaded.get("projects"), dict):
+                    all_state = loaded
+            except (OSError, json.JSONDecodeError):
+                pass
+        projects = all_state.setdefault("projects", {})
+        projects[str(Path.cwd().resolve())] = state
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(all_state, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        tmp.replace(_STATE_PATH)
+        return True
     except OSError:
-        pass
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+
+
+def _restore_state() -> None:
+    """Restore an active plan for this project after a process restart."""
+    global _plan_mode, _current_plan, _loaded_cwd
+    _loaded_cwd = str(Path.cwd().resolve())
+    _plan_mode = False
+    _current_plan = None
+    state = _load_state()
+    plan = state.get("current_plan")
+    if not state.get("plan_mode") or not isinstance(plan, dict):
+        return
+    plan_file = plan.get("file")
+    plan_cwd = plan.get("cwd")
+    try:
+        same_project = not plan_cwd or Path(plan_cwd).resolve() == Path.cwd().resolve()
+    except OSError:
+        same_project = False
+    if not same_project or not plan_file or not Path(plan_file).is_file():
+        return
+    _current_plan = dict(plan)
+    _plan_mode = True
+
+
+_restore_state()
+
+
+def _ensure_project_state() -> None:
+    if _loaded_cwd != str(Path.cwd().resolve()):
+        _restore_state()
 
 
 def is_plan_mode() -> bool:
     """Check if the agent is currently in plan mode."""
     global _plan_mode
+    _ensure_project_state()
     return _plan_mode
+
+
+_PLAN_ALLOWED_TOOLS = {
+    "fs.read", "fs.ls", "fs.grep", "fs.glob",
+    "web.search", "web.fetch", "time.now",
+    "plan.read", "plan.update", "plan.list",
+    "task.list", "task.get",
+    "skill.list", "skill.load", "skill.unload", "skill.reference",
+    "prompt.draft", "prompt.review", "prompt.skill_patch",
+    "agent.spawn", "agent.tell", "agent.list", "agent.wait", "agent.inbox",
+}
+
+
+def is_tool_allowed(tool_name: str) -> bool:
+    """Enforce read-only exploration while Plan Mode is active."""
+    if not is_plan_mode():
+        return True
+    return tool_name in _PLAN_ALLOWED_TOOLS
 
 
 def enter_plan_mode(task: str) -> dict:
@@ -77,6 +155,7 @@ def enter_plan_mode(task: str) -> dict:
     """
     global _plan_mode, _current_plan
     with _lock:
+        _ensure_project_state()
         ensure_plans_dir()
 
         # Generate a plan name from the task
@@ -100,6 +179,7 @@ def enter_plan_mode(task: str) -> dict:
             "updated": now,
             "status": "drafting",
             "approved": False,
+            "cwd": str(Path.cwd().resolve()),
         }
 
         # Write template
@@ -119,6 +199,7 @@ def exit_plan_mode(approve: bool = False) -> Optional[dict]:
     """
     global _plan_mode, _current_plan
     with _lock:
+        _ensure_project_state()
         plan = dict(_current_plan) if _current_plan else None
         if plan and approve:
             plan["status"] = "approved"
@@ -142,11 +223,13 @@ def exit_plan_mode(approve: bool = False) -> Optional[dict]:
 
 def get_current_plan() -> Optional[dict]:
     """Get the current plan, if any."""
+    _ensure_project_state()
     return dict(_current_plan) if _current_plan else None
 
 
 def read_plan(name: str = None) -> Optional[str]:
     """Read a plan file. If name is None, reads the current plan."""
+    _ensure_project_state()
     if name:
         p = PLANS_DIR / f"{name}.md"
     elif _current_plan:
@@ -164,6 +247,7 @@ def read_plan(name: str = None) -> Optional[str]:
 
 def update_plan(content: str) -> bool:
     """Overwrite the current plan file. Returns True on success."""
+    _ensure_project_state()
     if not _current_plan:
         return False
     try:

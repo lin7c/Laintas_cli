@@ -54,6 +54,9 @@ _DEFAULT_CONFIG = {
     "output_truncate": 3000,      # chars — lastOutput tail truncation
     "poll_timeout": 10.0,         # seconds — wait for first command output
     "terminal_tail_lines": 20,    # lines — sub-terminal snapshot
+    "paste_summary": True,        # collapse large pastes into a [Pasted #N ~L lines] placeholder in the prompt (expanded on submit)
+    "paste_summary_min_lines": 3, # paste line-count threshold that triggers the placeholder
+    "paste_summary_min_chars": 150, # paste char-count threshold that triggers the placeholder
     # A browser terminal is a full interactive shell. Keep it opt-in even when
     # remote agent registration is enabled.
     "disable_remote_terminal": True,
@@ -80,6 +83,7 @@ _DEFAULT_CONFIG = {
     "browser_action_delay_max": 1.5,   # max seconds of anti-bot delay before browser actions
     "browser_post_action_wait": 0.5,   # seconds to wait for SPA DOM updates before auto-snapshot
     "browser_auto_snapshot": True,     # return page snapshot after state-changing browser actions
+    "detail": False,                   # False = simplified progress rendering; True = full per-line detail (/detail on|off)
 }
 
 # ── Typed Error Classes ───────────────────────────────────────────────
@@ -140,6 +144,35 @@ def _diag(message: str, **context) -> None:
         _debug_log.pop(0)
 
 
+def _emit_simple_diff(console, diff_text: str, depth: int = 0, cap: int = 6) -> None:
+    """Render a minimal diff: changed (+/-) lines only, capped at `cap` lines.
+
+    Used in simplified progress mode. Skips file headers, hunk markers and
+    unchanged context — the reader just wants a glance at what changed. Full
+    diff remains available via /debug or /detail on.
+    """
+    if not diff_text:
+        return
+    changed = []
+    total_changed = 0
+    for ln in diff_text.splitlines():
+        if ln.startswith("+") and not ln.startswith("+++"):
+            total_changed += 1
+            if len(changed) < cap:
+                changed.append(("success", ln))
+        elif ln.startswith("-") and not ln.startswith("---"):
+            total_changed += 1
+            if len(changed) < cap:
+                changed.append(("error", ln))
+    if not changed:
+        return
+    inner = "  " * depth + "    "
+    for style, ln in changed:
+        console.print(f"{inner}[{style}]{ln[:100]}[/{style}]")
+    if total_changed > cap:
+        console.print(f"{inner}[muted]… {total_changed - cap} more change(s) · /detail on for full[/muted]")
+
+
 # ── Transition Labels ─────────────────────────────────────────────
 # Every exit from the agent loop carries a named reason string for
 # telemetry, debugging, and programmatic inspection.
@@ -165,6 +198,83 @@ TRANSITION_PARSE_GAVE_UP = "parse_gave_up"              # parse failure counter 
 
 _runtime_config: dict[str, object] = {}
 
+_RUNTIME_CONFIG_DESCRIPTIONS = {
+    "max_loops": "Maximum agent-loop iterations per task",
+    "max_tokens": "Requested model output-token budget",
+    "max_debug_entries": "In-memory debug entry limit",
+    "loop_delay": "Delay between loop iterations in seconds",
+    "output_truncate": "Maximum retained characters per tool-output section",
+    "poll_timeout": "Seconds to wait for initial command output",
+    "terminal_tail_lines": "Terminal snapshot line count",
+    "disable_remote_terminal": "Disable remote interactive terminal access",
+    "allow_remote_exec_without_approval": "Allow remote execution without local approval",
+    "heartbeat_interval": "Agent heartbeat interval in seconds",
+    "staleness_limit": "Consecutive idle steps before exit",
+    "repetition_threshold": "Consecutive repeated-output steps before exit",
+    "warning_force_limit": "Repeated warning limit before forced exit",
+    "output_similarity": "Repeated-output similarity threshold (0-1)",
+    "detail": "Show full per-line tool detail (True) or simplified progress (False)",
+}
+
+_RUNTIME_NONNEGATIVE = {
+    "loop_delay", "poll_timeout", "heartbeat_interval",
+    "browser_action_delay_min", "browser_action_delay_max",
+    "browser_post_action_wait",
+}
+_RUNTIME_POSITIVE = {
+    "max_loops", "max_tokens", "max_debug_entries", "output_truncate",
+    "terminal_tail_lines", "staleness_limit", "repetition_threshold",
+    "warning_force_limit", "microcompact_keep", "microcompact_read_budget",
+    "history_max_messages", "message_truncate", "short_memory_max_chars",
+    "model_context_window",
+}
+
+
+def _coerce_runtime_config_value(key: str, value):
+    if key not in _DEFAULT_CONFIG:
+        raise KeyError(f"Unknown config key: {key}")
+    default = _DEFAULT_CONFIG[key]
+    if isinstance(default, bool):
+        if isinstance(value, bool):
+            parsed = value
+        elif isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"true", "1", "yes", "on"}:
+                parsed = True
+            elif normalized in {"false", "0", "no", "off"}:
+                parsed = False
+            else:
+                raise ValueError(
+                    f"{key} expects a boolean: true/false, yes/no, on/off, or 1/0")
+        else:
+            raise ValueError(f"{key} expects a boolean")
+    elif isinstance(default, int) and not isinstance(default, bool):
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{key} expects an integer, got {value!r}") from exc
+    elif isinstance(default, float):
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{key} expects a number, got {value!r}") from exc
+    else:
+        parsed = str(value)
+
+    if key in _RUNTIME_POSITIVE and parsed <= 0:
+        raise ValueError(f"{key} must be greater than 0")
+    if key in _RUNTIME_NONNEGATIVE and parsed < 0:
+        raise ValueError(f"{key} must be 0 or greater")
+    if key == "output_similarity" and not 0 <= parsed <= 1:
+        raise ValueError("output_similarity must be between 0 and 1")
+    if (key == "browser_action_delay_min"
+            and parsed > float(get_runtime_config("browser_action_delay_max"))):
+        raise ValueError("browser_action_delay_min cannot exceed browser_action_delay_max")
+    if (key == "browser_action_delay_max"
+            and parsed < float(get_runtime_config("browser_action_delay_min"))):
+        raise ValueError("browser_action_delay_max cannot be below browser_action_delay_min")
+    return parsed
+
 
 def get_runtime_config(key: str):
     """Read a runtime config value, falling back to default."""
@@ -174,16 +284,30 @@ def get_runtime_config(key: str):
 
 
 def set_runtime_config(key: str, value) -> bool:
-    """Set a runtime config value. Returns True if key is valid."""
+    """Set a validated runtime config value. Returns False for an unknown key."""
     if key not in _DEFAULT_CONFIG:
         return False
-    _runtime_config[key] = value
+    _runtime_config[key] = _coerce_runtime_config_value(key, value)
     return True
 
 
 def list_runtime_config() -> dict:
     """Return {key: current_value, ...} for all config keys."""
     return {k: get_runtime_config(k) for k in _DEFAULT_CONFIG}
+
+
+def describe_runtime_config() -> dict[str, dict]:
+    """Return typed metadata used by /config without duplicating defaults."""
+    return {
+        key: {
+            "value": get_runtime_config(key),
+            "default": default,
+            "overridden": key in _runtime_config,
+            "type": type(default).__name__,
+            "description": _RUNTIME_CONFIG_DESCRIPTIONS.get(key, "Runtime option"),
+        }
+        for key, default in _DEFAULT_CONFIG.items()
+    }
 
 
 def reset_runtime_config():
@@ -386,15 +510,16 @@ def close_all_terminals() -> None:
 
 
 def rename_terminal(old_name: str, new_name: str) -> bool:
-    """Rename a terminal. Returns True on success, False if old_name not found."""
+    """Rename a terminal without overwriting an existing target."""
+    if not old_name or not new_name:
+        return False
+    if old_name == new_name:
+        return old_name in _terminal_registry
+    if new_name in _terminal_registry:
+        return False
     info = _terminal_registry.pop(old_name, None)
     if info is None:
         return False
-    if new_name in _terminal_registry:
-        try:
-            _terminal_registry[new_name].session.close()
-        except Exception:
-            pass
     old_cursor = _trigger_scan_cursors.pop(old_name, None)
     if old_cursor is not None:
         _trigger_scan_cursors[new_name] = old_cursor
@@ -739,6 +864,46 @@ def clear_resume_state(cwd: str) -> None:
         _resume_latest_path(cwd).unlink(missing_ok=True)
         for path in paths.SESSIONS_DIR.glob(_resume_checkpoint_pattern(cwd)):
             path.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def delete_resume_state(cwd: str, blob: dict) -> None:
+    """Delete one resume blob and every file that still references it.
+
+    A single logical session may exist in up to three files (checkpoint,
+    per-session, latest). Deleting only ``_path`` leaves the others to
+    "resurrect" the entry on the next ``list_resume_states`` call. This
+    removes the checkpoint file (for checkpoints) and conditionally removes
+    the per-session / latest files — only when their ``id`` still matches
+    the blob being deleted, so a newer autosave is never destroyed.
+    """
+    try:
+        key = _session_key(cwd)
+        blob_id = blob.get("id")
+        session_id = blob.get("session_id")
+
+        if blob.get("kind") == "checkpoint" and blob_id:
+            (paths.SESSIONS_DIR / f"{key}_resume_{blob_id}.json").unlink(missing_ok=True)
+
+        if session_id:
+            sess_path = paths.SESSIONS_DIR / f"{key}_session_{_normalize_session_id(session_id)}.json"
+            if sess_path.exists():
+                try:
+                    data = json.loads(sess_path.read_text(encoding="utf-8"))
+                    if data.get("id") == blob_id:
+                        sess_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+        latest = _resume_latest_path(cwd)
+        if latest.exists():
+            try:
+                data = json.loads(latest.read_text(encoding="utf-8"))
+                if data.get("id") == blob_id:
+                    latest.unlink(missing_ok=True)
+            except Exception:
+                pass
     except Exception:
         pass
 
@@ -2613,23 +2778,6 @@ def _thread_messages_for_turn(reply: str, executed: list) -> list:
     return msgs
 
 
-# Inputs that signal the user wants to resume prior work. An empty line (Enter)
-# plus a small set of continue/resume phrases. Other inputs — even a casual
-# "你好" — must NOT trigger auto-resume of an in_progress task.
-_CONTINUE_PREFIXES = (
-    "继续", "接着", "continue", "resume", "proceed", "go on",
-    "go ahead", "keep going", "carry on",
-)
-
-
-def _is_continue_request(text: str) -> bool:
-    """True if the user is asking to resume prior work (empty or continue phrase)."""
-    t = (text or "").strip().lower()
-    if not t:
-        return True
-    return any(t.startswith(p) for p in _CONTINUE_PREFIXES)
-
-
 def _build_user_message(original_input: str, state: dict, memory_entries: list,
                         chat_history: list, loop: int, max_loops: int,
                         thread_mode: bool = False, first_turn: bool = True) -> str:
@@ -2711,17 +2859,18 @@ def _build_user_message(original_input: str, state: dict, memory_entries: list,
     if objective and objective != str(original_input or "").strip():
         objective_block = f"\n<objective>\n{objective}\n</objective>\n"
 
-    # Continuation guidance: fires only when the user is actually asking to
-    # resume — an empty line (Enter) or an explicit continue/resume phrase.
-    # A casual new input like "你好" must NOT trigger auto-resume; the AI just
-    # answers it, and <active_tasks> is shown as reference only.
+    # Continuation guidance: shown whenever there is prior session context
+    # (an objective or active tasks). The AI decides whether the user's input
+    # is a continuation request and calls session.continue if so — no string
+    # matching in the REPL or prompt layer.
     continuation_block = ""
-    if _is_continue_request(original_input):
+    if objective or tasks_snapshot:
         continuation_block = (
             "\n<continuation>\n"
-            "The user wants to resume prior work. "
-            "Resume the in_progress item in <active_tasks>; if none, "
-            "check <objective>. Only ask the user if both are empty.\n"
+            "If the user is asking to resume/continue prior work (e.g. \"继续\", "
+            "\"continue\", \"接着\"), call `session.continue` to signal it, then "
+            "resume the in_progress item in <active_tasks>; if none, work on "
+            "<objective>. If the user is starting a new task, proceed normally.\n"
             "</continuation>\n"
         )
 
@@ -3330,12 +3479,13 @@ def run_agent_loop(
     chat_history = chat_history or []
 
     # ── Pin the objective (durable goal anchor) ────────────────────────────
-    # The user's goal is pinned here (persisted in the session snapshot) and
-    # rendered every turn as <objective> when it differs from the current input.
-    # The AI creates tasks via task.create — no auto-seeding.
+    # Pure session semantics: the objective is set once when the session
+    # starts (first non-empty input) and persists until /new resets state.
+    # Subsequent inputs — including "继续" — do NOT overwrite it. The AI
+    # decides via the session.continue tool whether to resume prior work.
     if depth == 0:
         _orig = (original_input or "").strip()
-        if _orig:
+        if _orig and not state.get("objective"):
             state["objective"] = _orig
 
     step_replies = []
@@ -3391,6 +3541,22 @@ def run_agent_loop(
     _warning_force_limit = int(get_runtime_config("warning_force_limit"))
     _force_exit = False                    # set by circuit breaker to break out of nested logic
     self_info = get_agent(agent_id) if agent_id else None
+    if depth == 0 and agent_id:
+        wf = workflow_engine.get_active_workflow()
+        current_phase = wf.current if wf and not wf.completed else None
+        for role in workflow_engine.get_auto_spawn_roles():
+            child_id = spawn_subagent(
+                parent_id=agent_id,
+                task=(
+                    f"Assist the active workflow phase "
+                    f"'{current_phase.name if current_phase else '?'}' for: "
+                    f"{wf.description if wf else original_input}. "
+                    "Return a concise phase-specific result."
+                ),
+                deps=deps, session=None, events_cb=events_cb, role=role,
+            )
+            if child_id:
+                workflow_engine.mark_auto_spawned(role, child_id)
     # ── Durable prompt admission (opencode pattern) ──
     # Write the prompt to the event log BEFORE execution starts, so a crash
     # never loses what the user asked. Recovery can detect an incomplete task.
@@ -3646,6 +3812,7 @@ def run_agent_loop(
 
         # 5. Call backend (skip spinner in non-interactive/execute mode)
         lang = _detect_lang(original_input)
+        _detail = bool(get_runtime_config("detail"))
         if events_cb is not None:
             # Streaming render: use rich.live.Live to render the reply as it arrives
             # via on_chunk. Falls back to spinner if backend doesn't accept on_chunk.
@@ -3666,14 +3833,14 @@ def run_agent_loop(
                         parts.append(deps.Markdown(stream_state["reply"]))
                     else:
                         parts.append(Spinner("dots", text=Text("thinking…", style="#7aa2f7")))
-                    if stream_state["command"]:
+                    if stream_state["command"] and _detail:
                         cmd_preview = stream_state["command"]
                         if len(cmd_preview) > 120:
                             cmd_preview = cmd_preview[:117] + "..."
                         parts.append(Text(f"→ {cmd_preview}", style="#5a7bbf"))
                     return Group(*parts)
 
-                _live_holder = {"live": None}
+                _live_holder = {"live": None, "last": 0.0}
 
                 def _on_chunk(field, value):
                     # Check for soft-interrupt during streaming
@@ -3689,7 +3856,12 @@ def run_agent_loop(
                     stream_state["started"] = True
                     _lv = _live_holder["live"]
                     if _lv is not None:
-                        try: _lv.update(_render())
+                        # Update the renderable but let rich's own refresh timer
+                        # (auto_refresh) paint it. Forcing refresh=True on every
+                        # chunk on top of the timer caused the reflowing Markdown to
+                        # flicker; leaving it to the throttled timer keeps the
+                        # spinner animating AND avoids the flicker.
+                        try: _lv.update(_render(), refresh=False)
                         except Exception as _e: _diag("live_render_failed", error=str(_e))
 
                 def _do_stream_call():
@@ -3717,10 +3889,14 @@ def run_agent_loop(
                         )
 
                 if _use_live:
-                    with Live(_render(), console=deps.console, refresh_per_second=12,
-                              transient=False) as live:
+                    with Live(_render(), console=deps.console, refresh_per_second=12.5,
+                              auto_refresh=True, transient=not _detail) as live:
                         _live_holder["live"] = live
                         response = _do_stream_call()
+                        # Final flush: the last chunk(s) may have been throttled,
+                        # so render the complete reply before Live tears down.
+                        try: live.update(_render(), refresh=True)
+                        except Exception: pass
                 else:
                     with deps.console.status("[#7aa2f7]thinking…[/#7aa2f7]",
                                              spinner="dots"):
@@ -3748,8 +3924,9 @@ def run_agent_loop(
                             lang=lang,
                         )
             # Mark that the streaming Live already rendered the reply — avoid
-            # re-printing it below.
-            _reply_already_rendered = _use_live and bool(stream_state.get("reply"))
+            # re-printing it below. When detail is off the Live is transient and
+            # erases its final frame, so the reply must be reprinted cleanly.
+            _reply_already_rendered = _use_live and _detail and bool(stream_state.get("reply"))
         else:
             _reply_already_rendered = False
             try:
@@ -3983,6 +4160,25 @@ def run_agent_loop(
 
                 # ── Role / Workflow tool filtering ──
                 _role_name = state.get("_role_name")
+                if not plan_mode.is_tool_allowed(name):
+                    result = {
+                        "ok": False,
+                        "error": (
+                            f"BLOCKED: tool '{name}' is not allowed in Plan Mode. "
+                            "Use read-only exploration or plan.update, then obtain "
+                            "user approval before implementation."
+                        ),
+                        "tool": name, "returncode": -1,
+                    }
+                    formatted_outputs.append(
+                        _format_tool_result_for_loop(
+                            name, result,
+                            int(get_runtime_config("output_truncate") or 3000)))
+                    per_call_rows.append({
+                        "command": salient, "output": result.get("error", ""),
+                        "returncode": -1, "tool": name, "call_id": call_id,
+                    })
+                    continue
                 if not agent_roles.is_tool_allowed_for_role(name, _role_name):
                     result = {"ok": False,
                               "error": f"BLOCKED: tool '{name}' not allowed for role '{_role_name}'",
@@ -4118,6 +4314,14 @@ def run_agent_loop(
                     _explicit_complete = True
                     _complete_summary = result.get("summary") or _complete_summary
 
+                # ── Session continuation signal ──
+                # session.continue was called: clear exhaustion state so the
+                # loop can run fresh. The pinned objective is already preserved
+                # by the objective-pinning logic (only set when empty).
+                if isinstance(result, dict) and result.get("_session_continue"):
+                    state.pop("_max_loops_exhausted", None)
+                    state.pop("_exhaustion_loop_count", None)
+
                 # ── Format result for AI prompt ──
                 truncate = int(get_runtime_config("output_truncate") or 3000)
                 formatted = _format_tool_result_for_loop(name, result, truncate)
@@ -4183,8 +4387,28 @@ def run_agent_loop(
                 if events_cb is not None:
                     ok_mark = "[green]✓[/green]" if result.get("ok") else "[red]✗[/red]"
                     _hint = salient[:80] if salient else display_name
-                    deps.console.print(
-                        f"  {ok_mark} [dim cyan]{display_name}[/dim cyan] [dim]{_hint}[/dim]")
+                    if _detail:
+                        deps.console.print(
+                            f"  {ok_mark} [dim cyan]{display_name}[/dim cyan] [dim]{_hint}[/dim]")
+                    else:
+                        # Simplified: one clean, aligned line per tool. A short
+                        # trailing meta carries the essentials (line count / exit
+                        # code); failures point to /debug. Full output stays in
+                        # terminalHistory / /debug.
+                        _mark2 = "[success]✓[/success]" if result.get("ok") else "[error]✗[/error]"
+                        _meta2 = ""
+                        if name in ("shell.exec", "terminal.send", "terminal.exec"):
+                            _nlines = len((formatted or "").split("\n")) if formatted else 0
+                            if result.get("ok"):
+                                _meta2 = f"{_nlines}L · exit {_rc}" if _nlines else f"exit {_rc}"
+                            else:
+                                _meta2 = f"exit {_rc} · /debug"
+                        elif not result.get("ok"):
+                            _meta2 = "/debug"
+                        _line = f"  {_mark2} [accent.dim]{display_name:<9}[/accent.dim] [muted]{_hint}[/muted]"
+                        if _meta2:
+                            _line += f"   [muted]{_meta2}[/muted]"
+                        deps.console.print(_line)
                     pending_events.append({"type": "system", "kind": "tool",
                                             "content": display_name,
                                             "meta": {"ok": result.get("ok", False),
@@ -4195,26 +4419,32 @@ def run_agent_loop(
                     events_cb(pending_events)
                     pending_events.clear()
 
-                    # Display panels for shell.exec (mirror old UX)
-                    if name == "shell.exec":
-                        if result.get("via") in ("stationed", "interactive"):
+                    if _detail:
+                        # Display panels for shell.exec (mirror old UX)
+                        if name == "shell.exec":
+                            if result.get("via") in ("stationed", "interactive"):
+                                try:
+                                    _alive = (_stationed_session.is_alive() if _stationed_session
+                                              else (interactive_session.is_alive() if interactive_session else False))
+                                    deps.display_sub_terminal_preview(
+                                        salient, formatted[:2000],
+                                        depth=depth + 1, alive=_alive)
+                                except Exception as _e: _diag("display_sub_terminal_failed", tool=name, error=str(_e))
+                            elif result.get("via") in ("subprocess", "parent", "loop_command"):
+                                try:
+                                    deps.display_command_output(salient, _rc, formatted, depth=depth + 1)
+                                except Exception as _e: _diag("display_command_output_failed", tool=name, error=str(_e))
+                        elif name in ("fs.write", "fs.edit", "fs.multi_edit") and result.get("diff"):
                             try:
-                                _alive = (_stationed_session.is_alive() if _stationed_session
-                                          else (interactive_session.is_alive() if interactive_session else False))
-                                deps.display_sub_terminal_preview(
-                                    salient, formatted[:2000],
-                                    depth=depth + 1, alive=_alive)
-                            except Exception as _e: _diag("display_sub_terminal_failed", tool=name, error=str(_e))
-                        elif result.get("via") in ("subprocess", "parent", "loop_command"):
-                            try:
-                                deps.display_command_output(salient, _rc, formatted, depth=depth + 1)
-                            except Exception as _e: _diag("display_command_output_failed", tool=name, error=str(_e))
+                                deps.display_file_diff(result.get("path") or salient or name,
+                                                       result.get("diff", ""),
+                                                       depth=depth + 1)
+                            except Exception as _e: _diag("display_file_diff_failed", tool=name, error=str(_e))
                     elif name in ("fs.write", "fs.edit", "fs.multi_edit") and result.get("diff"):
+                        # Simplified diff: changed lines only, capped at 6.
                         try:
-                            deps.display_file_diff(result.get("path") or salient or name,
-                                                   result.get("diff", ""),
-                                                   depth=depth + 1)
-                        except Exception as _e: _diag("display_file_diff_failed", tool=name, error=str(_e))
+                            _emit_simple_diff(deps.console, result.get("diff", ""), depth=depth + 1)
+                        except Exception as _e: _diag("emit_simple_diff_failed", tool=name, error=str(_e))
 
         # Concat all per-call outputs into lastOutput so the next prompt's fallback
         # rendering and shortTermMemory see every result, not just the last.
@@ -4439,6 +4669,19 @@ def run_agent_loop(
         # loop result so successful task.complete turns do not show Done False.
         debug_entry.done = done
         add_debug_log(debug_entry)
+
+        if done and depth == 0:
+            workflow_transition = workflow_engine.handle_done_signal(
+                reply or state.get("lastReply", ""))
+            if workflow_transition == "advanced":
+                done = False
+                debug_entry.done = False
+                _append_short_memory(
+                    state, "\n  - Workflow advanced to the next phase.")
+            elif workflow_transition == "awaiting_confirmation":
+                _append_short_memory(
+                    state,
+                    "\n  - Workflow phase is awaiting explicit user confirmation.")
 
         if done:
             # Close sub-terminal if still running, show final report

@@ -717,3 +717,39 @@ def reload_config() -> dict:
 def get_config() -> dict:
     """Return the current policy config (possibly cached)."""
     return _load_config()
+
+
+def set_mode(mode: str) -> tuple[bool, str]:
+    """Set the policy mode and persist to disk.
+
+    Returns (ok, message). mode must be one of: audit, enforce, disabled.
+    """
+    mode = (mode or "").strip().lower()
+    valid = {"audit", "enforce", "disabled"}
+    if mode not in valid:
+        return False, f"Invalid mode '{mode}'. Valid: {', '.join(sorted(valid))}"
+    cfg = _load_config(force=True)
+    old = cfg.get("mode", "audit")
+    cfg["mode"] = mode
+    tmp = CONFIG_PATH.with_suffix(".tmp")
+    try:
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        tmp.replace(CONFIG_PATH)
+    except OSError as e:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False, f"Failed to write config: {e}"
+    # Update cache so subsequent evaluate() calls see the new mode immediately.
+    global _config, _config_mtime
+    _config = cfg
+    try:
+        _config_mtime = CONFIG_PATH.stat().st_mtime
+    except OSError:
+        pass
+    return True, f"Policy mode: {old} → {mode}"

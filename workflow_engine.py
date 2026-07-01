@@ -22,8 +22,12 @@ from __future__ import annotations
 import json
 import os
 import time
+import threading
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
+
+import paths
 
 
 # ── Data Classes ────────────────────────────────────────────────────────
@@ -330,11 +334,97 @@ def list_workflow_templates() -> list[str]:
 # ── Active Workflow State ───────────────────────────────────────────────
 
 _active_workflow: Optional[WorkflowInstance] = None
+_active_workflow_cwd: Optional[str] = None
+_lock = threading.RLock()
 
 
-def start_workflow(name: str, description: str) -> Optional[WorkflowInstance]:
+class WorkflowTransitionError(ValueError):
+    """Raised when a phase transition would bypass its exit condition."""
+
+
+def _workflow_state_path() -> Path:
+    return paths.project_file("workflow.json")
+
+
+def _serialize_workflow(wf: WorkflowInstance) -> dict:
+    return {
+        "name": wf.name,
+        "description": wf.description,
+        "current_phase": wf.current_phase,
+        "phase_states": wf.phase_states,
+        "started_at": wf.started_at,
+        "phase_started_at": wf.phase_started_at,
+        "completed": wf.completed,
+        "summary": wf.summary,
+    }
+
+
+def _save_workflow() -> None:
+    path = _workflow_state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    try:
+        payload = (_serialize_workflow(_active_workflow)
+                   if _active_workflow is not None else None)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        tmp.replace(path)
+    except OSError:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _load_workflow_for_cwd() -> Optional[WorkflowInstance]:
+    global _active_workflow_cwd
+    path = _workflow_state_path()
+    _active_workflow_cwd = str(Path.cwd().resolve())
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    factory = _WORKFLOW_TEMPLATES.get(data.get("name"))
+    if factory is None:
+        return None
+    phases = factory()
+    try:
+        current_phase = int(data.get("current_phase", 0))
+    except (TypeError, ValueError):
+        current_phase = 0
+    def _float_value(key: str) -> float:
+        try:
+            return float(data.get(key, time.time()))
+        except (TypeError, ValueError):
+            return time.time()
+
+    return WorkflowInstance(
+        name=data.get("name", ""),
+        description=data.get("description", ""),
+        phases=phases,
+        current_phase=max(0, min(current_phase, len(phases))),
+        phase_states=(data.get("phase_states")
+                      if isinstance(data.get("phase_states"), dict) else {}),
+        started_at=_float_value("started_at"),
+        phase_started_at=_float_value("phase_started_at"),
+        completed=bool(data.get("completed", False)),
+        summary=data.get("summary", ""),
+    )
+
+
+def start_workflow(name: str, description: str,
+                   replace: bool = False) -> Optional[WorkflowInstance]:
     """Start a new workflow instance. Returns None if template not found."""
-    global _active_workflow
+    global _active_workflow, _active_workflow_cwd
+    existing = get_active_workflow()
+    if existing is not None and not existing.completed and not replace:
+        return None
     factory = _WORKFLOW_TEMPLATES.get(name)
     if factory is None:
         return None
@@ -346,29 +436,49 @@ def start_workflow(name: str, description: str) -> Optional[WorkflowInstance]:
         phase_states={p.name: {} for p in phases},
     )
     _active_workflow = wf
+    _active_workflow_cwd = str(Path.cwd().resolve())
+    _save_workflow()
     return wf
 
 
 def get_active_workflow() -> Optional[WorkflowInstance]:
     """Return the currently active workflow, or None."""
+    global _active_workflow
+    cwd = str(Path.cwd().resolve())
+    if _active_workflow_cwd != cwd:
+        _active_workflow = _load_workflow_for_cwd()
     return _active_workflow
 
 
-def advance_phase(summary: str = "") -> Optional[WorkflowPhase]:
+def advance_phase(summary: str = "", *, user_confirmed: bool = False,
+                  done_signal: bool = False,
+                  force: bool = False) -> Optional[WorkflowPhase]:
     """Advance to the next phase. Returns the new current phase, or None if completed."""
     global _active_workflow
-    wf = _active_workflow
+    wf = get_active_workflow()
     if wf is None or wf.completed:
         return None
 
     # Save phase summary
     current = wf.current
     if current:
-        wf.phase_states[current.name] = {
+        if current.exit_condition == "user_confirm" and not user_confirmed:
+            raise WorkflowTransitionError(
+                f"Phase '{current.name}' requires explicit user confirmation. "
+                "Use /workflow approve [summary].")
+        if (current.exit_condition == "done_signal"
+                and not done_signal and not force):
+            raise WorkflowTransitionError(
+                f"Phase '{current.name}' advances when the agent signals completion. "
+                "Use /workflow advance only for a manual override.")
+        if user_confirmed and not summary:
+            summary = wf.phase_states.get(current.name, {}).get(
+                "pending_summary", "")
+        wf.phase_states.setdefault(current.name, {}).update({
             "summary": summary,
             "completed_at": time.time(),
             "duration_s": time.time() - wf.phase_started_at,
-        }
+        })
 
     # Advance
     wf.current_phase += 1
@@ -377,29 +487,48 @@ def advance_phase(summary: str = "") -> Optional[WorkflowPhase]:
     if wf.current_phase >= len(wf.phases):
         wf.completed = True
         wf.summary = summary
+        _save_workflow()
         return None
 
+    _save_workflow()
     return wf.current
+
+
+def handle_done_signal(summary: str = "") -> str:
+    """Advance a done-signal phase, or pause when user confirmation is required."""
+    wf = get_active_workflow()
+    if wf is None or wf.completed or wf.current is None:
+        return "none"
+    current = wf.current
+    if current.exit_condition == "user_confirm":
+        wf.phase_states.setdefault(current.name, {})["pending_summary"] = summary
+        _save_workflow()
+        return "awaiting_confirmation"
+    new_phase = advance_phase(
+        summary, done_signal=current.exit_condition == "done_signal",
+        force=current.exit_condition == "auto")
+    return "completed" if new_phase is None else "advanced"
 
 
 def set_phase_data(key: str, value) -> None:
     """Store data in the current phase's state."""
-    wf = _active_workflow
+    wf = get_active_workflow()
     if wf is None or wf.current is None:
         return
     phase_name = wf.current.name
     if phase_name not in wf.phase_states:
         wf.phase_states[phase_name] = {}
     wf.phase_states[phase_name][key] = value
+    _save_workflow()
 
 
 def end_workflow(summary: str = "") -> None:
     """End the active workflow."""
-    global _active_workflow
-    if _active_workflow:
-        _active_workflow.completed = True
-        _active_workflow.summary = summary
-    _active_workflow = None
+    wf = get_active_workflow()
+    if wf:
+        wf.completed = True
+        wf.summary = summary
+    _save_workflow()
 
 
 def render_workflow_section() -> str:
@@ -407,7 +536,7 @@ def render_workflow_section() -> str:
 
     Returns empty string if no active workflow.
     """
-    wf = _active_workflow
+    wf = get_active_workflow()
     if wf is None or wf.completed:
         return ""
 
@@ -450,7 +579,7 @@ def is_tool_allowed_in_workflow(tool_name: str) -> bool:
 
     Returns True if no active workflow or the phase has no tool restrictions.
     """
-    wf = _active_workflow
+    wf = get_active_workflow()
     if wf is None or wf.completed:
         return True
     current = wf.current
@@ -463,7 +592,7 @@ def is_tool_allowed_in_workflow(tool_name: str) -> bool:
 
 def get_phase_max_loops() -> int:
     """Return the max_loops override for the current phase, or 0 for default."""
-    wf = _active_workflow
+    wf = get_active_workflow()
     if wf is None or wf.completed:
         return 0
     current = wf.current
@@ -473,11 +602,26 @@ def get_phase_max_loops() -> int:
 
 
 def get_auto_spawn_roles() -> list[str]:
-    """Return the roles that should be auto-spawned for the current phase."""
-    wf = _active_workflow
+    """Return current-phase roles not already auto-spawned."""
+    wf = get_active_workflow()
     if wf is None or wf.completed:
         return []
     current = wf.current
     if current is None:
         return []
-    return list(current.spawn_agents)
+    spawned = set(wf.phase_states.get(current.name, {}).get("spawned_roles", []))
+    return [role for role in current.spawn_agents if role not in spawned]
+
+
+def mark_auto_spawned(role: str, agent_id: str) -> None:
+    """Persist a successful automatic role spawn to prevent duplicates."""
+    wf = get_active_workflow()
+    if wf is None or wf.current is None:
+        return
+    state = wf.phase_states.setdefault(wf.current.name, {})
+    roles = state.setdefault("spawned_roles", [])
+    if role not in roles:
+        roles.append(role)
+    agents = state.setdefault("spawned_agents", {})
+    agents[role] = agent_id
+    _save_workflow()

@@ -682,11 +682,16 @@ def _bi_task_create(params: dict, ctx: ToolCtx) -> dict:
     description = params.get("description", "").strip()
     if not subject:
         return {"ok": False, "error": "missing 'subject'"}
-    task = _task_mgr.create_task(subject, description,
-                                  metadata=params.get("metadata"),
-                                  session_only=params.get("session_only", False),
-                                  parent_task_id=params.get("parent_task_id"),
-                                  cwd=ctx.cwd or None)
+    try:
+        task = _task_mgr.create_task(
+            subject, description,
+            metadata=params.get("metadata"),
+            session_only=params.get("session_only", False),
+            parent_task_id=params.get("parent_task_id"),
+            cwd=ctx.cwd or None,
+        )
+    except _task_mgr.TaskStorageError as exc:
+        return {"ok": False, "error": str(exc)}
     return {"ok": True, "result": task}
 
 
@@ -702,7 +707,11 @@ def _bi_task_update(params: dict, ctx: ToolCtx) -> dict:
               "progress", "notes", "addSubtask"):
         if k in params:
             kwargs[k] = params[k]
-    ok, msg, task = _task_mgr.update_task(str(task_id), cwd=ctx.cwd or None, **kwargs)
+    try:
+        ok, msg, task = _task_mgr.update_task(
+            str(task_id), cwd=ctx.cwd or None, **kwargs)
+    except _task_mgr.TaskStorageError as exc:
+        return {"ok": False, "result": None, "error": str(exc)}
     return {"ok": ok, "result": task if ok else None, "error": "" if ok else msg}
 
 
@@ -790,8 +799,8 @@ def _bi_prompt_draft(params: dict, ctx: ToolCtx) -> dict:
     feedback_id = params.get("feedback_id", "")
     patch = params.get("patch", "")
     rationale = params.get("rationale", "")
-    if not patch:
-        return {"ok": False, "error": "missing 'patch'"}
+    if not patch and not rationale:
+        return {"ok": False, "error": "missing 'patch' and 'rationale'"}
     if not feedback_id:
         return {"ok": False, "error": "missing 'feedback_id'"}
     cand = _prompt_opt_mod.draft_candidate(feedback_id, patch, rationale)
@@ -812,20 +821,16 @@ def _bi_prompt_review(params: dict, ctx: ToolCtx) -> dict:
 
 def _bi_prompt_apply(params: dict, ctx: ToolCtx) -> dict:
     """Apply a candidate patch to cli.prop."""
-    if _prompt_opt_mod is None:
-        return {"ok": False, "error": "prompt_opt module not available"}
-    cid = params.get("id") or None
-    force = params.get("force", False)
-    ok, msg = _prompt_opt_mod.apply_candidate(cid, force=force)
-    return {"ok": ok, "result": msg}
+    return {"ok": False, "error": (
+        "Applying prompt candidates requires explicit user approval. "
+        "Ask the user to run /prompt apply [id].")}
 
 
 def _bi_prompt_discard(params: dict, ctx: ToolCtx) -> dict:
     """Strip the applied patch from cli.prop."""
-    if _prompt_opt_mod is None:
-        return {"ok": False, "error": "prompt_opt module not available"}
-    ok, msg = _prompt_opt_mod.discard_candidate()
-    return {"ok": ok, "result": msg}
+    return {"ok": False, "error": (
+        "Discarding prompt candidates requires explicit user approval. "
+        "Ask the user to run /prompt discard [id].")}
 
 
 def _bi_prompt_structured_feedback(params: dict, ctx: ToolCtx) -> dict:
@@ -883,35 +888,29 @@ def _bi_prompt_skill_patch(params: dict, ctx: ToolCtx) -> dict:
         return {"ok": False, "error": "missing 'old_string' or 'new_string' (required for replace mode)"}
     if mode not in ("append", "replace"):
         return {"ok": False, "error": f"invalid mode '{mode}'. Use 'append' or 'replace'."}
-    cand = _prompt_opt_mod.draft_skill_patch(
-        skill_name=skill_name, skill_file=skill_file, mode=mode,
-        patch=patch, rationale=rationale, feedback_id=feedback_id,
-        old_string=old_string, new_string=new_string)
+    try:
+        cand = _prompt_opt_mod.draft_skill_patch(
+            skill_name=skill_name, skill_file=skill_file, mode=mode,
+            patch=patch, rationale=rationale, feedback_id=feedback_id,
+            old_string=old_string, new_string=new_string)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
     return {"ok": True, "result": f"Skill patch {cand['id']} drafted for "
             f"{skill_name}/{skill_file}.", "candidate_id": cand["id"]}
 
 
 def _bi_prompt_skill_apply(params: dict, ctx: ToolCtx) -> dict:
     """Apply a skill patch candidate."""
-    if _prompt_opt_mod is None:
-        return {"ok": False, "error": "prompt_opt module not available"}
-    cid = params.get("id")
-    if not cid:
-        return {"ok": False, "error": "missing 'id'"}
-    force = params.get("force", False)
-    ok, msg = _prompt_opt_mod.apply_skill_patch(cid, force=force)
-    return {"ok": ok, "result": msg}
+    return {"ok": False, "error": (
+        "Applying skill patches requires explicit user approval. "
+        "Ask the user to run /prompt skill apply <id>.")}
 
 
 def _bi_prompt_skill_discard(params: dict, ctx: ToolCtx) -> dict:
     """Discard a skill patch candidate (restore from backup)."""
-    if _prompt_opt_mod is None:
-        return {"ok": False, "error": "prompt_opt module not available"}
-    cid = params.get("id")
-    if not cid:
-        return {"ok": False, "error": "missing 'id'"}
-    ok, msg = _prompt_opt_mod.discard_skill_patch(cid)
-    return {"ok": ok, "result": msg}
+    return {"ok": False, "error": (
+        "Discarding skill patches requires explicit user approval. "
+        "Ask the user to run /prompt skill discard <id>.")}
 
 
 def _bi_fs_edit(params: dict, ctx: ToolCtx) -> dict:
@@ -2413,6 +2412,27 @@ def _bi_task_continue(params: dict, ctx: ToolCtx) -> dict:
     otherwise reads as "done / handing back to the user".
     """
     return {"ok": True, "result": "(continuing)"}
+
+
+def _bi_session_continue(params: dict, ctx: ToolCtx) -> dict:
+    """Signal that the user wants to resume prior session work.
+
+    Unlike task.continue (a generic keep-looping no-op), this is called when
+    the AI determines the user's input (e.g. "继续", "continue", "接着做") is a
+    request to resume the current session's pending task — not a new task.
+
+    The agent loop detects the _session_continue marker and:
+      - clears any max-loops exhaustion state so the loop can run fresh,
+      - preserves the pinned <objective> instead of overwriting it.
+
+    The AI should call this BEFORE resuming work, then proceed with the actual
+    task steps (shell.exec, fs.write, etc.) in subsequent turns.
+    """
+    reason = (params.get("reason") or "").strip()
+    result = "Continuing current session. Resume the in_progress task in <active_tasks>; if none, work on <objective>."
+    if reason:
+        result += f" (reason: {reason})"
+    return {"ok": True, "result": result, "_session_continue": True}
 
 
 def _bi_task_complete(params: dict, ctx: ToolCtx) -> dict:
@@ -3955,11 +3975,11 @@ def register_builtin_tools() -> None:
                     "feedback_id": {"type": "string",
                         "description": "The feedback id this patch addresses"},
                     "patch": {"type": "string",
-                        "description": "Patch block contents (without <prompt_opt_patch> wrapper)"},
+                        "description": "Patch block contents; omit/empty for a documented model limitation"},
                     "rationale": {"type": "string",
                         "description": "1-3 sentences: what deficiency, how the patch fixes it"},
                 },
-                "required": ["feedback_id", "patch"],
+                "required": ["feedback_id", "rationale"],
             },
             invoke=_bi_prompt_draft,
         ),
@@ -3974,28 +3994,6 @@ def register_builtin_tools() -> None:
                 },
             },
             invoke=_bi_prompt_review,
-        ),
-        Tool(
-            name="prompt.apply",
-            description="Apply a candidate patch to cli.prop. Appends a "
-                        "<prompt_opt_patch> block (idempotent — strips existing first). "
-                        "Takes effect next loop iteration, no /reload needed.",
-            schema={
-                "type": "object",
-                "properties": {
-                    "id": {"type": "string", "description": "Candidate id (omit for active)"},
-                    "force": {"type": "boolean", "default": False,
-                        "description": "Override drift detection if cli.prop changed"},
-                },
-            },
-            invoke=_bi_prompt_apply,
-        ),
-        Tool(
-            name="prompt.discard",
-            description="Strip the applied <prompt_opt_patch> block from cli.prop. "
-                        "Fully reverts the optimization patch.",
-            schema={"type": "object", "properties": {}},
-            invoke=_bi_prompt_discard,
         ),
         Tool(
             name="prompt.structured_feedback",
@@ -4055,35 +4053,6 @@ def register_builtin_tools() -> None:
                 "required": ["feedback_id", "skill_name", "rationale"],
             },
             invoke=_bi_prompt_skill_patch,
-        ),
-        Tool(
-            name="prompt.skill_apply",
-            description="Apply a skill patch candidate. Backs up the original "
-                        "file, applies the patch, and hot-reloads the skill. "
-                        "Changes take effect immediately.",
-            schema={
-                "type": "object",
-                "properties": {
-                    "id": {"type": "string", "description": "Skill patch candidate id"},
-                    "force": {"type": "boolean", "default": False,
-                        "description": "Override drift detection if the skill file changed"},
-                },
-                "required": ["id"],
-            },
-            invoke=_bi_prompt_skill_apply,
-        ),
-        Tool(
-            name="prompt.skill_discard",
-            description="Discard an applied skill patch by restoring the "
-                        "original file from backup. Hot-reloads the skill.",
-            schema={
-                "type": "object",
-                "properties": {
-                    "id": {"type": "string", "description": "Skill patch candidate id"},
-                },
-                "required": ["id"],
-            },
-            invoke=_bi_prompt_skill_discard,
         ),
         # ── Agent tools ─────────────────────────────────────────────
         Tool(
@@ -4497,6 +4466,24 @@ def register_builtin_tools() -> None:
             ),
             schema={"type": "object", "properties": {}},
             invoke=_bi_task_continue,
+        ),
+        Tool(
+            name="session.continue",
+            description=(
+                "Signal that the user is resuming prior work in the current live "
+                "session (e.g. they said \"继续\", \"continue\", \"接着\"). Call this "
+                "when you determine from <active_tasks> or <objective> that the user "
+                "wants to pick up an unfinished task, NOT start a new one. After "
+                "calling, proceed with the actual task steps in subsequent turns. "
+                "Optional 'reason' explains why you are continuing."
+            ),
+            schema={
+                "type": "object",
+                "properties": {
+                    "reason": {"type": "string", "description": "Why you are continuing (optional)."},
+                },
+            },
+            invoke=_bi_session_continue,
         ),
         Tool(
             name="task.complete",

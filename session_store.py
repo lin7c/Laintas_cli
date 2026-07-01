@@ -1,0 +1,190 @@
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import os
+import re
+import time
+import uuid
+from typing import Optional
+
+import paths
+
+CONTINUABLE_REASONS = {
+    "max_loops",
+    "interrupted",
+    "backend_error",
+    "provider_error",
+    "silent_failure",
+    "truncated",
+    "parse_failed",
+    "repair_gave_up",
+    "parse_gave_up",
+    "repetition",
+    "warning_force_exit",
+    "staleness",
+    "aborted",
+}
+
+def _session_key(cwd: str) -> str:
+    return hashlib.sha256(str(cwd).encode()).hexdigest()[:16]
+
+
+def _safe_id(value: object) -> str:
+    raw = str(value or "").strip()
+    safe = re.sub(r"[^A-Za-z0-9_-]", "-", raw)[:64]
+    return safe or uuid.uuid4().hex[:16]
+
+
+def _current_path(cwd: str):
+    return paths.SESSIONS_DIR / f"{_session_key(cwd)}_current.json"
+
+
+def _session_path(cwd: str, session_id: str):
+    return paths.SESSIONS_DIR / f"{_session_key(cwd)}_live_{_safe_id(session_id)}.json"
+
+
+def _atomic_write_json(dest, payload: dict) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_name(f".{dest.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(str(tmp), str(dest))
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def is_continuable_reason(reason: str) -> bool:
+    return str(reason or "") in CONTINUABLE_REASONS
+
+
+def create_session(cwd: str, state: Optional[dict] = None, chat_history: Optional[list] = None) -> dict:
+    now = time.time()
+    session_id = _safe_id((state or {}).get("_session_id") or uuid.uuid4().hex[:16])
+    session = {
+        "id": session_id,
+        "session_id": session_id,
+        "kind": "live",
+        "cwd": cwd,
+        "created_at": now,
+        "updated_at": now,
+        "timestamp": now,
+        "closed_at": None,
+        "status": "idle",
+        "objective": str((state or {}).get("objective") or "").strip(),
+        "last_user_input": "",
+        "last_original_input": "",
+        "last_exit_reason": "",
+        "pending_continuation": False,
+        "turn_count": 0,
+        "chat_history": copy.deepcopy(chat_history or []),
+        "state": copy.deepcopy(state or {}),
+        "agent_state": copy.deepcopy(state or {}),
+        "tasks": [],
+    }
+    if isinstance(session["state"], dict):
+        session["state"]["_session_id"] = session_id
+        session["agent_state"] = copy.deepcopy(session["state"])
+    save_session(session)
+    return session
+
+
+def load_current_session(cwd: str) -> Optional[dict]:
+    try:
+        path = _current_path(cwd)
+        if not path.exists():
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if data.get("cwd") != cwd or data.get("closed_at"):
+            return None
+        data.setdefault("id", data.get("session_id") or uuid.uuid4().hex[:16])
+        data.setdefault("session_id", data.get("id"))
+        data.setdefault("kind", "live")
+        data.setdefault("chat_history", [])
+        data.setdefault("state", data.get("agent_state") or {})
+        data.setdefault("agent_state", data.get("state") or {})
+        data.setdefault("pending_continuation", False)
+        data.setdefault("last_exit_reason", "")
+        data.setdefault("status", "idle")
+        return data
+    except Exception:
+        return None
+
+
+def ensure_current_session(cwd: str, state: Optional[dict] = None, chat_history: Optional[list] = None) -> dict:
+    return load_current_session(cwd) or create_session(cwd, state, chat_history)
+
+
+def save_session(session: dict) -> None:
+    if not session:
+        return
+    now = time.time()
+    session["updated_at"] = now
+    session["timestamp"] = now
+    session_id = _safe_id(session.get("session_id") or session.get("id"))
+    session["id"] = session_id
+    session["session_id"] = session_id
+    state = session.get("state") or session.get("agent_state") or {}
+    if isinstance(state, dict):
+        state = copy.deepcopy(state)
+        state["_session_id"] = session_id
+        session["state"] = state
+        session["agent_state"] = copy.deepcopy(state)
+    cwd = session.get("cwd") or os.getcwd()
+    paths.SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    _atomic_write_json(_session_path(cwd, session_id), session)
+    current = _current_path(cwd)
+    if session.get("closed_at"):
+        try:
+            existing = json.loads(current.read_text(encoding="utf-8")) if current.exists() else {}
+            if existing.get("session_id") == session_id or existing.get("id") == session_id:
+                current.unlink(missing_ok=True)
+        except Exception:
+            pass
+    else:
+        _atomic_write_json(current, session)
+
+
+def close_session(session: dict) -> dict:
+    if not session:
+        return session
+    session["closed_at"] = time.time()
+    session["status"] = "closed"
+    session["pending_continuation"] = False
+    save_session(session)
+    return session
+
+
+def sync_runtime(session: dict, state: dict, chat_history: list, *, cwd: str = None,
+                 objective: str = None, last_user_input: str = None,
+                 exit_reason: str = None, tasks: list = None) -> dict:
+    if not session:
+        session = create_session(cwd or os.getcwd(), state, chat_history)
+    if cwd:
+        session["cwd"] = cwd
+    if state is not None:
+        session["state"] = copy.deepcopy(state)
+        session["agent_state"] = copy.deepcopy(state)
+    if chat_history is not None:
+        session["chat_history"] = copy.deepcopy(chat_history)
+        session["turn_count"] = len([m for m in chat_history if isinstance(m, dict) and m.get("role") == "user"])
+    if objective is not None and str(objective).strip():
+        session["objective"] = str(objective).strip()
+    elif state and str(state.get("objective") or "").strip():
+        session["objective"] = str(state.get("objective") or "").strip()
+    if last_user_input is not None:
+        session["last_user_input"] = str(last_user_input)
+        session["last_original_input"] = str(last_user_input)
+    if exit_reason is not None:
+        session["last_exit_reason"] = str(exit_reason or "")
+        pending = is_continuable_reason(exit_reason)
+        session["pending_continuation"] = pending
+        session["status"] = str(exit_reason or "idle") if pending else "idle"
+    if tasks is not None:
+        session["tasks"] = copy.deepcopy(tasks)
+    save_session(session)
+    return session

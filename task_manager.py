@@ -49,6 +49,10 @@ _session_tasks: list[dict] = []
 _session_id_counter: int = 0
 
 
+class TaskStorageError(RuntimeError):
+    """Raised when task persistence fails instead of reporting false success."""
+
+
 def _project_path(cwd: str) -> Path:
     """Return the project-level tasks.json path for a given cwd."""
     return Path(cwd) / ".laintas" / "tasks.json"
@@ -62,7 +66,23 @@ def _load(cwd: str = None) -> list[dict]:
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return data if isinstance(data, list) else []
+        if not isinstance(data, list):
+            return []
+        normalized = []
+        for item in data:
+            if not isinstance(item, dict) or "id" not in item:
+                continue
+            task = dict(item)
+            task.setdefault("subject", "(untitled task)")
+            task.setdefault("description", "")
+            task.setdefault("status", "pending")
+            task.setdefault("metadata", {})
+            task.setdefault("blocks", [])
+            task.setdefault("blockedBy", [])
+            task.setdefault("progress", 0)
+            task.setdefault("notes", [])
+            normalized.append(task)
+        return normalized
     except (OSError, json.JSONDecodeError):
         return []
 
@@ -70,15 +90,42 @@ def _load(cwd: str = None) -> list[dict]:
 def _save(tasks: list[dict], cwd: str = None) -> None:
     """Atomically write tasks to disk. cwd selects project-level file."""
     path = _project_path(cwd) if cwd else TASKS_PATH
-    if cwd:
-        path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
     try:
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(tasks, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
         tmp.replace(path)
-    except OSError:
-        pass
+    except OSError as exc:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise TaskStorageError(f"Failed to save tasks to {path}: {exc}") from exc
+
+
+def _new_task_record(task_id: str, subject: str, description: str = "",
+                     metadata: dict = None, *, session_only: bool = False,
+                     parent_task_id: str = None) -> dict:
+    now = datetime.now(timezone.utc).isoformat()
+    task = {
+        "id": task_id,
+        "subject": subject,
+        "description": description,
+        "status": "pending",
+        "created": now,
+        "updated": now,
+        "metadata": metadata or {},
+        "blocks": [],
+        "blockedBy": [str(parent_task_id)] if parent_task_id else [],
+        "progress": 0,
+        "notes": [],
+    }
+    if session_only:
+        task["session_only"] = True
+    return task
 
 
 def _next_id(tasks: list[dict]) -> str:
@@ -105,47 +152,21 @@ def create_task(subject: str, description: str = "",
     """
     global _session_id_counter
     with _lock:
-        now = datetime.now(timezone.utc).isoformat()
-
         if session_only:
             _session_id_counter += 1
             task_id = f"s{_session_id_counter}"
-            task = {
-                "id": task_id,
-                "subject": subject,
-                "description": description,
-                "status": "pending",
-                "created": now,
-                "updated": now,
-                "metadata": metadata or {},
-                "blocks": [],
-                "blockedBy": [],
-                "progress": 0,
-                "notes": [],
-                "session_only": True,
-            }
-            if parent_task_id:
-                task["blockedBy"].append(str(parent_task_id))
+            task = _new_task_record(
+                task_id, subject, description, metadata,
+                session_only=True, parent_task_id=parent_task_id)
             _session_tasks.append(task)
             return dict(task)
 
         tasks = _load(cwd=cwd)
         task_id = _next_id(tasks)
-        task = {
-            "id": task_id,
-            "subject": subject,
-            "description": description,
-            "status": "pending",
-            "created": now,
-            "updated": now,
-            "metadata": metadata or {},
-            "blocks": [],
-            "blockedBy": [],
-            "progress": 0,
-            "notes": [],
-        }
+        task = _new_task_record(
+            task_id, subject, description, metadata,
+            parent_task_id=parent_task_id)
         if parent_task_id:
-            task["blockedBy"].append(str(parent_task_id))
             # Also add this task to parent's blocks list
             for t in tasks:
                 if str(t.get("id")) == str(parent_task_id):
@@ -173,6 +194,7 @@ def update_task(task_id: str, *, cwd: str = None, **kwargs) -> tuple[bool, str, 
     cwd selects the project-level tasks file for persisted tasks.
     Returns (ok, message, updated_task).
     """
+    global _session_id_counter
     with _lock:
         task_id_str = str(task_id)
 
@@ -202,6 +224,19 @@ def update_task(task_id: str, *, cwd: str = None, **kwargs) -> tuple[bool, str, 
             allowed = _STATUS_FLOW.get(current, set())
             if new_status not in allowed:
                 return False, f"Invalid status transition: {current} → {new_status}. Allowed: {allowed}", None
+            if new_status == "in_progress":
+                all_tasks = (_load(cwd=cwd) + list(_session_tasks))
+                incomplete_ids = {
+                    str(item.get("id")) for item in all_tasks
+                    if item.get("status") not in ("completed", "deleted")
+                }
+                blockers = sorted(
+                    set(map(str, target.get("blockedBy", []))) & incomplete_ids)
+                if blockers:
+                    return False, (
+                        f"Task '{task_id}' is blocked by incomplete task(s): "
+                        f"{', '.join(blockers)}. Complete or unlink them first."
+                    ), None
             target["status"] = new_status
 
         if "subject" in kwargs:
@@ -217,7 +252,7 @@ def update_task(task_id: str, *, cwd: str = None, **kwargs) -> tuple[bool, str, 
                 p = max(0, min(100, int(kwargs["progress"])))
                 target["progress"] = p
             except (ValueError, TypeError):
-                pass
+                return False, "progress must be an integer between 0 and 100", None
 
         # Notes (append-only log)
         if "notes" in kwargs:
@@ -238,9 +273,21 @@ def update_task(task_id: str, *, cwd: str = None, **kwargs) -> tuple[bool, str, 
             else:
                 subject = str(subtask_info)
                 desc = ""
-            subtask = create_task(subject, desc, parent_task_id=task_id_str,
-                                   session_only=is_session, cwd=cwd)
-            target.setdefault("blocks", []).append(subtask["id"])
+            if is_session:
+                _session_id_counter += 1
+                subtask_id = f"s{_session_id_counter}"
+                subtask = _new_task_record(
+                    subtask_id, subject, desc, session_only=True,
+                    parent_task_id=task_id_str)
+                _session_tasks.append(subtask)
+            else:
+                subtask_id = _next_id(tasks)
+                subtask = _new_task_record(
+                    subtask_id, subject, desc,
+                    parent_task_id=task_id_str)
+                tasks.append(subtask)
+            if subtask_id not in target.setdefault("blocks", []):
+                target["blocks"].append(subtask_id)
 
         # Dependency management
         for key, op in [("addBlocks", "blocks"), ("addBlockedBy", "blockedBy")]:
@@ -287,8 +334,19 @@ def list_tasks(status: str = None, blocked_by: str = None,
     if blocked_by:
         blocked_by = str(blocked_by)
         tasks = [t for t in tasks if blocked_by in t.get("blockedBy", [])]
-    # Sort: session tasks first (by id), then persisted (numerically)
-    tasks.sort(key=lambda t: (0 if t.get("session_only") else 1, str(t.get("id", "0"))))
+    # Sort session tasks first, then numeric persisted IDs without 10-before-2.
+    def _sort_key(task: dict):
+        task_id = str(task.get("id", ""))
+        numeric = task_id[1:] if task_id.startswith("s") else task_id
+        try:
+            number = int(numeric)
+            fallback = ""
+        except (TypeError, ValueError):
+            number = 10**18
+            fallback = task_id
+        return (0 if task.get("session_only") else 1, number, fallback)
+
+    tasks.sort(key=_sort_key)
     return tasks
 
 
@@ -393,4 +451,3 @@ def import_session_tasks(tasks: list[dict], *, cwd: str = None) -> int:
             restored.append(task)
         _session_tasks = restored
         return len(restored)
-

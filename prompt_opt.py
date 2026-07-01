@@ -37,6 +37,7 @@ import json
 import os
 import re
 import threading
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -51,6 +52,7 @@ _lock = threading.RLock()
 
 # Active optimization session: {"feedback_id", "candidate_id", "status", "child_agent_id"}
 _current_opt: Optional[dict] = None
+_optimizations: dict[str, dict] = {}
 
 # The marker block delimiters injected into cli.prop on /prompt apply.
 PATCH_OPEN = "<prompt_opt_patch>"
@@ -131,11 +133,24 @@ def _load_state() -> dict:
 
 def _save_state(state: dict) -> None:
     ensure_prompts_dir()
+    if state.get("feedback_id"):
+        _optimizations[state["feedback_id"]] = dict(state)
+    payload = {
+        "current": dict(state),
+        "optimizations": _optimizations,
+    }
+    tmp = STATE_PATH.with_suffix(".tmp")
     try:
-        STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2),
-                              encoding="utf-8")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        tmp.replace(STATE_PATH)
     except OSError:
-        pass
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _now_iso() -> str:
@@ -143,7 +158,25 @@ def _now_iso() -> str:
 
 
 def _now_id() -> str:
-    return datetime.now().strftime("%Y%m%d-%H%M%S")
+    return f"{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}-{uuid.uuid4().hex[:8]}"
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        tmp.replace(path)
+    except OSError:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 # ── Feedback capture ─────────────────────────────────────────────────────
@@ -456,11 +489,13 @@ def draft_candidate(feedback_id: str, patch: str, rationale: str) -> dict:
         base_content = ""
     base_sha = hashlib.sha256(base_content.encode("utf-8")).hexdigest()[:16]
 
+    candidate_type = "cli_prop" if patch.strip() else "model_limitation"
     candidate_raw = (
         f"---\n"
         f"id: {cid}\n"
         f"created: {_now_iso()}\n"
         f"status: draft\n"
+        f"type: {candidate_type}\n"
         f"feedback: \"{feedback_id}\"\n"
         f"base_prop_sha: {base_sha}\n"
         f"---\n\n"
@@ -470,28 +505,24 @@ def draft_candidate(feedback_id: str, patch: str, rationale: str) -> dict:
         f"## Patch\n"
         f"<prompt_opt_patch>\n{patch}\n</prompt_opt_patch>\n"
     )
-    _candidate_path(cid).write_text(candidate_raw, encoding="utf-8")
+    _atomic_write_text(_candidate_path(cid), candidate_raw)
 
     with _lock:
         global _current_opt
-        if _current_opt:
-            _current_opt["candidate_id"] = cid
-            _current_opt["status"] = "drafted"
-            _current_opt["patch"] = patch
-            _save_state(_current_opt)
-        else:
-            _current_opt = {
-                "feedback_id": feedback_id,
-                "candidate_id": cid,
-                "status": "drafted",
-                "child_agent_id": None,
-                "started": _now_iso(),
-                "patch": patch,
-            }
-            _save_state(_current_opt)
+        opt = dict(_optimizations.get(feedback_id, {}))
+        opt.update({
+            "feedback_id": feedback_id,
+            "candidate_id": cid,
+            "status": "drafted",
+            "child_agent_id": opt.get("child_agent_id"),
+            "started": opt.get("started") or _now_iso(),
+            "patch": patch,
+        })
+        _current_opt = opt
+        _save_state(_current_opt)
 
-    return {"id": cid, "status": "draft", "feedback": feedback_id,
-            "rationale": rationale, "patch": patch}
+    return {"id": cid, "status": "draft", "type": candidate_type,
+            "feedback": feedback_id, "rationale": rationale, "patch": patch}
 
 
 def list_candidates() -> list[dict]:
@@ -545,6 +576,14 @@ def get_active_candidate_id() -> Optional[str]:
         return (_current_opt or {}).get("candidate_id")
 
 
+def get_optimization_state(feedback_id: Optional[str] = None) -> dict:
+    """Return a copy of public optimizer state for /prompt status."""
+    with _lock:
+        if feedback_id:
+            return dict(_optimizations.get(feedback_id, {}))
+        return dict(_current_opt or {})
+
+
 # ── Apply / discard (cli.prop mutation) ──────────────────────────────────
 
 def _read_live_prop() -> str:
@@ -582,6 +621,11 @@ def apply_candidate(cid: Optional[str] = None,
             return False, "No candidate found to apply."
         patch = cand.get("patch", "").strip()
         if not patch:
+            if cand.get("type") == "model_limitation":
+                return False, (
+                    "This candidate records a model capability limitation and has "
+                    "no patch to apply. Review its rationale instead."
+                )
             return False, "Candidate has no patch block."
 
         # Drift detection
@@ -601,24 +645,35 @@ def apply_candidate(cid: Optional[str] = None,
         new_content = cleaned.rstrip("\n") + "\n\n" + \
             f"{PATCH_OPEN}\n{patch}\n{PATCH_CLOSE}\n"
 
+        cid = cand.get("id", "")
+        backup_path = _candidate_path(cid).with_suffix(".prop.backup")
         try:
-            paths.project_file(paths.CWD_CLI_PROP).write_text(
-                new_content, encoding="utf-8")
+            _atomic_write_text(backup_path, live)
+        except OSError as e:
+            return False, f"Failed to back up cli.prop: {e}"
+
+        try:
+            _atomic_write_text(paths.project_file(paths.CWD_CLI_PROP), new_content)
         except OSError as e:
             return False, f"Failed to write cli.prop: {e}"
 
         # Update candidate status
-        cid = cand.get("id", "")
         _update_candidate_status(cid, "applied")
+        _update_candidate_field(
+            cid, "applied_sha",
+            hashlib.sha256(new_content.encode("utf-8")).hexdigest()[:16],
+        )
         global _current_opt
-        if _current_opt:
-            _current_opt["status"] = "applied"
-            _current_opt["candidate_id"] = cid
-            _save_state(_current_opt)
-        else:
-            _current_opt = {"candidate_id": cid, "status": "applied",
-                            "started": _now_iso()}
-            _save_state(_current_opt)
+        feedback_id = cand.get("feedback", "")
+        opt = dict(_optimizations.get(feedback_id, {}))
+        opt.update({
+            "feedback_id": feedback_id,
+            "candidate_id": cid,
+            "status": "applied",
+            "started": opt.get("started") or _now_iso(),
+        })
+        _current_opt = opt
+        _save_state(_current_opt)
 
         return True, f"Candidate {cid} applied. Patch appended to cli.prop. " \
                      f"Next loop iteration will use the new prompt (no /reload needed)."
@@ -626,35 +681,74 @@ def apply_candidate(cid: Optional[str] = None,
 
 def discard_candidate(cid: Optional[str] = None) -> tuple[bool, str]:
     """Strip the <prompt_opt_patch> block from cli.prop. Fully reverts the patch."""
+    global _current_opt
     with _lock:
         live = _read_live_prop()
         if PATCH_OPEN not in live:
             return True, "No patch block found in cli.prop (nothing to discard)."
-        cleaned = _strip_existing_patch(live)
+        resolved_cid = cid or (_current_opt or {}).get("candidate_id")
+        candidate = read_candidate(resolved_cid) if resolved_cid else None
+        backup_path = (_candidate_path(resolved_cid).with_suffix(".prop.backup")
+                       if resolved_cid else None)
+        if backup_path and backup_path.exists():
+            applied_sha = (candidate or {}).get("applied_sha")
+            live_sha = hashlib.sha256(live.encode("utf-8")).hexdigest()[:16]
+            if applied_sha and live_sha != applied_sha:
+                return False, (
+                    "cli.prop changed after this candidate was applied "
+                    f"(applied sha {applied_sha} -> live {live_sha}). "
+                    "Refusing to overwrite later edits; review /prop diff first."
+                )
+            try:
+                cleaned = backup_path.read_text(encoding="utf-8")
+            except OSError as e:
+                return False, f"Failed to read cli.prop backup: {e}"
+        else:
+            cleaned = _strip_existing_patch(live)
         try:
-            paths.project_file(paths.CWD_CLI_PROP).write_text(
-                cleaned, encoding="utf-8")
+            _atomic_write_text(paths.project_file(paths.CWD_CLI_PROP), cleaned)
         except OSError as e:
             return False, f"Failed to write cli.prop: {e}"
 
-        if cid:
-            _update_candidate_status(cid, "discarded")
-        global _current_opt
-        if _current_opt:
-            _current_opt["status"] = "discarded"
+        if backup_path and backup_path.exists():
+            try:
+                backup_path.unlink()
+            except OSError:
+                pass
+
+        if resolved_cid:
+            _update_candidate_status(resolved_cid, "discarded")
+        feedback_id = ((candidate or {}).get("feedback")
+                       or (_current_opt or {}).get("feedback_id", ""))
+        opt = dict(_optimizations.get(feedback_id, _current_opt or {}))
+        if opt:
+            opt["status"] = "discarded"
+            _current_opt = opt
             _save_state(_current_opt)
 
         return True, "Patch discarded. cli.prop reverted to its base template."
 
 
 def _update_candidate_status(cid: str, status: str) -> None:
+    _update_candidate_field(cid, "status", status)
+
+
+def _update_candidate_field(cid: str, key: str, value: str) -> None:
     p = _candidate_path(cid)
     if not p.exists():
         return
     try:
         raw = p.read_text(encoding="utf-8")
-        raw = re.sub(r"status: \w+", f"status: {status}", raw, count=1)
-        p.write_text(raw, encoding="utf-8")
+        pattern = rf"(?m)^{re.escape(key)}:\s*.*$"
+        replacement = f"{key}: {value}"
+        if re.search(pattern, raw):
+            raw = re.sub(pattern, replacement, raw, count=1)
+        else:
+            end = raw.find("\n---", 3)
+            if end < 0:
+                return
+            raw = raw[:end] + f"\n{replacement}" + raw[end:]
+        _atomic_write_text(p, raw)
     except OSError:
         pass
 
@@ -674,15 +768,42 @@ def _update_candidate_status(cid: str, status: str) -> None:
 
 
 def _resolve_skill_file(skill_name: str, skill_file: str) -> Optional[Path]:
-    """Resolve the full path to a skill file."""
+    """Resolve a skill file while preventing absolute/path-traversal escapes."""
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", skill_name or ""):
+        return None
+    if any(char in (skill_file or "") for char in ("\x00", "\n", "\r")):
+        return None
+    relative = Path(skill_file or "")
+    if (not skill_file or relative.is_absolute()
+            or ".." in relative.parts or relative.name in ("", ".", "..")):
+        return None
     try:
         import skills as skills_mod
         meta = skills_mod.get_all_metadata().get(skill_name)
         if meta and meta.dir_path:
-            return Path(meta.dir_path) / skill_file
+            root = Path(meta.dir_path)
+        else:
+            root = paths.SKILLS_DIR / skill_name
+        allowed_roots = [
+            paths.SKILLS_DIR.expanduser().resolve(strict=False),
+            skills_mod.BUNDLED_SKILLS_DIR.expanduser().resolve(strict=False),
+        ]
     except Exception:
-        pass
-    return paths.SKILLS_DIR / skill_name / skill_file
+        root = paths.SKILLS_DIR / skill_name
+        allowed_roots = [paths.SKILLS_DIR.expanduser().resolve(strict=False)]
+    try:
+        resolved_root = root.expanduser().resolve(strict=False)
+        if not any(
+                resolved_root == allowed
+                or allowed in resolved_root.parents
+                for allowed in allowed_roots):
+            return None
+        resolved_file = (resolved_root / relative).resolve(strict=False)
+        if resolved_file != resolved_root and resolved_root not in resolved_file.parents:
+            return None
+        return resolved_file
+    except (OSError, RuntimeError):
+        return None
 
 
 def draft_skill_patch(skill_name: str, skill_file: str, mode: str,
@@ -697,6 +818,9 @@ def draft_skill_patch(skill_name: str, skill_file: str, mode: str,
     cid = _now_id()
 
     skill_path = _resolve_skill_file(skill_name, skill_file)
+    if skill_path is None:
+        raise ValueError(
+            "Invalid skill path: use a relative file inside the registered skill directory")
     if skill_path and skill_path.exists():
         try:
             base_content = skill_path.read_text(encoding="utf-8")
@@ -736,7 +860,7 @@ def draft_skill_patch(skill_name: str, skill_file: str, mode: str,
         f"---\n\n"
         + "\n".join(body_parts)
     )
-    _candidate_path(cid).write_text(candidate_raw, encoding="utf-8")
+    _atomic_write_text(_candidate_path(cid), candidate_raw)
 
     return {
         "id": cid,
@@ -870,11 +994,15 @@ def apply_skill_patch(cid: Optional[str] = None,
 
         # Write patched file
         try:
-            skill_path.write_text(new_content, encoding="utf-8")
+            _atomic_write_text(skill_path, new_content)
         except OSError as e:
             return False, f"Failed to write skill file: {e}"
 
         _update_candidate_status(cid, "applied")
+        _update_candidate_field(
+            cid, "applied_sha",
+            hashlib.sha256(new_content.encode("utf-8")).hexdigest()[:16],
+        )
 
         # Hot-reload the skill
         try:
@@ -929,13 +1057,24 @@ def discard_skill_patch(cid: Optional[str] = None) -> tuple[bool, str]:
                 flags=re.DOTALL,
             ).rstrip() + "\n"
             try:
-                skill_path.write_text(cleaned, encoding="utf-8")
+                _atomic_write_text(skill_path, cleaned)
             except OSError as e:
                 return False, f"Failed to write skill file: {e}"
         elif backup_path.exists():
             try:
+                current = skill_path.read_text(encoding="utf-8")
+                applied_sha = cand.get("applied_sha")
+                if applied_sha:
+                    current_sha = hashlib.sha256(
+                        current.encode("utf-8")).hexdigest()[:16]
+                    if current_sha != applied_sha:
+                        return False, (
+                            "Skill file changed after this patch was applied "
+                            f"(applied sha {applied_sha} -> live {current_sha}). "
+                            "Refusing to overwrite later edits; revert manually or re-review."
+                        )
                 original = backup_path.read_text(encoding="utf-8")
-                skill_path.write_text(original, encoding="utf-8")
+                _atomic_write_text(skill_path, original)
                 backup_path.unlink()
             except OSError as e:
                 return False, f"Failed to restore from backup: {e}"
@@ -1048,7 +1187,7 @@ def export_pack(cid: str, out_path: Optional[str] = None) -> tuple[bool, str]:
         f"<prompt_opt_patch>\n{cand.get('patch', '')}\n</prompt_opt_patch>\n"
     )
     try:
-        Path(out_path).write_text(pack, encoding="utf-8")
+        _atomic_write_text(Path(out_path), pack)
     except OSError as e:
         return False, str(e)
     return True, out_path
@@ -1060,6 +1199,7 @@ def install_pack(path_or_url: str) -> tuple[bool, str, Optional[str]]:
     Fetches from URL if the arg looks like a URL, else reads a local file.
     Installs as a 'draft' candidate — user must /prompt apply to activate.
     """
+    ensure_prompts_dir()
     raw = ""
     if path_or_url.startswith(("http://", "https://")):
         try:
@@ -1096,6 +1236,12 @@ def install_pack(path_or_url: str) -> tuple[bool, str, Optional[str]]:
         return False, "Invalid pack: no <prompt_opt_patch> block found.", None
     patch = m.group(1).strip()
 
+    try:
+        live_prop = paths.project_file(paths.CWD_CLI_PROP).read_text(encoding="utf-8")
+    except OSError:
+        live_prop = ""
+    base_sha = hashlib.sha256(live_prop.encode("utf-8")).hexdigest()[:16]
+
     cid = _now_id()
     candidate_raw = (
         f"---\n"
@@ -1103,7 +1249,7 @@ def install_pack(path_or_url: str) -> tuple[bool, str, Optional[str]]:
         f"created: {_now_iso()}\n"
         f"status: draft\n"
         f"feedback: \"installed-pack:{meta.get('name', 'unknown')}\"\n"
-        f"base_prop_sha: (imported)\n"
+        f"base_prop_sha: {base_sha}\n"
         f"---\n\n"
         f"# Imported Pack: {meta.get('name', cid)}\n\n"
         f"## Source\n{path_or_url}\n\n"
@@ -1111,7 +1257,7 @@ def install_pack(path_or_url: str) -> tuple[bool, str, Optional[str]]:
         f"## Patch\n"
         f"<prompt_opt_patch>\n{patch}\n</prompt_opt_patch>\n"
     )
-    _candidate_path(cid).write_text(candidate_raw, encoding="utf-8")
+    _atomic_write_text(_candidate_path(cid), candidate_raw)
     return True, f"Pack installed as candidate {cid}. Run /prompt apply {cid} to activate.", cid
 
 
@@ -1179,10 +1325,24 @@ def publish_pack(cid: str, session: dict) -> tuple[bool, str]:
 # ── Init: restore state from disk ────────────────────────────────────────
 
 def _restore_state() -> None:
-    global _current_opt
+    global _current_opt, _optimizations
     state = _load_state()
-    if state:
-        _current_opt = state
+    if not state:
+        return
+    if isinstance(state.get("optimizations"), dict):
+        _optimizations = {
+            str(key): dict(value)
+            for key, value in state["optimizations"].items()
+            if isinstance(value, dict)
+        }
+        current = state.get("current")
+        _current_opt = dict(current) if isinstance(current, dict) else None
+    else:
+        # Backward compatibility with the original single-state file.
+        _current_opt = dict(state)
+        feedback_id = _current_opt.get("feedback_id")
+        if feedback_id:
+            _optimizations[feedback_id] = dict(_current_opt)
 
 
 _restore_state()
