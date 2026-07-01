@@ -228,6 +228,8 @@ class SlashRegistryTests(unittest.TestCase):
             with mock.patch.object(laintas_cli, "get_terminal", return_value=terminal), \
                     mock.patch.object(laintas_cli, "_ensure_term0_alive"), \
                     mock.patch.object(laintas_cli, "_sync_cwd_from_term0"), \
+                    mock.patch.object(laintas_cli, "authorize_direct_command",
+                                      return_value=(True, "")), \
                     mock.patch.object(laintas_cli, "_marker_poll_exec", side_effect=execute):
                 laintas_cli.handle_meta_command(
                     "/bash printf '%s\\n' 'a  b'", _Registry(), {})
@@ -257,13 +259,39 @@ class SlashRegistryTests(unittest.TestCase):
         try:
             with mock.patch.object(
                     laintas_cli, "get_terminal",
-                    return_value=mock.Mock(session=session)):
+                    return_value=mock.Mock(session=session)), \
+                    mock.patch.object(laintas_cli, "authorize_direct_command",
+                                      return_value=(True, "")):
                 laintas_cli.handle_meta_command(
                     "/send term1 --wait 0.01 echo hi", _Registry(), {})
         finally:
             laintas_cli.console = old_console
         self.assertIn("NEW OUTPUT", output.getvalue())
         self.assertNotIn("STALE OUTPUT", output.getvalue())
+
+    def test_bash_denial_does_not_execute(self):
+        session = mock.Mock()
+        session.is_alive.return_value = True
+        terminal = mock.Mock(session=session)
+        with mock.patch.object(laintas_cli, "get_terminal", return_value=terminal), \
+                mock.patch.object(laintas_cli, "authorize_direct_command",
+                                  return_value=(False, "denied")), \
+                mock.patch.object(laintas_cli, "_marker_poll_exec") as execute:
+            laintas_cli.handle_meta_command(
+                "/bash rm file.txt", _Registry(), {})
+        execute.assert_not_called()
+
+    def test_send_denial_does_not_send_keys(self):
+        session = mock.Mock(full_output="")
+        session.is_alive.return_value = True
+        with mock.patch.object(
+                laintas_cli, "get_terminal",
+                return_value=mock.Mock(session=session)), \
+                mock.patch.object(laintas_cli, "authorize_direct_command",
+                                  return_value=(False, "denied")):
+            laintas_cli.handle_meta_command(
+                "/send term1 rm file.txt", _Registry(), {})
+        session.send_keys.assert_not_called()
 
 
 class ConfigAndMemoryTests(unittest.TestCase):

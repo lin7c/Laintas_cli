@@ -21,6 +21,9 @@ from __future__ import annotations
 import json
 import os
 import re
+import hashlib
+import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -596,6 +599,164 @@ def _check_file_write_policy(abs_path: str, ctx: ToolCtx, diff_preview: str) -> 
             if not approved:
                 return {"ok": False, "error": f"User denied write: {decision.reason}", "path": abs_path}
     return None
+
+
+def _check_file_delete_policy(abs_path: str, ctx: ToolCtx,
+                              preview: str) -> Optional[dict]:
+    """Authorize deletion before any filesystem mutation occurs."""
+    if _policy_mod is None:
+        return None
+    try:
+        decision = _policy_mod.evaluate_file_delete(
+            abs_path, ctx.cwd, agent_id=ctx.agent_id)
+    except Exception as exc:
+        return {"ok": False, "error": f"Delete policy failed: {exc}",
+                "path": abs_path}
+    if decision.action == "deny":
+        return {"ok": False,
+                "error": f"Blocked by policy: {decision.reason}",
+                "path": abs_path}
+    if decision.action == "needs_approval":
+        approve_fn = (getattr(ctx.deps, "request_file_delete_approval", None)
+                      if ctx.deps is not None else None)
+        if not callable(approve_fn):
+            return {"ok": False,
+                    "error": "Deletion requires approval but no approval channel is available",
+                    "path": abs_path}
+        try:
+            approved = approve_fn(abs_path, preview, decision.reason)
+        except Exception:
+            approved = False
+        if not approved:
+            return {"ok": False,
+                    "error": f"User denied deletion: {decision.reason}",
+                    "path": abs_path}
+    return None
+
+
+_DELETE_ENTRY_LIMIT = 10_000
+_DELETE_PREVIEW_LIMIT = 80
+
+
+def _describe_delete_target(abs_path: str) -> tuple[dict, Optional[str]]:
+    """Return a bounded preview and fingerprint without following symlinks."""
+    try:
+        root_stat = os.lstat(abs_path)
+    except OSError as exc:
+        return {}, str(exc)
+
+    digest = hashlib.sha256()
+    entries: list[str] = []
+    count = 1
+
+    def _add(rel: str, st, suffix: str = "") -> None:
+        nonlocal count
+        encoded = (f"{rel}\0{st.st_dev}\0{st.st_ino}\0{st.st_mode}\0"
+                   f"{st.st_size}\0{st.st_mtime_ns}").encode(
+                       "utf-8", errors="surrogateescape")
+        digest.update(encoded)
+        if len(entries) < _DELETE_PREVIEW_LIMIT:
+            entries.append(rel + suffix)
+
+    is_link = stat.S_ISLNK(root_stat.st_mode)
+    is_dir = stat.S_ISDIR(root_stat.st_mode) and not is_link
+    kind = "symlink" if is_link else "directory" if is_dir else "file"
+    _add(".", root_stat, "/" if is_dir else "")
+
+    if is_dir:
+        def _raise_walk_error(exc):
+            raise exc
+        try:
+            for base, dirs, files in os.walk(
+                    abs_path, followlinks=False, onerror=_raise_walk_error):
+                dirs.sort()
+                files.sort()
+                for name in dirs + files:
+                    full = os.path.join(base, name)
+                    rel = os.path.relpath(full, abs_path)
+                    try:
+                        item_stat = os.lstat(full)
+                    except OSError as exc:
+                        return {}, f"Cannot inspect '{rel}': {exc}"
+                    count += 1
+                    if count > _DELETE_ENTRY_LIMIT:
+                        return {}, (
+                            f"Refusing to delete more than {_DELETE_ENTRY_LIMIT} entries "
+                            "in one operation")
+                    _add(rel, item_stat,
+                         "/" if stat.S_ISDIR(item_stat.st_mode)
+                         and not stat.S_ISLNK(item_stat.st_mode) else "")
+        except OSError as exc:
+            return {}, str(exc)
+
+    preview_lines = [
+        f"DELETE {kind}: {abs_path}",
+        f"Entries: {count}",
+        "Contents:",
+        *[f"  - {entry}" for entry in entries],
+    ]
+    if count > len(entries):
+        preview_lines.append(
+            f"  ... {count - len(entries)} additional entries")
+    return {
+        "kind": kind,
+        "count": count,
+        "fingerprint": digest.hexdigest(),
+        "preview": "\n".join(preview_lines),
+    }, None
+
+
+def _bi_fs_delete(params: dict, ctx: ToolCtx) -> dict:
+    """Delete one file, symlink, or directory after explicit policy approval."""
+    path = params.get("path")
+    recursive = bool(params.get("recursive", False))
+    if not path:
+        return {"ok": False, "error": "missing 'path'"}
+    abs_path = (os.path.abspath(os.path.join(ctx.cwd or os.getcwd(), path))
+                if not os.path.isabs(path) else os.path.abspath(path))
+    if not os.path.lexists(abs_path):
+        return {"ok": False, "error": f"Path does not exist: {abs_path}",
+                "path": abs_path}
+
+    before, error = _describe_delete_target(abs_path)
+    if error:
+        return {"ok": False, "error": error, "path": abs_path}
+    if before["kind"] == "directory" and before["count"] > 1 and not recursive:
+        return {"ok": False,
+                "error": "Directory is not empty; set recursive=true to delete it",
+                "path": abs_path, "entries": before["count"]}
+
+    blocked = _check_file_delete_policy(abs_path, ctx, before["preview"])
+    if blocked is not None:
+        return blocked
+
+    # Detect replacements or content changes while the user was reviewing the
+    # confirmation.  Never apply an approval to a different target snapshot.
+    after, error = _describe_delete_target(abs_path)
+    if error:
+        return {"ok": False,
+                "error": f"Delete target changed before execution: {error}",
+                "path": abs_path}
+    if after["fingerprint"] != before["fingerprint"]:
+        return {"ok": False,
+                "error": "Delete target changed while awaiting approval; review again",
+                "path": abs_path}
+
+    try:
+        if before["kind"] == "directory":
+            if recursive:
+                shutil.rmtree(abs_path)
+            else:
+                os.rmdir(abs_path)
+        else:
+            os.unlink(abs_path)
+    except OSError as exc:
+        return {"ok": False, "error": str(exc), "path": abs_path}
+
+    return {"ok": True,
+            "result": f"Deleted {before['kind']} {abs_path}",
+            "path": abs_path, "kind": before["kind"],
+            "entries_deleted": before["count"]}
 
 
 def _bi_fs_write(params: dict, ctx: ToolCtx) -> dict:
@@ -3662,6 +3823,23 @@ def register_builtin_tools() -> None:
                 "required": ["path", "content"],
             },
             invoke=_bi_fs_write,
+        ),
+        Tool(
+            name="fs.delete",
+            description="Delete one file, symlink, or directory through the security policy. "
+                        "Non-empty directories require recursive=true. The target is inspected "
+                        "again after approval and deletion is cancelled if it changed.",
+            schema={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string",
+                             "description": "absolute or cwd-relative target"},
+                    "recursive": {"type": "boolean", "default": False,
+                                  "description": "required for non-empty directories"},
+                },
+                "required": ["path"],
+            },
+            invoke=_bi_fs_delete,
         ),
         Tool(
             name="fs.ls",

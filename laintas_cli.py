@@ -3162,6 +3162,21 @@ def ensure_files_exist() -> None:
 def reload_default_files() -> None:
     """Delete all project files in .laintas/ and restart laintas_cli."""
     proj = paths.project_dir()
+    existing = [proj / name for name in paths._ALL_CWD_FILES
+                if (proj / name).exists()]
+    if existing:
+        import policy as _policy
+        decision = _policy.evaluate_file_delete(str(proj), os.getcwd())
+        if decision.action == "deny":
+            console.print(f"[red]Blocked by policy: {decision.reason}[/red]")
+            return
+        if decision.action == "needs_approval":
+            preview = "DELETE generated project files\n" + "\n".join(
+                f"  {path}" for path in existing)
+            if not request_file_delete_approval(
+                    str(proj), preview, decision.reason):
+                console.print("[yellow]Reload cancelled; no files were deleted.[/yellow]")
+                return
     for name in paths._ALL_CWD_FILES:
         f = proj / name
         if f.exists():
@@ -4447,6 +4462,8 @@ class AgentRegistry:
                 req_id, cmd, os.getcwd()) == "approve",
             request_file_write_approval=lambda path, diff, reason: self._request_approval(
                 req_id, f"WRITE {path} — {reason}", os.getcwd()) == "approve",
+            request_file_delete_approval=lambda path, preview, reason: self._request_approval(
+                req_id, f"DELETE {path} — {reason}\n{preview}", os.getcwd()) == "approve",
         )
 
         session = self._session or {}
@@ -6054,6 +6071,10 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
                 console.print(f"[green]'{parts[2]}' now routes through term0/marker-poll.[/green]")
         else:
             raw_cmd = raw_args
+            allowed, denial = authorize_direct_command(raw_cmd, os.getcwd())
+            if not allowed:
+                console.print(f"[red]{denial}[/red]")
+                return False
             if not IS_WINDOWS:
                 _ensure_term0_alive()
             _t0 = get_terminal("term0")
@@ -7068,6 +7089,10 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
             elif term.session is None or not term.session.is_alive():
                 console.print(f"[yellow]Terminal '{name}' has no active session.[/yellow]")
             else:
+                allowed, denial = authorize_direct_command(cmd, os.getcwd())
+                if not allowed:
+                    console.print(f"[red]{denial}[/red]")
+                    return False
                 old_len = len(term.session.full_output)
                 term.session.send_keys(cmd + "\n")
                 console.print(f"[dim]Sent to [bold]{name}[/bold]: {cmd[:80]}[/dim]")
@@ -7954,6 +7979,7 @@ def get_loop_deps() -> LoopDeps:
             build_subterminal_cmd=_build_subterminal_cmd,
             request_command_approval=request_command_approval,
             request_file_write_approval=request_file_write_approval,
+            request_file_delete_approval=request_file_delete_approval,
         )
     return _loop_deps
 
@@ -8360,6 +8386,13 @@ def _blocking_approval_prompt(title: str, body: str, question: str,
 def request_command_approval(command: str, reason: str) -> bool:
     """Block and ask the user to approve a command that matched a needs_approval
     policy rule. Wired as LoopDeps.request_command_approval for the local REPL."""
+    import policy as _policy
+    if _policy.is_delete_command(command):
+        return request_file_delete_approval(
+            command,
+            f"DELETE via shell command\n{command}",
+            reason,
+        )
     if _session_approval_state["all_commands"]:
         return True
     choice = _blocking_approval_prompt(
@@ -8373,6 +8406,23 @@ def request_command_approval(command: str, reason: str) -> bool:
         console.print("[dim]↳ All commands auto-approved for this session.[/dim]")
         return True
     return choice == "yes"
+
+
+def authorize_direct_command(command: str, cwd: str = None) -> tuple[bool, str]:
+    """Apply the same policy gateway to commands typed into the REPL.
+
+    Direct commands previously bypassed policy entirely.  Returning a reason
+    lets the REPL and remote-chat caller report a deterministic denial without
+    executing any part of the command.
+    """
+    import policy as _policy
+    decision = _policy.evaluate(command, cwd or os.getcwd())
+    if decision.action == "deny":
+        return False, f"Blocked by policy: {decision.reason}"
+    if decision.action == "needs_approval":
+        if not request_command_approval(command, decision.reason):
+            return False, f"User denied: {decision.reason}"
+    return True, ""
 
 
 def request_file_write_approval(path: str, diff_preview: str, reason: str) -> bool:
@@ -8399,6 +8449,18 @@ def request_file_write_approval(path: str, diff_preview: str, reason: str) -> bo
         _session_approval_state["all_writes"] = True
         console.print("[dim]↳ All file writes auto-approved for this session.[/dim]")
         return True
+    return choice == "yes"
+
+
+def request_file_delete_approval(path: str, preview: str, reason: str) -> bool:
+    """Require a fresh confirmation for every destructive delete operation."""
+    body = "\n".join(part for part in (path, reason, "", preview) if part)
+    choice = _blocking_approval_prompt(
+        "Deletion approval required",
+        body,
+        "Delete this target?",
+        allow_always=False,
+    )
     return choice == "yes"
 
 
@@ -9274,6 +9336,30 @@ def main():
             console.print(f"\n[dim yellow]$ {user_input}[/dim yellow]")
             if agent_registry.agent_id:
                 agent_registry._push_events([{"type": "system", "kind": "command", "content": user_input}])
+
+            _command_allowed, _command_denial = authorize_direct_command(
+                user_input, os.getcwd())
+            if not _command_allowed:
+                console.print(f"[red]{_command_denial}[/red]")
+                agent_state["lastOutput"] = _command_denial
+                if agent_registry.agent_id:
+                    agent_registry._push_events([{
+                        "type": "system", "kind": "output",
+                        "content": _command_denial,
+                    }])
+                if args.depth == 0 and current_live_session:
+                    current_live_session = session_store.sync_runtime(
+                        current_live_session, agent_state, chat_history,
+                        cwd=_session_start_cwd,
+                        tasks=task_manager.export_active_tasks(
+                            cwd=_session_start_cwd),
+                    )
+                    handle_meta_command._current_live_session = current_live_session
+                    save_resume_state(
+                        agent_state, chat_history, _session_start_cwd)
+                if injected_done is not None:
+                    injected_done.set()
+                continue
 
             # Close previous AI-managed interactive session if any
             if interactive_session is not None:

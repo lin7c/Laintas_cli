@@ -1575,6 +1575,7 @@ class LoopDeps:
     build_subterminal_cmd: Optional[Callable[..., str]] = None
     request_command_approval: Optional[Callable[[str, str], bool]] = None
     request_file_write_approval: Optional[Callable[[str, str, str], bool]] = None
+    request_file_delete_approval: Optional[Callable[[str, str, str], bool]] = None
 
 
 # ── Structured Memory System (.laintas/memory.json) ───────────────────────
@@ -3148,7 +3149,8 @@ def _check_policy(command: str, agent_id: str = None,
     return True, "", False
 
 
-def _process_parent_cmd_marker(cmd_output: str) -> tuple:
+def _process_parent_cmd_marker(cmd_output: str, *, deps=None,
+                               agent_id: str = None) -> tuple:
     """Scan sub-terminal output for __PARENT_CMD__:<cmd> markers.
     Execute any found commands in the parent context and return
     (cleaned_output, parent_result | None)."""
@@ -3158,6 +3160,11 @@ def _process_parent_cmd_marker(cmd_output: str) -> tuple:
         return cmd_output, None
     cmd = m.group(1).strip()
     cleaned = _re.sub(r'__PARENT_CMD__:[^\n]*\n?', '', cmd_output).strip()
+    allowed, reason, _ = _check_policy(
+        cmd, agent_id=agent_id, deps=deps,
+    )
+    if not allowed:
+        return cleaned, f"BLOCKED: {reason}"
     result = _execute_parent_command(cmd)
     return cleaned, result
 
@@ -3237,7 +3244,12 @@ def _policy_command_arg(name: str, arguments: dict) -> str:
     if not isinstance(arguments, dict):
         return ""
     if name in ("shell.exec", "terminal.exec", "terminal.send"):
-        return arguments.get("command", "") or ""
+        command = arguments.get("command", "") or ""
+        # parent(<command>) executes the nested text in the parent process.
+        # Evaluate that text so anchored rules cannot be bypassed by the
+        # harmless-looking wrapper.
+        parent_match = re.fullmatch(r"\s*parent\((.*)\)\s*", command, re.DOTALL)
+        return parent_match.group(1).strip() if parent_match else command
     return ""
 
 
@@ -4351,7 +4363,10 @@ def run_agent_loop(
 
                         # __PARENT_CMD__ marker handling for shell.exec via session
                         if name == "shell.exec" and result.get("via") in ("stationed", "interactive"):
-                            _cleaned, _parent_result = _process_parent_cmd_marker(result.get("result", "") or "")
+                            _cleaned, _parent_result = _process_parent_cmd_marker(
+                                result.get("result", "") or "",
+                                deps=deps, agent_id=agent_id,
+                            )
                             if _parent_result is not None:
                                 result["result"] = (_cleaned or "").rstrip() + f"\n[parent] {_parent_result}"
 

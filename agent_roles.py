@@ -329,7 +329,7 @@ def _register_builtin_roles() -> None:
             system_prompt=_SIMPLIFIER_PROMPT,
             color="cyan",
             allowed_tools=[
-                "fs.read", "fs.write", "fs.edit", "fs.multi_edit", "fs.diff",
+                "fs.read", "fs.write", "fs.edit", "fs.multi_edit", "fs.delete", "fs.diff",
                 "fs.ls", "fs.grep", "fs.glob",
                 "shell.exec",
             ],

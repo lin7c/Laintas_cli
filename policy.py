@@ -69,6 +69,8 @@ _DEFAULT_CONFIG = {
         r"^/(?:term|t|session|keys|station|terminate|send|hire|agents|spawn|tell|wait|abort|tool|config|reload|scan|clear|debug|memory|prop|cwd|help|login|name|exit|quit)\b",
     ],
     "needs_approval": [
+        r"(?:^|[;&|]\s*|\n\s*)(?:\S*/)?(?:rm|rmdir|unlink|shred)(?:\s|$)",
+        r"\bxargs\s+(?:\S*/)?(?:rm|rmdir|unlink|shred)(?:\s|$)",
         r"^git\s+push", r"^git\s+commit", r"^git\s+reset",
         r"^git\s+rebase", r"^git\s+merge", r"^git\s+checkout",
         r"^npm\s+install\s+-g", r"^npm\s+uninstall",
@@ -167,6 +169,7 @@ _WINDOWS_DEFAULT_CONFIG = {
         r"^dotnet\s+--", r"^wsl\s+--list",
     ],
     "needs_approval": [
+        r"(?:^|[&|]\s*)(?:del|erase|rmdir|rd)(?:\s|$)",
         r"^del\s", r"^erase\s",
         r"^move\s", r"^copy\s", r"^xcopy\s", r"^robocopy\s",
         r"^attrib\s", r"^icacls\s", r"^takeown\s",
@@ -285,6 +288,17 @@ def _migrate_config(cfg: dict) -> dict:
         if rule not in approval_list:
             approval_list.append(rule)
             changed = True
+    # v2026-07-01: deletion was previously allowed inside allowedRoots.  It is
+    # destructive regardless of location, so existing configs must inherit the
+    # new confirmation rule as well as newly-created configs.
+    _required_approval = [
+        r"(?:^|[;&|]\s*|\n\s*)(?:\S*/)?(?:rm|rmdir|unlink|shred)(?:\s|$)",
+        r"\bxargs\s+(?:\S*/)?(?:rm|rmdir|unlink|shred)(?:\s|$)",
+    ]
+    for rule in _required_approval:
+        if rule not in approval_list:
+            approval_list.append(rule)
+            changed = True
     if changed:
         cfg["deny"] = deny_list
         cfg["needs_approval"] = approval_list
@@ -328,6 +342,27 @@ def _compile_rules(patterns: list) -> list[re.Pattern]:
     return compiled
 
 
+def is_delete_command(command: str) -> bool:
+    """Return whether *command* invokes a common destructive delete utility.
+
+    Callers use this to require a fresh Yes/No decision for deletion instead
+    of honoring the session-wide "approve all commands" shortcut.
+    """
+    stripped = (command or "").strip()
+    parent_match = re.fullmatch(r"parent\((.*)\)", stripped, re.DOTALL)
+    if parent_match:
+        stripped = parent_match.group(1).strip()
+    stripped = re.sub(r"^sudo(?:\s+-\S+)*\s+", "", stripped)
+    if IS_WINDOWS:
+        patterns = (r"(?:^|[&|]\s*)(?:del|erase|rmdir|rd)(?:\s|$)",)
+    else:
+        patterns = (
+            r"(?:^|[;&|]\s*|\n\s*)(?:\S*/)?(?:rm|rmdir|unlink|shred)(?:\s|$)",
+            r"\bxargs\s+(?:\S*/)?(?:rm|rmdir|unlink|shred)(?:\s|$)",
+        )
+    return any(re.search(pattern, stripped) for pattern in patterns)
+
+
 def evaluate(command: str, cwd: str = None,
              req_id: str = None, agent_id: str = None) -> PolicyDecision:
     """Evaluate a command against the security policy.
@@ -339,6 +374,12 @@ def evaluate(command: str, cwd: str = None,
     mode = cfg.get("mode", "audit")
 
     stripped = command.strip()
+    # `parent(...)` is a laintas shell override whose body executes in the
+    # parent process.  Policy must inspect the body at every entry point
+    # (/send, direct REPL, and agent tools), not the wrapper text.
+    parent_match = re.fullmatch(r"parent\((.*)\)", stripped, re.DOTALL)
+    if parent_match:
+        stripped = parent_match.group(1).strip()
 
     # ── Select platform-specific rule sets ─────────────────────────────
     if IS_WINDOWS:
@@ -365,12 +406,12 @@ def evaluate(command: str, cwd: str = None,
         ))
         return PolicyDecision("deny", "", f"Exceeds max command length ({max_len} chars)")
 
-    if cfg.get("blockSudo", True) and re.match(r'^sudo\s', stripped):
+    sudo_detected = bool(
+        cfg.get("blockSudo", True) and re.match(r'^sudo\s', stripped))
+    if sudo_detected:
         _write_audit(_audit_entry(
             command, "needs_approval", "sudo detected", cwd, req_id, agent_id,
         ))
-        if mode == "enforce":
-            return PolicyDecision("needs_approval", "sudo", "sudo commands require approval")
 
     # ── Check deny list first (takes precedence) ───────────────────────
     deny_rules = _compile_rules(_merged_rules("deny"))
@@ -385,6 +426,12 @@ def evaluate(command: str, cwd: str = None,
                 return PolicyDecision("deny", rule.pattern, reason)
 
     # ── Check needs_approval list ──────────────────────────────────────
+    # Deny rules take precedence over sudo approval.  Otherwise approving
+    # `sudo rm -rf /` would bypass the destructive-command deny list.
+    if sudo_detected and mode == "enforce":
+        return PolicyDecision(
+            "needs_approval", "sudo", "sudo commands require approval")
+
     approval_rules = _compile_rules(_merged_rules("needs_approval"))
     for rule in approval_rules:
         if rule.search(stripped):
@@ -591,6 +638,51 @@ def evaluate_file_write(path: str, cwd: str | None = None,
         return PolicyDecision("needs_approval", "", reason)
 
     _write_audit(_audit_entry(label, "allow", "default allow", cwd, req_id, agent_id))
+    return PolicyDecision("allow")
+
+
+def evaluate_file_delete(path: str, cwd: str | None = None,
+                         req_id: str | None = None,
+                         agent_id: str | None = None) -> PolicyDecision:
+    """Evaluate deletion of one filesystem target.
+
+    Sensitive credential/config targets remain denied.  In enforce mode every
+    other deletion requires explicit confirmation, including targets inside
+    the current project.  Audit mode records the decision and allows it;
+    disabled mode bypasses policy entirely.
+    """
+    cfg = _load_config()
+    mode = cfg.get("mode", "audit")
+    if mode == "disabled":
+        return PolicyDecision("allow")
+
+    try:
+        abs_path = str(Path(path).resolve(strict=False))
+    except OSError:
+        abs_path = path
+    label = f"delete {abs_path}"
+
+    deny_patterns = list(dict.fromkeys(
+        cfg.get("denyFileWrite", []) + _DEFAULT_CONFIG["denyFileWrite"]))
+    for pattern in deny_patterns:
+        try:
+            hit = re.search(pattern, abs_path)
+        except re.error:
+            continue
+        if hit:
+            reason = f"Matched protected delete target: {pattern}"
+            _write_audit(_audit_entry(
+                label, "deny", reason, cwd, req_id, agent_id))
+            return PolicyDecision("deny", pattern, reason)
+
+    if mode == "enforce":
+        reason = "enforce mode requires approval for all file deletions"
+        _write_audit(_audit_entry(
+            label, "needs_approval", reason, cwd, req_id, agent_id))
+        return PolicyDecision("needs_approval", "", reason)
+
+    _write_audit(_audit_entry(
+        label, "allow", "audit mode allows deletion", cwd, req_id, agent_id))
     return PolicyDecision("allow")
 
 
