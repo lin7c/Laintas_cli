@@ -217,6 +217,7 @@ import migrate as migrate_mod  # Auto-migration from old layout
 import hwo_ui as hwo_ui_mod  # /hwo orchestration UI
 import browser_session as browser_mod  # headless-browser live-view stack
 import session_store             # durable live current-session state
+import event_log                 # prompt admission + interrupted-run recovery
 
 # MCP client: lazy import (saves ~1.8s on startup)
 _mcp_mod = None
@@ -2850,7 +2851,7 @@ The catalog below documents each tool's purpose and parameters:
 
 <workflow>
 - Plan with tasks. For any multi-step task (≈3+ steps), at the FIRST turn call `task_create` to decompose into sub-tasks. Use clear, specific task names that describe the actual work (e.g., "Refactor auth module", "Extract API client"), NOT the user's raw request. Keep exactly one task `in_progress`; mark `task_update ... completed` as you finish each. The task list is your durable plan — it survives context compression and is how you resume. The `<active_tasks>` block shows it every turn.
-- Resuming: the session stays alive until `/q`. If the user asks to continue/resume prior work ("继续", "continue", "接着", etc.), call `session.continue` to resume the pinned `<objective>` and in_progress `<active_tasks>` — do NOT create a new task. The session's full context is already in your thread; just keep going.
+- Resuming: the session stays alive until `/q`. If the user asks to continue/resume prior work ("继续", "continue", "接着", etc.), call `session.continue` to resume the latest interrupted run and in_progress `<active_tasks>` — do NOT create a new task. The session's full context is already in your thread; just keep going.
 - If the user asks a clear read/edit/build/test/investigate task, act with tools. Do not ask for permission to do exactly what was asked.
 - Ask one concise clarifying question only when the target or intent is genuinely ambiguous, destructive, impossible to infer safely, or blocked on information you cannot discover yourself.
 - If there are multiple reasonable approaches with materially different tradeoffs, stop and present 2-3 labeled options. State the consequence of each option briefly, then wait for the user's choice.
@@ -3606,11 +3607,11 @@ def call_backend_stream(
             }
 
         # ── 3. PROSE FINAL ─────────────────────────────────────────────────
-        # No tool calls anywhere: a tool-call-free turn IS the model's final
-        # answer (or a question back to the user). The content is plain prose —
-        # there is no JSON-envelope protocol to parse or to fail on.
+        # No tool calls anywhere: return the provider text verbatim.  Do not
+        # fabricate a "(no response)" reply because that converts an empty or
+        # malformed provider turn into a successful prose completion.
         return {
-            "reply": raw_text or "(no response)",
+            "reply": raw_text,
             "tool_calls": [],
             "finish_reason": finish_reason or "stop",
             "done": False,
@@ -4400,9 +4401,7 @@ class AgentRegistry:
                 return
 
         max_loops_val = int(payload.get("maxLoops", get_runtime_config("max_loops")))
-        # Temporarily override max_loops for this delegation
-        old_max = get_runtime_config("max_loops")
-        set_runtime_config("max_loops", min(max_loops_val, 20))
+        max_loops_val = max(1, min(max_loops_val, 20))
 
         # Context briefing from the caller (HelpwoAI conversation summary).
         # Injected ahead of the goal so the delegated loop knows WHY it was
@@ -4479,6 +4478,8 @@ class AgentRegistry:
                         chat_history=chat_history,
                         events_cb=_delegate_events,
                         depth=0,
+                        interrupt_event=abort_ev,
+                        max_loops_override=max_loops_val,
                     )
                 except InterruptedError:
                     result = {"success": False, "msg": "aborted", "state": {}}
@@ -4506,7 +4507,6 @@ class AgentRegistry:
         except Exception as e:
             self._push_final(req_id, "fail", f"delegate error: {e}")
         finally:
-            set_runtime_config("max_loops", old_max)
             with self._active_req_lock:
                 self._active_requests.pop(req_id, None)
 
@@ -7556,10 +7556,18 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
         _prev_existing_session = getattr(handle_meta_command, '_last_existing_session', None)
 
         if _current_live:
-            _prev_state = _current_live.get("state") or _current_live.get("agent_state") or _prev_state
-            _prev_chat = _current_live.get("chat_history") or _prev_chat or []
-            _prev_input = (_current_live.get("objective") or _current_live.get("last_original_input")
-                           or _current_live.get("last_user_input") or _prev_input)
+            # Prefer the mutable objects used by the main REPL.  The persisted
+            # live-session payload is a restart fallback, not a second runtime
+            # source of truth.
+            if _prev_state is None:
+                _prev_state = (_current_live.get("state")
+                               or _current_live.get("agent_state"))
+            if _prev_chat is None:
+                _prev_chat = _current_live.get("chat_history") or []
+            _prev_input = (_current_live.get("last_original_input")
+                           or _current_live.get("last_user_input")
+                           or _prev_input
+                           or _current_live.get("objective"))
 
         if _prev_state is None or _prev_input is None:
             console.print("[yellow]No previous agent loop to continue.[/yellow]")
@@ -7581,13 +7589,20 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
 
         response = _run_agent_loop_with_interrupt(
             _prev_deps, _prev_input, _prev_session, _prev_state,
-            _prev_chat or [],
+            _prev_chat if _prev_chat is not None else [],
             events_cb=_prev_events_cb,
             existing_session=_prev_existing_session,
             continue_thread=True,
         )
 
-        handle_meta_command._last_agent_state = response.get("state", _prev_state)
+        _continued_state = prepare_state_for_repl(
+            response.get("state", _prev_state))
+        if isinstance(_prev_state, dict):
+            _prev_state.clear()
+            _prev_state.update(_continued_state)
+            _continued_state = _prev_state
+
+        handle_meta_command._last_agent_state = _continued_state
         handle_meta_command._last_chat_history = _prev_chat
         handle_meta_command._last_original_input = _prev_input
         handle_meta_command._last_deps = _prev_deps
@@ -7603,8 +7618,8 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
             try:
                 updated = session_store.sync_runtime(
                     _current_live,
-                    prepare_state_for_repl(response.get("state", _prev_state)),
-                    _prev_chat or [],
+                    _continued_state,
+                    _prev_chat if _prev_chat is not None else [],
                     cwd=_current_live.get("cwd") or os.getcwd(),
                     objective=_prev_input,
                     last_user_input=_prev_input,
@@ -8736,6 +8751,9 @@ def main():
     # Load last session snapshot for this directory (depth-0 only)
     if args.depth == 0:
         current_live_session = session_store.load_current_session(_session_start_cwd)
+        _session_warning = session_store.consume_last_error()
+        if _session_warning:
+            console.print(f"[yellow]{_session_warning}[/yellow]")
         if current_live_session:
             agent_state = _restore_resume_blob(current_live_session, chat_history)
             handle_meta_command._current_live_session = current_live_session
@@ -8747,6 +8765,39 @@ def main():
         else:
             current_live_session = session_store.create_session(_session_start_cwd, agent_state, chat_history)
             handle_meta_command._current_live_session = current_live_session
+
+        # Recover an admitted prompt whose run never emitted turn_ended.  Do
+        # not auto-execute it: tool side effects may already have happened.
+        # Restoring the prompt and marking it continuable is safe and leaves
+        # the retry decision with the user.
+        _incomplete = event_log.last_incomplete_task()
+        if (_incomplete and current_live_session
+                and not event_log.owner_process_is_alive(_incomplete)):
+            _event_session = str(_incomplete.get("session_id") or "")
+            _live_id = str(current_live_session.get("session_id") or "")
+            if not _event_session or _event_session == _live_id:
+                _recovered_text = str(_incomplete.get("text") or "").strip()
+                _already_present = any(
+                    m.get("role") == "user"
+                    and str(m.get("content") or "").strip() == _recovered_text
+                    for m in chat_history
+                )
+                if _recovered_text and not _already_present:
+                    chat_history.append({"role": "user", "content": _recovered_text})
+                current_live_session = session_store.sync_runtime(
+                    current_live_session, agent_state, chat_history,
+                    cwd=_session_start_cwd,
+                    objective=_recovered_text or None,
+                    last_user_input=_recovered_text or None,
+                    exit_reason="crash_recovery",
+                    tasks=task_manager.export_active_tasks(cwd=_session_start_cwd),
+                )
+                handle_meta_command._current_live_session = current_live_session
+                event_log.acknowledge_incomplete(_incomplete)
+                console.print(
+                    "[yellow]Recovered an interrupted agent run. "
+                    "Review the workspace, then use /continue to resume safely.[/yellow]"
+                )
         _snapshot = load_session_snapshot(_session_start_cwd)
         if _snapshot:
             agent_state["_last_session_snapshot"] = _snapshot
@@ -8778,6 +8829,21 @@ def main():
                 )
         elif args.resume or args.continue_session:
             console.print("[yellow]No saved session for this directory.[/yellow]")
+
+        # Bind /continue to the exact in-memory objects restored at startup.
+        # Without this, the command mutates a deserialized session copy and the
+        # next REPL prompt overwrites its result with stale local state.
+        handle_meta_command._last_agent_state = agent_state
+        handle_meta_command._last_chat_history = chat_history
+        handle_meta_command._last_original_input = (
+            (current_live_session or {}).get("last_original_input")
+            or (current_live_session or {}).get("last_user_input")
+            or agent_state.get("objective")
+        )
+        handle_meta_command._last_deps = get_loop_deps()
+        handle_meta_command._last_session = session
+        handle_meta_command._last_events_cb = None
+        handle_meta_command._last_existing_session = None
 
     if session.get("userId"):
         agent_registry.register(session, name=agent_name, quiet=(args.depth > 0))
@@ -9014,6 +9080,13 @@ def main():
                 agent_state = _restore_resume_blob(_blob, chat_history)
                 current_live_session = session_store.create_session(_session_start_cwd, agent_state, chat_history)
                 handle_meta_command._current_live_session = current_live_session
+                handle_meta_command._last_agent_state = agent_state
+                handle_meta_command._last_chat_history = chat_history
+                handle_meta_command._last_original_input = (
+                    current_live_session.get("last_original_input")
+                    or current_live_session.get("last_user_input")
+                    or current_live_session.get("objective")
+                )
                 _n = _resume_turn_count(_blob)
                 _ago = _format_time_ago(_blob.get("timestamp", 0))
                 console.print(
@@ -9042,6 +9115,9 @@ def main():
                 pass
             current_live_session = session_store.create_session(_session_start_cwd, agent_state, chat_history)
             handle_meta_command._current_live_session = current_live_session
+            handle_meta_command._last_agent_state = agent_state
+            handle_meta_command._last_chat_history = chat_history
+            handle_meta_command._last_original_input = None
             console.print("[green]Started a new session.[/green]")
             if injected_done is not None:
                 injected_done.set()
@@ -9150,6 +9226,10 @@ def main():
                 chat_history.append({"role": "assistant", "content": response["msg"]})
             # ── Cross-interaction state preservation ──
             agent_state = prepare_state_for_repl(response.get("state", {}))
+            handle_meta_command._last_agent_state = agent_state
+            handle_meta_command._last_chat_history = chat_history
+            handle_meta_command._last_original_input = user_input
+            handle_meta_command._last_existing_session = interactive_session
             if args.depth == 0:
                 current_live_session = session_store.sync_runtime(
                     current_live_session, agent_state, chat_history,
@@ -9167,18 +9247,21 @@ def main():
 
         # ── Normal input routing ───────────────────────────────────
 
+        # Add to chat history
+        chat_history.append({"role": "user", "content": user_input})
+        _system_input = is_system_command(user_input)
+
+        # Persist the admitted prompt before provider/tool execution so a
+        # crash cannot leave the live session one user turn behind.
         if args.depth == 0 and current_live_session:
             current_live_session = session_store.sync_runtime(
                 current_live_session, agent_state, chat_history,
                 cwd=_session_start_cwd,
-                objective=user_input if not agent_state.get("objective") else None,
-                last_user_input=user_input,
+                objective=None if _system_input else user_input,
+                last_user_input=None if _system_input else user_input,
                 tasks=task_manager.export_active_tasks(cwd=_session_start_cwd),
             )
             handle_meta_command._current_live_session = current_live_session
-
-        # Add to chat history
-        chat_history.append({"role": "user", "content": user_input})
 
         # Push user input event to remote stream
         if agent_registry.agent_id:
@@ -9187,7 +9270,7 @@ def main():
         # Route first word against PATH/builtins → system command or AI
         # All REPL instances (depth 0 and depth > 0) execute system commands
         # directly. Natural language goes to AI.
-        if is_system_command(user_input):
+        if _system_input:
             console.print(f"\n[dim yellow]$ {user_input}[/dim yellow]")
             if agent_registry.agent_id:
                 agent_registry._push_events([{"type": "system", "kind": "command", "content": user_input}])
@@ -9363,10 +9446,12 @@ def main():
             # On approval, re-run the same task in act mode to execute.
             if _show_plan_approval_menu():
                 console.print("[dim]Re-running task in ACT mode...[/dim]")
+                _plan_state = response.get("state", agent_state)
                 response = _run_agent_loop_with_interrupt(
-                    get_loop_deps(), user_input, session, agent_state, chat_history,
+                    get_loop_deps(), user_input, session, _plan_state, chat_history,
                     events_cb=local_events_cb,
-                    existing_session=interactive_session)
+                    existing_session=interactive_session,
+                    continue_thread=True)
                 interactive_session = response.get("session")
                 handle_meta_command._last_agent_state = response.get("state", agent_state)
                 handle_meta_command._last_existing_session = interactive_session
@@ -9383,13 +9468,20 @@ def main():
         # Preserve recent context across REPL interactions so the model
         # doesn't lose track of what it was doing.
         agent_state = prepare_state_for_repl(response.get("state", {}))
+        if not _system_input:
+            # `/continue` mutates these exact objects; keep the references
+            # aligned with the state carried by the main REPL.
+            handle_meta_command._last_agent_state = agent_state
+            handle_meta_command._last_chat_history = chat_history
+            handle_meta_command._last_original_input = user_input
+            handle_meta_command._last_existing_session = interactive_session
         if args.depth == 0:
             current_live_session = session_store.sync_runtime(
                 current_live_session, agent_state, chat_history,
                 cwd=_session_start_cwd,
-                objective=agent_state.get("objective") if not is_system_command(user_input) else None,
-                last_user_input=user_input,
-                exit_reason=response.get("exit_reason") if not is_system_command(user_input) else None,
+                objective=agent_state.get("objective") if not _system_input else None,
+                last_user_input=None if _system_input else user_input,
+                exit_reason=response.get("exit_reason") if not _system_input else None,
                 tasks=task_manager.export_active_tasks(cwd=_session_start_cwd),
             )
             handle_meta_command._current_live_session = current_live_session

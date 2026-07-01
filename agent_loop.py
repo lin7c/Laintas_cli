@@ -8,6 +8,7 @@ import re
 import json
 import queue
 import shlex
+import socket
 import subprocess
 import sys
 import threading
@@ -190,6 +191,7 @@ TRANSITION_STALENESS = "staleness"                      # too many idle steps
 TRANSITION_ABORTED = "aborted"                          # abort_event from control plane
 TRANSITION_INTERRUPTED = "interrupted"                  # Ctrl+C from user
 TRANSITION_BACKEND_ERROR = "backend_error"              # response.error == true
+TRANSITION_PROVIDER_ERROR = "provider_error"            # terminal provider finish (filter/safety)
 TRANSITION_SILENT_FAILURE = "silent_failure"            # tokens generated but no fields extracted
 TRANSITION_REPAIR_GAVE_UP = "repair_gave_up"            # JSON repair exhausted (2 attempts)
 TRANSITION_REPETITION = "repetition"                    # output similarity threshold hit
@@ -2318,8 +2320,8 @@ def prepare_state_for_repl(state: dict) -> dict:
         "lastOutput": _trim_text(state.get("lastOutput", ""), output_limit),
         "terminalHistory": _microcompact_history(history, keep_recent=5),
         "_files_seen": (state.get("_files_seen") or [])[-20:],
-        # Carry the pinned objective across REPL turns so a later "continue"
-        # still has the goal (this whitelist is the turn-to-turn hand-off).
+        # Carry the active objective across REPL turns so explicit continuation
+        # has a stable fallback (the live session also stores last_user_input).
         "objective": (state.get("objective") or "").strip(),
         # The native message thread is the authoritative cross-turn transcript.
         # Keep its structured assistant tool_calls + role:tool results intact.
@@ -3429,6 +3431,7 @@ def run_agent_loop(
     interrupt_event: threading.Event = None,   # soft-interrupt signal (Ctrl+C)
     message_queue: queue.Queue = None,         # supplementary user messages
     continue_thread: bool = False,             # resume the same top-level turn (/continue)
+    max_loops_override: int = None,             # per-run cap; avoids global config races
 ) -> dict:
     """Run the autonomous agent loop (mirrors AutonomousKernel.ts).
 
@@ -3476,16 +3479,16 @@ def run_agent_loop(
         state.get("lastOutput", ""),
         int(get_runtime_config("output_truncate") or 3000) * 2,
     )
-    chat_history = chat_history or []
+    if chat_history is None:
+        chat_history = []
 
     # ── Pin the objective (durable goal anchor) ────────────────────────────
-    # Pure session semantics: the objective is set once when the session
-    # starts (first non-empty input) and persists until /new resets state.
-    # Subsequent inputs — including "继续" — do NOT overwrite it. The AI
-    # decides via the session.continue tool whether to resume prior work.
+    # A session can contain multiple tasks.  This objective identifies the
+    # active run; full continuity lives in chat_history/_thread_messages.
+    _prior_objective = str(state.get("objective") or "").strip()
     if depth == 0:
         _orig = (original_input or "").strip()
-        if _orig and not state.get("objective"):
+        if _orig:
             state["objective"] = _orig
 
     step_replies = []
@@ -3499,11 +3502,24 @@ def run_agent_loop(
     thread_messages = [m for m in thread_messages if isinstance(m, dict) and m.get("role")]
     _stored_call_count = sum(len(m.get("tool_calls") or []) for m in thread_messages)
     _thread_call_seq = max(int(state.get("_thread_call_seq") or 0), _stored_call_count)
-    if _thread_mode and original_input and (not thread_messages or not continue_thread):
-        thread_messages.append({"role": "user", "content": original_input})
+    if _thread_mode and original_input:
+        _thread_has_input = any(
+            m.get("role") == "user"
+            and _stringify_message_content(m.get("content", "")).strip()
+            == str(original_input).strip()
+            for m in thread_messages
+        )
+        if not continue_thread or not _thread_has_input:
+            # Crash recovery can request continue_thread before the admitted
+            # prompt reached `_thread_messages`.  Add it exactly once instead
+            # of silently continuing an older task.
+            thread_messages.append({"role": "user", "content": original_input})
     pending_events: list[dict] = []
     done = False
     _exit_reason = TRANSITION_MAX_LOOPS  # default: assume exhaustion unless overridden by a break
+    _completion_source = ""
+    _run_id = uuid.uuid4().hex
+    _session_id = str(state.get("_session_id") or "")
     reply = ""
     interactive_session = existing_session  # InteractiveSession | SubTerminalSession | None
 
@@ -3522,10 +3538,13 @@ def run_agent_loop(
         deps.display_sub_terminal_preview = lambda *a, **kw: None
         deps.display_file_diff = lambda *a, **kw: None
 
-    max_loops = int(get_runtime_config("max_loops"))
+    max_loops = (int(max_loops_override) if max_loops_override is not None
+                 else int(get_runtime_config("max_loops")))
+    if max_loops <= 0:
+        raise ValueError("max_loops_override must be greater than 0")
     # Workflow phase may override max_loops (e.g. implementation phase gets more)
     _wf_max = workflow_engine.get_phase_max_loops()
-    if _wf_max > 0:
+    if _wf_max > 0 and max_loops_override is None:
         max_loops = _wf_max
     # Phase 2: lookup own AgentInfo once for the lifetime of this loop call.
     # Sub-agent threads MUST pass agent_id explicitly — relying on the global
@@ -3561,10 +3580,18 @@ def run_agent_loop(
     # Write the prompt to the event log BEFORE execution starts, so a crash
     # never loses what the user asked. Recovery can detect an incomplete task.
     event_log.append("prompt_admitted",
-                     text=(original_input or "")[:500],
+                     text=original_input or "",
                      cwd=os.getcwd(),
-                     agent_id=agent_id or "")
+                     agent_id=agent_id or "",
+                     session_id=_session_id,
+                     run_id=_run_id,
+                     pid=os.getpid(),
+                     hostname=socket.gethostname())
     for loop in range(max_loops):
+        # Only the iteration that actually terminates the run may supply the
+        # completion source.  Workflow phase advancement can turn a nominal
+        # completion back into continuation.
+        _completion_source = ""
         _loop_id = next_debug_loop()
         history_context = _history_without_current_turn(chat_history, original_input)
         skill_context = skills_mod.get_activated_skills_context()
@@ -3955,7 +3982,6 @@ def run_agent_loop(
             _partial_reply = response.get("reply", "") or ""
             if _partial_reply and _partial_reply != "(interrupted)":
                 deps.console.print(f"\n[dim]Partial response preserved: {_partial_reply[:300]}[/dim]")
-                chat_history.append({"role": "assistant", "content": _partial_reply + "\n\n[interrupted by user]"})
             reply = _partial_reply
             add_debug_log(debug_entry)
             _exit_reason = TRANSITION_INTERRUPTED
@@ -3996,48 +4022,65 @@ def run_agent_loop(
         reply = response.get("reply") or ""
         done = response.get("done", len(tool_calls) == 0)
         billing = response.get("_billing", {})
+        _provider_finish = response.get("finish_reason")
         _prose_final = False
 
         # ── Prose final answer ──
-        # A turn with no tool calls but a reply IS the model's final answer (a
-        # result report or a question back to the user). The completion decision
-        # below treats it as terminal.
-        if not tool_calls and reply:
+        # A complete, tool-free provider turn is an end-turn signal.  A reply
+        # cut off by the output limit is partial work and must never be promoted
+        # to a successful final answer.
+        if (not tool_calls and reply and not response.get("_truncated")
+                and _provider_finish in (None, "stop", "end_turn")):
             _prose_final = True
 
-        # ── Detect "silent failure": model billed tokens but produced no usable
-        # content (no reply text, no tool call). Retry a couple of times, then
-        # bail with a useful message. ──
-        if not reply and not tool_calls:
+        # ── Detect silent/protocol failure ──
+        # Empty provider turns are invalid regardless of whether the gateway
+        # supplied billing metadata.  In particular, finish_reason=tool_calls
+        # with no parsed calls must be retried rather than marked completed.
+        if not tool_calls and (not reply or _provider_finish == "tool_calls"):
             completion_tokens = (billing or {}).get("completionTokens", 0)
-            if completion_tokens > 0:
-                msg = (
-                    f"AI generated {completion_tokens} tokens but produced no reply "
-                    f"text and no tool call. Try rephrasing or shortening the prompt."
-                )
-                silent_count = state.get("_silent_fail_count", 0) + 1
-                state["_silent_fail_count"] = silent_count
-                if silent_count <= 2:
-                    response["_parse_failed"] = True
-                    done = False
-                    if events_cb is not None:
-                        deps.console.print("[dim yellow](empty response — asking AI to retry)[/dim yellow]")
-                    _append_short_memory(state, f"\n  -Empty-response retry {silent_count}/2: {msg}")
-                else:
-                    if events_cb is not None:
-                        deps.console.print(f"[yellow]{msg}[/yellow]")
-                    _append_short_memory(state, f"\n  -Error: {msg}")
-                    add_debug_log(debug_entry)
-                    _exit_reason = TRANSITION_SILENT_FAILURE
-                    break
+            reason = _provider_finish or "missing"
+            msg = (
+                f"AI produced an invalid tool-free turn "
+                f"(finish_reason={reason}, completion_tokens={completion_tokens})."
+            )
+            silent_count = state.get("_silent_fail_count", 0) + 1
+            state["_silent_fail_count"] = silent_count
+            if silent_count <= 2:
+                response["_parse_failed"] = True
+                done = False
+                if events_cb is not None:
+                    deps.console.print(
+                        "[dim yellow](empty response — asking AI to retry)[/dim yellow]")
+                _append_short_memory(
+                    state, f"\n  -Empty-response retry {silent_count}/2: {msg}")
+            else:
+                if events_cb is not None:
+                    deps.console.print(f"[yellow]{msg}[/yellow]")
+                _append_short_memory(state, f"\n  -Error: {msg}")
+                add_debug_log(debug_entry)
+                _exit_reason = TRANSITION_SILENT_FAILURE
+                break
         elif reply or tool_calls:
             state["_silent_fail_count"] = 0
 
         # ── Durable event: record AI response (crash recovery trail) ──
         event_log.append("ai_response",
                          reply=(reply or "")[:200],
-                         tool_count=len(tool_calls),
+                         tools=[tc.get("name", "") for tc in tool_calls],
+                         finish_reason=response.get("finish_reason"),
+                         session_id=_session_id,
+                         run_id=_run_id,
                          loop=loop + 1)
+
+        if _provider_finish in {"content_filter", "content-filter", "safety"}:
+            _append_short_memory(
+                state,
+                f"\n  -Provider stopped the response: {_provider_finish}.",
+            )
+            _exit_reason = TRANSITION_PROVIDER_ERROR
+            add_debug_log(debug_entry)
+            break
 
         # 6. Print AI reply (only in interactive mode). If the response failed
         # structural parsing, do not surface the malformed text as a normal
@@ -4055,10 +4098,6 @@ def run_agent_loop(
                     deps.console.print(deps.Markdown(display_reply))
             step_replies.append(display_reply)
             state["lastReply"] = display_reply
-            event_log.append("ai_response",
-                             reply=(reply or "")[:200],
-                             tool_calls=[tc.get("name", "?") for tc in (tool_calls or [])],
-                             loop=loop + 1)
             if events_cb is not None:
                 if _reply_already_rendered:
                     # Streaming chunks already sent; signal end-of-stream so
@@ -4157,6 +4196,15 @@ def run_agent_loop(
                 call_id = f"call_{loop+1:02d}_{idx+1:02d}"
                 salient = _salient_arg(name, arguments)
                 is_shell_flavored = name in ("shell.exec", "terminal.send", "terminal.exec")
+                event_log.append(
+                    "tool_call",
+                    name=name,
+                    call_id=call_id,
+                    arguments=arguments,
+                    session_id=_session_id,
+                    run_id=_run_id,
+                    loop=loop + 1,
+                )
 
                 # ── Role / Workflow tool filtering ──
                 _role_name = state.get("_role_name")
@@ -4316,11 +4364,13 @@ def run_agent_loop(
 
                 # ── Session continuation signal ──
                 # session.continue was called: clear exhaustion state so the
-                # loop can run fresh. The pinned objective is already preserved
-                # by the objective-pinning logic (only set when empty).
+                # loop can run fresh. The caller passes the latest run input
+                # explicitly and the state retains its active objective.
                 if isinstance(result, dict) and result.get("_session_continue"):
                     state.pop("_max_loops_exhausted", None)
                     state.pop("_exhaustion_loop_count", None)
+                    if _prior_objective:
+                        state["objective"] = _prior_objective
 
                 # ── Format result for AI prompt ──
                 truncate = int(get_runtime_config("output_truncate") or 3000)
@@ -4454,45 +4504,76 @@ def run_agent_loop(
                 event_log.append("tool_result",
                                  name=_row.get("tool", ""),
                                  ok=_row.get("returncode", -1) == 0,
+                                 call_id=_row.get("call_id", ""),
+                                 output=str(_row.get("output") or "")[:2000],
+                                 session_id=_session_id,
+                                 run_id=_run_id,
                                  loop=loop + 1)
+
+        # Completion must describe the outcome of the whole emitted batch.
+        # If the model called task.complete alongside a failed operation, keep
+        # the loop alive so it can inspect and repair the failure.
+        _failed_calls = [
+            row for row in per_call_rows
+            if row.get("tool") != "task.complete"
+            and row.get("returncode", -1) != 0
+        ]
+        if _explicit_complete and _failed_calls:
+            _explicit_complete = False
+            _append_short_memory(state, (
+                "\n  ⚠ task.complete was ignored because another tool in "
+                "the same turn failed. Inspect the failed result before "
+                "completing the task."
+            ))
 
         # ── Completion decision (affirmative, not inferred from empty tool_calls) ──
         # Historically `done` defaulted to `len(tool_calls)==0`, so ANY turn the
         # model spent narrating (no tool call) ended the loop — abandoning
         # multi-step tasks the moment the model paused to explain itself. Mainstream
         # agents make completion an explicit act instead. So:
-        #   - task.complete (_explicit_complete) or a pure-prose final answer
-        #     (_prose_final) or an explicit done:true always end the loop.
+        #   - task.complete, a complete provider prose turn, or explicit
+        #     done:true can end the loop.
         #   - finish_reason == "stop" with no tool call is the native signal that
         #     the model deliberately ended its turn — trust it (both modes).
-        #   - Interactive mode: an empty-tool-call turn yields to the user, who
-        #     drives the next turn — treat as done.
         #   - Autonomous/execute mode with no finish_reason (or "length"): the
         #     model may not be finished. Nudge toward task.complete and keep
         #     looping, with a small counter so it can't burn every loop.
         _finish_reason = response.get("finish_reason")
         if _explicit_complete:
             done = True
+            _completion_source = "task_complete"
             if _complete_summary and not reply:
                 reply = _complete_summary
             state["_no_action_count"] = 0
-        elif _prose_final or response.get("done") is True:
-            done = True
-            state["_no_action_count"] = 0
         elif tool_calls:
+            # Tool calls require their results to be returned to the model even
+            # when a provider incorrectly labels the same turn done/stop.
             done = False
+            state["_no_action_count"] = 0
+        elif response.get("done") is True:
+            done = True
+            _completion_source = "provider_done"
+            state["_no_action_count"] = 0
+        elif response.get("_truncated") or _finish_reason == "length":
+            # Preserve the partial text in the thread, then ask the model to
+            # continue in a bounded response on the next provider turn.
+            done = False
+            state["_no_action_count"] = 0
+            _completion_source = ""
+        elif _prose_final:
+            done = True
+            _completion_source = "provider_stop"
             state["_no_action_count"] = 0
         else:
             # No tool call this turn.
-            if events_cb is not None:
-                done = True   # interactive: hand control back to the user
-                state["_no_action_count"] = 0
-            elif _finish_reason == "stop" and not response.get("_parse_failed"):
+            if (_finish_reason == "stop"
+                    and not response.get("_parse_failed") and reply):
                 # Native: the model explicitly ended its turn with a final answer
                 # and no tool call. Trust finish_reason instead of nudging.
                 # (A botched JSON-envelope attempt that also stopped is NOT a
                 # clean finish — let it fall through to the nudge/retry path.)
                 done = True
+                _completion_source = "provider_stop"
                 state["_no_action_count"] = 0
             else:
                 # finish_reason missing or "length" (truncated): the model may
@@ -4500,7 +4581,8 @@ def run_agent_loop(
                 _no_action = state.get("_no_action_count", 0) + 1
                 state["_no_action_count"] = _no_action
                 if _no_action >= 3:
-                    done = True   # stop nudging; accept the reply as final
+                    done = True
+                    _completion_source = "no_action_limit"
                 else:
                     done = False
                     _append_short_memory(state, (
@@ -4703,7 +4785,13 @@ def run_agent_loop(
             if events_cb is not None and pending_events:
                 events_cb(pending_events)
                 pending_events.clear()
-            _exit_reason = TRANSITION_COMPLETED
+            if _completion_source in ("task_complete", "provider_done"):
+                _exit_reason = TRANSITION_COMPLETED
+            elif _completion_source == "provider_stop":
+                _exit_reason = TRANSITION_END_TURN
+            else:
+                # A circuit breaker ending the loop is not task completion.
+                _exit_reason = TRANSITION_STALENESS
             break
 
         # ── Staleness tracking: auto-exit when AI stops producing output ──
@@ -4774,7 +4862,9 @@ def run_agent_loop(
             reply = _exhaustion_msg
 
     # ── Telemetry: log exit reason to debug ──
-    event_log.append("turn_ended", reason=_exit_reason, loops=loop + 1)
+    event_log.append("turn_ended", reason=_exit_reason, loops=loop + 1,
+                     session_id=_session_id, run_id=_run_id,
+                     completion_source=_completion_source)
     _last_debug_entries = get_debug_logs()
     if _last_debug_entries:
         _last_debug_entries[-1].loop_exit_reason = _exit_reason
@@ -4783,8 +4873,8 @@ def run_agent_loop(
     # If the user interrupted, preserve any partial AI response so context
     # isn't lost. The next interaction will have this in chat_history.
     if _interrupt.is_set() and reply:
-        if reply.strip() and reply.strip() != "(interrupted by user)":
-            chat_history.append({"role": "assistant", "content": reply + "\n\n[interrupted by user]"})
+        if (reply.strip()
+                and reply.strip() not in {"(interrupted)", "(interrupted by user)"}):
             deps.console.print(f"\n[dim]💬 Partial response preserved ({len(reply)} chars)[/dim]")
 
     # Clean up session only when NOT managed by REPL (existing_session=None)
@@ -4813,8 +4903,27 @@ def run_agent_loop(
         except Exception:
             pass
 
-    if step_replies:
-        return {"success": done, "msg": "\n\n".join(step_replies), "state": state,
-                "session": interactive_session, "exit_reason": _exit_reason}
-    return {"success": done, "msg": reply, "state": state,
-            "session": interactive_session, "exit_reason": _exit_reason}
+    _clean_end = _exit_reason in (TRANSITION_COMPLETED, TRANSITION_END_TURN)
+    if _clean_end:
+        _turn_status = "completed"
+    elif _exit_reason in (TRANSITION_INTERRUPTED, TRANSITION_ABORTED):
+        _turn_status = "interrupted"
+    elif _exit_reason in (TRANSITION_BACKEND_ERROR, TRANSITION_PROVIDER_ERROR,
+                          TRANSITION_SILENT_FAILURE,
+                          TRANSITION_REPAIR_GAVE_UP, TRANSITION_PARSE_GAVE_UP):
+        _turn_status = "failed"
+    else:
+        _turn_status = "incomplete"
+    _task_status = ("completed" if _clean_end and _completion_source == "task_complete"
+                    else "ended" if _clean_end else "incomplete")
+    result = {
+        "success": _clean_end,
+        "msg": "\n\n".join(step_replies) if step_replies else reply,
+        "state": state,
+        "session": interactive_session,
+        "exit_reason": _exit_reason,
+        "turn_status": _turn_status,
+        "task_status": _task_status,
+        "completion_source": _completion_source,
+    }
+    return result

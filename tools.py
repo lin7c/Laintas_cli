@@ -2423,7 +2423,7 @@ def _bi_session_continue(params: dict, ctx: ToolCtx) -> dict:
 
     The agent loop detects the _session_continue marker and:
       - clears any max-loops exhaustion state so the loop can run fresh,
-      - preserves the pinned <objective> instead of overwriting it.
+      - preserves the active run objective instead of creating a new task.
 
     The AI should call this BEFORE resuming work, then proceed with the actual
     task steps (shell.exec, fs.write, etc.) in subsequent turns.

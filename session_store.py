@@ -11,6 +11,8 @@ from typing import Optional
 
 import paths
 
+_LAST_ERROR = ""
+
 CONTINUABLE_REASONS = {
     "max_loops",
     "interrupted",
@@ -25,6 +27,7 @@ CONTINUABLE_REASONS = {
     "warning_force_exit",
     "staleness",
     "aborted",
+    "crash_recovery",
 }
 
 def _session_key(cwd: str) -> str:
@@ -56,6 +59,40 @@ def _atomic_write_json(dest, payload: dict) -> None:
             tmp.unlink(missing_ok=True)
         except OSError:
             pass
+
+
+def _record_error(message: str) -> None:
+    global _LAST_ERROR
+    _LAST_ERROR = str(message or "")
+
+
+def consume_last_error() -> str:
+    """Return and clear the latest recoverable persistence warning."""
+    global _LAST_ERROR
+    message = _LAST_ERROR
+    _LAST_ERROR = ""
+    return message
+
+
+def _recover_latest_live(cwd: str) -> Optional[dict]:
+    """Recover the newest valid unclosed live copy for a working directory."""
+    pattern = f"{_session_key(cwd)}_live_*.json"
+    try:
+        candidates = sorted(
+            paths.SESSIONS_DIR.glob(pattern),
+            key=lambda item: item.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        return None
+    for candidate in candidates:
+        try:
+            data = json.loads(candidate.read_text(encoding="utf-8"))
+            if data.get("cwd") == cwd and not data.get("closed_at"):
+                return data
+        except (OSError, json.JSONDecodeError, TypeError):
+            continue
+    return None
 
 
 def is_continuable_reason(reason: str) -> bool:
@@ -94,11 +131,15 @@ def create_session(cwd: str, state: Optional[dict] = None, chat_history: Optiona
 
 
 def load_current_session(cwd: str) -> Optional[dict]:
+    path = _current_path(cwd)
     try:
-        path = _current_path(cwd)
         if not path.exists():
-            return None
-        data = json.loads(path.read_text(encoding="utf-8"))
+            data = _recover_latest_live(cwd)
+            if data is None:
+                return None
+            _record_error("Recovered current session from its live backup.")
+        else:
+            data = json.loads(path.read_text(encoding="utf-8"))
         if data.get("cwd") != cwd or data.get("closed_at"):
             return None
         data.setdefault("id", data.get("session_id") or uuid.uuid4().hex[:16])
@@ -110,8 +151,31 @@ def load_current_session(cwd: str) -> Optional[dict]:
         data.setdefault("pending_continuation", False)
         data.setdefault("last_exit_reason", "")
         data.setdefault("status", "idle")
+        if not path.exists():
+            _atomic_write_json(path, data)
         return data
-    except Exception:
+    except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        # Preserve the unreadable pointer for diagnosis, then fall back to the
+        # independently written per-session live copy.
+        try:
+            if path.exists():
+                corrupt = path.with_name(
+                    f"{path.name}.corrupt-{int(time.time())}")
+                os.replace(str(path), str(corrupt))
+        except OSError:
+            pass
+        recovered = _recover_latest_live(cwd)
+        if recovered is not None:
+            _record_error(
+                f"Current session index was unreadable ({exc}); recovered its live backup.")
+            try:
+                _atomic_write_json(path, recovered)
+            except OSError:
+                return recovered
+            # Re-enter the normal validation/default path now that the pointer
+            # has been rebuilt.
+            return load_current_session(cwd) or recovered
+        _record_error(f"Current session could not be loaded: {exc}")
         return None
 
 
@@ -128,7 +192,11 @@ def save_session(session: dict) -> None:
     session_id = _safe_id(session.get("session_id") or session.get("id"))
     session["id"] = session_id
     session["session_id"] = session_id
-    state = session.get("state") or session.get("agent_state") or {}
+    state = session.get("state")
+    if state is None:
+        state = session.get("agent_state")
+    if state is None:
+        state = {}
     if isinstance(state, dict):
         state = copy.deepcopy(state)
         state["_session_id"] = session_id
