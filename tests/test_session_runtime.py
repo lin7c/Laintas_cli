@@ -1,4 +1,5 @@
 import io
+import copy
 import json
 import tempfile
 import unittest
@@ -14,6 +15,7 @@ import agent_loop
 import event_log
 import laintas_cli
 import paths
+import policy
 import session_store
 import task_manager
 
@@ -392,6 +394,99 @@ class SessionStoreTests(unittest.TestCase):
             self.assertEqual(recovered["state"]["objective"], "recover me")
             self.assertIn("recovered", warning.lower())
             self.assertTrue(list(Path(tmp).glob("*_current.json.corrupt-*")))
+
+
+@contextmanager
+def _isolated_policy(root: str, mode: str = "enforce"):
+    """Set up an isolated enforce-mode policy so rm triggers needs_approval."""
+    root_path = Path(root)
+    config_path = root_path / "policy.json"
+    audit_path = root_path / "audit.log"
+    cfg = copy.deepcopy(policy._DEFAULT_CONFIG)
+    cfg["mode"] = mode
+    cfg["allowedRoots"] = [root]
+    config_path.write_text(json.dumps(cfg), encoding="utf-8")
+    with mock.patch.object(policy, "CONFIG_PATH", config_path), \
+            mock.patch.object(policy, "AUDIT_PATH", audit_path):
+        policy._config = None
+        policy._config_mtime = 0.0
+        try:
+            yield
+        finally:
+            policy._config = None
+            policy._config_mtime = 0.0
+
+
+class UserDenialTerminationTests(unittest.TestCase):
+    """Verify that denying an approval prompt terminates the agent loop."""
+
+    def setUp(self):
+        task_manager.clear_session_tasks()
+        agent_loop.reset_runtime_config()
+        agent_loop.set_runtime_config("auto_snapshot", False)
+        agent_loop.set_runtime_config("loop_delay", 0)
+        agent_loop.set_runtime_config("use_message_thread", False)
+
+    def tearDown(self):
+        agent_loop.reset_runtime_config()
+        task_manager.clear_session_tasks()
+
+    def _run_with_denial(self, responses, max_loops=5, deny_exits_loop=True):
+        deps, calls = _deps(responses)
+        deps.request_command_approval = lambda cmd, reason: False
+        agent_loop.set_runtime_config("deny_exits_loop", deny_exits_loop)
+        history = [{"role": "user", "content": "delete a file"}]
+        with tempfile.TemporaryDirectory() as tmp, _chdir(tmp), \
+                _isolated_policy(tmp):
+            Path(".laintas").mkdir()
+            result = agent_loop.run_agent_loop(
+                deps, "delete a file", {}, {}, history,
+                max_loops_override=max_loops,
+            )
+        return result, calls
+
+    def test_user_denial_terminates_loop(self):
+        """When the user denies command approval, the loop must exit at once."""
+        result, calls = self._run_with_denial([{
+            "reply": "I'll delete the file.",
+            "tool_calls": [{
+                "name": "shell.exec",
+                "arguments": {"command": "rm file.txt"},
+            }],
+            "finish_reason": "tool_calls",
+            "done": False,
+            "error": False,
+        }])
+        self.assertFalse(result["success"])
+        self.assertEqual(result["exit_reason"],
+                         agent_loop.TRANSITION_USER_DENIED)
+        self.assertEqual(result["turn_status"], "interrupted")
+        self.assertEqual(len(calls), 1)
+
+    def test_deny_exits_loop_false_keeps_old_behavior(self):
+        """When deny_exits_loop is off, denial is a tool error and the loop continues."""
+        result, calls = self._run_with_denial(
+            [{
+                "reply": "I'll delete the file.",
+                "tool_calls": [{
+                    "name": "shell.exec",
+                    "arguments": {"command": "rm file.txt"},
+                }],
+                "finish_reason": "tool_calls",
+                "done": False,
+                "error": False,
+            }, {
+                "reply": "OK, I won't delete it.",
+                "tool_calls": [],
+                "finish_reason": "stop",
+                "done": False,
+                "error": False,
+            }],
+            deny_exits_loop=False,
+        )
+        self.assertNotEqual(result["exit_reason"],
+                            agent_loop.TRANSITION_USER_DENIED)
+        self.assertEqual(len(calls), 2)
 
 
 if __name__ == "__main__":

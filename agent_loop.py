@@ -85,6 +85,8 @@ _DEFAULT_CONFIG = {
     "browser_post_action_wait": 0.5,   # seconds to wait for SPA DOM updates before auto-snapshot
     "browser_auto_snapshot": True,     # return page snapshot after state-changing browser actions
     "detail": False,                   # False = simplified progress rendering; True = full per-line detail (/detail on|off)
+    "deny_exits_loop": True,           # True = terminate the agent loop the moment the user denies an approval prompt; False = old behavior (feed denial back as a tool error and keep looping)
+    "enable_mouse": True,              # REPL input box: click-to-position the cursor (Shift+drag still selects text natively in most terminals)
 }
 
 # ── Typed Error Classes ───────────────────────────────────────────────
@@ -197,6 +199,7 @@ TRANSITION_REPAIR_GAVE_UP = "repair_gave_up"            # JSON repair exhausted 
 TRANSITION_REPETITION = "repetition"                    # output similarity threshold hit
 TRANSITION_WARNING_FORCE = "warning_force_exit"         # warning circuit breaker tripped
 TRANSITION_PARSE_GAVE_UP = "parse_gave_up"              # parse failure counter exhausted
+TRANSITION_USER_DENIED = "user_denied"                  # user explicitly denied an approval prompt
 
 _runtime_config: dict[str, object] = {}
 
@@ -216,6 +219,8 @@ _RUNTIME_CONFIG_DESCRIPTIONS = {
     "warning_force_limit": "Repeated warning limit before forced exit",
     "output_similarity": "Repeated-output similarity threshold (0-1)",
     "detail": "Show full per-line tool detail (True) or simplified progress (False)",
+    "deny_exits_loop": "Terminate the agent loop immediately when the user denies an approval prompt",
+    "enable_mouse": "Enable mouse click-to-position in the REPL input box",
 }
 
 _RUNTIME_NONNEGATIVE = {
@@ -3115,7 +3120,7 @@ def _check_policy(command: str, agent_id: str = None,
                   deps=None) -> tuple:
     """Evaluate security policy for a command before execution.
 
-    Returns (allowed: bool, reason: str, needs_approval: bool).
+    Returns (allowed: bool, reason: str, needs_approval: bool, user_denied: bool).
     Side-effect: logs audit entry, prints warning/error via deps.console.
 
     decision.action == "needs_approval" only ever happens in policy "enforce"
@@ -3124,6 +3129,11 @@ def _check_policy(command: str, agent_id: str = None,
     if one is wired (interactive REPL, or remote delegate via _request_approval);
     with no approval channel available, it fails closed rather than silently
     auto-allowing a command the user explicitly asked to gate.
+
+    ``user_denied`` is True only when an approval callback was invoked and the
+    user explicitly rejected the command — distinct from a policy "deny" rule
+    or a missing approval channel. The agent loop uses this to terminate the
+    task immediately (see ``deny_exits_loop`` runtime config).
     """
     decision = policy_mod.evaluate(command, os.getcwd(),
                                    req_id=req_id, agent_id=agent_id)
@@ -3131,7 +3141,7 @@ def _check_policy(command: str, agent_id: str = None,
         msg = f"[bold red]BLOCKED:[/bold red] {decision.reason}"
         if events_cb is not None and deps is not None:
             deps.console.print(msg)
-        return False, decision.reason, False
+        return False, decision.reason, False, False
     if decision.action == "needs_approval":
         msg = f"[bold yellow]APPROVAL REQUIRED:[/bold yellow] {decision.reason}"
         if events_cb is not None and deps is not None:
@@ -3143,10 +3153,10 @@ def _check_policy(command: str, agent_id: str = None,
             except Exception:
                 approved = False
             if not approved:
-                return False, f"User denied: {decision.reason}", True
-            return True, decision.reason, True
-        return False, f"{decision.reason} (approval required but no approval channel available)", True
-    return True, "", False
+                return False, f"User denied: {decision.reason}", True, True
+            return True, decision.reason, True, False
+        return False, f"{decision.reason} (approval required but no approval channel available)", True, False
+    return True, "", False, False
 
 
 def _process_parent_cmd_marker(cmd_output: str, *, deps=None,
@@ -3160,7 +3170,7 @@ def _process_parent_cmd_marker(cmd_output: str, *, deps=None,
         return cmd_output, None
     cmd = m.group(1).strip()
     cleaned = _re.sub(r'__PARENT_CMD__:[^\n]*\n?', '', cmd_output).strip()
-    allowed, reason, _ = _check_policy(
+    allowed, reason, _, _ = _check_policy(
         cmd, agent_id=agent_id, deps=deps,
     )
     if not allowed:
@@ -4172,6 +4182,7 @@ def run_agent_loop(
         per_call_rows: list[dict] = []
         _explicit_complete = False    # set when task.complete is invoked
         _complete_summary = ""
+        _user_denied = False          # set when the user rejects an approval prompt
 
         if tool_calls:
             # Resolve stationed terminal for this agent (if any)
@@ -4275,11 +4286,13 @@ def run_agent_loop(
                     skip_invoke = False
                     if is_shell_flavored:
                         policy_cmd = _policy_command_arg(name, arguments) or salient
-                        policy_ok, policy_reason, policy_approval = _check_policy(
+                        policy_ok, policy_reason, policy_approval, policy_user_denied = _check_policy(
                             policy_cmd, agent_id=agent_id, events_cb=events_cb, deps=deps)
                         if not policy_ok:
                             result = {"ok": False, "error": f"BLOCKED: {policy_reason}",
                                       "tool": name, "returncode": -1, "policy": "deny"}
+                            if policy_user_denied:
+                                result["_user_denied"] = True
                             skip_invoke = True
                         elif policy_approval:
                             _append_short_memory(state, f"\n  ⚠ Policy: {policy_reason}")
@@ -4386,6 +4399,15 @@ def run_agent_loop(
                     state.pop("_exhaustion_loop_count", None)
                     if _prior_objective:
                         state["objective"] = _prior_objective
+
+                # ── User-denial detection ──
+                # tools._check_file_write_policy / _check_file_delete_policy /
+                # _browser_check_action tag explicit user rejections with
+                # _user_denied so the loop can terminate the task immediately
+                # (gated by the deny_exits_loop runtime config).
+                if (isinstance(result, dict) and result.get("_user_denied")
+                        and get_runtime_config("deny_exits_loop")):
+                    _user_denied = True
 
                 # ── Format result for AI prompt ──
                 truncate = int(get_runtime_config("output_truncate") or 3000)
@@ -4510,6 +4532,26 @@ def run_agent_loop(
                         try:
                             _emit_simple_diff(deps.console, result.get("diff", ""), depth=depth + 1)
                         except Exception as _e: _diag("emit_simple_diff_failed", tool=name, error=str(_e))
+
+                # ── User-denied circuit breaker (inner loop) ──
+                # Stop dispatching the remaining tool calls in this turn — the
+                # outer loop will terminate immediately (see below).
+                if _user_denied:
+                    break
+
+        # ── User-denied circuit breaker (outer loop) ──
+        # When the user explicitly rejects an approval prompt (command, file
+        # write/delete, or browser action), terminate the task at once instead
+        # of feeding the denial back as a tool error and letting the model retry.
+        if _user_denied and get_runtime_config("deny_exits_loop"):
+            _exit_reason = TRANSITION_USER_DENIED
+            if events_cb is not None:
+                deps.console.print(
+                    "\n[yellow]⚡ User denied approval — terminating task.[/yellow]")
+                if pending_events:
+                    events_cb(pending_events)
+                    pending_events.clear()
+            break
 
         # Concat all per-call outputs into lastOutput so the next prompt's fallback
         # rendering and shortTermMemory see every result, not just the last.
@@ -4921,7 +4963,8 @@ def run_agent_loop(
     _clean_end = _exit_reason in (TRANSITION_COMPLETED, TRANSITION_END_TURN)
     if _clean_end:
         _turn_status = "completed"
-    elif _exit_reason in (TRANSITION_INTERRUPTED, TRANSITION_ABORTED):
+    elif _exit_reason in (TRANSITION_INTERRUPTED, TRANSITION_ABORTED,
+                          TRANSITION_USER_DENIED):
         _turn_status = "interrupted"
     elif _exit_reason in (TRANSITION_BACKEND_ERROR, TRANSITION_PROVIDER_ERROR,
                           TRANSITION_SILENT_FAILURE,

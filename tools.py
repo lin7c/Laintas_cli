@@ -597,7 +597,7 @@ def _check_file_write_policy(abs_path: str, ctx: ToolCtx, diff_preview: str) -> 
             except Exception:
                 approved = False
             if not approved:
-                return {"ok": False, "error": f"User denied write: {decision.reason}", "path": abs_path}
+                return {"ok": False, "error": f"User denied write: {decision.reason}", "path": abs_path, "_user_denied": True}
     return None
 
 
@@ -630,7 +630,8 @@ def _check_file_delete_policy(abs_path: str, ctx: ToolCtx,
         if not approved:
             return {"ok": False,
                     "error": f"User denied deletion: {decision.reason}",
-                    "path": abs_path}
+                    "path": abs_path,
+                    "_user_denied": True}
     return None
 
 
@@ -2968,7 +2969,7 @@ def _browser_check_action(action: str, params: dict, ctx: ToolCtx):
             return {"ok": False, "error": f"action requires approval but no approval callback is available: {cmd}"}
         approved = approve_fn(cmd, decision.reason)
         if not approved:
-            return {"ok": False, "error": f"action not approved: {cmd}"}
+            return {"ok": False, "error": f"action not approved: {cmd}", "_user_denied": True}
     return None
 
 

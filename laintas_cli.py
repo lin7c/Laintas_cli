@@ -101,6 +101,7 @@ from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.layout.controls import BufferControl
 from prompt_toolkit.lexers import Lexer
+from prompt_toolkit.filters import Condition
 
 # ── Central UI theme ──────────────────────────────────────────────────
 # Minimal palette: one accent, muted secondaries, semantic status colors.
@@ -1358,6 +1359,9 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec("/snapshot", "Create a git checkpoint", "History", "/snapshot [label]"),
     CommandSpec("/snapshots", "List git checkpoints", "History"),
     CommandSpec("/continue", "Continue the current live session", "History"),
+    CommandSpec("/told", "Show what you last asked the AI", "History",
+                "/told [N|all|reply [N]|log [N]]",
+                subcommands=("all", "reply", "log")),
     # Keep /reload discoverable, but its existing handler and behavior stay untouched.
     CommandSpec("/reload", "Reload default files and restart", "History"),
 )
@@ -1566,6 +1570,31 @@ class _PastePlaceholderLexer(Lexer):
         return get_line
 
 
+class _PasteGuardBuffer(Buffer):
+    """Buffer whose cursor cannot enter a paste-placeholder span.
+
+    [Pasted #N ~L lines] tokens are atomic and non-editable: arrow keys and
+    mouse clicks skip over the whole token instead of landing inside it.
+
+    The cursor_position setter is the single chokepoint — Buffer.cursor_left/
+    right/up/down all go through ``self.cursor_position += ...``, and
+    BufferControl's mouse handler sets ``buffer.cursor_position`` directly,
+    so overriding the setter covers both keyboard and mouse in one place.
+    """
+
+    @property
+    def cursor_position(self) -> int:
+        return Buffer.cursor_position.fget(self)
+
+    @cursor_position.setter
+    def cursor_position(self, value: int) -> None:
+        span = _paste_span_at(self.text, value)
+        if span is not None and span[0] < value < span[1]:
+            current = Buffer.cursor_position.fget(self)
+            value = span[1] if value >= current else span[0]
+        Buffer.cursor_position.fset(self, value)
+
+
 def _build_keybindings() -> KeyBindings:
     """Build custom keybindings for the prompt."""
     kb = KeyBindings()
@@ -1672,7 +1701,14 @@ def get_prompt_session() -> PromptSession:
             lexer=_PastePlaceholderLexer(),
             enable_history_search=True,
             vi_mode=False,
+            mouse_support=Condition(lambda: bool(get_runtime_config("enable_mouse"))),
         )
+        # Upgrade the default buffer so the cursor snaps out of paste
+        # placeholders instead of entering them (arrow keys + mouse clicks).
+        try:
+            _prompt_session.default_buffer.__class__ = _PasteGuardBuffer
+        except TypeError:
+            pass
     return _prompt_session
 
 
@@ -7656,6 +7692,136 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
                 pass
 
         return False
+
+    elif action == "/told":
+        from rich.markup import escape
+        sub = parts[1].lower() if len(parts) > 1 else ""
+        _chat = getattr(handle_meta_command, '_last_chat_history', None) or []
+        _user_msgs = [m.get("content", "") for m in _chat
+                      if isinstance(m, dict) and m.get("role") == "user"]
+
+        def _parse_n(token, default):
+            try:
+                n = int(token)
+                return n if n > 0 else default
+            except (TypeError, ValueError):
+                return default
+
+        if sub == "":
+            if _user_msgs:
+                console.print("[bold]You last asked:[/bold]")
+                console.print(f"  [cyan]{escape(_user_msgs[-1])}[/cyan]")
+            else:
+                _fallback = getattr(handle_meta_command, '_last_original_input', None)
+                if _fallback:
+                    console.print("[bold]You last asked:[/bold]")
+                    console.print(f"  [cyan]{escape(_fallback)}[/cyan]")
+                else:
+                    console.print("[yellow]You haven't asked anything yet this session.[/yellow]")
+                    console.print("[dim]Tip: /told log shows prompts from the on-disk journal "
+                                  "(survives /new and restarts).[/dim]")
+
+        elif sub == "all":
+            if not _user_msgs:
+                console.print("[yellow]No user messages in this session yet.[/yellow]")
+                console.print("[dim]Tip: /told log reads the durable per-cwd journal.[/dim]")
+            else:
+                console.print(f"[bold]All your messages ({len(_user_msgs)}):[/bold]")
+                for i, msg in enumerate(_user_msgs, 1):
+                    console.print(f"  [dim][{i}][/dim] {escape(msg)}")
+
+        elif sub == "reply":
+            n = _parse_n(parts[2] if len(parts) > 2 else "", 1)
+            _turns = []
+            i = 0
+            while i < len(_chat):
+                m = _chat[i]
+                if isinstance(m, dict) and m.get("role") == "user":
+                    asst = None
+                    j = i + 1
+                    while j < len(_chat):
+                        am = _chat[j]
+                        if isinstance(am, dict) and am.get("role") == "assistant":
+                            asst = am.get("content", "")
+                            break
+                        if isinstance(am, dict) and am.get("role") == "user":
+                            break
+                        j += 1
+                    _turns.append((m.get("content", ""), asst or "[no reply]"))
+                    i = j + 1 if asst is not None else j
+                else:
+                    i += 1
+            if not _turns:
+                console.print("[yellow]No conversation turns to replay.[/yellow]")
+                console.print("[dim]Tip: /told log reads the durable per-cwd journal.[/dim]")
+            else:
+                recent = _turns[-n:] if n < len(_turns) else _turns
+                label = "Last turn" if len(recent) == 1 else f"Last {len(recent)} turns"
+                console.print(f"[bold]── {label} ──[/bold]")
+                for idx, (u, a) in enumerate(recent, 1):
+                    console.print(f"[bold]You:[/bold]        [cyan]{escape(u)}[/cyan]")
+                    console.print(f"[bold]Assistant:[/bold]   [green]{escape(a)}[/green]")
+                    if idx < len(recent):
+                        console.print()
+
+        elif sub == "log":
+            n = _parse_n(parts[2] if len(parts) > 2 else "", 10)
+            _log_path = paths.project_dir() / "events.jsonl"
+            _entries = []
+            try:
+                if _log_path.exists():
+                    with open(_log_path, "r", encoding="utf-8") as f:
+                        for line in f:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                evt = json.loads(line)
+                            except (ValueError, TypeError):
+                                continue
+                            if isinstance(evt, dict) and evt.get("type") == "prompt_admitted":
+                                _entries.append(evt)
+            except OSError:
+                pass
+            if not _entries:
+                console.print("[yellow]No prompts recorded in the journal yet.[/yellow]")
+                console.print(f"[dim]Journal: {escape(str(_log_path))}[/dim]")
+            else:
+                recent = _entries[-n:] if n < len(_entries) else _entries
+                console.print(f"[bold]Recent prompts (from journal):[/bold]")
+                for evt in recent:
+                    ts = evt.get("ts")
+                    tstr = ""
+                    if isinstance(ts, (int, float)) and ts > 0:
+                        try:
+                            tstr = datetime.fromtimestamp(ts).strftime("%H:%M:%S")
+                        except (OSError, ValueError, OverflowError):
+                            tstr = ""
+                    text = evt.get("text", "") or ""
+                    if tstr:
+                        console.print(f"  [dim]{tstr}[/dim]  {escape(text)}")
+                    else:
+                        console.print(f"  {escape(text)}")
+
+        else:
+            try:
+                n = int(sub)
+            except ValueError:
+                console.print(f"[red]Unknown subcommand: {escape(sub)}[/red]")
+                console.print("[yellow]Usage: /told [N|all|reply [N]|log [N]][/yellow]")
+                return False
+            if n <= 0:
+                console.print("[yellow]N must be a positive integer.[/yellow]")
+                return False
+            if not _user_msgs:
+                console.print("[yellow]No user messages in this session yet.[/yellow]")
+                console.print("[dim]Tip: /told log reads the durable per-cwd journal.[/dim]")
+            else:
+                recent = _user_msgs[-n:] if n < len(_user_msgs) else _user_msgs
+                label = "Last message" if len(recent) == 1 else f"Last {len(recent)} messages"
+                console.print(f"[bold]{label}:[/bold]")
+                for i, msg in enumerate(recent, 1):
+                    console.print(f"  [dim][{i}][/dim] {escape(msg)}")
 
     elif action == "/hwo":
         sub = parts[1].lower() if len(parts) > 1 else ""
