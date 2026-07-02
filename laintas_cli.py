@@ -175,6 +175,309 @@ def _ptk_fragments(pairs):
     return out
 
 
+# ── Reusable selection dialog ──────────────────────────────────────────
+# A single component covering single-select, multi-select, inline (non-full-
+# screen), full-screen, fuzzy-search, and action-key variants.  Supersedes
+# the ~40-line scaffold duplicated across the 7 hand-rolled pickers.
+
+
+def _fuzzy_match(text: str, pattern: str) -> bool:
+    """Return True if all chars of pattern appear in text in order (fuzzy match)."""
+    it = iter(text)
+    return all(c in it for c in pattern)
+
+
+def select_dialog(
+    items,
+    *,
+    title: str = "",
+    multi: bool = False,
+    full_screen: bool = True,
+    selected_index: int = 0,
+    checked=None,
+    search: bool = False,
+    hint: str = "",
+    action_keys=None,
+    enter_action: str = "",
+    letter_shortcuts: bool = False,
+    refresh_interval: float = 0.05,
+):
+    """Interactive arrow-key selector — single or multi-select.
+
+    Parameters
+    ----------
+    items : list[str] | list[tuple[str, str]]
+        Options to choose from.  Each entry is either a bare label or a
+        ``(label, description)`` tuple; both are rendered with Rich markup.
+    title : str
+        Bold header line (rendered with Rich markup).
+    multi : bool
+        ``False`` (default) → single-select: Enter returns the chosen item.
+        ``True`` → multi-select: Space toggles a checkbox, Enter returns the
+        list of checked items.
+    full_screen : bool
+        ``True`` (default) → takes over the alternate screen buffer with
+        terminal-height-aware pagination.  ``False`` → inline non-full-screen
+        renderer (for approval gates that keep body content in scrollback).
+    selected_index : int
+        Initial highlighted row.
+    checked : set[int] | None
+        (multi only) Pre-checked row indices.
+    search : bool
+        Show a fuzzy-filter input box above the list (typed text filters
+        items by subsequence match on the label).
+    hint : str
+        Footer hint line.  Auto-derived from mode when empty.
+    action_keys : dict[str, str] | None
+        Map of ``key → action_name``.  When a key is pressed the dialog exits
+        returning ``(action_name, absolute_index)`` instead of an item.  The
+        caller can loop and re-invoke for multi-step pickers (like the resume
+        picker's d/x keys).
+    enter_action : str
+        When non-empty (and ``action_keys`` is also set), Enter returns
+        ``(enter_action, idx)`` instead of the raw item.  Useful for pickers
+        where Enter triggers an action (e.g. "resume", "toggle") rather than
+        returning a value.
+    letter_shortcuts : bool
+        When True, pressing a letter jumps to the first option whose label
+        starts with that letter and confirms (muscle-memory compat for
+        y/n/a approval gates).  Ignored in multi mode.
+    refresh_interval : float
+        Application refresh interval in seconds.
+
+    Returns
+    -------
+    Single-select → the chosen item (str or tuple) or ``None`` (cancelled).
+    Multi-select  → list of checked items, or ``None`` (cancelled).
+    action_keys   → ``(action_name, absolute_index)`` or ``(None, -1)``.
+    """
+    if not items:
+        return None
+
+    # ── Normalise items into (label, desc) pairs ──────────────────
+    norm: list[tuple[str, str]] = []
+    for it in items:
+        if isinstance(it, (tuple, list)):
+            norm.append((str(it[0]), str(it[1]) if len(it) > 1 else ""))
+        else:
+            norm.append((str(it), ""))
+
+    sel = [max(0, min(selected_index, len(norm) - 1))]
+    chk: set[int] = set(checked) if (multi and checked) else set()
+    filter_buf = Buffer() if search else None
+    act_keys: dict[str, str] = action_keys or {}
+
+    def _visible():
+        """Return (list_of_(orig_idx, label, desc)) after filtering."""
+        if not filter_buf:
+            return list(enumerate(norm))
+        f = filter_buf.text.strip().lower()
+        if not f:
+            return list(enumerate(norm))
+        out = []
+        for oi, (lab, _desc) in enumerate(norm):
+            plain = re.sub(r"\[/?[^\]]+\]", "", lab).lower()
+            if _fuzzy_match(plain, f):
+                out.append((oi, lab, _desc))
+        return out
+
+    def _clamp_sel():
+        vis = _visible()
+        if not vis:
+            sel[0] = 0
+            return vis
+        if sel[0] >= vis[-1][0]:
+            sel[0] = vis[-1][0]
+        if sel[0] < vis[0][0]:
+            sel[0] = vis[0][0]
+        return vis
+
+    def _build_lines():
+        lines = []
+        if title:
+            lines.append(("bold cyan", f"{title}\n"))
+
+        vis = _clamp_sel()
+
+        # ── Pagination (full-screen only) ──
+        start, end = 0, len(vis)
+        if full_screen and vis:
+            import shutil
+            term_h = shutil.get_terminal_size().lines
+            # Reserve lines for title, search, header/footer hints
+            reserve = (3 if title else 0) + (3 if search else 0) + 3
+            list_h = max(4, term_h - reserve)
+            if len(vis) > list_h:
+                cur_pos = next((i for i, (oi, _, _) in enumerate(vis)
+                                if oi == sel[0]), 0)
+                half = list_h // 2
+                start = max(0, min(cur_pos - half, len(vis) - list_h))
+                end = min(start + list_h, len(vis))
+
+        if start > 0:
+            lines.append(("dim", f"  ... {start} more above ...\n"))
+
+        for vi in range(start, end):
+            oi, lab, desc = vis[vi]
+            is_sel = (oi == sel[0])
+            prefix = "▶" if is_sel else " "
+            if multi:
+                mark = "☑" if oi in chk else "☐"
+                row_text = f" {prefix} {mark}  {lab}"
+            else:
+                row_text = f" {prefix} {lab}"
+            if desc:
+                row_text += f"  [dim]{desc}[/dim]"
+            style = "class:selected" if is_sel else ""
+            lines.append((style, row_text + "\n"))
+
+        if end < len(vis):
+            lines.append(("dim", f"  ... {len(vis) - end} more below ...\n"))
+
+        # ── Footer hint ──
+        lines.append(("", "\n"))
+        if not hint:
+            if multi:
+                parts = ["Space toggle", "Enter confirm", "Esc cancel"]
+            else:
+                parts = ["Enter select", "Esc cancel"]
+            if search:
+                parts.insert(0, "Type to filter")
+            if act_keys:
+                parts.insert(0, "  ".join(f"{k}={a}" for k, a in act_keys.items()))
+            lines.append(("dim", "  " + "  ".join(parts)))
+        else:
+            lines.append(("dim", "  " + hint))
+        return lines
+
+    # ── Key bindings ──────────────────────────────────────────────
+    kb = KeyBindings()
+
+    @kb.add("up")
+    def _(event):
+        vis = _visible()
+        if not vis:
+            return
+        cur_vi = next((i for i, (oi, _, _) in enumerate(vis) if oi == sel[0]), 0)
+        if cur_vi > 0:
+            sel[0] = vis[cur_vi - 1][0]
+
+    @kb.add("down")
+    def _(event):
+        vis = _visible()
+        if not vis:
+            return
+        cur_vi = next((i for i, (oi, _, _) in enumerate(vis) if oi == sel[0]), 0)
+        if cur_vi < len(vis) - 1:
+            sel[0] = vis[cur_vi + 1][0]
+
+    @kb.add("home")
+    def _(event):
+        vis = _visible()
+        if vis:
+            sel[0] = vis[0][0]
+
+    @kb.add("end")
+    def _(event):
+        vis = _visible()
+        if vis:
+            sel[0] = vis[-1][0]
+
+    if multi:
+        @kb.add("space")
+        def _(event):
+            if sel[0] in chk:
+                chk.discard(sel[0])
+            else:
+                chk.add(sel[0])
+
+    @kb.add("enter")
+    def _(event):
+        vis = _clamp_sel()
+        if not vis:
+            if act_keys:
+                event.app.exit(result=(None, -1))
+            else:
+                event.app.exit(result=None)
+            return
+        if multi:
+            checked_items = [items[oi] for oi in sorted(chk)
+                             if oi < len(items)]
+            event.app.exit(result=checked_items)
+        elif enter_action and act_keys:
+            event.app.exit(result=(enter_action, sel[0]))
+        else:
+            event.app.exit(result=items[sel[0]])
+
+    # Action keys (e.g. d=details, x=delete in resume picker)
+    for _key, _action in list(act_keys.items()):
+
+        @kb.add(_key)
+        def _ak(event, _a=_action):
+            vis = _clamp_sel()
+            if vis and 0 <= sel[0] < len(items):
+                event.app.exit(result=(_a, sel[0]))
+            else:
+                event.app.exit(result=(_a, -1))
+
+    # Letter shortcuts (y/n/a for approval gates)
+    if letter_shortcuts and not multi:
+        # Collect the first letter of each label (lowercased).
+        _first_letters = set()
+        for lab, _desc in norm:
+            fl = lab.strip()[:1].lower()
+            if fl:
+                _first_letters.add(fl)
+
+        for _letter in sorted(_first_letters):
+
+            @kb.add(_letter)
+            @kb.add(_letter.upper())
+            def _lk(event, _l=_letter):
+                for i, (lab, _desc) in enumerate(norm):
+                    if lab.strip()[:1].lower() == _l:
+                        sel[0] = i
+                        event.app.exit(result=items[i])
+                        return
+
+    @kb.add("escape")
+    @kb.add("q")
+    @kb.add("c-c")
+    def _(event):
+        if multi:
+            event.app.exit(result=None)
+        elif act_keys:
+            event.app.exit(result=(None, -1))
+        else:
+            event.app.exit(result=None)
+
+    # ── Layout ────────────────────────────────────────────────────
+    windows = []
+    if search:
+        windows.append(Window(content=BufferControl(buffer=filter_buf), height=1))
+    list_ctrl = FormattedTextControl(lambda: _ptk_fragments(_build_lines()))
+    if full_screen:
+        windows.append(Window(content=list_ctrl))
+    else:
+        n = len(norm)
+        windows.append(Window(content=list_ctrl, always_hide_cursor=True, height=n))
+
+    layout = Layout(HSplit(windows))
+    style = Style.from_dict({
+        "selected": "reverse",
+        "option": "",
+    })
+
+    app = Application(
+        layout=layout,
+        key_bindings=kb,
+        style=style,
+        full_screen=full_screen,
+        refresh_interval=refresh_interval,
+    )
+    return app.run()
+
+
 try:
     from version import __version__
 except Exception:
@@ -2008,77 +2311,25 @@ def show_model_selector(models: list[dict], current: str = "") -> Optional[str]:
     """Interactive model selector. Returns selected model id or None."""
     if not models:
         return None
-    selected = [0]
-    if current:
-        for i, model in enumerate(models):
-            if model.get("id") == current:
-                selected[0] = i
-                break
-
-    def _build_lines():
-        lines = []
-        lines.append(("bold cyan", "Models — choose with ↑↓ and Enter\n"))
-        lines.append(("dim", "─" * 72 + "\n"))
-
-        import shutil
-        term_h = shutil.get_terminal_size().lines
-        list_h = max(4, term_h - 5)
-        start = 0
-        if len(models) > list_h:
-            half = list_h // 2
-            start = max(0, min(selected[0] - half, len(models) - list_h))
-        end = min(start + list_h, len(models))
-
-        if start > 0:
-            lines.append(("dim", f"  ... {start} more above ...\n"))
-
-        for idx in range(start, end):
-            model = models[idx]
-            model_id = model.get("id", "")
-            provider = model.get("description") or model.get("provider") or ""
-            prefix = "▶" if idx == selected[0] else " "
-            current_mark = " *" if current and model_id == current else "  "
-            style = "class:selected" if idx == selected[0] else ""
-            lines.append((style, f" {prefix}{current_mark} [cyan]{model_id:30}[/cyan] {provider}\n"))
-
-        if end < len(models):
-            lines.append(("dim", f"  ... {len(models) - end} more below ...\n"))
-
-        lines.append(("", "\n"))
-        lines.append(("dim", " ↑↓ navigate  ↵ select  Esc/q cancel"))
-        return lines
-
-    kb = KeyBindings()
-
-    @kb.add("up")
-    def _(event):
-        selected[0] = max(0, selected[0] - 1)
-
-    @kb.add("down")
-    def _(event):
-        selected[0] = min(len(models) - 1, selected[0] + 1)
-
-    @kb.add("enter")
-    def _(event):
-        event.app.exit(result=models[selected[0]])
-
-    @kb.add("escape")
-    @kb.add("q")
-    @kb.add("c-c")
-    def _(event):
-        event.app.exit(result=None)
-
-    layout = Layout(HSplit([Window(content=FormattedTextControl(
-        lambda: _ptk_fragments(_build_lines())))]))
-    style = Style.from_dict({"selected": "reverse"})
-    app = Application(
-        layout=layout,
-        key_bindings=kb,
-        style=style,
+    labels = []
+    sel_idx = 0
+    for i, model in enumerate(models):
+        model_id = model.get("id", "")
+        provider = model.get("description") or model.get("provider") or ""
+        mark = " *" if current and model_id == current else "  "
+        labels.append(f"{mark}[cyan]{model_id:30}[/cyan] {provider}")
+        if current and model_id == current:
+            sel_idx = i
+    chosen = select_dialog(
+        labels,
+        title="Models — choose with ↑↓ and Enter",
         full_screen=True,
-        refresh_interval=0.05,
+        selected_index=sel_idx,
+        hint="↑↓ navigate  ↵ select  Esc/q cancel",
     )
-    return app.run()
+    if chosen is None:
+        return None
+    return models[labels.index(chosen)].get("id")
 
 
 # ── Authentication ──────────────────────────────────────────────────────
@@ -3006,69 +3257,34 @@ def show_resume_picker(cwd: str) -> Optional[dict]:
         console.print("[yellow]No saved session to resume in this directory.[/yellow]")
         return None
 
-    selected = [0]
-
-    def _build_lines():
-        lines = []
-        lines.append(("bold cyan", "Resume Session\n"))
-        lines.append(("dim", "↑↓ navigate  ↵ resume  d details  x delete  q cancel\n\n"))
-        for i, item in enumerate(choices):
-            prefix = "▶" if i == selected[0] else " "
+    def _build_labels():
+        labels = []
+        for item in choices:
             kind = item.get("kind", "session")
             badge = "[magenta]◆ checkpoint[/magenta]" if kind == "checkpoint" else "[blue]○ autosave[/blue]"
             turns = item.get("turn_count") or _resume_turn_count(item)
             ago = _format_time_ago(item.get("timestamp", 0))
             title = str(item.get("title") or "Untitled session")[:60].replace("\n", " ")
-            style = "class:selected" if i == selected[0] else ""
-            lines.append((style, f" {prefix} {badge}  [dim]{ago}[/dim]  "
-                                 f"{turns} turn(s)  [bold]{title}[/bold]\n"))
-        lines.append(("", "\n"))
-        lines.append(("dim", f"{len(choices)} saved session(s).  "
-                      "Enter=resume  d=details  x=delete  q=cancel"))
-        return lines
+            labels.append(f"{badge}  [dim]{ago}[/dim]  {turns} turn(s)  [bold]{title}[/bold]")
+        return labels
 
-    kb = KeyBindings()
-
-    @kb.add("up")
-    def _(event):
-        selected[0] = max(0, selected[0] - 1)
-
-    @kb.add("down")
-    def _(event):
-        selected[0] = min(len(choices) - 1, selected[0] + 1)
-
-    @kb.add("enter")
-    def _(event):
-        event.app.exit(result=("resume", selected[0]))
-
-    @kb.add("d")
-    def _(event):
-        event.app.exit(result=("details", selected[0]))
-
-    @kb.add("x")
-    def _(event):
-        event.app.exit(result=("delete", selected[0]))
-
-    @kb.add("q")
-    @kb.add("escape")
-    @kb.add("c-c")
-    def _(event):
-        event.app.exit(result=("quit", -1))
-
-    style = Style.from_dict({"selected": "reverse"})
-    window = Window(content=FormattedTextControl(
-        lambda: _ptk_fragments(_build_lines())), always_hide_cursor=True)
-    app = Application(
-        layout=Layout(HSplit([window])), key_bindings=kb, style=style,
-        full_screen=True, refresh_interval=0.5,
-    )
-
+    sel_idx = 0
     while choices:
-        action, idx = app.run()
-        if action == "quit":
+        labels = _build_labels()
+        result = select_dialog(
+            labels,
+            title="Resume Session",
+            full_screen=True,
+            selected_index=sel_idx,
+            action_keys={"d": "details", "x": "delete"},
+            enter_action="resume",
+            hint="↑↓ navigate  ↵ resume  d details  x delete  q cancel",
+        )
+        if result is None:
             return None
-        if idx < 0 or idx >= len(choices):
-            continue
+        action, idx = result
+        if action is None or idx < 0 or idx >= len(choices):
+            return None
         item = choices[idx]
         if action == "resume":
             return item
@@ -3076,6 +3292,7 @@ def show_resume_picker(cwd: str) -> Optional[dict]:
             _show_resume_detail(item)
             _print_resume_transcript(item, 20)
             input("\n[dim]Press Enter to continue...[/dim]")
+            sel_idx = idx
         elif action == "delete":
             delete_resume_state(cwd, item)
             del choices[idx]
@@ -3083,7 +3300,7 @@ def show_resume_picker(cwd: str) -> Optional[dict]:
             if not choices:
                 console.print("[dim]No more saved sessions.[/dim]")
                 return None
-            selected[0] = min(selected[0], len(choices) - 1)
+            sel_idx = min(idx, len(choices) - 1)
     return None
 
 
@@ -4745,20 +4962,14 @@ class AgentRegistry:
 
 def show_debug_browser_interactive() -> None:
     """Interactive debug browser — arrow keys to select, Enter to view detail, q/Esc to exit."""
-    entries = get_debug_logs()[:20]
-    if not entries:
-        console.print("[dim]No debug entries yet. Run an AI command to see data.[/dim]")
-        return
+    while True:
+        entries = get_debug_logs()[:20]
+        if not entries:
+            console.print("[dim]No debug entries yet. Run an AI command to see data.[/dim]")
+            return
 
-    selected = [0]  # mutable for closure capture
-
-    def _build_lines():
-        lines = []
-        lines.append(("bold cyan", "Debug Log — Last 20 Entries\n"))
-        lines.append(("dim", "↑↓ navigate  ↵ view detail  q/Esc back\n\n"))
-
+        labels = []
         for i, e in enumerate(entries):
-            prefix = "▶" if i == selected[0] else " "
             ts = e.timestamp[-19:] if len(e.timestamp) > 19 else e.timestamp
             if e.request_body:
                 tag = "AI "
@@ -4767,58 +4978,19 @@ def show_debug_browser_interactive() -> None:
                 tag = "CMD"
                 summary = e.exec_command[:60] or "(no output)"
             summary = summary.replace("\n", " ")[:60]
-            style = "class:selected" if i == selected[0] else ""
-            lines.append((style, f" {prefix} #{i+1:2d}  {ts}  [{tag}]  {summary}\n"))
+            labels.append(f"#{i+1:2d}  {ts}  [{tag}]  {summary}")
 
-        lines.append(("", "\n"))
-        lines.append(("dim", f"{len(entries)} entries shown.  /debug clear | /debug <N> | /debug <N> <file>"))
-        return lines
-
-    def _get_text():
-        return _build_lines()
-
-    kb = KeyBindings()
-
-    @kb.add("up")
-    def _(event):
-        selected[0] = max(0, selected[0] - 1)
-
-    @kb.add("down")
-    def _(event):
-        selected[0] = min(len(entries) - 1, selected[0] + 1)
-
-    @kb.add("enter")
-    def _(event):
-        event.app.exit(result=selected[0])
-
-    @kb.add("q")
-    @kb.add("escape")
-    @kb.add("c-c")
-    def _(event):
-        event.app.exit(result=-1)
-
-    style = Style.from_dict({
-        "selected": "reverse",
-    })
-
-    text_control = FormattedTextControl(_get_text)
-    window = Window(content=text_control, always_hide_cursor=False)
-    layout = Layout(HSplit([window]))
-
-    app = Application(
-        layout=layout,
-        key_bindings=kb,
-        style=style,
-        full_screen=True,
-        refresh_interval=0.1,
-    )
-
-    result = app.run()
-    if result >= 0:
-        show_debug_detail(result)
-        # After viewing detail, wait for key then return to browser
+        chosen = select_dialog(
+            labels,
+            title="Debug Log — Last 20 Entries",
+            full_screen=True,
+            hint="↑↓ navigate  ↵ view detail  q/Esc back",
+        )
+        if chosen is None:
+            return
+        idx = labels.index(chosen)
+        show_debug_detail(idx)
         input("\n[dim]Press Enter to return to debug browser...[/dim]")
-        show_debug_browser_interactive()  # loop back
 
 
 def show_debug_detail(index: int) -> None:
@@ -4929,31 +5101,23 @@ def show_terminal_manager(primary_session=None) -> None:
     Arrow keys to navigate, Enter to fully enter (interactive takeover),
     o to observe read-only, c to close, d for details, q to exit.
     """
-    items: list = []  # [(display_name, command, session, created_at, is_alive)]
 
-    # term0 is the shell laintas_cli runs on — "entering" it just drops to a
-    # raw bash that requires `exit` to return, which is confusing and useless.
-    # Show named sub-terminals only.
-    for term in get_all_terminals():
-        if term.name == "term0":
-            continue
-        items.append((term.name, term.command, term.session,
-                      term.created_at, term.session is not None and term.session.is_alive()))
+    def _collect():
+        out = []
+        if primary_session is not None and primary_session.is_alive():
+            out.append(("term0 (primary)", primary_session.command,
+                        primary_session, 0.0, True))
+        for term in get_all_terminals():
+            if term.name == "term0":
+                continue
+            out.append((term.name, term.command, term.session,
+                        term.created_at,
+                        term.session is not None and term.session.is_alive()))
+        return out
 
-    if not items:
-        console.print("[dim]No sub-terminals. Use /t <name> to create one, "
-                      "or let the AI spawn a command.[/dim]")
-        return
-
-    selected = [0]
-
-    def _build_lines():
-        lines = []
-        lines.append(("bold cyan", "Terminal Manager\n"))
-        lines.append(("dim", "↑↓ navigate  ↵ enter  o observe  c close  d details  q back\n\n"))
-
-        for i, (name, cmd, sess, created, alive) in enumerate(items):
-            prefix = "▶" if i == selected[0] else " "
+    def _build_labels(items):
+        labels = []
+        for name, cmd, _sess, created, alive in items:
             status = "[green]● alive[/green]" if alive else "[red]■ dead[/red]"
             uptime_str = ""
             if created > 0:
@@ -4965,69 +5129,39 @@ def show_terminal_manager(primary_session=None) -> None:
                 else:
                     uptime_str = f" {uptime / 3600:.1f}h"
             cmd_preview = cmd[:60].replace("\n", " ")
-            style = "class:selected" if i == selected[0] else ""
-            lines.append((style, f" {prefix} [bold]{name}[/bold]  {status}{uptime_str}  "
-                                  f"[dim]{cmd_preview}[/dim]\n"))
+            labels.append(f"[bold]{name}[/bold]  {status}{uptime_str}  "
+                          f"[dim]{cmd_preview}[/dim]")
+        return labels
 
-        lines.append(("", "\n"))
-        lines.append(("dim", f"{len(items)} terminal(s).  "
-                      "Enter=embody  o=observe  c=close  d=details  q=back"))
-        return lines
-
-    def _get_text():
-        return _ptk_fragments(_build_lines())
-
-    kb = KeyBindings()
-
-    @kb.add("up")
-    def _(event):
-        selected[0] = max(0, selected[0] - 1)
-
-    @kb.add("down")
-    def _(event):
-        selected[0] = min(len(items) - 1, selected[0] + 1)
-
-    @kb.add("enter")
-    def _(event):
-        event.app.exit(result=("enter", selected[0]))
-
-    @kb.add("o")
-    def _(event):
-        event.app.exit(result=("observe", selected[0]))
-
-    @kb.add("c")
-    def _(event):
-        event.app.exit(result=("close", selected[0]))
-
-    @kb.add("d")
-    def _(event):
-        event.app.exit(result=("details", selected[0]))
-
-    @kb.add("q")
-    @kb.add("escape")
-    @kb.add("c-c")
-    def _(event):
-        event.app.exit(result=("quit", -1))
-
-    style = Style.from_dict({"selected": "reverse"})
-    text_control = FormattedTextControl(_get_text)
-    window = Window(content=text_control, always_hide_cursor=False)
-    layout = Layout(HSplit([window]))
-
-    app = Application(
-        layout=layout, key_bindings=kb, style=style,
-        full_screen=True, refresh_interval=0.5,
-    )
-
+    sel_idx = 0
+    first = True
     while True:
-        result = app.run()
+        items = _collect()
+        if not items:
+            if first:
+                console.print("[dim]No sub-terminals. Use /t <name> to create one, "
+                              "or let the AI spawn a command.[/dim]")
+            else:
+                console.print("\n[dim]No more terminals.[/dim]")
+            return
+        first = False
+        sel_idx = min(sel_idx, len(items) - 1)
+
+        labels = _build_labels(items)
+        result = select_dialog(
+            labels,
+            title="Terminal Manager",
+            full_screen=True,
+            selected_index=sel_idx,
+            action_keys={"o": "observe", "c": "close", "d": "details"},
+            enter_action="enter",
+            hint="↑↓ navigate  ↵ enter  o observe  c close  d details  q back",
+        )
+        if result is None:
+            return
         action, idx = result
-
-        if action == "quit":
-            break
-
-        if idx < 0 or idx >= len(items):
-            continue
+        if action is None or idx < 0 or idx >= len(items):
+            return
 
         name, cmd, sess, created, alive = items[idx]
 
@@ -5035,47 +5169,33 @@ def show_terminal_manager(primary_session=None) -> None:
             if not alive:
                 console.print("\n[yellow]Session has already ended.[/yellow]")
                 input("[dim]Press Enter to continue...[/dim]")
-                continue
-            enter_session(sess, display_name=name, display_cmd=cmd)
-            # After detaching from enter_session, the terminal may need
-            # a moment to restore before prompt_toolkit takes over again
-            time.sleep(0.1)
-            # If session died during enter, unregister it
-            if name != "term0 (primary)" and not sess.is_alive():
-                unregister_terminal(name)
+            else:
+                enter_session(sess, display_name=name, display_cmd=cmd)
+                time.sleep(0.1)
+                if name != "term0 (primary)" and not sess.is_alive():
+                    unregister_terminal(name)
 
         elif action == "observe":
             if not alive:
                 console.print("\n[yellow]Session has already ended.[/yellow]")
                 input("[dim]Press Enter to continue...[/dim]")
-                continue
-            observe_session(sess, display_name=name, display_cmd=cmd)
+            else:
+                observe_session(sess, display_name=name, display_cmd=cmd)
 
         elif action == "close":
             if name == "term0 (primary)":
                 console.print("\n[yellow]Cannot close the primary session. "
                               "Use /exit or close the parent terminal.[/yellow]")
                 input("[dim]Press Enter to continue...[/dim]")
-                continue
-            unregister_terminal(name)
-            console.print(f"\n[green]Closed terminal [bold]{name}[/bold][/green]")
+            else:
+                unregister_terminal(name)
+                console.print(f"\n[green]Closed terminal [bold]{name}[/bold][/green]")
 
         elif action == "details":
             _show_terminal_detail(name, cmd, sess, created, alive)
             input("\n[dim]Press Enter to continue...[/dim]")
 
-        # Rebuild items after mutations
-        items.clear()
-        if primary_session is not None and primary_session.is_alive():
-            items.append(("term0 (primary)", primary_session.command, primary_session,
-                          0.0, True))
-        for term in get_all_terminals():
-            items.append((term.name, term.command, term.session,
-                          term.created_at, term.session is not None and term.session.is_alive()))
-        if not items:
-            console.print("\n[dim]No more terminals.[/dim]")
-            break
-        selected[0] = min(selected[0], len(items) - 1)
+        sel_idx = idx
 
 
 def _show_skill_detail(name: str) -> None:
@@ -5118,96 +5238,60 @@ def show_skill_manager() -> None:
                         len(groups.get(f"skill:{n}", []))))
         return out
 
-    items = _collect()
-    if not items:
-        console.print(f"[dim]No skills in {skills_mod.SKILLS_DIR}[/dim]")
-        console.print("[dim]Create one with: /skill new <name>[/dim]")
-        return
-
-    selected = [0]
-    status = [""]
-
-    def _build_lines():
-        lines = []
-        lines.append(("bold cyan", "Skill Manager\n"))
-        lines.append(("dim", "↑↓ navigate  ↵/space toggle  l load  u unload  "
-                             "r reload  d details  q back\n\n"))
-        for i, (name, desc, loaded, ntools) in enumerate(items):
-            prefix = "▶" if i == selected[0] else " "
+    def _build_labels(items):
+        labels = []
+        for name, desc, loaded, ntools in items:
             badge = "[green]● loaded[/green]" if loaded else "[dim]○ available[/dim]"
             tool_str = f" [dim]({ntools} tool{'s' if ntools != 1 else ''})[/dim]" if ntools else ""
             desc_preview = (desc or "").replace("\n", " ")[:56]
-            style = "class:selected" if i == selected[0] else ""
-            lines.append((style, f" {prefix} [bold]{name}[/bold]  {badge}{tool_str}  "
-                                 f"[dim]{desc_preview}[/dim]\n"))
-        lines.append(("", "\n"))
-        loaded_n = sum(1 for _, _, ld, _ in items if ld)
-        lines.append(("dim", f"{len(items)} skill(s), {loaded_n} loaded.  "
-                             "↵/space=toggle  l=load  u=unload  r=reload  d=details  q=back"))
-        if status[0]:
-            lines.append(("", "\n"))
-            lines.append(("yellow", status[0]))
-        return lines
+            labels.append(f"[bold]{name}[/bold]  {badge}{tool_str}  "
+                          f"[dim]{desc_preview}[/dim]")
+        return labels
 
-    kb = KeyBindings()
-
-    @kb.add("up")
-    def _(event):
-        selected[0] = max(0, selected[0] - 1)
-
-    @kb.add("down")
-    def _(event):
-        selected[0] = min(len(items) - 1, selected[0] + 1)
-
-    @kb.add("enter")
-    @kb.add("space")
-    def _(event):
-        event.app.exit(result=("toggle", selected[0]))
-
-    @kb.add("l")
-    def _(event):
-        event.app.exit(result=("load", selected[0]))
-
-    @kb.add("u")
-    def _(event):
-        event.app.exit(result=("unload", selected[0]))
-
-    @kb.add("r")
-    def _(event):
-        event.app.exit(result=("reload", selected[0]))
-
-    @kb.add("d")
-    def _(event):
-        event.app.exit(result=("details", selected[0]))
-
-    @kb.add("q")
-    @kb.add("escape")
-    @kb.add("c-c")
-    def _(event):
-        event.app.exit(result=("quit", -1))
-
-    style = Style.from_dict({"selected": "reverse"})
-    text_control = FormattedTextControl(lambda: _ptk_fragments(_build_lines()))
-    window = Window(content=text_control, always_hide_cursor=False)
-    layout = Layout(HSplit([window]))
-    app = Application(layout=layout, key_bindings=kb, style=style,
-                      full_screen=True, refresh_interval=0.5)
-
+    sel_idx = 0
+    status_msg = ""
+    first = True
     while True:
-        action, idx = app.run()
+        items = _collect()
+        if not items:
+            if first:
+                console.print(f"[dim]No skills in {skills_mod.SKILLS_DIR}[/dim]")
+                console.print("[dim]Create one with: /skill new <name>[/dim]")
+            return
+        first = False
+        sel_idx = min(sel_idx, len(items) - 1)
 
-        if action == "quit":
-            break
-        if idx < 0 or idx >= len(items):
-            continue
+        labels = _build_labels(items)
+        hint = ("↑↓ navigate  ↵/space toggle  l load  u unload  "
+                "r reload  d details  q back")
+        if status_msg:
+            hint = f"{status_msg}\n{hint}"
+
+        result = select_dialog(
+            labels,
+            title="Skill Manager",
+            full_screen=True,
+            selected_index=sel_idx,
+            action_keys={"l": "load", "u": "unload", "r": "reload",
+                         "d": "details", "space": "toggle"},
+            enter_action="toggle",
+            hint=hint,
+        )
+        if result is None:
+            return
+        action, idx = result
+        if action is None or idx < 0 or idx >= len(items):
+            return
+
         name, desc, loaded, ntools = items[idx]
+        status_msg = ""
 
         if action == "details":
             _show_skill_detail(name)
             input("\n[dim]Press Enter to continue...[/dim]")
         elif action == "reload":
             results = skills_mod.reload_all()
-            status[0] = f"Reloaded: {len(results)} skill(s) re-scanned from disk."
+            status_msg = f"Reloaded: {len(results)} skill(s) re-scanned from disk."
         elif action in ("toggle", "load", "unload"):
             want_load = action == "load" or (action == "toggle" and not loaded)
             if action == "unload" or (action == "toggle" and loaded):
@@ -5216,13 +5300,10 @@ def show_skill_manager() -> None:
                 ok, msg = skills_mod.load_skill(name)
             else:
                 ok, msg = skills_mod.unload_skill(name)
-            status[0] = ("[green]" if ok else "[red]") + msg + ("[/green]" if ok else "[/red]")
+            status_msg = ("[green]" if ok else "[red]") + msg + (
+                "[/green]" if ok else "[/red]")
 
-        # Rebuild after any mutation
-        items[:] = _collect()
-        if not items:
-            break
-        selected[0] = min(selected[0], len(items) - 1)
+        sel_idx = idx
 
 
 # ── Meta Commands ──────────────────────────────────────────────────────
@@ -7959,122 +8040,22 @@ _COMMANDS = [
 ]
 
 
-def _fuzzy_match(text: str, pattern: str) -> bool:
-    """Return True if all chars of pattern appear in text in order (fuzzy match)."""
-    it = iter(text)
-    return all(c in it for c in pattern)
-
-
 def show_command_palette():
     """Interactive full-screen command selector — fuzzy filter, arrow keys, Enter.
 
     Returns the selected command string (e.g. \"/help\") or None if cancelled.
     """
-    filter_buffer = Buffer()
-    selected = [0]
-
-    def _get_filtered():
-        filt = filter_buffer.text.strip().lower()
-        if not filt:
-            return _COMMANDS[:]
-        return [(n, d) for n, d in _COMMANDS if _fuzzy_match(n.lower(), filt)]
-
-    def _build_lines():
-        lines = []
-        lines.append(("bold cyan", "Commands — type to filter\n"))
-        filt = filter_buffer.text.strip()
-        if filt:
-            lines.append(("", f"  filter: [white bold]{filt}[/white bold]\n"))
-        else:
-            lines.append(("dim", "  (start typing to filter)\n"))
-        lines.append(("dim", "─" * 50 + "\n"))
-
-        filtered = _get_filtered()
-        if not filtered:
-            lines.append(("", "\n"))
-            lines.append(("dim", "  No matching commands.\n"))
-            lines.append(("", "\n"))
-            return lines
-
-        # Clamp selection
-        if selected[0] >= len(filtered):
-            selected[0] = max(0, len(filtered) - 1)
-
-        # Compute visible range
-        import shutil
-        term_h = shutil.get_terminal_size().lines
-        list_h = max(4, term_h - 5)
-        start = 0
-        if len(filtered) > list_h:
-            start = min(selected[0], len(filtered) - list_h)
-            start = max(0, start)
-        end = min(start + list_h, len(filtered))
-
-        if start > 0:
-            lines.append(("dim", f"  ... {start} more above ...\n"))
-
-        for i in range(start, end):
-            cmd, desc = filtered[i]
-            prefix = "▶" if i == selected[0] else " "
-            style = "class:selected" if i == selected[0] else ""
-            lines.append((style, f" {prefix} [cyan]{cmd:14}[/cyan] {desc}\n"))
-
-        if end < len(filtered):
-            lines.append(("dim", f"  ... {len(filtered) - end} more below ...\n"))
-
-        lines.append(("", "\n"))
-        lines.append(("dim", f" {len(filtered)} commands  ↑↓ navigate  ↵ select  Esc cancel"))
-        return lines
-
-    # ── Key bindings ──────────────────────────────────────────────
-    kb = KeyBindings()
-
-    @kb.add("up")
-    def _(event):
-        filtered = _get_filtered()
-        if filtered:
-            selected[0] = max(0, selected[0] - 1)
-
-    @kb.add("down")
-    def _(event):
-        filtered = _get_filtered()
-        if filtered:
-            selected[0] = min(len(filtered) - 1, selected[0] + 1)
-
-    @kb.add("enter")
-    def _(event):
-        filtered = _get_filtered()
-        if filtered and 0 <= selected[0] < len(filtered):
-            event.app.exit(result=filtered[selected[0]][0])
-
-    @kb.add("escape")
-    @kb.add("c-c")
-    def _(event):
-        event.app.exit(result=None)
-
-    # ── Layout ────────────────────────────────────────────────────
-    search_control = BufferControl(buffer=filter_buffer)
-    search_window = Window(content=search_control, height=1)
-
-    list_control = FormattedTextControl(lambda: _ptk_fragments(_build_lines()))
-    list_window = Window(content=list_control)
-
-    layout = Layout(HSplit([search_window, list_window]))
-
-    # ── Style ─────────────────────────────────────────────────────
-    style = Style.from_dict({
-        "selected": "reverse",
-    })
-
-    # ── Run ───────────────────────────────────────────────────────
-    app = Application(
-        layout=layout,
-        key_bindings=kb,
-        style=style,
+    items = [(f"[cyan]{name}[/cyan]", desc) for name, desc in _COMMANDS]
+    chosen = select_dialog(
+        items,
+        title="Commands — type to filter",
         full_screen=True,
-        refresh_interval=0.05,
+        search=True,
+        hint="↑↓ navigate  ↵ select  Esc cancel",
     )
-    return app.run()
+    if chosen is None:
+        return None
+    return chosen[0]
 
 
 def show_help(command: str = ""):
@@ -8442,70 +8423,15 @@ def _arrow_approval_prompt(title: str, body_lines: list[str],
     # rather than approves an approval gate. Falls back to first option.
     _default_idx = next((i for i, o in enumerate(options)
                          if o.strip().lower().startswith("no")), 0)
-    selected = [_default_idx]
 
-    def _build_lines():
-        lines = []
-        for i, opt in enumerate(options):
-            prefix = "▶" if i == selected[0] else " "
-            style = "class:selected" if i == selected[0] else "class:option"
-            nl = "\n" if i < len(options) - 1 else ""
-            lines.append((style, f" {prefix} {opt}{nl}"))
-        return lines
-
-    kb = KeyBindings()
-
-    @kb.add("up")
-    def _(event):
-        selected[0] = max(0, selected[0] - 1)
-
-    @kb.add("down")
-    def _(event):
-        selected[0] = min(len(options) - 1, selected[0] + 1)
-
-    @kb.add("enter")
-    def _(event):
-        event.app.exit(result=options[selected[0]])
-
-    def _exit_by_prefix(event, prefix: str):
-        # Match the old [y/N/a] muscle-memory: a letter key jumps straight to
-        # the matching option and confirms it, no navigation needed.
-        for opt in options:
-            if opt.strip().lower().startswith(prefix):
-                event.app.exit(result=opt)
-                return
-
-    @kb.add("y")
-    @kb.add("Y")
-    def _(event):
-        _exit_by_prefix(event, "y")
-
-    @kb.add("n")
-    @kb.add("N")
-    def _(event):
-        _exit_by_prefix(event, "n")
-
-    @kb.add("a")
-    @kb.add("A")
-    def _(event):
-        _exit_by_prefix(event, "a")
-
-    @kb.add("escape")
-    @kb.add("c-c")
-    def _(event):
-        event.app.exit(result=None)
-
-    style = Style.from_dict({
-        "option": "",
-        "selected": "reverse",
-    })
-    window = Window(content=FormattedTextControl(_build_lines),
-                    always_hide_cursor=True, height=len(options))
-    app = Application(
-        layout=Layout(HSplit([window])), key_bindings=kb, style=style,
-        full_screen=False, refresh_interval=0.5,
+    return select_dialog(
+        options,
+        full_screen=False,
+        selected_index=_default_idx,
+        letter_shortcuts=True,
+        hint="↑↓ choose  y/n/a shortcut  ↵ confirm  Esc cancel",
+        refresh_interval=0.5,
     )
-    return app.run()
 
 
 def _blocking_approval_prompt(title: str, body: str, question: str,
