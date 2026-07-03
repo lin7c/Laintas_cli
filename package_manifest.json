@@ -12,10 +12,18 @@
     "memory_system",
     "hooks",
     "plan_mode",
+    "prompt_opt",
+    "prompt_lab",
+    "evolution_lab",
+    "evolution_runner",
+    "extension_runtime",
     "task_manager",
+    "workgraph",
     "agent_persistence",
     "agent_roles",
     "workflow_engine",
+    "backend_profiles",
+    "trust_store",
     "paths",
     "migrate",
     "cloud_provider",
@@ -46,7 +54,7 @@
 
   "data_dirs": ["default_skills"],
 
-  "extra_files": ["PROJECT.md", "requirements.txt", "setup.py"],
+  "extra_files": ["PROJECT.md", "SECURITY_CUSTOMIZATION.md", "requirements.txt", "setup.py"],
 
   "frozen_deps": {
     "linux":   ["websockets", "playwright", "aiortc", "av", "cffi"],

@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import threading
@@ -37,6 +38,7 @@ from typing import Any, Callable, Optional
 
 
 import paths
+import trust_store
 
 CONFIG_PATH = paths.HOOKS_FILE
 PYTHON_HOOKS_PATH = paths.PYTHON_HOOKS_FILE
@@ -67,6 +69,10 @@ def _load_config(force: bool = False) -> list[dict]:
             _hooks_config = []
             return _hooks_config
 
+        if not paths.ensure_private_file(CONFIG_PATH):
+            _hooks_config = []
+            return _hooks_config
+
         try:
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -76,6 +82,13 @@ def _load_config(force: bool = False) -> list[dict]:
                 _hooks_config = data
             else:
                 _hooks_config = []
+            if any(isinstance(hook, dict) and hook.get("enabled", True)
+                   and (hook.get("argv") or hook.get("command") or hook.get("exec"))
+                   for hook in _hooks_config):
+                trust = trust_store.extension_status(
+                    "hooks", "config", CONFIG_PATH)
+                if not trust.get("trusted"):
+                    _hooks_config = []
         except (OSError, json.JSONDecodeError):
             _hooks_config = []
         return _hooks_config
@@ -100,8 +113,8 @@ def _write_default_config() -> None:
             },
             {
                 "type": "on_error",
-                "comment": "Example: log errors to a file",
-                "command": "echo '[{timestamp}] Error: {error}' >> ~/laintas_errors.log",
+                "comment": "Example: hook receives JSON context on stdin",
+                "argv": ["/usr/bin/logger", "-t", "laintas-hook"],
                 "enabled": False,
             },
         ]
@@ -110,6 +123,7 @@ def _write_default_config() -> None:
         CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:
             json.dump(template, f, ensure_ascii=False, indent=2)
+        paths.ensure_private_file(CONFIG_PATH)
     except OSError:
         pass
 
@@ -118,6 +132,13 @@ def _load_python_hooks() -> dict:
     """Load ~/.laintas/hooks.py dynamically. mtime-cached."""
     global _python_hooks, _python_hooks_mtime
     if not PYTHON_HOOKS_PATH.exists():
+        return {}
+    if not paths.ensure_private_file(PYTHON_HOOKS_PATH):
+        return {}
+
+    trust = trust_store.extension_status(
+        "hooks", "python", PYTHON_HOOKS_PATH)
+    if not trust.get("trusted"):
         return {}
 
     try:
@@ -167,30 +188,36 @@ def _eval_condition(condition: str, ctx: dict) -> bool:
         result = eval(condition, {"__builtins__": safe_ns["__builtins__"]}, safe_ns)
         return bool(result)
     except Exception:
-        return True  # if condition is broken, don't block the hook
+        return False
 
 
-def _run_shell_hook(hook: dict, ctx: dict) -> Optional[str]:
-    """Execute a shell command hook. Returns stdout or None on failure."""
-    cmd_template = hook.get("command", "")
-    if not cmd_template:
-        return None
+def _run_shell_hook(hook: dict, ctx: dict) -> tuple[Optional[str], int]:
+    """Execute an argv hook with JSON context on stdin; never invoke a shell."""
+    argv = hook.get("argv")
+    if argv is None and isinstance(hook.get("exec"), dict):
+        argv = hook["exec"].get("argv")
+    if argv is None and hook.get("command"):
+        try:
+            argv = shlex.split(str(hook["command"]))
+        except ValueError:
+            return None, -1
+    if not isinstance(argv, list) or not argv or not all(isinstance(v, str) for v in argv):
+        return None, -1
 
-    # Substitute template variables
-    cmd = cmd_template
-    for key, val in ctx.items():
-        if isinstance(val, (str, int, float, bool)):
-            cmd = cmd.replace(f"{{{key}}}", str(val))
-
+    env = {
+        key: os.environ[key] for key in ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR")
+        if key in os.environ
+    }
+    env["LAINTAS_HOOK_TYPE"] = str(hook.get("type") or "")
     try:
         result = subprocess.run(
-            cmd, shell=True, capture_output=True, text=True,
-            timeout=hook.get("timeout", 10),
-            cwd=os.getcwd(),
+            argv, input=json.dumps(ctx, ensure_ascii=False, default=str),
+            shell=False, capture_output=True, text=True,
+            timeout=hook.get("timeout", 10), cwd=os.getcwd(), env=env,
         )
-        return (result.stdout + result.stderr).strip() or None
+        return (result.stdout + result.stderr).strip() or None, result.returncode
     except Exception:
-        return None
+        return None, -1
 
 
 def _run_python_hook(hook_name: str, ctx: dict) -> Optional[bool]:
@@ -205,7 +232,7 @@ def _run_python_hook(hook_name: str, ctx: dict) -> Optional[bool]:
             return False
         return True
     except Exception:
-        return True  # Don't block on hook errors
+        return False if hook_name in ("pre_command", "pre_tool") else True
 
 
 def trigger(hook_type: str, ctx: dict = None) -> tuple[bool, list[str]]:
@@ -239,15 +266,13 @@ def trigger(hook_type: str, ctx: dict = None) -> tuple[bool, list[str]]:
         if condition and not _eval_condition(condition, ctx):
             continue
 
-        output = _run_shell_hook(hook, ctx)
+        output, returncode = _run_shell_hook(hook, ctx)
         if output:
             messages.append(output)
 
         # pre_ hooks can block via exit code
         if hook_type.startswith("pre_") and hook.get("block_on_failure"):
-            # If a pre_ hook's command exits non-zero, consider it a block
-            # (We can't check exit code here, but the hook can output "BLOCK")
-            if output and "BLOCK" in output:
+            if returncode != 0 or (output and "BLOCK" in output):
                 return False, messages + ["Blocked by hook"]
 
     # ── Python post hooks ──

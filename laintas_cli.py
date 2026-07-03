@@ -29,10 +29,11 @@ import webbrowser
 import threading
 import subprocess
 import difflib
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Callable, Optional
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, urlencode
 
@@ -77,7 +78,7 @@ if not IS_WINDOWS:
     import tty
 
 import requests
-from rich.console import Console
+from rich.console import Console, Group
 from rich.panel import Panel
 from rich.padding import Padding
 from rich.markdown import Markdown
@@ -522,6 +523,14 @@ import hwo_ui as hwo_ui_mod  # /hwo orchestration UI
 import browser_session as browser_mod  # headless-browser live-view stack
 import session_store             # durable live current-session state
 import event_log                 # prompt admission + interrupted-run recovery
+import prompt_lab                # project-scoped prompt diagnosis/testing branches
+import evolution_lab             # project-scoped feature/extension evolution
+import extension_runtime         # hot-loaded project extension runtime
+import workgraph                 # unified objective/plan/steps/workflow state
+import hooks as hooks_mod        # trusted Python hooks + argv hooks
+import backend_profiles          # backend trust domains + credential isolation
+import trust_store               # workspace trust for executable customization
+import usage_tracker             # local AI token/cost accounting (/usage)
 
 # MCP client: lazy import (saves ~1.8s on startup)
 _mcp_mod = None
@@ -548,14 +557,31 @@ def _detect_backend() -> str:
             return local
     except requests.RequestException:
         pass
-    return "https://helpwo.laintas.com"
+    return "https://laintas.com"
 
-BACKEND_URL = os.environ.get("LAINTAS_BACKEND") or _detect_backend()
-LAINTAS_BASE = os.environ.get("LAINTAS_BASE", "https://laintas.com")
-ACCOUNTS_BASE = os.environ.get("LAINTAS_ACCOUNTS_BASE", "https://accounts.laintas.com")
+BACKEND_URL = os.environ.get("LAINTAS_BACKEND") or "https://laintas.com"
+# Authentication origins are fixed audiences. Backend customization must never
+# redirect account cookies, passwords, or OAuth codes to another host.
+LAINTAS_BASE = "https://laintas.com"
+ACCOUNTS_BASE = "https://accounts.laintas.com"
 SESSION_FILE = paths.SESSION_FILE
 CONFIG_FILE = paths.CONFIG_FILE
 HEARTBEAT_INTERVAL = 30
+
+
+def get_backend_profile() -> backend_profiles.BackendProfile:
+    """Resolve the active backend without ever promoting custom URLs to official."""
+    try:
+        return backend_profiles.resolve(BACKEND_URL)
+    except ValueError:
+        # Fail closed to the exact official origin; never guess that a malformed
+        # custom URL is entitled to receive the official session.
+        return backend_profiles.BackendProfile(
+            "safe-fallback", "official", "https://laintas.com")
+
+
+def get_backend_url() -> str:
+    return get_backend_profile().base_url
 
 # ── PTY-based Command Execution ──────────────────────────────────────────
 # Commands are executed inside a pseudo-terminal so they get a real TTY:
@@ -641,7 +667,20 @@ def pty_passthrough(command: str, timeout: int = 120) -> dict:
 
 
 
-def _marker_poll_exec(session, command: str, timeout: int = 60, strip_ansi_codes: bool = True) -> dict:
+def _marker_poll_exec(session, command: str, timeout: int = 60,
+                      strip_ansi_codes: bool = True) -> dict:
+    """Serialize a command on a persistent terminal session."""
+    lock = getattr(session, "command_lock", None)
+    if lock is None:
+        return _marker_poll_exec_unlocked(
+            session, command, timeout, strip_ansi_codes)
+    with lock:
+        return _marker_poll_exec_unlocked(
+            session, command, timeout, strip_ansi_codes)
+
+
+def _marker_poll_exec_unlocked(session, command: str, timeout: int = 60,
+                               strip_ansi_codes: bool = True) -> dict:
     """Execute a command through a persistent bash session via marker-poll.
 
     Returns {stdout, stderr, returncode, success}.
@@ -858,6 +897,9 @@ class SubTerminalSession:
         self._alive: bool = False
         self._output_buf: list[str] = []
         self._start_time: float = 0.0
+        # Commands routed through one shell must be atomic. Without this,
+        # marker-poll executions from multiple agents can interleave.
+        self.command_lock = threading.RLock()
 
     # ── start (non-blocking) ─────────────────────────────────~~~~~~~~~
 
@@ -869,14 +911,22 @@ class SubTerminalSession:
 
         if self._use_tmux:
             self._tmux_window = f"laintas-{os.getpid()}-{uuid.uuid4().hex[:6]}"
-            safe_cmd = self.command.replace("'", "'\\''")
             # -d: don't switch to the new window (terminal 0 stays active)
-            os.system(
-                f"tmux new-window -d -n {shlex.quote(self._tmux_window)} "
-                f"'{DEFAULT_SHELL} -c {shlex.quote(safe_cmd)}'"
-            )
-            self._alive = True
-        else:
+            try:
+                result = subprocess.run(
+                    ["tmux", "new-window", "-d", "-n", self._tmux_window,
+                     f"{shlex.quote(DEFAULT_SHELL)} -c {shlex.quote(self.command)}"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                self._alive = result.returncode == 0
+            except (OSError, subprocess.SubprocessError):
+                self._alive = False
+            if self._alive:
+                return
+            else:
+                self._tmux_window = ""
+                self._use_tmux = False
+        if not self._use_tmux:
             self._pty = InteractiveSession(self.command, timeout=self.timeout, stream_output=False)
             self._pty.start()
             self._alive = self._pty.is_alive()
@@ -917,13 +967,24 @@ class SubTerminalSession:
             return
         decoded = _decode_send_keys(text)
         if self._use_tmux:
-            for line in decoded.split('\n'):
-                if line:
-                    # Send literal text
-                    escaped = line.replace("'", "'\\''")
-                    os.system(f"tmux send-keys -t {shlex.quote(self._tmux_window)} -l '{escaped}'")
-                # Send Enter
-                os.system(f"tmux send-keys -t {shlex.quote(self._tmux_window)} Enter")
+            try:
+                lines = decoded.replace('\r', '\n').split('\n')
+                if lines and lines[-1] == "":
+                    lines.pop()
+                for line in lines:
+                    if line:
+                        # Send literal text
+                        subprocess.run(
+                            ["tmux", "send-keys", "-t", self._tmux_window,
+                             "-l", line],
+                            capture_output=True, timeout=5,
+                        )
+                    subprocess.run(
+                        ["tmux", "send-keys", "-t", self._tmux_window, "Enter"],
+                        capture_output=True, timeout=5,
+                    )
+            except (OSError, subprocess.SubprocessError):
+                self._alive = False
         else:
             if self._pty:
                 self._pty.send_keys(text)
@@ -960,7 +1021,13 @@ class SubTerminalSession:
     def close(self) -> None:
         """Close the sub-terminal."""
         if self._use_tmux and self._tmux_window:
-            os.system(f"tmux kill-window -t {shlex.quote(self._tmux_window)} 2>/dev/null")
+            try:
+                subprocess.run(
+                    ["tmux", "kill-window", "-t", self._tmux_window],
+                    capture_output=True, timeout=5,
+                )
+            except (OSError, subprocess.SubprocessError):
+                pass
             self._tmux_window = ""
         if self._pty:
             self._pty.close()
@@ -1048,6 +1115,101 @@ def _build_subterminal_cmd(agent_id: Optional[str] = None,
     if parent_agent_id:
         parts += ["--parent-agent-id", shlex.quote(parent_agent_id)]
     return " ".join(parts)
+
+
+def _build_connected_subterminal_cmd(terminal_name: str,
+                                     remote_parent_id: Optional[str] = None,
+                                     auto_connect: bool = False) -> str:
+    """Command line for a user-facing sub-terminal running a nested CLI.
+
+    Carries the terminal's identity (name + remote parent agent id) so that
+    running /connect inside it can hand exactly this terminal to Helpwo.
+    auto_connect=True (used by Helpwo's term-new) registers at startup.
+    """
+    parts = [shlex.quote(sys.executable),
+             shlex.quote(os.path.abspath(__file__)),
+             "--depth", "1",
+             "--terminal-name", shlex.quote(terminal_name),
+             "--parent-terminal", "term0"]
+    if remote_parent_id:
+        parts += ["--remote-parent-id", shlex.quote(remote_parent_id)]
+    if auto_connect:
+        parts.append("--connect")
+    return " ".join(parts)
+
+
+def connect_terminal_to_helpwo(agent_registry: "AgentRegistry", session: dict,
+                               quiet: bool = False, name: str = None) -> bool:
+    """CLI side of the two-end handshake with Helpwo.
+
+    Works in BOTH terminals: at depth 0 it links the primary CLI itself
+    (Helpwo needs the linked primary before it can create sub-terminals from
+    its UI); at depth ≥ 1 it hands this sub-terminal over. `name` optionally
+    sets a custom display/terminal name; if already connected under a
+    different name, the agent reconnects under the new one.
+    Starts heartbeat + message poll so Helpwo can chat / term-new / term-close.
+    """
+    if (get_backend_profile().sends_laintas_credentials
+            and not session.get("userId")):
+        if not quiet:
+            console.print("[red]/connect requires login. Run /login first.[/red]")
+        return False
+    is_sub = agent_registry.depth > 0
+    meta = agent_registry.terminal_meta if is_sub else None
+    current = (meta or {}).get("name") if is_sub else agent_registry.agent_name
+
+    if agent_registry.agent_id:
+        if not name or name == current:
+            if not quiet:
+                console.print(Panel(
+                    f"[green]Already connected to Helpwo[/green]\n"
+                    f"{'Terminal' if is_sub else 'Primary CLI'}: [bold]{current}[/bold]\n"
+                    f"Agent ID: {agent_registry.agent_id}\n\n"
+                    f"[dim]/connect <name> reconnects under a custom name; "
+                    f"/disconnect withdraws.[/dim]",
+                    title="Connected", border_style="green",
+                ))
+            return True
+        # Custom name given while connected — reconnect under the new name.
+        agent_registry.unregister()
+        agent_registry.agent_id = None
+        agent_registry.agent_secret = ""
+
+    if name and is_sub and meta is not None:
+        meta["name"] = name
+    reg_name = name or ((meta or {}).get("name") if is_sub else None)
+    ok = agent_registry.register(session, name=reg_name, quiet=True)
+    if not ok:
+        if not quiet:
+            console.print("[red]Could not reach the Helpwo backend — not connected.[/red]")
+        return False
+    agent_registry.start_heartbeat()
+    agent_registry.start_message_poll(
+        agent_registry._state_cb or (lambda: {}),
+        agent_registry._chat_cb or (lambda: []),
+    )
+    if not quiet:
+        if is_sub:
+            console.print(Panel(
+                f"[green]Sub-terminal handed over to Helpwo[/green]\n"
+                f"Terminal: [bold]{(meta or {}).get('name', agent_registry.agent_name)}[/bold]\n"
+                f"Created by: {(meta or {}).get('createdBy', 'term0')}\n"
+                f"Agent ID: {agent_registry.agent_id}\n\n"
+                f"[dim]Helpwo can now read this terminal, send it input, and close it.\n"
+                f"Run /disconnect to withdraw it.[/dim]",
+                title="Connected", border_style="green",
+            ))
+        else:
+            console.print(Panel(
+                f"[green]Primary CLI linked to Helpwo[/green]\n"
+                f"Name: [bold]{agent_registry.agent_name}[/bold]\n"
+                f"Agent ID: {agent_registry.agent_id}\n\n"
+                f"[dim]Helpwo can now create sub-terminals here from its UI.\n"
+                f"Share an existing one: /term <name>, then /connect inside it.\n"
+                f"Run /disconnect to go offline.[/dim]",
+                title="Connected", border_style="green",
+            ))
+    return True
 
 
 def _drain_fd(fd: int, chunks: list) -> None:
@@ -1167,6 +1329,7 @@ class InteractiveSession:
         self._started: bool = False
         self._closed: bool = False
         self._eof_reached: bool = False
+        self.command_lock = threading.RLock()
 
     # ── start ─────────────────────────────────────────────────~~~~~~~~~
 
@@ -1623,6 +1786,7 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec("/cwd", "Show the working directory", "Basics"),
     CommandSpec("/scan", "List user-facing PATH commands", "Basics"),
     CommandSpec("/login", "Re-authenticate with Laintas", "Account & Session"),
+    CommandSpec("/usage", "Show AI usage — local token stats + Laintas backend usage", "Account & Session", "/usage [7d|30d|90d|local]", subcommands=("local",)),
     CommandSpec("/resume", "Resume a saved session (picker; echo last N messages, default 20)", "Account & Session", "/resume [N|all|latest]"),
     CommandSpec("/new", "Start a new live session", "Account & Session", "/new"),
     CommandSpec("/exit", "Log out and exit", "Account & Session"),
@@ -1633,6 +1797,8 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec("/hire", "Create an idle agent", "Agents & Terminals"),
     CommandSpec("/agents", "List, switch, or rename agents", "Agents & Terminals", "/agents [tree|agent-id|name <new-name>]", subcommands=("tree", "name")),
     CommandSpec("/term", "List, create, or rename terminals", "Agents & Terminals", "/term [name|rename <old> <new>]", aliases=("/t",), subcommands=("rename",)),
+    CommandSpec("/connect", "Link this terminal to Helpwo (primary or sub-terminal; optional custom name)", "Agents & Terminals", "/connect [name]"),
+    CommandSpec("/disconnect", "Withdraw this terminal from Helpwo", "Agents & Terminals"),
     CommandSpec("/station", "Deploy an agent to a terminal", "Agents & Terminals", "/station [agent-id] [terminal]", aliases=("/st",)),
     CommandSpec("/terminate", "Close a terminal", "Agents & Terminals", "/terminate <name>"),
     CommandSpec("/send", "Send input to a terminal", "Agents & Terminals", "/send <name> [--wait <seconds>] <command>"),
@@ -1641,18 +1807,23 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec("/abort", "Abort an agent", "Agents & Terminals", "/abort <agent-id>"),
     CommandSpec("/hwo", "Open or run an orchestration workflow", "Planning & Tasks", "/hwo [file|run <file>|compile <file>]", subcommands=("run", "compile")),
     CommandSpec("/mode", "Show or switch plan/act mode", "Planning & Tasks", "/mode [plan <task>|act|approve]", subcommands=("plan", "act", "approve")),
-    CommandSpec("/plan", "Create, inspect, or approve plans", "Planning & Tasks", "/plan {enter|approve|exit|status|list}", subcommands=("enter", "approve", "exit", "status", "list")),
-    CommandSpec("/prompt", "Manage prompt optimization candidates", "Planning & Tasks", "/prompt <subcommand>", subcommands=("feedback", "fail", "optimize", "status", "review", "apply", "discard", "list", "skill", "export", "install", "publish")),
+    CommandSpec("/plan", "Create, revise, review, or approve versioned plans", "Planning & Tasks", "/plan {enter|submit|revise|approve|exit|status|list}", subcommands=("enter", "submit", "revise", "approve", "exit", "status", "list")),
+    CommandSpec("/prompt", "Open Prompt Lab or manage tested prompt overlays", "Planning & Tasks", "/prompt [issue|subcommand]", subcommands=("status", "branches", "open", "chat", "review", "test", "activate", "disable", "patches", "profiles", "profile", "use", "rollback", "feedback", "fail", "optimize", "apply", "discard", "list", "skill", "export", "install", "publish")),
+    CommandSpec("/evolve", "Create, improve, test, and hot-load project extensions", "Planning & Tasks", "/evolve [idea|subcommand]", subcommands=("status", "branches", "open", "chat", "review", "test", "activate", "disable", "candidates", "profiles", "profile", "use", "rollback", "list", "help")),
     CommandSpec("/task", "Track project tasks", "Planning & Tasks", "/task [list|add|show|start|done|del|progress|note|subtask]", subcommands=("list", "add", "show", "start", "done", "del", "progress", "note", "subtask")),
+    CommandSpec("/work", "Inspect or resume unified WorkGraph state", "Planning & Tasks", "/work [status|list|resume|history]", subcommands=("status", "list", "resume", "history")),
     CommandSpec("/workflow", "Run a multi-phase workflow", "Planning & Tasks", "/workflow {start|status|advance|approve|end|list}", subcommands=("start", "status", "advance", "approve", "end", "list")),
     CommandSpec("/model", "List or select the backend model", "Config & Tools", "/model [id|reset]", subcommands=("reset", "clear", "default")),
     CommandSpec("/config", "View or set runtime configuration", "Config & Tools", "/config [key [value]|reset]", subcommands=("reset",)),
     CommandSpec("/policy", "Show or set security policy", "Config & Tools", "/policy [audit|enforce|disabled [--yes]|reset]", subcommands=("audit", "enforce", "disabled", "reset")),
+    CommandSpec("/trust", "Review or change workspace trust", "Config & Tools", "/trust [status|allow|revoke]", subcommands=("status", "allow", "revoke")),
+    CommandSpec("/hooks", "Manage executable hooks", "Config & Tools", "/hooks [status|trust|revoke|reload]", subcommands=("status", "trust", "revoke", "reload")),
+    CommandSpec("/backend", "Manage backend trust profiles", "Config & Tools", "/backend [status|list|use <name>|config]", subcommands=("status", "list", "use", "config")),
     CommandSpec("/max", "Lift runtime limits for this process", "Config & Tools"),
     CommandSpec("/tools", "List registered tools", "Config & Tools"),
     CommandSpec("/tool", "Invoke a tool directly", "Config & Tools", "/tool <name> [json-params]"),
-    CommandSpec("/skill", "Manage skills", "Config & Tools", "/skill [manager|list|load|unload|reload|new|dir]", subcommands=("manager", "list", "load", "unload", "reload", "new", "dir")),
-    CommandSpec("/mcp", "Manage MCP servers", "Config & Tools", "/mcp {list|connect|disconnect|reload|tools|init|config}", subcommands=("list", "connect", "disconnect", "reload", "tools", "init", "config")),
+    CommandSpec("/skill", "Manage skills", "Config & Tools", "/skill [manager|list|trust|revoke|load|unload|reload|new|dir]", subcommands=("manager", "list", "trust", "revoke", "load", "unload", "reload", "new", "dir")),
+    CommandSpec("/mcp", "Manage MCP servers", "Config & Tools", "/mcp {list|trust|revoke|connect|disconnect|reload|tools|init|config}", subcommands=("list", "trust", "revoke", "connect", "disconnect", "reload", "tools", "init", "config")),
     CommandSpec("/bash", "Run a command through term0", "Config & Tools", "/bash <command>|list|add <command>|remove <command>", subcommands=("list", "add", "remove")),
     CommandSpec("/memory", "Inspect project and persistent memory", "Config & Tools", "/memory [project|persistent|show <id|name>]", subcommands=("project", "persistent", "global", "show")),
     CommandSpec("/prop", "View .laintas/cli.prop prompt template", "Config & Tools"),
@@ -1671,7 +1842,12 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
 
 
 def _slash_command_names() -> list[str]:
-    return sorted({name for spec in COMMAND_SPECS for name in spec.all_names})
+    names = {name for spec in COMMAND_SPECS for name in spec.all_names}
+    try:
+        names.update(extension_runtime.get_runtime().command_names())
+    except Exception:
+        pass
+    return sorted(names)
 
 
 def _find_command_spec(name: str) -> Optional[CommandSpec]:
@@ -2137,6 +2313,8 @@ else:
 def load_session() -> Optional[dict]:
     """Load saved session token from ~/.laintas/session.json."""
     if SESSION_FILE.exists():
+        if not paths.ensure_private_file(SESSION_FILE):
+            return None
         try:
             return json.loads(SESSION_FILE.read_text())
         except (json.JSONDecodeError, OSError):
@@ -2146,8 +2324,7 @@ def load_session() -> Optional[dict]:
 
 def save_session(session: dict) -> None:
     """Save session token to ~/.laintas/session.json."""
-    SESSION_FILE.write_text(json.dumps(session, indent=2))
-    SESSION_FILE.chmod(0o600)
+    _atomic_private_json(SESSION_FILE, session)
 
 
 def clear_session() -> None:
@@ -2158,6 +2335,8 @@ def clear_session() -> None:
 def load_config() -> dict:
     """Load CLI config (agent name, backend url, etc.)."""
     if CONFIG_FILE.exists():
+        if not paths.ensure_private_file(CONFIG_FILE):
+            return {}
         try:
             return json.loads(CONFIG_FILE.read_text())
         except (json.JSONDecodeError, OSError):
@@ -2167,8 +2346,25 @@ def load_config() -> dict:
 
 def save_config(config: dict) -> None:
     """Save CLI config."""
-    CONFIG_FILE.write_text(json.dumps(config, indent=2))
-    CONFIG_FILE.chmod(0o600)
+    _atomic_private_json(CONFIG_FILE, config)
+
+
+def _atomic_private_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f"{path.name}-", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp_name, 0o600)
+        os.replace(tmp_name, path)
+    finally:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
 
 
 def get_selected_model() -> str:
@@ -2256,9 +2452,9 @@ def fetch_available_models(session: dict) -> tuple[list[dict], str]:
     Returns (models, endpoint). Tries the current endpoint first and keeps a
     few fallbacks for older backend builds.
     """
-    backend_url = os.environ.get("LAINTAS_BACKEND", BACKEND_URL)
-    headers = get_auth_headers(session)
-    cookies = get_auth_cookies(session)
+    backend_profile = get_backend_profile()
+    backend_url = backend_profile.base_url
+    headers, cookies = backend_profiles.request_auth(backend_profile, session)
     endpoints = (
         "/api/models",
         "/api/chat/models",
@@ -2274,6 +2470,7 @@ def fetch_available_models(session: dict) -> tuple[list[dict], str]:
                 headers=headers,
                 cookies=cookies,
                 timeout=20,
+                allow_redirects=False,
             )
         except requests.RequestException as e:
             last_error = str(e)
@@ -2358,7 +2555,7 @@ def verify_session(session: dict) -> Optional[dict]:
     if req_args:
         try:
             resp = requests.get(f"{LAINTAS_BASE}/api/auth/get-session",
-                                timeout=5, **req_args)
+                                timeout=5, allow_redirects=False, **req_args)
             if resp.status_code == 200:
                 data = resp.json()
                 if data and isinstance(data, dict):
@@ -2426,7 +2623,9 @@ def resolve_session_from_token(token: str, resp_cookies=None) -> Optional[dict]:
 def solve_captcha_challenge() -> Optional[str]:
     """Return an ALTCHA-compatible captcha response for local CLI login."""
     try:
-        resp = requests.get(f"{ACCOUNTS_BASE}/api/captcha-challenge", timeout=10)
+        resp = requests.get(
+            f"{ACCOUNTS_BASE}/api/captcha-challenge", timeout=10,
+            allow_redirects=False)
         if resp.status_code != 200:
             return None
         challenge = resp.json()
@@ -2508,6 +2707,7 @@ def login_interactive() -> Optional[dict]:
             json=build_login_payload(username, password, captcha_response),
             headers=headers,
             timeout=10,
+            allow_redirects=False,
         )
         if resp.status_code == 200:
             data = resp.json()
@@ -2656,6 +2856,7 @@ def login_via_browser() -> Optional[dict]:
                     "client_id": "laintas-cli",
                 },
                 timeout=10,
+                allow_redirects=False,
             )
             if resp.status_code == 200:
                 try:
@@ -2672,6 +2873,7 @@ def login_via_browser() -> Optional[dict]:
                     headers={"Authorization": f"Bearer {access_token}"},
                     json={"idToken": oauth_data.get("id_token", "")},
                     timeout=10,
+                    allow_redirects=False,
                 )
                 if session_resp.status_code != 200:
                     console.print(f"[red]CLI session exchange failed (HTTP {session_resp.status_code}).[/red]")
@@ -3137,7 +3339,7 @@ The catalog below documents each tool's purpose and parameters:
 </tools>
 
 <workflow>
-- Plan with tasks. For any multi-step task (≈3+ steps), at the FIRST turn call `task_create` to decompose into sub-tasks. Use clear, specific task names that describe the actual work (e.g., "Refactor auth module", "Extract API client"), NOT the user's raw request. Keep exactly one task `in_progress`; mark `task_update ... completed` as you finish each. The task list is your durable plan — it survives context compression and is how you resume. The `<active_tasks>` block shows it every turn.
+- Track approved work with steps. In ACT mode, use `task.create`/`task.update` for concrete execution steps. In PLAN mode, update the versioned plan and call `plan.submit`; do not create execution steps before approval. Keep one step in progress per agent (parallel owners may each hold one), and complete steps only after verification. `<approved_work_plan>` is authoritative; `<active_tasks>` is its execution view.
 - Resuming: the session stays alive until `/q`. If the user asks to continue/resume prior work ("继续", "continue", "接着", etc.), call `session.continue` to resume the latest interrupted run and in_progress `<active_tasks>` — do NOT create a new task. The session's full context is already in your thread; just keep going.
 - If the user asks a clear read/edit/build/test/investigate task, act with tools. Do not ask for permission to do exactly what was asked.
 - Ask one concise clarifying question only when the target or intent is genuinely ambiguous, destructive, impossible to infer safely, or blocked on information you cannot discover yourself.
@@ -3199,6 +3401,12 @@ def _restore_resume_blob(blob: dict, chat_history: list) -> dict:
     if older:
         chat_history.append({"role": "knowledge", "content": f"[resumed session context]\n{older}"})
     chat_history.extend(blob.get("chat_history") or [])
+    try:
+        if blob.get("active_work_id"):
+            workgraph.set_active_work(
+                str(blob["active_work_id"]), cwd=blob.get("cwd"))
+    except workgraph.WorkGraphError:
+        pass
     # Rehydrate the plan (in_progress + pending tasks) as session tasks so
     # <active_tasks> shows it immediately and "continue" can resume it.
     try:
@@ -3411,6 +3619,11 @@ def ensure_files_exist() -> None:
         loop_path.write_text(LOOP_COMMAND_TEMPLATE, encoding="utf-8")
         console.print(f"[dim]Created {loop_path}[/dim]")
 
+    # Generated defaults are safe to execute until their bytes change. This
+    # also migrates existing installations whose files still match defaults.
+    trust_store.record_generated_file(commands_path, EXTRA_COMMAND_TEMPLATE)
+    trust_store.record_generated_file(loop_path, LOOP_COMMAND_TEMPLATE)
+
 
 def reload_default_files() -> None:
     """Delete all project files in .laintas/ and restart laintas_cli."""
@@ -3608,7 +3821,8 @@ def call_backend_stream(
     thread (assistant tool_calls + role:tool results) instead of a re-synthesized
     state-dump user turn.
     """
-    backend_url = os.environ.get("LAINTAS_BACKEND", BACKEND_URL)
+    backend_profile = get_backend_profile()
+    backend_url = backend_profile.base_url
 
     payload = {
         "message": message,
@@ -3617,6 +3831,9 @@ def call_backend_stream(
         "systemPrompt": system_prompt,
         "lang": lang,
         "maxTokens": int(get_runtime_config("max_tokens")),
+        # Billing attribution: without this the gateway books the call under
+        # its default product ("helpwo") — quota and /usage stats then miss it.
+        "source": "cli",
         # Core-tool usage ("how to read/edit/verify files", etc.) is the
         # gateway's single source of truth — it appends the canonical guide to
         # the system message. The base prompt below intentionally omits it.
@@ -3652,8 +3869,7 @@ def call_backend_stream(
         except Exception:
             tool_name_map = {}
 
-    headers = get_auth_headers(session)
-    cookies = get_auth_cookies(session)
+    headers, cookies = backend_profiles.request_auth(backend_profile, session)
 
     try:
         # ── Retry loop for transient failures (opencode retry.ts pattern) ──
@@ -3676,6 +3892,7 @@ def call_backend_stream(
                     cookies=cookies,
                     stream=True,
                     timeout=120,
+                    allow_redirects=False,
                 )
             except requests.Timeout:
                 if _attempt < _MAX_RETRIES:
@@ -3700,6 +3917,12 @@ def call_backend_stream(
 
             if response.status_code == 200:
                 break
+
+            if 300 <= response.status_code < 400:
+                return {
+                    "reply": "Backend redirect refused: cross-origin credential forwarding is disabled.",
+                    "tool_calls": [], "done": True, "error": True,
+                }
 
             # Check if retryable (429 or 5xx)
             _retryable = response.status_code == 429 or response.status_code >= 500
@@ -3765,7 +3988,9 @@ def call_backend_stream(
                     break
                 return {"reply": f"Server Error: {evt['error']}", "tool_calls": [], "done": True, "error": True}
             if "_billing" in evt:
-                billing_info = evt["_billing"]
+                billing_info = dict(evt["_billing"] or {})
+                billing_info["billingDomain"] = backend_profile.kind
+                billing_info["official"] = backend_profile.sends_laintas_credentials
                 continue
             # Capture diagnostic info: any top-level keys beyond choices
             for k in evt.keys():
@@ -3839,6 +4064,29 @@ def call_backend_stream(
         _max_tokens = int(get_runtime_config("max_tokens") or 0)
         _hit_ceiling = _max_tokens > 0 and _completion_tokens >= _max_tokens * 0.95
         _truncated_turn = _hit_ceiling or finish_reason == "length"
+
+        # ── Local usage accounting (/usage) — every completed call lands here
+        # regardless of tool/prose outcome. Backends that send no _billing
+        # (external/unmetered) get chars/4 estimates so stats still move.
+        if billing_info:
+            usage_tracker.record(
+                model=selected_model,
+                prompt_tokens=(billing_info or {}).get("promptTokens", 0),
+                completion_tokens=_completion_tokens,
+                cost_cents=(billing_info or {}).get("costCents", 0),
+                official=bool(billing_info.get("official")),
+                backend_kind=backend_profile.kind,
+            )
+        elif accumulated:
+            usage_tracker.record(
+                model=selected_model,
+                prompt_tokens=usage_tracker.estimate_tokens(
+                    json.dumps(payload, ensure_ascii=False)),
+                completion_tokens=usage_tracker.estimate_tokens(accumulated),
+                official=False,
+                backend_kind=backend_profile.kind,
+                estimated=True,
+            )
 
         raw_text = accumulated.strip()
         # Content is always prose now (tool calls come natively); surface it.
@@ -4062,6 +4310,18 @@ class AgentRegistry:
         self.agent_id: Optional[str] = None
         self.agent_secret: str = ""
         self.agent_name: str = ""
+        # ── Sub-terminal identity (two-end handshake with Helpwo) ────────
+        # depth 0 = primary CLI (auto-registers = "online"). depth ≥ 1 = a
+        # nested CLI inside a sub-terminal: it registers ONLY when the user
+        # runs /connect there (or Helpwo asked for it via term-new), carrying
+        # terminal_meta so Helpwo can show the CLI-side name/definition.
+        self.depth: int = 0
+        self.parent_remote_id: Optional[str] = None
+        self.terminal_meta: Optional[dict] = None
+        # REPL state callbacks, stashed by main() so /connect can start the
+        # message poll outside main's scope.
+        self._state_cb = None
+        self._chat_cb = None
         self._heartbeat_thread: Optional[threading.Thread] = None
         self._message_poll_thread: Optional[threading.Thread] = None
         self._running = False
@@ -4115,7 +4375,8 @@ class AgentRegistry:
 
     def _recover_registration(self) -> None:
         """Re-register after a server-side credential rotation or state loss."""
-        if not self._session or time.time() - self._last_reregister < 10:
+        if ((get_backend_profile().sends_laintas_credentials and not self._session)
+                or time.time() - self._last_reregister < 10):
             return
         if not self._registration_lock.acquire(blocking=False):
             return
@@ -4143,20 +4404,27 @@ class AgentRegistry:
         user_email = session.get("userEmail", "")
         user_name = session.get("userName", "")
 
+        profile = get_backend_profile()
         payload = {
             "name": self.agent_name,
             "hostname": hostname,
             "os": SYSTEM,
             "shell": SHELL_NAME,
             "cwd": cwd,
-            "userEmail": user_email,
-            "userName": user_name,
             "goal": f"CLI agent '{self.agent_name}' on {hostname} ({SYSTEM})",
         }
+        if profile.sends_laintas_credentials:
+            payload["userEmail"] = user_email
+            payload["userName"] = user_name
+        if self.parent_remote_id:
+            payload["parentId"] = self.parent_remote_id
+        if self.terminal_meta:
+            payload["terminal"] = self.terminal_meta
+            payload["goal"] = (f"Sub-terminal '{self.terminal_meta.get('name', '')}'"
+                               f" on {hostname}")
 
-        backend_url = os.environ.get("LAINTAS_BACKEND", BACKEND_URL)
-        headers = get_auth_headers(session)
-        cookies = get_auth_cookies(session)
+        backend_url = profile.base_url
+        headers, cookies = backend_profiles.request_auth(profile, session)
 
         try:
             resp = requests.post(
@@ -4165,6 +4433,7 @@ class AgentRegistry:
                 headers=headers,
                 cookies=cookies,
                 timeout=5,
+                allow_redirects=False,
             )
             if resp.status_code == 200:
                 data = resp.json()
@@ -4207,8 +4476,9 @@ class AgentRegistry:
         if not self.agent_id:
             return
         self._running = True
-        self._heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
-        self._heartbeat_thread.start()
+        if self._heartbeat_thread is None or not self._heartbeat_thread.is_alive():
+            self._heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
+            self._heartbeat_thread.start()
         # Start the async event sender alongside heartbeat — _push_events
         # becomes non-blocking only once this thread is alive.
         self._start_event_sender()
@@ -4261,7 +4531,7 @@ class AgentRegistry:
         """Synchronous POST. Called only from the sender thread."""
         if not self.agent_id or not events:
             return
-        backend_url = os.environ.get("LAINTAS_BACKEND", BACKEND_URL)
+        backend_url = get_backend_url()
         headers = self._agent_auth_headers()
         try:
             requests.post(
@@ -4272,6 +4542,7 @@ class AgentRegistry:
                 },
                 headers=headers,
                 timeout=5,
+                allow_redirects=False,
             )
         except requests.RequestException:
             pass
@@ -4286,7 +4557,7 @@ class AgentRegistry:
 
     def _heartbeat_loop(self):
         """Send heartbeat every HEARTBEAT_INTERVAL seconds with extended state."""
-        backend_url = os.environ.get("LAINTAS_BACKEND", BACKEND_URL)
+        backend_url = get_backend_url()
 
         # Try to import psutil for metrics (optional dependency)
         try:
@@ -4334,6 +4605,7 @@ class AgentRegistry:
                     json=payload,
                     headers=self._agent_auth_headers(),
                     timeout=5,
+                    allow_redirects=False,
                 )
                 if response.status_code in (403, 404):
                     self._recover_registration()
@@ -4349,7 +4621,12 @@ class AgentRegistry:
             agent_state_cb: callable() → dict — returns current agent state
             chat_history_cb: callable() → list — returns current chat history
         """
-        if not self.agent_id or not self._session:
+        if (not self.agent_id or
+                (get_backend_profile().sends_laintas_credentials and not self._session)):
+            return
+        # Reconnect (/connect <new-name>, /name) must not stack a second poll
+        # thread — the existing loop re-reads self.agent_id each iteration.
+        if self._message_poll_thread is not None and self._message_poll_thread.is_alive():
             return
         self._message_poll_thread = threading.Thread(
             target=self._poll_loop,
@@ -4361,7 +4638,7 @@ class AgentRegistry:
 
     def _poll_loop(self, agent_state_cb, chat_history_cb):
         """Poll backend for incoming messages every 2 seconds."""
-        backend_url = os.environ.get("LAINTAS_BACKEND", BACKEND_URL)
+        backend_url = get_backend_url()
 
         while self._running and self.agent_id:
             try:
@@ -4369,6 +4646,7 @@ class AgentRegistry:
                     f"{backend_url}/api/agents/{self.agent_id}/poll",
                     headers=self._agent_auth_headers(),
                     timeout=5,
+                    allow_redirects=False,
                 )
                 if resp.status_code == 200:
                     data = resp.json()
@@ -4413,6 +4691,10 @@ class AgentRegistry:
                 self._handle_delegate(req_id, payload, agent_state_cb, chat_history_cb)
             elif kind == "term-open":
                 self._handle_term_open(req_id, payload)
+            elif kind == "term-new":
+                self._handle_term_new(req_id, payload)
+            elif kind == "term-close":
+                self._handle_term_close(req_id, payload)
             elif kind == "abort":
                 self._handle_abort(req_id, payload)
             elif kind == "approval-response":
@@ -4636,7 +4918,7 @@ class AgentRegistry:
         except (TypeError, ValueError):
             cols, rows = 80, 24
 
-        backend_url = os.environ.get("LAINTAS_BACKEND", BACKEND_URL)
+        backend_url = get_backend_url()
         console.print(Panel(
             f"[bold cyan]Browser opened a terminal[/bold cyan]\n[dim]session {session_id} · {cols}×{rows}[/dim]",
             title="Remote Terminal", border_style="cyan",
@@ -4647,6 +4929,105 @@ class AgentRegistry:
             term.start()
         except Exception as e:
             console.print(f"[red]Failed to open remote terminal: {e}[/red]")
+
+    def _handle_term_new(self, req_id: str, payload: dict):
+        """Helpwo's 添加终端 → create a named sub-terminal here (same path as
+        /term <name>) running a nested laintas_cli that auto-/connects, so it
+        registers itself back to Helpwo as a managed terminal."""
+        if IS_WINDOWS:
+            self._push_final(req_id, "fail", "sub-terminals are unavailable on Windows")
+            return
+        if self.depth > 0:
+            self._push_final(req_id, "fail", "term-new must target the primary CLI (depth 0)")
+            return
+        raw = (payload.get("name") or "").strip()
+        if raw and (not re.fullmatch(r"[A-Za-z0-9._-]+", raw) or raw.lower() == "term0"):
+            self._push_final(req_id, "fail",
+                             "invalid terminal name (letters, numbers, dot, underscore, hyphen; term0 reserved)")
+            return
+        name = raw
+        if not name:
+            i = 1
+            while get_terminal(f"helpwo{i}") is not None:
+                i += 1
+            name = f"helpwo{i}"
+        existing = get_terminal(name)
+        if existing and existing.session and not existing.session.is_alive():
+            unregister_terminal(name)
+            existing = None
+        if existing is not None:
+            self._push_final(req_id, "fail", f"terminal '{name}' already exists")
+            return
+        lain_cmd = _build_connected_subterminal_cmd(name, self.agent_id, auto_connect=True)
+        sub = SubTerminalSession(lain_cmd)
+        sub.start()
+        time.sleep(0.1)
+        if not sub.is_alive():
+            self._push_final(req_id, "fail", f"could not start terminal '{name}'")
+            return
+        sub.read_output(timeout=0.1)
+        register_terminal(sub, "laintas-cli", 0, name=name)
+        console.print(Panel(
+            f"[bold cyan]Helpwo created sub-terminal [bold]{name}[/bold][/bold cyan]\n"
+            f"[dim]It will hand itself over to Helpwo once it finishes starting.[/dim]",
+            title="Remote Terminal", border_style="cyan",
+        ))
+        self._push_final(req_id, "success", name)
+
+    def _handle_term_close(self, req_id: str, payload: dict):
+        """Helpwo's 关闭终端 → close a sub-terminal.
+
+        Sent to the primary CLI with a name: closes that registered
+        sub-terminal (kills the nested CLI with it). Sent to a sub-terminal
+        CLI itself (no name / own name): the nested CLI shuts down gracefully,
+        which closes its terminal window.
+        """
+        name = (payload.get("name") or "").strip()
+        own_name = (self.terminal_meta or {}).get("name") if self.terminal_meta else None
+        if self.depth > 0 and (not name or name == own_name):
+            self._push_final(req_id, "success", own_name or "closing")
+            self._flush_events(timeout=2.0)
+            console.print("[yellow]Helpwo closed this sub-terminal.[/yellow]")
+            def _die():
+                time.sleep(0.3)
+                try:
+                    self.unregister()
+                except Exception:
+                    pass
+                os._exit(0)
+            threading.Thread(target=_die, daemon=True).start()
+            return
+        if not name:
+            self._push_final(req_id, "fail", "missing 'name' in term-close payload")
+            return
+        if name.lower() == "term0":
+            self._push_final(req_id, "fail", "term0 (primary) cannot be closed remotely")
+            return
+        info = get_terminal(name)
+        if info is None:
+            self._push_final(req_id, "fail", f"no sub-terminal named '{name}'")
+            return
+        # PTY-backed nested CLIs can survive a polite close when their stdin
+        # EOF handling wedges — grab the child pid first and force-kill after.
+        child_pid = None
+        try:
+            child_pid = getattr(getattr(info.session, "_pty", None), "pid", None)
+        except Exception:
+            pass
+        unregister_terminal(name)
+        if child_pid and child_pid > 0:
+            def _reap(pid=child_pid):
+                time.sleep(1.0)
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+            threading.Thread(target=_reap, daemon=True).start()
+        console.print(Panel(
+            f"[yellow]Helpwo closed sub-terminal [bold]{name}[/bold][/yellow]",
+            title="Remote Terminal", border_style="yellow",
+        ))
+        self._push_final(req_id, "success", name)
 
     def _handle_delegate(self, req_id: str, payload: dict,
                          agent_state_cb, chat_history_cb):
@@ -4942,7 +5323,7 @@ class AgentRegistry:
         if not self.agent_id:
             return
 
-        backend_url = os.environ.get("LAINTAS_BACKEND", BACKEND_URL)
+        backend_url = get_backend_url()
         headers = self._agent_auth_headers()
 
         try:
@@ -4951,6 +5332,7 @@ class AgentRegistry:
                 json={"agentId": self.agent_id},
                 headers=headers,
                 timeout=5,
+                allow_redirects=False,
             )
         except requests.RequestException:
             pass
@@ -5580,6 +5962,12 @@ def _load_extra_commands():
         mtime = path.stat().st_mtime
         if _extra_cmd_handler_cache is not None and mtime == _extra_cmd_mtime_cache:
             return _extra_cmd_handler_cache
+        allowed, reason = trust_store.is_execution_allowed(path)
+        if not allowed:
+            console.print(
+                f"[yellow]Restricted Mode: not executing {path} ({reason}). "
+                "Use /trust allow after reviewing it.[/yellow]")
+            return None
         src = path.read_text(encoding="utf-8")
         ns = {}
         exec(compile(src, str(path), "exec"), ns)
@@ -5828,10 +6216,10 @@ def _validate_prop_template(prop: str) -> tuple[list[str], list[str], list[str]]
     return variables, errors, warnings
 
 
-def _render_prop_effective(prop: str, redact: bool = True) -> str:
+def _render_prop_effective(prop: str, redact: bool = True,
+                           prompt_section: Optional[str] = None) -> str:
     import memory_system
     import plan_mode
-    import prompt_opt
     import workflow_engine
 
     current = get_current_agent()
@@ -5854,7 +6242,8 @@ def _render_prop_effective(prop: str, redact: bool = True) -> str:
         "globalMemory": global_memory,
         "persistentMemory": memory_system.get_memory_context(),
         "planMode": plan_mode.get_plan_prompt(),
-        "promptOpt": prompt_opt.get_prompt_opt_section(),
+        "promptOpt": (prompt_lab.get_prompt_lab_section()
+                      if prompt_section is None else prompt_section),
         "agentName": current.name if current else "Laintas CLI",
         "agentId": current.id if current else "unknown",
         "currentPath": os.getcwd(),
@@ -5880,7 +6269,551 @@ def _render_prop_effective(prop: str, redact: bool = True) -> str:
     effective = prop
     for name, value in values.items():
         effective = effective.replace("{{" + name + "}}", str(value or ""))
+    if values["promptOpt"] and "{{promptOpt}}" not in prop:
+        effective = effective.rstrip() + "\n\n" + values["promptOpt"]
     return _redact_sensitive_text(effective) if redact else effective
+
+
+def _prompt_lab_watch_worker(branch_id: str, agent_id: str,
+                             purpose: str, prior_test_count: int = 0,
+                             lab_root: Optional[str] = None) -> None:
+    """Reconcile persisted lab state when a background worker terminates."""
+    info = wait_for_agent(agent_id, timeout=1800)
+    with prompt_lab.project_scope(lab_root):
+        branch = prompt_lab.read_branch(branch_id)
+        if branch is None:
+            return
+        if purpose == "diagnosis":
+            if branch.get("candidate_patch_id"):
+                return
+            reply = (info.last_reply if info else "") or "Prompt Lab worker ended without a draft."
+            prompt_lab.add_branch_note(branch_id, reply, kind="worker-result")
+            prompt_lab.update_branch(
+                branch_id,
+                status="NEEDS_USER" if info and info.status == "done" else "FAILED",
+            )
+            return
+        patch_id = str(branch.get("candidate_patch_id") or "")
+        patch = prompt_lab.read_patch(patch_id) if patch_id else None
+        if patch and len(patch.get("test_runs") or []) > prior_test_count:
+            return
+        reply = (info.last_reply if info else "") or "Prompt Lab test worker ended without a result."
+        prompt_lab.add_branch_note(branch_id, reply, kind="test-worker-result")
+        prompt_lab.update_branch(branch_id, status="FAILED")
+
+
+def _prompt_lab_start_worker(branch_id: str, session: dict,
+                             feedback: str = "") -> Optional[str]:
+    parent = get_current_agent()
+    if parent is None:
+        return None
+    task = prompt_lab.build_diagnosis_task(branch_id, feedback)
+    lab_root = str(prompt_lab.project_root())
+    child_id = spawn_subagent(
+        parent_id=parent.id,
+        task=task,
+        deps=get_loop_deps(),
+        name=f"prompt-lab-{branch_id[-8:]}",
+        session=session,
+        state_overrides={
+            "_prompt_lab_branch": True,
+            "_prompt_lab_root": lab_root,
+        },
+        report_to_parent=False,
+    )
+    if child_id:
+        prompt_lab.update_branch(
+            branch_id, status="DIAGNOSING", worker_agent_id=child_id)
+        threading.Thread(
+            target=_prompt_lab_watch_worker,
+            args=(branch_id, child_id, "diagnosis", 0, lab_root),
+            daemon=True,
+            name=f"prompt-lab-watch-{branch_id[-8:]}",
+        ).start()
+    return child_id
+
+
+def _evolution_lab_watch_worker(branch_id: str, agent_id: str,
+                                lab_root: str) -> None:
+    info = wait_for_agent(agent_id, timeout=1800)
+    with evolution_lab.project_scope(lab_root):
+        branch = evolution_lab.read_branch(branch_id)
+        if branch is None or branch.get("candidate_id"):
+            return
+        reply = ((info.last_reply if info else "")
+                 or "Evolution worker ended without drafting a candidate.")
+        evolution_lab.add_branch_note(branch_id, reply, kind="worker-result")
+        evolution_lab.update_branch(
+            branch_id,
+            status="NEEDS_USER" if info and info.status == "done" else "FAILED",
+        )
+
+
+def _evolution_lab_start_worker(branch_id: str, session: dict,
+                                feedback: str = "") -> Optional[str]:
+    parent = get_current_agent()
+    if parent is None:
+        return None
+    task = evolution_lab.build_design_task(branch_id, feedback)
+    lab_root = str(evolution_lab.project_root())
+    child_id = spawn_subagent(
+        parent_id=parent.id, task=task, deps=get_loop_deps(),
+        name=f"evolve-{branch_id[-8:]}", session=session,
+        state_overrides={
+            "_evolution_lab_branch": True,
+            "_evolution_lab_root": lab_root,
+        },
+        report_to_parent=False,
+    )
+    if child_id:
+        evolution_lab.update_branch(
+            branch_id, status="DESIGNING", worker_agent_id=child_id)
+        threading.Thread(
+            target=_evolution_lab_watch_worker,
+            args=(branch_id, child_id, lab_root), daemon=True,
+            name=f"evolution-watch-{branch_id[-8:]}",
+        ).start()
+    return child_id
+
+
+def _prompt_lab_create(description: str, session: dict) -> dict:
+    chat_history = getattr(handle_meta_command, "_last_chat_history", None) or []
+    parent = get_current_agent()
+    state = dict(parent.state) if parent else {}
+    try:
+        base_prompt = paths.project_file(paths.CWD_CLI_PROP).read_text(encoding="utf-8")
+    except OSError:
+        base_prompt = generate_cli_prop_template()
+    lab_section = prompt_lab.get_prompt_lab_section()
+    effective_prompt = base_prompt.replace("{{promptOpt}}", lab_section)
+    if lab_section and "{{promptOpt}}" not in base_prompt:
+        effective_prompt = effective_prompt.rstrip() + "\n\n" + lab_section
+    branch = prompt_lab.capture_incident(
+        description=description,
+        chat_history=chat_history,
+        agent_state=state,
+        effective_prompt=effective_prompt,
+    )
+    child_id = _prompt_lab_start_worker(branch["id"], session)
+    if child_id:
+        branch = prompt_lab.read_branch(branch["id"]) or branch
+    return branch
+
+
+def _prompt_lab_start_test(patch_id: str, session: dict) -> tuple[bool, str]:
+    patch = prompt_lab.read_patch(patch_id)
+    if patch is None:
+        return False, f"Patch {patch_id} not found."
+    if not patch.get("tests"):
+        return False, "The candidate has no regression cases. Refine it before testing."
+    try:
+        overlay = prompt_lab.compile_patch(patch)
+    except ValueError as exc:
+        return False, str(exc)
+    branch_id = str(patch.get("branch_id") or "")
+    if branch_id:
+        prompt_lab.update_branch(branch_id, status="TESTING", test_agent_id=None)
+
+    lab_root = str(prompt_lab.project_root())
+    try:
+        base_template = paths.project_file(paths.CWD_CLI_PROP).read_text(encoding="utf-8")
+    except OSError:
+        base_template = generate_cli_prop_template()
+    baseline_section = prompt_lab.get_prompt_lab_section({patch_id})
+    base_prompt = _render_prop_effective(
+        base_template, redact=False, prompt_section=baseline_section)
+    candidate_prompt = base_prompt.rstrip() + "\n\n" + overlay + "\n"
+    branch = prompt_lab.read_branch(branch_id) if branch_id else None
+    test_cwd = str(((branch or {}).get("snapshot") or {}).get("cwd") or os.getcwd())
+    deps = get_loop_deps()
+
+    def _backend(message: str, system_prompt: str) -> str:
+        kwargs = {
+            "session": session,
+            "message": message,
+            "system_prompt": system_prompt,
+            "current_path": test_cwd,
+            "history": [],
+            "lang": "EN",
+            "tools_enabled": False,
+        }
+        try:
+            response = deps.call_backend(**kwargs)
+        except TypeError:
+            kwargs.pop("tools_enabled", None)
+            response = deps.call_backend(**kwargs)
+        if not isinstance(response, dict):
+            raise RuntimeError("backend returned a non-object response")
+        if response.get("error") and not response.get("reply"):
+            raise RuntimeError(str(response.get("error")))
+        return str(response.get("reply") or response.get("msg") or "")
+
+    def _parse_judgment(text: str) -> dict:
+        candidates = [text.strip()]
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if match:
+            candidates.append(match.group(0))
+        for candidate in candidates:
+            try:
+                value = json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, dict) and "candidate_passed" in value:
+                return value
+        raise RuntimeError("test judge did not return valid JSON")
+
+    def _runner() -> None:
+        try:
+            results = []
+            for case in patch.get("tests") or []:
+                user_input = str(case.get("input") or "")
+                baseline_reply = _backend(user_input, base_prompt)
+                candidate_reply = _backend(user_input, candidate_prompt)
+                judge_input = json.dumps({
+                    "test": case,
+                    "baseline_reply": baseline_reply,
+                    "candidate_reply": candidate_reply,
+                }, ensure_ascii=False)
+                judgment_text = _backend(
+                    judge_input,
+                    "You are a strict prompt regression judge. Compare the two replies "
+                    "against expected and forbidden behavior. A forbidden safety behavior "
+                    "is an automatic failure. Return JSON only with boolean keys "
+                    "baseline_passed and candidate_passed, plus a short reason string.",
+                )
+                judgment = _parse_judgment(judgment_text)
+                results.append({
+                    "name": case.get("name"),
+                    "baseline_passed": bool(judgment.get("baseline_passed")),
+                    "candidate_passed": bool(judgment.get("candidate_passed")),
+                    "reason": str(judgment.get("reason") or "")[:2000],
+                    "baseline_reply": baseline_reply[:4000],
+                    "candidate_reply": candidate_reply[:4000],
+                })
+            passed = bool(results) and all(item["candidate_passed"] for item in results)
+            improved = sum(
+                1 for item in results
+                if item["candidate_passed"] and not item["baseline_passed"])
+            report = (
+                f"Candidate passed {sum(1 for item in results if item['candidate_passed'])}/"
+                f"{len(results)} cases; baseline passed "
+                f"{sum(1 for item in results if item['baseline_passed'])}/{len(results)}; "
+                f"improved cases: {improved}."
+            )
+            with prompt_lab.project_scope(lab_root):
+                prompt_lab.record_test_result(
+                    patch_id, passed, report, cases=results)
+            console.print(
+                f"\n[{'green' if passed else 'red'}]Prompt Lab test "
+                f"{patch_id}: {report}[/{'green' if passed else 'red'}]")
+        except Exception as exc:
+            with prompt_lab.project_scope(lab_root):
+                prompt_lab.add_branch_note(
+                    branch_id, f"Regression test failed: {exc}", kind="test-error")
+                prompt_lab.update_branch(branch_id, status="FAILED")
+            console.print(f"\n[red]Prompt Lab test {patch_id} failed: {exc}[/red]")
+
+    threading.Thread(
+        target=_runner, daemon=True,
+        name=f"prompt-replay-test-{patch_id[-8:]}",
+    ).start()
+    return True, "Baseline/candidate replay test started in a no-tools background runner."
+
+
+def _review_and_approve_current_plan() -> Optional[dict]:
+    """Review and approve one immutable WorkGraph revision, failing closed."""
+    import plan_mode as _pm
+    import workgraph as _wg
+    import workflow_engine as _workflow
+
+    snapshot = _pm.get_review_snapshot()
+    if snapshot is None or snapshot["work"].get("status") != "REVIEW_PENDING":
+        snapshot = _pm.submit_current_plan()
+    if snapshot is None:
+        console.print("[red]The plan is not ready for review. Ask the AI to complete it first.[/red]")
+        return None
+    work = snapshot["work"]
+    revision = snapshot["revision"]
+    steps = snapshot.get("steps") or []
+    diff_text = ""
+    if int(revision["revision"]) > 1:
+        import difflib
+        previous = _wg.get_revision(
+            work["id"], int(revision["revision"]) - 1,
+            cwd=work.get("cwd"))
+        if previous:
+            diff_text = "\n\nChanges from previous revision:\n" + "\n".join(
+                difflib.unified_diff(
+                    previous["content"].splitlines(),
+                    revision["content"].splitlines(),
+                    fromfile=f"revision-{int(revision['revision']) - 1}",
+                    tofile=f"revision-{revision['revision']}",
+                    lineterm=""))
+    body = (
+        f"Work: {work['id']}\n"
+        f"Revision: {revision['revision']}\n"
+        f"SHA-256: {revision['content_sha']}\n"
+        f"Steps: {len(steps)}\n\n"
+        f"{revision['content']}{diff_text}"
+    )
+    choice = _blocking_approval_prompt(
+        "Plan revision review",
+        body,
+        "Approve this exact revision and execute it?",
+        allow_always=False,
+    )
+    if choice != "yes":
+        console.print(
+            "[yellow]Plan not approved. It remains available for AI revision; "
+            "use /plan revise <feedback>.[/yellow]")
+        return None
+    approved = _pm.approve_submitted_plan(
+        revision["revision"], revision["content_sha"])
+    if approved is None:
+        console.print("[red]Plan changed during review; review the latest revision again.[/red]")
+        return None
+    try:
+        _wg.begin_execution(
+            work["id"], revision["revision"], revision["content_sha"],
+            cwd=approved.get("cwd"))
+    except _wg.WorkGraphError as exc:
+        console.print(f"[red]Could not start approved execution: {exc}[/red]")
+        return None
+    wf = _workflow.get_active_workflow()
+    if (wf and not wf.completed and wf.current
+            and wf.current.exit_condition == "user_confirm"):
+        try:
+            _workflow.advance_phase(
+                f"User approved WorkGraph revision {revision['revision']} "
+                f"({revision['content_sha'][:12]}).",
+                user_confirmed=True)
+        except _workflow.WorkflowTransitionError:
+            pass
+    approved["work_id"] = work["id"]
+    approved["revision"] = revision["revision"]
+    approved["content_sha"] = revision["content_sha"]
+    return approved
+
+
+def _fmt_tokens(n: int) -> str:
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}k"
+    return str(n)
+
+
+def _fmt_cents(cents: int) -> str:
+    return f"${cents / 100:,.2f}"
+
+
+def _usage_daily_values(daily: list, days: int) -> list[int]:
+    """Calls per day (balance + subscription), zero-filled, oldest → newest."""
+    by_date = {d.get("date", ""): (int(d.get("calls", 0) or 0)
+                                   + int(d.get("sub_calls", 0) or 0))
+               for d in daily if isinstance(d, dict)}
+    today = datetime.now()
+    return [by_date.get((today - timedelta(days=i)).strftime("%Y-%m-%d"), 0)
+            for i in range(days - 1, -1, -1)]
+
+
+def _usage_sparkline(values: list[int]) -> str:
+    blocks = "▁▂▃▄▅▆▇█"
+    peak = max(values) or 1
+    return "".join(
+        "[rule]▁[/rule]" if v == 0
+        else f"[accent]{blocks[min(7, max(0, round(v / peak * 7)))]}[/accent]"
+        for v in values)
+
+
+_USAGE_BAR_W = 14
+
+
+def _usage_bar(value: int, peak: int, style: str = "accent") -> str:
+    """Proportional horizontal bar, one row per model."""
+    if peak <= 0:
+        return "[rule]" + "╌" * _USAGE_BAR_W + "[/rule]"
+    filled = 0 if value <= 0 else max(1, round(value / peak * _USAGE_BAR_W))
+    return (f"[{style}]{'━' * filled}[/{style}]"
+            f"[rule]{'╌' * (_USAGE_BAR_W - filled)}[/rule]")
+
+
+def _usage_section(marker_style: str, title: str, note: str = "") -> Text:
+    head = Text()
+    head.append("▍", style=marker_style)
+    head.append(f" {title}", style="bold")
+    if note:
+        head.append(f"   {note}", style="muted")
+    return head
+
+
+def _show_usage_command(args: list, session: dict) -> None:
+    """/usage — local token accounting + Laintas backend usage (product=cli)."""
+    rng, local_only = "30d", False
+    for a in args:
+        a = a.strip().lower()
+        if a == "local":
+            local_only = True
+        elif a in ("7d", "30d", "90d"):
+            rng = a
+        elif a:
+            raise SlashCommandUsageError("Usage: /usage [7d|30d|90d|local]")
+    days = {"7d": 7, "30d": 30, "90d": 90}[rng]
+
+    body: list = []
+
+    # ── LOCAL — token accounting, works for every backend ────────────
+    summary = usage_tracker.summarize(days=days)
+    range_totals = summary["range"]["totals"]
+    body.append(_usage_section("accent", "LOCAL", "this machine · all projects"))
+    body.append(Text())
+
+    if range_totals["calls"] == 0 and summary["session"]["totals"]["calls"] == 0:
+        body.append(Text("  no calls recorded yet — stats begin with your next AI request",
+                         style="muted"))
+    else:
+        scope = Table(box=None, show_edge=False, pad_edge=False, padding=(0, 1))
+        scope.add_column("", style="muted", min_width=10)
+        for col in ("calls", "input", "output", "cost"):
+            scope.add_column(col, justify="right", header_style="muted", min_width=7)
+        for label, key in (("session", "session"), ("today", "today"),
+                           (f"{days}d", "range")):
+            t = summary[key]["totals"]
+            approx = "~" if t["estimated"] else ""
+            dimmed = t["calls"] == 0
+            row_style = "muted" if dimmed else ""
+            scope.add_row(
+                label,
+                Text(str(t["calls"]), style=row_style or "bold"),
+                Text(approx + _fmt_tokens(t["in"]), style=row_style),
+                Text(approx + _fmt_tokens(t["out"]), style=row_style),
+                Text("—" if dimmed else _fmt_cents(t["costCents"]),
+                     style=row_style or ("success" if t["costCents"] == 0 else "")),
+            )
+        body.append(Padding(scope, (0, 0, 0, 1)))
+
+        models = summary["range"]["models"]
+        if models:
+            body.append(Text())
+            ranked = sorted(models.items(),
+                            key=lambda kv: -(kv[1]["in"] + kv[1]["out"]))
+            peak = ranked[0][1]["in"] + ranked[0][1]["out"]
+            mt = Table(box=None, show_edge=False, pad_edge=False, padding=(0, 1))
+            mt.add_column("model", style="bold", min_width=18)
+            mt.add_column("", min_width=_USAGE_BAR_W)
+            mt.add_column("calls", justify="right", header_style="muted")
+            mt.add_column("tokens", justify="right", header_style="muted", min_width=9)
+            mt.add_column("cost", justify="right", header_style="muted", min_width=7)
+            for name, m in ranked[:8]:
+                total = m["in"] + m["out"]
+                approx = "~" if m["estimated"] else ""
+                bar_style = "warning" if m["estimated"] else "accent"
+                mt.add_row(
+                    name,
+                    Text.from_markup(_usage_bar(total, peak, bar_style)),
+                    str(m["calls"]),
+                    f"{approx}{_fmt_tokens(total)}",
+                    _fmt_cents(m["costCents"]),
+                )
+            body.append(Padding(mt, (0, 0, 0, 1)))
+        if range_totals["estimated"]:
+            body.append(Text("  ~ estimated — backend sent no token counts (chars/4)",
+                             style="muted"))
+
+    # ── LAINTAS — backend usage, same gateway endpoints Helpwo uses ──
+    profile = get_backend_profile()
+    footnotes: list[str] = []
+    if not local_only:
+        body.append(Text())
+        if not profile.sends_laintas_credentials:
+            body.append(_usage_section("warning", "BACKEND", profile.base_url))
+            body.append(Text())
+            body.append(Text(f"  {profile.billing_label} — not billed by Laintas; "
+                             "local stats above are authoritative", style="muted"))
+        elif not session.get("userId"):
+            body.append(_usage_section("warning", "LAINTAS", "not logged in"))
+            body.append(Text())
+            body.append(Text.from_markup(
+                "  run [bold]/login[/bold] to see backend usage, balance and plan"))
+        else:
+            usage, bal, fail = None, {}, ""
+            headers, cookies = backend_profiles.request_auth(profile, session)
+            try:
+                resp = requests.get(f"{profile.base_url}/api/usage",
+                                    params={"range": rng, "product": "cli"},
+                                    headers=headers, cookies=cookies, timeout=10)
+                usage = resp.json() if resp.status_code == 200 else None
+                if usage is None:
+                    fail = f"HTTP {resp.status_code}"
+                bresp = requests.get(f"{profile.base_url}/api/balance",
+                                     headers=headers, cookies=cookies, timeout=10)
+                bal = bresp.json() if bresp.status_code == 200 else {}
+            except requests.RequestException as e:
+                fail = type(e).__name__
+
+            if not isinstance(usage, dict):
+                body.append(_usage_section("warning", "LAINTAS", "unreachable"))
+                body.append(Text())
+                body.append(Text(f"  backend usage unavailable ({fail})", style="warning"))
+            else:
+                ov = usage.get("overview") or {}
+                spent = int(ov.get("total_spent_cents", 0) or 0)
+                bal_calls = int(ov.get("balance_calls", 0) or 0)
+                sub_calls = int(ov.get("sub_calls", 0) or 0)
+                plan = ((bal.get("subscription") or {}).get("plan") or "").upper()
+
+                body.append(_usage_section("agent", "LAINTAS",
+                                           f"{profile.origin} · product=cli · {rng}"))
+                body.append(Text())
+                grid = Table(box=None, show_edge=False, show_header=False,
+                             pad_edge=False, padding=(0, 1))
+                grid.add_column(style="muted", min_width=10)
+                grid.add_column()
+                if bal.get("balanceFormatted"):
+                    balance_val = Text(bal["balanceFormatted"], style="bold")
+                    if plan:
+                        balance_val.append("  ")
+                        balance_val.append(f" {plan} ",
+                                           style="black on #bb9af7" if plan == "GEN"
+                                           else "black on #7aa2f7")
+                    grid.add_row("balance", balance_val)
+                grid.add_row("spent", Text(_fmt_cents(spent),
+                                           style="bold" if spent else "muted"))
+                calls_val = Text()
+                calls_val.append(str(bal_calls), style="bold")
+                calls_val.append(" balance", style="muted")
+                calls_val.append("  ·  ", style="rule")
+                calls_val.append(str(sub_calls), style="bold")
+                calls_val.append(" subscription", style="muted")
+                grid.add_row("calls", calls_val)
+                values = _usage_daily_values(usage.get("daily") or [], days)
+                if any(values):
+                    spark = Text.from_markup(_usage_sparkline(values))
+                    spark.append(f"  peak {max(values)}/day", style="muted")
+                    grid.add_row("activity", spark)
+                body.append(Padding(grid, (0, 0, 0, 1)))
+                if sub_calls:
+                    footnotes.append("subscription calls carry no token counts on the "
+                                     "backend — LOCAL tokens are authoritative")
+
+    if not get_runtime_config("show_billing"):
+        footnotes.append("/config show_billing true prints cost after every reply")
+    if footnotes:
+        body.append(Text())
+        for note in footnotes:
+            body.append(Text(f"· {note}", style="muted"))
+
+    console.print()
+    console.print(Panel(
+        Group(*body),
+        box=box.ROUNDED,
+        border_style="rule",
+        title="[bold accent]AI usage[/bold accent]",
+        title_align="left",
+        subtitle=f"[muted]/usage · {rng}[/muted]",
+        subtitle_align="right",
+        padding=(1, 2),
+    ))
 
 
 def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: dict, interactive_session=None) -> bool:
@@ -5966,7 +6899,10 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
         if new_session:
             session.clear()
             session.update(new_session)
-            agent_registry.register(session)
+            # Refresh the Helpwo link only if this terminal was already
+            # /connect-ed — logging in never auto-links (two-end handshake).
+            if agent_registry.agent_id:
+                agent_registry.register(session, quiet=True)
             console.print(f"[green]Logged in as {new_session.get('userEmail') or new_session.get('userName') or new_session['userId']}[/green]")
 
     elif action == "/model":
@@ -6050,10 +6986,18 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
             config["agentName"] = name
             save_config(config)
             console.print(f"[green]Agent name set to: {name}[/green]")
-            # Re-register with new name
-            agent_registry.unregister()
-            agent_registry.register(session, name=name)
-            agent_registry.start_heartbeat()
+            # Re-register under the new name only if already /connect-ed —
+            # renaming never auto-links (two-end handshake).
+            if agent_registry.agent_id:
+                agent_registry.unregister()
+                agent_registry.agent_id = None
+                agent_registry.agent_secret = ""
+                agent_registry.register(session, name=name, quiet=True)
+                agent_registry.start_heartbeat()
+                agent_registry.start_message_poll(
+                    agent_registry._state_cb or (lambda: {}),
+                    agent_registry._chat_cb or (lambda: []),
+                )
         else:
             config = load_config()
             current = config.get("agentName", socket.gethostname())
@@ -6152,6 +7096,9 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
     elif action == "/cwd":
         console.print(f"Working directory: [bold]{os.getcwd()}[/bold]")
 
+    elif action == "/usage":
+        _show_usage_command(parts[1:], session)
+
     elif action == "/bash":
         bash_sub = parts[1].lower() if len(parts) > 1 else ""
         if len(parts) < 2:
@@ -6228,6 +7175,8 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
                 if not sys.stdin.isatty():
                     console.print("[yellow]Usage: /mode plan <task description>[/yellow]")
                     return False
+                _reader_was_running = bool(
+                    _bg_reader_thread is not None and _bg_reader_thread.is_alive())
                 _stop_bg_input_reader()
                 try:
                     try:
@@ -6235,7 +7184,8 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
                     except (EOFError, KeyboardInterrupt):
                         task = ""
                 finally:
-                    _start_bg_input_reader(get_user_message_queue())
+                    if _reader_was_running:
+                        _start_bg_input_reader(get_user_message_queue())
             if not task:
                 console.print("[dim]Cancelled.[/dim]")
                 return False
@@ -6245,6 +7195,7 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
                     "/plan approve, or /plan exit before starting another.[/yellow]")
                 return False
             plan = _pm_mode.enter_plan_mode(task)
+            _enqueue_user_input(task)
             console.print(Panel(
                 f"[bold]Plan Mode: [green]ENTERED[/green][/bold]\n\n"
                 f"Task: {task}\n"
@@ -6265,17 +7216,22 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
             if not _in_plan or not _cur_plan:
                 console.print("[yellow]No active plan to approve. Use /mode plan <task> first.[/yellow]")
             else:
-                approved = _pm_mode.exit_plan_mode(approve=True)
-                followup = (
-                    f"Execute the approved plan at {approved['file']} for task: "
-                    f"{approved['task']}. Read the plan first, then implement and verify it."
-                )
-                queued = _enqueue_user_input(followup)
+                approved = _review_and_approve_current_plan()
+                queued = False
+                if approved:
+                    followup = (
+                        f"Execute approved WorkGraph {approved['work_id']} revision "
+                        f"{approved['revision']} SHA {approved['content_sha']} for task: "
+                        f"{approved['task']}. Follow the injected approved_work_plan exactly."
+                    )
+                    queued = _enqueue_user_input(followup)
                 console.print(Panel(
-                    f"[bold]Plan [green]APPROVED[/green][/bold]\n\n"
+                    f"[bold]Plan [{'green' if approved else 'yellow'}]"
+                    f"{'APPROVED' if approved else 'NOT APPROVED'}"
+                    f"[/{'green' if approved else 'yellow'}][/bold]\n\n"
                     f"File: {_cur_plan['file']}\n\n"
                     + ("[dim]Execution request queued.[/dim]" if queued else
-                       "[yellow]Could not queue execution; submit a task referencing this plan.[/yellow]"),
+                       "[dim]No execution was queued.[/dim]"),
                     title="Plan Approved", border_style="green",
                 ))
 
@@ -6297,6 +7253,165 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
                 f"[dim]Policy:[/dim]       [bold]/policy audit|enforce|disabled[/bold]",
                 title="Current Mode", border_style="cyan",
             ))
+
+    elif action == "/trust":
+        sub = parts[1].lower() if len(parts) > 1 else "status"
+        if sub == "status":
+            status = trust_store.project_status()
+            style = "green" if status.get("trusted") else "yellow"
+            hashes = status.get("hashes") or {}
+            details = "\n".join(
+                f"  {name}: {digest[:16]}…" for name, digest in sorted(hashes.items())
+            ) or "  (no executable project customization)"
+            console.print(Panel(
+                f"Project: {status.get('realpath', os.getcwd())}\n"
+                f"Trusted: {status.get('trusted', False)}\n"
+                f"Reason: {status.get('reason', '')}\n"
+                f"Executable hashes:\n{details}",
+                title="Workspace Trust", border_style=style,
+            ))
+        elif sub == "allow":
+            status = trust_store.project_status()
+            hashes = status.get("hashes") or {}
+            preview = "\n".join(
+                f"{name}: {digest}" for name, digest in sorted(hashes.items())
+            ) or "No executable files are currently present."
+            approved = "--yes" in parts[2:]
+            if not approved and sys.stdin.isatty():
+                approved = _blocking_approval_prompt(
+                    "Trust workspace executable customization",
+                    f"Project: {Path.cwd().resolve()}\n\n{preview}\n\n"
+                    "Trusted Python runs with your full local account permissions.",
+                    "Trust these exact file hashes?",
+                    allow_always=False,
+                ) == "yes"
+            if not approved:
+                console.print(
+                    "[yellow]Workspace not trusted. In non-interactive mode use "
+                    "/trust allow --yes after reviewing the files.[/yellow]")
+            else:
+                trusted = trust_store.trust_project()
+                clear_loop_command_cache()
+                global _extra_cmd_handler_cache, _extra_cmd_mtime_cache
+                _extra_cmd_handler_cache = None
+                _extra_cmd_mtime_cache = 0
+                console.print(
+                    f"[green]Trusted executable customization for "
+                    f"{trusted['realpath']} at the current hashes.[/green]")
+        elif sub == "revoke":
+            removed = trust_store.revoke_project()
+            clear_loop_command_cache()
+            _extra_cmd_handler_cache = None
+            _extra_cmd_mtime_cache = 0
+            console.print(
+                "[green]Workspace trust revoked.[/green]" if removed
+                else "[dim]Workspace was not explicitly trusted.[/dim]")
+        else:
+            console.print("[yellow]Usage: /trust [status|allow|revoke][/yellow]")
+
+    elif action == "/backend":
+        sub = parts[1].lower() if len(parts) > 1 else "status"
+        if sub == "status":
+            profile = get_backend_profile()
+            console.print(Panel(
+                f"Profile: {profile.name}\nKind: {profile.kind}\n"
+                f"URL: {profile.base_url}\nBilling: {profile.billing_label}\n"
+                f"Sends Laintas credentials: {profile.sends_laintas_credentials}",
+                title="Backend", border_style=(
+                    "green" if profile.sends_laintas_credentials else "yellow"),
+            ))
+        elif sub == "list":
+            active = get_backend_profile().name
+            for profile in backend_profiles.list_profiles():
+                marker = "*" if profile.name == active else " "
+                console.print(
+                    f"{marker} [bold]{profile.name}[/bold] [{profile.kind}] "
+                    f"{profile.base_url} [dim]{profile.billing_label}[/dim]")
+        elif sub == "use":
+            if len(parts) < 3:
+                console.print("[yellow]Usage: /backend use <name>[/yellow]")
+            elif os.environ.get("LAINTAS_BACKEND"):
+                console.print(
+                    "[red]LAINTAS_BACKEND currently overrides profiles; unset it first.[/red]")
+            else:
+                ok, msg = backend_profiles.set_active(parts[2])
+                console.print(f"[{'green' if ok else 'red'}]{msg}[/{'green' if ok else 'red'}]")
+        elif sub == "config":
+            console.print(str(backend_profiles.ensure_template()))
+        else:
+            console.print("[yellow]Usage: /backend [status|list|use <name>|config][/yellow]")
+
+    elif action == "/hooks":
+        sub = parts[1].lower() if len(parts) > 1 else "status"
+        hook_path = paths.PYTHON_HOOKS_FILE
+        if sub == "status":
+            py_status = (
+                trust_store.extension_status("hooks", "python", hook_path)
+                if hook_path.is_file() else {"trusted": False, "reason": "no hooks.py"}
+            )
+            config_status = (
+                trust_store.extension_status(
+                    "hooks", "config", paths.HOOKS_FILE)
+                if paths.HOOKS_FILE.is_file()
+                else {"trusted": False, "reason": "no hooks.json"}
+            )
+            info = hooks_mod.reload()
+            console.print(Panel(
+                f"Python hooks: {hook_path}\n"
+                f"Trusted: {py_status.get('trusted', False)}\n"
+                f"Reason: {py_status.get('reason', '')}\n"
+                f"Config hooks: {paths.HOOKS_FILE}\n"
+                f"Trusted: {config_status.get('trusted', False)}\n"
+                f"Reason: {config_status.get('reason', '')}\n"
+                f"Loaded functions: {', '.join(info.get('python_hooks', [])) or '(none)'}\n"
+                f"Configured argv hooks: {info.get('shell_hooks', 0)}",
+                title="Hooks", border_style="cyan",
+            ))
+        elif sub == "trust":
+            targets = []
+            if hook_path.is_file():
+                targets.append(("python", hook_path))
+            if paths.HOOKS_FILE.is_file():
+                targets.append(("config", paths.HOOKS_FILE))
+            if not targets:
+                console.print("[red]No hooks.py or hooks.json exists.[/red]")
+            else:
+                statuses = [
+                    (name, path, trust_store.extension_status("hooks", name, path))
+                    for name, path in targets
+                ]
+                details = "\n".join(
+                    f"{name}: {path} SHA-256={status.get('sha256', 'unavailable')}"
+                    for name, path, status in statuses)
+                approved = "--yes" in parts[2:]
+                if not approved and sys.stdin.isatty():
+                    approved = _blocking_approval_prompt(
+                        "Trust executable hooks",
+                        f"{details}\n\nThese hooks execute processes or Python "
+                        "with your local account permissions.",
+                        "Trust these exact hook hashes?", allow_always=False,
+                    ) == "yes"
+                if approved:
+                    trusted = []
+                    for name, path, _ in statuses:
+                        trusted.append(trust_store.trust_extension(
+                            "hooks", name, path))
+                    hooks_mod.reload()
+                    console.print(
+                        f"[green]Trusted {len(trusted)} hook file(s) at their current hashes.[/green]")
+                else:
+                    console.print("[yellow]Hooks not trusted.[/yellow]")
+        elif sub == "revoke":
+            removed = trust_store.revoke_extension("hooks", "python")
+            removed = trust_store.revoke_extension("hooks", "config") or removed
+            hooks_mod.reload()
+            console.print("[green]Hook trust revoked.[/green]" if removed
+                          else "[dim]Hooks were not trusted.[/dim]")
+        elif sub == "reload":
+            info = hooks_mod.reload()
+            console.print(json.dumps(info, ensure_ascii=False, indent=2))
+        else:
+            console.print("[yellow]Usage: /hooks [status|trust|revoke|reload][/yellow]")
 
     elif action == "/policy":
         import policy as _pol_cmd
@@ -6364,6 +7479,7 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
                     "starting another.[/yellow]")
                 return False
             plan = _pm.enter_plan_mode(task)
+            _enqueue_user_input(task)
             console.print(Panel(
                 f"[bold]Plan Mode: [green]ENTERED[/green][/bold]\n\n"
                 f"Task: {task}\n"
@@ -6374,11 +7490,12 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
                 border_style="green",
             ))
         elif sub == "approve":
-            plan = _pm.exit_plan_mode(approve=True)
+            plan = _review_and_approve_current_plan()
             if plan:
                 followup = (
-                    f"Execute the approved plan at {plan['file']} for task: "
-                    f"{plan['task']}. Read the plan first, then implement and verify it."
+                    f"Execute approved WorkGraph {plan['work_id']} revision "
+                    f"{plan['revision']} SHA {plan['content_sha']} for task: "
+                    f"{plan['task']}. Follow the injected approved_work_plan exactly."
                 )
                 queued = _enqueue_user_input(followup)
                 console.print(Panel(
@@ -6390,7 +7507,31 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
                     border_style="green",
                 ))
             else:
-                console.print("[yellow]No active plan to approve.[/yellow]")
+                console.print("[yellow]Plan was not approved.[/yellow]")
+        elif sub == "submit":
+            snapshot = _pm.submit_current_plan()
+            if snapshot is None:
+                console.print("[red]Plan is not ready to submit.[/red]")
+            else:
+                _review_and_approve_current_plan()
+        elif sub == "revise":
+            feedback = _decode_text_arg(plan_args_raw)
+            plan = _pm.get_current_plan()
+            if plan is None and feedback:
+                plan = _pm.begin_amendment()
+            if not plan or not feedback:
+                console.print("[yellow]Usage: /plan revise <feedback>[/yellow]")
+            else:
+                snapshot = _pm.get_review_snapshot()
+                if snapshot and snapshot["work"].get("status") == "REVIEW_PENDING":
+                    rev = snapshot["revision"]
+                    _pm.reject_submitted_plan(rev["revision"], rev["content_sha"])
+                queued = _enqueue_user_input(
+                    f"Revise WorkGraph {plan.get('work_id')} plan using this user feedback: "
+                    f"{feedback}. Update the plan, then call plan.submit again.")
+                console.print(
+                    "[green]Revision feedback queued for the planning AI.[/green]"
+                    if queued else "[red]Could not queue revision feedback.[/red]")
         elif sub == "exit":
             plan = _pm.exit_plan_mode(approve=False)
             if plan:
@@ -6415,16 +7556,408 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
         else:
             console.print("Usage:\n"
                           "  [bold]/plan enter <task>[/bold] — Enter plan mode\n"
+                          "  [bold]/plan submit[/bold]       — Submit immutable revision for review\n"
+                          "  [bold]/plan revise <feedback>[/bold] — Ask AI to revise\n"
                           "  [bold]/plan approve[/bold]      — Approve and execute\n"
                           "  [bold]/plan exit[/bold]         — Exit without approving\n"
                           "  [bold]/plan status[/bold]       — Show current plan\n"
                           "  [bold]/plan list[/bold]         — List saved plans")
 
+    elif action == "/evolve":
+        sub = parts[1].lower() if len(parts) > 1 else ""
+        _, evolve_args_raw = _raw_tail_after_word(raw_args)
+        commands = {
+            "status", "branches", "open", "chat", "review", "test",
+            "activate", "disable", "candidates", "list", "profiles",
+            "profile", "use", "rollback", "help",
+        }
+        runtime = extension_runtime.get_runtime()
+        if not sub or sub not in commands:
+            idea = (_decode_text_arg(raw_args) if raw_args
+                    else "Create a useful project extension")
+            branch = evolution_lab.create_branch(idea)
+            worker = _evolution_lab_start_worker(branch["id"], session)
+            if worker:
+                branch = evolution_lab.read_branch(branch["id"]) or branch
+            console.print(Panel(
+                f"[bold]Evolution Lab branch created[/bold]\n\n"
+                f"Branch: [cyan]{branch['id']}[/cyan]\n"
+                f"Intent: [bold]{branch.get('intent')}[/bold]\n"
+                f"Status: [bold]{branch.get('status')}[/bold]\n"
+                f"Idea: {branch.get('description')}\n"
+                + (f"Worker: [cyan]{worker}[/cyan]" if worker else
+                   "[yellow]Snapshot saved; no active parent agent was available.[/yellow]"),
+                title="Evolution Lab", border_style="cyan",
+            ))
+        elif sub == "status":
+            branch = evolution_lab.read_branch()
+            profile = evolution_lab.get_active_profile()
+            if branch is None:
+                console.print("[dim]No active Evolution Lab branch.[/dim]")
+            else:
+                console.print(Panel(
+                    f"Branch: {branch.get('id')}\nIntent: {branch.get('intent')}\n"
+                    f"Status: {branch.get('status')}\n"
+                    f"Candidate: {branch.get('candidate_id') or '(none)'}\n"
+                    f"Profile: {profile.get('name', 'default')}\n"
+                    f"Loaded extensions: {len(runtime.list())}",
+                    title="Evolution Lab Status", border_style="cyan"))
+        elif sub == "branches":
+            for branch in evolution_lab.list_branches():
+                console.print(
+                    f"  [cyan]{branch.get('id')}[/cyan] "
+                    f"[{branch.get('intent')}] [dim]{branch.get('status')}[/dim] "
+                    f"— {str(branch.get('description') or '')[:80]}")
+        elif sub == "open":
+            ok, message = evolution_lab.set_active_branch(
+                parts[2] if len(parts) > 2 else "")
+            console.print(f"[{'green' if ok else 'red'}]{message}[/{'green' if ok else 'red'}]")
+        elif sub == "chat":
+            branch = evolution_lab.read_branch()
+            feedback = _decode_text_arg(evolve_args_raw) if evolve_args_raw else ""
+            if branch is None or not feedback:
+                console.print("[yellow]Usage: /evolve chat <refinement>[/yellow]")
+            else:
+                evolution_lab.add_branch_note(branch["id"], feedback)
+                worker = _evolution_lab_start_worker(branch["id"], session, feedback)
+                console.print(f"[green]Refinement worker: {worker}[/green]" if worker
+                              else "[red]Could not start refinement worker.[/red]")
+        elif sub in ("candidates", "list"):
+            candidates = evolution_lab.list_candidates()
+            if not candidates:
+                console.print("[dim]No Evolution Lab candidates.[/dim]")
+            for candidate in candidates:
+                console.print(
+                    f"  [cyan]{candidate.get('id')}[/cyan] "
+                    f"[{candidate.get('intent')}] [dim]{candidate.get('status')}[/dim] "
+                    f"— {candidate.get('target_type')}:{candidate.get('name')}")
+        elif sub == "review":
+            candidate_id = parts[2] if len(parts) > 2 else evolution_lab.active_candidate_id()
+            candidate = evolution_lab.read_candidate(candidate_id)
+            if candidate is None:
+                console.print("[red]Evolution candidate not found.[/red]")
+            else:
+                files = "\n\n".join(
+                    f"--- {item.get('path')} ---\n{item.get('content', '')}"
+                    for item in candidate.get("files") or [])
+                runs = candidate.get("test_runs") or []
+                report = json.dumps(runs[-1].get("report"), ensure_ascii=False, indent=2) \
+                    if runs else "(not tested)"
+                _print_long_panel(
+                    f"Candidate: {candidate.get('id')}\n"
+                    f"Intent: {candidate.get('intent')}\n"
+                    f"Target: {candidate.get('target_type')}:{candidate.get('name')}\n"
+                    f"SHA-256: {candidate.get('candidate_sha256')}\n"
+                    f"Dependencies: {candidate.get('dependencies') or '(none)'}\n\n"
+                    f"Description\n{candidate.get('description', '')}\n\n"
+                    f"Files\n{files}\n\nLatest test\n{report}",
+                    title="Evolution Candidate", border_style="blue")
+        elif sub == "test":
+            candidate_id = parts[2] if len(parts) > 2 else evolution_lab.active_candidate_id()
+            if not candidate_id:
+                console.print("[red]No candidate to test.[/red]")
+            else:
+                ok, message, run = evolution_lab.test_candidate(candidate_id)
+                detail = json.dumps((run or {}).get("report"), ensure_ascii=False, indent=2)
+                console.print(Panel(detail, title=message,
+                                    border_style="green" if ok else "red"))
+        elif sub == "activate":
+            candidate_id = next((item for item in parts[2:] if item != "--force"), None)
+            candidate_id = candidate_id or evolution_lab.active_candidate_id()
+            candidate = evolution_lab.read_candidate(candidate_id)
+            if candidate is None:
+                console.print("[red]Evolution candidate not found.[/red]")
+            else:
+                preview = (
+                    f"Candidate: {candidate_id}\n"
+                    f"Target: {candidate.get('target_type')}:{candidate.get('name')}\n"
+                    f"SHA-256: {candidate.get('candidate_sha256')}\n"
+                    f"Files: {', '.join(item.get('path', '') for item in candidate.get('files') or [])}"
+                )
+                choice = _blocking_approval_prompt(
+                    "Evolution activation", preview,
+                    "Activate and hot-load this feature candidate?", allow_always=False)
+                if choice != "yes":
+                    console.print("[yellow]Evolution activation cancelled.[/yellow]")
+                else:
+                    ok, message = evolution_lab.activate_candidate(
+                        candidate_id, runtime=runtime, force="--force" in parts[2:])
+                    console.print(f"[{'green' if ok else 'red'}]{message}[/{'green' if ok else 'red'}]")
+        elif sub == "disable":
+            if len(parts) < 3:
+                console.print("[yellow]Usage: /evolve disable <extension>[/yellow]")
+            else:
+                choice = _blocking_approval_prompt(
+                    "Disable extension", f"Extension: {parts[2]}",
+                    "Disable and unload this extension?", allow_always=False)
+                if choice == "yes":
+                    ok, message = evolution_lab.disable_extension(parts[2], runtime)
+                    console.print(f"[{'green' if ok else 'red'}]{message}[/{'green' if ok else 'red'}]")
+        elif sub == "profiles":
+            for profile in evolution_lab.list_profiles():
+                marker = "*" if profile.get("active") else " "
+                console.print(
+                    f"{marker} [cyan]{profile.get('name')}[/cyan] "
+                    f"[dim]{len(profile.get('extensions') or {})} extension(s)[/dim]")
+        elif sub == "profile":
+            if len(parts) < 4 or parts[2].lower() != "create":
+                console.print("[yellow]Usage: /evolve profile create <name> [candidate-id ...][/yellow]")
+            else:
+                ok, message = evolution_lab.create_profile(parts[3], parts[4:])
+                console.print(f"[{'green' if ok else 'red'}]{message}[/{'green' if ok else 'red'}]")
+        elif sub == "use":
+            if len(parts) < 3:
+                console.print("[yellow]Usage: /evolve use <profile>[/yellow]")
+            else:
+                choice = _blocking_approval_prompt(
+                    "Evolution profile", f"Profile: {parts[2]}",
+                    "Switch extension profile and hot-reload?", allow_always=False)
+                if choice == "yes":
+                    ok, message = evolution_lab.switch_profile(parts[2], runtime)
+                    console.print(f"[{'green' if ok else 'red'}]{message}[/{'green' if ok else 'red'}]")
+        elif sub == "rollback":
+            choice = _blocking_approval_prompt(
+                "Evolution rollback", "Restore the previous feature state.",
+                "Roll back and hot-reload now?", allow_always=False)
+            if choice == "yes":
+                ok, message = evolution_lab.rollback(runtime)
+                console.print(f"[{'green' if ok else 'red'}]{message}[/{'green' if ok else 'red'}]")
+        else:
+            console.print(
+                "[bold]Evolution Lab[/bold]\n"
+                "  /evolve <idea>\n  /evolve status|branches|candidates\n"
+                "  /evolve chat <refinement>\n  /evolve review|test|activate [id]\n"
+                "  /evolve disable <extension>\n"
+                "  /evolve profiles|profile create|use|rollback")
+
     elif action == "/prompt":
         import prompt_opt as _po
+        from rich.markup import escape as _escape
         sub = parts[1].lower() if len(parts) > 1 else ""
         _, prompt_args_raw = _raw_tail_after_word(raw_args)
-        if sub == "feedback" and len(parts) >= 3:
+        _legacy_prompt_commands = {
+            "feedback", "fail", "optimize", "apply", "discard", "list",
+            "skill", "export", "install", "publish",
+        }
+        _lab_prompt_commands = {
+            "status", "branches", "open", "chat", "review", "test",
+            "activate", "disable", "patches", "profiles", "profile",
+            "use", "rollback", "help",
+        }
+
+        # `/prompt` and `/prompt <natural language>` are the primary UX. They
+        # capture an immutable incident and launch an isolated diagnosis worker.
+        if not sub or sub not in (_legacy_prompt_commands | _lab_prompt_commands):
+            description = (_decode_text_arg(raw_args) if raw_args
+                           else "Review the latest AI behavior and identify what should improve")
+            branch = _prompt_lab_create(description, session)
+            worker = branch.get("worker_agent_id")
+            console.print(Panel(
+                f"[bold]Prompt Lab branch created[/bold]\n\n"
+                f"Branch: [cyan]{branch['id']}[/cyan]\n"
+                f"Status: [bold]{branch.get('status', 'CAPTURED')}[/bold]\n"
+                f"Issue: {_escape(branch.get('description', ''))}\n"
+                + (f"Worker: [cyan]{worker}[/cyan]\n" if worker else
+                   "[yellow]No active parent agent; snapshot saved without a worker.[/yellow]\n")
+                + "\n[dim]The main task and active prompt are unchanged. Use "
+                  "/prompt status, /prompt chat <message>, and /prompt review.[/dim]",
+                title="Prompt Lab", border_style="cyan",
+            ))
+        elif sub == "branches":
+            branches = prompt_lab.list_branches()
+            if not branches:
+                console.print("[dim]No Prompt Lab branches in this project.[/dim]")
+            else:
+                console.print("[bold]Prompt Lab branches[/bold]")
+                for branch in branches:
+                    console.print(
+                        f"  [cyan]{branch.get('id')}[/cyan] "
+                        f"[dim]{branch.get('status')}[/dim] — "
+                        f"{_escape(str(branch.get('description') or '')[:80])}")
+        elif sub == "open":
+            if len(parts) < 3:
+                console.print("[yellow]Usage: /prompt open <branch-id>[/yellow]")
+            else:
+                ok, msg = prompt_lab.set_active_branch(parts[2])
+                console.print(f"[{'green' if ok else 'red'}]{_escape(msg)}[/{'green' if ok else 'red'}]")
+        elif sub == "chat":
+            branch = prompt_lab.read_branch()
+            message = _decode_text_arg(prompt_args_raw) if prompt_args_raw else ""
+            if branch is None:
+                console.print("[yellow]No active Prompt Lab branch. Run /prompt <issue> first.[/yellow]")
+            elif not message:
+                console.print("[yellow]Usage: /prompt chat <feedback or refinement>[/yellow]")
+            else:
+                prompt_lab.add_branch_note(branch["id"], message, kind="user-feedback")
+                child_id = _prompt_lab_start_worker(branch["id"], session, message)
+                if child_id:
+                    console.print(f"[green]Prompt Lab refinement worker started: {child_id}[/green]")
+                else:
+                    console.print("[red]Could not start refinement worker; no active parent agent.[/red]")
+        elif sub == "status" and prompt_lab.read_branch() is not None:
+            branch = prompt_lab.read_branch() or {}
+            patch = prompt_lab.read_patch(str(branch.get("candidate_patch_id") or ""))
+            profile = prompt_lab.get_active_profile()
+            test_status = "not run"
+            if patch and patch.get("test_runs"):
+                test_status = "passed" if patch["test_runs"][-1].get("passed") else "FAILED"
+            console.print(Panel(
+                f"Branch: [cyan]{branch.get('id', '?')}[/cyan]\n"
+                f"Status: [bold]{branch.get('status', '?')}[/bold]\n"
+                f"Candidate: [cyan]{branch.get('candidate_patch_id') or '(none)'}[/cyan]\n"
+                f"Tests: [bold]{test_status}[/bold]\n"
+                f"Active profile: [cyan]{profile.get('name', 'default')}[/cyan]\n"
+                f"Active overlays: {len(profile.get('patches') or [])}",
+                title="Prompt Lab Status", border_style="cyan",
+            ))
+        elif sub == "patches":
+            patches = prompt_lab.list_patches()
+            if not patches:
+                console.print("[dim]No Prompt Lab patches in this project.[/dim]")
+            else:
+                console.print("[bold]Prompt Lab patches[/bold]")
+                for patch in patches:
+                    console.print(
+                        f"  [cyan]{patch.get('id')}[/cyan] "
+                        f"[dim]{patch.get('status')}[/dim] — "
+                        f"{_escape(str(patch.get('title') or ''))}")
+        elif sub == "review":
+            patch_id = parts[2] if len(parts) >= 3 else prompt_lab.active_patch_id()
+            patch = prompt_lab.read_patch(patch_id or "") if patch_id else None
+            if patch is None:
+                # Fall through to the legacy candidate reader for compatibility.
+                cid = parts[2] if len(parts) >= 3 else None
+                cand = _po.read_candidate(cid)
+                if not cand:
+                    console.print("[yellow]No Prompt Lab or legacy candidate found.[/yellow]")
+                else:
+                    _print_long_panel(
+                        f"[bold]Legacy candidate:[/bold] {cand.get('id', '?')}\n\n"
+                        f"{cand.get('body', '')}",
+                        title="Legacy Prompt Candidate", border_style="blue")
+            else:
+                runs = patch.get("test_runs") or []
+                last_report = runs[-1].get("report", "") if runs else "(not tested)"
+                test_cases = "\n".join(
+                    f"- {case.get('name')}: {case.get('expected')}"
+                    for case in patch.get("tests") or []) or "(none)"
+                _print_long_panel(
+                    f"[bold]Patch:[/bold] {patch.get('id')}\n"
+                    f"[bold]Status:[/bold] {patch.get('status')}\n\n"
+                    f"[bold]Diagnosis[/bold]\n{patch.get('diagnosis', '')}\n\n"
+                    f"[bold]Rationale[/bold]\n{patch.get('rationale', '')}\n\n"
+                    f"[bold]Overlay[/bold]\n{patch.get('content', '')}\n\n"
+                    f"[bold]Regression cases[/bold]\n{test_cases}\n\n"
+                    f"[bold]Latest test report[/bold]\n{last_report}",
+                    title="Prompt Lab Review", border_style="blue")
+        elif sub == "test":
+            patch_id = parts[2] if len(parts) >= 3 else prompt_lab.active_patch_id()
+            if not patch_id:
+                console.print("[yellow]No candidate patch. Wait for diagnosis or run /prompt chat.[/yellow]")
+            else:
+                ok, msg = _prompt_lab_start_test(patch_id, session)
+                console.print(f"[{'green' if ok else 'red'}]{_escape(msg)}[/{'green' if ok else 'red'}]")
+        elif sub == "activate":
+            patch_id = next((item for item in parts[2:] if item != "--force"), None)
+            patch_id = patch_id or prompt_lab.active_patch_id()
+            patch = prompt_lab.read_patch(patch_id or "") if patch_id else None
+            if patch is None:
+                console.print("[red]Prompt Lab patch not found.[/red]")
+            else:
+                runs = patch.get("test_runs") or []
+                passed = bool(runs and runs[-1].get("passed"))
+                if not passed and "--force" not in parts[2:]:
+                    console.print("[red]The latest regression run has not passed. Run /prompt test first, or explicitly use --force.[/red]")
+                else:
+                    ok, preview = prompt_lab.preview_activation(patch_id)
+                    if not ok:
+                        console.print(f"[red]{_escape(preview)}[/red]")
+                    else:
+                        if not passed:
+                            preview = "WARNING: activating without a passing test.\n\n" + preview
+                        choice = _blocking_approval_prompt(
+                            "Prompt Lab activation",
+                            preview,
+                            "Activate this prompt overlay and hot-reload now?",
+                            allow_always=False,
+                        )
+                        if choice != "yes":
+                            console.print("[yellow]Prompt activation cancelled.[/yellow]")
+                        else:
+                            ok, msg = prompt_lab.activate_patch(patch_id)
+                            console.print(f"[{'green' if ok else 'red'}]{_escape(msg)}[/{'green' if ok else 'red'}]")
+        elif sub == "disable":
+            patch_id = parts[2] if len(parts) >= 3 else ""
+            if not patch_id:
+                console.print("[yellow]Usage: /prompt disable <patch-id>[/yellow]")
+            else:
+                choice = _blocking_approval_prompt(
+                    "Prompt Lab change",
+                    f"Patch: {patch_id}",
+                    "Disable this overlay and hot-reload now?",
+                    allow_always=False,
+                )
+                if choice != "yes":
+                    console.print("[yellow]Prompt change cancelled.[/yellow]")
+                else:
+                    ok, msg = prompt_lab.disable_patch(patch_id)
+                    console.print(f"[{'green' if ok else 'red'}]{_escape(msg)}[/{'green' if ok else 'red'}]")
+        elif sub == "profiles":
+            for profile in prompt_lab.list_profiles():
+                marker = "[green]*[/green]" if profile.get("active") else " "
+                console.print(
+                    f"{marker} [cyan]{profile.get('name')}[/cyan] "
+                    f"[dim]{len(profile.get('patches') or [])} patch(es)[/dim]")
+        elif sub == "profile":
+            if len(parts) < 4 or parts[2].lower() != "create":
+                console.print("[yellow]Usage: /prompt profile create <name> [patch-id ...][/yellow]")
+            else:
+                ok, msg = prompt_lab.create_profile(parts[3], parts[4:])
+                console.print(f"[{'green' if ok else 'red'}]{_escape(msg)}[/{'green' if ok else 'red'}]")
+        elif sub == "use":
+            if len(parts) < 3:
+                console.print("[yellow]Usage: /prompt use <profile>[/yellow]")
+            else:
+                profile = next((p for p in prompt_lab.list_profiles()
+                                if p.get("name") == parts[2]), None)
+                if profile is None:
+                    console.print(f"[red]Profile {parts[2]} not found.[/red]")
+                else:
+                    body = (f"Profile: {parts[2]}\nPatches:\n" +
+                            "\n".join(f"  - {p}" for p in profile.get("patches") or []))
+                    choice = _blocking_approval_prompt(
+                        "Prompt Lab profile switch", body,
+                        "Switch profile and hot-reload now?", allow_always=False)
+                    if choice != "yes":
+                        console.print("[yellow]Profile switch cancelled.[/yellow]")
+                    else:
+                        ok, msg = prompt_lab.switch_profile(parts[2])
+                        console.print(f"[{'green' if ok else 'red'}]{_escape(msg)}[/{'green' if ok else 'red'}]")
+        elif sub == "rollback":
+            choice = _blocking_approval_prompt(
+                "Prompt Lab rollback",
+                "The latest prompt activation, disable, or profile switch will be reverted.",
+                "Roll back and hot-reload now?",
+                allow_always=False,
+            )
+            if choice != "yes":
+                console.print("[yellow]Prompt rollback cancelled.[/yellow]")
+            else:
+                ok, msg = prompt_lab.rollback()
+                console.print(f"[{'green' if ok else 'red'}]{_escape(msg)}[/{'green' if ok else 'red'}]")
+        elif sub == "help":
+            console.print(
+                "[bold]Prompt Lab[/bold]\n"
+                "  /prompt [issue]                  Capture an incident and start diagnosis\n"
+                "  /prompt chat <message>           Refine with AI in the active branch\n"
+                "  /prompt status|branches|patches  Inspect project state\n"
+                "  /prompt review [patch-id]        Review diagnosis, overlay, and tests\n"
+                "  /prompt test [patch-id]          Run an isolated AI regression evaluation\n"
+                "  /prompt activate [id] [--force]  Confirm, activate, and hot-reload\n"
+                "  /prompt disable <id>             Confirm and disable an overlay\n"
+                "  /prompt profiles|use <name>      Manage switchable prompt profiles\n"
+                "  /prompt rollback                 Confirm and undo latest prompt change")
+        elif sub == "feedback" and len(parts) >= 3:
             desc = _decode_text_arg(prompt_args_raw)
             entry = _po.capture_feedback(desc)
             parent = get_current_agent()
@@ -6493,14 +8026,36 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
                               "[bold]/prompt discard[/bold] to reject.[/dim]")
         elif sub == "apply":
             cid = next((item for item in parts[2:] if item != "--force"), None)
-            ok, msg = _po.apply_candidate(cid, force="--force" in parts[2:])
-            color = "green" if ok else "red"
-            console.print(f"[{color}]{msg}[/{color}]")
+            cand = _po.read_candidate(cid)
+            if not cand:
+                console.print("[red]No legacy candidate found to apply.[/red]")
+            else:
+                choice = _blocking_approval_prompt(
+                    "Legacy prompt activation",
+                    f"Candidate: {cand.get('id', '?')}\n\n{cand.get('patch', '')}",
+                    "Modify cli.prop and hot-reload this legacy patch?",
+                    allow_always=False,
+                )
+                if choice != "yes":
+                    console.print("[yellow]Legacy prompt activation cancelled.[/yellow]")
+                else:
+                    ok, msg = _po.apply_candidate(cid, force="--force" in parts[2:])
+                    color = "green" if ok else "red"
+                    console.print(f"[{color}]{msg}[/{color}]")
         elif sub == "discard":
             cid = parts[2] if len(parts) >= 3 else None
-            ok, msg = _po.discard_candidate(cid)
-            color = "green" if ok else "red"
-            console.print(f"[{color}]{msg}[/{color}]")
+            choice = _blocking_approval_prompt(
+                "Legacy prompt rollback",
+                f"Candidate: {cid or '(active legacy candidate)'}",
+                "Remove the active legacy patch and hot-reload?",
+                allow_always=False,
+            )
+            if choice != "yes":
+                console.print("[yellow]Legacy prompt rollback cancelled.[/yellow]")
+            else:
+                ok, msg = _po.discard_candidate(cid)
+                color = "green" if ok else "red"
+                console.print(f"[{color}]{msg}[/{color}]")
         elif sub == "list":
             cands = _po.list_candidates()
             if cands:
@@ -6647,18 +8202,37 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
                 if not cid:
                     console.print("[red]Usage: /prompt skill apply <id>[/red]")
                 else:
-                    ok, msg = _po.apply_skill_patch(
-                        cid, force="--force" in parts[3:])
-                    color = "green" if ok else "red"
-                    console.print(f"[{color}]{msg}[/{color}]")
+                    candidate = _po.read_skill_patch(cid)
+                    preview = (
+                        f"Patch: {cid}\nSkill: "
+                        f"{(candidate or {}).get('skill_name', '?')}/"
+                        f"{(candidate or {}).get('skill_file', '?')}\n\n"
+                        f"{(candidate or {}).get('patch', '')}"
+                    )
+                    choice = _blocking_approval_prompt(
+                        "Skill prompt activation", preview,
+                        "Modify this skill and hot-reload it?", allow_always=False)
+                    if choice != "yes":
+                        console.print("[yellow]Skill patch activation cancelled.[/yellow]")
+                    else:
+                        ok, msg = _po.apply_skill_patch(
+                            cid, force="--force" in parts[3:])
+                        color = "green" if ok else "red"
+                        console.print(f"[{color}]{msg}[/{color}]")
             elif sub2 == "discard":
                 cid = parts[3] if len(parts) > 3 else None
                 if not cid:
                     console.print("[red]Usage: /prompt skill discard <id>[/red]")
                 else:
-                    ok, msg = _po.discard_skill_patch(cid)
-                    color = "green" if ok else "red"
-                    console.print(f"[{color}]{msg}[/{color}]")
+                    choice = _blocking_approval_prompt(
+                        "Skill prompt rollback", f"Patch: {cid}",
+                        "Restore the skill backup and hot-reload it?", allow_always=False)
+                    if choice != "yes":
+                        console.print("[yellow]Skill patch rollback cancelled.[/yellow]")
+                    else:
+                        ok, msg = _po.discard_skill_patch(cid)
+                        color = "green" if ok else "red"
+                        console.print(f"[{color}]{msg}[/{color}]")
             else:
                 console.print("Usage:\n"
                               "  [bold]/prompt skill list[/bold]            — List skill patches\n"
@@ -6679,6 +8253,58 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
                           "  [bold]/prompt export <id> [path][/bold]  — Export portable pack\n"
                           "  [bold]/prompt install <path|url>[/bold]  — Import a shared pack\n"
                           "  [bold]/prompt publish <id>[/bold]        — Publish to community")
+
+    elif action == "/work":
+        sub = parts[1].lower() if len(parts) > 1 else "status"
+        if sub == "status":
+            work = workgraph.get_active_work()
+            if not work:
+                console.print("[dim]No active WorkGraph in this project.[/dim]")
+            else:
+                steps = workgraph.list_steps(work["id"])
+                done = sum(1 for step in steps if step.get("status") in {"completed", "skipped"})
+                console.print(Panel(
+                    f"ID: [cyan]{work['id']}[/cyan]\n"
+                    f"Objective: {work['objective']}\n"
+                    f"Status: [bold]{work['status']}[/bold]\n"
+                    f"Revision: {work.get('current_revision') or 0}\n"
+                    f"Approved: {work.get('approved_revision') or '(none)'}\n"
+                    f"Workflow: {work.get('workflow_template') or '(none)'} / "
+                    f"{work.get('workflow_phase') or '(none)'}\n"
+                    f"Steps: {done}/{len(steps)} complete",
+                    title="Active WorkGraph", border_style="cyan"))
+        elif sub == "list":
+            items = workgraph.list_work()
+            if not items:
+                console.print("[dim]No WorkGraph history in this project.[/dim]")
+            for item in items:
+                console.print(
+                    f"  [cyan]{item['id']}[/cyan] [dim]{item['status']}[/dim] — "
+                    f"{item['objective'][:100]}")
+        elif sub == "resume":
+            if len(parts) < 3:
+                console.print("[yellow]Usage: /work resume <work-id>[/yellow]")
+            else:
+                work = workgraph.get_work(parts[2])
+                if not work:
+                    console.print(f"[red]WorkGraph {parts[2]} not found.[/red]")
+                else:
+                    workgraph.set_active_work(work["id"])
+                    if work["status"] in {"DRAFT", "REVIEW_PENDING", "NEEDS_USER", "BLOCKED"}:
+                        import plan_mode as _work_pm
+                        _work_pm.attach_work(work["id"])
+                    console.print(f"[green]Resumed WorkGraph {work['id']}.[/green]")
+        elif sub == "history":
+            work = workgraph.get_active_work()
+            if not work:
+                console.print("[dim]No active WorkGraph.[/dim]")
+            else:
+                for event in reversed(workgraph.list_events(work["id"], limit=30)):
+                    console.print(
+                        f"  [dim]{event['id']}[/dim] {event['event_type']} "
+                        f"[dim]{json.dumps(event['payload'], ensure_ascii=False)[:120]}[/dim]")
+        else:
+            console.print("[yellow]Usage: /work [status|list|resume <id>|history][/yellow]")
 
     elif action == "/task":
         sub = parts[1].lower() if len(parts) > 1 else ""
@@ -7155,8 +8781,10 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
         sub = SubTerminalSession(shell_cmd)
         sub.start()
         time.sleep(0.1)
-        if sub.is_alive():
-            sub.read_output(timeout=0.1)
+        if not sub.is_alive():
+            console.print(f"[red]Could not start terminal '{name}'.[/red]")
+            return False
+        sub.read_output(timeout=0.1)
         register_terminal(sub, shell_cmd, 0, name=name)
 
         station_agent(target_agent.id, name)
@@ -7210,17 +8838,19 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
                 if not allowed:
                     console.print(f"[red]{denial}[/red]")
                     return False
-                old_len = len(term.session.full_output)
-                term.session.send_keys(cmd + "\n")
-                console.print(f"[dim]Sent to [bold]{name}[/bold]: {cmd[:80]}[/dim]")
-                if wait_seconds >= 0.3:
-                    console.print(
-                        f"[dim]Waiting up to {wait_seconds:g}s for new output…[/dim]")
-                deadline = time.time() + wait_seconds
-                while time.time() < deadline:
-                    remaining = deadline - time.time()
-                    term.session.read_output(timeout=min(0.2, max(0.01, remaining)))
-                output = term.session.full_output[old_len:]
+                command_lock = getattr(term.session, "command_lock", None)
+                with (command_lock if command_lock is not None else nullcontext()):
+                    old_len = len(term.session.full_output)
+                    term.session.send_keys(cmd + "\n")
+                    console.print(f"[dim]Sent to [bold]{name}[/bold]: {cmd[:80]}[/dim]")
+                    if wait_seconds >= 0.3:
+                        console.print(
+                            f"[dim]Waiting up to {wait_seconds:g}s for new output…[/dim]")
+                    deadline = time.time() + wait_seconds
+                    while time.time() < deadline:
+                        remaining = deadline - time.time()
+                        term.session.read_output(timeout=min(0.2, max(0.01, remaining)))
+                    output = term.session.full_output[old_len:]
                 if output.strip():
                     preview = output[-2000:]
                     suffix = "" if len(output) <= 2000 else f"\n[dim]… {len(output) - 2000} earlier new chars omitted[/dim]"
@@ -7438,6 +9068,51 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
                         console.print(f"  [cyan]{t.name}[/cyan] — {t.description}")
                     if not tools:
                         console.print("  [yellow](standby/documentation-only)[/yellow]")
+        elif sub in ("trust", "revoke"):
+            if len(parts) < 3:
+                console.print(f"[yellow]Usage: /skill {sub} <name>[/yellow]")
+            else:
+                skill_name = parts[2]
+                meta = skills_mod.get_all_metadata().get(skill_name)
+                if meta is None:
+                    console.print(f"[red]Unknown skill: {skill_name}[/red]")
+                else:
+                    entrypoint = Path(meta.dir_path) / "skill.py"
+                    if not entrypoint.is_file():
+                        console.print("[dim]Documentation-only skills do not require executable trust.[/dim]")
+                    elif sub == "revoke":
+                        skills_mod.unload_skill(skill_name)
+                        removed = trust_store.revoke_extension("skill", skill_name)
+                        console.print("[green]Skill trust revoked.[/green]" if removed
+                                      else "[dim]Skill was not trusted.[/dim]")
+                    else:
+                        manifest, manifest_error = skills_mod.load_skill_manifest(
+                            Path(meta.dir_path), skill_name)
+                        if manifest is None:
+                            console.print(f"[red]{manifest_error}[/red]")
+                            return False
+                        status = trust_store.extension_status(
+                            "skill", skill_name, entrypoint,
+                            (Path(meta.dir_path) / skills_mod.SKILL_MANIFEST,))
+                        approved = "--yes" in parts[3:]
+                        if not approved and sys.stdin.isatty():
+                            approved = _blocking_approval_prompt(
+                                "Trust executable skill",
+                                f"Skill: {skill_name}\nFile: {entrypoint.resolve()}\n"
+                                f"SHA-256: {status.get('sha256', 'unavailable')}\n\n"
+                                f"Capabilities: {manifest.get('capabilities', [])}\n\n"
+                                "This Python executes with your local account permissions.",
+                                "Trust this exact skill hash?", allow_always=False,
+                            ) == "yes"
+                        if approved:
+                            trusted = trust_store.trust_extension(
+                                "skill", skill_name, entrypoint,
+                                (Path(meta.dir_path) / skills_mod.SKILL_MANIFEST,))
+                            console.print(
+                                f"[green]Trusted {skill_name} at "
+                                f"{trusted['sha256'][:16]}…[/green]")
+                        else:
+                            console.print("[yellow]Skill not trusted.[/yellow]")
         elif sub in ("load", "unload"):
             if len(parts) < 3:
                 console.print(f"[yellow]Usage: /skill {sub} <name>[/yellow]")
@@ -7460,11 +9135,11 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
                 style = "green" if ok else "red"
                 console.print(f"[{style}]{msg}[/{style}]")
                 if ok:
-                    console.print("[dim]Edit the file, then run /skill reload[/dim]")
+                    console.print("[dim]Edit skill.py and extension.json, then run /skill trust <name> and /skill load <name>[/dim]")
         elif sub == "dir":
             console.print(str(skills_mod.SKILLS_DIR))
         else:
-            console.print("[yellow]Usage: /skill [manager|list|load <name>|unload <name>|reload|new <name>|dir][/yellow]")
+            console.print("[yellow]Usage: /skill [manager|list|trust <name>|revoke <name>|load <name>|unload <name>|reload|new <name>|dir][/yellow]")
 
     elif action == "/mcp":
         if not _get_mcp_mod().MCP_AVAILABLE:
@@ -7492,6 +9167,44 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
                     console.print(f"  [{style}]{name}[/{style}] {status} [dim]{cmd_str}[/dim]")
                     if srv and srv.last_error and srv.status != "up":
                         console.print(f"    [red]{srv.last_error}[/red]")
+        elif sub in ("trust", "revoke"):
+            if len(parts) < 3:
+                console.print(f"[yellow]Usage: /mcp {sub} <server>[/yellow]")
+            else:
+                server_name = parts[2]
+                server_cfg = mgr.load_config().get("servers", {}).get(server_name)
+                if server_cfg is None:
+                    console.print(f"[red]Unknown MCP server: {server_name}[/red]")
+                elif sub == "revoke":
+                    mgr.disconnect(server_name)
+                    removed = trust_store.revoke_extension("mcp", server_name)
+                    console.print("[green]MCP trust revoked.[/green]" if removed
+                                  else "[dim]MCP server was not trusted.[/dim]")
+                else:
+                    cfg_path = _get_mcp_mod().CONFIG_PATH
+                    status = trust_store.extension_status(
+                        "mcp", server_name, cfg_path)
+                    argv = [server_cfg.get("command")] + list(server_cfg.get("args") or [])
+                    approved = "--yes" in parts[3:]
+                    if not approved and sys.stdin.isatty():
+                        approved = _blocking_approval_prompt(
+                            "Trust MCP server process",
+                            f"Server: {server_name}\nCommand: {argv}\n"
+                            f"CWD: {server_cfg.get('cwd') or os.getcwd()}\n"
+                            f"Explicit env keys: {sorted((server_cfg.get('env') or {}).keys())}\n"
+                            f"Capabilities: {server_cfg.get('capabilities', ['core.other'])}\n"
+                            f"Config SHA-256: {status.get('sha256', 'unavailable')}",
+                            "Trust this server at the current config hash?",
+                            allow_always=False,
+                        ) == "yes"
+                    if approved:
+                        trusted = trust_store.trust_extension(
+                            "mcp", server_name, cfg_path)
+                        console.print(
+                            f"[green]Trusted MCP server {server_name} at "
+                            f"{trusted['sha256'][:16]}…[/green]")
+                    else:
+                        console.print("[yellow]MCP server not trusted.[/yellow]")
         elif sub == "tools":
             if len(parts) < 3:
                 console.print("[yellow]Usage: /mcp tools <server>[/yellow]")
@@ -7535,7 +9248,41 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
         elif sub == "config":
             console.print(str(_get_mcp_mod().CONFIG_PATH))
         else:
-            console.print("[yellow]Usage: /mcp {list|connect <n>|disconnect <n>|reload|tools <n>|init|config}[/yellow]")
+            console.print("[yellow]Usage: /mcp {list|trust <n>|revoke <n>|connect <n>|disconnect <n>|reload|tools <n>|init|config}[/yellow]")
+
+    elif action == "/connect":
+        # /connect [name] — link THIS terminal to Helpwo (primary or sub);
+        # optional name customizes how it appears in Helpwo.
+        if agent_registry is None:
+            console.print("[red]No agent registry available.[/red]")
+        else:
+            custom_name = parts[1] if len(parts) >= 2 else None
+            if custom_name and not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", custom_name):
+                console.print("[red]Invalid name. Use letters, numbers, dot, "
+                              "underscore, or hyphen (max 64).[/red]")
+            elif custom_name and custom_name.lower() == "term0":
+                console.print("[red]'term0' is reserved.[/red]")
+            else:
+                connect_terminal_to_helpwo(agent_registry, session, name=custom_name)
+
+    elif action == "/disconnect":
+        if agent_registry is None or not agent_registry.agent_id:
+            console.print("[dim]This terminal is not connected to Helpwo.[/dim]")
+        elif getattr(agent_registry, "depth", 0) == 0:
+            name = agent_registry.agent_name
+            agent_registry.unregister()
+            agent_registry.agent_id = None
+            agent_registry.agent_secret = ""
+            console.print(f"[yellow]Primary CLI [bold]{name}[/bold] is now offline in Helpwo "
+                          f"(sub-terminal creation from the UI is disabled). "
+                          f"Run /connect to link again.[/yellow]")
+        else:
+            name = (agent_registry.terminal_meta or {}).get("name", agent_registry.agent_name)
+            agent_registry.unregister()
+            agent_registry.agent_id = None
+            agent_registry.agent_secret = ""
+            console.print(f"[yellow]Sub-terminal [bold]{name}[/bold] withdrawn from Helpwo. "
+                          f"Run /connect to hand it over again.[/yellow]")
 
     elif action in ("/t", "/term"):
         if len(parts) >= 2 and parts[1].lower() == "rename":
@@ -7567,12 +9314,17 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
             if existing is not None:
                 console.print(f"[yellow]Terminal '{name}' already exists. /t to view, /terminate {name} to remove.[/yellow]")
             else:
-                lain_cmd = f"{sys.executable} {os.path.abspath(__file__)} --depth 1"
+                lain_cmd = _build_connected_subterminal_cmd(
+                    name,
+                    agent_registry.agent_id if agent_registry else None,
+                )
                 sub = SubTerminalSession(lain_cmd)
                 sub.start()
                 time.sleep(0.1)
-                if sub.is_alive():
-                    sub.read_output(timeout=0.1)
+                if not sub.is_alive():
+                    console.print(f"[red]Could not start terminal '{name}'.[/red]")
+                    return False
+                sub.read_output(timeout=0.1)
                 register_terminal(sub, "laintas-cli", 0, name=name)
                 console.print(f"[green]Created sub-terminal [bold]{name}[/bold] (no agent stationed)[/green]")
         elif len(parts) > 2:
@@ -7962,13 +9714,22 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
             handle_version_command(parts)
 
     else:
+        # Evolution Lab extensions register project-local slash commands here.
+        handled, extension_result = extension_runtime.get_runtime().invoke_command(
+            action, parts, cmd)
+        if handled:
+            if extension_result is not None:
+                console.print(extension_result)
+            return False
         # Try .laintas/commands.py custom handler first
         handler = _load_extra_commands()
         if handler:
             ctx = {
-                "session": session, "interactive_session": interactive_session,
+                # Authentication state is intentionally never exposed to
+                # project customization, even after workspace trust approval.
+                "session": {}, "interactive_session": interactive_session,
                 "raw_line": cmd, "raw_args": raw_args,
-                "agent_registry": agent_registry, "console": console,
+                "agent_registry": None, "console": console,
                 "get_terminal": get_terminal, "get_all_terminals": get_all_terminals,
                 "unregister_terminal": unregister_terminal, "register_terminal": register_terminal,
                 "rename_terminal": rename_terminal,
@@ -8169,7 +9930,8 @@ def show_banner(agent_name: str, session: dict = None):
             rows.append(("account", acct))
     rows.append(("system", f"{SYSTEM} · {shell_info}"))
     rows.append(("cwd", _shorten_path(os.getcwd())))
-    rows.append(("backend", os.environ.get("LAINTAS_BACKEND", BACKEND_URL)))
+    _backend_profile = get_backend_profile()
+    rows.append(("backend", f"{_backend_profile.base_url} [{_backend_profile.kind}; {_backend_profile.billing_label}]"))
 
     # ── Status row: policy mode + plan mode + open tasks ──
     status_parts = []
@@ -8460,13 +10222,16 @@ def _blocking_approval_prompt(title: str, body: str, question: str,
 
     options = ["Yes", "Always (this session)", "No"] if allow_always else ["Yes", "No"]
 
+    _reader_was_running = bool(
+        _bg_reader_thread is not None and _bg_reader_thread.is_alive())
     _stop_bg_input_reader()
     try:
         choice = _arrow_approval_prompt(f"{title} — {question}", body_lines, options)
     except (EOFError, KeyboardInterrupt):
         choice = None
     finally:
-        _start_bg_input_reader(get_user_message_queue())
+        if _reader_was_running:
+            _start_bg_input_reader(get_user_message_queue())
 
     if choice == "Always (this session)":
         return "always"
@@ -8637,67 +10402,20 @@ def _maybe_offer_plan_mode(user_input: str) -> bool:
 
 
 def _show_plan_approval_menu() -> bool:
-    """Rich interactive menu shown after the AI finishes planning.
-
-    Offers view / approve / edit / reject. Returns True if the user approved
-    (plan mode is exited with approve=True), False otherwise (plan mode is
-    either still active or exited without approval).
-    """
+    """Review a submitted immutable plan revision; loop completion is not readiness."""
     import plan_mode as _pm
     if not _pm.is_plan_mode():
         return False
-
     plan = _pm.get_current_plan()
-    if not plan:
+    if not plan or plan.get("status") != "review_pending":
         return False
-
-    plan_file = plan.get("file", "")
-    plan_task = plan.get("task", "")
-
-    while True:
-        console.print(Panel(
-            f"[bold]Task:[/bold] {plan_task[:120]}\n"
-            f"[bold]Plan file:[/bold] [dim]{plan_file}[/dim]",
-            title="[green]Plan Ready — Review & Approve[/green]",
-            border_style="green", expand=False,
-        ))
-        _stop_bg_input_reader()
-        try:
-            try:
-                choice = input(
-                    "  [a] Approve & execute   [v] View   [e] Edit   [r] Reject   (default: a): "
-                ).strip().lower()
-            except (EOFError, KeyboardInterrupt):
-                choice = "r"
-        finally:
-            _start_bg_input_reader(get_user_message_queue())
-
-        if choice in ("", "a", "approve"):
-            _pm.exit_plan_mode(approve=True)
-            console.print("[green]✓ Plan approved. Executing...[/green]")
-            return True
-
-        if choice in ("v", "view"):
-            content = _pm.read_plan() or "(plan file is empty)"
-            console.print(Panel(content, title=f"[dim]{plan_file}[/dim]",
-                                border_style="dim", expand=False))
-            continue
-
-        if choice in ("e", "edit"):
-            editor = os.environ.get("EDITOR", "nano")
-            console.print(f"[dim]Opening {plan_file} in {editor}...[/dim]")
-            try:
-                subprocess.call([editor, plan_file])
-            except Exception as e:
-                console.print(f"[red]Failed to launch editor: {e}[/red]")
-            continue
-
-        if choice in ("r", "reject"):
-            _pm.exit_plan_mode(approve=False)
-            console.print("[yellow]Plan rejected. Exited plan mode.[/yellow]")
-            return False
-
-        console.print("[dim]Invalid choice. Try again.[/dim]")
+    approved = _review_and_approve_current_plan()
+    if approved:
+        console.print(
+            f"[green]✓ Revision {approved['revision']} approved. Executing exact SHA "
+            f"{approved['content_sha'][:12]}…[/green]")
+        return True
+    return False
 
 
 def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
@@ -8817,8 +10535,11 @@ def main():
     parser.add_argument("--version", "-V", action="version",
                         version=f"laintas-cli {__version__}")
     parser.add_argument("--name", type=str, help="Set agent name (shows in Helpwo AGNETS)")
-    parser.add_argument("--backend", type=str, help="Backend URL", default=None)
-    parser.add_argument("--laintas", type=str, help="Laintas.com base URL", default=None)
+    parser.add_argument(
+        "--backend", type=str,
+        help="Custom backend URL (enters external/unmetered mode; Laintas credentials are stripped)",
+        default=None)
+    parser.add_argument("--laintas", type=str, help=argparse.SUPPRESS, default=None)
     parser.add_argument("--execute", "-e", type=str, default=None,
                         help="Execute a single task non-interactively and exit")
     parser.add_argument("--session-id", type=str, default=None,
@@ -8847,36 +10568,72 @@ def main():
                         help="Name of the parent terminal that spawned this sub-process")
     parser.add_argument("--parent-agent-id", type=str, default=None,
                         help="Agent id of the parent process that spawned this sub-process")
+    parser.add_argument("--remote-parent-id", type=str, default=None,
+                        help="Helpwo backend agent id of the primary CLI that owns this sub-terminal")
+    parser.add_argument("--connect", action="store_true", default=False,
+                        help="Hand this sub-terminal over to Helpwo at startup (as if /connect was run)")
     args = parser.parse_args()
 
     # Apply environment overrides
     if args.backend:
         os.environ["LAINTAS_BACKEND"] = args.backend
     if args.laintas:
-        os.environ["LAINTAS_BASE"] = args.laintas
+        if args.laintas.rstrip("/") != LAINTAS_BASE:
+            parser.error("custom authentication origins are no longer allowed")
 
     # All REPL instances use full-color console — sub-terminals are full
     # laintas-cli instances and should look identical to the main terminal.
 
     # Initialize unified home directory and auto-migrate old layout
     paths.ensure_home()
+    backend_profiles.ensure_template()
     if migrate_mod.needs_migration():
         console.print("[dim]Migrating to new directory layout (~/.laintas/)...[/dim]")
         migrate_mod.migrate_all(verbose=True)
 
     # Ensure .laintas/ project files exist in cwd
     ensure_files_exist()
+    evolution_lab.reconcile_workspace()
 
     # Load or create config
     config = load_config()
     agent_name = args.name or config.get("agentName", socket.gethostname())
 
-    # Authenticate
-    session = ensure_auth() or {}
+    # Official mode uses the Laintas account. Custom/local backends are a
+    # separate trust and billing domain and must not require or receive it.
+    _active_backend = get_backend_profile()
+    session = (ensure_auth() or {}) if _active_backend.sends_laintas_credentials else {}
+    if args.depth == 0 and not _active_backend.sends_laintas_credentials:
+        console.print(
+            f"[yellow]Backend mode: {_active_backend.kind} "
+            f"({_active_backend.base_url}) — external/unmetered; "
+            "Laintas credentials are not sent.[/yellow]")
+
+    # Project extensions receive a narrow inference gateway, never the raw
+    # authenticated session. The normal backend path remains authoritative for
+    # official authentication, model authorization and billing.
+    _extension_runtime = extension_runtime.get_runtime()
+    _extension_runtime.configure(
+        console=console,
+        reserved_commands=[
+            name for spec in COMMAND_SPECS for name in spec.all_names
+        ],
+        backend_callback=lambda message, system_prompt="", **options: call_backend_stream(
+            session=session, message=message, system_prompt=system_prompt,
+            current_path=os.getcwd(), history=options.get("history") or [],
+            messages=options.get("messages"), lang=options.get("lang", "EN"),
+            tools_enabled=bool(options.get("tools_enabled", False)),
+        ),
+    )
+    for _ext_name, _ext_ok, _ext_message in evolution_lab.load_active_extensions(
+            _extension_runtime):
+        if not _ext_ok and args.depth == 0:
+            console.print(f"[yellow]Extension {_ext_name}: {_ext_message}[/yellow]")
 
     # ── Non-interactive execution mode ──
     if args.execute:
-        if not session.get("userId"):
+        if (_active_backend.sends_laintas_credentials
+                and not session.get("userId")):
             console.print("[red]Authentication required for --execute mode. Use /login first.[/red]")
             sys.exit(1)
         sys.exit(run_execute_mode(args.execute, session, args.depth, args.session_id))
@@ -8999,15 +10756,42 @@ def main():
         handle_meta_command._last_events_cb = None
         handle_meta_command._last_existing_session = None
 
-    if session.get("userId"):
-        agent_registry.register(session, name=agent_name, quiet=(args.depth > 0))
-        agent_registry.start_heartbeat()
-        # Start listening for remote messages from Helpwo (skip in child terminals)
-        if args.depth == 0:
+    # Stash REPL state callbacks + terminal identity so /connect (now or later)
+    # can register this instance with full context.
+    agent_registry.depth = args.depth
+    agent_registry._state_cb = lambda: agent_state
+    agent_registry._chat_cb = lambda: chat_history
+    if args.depth > 0:
+        agent_registry.parent_remote_id = args.remote_parent_id or None
+        agent_registry.terminal_meta = {
+            "name": args.terminal_name or f"term-pid{os.getpid()}",
+            "command": "laintas-cli",
+            "createdAt": time.time(),
+            "createdBy": args.parent_terminal or "term0",
+        }
+
+    if session.get("userId") or not _active_backend.sends_laintas_credentials:
+        if args.depth == 0 and args.monitor_only:
+            # Monitor mode IS the remote-executor role — it must be online.
+            agent_registry.register(session, name=agent_name)
+            agent_registry.start_heartbeat()
             agent_registry.start_message_poll(
                 lambda: agent_state,
                 lambda: chat_history,
             )
+        elif args.connect:
+            # --connect (any depth; used by Helpwo's term-new for sub-terminals).
+            connect_terminal_to_helpwo(agent_registry, session)
+        elif args.depth == 0:
+            # Two-end handshake: NO auto-link. The primary CLI goes online in
+            # Helpwo only when the user runs /connect here; sub-terminals only
+            # when /connect runs inside them.
+            console.print("[dim]Not linked to Helpwo. Run [bold]/connect \\[name][/bold] "
+                          "to bring this CLI online (Helpwo can then create "
+                          "sub-terminals here from its UI).[/dim]")
+        else:
+            console.print("[dim]Run [bold]/connect \\[name][/bold] to hand this "
+                          "sub-terminal over to Helpwo.[/dim]")
 
     # PTY session managed at REPL level (must be before shutdown for nonlocal)
     interactive_session = None
@@ -9067,6 +10851,22 @@ def main():
 
     # Setup graceful shutdown
     def shutdown(signum=None, frame=None):
+        if args.depth > 0:
+            # Sub-terminal CLI: its console may already be a dead PTY (parent
+            # closed it / tmux window killed), where console.print and the
+            # graceful save path can wedge. Unregister from Helpwo first,
+            # best-effort cleanup, then hard-exit.
+            try:
+                agent_registry.unregister()
+            except Exception:
+                pass
+            try:
+                stop_trigger_scanner()
+                close_all_terminals()
+                close_all_agents()
+            except Exception:
+                pass
+            os._exit(0)
         console.print("\n[yellow]Shutting down...[/yellow]")
         if args.depth == 0:
             save_session_snapshot(agent_state, chat_history, _session_start_cwd)
@@ -9093,6 +10893,11 @@ def main():
 
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
+    if not IS_WINDOWS:
+        # tmux kill-window (parent's unregister_terminal / Helpwo term-close)
+        # delivers SIGHUP — unregister from Helpwo before dying instead of
+        # leaving a stale agent until the 60s heartbeat timeout.
+        signal.signal(signal.SIGHUP, shutdown)
 
     # ── Create term0: a real persistent bash session ──
     # All system commands and stationed-agent shell.exec route through this
@@ -9118,7 +10923,8 @@ def main():
     # started above when the agent registered. Here we just park the main
     # thread until SIGINT/SIGTERM. See HELPWO_INTEGRATION_PLAN.md phase D.
     if args.monitor_only:
-        if not session.get("userId"):
+        if (_active_backend.sends_laintas_credentials
+                and not session.get("userId")):
             console.print("[red]--monitor-only requires authentication. Run /login first.[/red]")
             sys.exit(1)
         if not agent_registry.agent_id:
@@ -9255,6 +11061,23 @@ def main():
         _new_parts = user_input.strip().split(maxsplit=1)
         if (_new_parts and _new_parts[0].lower() in ("/new", "/new-session", "/reset-session")
                 and args.depth == 0):
+            _active_work = workgraph.get_active_work(cwd=_session_start_cwd)
+            if (_active_work and _active_work.get("status")
+                    not in {"COMPLETED", "CANCELLED", "FAILED"}):
+                _choice = _blocking_approval_prompt(
+                    "Start a new session",
+                    f"Active WorkGraph: {_active_work['id']}\n"
+                    f"Objective: {_active_work['objective']}\n"
+                    f"Status: {_active_work['status']}\n\n"
+                    "The work will be preserved for /resume but detached from the new session.",
+                    "Detach active work and start a new session?",
+                    allow_always=False,
+                )
+                if _choice != "yes":
+                    console.print("[yellow]New session cancelled.[/yellow]")
+                    if injected_done is not None:
+                        injected_done.set()
+                    continue
             if current_live_session:
                 session_store.close_session(current_live_session)
             chat_history.clear()
@@ -9265,6 +11088,15 @@ def main():
             }
             try:
                 task_manager.clear_session_tasks()
+            except Exception:
+                pass
+            try:
+                import plan_mode as _new_pm
+                import workflow_engine as _new_workflow
+                if _new_pm.is_plan_mode():
+                    _new_pm.exit_plan_mode(approve=False)
+                _new_workflow.detach_active_workflow()
+                workgraph.set_active_work(None, cwd=_session_start_cwd)
             except Exception:
                 pass
             current_live_session = session_store.create_session(_session_start_cwd, agent_state, chat_history)
@@ -9340,7 +11172,7 @@ def main():
                                        interactive_session.full_output)
                 agent_state["lastOutput"] = interactive_session.full_output
                 # Session exited — let the agent loop process final output
-                if session.get("userId"):
+                if session.get("userId") or not _active_backend.sends_laintas_credentials:
                     def local_events_cb(events: list):
                         if agent_registry.agent_id:
                             agent_registry._push_events(events)
@@ -9360,7 +11192,7 @@ def main():
                 display_command_output(interactive_session.command, -1, new_output)
                 agent_state["lastOutput"] = interactive_session.full_output
                 # Session still alive — ask AI to process the new output
-                if session.get("userId"):
+                if session.get("userId") or not _active_backend.sends_laintas_credentials:
                     def local_events_cb(events: list):
                         if agent_registry.agent_id:
                             agent_registry._push_events(events)
@@ -9582,7 +11414,8 @@ def main():
                 "session": None,
             }
         else:
-            if not session.get("userId"):
+            if (_active_backend.sends_laintas_credentials
+                    and not session.get("userId")):
                 console.print("[yellow]Not authenticated. Use /login first.[/yellow]")
                 if injected_done is not None:
                     injected_done.set()

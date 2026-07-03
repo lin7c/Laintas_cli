@@ -79,6 +79,28 @@ class Tool:
     schema: dict                                          # JSONSchema-ish
     invoke: Callable[[dict, ToolCtx], dict]               # → {ok,result,error}
     source: str = "builtin"
+    capabilities: frozenset[str] = field(default_factory=frozenset)
+    trust_level: str = "untrusted"
+
+
+def infer_capabilities(name: str) -> frozenset[str]:
+    """Conservative capability labels used by policy and audit layers."""
+    caps: set[str] = set()
+    if name.startswith(("fs.read", "fs.ls", "fs.grep", "fs.glob")):
+        caps.add("fs.read")
+    if name.startswith(("fs.write", "fs.edit", "fs.multi_edit", "fs.delete")):
+        caps.add("fs.write")
+    if name.startswith(("shell.", "terminal.", "session.keys")):
+        caps.add("process.exec")
+    if name.startswith(("web.", "browser.")):
+        caps.add("network")
+    if name.startswith("browser.") and name not in {
+            "browser.snapshot", "browser.query", "browser.get_url",
+            "browser.get_title", "browser.screenshot"}:
+        caps.add("browser.mutate")
+    if name.startswith(("agent.", "spawn", "await_spawns")):
+        caps.add("agent.control")
+    return frozenset(caps or {"core.other"})
 
 
 # ── Input validation ───────────────────────────────────────────────────
@@ -126,10 +148,24 @@ def _validate_params(params: dict, schema: dict) -> Optional[str]:
 class ToolRegistry:
     def __init__(self):
         self._tools: dict[str, Tool] = {}
+        self._builtin_names: set[str] = set()
 
     def register(self, tool: Tool, overwrite: bool = True) -> bool:
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,160}", tool.name or ""):
+            return False
+        existing = self._tools.get(tool.name)
+        if existing is not None and existing.source == "builtin" and tool.source != "builtin":
+            return False
+        if (existing is not None and tool.source != "builtin"
+                and existing.source != tool.source):
+            return False
         if not overwrite and tool.name in self._tools:
             return False
+        if not tool.capabilities:
+            tool.capabilities = infer_capabilities(tool.name)
+        if tool.source == "builtin":
+            tool.trust_level = "builtin"
+            self._builtin_names.add(tool.name)
         self._tools[tool.name] = tool
         return True
 
@@ -165,6 +201,11 @@ class ToolRegistry:
         tool = self._tools.get(name)
         if tool is None:
             return {"ok": False, "error": f"tool '{name}' not found", "tool": name}
+        if tool.source != "builtin" and tool.trust_level != "trusted-extension":
+            return {
+                "ok": False, "tool": name,
+                "error": f"tool '{name}' is from an untrusted extension",
+            }
         # ── Input validation (opencode Schema.Struct gate) ──
         schema = tool.schema
         if schema and isinstance(schema, dict) and schema.get("properties") is not None:
@@ -172,7 +213,18 @@ class ToolRegistry:
             if _vErr:
                 return {"ok": False, "tool": name, "error": _vErr, "_validation_error": True}
         try:
-            out = tool.invoke(params or {}, ctx)
+            invoke_ctx = ctx
+            if tool.source != "builtin":
+                # Never hand authentication state or control-plane callbacks to
+                # extension code. Extensions receive only task identity and cwd;
+                # stronger OS isolation remains an optional deployment boundary.
+                invoke_ctx = ToolCtx(
+                    agent_id=ctx.agent_id,
+                    cwd=ctx.cwd,
+                    depth=ctx.depth,
+                    session={},
+                )
+            out = tool.invoke(params or {}, invoke_ctx)
             if not isinstance(out, dict):
                 out = {"ok": True, "result": out}
             out.setdefault("ok", True)
@@ -929,6 +981,28 @@ def _bi_plan_list(params: dict, ctx: ToolCtx) -> dict:
     return {"ok": True, "result": plans, "count": len(plans)}
 
 
+def _bi_plan_submit(params: dict, ctx: ToolCtx) -> dict:
+    """Declare the current immutable plan revision ready for user review."""
+    if _plan_mod is None:
+        return {"ok": False, "error": "plan_mode module not available"}
+    snapshot = _plan_mod.submit_current_plan()
+    if not snapshot:
+        return {"ok": False, "error": (
+            "Plan could not be submitted. Ensure it is substantial and has an active revision.")}
+    revision = snapshot["revision"]
+    return {
+        "ok": True,
+        "result": (
+            f"Plan revision {revision['revision']} submitted for user review. "
+            "Stop planning; the CLI will display the approval dialog."
+        ),
+        "_plan_submitted": True,
+        "work_id": snapshot["work"]["id"],
+        "revision": revision["revision"],
+        "content_sha": revision["content_sha"],
+    }
+
+
 def _bi_prompt_feedback(params: dict, ctx: ToolCtx) -> dict:
     """Capture feedback and spawn a background optimizer sub-agent."""
     if _prompt_opt_mod is None:
@@ -1073,6 +1147,65 @@ def _bi_prompt_skill_discard(params: dict, ctx: ToolCtx) -> dict:
     return {"ok": False, "error": (
         "Discarding skill patches requires explicit user approval. "
         "Ask the user to run /prompt skill discard <id>.")}
+
+
+def _bi_prompt_lab_draft(params: dict, ctx: ToolCtx) -> dict:
+    """Draft a project-scoped Prompt Lab overlay; activation stays user-only."""
+    if _prompt_lab_mod is None:
+        return {"ok": False, "error": "prompt_lab module not available"}
+    agent = ctx.get_agent(ctx.agent_id) if ctx.get_agent and ctx.agent_id else None
+    lab_root = ((agent.state or {}).get("_prompt_lab_root") if agent else None)
+    try:
+        with _prompt_lab_mod.project_scope(lab_root):
+            patch = _prompt_lab_mod.draft_patch(
+                branch_id=str(params.get("branch_id") or ""),
+                title=str(params.get("title") or ""),
+                content=str(params.get("content") or ""),
+                rationale=str(params.get("rationale") or ""),
+                diagnosis=str(params.get("diagnosis") or ""),
+                tests=params.get("tests") if isinstance(params.get("tests"), list) else [],
+            )
+    except (ValueError, OSError) as exc:
+        return {"ok": False, "error": str(exc)}
+    return {
+        "ok": True,
+        "result": (
+            f"Prompt Lab patch {patch['id']} drafted. It is NOT active. "
+            f"Ask the user to run /prompt test {patch['id']} and review it."
+        ),
+        "patch_id": patch["id"],
+    }
+
+
+def _bi_evolve_lab_draft(params: dict, ctx: ToolCtx) -> dict:
+    """Draft an Evolution Lab feature candidate; activation stays user-only."""
+    if _evolution_lab_mod is None:
+        return {"ok": False, "error": "evolution_lab module not available"}
+    agent = ctx.get_agent(ctx.agent_id) if ctx.get_agent and ctx.agent_id else None
+    lab_root = ((agent.state or {}).get("_evolution_lab_root") if agent else None)
+    try:
+        with _evolution_lab_mod.project_scope(lab_root):
+            candidate = _evolution_lab_mod.draft_candidate(
+                branch_id=str(params.get("branch_id") or ""),
+                title=str(params.get("title") or ""),
+                target_type=str(params.get("target_type") or "extension"),
+                name=str(params.get("name") or ""),
+                files=params.get("files") if isinstance(params.get("files"), list) else [],
+                description=str(params.get("description") or ""),
+                dependencies=(params.get("dependencies")
+                              if isinstance(params.get("dependencies"), list) else []),
+                tests=params.get("tests") if isinstance(params.get("tests"), list) else [],
+            )
+    except (ValueError, OSError) as exc:
+        return {"ok": False, "error": str(exc)}
+    return {
+        "ok": True,
+        "result": (
+            f"Evolution candidate {candidate['id']} drafted. It is not active. "
+            f"Ask the user to run /evolve test {candidate['id']} and review it."
+        ),
+        "candidate_id": candidate["id"],
+    }
 
 
 def _bi_fs_edit(params: dict, ctx: ToolCtx) -> dict:
@@ -1496,6 +1629,16 @@ except ImportError:
     _prompt_opt_mod = None
 
 try:
+    import prompt_lab as _prompt_lab_mod
+except ImportError:
+    _prompt_lab_mod = None
+
+try:
+    import evolution_lab as _evolution_lab_mod
+except ImportError:
+    _evolution_lab_mod = None
+
+try:
     import policy as _policy_mod
 except ImportError:
     _policy_mod = None
@@ -1772,12 +1915,19 @@ def _bi_agent_spawn(params: dict, ctx: ToolCtx) -> dict:
         # If wait=true, block until all children complete
         if params.get("wait", False):
             results = []
-            for cid in child_ids:
-                info = _al.wait_for_agent(cid, timeout=params.get("timeout", 120.0))
-                if info:
-                    results.append(f"[{cid}] {info.status}: {info.last_reply[:200] if info.last_reply else '(no reply)'}")
-                else:
-                    results.append(f"[{cid}] timeout or not found")
+            deadline = time.time() + float(params.get("timeout", 120.0))
+            _al.enter_waiting(parent_id)
+            try:
+                for cid in child_ids:
+                    remaining = max(0.0, deadline - time.time())
+                    info = _al.wait_for_agent(cid, timeout=remaining)
+                    if info:
+                        results.append(f"[{cid}] {info.status}: {info.last_reply[:200] if info.last_reply else '(no reply)'}")
+                    else:
+                        _al.abort_agent(cid)
+                        results.append(f"[{cid}] timed out; cancellation requested")
+            finally:
+                _al.exit_waiting(parent_id)
             return {"ok": True,
                     "result": f"Spawned {len(child_ids)} agents in parallel. Results:\n" + "\n".join(results),
                     "child_ids": child_ids}
@@ -1866,7 +2016,9 @@ def _bi_spawn(params: dict, ctx: ToolCtx) -> dict:
             _al.exit_waiting(parent_id)
 
     if not result_holder:
-        _al.mark_agent_finished(child.id, error="timeout")
+        # Timeout is cancellation, not completion. Signal the live loop and
+        # leave its scheduler lease intact until the runner actually exits.
+        _al.abort_agent(child.id)
         return {"ok": False, "error": f"spawn timed out: {goal[:80]}"}
     return result_holder
 
@@ -1941,6 +2093,10 @@ def _bi_spawn_parallel(params: dict, ctx: ToolCtx) -> dict:
     finally:
         if parent_id:
             _al.exit_waiting(parent_id)
+
+    for (child, _), result in zip(children, results):
+        if result is None:
+            _al.abort_agent(child.id)
 
     ok = all(r and r.get("ok") for r in results)
     succeeded = sum(1 for r in results if r and r.get("ok"))
@@ -2045,17 +2201,17 @@ def _bi_spawn_chain(params: dict, ctx: ToolCtx) -> dict:
             done_evt.wait(timeout=300)
 
             if not result_holder:
-                _al.mark_agent_finished(child.id, error="timeout")
+                _al.abort_agent(child.id)
                 # abort remaining
                 for j, (c2, _) in enumerate(children):
                     if j > i:
-                        _al.mark_agent_finished(c2.id, error=f"Chain aborted at step {i+1}")
+                        _al.abort_agent(c2.id)
                 return {"ok": False, "result": f"Chain {chain_id} timed out at step {i+1}"}
 
             if not result_holder.get("ok"):
                 for j, (c2, _) in enumerate(children):
                     if j > i:
-                        _al.mark_agent_finished(c2.id, error=f"Chain aborted: step {i+1} failed")
+                        _al.abort_agent(c2.id)
                 done_steps = "\n".join(summaries)
                 return {
                     "ok": False,
@@ -2104,6 +2260,7 @@ def _bi_await_spawns(params: dict, ctx: ToolCtx) -> dict:
     STALL_S = 120
     HARD_CAP_S = 20 * 60
     start = time.time()
+    hard_cap_reached = False
 
     if parent_id:
         _al.enter_waiting(parent_id)
@@ -2115,11 +2272,18 @@ def _bi_await_spawns(params: dict, ctx: ToolCtx) -> dict:
                 break
             elapsed = time.time() - start
             if elapsed > HARD_CAP_S:
+                hard_cap_reached = True
                 break
             time.sleep(0.5)
     finally:
         if parent_id:
             _al.exit_waiting(parent_id)
+
+    if hard_cap_reached:
+        for aid in target_ids:
+            info = _al.get_agent(aid)
+            if info and info.status not in ("done", "error", "aborted"):
+                _al.abort_agent(aid)
 
     agents = [_al.get_agent(aid) for aid in target_ids if _al.get_agent(aid)]
     lines = [f"═══ Sub-agent Results ({len(agents)} agents) ═══"]
@@ -2269,9 +2433,11 @@ def _bi_agent_tell(params: dict, ctx: ToolCtx) -> dict:
 def _bi_agent_station(params: dict, ctx: ToolCtx) -> dict:
     """Station the current agent at a named terminal (bash sub-shell)."""
     name = (params.get("name") or "main").strip() or "main"
-    target_agent = None
-    if ctx.get_current_agent is not None:
-        target_agent = ctx.get_current_agent()
+    target_agent = (
+        ctx.get_agent(ctx.agent_id)
+        if ctx.get_agent is not None and ctx.agent_id
+        else None
+    )
     if target_agent is None:
         return {"ok": False, "error": "no current agent to station"}
 
@@ -2290,8 +2456,9 @@ def _bi_agent_station(params: dict, ctx: ToolCtx) -> dict:
         sub = ctx.deps.SubTerminalSession(shell_cmd)
         sub.start()
         time.sleep(0.1)
-        if sub.is_alive():
-            sub.read_output(timeout=0.1)
+        if not sub.is_alive():
+            return {"ok": False, "error": f"failed to start terminal '{name}'"}
+        sub.read_output(timeout=0.1)
         ctx.register_terminal(sub, shell_cmd, ctx.depth, name=name)
     if ctx.station_agent is not None:
         ctx.station_agent(target_agent.id, name)
@@ -2319,7 +2486,14 @@ def _bi_agent_wait(params: dict, ctx: ToolCtx) -> dict:
     timeout = float(params.get("timeout", 300))
     if ctx.wait_for_agent is None:
         return {"ok": False, "error": "wait not available"}
-    info = ctx.wait_for_agent(target_id, timeout)
+    import agent_loop as _al
+    if ctx.agent_id:
+        _al.enter_waiting(ctx.agent_id)
+    try:
+        info = ctx.wait_for_agent(target_id, timeout)
+    finally:
+        if ctx.agent_id:
+            _al.exit_waiting(ctx.agent_id)
     if info is None:
         return {"ok": False, "error": f"agent '{target_id}' not found or timed out"}
     return {"ok": True, "result": f"Agent {target_id}: {info.status}", "status": info.status}
@@ -2338,7 +2512,11 @@ def _bi_agent_list(params: dict, ctx: ToolCtx) -> dict:
     if ctx.get_all_agents is None:
         return {"ok": False, "error": "agent listing not available"}
     agents = ctx.get_all_agents()
-    current = ctx.get_current_agent() if ctx.get_current_agent else None
+    current = (
+        ctx.get_agent(ctx.agent_id)
+        if ctx.get_agent is not None and ctx.agent_id
+        else None
+    )
     lines = []
     for a in agents:
         marker = " <-- self" if (current and a.id == current.id) else ""
@@ -2353,9 +2531,9 @@ def _bi_agent_rename(params: dict, ctx: ToolCtx) -> dict:
     new_name = (params.get("name") or "").strip()
     if not new_name:
         return {"ok": False, "error": "missing 'name'"}
-    if ctx.rename_agent is None or ctx.get_current_agent is None:
+    if ctx.rename_agent is None or ctx.get_agent is None or not ctx.agent_id:
         return {"ok": False, "error": "rename not available"}
-    current = ctx.get_current_agent()
+    current = ctx.get_agent(ctx.agent_id)
     if current and ctx.rename_agent(current.id, new_name):
         return {"ok": True, "result": f"Renamed to {new_name}"}
     return {"ok": False, "error": "no current agent to rename"}
@@ -2363,6 +2541,8 @@ def _bi_agent_rename(params: dict, ctx: ToolCtx) -> dict:
 
 def _bi_agent_switch(params: dict, ctx: ToolCtx) -> dict:
     """Switch to a different agent identity."""
+    if ctx.depth > 0:
+        return {"ok": False, "error": "sub-agents cannot change the REPL's active agent"}
     target_id = (params.get("agent_id") or "").strip()
     if not target_id:
         return {"ok": False, "error": "missing 'agent_id'"}
@@ -2439,8 +2619,9 @@ def _bi_terminal_create(params: dict, ctx: ToolCtx) -> dict:
     sub = ctx.deps.SubTerminalSession(lain_cmd)
     sub.start()
     time.sleep(0.15)
-    if sub.is_alive():
-        sub.read_output(timeout=0.1)
+    if not sub.is_alive():
+        return {"ok": False, "error": f"failed to start terminal '{name}'"}
+    sub.read_output(timeout=0.1)
     ctx.register_terminal(sub, "laintas-cli", ctx.depth, name=name)
     return {"ok": True, "result": f"Created sub-terminal {name}", "terminal": name}
 
@@ -2668,6 +2849,15 @@ def _bi_shell_exec(params: dict, ctx: ToolCtx) -> dict:
         )
         if _is_bare_cd:
             path = stripped[3:].strip() if stripped.startswith("cd ") else os.path.expanduser("~")
+            if ctx.depth > 0:
+                return {
+                    "ok": False,
+                    "error": (
+                        "A sub-agent cannot change the process-global cwd. "
+                        "Pass cwd to shell.exec or use 'cd <path> && <command>'."
+                    ),
+                    "returncode": -1,
+                }
             try:
                 os.chdir(path)
                 return {"ok": True, "result": f"cd → {os.getcwd()}", "returncode": 0}
@@ -4013,8 +4203,8 @@ def register_builtin_tools() -> None:
         ),
         Tool(
             name="task.create",
-            description="Create a new task for structured work tracking. "
-                        "Decompose the user's goal into specific, actionable tasks "
+            description="Create an executable Step in the active WorkGraph. "
+                        "In ACT mode, decompose the approved plan into specific steps "
                         "with clear names. Tasks have status (pending→in_progress→completed), "
                         "dependencies (blocks/blockedBy), progress (0-100), "
                         "notes, and metadata. Use session_only=true for ephemeral "
@@ -4030,7 +4220,7 @@ def register_builtin_tools() -> None:
                     "session_only": {"type": "boolean", "default": False,
                                      "description": "If true, task exists only in this session"},
                     "parent_task_id": {"type": "string",
-                                       "description": "Auto-link as blockedBy this parent task"},
+                                       "description": "Optional hierarchy parent; does not create an execution dependency"},
                 },
                 "required": ["subject"],
             },
@@ -4038,7 +4228,7 @@ def register_builtin_tools() -> None:
         ),
         Tool(
             name="task.update",
-            description="Update a task's status, description, dependencies, progress, "
+            description="Update a WorkGraph Step's status, description, dependencies, progress, "
                         "notes, or metadata. Use addSubtask to create a child task "
                         "with automatic dependency linking.",
             schema={
@@ -4108,8 +4298,8 @@ def register_builtin_tools() -> None:
         ),
         Tool(
             name="plan.update",
-            description="Update the current plan's content. Use during plan mode to "
-                        "document your findings, architecture decisions, and implementation steps.",
+            description="Create a new immutable revision of the current plan and refresh "
+                        "its Markdown projection. Any prior approval is invalidated.",
             schema={
                 "type": "object",
                 "properties": {
@@ -4124,6 +4314,15 @@ def register_builtin_tools() -> None:
             description="List all saved plans.",
             schema={"type": "object", "properties": {}},
             invoke=_bi_plan_list,
+        ),
+        Tool(
+            name="plan.submit",
+            description="Submit the current immutable plan revision for explicit "
+                        "user review. Call only after exploration, risks, concrete "
+                        "steps, and verification criteria are complete. This does "
+                        "not approve or execute the plan.",
+            schema={"type": "object", "properties": {}},
+            invoke=_bi_plan_submit,
         ),
         # ── Prompt optimization tools ──────────────────────────────
         Tool(
@@ -4232,6 +4431,72 @@ def register_builtin_tools() -> None:
                 "required": ["feedback_id", "skill_name", "rationale"],
             },
             invoke=_bi_prompt_skill_patch,
+        ),
+        Tool(
+            name="prompt.lab_draft",
+            description="Draft a project-scoped Prompt Lab overlay and regression "
+                        "cases after diagnosing a captured incident. This never "
+                        "activates the patch; only the user can activate it.",
+            schema={
+                "type": "object",
+                "properties": {
+                    "branch_id": {"type": "string"},
+                    "title": {"type": "string"},
+                    "content": {"type": "string",
+                                "description": "Minimal additive prompt instructions; no wrapper tags or template variables"},
+                    "rationale": {"type": "string"},
+                    "diagnosis": {"type": "string",
+                                  "description": "Root-cause hypotheses, including model/prompt/skill/policy distinctions"},
+                    "tests": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                                "input": {"type": "string"},
+                                "expected": {"type": "string"},
+                                "forbidden": {"type": "string"},
+                            },
+                            "required": ["name", "input", "expected"],
+                        },
+                    },
+                },
+                "required": ["branch_id", "title", "content", "rationale", "diagnosis", "tests"],
+            },
+            invoke=_bi_prompt_lab_draft,
+        ),
+        Tool(
+            name="evolve.lab_draft",
+            description="Draft a project-scoped feature/extension candidate in "
+                        "Evolution Lab. This writes only a candidate and never "
+                        "activates executable code.",
+            schema={
+                "type": "object",
+                "properties": {
+                    "branch_id": {"type": "string"},
+                    "title": {"type": "string"},
+                    "target_type": {"type": "string",
+                                    "enum": ["extension", "commands", "loop"]},
+                    "name": {"type": "string"},
+                    "description": {"type": "string"},
+                    "files": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string"},
+                                "operation": {"type": "string"},
+                                "content": {"type": "string"},
+                            },
+                            "required": ["path", "content"],
+                        },
+                    },
+                    "dependencies": {"type": "array", "items": {"type": "string"}},
+                    "tests": {"type": "array", "items": {"type": "object"}},
+                },
+                "required": ["branch_id", "title", "target_type", "name", "files"],
+            },
+            invoke=_bi_evolve_lab_draft,
         ),
         # ── Agent tools ─────────────────────────────────────────────
         Tool(

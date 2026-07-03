@@ -38,6 +38,7 @@ Layout:
 """
 
 import os
+import stat
 from pathlib import Path
 
 
@@ -54,6 +55,8 @@ AUDIT_FILE        = LAINTAS_HOME / "audit.log"
 HOOKS_FILE        = LAINTAS_HOME / "hooks.json"
 PYTHON_HOOKS_FILE = LAINTAS_HOME / "hooks.py"
 MCP_FILE          = LAINTAS_HOME / "mcp.json"
+BACKENDS_FILE     = LAINTAS_HOME / "backends.json"
+TRUST_FILE        = LAINTAS_HOME / "trust.json"
 TASKS_FILE        = LAINTAS_HOME / "tasks.json"
 INTERACTIVE_COMMANDS_FILE = LAINTAS_HOME / "interactive_commands.json"
 
@@ -113,6 +116,16 @@ def project_file(name: str) -> Path:
     return project_dir() / name
 
 
+def extensions_dir() -> Path:
+    """Project-local, user-created runtime extensions."""
+    return project_dir() / "extensions"
+
+
+def evolution_lab_dir() -> Path:
+    """Project-local Evolution Lab branches, candidates, tests and history."""
+    return project_dir() / "evolution-lab"
+
+
 # ── Initialization ───────────────────────────────────────────────────────
 
 def ensure_home() -> None:
@@ -129,6 +142,30 @@ def ensure_home() -> None:
     for d in (MEMORY_DIR, PLANS_DIR, AGENTS_DIR, SKILLS_DIR, SESSIONS_DIR,
               PROMPTS_DIR, PROMPT_CANDIDATES_DIR):
         d.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(str(d), 0o700)
+        except OSError:
+            pass
+    for private_file in (
+        CONFIG_FILE, SESSION_FILE, POLICY_FILE, HOOKS_FILE, PYTHON_HOOKS_FILE,
+        MCP_FILE, BACKENDS_FILE, TRUST_FILE, INTERACTIVE_COMMANDS_FILE,
+    ):
+        ensure_private_file(private_file)
+
+
+def ensure_private_file(path: Path) -> bool:
+    """Apply private permissions without following attacker-controlled symlinks."""
+    try:
+        if not path.exists():
+            return True
+        if path.is_symlink():
+            return False
+        if hasattr(os, "getuid") and path.stat().st_uid != os.getuid():
+            return False
+        path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+        return True
+    except OSError:
+        return False
 
 
 def ensure_project_dir() -> Path:

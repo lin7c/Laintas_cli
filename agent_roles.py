@@ -280,7 +280,6 @@ def _register_builtin_roles() -> None:
             color="yellow",
             allowed_tools=[
                 "fs.read", "fs.ls", "fs.grep", "fs.glob",
-                "shell.exec",  # for grep/find/git commands
                 "web.search", "web.fetch",
             ],
             output_format="Entry points with file:line, execution flow, architecture layers, key files list",
@@ -292,7 +291,6 @@ def _register_builtin_roles() -> None:
             color="green",
             allowed_tools=[
                 "fs.read", "fs.ls", "fs.grep", "fs.glob",
-                "shell.exec",  # for read-only exploration
                 "web.search", "web.fetch",
                 "plan.read", "plan.update", "plan.list",
                 "task.create", "task.update", "task.list",
@@ -306,7 +304,6 @@ def _register_builtin_roles() -> None:
             color="red",
             allowed_tools=[
                 "fs.read", "fs.ls", "fs.grep", "fs.glob",
-                "shell.exec",  # for git diff, etc.
             ],
             output_format="Confidence-scored issues (>=80 only), grouped by severity, with fix suggestions",
             confidence_threshold=80,
@@ -318,7 +315,6 @@ def _register_builtin_roles() -> None:
             color="yellow",
             allowed_tools=[
                 "fs.read", "fs.ls", "fs.grep", "fs.glob",
-                "shell.exec",
             ],
             output_format="CRITICAL/HIGH/MEDIUM issues with location, hidden error types, fix examples",
             confidence_threshold=70,
@@ -342,7 +338,6 @@ def _register_builtin_roles() -> None:
             color="cyan",
             allowed_tools=[
                 "fs.read", "fs.ls", "fs.grep", "fs.glob",
-                "shell.exec",
             ],
             output_format="Coverage summary, critical gaps (rated 1-10), quality issues, positive observations",
             confidence_threshold=50,

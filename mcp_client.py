@@ -48,6 +48,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import threading
 import time
 import traceback
@@ -74,11 +75,16 @@ except Exception as _e:
 
 
 import paths
+import trust_store
 
 CONFIG_PATH = paths.MCP_FILE
 DEFAULT_CALL_TIMEOUT = 30.0     # seconds — per tool call
 CONNECT_TIMEOUT = 15.0          # seconds — per server initialize
 LIST_TOOLS_TIMEOUT = 10.0
+ALLOWED_CAPABILITIES = {
+    "fs.read", "fs.write", "process.exec", "network", "browser.mutate",
+    "agent.control", "core.other",
+}
 
 
 # ── Per-server state ───────────────────────────────────────────────────
@@ -164,13 +170,49 @@ class MCPManager:
     def load_config() -> dict:
         if not CONFIG_PATH.is_file():
             return {"servers": {}}
+        if not paths.ensure_private_file(CONFIG_PATH):
+            return {"servers": {}}
         try:
             with CONFIG_PATH.open("r", encoding="utf-8") as f:
                 data = json.load(f)
             if not isinstance(data, dict):
                 return {"servers": {}}
-            data.setdefault("servers", {})
-            return data
+            raw_servers = data.get("servers")
+            if not isinstance(raw_servers, dict):
+                return {"servers": {}}
+            servers = {}
+            for name, cfg in raw_servers.items():
+                if (not isinstance(name, str)
+                        or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name)
+                        or not isinstance(cfg, dict)):
+                    continue
+                command = cfg.get("command")
+                args = cfg.get("args", [])
+                env = cfg.get("env", {})
+                if (not isinstance(command, str) or not command.strip()
+                        or not isinstance(args, list)
+                        or not all(isinstance(v, str) for v in args)
+                        or not isinstance(env, dict)
+                        or not all(isinstance(k, str) and isinstance(v, (str, int, float, bool))
+                                   for k, v in env.items())):
+                    continue
+                normalized = dict(cfg)
+                normalized["command"] = command.strip()
+                normalized["args"] = args
+                normalized["env"] = env
+                caps = cfg.get("capabilities", ["core.other"])
+                if (not isinstance(caps, list)
+                        or not all(isinstance(cap, str) and cap in ALLOWED_CAPABILITIES
+                                   for cap in caps)):
+                    continue
+                normalized["capabilities"] = caps
+                try:
+                    normalized["call_timeout"] = max(
+                        1.0, min(float(cfg.get("call_timeout", DEFAULT_CALL_TIMEOUT)), 300.0))
+                except (TypeError, ValueError):
+                    normalized["call_timeout"] = DEFAULT_CALL_TIMEOUT
+                servers[name] = normalized
+            return {"servers": servers}
         except (OSError, ValueError):
             return {"servers": {}}
 
@@ -186,11 +228,16 @@ class MCPManager:
                     "env": {},
                     "enabled": False,
                     "call_timeout": 30,
+                    "capabilities": ["fs.read", "fs.write"],
                 }
             }
         }
         try:
             CONFIG_PATH.write_text(json.dumps(template, indent=2), encoding="utf-8")
+            try:
+                CONFIG_PATH.chmod(0o600)
+            except OSError:
+                pass
             return True, str(CONFIG_PATH)
         except OSError as e:
             return False, str(e)
@@ -217,6 +264,13 @@ class MCPManager:
             server_config = cfg.get("servers", {}).get(name)
             if server_config is None:
                 return False, f"no server '{name}' in config"
+
+        trust = trust_store.extension_status("mcp", name, CONFIG_PATH)
+        if not trust.get("trusted"):
+            return False, (
+                f"MCP server '{name}' is not trusted ({trust.get('reason')}). "
+                f"Review {CONFIG_PATH} and run '/mcp trust {name}'."
+            )
 
         if not self._ensure_loop():
             return False, "failed to start mcp event loop"
@@ -245,15 +299,22 @@ class MCPManager:
         registered = 0
         for t in srv.tools:
             ltool = self._adapt_tool(srv, t)
-            registry.register(ltool)
-            registered += 1
+            if registry.register(ltool, overwrite=False):
+                registered += 1
         return True, f"connected ({registered} tools)"
 
     async def _connect_async(self, srv: MCPServer):
+        child_env = {
+            key: os.environ[key] for key in ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR")
+            if key in os.environ
+        }
+        child_env.update({
+            str(k): str(v) for k, v in (srv.config.get("env") or {}).items()
+        })
         params = StdioServerParameters(
             command=srv.config.get("command"),
             args=list(srv.config.get("args", [])),
-            env=srv.config.get("env") or None,
+            env=child_env,
             cwd=srv.config.get("cwd") or None,
         )
         stack = AsyncExitStack()
@@ -304,7 +365,7 @@ class MCPManager:
 
     # ── Tool adapter ─────────────────────────────────────────────────
     def _adapt_tool(self, srv: MCPServer, mcp_tool) -> Tool:
-        name = f"{srv.name}.{mcp_tool.name}"
+        name = f"mcp.{srv.name}.{mcp_tool.name}"
         description = (getattr(mcp_tool, "description", "") or "").strip() \
                       or f"MCP tool {mcp_tool.name} from {srv.name}"
         schema = getattr(mcp_tool, "inputSchema", None) or \
@@ -357,6 +418,8 @@ class MCPManager:
             schema=schema,
             invoke=_invoke,
             source=f"mcp:{srv.name}",
+            trust_level="trusted-extension",
+            capabilities=frozenset(srv.config.get("capabilities") or ["core.other"]),
         )
 
 

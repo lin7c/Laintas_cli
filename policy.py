@@ -237,6 +237,11 @@ def _load_config(force: bool = False) -> dict:
     if not CONFIG_PATH.exists():
         _write_default_config()
 
+    if not paths.ensure_private_file(CONFIG_PATH):
+        _config = dict(_DEFAULT_CONFIG)
+        _config["mode"] = "enforce"
+        return _config
+
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             cfg = json.load(f)
@@ -326,8 +331,11 @@ def _write_audit(entry: dict) -> None:
     with _audit_lock:
         try:
             AUDIT_PATH.parent.mkdir(parents=True, exist_ok=True)
+            if AUDIT_PATH.exists() and not paths.ensure_private_file(AUDIT_PATH):
+                return
             with open(AUDIT_PATH, "a", encoding="utf-8") as f:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            paths.ensure_private_file(AUDIT_PATH)
         except OSError:
             pass
 

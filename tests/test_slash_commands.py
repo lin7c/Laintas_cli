@@ -391,6 +391,36 @@ class PromptOptimizationTests(unittest.TestCase):
                     "f3", "", "model limitation")
                 self.assertEqual(limitation["type"], "model_limitation")
 
+    def test_export_install_round_trip_preserves_one_patch(self):
+        with tempfile.TemporaryDirectory() as tmp, _chdir(tmp):
+            root = Path(tmp)
+            prompts = root / "prompts"
+            candidates = prompts / "candidates"
+            (root / ".laintas").mkdir()
+            (root / ".laintas/cli.prop").write_text("BASE\n", encoding="utf-8")
+            with mock.patch.multiple(
+                    prompt_opt,
+                    CANDIDATES_DIR=candidates,
+                    FEEDBACK_LOG=prompts / "feedback.jsonl",
+                    STATE_PATH=prompts / "_state.json"), \
+                    mock.patch.object(prompt_opt.paths, "PROMPTS_DIR", prompts):
+                prompt_opt._current_opt = None
+                prompt_opt._optimizations = {}
+                original = prompt_opt.draft_candidate(
+                    "feedback-1", "<rule>ask first</rule>", "reason")
+                ok, pack_path = prompt_opt.export_pack(
+                    original["id"], str(root / "pack.md"))
+                self.assertTrue(ok)
+                ok, _, imported_id = prompt_opt.install_pack(pack_path)
+                self.assertTrue(ok)
+                imported = prompt_opt.read_candidate(imported_id)
+                self.assertEqual(imported["patch"], "<rule>ask first</rule>")
+                self.assertNotIn("<prompt_opt_patch>", imported["patch"])
+                self.assertEqual(
+                    prompt_opt.read_candidate(original["id"])["feedback"],
+                    "feedback-1",
+                )
+
 
 class PlanAndWorkflowTests(unittest.TestCase):
     def test_plan_state_restores_for_same_project(self):

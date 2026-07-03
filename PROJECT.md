@@ -147,9 +147,41 @@ Three methods: cached session (`~/.laintas_cli_session.json`, chmod 600), browse
 
 The AI system prompt is templated from `.cli.prop` (auto-generated if missing). Template variables: `{{currentPath}}`, `{{activeFile}}`, `{{globalMemory}}`, `{{lastOutput}}`, `{{conversationHistory}}`, `{{depth}}`, `{{nextDepth}}`.
 
+`/prompt [issue]` opens a project-scoped Prompt Lab branch. It snapshots the
+current conversation, effective prompt, tool events, and agent state, then runs
+a read-only background diagnosis without injecting results into the main task.
+The AI drafts a structured overlay plus regression cases. `/prompt test` runs a
+no-side-effects evaluator. Activation, profile switching, disabling, and
+rollback require an interactive confirmation and are hot-reloaded on the next
+agent-loop iteration; the base `cli.prop` is not rewritten.
+
+### 10.1 Evolution Lab and project extensions
+
+`/evolve <idea>` mirrors Prompt Lab for executable project creativity. It
+creates a project-scoped branch, asks a restricted design worker to draft an
+extension or focused `commands.py`/`loop.py` improvement, compares the current
+and candidate implementations in a temporary subprocess environment, and
+requires user confirmation before activation. Candidates, runs, profiles and
+history live under `.laintas/evolution-lab/`; activated standalone extensions
+live under `.laintas/extensions/` and register commands, tools or loop
+interceptors through `setup(ctx)`. Extensions hot-load independently and
+survive `/reload`. Integrated inference is exposed as `ctx.backend.chat()` so
+raw authentication is not placed in the extension context.
+
 ### 11. Debug System
 
 `DebugEntry` dataclass captures full state of each agent interaction. In-memory ring buffer (configurable size). Interactive `prompt_toolkit` TUI browser with arrow-key navigation, detail view (user input, request payload, AI response, raw JSON, command output).
+
+### 11.1 Unified WorkGraph
+
+Plans, executable steps (`/task`), workflow phase, approvals, and resume identity
+share one project-local SQLite authority at `.laintas/workgraph.db`. Plans are
+immutable revisions identified by SHA-256. `plan.submit` is the only readiness
+signal; user approval binds the exact revision/SHA before ACT mode begins.
+Markdown files under `~/.laintas/plans/` and legacy JSON files are compatibility
+projections/import sources, not authorities. Plan implementation steps are
+transactionally projected into WorkGraph Steps, with foreign-key dependencies,
+cycle detection, normalized progress/status, and an append-only event history.
 
 ### 12. Meta Commands (Slash Commands)
 
@@ -160,6 +192,10 @@ The AI system prompt is templated from `.cli.prop` (auto-generated if missing). 
 | `/name [n]` | Set/view agent name; `/name term<N> <new>` renames a terminal |
 | `/memory` | View `.helpwo` contents |
 | `/prop` | View `.cli.prop` template |
+| `/prompt [issue]` | Capture a behavior incident and open Prompt Lab |
+| `/work [status|list|resume|history]` | Inspect unified work state |
+| `/plan enter|submit|revise|approve` | Manage versioned, reviewed plans |
+| `/task` | View or update the active WorkGraph steps |
 | `/scan` | Rescan PATH for executables |
 | `/debug` | Browse AI interaction debug logs (TUI) |
 | `/cwd` | Show current working directory |
@@ -182,6 +218,8 @@ The AI system prompt is templated from `.cli.prop` (auto-generated if missing). 
 | `.helpwo` | Working directory | AI memory / project rules (auto-created empty) |
 | `.extra_command.py` | Working directory | Custom slash command handlers (auto-created) |
 | `.loop_command.py` | Working directory | Custom loop command handlers (auto-created) |
+| `.laintas/prompt-lab/` | Project directory | Prompt Lab branches, tested overlays, profiles, and activation history |
+| `.laintas/workgraph.db` | Project directory | Transactional objective, plan revisions, steps, workflow, approvals, and events |
 
 ---
 

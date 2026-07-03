@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Optional
 
 import paths
+import workgraph
 
 
 # ── Data Classes ────────────────────────────────────────────────────────
@@ -75,6 +76,14 @@ class WorkflowInstance:
         return f"Phase {cur}/{total}: {names}"
 
 
+_READ_ONLY_PHASE_TOOLS = [
+    "fs.read", "fs.ls", "fs.grep", "fs.glob",
+    "web.search", "web.fetch", "time.now",
+    "agent.spawn", "agent.tell", "agent.wait", "agent.list", "agent.inbox",
+    "task.list", "task.get", "plan.read", "plan.update", "plan.list",
+]
+
+
 # ── Built-in Workflow Definitions ───────────────────────────────────────
 
 def _feature_dev_phases() -> list[WorkflowPhase]:
@@ -91,6 +100,7 @@ def _feature_dev_phases() -> list[WorkflowPhase]:
                 "- Any constraints or requirements\n"
                 "When ready, set done=true and provide a clear task summary."
             ),
+            allowed_tools=list(_READ_ONLY_PHASE_TOOLS),
             exit_condition="done_signal",
         ),
         WorkflowPhase(
@@ -126,6 +136,7 @@ def _feature_dev_phases() -> list[WorkflowPhase]:
                 "Wait for user responses, then set done=true with clarified requirements."
             ),
             requires_user_input=True,
+            allowed_tools=list(_READ_ONLY_PHASE_TOOLS),
             exit_condition="user_confirm",
         ),
         WorkflowPhase(
@@ -144,10 +155,10 @@ def _feature_dev_phases() -> list[WorkflowPhase]:
             ),
             allowed_tools=[
                 "fs.read", "fs.ls", "fs.grep", "fs.glob",
-                "shell.exec", "web.search", "web.fetch",
+                "web.search", "web.fetch",
                 "agent.spawn", "agent.tell", "agent.wait", "agent.list",
-                "plan.read", "plan.update", "plan.list",
-                "task.create", "task.update", "task.list",
+                "plan.read", "plan.update", "plan.list", "plan.submit",
+                "task.list", "task.get",
             ],
             spawn_agents=["architect"],
             requires_user_input=True,
@@ -219,6 +230,7 @@ def _bug_fix_phases() -> list[WorkflowPhase]:
                 "- Identify the root cause hypothesis\n"
                 "Set done=true with bug description and root cause hypothesis."
             ),
+            allowed_tools=list(_READ_ONLY_PHASE_TOOLS),
             exit_condition="done_signal",
         ),
         WorkflowPhase(
@@ -234,7 +246,7 @@ def _bug_fix_phases() -> list[WorkflowPhase]:
             ),
             allowed_tools=[
                 "fs.read", "fs.ls", "fs.grep", "fs.glob",
-                "shell.exec", "web.search", "web.fetch",
+                "web.search", "web.fetch",
                 "agent.spawn", "agent.tell", "agent.wait",
             ],
             exit_condition="done_signal",
@@ -360,34 +372,54 @@ def _serialize_workflow(wf: WorkflowInstance) -> dict:
 
 
 def _save_workflow() -> None:
-    path = _workflow_state_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
     try:
-        payload = (_serialize_workflow(_active_workflow)
-                   if _active_workflow is not None else None)
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        tmp.replace(path)
-    except OSError:
-        try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
+        work = workgraph.get_active_work()
+        if work is None:
+            if _active_workflow is None:
+                return
+            work = workgraph.create_work(
+                _active_workflow.description,
+                workflow_template=_active_workflow.name)
+        if _active_workflow is None:
+            workgraph.update_work(
+                work["id"], workflow_template="", workflow_phase="",
+                workflow_state={})
+            return
+        current = _active_workflow.current
+        phase_name = current.name if current else "completed"
+        phase_status = (
+            "COMPLETED" if _active_workflow.completed else
+            "EXECUTING" if phase_name in {"implement", "fix"} else
+            "VERIFYING" if phase_name in {"verify", "review", "summarize", "report"} else
+            "DRAFT"
+        )
+        if work.get("status") in {"REVIEW_PENDING", "APPROVED"} and phase_status == "DRAFT":
+            phase_status = work["status"]
+        workgraph.update_work(
+            work["id"],
+            workflow_template=_active_workflow.name,
+            workflow_phase=phase_name,
+            workflow_state=_serialize_workflow(_active_workflow),
+            status=phase_status,
+        )
+    except workgraph.WorkGraphError:
+        pass
 
 
 def _load_workflow_for_cwd() -> Optional[WorkflowInstance]:
     global _active_workflow_cwd
-    path = _workflow_state_path()
     _active_workflow_cwd = str(Path.cwd().resolve())
-    if not path.exists():
-        return None
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
+    work = workgraph.get_active_work()
+    data = work.get("workflow_state") if work else None
+    if not isinstance(data, dict) or not data:
+        # One-way migration from the legacy per-project workflow file.
+        path = _workflow_state_path()
+        if not path.exists():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
     if not isinstance(data, dict):
         return None
     factory = _WORKFLOW_TEMPLATES.get(data.get("name"))
@@ -404,7 +436,7 @@ def _load_workflow_for_cwd() -> Optional[WorkflowInstance]:
         except (TypeError, ValueError):
             return time.time()
 
-    return WorkflowInstance(
+    instance = WorkflowInstance(
         name=data.get("name", ""),
         description=data.get("description", ""),
         phases=phases,
@@ -416,6 +448,22 @@ def _load_workflow_for_cwd() -> Optional[WorkflowInstance]:
         completed=bool(data.get("completed", False)),
         summary=data.get("summary", ""),
     )
+    if not work:
+        try:
+            work = workgraph.create_work(
+                instance.description or "Imported workflow",
+                workflow_template=instance.name)
+        except workgraph.WorkGraphError:
+            return instance
+    try:
+        current = instance.current
+        workgraph.update_work(
+            work["id"], workflow_template=instance.name,
+            workflow_phase=current.name if current else "completed",
+            workflow_state=_serialize_workflow(instance))
+    except workgraph.WorkGraphError:
+        pass
+    return instance
 
 
 def start_workflow(name: str, description: str,
@@ -437,6 +485,17 @@ def start_workflow(name: str, description: str,
     )
     _active_workflow = wf
     _active_workflow_cwd = str(Path.cwd().resolve())
+    try:
+        work = workgraph.get_active_work()
+        if work is None or work.get("status") in {"COMPLETED", "CANCELLED", "FAILED"}:
+            workgraph.create_work(description, workflow_template=name)
+        else:
+            workgraph.update_work(
+                work["id"], workflow_template=name,
+                workflow_phase=phases[0].name,
+                workflow_state=_serialize_workflow(wf))
+    except workgraph.WorkGraphError:
+        pass
     _save_workflow()
     return wf
 
@@ -531,6 +590,13 @@ def end_workflow(summary: str = "") -> None:
     _save_workflow()
 
 
+def detach_active_workflow() -> None:
+    """Detach the in-memory view; persisted WorkGraph state remains resumable."""
+    global _active_workflow, _active_workflow_cwd
+    _active_workflow = None
+    _active_workflow_cwd = str(Path.cwd().resolve())
+
+
 def render_workflow_section() -> str:
     """Render the workflow phase section for the system prompt / user message.
 
@@ -558,7 +624,7 @@ def render_workflow_section() -> str:
         ps = wf.phase_states.get(phase.name, {})
         summary = ps.get("summary", "")
         if summary:
-            completed.append(f"  [{phase.name}]: {summary[:200]}")
+            completed.append(f"  [{phase.name}]: {summary[:1000]}")
     if completed:
         lines.append("")
         lines.append("### Completed Phases")
@@ -579,6 +645,8 @@ def is_tool_allowed_in_workflow(tool_name: str) -> bool:
 
     Returns True if no active workflow or the phase has no tool restrictions.
     """
+    if tool_name in {"task.complete", "task.continue", "session.continue"}:
+        return True
     wf = get_active_workflow()
     if wf is None or wf.completed:
         return True

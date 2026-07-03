@@ -65,6 +65,7 @@ ToolRegistry.unregister_source can pull them out on reload.
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import re
 import shutil
@@ -74,13 +75,38 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from tools import Tool, get_registry
+from tools import Tool, get_registry, infer_capabilities
 
 
 import paths
+import trust_store
 
 SKILLS_DIR = paths.SKILLS_DIR
 BUNDLED_SKILLS_DIR = Path(__file__).resolve().parent / "default_skills"
+SKILL_MANIFEST = "extension.json"
+ALLOWED_CAPABILITIES = {
+    "fs.read", "fs.write", "process.exec", "network", "browser.mutate",
+    "agent.control", "core.other",
+}
+
+
+def load_skill_manifest(skill_dir: Path, expected_name: str) -> tuple[Optional[dict], str]:
+    path = skill_dir / SKILL_MANIFEST
+    if not path.is_file() or path.is_symlink():
+        return None, f"missing trusted extension manifest: {path}"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return None, f"invalid extension manifest: {exc}"
+    caps = data.get("capabilities")
+    if (not isinstance(data, dict) or data.get("schemaVersion") != 1
+            or data.get("name") != expected_name
+            or data.get("entrypoint") != "skill.py"
+            or not isinstance(caps, list)
+            or not all(isinstance(cap, str) and cap in ALLOWED_CAPABILITIES
+                       for cap in caps)):
+        return None, "extension manifest fields or capabilities are invalid"
+    return data, ""
 
 
 def ensure_skills_dir() -> Path:
@@ -253,6 +279,8 @@ def scan_metadata() -> dict[str, SkillMetadata]:
         if not (child / "skill.py").is_file() and not (child / "SKILL.md").is_file():
             continue
         meta, _ = _parse_skill_md(child)
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", meta.name):
+            continue
         _skill_metadata[meta.name] = meta
 
     # Bundled defaults are also usable in-place. User-installed skills with the
@@ -264,6 +292,8 @@ def scan_metadata() -> dict[str, SkillMetadata]:
             if not (child / "skill.py").is_file() and not (child / "SKILL.md").is_file():
                 continue
             meta, _ = _parse_skill_md(child)
+            if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", meta.name):
+                continue
             _skill_metadata.setdefault(meta.name, meta)
 
     _scan_done = True
@@ -360,6 +390,18 @@ def _load_skill_full(name: str) -> tuple[bool, str]:
         state.loaded = True
         return True, f"{name}: loaded (documentation only, no tools)"
 
+    trust = trust_store.extension_status(
+        "skill", name, skill_py, (skill_dir / SKILL_MANIFEST,))
+    if not trust.get("trusted"):
+        return False, (
+            f"{name}: executable skill is not trusted ({trust.get('reason')}). "
+            f"Review {skill_py} and run '/skill trust {name}'."
+        )
+    manifest, manifest_error = load_skill_manifest(skill_dir, name)
+    if manifest is None:
+        return False, f"{name}: {manifest_error}"
+    declared_capabilities = frozenset(manifest["capabilities"])
+
     # Add skill dir to sys.path temporarily
     added_path = str(skill_dir)
     path_inserted = False
@@ -379,18 +421,47 @@ def _load_skill_full(name: str) -> tuple[bool, str]:
 
         getter = getattr(module, "get_tools", None)
         if getter is None:
-            return False, f"{name}: no get_tools()"
+            raise ValueError("no get_tools()")
 
-        tools = getter() or []
+        provided_tools = getter() or []
+        if not isinstance(provided_tools, (list, tuple)):
+            raise ValueError("get_tools() must return a list or tuple")
         registry = get_registry()
-        registered = 0
-        for t in tools:
+        prepared_tools: list[Tool] = []
+        prepared_names: set[str] = set()
+        for t in provided_tools:
             if not isinstance(t, Tool):
-                continue
+                raise ValueError("get_tools() returned a non-Tool value")
+            original_name = t.name
+            prefix = f"skill.{name}."
+            if not t.name.startswith(prefix):
+                t.name = prefix + t.name.lstrip(".")
+            if not re.fullmatch(r"[A-Za-z0-9_.-]{1,160}", t.name or ""):
+                raise ValueError(f"invalid tool name: {t.name!r}")
+            if t.name in prepared_names or registry.get(t.name) is not None:
+                raise ValueError(f"tool name is already registered: {t.name}")
             t.source = f"skill:{name}"
-            registry.register(t)
-            state.tools.append(t)
-            registered += 1
+            t.trust_level = "trusted-extension"
+            # Infer from the author-supplied name before applying our namespace;
+            # otherwise "shell.exec" becomes "skill.foo.shell.exec" and looks
+            # like an unprivileged, unknown tool.
+            effective_caps = t.capabilities or infer_capabilities(original_name)
+            if not effective_caps.issubset(declared_capabilities):
+                raise ValueError(
+                    f"{name}: tool {t.name} requests undeclared capabilities: "
+                    f"{sorted(effective_caps - declared_capabilities)}"
+                )
+            t.capabilities = effective_caps
+            prepared_names.add(t.name)
+            prepared_tools.append(t)
+
+        # Registration is transactional: a failed load leaves no partial tools.
+        for t in prepared_tools:
+            if not registry.register(t, overwrite=False):
+                registry.unregister_source(f"skill:{name}")
+                raise ValueError(f"failed to register tool: {t.name}")
+        state.tools.extend(prepared_tools)
+        registered = len(prepared_tools)
 
         # Load references/ directory
         refs_dir = skill_dir / "references"
@@ -405,6 +476,10 @@ def _load_skill_full(name: str) -> tuple[bool, str]:
         state.loaded = True
         return True, f"{name}: registered {registered} tool(s), {len(state.references)} reference(s)"
     except Exception as e:
+        get_registry().unregister_source(f"skill:{name}")
+        state.tools.clear()
+        state.module = None
+        sys.modules.pop(mod_name, None)
         return False, f"{name}: {type(e).__name__}: {e}\n{traceback.format_exc(limit=3)}"
     finally:
         if path_inserted:
@@ -511,6 +586,8 @@ def install_template(name: str) -> tuple[bool, str]:
     Creates the full progressive-disclosure directory structure.
     """
     ensure_skills_dir()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name or ""):
+        return False, "skill name must contain only letters, numbers, underscore, or hyphen"
     target = SKILLS_DIR / name
     if target.exists():
         return False, f"already exists: {target}"
@@ -518,6 +595,16 @@ def install_template(name: str) -> tuple[bool, str]:
         target.mkdir(parents=True)
         (target / "skill.py").write_text(_SKELETON.format(name=name), encoding="utf-8")
         (target / "SKILL.md").write_text(_SKILL_MD_TEMPLATE.format(name=name), encoding="utf-8")
+        (target / SKILL_MANIFEST).write_text(
+            json.dumps({
+                "schemaVersion": 1,
+                "name": name,
+                "version": "0.1.0",
+                "entrypoint": "skill.py",
+                "capabilities": ["core.other"],
+            }, indent=2),
+            encoding="utf-8",
+        )
         # Create optional directories
         (target / "references").mkdir(exist_ok=True)
         (target / "references" / "README.md").write_text(
@@ -577,13 +664,14 @@ def _hello(params: dict, ctx: ToolCtx) -> dict:
 def get_tools():
     return [
         Tool(
-            name="{name}.hello",
+            name="hello",
             description="Say hello to someone.",
             schema={{
                 "type": "object",
                 "properties": {{"name": {{"type": "string", "default": "world"}}}},
             }},
             invoke=_hello,
+            capabilities=frozenset({{"core.other"}}),
         ),
     ]
 '''

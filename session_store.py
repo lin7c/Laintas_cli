@@ -113,6 +113,7 @@ def create_session(cwd: str, state: Optional[dict] = None, chat_history: Optiona
         "closed_at": None,
         "status": "idle",
         "objective": str((state or {}).get("objective") or "").strip(),
+        "active_work_id": str((state or {}).get("_work_id") or ""),
         "last_user_input": "",
         "last_original_input": "",
         "last_exit_reason": "",
@@ -126,6 +127,13 @@ def create_session(cwd: str, state: Optional[dict] = None, chat_history: Optiona
     if isinstance(session["state"], dict):
         session["state"]["_session_id"] = session_id
         session["agent_state"] = copy.deepcopy(session["state"])
+    try:
+        import workgraph
+        active = workgraph.get_active_work(cwd=cwd)
+        if active:
+            session["active_work_id"] = active["id"]
+    except Exception:
+        pass
     save_session(session)
     return session
 
@@ -237,6 +245,8 @@ def sync_runtime(session: dict, state: dict, chat_history: list, *, cwd: str = N
     if state is not None:
         session["state"] = copy.deepcopy(state)
         session["agent_state"] = copy.deepcopy(state)
+        if state.get("_work_id"):
+            session["active_work_id"] = str(state["_work_id"])
     if chat_history is not None:
         session["chat_history"] = copy.deepcopy(chat_history)
         session["turn_count"] = len([m for m in chat_history if isinstance(m, dict) and m.get("role") == "user"])
@@ -254,5 +264,11 @@ def sync_runtime(session: dict, state: dict, chat_history: list, *, cwd: str = N
         session["status"] = str(exit_reason or "idle") if pending else "idle"
     if tasks is not None:
         session["tasks"] = copy.deepcopy(tasks)
+    try:
+        import workgraph
+        active = workgraph.get_active_work(cwd=session.get("cwd") or cwd)
+        session["active_work_id"] = active["id"] if active else ""
+    except Exception:
+        pass
     save_session(session)
     return session

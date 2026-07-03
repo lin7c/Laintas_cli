@@ -464,7 +464,11 @@ def _parse_candidate(raw: str) -> dict:
             for line in parts[1].strip().splitlines():
                 if ":" in line:
                     k, _, v = line.partition(":")
-                    meta[k.strip()] = v.strip()
+                    value = v.strip()
+                    if (len(value) >= 2 and value[0] == value[-1]
+                            and value[0] in {'"', "'"}):
+                        value = value[1:-1]
+                    meta[k.strip()] = value
             body = parts[2].strip()
     meta["body"] = body
     # Extract the patch block from the body.
@@ -1171,6 +1175,11 @@ def export_pack(cid: str, out_path: Optional[str] = None) -> tuple[bool, str]:
     if not out_path:
         out_path = str(paths.PROMPTS_DIR / f"{name}.md")
 
+    rationale = re.sub(
+        r"(?s)\n*## Patch\s*\n<prompt_opt_patch>.*?</prompt_opt_patch>\s*",
+        "\n",
+        str(cand.get("body", "")),
+    ).strip()
     pack = (
         f"---\n"
         f"kind: {_PACK_KIND}\n"
@@ -1182,7 +1191,7 @@ def export_pack(cid: str, out_path: Optional[str] = None) -> tuple[bool, str]:
         f"base_template: additive\n"
         f"---\n\n"
         f"# {name}\n\n"
-        f"## Rationale\n{cand.get('body', '')}\n\n"
+        f"## Rationale\n{rationale}\n\n"
         f"## Patch\n"
         f"<prompt_opt_patch>\n{cand.get('patch', '')}\n</prompt_opt_patch>\n"
     )
@@ -1231,10 +1240,17 @@ def install_pack(path_or_url: str) -> tuple[bool, str, Optional[str]]:
     if meta.get("kind") != _PACK_KIND:
         return False, f"Invalid pack: kind must be '{_PACK_KIND}', got '{meta.get('kind')}'.", None
 
-    m = re.search(r"<prompt_opt_patch>(.*)</prompt_opt_patch>", body, re.DOTALL)
-    if not m:
-        return False, "Invalid pack: no <prompt_opt_patch> block found.", None
-    patch = m.group(1).strip()
+    matches = re.findall(
+        r"<prompt_opt_patch>(.*?)</prompt_opt_patch>", body, re.DOTALL)
+    if len(matches) != 1:
+        if not matches:
+            return False, "Invalid pack: no <prompt_opt_patch> block found.", None
+        return False, "Invalid pack: expected exactly one prompt patch block.", None
+    patch = matches[0].strip()
+    if "<prompt_opt_patch" in patch or "</prompt_opt_patch" in patch:
+        return False, "Invalid pack: nested prompt patch markers are not allowed.", None
+    if not patch:
+        return False, "Invalid pack: prompt patch is empty.", None
 
     try:
         live_prop = paths.project_file(paths.CWD_CLI_PROP).read_text(encoding="utf-8")
@@ -1281,39 +1297,32 @@ def publish_pack(cid: str, session: dict) -> tuple[bool, str]:
 
     # Attempt backend publish
     try:
-        import urllib.request
-        backend_url = os.environ.get("LAINTAS_BACKEND", "")
-        if not backend_url:
-            return False, (
-                f"No backend URL configured (LAINTAS_BACKEND). "
-                f"Pack saved locally at {pack_path}. Share it via git/gist."
-            )
-
-        # Build auth headers from session
-        headers = {"Content-Type": "application/json", "User-Agent": "laintas-cli"}
-        token = session.get("token") if session else None
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
-
-        payload = json.dumps({
+        import requests
+        import backend_profiles
+        profile = backend_profiles.resolve("https://laintas.com")
+        headers, cookies = backend_profiles.request_auth(profile, session)
+        headers["User-Agent"] = "laintas-cli"
+        payload = {
             "candidate_id": cid,
             "name": f"prompt-pack-{cid}",
             "patch": cand.get("patch", ""),
             "rationale": cand.get("body", "")[:500],
-            "author": session.get("userName", "unknown") if session else "unknown",
-        }).encode("utf-8")
-
-        req = urllib.request.Request(
-            f"{backend_url.rstrip('/')}/api/prompts/publish",
-            data=payload, headers=headers, method="POST",
+            "author": (
+                session.get("userName", "unknown")
+                if session and profile.sends_laintas_credentials else "unknown"
+            ),
+        }
+        resp = requests.post(
+            f"{profile.base_url}/api/prompts/publish", json=payload,
+            headers=headers, cookies=cookies, timeout=15,
+            allow_redirects=False,
         )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            if resp.status in (200, 201):
-                body = json.loads(resp.read().decode("utf-8", errors="replace"))
-                share_url = body.get("url") or body.get("shareUrl") or ""
-                return True, f"Published. Share URL: {share_url}" if share_url \
-                    else f"Published (id: {body.get('id', cid)})."
-            return False, f"Backend returned status {resp.status}."
+        if resp.status_code in (200, 201):
+            body = resp.json()
+            share_url = body.get("url") or body.get("shareUrl") or ""
+            return True, f"Published. Share URL: {share_url}" if share_url \
+                else f"Published (id: {body.get('id', cid)})."
+        return False, f"Backend returned status {resp.status_code}."
     except Exception as e:
         return False, (
             f"Backend publish failed ({e}). Pack saved locally at {pack_path}. "
