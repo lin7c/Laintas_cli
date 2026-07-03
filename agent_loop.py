@@ -217,6 +217,32 @@ TRANSITION_WARNING_FORCE = "warning_force_exit"         # warning circuit breake
 TRANSITION_PARSE_GAVE_UP = "parse_gave_up"              # parse failure counter exhausted
 TRANSITION_USER_DENIED = "user_denied"                  # user explicitly denied an approval prompt
 
+# ── Live status (read by REPL bottom toolbar) ─────────────────────────
+# Updated after each backend call within run_agent_loop; consumed by
+# laintas_cli._render_bottom_toolbar() for the "last thinking time" field.
+_last_thinking_time: float = 0.0
+
+
+def _set_last_thinking_time(seconds: float) -> None:
+    """Store the most recent backend-call duration and sync to REPL status bar."""
+    global _last_thinking_time
+    _last_thinking_time = max(0.0, seconds)
+    try:
+        import laintas_cli
+        laintas_cli._update_status_cache(last_thinking_time=_last_thinking_time)
+    except Exception:
+        pass
+
+
+def _live_status_model() -> str:
+    """Best-effort read of the current model name for the thinking spinner."""
+    try:
+        import laintas_cli
+        return laintas_cli._status_cache.get("model", "") or ""
+    except Exception:
+        return ""
+
+
 _runtime_config: dict[str, object] = {}
 
 _RUNTIME_CONFIG_DESCRIPTIONS = {
@@ -4134,6 +4160,7 @@ def run_agent_loop(
         # 5. Call backend (skip spinner in non-interactive/execute mode)
         lang = _detect_lang(original_input)
         _detail = bool(get_runtime_config("detail"))
+        _thinking_t0 = time.monotonic()
         if events_cb is not None:
             # Streaming render: use rich.live.Live to render the reply as it arrives
             # via on_chunk. Falls back to spinner if backend doesn't accept on_chunk.
@@ -4142,6 +4169,9 @@ def run_agent_loop(
             # (it reprints each frame, duplicating lines). Stream with a plain
             # spinner there and print the final reply once instead.
             _use_live = not sys.platform.startswith("win")
+            # Capture model/mode labels once for the spinner text
+            _spin_model = _live_status_model() or "default"
+            _spin_mode = "PLAN" if plan_mode.is_plan_mode() else "ACT"
             try:
                 from rich.live import Live
                 from rich.spinner import Spinner
@@ -4153,7 +4183,10 @@ def run_agent_loop(
                     if stream_state["reply"]:
                         parts.append(deps.Markdown(stream_state["reply"]))
                     else:
-                        parts.append(Spinner("dots", text=Text("thinking…", style="#7aa2f7")))
+                        _elapsed = time.monotonic() - _thinking_t0
+                        parts.append(Spinner("dots", text=Text(
+                            f"thinking… {_elapsed:.1f}s · {_spin_model} · {_spin_mode}",
+                            style="#7aa2f7")))
                     if stream_state["command"] and _detail:
                         cmd_preview = stream_state["command"]
                         if len(cmd_preview) > 120:
@@ -4219,11 +4252,11 @@ def run_agent_loop(
                         try: live.update(_render(), refresh=True)
                         except Exception: pass
                 else:
-                    with deps.console.status("[#7aa2f7]thinking…[/#7aa2f7]",
+                    with deps.console.status(f"[#7aa2f7]thinking… · {_spin_model} · {_spin_mode}[/#7aa2f7]",
                                              spinner="dots"):
                         response = _do_stream_call()
             except ImportError:
-                with deps.console.status("[#7aa2f7]thinking…[/#7aa2f7]", spinner="dots"):
+                with deps.console.status(f"[#7aa2f7]thinking… · {_spin_model} · {_spin_mode}[/#7aa2f7]", spinner="dots"):
                     try:
                         response = deps.call_backend(
                             session=session,
@@ -4270,6 +4303,9 @@ def run_agent_loop(
                     history=history_for_backend,
                     lang=lang,
                 )
+
+        # Store thinking time for the REPL status bar
+        _set_last_thinking_time(time.monotonic() - _thinking_t0)
 
         # ── Handle soft-interrupt during backend call ──
         if response.get("_interrupted"):

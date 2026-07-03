@@ -1895,7 +1895,7 @@ class MetaCompleter(Completer):
         text = document.text_before_cursor.lstrip()
         if not text:
             return
-        # /-command completion
+        # /-command completion — auto-popup while typing (complete_while_typing)
         if text.startswith("/"):
             if any(ch.isspace() for ch in text):
                 head, _, tail = text.partition(" ")
@@ -1909,7 +1909,18 @@ class MetaCompleter(Completer):
                 return
             for cmd in self.META_COMMANDS:
                 if cmd.startswith(text):
-                    yield Completion(cmd, start_position=-len(text))
+                    _spec = _find_command_spec(cmd)
+                    yield Completion(
+                        cmd,
+                        start_position=-len(text),
+                        display_meta=_spec.description if _spec else "",
+                    )
+            return
+
+        # For non-/-prefixed input, only show completions on explicit Tab —
+        # avoids a noisy menu popping up on every keystroke while typing
+        # natural-language input.
+        if not complete_event.completion_requested:
             return
 
         # First word — complete from PATH + builtins
@@ -1936,11 +1947,32 @@ class MetaCompleter(Completer):
 
 
 def _build_prompt_style() -> Style:
-    """Build prompt_toolkit Style for the prompt."""
+    """Build prompt_toolkit Style for the prompt, completion menu, and status bar."""
     return Style.from_dict({
         "prompt-path": "bold #7aa2f7",
         "separator": "#bb9af7",
         "paste-placeholder": "bold #7aa2f7 bg:#2a2a37",
+        # Completion menu (Tokyo Night palette)
+        "completion-menu": "bg:#1a1b26",
+        "completion-menu.completion": "bg:#1a1b26 #c0caf5",
+        "completion-menu.completion.current": "bg:#364a82 #1a1b26 bold",
+        "completion-menu.meta.completion": "bg:#16161e #565f89",
+        "completion-menu.meta.completion.current": "bg:#16161e #7aa2f7",
+        # Bottom status bar
+        "bottom-toolbar": "bg:#16161e #9aa5ce",
+        "stbar-sep": "bg:#16161e #2a2a37",
+        "stbar-model": "bg:#16161e #7aa2f7 bold",
+        "stbar-mode-act": "bg:#16161e #9ece6a bold",
+        "stbar-mode-plan": "bg:#16161e #e0af68 bold",
+        "stbar-tokens": "bg:#16161e #bb9af7",
+        "stbar-time": "bg:#16161e #565f89",
+        "stbar-dot-act": "bg:#16161e #9ece6a bold",
+        "stbar-dot-plan": "bg:#16161e #e0af68 bold",
+        # rprompt (right side of prompt line — no background)
+        "rprompt-mode-act": "#9ece6a bold",
+        "rprompt-mode-plan": "#e0af68 bold",
+        "rprompt-sep": "#2a2a37",
+        "rprompt-model": "#7aa2f7",
     })
 
 
@@ -2146,6 +2178,79 @@ def _build_keybindings() -> KeyBindings:
     return kb
 
 
+# ── Status bar (bottom toolbar) ───────────────────────────────────────
+# Lightweight session-status cache read by the bottom_toolbar callable.
+# Updated at key moments (startup, /model, after backend call, after agent
+# loop) so the toolbar callback itself never touches disk — only reads this
+# in-memory dict + usage_tracker._SESSION (also in-memory).
+_status_cache: dict = {
+    "model": "",
+    "last_thinking_time": 0.0,
+}
+
+
+def _update_status_cache(**kwargs) -> None:
+    """Patch one or more fields in the module-level status cache."""
+    _status_cache.update(kwargs)
+
+
+def _fmt_tokens(n: int) -> str:
+    """Compact token count: 856 → '856', 12345 → '12.3k'."""
+    if n < 1000:
+        return str(n)
+    if n < 1_000_000:
+        return f"{n / 1000:.1f}k"
+    return f"{n / 1_000_000:.1f}M"
+
+
+def _session_token_totals() -> tuple[int, int]:
+    """Return (prompt_tokens, completion_tokens) for this process session."""
+    try:
+        import usage_tracker as _ut
+        with _ut._LOCK:
+            total_in = sum(r.get("in", 0) for r in _ut._SESSION)
+            total_out = sum(r.get("out", 0) for r in _ut._SESSION)
+        return total_in, total_out
+    except Exception:
+        return 0, 0
+
+
+def _render_rprompt():
+    """Formatted text for the right side of the prompt line (mode + model)."""
+    try:
+        import plan_mode as _pm
+        _is_plan = _pm.is_plan_mode()
+    except Exception:
+        _is_plan = False
+    _mode_label = "PLAN" if _is_plan else "ACT"
+    _mode_cls = "rprompt-mode-plan" if _is_plan else "rprompt-mode-act"
+    _model = _status_cache.get("model", "") or "default"
+    return [
+        ("class:" + _mode_cls, _mode_label),
+        ("class:rprompt-sep", " · "),
+        ("class:rprompt-model", _model),
+    ]
+
+
+def _render_bottom_toolbar():
+    """prompt_toolkit bottom_toolbar callable — single-line status bar.
+
+    Invoked on every keystroke; must be fast (all reads are in-memory).
+    Shows: last thinking time | session tokens.
+    Mode and model are displayed in the rprompt (right side of prompt line).
+    """
+    _tin, _tout = _session_token_totals()
+    _think = _status_cache.get("last_thinking_time", 0.0)
+    _think_str = _fmt_elapsed(_think) if _think > 0 else "—"
+
+    sep = ("class:stbar-sep", "  │  ")
+    return [
+        ("class:stbar-time", f"last {_think_str}"),
+        sep,
+        ("class:stbar-tokens", f"↑ {_fmt_tokens(_tin)}  ↓ {_fmt_tokens(_tout)}"),
+    ]
+
+
 _prompt_session: Optional[PromptSession] = None
 
 
@@ -2178,8 +2283,9 @@ def get_prompt_session() -> PromptSession:
             style=_build_prompt_style(),
             key_bindings=_build_keybindings(),
             lexer=_PastePlaceholderLexer(),
-            enable_history_search=True,
+            enable_history_search=False,
             vi_mode=False,
+            complete_while_typing=True,
             mouse_support=Condition(lambda: bool(get_runtime_config("enable_mouse"))),
         )
         # Upgrade the default buffer so the cursor snaps out of paste
@@ -2202,6 +2308,8 @@ def pt_prompt(cwd: str) -> str:
              ("class:separator", "❯ ")],
             style=_build_prompt_style(),
             multiline=False,
+            rprompt=_render_rprompt(),
+            complete_while_typing=True,
         )
         expanded = _expand_pastes(user_input) if user_input else user_input
         _reset_paste_registry()
@@ -3955,6 +4063,7 @@ def call_backend_stream(
         # Accumulate deltas into one string, then parse JSON {reply,command,...}.
         accumulated = ""
         billing_info: dict = {}
+        streamed_model: str = ""
         got_any_event = False
         finish_reason: Optional[str] = None  # last non-null choices[0].finish_reason
         _diag_events: list = []  # diagnostic: capture non-content fields
@@ -3992,6 +4101,12 @@ def call_backend_stream(
                 billing_info["billingDomain"] = backend_profile.kind
                 billing_info["official"] = backend_profile.sends_laintas_credentials
                 continue
+            # Capture the actual model name streamed by the backend (first
+            # non-empty occurrence wins) for the status-bar display.
+            if not streamed_model:
+                _m = evt.get("model")
+                if _m and isinstance(_m, str):
+                    streamed_model = _m
             # Capture diagnostic info: any top-level keys beyond choices
             for k in evt.keys():
                 if k not in ("choices", "id", "object", "created", "model", "system_fingerprint") and k not in _diag_events:
@@ -4087,6 +4202,13 @@ def call_backend_stream(
                 backend_kind=backend_profile.kind,
                 estimated=True,
             )
+
+        # Update the REPL status bar with the actual model used this call.
+        # Falls back to the user's configured selection if the backend
+        # didn't echo a model name in the SSE stream.
+        _effective_model = streamed_model or selected_model
+        if _effective_model:
+            _update_status_cache(model=_effective_model)
 
         raw_text = accumulated.strip()
         # Content is always prose now (tool calls come natively); surface it.
@@ -6909,10 +7031,12 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
         if len(parts) >= 2 and parts[1].lower() in ("reset", "clear", "default"):
             set_selected_model("")
             set_selected_provider("")
+            _update_status_cache(model="")
             console.print("[green]Model reset. Backend default will be used.[/green]")
         elif len(parts) >= 2:
             model = _decode_text_arg(raw_args)
             set_selected_model(model)
+            _update_status_cache(model=model)
             console.print(f"[green]Model set to: [bold]{model}[/bold][/green]")
         else:
             current = get_selected_model()
@@ -6932,6 +7056,7 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
                         provider_id = selected.get("provider", "") if isinstance(selected, dict) else ""
                         set_selected_model(model_id)
                         set_selected_provider(provider_id)
+                        _update_status_cache(model=model_id)
                         info = f"[bold]{model_id}[/bold]"
                         if provider_id:
                             info += f" ([dim]{provider_id}[/dim])"
@@ -6974,6 +7099,7 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
                             if chosen:
                                 set_selected_model(chosen["id"])
                                 set_selected_provider(chosen.get("provider", ""))
+                                _update_status_cache(model=chosen["id"])
                                 console.print(f"[green]Model set to: [bold]{chosen['id']}[/bold][/green]")
                             else:
                                 console.print(f"[red]Invalid model selection: {choice}[/red]")
@@ -10598,6 +10724,7 @@ def main():
     # Load or create config
     config = load_config()
     agent_name = args.name or config.get("agentName", socket.gethostname())
+    _update_status_cache(model=config.get("model", ""))
 
     # Official mode uses the Laintas account. Custom/local backends are a
     # separate trust and billing domain and must not require or receive it.
