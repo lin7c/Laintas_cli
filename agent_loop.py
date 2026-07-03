@@ -1730,9 +1730,9 @@ class LoopDeps:
     request_file_delete_approval: Optional[Callable[[str, str, str], bool]] = None
 
 
-# ── Structured Memory System (.laintas/memory.json) ───────────────────────
-# Project memory stores a JSON array of entries: [{"id": N, "content": "...", "created": "...", "updated": "..."}]
-# AI reads/writes these via the mem.* tools (mem.read, mem.save, mem.delete, mem.list).
+# ── Legacy project context (.laintas/memory.json) ────────────────────────
+# Kept as a read-only compatibility input for existing projects. The mem.*
+# tools use memory_system.py as their single read/write store.
 
 _MEMORY_FILE = ".laintas/memory.json"
 
@@ -3605,6 +3605,39 @@ def _format_parallel_results(inbox_msgs: list) -> str:
     return f"{header}\n\n" + "\n\n---\n\n".join(results)
 
 
+def _allowed_tool_names_for_state(state: dict) -> set[str]:
+    """Return the exact internal tool set the current runtime may dispatch.
+
+    The same set is sent to the provider, preventing blocked tools from wasting
+    schema tokens or being selected only to fail during dispatch.
+    """
+    names = {tool.name for tool in tools_mod.get_registry().list()}
+    if state.get("_prompt_lab_branch"):
+        return names & {
+            "fs.read", "fs.ls", "fs.grep", "fs.glob",
+            "skill.list", "skill.reference", "prompt.lab_draft",
+            "task.complete", "time.now",
+        }
+    if state.get("_evolution_lab_branch"):
+        return names & {
+            "fs.read", "fs.ls", "fs.grep", "fs.glob",
+            "skill.list", "skill.reference", "evolve.lab_draft",
+            "task.complete", "time.now",
+        }
+
+    if plan_mode.is_plan_mode():
+        names = {name for name in names if plan_mode.is_tool_allowed(name)}
+    else:
+        names = {name for name in names if mode_manager.is_tool_allowed(name)}
+    role_name = state.get("_role_name")
+    names = {
+        name for name in names
+        if agent_roles.is_tool_allowed_for_role(name, role_name)
+        and workflow_engine.is_tool_allowed_in_workflow(name)
+    }
+    return names
+
+
 def run_agent_loop(
     deps: LoopDeps,
     original_input: str,
@@ -4179,6 +4212,7 @@ def run_agent_loop(
 
         # 5. Call backend (skip spinner in non-interactive/execute mode)
         lang = _detect_lang(original_input)
+        _allowed_tool_names = _allowed_tool_names_for_state(state)
         _detail = bool(get_runtime_config("detail"))
         _thinking_t0 = time.monotonic()
         if events_cb is not None:
@@ -4250,6 +4284,7 @@ def run_agent_loop(
                             lang=lang,
                             interrupt_event=_interrupt,
                             messages=_thread_to_send,
+                            allowed_tool_names=_allowed_tool_names,
                         )
                     except TypeError:
                         # Backend doesn't support on_chunk/interrupt_event — fall back
@@ -4287,6 +4322,7 @@ def run_agent_loop(
                             lang=lang,
                             interrupt_event=_interrupt,
                             messages=_thread_to_send,
+                            allowed_tool_names=_allowed_tool_names,
                         )
                     except TypeError:
                         response = deps.call_backend(
@@ -4313,6 +4349,7 @@ def run_agent_loop(
                     lang=lang,
                     interrupt_event=_interrupt,
                     messages=_thread_to_send,
+                    allowed_tool_names=_allowed_tool_names,
                 )
             except TypeError:
                 response = deps.call_backend(

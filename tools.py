@@ -114,33 +114,80 @@ def _validate_params(params: dict, schema: dict) -> Optional[str]:
     """
     if not isinstance(params, dict):
         return f"expected object, got {type(params).__name__}"
-    try:
-        import jsonschema
-        jsonschema.validate(params, schema)
+    def _matches_type(value, expected: str) -> bool:
+        if expected == "null":
+            return value is None
+        if expected == "boolean":
+            return type(value) is bool
+        if expected == "integer":
+            return type(value) is int
+        if expected == "number":
+            return type(value) in (int, float)
+        return isinstance(value, {
+            "string": str, "array": list, "object": dict,
+        }.get(expected, object))
+
+    def _check(value, rule: dict, path: str) -> Optional[str]:
+        if not isinstance(rule, dict):
+            return None
+        expected = rule.get("type")
+        expected_types = expected if isinstance(expected, list) else [expected]
+        expected_types = [item for item in expected_types if item]
+        if expected_types and not any(_matches_type(value, item) for item in expected_types):
+            return (f"param '{path}': expected {' or '.join(expected_types)}, "
+                    f"got {type(value).__name__}")
+        if "enum" in rule and value not in rule["enum"]:
+            return f"param '{path}': value is not in enum {rule['enum']}"
+
+        if isinstance(value, dict):
+            properties = rule.get("properties") or {}
+            for required in rule.get("required") or []:
+                if required not in value:
+                    child = f"{path}.{required}" if path != "(root)" else required
+                    return f"missing required param '{child}'"
+            if rule.get("additionalProperties") is False:
+                unexpected = sorted(set(value) - set(properties))
+                if unexpected:
+                    return f"param '{path}': unexpected property '{unexpected[0]}'"
+            for key, item in value.items():
+                if key not in properties:
+                    continue
+                child = f"{path}.{key}" if path != "(root)" else key
+                error = _check(item, properties[key], child)
+                if error:
+                    return error
+        elif isinstance(value, list):
+            if "minItems" in rule and len(value) < int(rule["minItems"]):
+                return f"param '{path}': fewer than minItems={rule['minItems']}"
+            if "maxItems" in rule and len(value) > int(rule["maxItems"]):
+                return f"param '{path}': more than maxItems={rule['maxItems']}"
+            item_rule = rule.get("items")
+            if isinstance(item_rule, dict):
+                for index, item in enumerate(value):
+                    error = _check(item, item_rule, f"{path}[{index}]")
+                    if error:
+                        return error
+        elif isinstance(value, str):
+            if "minLength" in rule and len(value) < int(rule["minLength"]):
+                return f"param '{path}': shorter than minLength={rule['minLength']}"
+            if "maxLength" in rule and len(value) > int(rule["maxLength"]):
+                return f"param '{path}': longer than maxLength={rule['maxLength']}"
+            if rule.get("pattern"):
+                try:
+                    if re.search(rule["pattern"], value) is None:
+                        return f"param '{path}': does not match pattern"
+                except re.error:
+                    return f"param '{path}': tool schema has an invalid pattern"
+        elif type(value) in (int, float):
+            if "minimum" in rule and value < rule["minimum"]:
+                return f"param '{path}': below minimum={rule['minimum']}"
+            if "maximum" in rule and value > rule["maximum"]:
+                return f"param '{path}': above maximum={rule['maximum']}"
         return None
-    except ImportError:
-        pass
-    except jsonschema.ValidationError as e:
-        path = ".".join(str(p) for p in e.absolute_path) or "(root)"
-        return f"param '{path}': {e.message}"
-    except Exception:
-        pass
-    # Lightweight fallback: check required + basic types
-    required = schema.get("required") or []
-    for r in required:
-        if r not in params:
-            return f"missing required param '{r}'"
-    props = schema.get("properties") or {}
-    _py_types = {"string": str, "integer": int, "number": (int, float),
-                 "boolean": bool, "array": list, "object": dict}
-    for k, v in params.items():
-        if k not in props:
-            continue
-        ptype = (props[k] or {}).get("type")
-        if ptype and ptype in _py_types:
-            if not isinstance(v, _py_types[ptype]):
-                return f"param '{k}': expected {ptype}, got {type(v).__name__}"
-    return None
+
+    # Keep validation deterministic even when the optional jsonschema package
+    # is absent. The supported subset covers every built-in schema.
+    return _check(params, schema or {}, "(root)")
 
 
 # ── Registry ───────────────────────────────────────────────────────────
@@ -320,7 +367,8 @@ class ToolRegistry:
             f"Call them via the native function-calling interface."
         )
 
-    def to_openai_tools(self, unified: bool = False) -> tuple[list[dict], dict[str, str]]:
+    def to_openai_tools(self, unified: bool = False,
+                        allowed_names: Optional[set[str]] = None) -> tuple[list[dict], dict[str, str]]:
         """Render the toolset as OpenAI-style function-calling schemas.
 
         Returns ``(tools, name_map)`` where ``tools`` is a list of
@@ -340,6 +388,9 @@ class ToolRegistry:
         the reverse map still points back to this registry's internal name, so
         dispatch is unchanged. Tools with no catalog alias (CLI-specific
         extensions) fall back to the mangled name.
+
+        ``allowed_names`` filters by internal registry name before aliases are
+        applied, so provider visibility matches runtime authorization.
         """
         _canon = None
         if unified:
@@ -352,6 +403,8 @@ class ToolRegistry:
         name_map: dict[str, str] = {}
         used: set[str] = set()
         for t in self.list():
+            if allowed_names is not None and t.name not in allowed_names:
+                continue
             wire = None
             if _canon is not None:
                 wire = _canon.canonical(t.name, "laintas_cli")
@@ -479,11 +532,15 @@ def _run_formatter(abs_path: str) -> bool:
 # layer doesn't cover: filesystem reads, memory introspection.
 
 def _bi_mem_read(params: dict, ctx: ToolCtx) -> dict:
-    deps = ctx.deps
-    if deps is None or not hasattr(deps, "read_file"):
-        return {"ok": False, "error": "no deps.read_file available"}
-    content = deps.read_file(str(paths.project_file(paths.CWD_MEMORY))) or ""
-    return {"ok": True, "result": content}
+    if _mem_sys is None:
+        return {"ok": False, "error": "memory_system module not available"}
+    name = (params.get("name") or "").strip()
+    if not name:
+        return {"ok": False, "error": "missing 'name'"}
+    data = _mem_sys.read_memory(name)
+    if data is None:
+        return {"ok": False, "error": f"memory '{name}' not found in the current scope"}
+    return {"ok": True, "result": {"name": name, **data}}
 
 
 def _bi_mem_save(params: dict, ctx: ToolCtx) -> dict:
@@ -518,7 +575,9 @@ def _bi_mem_list(params: dict, ctx: ToolCtx) -> dict:
     if _mem_sys is None:
         return {"ok": False, "error": "memory_system module not available"}
     mem_type = params.get("type") or None
-    entries = _mem_sys.list_memories(mem_type)
+    query = (params.get("query") or "").strip()
+    limit = params.get("limit", 10)
+    entries = _mem_sys.search_memories(query, mem_type, limit)
     return {"ok": True, "result": entries, "count": len(entries)}
 
 
@@ -637,19 +696,24 @@ def _check_file_write_policy(abs_path: str, ctx: ToolCtx, diff_preview: str) -> 
         return None
     try:
         decision = _policy_mod.evaluate_file_write(abs_path, ctx.cwd, agent_id=ctx.agent_id)
-    except Exception:
-        return None
+    except Exception as exc:
+        return {"ok": False,
+                "error": f"Write policy failed closed: {exc}",
+                "path": abs_path}
     if decision.action == "deny":
         return {"ok": False, "error": f"Blocked by policy: {decision.reason}", "path": abs_path}
     if decision.action == "needs_approval":
         approve_fn = getattr(ctx.deps, "request_file_write_approval", None) if ctx.deps is not None else None
-        if callable(approve_fn):
-            try:
-                approved = approve_fn(abs_path, diff_preview, decision.reason)
-            except Exception:
-                approved = False
-            if not approved:
-                return {"ok": False, "error": f"User denied write: {decision.reason}", "path": abs_path, "_user_denied": True}
+        if not callable(approve_fn):
+            return {"ok": False,
+                    "error": "Write requires approval but no approval channel is available",
+                    "path": abs_path}
+        try:
+            approved = approve_fn(abs_path, diff_preview, decision.reason)
+        except Exception:
+            approved = False
+        if not approved:
+            return {"ok": False, "error": f"User denied write: {decision.reason}", "path": abs_path, "_user_denied": True}
     return None
 
 
@@ -3894,8 +3958,15 @@ def register_builtin_tools() -> None:
     builtins = [
         Tool(
             name="mem.read",
-            description="Read the agent's persistent .laintas/memory.json file in full.",
-            schema={"type": "object", "properties": {}},
+            description="Read one persistent memory by name from the current user/project scope.",
+            schema={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_-]{0,79}$"},
+                },
+                "required": ["name"],
+                "additionalProperties": False,
+            },
             invoke=_bi_mem_read,
         ),
         Tool(
@@ -3907,7 +3978,8 @@ def register_builtin_tools() -> None:
             schema={
                 "type": "object",
                 "properties": {
-                    "name": {"type": "string", "description": "short kebab-case slug (e.g., 'user-role')"},
+                    "name": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_-]{0,79}$",
+                             "description": "lowercase slug (e.g., 'user-role')"},
                     "type": {"type": "string", "enum": ["user", "feedback", "project", "reference"],
                             "description": "memory category"},
                     "description": {"type": "string", "description": "one-line summary for the index"},
@@ -3927,7 +3999,8 @@ def register_builtin_tools() -> None:
             schema={
                 "type": "object",
                 "properties": {
-                    "name": {"type": "string", "description": "memory slug to delete"},
+                    "name": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_-]{0,79}$",
+                             "description": "memory slug to delete"},
                 },
                 "required": ["name"],
             },
@@ -3935,12 +4008,14 @@ def register_builtin_tools() -> None:
         ),
         Tool(
             name="mem.list",
-            description="List all persistent memories, optionally filtered by type.",
+            description="Search persistent memories in the current scope. Results include a body preview and relevance score.",
             schema={
                 "type": "object",
                 "properties": {
+                    "query": {"type": "string", "description": "optional lexical search query"},
                     "type": {"type": "string", "enum": ["user", "feedback", "project", "reference"],
                             "description": "filter by type (omit for all)"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10},
                 },
             },
             invoke=_bi_mem_list,

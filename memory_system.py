@@ -18,6 +18,7 @@ import re
 import json
 import time
 import hashlib
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -36,6 +37,37 @@ MEMORY_TYPES = {
     "project": "Project goals, deadlines, constraints, ongoing initiatives",
     "reference": "Pointers to external resources (dashboards, repos, channels)",
 }
+
+_MEMORY_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,79}$")
+_LEGACY_MEMORY_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_. -]{0,79}$")
+
+
+def _memory_path(name: str, *, strict: bool = False) -> Path:
+    """Resolve a validated memory slug without permitting path traversal."""
+    candidate = str(name or "").strip()
+    accepted = (_MEMORY_NAME_RE if strict else _LEGACY_MEMORY_NAME_RE).fullmatch(candidate)
+    if not accepted:
+        raise ValueError(
+            "memory name must be a safe slug without path separators"
+        )
+    root = MEMORY_DIR.resolve()
+    path = (root / f"{candidate}.md").resolve()
+    if path.parent != root:
+        raise ValueError("memory name escapes the memory directory")
+    return path
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_text(content, encoding="utf-8")
+        os.replace(str(tmp), str(path))
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def ensure_memory_dir() -> Path:
@@ -212,15 +244,56 @@ def list_memories(mem_type: str = None) -> list[dict]:
 def read_memory(name: str) -> Optional[dict]:
     """Read a single memory file. Returns {meta, body, path} or None."""
     ensure_memory_dir()
-    f = MEMORY_DIR / f"{name}.md"
+    try:
+        f = _memory_path(name)
+    except ValueError:
+        return None
     if not f.exists():
         return None
     try:
         content = f.read_text(encoding="utf-8")
         meta, body = _parse_frontmatter(content)
+        entry_type = meta.get("type") or meta.get("metadata", {}).get("type", "unknown")
+        if not meta.get("scope") or not meta.get("scope_id"):
+            scope, scope_id = _resolve_scope(entry_type)
+            meta.update({
+                "product": "laintas_cli",
+                "scope": scope,
+                "scope_id": scope_id,
+                "importance": meta.get("importance", "0.5"),
+            })
+            _atomic_write_text(f, _format_frontmatter(meta, body))
+        if not _visible_in_current_scope(meta):
+            return None
         return {"meta": meta, "body": body, "path": str(f)}
-    except OSError:
+    except (OSError, ValueError):
         return None
+
+
+def search_memories(query: str = "", mem_type: str = None,
+                    limit: int = 10) -> list[dict]:
+    """Return visible memories ranked by lexical relevance and importance."""
+    query_terms = set(re.findall(r"[\w-]+", str(query or "").lower()))
+    ranked = []
+    for entry in list_memories(mem_type):
+        data = read_memory(entry["name"])
+        if not data:
+            continue
+        searchable = (
+            f"{entry['name']} {entry.get('description', '')} {data['body']}"
+        ).lower()
+        hits = sum(1 for term in query_terms if term in searchable)
+        if query_terms and hits == 0:
+            continue
+        score = hits * 10.0 + float(entry.get("importance", 0.5))
+        ranked.append({
+            **entry,
+            "body_preview": data["body"][:500],
+            "score": round(score, 3),
+        })
+    ranked.sort(
+        key=lambda item: (item["score"], item.get("mtime", 0)), reverse=True)
+    return ranked[:max(1, min(int(limit or 10), 50))]
 
 
 def write_memory(name: str, mem_type: str, description: str,
@@ -236,7 +309,10 @@ def write_memory(name: str, mem_type: str, description: str,
     if mem_type not in MEMORY_TYPES and mem_type != "unknown":
         return False, f"Invalid memory type: {mem_type}. Use: {list(MEMORY_TYPES)}"
 
-    f = MEMORY_DIR / f"{name}.md"
+    try:
+        f = _memory_path(name, strict=True)
+    except ValueError as exc:
+        return False, str(exc)
     if f.exists() and not overwrite:
         return False, f"Memory '{name}' already exists. Use overwrite=True."
 
@@ -257,7 +333,7 @@ def write_memory(name: str, mem_type: str, description: str,
     }
     content = _format_frontmatter(meta, body)
     try:
-        f.write_text(content, encoding="utf-8")
+        _atomic_write_text(f, content)
     except OSError as e:
         return False, str(e)
 
@@ -270,7 +346,10 @@ def delete_memory(name: str) -> tuple[bool, str]:
 
     Returns (ok, message).
     """
-    f = MEMORY_DIR / f"{name}.md"
+    try:
+        f = _memory_path(name)
+    except ValueError as exc:
+        return False, str(exc)
     if not f.exists():
         return False, f"Memory '{name}' not found"
     try:

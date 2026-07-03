@@ -270,7 +270,7 @@ def select_dialog(
         try:
             import termios as _termios
             _termios.tcflush(sys.stdin.fileno(), _termios.TCIFLUSH)
-        except (OSError, ValueError, io.UnsupportedOperation):
+        except (OSError, ValueError, io.UnsupportedOperation, _termios.error):
             pass
 
     # ── Normalise items into (label, desc) pairs ──────────────────
@@ -3956,6 +3956,7 @@ def call_backend_stream(
     interrupt_event: Optional[threading.Event] = None,
     messages: Optional[list] = None,
     tools_enabled: bool = True,
+    allowed_tool_names: Optional[set[str]] = None,
 ) -> dict:
     """Call Helpwo backend /api/chat/stream, same as Helpwo frontend.
     Returns parsed {reply, command, memory, done, _billing} dict.
@@ -4011,7 +4012,10 @@ def call_backend_stream(
     else:
         try:
             _unified_catalog = bool(get_runtime_config("use_unified_catalog"))
-            _openai_tools, tool_name_map = tools_mod.get_registry().to_openai_tools(unified=_unified_catalog)
+            _openai_tools, tool_name_map = tools_mod.get_registry().to_openai_tools(
+                unified=_unified_catalog,
+                allowed_names=allowed_tool_names,
+            )
             if _openai_tools:
                 payload["tools"] = _openai_tools
                 payload["tool_choice"] = "auto"
