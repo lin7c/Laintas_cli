@@ -11,6 +11,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -19,6 +20,7 @@ from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 
 import laintas_cli
+import plan_mode
 
 # select_dialog ignores confirm/cancel keys for 250ms after open (replayed
 # typeahead defense); feed keys after this to act as a real user.
@@ -74,6 +76,80 @@ class SelectDialogTests(unittest.TestCase):
             self._run(["Yes", "No"], "n", full_screen=False,
                       letter_shortcuts=True),
             "No")
+
+
+class SelectionEntryPointTests(unittest.TestCase):
+    def test_choose_record_maps_rendered_row_back_to_record(self):
+        records = [
+            {"id": "a", "description": "first"},
+            {"id": "b", "description": "second"},
+        ]
+
+        def choose_second(rows, **_kwargs):
+            return rows[1]
+
+        with mock.patch.object(
+                laintas_cli.sys.stdin, "isatty", return_value=True), \
+                mock.patch.object(
+                    laintas_cli, "select_dialog", side_effect=choose_second):
+            chosen = laintas_cli.choose_record(
+                records,
+                title="Choose",
+                label=lambda item: item["id"],
+                description=lambda item: item["description"],
+            )
+        self.assertIs(chosen, records[1])
+
+    def test_choose_record_does_not_prompt_without_tty(self):
+        with mock.patch.object(
+                laintas_cli.sys.stdin, "isatty", return_value=False), \
+                mock.patch.object(laintas_cli, "select_dialog") as dialog:
+            self.assertIsNone(laintas_cli.choose_record(
+                [{"id": "a"}], title="Choose",
+                label=lambda item: item["id"]))
+        dialog.assert_not_called()
+
+    def test_login_method_uses_shared_selector(self):
+        def choose_local(items, **kwargs):
+            self.assertFalse(kwargs["full_screen"])
+            return items[1]
+
+        with mock.patch.object(
+                laintas_cli.sys.stdin, "isatty", return_value=True), \
+                mock.patch.object(
+                    laintas_cli, "select_dialog", side_effect=choose_local):
+            self.assertEqual(laintas_cli.choose_login_method(), "local")
+
+    def test_login_method_cancellation_is_preserved(self):
+        with mock.patch.object(
+                laintas_cli.sys.stdin, "isatty", return_value=True), \
+                mock.patch.object(
+                    laintas_cli, "select_dialog", return_value=None):
+            self.assertIsNone(laintas_cli.choose_login_method())
+
+    def test_complex_task_approach_uses_shared_selector(self):
+        selected = {}
+
+        def choose_act(items, **kwargs):
+            selected["items"] = items
+            selected["index"] = kwargs["selected_index"]
+            return items[1]
+
+        with mock.patch.object(
+                laintas_cli.sys.stdin, "isatty", return_value=True), \
+                mock.patch.object(
+                    laintas_cli, "_looks_complex", return_value=True), \
+                mock.patch.object(
+                    plan_mode, "is_plan_mode", return_value=False), \
+                mock.patch.object(laintas_cli, "_stop_bg_input_reader"), \
+                mock.patch.object(laintas_cli, "_start_bg_input_reader"), \
+                mock.patch.object(
+                    laintas_cli, "select_dialog", side_effect=choose_act):
+            self.assertFalse(laintas_cli._maybe_offer_plan_mode("complex task"))
+
+        self.assertEqual(selected["index"], 1)
+        self.assertEqual([item[0] for item in selected["items"]],
+                         ["Plan first", "Act directly"])
 
 
 if __name__ == "__main__":

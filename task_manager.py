@@ -50,13 +50,17 @@ _STATUS_FLOW = {
 _session_tasks: list[dict] = []
 _session_id_counter: int = 0
 _session_key: str = uuid.uuid4().hex[:16]
+_LEGACY_IMPORT_KEY = "legacy_tasks_imported"
 
 
 def _active_work(cwd: str = None) -> dict:
     work = workgraph.ensure_active_work(cwd=cwd)
     # One-way compatibility import. The legacy file is retained as an archive;
     # a non-empty WorkGraph prevents repeated imports.
-    if (not work.get("current_revision")
+    legacy_imported = bool(workgraph.get_project_value(
+        _LEGACY_IMPORT_KEY, cwd=cwd))
+    if (not legacy_imported
+            and not work.get("current_revision")
             and not workgraph.list_steps(work["id"], cwd=cwd, include_deleted=True)):
         legacy = _load(cwd=cwd)
         if legacy:
@@ -90,6 +94,8 @@ def _active_work(cwd: str = None) -> dict:
                                 work["id"], step_id, blocker_id, cwd=cwd)
                         except workgraph.WorkGraphError:
                             pass
+    if not legacy_imported:
+        workgraph.set_project_value(_LEGACY_IMPORT_KEY, True, cwd=cwd)
     return work
 
 
@@ -99,7 +105,8 @@ def _read_work(cwd: str = None) -> Optional[dict]:
         return work
     # Reading must not create an empty WorkGraph, but it may trigger one-way
     # migration when real legacy tasks exist.
-    if _load(cwd=cwd):
+    if (_load(cwd=cwd)
+            and not workgraph.get_project_value(_LEGACY_IMPORT_KEY, cwd=cwd)):
         return _active_work(cwd)
     return None
 
@@ -379,17 +386,29 @@ def get_active_tasks_snapshot(*, cwd: str = None) -> str:
     return "\n".join(lines)
 
 
-def clear_session_tasks() -> None:
+def clear_session_tasks(*, cwd: str = None) -> None:
     """Remove all session-level tasks."""
     global _session_tasks, _session_id_counter
     with _lock:
         _session_tasks.clear()
         _session_id_counter = 0
         try:
-            if workgraph.db_path().exists():
-                workgraph.clear_session_steps()
+            if workgraph.db_path(cwd).exists():
+                workgraph.clear_session_steps(cwd=cwd)
         except workgraph.WorkGraphError:
             pass
+
+
+def detach_active_tasks(*, cwd: str = None) -> None:
+    """Detach all task context when starting a fresh session.
+
+    Persisted WorkGraph history remains available for explicit /resume or
+    /work resume, while the retained legacy tasks.json archive is marked as
+    already migrated so it cannot silently reactivate the old task list.
+    """
+    clear_session_tasks(cwd=cwd)
+    workgraph.set_project_value(_LEGACY_IMPORT_KEY, True, cwd=cwd)
+    workgraph.set_active_work(None, cwd=cwd)
 
 
 def export_active_tasks(*, cwd: str = None) -> list[dict]:

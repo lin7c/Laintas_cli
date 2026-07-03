@@ -18,6 +18,7 @@ dist/
 # laintas_cli_download (React/Vite)
 laintas_cli_download/node_modules/
 laintas_cli_download/dist/
+laintas_cli_download/**/*_amd64.deb
 
 # Generated architecture visualization (optional to commit)
 architecture-zh.html

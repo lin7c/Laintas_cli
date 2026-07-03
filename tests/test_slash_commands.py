@@ -8,11 +8,14 @@ from pathlib import Path
 from unittest import mock
 
 from rich.console import Console
+from rich.theme import Theme
 
 import agent_loop
+import backend_profiles
 import laintas_cli
 import mode_manager
 import plan_mode
+import policy
 import prompt_opt
 import task_manager
 import workflow_engine
@@ -39,6 +42,140 @@ class SlashRegistryTests(unittest.TestCase):
         self.assertEqual(len(palette), len(set(palette)))
         self.assertEqual(set(names), set(laintas_cli.MetaCompleter.META_COMMANDS))
         self.assertIn("/resume", names)
+        self.assertIn("/compact", names)
+        self.assertIn("/clear", names)
+        self.assertIn("/clear", laintas_cli._NEW_SESSION_COMMANDS)
+
+    def test_clear_dispatches_as_new_session_command(self):
+        output = io.StringIO()
+        old_console = laintas_cli.console
+        laintas_cli.console = Console(file=output, force_terminal=False)
+        try:
+            self.assertFalse(laintas_cli.handle_meta_command(
+                "/clear", _Registry(), {}))
+        finally:
+            laintas_cli.console = old_console
+        self.assertIn("handled by the main REPL", output.getvalue())
+
+    def test_usage_model_tier_mapping_and_rendering(self):
+        balance = {
+            "balanceFormatted": "$1.00",
+            "pricing": {
+                "defaultTier": "T3",
+                "tiers": [{
+                    "tier": "T1",
+                    "models": ["deepseek-v4-pro"],
+                }],
+            },
+        }
+        self.assertEqual(
+            laintas_cli._usage_model_tiers(balance),
+            {"deepseek-v4-pro": "T1"},
+        )
+
+        totals = {
+            "calls": 1, "in": 100, "out": 20,
+            "costCents": 1, "estimated": False,
+        }
+        summary = {
+            "session": {"totals": totals, "models": {}},
+            "today": {"totals": totals, "models": {}},
+            "range": {
+                "totals": totals,
+                "models": {"deepseek-v4-pro": totals},
+            },
+            "days": 30,
+        }
+        usage_response = mock.Mock(status_code=200)
+        usage_response.json.return_value = {
+            "overview": {}, "daily": [],
+        }
+        balance_response = mock.Mock(status_code=200)
+        balance_response.json.return_value = balance
+        profile = backend_profiles.BackendProfile(
+            "official", "official", "https://laintas.com")
+        output = io.StringIO()
+        old_console = laintas_cli.console
+        laintas_cli.console = Console(
+            file=output, force_terminal=False, width=160,
+            theme=Theme({
+                "rule": "dim", "accent": "cyan", "agent": "magenta",
+                "warning": "yellow", "muted": "dim", "success": "green",
+            }))
+        try:
+            with mock.patch.object(
+                    laintas_cli.usage_tracker, "summarize",
+                    return_value=summary), \
+                    mock.patch.object(
+                        laintas_cli, "get_backend_profile",
+                        return_value=profile), \
+                    mock.patch.object(
+                        laintas_cli.backend_profiles, "request_auth",
+                        return_value=({}, {})), \
+                    mock.patch.object(
+                        laintas_cli.requests, "get",
+                        side_effect=[usage_response, balance_response]):
+                laintas_cli._show_usage_command([], {"userId": "u1"})
+        finally:
+            laintas_cli.console = old_console
+        rendered = output.getvalue()
+        self.assertIn("tier", rendered)
+        self.assertIn("deepseek-v4-pro", rendered)
+        self.assertIn("T1", rendered)
+        header = next(line for line in rendered.splitlines()
+                      if "model" in line and "tier" in line)
+        self.assertLess(header.index("cost"), header.index("tier"))
+
+    def test_compact_command_syncs_live_and_resume_state(self):
+        state = {"_session_id": "s1", "_thread_messages": [{}] * 8}
+        chat = [{"role": "user", "content": "task"}]
+        live = {"session_id": "s1", "cwd": "/work"}
+        attrs = {
+            "_last_agent_state": state,
+            "_last_chat_history": chat,
+            "_last_deps": object(),
+            "_last_session": {"userId": "u1"},
+            "_current_live_session": live,
+        }
+        previous = {
+            name: getattr(laintas_cli.handle_meta_command, name, None)
+            for name in attrs
+        }
+        for name, value in attrs.items():
+            setattr(laintas_cli.handle_meta_command, name, value)
+        result = {
+            "ok": True, "changed": True,
+            "tokens": 12000, "after_tokens": 4000,
+            "messages": 8, "after_messages": 4,
+        }
+        output = io.StringIO()
+        old_console = laintas_cli.console
+        laintas_cli.console = Console(
+            file=output, force_terminal=False,
+            theme=Theme({"rule": "dim", "accent": "cyan", "muted": "dim"}))
+        try:
+            with mock.patch.object(
+                    laintas_cli, "compact_session_context",
+                    return_value=result) as compact_mock, \
+                    mock.patch.object(
+                        laintas_cli.session_store, "sync_runtime",
+                        return_value=live) as sync_mock, \
+                    mock.patch.object(
+                        laintas_cli, "save_resume_state") as save_mock, \
+                    mock.patch.object(
+                        laintas_cli.task_manager, "export_active_tasks",
+                        return_value=[]), \
+                    mock.patch.object(laintas_cli.event_log, "append"):
+                self.assertFalse(laintas_cli.handle_meta_command(
+                    "/compact", _Registry(), {}))
+        finally:
+            laintas_cli.console = old_console
+            for name, value in previous.items():
+                setattr(laintas_cli.handle_meta_command, name, value)
+        compact_mock.assert_called_once()
+        sync_mock.assert_called_once()
+        save_mock.assert_called_once_with(state, chat, "/work")
+        self.assertIn("12.0k → 4.0k tokens", output.getvalue())
 
     def test_raw_parser_preserves_quotes_json_and_spacing(self):
         _, raw, parts = laintas_cli._parse_slash_command(
@@ -105,6 +242,46 @@ class SlashRegistryTests(unittest.TestCase):
             self.assertIn("Created mode strict", text)
             self.assertIn("Switched to STRICT mode", text)
             self.assertEqual(mode_manager.get_active_mode()["name"], "act")
+
+    def test_mode_without_args_uses_picker(self):
+        with tempfile.TemporaryDirectory() as tmp, _chdir(tmp), \
+                mock.patch.object(
+                    laintas_cli.sys.stdin, "isatty", return_value=True), \
+                mock.patch.object(
+                    laintas_cli, "choose_record",
+                    side_effect=lambda records, **_kwargs: next(
+                        item for item in records if item["name"] == "review")):
+            self.assertFalse(laintas_cli.handle_meta_command(
+                "/mode", _Registry(), {}))
+            self.assertEqual(mode_manager.get_active_mode()["name"], "review")
+
+    def test_backend_use_without_name_uses_picker(self):
+        selected = backend_profiles.BackendProfile(
+            "test", "custom", "https://example.test")
+        with mock.patch.object(
+                laintas_cli.sys.stdin, "isatty", return_value=True), \
+                mock.patch.object(
+                    backend_profiles, "list_profiles", return_value=[selected]), \
+                mock.patch.object(
+                    laintas_cli, "choose_record", return_value=selected), \
+                mock.patch.object(
+                    backend_profiles, "set_active",
+                    return_value=(True, "selected")) as set_active:
+            self.assertFalse(laintas_cli.handle_meta_command(
+                "/backend use", _Registry(), {}))
+        set_active.assert_called_once_with(selected.name)
+
+    def test_policy_without_mode_uses_picker(self):
+        with mock.patch.object(
+                laintas_cli.sys.stdin, "isatty", return_value=True), \
+                mock.patch.object(
+                    laintas_cli, "choose_record",
+                    return_value={"name": "enforce"}), \
+                mock.patch.object(
+                    policy, "set_mode", return_value=(True, "enforced")) as set_mode:
+            self.assertFalse(laintas_cli.handle_meta_command(
+                "/policy", _Registry(), {}))
+        set_mode.assert_called_once_with("enforce")
 
     def test_model_selector_preserves_provider_metadata(self):
         models = [

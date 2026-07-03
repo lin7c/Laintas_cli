@@ -233,6 +233,96 @@ class AgentTerminationTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertEqual(result["completion_source"], "provider_stop")
 
+    def test_short_final_reply_has_no_decorative_dot_prefix(self):
+        deps, _ = _deps([{
+            "reply": "你好！有什么可以帮你的？",
+            "tool_calls": [],
+            "finish_reason": "stop",
+            "done": False,
+            "error": False,
+        }])
+        history = [{"role": "user", "content": "你好"}]
+        with tempfile.TemporaryDirectory() as tmp, _chdir(tmp):
+            Path(".laintas").mkdir()
+            agent_loop.run_agent_loop(
+                deps, "你好", {}, {}, history,
+                events_cb=lambda events: None,
+                max_loops_override=2,
+            )
+        rendered = deps.console.file.getvalue()
+        self.assertIn("你好！有什么可以帮你的？", rendered)
+        self.assertNotIn("· 你好！有什么可以帮你的？", rendered)
+
+    def test_manual_compaction_summarizes_head_and_keeps_recent_user_turns(self):
+        deps, calls = _deps([{
+            "reply": "anchored compact summary",
+            "tool_calls": [],
+            "finish_reason": "stop",
+            "done": True,
+            "error": False,
+        }])
+        messages = [{"role": "user", "content": "initial task"}]
+        for index in range(1, 5):
+            messages.extend([
+                {"role": "assistant", "content": f"answer {index}"},
+                {"role": "user", "content": f"follow-up {index}"},
+            ])
+        state = {
+            "objective": "initial task",
+            "_thread_messages": messages,
+            "terminalHistory": [],
+        }
+
+        result = agent_loop.compact_session_context(
+            deps, {}, state,
+            [{"role": "user", "content": "follow-up 4"}],
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["changed"])
+        self.assertTrue(result["summary_created"])
+        self.assertEqual(len(calls), 1)
+        compacted = state["_thread_messages"]
+        self.assertEqual(compacted[0]["content"], "initial task")
+        self.assertIn("anchored compact summary", compacted[1]["content"])
+        self.assertEqual(compacted[2]["role"], "user")
+        self.assertLess(result["after_messages"], result["messages"])
+
+    def test_manual_compaction_is_noop_for_short_context(self):
+        deps, calls = _deps([{"reply": "must not be called"}])
+        state = {
+            "_thread_messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "hi"},
+            ],
+        }
+        original = copy.deepcopy(state)
+
+        result = agent_loop.compact_session_context(deps, {}, state, [])
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["changed"])
+        self.assertEqual(state, original)
+        self.assertEqual(calls, [])
+
+    def test_manual_compaction_rolls_back_when_summary_fails(self):
+        deps, calls = _deps([{"reply": "", "tool_calls": []}])
+        messages = [{"role": "user", "content": "initial"}]
+        for index in range(1, 5):
+            messages.extend([
+                {"role": "assistant", "content": f"answer {index}"},
+                {"role": "user", "content": f"follow-up {index}"},
+            ])
+        state = {"_thread_messages": messages, "terminalHistory": []}
+        original = copy.deepcopy(state)
+
+        result = agent_loop.compact_session_context(deps, {}, state, [])
+
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["changed"])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(state, original)
+
     def test_missing_tool_calls_and_content_filter_are_not_success(self):
         missing, calls, _ = self._run([{
             "reply": "I intended to call a tool",
@@ -394,6 +484,20 @@ class SessionStoreTests(unittest.TestCase):
             self.assertEqual(recovered["state"]["objective"], "recover me")
             self.assertIn("recovered", warning.lower())
             self.assertTrue(list(Path(tmp).glob("*_current.json.corrupt-*")))
+
+    def test_closed_current_does_not_resurrect_older_orphan(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(paths, "SESSIONS_DIR", Path(tmp)):
+            orphan = session_store.create_session(
+                "/work", {"objective": "stale orphan"}, [])
+            current = session_store.create_session(
+                "/work", {"objective": "current"}, [])
+            session_store.close_session(current)
+
+            self.assertTrue(
+                session_store._session_path(
+                    "/work", orphan["session_id"]).exists())
+            self.assertIsNone(session_store.load_current_session("/work"))
 
 
 @contextmanager

@@ -27,6 +27,7 @@ from typing import Callable
 # File RPC limits (Layer 2). Bytes flow as raw binary DataChannel messages.
 _CHUNK = 16 * 1024            # per binary message (safe under SCTP message size)
 _MAX_FILE_BYTES = 5 * 1024 * 1024
+_MAX_HTTP_BYTES = 20 * 1024 * 1024   # per tunneled HTTP response (dev bundles can be big)
 
 try:
     from aiortc import (
@@ -163,6 +164,8 @@ class WebrtcManager:
             self._finish_put(channel, data)
         elif t == "exec":
             asyncio.ensure_future(self._serve_exec(channel, data))
+        elif t == "http":
+            asyncio.ensure_future(self._serve_http(channel, data))
         elif t == "vnc-open":
             asyncio.ensure_future(self._open_vnc(channel, data))
         elif t == "vnc-close":
@@ -189,6 +192,82 @@ class WebrtcManager:
                                      "out": "command timed out"}))
         except Exception as e:
             channel.send(json.dumps({"t": "exec-res", "id": rid, "ok": False, "code": -1, "out": str(e)}))
+
+    # ── HTTP tunnel RPC: proxy one request to a loopback port ───────────
+    # Lets Helpwo render a dev server running on this host inside its preview
+    # iframe (service worker → P2P → here → 127.0.0.1:<port>). Loopback-only
+    # by design: this must never become an open proxy into the host's network.
+    async def _serve_http(self, channel, msg: dict):
+        rid = msg.get("id")
+
+        def _head(ok, status=0, headers=None, error=None):
+            payload = {"t": "http-head", "id": rid, "ok": ok, "status": status,
+                       "headers": headers or {}}
+            if error:
+                payload["error"] = error
+            channel.send(json.dumps(payload))
+
+        try:
+            port = int(msg.get("port") or 0)
+            method = str(msg.get("method") or "GET").upper()
+            path = str(msg.get("path") or "/")
+            if not (1 <= port <= 65535):
+                _head(False, error="bad port")
+                return
+            if not path.startswith("/"):
+                path = "/" + path
+            req_headers = msg.get("headers") or {}
+            body_b64 = msg.get("body")
+
+            def _do_request():
+                import base64
+                import http.client
+                conn = http.client.HTTPConnection("127.0.0.1", port, timeout=20)
+                try:
+                    headers = {}
+                    for k, v in req_headers.items():
+                        # Hop-by-hop / auto-computed headers break the replayed request.
+                        if k.lower() in ("host", "connection", "content-length",
+                                         "accept-encoding", "transfer-encoding", "upgrade"):
+                            continue
+                        headers[str(k)] = str(v)
+                    headers["Host"] = f"127.0.0.1:{port}"
+                    headers["Accept-Encoding"] = "identity"
+                    body = base64.b64decode(body_b64) if body_b64 else None
+                    conn.request(method, path, body=body, headers=headers)
+                    resp = conn.getresponse()
+                    resp_headers = {}
+                    for k, v in resp.getheaders():
+                        if k.lower() in ("connection", "transfer-encoding", "keep-alive",
+                                         "content-length"):
+                            continue
+                        resp_headers[k] = v
+                    data = resp.read(_MAX_HTTP_BYTES + 1)
+                    return resp.status, resp_headers, data
+                finally:
+                    conn.close()
+
+            loop = asyncio.get_event_loop()
+            status, resp_headers, body = await asyncio.wait_for(
+                loop.run_in_executor(None, _do_request), timeout=25)
+            if len(body) > _MAX_HTTP_BYTES:
+                _head(False, error=f"response too large (>{_MAX_HTTP_BYTES} bytes)")
+                return
+            _head(True, status=status, headers=resp_headers)
+            for i in range(0, len(body), _CHUNK):
+                while channel.bufferedAmount > 1_000_000:
+                    await asyncio.sleep(0.02)
+                channel.send(body[i:i + _CHUNK])
+            channel.send(json.dumps({"t": "http-end", "id": rid}))
+        except asyncio.TimeoutError:
+            _head(False, error="request timed out")
+        except ConnectionRefusedError:
+            _head(False, error="connection refused (is the dev server running on that port?)")
+        except Exception as e:
+            try:
+                _head(False, error=str(e))
+            except Exception:
+                pass
 
     # ── File RPC: get (host → browser) ───────────────────────────────────
     async def _serve_get(self, channel, msg: dict):

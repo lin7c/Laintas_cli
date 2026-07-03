@@ -24,7 +24,7 @@ if [ "$INSTALL_MODE" = "linux" ]; then
 
     # Download tarball
     echo "  Downloading…"
-    curl -fsSL "$BASE_URL/releases/v1.4/laintas-cli_linux.tar.gz" -o "$TMP_DIR/laintas-cli_linux.tar.gz"
+    curl -fsSL "$BASE_URL/releases/v1.5/laintas-cli_linux.tar.gz" -o "$TMP_DIR/laintas-cli_linux.tar.gz"
 
     # Extract
     echo "  Extracting package…"
@@ -38,7 +38,7 @@ if [ "$INSTALL_MODE" = "linux" ]; then
 elif [ "$INSTALL_MODE" = "windows" ]; then
     echo "  Detected: Windows (Git Bash / MSYS2)"
     echo "  Downloading Windows executable…"
-    curl -fsSL "$BASE_URL/releases/v1.4/laintas_cli.exe" -o "$TMP_DIR/laintas_cli.exe"
+    curl -fsSL "$BASE_URL/releases/v1.5/laintas_cli.exe" -o "$TMP_DIR/laintas_cli.exe"
     echo "  Launching executable…"
     "$TMP_DIR/laintas_cli.exe"
 fi

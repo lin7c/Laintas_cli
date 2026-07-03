@@ -42,7 +42,7 @@ const PLATFORMS = [
   },
 ];
 
-const DOWNLOAD_BASE = '/releases/v1.4';
+const DOWNLOAD_BASE = '/releases/v1.5';
 
 function detectOS() {
   if (typeof navigator === 'undefined') return 'linux';
@@ -341,7 +341,7 @@ export default function DownloadSection() {
 }
 
 /* Curl download commands */
-const BASE_URL = 'https://cli.laintas.com/releases/v1.4';
+const BASE_URL = 'https://cli.laintas.com/releases/v1.5';
 
 function CurlCommands({ isDark, selectedOS }) {
   const [copied, setCopied] = useState(false);

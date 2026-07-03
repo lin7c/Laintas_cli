@@ -58,6 +58,27 @@ Run unit, integration, stale-revision, dependency, and recovery tests.
 
 
 class WorkGraphTests(unittest.TestCase):
+    def test_plan_submit_is_not_exposed_outside_plan_mode(self):
+        with tempfile.TemporaryDirectory() as tmp, _Chdir(tmp):
+            plan_mode.exit_plan_mode(approve=False)
+            allowed = agent_loop._allowed_tool_names_for_state({})
+            self.assertNotIn("plan.submit", allowed)
+            self.assertNotIn("plan.update", allowed)
+
+    def test_fresh_session_resets_persisted_plan_and_active_work(self):
+        with tempfile.TemporaryDirectory() as tmp, _Chdir(tmp), \
+                mock.patch.object(plan_mode, "PLANS_DIR", Path(tmp) / "plans"), \
+                mock.patch.object(
+                    plan_mode, "_STATE_PATH", Path(tmp) / "plans" / "_state.json"):
+            plan_mode._loaded_cwd = None
+            plan_mode.arm_plan_mode()
+            self.assertTrue(plan_mode.is_plan_mode())
+
+            laintas_cli._reset_fresh_session_context(tmp)
+
+            self.assertFalse(plan_mode.is_plan_mode())
+            self.assertIsNone(workgraph.get_active_work(cwd=tmp))
+
     def test_revision_sha_binding_and_step_projection(self):
         with tempfile.TemporaryDirectory() as tmp, _Chdir(tmp):
             work = workgraph.create_work("Build it")
@@ -126,6 +147,26 @@ class WorkGraphTests(unittest.TestCase):
                 self.assertTrue(plan_mode.is_tool_allowed("task.complete"))
                 self.assertFalse(plan_mode.is_tool_allowed("skill.load"))
                 self.assertFalse(plan_mode.is_tool_allowed("task.create"))
+
+    def test_new_session_detaches_tasks_without_reimporting_legacy_archive(self):
+        with tempfile.TemporaryDirectory() as tmp, _Chdir(tmp):
+            legacy = Path(tmp) / ".laintas" / "tasks.json"
+            legacy.parent.mkdir()
+            legacy.write_text(
+                '[{"id":"1","subject":"unfinished legacy task",'
+                '"status":"in_progress","blockedBy":[],"blocks":[],'
+                '"progress":20}]', encoding="utf-8")
+
+            self.assertEqual(len(task_manager.list_tasks(cwd=tmp)), 1)
+            original_work = workgraph.get_active_work(cwd=tmp)
+
+            task_manager.detach_active_tasks(cwd=tmp)
+
+            self.assertIsNone(workgraph.get_active_work(cwd=tmp))
+            self.assertEqual(task_manager.list_tasks(cwd=tmp), [])
+            self.assertEqual(len(workgraph.list_work(cwd=tmp)), 1)
+            self.assertIsNotNone(workgraph.get_work(
+                original_work["id"], cwd=tmp))
 
     def test_workflow_phase_uses_same_active_work(self):
         with tempfile.TemporaryDirectory() as tmp, _Chdir(tmp):

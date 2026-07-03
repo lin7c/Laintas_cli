@@ -38,6 +38,7 @@ import paths                 # Centralized path management
 import skills as skills_mod   # Progressive skill metadata + context loading
 import event_log              # Durable prompt admission + turn event log
 import trust_store            # workspace trust for executable project hooks
+import usage_tracker          # Local AI token/cost accounting
 try:
     import context_policy as ctxpol  # Vendored shared compaction policy (opencode-derived)
 except Exception:  # pragma: no cover — graceful if the vendored package is missing
@@ -2267,9 +2268,16 @@ def _compact_thread_messages(thread_messages: list, deps, session, lang: str, st
 
         # Recent tail to preserve verbatim (token-budgeted, from the end).
         keep_recent = ctxpol.keep_recent_tokens(usable)
+        tail_turns = max(1, int(ctxpol.load().get("tail_turns", 2) or 2))
         acc = 0
         protect_from = len(thread_messages)
+        recent_user_turns = 0
         for i in range(len(thread_messages) - 1, 0, -1):
+            if thread_messages[i].get("role") == "user":
+                recent_user_turns += 1
+                if recent_user_turns > tail_turns:
+                    protect_from = i + 1
+                    break
             acc += _thread_tokens([thread_messages[i]])
             protect_from = i
             if acc > keep_recent:
@@ -2292,10 +2300,12 @@ def _compact_thread_messages(thread_messages: list, deps, session, lang: str, st
         if not force and _thread_tokens(thread_messages) <= usable:
             return changed
 
-        # 2) Summarize the head. Start the tail on a clean boundary — never on a
-        #    bare role:tool (its assistant tool_call would be summarized away).
+        # 2) Summarize the head. Start the retained tail at a user-turn boundary;
+        #    this keeps an assistant/tool exchange paired with the user request
+        #    that caused it instead of retaining an orphan assistant message.
         tail_start = protect_from
-        while tail_start < len(thread_messages) and thread_messages[tail_start].get("role") == "tool":
+        while (tail_start < len(thread_messages)
+               and thread_messages[tail_start].get("role") != "user"):
             tail_start += 1
         if tail_start <= 1 or tail_start >= len(thread_messages):
             return changed
@@ -2314,6 +2324,87 @@ def _compact_thread_messages(thread_messages: list, deps, session, lang: str, st
         return True
     except Exception:
         return False
+
+
+def session_context_status(state: dict) -> dict:
+    """Return read-only token/budget information for `/compact status`."""
+    messages = (state or {}).get("_thread_messages") or []
+    if not isinstance(messages, list):
+        messages = []
+    window = int(get_runtime_config("model_context_window") or 64000)
+    max_out = int(get_runtime_config("max_tokens") or 8192)
+    usable = ctxpol.usable_tokens(window, max_out) if ctxpol is not None else 0
+    return {
+        "supported": ctxpol is not None,
+        "messages": len(messages),
+        "tokens": _thread_tokens(messages),
+        "window": window,
+        "usable": usable,
+        "summary": bool((state or {}).get("_thread_summary")),
+    }
+
+
+def compact_session_context(deps, session: dict, state: dict,
+                            chat_history: Optional[list] = None) -> dict:
+    """Safely force-compact the current session without touching work state.
+
+    Work happens on a copy and is committed only when something changed, so a
+    failed summarizer cannot corrupt the live transcript.
+    """
+    before = session_context_status(state)
+    if not before["supported"]:
+        return {**before, "ok": False, "changed": False,
+                "error": "context compaction policy is unavailable"}
+    if before["messages"] < 4:
+        return {**before, "ok": True, "changed": False,
+                "after_tokens": before["tokens"],
+                "reason": "not enough message history to compact"}
+
+    working = copy.deepcopy(state or {})
+    messages = working.get("_thread_messages") or []
+    if not isinstance(messages, list):
+        messages = []
+    old_summary = str(working.get("_thread_summary") or "")
+    lang_source = ""
+    for item in reversed(chat_history or []):
+        if isinstance(item, dict) and item.get("role") == "user":
+            lang_source = _stringify_message_content(item.get("content", ""))
+            break
+    changed = _compact_thread_messages(
+        messages, deps, session, _detect_lang(lang_source), working, force=True)
+    working["_thread_messages"] = messages
+    history = working.get("terminalHistory") or []
+    compacted_history = _microcompact_history(
+        history, keep_recent=int(get_runtime_config("microcompact_keep") or 8))
+    history_changed = compacted_history != history
+    working["terminalHistory"] = compacted_history
+    changed = changed or history_changed
+
+    user_turn_count = sum(
+        1 for item in messages
+        if isinstance(item, dict) and item.get("role") == "user")
+    tail_turns = max(1, int(ctxpol.load().get("tail_turns", 2) or 2))
+    if not changed and user_turn_count > tail_turns + 1:
+        return {
+            **before,
+            "ok": False,
+            "changed": False,
+            "error": "the context summarizer returned no usable summary",
+        }
+
+    if changed:
+        state.clear()
+        state.update(working)
+    after = session_context_status(working if changed else state)
+    return {
+        **before,
+        "ok": True,
+        "changed": changed,
+        "after_tokens": after["tokens"],
+        "after_messages": after["messages"],
+        "summary_created": str(working.get("_thread_summary") or "") != old_summary,
+        "reason": "" if changed else "recent context already fits the protected tail",
+    }
 
 
 def _compress_conversation(chat_history: list, max_messages: int = 20) -> list:
@@ -3629,6 +3720,10 @@ def _allowed_tool_names_for_state(state: dict) -> set[str]:
         names = {name for name in names if plan_mode.is_tool_allowed(name)}
     else:
         names = {name for name in names if mode_manager.is_tool_allowed(name)}
+        # Mutating/submitting a plan without an attached PLAN session can only
+        # fail and should not be offered to the provider. Read/list remain
+        # available for inspection from normal modes.
+        names -= {"plan.update", "plan.submit"}
     role_name = state.get("_role_name")
     names = {
         name for name in names
@@ -4131,11 +4226,9 @@ def run_agent_loop(
         # {{behaviorDiagnostics}} — empty placeholder (filled in user message)
         system_prompt = system_prompt.replace("{{behaviorDiagnostics}}", "")
 
-        # {{lastSession}} — snapshot from the previous session in this cwd
-        last_session_text = format_snapshot_for_prompt(
-            state.get("_last_session_snapshot")
-        ) if state.get("_last_session_snapshot") else ""
-        system_prompt = system_prompt.replace("{{lastSession}}", last_session_text)
+        # Previous-session context is restored only through explicit /resume.
+        # Keep the legacy template placeholder harmless for existing cli.prop files.
+        system_prompt = system_prompt.replace("{{lastSession}}", "")
 
         # Inject current date/time so the AI always knows when it is.
         system_prompt += f"\n\n[CURRENT DATE & TIME]\n{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} (local)"
@@ -4232,21 +4325,52 @@ def run_agent_loop(
                 from rich.console import Group
                 from rich.text import Text
 
+                # Create the Spinner ONCE — a fresh Spinner resets start_time
+                # on each draw, freezing the animation on frame 0.
+                _spinner = Spinner("dots", style="#7aa2f7")
+
+                def _fmt_tokens(n: int) -> str:
+                    if n >= 1_000_000:
+                        return f"{n / 1_000_000:.1f}M"
+                    if n >= 1_000:
+                        return f"{n / 1_000:.1f}k"
+                    return str(n)
+
+                # Current call's input estimate (computed once before streaming).
+                _cur_in_est = usage_tracker.estimate_tokens(
+                    (system_prompt or "") + (user_input or "")
+                    + json.dumps(history_for_backend or [], ensure_ascii=False))
+
                 def _render():
                     parts = []
+                    _elapsed = time.monotonic() - _thinking_t0
+                    # Output tokens grow in real-time from the streamed reply.
+                    _cur_out_est = usage_tracker.estimate_tokens(stream_state["reply"])
                     if stream_state["reply"]:
                         parts.append(deps.Markdown(stream_state["reply"]))
+                        _label = "streaming…"
                     else:
-                        _elapsed = time.monotonic() - _thinking_t0
-                        parts.append(Spinner("dots", text=Text(
-                            f"thinking… {_elapsed:.1f}s · {_spin_model} · {_spin_mode}",
-                            style="#7aa2f7")))
+                        _label = "thinking…"
+                    # Update the shared spinner's text (keeps animation
+                    # continuity — start_time is preserved).
+                    _spinner.text = Text(
+                        f"{_label} {_elapsed:.1f}s · ↑{_fmt_tokens(_cur_in_est)} ↓{_fmt_tokens(_cur_out_est)} · {_spin_model} · {_spin_mode}",
+                        style="#7aa2f7")
+                    parts.append(_spinner)
                     if stream_state["command"] and _detail:
                         cmd_preview = stream_state["command"]
                         if len(cmd_preview) > 120:
                             cmd_preview = cmd_preview[:117] + "..."
                         parts.append(Text(f"→ {cmd_preview}", style="#5a7bbf"))
                     return Group(*parts)
+
+                # Wrapper that re-computes _render() on every draw so the
+                # elapsed-time clock stays live between SSE chunks.  Without
+                # this, rich's _RefreshThread just re-paints the same stale
+                # Group (spinner dots animate but the clock freezes).
+                class _LiveWrapper:
+                    def __rich__(self):
+                        return _render()
 
                 _live_holder = {"live": None, "last": 0.0}
 
@@ -4262,15 +4386,8 @@ def run_agent_loop(
                     elif field == "command":
                         stream_state["command"] = value
                     stream_state["started"] = True
-                    _lv = _live_holder["live"]
-                    if _lv is not None:
-                        # Update the renderable but let rich's own refresh timer
-                        # (auto_refresh) paint it. Forcing refresh=True on every
-                        # chunk on top of the timer caused the reflowing Markdown to
-                        # flicker; leaving it to the throttled timer keeps the
-                        # spinner animating AND avoids the flicker.
-                        try: _lv.update(_render(), refresh=False)
-                        except Exception as _e: _diag("live_render_failed", error=str(_e))
+                    # No need to call live.update() — the _LiveWrapper
+                    # re-computes _render() on every auto-refresh tick.
 
                 def _do_stream_call():
                     try:
@@ -4298,13 +4415,13 @@ def run_agent_loop(
                         )
 
                 if _use_live:
-                    with Live(_render(), console=deps.console, refresh_per_second=12.5,
+                    with Live(_LiveWrapper(), console=deps.console, refresh_per_second=12.5,
                               auto_refresh=True, transient=not _detail) as live:
                         _live_holder["live"] = live
                         response = _do_stream_call()
-                        # Final flush: the last chunk(s) may have been throttled,
-                        # so render the complete reply before Live tears down.
-                        try: live.update(_render(), refresh=True)
+                        # Final flush: the _LiveWrapper already re-computes
+                        # _render() on every draw, so a plain refresh is enough.
+                        try: live.refresh()
                         except Exception: pass
                 else:
                     with deps.console.status(f"[#7aa2f7]thinking… · {_spin_model} · {_spin_mode}[/#7aa2f7]",
@@ -4476,10 +4593,11 @@ def run_agent_loop(
         if display_reply:
             if events_cb is not None and not _reply_already_rendered:
                 _stripped = display_reply.strip()
-                # Short, single-line replies render inline (dim, marker) instead
-                # of a full Markdown block — keeps the transcript tight when the
-                # AI just acknowledges or narrates briefly.
-                if "\n" not in _stripped and len(_stripped) <= 100:
+                # Keep the marker only for short intermediate narration before
+                # tool calls. A final one-line answer is ordinary user-facing
+                # output and must not be prefixed with a decorative dot.
+                if ("\n" not in _stripped and len(_stripped) <= 100
+                        and not _prose_final):
                     deps.console.print(f"[accent]·[/accent] [dim]{_stripped}[/dim]")
                 else:
                     deps.console.print(deps.Markdown(display_reply))

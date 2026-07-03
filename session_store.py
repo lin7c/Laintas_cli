@@ -142,10 +142,11 @@ def load_current_session(cwd: str) -> Optional[dict]:
     path = _current_path(cwd)
     try:
         if not path.exists():
-            data = _recover_latest_live(cwd)
-            if data is None:
-                return None
-            _record_error("Recovered current session from its live backup.")
+            # A missing current pointer is the durable signal that the prior
+            # session was intentionally closed. Recover live copies only when
+            # the pointer exists but is corrupt; otherwise an older orphan can
+            # resurrect after /q or /new.
+            return None
         else:
             data = json.loads(path.read_text(encoding="utf-8"))
         if data.get("cwd") != cwd or data.get("closed_at"):
@@ -159,8 +160,6 @@ def load_current_session(cwd: str) -> Optional[dict]:
         data.setdefault("pending_continuation", False)
         data.setdefault("last_exit_reason", "")
         data.setdefault("status", "idle")
-        if not path.exists():
-            _atomic_write_json(path, data)
         return data
     except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
         # Preserve the unreadable pointer for diagnosis, then fall back to the
