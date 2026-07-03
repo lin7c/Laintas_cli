@@ -255,6 +255,23 @@ def select_dialog(
     if not items:
         return None
 
+    # Clear stray typeahead and flush terminal input buffer so that keys
+    # left over from a previous prompt_toolkit session (e.g. the REPL
+    # PromptSession, or Enter pressed during the agent loop) don't get
+    # replayed here and auto-cancel the dialog before the user can react.
+    try:
+        from prompt_toolkit.input.typeahead import clear_typeahead
+        from prompt_toolkit.application.current import get_app_session
+        clear_typeahead(get_app_session().input)
+    except Exception:
+        pass
+    if not IS_WINDOWS:
+        try:
+            import termios as _termios
+            _termios.tcflush(sys.stdin.fileno(), _termios.TCIFLUSH)
+        except (OSError, ValueError, io.UnsupportedOperation):
+            pass
+
     # ── Normalise items into (label, desc) pairs ──────────────────
     norm: list[tuple[str, str]] = []
     for it in items:
@@ -352,6 +369,17 @@ def select_dialog(
         return lines
 
     # ── Key bindings ──────────────────────────────────────────────
+    # Second line of defense after the typeahead/tcflush purge above: bytes
+    # that land between the flush and prompt_toolkit's first read (a queued
+    # Enter from fast typing, mouse-report escape sequences) would otherwise
+    # confirm or cancel the dialog before it is even rendered. Confirm/cancel
+    # keys are ignored for a short window after open; navigation keys are
+    # harmless and stay live.
+    _opened_at = time.monotonic()
+
+    def _in_grace() -> bool:
+        return (time.monotonic() - _opened_at) < 0.25
+
     kb = KeyBindings()
 
     @kb.add("up")
@@ -394,6 +422,8 @@ def select_dialog(
 
     @kb.add("enter")
     def _(event):
+        if _in_grace():
+            return
         vis = _clamp_sel()
         if not vis:
             if act_keys:
@@ -415,6 +445,8 @@ def select_dialog(
 
         @kb.add(_key)
         def _ak(event, _a=_action):
+            if _in_grace():
+                return
             vis = _clamp_sel()
             if vis and 0 <= sel[0] < len(items):
                 event.app.exit(result=(_a, sel[0]))
@@ -435,6 +467,8 @@ def select_dialog(
             @kb.add(_letter)
             @kb.add(_letter.upper())
             def _lk(event, _l=_letter):
+                if _in_grace():
+                    return
                 for i, (lab, _desc) in enumerate(norm):
                     if lab.strip()[:1].lower() == _l:
                         sel[0] = i
@@ -445,6 +479,8 @@ def select_dialog(
     @kb.add("q")
     @kb.add("c-c")
     def _(event):
+        if _in_grace():
+            return
         if multi:
             event.app.exit(result=None)
         elif act_keys:
@@ -2615,8 +2651,8 @@ def fetch_available_models(session: dict) -> tuple[list[dict], str]:
     raise RuntimeError(last_error or "No model endpoint responded")
 
 
-def show_model_selector(models: list[dict], current: str = "") -> Optional[str]:
-    """Interactive model selector. Returns selected model id or None."""
+def show_model_selector(models: list[dict], current: str = "") -> Optional[dict]:
+    """Interactive model selector. Returns the complete model row or None."""
     if not models:
         return None
     labels = []
@@ -2637,7 +2673,7 @@ def show_model_selector(models: list[dict], current: str = "") -> Optional[str]:
     )
     if chosen is None:
         return None
-    return models[labels.index(chosen)].get("id")
+    return models[labels.index(chosen)]
 
 
 # ── Authentication ──────────────────────────────────────────────────────

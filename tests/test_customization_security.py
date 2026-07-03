@@ -104,6 +104,25 @@ class BackendProfileSecurityTests(unittest.TestCase):
         self.assertTrue(result["error"])
         self.assertIn("redirect refused", result["reply"].lower())
 
+    def test_chat_request_includes_selected_model_and_provider(self):
+        profile = backend_profiles.BackendProfile(
+            "custom", "custom", "https://ai.example.com")
+        redirect = mock.Mock(status_code=302, headers={})
+        with mock.patch.object(
+                laintas_cli, "get_backend_profile", return_value=profile), \
+                mock.patch.object(
+                    laintas_cli.requests, "post", return_value=redirect) as post, \
+                mock.patch.object(
+                    laintas_cli, "get_selected_model", return_value="model-x"), \
+                mock.patch.object(
+                    laintas_cli, "get_selected_provider", return_value="provider-a"):
+            laintas_cli.call_backend_stream(
+                {}, "hello", "system", "/tmp", tools_enabled=False)
+
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual(payload["model"], "model-x")
+        self.assertEqual(payload["provider"], "provider-a")
+
 
 class WorkspaceTrustTests(unittest.TestCase):
     def test_generated_project_defaults_are_allowed_but_edits_are_restricted(self):

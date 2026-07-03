@@ -103,7 +103,7 @@ _DEFAULT_CONFIG = {
     "browser_auto_snapshot": True,     # return page snapshot after state-changing browser actions
     "detail": False,                   # False = simplified progress rendering; True = full per-line detail (/detail on|off)
     "deny_exits_loop": True,           # True = terminate the agent loop the moment the user denies an approval prompt; False = old behavior (feed denial back as a tool error and keep looping)
-    "enable_mouse": True,              # REPL input box: click-to-position the cursor (Shift+drag still selects text natively in most terminals)
+    "enable_mouse": False,             # REPL input box: click-to-position the cursor. Off by default: terminal mouse reporting hijacks native drag-to-select of scrollback (Shift+drag is the only workaround), which costs more than click-to-position gains
 }
 
 # ── Typed Error Classes ───────────────────────────────────────────────

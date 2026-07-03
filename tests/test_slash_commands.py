@@ -106,6 +106,47 @@ class SlashRegistryTests(unittest.TestCase):
             self.assertIn("Switched to STRICT mode", text)
             self.assertEqual(mode_manager.get_active_mode()["name"], "act")
 
+    def test_model_selector_preserves_provider_metadata(self):
+        models = [
+            {"id": "model-a", "provider": "provider-a"},
+            {"id": "model-b", "provider": "provider-b"},
+        ]
+
+        def choose_second(items, **_kwargs):
+            return items[1]
+
+        with mock.patch.object(
+                laintas_cli, "select_dialog", side_effect=choose_second):
+            selected = laintas_cli.show_model_selector(models, "model-a")
+        self.assertEqual(selected, models[1])
+
+    def test_model_command_persists_selected_provider(self):
+        models = [{
+            "id": "model-x", "name": "Model X",
+            "provider": "provider-a", "description": "Provider A",
+        }]
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(
+                    laintas_cli, "CONFIG_FILE", Path(tmp) / "config.json"), \
+                mock.patch.object(
+                    laintas_cli, "fetch_available_models",
+                    return_value=(models, "/api/models")), \
+                mock.patch.object(
+                    laintas_cli, "show_model_selector", return_value=models[0]), \
+                mock.patch.object(
+                    laintas_cli.sys.stdin, "isatty", return_value=True):
+            output = io.StringIO()
+            old_console = laintas_cli.console
+            laintas_cli.console = Console(file=output, force_terminal=False)
+            try:
+                self.assertFalse(laintas_cli.handle_meta_command(
+                    "/model", _Registry(), {}))
+            finally:
+                laintas_cli.console = old_console
+            self.assertEqual(laintas_cli.get_selected_model(), "model-x")
+            self.assertEqual(
+                laintas_cli.get_selected_provider(), "provider-a")
+
     def test_dangerous_commands_reject_extra_args(self):
         output = io.StringIO()
         old_console = laintas_cli.console
