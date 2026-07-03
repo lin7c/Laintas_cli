@@ -10,6 +10,7 @@ Usage:
     laintas-cli --backend URL      # Custom backend URL
 """
 
+import io
 import os
 import re
 import sys
@@ -287,11 +288,12 @@ def select_dialog(
 
     def _visible():
         """Return (list_of_(orig_idx, label, desc)) after filtering."""
+        unfiltered = [(oi, lab, desc) for oi, (lab, desc) in enumerate(norm)]
         if not filter_buf:
-            return list(enumerate(norm))
+            return unfiltered
         f = filter_buf.text.strip().lower()
         if not f:
-            return list(enumerate(norm))
+            return unfiltered
         out = []
         for oi, (lab, _desc) in enumerate(norm):
             plain = re.sub(r"\[/?[^\]]+\]", "", lab).lower()
