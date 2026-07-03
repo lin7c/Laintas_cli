@@ -37,6 +37,7 @@ _lock = threading.RLock()
 # Current plan state (in-memory, synced to disk)
 _current_plan: Optional[dict] = None
 _plan_mode: bool = False
+_pending_task: bool = False
 _loaded_cwd: Optional[str] = None
 
 
@@ -103,11 +104,16 @@ def _save_state(state: dict) -> bool:
 
 def _restore_state() -> None:
     """Restore an active plan for this project after a process restart."""
-    global _plan_mode, _current_plan, _loaded_cwd
+    global _plan_mode, _current_plan, _pending_task, _loaded_cwd
     _loaded_cwd = str(Path.cwd().resolve())
     _plan_mode = False
+    _pending_task = False
     _current_plan = None
     state = _load_state()
+    if state.get("plan_mode") and state.get("pending_task"):
+        _plan_mode = True
+        _pending_task = True
+        return
     plan = state.get("current_plan")
     if not state.get("plan_mode") or not isinstance(plan, dict):
         return
@@ -158,6 +164,25 @@ def is_plan_mode() -> bool:
     return _plan_mode
 
 
+def is_pending_task() -> bool:
+    """Return True when PLAN is armed and waiting for the next user message."""
+    _ensure_project_state()
+    return _plan_mode and _pending_task and _current_plan is None
+
+
+def arm_plan_mode() -> None:
+    """Enter PLAN without creating a plan until the next task is provided."""
+    global _plan_mode, _pending_task, _current_plan
+    with _lock:
+        _ensure_project_state()
+        _plan_mode = True
+        _pending_task = True
+        _current_plan = None
+        _save_state({
+            "plan_mode": True, "pending_task": True, "current_plan": None,
+        })
+
+
 _PLAN_ALLOWED_TOOLS = {
     "fs.read", "fs.ls", "fs.grep", "fs.glob",
     "web.search", "web.fetch", "time.now",
@@ -182,7 +207,7 @@ def enter_plan_mode(task: str) -> dict:
     Creates a new plan file and sets plan mode active.
     Returns the plan metadata.
     """
-    global _plan_mode, _current_plan
+    global _plan_mode, _current_plan, _pending_task
     with _lock:
         _ensure_project_state()
         ensure_plans_dir()
@@ -226,6 +251,7 @@ def enter_plan_mode(task: str) -> dict:
 
         _current_plan = plan
         _plan_mode = True
+        _pending_task = False
         _save_state({"plan_mode": True, "current_plan": plan})
 
         return dict(plan)
@@ -236,7 +262,7 @@ def exit_plan_mode(approve: bool = False) -> Optional[dict]:
 
     Returns the final plan or None.
     """
-    global _plan_mode, _current_plan
+    global _plan_mode, _current_plan, _pending_task
     with _lock:
         _ensure_project_state()
         plan = dict(_current_plan) if _current_plan else None
@@ -267,6 +293,7 @@ def exit_plan_mode(approve: bool = False) -> Optional[dict]:
                 pass
 
         _plan_mode = False
+        _pending_task = False
         _current_plan = None
         _save_state({"plan_mode": False, "current_plan": None})
 
@@ -356,7 +383,7 @@ def submit_current_plan() -> Optional[dict]:
 
 def approve_submitted_plan(revision: int, content_sha: str) -> Optional[dict]:
     """Approve exactly the revision shown in the confirmation UI."""
-    global _plan_mode, _current_plan
+    global _plan_mode, _current_plan, _pending_task
     with _lock:
         _ensure_project_state()
         if not _current_plan or not _current_plan.get("work_id"):
@@ -375,6 +402,7 @@ def approve_submitted_plan(revision: int, content_sha: str) -> Optional[dict]:
         })
         _write_projection_status(plan, approved=True)
         _plan_mode = False
+        _pending_task = False
         _current_plan = None
         _save_state({"plan_mode": False, "current_plan": None})
         return plan
@@ -425,7 +453,7 @@ def get_review_snapshot() -> Optional[dict]:
 
 def attach_work(work_id: str) -> Optional[dict]:
     """Attach an existing draft/review WorkGraph to Plan Mode."""
-    global _plan_mode, _current_plan, _loaded_cwd
+    global _plan_mode, _current_plan, _pending_task, _loaded_cwd
     with _lock:
         work = workgraph.get_work(work_id)
         if not work:
@@ -453,6 +481,7 @@ def attach_work(work_id: str) -> Optional[dict]:
             "content_sha": revision["content_sha"],
         }
         _plan_mode = work["status"] in {"DRAFT", "REVIEW_PENDING", "NEEDS_USER", "BLOCKED"}
+        _pending_task = False
         _loaded_cwd = str(Path.cwd().resolve())
         workgraph.set_active_work(work_id)
         _save_state({"plan_mode": _plan_mode, "current_plan": _current_plan if _plan_mode else None})
@@ -521,7 +550,12 @@ def get_plan_prompt() -> str:
     """Return the plan mode instructions for the AI system prompt."""
     plan = get_current_plan()
     if not plan:
-        return ""
+        return (
+            "[PLAN MODE ACTIVE]\n"
+            "Plan mode is waiting for the user to provide the task. Do not take "
+            "implementation actions until a task has been bound."
+            if is_pending_task() else ""
+        )
 
     plan_content = read_plan() or ""
     return f"""[PLAN MODE ACTIVE]

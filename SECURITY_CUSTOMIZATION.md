@@ -6,6 +6,7 @@
 | --- | --- | --- | --- |
 | Backend profile | URL and separate auth reference | Network/data disclosure | Use official, self-hosted, or local model gateways |
 | `cli.prop` | Prompt text | Prompt injection, no direct code execution | Project-specific agent behavior |
+| `modes.json` | Prompt text and tool allowlist | Prompt injection, no direct code execution | Switchable project behavior modes |
 | Project memory | JSON/Markdown data | Prompt/data poisoning | Persistent project context |
 | `commands.py`, `loop.py` | Python | Full local-user code execution | Project commands and loop interception |
 | Skill | Python, manifest, references | Full local-user code execution | Reusable tools and instructions |
@@ -17,6 +18,11 @@ hash-approved so that cloning a repository or editing an approved file cannot
 silently introduce code execution. This is intentionally more usable than a
 global on/off switch: approvals are scoped to a project or extension and are
 invalidated only when executable content changes.
+
+Custom mode tool lists are restrictive only: they are intersected with Plan
+Mode, workflow, role and global policy decisions and cannot grant a capability
+that another layer denies. The built-in `/policy` setting remains independent
+from agent behavior modes.
 
 ## Trust domains
 

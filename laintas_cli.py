@@ -531,6 +531,7 @@ import hooks as hooks_mod        # trusted Python hooks + argv hooks
 import backend_profiles          # backend trust domains + credential isolation
 import trust_store               # workspace trust for executable customization
 import usage_tracker             # local AI token/cost accounting (/usage)
+import mode_manager              # declarative user-selectable agent modes
 
 # MCP client: lazy import (saves ~1.8s on startup)
 _mcp_mod = None
@@ -1806,7 +1807,7 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec("/tell", "Send a message to an agent", "Agents & Terminals", "/tell <agent-id> <message|json>"),
     CommandSpec("/abort", "Abort an agent", "Agents & Terminals", "/abort <agent-id>"),
     CommandSpec("/hwo", "Open or run an orchestration workflow", "Planning & Tasks", "/hwo [file|run <file>|compile <file>]", subcommands=("run", "compile")),
-    CommandSpec("/mode", "Show or switch plan/act mode", "Planning & Tasks", "/mode [plan <task>|act|approve]", subcommands=("plan", "act", "approve")),
+    CommandSpec("/mode", "Show, switch, or create agent modes", "Planning & Tasks", "/mode [act|plan [task]|review|list|create|delete]", subcommands=("act", "plan", "review", "list", "create", "delete")),
     CommandSpec("/plan", "Create, revise, review, or approve versioned plans", "Planning & Tasks", "/plan {enter|submit|revise|approve|exit|status|list}", subcommands=("enter", "submit", "revise", "approve", "exit", "status", "list")),
     CommandSpec("/prompt", "Open Prompt Lab or manage tested prompt overlays", "Planning & Tasks", "/prompt [issue|subcommand]", subcommands=("status", "branches", "open", "chat", "review", "test", "activate", "disable", "patches", "profiles", "profile", "use", "rollback", "feedback", "fail", "optimize", "apply", "discard", "list", "skill", "export", "install", "publish")),
     CommandSpec("/evolve", "Create, improve, test, and hot-load project extensions", "Planning & Tasks", "/evolve [idea|subcommand]", subcommands=("status", "branches", "open", "chat", "review", "test", "activate", "disable", "candidates", "profiles", "profile", "use", "rollback", "list", "help")),
@@ -2222,7 +2223,9 @@ def _render_rprompt():
         _is_plan = _pm.is_plan_mode()
     except Exception:
         _is_plan = False
-    _mode_label = "PLAN" if _is_plan else "ACT"
+    _mode_label = (
+        "PLAN" if _is_plan else mode_manager.get_active_mode()["name"].upper()
+    )
     _mode_cls = "rprompt-mode-plan" if _is_plan else "rprompt-mode-act"
     _model = _status_cache.get("model", "") or "default"
     return [
@@ -6391,6 +6394,12 @@ def _render_prop_effective(prop: str, redact: bool = True,
     effective = prop
     for name, value in values.items():
         effective = effective.replace("{{" + name + "}}", str(value or ""))
+    custom_mode_section = (
+        "" if plan_mode.is_plan_mode()
+        else mode_manager.render_prompt_section()
+    )
+    if custom_mode_section:
+        effective = effective.rstrip() + "\n\n" + custom_mode_section
     if values["promptOpt"] and "{{promptOpt}}" not in prop:
         effective = effective.rstrip() + "\n\n" + values["promptOpt"]
     return _redact_sensitive_text(effective) if redact else effective
@@ -7285,41 +7294,35 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
 
     elif action == "/mode":
         import plan_mode as _pm_mode
-        import policy as _pol_mode
+        from rich.markup import escape as _escape
         sub = parts[1].lower() if len(parts) > 1 else ""
         _, mode_args_raw = _raw_tail_after_word(raw_args)
 
         # Gather current state
         _in_plan = _pm_mode.is_plan_mode()
         _cur_plan = _pm_mode.get_current_plan()
-        _pol_cfg = _pol_mode.get_config()
-        _pol_mode_val = _pol_cfg.get("mode", "audit")
 
         if sub == "plan":
             task = _decode_text_arg(mode_args_raw)
             if not task:
-                if not sys.stdin.isatty():
-                    console.print("[yellow]Usage: /mode plan <task description>[/yellow]")
+                if _in_plan:
+                    console.print("[dim]Already in PLAN mode.[/dim]")
                     return False
-                _reader_was_running = bool(
-                    _bg_reader_thread is not None and _bg_reader_thread.is_alive())
-                _stop_bg_input_reader()
-                try:
-                    try:
-                        task = input("Describe the task to plan: ").strip()
-                    except (EOFError, KeyboardInterrupt):
-                        task = ""
-                finally:
-                    if _reader_was_running:
-                        _start_bg_input_reader(get_user_message_queue())
-            if not task:
-                console.print("[dim]Cancelled.[/dim]")
+                mode_manager.activate("act")
+                _pm_mode.arm_plan_mode()
+                console.print(Panel(
+                    "[bold]PLAN mode[/bold]\n\n"
+                    "Describe the task in your next message. The agent will plan "
+                    "without modifying files or the system.",
+                    title="Mode changed", border_style="green",
+                ))
                 return False
             if _in_plan:
                 console.print(
                     "[yellow]A plan is already active. Use /plan status, "
                     "/plan approve, or /plan exit before starting another.[/yellow]")
                 return False
+            mode_manager.activate("act")
             plan = _pm_mode.enter_plan_mode(task)
             _enqueue_user_input(task)
             console.print(Panel(
@@ -7327,20 +7330,24 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
                 f"Task: {task}\n"
                 f"Plan file: {plan['file']}\n\n"
                 f"[dim]The AI will explore and design — no code will be executed.[/dim]\n"
-                f"[dim]When ready: [bold]/mode approve[/bold] or [bold]/plan approve[/bold][/dim]",
+                f"[dim]When ready, the review menu will offer execute, revise, or exit.[/dim]",
                 title="Plan Mode", border_style="green",
             ))
 
         elif sub == "act":
             if _in_plan:
                 _pm_mode.exit_plan_mode(approve=False)
-                console.print("[green]Switched to ACT mode[/green] [dim](plan saved, not executed)[/dim]")
-            else:
-                console.print("[dim]Already in ACT mode.[/dim]")
+            ok, msg = mode_manager.activate("act")
+            console.print(
+                f"[{'green' if ok else 'red'}]{_escape(msg)}"
+                f"[/{'green' if ok else 'red'}]"
+                + (" [dim](draft plan saved)[/dim]" if _cur_plan else ""))
 
         elif sub == "approve":
+            # Backward compatibility. Approval is a plan action, not a mode.
+            console.print("[yellow]/mode approve is deprecated; use /plan approve.[/yellow]")
             if not _in_plan or not _cur_plan:
-                console.print("[yellow]No active plan to approve. Use /mode plan <task> first.[/yellow]")
+                console.print("[yellow]No active plan to approve.[/yellow]")
             else:
                 approved = _review_and_approve_current_plan()
                 queued = False
@@ -7361,22 +7368,68 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
                     title="Plan Approved", border_style="green",
                 ))
 
+        elif sub == "list":
+            active_name = "plan" if _in_plan else mode_manager.get_active_mode()["name"]
+            console.print("[bold]Agent modes[/bold]")
+            console.print(
+                f"{'[green]*[/green]' if active_name == 'plan' else ' '} "
+                "[cyan]plan[/cyan] [dim]Reviewed, read-only planning[/dim]")
+            for item in mode_manager.list_modes():
+                marker = "[green]*[/green]" if item["name"] == active_name else " "
+                source = "built-in" if item["builtin"] else "custom"
+                console.print(
+                    f"{marker} [cyan]{item['name']}[/cyan] "
+                    f"[dim]{item['description']} · {source}[/dim]")
+
+        elif sub == "create":
+            if len(parts) < 4:
+                console.print(
+                    "[yellow]Usage: /mode create <name> [--read-only] "
+                    "<instructions>[/yellow]")
+            else:
+                name = parts[2]
+                read_only = "--read-only" in parts[3:]
+                instructions = " ".join(
+                    item for item in parts[3:] if item != "--read-only")
+                ok, msg = mode_manager.create_mode(
+                    name, instructions, read_only=read_only)
+                console.print(
+                    f"[{'green' if ok else 'red'}]{_escape(msg)}"
+                    f"[/{'green' if ok else 'red'}]")
+
+        elif sub == "delete":
+            if len(parts) != 3:
+                console.print("[yellow]Usage: /mode delete <name>[/yellow]")
+            else:
+                ok, msg = mode_manager.delete_mode(parts[2])
+                console.print(
+                    f"[{'green' if ok else 'red'}]{_escape(msg)}"
+                    f"[/{'green' if ok else 'red'}]")
+
+        elif sub:
+            if mode_manager.get_mode(sub) is None:
+                ok, msg = False, f"Unknown mode: {sub}"
+            else:
+                if _in_plan:
+                    _pm_mode.exit_plan_mode(approve=False)
+                ok, msg = mode_manager.activate(sub)
+            console.print(
+                f"[{'green' if ok else 'red'}]{_escape(msg)}"
+                f"[/{'green' if ok else 'red'}]")
+
         else:
-            # Show current mode
-            _mode_label = "[green]PLAN[/green]" if _in_plan else "[accent]ACT[/accent]"
+            active = mode_manager.get_active_mode()
+            _mode_name = "PLAN" if _in_plan else active["name"].upper()
+            _mode_desc = (
+                "Waiting for a task" if _pm_mode.is_pending_task() else
+                (_cur_plan.get("task", "") if _cur_plan else active["description"])
+            )
             console.print(Panel(
-                f"Agent mode:     {_mode_label}\n"
-                + (f"Current plan:   [dim]{_cur_plan['task'][:80]}[/dim]\n" if _cur_plan else "")
-                + f"Policy mode:    [accent]{_pol_mode_val}[/accent]\n"
-                + f"Auto-approve:   "
-                f"[{'green' if _session_approval_state['all_commands'] else 'dim'}]"
-                f"commands={'on' if _session_approval_state['all_commands'] else 'off'}"
-                f"[/{'green' if _session_approval_state['all_commands'] else 'dim'}]  "
-                f"[{'green' if _session_approval_state['all_writes'] else 'dim'}]"
-                f"writes={'on' if _session_approval_state['all_writes'] else 'off'}"
-                f"[/{'green' if _session_approval_state['all_writes'] else 'dim'}]\n\n"
-                f"[dim]Switch with:[/dim]  [bold]/mode plan <task>[/bold]  [bold]/mode act[/bold]  [bold]/mode approve[/bold]\n"
-                f"[dim]Policy:[/dim]       [bold]/policy audit|enforce|disabled[/bold]",
+                f"Mode: [accent]{_mode_name}[/accent]\n"
+                f"[dim]{_escape(_mode_desc[:120])}[/dim]\n\n"
+                "[bold]/mode act[/bold] · [bold]/mode plan[/bold] · "
+                "[bold]/mode review[/bold] · [bold]/mode list[/bold]\n"
+                "[dim]Security policy is managed separately with /policy.[/dim]",
                 title="Current Mode", border_style="cyan",
             ))
 
@@ -7604,6 +7657,7 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
                     "[yellow]A plan is already active. Approve or exit it before "
                     "starting another.[/yellow]")
                 return False
+            mode_manager.activate("act")
             plan = _pm.enter_plan_mode(task)
             _enqueue_user_input(task)
             console.print(Panel(
@@ -10059,22 +10113,25 @@ def show_banner(agent_name: str, session: dict = None):
     _backend_profile = get_backend_profile()
     rows.append(("backend", f"{_backend_profile.base_url} [{_backend_profile.kind}; {_backend_profile.billing_label}]"))
 
-    # ── Status row: policy mode + plan mode + open tasks ──
-    status_parts = []
+    # Agent behavior and security policy are separate concepts.
+    try:
+        import plan_mode as _pm
+        agent_mode = (
+            "plan" if _pm.is_plan_mode()
+            else mode_manager.get_active_mode()["name"]
+        )
+        rows.append(("mode", agent_mode))
+    except Exception:
+        pass
     try:
         import policy as _pol
         _mode = _pol.get_config().get("mode", "audit")
         _mode_style = {"audit": "cyan", "enforce": "yellow",
                        "disabled": "red"}.get(_mode, "cyan")
-        status_parts.append(f"policy: [{_mode_style}]{_mode}[/{_mode_style}]")
+        rows.append(("policy", f"[{_mode_style}]{_mode}[/{_mode_style}]"))
     except Exception:
         pass
-    try:
-        import plan_mode as _pm
-        if _pm.is_plan_mode():
-            status_parts.append("[green]PLAN MODE[/green]")
-    except Exception:
-        pass
+    status_parts = []
     try:
         _open = [t for t in task_manager.list_tasks(cwd=os.getcwd())
                  if t.get("status") in ("pending", "in_progress")]
@@ -10521,6 +10578,7 @@ def _maybe_offer_plan_mode(user_input: str) -> bool:
         _start_bg_input_reader(get_user_message_queue())
 
     if choice in ("p", "plan"):
+        mode_manager.activate("act")
         plan = _pm.enter_plan_mode(user_input)
         console.print(f"[green]Entered plan mode.[/green] [dim](plan file: {plan['file']})[/dim]")
         return True
@@ -11363,6 +11421,12 @@ def main():
         # Add to chat history
         chat_history.append({"role": "user", "content": user_input})
         _system_input = is_system_command(user_input)
+        if not _system_input:
+            import plan_mode as _pending_pm
+            if _pending_pm.is_pending_task():
+                _pending_pm.enter_plan_mode(user_input)
+                console.print(
+                    "[green]PLAN task set from this message.[/green]")
 
         # Persist the admitted prompt before provider/tool execution so a
         # crash cannot leave the live session one user turn behind.

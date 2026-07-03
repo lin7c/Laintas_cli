@@ -193,6 +193,9 @@ cycle detection, normalized progress/status, and an append-only event history.
 | `/memory` | View `.helpwo` contents |
 | `/prop` | View `.cli.prop` template |
 | `/prompt [issue]` | Capture a behavior incident and open Prompt Lab |
+| `/mode [act|plan|review|list]` | View or switch agent behavior mode |
+| `/mode create <name> [--read-only] <instructions>` | Create a declarative project mode |
+| `/mode delete <name>` | Delete a custom project mode |
 | `/work [status|list|resume|history]` | Inspect unified work state |
 | `/plan enter|submit|revise|approve` | Manage versioned, reviewed plans |
 | `/task` | View or update the active WorkGraph steps |
@@ -211,6 +214,7 @@ cycle detection, normalized progress/status, and an append-only event history.
 
 | File | Location | Purpose |
 |---|---|---|
+| `modes.json` | `<project>/.laintas/` | Active mode and declarative custom modes |
 | `~/.laintas_cli_session.json` | Home directory | Cached auth session (chmod 600) |
 | `~/.laintas_cli_config.json` | Home directory | CLI config (agent name, preferences) |
 | `~/.laintas_cli_history` | Home directory | prompt_toolkit command history |

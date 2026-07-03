@@ -25,6 +25,7 @@ import policy as policy_mod  # Security policy engine
 import memory_system         # Cross-session persistent memory
 import hooks as hooks_mod    # Extensible hook system
 import plan_mode             # Structured planning before execution
+import mode_manager          # Declarative user-selectable agent modes
 import prompt_lab            # Project-scoped, tested prompt overlays
 import evolution_lab         # Project-scoped feature/extension evolution
 import extension_runtime     # Hot-loaded project extensions
@@ -241,6 +242,12 @@ def _live_status_model() -> str:
         return laintas_cli._status_cache.get("model", "") or ""
     except Exception:
         return ""
+
+
+def _active_mode_label() -> str:
+    if plan_mode.is_plan_mode():
+        return "PLAN"
+    return mode_manager.get_active_mode()["name"].upper()
 
 
 _runtime_config: dict[str, object] = {}
@@ -3495,9 +3502,13 @@ def _render_tool_catalog_enhanced(state: dict, loop: int, depth: int = 0) -> str
     """
     role_name = state.get("_role_name")
     wf_active = workflow_engine.get_active_workflow() is not None
+    mode_allowed = (
+        None if plan_mode.is_plan_mode()
+        else mode_manager.get_active_mode().get("allowed_tools")
+    )
 
     # If neither workflow nor role is active, use the standard catalog
-    if not wf_active and not role_name:
+    if not wf_active and not role_name and mode_allowed is None:
         base = _render_tool_catalog(state, loop)
         # Append role catalog for sub-agents
         if depth > 0:
@@ -3516,6 +3527,9 @@ def _render_tool_catalog_enhanced(state: dict, loop: int, depth: int = 0) -> str
         current_phase = workflow_engine.get_active_workflow().current
         if current_phase and current_phase.allowed_tools:
             allowed = set(current_phase.allowed_tools)
+    if mode_allowed is not None:
+        mode_tools = set(mode_allowed)
+        allowed = mode_tools if allowed is None else allowed & mode_tools
     if role_name:
         role = agent_roles.get_role(role_name)
         if role and role.allowed_tools:
@@ -4035,6 +4049,12 @@ def run_agent_loop(
             .replace("{{deploymentStatus}}", deployment_status_str) \
             .replace("{{tools}}", _render_tool_catalog_enhanced(state, loop, depth)) \
             .replace("{{skills}}", skill_catalog)
+        mode_section = (
+            "" if plan_mode.is_plan_mode()
+            else mode_manager.render_prompt_section()
+        )
+        if mode_section:
+            system_prompt = system_prompt.rstrip() + "\n\n" + mode_section
         if _prompt_lab_section and not _prompt_lab_has_slot:
             system_prompt = system_prompt.rstrip() + "\n\n" + _prompt_lab_section
         system_prompt = (
@@ -4171,7 +4191,7 @@ def run_agent_loop(
             _use_live = not sys.platform.startswith("win")
             # Capture model/mode labels once for the spinner text
             _spin_model = _live_status_model() or "default"
-            _spin_mode = "PLAN" if plan_mode.is_plan_mode() else "ACT"
+            _spin_mode = _active_mode_label()
             try:
                 from rich.live import Live
                 from rich.spinner import Spinner
@@ -4606,6 +4626,27 @@ def run_agent_loop(
                             f"BLOCKED: tool '{name}' is not allowed in Plan Mode. "
                             "Use read-only exploration or plan.update, then obtain "
                             "user approval before implementation."
+                        ),
+                        "tool": name, "returncode": -1,
+                    }
+                    formatted_outputs.append(
+                        _format_tool_result_for_loop(
+                            name, result,
+                            int(get_runtime_config("output_truncate") or 3000)))
+                    per_call_rows.append({
+                        "command": salient, "output": result.get("error", ""),
+                        "returncode": -1, "tool": name, "call_id": call_id,
+                    })
+                    continue
+                if (not _prompt_lab_worker and not _evolution_lab_worker
+                        and not plan_mode.is_plan_mode()
+                        and not mode_manager.is_tool_allowed(name)):
+                    _active_mode_name = mode_manager.get_active_mode()["name"]
+                    result = {
+                        "ok": False,
+                        "error": (
+                            f"BLOCKED: tool '{name}' is not allowed in "
+                            f"{_active_mode_name.upper()} mode."
                         ),
                         "tool": name, "returncode": -1,
                     }

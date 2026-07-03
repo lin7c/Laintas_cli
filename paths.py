@@ -32,6 +32,7 @@ Layout:
 
     <cwd>/.laintas/                      # Per-project configuration
     ├── cli.prop                         # AI system prompt template
+    ├── modes.json                       # Declarative custom agent modes
     ├── memory.json                      # Project-scoped structured memory
     ├── commands.py                      # User-defined custom slash commands
     └── loop.py                          # User-defined loop command interceptor

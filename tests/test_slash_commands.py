@@ -11,6 +11,7 @@ from rich.console import Console
 
 import agent_loop
 import laintas_cli
+import mode_manager
 import plan_mode
 import prompt_opt
 import task_manager
@@ -83,6 +84,27 @@ class SlashRegistryTests(unittest.TestCase):
             laintas_cli.console = old_console
         self.assertFalse(should_exit)
         self.assertIn("RuntimeError: boom", output.getvalue())
+
+    def test_mode_commands_create_switch_and_list(self):
+        with tempfile.TemporaryDirectory() as tmp, _chdir(tmp):
+            output = io.StringIO()
+            old_console = laintas_cli.console
+            laintas_cli.console = Console(file=output, force_terminal=False)
+            try:
+                commands = (
+                    '/mode create strict --read-only "Only report confirmed defects"',
+                    "/mode strict", "/mode list", "/mode act",
+                )
+                for command in commands:
+                    self.assertFalse(laintas_cli.handle_meta_command(
+                        command, _Registry(), {}))
+            finally:
+                laintas_cli.console = old_console
+            text = output.getvalue()
+            self.assertNotIn("failed:", text)
+            self.assertIn("Created mode strict", text)
+            self.assertIn("Switched to STRICT mode", text)
+            self.assertEqual(mode_manager.get_active_mode()["name"], "act")
 
     def test_dangerous_commands_reject_extra_args(self):
         output = io.StringIO()
@@ -423,6 +445,48 @@ class PromptOptimizationTests(unittest.TestCase):
 
 
 class PlanAndWorkflowTests(unittest.TestCase):
+    def test_custom_agent_mode_persists_and_restricts_tools(self):
+        with tempfile.TemporaryDirectory() as tmp, _chdir(tmp):
+            ok, _ = mode_manager.create_mode(
+                "audit-review", "Find concrete defects.", read_only=True)
+            self.assertTrue(ok)
+            self.assertTrue(mode_manager.activate("audit-review")[0])
+            self.assertEqual(
+                mode_manager.get_active_mode()["name"], "audit-review")
+            self.assertTrue(mode_manager.is_tool_allowed("fs.read"))
+            self.assertFalse(mode_manager.is_tool_allowed("fs.write"))
+            self.assertIn("Find concrete defects", mode_manager.render_prompt_section())
+            self.assertTrue(mode_manager.delete_mode("audit-review")[0])
+            self.assertEqual(mode_manager.get_active_mode()["name"], "act")
+
+    def test_builtin_review_mode_is_read_only(self):
+        with tempfile.TemporaryDirectory() as tmp, _chdir(tmp):
+            self.assertTrue(mode_manager.activate("review")[0])
+            self.assertTrue(mode_manager.is_tool_allowed("fs.grep"))
+            self.assertFalse(mode_manager.is_tool_allowed("shell.exec"))
+            self.assertFalse(mode_manager.delete_mode("review")[0])
+
+    def test_plan_can_wait_for_next_task_message(self):
+        with tempfile.TemporaryDirectory() as tmp, _chdir(tmp):
+            root = Path(tmp)
+            with mock.patch.object(plan_mode, "PLANS_DIR", root / "plans"), \
+                    mock.patch.object(plan_mode, "_STATE_PATH", root / "plans/_state.json"):
+                plan_mode._loaded_cwd = None
+                plan_mode._current_plan = None
+                plan_mode._plan_mode = False
+                plan_mode._pending_task = False
+                plan_mode.arm_plan_mode()
+                self.assertTrue(plan_mode.is_plan_mode())
+                self.assertTrue(plan_mode.is_pending_task())
+                plan_mode._plan_mode = False
+                plan_mode._pending_task = False
+                plan_mode._restore_state()
+                self.assertTrue(plan_mode.is_pending_task())
+                plan = plan_mode.enter_plan_mode("describe it later")
+                self.assertEqual(plan["task"], "describe it later")
+                self.assertFalse(plan_mode.is_pending_task())
+                plan_mode.exit_plan_mode()
+
     def test_plan_state_restores_for_same_project(self):
         with tempfile.TemporaryDirectory() as tmp, _chdir(tmp):
             root = Path(tmp)
