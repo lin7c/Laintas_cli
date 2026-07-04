@@ -75,11 +75,15 @@ def _ip_is_blocked(ip_str: str) -> bool:
             or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
 
 
-def validate_browse_url(raw: str) -> str:
+def validate_browse_url(raw: str, allow_loopback: bool = False) -> str:
     """Normalize and security-check a URL the remote Chrome will navigate to.
     Returns an absolute http(s) URL or raises ValueError. Refuses non-http(s)
     schemes and any host that resolves to a loopback/private/link-local address
-    so a driven page cannot pivot into the host's internal network or metadata."""
+    so a driven page cannot pivot into the host's internal network or metadata.
+
+    allow_loopback=True permits 127.0.0.0/8 ONLY (::1 included) — for the
+    user-approved webtest flow, whose whole point is testing the host's own
+    dev server. Private/link-local/metadata ranges stay blocked regardless."""
     from urllib.parse import urlparse
     s = (raw or "").strip()
     if not s:
@@ -98,8 +102,15 @@ def validate_browse_url(raw: str) -> str:
                                    proto=socket.IPPROTO_TCP)
     except OSError as e:
         raise ValueError(f"cannot resolve host {host!r}: {e}")
+    import ipaddress
     for info in infos:
         ip = info[4][0]
+        if allow_loopback:
+            try:
+                if ipaddress.ip_address(ip).is_loopback:
+                    continue
+            except ValueError:
+                pass
         if _ip_is_blocked(ip):
             raise ValueError(
                 f"refusing to browse {host!r}: resolves to non-public address {ip} "
@@ -520,7 +531,19 @@ class BrowserSession:
                                f"(see {self._log('xvfb')})")
         self._start_chrome()
         if not _wait_for_port("127.0.0.1", self.cdp_port, timeout=15):
-            raise RuntimeError(f"Chrome CDP port {self.cdp_port} did not open")
+            # Sandboxed launch can die at boot on hosts that block unprivileged
+            # user namespaces (Ubuntu 24's apparmor_restrict_unprivileged_userns=1
+            # → FATAL in sandbox/linux/services/credentials.cc). Retry once
+            # without the sandbox — still as the dropped user, Site Isolation on.
+            try:
+                if self._chrome is not None:
+                    self._chrome.kill()
+            except OSError:
+                pass
+            self._start_chrome(no_sandbox=True)
+            if not _wait_for_port("127.0.0.1", self.cdp_port, timeout=15):
+                raise RuntimeError(f"Chrome CDP port {self.cdp_port} did not open "
+                                   f"(see {self._log('chrome')})")
         self._start_x11vnc()
         if not _wait_for_port("127.0.0.1", self.rfb_port, timeout=5):
             raise RuntimeError(f"x11vnc RFB port {self.rfb_port} did not open")
@@ -594,7 +617,7 @@ class BrowserSession:
             start_new_session=True,
         )
 
-    def _start_chrome(self) -> None:
+    def _start_chrome(self, no_sandbox: bool = False) -> None:
         chrome = find_chrome()
         if not chrome:
             raise RuntimeError("no Chrome/Chromium binary on PATH")
@@ -634,6 +657,19 @@ class BrowserSession:
                     _chown_tree(self.user_data_dir, uid, gid)
                 except OSError:
                     pass
+                # System accounts like `nobody` have HOME=/nonexistent; Chrome's
+                # crashpad handler then dies on startup ("--database is required")
+                # and takes Chrome with it. Point HOME (and crash dumps) at the
+                # session's profile dir, which the dropped user owns.
+                if not uhome or not os.path.isdir(uhome):
+                    uhome = self.user_data_dir
+                crash_dir = os.path.join(self.user_data_dir, "crash-dumps")
+                try:
+                    os.makedirs(crash_dir, exist_ok=True)
+                    os.chown(crash_dir, uid, gid)
+                except OSError:
+                    pass
+                args.append(f"--crash-dumps-dir={crash_dir}")
                 run_env["HOME"] = uhome
                 run_env["USER"] = uname
 
@@ -648,6 +684,9 @@ class BrowserSession:
             else:
                 # No unprivileged user available — sandbox cannot run as root.
                 args.append("--no-sandbox")
+
+        if no_sandbox and "--no-sandbox" not in args:
+            args.append("--no-sandbox")
 
         args.append(self.url)
 

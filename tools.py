@@ -3389,10 +3389,12 @@ def _bi_browser_navigate(params: dict, ctx: ToolCtx) -> dict:
     if not url:
         return {"ok": False, "error": "missing 'url'"}
     # SSRF / scheme guard — refuse loopback/private/link-local/metadata targets.
+    # allow_local (internal, set by the user-approved webtest flow) permits
+    # loopback only, so tests can target the host's own dev server.
     if url not in ("about:blank",) and not url.startswith("about:"):
         import browser_session as _bs
         try:
-            url = _bs.validate_browse_url(url)
+            url = _bs.validate_browse_url(url, allow_loopback=bool(params.get("allow_local")))
         except ValueError as e:
             return {"ok": False, "error": str(e)}
     wait_until = params.get("wait_until", "domcontentloaded")

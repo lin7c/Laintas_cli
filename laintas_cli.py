@@ -5106,11 +5106,38 @@ class AgentRegistry:
             self._push_final(req_id, "fail", "missing 'tests' in webtest payload")
             return
 
+        # One approval for the whole run (same gate as remote exec); the
+        # per-step browser policy is then auto-approved below — the user
+        # already said yes to exactly this set of tests/targets.
+        if not get_runtime_config("allow_remote_exec_without_approval"):
+            targets = ", ".join(sorted({str(t.get("target", "?"))[:80]
+                                        for t in tests if isinstance(t, dict)}))
+            approval = self._request_approval(
+                req_id, f"WEBTEST: {len(tests)} test(s) against {targets}",
+                os.getcwd(), timeout=300,
+            )
+            if approval != "approve":
+                self._push_final(req_id, "aborted", f"User {approval}: webtest")
+                return
+
         def _run():
             import tools as tools_mod
             registry = tools_mod.get_registry()
+
+            class _ApprovedDeps:
+                """Wraps loop deps; browser steps of an approved webtest run
+                don't re-prompt per action."""
+                def __init__(self, base):
+                    self._base = base
+
+                def __getattr__(self, name):
+                    return getattr(self._base, name)
+
+                def request_command_approval(self, cmd, reason=None):
+                    return True
+
             ctx = tools_mod.ToolCtx(
-                deps=get_loop_deps(), agent_id=None, session=None,
+                deps=_ApprovedDeps(get_loop_deps()), agent_id=None, session=None,
                 events_cb=None, cwd=os.getcwd(),
             )
             session = f"webtest-{req_id[-6:]}"
@@ -5142,7 +5169,10 @@ class AgentRegistry:
                                f"running '{name}' ({len(steps)} step(s))")
                     flow = registry.invoke("browser.test_flow", {
                         "session": session,
-                        "steps": [{"action": "navigate", "url": target}] + list(steps),
+                        # allow_local: the approval prompt showed these targets;
+                        # loopback-only relaxation lets tests hit the host's
+                        # own dev server.
+                        "steps": [{"action": "navigate", "url": target, "allow_local": True}] + list(steps),
                         "check_errors": bool(spec.get("checkErrors", True)),
                         "screenshot_on_failure": True,
                         "clear_captures": True,
@@ -6372,6 +6402,163 @@ class SlashCommandUsageError(ValueError):
     """A recoverable slash-command parsing/usage error."""
 
 
+@dataclass(frozen=True)
+class SlashArgRule:
+    """Opt-in argument contract for a stable built-in slash-command leaf.
+
+    Commands without a rule remain open-ended.  This is deliberate: project
+    extensions and built-ins that consume free-form text must not be constrained
+    by a global argument policy.
+    """
+
+    max_args: int
+    usage: str
+    flag_start: Optional[int] = None
+    allowed_flags: frozenset[str] = frozenset()
+
+
+def _arg_rule(max_args: int, usage: str, *, flag_start: Optional[int] = None,
+              allowed_flags: tuple[str, ...] = ()) -> SlashArgRule:
+    return SlashArgRule(
+        max_args=max_args,
+        usage=usage,
+        flag_start=flag_start,
+        allowed_flags=frozenset(allowed_flags),
+    )
+
+
+# Keys are (canonical command, optional subcommand).  Rules are intentionally
+# opt-in and leaf-specific: adding a command or a free-form argument remains
+# backwards compatible until that exact leaf is declared stable here.
+_SLASH_ARG_RULES: dict[tuple[str, ...], SlashArgRule] = {
+    **{
+        (name,): _arg_rule(0, name)
+        for name in (
+            "/cwd", "/scan", "/login", "/hire", "/disconnect", "/max",
+            "/tools", "/prop", "/snapshots", "/continue",
+        )
+    },
+    ("/help",): _arg_rule(1, "/help [command]"),
+    ("/connect",): _arg_rule(1, "/connect [name]"),
+    ("/station",): _arg_rule(2, "/station [agent-id] [terminal]"),
+    ("/terminate",): _arg_rule(1, "/terminate <name>"),
+    ("/abort",): _arg_rule(1, "/abort <agent-id>"),
+    ("/undo",): _arg_rule(1, "/undo [sha]"),
+    ("/detail",): _arg_rule(1, "/detail [on|off]"),
+    ("/model", "reset"): _arg_rule(1, "/model reset"),
+    ("/model", "clear"): _arg_rule(1, "/model clear"),
+    ("/model", "default"): _arg_rule(1, "/model default"),
+    ("/mode", "act"): _arg_rule(1, "/mode act"),
+    ("/mode", "review"): _arg_rule(1, "/mode review"),
+    ("/mode", "approve"): _arg_rule(1, "/mode approve"),
+    ("/mode", "list"): _arg_rule(1, "/mode list"),
+    ("/mode", "status"): _arg_rule(1, "/mode status"),
+    ("/plan", "submit"): _arg_rule(1, "/plan submit"),
+    ("/plan", "approve"): _arg_rule(1, "/plan approve"),
+    ("/plan", "exit"): _arg_rule(1, "/plan exit"),
+    ("/plan", "status"): _arg_rule(1, "/plan status"),
+    ("/plan", "list"): _arg_rule(1, "/plan list"),
+    ("/memory", "project"): _arg_rule(1, "/memory project"),
+    ("/memory", "persistent"): _arg_rule(1, "/memory persistent"),
+    ("/memory", "global"): _arg_rule(1, "/memory global"),
+    ("/memory", "show"): _arg_rule(2, "/memory show <id|name>"),
+    ("/backend", "status"): _arg_rule(1, "/backend status"),
+    ("/backend", "list"): _arg_rule(1, "/backend list"),
+    ("/backend", "use"): _arg_rule(2, "/backend use <name>"),
+    ("/backend", "config"): _arg_rule(1, "/backend config"),
+    ("/work", "status"): _arg_rule(1, "/work status"),
+    ("/work", "list"): _arg_rule(1, "/work list"),
+    ("/work", "resume"): _arg_rule(2, "/work resume <id>"),
+    ("/work", "history"): _arg_rule(1, "/work history"),
+    ("/task", "list"): _arg_rule(1, "/task list"),
+    ("/task", "show"): _arg_rule(2, "/task show <id>"),
+    ("/task", "start"): _arg_rule(2, "/task start <id>"),
+    ("/task", "done"): _arg_rule(2, "/task done <id>"),
+    ("/task", "del"): _arg_rule(2, "/task del <id>"),
+    ("/task", "progress"): _arg_rule(3, "/task progress <id> <n>"),
+    ("/workflow", "status"): _arg_rule(1, "/workflow status"),
+    ("/workflow", "list"): _arg_rule(1, "/workflow list"),
+    ("/trust", "status"): _arg_rule(1, "/trust status"),
+    ("/trust", "allow"): _arg_rule(
+        2, "/trust allow [--yes]", flag_start=1, allowed_flags=("--yes",)),
+    ("/trust", "revoke"): _arg_rule(1, "/trust revoke"),
+    ("/hooks", "status"): _arg_rule(1, "/hooks status"),
+    ("/hooks", "trust"): _arg_rule(
+        2, "/hooks trust [--yes]", flag_start=1, allowed_flags=("--yes",)),
+    ("/hooks", "revoke"): _arg_rule(1, "/hooks revoke"),
+    ("/hooks", "reload"): _arg_rule(1, "/hooks reload"),
+    ("/policy", "audit"): _arg_rule(1, "/policy audit"),
+    ("/policy", "enforce"): _arg_rule(1, "/policy enforce"),
+    ("/policy", "disabled"): _arg_rule(
+        2, "/policy disabled [--yes]", flag_start=1,
+        allowed_flags=("--yes",)),
+    ("/policy", "reset"): _arg_rule(1, "/policy reset"),
+    ("/skill", "manager"): _arg_rule(1, "/skill manager"),
+    ("/skill", "list"): _arg_rule(1, "/skill list"),
+    ("/skill", "trust"): _arg_rule(
+        3, "/skill trust <name> [--yes]", flag_start=2,
+        allowed_flags=("--yes",)),
+    ("/skill", "revoke"): _arg_rule(2, "/skill revoke <name>"),
+    ("/skill", "load"): _arg_rule(2, "/skill load <name>"),
+    ("/skill", "unload"): _arg_rule(2, "/skill unload <name>"),
+    ("/skill", "reload"): _arg_rule(1, "/skill reload"),
+    ("/skill", "new"): _arg_rule(2, "/skill new <name>"),
+    ("/skill", "dir"): _arg_rule(1, "/skill dir"),
+    ("/mcp", "list"): _arg_rule(1, "/mcp list"),
+    ("/mcp", "trust"): _arg_rule(
+        3, "/mcp trust <name> [--yes]", flag_start=2,
+        allowed_flags=("--yes",)),
+    ("/mcp", "revoke"): _arg_rule(2, "/mcp revoke <name>"),
+    ("/mcp", "tools"): _arg_rule(2, "/mcp tools <name>"),
+    ("/mcp", "connect"): _arg_rule(2, "/mcp connect <name>"),
+    ("/mcp", "disconnect"): _arg_rule(2, "/mcp disconnect <name>"),
+    ("/mcp", "reload"): _arg_rule(1, "/mcp reload"),
+    ("/mcp", "init"): _arg_rule(1, "/mcp init"),
+    ("/mcp", "config"): _arg_rule(1, "/mcp config"),
+    ("/bash", "list"): _arg_rule(1, "/bash list"),
+    ("/bash", "add"): _arg_rule(2, "/bash add <command>"),
+    ("/bash", "remove"): _arg_rule(2, "/bash remove <command>"),
+    ("/debug", "clear"): _arg_rule(1, "/debug clear"),
+    ("/told", "all"): _arg_rule(1, "/told all"),
+    ("/told", "reply"): _arg_rule(2, "/told reply [N]"),
+    ("/told", "log"): _arg_rule(2, "/told log [N]"),
+    ("/version", "check"): _arg_rule(1, "/version check"),
+    ("/version", "update"): _arg_rule(
+        2, "/version update [--force]", flag_start=1,
+        allowed_flags=("--force", "-f")),
+    ("/update", "check"): _arg_rule(1, "/update check"),
+    ("/update", "--force"): _arg_rule(1, "/update [--force]"),
+    ("/update", "-f"): _arg_rule(1, "/update [-f]"),
+}
+
+
+def _validate_slash_args(action: str, args: list[str]) -> None:
+    """Reject ignored arguments only for explicitly contracted built-ins."""
+    spec = _find_command_spec(action)
+    if spec is None:
+        return
+    canonical = spec.name.lower()
+    sub = args[0].lower() if args else ""
+    normalized_action = action.lower()
+    rule = _SLASH_ARG_RULES.get((normalized_action, sub))
+    if rule is None:
+        rule = _SLASH_ARG_RULES.get((normalized_action,))
+    if rule is None:
+        rule = _SLASH_ARG_RULES.get((canonical, sub))
+    if rule is None:
+        rule = _SLASH_ARG_RULES.get((canonical,))
+    if rule is None:
+        return
+    if len(args) > rule.max_args:
+        raise SlashCommandUsageError(f"Usage: {rule.usage}")
+    if rule.flag_start is not None:
+        invalid = [item for item in args[rule.flag_start:]
+                   if item not in rule.allowed_flags]
+        if invalid:
+            raise SlashCommandUsageError(
+                f"Unexpected argument: {invalid[0]}. Usage: {rule.usage}")
+
+
 def _parse_slash_command(cmd: str) -> tuple[str, str, list[str]]:
     """Return (action, raw_args, argv) without losing raw argument spacing."""
     stripped = (cmd or "").strip()
@@ -7166,6 +7353,7 @@ def _show_usage_command(args: list, session: dict) -> None:
 def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: dict, interactive_session=None) -> bool:
     """Handle meta commands. Returns True if should exit."""
     action, raw_args, parts = _parse_slash_command(cmd)
+    _validate_slash_args(action, parts[1:])
 
     if action == "/":
         selected = show_command_palette()

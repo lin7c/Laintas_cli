@@ -373,6 +373,53 @@ class SlashRegistryTests(unittest.TestCase):
         sub_mock.assert_not_called()
         self.assertIn("Usage: /term", output.getvalue())
 
+    def test_declared_slash_leaves_reject_ignored_arguments(self):
+        cases = (
+            ("/help task extra", "/help [command]"),
+            ("/connect worker extra", "/connect [name]"),
+            ("/station agent1 term1 extra", "/station [agent-id] [terminal]"),
+            ("/terminate term1 extra", "/terminate <name>"),
+            ("/abort agent1 extra", "/abort <agent-id>"),
+            ("/task done 1 extra", "/task done <id>"),
+            ("/skill load demo extra", "/skill load <name>"),
+            ("/bash add vim extra", "/bash add <command>"),
+            ("/plan approve extra", "/plan approve"),
+            ("/version check extra", "/version check"),
+            ("/update --force extra", "/update [--force]"),
+        )
+        for command, usage in cases:
+            action, _, parts = laintas_cli._parse_slash_command(command)
+            with self.subTest(command=command), self.assertRaisesRegex(
+                    laintas_cli.SlashCommandUsageError, usage.replace("[", r"\[").replace("]", r"\]")):
+                laintas_cli._validate_slash_args(action, parts[1:])
+
+    def test_approval_flags_reject_unknown_trailing_arguments(self):
+        cases = (
+            "/policy disabled typo",
+            "/trust allow typo",
+            "/hooks trust typo",
+            "/skill trust demo typo",
+            "/mcp trust demo typo",
+        )
+        for command in cases:
+            action, _, parts = laintas_cli._parse_slash_command(command)
+            with self.subTest(command=command), self.assertRaisesRegex(
+                    laintas_cli.SlashCommandUsageError, "Unexpected argument"):
+                laintas_cli._validate_slash_args(action, parts[1:])
+
+    def test_uncontracted_and_free_form_slash_commands_remain_open(self):
+        # Unknown commands may belong to extensions; free-form built-ins consume
+        # their raw tail.  Neither is subject to the opt-in leaf contracts.
+        for command in (
+            "/project-extension one two three",
+            "/spawn worker: investigate one two three",
+            "/tell agent1 this is a multi word message",
+            "/snapshot release candidate one",
+        ):
+            action, _, parts = laintas_cli._parse_slash_command(command)
+            with self.subTest(command=command):
+                laintas_cli._validate_slash_args(action, parts[1:])
+
     def test_json_args_preserve_quotes(self):
         sent = {}
         invoked = {}
