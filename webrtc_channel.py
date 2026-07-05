@@ -43,6 +43,41 @@ except Exception as e:  # aiortc optional — CLI runs without it
 # leaking IPs to a third party (see the security notes in the design).
 _DEFAULT_ICE = ["stun:stun.l.google.com:19302"]
 
+# ICE candidate sockets bind inside this fixed UDP window instead of a random
+# ephemeral port, so a host firewall can allowlist exactly this range. On the
+# hosted CLI the input chain drops all other inbound UDP — random ports made
+# every P2P session die at ICE with no error surfaced. Override with
+# LAINTAS_RTC_PORTS="lo-hi".
+def _rtc_port_range() -> tuple:
+    raw = os.environ.get("LAINTAS_RTC_PORTS", "50700-50899")
+    try:
+        lo, hi = raw.split("-", 1)
+        lo, hi = int(lo), int(hi)
+        if 1024 <= lo < hi <= 65535:
+            return lo, hi
+    except (ValueError, AttributeError):
+        pass
+    return 50700, 50899
+
+
+def _bind_ports_in_range(loop, lo: int, hi: int) -> None:
+    """Wrap this loop's create_datagram_endpoint so port-0 binds land in
+    [lo, hi]. Only this manager's private loop is patched."""
+    orig = loop.create_datagram_endpoint
+
+    async def patched(factory, local_addr=None, **kw):
+        if local_addr and len(local_addr) == 2 and local_addr[1] == 0:
+            last_err = None
+            for port in range(lo, hi + 1):
+                try:
+                    return await orig(factory, local_addr=(local_addr[0], port), **kw)
+                except OSError as e:
+                    last_err = e
+            raise last_err or OSError(f"no free UDP port in RTC range {lo}-{hi}")
+        return await orig(factory, local_addr=local_addr, **kw)
+
+    loop.create_datagram_endpoint = patched
+
 
 class WebrtcManager:
     """One per agent connection. Holds a dedicated asyncio loop in a daemon
@@ -58,6 +93,7 @@ class WebrtcManager:
         self._puts: dict = {}  # channel -> in-progress upload {f, path, written}
         self._vnc: dict = {}   # channel -> live VNC bridge {sock, task, name}
         self._loop = asyncio.new_event_loop()
+        _bind_ports_in_range(self._loop, *_rtc_port_range())
         self._thread = threading.Thread(
             target=self._run_loop, daemon=True, name="laintas-webrtc",
         )

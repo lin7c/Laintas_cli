@@ -13,6 +13,7 @@ from rich.console import Console
 from rich.markdown import Markdown
 
 import agent_loop
+import agent_persistence
 import agent_roles
 import tools
 
@@ -133,7 +134,8 @@ class AgentIsolationTests(unittest.TestCase):
         agent_loop.get_user_message_queue().put("for-primary")
         child.message_queue.put("for-child")
 
-        with tempfile.TemporaryDirectory() as tmp, _chdir(tmp):
+        with tempfile.TemporaryDirectory() as tmp, _chdir(tmp), \
+                mock.patch.object(agent_persistence, "AGENTS_DIR", Path(tmp) / "agents"):
             Path(".laintas").mkdir()
             agent_loop.run_agent_loop(
                 _deps(), "child task", {}, child.state, child.chat_history,
@@ -161,11 +163,192 @@ class AgentIsolationTests(unittest.TestCase):
         self.assertEqual(child.name, "worker")
         self.assertEqual(primary.name, "primary")
 
+    def test_agent_hire_tool_defines_profile_without_starting_work(self):
+        ctx = tools.ToolCtx(
+            agent_id="primary",
+            depth=0,
+            register_agent_fn=agent_loop.register_agent,
+            get_agent=agent_loop.get_agent,
+        )
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(agent_persistence, "AGENTS_DIR", Path(tmp)):
+            result = tools._bi_agent_hire({
+                "name": "review-employee", "profile": "reviewer",
+            }, ctx)
+
+        employee = agent_loop.get_agent("review-employee")
+        self.assertTrue(result["ok"])
+        self.assertEqual(employee.profile.specialist_role, "reviewer")
+        self.assertIsNone(employee.active_assignment)
+        self.assertEqual(employee.status, "idle")
+        self.assertIsNone(tools.get_registry().get("agent.switch"))
+
+    def test_agent_station_tool_uses_logical_station_on_windows(self):
+        employee = agent_loop.register_agent(
+            name="win-worker", depth=1, role="pool")
+        deps = mock.Mock()
+        ctx = tools.ToolCtx(
+            deps=deps,
+            agent_id=employee.id,
+            depth=1,
+            get_agent=agent_loop.get_agent,
+            get_terminal=lambda _name: None,
+            register_terminal=mock.Mock(),
+            station_agent=mock.Mock(return_value=True),
+        )
+        with mock.patch.object(tools.os, "name", "nt"), \
+                mock.patch.dict(tools.os.environ, {"COMSPEC": "cmd.exe"}):
+            result = tools._bi_agent_station({"name": "win-shell"}, ctx)
+
+        self.assertTrue(result["ok"])
+        deps.SubTerminalSession.assert_not_called()
+        ctx.register_terminal.assert_called_once_with(
+            None, "cmd.exe", 1, name="win-shell")
+        ctx.station_agent.assert_called_once_with(employee.id, "win-shell")
+
     def test_read_only_roles_cannot_escape_through_shell(self):
         for role in ("explorer", "architect", "reviewer",
                      "silent-failure-hunter", "tester"):
             self.assertFalse(
                 agent_roles.is_tool_allowed_for_role("shell.exec", role), role)
+
+    def test_employee_tool_policy_is_an_independent_allowlist(self):
+        profile = agent_loop.EmployeeProfile(
+            title="Reader",
+            tool_policy=agent_loop.AgentToolPolicy(
+                allowed_tools=["fs.read", "fs.grep"],
+                denied_tools=["fs.grep"],
+            ),
+        )
+        employee = agent_loop.register_agent(
+            name="reader", role="pool", profile=profile)
+
+        allowed = agent_loop._allowed_tool_names_for_state(
+            employee.state, employee.id)
+
+        self.assertEqual(allowed, {"fs.read"})
+
+    def test_assignment_uses_employee_prompt_and_fresh_context(self):
+        prompts = []
+        deps = _deps()
+
+        def backend(**kwargs):
+            prompts.append(kwargs["system_prompt"])
+            return {
+                "reply": "assignment complete",
+                "tool_calls": [],
+                "finish_reason": "stop",
+                "done": True,
+                "error": False,
+            }
+
+        deps.call_backend = backend
+        employee = agent_loop.register_agent(
+            name="alice", role="pool",
+            profile=agent_loop.EmployeeProfile(
+                title="Backend Engineer",
+                prompt="ALICE-ONLY-PROMPT",
+            ),
+        )
+        employee.state["shortTermMemory"] = "old assignment memory"
+        employee.chat_history.append({"role": "user", "content": "old task"})
+        employee.stationed_terminal = "alice-work"
+        employee.home_terminal = "alice-work"
+
+        with tempfile.TemporaryDirectory() as tmp, _chdir(tmp), \
+                mock.patch.object(agent_persistence, "AGENTS_DIR", Path(tmp) / "agents"):
+            Path(".laintas").mkdir()
+            ok, _, assignment = agent_loop.start_agent_assignment(
+                employee.id, "implement feature X", deps, session={})
+            self.assertTrue(ok)
+            employee.thread.join(timeout=5)
+
+        self.assertFalse(employee.thread.is_alive())
+        self.assertIsNone(employee.active_assignment)
+        self.assertEqual(employee.status, "idle")
+        self.assertEqual(employee.assignment_history[-1]["id"], assignment.id)
+        self.assertNotIn("old assignment memory", employee.state.get("shortTermMemory", ""))
+        self.assertNotIn(
+            {"role": "user", "content": "old task"}, employee.chat_history)
+        self.assertTrue(any("ALICE-ONLY-PROMPT" in prompt for prompt in prompts))
+        self.assertTrue(any("implement feature X" in prompt for prompt in prompts))
+
+    def test_employee_profile_persistence_round_trip(self):
+        profile = agent_loop.EmployeeProfile(
+            title="Reviewer",
+            specialist_role="reviewer",
+            prompt="review carefully",
+            capability_tags=["review"],
+            tool_policy=agent_loop.AgentToolPolicy(
+                allowed_tools=["fs.read"], denied_tools=["shell.exec"]),
+        )
+        employee = agent_loop.register_agent(
+            name="persisted", role="pool", profile=profile)
+        employee.assignment_history.append({
+            "id": "job-1", "status": "completed", "result": "done"})
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(agent_persistence, "AGENTS_DIR", Path(tmp)):
+            self.assertTrue(agent_persistence.save_agent_state(employee))
+            payload = agent_persistence.load_agent_state(employee.id)
+            restored = agent_loop.AgentInfo(id=employee.id, name=employee.id)
+            agent_persistence.apply_persisted_state(restored, payload)
+
+        self.assertEqual(restored.profile.title, "Reviewer")
+        self.assertEqual(restored.profile.specialist_role, "reviewer")
+        self.assertEqual(restored.profile.tool_policy.allowed_tools, ["fs.read"])
+        self.assertEqual(restored.profile.tool_policy.denied_tools, ["shell.exec"])
+        self.assertEqual(restored.assignment_history[-1]["id"], "job-1")
+
+    def test_employee_tool_policy_blocks_forged_tool_call_at_dispatch(self):
+        calls = []
+        responses = iter([
+            {
+                "reply": "trying write",
+                "tool_calls": [{
+                    "name": "fs.write",
+                    "arguments": {"path": "blocked.txt", "content": "no"},
+                }],
+                "finish_reason": "tool_calls",
+                "done": False,
+                "error": False,
+            },
+            {
+                "reply": "done",
+                "tool_calls": [],
+                "finish_reason": "stop",
+                "done": True,
+                "error": False,
+            },
+        ])
+        deps = _deps()
+
+        def backend(**kwargs):
+            calls.append(kwargs)
+            return next(responses)
+
+        deps.call_backend = backend
+        employee = agent_loop.register_agent(
+            name="locked", depth=1, role="pool",
+            profile=agent_loop.EmployeeProfile(
+                tool_policy=agent_loop.AgentToolPolicy(
+                    allowed_tools=["fs.read"])),
+        )
+        with tempfile.TemporaryDirectory() as tmp, _chdir(tmp), \
+                mock.patch.object(agent_persistence, "AGENTS_DIR", Path(tmp) / "agents"):
+            Path(".laintas").mkdir()
+            with mock.patch.object(
+                    tools.get_registry(), "invoke",
+                    wraps=tools.get_registry().invoke) as invoke:
+                result = agent_loop.run_agent_loop(
+                    deps, "read only", {}, employee.state,
+                    employee.chat_history, depth=1, agent_id=employee.id,
+                    max_loops_override=2)
+
+        invoke.assert_not_called()
+        self.assertTrue(calls)
+        self.assertEqual(calls[0]["allowed_tool_names"], {"fs.read"})
+        self.assertIn("not available to agent", result["state"]["lastOutput"])
 
 
 class TerminalTriggerTests(unittest.TestCase):

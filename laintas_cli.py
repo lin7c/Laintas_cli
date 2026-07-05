@@ -559,7 +559,7 @@ except Exception:
 # ── Agent Loop (extracted module) ─────────────────────────────────────
 from agent_loop import (
     MAX_LOOPS, MAX_TOKENS, MAX_DEBUG_ENTRIES,
-    DebugEntry, TerminalInfo, AgentInfo,
+    DebugEntry, TerminalInfo, AgentInfo, EmployeeProfile, AgentToolPolicy,
     add_debug_log, clear_debug_logs,
     next_debug_loop, get_debug_logs,
     run_agent_loop, LoopDeps,
@@ -569,6 +569,7 @@ from agent_loop import (
     register_agent, unregister_agent,
     get_agent, get_all_agents, get_current_agent,
     get_pool_agents, get_deployed_agents, get_or_hire_pool_agent,
+    start_agent_assignment,
     switch_to_agent, set_current_agent_id,
     rename_agent, station_agent, unstation_agent,
     close_all_agents,
@@ -1847,6 +1848,7 @@ class CommandSpec:
     aliases: tuple[str, ...] = ()
     palette: bool = True
     subcommands: tuple[str, ...] = ()
+    help_text: str = ""
 
     @property
     def all_names(self) -> tuple[str, ...]:
@@ -1866,12 +1868,35 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec("/back", "Detach from a sub-terminal", "Account & Session"),
     CommandSpec("/version", "Show version or update", "Account & Session", "/version [check|update [--force]]", aliases=("/v", "/update"), subcommands=("check", "update")),
     CommandSpec("/name", "Show or set the current agent name", "Agents & Terminals", "/name [new-name]"),
-    CommandSpec("/hire", "Create an idle agent", "Agents & Terminals"),
-    CommandSpec("/agents", "List, switch, or rename agents", "Agents & Terminals", "/agents [tree|agent-id|name <new-name>]", subcommands=("tree", "name")),
+    CommandSpec(
+        "/hire", "Define an available employee; does not start work",
+        "Agents & Terminals",
+        "/hire [name] [--profile role] [--prompt file] [--tools name,...|inherit]",
+        subcommands=("--profile", "--prompt", "--tools"),
+        help_text=(
+            "Creates a persistent employee identity with its own prompt and tool policy. "
+            "Use /station <agent> [terminal] --task <work> to start an assignment."
+        )),
+    CommandSpec(
+        "/agents", "List employees or inspect capabilities and assignment history",
+        "Agents & Terminals", "/agents [tree|agent-id]", subcommands=("tree",),
+        help_text=(
+            "Passing an employee ID shows its profile, station, current assignment, "
+            "and latest result; it does not switch the manager identity."
+        )),
     CommandSpec("/term", "List, create, or rename terminals", "Agents & Terminals", "/term [name|rename <old> <new>]", aliases=("/t",), subcommands=("rename",)),
     CommandSpec("/connect", "Link this terminal to Helpwo (primary or sub-terminal; optional custom name)", "Agents & Terminals", "/connect [name]"),
     CommandSpec("/disconnect", "Withdraw this terminal from Helpwo", "Agents & Terminals"),
-    CommandSpec("/station", "Deploy an agent to a terminal", "Agents & Terminals", "/station [agent-id] [terminal]", aliases=("/st",)),
+    CommandSpec(
+        "/station", "Bind an employee to a terminal and optionally start work",
+        "Agents & Terminals", "/station <agent-id> [terminal] [--task <work>]",
+        aliases=("/st",),
+        help_text=(
+            "Without --task, only prepares the station. With --task, starts a fresh "
+            "background Assignment with isolated state/history. Omitting the terminal "
+            "creates work-<agent-id> (a dedicated PTY on POSIX, or a logical "
+            "subprocess-backed station on Windows)."
+        )),
     CommandSpec("/terminate", "Close a terminal", "Agents & Terminals", "/terminate <name>"),
     CommandSpec("/send", "Send input to a terminal", "Agents & Terminals", "/send <name> [--wait <seconds>] <command>"),
     CommandSpec("/spawn", "Spawn a sub-agent", "Agents & Terminals", "/spawn [name:] <task>"),
@@ -1977,6 +2002,64 @@ class MetaCompleter(Completer):
                 head, _, tail = text.partition(" ")
                 spec = _find_command_spec(head)
                 partial = tail.lstrip()
+                head_lower = head.lower()
+
+                # Context-aware employee command completion. These values are
+                # runtime data, so they cannot live in static CommandSpec.
+                if head_lower == "/hire":
+                    hire_words = partial.split()
+                    if "--profile" in hire_words:
+                        profile_index = hire_words.index("--profile")
+                        if profile_index == len(hire_words) - 1:
+                            fragment = ""
+                        elif profile_index == len(hire_words) - 2:
+                            fragment = hire_words[-1]
+                        else:
+                            fragment = None
+                        if fragment is not None:
+                            import agent_roles
+                            for role in agent_roles.list_roles():
+                                if role.name.startswith(fragment.lower()):
+                                    yield Completion(
+                                        role.name,
+                                        start_position=-len(fragment),
+                                        display_meta=role.description)
+                            return
+                if head_lower in ("/agents", "/station", "/st"):
+                    words = partial.split()
+                    trailing_space = tail.endswith(" ")
+                    if not words or (len(words) == 1 and not trailing_space):
+                        fragment = words[0] if words else ""
+                        candidates = []
+                        if head_lower == "/agents":
+                            candidates.append(("tree", "show employee tree"))
+                        candidates.extend(
+                            (agent.id, agent.profile.title)
+                            for agent in get_all_agents()
+                            if agent.role != "primary"
+                        )
+                        for value, meta in candidates:
+                            if value.lower().startswith(fragment.lower()):
+                                yield Completion(
+                                    value, start_position=-len(fragment),
+                                    display_meta=meta)
+                        return
+                    if head_lower in ("/station", "/st"):
+                        if "--task" in words or "--" in words:
+                            return
+                        fragment = "" if trailing_space else words[-1]
+                        candidates = [("--task", "start a fresh assignment")]
+                        candidates.extend(
+                            (term.name, "existing terminal")
+                            for term in get_all_terminals()
+                            if term.name != "term0"
+                        )
+                        for value, meta in candidates:
+                            if value.lower().startswith(fragment.lower()):
+                                yield Completion(
+                                    value, start_position=-len(fragment),
+                                    display_meta=meta)
+                        return
                 if spec and " " not in partial:
                     for subcommand in spec.subcommands:
                         if subcommand.startswith(partial.lower()):
@@ -4018,6 +4101,7 @@ def call_backend_stream(
     messages: Optional[list] = None,
     tools_enabled: bool = True,
     allowed_tool_names: Optional[set[str]] = None,
+    model_override: Optional[str] = None,
 ) -> dict:
     """Call Helpwo backend /api/chat/stream, same as Helpwo frontend.
     Returns parsed {reply, command, memory, done, _billing} dict.
@@ -4052,12 +4136,18 @@ def call_backend_stream(
     }
     if messages:
         payload["messages"] = messages
-    selected_model = get_selected_model()
+    # An HWO `#name@model#` pin (model_override) overrides the globally-selected
+    # model for this one call.
+    selected_model = model_override or get_selected_model()
     if selected_model:
         payload["model"] = selected_model
-    selected_provider = get_selected_provider()
-    if selected_provider:
-        payload["provider"] = selected_provider
+    # Only forward the globally-selected provider when the model is NOT pinned.
+    # A pinned model may belong to a different provider; forcing the global one
+    # would misroute it, so let the gateway resolve from the model name.
+    if not model_override:
+        selected_provider = get_selected_provider()
+        if selected_provider:
+            payload["provider"] = selected_provider
 
     # Native function-calling: advertise the tool registry as OpenAI-style
     # `tools` schemas so the model emits grammar-constrained `delta.tool_calls`
@@ -4558,6 +4648,11 @@ class AgentRegistry:
         self._pending_responses: list = []  # thread-safe queue for responses to send
         self._registration_lock = threading.Lock()
         self._last_reregister = 0.0
+        # Remembered across re-registrations so the gateway can resurrect the
+        # same agentId (keeps Helpwo tabs + sub-terminal parent links stable).
+        self._last_agent_id: str = ""
+        # Serializes background Helpwo chats (they share the REPL history).
+        self._chat_run_lock = threading.Lock()
 
         # ── Async event bus (Phase 1) ───────────────────────────────────
         # _event_q holds batches of events (each item is a list[dict]).
@@ -4646,6 +4741,10 @@ class AgentRegistry:
             payload["userName"] = user_name
         if self.parent_remote_id:
             payload["parentId"] = self.parent_remote_id
+        if self._last_agent_id:
+            # Ask the gateway to resurrect the same agentId so Helpwo tabs
+            # and sub-terminal parent links survive re-registration.
+            payload["previousAgentId"] = self._last_agent_id
         if self.terminal_meta:
             payload["terminal"] = self.terminal_meta
             payload["goal"] = (f"Sub-terminal '{self.terminal_meta.get('name', '')}'"
@@ -4667,6 +4766,7 @@ class AgentRegistry:
                 data = resp.json()
                 self.agent_id = data.get("agentId", "")
                 self.agent_secret = data.get("agentSecret", "")
+                self._last_agent_id = self.agent_id
                 if not quiet:
                     console.print(Panel(
                         f"[green]Agent linked to Helpwo AGENTS[/green]\n"
@@ -4837,10 +4937,14 @@ class AgentRegistry:
                 )
                 if response.status_code in (403, 404):
                     self._recover_registration()
+                beat_ok = response.status_code == 200
             except requests.RequestException:
-                pass  # heartbeat failures are silent
+                beat_ok = False  # heartbeat failures are silent
 
-            time.sleep(float(get_runtime_config("heartbeat_interval")))
+            # A failed beat retries quickly so one transient error can't
+            # open a heartbeat gap big enough to look offline to Helpwo.
+            time.sleep(5.0 if not beat_ok
+                       else float(get_runtime_config("heartbeat_interval")))
 
     def start_message_poll(self, agent_state_cb, chat_history_cb):
         """Start background thread to poll for incoming messages from Helpwo UI.
@@ -4880,9 +4984,16 @@ class AgentRegistry:
                     data = resp.json()
                     messages = data.get("inputs", [])
                     for msg in messages:
-                        self._handle_remote_message(
-                            msg, agent_state_cb, chat_history_cb,
-                        )
+                        # Dispatch in a worker so a long-running handler
+                        # (chat/delegate can run for minutes) never stalls
+                        # the poll loop — term-new/term-close/abort from
+                        # Helpwo must stay responsive throughout.
+                        threading.Thread(
+                            target=self._handle_remote_message,
+                            args=(msg, agent_state_cb, chat_history_cb),
+                            daemon=True,
+                            name=f"laintas-remote-{msg.get('kind', 'chat')}",
+                        ).start()
                 elif resp.status_code in (403, 404):
                     self._recover_registration()
             except requests.RequestException:
@@ -4919,12 +5030,16 @@ class AgentRegistry:
                 self._handle_delegate(req_id, payload, agent_state_cb, chat_history_cb)
             elif kind == "webtest":
                 self._handle_webtest(req_id, payload)
+            elif kind == "analyze_site":
+                self._handle_analyze_site(req_id, payload)
             elif kind == "term-open":
                 self._handle_term_open(req_id, payload)
             elif kind == "term-new":
                 self._handle_term_new(req_id, payload)
             elif kind == "term-close":
                 self._handle_term_close(req_id, payload)
+            elif kind == "disconnect":
+                self._handle_disconnect(req_id, payload)
             elif kind == "abort":
                 self._handle_abort(req_id, payload)
             elif kind == "approval-response":
@@ -4964,11 +5079,13 @@ class AgentRegistry:
         mgr.handle_offer(req_id, sdp)
 
     def _handle_chat(self, req_id: str, payload: dict, agent_state_cb, chat_history_cb):
-        """Inject a remote chat message into the main REPL loop.
+        """Run a remote chat message WITHOUT occupying the local REPL.
 
-        The message goes through the exact same input→route→execute pipeline as
-        local user input. We block the poll thread until the main loop finishes
-        processing, then push the terminal 'final' event.
+        Plain messages run their own agent loop in this worker thread (the
+        local prompt stays usable; Helpwo streams the events). The shared
+        chat history keeps continuity with the local conversation. Slash
+        commands are the exception — they must execute in the main loop, so
+        they still go through REPL injection.
         """
         content = payload.get("message", "")
 
@@ -4978,16 +5095,63 @@ class AgentRegistry:
             border_style="cyan",
         ))
 
-        done = threading.Event()
-        _inject_input(content, done)
-
-        if not done.wait(timeout=120):
-            self._push_final(req_id, "fail", "processing timeout — main loop busy")
+        if content.lstrip().startswith("/"):
+            done = threading.Event()
+            _inject_input(content, done)
+            if not done.wait(timeout=120):
+                self._push_final(req_id, "fail", "processing timeout — main loop busy")
+                return
+            state = agent_state_cb() if callable(agent_state_cb) else {}
+            summary = state.get("lastReply", "") or state.get("lastOutput", "") or "done"
+            self._push_final(req_id, "success", summary[:2000])
             return
 
-        state = agent_state_cb() if callable(agent_state_cb) else {}
-        summary = state.get("lastReply", "") or state.get("lastOutput", "") or "done"
-        self._push_final(req_id, "success", summary[:2000])
+        if not self._chat_run_lock.acquire(timeout=300):
+            self._push_final(req_id, "fail", "another Helpwo chat is still running")
+            return
+        try:
+            abort_ev = threading.Event()
+            with self._active_req_lock:
+                self._active_requests[req_id] = abort_ev
+
+            deps = self._build_loop_deps(req_id)
+            session = self._session or {}
+            chat_history = chat_history_cb() if callable(chat_history_cb) else []
+            if not isinstance(chat_history, list):
+                chat_history = []
+
+            def _chat_events(events):
+                if abort_ev.is_set():
+                    raise InterruptedError("chat aborted")
+                for ev in events:
+                    ev["reqId"] = req_id
+                self._push_events(events, req_id=req_id)
+
+            try:
+                result = run_agent_loop(
+                    deps=deps, original_input=content,
+                    session=session, state={},
+                    chat_history=chat_history,
+                    events_cb=_chat_events,
+                    depth=0,
+                    interrupt_event=abort_ev,
+                    max_loops_override=int(get_runtime_config("max_loops")),
+                )
+            except InterruptedError:
+                self._push_final(req_id, "aborted", "chat aborted by remote")
+                return
+            except Exception as e:
+                self._push_final(req_id, "fail", str(e)[:2000])
+                return
+
+            reply = (result.get("msg", "")
+                     or result.get("state", {}).get("lastReply", "")) if isinstance(result, dict) else ""
+            status = "success" if (isinstance(result, dict) and result.get("success")) else "fail"
+            self._push_final(req_id, status, (reply or "done")[:2000])
+        finally:
+            with self._active_req_lock:
+                self._active_requests.pop(req_id, None)
+            self._chat_run_lock.release()
 
     def _handle_exec(self, req_id: str, payload: dict):
         """Run a shell command in a PTY and stream stdout under req_id.
@@ -5205,6 +5369,275 @@ class AgentRegistry:
         threading.Thread(target=_run, daemon=True,
                          name=f"webtest-{req_id[-6:]}").start()
 
+    @staticmethod
+    def _robots_allowed(url: str) -> tuple:
+        """Best-effort robots.txt check. Returns (allowed: bool, note: str).
+        Missing/unreachable robots.txt is treated as allowed."""
+        try:
+            import urllib.parse as _up
+            import urllib.robotparser as _rp
+            import urllib.request as _ur
+            parts = _up.urlsplit(url)
+            robots_url = f"{parts.scheme}://{parts.netloc}/robots.txt"
+            req = _ur.Request(robots_url, headers={"User-Agent": "laintas-analyze"})
+            try:
+                with _ur.urlopen(req, timeout=8) as resp:
+                    body = resp.read().decode("utf-8", "replace")
+            except Exception:
+                return True, "robots.txt unreachable — treated as allowed"
+            rp = _rp.RobotFileParser()
+            rp.parse(body.splitlines())
+            allowed = rp.can_fetch("*", url)
+            return allowed, ("allowed by robots.txt" if allowed
+                             else "DISALLOWED by robots.txt")
+        except Exception as e:
+            return True, f"robots check error ({e}) — treated as allowed"
+
+    def _handle_analyze_site(self, req_id: str, payload: dict):
+        """Capture a public web page for Helpwo's analyze_site tool (analysis &
+        reference, NOT clone-and-republish).
+
+        payload: {url, desktopWidth?, mobileWidth?}. Respects robots.txt,
+        requires one user approval (with a risk warning), then in a dedicated
+        throwaway browser session: navigates, gently scrolls to trigger lazy
+        content + API calls, and collects a full-page desktop + mobile
+        screenshot, the rendered DOM, design tokens (colors/fonts/sizes), the
+        referenced first-party asset URLs, and the observed XHR/fetch API log.
+        Large artifacts are written to host temp files; the report (meta.report)
+        carries their paths so Helpwo pulls them over P2P. Exactly one final.
+        """
+        url = str(payload.get("url") or "").strip()
+        if not url:
+            self._push_final(req_id, "fail", "missing 'url' in analyze_site payload")
+            return
+        if not re.match(r"^https?://", url, re.I):
+            self._push_final(req_id, "fail", "url must start with http:// or https://")
+            return
+
+        allowed, robots_note = self._robots_allowed(url)
+        if not allowed:
+            self._push_final(req_id, "aborted",
+                             f"Refusing: {robots_note} for {url}")
+            return
+
+        # One approval for the whole capture, with an explicit risk warning.
+        if not get_runtime_config("allow_remote_exec_without_approval"):
+            approval = self._request_approval(
+                req_id,
+                f"ANALYZE SITE (reference only): {url}\n"
+                f"robots: {robots_note}\n"
+                f"⚠ Downloads another site's rendered UI + observed API for "
+                f"analysis. Only do this for pages you are authorized to access.",
+                os.getcwd(), timeout=300,
+            )
+            if approval != "approve":
+                self._push_final(req_id, "aborted", f"User {approval}: analyze_site")
+                return
+
+        def _run():
+            import json as _json
+            import tempfile as _tf
+            import tools as tools_mod
+            import browser_session as _bs
+            registry = tools_mod.get_registry()
+
+            class _ApprovedDeps:
+                def __init__(self, base):
+                    self._base = base
+
+                def __getattr__(self, name):
+                    return getattr(self._base, name)
+
+                def request_command_approval(self, cmd, reason=None):
+                    return True
+
+            ctx = tools_mod.ToolCtx(
+                deps=_ApprovedDeps(get_loop_deps()), agent_id=None, session=None,
+                events_cb=None, cwd=os.getcwd(),
+            )
+            session = f"analyze-{req_id[-6:]}"
+            dweb = int(payload.get("desktopWidth") or 1440)
+            mweb = int(payload.get("mobileWidth") or 390)
+            opened = False
+            try:
+                r = registry.invoke("browser.open", {
+                    "url": "about:blank", "name": session,
+                    "width": dweb, "height": 900,
+                }, ctx)
+                if not r.get("ok"):
+                    self._push_final(req_id, "fail",
+                                     f"browser.open failed: {r.get('error')}")
+                    return
+                opened = True
+
+                sess = _bs.get_browser_session(session)
+                if sess is None:
+                    self._push_final(req_id, "fail", "browser session vanished after open")
+                    return
+                sess.set_api_capture(True)
+                sess.clear_captures()
+
+                self._push(req_id, "analyze-progress", f"navigating to {url}")
+                nav = registry.invoke("browser.navigate", {
+                    "session": session, "url": url, "timeout": 45,
+                }, ctx)
+                if not nav.get("ok"):
+                    self._push_final(req_id, "fail",
+                                     f"navigation failed: {nav.get('error')}")
+                    return
+
+                page = sess.get_page()
+                final_url = nav.get("url") or url
+                title = nav.get("title") or ""
+
+                # Gentle interaction: scroll in steps to trigger lazy content and
+                # XHR/fetch, then settle. Every step is best-effort.
+                self._push(req_id, "analyze-progress", "capturing (scroll + settle)")
+                try:
+                    for frac in (0.25, 0.5, 0.75, 1.0):
+                        page.evaluate(
+                            "f => window.scrollTo(0, document.body.scrollHeight * f)", frac)
+                        page.wait_for_timeout(700)
+                    page.evaluate("() => window.scrollTo(0, 0)")
+                except Exception:
+                    pass
+                try:
+                    page.wait_for_load_state("networkidle", timeout=8000)
+                except Exception:
+                    pass
+
+                # Design tokens + first-party asset URLs + heading samples.
+                tokens = {}
+                assets = []
+                try:
+                    extracted = page.evaluate(r"""
+                        () => {
+                          const uniq = (a) => Array.from(new Set(a)).filter(Boolean);
+                          const isPaint = (c) => c && c !== 'rgba(0, 0, 0, 0)' && c !== 'transparent';
+                          const els = Array.from(document.querySelectorAll('body *')).slice(0, 4000);
+                          const colors = [], bgs = [], fonts = [], sizes = [];
+                          for (const el of els) {
+                            const s = getComputedStyle(el);
+                            if (isPaint(s.color)) colors.push(s.color);
+                            if (isPaint(s.backgroundColor)) bgs.push(s.backgroundColor);
+                            if (s.fontFamily) fonts.push(s.fontFamily);
+                            if (s.fontSize) sizes.push(s.fontSize);
+                          }
+                          const a = [];
+                          document.querySelectorAll('img[src]').forEach(i => a.push(i.src));
+                          document.querySelectorAll('link[rel="stylesheet"][href]').forEach(l => a.push(l.href));
+                          document.querySelectorAll('source[src]').forEach(s => a.push(s.src));
+                          return {
+                            colors: uniq(colors).slice(0, 30),
+                            backgrounds: uniq(bgs).slice(0, 30),
+                            fonts: uniq(fonts).slice(0, 15),
+                            fontSizes: uniq(sizes).slice(0, 20),
+                            assets: uniq(a).slice(0, 120),
+                            headings: Array.from(document.querySelectorAll('h1,h2'))
+                              .slice(0, 12).map(h => (h.innerText || '').trim().slice(0, 100))
+                              .filter(Boolean),
+                          };
+                        }
+                    """) or {}
+                    tokens = {
+                        "colors": extracted.get("colors", []),
+                        "backgrounds": extracted.get("backgrounds", []),
+                        "fonts": extracted.get("fonts", []),
+                        "fontSizes": extracted.get("fontSizes", []),
+                        "headings": extracted.get("headings", []),
+                    }
+                    # First-party assets only (same host as the final URL).
+                    import urllib.parse as _up
+                    host = _up.urlsplit(final_url).netloc
+                    for a in extracted.get("assets", []):
+                        try:
+                            if _up.urlsplit(a).netloc == host:
+                                assets.append(a)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+                # Rendered DOM (size-capped) → host temp file.
+                dom_path = None
+                try:
+                    dom = page.evaluate("() => document.documentElement.outerHTML") or ""
+                    dom = dom[:500000]
+                    dom_path = _tf.mktemp(prefix="analyze-dom-", suffix=".html")
+                    with open(dom_path, "w", encoding="utf-8") as f:
+                        f.write(dom)
+                except Exception:
+                    dom_path = None
+
+                # Desktop full-page screenshot.
+                shot_desktop = None
+                try:
+                    p = _tf.mktemp(prefix="analyze-desktop-", suffix=".png")
+                    s = registry.invoke("browser.screenshot", {
+                        "session": session, "full_page": True, "path": p,
+                    }, ctx)
+                    if s.get("ok"):
+                        shot_desktop = s.get("path") or p
+                except Exception:
+                    shot_desktop = None
+
+                # Mobile full-page screenshot (best-effort; viewport resize may
+                # no-op on some CDP setups — never fail the run over it).
+                shot_mobile = None
+                try:
+                    page.set_viewport_size({"width": mweb, "height": 844})
+                    page.wait_for_timeout(800)
+                    p = _tf.mktemp(prefix="analyze-mobile-", suffix=".png")
+                    s = registry.invoke("browser.screenshot", {
+                        "session": session, "full_page": True, "path": p,
+                    }, ctx)
+                    if s.get("ok"):
+                        shot_mobile = s.get("path") or p
+                except Exception:
+                    shot_mobile = None
+
+                # Observed API log → host temp JSON file.
+                api_path = None
+                api_count = 0
+                try:
+                    api_log = sess.get_api_log()
+                    api_count = len(api_log)
+                    if api_log:
+                        api_path = _tf.mktemp(prefix="analyze-api-", suffix=".json")
+                        with open(api_path, "w", encoding="utf-8") as f:
+                            _json.dump(api_log, f, ensure_ascii=False)
+                except Exception:
+                    api_path = None
+
+                report = {
+                    "url": final_url,
+                    "title": title,
+                    "robots": robots_note,
+                    "tokens": tokens,
+                    "assets": assets,
+                    "apiCount": api_count,
+                    "domPath": dom_path,
+                    "apiPath": api_path,
+                    "screenshots": {"desktop": shot_desktop, "mobile": shot_mobile},
+                }
+                self._push_final(
+                    req_id, "success",
+                    f"analyzed {final_url} — {api_count} API call(s), "
+                    f"{len(assets)} first-party asset(s)",
+                    meta={"report": report},
+                )
+            except Exception as e:
+                self._push_final(req_id, "fail", f"analyze_site error: {e}")
+            finally:
+                if opened:
+                    try:
+                        registry.invoke("browser.close", {"name": session}, ctx)
+                    except Exception:
+                        pass
+
+        threading.Thread(target=_run, daemon=True,
+                         name=f"analyze-{req_id[-6:]}").start()
+
     def _handle_query(self, req_id: str, payload: dict):
         """Read-only reconnaissance. Returns one final with data in meta."""
         what = payload.get("what")
@@ -5373,6 +5806,42 @@ class AgentRegistry:
         ))
         self._push_final(req_id, "success", name)
 
+    def _build_loop_deps(self, req_id: str) -> "LoopDeps":
+        """LoopDeps for a remote-initiated agent loop (chat/delegate): local
+        display wiring plus approvals routed back to Helpwo under req_id."""
+        return LoopDeps(
+            read_file=read_file, append_file=append_file,
+            write_file=write_file, strip_ansi=strip_ansi,
+            generate_prompt=generate_cli_prop_template,
+            call_backend=lambda **kw: call_backend_stream(**kw),
+            SubTerminalSession=SubTerminalSession,
+            display_command_output=display_command_output,
+            display_sub_terminal_preview=display_sub_terminal_preview,
+            display_file_diff=display_file_diff,
+            console=console, Markdown=Markdown,
+            pty_passthrough=pty_passthrough,
+            request_command_approval=lambda cmd, reason: self._request_approval(
+                req_id, cmd, os.getcwd()) == "approve",
+            request_file_write_approval=lambda path, diff, reason: self._request_approval(
+                req_id, f"WRITE {path} — {reason}", os.getcwd()) == "approve",
+            request_file_delete_approval=lambda path, preview, reason: self._request_approval(
+                req_id, f"DELETE {path} — {reason}\n{preview}", os.getcwd()) == "approve",
+        )
+
+    def _handle_disconnect(self, req_id: str, payload: dict):
+        """Helpwo unilaterally unlinked this agent. Withdraw quietly: stop
+        heartbeat/poll and unregister. The local terminal keeps running."""
+        console.print(Panel(
+            "[yellow]Helpwo disconnected this terminal.[/yellow]\n"
+            "[dim]The CLI keeps running locally. Run /connect to link again.[/dim]",
+            title="Disconnected", border_style="yellow",
+        ))
+        # Suppress same-id resurrection: this was an explicit user action.
+        self._last_agent_id = ""
+        self.unregister()
+        self.agent_id = None
+        self.agent_secret = ""
+
     def _handle_delegate(self, req_id: str, payload: dict,
                          agent_state_cb, chat_history_cb):
         """Launch a local agent loop for a delegated task.
@@ -5385,11 +5854,20 @@ class AgentRegistry:
             self._push_final(req_id, "fail", "missing 'goal' in delegate payload")
             return
 
+        # Register the abort event BEFORE the approval prompt — an abort that
+        # lands while we're waiting for approval must find the request (it
+        # also force-rejects the pending approval, see _handle_abort).
+        abort_ev = threading.Event()
+        with self._active_req_lock:
+            self._active_requests[req_id] = abort_ev
+
         if not get_runtime_config("allow_remote_exec_without_approval"):
             approval = self._request_approval(
                 req_id, f"DELEGATE: {goal[:500]}", os.getcwd(), timeout=300,
             )
-            if approval != "approve":
+            if approval != "approve" or abort_ev.is_set():
+                with self._active_req_lock:
+                    self._active_requests.pop(req_id, None)
                 self._push_final(req_id, "aborted", f"User {approval}: delegation")
                 return
 
@@ -5420,29 +5898,7 @@ class AgentRegistry:
         ))
 
         # Track this request for abort support
-        abort_ev = threading.Event()
-        with self._active_req_lock:
-            self._active_requests[req_id] = abort_ev
-
-        # Build deps for agent_loop
-        deps = LoopDeps(
-            read_file=read_file, append_file=append_file,
-            write_file=write_file, strip_ansi=strip_ansi,
-            generate_prompt=generate_cli_prop_template,
-            call_backend=lambda **kw: call_backend_stream(**kw),
-            SubTerminalSession=SubTerminalSession,
-            display_command_output=display_command_output,
-            display_sub_terminal_preview=display_sub_terminal_preview,
-            display_file_diff=display_file_diff,
-            console=console, Markdown=Markdown,
-            pty_passthrough=pty_passthrough,
-            request_command_approval=lambda cmd, reason: self._request_approval(
-                req_id, cmd, os.getcwd()) == "approve",
-            request_file_write_approval=lambda path, diff, reason: self._request_approval(
-                req_id, f"WRITE {path} — {reason}", os.getcwd()) == "approve",
-            request_file_delete_approval=lambda path, preview, reason: self._request_approval(
-                req_id, f"DELETE {path} — {reason}\n{preview}", os.getcwd()) == "approve",
-        )
+        deps = self._build_loop_deps(req_id)
 
         session = self._session or {}
         # Isolation: a delegated loop should see only its goal + the caller's
@@ -5521,10 +5977,20 @@ class AgentRegistry:
 
         with self._active_req_lock:
             abort_ev = self._active_requests.get(target)
+            pending_approval = self._pending_approvals.get(target)
+
+        # If the target is blocked on an approval prompt, resolve it as a
+        # rejection so the waiting handler unblocks immediately.
+        if pending_approval:
+            approval_ev, response_dict = pending_approval
+            response_dict["decision"] = "reject"
+            approval_ev.set()
 
         if abort_ev:
             abort_ev.set()
             self._push_final(req_id, "success", f"abort signal sent to {target}")
+        elif pending_approval:
+            self._push_final(req_id, "success", f"pending approval for {target} rejected")
         else:
             # The request may have already completed or doesn't support abort
             self._push_final(req_id, "fail", f"request '{target}' not found or not abortable")
@@ -6434,13 +6900,12 @@ _SLASH_ARG_RULES: dict[tuple[str, ...], SlashArgRule] = {
     **{
         (name,): _arg_rule(0, name)
         for name in (
-            "/cwd", "/scan", "/login", "/hire", "/disconnect", "/max",
+            "/cwd", "/scan", "/login", "/disconnect", "/max",
             "/tools", "/prop", "/snapshots", "/continue",
         )
     },
     ("/help",): _arg_rule(1, "/help [command]"),
     ("/connect",): _arg_rule(1, "/connect [name]"),
-    ("/station",): _arg_rule(2, "/station [agent-id] [terminal]"),
     ("/terminate",): _arg_rule(1, "/terminate <name>"),
     ("/abort",): _arg_rule(1, "/abort <agent-id>"),
     ("/undo",): _arg_rule(1, "/undo [sha]"),
@@ -6601,12 +7066,140 @@ def _decode_text_arg(text: str) -> str:
     return parsed[0] if len(parsed) == 1 else raw
 
 
+def _normalize_slash_arg(token: str) -> str:
+    """Remove quotes retained by shlex(posix=False) on Windows."""
+    value = str(token or "")
+    if (IS_WINDOWS and len(value) >= 2
+            and value[0] == value[-1] and value[0] in {'"', "'"}):
+        return value[1:-1]
+    return value
+
+
 def _json_arg_candidates(text: str) -> list[str]:
     raw = (text or "").strip()
     if not raw:
         return []
     decoded = _decode_text_arg(raw)
     return list(dict.fromkeys([raw, decoded]))
+
+
+def _parse_hire_profile(args: list[str]) -> tuple[Optional[str], EmployeeProfile]:
+    """Parse /hire without coupling employee profiles to argparse globals."""
+    import agent_roles
+
+    args = [_normalize_slash_arg(item) for item in args]
+    name: Optional[str] = None
+    role_name: Optional[str] = None
+    prompt = ""
+    allowed_tools: Optional[list[str]] = None
+    tools_explicit = False
+    i = 0
+    while i < len(args):
+        token = args[i]
+        if token in {"--profile", "--prompt", "--tools"}:
+            if i + 1 >= len(args):
+                raise SlashCommandUsageError(
+                    f"{token} requires a value. Usage: /hire [name] "
+                    "[--profile role] [--prompt file] [--tools name,...]")
+            value = args[i + 1]
+            if token == "--profile":
+                role_name = value
+            elif token == "--prompt":
+                path = Path(value).expanduser()
+                if not path.is_absolute():
+                    path = Path.cwd() / path
+                try:
+                    prompt = path.read_text(encoding="utf-8")
+                except OSError as exc:
+                    raise SlashCommandUsageError(
+                        f"Could not read employee prompt {path}: {exc}") from exc
+                if len(prompt) > 100_000:
+                    raise SlashCommandUsageError(
+                        "Employee prompt exceeds the 100,000 character limit.")
+            else:
+                tools_explicit = True
+                if value.lower() == "inherit":
+                    allowed_tools = None
+                else:
+                    allowed_tools = [
+                        item.strip() for item in value.split(",") if item.strip()
+                    ]
+            i += 2
+            continue
+        if token.startswith("--"):
+            raise SlashCommandUsageError(f"Unknown /hire option: {token}")
+        if name is not None:
+            raise SlashCommandUsageError(
+                "Usage: /hire [name] [--profile role] [--prompt file] "
+                "[--tools name,...]")
+        name = token
+        i += 1
+
+    role = agent_roles.get_role(role_name) if role_name else None
+    if role_name and role is None:
+        available = ", ".join(item.name for item in agent_roles.list_roles())
+        raise SlashCommandUsageError(
+            f"Unknown employee profile '{role_name}'. Available: {available}")
+    if (not tools_explicit and allowed_tools is None
+            and role is not None and role.allowed_tools):
+        allowed_tools = list(role.allowed_tools)
+    if not tools_explicit and allowed_tools is None and role is None:
+        # Hiring freezes a capability snapshot. Newly installed tools are not
+        # silently granted to existing employees; use --tools inherit to opt in.
+        allowed_tools = sorted(
+            tool.name for tool in tools_mod.get_registry().list())
+    if tools_explicit and allowed_tools is not None:
+        known = {tool.name for tool in tools_mod.get_registry().list()}
+        unknown = sorted(set(allowed_tools) - known)
+        if unknown:
+            raise SlashCommandUsageError(
+                f"Unknown employee tool(s): {', '.join(unknown)}")
+
+    profile = EmployeeProfile(
+        title=(role.name.replace("-", " ").title() if role else "General Agent"),
+        description=(role.description if role else
+                     "General-purpose autonomous employee"),
+        specialist_role=role_name,
+        prompt=prompt,
+        capability_tags=([role.name] if role else ["general"]),
+        tool_policy=AgentToolPolicy(allowed_tools=allowed_tools),
+    )
+    return name, profile
+
+
+def _employee_capability_text(agent: AgentInfo) -> str:
+    profile = agent.profile
+    allowed = profile.tool_policy.allowed_tools
+    tools_text = "inherit current company policy" if allowed is None else (
+        ", ".join(allowed) if allowed else "none")
+    prompt_text = "custom overlay" if profile.prompt.strip() else (
+        f"role:{profile.specialist_role}" if profile.specialist_role else
+        "company default")
+    assignment = agent.active_assignment
+    assignment_text = (
+        f"{assignment.id} [{assignment.status}] — {assignment.task}"
+        if assignment else "(none)"
+    )
+    last_assignment = (agent.assignment_history[-1]
+                       if agent.assignment_history else None)
+    last_text = (
+        f"{last_assignment.get('id')} [{last_assignment.get('status')}] — "
+        f"{str(last_assignment.get('result') or last_assignment.get('error') or '')[:240]}"
+        if last_assignment else "(none)"
+    )
+    return (
+        f"ID: {agent.id}\n"
+        f"Name: {agent.name}\n"
+        f"Title: {profile.title}\n"
+        f"Description: {profile.description}\n"
+        f"Capabilities: {', '.join(profile.capability_tags) or '(none)'}\n"
+        f"Prompt: {prompt_text}\n"
+        f"Tools: {tools_text}\n"
+        f"Station: {agent.home_terminal or '(not stationed)'}\n"
+        f"Assignment: {assignment_text}\n"
+        f"Completed assignments: {len(agent.assignment_history)}\n"
+        f"Last result: {last_text}"
+    )
 
 
 def _enqueue_user_input(text: str) -> bool:
@@ -7518,7 +8111,6 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
             current = config.get("agentName", socket.gethostname())
             console.print(f"Current agent name: [bold]{current}[/bold]")
             console.print("Usage: /name <new-name>")
-            console.print("       /agents name <new-name>  (rename current agent)")
             console.print("       /term rename <old> <new>  (rename a terminal)")
 
     elif action == "/memory":
@@ -9577,45 +10169,43 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
                 console.print("[red]Usage: /detail [on|off][/red]")
 
     elif action in ("/station", "/st"):
-        # Syntax:
-        #   /station                        — current agent → this REPL
-        #   /station <agent_id>             — that agent → this REPL
-        #   /station <terminal>             — current agent → sub-terminal
-        #   /station <agent_id> <terminal>  — that agent → sub-terminal
-        # Single-arg form: looked up as agent first; if no such agent exists,
-        # treated as a terminal name. Use the two-arg form to disambiguate
-        # when names collide.
-        agent_id_arg: Optional[str] = None
-        if len(parts) == 1:
-            name = "term0"  # default: deploy current agent in this REPL
-        elif len(parts) == 2:
-            candidate = parts[1]
-            if get_agent(candidate) is not None:
-                # exists as an agent → treat as agent_id, deploy in this REPL
-                agent_id_arg = candidate
-                name = "term0"
-            else:
-                # not an agent → treat as a terminal name
-                name = candidate
-        else:
-            agent_id_arg = parts[1]
-            name = parts[2]
+        station_args = [_normalize_slash_arg(item) for item in parts[1:]]
+        task = ""
+        task_marker = next(
+            (i for i, item in enumerate(station_args)
+             if item in {"--task", "--"}), None)
+        if task_marker is not None:
+            task = " ".join(station_args[task_marker + 1:]).strip()
+            station_args = station_args[:task_marker]
+            if not task:
+                console.print(
+                    "[yellow]Usage: /station <agent-id> [terminal] "
+                    "--task <work>[/yellow]")
+                return False
+        if not station_args or len(station_args) > 2:
+            console.print(
+                "[yellow]Usage: /station <agent-id> [terminal] "
+                "[--task <work>][/yellow]")
+            return False
 
-        # Normalize aliases for the parent REPL
+        agent_id_arg = station_args[0]
+        target_agent = get_agent(agent_id_arg)
+        if target_agent is None:
+            console.print(
+                f"[red]Agent '{agent_id_arg}' not found. Use /hire to create one.[/red]")
+            return False
+        name = (station_args[1] if len(station_args) == 2
+                else (f"work-{target_agent.id}" if task else "term0"))
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", name):
+            console.print("[red]Invalid terminal name.[/red]")
+            return False
+        if task and name.lower() in {"current", "here", "term0"}:
+            console.print(
+                "[red]Assignments require a dedicated terminal; omit the terminal "
+                "to create one automatically.[/red]")
+            return False
         if name.lower() in ("current", "here", "term0"):
             name = "term0"
-
-        # Resolve target agent
-        if agent_id_arg:
-            target_agent = get_agent(agent_id_arg)
-            if target_agent is None:
-                console.print(f"[red]Agent '{agent_id_arg}' not found. Use /hire to create one.[/red]")
-                return False
-        else:
-            target_agent = get_current_agent()
-            if target_agent is None:
-                console.print("[red]No current agent. /hire one first.[/red]")
-                return False
 
         # If the agent is already deployed somewhere else, refuse so the user is explicit
         existing_home = getattr(target_agent, "home_terminal", None)
@@ -9650,9 +10240,7 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
             target_agent.stationed_terminal = "term0"
             if target_agent.role != "primary":
                 target_agent.role = "deployed"
-            switch_to_agent(target_agent.id)
             console.print(f"[green]Stationed [bold]{target_agent.id}[/bold] in this REPL (term0)[/green]")
-            console.print("  [dim]Its shell commands dispatch like user input. /agents to switch back.[/dim]")
             return False
 
         # Sub-terminal path: inspect existing terminal
@@ -9663,26 +10251,53 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
             # send_keys + marker-poll into that terminal's PTY.
             station_agent(target_agent.id, name)
             console.print(f"[green]Stationed [bold]{target_agent.id}[/bold] → terminal [bold]{name}[/bold] (existing)[/green]")
-            return False
-        if existing:
-            unregister_terminal(name)
+        else:
+            if existing:
+                unregister_terminal(name)
 
-        # Spawn a fresh bash sub-terminal as the agent's execution target.
-        # Plain shell (not sub-laintas-cli) — /station is for command
-        # execution; /t is for spawning sub-agent laintas-cli terminals.
-        shell_cmd = os.environ.get("SHELL", "/bin/bash")
-        sub = SubTerminalSession(shell_cmd)
-        sub.start()
-        time.sleep(0.1)
-        if not sub.is_alive():
-            console.print(f"[red]Could not start terminal '{name}'.[/red]")
-            return False
-        sub.read_output(timeout=0.1)
-        register_terminal(sub, shell_cmd, 0, name=name)
+            # A station is a work place, not another CLI identity.  The employee
+            # loop stays in-process; POSIX uses a dedicated PTY and Windows uses
+            # a logical station with subprocess-backed shell execution.
+            shell_cmd = DEFAULT_SHELL
+            if IS_WINDOWS:
+                # Windows has no PTY implementation in InteractiveSession.
+                # Keep a logical station so assignment identity/lifecycle work;
+                # shell.exec safely falls back to subprocess.run(shell=True).
+                register_terminal(None, shell_cmd, 0, name=name)
+            else:
+                sub = SubTerminalSession(shell_cmd)
+                sub.start()
+                time.sleep(0.1)
+                if not sub.is_alive():
+                    console.print(f"[red]Could not start terminal '{name}'.[/red]")
+                    return False
+                sub.read_output(timeout=0.1)
+                register_terminal(sub, shell_cmd, 0, name=name)
+            station_agent(target_agent.id, name)
+            console.print(
+                f"[green]Stationed [bold]{target_agent.id}[/bold] → "
+                f"terminal [bold]{name}[/bold] "
+                f"({'Windows subprocess' if IS_WINDOWS else 'shell'})[/green]")
 
-        station_agent(target_agent.id, name)
-        console.print(f"[green]Stationed [bold]{target_agent.id}[/bold] → terminal [bold]{name}[/bold] (bash)[/green]")
-        console.print(f"  [dim]Enter with /t {name}[/dim]")
+        if task:
+            assignment_events = (
+                (lambda events: agent_registry._push_events(events))
+                if agent_registry and agent_registry.agent_id else None
+            )
+            ok, message, assignment = start_agent_assignment(
+                target_agent.id, task, get_loop_deps(),
+                session=session, events_cb=assignment_events)
+            style = "green" if ok else "red"
+            console.print(f"[{style}]{message}[/{style}]")
+            if ok and assignment:
+                console.print(
+                    f"[dim]Task: {assignment.task}\n"
+                    f"Inspect with /agents {target_agent.id}; send updates with "
+                    f"/tell {target_agent.id} <message>.[/dim]")
+        else:
+            console.print(
+                f"[dim]Assign work with /station {target_agent.id} {name} "
+                "--task \"...\"[/dim]")
 
     elif action == "/terminate":
         name = parts[1] if len(parts) >= 2 else ""
@@ -9706,6 +10321,9 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
             returned: list[str] = []
             if term:
                 for aid in list(term.stationed_agent_ids):
+                    employee = get_agent(aid)
+                    if employee and employee.active_assignment is not None:
+                        abort_agent(aid)
                     unstation_agent(aid)
                     returned.append(aid)
             if unregister_terminal(name):
@@ -9785,10 +10403,35 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
                     console.print("[dim]No new output arrived within the wait window.[/dim]")
 
     elif action == "/hire":
-        agent_info = register_agent(depth=0, role="pool")
+        import agent_persistence
+        hire_name, employee_profile = _parse_hire_profile(parts[1:])
+        if hire_name and not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", hire_name):
+            console.print(
+                "[red]Employee names may contain only letters, numbers, dot, "
+                "underscore, and hyphen (max 64).[/red]")
+            return False
+        if hire_name and get_agent(hire_name) is not None:
+            console.print(f"[red]Agent '{hire_name}' already exists.[/red]")
+            return False
+        agent_info = register_agent(
+            name=hire_name, depth=1, role="pool", profile=employee_profile)
+        if (not agent_info.profile.prompt.strip()
+                and not agent_info.profile.specialist_role):
+            agent_info.profile.prompt = (
+                f"You are {agent_info.name}, a hired employee of this project. "
+                "Use only your assigned capabilities, work only on the current "
+                "station assignment, and report concrete results to the manager."
+            )
         agent_info.parent_terminal = "term0"
-        console.print(f"[green]Hired [bold]{agent_info.id}[/bold] → added to pool[/green]")
-        console.print(f"  [dim]Deploy with /station {agent_info.id} <terminal>  |  Switch with /agents {agent_info.id}[/dim]")
+        agent_persistence.save_agent_state(agent_info)
+        console.print(Panel(
+            _employee_capability_text(agent_info),
+            title=f"Hired employee: {agent_info.name}",
+            border_style="green",
+        ))
+        console.print(
+            f"[dim]Assign work with /station {agent_info.id} "
+            "[terminal] --task \"...\"[/dim]")
 
     elif action == "/agents":
         if len(parts) == 1:
@@ -9845,21 +10488,15 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
             console.print(build_agents_tree())
         elif len(parts) == 2:
             agent_id = parts[1]
-            if switch_to_agent(agent_id):
-                agent = get_agent(agent_id)
-                console.print(f"[green]Switched to [bold]{agent.name}[/bold] ({agent.id})[/green]")
-            else:
+            agent = get_agent(agent_id)
+            if agent is None:
                 console.print(f"[red]Agent '{agent_id}' not found. Use /hire to create one.[/red]")
-        elif len(parts) >= 3 and parts[1].lower() == "name":
-            _, new_name_raw = _raw_tail_after_word(raw_args)
-            new_name = _decode_text_arg(new_name_raw)
-            current = get_current_agent()
-            if current and rename_agent(current.id, new_name):
-                console.print(f"[green]Agent renamed to [bold]{new_name}[/bold][/green]")
             else:
-                console.print("[red]No current agent to rename.[/red]")
+                console.print(Panel(
+                    _employee_capability_text(agent),
+                    title=f"Employee: {agent.name}", border_style="cyan"))
         else:
-            console.print("[yellow]Usage: /agents [tree|agent-id|name <new-name>][/yellow]")
+            console.print("[yellow]Usage: /agents [tree|agent-id][/yellow]")
 
     elif action == "/spawn":
         if not raw_args:
@@ -10294,6 +10931,7 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
             console.print("[dim]This terminal is not connected to Helpwo.[/dim]")
         elif getattr(agent_registry, "depth", 0) == 0:
             name = agent_registry.agent_name
+            agent_registry._last_agent_id = ""  # explicit — don't resurrect
             agent_registry.unregister()
             agent_registry.agent_id = None
             agent_registry.agent_secret = ""
@@ -10302,6 +10940,7 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
                           f"Run /connect to link again.[/yellow]")
         else:
             name = (agent_registry.terminal_meta or {}).get("name", agent_registry.agent_name)
+            agent_registry._last_agent_id = ""  # explicit — don't resurrect
             agent_registry.unregister()
             agent_registry.agent_id = None
             agent_registry.agent_secret = ""
@@ -10359,7 +10998,7 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
             has_primary = interactive_session is not None and interactive_session.is_alive()
             if not terminals and not has_primary:
                 console.print("[dim]No active sub-terminal sessions. "
-                              "Use /station or let the AI spawn a command.[/dim]")
+                              "Use /station <agent-id> or let the AI spawn a command.[/dim]")
             elif not terminals and has_primary:
                 # Only term0 exists — entering it is redundant (already in REPL).
                 console.print("[dim]No sub-terminals. You are already in term0 (primary).[/dim]")
@@ -10912,7 +11551,8 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict,
 
 
 _COMMANDS = [
-    (spec.name, spec.description)
+    (spec.name, (
+        f"{spec.description} · {spec.usage}" if spec.usage else spec.description))
     for spec in COMMAND_SPECS
     if spec.palette
 ]
@@ -10947,9 +11587,11 @@ def show_help(command: str = ""):
             return
         aliases = ", ".join(spec.aliases) or "(none)"
         usage = spec.usage or spec.name
+        details = (
+            f"\n\n{escape(spec.help_text)}" if spec.help_text else "")
         console.print(Panel(
             f"[bold]{escape(usage)}[/bold]\n\n"
-            f"{escape(spec.description)}\n\n"
+            f"{escape(spec.description)}{details}\n\n"
             f"[dim]Aliases: {escape(aliases)}[/dim]",
             title=escape(spec.name), border_style="cyan",
         ))
@@ -11595,10 +12237,18 @@ def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
     _start_bg_input_reader(_msg_queue)
 
     try:
+        active_agent = get_current_agent()
+        loop_agent_id = (
+            active_agent.id
+            if active_agent is not None and active_agent.role != "primary"
+            else None
+        )
         response = run_agent_loop(
             deps, user_input, session, agent_state, chat_history,
             events_cb=events_cb,
             existing_session=existing_session,
+            depth=(active_agent.depth if loop_agent_id else 0),
+            agent_id=loop_agent_id,
             interrupt_event=_interrupt_event,
             message_queue=_msg_queue,
             continue_thread=continue_thread,
@@ -11928,6 +12578,10 @@ def main():
         if args.terminal_name:
             sub.home_terminal = args.terminal_name
             sub.stationed_terminal = args.terminal_name
+        # A pre-assigned child process owns this employee's persisted context;
+        # do not overwrite it with the empty REPL locals created above.
+        agent_state = sub.state
+        chat_history = sub.chat_history
         set_current_agent_id(args.agent_id)
     else:
         primary = register_agent(name="primary", depth=0, role="primary",

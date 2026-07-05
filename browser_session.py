@@ -308,6 +308,15 @@ class BrowserSession:
         self._network_errors = _collections.deque(maxlen=300) # {url, method, status?/failure?}
         self._instrumented = set()   # id(page) already wired up
 
+        # ── full XHR/fetch capture (for site analysis) ──────────────────────
+        # OFF by default — only site analysis turns it on, so ordinary browsing
+        # and testing pay nothing. When enabled, _on_response records every
+        # XHR/fetch request+response (headers redacted, body size-capped) so the
+        # observed API surface can be reconstructed. Set via set_api_capture().
+        self._api_capture_on = False
+        self._api_log = _collections.deque(maxlen=500)        # {url, method, status, req_body?, res_body?, content_type}
+        self._API_BODY_CAP = 20000   # bytes per body kept
+
     # ── public ─────────────────────────────────────────────────────────
 
     def inject_refs(self) -> list:
@@ -471,6 +480,46 @@ class BrowserSession:
                         })
                 except Exception:
                     pass
+                # Full XHR/fetch capture (site analysis only). Kept fully
+                # separate from the error path above so a body-read failure
+                # never affects error capture.
+                if not self._api_capture_on:
+                    return
+                try:
+                    req = resp.request
+                    if req.resource_type not in ("xhr", "fetch"):
+                        return
+                    ctype = ""
+                    try:
+                        ctype = (resp.headers or {}).get("content-type", "")
+                    except Exception:
+                        ctype = ""
+                    entry = {
+                        "url": resp.url,
+                        "method": req.method,
+                        "status": resp.status,
+                        "content_type": ctype,
+                        "req_body": None,
+                        "res_body": None,
+                    }
+                    try:
+                        pd = req.post_data
+                        if pd:
+                            entry["req_body"] = pd[: self._API_BODY_CAP]
+                    except Exception:
+                        pass
+                    # Only read text-ish bodies; skip binary. body-read can throw
+                    # (cached/redirected/no-body) — swallow and keep the metadata.
+                    if any(t in ctype.lower() for t in ("json", "text", "javascript", "xml", "urlencoded")):
+                        try:
+                            txt = resp.text()
+                            if txt:
+                                entry["res_body"] = txt[: self._API_BODY_CAP]
+                        except Exception:
+                            pass
+                    self._api_log.append(entry)
+                except Exception:
+                    pass
 
             page.on("console", _on_console)
             page.on("pageerror", _on_pageerror)
@@ -491,10 +540,18 @@ class BrowserSession:
     def get_network_errors(self) -> list:
         return list(self._network_errors)
 
+    def set_api_capture(self, on: bool) -> None:
+        """Enable/disable full XHR/fetch body capture (site analysis)."""
+        self._api_capture_on = bool(on)
+
+    def get_api_log(self) -> list:
+        return list(self._api_log)
+
     def clear_captures(self) -> None:
         self._console_log.clear()
         self._page_errors.clear()
         self._network_errors.clear()
+        self._api_log.clear()
 
     def _close_playwright(self) -> None:
         """Disconnect Playwright from Chrome (called by close())."""

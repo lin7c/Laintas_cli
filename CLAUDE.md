@@ -123,7 +123,7 @@ All configuration lives in a single `~/.laintas/` directory (override with `LAIN
 | `~/.laintas/session.json` | `laintas_cli.py` | Authentication session (chmod 600) |
 | `~/.laintas/config.json` | `laintas_cli.py` | Global settings (agentName, backendUrl) |
 | `~/.laintas/history` | `laintas_cli.py` | REPL command history |
-| `~/.laintas/agents/` | `agent_persistence.py` | Per-agent state and chat history |
+| `~/.laintas/agents/` | `agent_persistence.py` | Employee profiles, tool policies, assignment history, state, and chat history |
 | `~/.laintas/skills/` | `skills.py` | User-installed skill directories |
 
 All paths are centralized in `paths.py`. On first launch, `migrate.py` auto-migrates any old `~/.laintas_cli_*` files to the new layout.

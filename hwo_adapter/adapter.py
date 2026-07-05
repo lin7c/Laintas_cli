@@ -14,11 +14,12 @@ samples/ + test_parity.py guard against drift.
 
 ── Canonical AST (JSON) ─────────────────────────────────────────────────
   task     : {"type": "task",     "text": str}
-  agent    : {"type": "agent",    "name": str, "promptFile": str|None, "body": [node, ...]}
+  agent    : {"type": "agent",    "name": str, "promptFile": str|None, "model": str|None, "body": [node, ...]}
   parallel : {"type": "parallel", "body": [node, ...]}
 
 ── Grammar ──────────────────────────────────────────────────────────────
   #name# { ... }            an agent with a body
+  #name@model# { ... }      pin the agent to a backend model (e.g. #fe@glm-5.2#)
   (prop.md)#name# { ... }   leading prompt-file prefix
   #name#(prop.md) { ... }   trailing prompt-file prefix (alias)
   // ... //                 parallel block (agents only)
@@ -117,9 +118,17 @@ class _Parser:
             self.i += 1
         if self._eof():
             raise HwoParseError("Unclosed agent name, expected #", start)
-        name = self.source[name_start:self.i].strip()
+        # The token between the #…# hashes is `name` or `name@model`. A trailing
+        # `@model` (split on the FIRST '@'; model ids never contain '@') pins this
+        # agent to a specific backend model, e.g. #researcher@deepseek-v4-flash#.
+        raw_name = self.source[name_start:self.i].strip()
+        name, sep, model = raw_name.partition("@")
+        name = name.strip()
+        model = model.strip() if sep else None
         if not name:
             raise HwoParseError("Empty agent name", start)
+        if sep and not model:
+            raise HwoParseError("Empty model after '@' in agent name", start)
         self._expect("#")
         self._skip_ws()
 
@@ -140,7 +149,7 @@ class _Parser:
         if self._peek() != "}":
             raise HwoParseError(f'Unclosed body for agent "{name}", expected }}', self.i)
         self._expect("}")
-        return {"type": "agent", "name": name, "promptFile": prompt_file, "body": body}
+        return {"type": "agent", "name": name, "promptFile": prompt_file, "model": model, "body": body}
 
     def _read_prompt_prefix(self, start: int) -> Optional[str]:
         self._expect("(")

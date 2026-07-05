@@ -45,6 +45,38 @@ class SlashRegistryTests(unittest.TestCase):
         self.assertIn("/compact", names)
         self.assertIn("/clear", names)
         self.assertIn("/clear", laintas_cli._NEW_SESSION_COMMANDS)
+        palette_descriptions = dict(laintas_cli._COMMANDS)
+        self.assertIn("/station <agent-id>", palette_descriptions["/station"])
+
+    def test_employee_help_and_completion_are_synchronized(self):
+        output = io.StringIO()
+        old_console = laintas_cli.console
+        laintas_cli.console = Console(file=output, force_terminal=False)
+        agent_loop.close_all_agents()
+        try:
+            employee = agent_loop.register_agent(
+                name="alice", depth=1, role="pool")
+            completer = laintas_cli.MetaCompleter()
+            completions = list(completer.get_completions(
+                laintas_cli.Document("/station al", len("/station al")),
+                mock.Mock(completion_requested=True)))
+            profile_completions = list(completer.get_completions(
+                laintas_cli.Document(
+                    "/hire bob --profile rev",
+                    len("/hire bob --profile rev")),
+                mock.Mock(completion_requested=True)))
+            laintas_cli.show_help("/hire")
+            laintas_cli.show_help("/station")
+        finally:
+            laintas_cli.console = old_console
+            agent_loop.close_all_agents()
+
+        self.assertIn(employee.id, [item.text for item in completions])
+        self.assertIn("reviewer", [item.text for item in profile_completions])
+        text = output.getvalue()
+        self.assertIn("does not start work", text)
+        self.assertIn("background Assignment", text)
+        self.assertIn("isolated state/history", text)
 
     def test_clear_dispatches_as_new_session_command(self):
         output = io.StringIO()
@@ -377,7 +409,6 @@ class SlashRegistryTests(unittest.TestCase):
         cases = (
             ("/help task extra", "/help [command]"),
             ("/connect worker extra", "/connect [name]"),
-            ("/station agent1 term1 extra", "/station [agent-id] [terminal]"),
             ("/terminate term1 extra", "/terminate <name>"),
             ("/abort agent1 extra", "/abort <agent-id>"),
             ("/task done 1 extra", "/task done <id>"),
@@ -419,6 +450,97 @@ class SlashRegistryTests(unittest.TestCase):
             action, _, parts = laintas_cli._parse_slash_command(command)
             with self.subTest(command=command):
                 laintas_cli._validate_slash_args(action, parts[1:])
+
+    def test_hire_defines_employee_profile_without_starting_work(self):
+        agent_loop.close_all_agents()
+        output = io.StringIO()
+        old_console = laintas_cli.console
+        laintas_cli.console = Console(file=output, force_terminal=False)
+        try:
+            with mock.patch("agent_persistence.save_agent_state", return_value=True):
+                laintas_cli.handle_meta_command(
+                    "/hire alice --profile reviewer", _Registry(), {})
+            employee = agent_loop.get_agent("alice")
+            self.assertIsNotNone(employee)
+            self.assertEqual(employee.profile.specialist_role, "reviewer")
+            self.assertEqual(employee.status, "idle")
+            self.assertIsNone(employee.active_assignment)
+            self.assertNotIn(
+                "shell.exec", employee.profile.tool_policy.allowed_tools)
+        finally:
+            laintas_cli.console = old_console
+            agent_loop.close_all_agents()
+        self.assertIn("Hired employee: alice", output.getvalue())
+
+    def test_hire_prompt_path_with_spaces_is_normalized_on_windows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prompt_path = Path(tmp) / "employee prompt.md"
+            prompt_path.write_text("WINDOWS EMPLOYEE PROMPT", encoding="utf-8")
+            with mock.patch.object(laintas_cli, "IS_WINDOWS", True):
+                name, profile = laintas_cli._parse_hire_profile([
+                    "alice", "--prompt", f'"{prompt_path}"',
+                    "--tools", "inherit",
+                ])
+
+        self.assertEqual(name, "alice")
+        self.assertEqual(profile.prompt, "WINDOWS EMPLOYEE PROMPT")
+        self.assertIsNone(profile.tool_policy.allowed_tools)
+
+    def test_station_task_starts_assignment_without_switching_manager(self):
+        agent_loop.close_all_agents()
+        manager = agent_loop.register_agent(name="primary", role="primary")
+        employee = agent_loop.register_agent(name="alice", role="pool")
+        agent_loop.set_current_agent_id(manager.id)
+        terminal = mock.Mock()
+        terminal.session.is_alive.return_value = True
+        assignment = mock.Mock(task="fix login race")
+        registry = _Registry()
+        try:
+            with mock.patch.object(
+                    laintas_cli, "get_terminal", return_value=terminal), \
+                    mock.patch.object(laintas_cli, "station_agent") as station, \
+                    mock.patch.object(
+                        laintas_cli, "start_agent_assignment",
+                        return_value=(True, "started", assignment)) as start:
+                laintas_cli.handle_meta_command(
+                    "/station alice work-a --task fix login race",
+                    registry, {})
+            station.assert_called_once_with(employee.id, "work-a")
+            self.assertEqual(start.call_args.args[:2],
+                             (employee.id, "fix login race"))
+            self.assertEqual(agent_loop.get_current_agent().id, manager.id)
+        finally:
+            agent_loop.close_all_agents()
+
+    def test_station_task_uses_logical_terminal_on_windows(self):
+        agent_loop.close_all_agents()
+        agent_loop.close_all_terminals()
+        manager = agent_loop.register_agent(name="primary", role="primary")
+        employee = agent_loop.register_agent(name="alice", depth=1, role="pool")
+        agent_loop.set_current_agent_id(manager.id)
+        assignment = mock.Mock(task="fix login race")
+        try:
+            with mock.patch.object(laintas_cli, "IS_WINDOWS", True), \
+                    mock.patch.object(laintas_cli, "DEFAULT_SHELL", "cmd.exe"), \
+                    mock.patch.object(laintas_cli, "SubTerminalSession") as subterm, \
+                    mock.patch.object(
+                        laintas_cli, "start_agent_assignment",
+                        return_value=(True, "started", assignment)) as start:
+                laintas_cli.handle_meta_command(
+                    '/station alice win-work --task "fix login race"',
+                    _Registry(), {})
+
+            subterm.assert_not_called()
+            station = agent_loop.get_terminal("win-work")
+            self.assertIsNotNone(station)
+            self.assertIsNone(station.session)
+            self.assertEqual(employee.stationed_terminal, "win-work")
+            self.assertEqual(start.call_args.args[:2],
+                             (employee.id, "fix login race"))
+            self.assertEqual(agent_loop.get_current_agent().id, manager.id)
+        finally:
+            agent_loop.close_all_terminals()
+            agent_loop.close_all_agents()
 
     def test_json_args_preserve_quotes(self):
         sent = {}

@@ -202,6 +202,9 @@ cycle detection, normalized progress/status, and an append-only event history.
 | `/scan` | Rescan PATH for executables |
 | `/debug` | Browse AI interaction debug logs (TUI) |
 | `/cwd` | Show current working directory |
+| `/hire [name] [--profile role] [--prompt file] [--tools names\|inherit]` | Define a persistent employee capability profile without starting work |
+| `/station <agent> [terminal] --task <work>` | Give an employee a fresh assignment (dedicated PTY on POSIX; subprocess-backed logical station on Windows) |
+| `/agents [agent-id]` | List employees or inspect one employee's capabilities and assignment history |
 | `/t, /term` | Sub-terminal manager: `new <n> <cmd>`, `send <n> <k>`, `close <n>`, `details <n>` |
 | `/config [key] [value]` | View/set runtime config (from `.extra_command.py`) |
 | `/reload` | Delete all default files and restart laintas-cli (from `.extra_command.py`) |

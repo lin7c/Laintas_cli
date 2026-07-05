@@ -34,6 +34,7 @@ class HwoAgent:
     name: str = ""
     body: list = field(default_factory=list)   # list[HwoStep]
     prompt_file: Optional[str] = None           # optional (file.md) prefix override
+    model: Optional[str] = None                 # optional #name@model# backend-model pin
 
 
 @dataclass
@@ -66,6 +67,7 @@ def _to_node(d: dict) -> HwoStep:
         return HwoAgent(
             name=d["name"],
             prompt_file=d.get("promptFile"),
+            model=d.get("model"),
             body=[_to_node(c) for c in d["body"]],
         )
     if t == "parallel":
@@ -85,7 +87,8 @@ def summarize_steps(steps: list, indent: int = 0) -> list:
         if step.kind == 'task':
             lines.append(f"{pad}- task: {step.text.replace(chr(10), ' ')[:100]}")
         elif step.kind == 'agent':
-            lines.append(f"{pad}- agent: #{step.name}#")
+            _model = f"@{step.model}" if step.model else ""
+            lines.append(f"{pad}- agent: #{step.name}{_model}#")
             lines.extend(summarize_steps(step.body, indent + 1))
         elif step.kind == 'parallel':
             lines.append(f"{pad}- parallel:")
@@ -276,6 +279,7 @@ class HwoCtx:
     abort_event: Optional[object] = None
     workflow_manifest: Optional[dict] = None   # name -> {parent_name, sibling_names, child_names, prompt_file}
     prompt_override: Optional[str] = None      # resolved (prompt.md) content, inherited down the tree
+    model_override: Optional[str] = None       # #name@model# backend-model pin, inherited down the tree
 
 
 # ── Execution ─────────────────────────────────────────────────────────────
@@ -331,6 +335,8 @@ def _run_task(text: str, ctx: HwoCtx, inherited: str = "") -> dict:
     )
     if ctx.prompt_override:
         child.state['_prompt_override'] = ctx.prompt_override
+    if ctx.model_override:
+        child.state['_model_override'] = ctx.model_override
 
     spawn_ctx = (
         "[HWO] Execute this workflow step exactly. Do not reinterpret the workflow; "
@@ -433,6 +439,11 @@ def _run_agent(agent_step: HwoAgent, ctx: HwoCtx, inherited: str = "") -> dict:
     if prompt_override:
         child.state['_prompt_override'] = prompt_override
 
+    # Model pin: this agent's own `@model` wins, else inherit the parent's pin.
+    model_override = agent_step.model or ctx.model_override
+    if model_override:
+        child.state['_model_override'] = model_override
+
     team_manifest = generate_team_manifest(agent_step.name, ctx.workflow_manifest) if ctx.workflow_manifest else ""
     body_context = f"{team_manifest}\n\n{inherited}" if (team_manifest and inherited) else (team_manifest or inherited)
 
@@ -484,6 +495,7 @@ def _run_agent(agent_step: HwoAgent, ctx: HwoCtx, inherited: str = "") -> dict:
                     abort_event=ctx.abort_event,
                     workflow_manifest=ctx.workflow_manifest,
                     prompt_override=prompt_override,
+                    model_override=model_override,
                 )
                 result = run_sequence(agent_step.body, sub_ctx)
                 msg = result.get("msg", "")

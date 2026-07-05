@@ -1053,6 +1053,41 @@ def format_snapshot_for_prompt(snapshot: dict) -> str:
 # ── Agent Registry ──────────────────────────────────────────────────────
 
 @dataclass
+class AgentToolPolicy:
+    """Per-employee tool visibility. ``None`` means inherit the global set."""
+
+    allowed_tools: Optional[list[str]] = None
+    denied_tools: list[str] = field(default_factory=list)
+
+
+@dataclass
+class EmployeeProfile:
+    """Persistent capability definition created by /hire."""
+
+    title: str = "General Agent"
+    description: str = "General-purpose autonomous employee"
+    specialist_role: Optional[str] = None
+    prompt: str = ""
+    capability_tags: list[str] = field(default_factory=list)
+    tool_policy: AgentToolPolicy = field(default_factory=AgentToolPolicy)
+
+
+@dataclass
+class AgentAssignment:
+    """One concrete unit of work started by /station."""
+
+    id: str
+    task: str
+    terminal_name: str
+    status: str = "queued"
+    created_at: float = 0.0
+    started_at: Optional[float] = None
+    completed_at: Optional[float] = None
+    result: str = ""
+    error: str = ""
+
+
+@dataclass
 class AgentInfo:
     """Metadata about a logical AI agent managed by the REPL."""
     id: str
@@ -1082,6 +1117,10 @@ class AgentInfo:
     group_id: Optional[str] = None            # parallel group this agent belongs to
     result: str = ""                          # final result text (set by mark_agent_finished)
     error: str = ""                           # error text if status=error
+    # ── Employee / assignment model ─────────────────────────────────
+    profile: EmployeeProfile = field(default_factory=EmployeeProfile)
+    active_assignment: Optional[AgentAssignment] = None
+    assignment_history: list[dict] = field(default_factory=list)
 
 
 _agent_registry: dict[str, AgentInfo] = {}
@@ -1099,7 +1138,8 @@ _wait_queue: list = []                           # FIFO: (agent_id, start_fn) pa
 def register_agent(name: str = None, depth: int = 0,
                    parent_id: Optional[str] = None,
                    role: str = "pool",
-                   load_existing: bool = False) -> AgentInfo:
+                   load_existing: bool = False,
+                   profile: Optional[EmployeeProfile] = None) -> AgentInfo:
     """Create and register a new AI agent. Returns the AgentInfo.
 
     If load_existing=True and a persisted state file exists for the given
@@ -1121,6 +1161,7 @@ def register_agent(name: str = None, depth: int = 0,
             depth=depth,
             parent_id=parent_id,
             role=role,
+            profile=profile or EmployeeProfile(),
         )
         if load_existing:
             data = agent_persistence.load_agent_state(agent_id)
@@ -1322,6 +1363,108 @@ def get_or_hire_pool_agent() -> AgentInfo:
     if pool:
         return pool[0]
     return register_agent(depth=0, role="pool")
+
+
+def start_agent_assignment(agent_id: str, task: str, deps,
+                           session: Optional[dict] = None,
+                           events_cb=None) -> tuple[bool, str, Optional[AgentAssignment]]:
+    """Start one concrete background assignment for a hired employee.
+
+    Employee capability/profile is persistent; state and chat history are fresh
+    for every assignment.  The employee returns to idle after the runner exits.
+    """
+    employee = get_agent(agent_id)
+    task = str(task or "").strip()
+    if employee is None:
+        return False, f"Agent '{agent_id}' not found.", None
+    if not task:
+        return False, "Assignment task cannot be empty.", None
+    if employee.active_assignment is not None or employee.status in {
+            "queued", "running", "waiting"}:
+        active = employee.active_assignment
+        suffix = f" ({active.id})" if active else ""
+        return False, f"Agent '{agent_id}' is already working{suffix}.", active
+    terminal_name = employee.stationed_terminal or employee.home_terminal
+    if not terminal_name:
+        return False, f"Agent '{agent_id}' is not stationed at a terminal.", None
+
+    assignment = AgentAssignment(
+        id=f"job-{uuid.uuid4().hex[:10]}",
+        task=task,
+        terminal_name=terminal_name,
+        created_at=time.time(),
+    )
+    employee.active_assignment = assignment
+    employee.abort_event.clear()
+    employee.state = {
+        "shortTermMemory": "",
+        "lastReply": "",
+        "lastOutput": "",
+        "_assignment_id": assignment.id,
+        "_assignment_task": task,
+    }
+    if employee.profile.specialist_role:
+        employee.state["_role_name"] = employee.profile.specialist_role
+    employee.chat_history = []
+
+    def _finish(result: str = "", error: str = "") -> None:
+        assignment.completed_at = time.time()
+        assignment.result = result
+        assignment.error = error
+        assignment.status = (
+            "aborted" if employee.abort_event.is_set()
+            else "error" if error else "completed"
+        )
+        mark_agent_finished(employee.id, result=result, error=error)
+        employee.assignment_history.append({
+            "id": assignment.id,
+            "task": assignment.task,
+            "terminal_name": assignment.terminal_name,
+            "status": assignment.status,
+            "created_at": assignment.created_at,
+            "started_at": assignment.started_at,
+            "completed_at": assignment.completed_at,
+            "result": result,
+            "error": error,
+        })
+        employee.assignment_history = employee.assignment_history[-100:]
+        employee.active_assignment = None
+        employee.status = "idle"
+        try:
+            agent_persistence.save_agent_state(employee)
+        except Exception:
+            pass
+
+    def _runner(ok: bool) -> None:
+        if not ok:
+            _finish(error="Cancelled while queued.")
+            return
+        assignment.status = "running"
+        assignment.started_at = time.time()
+        try:
+            result = run_agent_loop(
+                deps, task, session or {}, employee.state,
+                employee.chat_history, events_cb=events_cb,
+                depth=employee.depth, agent_id=employee.id,
+            )
+            reply = ((result.get("state") or {}).get("lastReply", "")
+                     if isinstance(result, dict) else "")
+            _finish(result=reply)
+        except Exception as exc:
+            _finish(error=f"{type(exc).__name__}: {exc}")
+
+    thread = threading.Thread(
+        target=lambda: schedule_agent(employee.id, _runner),
+        daemon=True,
+        name=f"laintas-assignment-{assignment.id}",
+    )
+    employee.thread = thread
+    try:
+        agent_persistence.save_agent_state(employee)
+    except Exception:
+        pass
+    thread.start()
+    return True, f"Assignment {assignment.id} started for {employee.name}.", assignment
 
 
 def _format_deployment(a: Optional["AgentInfo"]) -> str:
@@ -1527,9 +1670,16 @@ def wait_for_agent(agent_id: str, timeout: float = 30.0) -> Optional[AgentInfo]:
     info = get_agent(agent_id)
     if info is None:
         return None
+    waiting_for_assignment = info.active_assignment is not None
     deadline = time.time() + timeout
     while time.time() < deadline:
         if info.status in ("done", "aborted", "error"):
+            return info
+        if (waiting_for_assignment and info.active_assignment is None
+                and info.status == "idle"):
+            return info
+        if (not waiting_for_assignment and info.status == "idle"
+                and info.assignment_history):
             return info
         time.sleep(0.1)
     return None
@@ -3477,7 +3627,7 @@ def _salient_arg(name: str, arguments: dict) -> str:
         return (arguments.get("task") or "")[:80]
     if name == "agent.tell":
         return f'{arguments.get("agent_id", "?")}: {(arguments.get("message") or "")[:60]}'
-    if name in ("agent.wait", "agent.abort", "agent.switch"):
+    if name in ("agent.wait", "agent.abort"):
         return arguments.get("agent_id", "") or ""
     if name in ("web.fetch",):
         return arguments.get("url", "") or ""
@@ -3574,16 +3724,21 @@ def _format_tool_result_for_loop(tool_name: str, result: dict, max_chars: int) -
     return text
 
 
-def _render_tool_catalog(state: dict, loop: int) -> str:
+def _render_tool_catalog(state: dict, loop: int,
+                         allowed_names: Optional[set[str]] = None) -> str:
     """Full catalog on turn 1 (or after an unknown-tool error); short reminder
     afterwards. Saves ~5KB × max_loops per task on follow-up turns."""
     if loop == 0 or state.get("_force_full_catalog_next"):
         state["_force_full_catalog_next"] = False
-        return tools_mod.get_registry().describe_for_prompt()
-    return tools_mod.get_registry().describe_short_reminder()
+        return tools_mod.get_registry().describe_for_prompt(
+            allowed_names=allowed_names)
+    return tools_mod.get_registry().describe_short_reminder(
+        allowed_names=allowed_names)
 
 
-def _render_tool_catalog_enhanced(state: dict, loop: int, depth: int = 0) -> str:
+def _render_tool_catalog_enhanced(
+        state: dict, loop: int, depth: int = 0,
+        allowed_names: Optional[set[str]] = None) -> str:
     """Layered tool catalog rendering:
     - Tools allowed by current workflow phase / role: full description
     - Other tools: name only
@@ -3600,7 +3755,7 @@ def _render_tool_catalog_enhanced(state: dict, loop: int, depth: int = 0) -> str
 
     # If neither workflow nor role is active, use the standard catalog
     if not wf_active and not role_name and mode_allowed is None:
-        base = _render_tool_catalog(state, loop)
+        base = _render_tool_catalog(state, loop, allowed_names)
         # Append role catalog for sub-agents
         if depth > 0:
             role_section = agent_roles.describe_roles_for_prompt()
@@ -3610,7 +3765,10 @@ def _render_tool_catalog_enhanced(state: dict, loop: int, depth: int = 0) -> str
 
     # Build layered rendering
     registry = tools_mod.get_registry()
-    all_tools = registry.list()
+    all_tools = [
+        tool for tool in registry.list()
+        if allowed_names is None or tool.name in allowed_names
+    ]
 
     # Determine allowed tools from workflow + role
     allowed = None  # None means all allowed
@@ -3629,7 +3787,7 @@ def _render_tool_catalog_enhanced(state: dict, loop: int, depth: int = 0) -> str
 
     if allowed is None:
         # No restrictions — full catalog
-        base = _render_tool_catalog(state, loop)
+        base = _render_tool_catalog(state, loop, allowed_names)
     else:
         # Layered: allowed tools get full description, others get name-only
         lines = []
@@ -3696,7 +3854,8 @@ def _format_parallel_results(inbox_msgs: list) -> str:
     return f"{header}\n\n" + "\n\n---\n\n".join(results)
 
 
-def _allowed_tool_names_for_state(state: dict) -> set[str]:
+def _allowed_tool_names_for_state(
+        state: dict, agent_id: Optional[str] = None) -> set[str]:
     """Return the exact internal tool set the current runtime may dispatch.
 
     The same set is sent to the provider, preventing blocked tools from wasting
@@ -3730,6 +3889,13 @@ def _allowed_tool_names_for_state(state: dict) -> set[str]:
         if agent_roles.is_tool_allowed_for_role(name, role_name)
         and workflow_engine.is_tool_allowed_in_workflow(name)
     }
+    employee = get_agent(agent_id) if agent_id else None
+    profile = getattr(employee, "profile", None) if employee else None
+    policy = getattr(profile, "tool_policy", None) if profile else None
+    if policy is not None:
+        if policy.allowed_tools is not None:
+            names &= set(policy.allowed_tools)
+        names -= set(policy.denied_tools or [])
     return names
 
 
@@ -3932,6 +4098,7 @@ def run_agent_loop(
         history_context = _history_without_current_turn(chat_history, original_input)
         skill_context = skills_mod.get_activated_skills_context()
         skill_catalog = skills_mod.describe_skills_for_prompt()
+        _allowed_tool_names = _allowed_tool_names_for_state(state, agent_id)
 
         # ── Phase 2: abort check + inbox drain ────────────────────────
         if self_info is not None:
@@ -4175,7 +4342,8 @@ def run_agent_loop(
             .replace("{{terminalName}}", terminal_name_str) \
             .replace("{{parentTerminal}}", parent_terminal_str) \
             .replace("{{deploymentStatus}}", deployment_status_str) \
-            .replace("{{tools}}", _render_tool_catalog_enhanced(state, loop, depth)) \
+            .replace("{{tools}}", _render_tool_catalog_enhanced(
+                state, loop, depth, _allowed_tool_names)) \
             .replace("{{skills}}", skill_catalog)
         mode_section = (
             "" if plan_mode.is_plan_mode()
@@ -4185,12 +4353,26 @@ def run_agent_loop(
             system_prompt = system_prompt.rstrip() + "\n\n" + mode_section
         if _prompt_lab_section and not _prompt_lab_has_slot:
             system_prompt = system_prompt.rstrip() + "\n\n" + _prompt_lab_section
-        system_prompt = (
-            PLATFORM_SAFETY_POLICY
-            + "\n<user_customization>\n"
-            + system_prompt
-            + "\n</user_customization>"
-        )
+        # Hired employees keep a persistent capability/persona overlay.  A
+        # station assignment is a fresh work context layered on top of it.
+        employee_profile = getattr(current_agent, "profile", None)
+        if employee_profile and employee_profile.prompt.strip():
+            system_prompt += (
+                "\n\n<employee_profile>\n"
+                f"Title: {employee_profile.title}\n"
+                f"Description: {employee_profile.description}\n\n"
+                f"{employee_profile.prompt.strip()}\n"
+                "</employee_profile>"
+            )
+        assignment_task = str(state.get("_assignment_task") or "").strip()
+        if assignment_task:
+            system_prompt += (
+                "\n\n<assignment>\n"
+                f"ID: {state.get('_assignment_id', '(unknown)')}\n"
+                f"Task: {assignment_task}\n"
+                "Work only on this assignment. Report a concise result when complete.\n"
+                "</assignment>"
+            )
 
         # ── Extended template variables (from agent_roles, workflow_engine, etc.) ──
 
@@ -4229,6 +4411,15 @@ def run_agent_loop(
         # Previous-session context is restored only through explicit /resume.
         # Keep the legacy template placeholder harmless for existing cli.prop files.
         system_prompt = system_prompt.replace("{{lastSession}}", "")
+
+        # Employee and assignment instructions are workspace customization and
+        # therefore remain inside the platform-safety boundary.
+        system_prompt = (
+            PLATFORM_SAFETY_POLICY
+            + "\n<user_customization>\n"
+            + system_prompt
+            + "\n</user_customization>"
+        )
 
         # Inject current date/time so the AI always knows when it is.
         system_prompt += f"\n\n[CURRENT DATE & TIME]\n{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} (local)"
@@ -4305,7 +4496,6 @@ def run_agent_loop(
 
         # 5. Call backend (skip spinner in non-interactive/execute mode)
         lang = _detect_lang(original_input)
-        _allowed_tool_names = _allowed_tool_names_for_state(state)
         _detail = bool(get_runtime_config("detail"))
         _thinking_t0 = time.monotonic()
         if events_cb is not None:
@@ -4402,6 +4592,7 @@ def run_agent_loop(
                             interrupt_event=_interrupt,
                             messages=_thread_to_send,
                             allowed_tool_names=_allowed_tool_names,
+                            model_override=state.get('_model_override'),
                         )
                     except TypeError:
                         # Backend doesn't support on_chunk/interrupt_event — fall back
@@ -4773,6 +4964,25 @@ def run_agent_loop(
 
                 # ── Role / Workflow tool filtering ──
                 _role_name = state.get("_role_name")
+                if name not in _allowed_tool_names:
+                    result = {
+                        "ok": False,
+                        "error": (
+                            f"BLOCKED: tool '{name}' is not available to agent "
+                            f"'{agent_id or 'current'}'."
+                        ),
+                        "tool": name,
+                        "returncode": -1,
+                    }
+                    formatted_outputs.append(
+                        _format_tool_result_for_loop(
+                            name, result,
+                            int(get_runtime_config("output_truncate") or 3000)))
+                    per_call_rows.append({
+                        "command": salient, "output": result["error"],
+                        "returncode": -1, "tool": name, "call_id": call_id,
+                    })
+                    continue
                 if (not _prompt_lab_worker and not _evolution_lab_worker
                         and not plan_mode.is_tool_allowed(name)):
                     result = {
