@@ -1,0 +1,6 @@
+{
+  "schemaVersion": 1,
+  "name": "company-process",
+  "entrypoint": "skill.py",
+  "capabilities": ["agent.control", "fs.read", "fs.write"]
+}

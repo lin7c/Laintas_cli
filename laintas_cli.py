@@ -2724,24 +2724,8 @@ def show_model_selector(models: list[dict], current: str = "") -> Optional[dict]
 
 
 def choose_login_method() -> Optional[str]:
-    """Choose an authentication path through the shared keyboard UI."""
-    if not sys.stdin.isatty():
-        return None
-    options = [
-        ("Remote login", "Open accounts.laintas.com; no password typing"),
-        ("Local login", "Enter username and password in this terminal"),
-    ]
-    chosen = select_dialog(
-        options,
-        title="Login to Laintas",
-        full_screen=False,
-        selected_index=0,
-        hint="↑↓ navigate  ↵ select  Esc/q cancel",
-        letter_shortcuts=True,
-    )
-    if chosen is None:
-        return None
-    return "remote" if chosen == options[0] else "local"
+    """Use browser OAuth exclusively; public CLI binaries cannot protect passwords."""
+    return "remote"
 
 
 # ── Authentication ──────────────────────────────────────────────────────
@@ -2889,7 +2873,14 @@ def build_login_payload(username: str, password: str, captcha_response: str) -> 
 
 
 def login_interactive() -> Optional[dict]:
-    """Interactive login flow — username+password via Better Auth. Returns session dict or None."""
+    """Retained API shim: direct password/token login is intentionally disabled."""
+    console.print(
+        "[yellow]Direct terminal password login is disabled. "
+        "Use browser OAuth with PKCE instead.[/yellow]")
+    return None
+
+    # Legacy implementation below is unreachable and retained temporarily so
+    # old source patches fail closed while packaged releases migrate.
     console.print(Panel(
         "[bold]Login to Laintas[/bold]\n\n"
         "Enter your laintas.com username and password.\n"
@@ -3155,7 +3146,7 @@ def ensure_auth() -> Optional[dict]:
             clear_session()
             return None
 
-    # 2. No cached account — ask for login method through the shared selector.
+    # 2. No cached account — browser OAuth + PKCE is the only login path.
     for _ in range(3):
         choice = choose_login_method()
         if choice is None:
@@ -3165,11 +3156,7 @@ def ensure_auth() -> Optional[dict]:
             session = login_via_browser()
             if session:
                 return session
-            console.print("[yellow]Remote login failed. Choose local login to retry.[/yellow]")
-        elif choice == "local":
-            session = login_interactive()
-            if session:
-                return session
+            console.print("[yellow]Remote login failed. Retrying browser OAuth is required.[/yellow]")
 
     console.print("[red]Authentication failed. Exiting.[/red]")
     sys.exit(1)
@@ -7926,8 +7913,6 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
         choice = choose_login_method()
         if choice == "remote":
             new_session = login_via_browser()
-        elif choice == "local":
-            new_session = login_interactive()
         else:
             new_session = None
             console.print("[dim]Login cancelled.[/dim]")

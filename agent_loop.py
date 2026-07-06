@@ -4532,22 +4532,29 @@ def run_agent_loop(
                     _elapsed = time.monotonic() - _thinking_t0
                     # Output tokens grow in real-time from the streamed reply.
                     _cur_out_est = usage_tracker.estimate_tokens(stream_state["reply"])
-                    # Cap the preview to a few lines short of the terminal
-                    # height so the Live frame (reply tail + spinner + command
-                    # line) always fits the viewport. rich.Live only does clean
-                    # in-place redraw while the frame is shorter than the
-                    # viewport; once it overflows it re-emits the whole content
-                    # on every refresh, leaving duplicate copies in the
-                    # scrollback ("复读"). The full reply is printed once after
+                    # Show a SMALL plain-text tail preview (not Markdown).
+                    # Markdown rendering expands height unpredictably (list
+                    # padding, code-block borders, paragraph spacing) — 18 raw
+                    # lines easily become 30+ rendered lines, overflowing the
+                    # terminal viewport.  When the Live frame overflows,
+                    # rich switches from in-place redraw to append mode, and
+                    # transient=True can only clear the last frame, leaving
+                    # stale copies in the scrollback ("复读").  Plain Text with
+                    # a fixed 5-line cap + per-line width truncation keeps the
+                    # frame tiny and predictable, so transient clearing always
+                    # works.  The full reply is printed once as Markdown after
                     # streaming finishes.
-                    _cap = max(4, (deps.console.height or 24) - 6)
+                    _cap = 5
+                    _cw = (deps.console.width or 80) - 1
                     if stream_state["reply"]:
                         _rlines = stream_state["reply"].split("\n")
                         if len(_rlines) > _cap:
-                            _preview = f"… streaming ({len(_rlines)} lines) …\n" + "\n".join(_rlines[-_cap:])
+                            _tail = _rlines[-_cap:]
+                            _preview = f"… streaming ({len(_rlines)} lines) …\n" + "\n".join(
+                                (ln[:_cw - 3] + "…" if len(ln) > _cw else ln) for ln in _tail)
                         else:
                             _preview = stream_state["reply"]
-                        parts.append(deps.Markdown(_preview))
+                        parts.append(Text(_preview, style="dim"))
                         _label = "streaming…"
                     else:
                         _label = "thinking…"

@@ -109,23 +109,10 @@ class SelectionEntryPointTests(unittest.TestCase):
                 label=lambda item: item["id"]))
         dialog.assert_not_called()
 
-    def test_login_method_uses_shared_selector(self):
-        def choose_local(items, **kwargs):
-            self.assertFalse(kwargs["full_screen"])
-            return items[1]
-
-        with mock.patch.object(
-                laintas_cli.sys.stdin, "isatty", return_value=True), \
-                mock.patch.object(
-                    laintas_cli, "select_dialog", side_effect=choose_local):
-            self.assertEqual(laintas_cli.choose_login_method(), "local")
-
-    def test_login_method_cancellation_is_preserved(self):
-        with mock.patch.object(
-                laintas_cli.sys.stdin, "isatty", return_value=True), \
-                mock.patch.object(
-                    laintas_cli, "select_dialog", return_value=None):
-            self.assertIsNone(laintas_cli.choose_login_method())
+    def test_login_method_is_browser_oauth_only(self):
+        with mock.patch.object(laintas_cli, "select_dialog") as dialog:
+            self.assertEqual(laintas_cli.choose_login_method(), "remote")
+        dialog.assert_not_called()
 
     def test_complex_task_approach_uses_shared_selector(self):
         selected = {}
