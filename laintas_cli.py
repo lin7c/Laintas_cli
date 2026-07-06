@@ -39,8 +39,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, urlencode
 
 # ── OS Detection (must come before Unix-specific imports) ────────────────
-SYSTEM = platform.system()  # "Linux", "Windows", "Darwin"
-IS_WINDOWS = SYSTEM == "Windows"
+SYSTEM = platform.system()  # "Linux", "Darwin"
 
 # Resolved once, at import time, while cwd is still the launch directory.
 # sys.argv[0] is often relative (e.g. "laintas_cli.py") — os.execv() resolves
@@ -49,34 +48,11 @@ IS_WINDOWS = SYSTEM == "Windows"
 # absolute path now makes restart correct regardless of later cwd changes.
 _LAUNCH_SCRIPT_PATH = os.path.abspath(sys.argv[0]) if sys.argv else __file__
 
-# Windows cmd.exe internal commands — not on PATH but always available
-_WINDOWS_CMD_BUILTINS = {
-    # Navigation
-    "dir", "cd", "chdir", "md", "mkdir", "rd", "rmdir", "tree",
-    "pushd", "popd", "dironly",
-    # Files
-    "copy", "del", "erase", "type", "ren", "rename", "move",
-    "attrib", "icacls", "replace", "robocopy", "xcopy",
-    # Text
-    "find", "findstr", "more", "sort", "comp", "fc",
-    # System
-    "cls", "ver", "vol", "date", "time", "tasklist", "taskkill",
-    "shutdown", "systeminfo", "driverquery",
-    # Shell
-    "echo", "set", "prompt", "title", "color", "exit", "start",
-    "call", "cmd", "doskey", "path", "pause", "rem",
-    # Utility
-    "where", "whoami", "assoc", "ftype", "chkdsk", "mklink",
-    "help", "print", "clip",
-}
-
-# Unix-only modules (don't exist on Windows)
-if not IS_WINDOWS:
-    import pty
-    import select
-    import fcntl
-    import termios
-    import tty
+import pty
+import select
+import fcntl
+import termios
+import tty
 
 import requests
 from rich.console import Console, Group
@@ -266,12 +242,11 @@ def select_dialog(
         clear_typeahead(get_app_session().input)
     except Exception:
         pass
-    if not IS_WINDOWS:
-        try:
-            import termios as _termios
-            _termios.tcflush(sys.stdin.fileno(), _termios.TCIFLUSH)
-        except (OSError, ValueError, io.UnsupportedOperation, _termios.error):
-            pass
+    try:
+        import termios as _termios
+        _termios.tcflush(sys.stdin.fileno(), _termios.TCIFLUSH)
+    except (OSError, ValueError, io.UnsupportedOperation, _termios.error):
+        pass
 
     # ── Normalise items into (label, desc) pairs ──────────────────
     norm: list[tuple[str, str]] = []
@@ -666,11 +641,7 @@ def execute_command_pty(command: str, timeout: int = 120) -> dict:
     """Execute a shell command in a PTY. Output streams to terminal AND is captured.
 
     Returns {stdout, stderr, returncode, success}.
-    On Windows falls back to subprocess.run with capture_output.
     """
-    if IS_WINDOWS:
-        return _execute_windows(command, timeout)
-
     session = InteractiveSession(command, timeout=timeout, stream_output=True)
     try:
         return session.run_to_completion()
@@ -687,11 +658,7 @@ def pty_passthrough(command: str, timeout: int = 120) -> dict:
     same terminal environment the user sees.
 
     Returns {stdout, stderr, returncode, success}.
-    On Windows falls back to subprocess.run.
     """
-    if IS_WINDOWS:
-        return _execute_windows(command, timeout)
-
     fd = sys.stdin.fileno()
     old_tcattr = termios.tcgetattr(fd)
     old_sigint = signal.getsignal(signal.SIGINT)
@@ -965,7 +932,7 @@ class SubTerminalSession:
     def __init__(self, command: str, timeout: int = 120):
         self.command = command
         self.timeout = timeout
-        self._use_tmux = "TMUX" in os.environ and not IS_WINDOWS
+        self._use_tmux = "TMUX" in os.environ
         self._tmux_window: str = ""
         self._pty: Optional[InteractiveSession] = None
         self._alive: bool = False
@@ -1304,24 +1271,6 @@ def _drain_fd(fd: int, chunks: list) -> None:
             break
 
 
-def _execute_windows(command: str, timeout: int) -> dict:
-    """Fallback subprocess execution on Windows."""
-    try:
-        result = subprocess.run(
-            command, shell=True, capture_output=True, text=True, timeout=timeout,
-        )
-        return {
-            "stdout": result.stdout.strip(),
-            "stderr": result.stderr.strip(),
-            "returncode": result.returncode,
-            "success": result.returncode == 0,
-        }
-    except subprocess.TimeoutExpired:
-        return {"stdout": "", "stderr": "Command timed out", "returncode": -1, "success": False}
-    except Exception as e:
-        return {"stdout": "", "stderr": str(e), "returncode": -1, "success": False}
-
-
 def _child_env() -> dict:
     """Build child process environment with TERM and color vars set for PTY."""
     env = os.environ.copy()
@@ -1412,11 +1361,6 @@ class InteractiveSession:
         if self._started:
             return
         self._started = True
-
-        if IS_WINDOWS:
-            self._returncode = 0
-            self._eof_reached = True
-            return
 
         # Save terminal attrs for restoration
         try:
@@ -1894,8 +1838,7 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
         help_text=(
             "Without --task, only prepares the station. With --task, starts a fresh "
             "background Assignment with isolated state/history. Omitting the terminal "
-            "creates work-<agent-id> (a dedicated PTY on POSIX, or a logical "
-            "subprocess-backed station on Windows)."
+            "creates work-<agent-id> (a dedicated PTY)."
         )),
     CommandSpec("/terminate", "Close a terminal", "Agents & Terminals", "/terminate <name>"),
     CommandSpec("/send", "Send input to a terminal", "Agents & Terminals", "/send <name> [--wait <seconds>] <command>"),
@@ -2505,7 +2448,7 @@ _POSIX_SHELL_BUILTINS = {
 
 
 def _builtins_for_platform() -> set:
-    return _WINDOWS_CMD_BUILTINS if IS_WINDOWS else _POSIX_SHELL_BUILTINS
+    return _POSIX_SHELL_BUILTINS
 
 
 def extract_first_word(user_input: str) -> str:
@@ -2531,30 +2474,16 @@ def list_path_commands() -> list:
     commands = set()
     path_dirs = os.environ.get("PATH", "").split(os.pathsep)
 
-    if IS_WINDOWS:
-        pathext = [ext.upper() for ext in os.environ.get("PATHEXT", ".EXE;.CMD;.BAT;.COM").split(";") if ext]
-        for path_dir in path_dirs:
-            p = Path(path_dir)
-            if not p.is_dir():
-                continue
-            try:
-                for entry in p.iterdir():
-                    if entry.is_file() and entry.suffix.upper() in pathext:
-                        commands.add(entry.stem)
-            except (PermissionError, OSError):
-                pass
-        commands.update(_WINDOWS_CMD_BUILTINS)
-    else:
-        for path_dir in path_dirs:
-            p = Path(path_dir)
-            if not p.is_dir():
-                continue
-            try:
-                for entry in p.iterdir():
-                    if entry.is_file() and os.access(entry, os.X_OK):
-                        commands.add(entry.name)
-            except (PermissionError, OSError):
-                pass
+    for path_dir in path_dirs:
+        p = Path(path_dir)
+        if not p.is_dir():
+            continue
+        try:
+            for entry in p.iterdir():
+                if entry.is_file() and os.access(entry, os.X_OK):
+                    commands.add(entry.name)
+        except (PermissionError, OSError):
+            pass
 
     result = []
     for c in sorted(commands):
@@ -2570,12 +2499,8 @@ def list_path_commands() -> list:
 
 # ── Shell Detection ──────────────────────────────────────────────────────
 
-if IS_WINDOWS:
-    DEFAULT_SHELL = os.environ.get("COMSPEC", "cmd.exe")
-    SHELL_NAME = "cmd"
-else:
-    DEFAULT_SHELL = os.environ.get("SHELL", "/bin/bash")
-    SHELL_NAME = "bash" if "bash" in DEFAULT_SHELL else ("zsh" if "zsh" in DEFAULT_SHELL else "sh")
+DEFAULT_SHELL = os.environ.get("SHELL", "/bin/bash")
+SHELL_NAME = "bash" if "bash" in DEFAULT_SHELL else ("zsh" if "zsh" in DEFAULT_SHELL else "sh")
 
 # ── Session Management ─────────────────────────────────────────────────
 
@@ -2957,7 +2882,7 @@ def build_login_payload(username: str, password: str, captcha_response: str) -> 
         "username": username.strip(),
         "password": password,
         # The backend has used both names across versions. Keep both so old
-        # Windows builds and the current web auth middleware can agree.
+        # builds and the current web auth middleware can agree.
         "captchaResponse": captcha_response,
         "captcha": captcha_response,
     }
@@ -3573,7 +3498,7 @@ def generate_cli_prop_template() -> str:
     string "None" and {{behaviorDiagnostics}} is always "", so neither carries
     real signal yet. Add them back here if/when they're wired to real values.
     """
-    shell_info = "cmd.exe" if IS_WINDOWS else SHELL_NAME
+    shell_info = SHELL_NAME
 
     return f"""<role>
 You are {{{{agentName}}}} (id: {{{{agentId}}}}, role: {{{{deploymentStatus}}}}), an autonomous coding agent running in laintas-cli.
@@ -5681,8 +5606,6 @@ class AgentRegistry:
         commands. It is disabled by default and can only be enabled in the
         CLI's local runtime configuration.
         """
-        if IS_WINDOWS:
-            return  # PTY relay is Unix-only for now
         if get_runtime_config("disable_remote_terminal"):
             console.print("[yellow]Remote terminal request ignored (disable_remote_terminal is set).[/yellow]")
             return
@@ -5711,9 +5634,6 @@ class AgentRegistry:
         """Helpwo's 添加终端 → create a named sub-terminal here (same path as
         /term <name>) running a nested laintas_cli that auto-/connects, so it
         registers itself back to Helpwo as a managed terminal."""
-        if IS_WINDOWS:
-            self._push_final(req_id, "fail", "sub-terminals are unavailable on Windows")
-            return
         if self.depth > 0:
             self._push_final(req_id, "fail", "term-new must target the primary CLI (depth 0)")
             return
@@ -7035,7 +6955,7 @@ def _parse_slash_command(cmd: str) -> tuple[str, str, list[str]]:
     action = match.group(1).lower()
     raw_args = match.group(2) or ""
     try:
-        args = shlex.split(raw_args, posix=not IS_WINDOWS) if raw_args else []
+        args = shlex.split(raw_args) if raw_args else []
     except ValueError as exc:
         raise SlashCommandUsageError(
             f"Invalid quoting: {exc}. Close the quote or escape it, then retry."
@@ -7060,19 +6980,15 @@ def _decode_text_arg(text: str) -> str:
     if not raw:
         return ""
     try:
-        parsed = shlex.split(raw, posix=not IS_WINDOWS)
+        parsed = shlex.split(raw)
     except ValueError:
         return raw
     return parsed[0] if len(parsed) == 1 else raw
 
 
 def _normalize_slash_arg(token: str) -> str:
-    """Remove quotes retained by shlex(posix=False) on Windows."""
-    value = str(token or "")
-    if (IS_WINDOWS and len(value) >= 2
-            and value[0] == value[-1] and value[0] in {'"', "'"}):
-        return value[1:-1]
-    return value
+    """Return the token as a string (quotes already stripped by shlex)."""
+    return str(token or "")
 
 
 def _json_arg_candidates(text: str) -> list[str]:
@@ -8277,11 +8193,10 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
             if not allowed:
                 console.print(f"[red]{denial}[/red]")
                 return False
-            if not IS_WINDOWS:
-                _ensure_term0_alive()
+            _ensure_term0_alive()
             _t0 = get_terminal("term0")
-            if IS_WINDOWS or _t0 is None or _t0.session is None or not _t0.session.is_alive():
-                console.print("[red]term0 session unavailable (Windows has no persistent bash).[/red]")
+            if _t0 is None or _t0.session is None or not _t0.session.is_alive():
+                console.print("[red]term0 session unavailable.[/red]")
             else:
                 result = _marker_poll_exec(_t0.session, raw_cmd, strip_ansi_codes=False)
                 _sync_cwd_from_term0(_t0.session)
@@ -10222,19 +10137,16 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
             if (term0_info is None
                     or term0_info.session is None
                     or not term0_info.session.is_alive()):
-                if not IS_WINDOWS:
-                    try:
-                        _term0 = InteractiveSession(
-                            DEFAULT_SHELL, timeout=0, stream_output=False,
-                            persistent=True)
-                        _term0.start()
-                        time.sleep(0.08)
-                        if _term0.is_alive():
-                            _term0.read_output(timeout=0.1)
-                        register_terminal(_term0, DEFAULT_SHELL, 0, name="term0")
-                    except Exception:
-                        register_terminal(None, "parent-repl", 0, name="term0")
-                else:
+                try:
+                    _term0 = InteractiveSession(
+                        DEFAULT_SHELL, timeout=0, stream_output=False,
+                        persistent=True)
+                    _term0.start()
+                    time.sleep(0.08)
+                    if _term0.is_alive():
+                        _term0.read_output(timeout=0.1)
+                    register_terminal(_term0, DEFAULT_SHELL, 0, name="term0")
+                except Exception:
                     register_terminal(None, "parent-repl", 0, name="term0")
             target_agent.home_terminal = "term0"
             target_agent.stationed_terminal = "term0"
@@ -10256,28 +10168,21 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
                 unregister_terminal(name)
 
             # A station is a work place, not another CLI identity.  The employee
-            # loop stays in-process; POSIX uses a dedicated PTY and Windows uses
-            # a logical station with subprocess-backed shell execution.
+            # loop stays in-process; POSIX uses a dedicated PTY.
             shell_cmd = DEFAULT_SHELL
-            if IS_WINDOWS:
-                # Windows has no PTY implementation in InteractiveSession.
-                # Keep a logical station so assignment identity/lifecycle work;
-                # shell.exec safely falls back to subprocess.run(shell=True).
-                register_terminal(None, shell_cmd, 0, name=name)
-            else:
-                sub = SubTerminalSession(shell_cmd)
-                sub.start()
-                time.sleep(0.1)
-                if not sub.is_alive():
-                    console.print(f"[red]Could not start terminal '{name}'.[/red]")
-                    return False
-                sub.read_output(timeout=0.1)
-                register_terminal(sub, shell_cmd, 0, name=name)
+            sub = SubTerminalSession(shell_cmd)
+            sub.start()
+            time.sleep(0.1)
+            if not sub.is_alive():
+                console.print(f"[red]Could not start terminal '{name}'.[/red]")
+                return False
+            sub.read_output(timeout=0.1)
+            register_terminal(sub, shell_cmd, 0, name=name)
             station_agent(target_agent.id, name)
             console.print(
                 f"[green]Stationed [bold]{target_agent.id}[/bold] → "
                 f"terminal [bold]{name}[/bold] "
-                f"({'Windows subprocess' if IS_WINDOWS else 'shell'})[/green]")
+                f"(shell)[/green]")
 
         if task:
             assignment_events = (
@@ -11671,7 +11576,7 @@ def _shorten_path(p: str, max_len: int = 48) -> str:
 
 def show_banner(agent_name: str, session: dict = None):
     """Display a minimal, art-font startup banner."""
-    shell_info = "cmd.exe" if IS_WINDOWS else SHELL_NAME
+    shell_info = SHELL_NAME
 
     for line in _LOGO_LINES:
         console.print(f"[accent]{line}[/accent]")
@@ -11771,7 +11676,7 @@ _IN_SUB_TERMINAL = False
 def _init_injection_pipe():
     """Create the wakeup pipe (Unix only). Idempotent, thread-safe enough."""
     global _wakeup_r, _wakeup_w
-    if _wakeup_r is None and not IS_WINDOWS:
+    if _wakeup_r is None:
         _wakeup_r, _wakeup_w = os.pipe()
         for fd in (_wakeup_r, _wakeup_w):
             fl = fcntl.fcntl(fd, fcntl.F_GETFL)
@@ -11794,7 +11699,7 @@ def _inject_input(text: str, done: threading.Event):
         _injected_input_queue.put_nowait(_InjectedInput(text, done))
     except queue.Full:
         pass
-    if not IS_WINDOWS and _wakeup_w is not None:
+    if _wakeup_w is not None:
         try:
             os.write(_wakeup_w, b'\x00')
         except (BlockingIOError, OSError):
@@ -11816,9 +11721,6 @@ def _get_input(cwd: str):
         return _injected_input_queue.get_nowait()
     except queue.Empty:
         pass
-
-    if IS_WINDOWS:
-        return pt_prompt(cwd)
 
     # Non-blocking check: is there a remote message waiting?
     _init_injection_pipe()
@@ -11850,7 +11752,7 @@ def _start_bg_input_reader(target_queue: queue.Queue):
 
     Only active during run_agent_loop() — the normal REPL prompt uses
     prompt_toolkit which owns stdin. The background reader uses select()
-    on Unix and a polling fallback on Windows.
+    on stdin.
 
     target_queue: the queue to put supplementary messages into (should be
     the same queue that run_agent_loop() drains between iterations).
@@ -11863,7 +11765,7 @@ def _start_bg_input_reader(target_queue: queue.Queue):
     def _reader():
         while not _bg_reader_stop.is_set():
             try:
-                if not IS_WINDOWS and hasattr(sys.stdin, 'fileno'):
+                if hasattr(sys.stdin, 'fileno'):
                     try:
                         r, _, _ = select.select([sys.stdin], [], [], 0.5)
                         if not r:
@@ -12662,11 +12564,10 @@ def main():
 
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
-    if not IS_WINDOWS:
-        # tmux kill-window (parent's unregister_terminal / Helpwo term-close)
-        # delivers SIGHUP — unregister from Helpwo before dying instead of
-        # leaving a stale agent until the 60s heartbeat timeout.
-        signal.signal(signal.SIGHUP, shutdown)
+    # tmux kill-window (parent's unregister_terminal / Helpwo term-close)
+    # delivers SIGHUP — unregister from Helpwo before dying instead of
+    # leaving a stale agent until the 60s heartbeat timeout.
+    signal.signal(signal.SIGHUP, shutdown)
 
     # ── Create term0: a real persistent bash session ──
     # All system commands and stationed-agent shell.exec route through this
@@ -12674,18 +12575,17 @@ def main():
     # Created for ALL interactive REPL instances (depth 0 and depth > 0),
     # so sub-terminals have the same capabilities as the main terminal.
     _term0_session = None
-    if not IS_WINDOWS:
-        try:
-            _term0_session = InteractiveSession(
-                DEFAULT_SHELL, timeout=0, stream_output=False, persistent=True)
-            _term0_session.start()
-            time.sleep(0.08)
-            if _term0_session.is_alive():
-                _term0_session.read_output(timeout=0.1)
-            register_terminal(_term0_session, DEFAULT_SHELL, 0, name="term0")
-        except Exception as _e:
-            console.print(f"[dim yellow]term0 bash session init failed: {_e}[/dim yellow]")
-            _term0_session = None
+    try:
+        _term0_session = InteractiveSession(
+            DEFAULT_SHELL, timeout=0, stream_output=False, persistent=True)
+        _term0_session.start()
+        time.sleep(0.08)
+        if _term0_session.is_alive():
+            _term0_session.read_output(timeout=0.1)
+        register_terminal(_term0_session, DEFAULT_SHELL, 0, name="term0")
+    except Exception as _e:
+        console.print(f"[dim yellow]term0 bash session init failed: {_e}[/dim yellow]")
+        _term0_session = None
 
     # ── Monitor-only mode (no interactive REPL) ──
     # Runs purely as a remote executor: heartbeat + /poll loop already
@@ -12718,8 +12618,7 @@ def main():
 
     while True:
         # ── term0 health check ──
-        if not IS_WINDOWS:
-            _ensure_term0_alive()
+        _ensure_term0_alive()
         try:
             item = _get_input(str(os.getcwd()))
         except (KeyboardInterrupt, EOFError):
@@ -13102,8 +13001,7 @@ def main():
                 _first = extract_first_word(user_input)
                 _term0_info = get_terminal("term0")
                 _use_term0 = (
-                    not IS_WINDOWS
-                    and _first not in get_interactive_commands()
+                    _first not in get_interactive_commands()
                     and _term0_info is not None
                     and _term0_info.session is not None
                     and _term0_info.session.is_alive()
@@ -13126,37 +13024,18 @@ def main():
                             pass
                 else:
                     # Drain any queued terminal query responses before passthrough.
-                    if not IS_WINDOWS:
-                        _fl = fcntl.fcntl(sys.stdin.fileno(), fcntl.F_GETFL)
-                        fcntl.fcntl(sys.stdin.fileno(), fcntl.F_SETFL, _fl | os.O_NONBLOCK)
-                        try:
-                            while True:
-                                if not sys.stdin.buffer.read(4096):
-                                    break
-                        except (BlockingIOError, OSError):
-                            pass
-                        finally:
-                            fcntl.fcntl(sys.stdin.fileno(), fcntl.F_SETFL, _fl)
+                    _fl = fcntl.fcntl(sys.stdin.fileno(), fcntl.F_GETFL)
+                    fcntl.fcntl(sys.stdin.fileno(), fcntl.F_SETFL, _fl | os.O_NONBLOCK)
+                    try:
+                        while True:
+                            if not sys.stdin.buffer.read(4096):
+                                break
+                    except (BlockingIOError, OSError):
+                        pass
+                    finally:
+                        fcntl.fcntl(sys.stdin.fileno(), fcntl.F_SETFL, _fl)
 
                     result = pty_passthrough(user_input)
-                    # On Windows pty_passthrough() captures output via
-                    # subprocess instead of echoing to the terminal (no PTY),
-                    # so print it here or the user sees nothing for `dir`, etc.
-                    if IS_WINDOWS:
-                        _win_out = result.get("stdout", "")
-                        _win_err = result.get("stderr", "")
-                        try:
-                            if _win_out:
-                                sys.stdout.write(_win_out)
-                                if not _win_out.endswith("\n"):
-                                    sys.stdout.write("\n")
-                            if _win_err:
-                                sys.stderr.write(_win_err)
-                                if not _win_err.endswith("\n"):
-                                    sys.stderr.write("\n")
-                            sys.stdout.flush()
-                        except (BrokenPipeError, OSError):
-                            pass
 
                 if agent_registry.agent_id:
                     output_preview = result.get("stdout", "")[:2000]
@@ -13217,10 +13096,9 @@ def main():
             # Sync CWD after AI loop — the AI may have run shell.exec("cd ...")
             # which changed term0's bash CWD. Sync so the next prompt shows
             # the correct directory.
-            if not IS_WINDOWS:
-                _t0 = get_terminal("term0")
-                if _t0 and _t0.session and _t0.session.is_alive():
-                    _sync_cwd_from_term0(_t0.session)
+            _t0 = get_terminal("term0")
+            if _t0 and _t0.session and _t0.session.is_alive():
+                _sync_cwd_from_term0(_t0.session)
 
             # ── Plan approval menu ──
             # If the agent ran in plan mode, offer a rich review menu.
@@ -13236,10 +13114,9 @@ def main():
                 interactive_session = response.get("session")
                 handle_meta_command._last_agent_state = response.get("state", agent_state)
                 handle_meta_command._last_existing_session = interactive_session
-                if not IS_WINDOWS:
-                    _t0 = get_terminal("term0")
-                    if _t0 and _t0.session and _t0.session.is_alive():
-                        _sync_cwd_from_term0(_t0.session)
+                _t0 = get_terminal("term0")
+                if _t0 and _t0.session and _t0.session.is_alive():
+                    _sync_cwd_from_term0(_t0.session)
 
         # Save AI reply to chat history
         if response.get("msg"):

@@ -1,0 +1,238 @@
+{
+  "version": "0.1.0",
+  "description": "Canonical, language-neutral agent tool catalog shared across agent products (laintas_cli, Helpwo, future agents). Single source of truth for tool NAMES, parameter JSON Schemas, and execution context. Per-language adapters (Python/TS) consume this. Names are flat snake_case with NO dots (DeepSeek and other providers reject '.' in function names). Product-specific legacy names are recorded under `aliases` to support a migration window.",
+  "conventions": {
+    "naming": "flat snake_case, no dots, no namespaces; extensions use a source prefix (e.g. mcp__server__tool), the core stays unprefixed",
+    "execContext": "host = runs where the OS/files live (CLI local PTY, remote agent); backend = runs server-side (gateway); either = location-agnostic / logical",
+    "result_envelope": "{ ok: bool, result?: any, error?: string, diff?: string } — every executor returns this shape"
+  },
+  "tools": [
+    {
+      "name": "read", "category": "fs", "execContext": "host",
+      "description": "Read a file as UTF-8 text. Supports offset/limit for large files. Output is line-numbered (cat -n style).",
+      "params": {"type": "object", "properties": {
+        "path": {"type": "string", "description": "absolute or cwd-relative path"},
+        "offset": {"type": "integer", "default": 1, "description": "1-based starting line"},
+        "limit": {"type": "integer", "default": 2000, "description": "max lines to return"}
+      }, "required": ["path"]},
+      "aliases": {"laintas_cli": "fs.read", "helpwo": "view"}
+    },
+    {
+      "name": "write", "category": "fs", "execContext": "host",
+      "description": "Overwrite (or create) a file with the provided UTF-8 content.",
+      "params": {"type": "object", "properties": {
+        "path": {"type": "string"}, "content": {"type": "string"}
+      }, "required": ["path", "content"]},
+      "aliases": {"laintas_cli": "fs.write", "helpwo": "write"}
+    },
+    {
+      "name": "edit", "category": "fs", "execContext": "host",
+      "description": "Exact string replacement in a file. Replace old_string with new_string; set replace_all when old_string is not unique.",
+      "params": {"type": "object", "properties": {
+        "path": {"type": "string", "description": "absolute or cwd-relative path"},
+        "old_string": {"type": "string", "description": "exact text to find"},
+        "new_string": {"type": "string", "description": "replacement text"},
+        "replace_all": {"type": "boolean", "default": false, "description": "replace all occurrences (required if not unique)"}
+      }, "required": ["path", "old_string", "new_string"]},
+      "aliases": {"laintas_cli": "fs.edit", "helpwo": "patch"}
+    },
+    {
+      "name": "multi_edit", "category": "fs", "execContext": "host",
+      "description": "Apply multiple find/replace edits to one file atomically (all-or-nothing).",
+      "params": {"type": "object", "properties": {
+        "path": {"type": "string"},
+        "edits": {"type": "array", "items": {"type": "object", "properties": {
+          "old_string": {"type": "string"}, "new_string": {"type": "string"},
+          "replace_all": {"type": "boolean", "default": false}
+        }, "required": ["old_string", "new_string"]}}
+      }, "required": ["path", "edits"]},
+      "aliases": {"laintas_cli": "fs.multi_edit"}
+    },
+    {
+      "name": "ls", "category": "fs", "execContext": "host",
+      "description": "List directory entries (one level): name, type, size.",
+      "params": {"type": "object", "properties": {
+        "path": {"type": "string", "default": "."}
+      }},
+      "aliases": {"laintas_cli": "fs.ls", "helpwo": "expend"}
+    },
+    {
+      "name": "glob", "category": "fs", "execContext": "host",
+      "description": "Find files by glob pattern (e.g. **/*.py).",
+      "params": {"type": "object", "properties": {
+        "pattern": {"type": "string"}, "path": {"type": "string", "default": "."}
+      }, "required": ["pattern"]},
+      "aliases": {"laintas_cli": "fs.glob", "helpwo": "find"}
+    },
+    {
+      "name": "grep", "category": "fs", "execContext": "host",
+      "description": "Search file contents by regex; returns matching lines with locations.",
+      "params": {"type": "object", "properties": {
+        "pattern": {"type": "string"}, "path": {"type": "string", "default": "."},
+        "glob": {"type": "string", "description": "optional file filter"}
+      }, "required": ["pattern"]},
+      "aliases": {"laintas_cli": "fs.grep", "helpwo": "grep"}
+    },
+    {
+      "name": "diff", "category": "fs", "execContext": "host",
+      "description": "Show a unified diff between a file's current content and proposed content.",
+      "params": {"type": "object", "properties": {
+        "path": {"type": "string"}, "content": {"type": "string"}
+      }, "required": ["path", "content"]},
+      "aliases": {"laintas_cli": "fs.diff"}
+    },
+    {
+      "name": "move", "category": "fs", "execContext": "host",
+      "description": "Move or rename a file/directory.",
+      "params": {"type": "object", "properties": {
+        "from": {"type": "string"}, "to": {"type": "string"}
+      }, "required": ["from", "to"]},
+      "aliases": {"helpwo": "move"}
+    },
+    {
+      "name": "delete", "category": "fs", "execContext": "host",
+      "description": "Delete a file or directory.",
+      "params": {"type": "object", "properties": {
+        "path": {"type": "string"}
+      }, "required": ["path"]},
+      "aliases": {"helpwo": "destroy"}
+    },
+
+    {
+      "name": "shell", "category": "shell", "execContext": "host",
+      "description": "Run a shell command and capture stdout/stderr/exit code. The SAME tool regardless of host: the local CLI runs it on a local PTY (through the security policy gateway); a backend-driven agent routes it to a remote agent. Executor is swapped per host; the model sees one `shell`.",
+      "params": {"type": "object", "properties": {
+        "command": {"type": "string"},
+        "cwd": {"type": "string", "description": "working directory"},
+        "timeout": {"type": "integer", "default": 30, "description": "seconds, capped per-host"},
+        "stdin": {"type": "string"}
+      }, "required": ["command"]},
+      "aliases": {"laintas_cli": "shell.exec", "helpwo": "remote_exec"}
+    },
+
+    {
+      "name": "agent_spawn", "category": "agent", "execContext": "either",
+      "description": "Spawn a sub-agent with a goal; it runs its own loop and reports back.",
+      "params": {"type": "object", "properties": {
+        "goal": {"type": "string"}, "context": {"type": "string", "description": "optional briefing"}
+      }, "required": ["goal"]},
+      "aliases": {"laintas_cli": "agent.spawn", "helpwo": "spawn"}
+    },
+    {
+      "name": "agent_send", "category": "agent", "execContext": "either",
+      "description": "Send a message to a named/known agent's inbox.",
+      "params": {"type": "object", "properties": {
+        "target": {"type": "string"}, "message": {"type": "string"}
+      }, "required": ["target", "message"]},
+      "aliases": {"laintas_cli": "agent_send"}
+    },
+    {
+      "name": "agent_list", "category": "agent", "execContext": "either",
+      "description": "List known/child agents and their status.",
+      "params": {"type": "object", "properties": {}},
+      "aliases": {"laintas_cli": "agent.list"}
+    },
+    {
+      "name": "agent_return", "category": "agent", "execContext": "either",
+      "description": "Terminate the current agent and return an explicit result to its caller.",
+      "params": {"type": "object", "properties": {
+        "value": {"type": "string"}
+      }, "required": ["value"]},
+      "aliases": {"laintas_cli": "agent_return", "helpwo": "agent_return"}
+    },
+    {
+      "name": "agent_wait", "category": "agent", "execContext": "either",
+      "description": "Block until a spawned agent (or all spawns) completes, then collect results.",
+      "params": {"type": "object", "properties": {
+        "target": {"type": "string", "description": "agent id; omit to wait for all spawns"}
+      }},
+      "aliases": {"laintas_cli": "agent.wait"}
+    },
+
+    {
+      "name": "memory_save", "category": "memory", "execContext": "either",
+      "description": "Save a persistent memory that survives across sessions.",
+      "params": {"type": "object", "properties": {
+        "name": {"type": "string", "description": "short kebab-case slug"},
+        "type": {"type": "string", "enum": ["user", "feedback", "project", "reference"]},
+        "description": {"type": "string", "description": "one-line index summary"},
+        "body": {"type": "string", "description": "full content (markdown)"}
+      }, "required": ["name", "type", "description", "body"]},
+      "aliases": {"laintas_cli": "mem.save", "helpwo": "memory_save"}
+    },
+    {
+      "name": "memory_search", "category": "memory", "execContext": "either",
+      "description": "Search/list persistent memories by relevance.",
+      "params": {"type": "object", "properties": {
+        "query": {"type": "string"}
+      }},
+      "aliases": {"laintas_cli": "mem.list", "helpwo": "memory_search"}
+    },
+    {
+      "name": "memory_read", "category": "memory", "execContext": "either",
+      "description": "Read a specific memory by name.",
+      "params": {"type": "object", "properties": {
+        "name": {"type": "string"}
+      }, "required": ["name"]},
+      "aliases": {"laintas_cli": "mem.read"}
+    },
+
+    {
+      "name": "task_create", "category": "task", "execContext": "either",
+      "description": "Create a tracked task.",
+      "params": {"type": "object", "properties": {
+        "title": {"type": "string"}, "description": {"type": "string"}
+      }, "required": ["title"]},
+      "aliases": {"laintas_cli": "task.create", "helpwo": "task_create"}
+    },
+    {
+      "name": "task_update", "category": "task", "execContext": "either",
+      "description": "Update a task's status or fields.",
+      "params": {"type": "object", "properties": {
+        "id": {"type": "string"},
+        "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}
+      }, "required": ["id"]},
+      "aliases": {"laintas_cli": "task.update", "helpwo": "task_update"}
+    },
+    {
+      "name": "task_list", "category": "task", "execContext": "either",
+      "description": "List tracked tasks.",
+      "params": {"type": "object", "properties": {}},
+      "aliases": {"laintas_cli": "task.list", "helpwo": "task_list"}
+    },
+    {
+      "name": "task_get", "category": "task", "execContext": "either",
+      "description": "Get one task by id.",
+      "params": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]},
+      "aliases": {"laintas_cli": "task.get"}
+    },
+
+    {
+      "name": "web_fetch", "category": "web", "execContext": "backend",
+      "description": "Fetch a URL and extract its text content.",
+      "params": {"type": "object", "properties": {
+        "url": {"type": "string"},
+        "max_bytes": {"type": "integer", "default": 65536},
+        "timeout": {"type": "integer", "default": 15}
+      }, "required": ["url"]},
+      "aliases": {"laintas_cli": "web.fetch"}
+    },
+    {
+      "name": "web_search", "category": "web", "execContext": "backend",
+      "description": "Search the web and return result snippets.",
+      "params": {"type": "object", "properties": {
+        "query": {"type": "string"}
+      }, "required": ["query"]},
+      "aliases": {"laintas_cli": "web.search"}
+    },
+
+    {
+      "name": "hwo", "category": "hwo", "execContext": "backend",
+      "description": "Run / manage an HWO multi-agent workflow.",
+      "params": {"type": "object", "properties": {
+        "action": {"type": "string"}, "name": {"type": "string"}
+      }, "required": ["action"]},
+      "aliases": {"laintas_cli": "hwo", "helpwo": "hwo"}
+    }
+  ]
+}

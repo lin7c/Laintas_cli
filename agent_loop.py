@@ -4502,10 +4502,6 @@ def run_agent_loop(
             # Streaming render: use rich.live.Live to render the reply as it arrives
             # via on_chunk. Falls back to spinner if backend doesn't accept on_chunk.
             stream_state = {"reply": "", "command": "", "started": False}
-            # rich.Live's in-place redraw is unreliable on the Windows console
-            # (it reprints each frame, duplicating lines). Stream with a plain
-            # spinner there and print the final reply once instead.
-            _use_live = not sys.platform.startswith("win")
             # Capture model/mode labels once for the spinner text
             _spin_model = _live_status_model() or "default"
             _spin_mode = _active_mode_label()
@@ -4536,8 +4532,22 @@ def run_agent_loop(
                     _elapsed = time.monotonic() - _thinking_t0
                     # Output tokens grow in real-time from the streamed reply.
                     _cur_out_est = usage_tracker.estimate_tokens(stream_state["reply"])
+                    # Cap the preview to a few lines short of the terminal
+                    # height so the Live frame (reply tail + spinner + command
+                    # line) always fits the viewport. rich.Live only does clean
+                    # in-place redraw while the frame is shorter than the
+                    # viewport; once it overflows it re-emits the whole content
+                    # on every refresh, leaving duplicate copies in the
+                    # scrollback ("复读"). The full reply is printed once after
+                    # streaming finishes.
+                    _cap = max(4, (deps.console.height or 24) - 6)
                     if stream_state["reply"]:
-                        parts.append(deps.Markdown(stream_state["reply"]))
+                        _rlines = stream_state["reply"].split("\n")
+                        if len(_rlines) > _cap:
+                            _preview = f"… streaming ({len(_rlines)} lines) …\n" + "\n".join(_rlines[-_cap:])
+                        else:
+                            _preview = stream_state["reply"]
+                        parts.append(deps.Markdown(_preview))
                         _label = "streaming…"
                     else:
                         _label = "thinking…"
@@ -4605,19 +4615,14 @@ def run_agent_loop(
                             lang=lang,
                         )
 
-                if _use_live:
-                    with Live(_LiveWrapper(), console=deps.console, refresh_per_second=12.5,
-                              auto_refresh=True, transient=not _detail) as live:
-                        _live_holder["live"] = live
-                        response = _do_stream_call()
-                        # Final flush: the _LiveWrapper already re-computes
-                        # _render() on every draw, so a plain refresh is enough.
-                        try: live.refresh()
-                        except Exception: pass
-                else:
-                    with deps.console.status(f"[#7aa2f7]thinking… · {_spin_model} · {_spin_mode}[/#7aa2f7]",
-                                             spinner="dots"):
-                        response = _do_stream_call()
+                with Live(_LiveWrapper(), console=deps.console, refresh_per_second=12.5,
+                          auto_refresh=True, transient=True) as live:
+                    _live_holder["live"] = live
+                    response = _do_stream_call()
+                    # Final flush: the _LiveWrapper already re-computes
+                    # _render() on every draw, so a plain refresh is enough.
+                    try: live.refresh()
+                    except Exception: pass
             except ImportError:
                 with deps.console.status(f"[#7aa2f7]thinking… · {_spin_model} · {_spin_mode}[/#7aa2f7]", spinner="dots"):
                     try:
@@ -4641,12 +4646,16 @@ def run_agent_loop(
                             history=history_for_backend,
                             lang=lang,
                         )
-            # Mark that the streaming Live already rendered the reply — avoid
-            # re-printing it below. When detail is off the Live is transient and
-            # erases its final frame, so the reply must be reprinted cleanly.
-            _reply_already_rendered = _use_live and _detail and bool(stream_state.get("reply"))
+            # Live painted only a transient tail PREVIEW (cleared on exit), so
+            # the full reply still must be printed once below regardless of
+            # detail mode. _ui_streamed tracks whether ai_stream chunks were
+            # pushed to the UI so the event path emits ai_end instead of
+            # re-sending the whole reply.
+            _reply_already_rendered = False
+            _ui_streamed = bool(stream_state.get("reply"))
         else:
             _reply_already_rendered = False
+            _ui_streamed = False
             try:
                 response = deps.call_backend(
                     session=session,
@@ -4795,7 +4804,7 @@ def run_agent_loop(
             step_replies.append(display_reply)
             state["lastReply"] = display_reply
             if events_cb is not None:
-                if _reply_already_rendered:
+                if _ui_streamed:
                     # Streaming chunks already sent; signal end-of-stream so
                     # the UI can finalise the current line and redraw the prompt.
                     pending_events.append({"type": "ai_end"})

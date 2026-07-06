@@ -57,8 +57,7 @@
   "extra_files": ["PROJECT.md", "SECURITY_CUSTOMIZATION.md", "requirements.txt", "setup.py"],
 
   "frozen_deps": {
-    "linux":   ["websockets", "playwright", "aiortc", "av", "cffi"],
-    "windows": ["aiortc", "av", "cffi"]
+    "linux":   ["websockets", "playwright", "aiortc", "av", "cffi"]
   },
 
   "extras_require": {

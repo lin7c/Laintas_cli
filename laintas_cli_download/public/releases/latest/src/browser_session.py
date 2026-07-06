@@ -14,8 +14,7 @@ PTY relay — so the backend can reuse one relay implementation:
   browser → host : {"t":"i","d":<b64>}   RFB bytes from noVNC
   host → browser : {"t":"exit"}          x11vnc ended
 
-Unix-only: Windows has no Xvfb. browser.* tools degrade to headless-only
-(no live view) there; see the IS_WINDOWS guard.
+Unix-only: requires Xvfb for the live view.
 
 Optional system packages (probed at start; missing → clear error, no crash):
   Xvfb, x11vnc, google-chrome | chromium | chromium-browser
@@ -37,8 +36,6 @@ import shutil
 import tempfile
 from dataclasses import dataclass, field
 from typing import Optional, List
-
-IS_WINDOWS = sys.platform == "win32"
 
 # Chrome binaries tried in order.
 _CHROME_CANDIDATES = (
@@ -75,11 +72,15 @@ def _ip_is_blocked(ip_str: str) -> bool:
             or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
 
 
-def validate_browse_url(raw: str) -> str:
+def validate_browse_url(raw: str, allow_loopback: bool = False) -> str:
     """Normalize and security-check a URL the remote Chrome will navigate to.
     Returns an absolute http(s) URL or raises ValueError. Refuses non-http(s)
     schemes and any host that resolves to a loopback/private/link-local address
-    so a driven page cannot pivot into the host's internal network or metadata."""
+    so a driven page cannot pivot into the host's internal network or metadata.
+
+    allow_loopback=True permits 127.0.0.0/8 ONLY (::1 included) — for the
+    user-approved webtest flow, whose whole point is testing the host's own
+    dev server. Private/link-local/metadata ranges stay blocked regardless."""
     from urllib.parse import urlparse
     s = (raw or "").strip()
     if not s:
@@ -98,8 +99,15 @@ def validate_browse_url(raw: str) -> str:
                                    proto=socket.IPPROTO_TCP)
     except OSError as e:
         raise ValueError(f"cannot resolve host {host!r}: {e}")
+    import ipaddress
     for info in infos:
         ip = info[4][0]
+        if allow_loopback:
+            try:
+                if ipaddress.ip_address(ip).is_loopback:
+                    continue
+            except ValueError:
+                pass
         if _ip_is_blocked(ip):
             raise ValueError(
                 f"refusing to browse {host!r}: resolves to non-public address {ip} "
@@ -122,7 +130,7 @@ def _unpriv_user():
     """Pick a non-root user to run Chrome as, so the setuid sandbox can stay on
     even in a root container. Returns (uid, gid, name, home) or None if none is
     suitable / not running as root / not Unix."""
-    if IS_WINDOWS or os.geteuid() != 0:
+    if os.geteuid() != 0:
         return None
     try:
         import pwd
@@ -144,9 +152,6 @@ def _unpriv_user():
 
 def _check_host_deps() -> Optional[str]:
     """Return an error message string if a required binary is missing, else None."""
-    if IS_WINDOWS:
-        return ("headless-browser live view is Unix-only (no Xvfb on Windows); "
-                "browser.* screenshot/snapshot tools degrade to headless-only.")
     missing = []
     if not _which("Xvfb"):
         missing.append("Xvfb (apt install xvfb)")
@@ -296,6 +301,15 @@ class BrowserSession:
         self._page_errors = _collections.deque(maxlen=300)    # {message}
         self._network_errors = _collections.deque(maxlen=300) # {url, method, status?/failure?}
         self._instrumented = set()   # id(page) already wired up
+
+        # ── full XHR/fetch capture (for site analysis) ──────────────────────
+        # OFF by default — only site analysis turns it on, so ordinary browsing
+        # and testing pay nothing. When enabled, _on_response records every
+        # XHR/fetch request+response (headers redacted, body size-capped) so the
+        # observed API surface can be reconstructed. Set via set_api_capture().
+        self._api_capture_on = False
+        self._api_log = _collections.deque(maxlen=500)        # {url, method, status, req_body?, res_body?, content_type}
+        self._API_BODY_CAP = 20000   # bytes per body kept
 
     # ── public ─────────────────────────────────────────────────────────
 
@@ -460,6 +474,46 @@ class BrowserSession:
                         })
                 except Exception:
                     pass
+                # Full XHR/fetch capture (site analysis only). Kept fully
+                # separate from the error path above so a body-read failure
+                # never affects error capture.
+                if not self._api_capture_on:
+                    return
+                try:
+                    req = resp.request
+                    if req.resource_type not in ("xhr", "fetch"):
+                        return
+                    ctype = ""
+                    try:
+                        ctype = (resp.headers or {}).get("content-type", "")
+                    except Exception:
+                        ctype = ""
+                    entry = {
+                        "url": resp.url,
+                        "method": req.method,
+                        "status": resp.status,
+                        "content_type": ctype,
+                        "req_body": None,
+                        "res_body": None,
+                    }
+                    try:
+                        pd = req.post_data
+                        if pd:
+                            entry["req_body"] = pd[: self._API_BODY_CAP]
+                    except Exception:
+                        pass
+                    # Only read text-ish bodies; skip binary. body-read can throw
+                    # (cached/redirected/no-body) — swallow and keep the metadata.
+                    if any(t in ctype.lower() for t in ("json", "text", "javascript", "xml", "urlencoded")):
+                        try:
+                            txt = resp.text()
+                            if txt:
+                                entry["res_body"] = txt[: self._API_BODY_CAP]
+                        except Exception:
+                            pass
+                    self._api_log.append(entry)
+                except Exception:
+                    pass
 
             page.on("console", _on_console)
             page.on("pageerror", _on_pageerror)
@@ -480,10 +534,18 @@ class BrowserSession:
     def get_network_errors(self) -> list:
         return list(self._network_errors)
 
+    def set_api_capture(self, on: bool) -> None:
+        """Enable/disable full XHR/fetch body capture (site analysis)."""
+        self._api_capture_on = bool(on)
+
+    def get_api_log(self) -> list:
+        return list(self._api_log)
+
     def clear_captures(self) -> None:
         self._console_log.clear()
         self._page_errors.clear()
         self._network_errors.clear()
+        self._api_log.clear()
 
     def _close_playwright(self) -> None:
         """Disconnect Playwright from Chrome (called by close())."""
@@ -520,7 +582,19 @@ class BrowserSession:
                                f"(see {self._log('xvfb')})")
         self._start_chrome()
         if not _wait_for_port("127.0.0.1", self.cdp_port, timeout=15):
-            raise RuntimeError(f"Chrome CDP port {self.cdp_port} did not open")
+            # Sandboxed launch can die at boot on hosts that block unprivileged
+            # user namespaces (Ubuntu 24's apparmor_restrict_unprivileged_userns=1
+            # → FATAL in sandbox/linux/services/credentials.cc). Retry once
+            # without the sandbox — still as the dropped user, Site Isolation on.
+            try:
+                if self._chrome is not None:
+                    self._chrome.kill()
+            except OSError:
+                pass
+            self._start_chrome(no_sandbox=True)
+            if not _wait_for_port("127.0.0.1", self.cdp_port, timeout=15):
+                raise RuntimeError(f"Chrome CDP port {self.cdp_port} did not open "
+                                   f"(see {self._log('chrome')})")
         self._start_x11vnc()
         if not _wait_for_port("127.0.0.1", self.rfb_port, timeout=5):
             raise RuntimeError(f"x11vnc RFB port {self.rfb_port} did not open")
@@ -594,7 +668,7 @@ class BrowserSession:
             start_new_session=True,
         )
 
-    def _start_chrome(self) -> None:
+    def _start_chrome(self, no_sandbox: bool = False) -> None:
         chrome = find_chrome()
         if not chrome:
             raise RuntimeError("no Chrome/Chromium binary on PATH")
@@ -634,6 +708,19 @@ class BrowserSession:
                     _chown_tree(self.user_data_dir, uid, gid)
                 except OSError:
                     pass
+                # System accounts like `nobody` have HOME=/nonexistent; Chrome's
+                # crashpad handler then dies on startup ("--database is required")
+                # and takes Chrome with it. Point HOME (and crash dumps) at the
+                # session's profile dir, which the dropped user owns.
+                if not uhome or not os.path.isdir(uhome):
+                    uhome = self.user_data_dir
+                crash_dir = os.path.join(self.user_data_dir, "crash-dumps")
+                try:
+                    os.makedirs(crash_dir, exist_ok=True)
+                    os.chown(crash_dir, uid, gid)
+                except OSError:
+                    pass
+                args.append(f"--crash-dumps-dir={crash_dir}")
                 run_env["HOME"] = uhome
                 run_env["USER"] = uname
 
@@ -648,6 +735,9 @@ class BrowserSession:
             else:
                 # No unprivileged user available — sandbox cannot run as root.
                 args.append("--no-sandbox")
+
+        if no_sandbox and "--no-sandbox" not in args:
+            args.append("--no-sandbox")
 
         args.append(self.url)
 

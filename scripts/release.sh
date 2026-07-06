@@ -9,7 +9,7 @@
 #   3. Commit + tag + push to main (triggers .github/workflows/release.yml).
 #   4. Watch the CI run and print the GitHub Release URL when done.
 #
-# CI then builds all 5 artifacts (Linux/macOS/source/Windows/deb) in parallel,
+# CI then builds all 3 artifacts (Linux/macOS/source) in parallel,
 # publishes them to a GitHub Release, and uploads the self-update src/ manifest.
 # No binaries are committed to the repo — they live in the Release assets.
 set -euo pipefail

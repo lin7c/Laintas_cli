@@ -284,7 +284,8 @@ class ToolRegistry:
                 "trace": traceback.format_exc(limit=3),
             }
 
-    def describe_for_prompt(self, indent: int = 2) -> str:
+    def describe_for_prompt(self, indent: int = 2,
+                            allowed_names: Optional[set[str]] = None) -> str:
         """Render the toolset for inclusion in the AI system prompt.
 
         Format: grouped by source (builtin / skill:* / mcp:*), each tool on
@@ -293,6 +294,14 @@ class ToolRegistry:
         teachable than a raw JSON dump.
         """
         groups = self.list_by_source()
+        if allowed_names is not None:
+            groups = {
+                source: [tool for tool in source_tools
+                         if tool.name in allowed_names]
+                for source, source_tools in groups.items()
+            }
+            groups = {source: source_tools for source, source_tools in groups.items()
+                      if source_tools}
         # Stable source ordering: builtin first, then skills, then MCP, then anything else.
         def _src_key(s: str) -> tuple:
             if s == "builtin":
@@ -347,14 +356,17 @@ class ToolRegistry:
 
         return "\n".join(lines).rstrip()
 
-    def describe_short_reminder(self) -> str:
+    def describe_short_reminder(
+            self, allowed_names: Optional[set[str]] = None) -> str:
         """One-line tool reminder for follow-up turns (saves prompt tokens).
 
         After turn 1, the model has already seen the full catalog and the
         examples; we only need to remind it of available names. If it tries
         an unknown name, the dispatch loop re-injects the full catalog.
         """
-        names = sorted(self._tools.keys())
+        names = sorted(
+            name for name in self._tools
+            if allowed_names is None or name in allowed_names)
         n = len(names)
         # Show the most-used names verbatim; truncate the rest into a count.
         head = names[:18]
@@ -2515,7 +2527,6 @@ def _bi_agent_station(params: dict, ctx: ToolCtx) -> dict:
         if existing and ctx.unregister_terminal:
             ctx.unregister_terminal(name)
 
-        # Spawn a fresh bash sub-terminal — agents operate via marker-poll
         shell_cmd = os.environ.get("SHELL", "/bin/bash")
         sub = ctx.deps.SubTerminalSession(shell_cmd)
         sub.start()
@@ -2564,11 +2575,57 @@ def _bi_agent_wait(params: dict, ctx: ToolCtx) -> dict:
 
 
 def _bi_agent_hire(params: dict, ctx: ToolCtx) -> dict:
-    """Register a new agent slot."""
+    """Define an available employee capability profile; do not start work."""
     if ctx.register_agent_fn is None:
         return {"ok": False, "error": "hire not available"}
-    info = ctx.register_agent_fn(depth=ctx.depth)
-    return {"ok": True, "result": f"Hired {info.id}", "agent_id": info.id}
+    import agent_loop as _al
+    import agent_persistence as _ap
+    import agent_roles as _roles
+
+    name = (params.get("name") or "").strip() or None
+    if name and ctx.get_agent is not None and ctx.get_agent(name) is not None:
+        return {"ok": False, "error": f"agent '{name}' already exists"}
+    role_name = (params.get("profile") or "").strip() or None
+    role = _roles.get_role(role_name) if role_name else None
+    if role_name and role is None:
+        return {"ok": False, "error": f"unknown employee profile '{role_name}'"}
+    requested_tools = params.get("tools")
+    if requested_tools is not None:
+        if not isinstance(requested_tools, list):
+            return {"ok": False, "error": "tools must be an array of tool names"}
+        known = {tool.name for tool in get_registry().list()}
+        unknown = sorted(set(requested_tools) - known)
+        if unknown:
+            return {"ok": False, "error": f"unknown tools: {', '.join(unknown)}"}
+        allowed_tools = [str(item) for item in requested_tools]
+    elif role and role.allowed_tools:
+        allowed_tools = list(role.allowed_tools)
+    else:
+        allowed_tools = sorted(tool.name for tool in get_registry().list())
+    profile = _al.EmployeeProfile(
+        title=(role.name.replace("-", " ").title() if role else "General Agent"),
+        description=(role.description if role else
+                     "General-purpose autonomous employee"),
+        specialist_role=role_name,
+        prompt=(params.get("prompt") or "").strip(),
+        capability_tags=([role.name] if role else ["general"]),
+        tool_policy=_al.AgentToolPolicy(allowed_tools=allowed_tools),
+    )
+    info = ctx.register_agent_fn(
+        name=name, depth=max(1, ctx.depth + 1), role="pool", profile=profile)
+    if not info.profile.prompt and not info.profile.specialist_role:
+        info.profile.prompt = (
+            f"You are {info.name}, a hired employee. Work only on explicit "
+            "station assignments and report concrete results to the manager.")
+    _ap.save_agent_state(info)
+    return {
+        "ok": True,
+        "result": (
+            f"Hired available employee {info.id} ({info.profile.title}). "
+            "No work has started; assign it with /station --task."
+        ),
+        "agent_id": info.id,
+    }
 
 
 def _bi_agent_list(params: dict, ctx: ToolCtx) -> dict:
@@ -2601,22 +2658,6 @@ def _bi_agent_rename(params: dict, ctx: ToolCtx) -> dict:
     if current and ctx.rename_agent(current.id, new_name):
         return {"ok": True, "result": f"Renamed to {new_name}"}
     return {"ok": False, "error": "no current agent to rename"}
-
-
-def _bi_agent_switch(params: dict, ctx: ToolCtx) -> dict:
-    """Switch to a different agent identity."""
-    if ctx.depth > 0:
-        return {"ok": False, "error": "sub-agents cannot change the REPL's active agent"}
-    target_id = (params.get("agent_id") or "").strip()
-    if not target_id:
-        return {"ok": False, "error": "missing 'agent_id'"}
-    if ctx.switch_to_agent is None:
-        return {"ok": False, "error": "switch not available"}
-    if ctx.switch_to_agent(target_id):
-        agent = ctx.get_agent(target_id) if ctx.get_agent else None
-        label = agent.name if agent else target_id
-        return {"ok": True, "result": f"Switched to {label}"}
-    return {"ok": False, "error": f"agent '{target_id}' not found"}
 
 
 def _bi_terminal_send(params: dict, ctx: ToolCtx) -> dict:
@@ -3389,10 +3430,12 @@ def _bi_browser_navigate(params: dict, ctx: ToolCtx) -> dict:
     if not url:
         return {"ok": False, "error": "missing 'url'"}
     # SSRF / scheme guard — refuse loopback/private/link-local/metadata targets.
+    # allow_local (internal, set by the user-approved webtest flow) permits
+    # loopback only, so tests can target the host's own dev server.
     if url not in ("about:blank",) and not url.startswith("about:"):
         import browser_session as _bs
         try:
-            url = _bs.validate_browse_url(url)
+            url = _bs.validate_browse_url(url, allow_loopback=bool(params.get("allow_local")))
         except ValueError as e:
             return {"ok": False, "error": str(e)}
     wait_until = params.get("wait_until", "domcontentloaded")
@@ -4626,7 +4669,9 @@ def register_builtin_tools() -> None:
         ),
         Tool(
             name="agent.station",
-            description="Station yourself at a named terminal so your commands run there.",
+            description=(
+                "Bind the calling, already-running agent to a named shell terminal. "
+                "User-created employee assignments start through /station --task."),
             schema={
                 "type": "object",
                 "properties": {
@@ -4662,8 +4707,21 @@ def register_builtin_tools() -> None:
         ),
         Tool(
             name="agent.hire",
-            description="Register a new agent slot. Returns the new agent's ID.",
-            schema={"type": "object", "properties": {}},
+            description=(
+                "Define an available employee with an independent prompt/tool policy. "
+                "This does not start work; /station --task creates an assignment."),
+            schema={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Optional employee ID"},
+                    "profile": {"type": "string", "description": "Optional specialist role"},
+                    "prompt": {"type": "string", "description": "Employee prompt overlay"},
+                    "tools": {
+                        "type": "array", "items": {"type": "string"},
+                        "description": "Explicit tool allowlist",
+                    },
+                },
+            },
             invoke=_bi_agent_hire,
         ),
         Tool(
@@ -4683,18 +4741,6 @@ def register_builtin_tools() -> None:
                 "required": ["name"],
             },
             invoke=_bi_agent_rename,
-        ),
-        Tool(
-            name="agent.switch",
-            description="Switch to a different agent identity.",
-            schema={
-                "type": "object",
-                "properties": {
-                    "agent_id": {"type": "string", "description": "Target agent ID"},
-                },
-                "required": ["agent_id"],
-            },
-            invoke=_bi_agent_switch,
         ),
         # ── HWO spawn primitives ────────────────────────────────────
         Tool(

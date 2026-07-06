@@ -1,0 +1,23 @@
+{
+  "version": "0.1.0",
+  "description": "Shared code-formatter registry: file extension -> ordered list of IN-PLACE formatter commands. The agent product runs the first formatter whose binary is installed after a full-file write, then re-reads the formatted file. `{file}` is substituted with the path. No-op (safe) when no formatter is installed. Applied to WRITES only, not surgical edits, so reformatting can't break a subsequent exact-string edit. Vendored into each product; execution + file I/O stay client-side.",
+  "timeout_seconds": 15,
+  "formatters": {
+    ".py": [
+      { "bin": "ruff",     "cmd": ["ruff", "format", "-q", "{file}"] },
+      { "bin": "black",    "cmd": ["black", "-q", "{file}"] }
+    ],
+    ".js":   [ { "bin": "prettier", "cmd": ["prettier", "--write", "--log-level", "silent", "{file}"] } ],
+    ".jsx":  [ { "bin": "prettier", "cmd": ["prettier", "--write", "--log-level", "silent", "{file}"] } ],
+    ".ts":   [ { "bin": "prettier", "cmd": ["prettier", "--write", "--log-level", "silent", "{file}"] } ],
+    ".tsx":  [ { "bin": "prettier", "cmd": ["prettier", "--write", "--log-level", "silent", "{file}"] } ],
+    ".css":  [ { "bin": "prettier", "cmd": ["prettier", "--write", "--log-level", "silent", "{file}"] } ],
+    ".html": [ { "bin": "prettier", "cmd": ["prettier", "--write", "--log-level", "silent", "{file}"] } ],
+    ".json": [ { "bin": "prettier", "cmd": ["prettier", "--write", "--log-level", "silent", "{file}"] } ],
+    ".md":   [ { "bin": "prettier", "cmd": ["prettier", "--write", "--log-level", "silent", "{file}"] } ],
+    ".go":   [ { "bin": "gofmt", "cmd": ["gofmt", "-w", "{file}"] } ],
+    ".rs":   [ { "bin": "rustfmt", "cmd": ["rustfmt", "--quiet", "{file}"] } ],
+    ".sh":   [ { "bin": "shfmt", "cmd": ["shfmt", "-w", "{file}"] } ],
+    ".rb":   [ { "bin": "rubocop", "cmd": ["rubocop", "-A", "-f", "quiet", "{file}"] } ]
+  }
+}

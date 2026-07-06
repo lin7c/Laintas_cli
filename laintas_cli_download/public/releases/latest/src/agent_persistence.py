@@ -15,6 +15,7 @@ What is persisted:
 - id, name, role, depth, parent_id
 - parent_terminal, home_terminal, stationed_terminal
 - chat_history, state (shortTermMemory / lastReply / lastOutput)
+- employee profile, tool policy, assignment history
 - created_at, last_saved
 
 What is NOT persisted (runtime-only):
@@ -74,6 +75,11 @@ def save_agent_state(agent: "AgentInfo") -> bool:
         "stationed_terminal": getattr(agent, "stationed_terminal", None),
         "chat_history": history,
         "state": dict(getattr(agent, "state", {}) or {}),
+        "profile": _serialize_profile(getattr(agent, "profile", None)),
+        "assignment_history": list(
+            getattr(agent, "assignment_history", []) or [])[-100:],
+        "active_assignment": _serialize_assignment(
+            getattr(agent, "active_assignment", None)),
         "created_at": getattr(agent, "created_at", time.time()),
         "last_saved": time.time(),
     }
@@ -124,6 +130,42 @@ def delete_agent_state(agent_id: str) -> bool:
     return False
 
 
+def _serialize_profile(profile) -> dict:
+    if profile is None:
+        return {}
+    policy = getattr(profile, "tool_policy", None)
+    return {
+        "title": getattr(profile, "title", "General Agent"),
+        "description": getattr(
+            profile, "description", "General-purpose autonomous employee"),
+        "specialist_role": getattr(profile, "specialist_role", None),
+        "prompt": getattr(profile, "prompt", ""),
+        "capability_tags": list(
+            getattr(profile, "capability_tags", []) or []),
+        "tool_policy": {
+            "allowed_tools": (
+                list(policy.allowed_tools)
+                if policy is not None and policy.allowed_tools is not None
+                else None
+            ),
+            "denied_tools": list(
+                getattr(policy, "denied_tools", []) or []),
+        },
+    }
+
+
+def _serialize_assignment(assignment) -> Optional[dict]:
+    if assignment is None:
+        return None
+    return {
+        key: getattr(assignment, key, None)
+        for key in (
+            "id", "task", "terminal_name", "status", "created_at",
+            "started_at", "completed_at", "result", "error",
+        )
+    }
+
+
 def list_persisted_agents() -> list[dict]:
     """List all persisted agents (metadata only, chat_history omitted)."""
     if not AGENTS_DIR.exists():
@@ -161,3 +203,41 @@ def apply_persisted_state(agent: "AgentInfo", data: dict) -> None:
         merged = dict(agent.state or {})
         merged.update(data["state"])
         agent.state = merged
+    profile_data = data.get("profile")
+    if isinstance(profile_data, dict) and profile_data:
+        # Import lazily to keep this persistence module free of an import cycle.
+        from agent_loop import AgentToolPolicy, EmployeeProfile
+        policy_data = profile_data.get("tool_policy") or {}
+        allowed = policy_data.get("allowed_tools")
+        agent.profile = EmployeeProfile(
+            title=str(profile_data.get("title") or "General Agent"),
+            description=str(profile_data.get("description") or ""),
+            specialist_role=profile_data.get("specialist_role") or None,
+            prompt=str(profile_data.get("prompt") or ""),
+            capability_tags=[str(item) for item in
+                             profile_data.get("capability_tags", [])],
+            tool_policy=AgentToolPolicy(
+                allowed_tools=(
+                    [str(item) for item in allowed]
+                    if isinstance(allowed, list) else None),
+                denied_tools=[str(item) for item in
+                              policy_data.get("denied_tools", [])],
+            ),
+        )
+        active_data = data.get("active_assignment")
+        if isinstance(active_data, dict) and active_data.get("id"):
+            # A process restart cannot resume the old thread automatically.
+            active_data = dict(active_data)
+            active_data["status"] = "interrupted"
+            agent.assignment_history.append(active_data)
+            agent.active_assignment = None
+    if isinstance(data.get("assignment_history"), list):
+        existing_ids = {
+            str(item.get("id")) for item in agent.assignment_history
+            if isinstance(item, dict)
+        }
+        agent.assignment_history.extend(
+            item for item in data["assignment_history"]
+            if isinstance(item, dict) and str(item.get("id")) not in existing_ids
+        )
+        agent.assignment_history = agent.assignment_history[-100:]

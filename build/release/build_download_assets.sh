@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # build_download_assets.sh — build the 3 local download artifacts + self-update
-# manifest. Windows exe is NOT rebuilt here (CI-only); we copy the checked-in one.
+# manifest.
 #
 # Reads package_manifest.json as the single source of truth for which modules
 # and packages to ship. See build/HEADLESS_BROWSER_PACKAGING.md.
@@ -57,8 +57,7 @@ mkdir -p "$RELEASE_DIR"
 rm -f \
   "$RELEASE_DIR/laintas-cli_linux.tar.gz" \
   "$RELEASE_DIR/laintas-cli_macos.tar.gz" \
-  "$RELEASE_DIR/laintas-cli_source.zip" \
-  "$RELEASE_DIR/laintas_cli.exe"
+  "$RELEASE_DIR/laintas-cli_source.zip"
 
 echo "Building Linux standalone binary in old-glibc container..."
 # IMPORTANT: do NOT build the Linux binary with the host's PyInstaller — the
@@ -164,9 +163,6 @@ SOURCE_PACKAGE_DIR="$TMP_DIR/laintas-cli-source"
 mkdir -p "$SOURCE_PACKAGE_DIR"
 copy_bundle "$SOURCE_PACKAGE_DIR"
 (cd "$TMP_DIR" && zip -qr "$RELEASE_DIR/laintas-cli_source.zip" laintas-cli-source)
-
-echo "Refreshing Windows executable from checked-in artifact..."
-cp "$PROJECT_DIR/build/windows/laintas_cli.exe" "$RELEASE_DIR/laintas_cli.exe"
 
 echo "Publishing loose source files + manifest for partial self-update (/v update)..."
 # The self-updater downloads only the .py files whose sha256 changed. To make

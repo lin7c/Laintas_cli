@@ -1,18 +1,18 @@
 {
-  "version": "1.5.0",
-  "released": "2026-07-03",
+  "version": "1.6.0",
+  "released": "2026-07-06",
   "files": {
     "laintas_cli.py": {
-      "sha256": "894ef999049cd3e747aabe26f54320b9be46c88b2e010cea3385529cf24e7ef5",
-      "size": 550307
+      "sha256": "25eb2300f8675e58362a155f53245e5c5e8429acd0368d375bb040e8ee5e2735",
+      "size": 588843
     },
     "agent_loop.py": {
-      "sha256": "a9b2252ff75b412bd1195c51e77e796166e4826bb92f3ee83bd28beea84f0022",
-      "size": 253483
+      "sha256": "2820f2589d3556a661f1d1a6e8d30fdb419a80ec2ecf1848de417c08ce546b2e",
+      "size": 262491
     },
     "tools.py": {
-      "sha256": "821ecb3f362051fe919e3d71aa30964894b5d10d55ab40ff080483a7554712f1",
-      "size": 231097
+      "sha256": "44de63ac70381a747148bb86c69bc7b2a193913019f3cc7077b7e93b5cc0c740",
+      "size": 233612
     },
     "skills.py": {
       "sha256": "fea93a1fa65e3df8f2011ce64341a266b58e9626bf659cee2548eb4c83aef3a6",
@@ -23,8 +23,8 @@
       "size": 17045
     },
     "policy.py": {
-      "sha256": "ea65e7548c25d22e2ff9c4c17017b36eb1c9ebf8a1b051dd2868acc7baa1463d",
-      "size": 35732
+      "sha256": "229bfd3f228333c79410baf831a2b252a0560455c68d97639f908bc542f58843",
+      "size": 31828
     },
     "memory_system.py": {
       "sha256": "daee4ee35e817f31e9afc7d1c46560f157927538066a471e57eed0f2d3efbb02",
@@ -67,8 +67,8 @@
       "size": 34541
     },
     "agent_persistence.py": {
-      "sha256": "7ac56d3786f67b92766fcf4bea126bbe4e7ca7e19bf6c5d7ac25a56728a080af",
-      "size": 5220
+      "sha256": "b8b54432846a2ad7a83bdfd23e5bae918924b62b29573901345b7c29cd2e6dcc",
+      "size": 8699
     },
     "agent_roles.py": {
       "sha256": "bf43a91d883ed3cddc018aba9fa0216c48bee0b408573635cae20f547e3c8e56",
@@ -99,40 +99,40 @@
       "size": 16881
     },
     "hwo_runner.py": {
-      "sha256": "9812f9142a5f12bb7a6127fc06384d957d38aab532ed6ed55e297eb0d3cca718",
-      "size": 23684
+      "sha256": "71817949b4d5b6d0edf32f7d9b70e110f21405d2a36d77b6982c0984e6ffae19",
+      "size": 24339
     },
     "hwo_ui.py": {
       "sha256": "ea2c408e1ce1cac3dffca233c2dc8f53790e56fa10194919637fc0a5cf1685c7",
       "size": 31212
     },
     "updater.py": {
-      "sha256": "21ce8f4f740284e625b319cbc8c8cb426219e8d9a5a5d9d82ed88ef78b9282d5",
-      "size": 13110
+      "sha256": "86eb7c163fa9fd40617c57823409a86cac2b6f64057a405ab778c01ab3e8d151",
+      "size": 12225
     },
     "version.py": {
-      "sha256": "879b2b30ea8ef1f5e1dfffc4e2d9cd8918755673dba8de31383d63b36c7cc86e",
+      "sha256": "11830054a2c05cdf6028d467ca3085e9571eb68e3234d007a88dbd04bacf8073",
       "size": 297
     },
     "browser_session.py": {
-      "sha256": "979790b27c5570a5c5b61ca48fce1c24e1ce4c5b21e3110fb72e3f1d8b17477f",
-      "size": 35120
+      "sha256": "1136c5cad1ddb06026b8ed868260fedda1810bbe3f95ce7d1fe66e52067ea845",
+      "size": 39571
     },
     "snapshot.py": {
       "sha256": "a3e700b5d2d8a0dc768549ade5adb73905ea34c571eae1bec92c4c3f7e2cf94d",
       "size": 5910
     },
     "webrtc_channel.py": {
-      "sha256": "3fea983e0c2e65e8c216aa89b137f3b2d3a79cf91c8471ef7db2ba098d33f541",
-      "size": 13324
+      "sha256": "f74b6a062547cff5a958b7858434ef3b9fd5a4d6f36bd602f5330059e512546a",
+      "size": 18653
     },
     "requirements.txt": {
       "sha256": "9e503b94c0c007a9bcabefee3c6096135c68ae5562fbf33ac51639104cf7fc19",
       "size": 1736
     },
     "setup.py": {
-      "sha256": "a4e8dd185043a14ecc1b12df2552e8a6af9bde39e37789ca8cb5424b38143f62",
-      "size": 1662
+      "sha256": "661dace4273e06105a2ece8d5e1e28801ac392cdf2702e2eec7583788314d13d",
+      "size": 1610
     },
     "agent_tools/adapter.py": {
       "sha256": "942886a13b8c4f4069b9b2fc8be979b56f30ef3f8812b20f98c84e4651d5b678",
@@ -193,6 +193,14 @@
     "patch_adapter/__init__.py": {
       "sha256": "6b5d4cf69a3d97e64df5f1cd04f039016f22b2b29417ee6d1774ec317aa60793",
       "size": 414
+    },
+    "default_skills/company-process/extension.json": {
+      "sha256": "43388b24baf8788206dd39d5c588ce9fb9d8cfc7c7d695ec1425f90e49d324fc",
+      "size": 142
+    },
+    "default_skills/company-process/skill.py": {
+      "sha256": "a7bae04ab905c2e97f4a545f98c4a6a3a89af0b33d30eaaf4fb8d9e28157b953",
+      "size": 16774
     }
   }
 }

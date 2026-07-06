@@ -22,14 +22,13 @@ There is no test suite, no linter config, and no Makefile — iterate by running
 
 ```bash
 ./build/linux/build_deb.sh [VERSION]     # Requires fpm (gem install fpm); outputs build/linux/laintas-cli_X.Y.Z_amd64.deb
-pyinstaller build/windows/laintas_cli.spec   # Outputs Windows exe; spec lists hiddenimports for rich/prompt_toolkit
 ```
 
-The .deb launcher (`/usr/bin/laintas-cli`) lazy-installs `requirements.txt` via pip on first run and `cd`s into `$LAINTAS_WORKSPACE` (default `~/laintas_workspace`). Windows builds also have an NSIS installer (`build/windows/installer.nsi`).
+The .deb launcher (`/usr/bin/laintas-cli`) lazy-installs `requirements.txt` via pip on first run and `cd`s into `$LAINTAS_WORKSPACE` (default `~/laintas_workspace`).
 
 A companion React/Vite download site lives in `laintas_cli_download/` (separate build, not part of the Python package).
 
-**To publish a release to the download page, read `build/RELEASE.md`** — it documents the full flow for the 4 download artifacts (Linux/macOS/source built locally via `build/release/build_download_assets.sh`; the Windows `.exe` is **CI-only**, rebuilt on `windows-latest` when `laintas_cli.py`/`build/windows/**` is pushed to `main`).
+**To publish a release to the download page, read `build/RELEASE.md`** — it documents the full flow for the download artifacts (Linux binary + macOS/source bundles built locally via `build/release/build_download_assets.sh`).
 
 ## Architecture (read PROJECT.md for full detail)
 
@@ -57,7 +56,7 @@ The project has grown from two core modules to ten, organized in layers:
 2. First whitespace token resolves via `shutil.which(...)` or matches a shell/cmd builtin → direct PTY passthrough, no AI. `cd` is special-cased at the REPL to mutate parent CWD (PTY subshell can't).
 3. Otherwise → `run_agent_loop()` (natural language).
 
-Routing uses live `shutil.which()` lookups plus a fixed builtin set (`_POSIX_SHELL_BUILTINS` / `_WINDOWS_CMD_BUILTINS`) — newly-installed binaries are picked up immediately, no snapshot to refresh. `/scan` is a display-only enumerator.
+Routing uses live `shutil.which()` lookups plus a fixed builtin set (`_POSIX_SHELL_BUILTINS`) — newly-installed binaries are picked up immediately, no snapshot to refresh. `/scan` is a display-only enumerator.
 
 ### Auto-Generated Working-Directory Files
 
@@ -74,7 +73,7 @@ Both `.laintas/commands.py` and `.laintas/loop.py` are **mtime-cached** — edit
 
 ### PTY Model
 
-`InteractiveSession` is the workhorse: `os.fork()` + `pty.openpty()` + non-blocking `fcntl` reads + `termios` restore. Windows has no PTY — Unix-only stdlib imports (`pty`, `fcntl`, `termios`, `tty`, `select`) are guarded by `if not IS_WINDOWS:` near the top of `laintas_cli.py`, and Windows takes a `subprocess.run` fallback. **Any new code touching those modules must keep the `IS_WINDOWS` guard** — recent commits (`9cc8d07`, `8f53d4b`) fixed regressions caused by missing guards.
+`InteractiveSession` is the workhorse: `os.fork()` + `pty.openpty()` + non-blocking `fcntl` reads + `termios` restore. Unix-only stdlib imports (`pty`, `fcntl`, `termios`, `tty`, `select`) are unconditional top-level imports in `laintas_cli.py` (Linux-only; Windows is no longer supported).
 
 `SubTerminalSession` inside tmux spawns a new tmux window (`tmux new-window -d`) so interactive programs (`vim`, `claude`, REPLs) get native passthrough while the AI loop keeps running in the main pane. Outside tmux it degrades to a backgrounded `InteractiveSession`.
 

@@ -25,30 +25,21 @@ const PLATFORMS = [
     desc: 'macOS 12+ · 需要 Python 3.10+',
   },
   {
-    id: 'windows',
-    labels: { zh: 'Windows', en: 'Windows' },
-    filename: 'laintas_cli.exe',
-    arch: 'x64',
-    icon: WindowsIcon,
-    desc: 'Windows 10+ · 无需 Python',
-  },
-  {
     id: 'source',
     labels: { zh: '源码', en: 'Source' },
     filename: 'laintas-cli_source.zip',
-    arch: 'Windows · macOS · Linux',
+    arch: 'macOS · Linux',
     icon: SourceIcon,
     desc: 'Python 3.10+ · source package',
   },
 ];
 
-const DOWNLOAD_BASE = '/releases/v1.5';
+const DOWNLOAD_BASE = '/releases/v1.6';
 
 function detectOS() {
   if (typeof navigator === 'undefined') return 'linux';
   const p = navigator.platform || '';
   const ua = navigator.userAgent || '';
-  if (p.includes('Win')) return 'windows';
   if (p.includes('Mac') || ua.includes('Mac OS X') || ua.includes('Macintosh')) return 'macos';
   return 'linux';
 }
@@ -331,7 +322,6 @@ export default function DownloadSection() {
         <CurlCommands isDark={isDark} selectedOS={selectedOS} />
 
         {/* Platform Installation Guide */}
-        {selectedOS === 'windows' && <WindowsGuide isDark={isDark} />}
         {selectedOS === 'macos' && <MacGuide isDark={isDark} />}
         {selectedOS === 'linux' && <LinuxGuide isDark={isDark} />}
         {selectedOS === 'source' && <SourceGuide isDark={isDark} />}
@@ -341,7 +331,7 @@ export default function DownloadSection() {
 }
 
 /* Curl download commands */
-const BASE_URL = 'https://cli.laintas.com/releases/v1.5';
+const BASE_URL = 'https://cli.laintas.com/releases/v1.6';
 
 function CurlCommands({ isDark, selectedOS }) {
   const [copied, setCopied] = useState(false);
@@ -544,11 +534,6 @@ function InstallGuide({ isDark, guide }) {
   );
 }
 
-function WindowsGuide({ isDark }) {
-  const { t } = useLanguage();
-  return <InstallGuide isDark={isDark} guide={t.winGuide} />;
-}
-
 function MacGuide({ isDark }) {
   const { t } = useLanguage();
   return <InstallGuide isDark={isDark} guide={t.macGuide} />;
@@ -633,14 +618,6 @@ function formatBytes(bytes) {
 }
 
 /* Icons */
-function WindowsIcon() {
-  return (
-    <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
-      <path d="M0 2.5l6.5-1v6.5H0V2.5zM7.5 1.5l8-1V8h-8V1.5zM0 9h6.5v6L0 14V9zM7.5 9H15.5v6.5l-8-1V9z" />
-    </svg>
-  );
-}
-
 function SourceIcon() {
   return (
     <svg width="16" height="16" viewBox="0 0 16 16" fill="none">

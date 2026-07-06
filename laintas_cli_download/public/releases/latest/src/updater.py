@@ -280,14 +280,10 @@ def apply_source_update(manifest: dict, changed_files: list, channel_dir: str,
 def apply_frozen_update(manifest: dict, channel_dir: str, log) -> Optional[str]:
     """Replace the running PyInstaller binary. Returns path to new binary, or None.
 
-    On POSIX the running executable can be unlinked and rewritten in place. On
-    Windows a running .exe is locked, so we download alongside it and leave the
-    user to swap it (handled by the caller's messaging).
+    On POSIX the running executable can be unlinked and rewritten in place.
     """
     target = os.path.abspath(sys.executable)
-    if os.name == "nt":
-        asset = "laintas_cli.exe"
-    elif sys.platform == "darwin":
+    if sys.platform == "darwin":
         asset = "laintas-cli_macos.tar.gz"
     else:
         asset = "laintas-cli_linux.tar.gz"
@@ -298,44 +294,32 @@ def apply_frozen_update(manifest: dict, channel_dir: str, log) -> Optional[str]:
 
     tmpdir = tempfile.mkdtemp(prefix="laintas-update-")
     try:
-        if os.name == "nt":
-            new_exe = os.path.join(tmpdir, "laintas_cli.exe")
-            with open(new_exe, "wb") as fh:
-                fh.write(data)
-            # Can't overwrite the running exe; drop it next to the current one.
-            staged = target + ".new"
-            shutil.copy2(new_exe, staged)
-            log(f"[yellow]Windows can't replace a running .exe. "
-                f"New binary saved as:[/yellow] {staged}")
-            log("[yellow]Close laintas-cli, then replace the old .exe with it.[/yellow]")
+        archive = os.path.join(tmpdir, asset)
+        with open(archive, "wb") as fh:
+            fh.write(data)
+        import tarfile
+        with tarfile.open(archive, "r:gz") as tf:
+            tf.extractall(tmpdir)
+        # GitHub tarball lays the binary out at the archive root (./laintas-cli
+        # alongside ./install.sh); older layouts nested it one level deeper.
+        extracted = os.path.join(tmpdir, "laintas-cli")
+        if not os.path.exists(extracted):
+            extracted = os.path.join(tmpdir, "laintas-cli", "laintas-cli")
+        if not os.path.exists(extracted):
+            log("[red]Unexpected tarball layout; aborting.[/red]")
             return None
-        else:
-            archive = os.path.join(tmpdir, asset)
-            with open(archive, "wb") as fh:
-                fh.write(data)
-            import tarfile
-            with tarfile.open(archive, "r:gz") as tf:
-                tf.extractall(tmpdir)
-            # GitHub tarball lays the binary out at the archive root (./laintas-cli
-            # alongside ./install.sh); older layouts nested it one level deeper.
-            extracted = os.path.join(tmpdir, "laintas-cli")
-            if not os.path.exists(extracted):
-                extracted = os.path.join(tmpdir, "laintas-cli", "laintas-cli")
-            if not os.path.exists(extracted):
-                log("[red]Unexpected tarball layout; aborting.[/red]")
-                return None
-            if not os.access(os.path.dirname(target), os.W_OK):
-                log(f"[red]No write permission for {os.path.dirname(target)}.[/red]")
-                log("[yellow]Re-run with sudo to replace the binary in place.[/yellow]")
-                return None
-            # Replace in place: unlink the running file (the open fd keeps the
-            # current process alive), then move the new one into its path.
-            try:
-                os.remove(target)
-            except OSError:
-                pass
-            shutil.move(extracted, target)
-            os.chmod(target, os.stat(target).st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
-            return target
+        if not os.access(os.path.dirname(target), os.W_OK):
+            log(f"[red]No write permission for {os.path.dirname(target)}.[/red]")
+            log("[yellow]Re-run with sudo to replace the binary in place.[/yellow]")
+            return None
+        # Replace in place: unlink the running file (the open fd keeps the
+        # current process alive), then move the new one into its path.
+        try:
+            os.remove(target)
+        except OSError:
+            pass
+        shutil.move(extracted, target)
+        os.chmod(target, os.stat(target).st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+        return target
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)

@@ -14,8 +14,7 @@ PTY relay — so the backend can reuse one relay implementation:
   browser → host : {"t":"i","d":<b64>}   RFB bytes from noVNC
   host → browser : {"t":"exit"}          x11vnc ended
 
-Unix-only: Windows has no Xvfb. browser.* tools degrade to headless-only
-(no live view) there; see the IS_WINDOWS guard.
+Unix-only: requires Xvfb for the live view.
 
 Optional system packages (probed at start; missing → clear error, no crash):
   Xvfb, x11vnc, google-chrome | chromium | chromium-browser
@@ -37,8 +36,6 @@ import shutil
 import tempfile
 from dataclasses import dataclass, field
 from typing import Optional, List
-
-IS_WINDOWS = sys.platform == "win32"
 
 # Chrome binaries tried in order.
 _CHROME_CANDIDATES = (
@@ -133,7 +130,7 @@ def _unpriv_user():
     """Pick a non-root user to run Chrome as, so the setuid sandbox can stay on
     even in a root container. Returns (uid, gid, name, home) or None if none is
     suitable / not running as root / not Unix."""
-    if IS_WINDOWS or os.geteuid() != 0:
+    if os.geteuid() != 0:
         return None
     try:
         import pwd
@@ -155,9 +152,6 @@ def _unpriv_user():
 
 def _check_host_deps() -> Optional[str]:
     """Return an error message string if a required binary is missing, else None."""
-    if IS_WINDOWS:
-        return ("headless-browser live view is Unix-only (no Xvfb on Windows); "
-                "browser.* screenshot/snapshot tools degrade to headless-only.")
     missing = []
     if not _which("Xvfb"):
         missing.append("Xvfb (apt install xvfb)")

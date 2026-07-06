@@ -2527,20 +2527,14 @@ def _bi_agent_station(params: dict, ctx: ToolCtx) -> dict:
         if existing and ctx.unregister_terminal:
             ctx.unregister_terminal(name)
 
-        shell_cmd = (os.environ.get("COMSPEC", "cmd.exe") if os.name == "nt"
-                     else os.environ.get("SHELL", "/bin/bash"))
-        if os.name == "nt":
-            # InteractiveSession intentionally has no Windows PTY backend.
-            # Register a logical station; shell.exec uses subprocess fallback.
-            ctx.register_terminal(None, shell_cmd, ctx.depth, name=name)
-        else:
-            sub = ctx.deps.SubTerminalSession(shell_cmd)
-            sub.start()
-            time.sleep(0.1)
-            if not sub.is_alive():
-                return {"ok": False, "error": f"failed to start terminal '{name}'"}
-            sub.read_output(timeout=0.1)
-            ctx.register_terminal(sub, shell_cmd, ctx.depth, name=name)
+        shell_cmd = os.environ.get("SHELL", "/bin/bash")
+        sub = ctx.deps.SubTerminalSession(shell_cmd)
+        sub.start()
+        time.sleep(0.1)
+        if not sub.is_alive():
+            return {"ok": False, "error": f"failed to start terminal '{name}'"}
+        sub.read_output(timeout=0.1)
+        ctx.register_terminal(sub, shell_cmd, ctx.depth, name=name)
     if ctx.station_agent is not None:
         ctx.station_agent(target_agent.id, name)
     return {"ok": True, "result": f"Stationed {target_agent.id} in terminal {name}"}

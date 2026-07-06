@@ -47,7 +47,7 @@ docker run --rm \
       --noconfirm --onefile --name laintas-cli \
       --distpath /tmp/d --workpath /tmp/b --specpath /tmp \
       --collect-data certifi \
-      --runtime-hook /src/build/windows/hook_ssl.py \
+      --runtime-hook /src/build/linux/hook_ssl.py \
       --hidden-import requests \
       --hidden-import certifi \
       --hidden-import rich.console \

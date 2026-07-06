@@ -185,77 +185,6 @@ jobs:
             src_manifest.zip
 
   # ──────────────────────────────────────────────────────────────────────
-  windows:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
-
-      - name: Install dependencies
-        shell: pwsh
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install --prefer-binary requests certifi rich prompt-toolkit aiortc pyinstaller
-
-      - name: Build laintas_cli.exe
-        shell: pwsh
-        run: pyinstaller --noconfirm build/windows/laintas_cli.spec
-
-      - name: Detect signing config
-        id: signcfg
-        shell: pwsh
-        env:
-          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
-        run: |
-          if ($env:AZURE_CLIENT_ID) { "enabled=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append }
-          else { "enabled=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append; Write-Host "::warning::Azure Trusted Signing secrets not set — producing an UNSIGNED exe." }
-
-      - name: Sign laintas_cli.exe (Azure Trusted Signing)
-        if: steps.signcfg.outputs.enabled == 'true'
-        uses: azure/trusted-signing-action@v0
-        with:
-          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
-          endpoint: ${{ secrets.AZURE_TS_ENDPOINT }}
-          trusted-signing-account-name: ${{ secrets.AZURE_TS_ACCOUNT }}
-          certificate-profile-name: ${{ secrets.AZURE_TS_PROFILE }}
-          files-folder: ${{ github.workspace }}/dist
-          files-folder-filter: exe
-          file-digest: SHA256
-          timestamp-rfc3161: http://timestamp.acs.microsoft.com
-          timestamp-digest: SHA256
-
-      - name: Verify signature
-        if: steps.signcfg.outputs.enabled == 'true'
-        shell: pwsh
-        run: |
-          $sig = Get-AuthenticodeSignature dist/laintas_cli.exe
-          Write-Host "Signature status: $($sig.Status)"
-          if ($sig.Status -ne 'Valid') { throw "Signature invalid: $($sig.Status)" }
-
-      - name: Build Windows zip
-        shell: pwsh
-        run: |
-          $tmp = Join-Path $env:RUNNER_TEMP "laintas-cli-windows"
-          New-Item -ItemType Directory -Path $tmp -Force | Out-Null
-          Copy-Item dist/laintas_cli.exe (Join-Path $tmp "laintas_cli.exe") -Force
-          Compress-Archive -Path (Join-Path $tmp "laintas_cli.exe") -DestinationPath laintas-cli_windows.zip -Force
-          # Copy exe to workspace root so upload-artifact doesn't keep the dist/ prefix.
-          Copy-Item dist/laintas_cli.exe laintas_cli.exe -Force
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: windows
-          path: |
-            laintas_cli.exe
-            laintas-cli_windows.zip
-
-  # ──────────────────────────────────────────────────────────────────────
   deb:
     runs-on: ubuntu-latest
     steps:
@@ -286,7 +215,7 @@ jobs:
 
   # ──────────────────────────────────────────────────────────────────────
   publish:
-    needs: [linux, macos, source, windows, deb]
+    needs: [linux, macos, source, deb]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -322,8 +251,6 @@ jobs:
           cp artifacts/macos/laintas-cli_macos.tar.gz release/
           cp artifacts/source/laintas-cli_source.zip release/
           cp artifacts/source/src_manifest.zip release/src_manifest.zip
-          cp artifacts/windows/laintas_cli.exe release/
-          cp artifacts/windows/laintas-cli_windows.zip release/
           cp artifacts/deb/laintas-cli.deb "release/laintas-cli_${{ steps.ver.outputs.version }}_amd64.deb"
 
           # Generate SHA256SUMS.txt
@@ -332,8 +259,6 @@ jobs:
             laintas-cli_linux.tar.gz \
             laintas-cli_macos.tar.gz \
             laintas-cli_source.zip \
-            laintas_cli.exe \
-            laintas-cli_windows.zip \
             "laintas-cli_${{ steps.ver.outputs.version }}_amd64.deb" \
             > SHA256SUMS.txt
           # Unzip the src manifest for upload
@@ -352,8 +277,6 @@ jobs:
             release/laintas-cli_linux.tar.gz \
             release/laintas-cli_macos.tar.gz \
             release/laintas-cli_source.zip \
-            release/laintas_cli.exe \
-            release/laintas-cli_windows.zip \
             "release/laintas-cli_${{ steps.ver.outputs.version }}_amd64.deb" \
             release/SHA256SUMS.txt \
             release/manifest.json \

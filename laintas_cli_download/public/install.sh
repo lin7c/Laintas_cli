@@ -12,10 +12,8 @@ echo "── Laintas CLI Installer ───────────────
 UNAME_S=$(uname -s)
 if [ "$UNAME_S" = "Linux" ]; then
     INSTALL_MODE="linux"
-elif echo "$UNAME_S" | grep -qi "MINGW\|MSYS\|CYGWIN"; then
-    INSTALL_MODE="windows"
 else
-    echo "Unsupported OS: $UNAME_S"
+    echo "Unsupported OS: $UNAME_S (Linux only)"
     exit 1
 fi
 
@@ -24,7 +22,7 @@ if [ "$INSTALL_MODE" = "linux" ]; then
 
     # Download tarball
     echo "  Downloading…"
-    curl -fsSL "$BASE_URL/releases/v1.5/laintas-cli_linux.tar.gz" -o "$TMP_DIR/laintas-cli_linux.tar.gz"
+    curl -fsSL "$BASE_URL/releases/v1.6/laintas-cli_linux.tar.gz" -o "$TMP_DIR/laintas-cli_linux.tar.gz"
 
     # Extract
     echo "  Extracting package…"
@@ -34,13 +32,6 @@ if [ "$INSTALL_MODE" = "linux" ]; then
     "$TMP_DIR/laintas-cli/install.sh"
 
     printf '\n  Done! Run `laintas-cli` to start.\n\n'
-
-elif [ "$INSTALL_MODE" = "windows" ]; then
-    echo "  Detected: Windows (Git Bash / MSYS2)"
-    echo "  Downloading Windows executable…"
-    curl -fsSL "$BASE_URL/releases/v1.5/laintas_cli.exe" -o "$TMP_DIR/laintas_cli.exe"
-    echo "  Launching executable…"
-    "$TMP_DIR/laintas_cli.exe"
 fi
 
 echo "── ────────────────────────────────────────────────────────────"

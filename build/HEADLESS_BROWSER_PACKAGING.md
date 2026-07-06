@@ -1,7 +1,7 @@
 # Headless-Browser / WebRTC / Snapshot — Packaging Plan
 
 How the three "heavy / optional / platform-locked" subsystem modules must be
-handled across the 5 release artifacts. This is the authoritative spec for the
+handled across the 3 release artifacts. This is the authoritative spec for the
 `package_manifest.json` fields and the per-platform PyInstaller spec changes.
 
 Read this before touching `package_manifest.json`, either `laintas_cli.spec`,
@@ -11,7 +11,7 @@ or `build_download_assets.sh`.
 
 | Module | Python deps | System binaries | Platform | Import style | Backend dep |
 |---|---|---|---|---|---|
-| `browser_session.py` | `websockets` (WS↔RFB), `playwright` (CDP) — both lazy | Xvfb / x11vnc / chrome\|chromium | **Unix-only** (no Xvfb on Windows) | `laintas_cli.py:141` **top-level** + `tools.py` lazy-in-fn | Helpwo `/vnc` relay (retries, no crash) |
+| `browser_session.py` | `websockets` (WS↔RFB), `playwright` (CDP) — both lazy | Xvfb / x11vnc / chrome\|chromium | **Linux-only** | `laintas_cli.py:141` **top-level** + `tools.py` lazy-in-fn | Helpwo `/vnc` relay (retries, no crash) |
 | `webrtc_channel.py` | `aiortc` (top-level try/except) | none | cross-platform | `laintas_cli.py:3357` lazy-in-fn | agent protocol carries SDP |
 | `snapshot.py` | none (stdlib + `git`) | `git` | cross-platform | `laintas_cli.py:6043`, `agent_loop.py:3149` lazy-in-fn | none |
 
@@ -87,21 +87,6 @@ packaging manifests move.
   resolves from the bundled package, the browser comes from
   `~/.cache/ms-playwright`.
 
-### Windows frozen binary (prune VNC deps, keep webrtc + snapshot)
-
-- `browser_session.py` **is still bundled** (top-level import must succeed),
-  but `hiddenimports` does **NOT** list `websockets` / `playwright`. At runtime:
-  - `_ws_bridge_loop` hits `ImportError` on `from websockets.sync.client import
-    connect` and `return`s (`:583-584`) — VNC relay silently off.
-  - `get_page()` hits `ImportError` on `from playwright.sync_api import
-    sync_playwright` — `tools.py`'s try/except returns
-    `{"ok": False, "error": "browser_session module not available"}` (`:2396`).
-  - `_check_host_deps()` returns the Windows-specific message (`:67-69`).
-  Net: browser.* tools degrade cleanly, no crash, no exe bloat.
-- `webrtc_channel.py` is bundled; `hiddenimports` adds `aiortc` + `av` + `cffi`
-  (cross-platform, worth the ~15 MB).
-- `snapshot.py` is bundled (pure stdlib, zero cost).
-
 ### Self-updater (`/v update`)
 
 - `manifest.json` covers the sha256 of all 3 modules' `.py`. Source-install
@@ -109,7 +94,7 @@ packaging manifests move.
 - Optional pip deps are NOT auto-installed by the updater. When
   `AIORTC_AVAILABLE is False` or `find_chrome() is None`, the relevant tool
   prints the exact `pip install laintas-cli[<extra>]` / `apt install ...` hint.
-- Frozen-binary updates replace the whole platform tarball/exe, which already
+- Frozen-binary updates replace the whole platform tarball, which already
   carries the platform-pruned content.
 
 ## PyInstaller pitfalls (learned the hard way)
@@ -118,7 +103,7 @@ packaging manifests move.
   it by default. If you want playwright fully working inside the frozen exe you
   must add `('path/to/playwright/driver', 'playwright/driver')` to `binaries`.
   We deliberately skip this — users `pip install playwright` into the
-  environment instead. The frozen exe only needs the Python API stub to import.
+  environment instead. The frozen binary only needs the Python API stub to import.
 - **PyAV (`av`) is a C extension.** `collect_submodules('av')` alone is not
   enough; also `collect_data_files('av')` for its codec metadata. Without it
   aiortc's `from av import ...` fails on first RTCPeerConnection.
@@ -126,8 +111,7 @@ packaging manifests move.
   add to `hiddenimports` as belt-and-suspenders.
 - **websockets** is pure Python but splits across many submodules; use
   `collect_submodules('websockets')` not a bare `'websockets'` hidden import.
-- **Do NOT add `playwright` to `excludes`** on Linux — that defeats CDP. Only
-  omit it from `hiddenimports` on Windows.
+- **Do NOT add `playwright` to `excludes`** on Linux — that defeats CDP.
 
 ## Minimal change surface (lands in Phase 0)
 
@@ -139,9 +123,9 @@ everything.
 {
   "modules": [
     {"name": "browser_session", "platform": "all",
-     "frozen_deps": {"linux": ["websockets", "playwright"], "windows": []}},
+     "frozen_deps": {"linux": ["websockets", "playwright"]}},
     {"name": "webrtc_channel", "platform": "all",
-     "frozen_deps": {"linux": ["aiortc", "av", "cffi"], "windows": ["aiortc", "av", "cffi"]}},
+     "frozen_deps": {"linux": ["aiortc", "av", "cffi"]}},
     {"name": "snapshot", "platform": "all", "frozen_deps": {}}
   ],
   "extras_require": {
@@ -158,7 +142,7 @@ The spec generator reads `frozen_deps[<platform>]` to decide `hiddenimports` +
 
 ## Acceptance smoke test (per artifact)
 
-Run on each of the 5 artifacts after build:
+Run on each of the 3 artifacts after build:
 
 ```bash
 # 1. startup doesn't crash (top-level browser_session import)
@@ -172,7 +156,7 @@ laintas-cli --execute "create a snapshot"       # succeeds on any git repo
 
 # 4. webrtc optional
 python -c "from webrtc_channel import AIORTC_AVAILABLE; print(AIORTC_AVAILABLE)"
-# Linux frozen: True ; Windows frozen: True ; source without [webrtc]: False
+# Linux frozen: True ; source without [webrtc]: False
 ```
 
 A failure of test 1 or 3 on any artifact blocks the release.
