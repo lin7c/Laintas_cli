@@ -466,24 +466,24 @@ def select_dialog(
             event.app.exit(result=None)
 
     # ── Layout ────────────────────────────────────────────────────
-    windows = []
+    layout_panes = []
     if search:
-        windows.append(Window(content=BufferControl(buffer=filter_buf), height=1))
+        layout_panes.append(Window(content=BufferControl(buffer=filter_buf), height=1))
     list_ctrl = FormattedTextControl(lambda: _ptk_fragments(_build_lines()))
     if full_screen:
-        windows.append(Window(content=list_ctrl))
+        layout_panes.append(Window(content=list_ctrl))
     else:
         # Rows + optional title + spacer + footer. The old ``height=len(items)``
         # clipped the hint and sometimes the final choices, making inline
         # selectors look like a plain, incomplete box.
         inline_height = len(norm) + 2 + (1 if title else 0)
-        windows.append(Window(
+        layout_panes.append(Window(
             content=list_ctrl,
             always_hide_cursor=True,
             height=max(3, inline_height),
         ))
 
-    layout = Layout(HSplit(windows))
+    layout = Layout(HSplit(layout_panes))
     style = Style.from_dict({
         "selected": "reverse",
         "option": "",
@@ -4452,6 +4452,7 @@ class AgentRegistry:
         self.agent_id: Optional[str] = None
         self.agent_secret: str = ""
         self.agent_name: str = ""
+        self.instance_id: str = getattr(paths, "INSTANCE_ID", f"pid-{os.getpid()}")
         # ── Sub-terminal identity (two-end handshake with Helpwo) ────────
         # depth 0 = primary CLI (auto-registers = "online"). depth ≥ 1 = a
         # nested CLI inside a sub-terminal: it registers ONLY when the user
@@ -4554,6 +4555,7 @@ class AgentRegistry:
         profile = get_backend_profile()
         payload = {
             "name": self.agent_name,
+            "instanceId": self.instance_id,
             "hostname": hostname,
             "os": SYSTEM,
             "shell": SHELL_NAME,
@@ -4690,7 +4692,12 @@ class AgentRegistry:
                 f"{backend_url}/api/agents/{self.agent_id}/events",
                 json={
                     "events": events,
-                    "state": {"cwd": os.getcwd(), "status": "running"},
+                    "instanceId": self.instance_id,
+                    "state": {
+                        "cwd": os.getcwd(),
+                        "status": "running",
+                        "instanceId": self.instance_id,
+                    },
                 },
                 headers=headers,
                 timeout=5,
@@ -4722,6 +4729,7 @@ class AgentRegistry:
             try:
                 payload = {
                     "agentId": self.agent_id,
+                    "instanceId": self.instance_id,
                     "cwd": os.getcwd(),
                     "shell": SHELL_NAME,
                 }
@@ -4800,6 +4808,7 @@ class AgentRegistry:
             try:
                 resp = requests.get(
                     f"{backend_url}/api/agents/{self.agent_id}/poll",
+                    params={"instanceId": self.instance_id},
                     headers=self._agent_auth_headers(),
                     timeout=5,
                     allow_redirects=False,
@@ -5958,7 +5967,7 @@ class AgentRegistry:
         try:
             requests.post(
                 f"{backend_url}/api/agents/unregister",
-                json={"agentId": self.agent_id},
+                json={"agentId": self.agent_id, "instanceId": self.instance_id},
                 headers=headers,
                 timeout=5,
                 allow_redirects=False,

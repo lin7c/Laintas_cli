@@ -5,13 +5,6 @@ import { useTheme } from '../contexts/ThemeContext';
 
 const OS_OPTIONS = [
   {
-    id: 'windows',
-    label: 'Windows',
-    ext: 'exe',
-    icon: WindowsIcon,
-    arch: 'x64 / ARM64',
-  },
-  {
     id: 'linux',
     label: 'Linux',
     ext: 'deb',
@@ -59,7 +52,7 @@ export default function DownloadPage() {
           <WebAppLinks t={t} isDark={isDark} />
 
           {/* ─── Script install ─── */}
-          <ScriptInstall t={t} isDark={isDark} current={current} />
+          <ScriptInstall t={t} isDark={isDark} />
 
           {/* ─── Divider ─── */}
           <div className="my-16 flex items-center gap-4" aria-hidden>
@@ -229,11 +222,7 @@ function DownloadCard({ current, t, isDark }) {
 
         {/* Download button */}
         <a
-          href={
-            current.id === 'windows' ? '/releases/v1.5/laintas_cli.exe' :
-            current.id === 'linux' ? '/releases/v1.5/laintas-cli_1.5.0_amd64.deb' :
-            `/releases/v1.5/laintas_cli.${current.ext}`
-          }
+          href="/releases/v1.5/laintas-cli_1.5.0_amd64.deb"
             className="inline-flex items-center gap-2.5 px-8 py-3.5 rounded-xl text-base font-semibold transition-all duration-200"
             style={{
               background: 'var(--accent-soft)',
@@ -316,13 +305,9 @@ function WebAppLinks({ t, isDark }) {
 }
 
 /* ─── Script Install ─── */
-function ScriptInstall({ t, isDark, current }) {
+function ScriptInstall({ t, isDark }) {
   const [copied, setCopied] = useState(false);
-  const installCmd = current.id === 'windows'
-    ? 'curl -LO https://helpwo.laintas.com/releases/v1.5/laintas_cli.exe'
-    : current.id === 'linux'
-    ? 'curl -LO https://helpwo.laintas.com/releases/v1.5/laintas-cli_1.5.0_amd64.deb && sudo dpkg -i laintas-cli_1.5.0_amd64.deb'
-    : 'curl -fsSL https://cli.laintas.com/install.sh | bash';
+  const installCmd = 'curl -LO https://helpwo.laintas.com/releases/v1.5/laintas-cli_1.5.0_amd64.deb && sudo dpkg -i laintas-cli_1.5.0_amd64.deb';
 
   const handleCopy = () => {
     navigator.clipboard.writeText(installCmd).then(() => {
@@ -438,9 +423,6 @@ function Background({ isDark }) {
 
 /* ─── OS detection ─── */
 function detectOS() {
-  if (typeof navigator === 'undefined') return 'linux';
-  const p = navigator.platform || '';
-  if (p.includes('Win')) return 'windows';
   return 'linux';
 }
 
@@ -454,14 +436,6 @@ function TerminalIcon() {
         style={{ color: 'var(--accent-soft)' }} />
       <path d="M13 19h5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"
         style={{ color: 'var(--accent-soft)' }} />
-    </svg>
-  );
-}
-
-function WindowsIcon() {
-  return (
-    <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
-      <path d="M0 2.5l6.5-1v6.5H0V2.5zM7.5 1.5l8-1V8h-8V1.5zM0 9h6.5v6L0 14V9zM7.5 9H15.5v6.5l-8-1V9z" />
     </svg>
   );
 }

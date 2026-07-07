@@ -40,12 +40,28 @@ Layout:
 
 import os
 import stat
+import uuid
 from pathlib import Path
 
 
 # ── Home Directory (global config) ───────────────────────────────────────
 
 LAINTAS_HOME = Path(os.environ.get("LAINTAS_HOME", str(Path.home() / ".laintas")))
+
+
+def _safe_instance_id(value: str) -> str:
+    """Return a short filesystem/API-safe id for this CLI process."""
+    safe = "".join(c if c.isalnum() or c in "._-" else "-" for c in value)
+    safe = safe.strip(".-_")
+    return safe[:64] or f"pid-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+
+
+# Process-level identity. This separates concurrent terminals that share the
+# same user, cwd and ~/.laintas directory without changing the account session.
+INSTANCE_ID = _safe_instance_id(
+    os.environ.get("LAINTAS_INSTANCE_ID")
+    or f"pid-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+)
 
 # Flat files
 CONFIG_FILE       = LAINTAS_HOME / "config.json"

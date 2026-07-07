@@ -183,29 +183,6 @@ class AgentIsolationTests(unittest.TestCase):
         self.assertEqual(employee.status, "idle")
         self.assertIsNone(tools.get_registry().get("agent.switch"))
 
-    def test_agent_station_tool_uses_logical_station_on_windows(self):
-        employee = agent_loop.register_agent(
-            name="win-worker", depth=1, role="pool")
-        deps = mock.Mock()
-        ctx = tools.ToolCtx(
-            deps=deps,
-            agent_id=employee.id,
-            depth=1,
-            get_agent=agent_loop.get_agent,
-            get_terminal=lambda _name: None,
-            register_terminal=mock.Mock(),
-            station_agent=mock.Mock(return_value=True),
-        )
-        with mock.patch.object(tools.os, "name", "nt"), \
-                mock.patch.dict(tools.os.environ, {"COMSPEC": "cmd.exe"}):
-            result = tools._bi_agent_station({"name": "win-shell"}, ctx)
-
-        self.assertTrue(result["ok"])
-        deps.SubTerminalSession.assert_not_called()
-        ctx.register_terminal.assert_called_once_with(
-            None, "cmd.exe", 1, name="win-shell")
-        ctx.station_agent.assert_called_once_with(employee.id, "win-shell")
-
     def test_read_only_roles_cannot_escape_through_shell(self):
         for role in ("explorer", "architect", "reviewer",
                      "silent-failure-hunter", "tester"):

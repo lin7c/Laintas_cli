@@ -472,20 +472,6 @@ class SlashRegistryTests(unittest.TestCase):
             agent_loop.close_all_agents()
         self.assertIn("Hired employee: alice", output.getvalue())
 
-    def test_hire_prompt_path_with_spaces_is_normalized_on_windows(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            prompt_path = Path(tmp) / "employee prompt.md"
-            prompt_path.write_text("WINDOWS EMPLOYEE PROMPT", encoding="utf-8")
-            with mock.patch.object(laintas_cli, "IS_WINDOWS", True):
-                name, profile = laintas_cli._parse_hire_profile([
-                    "alice", "--prompt", f'"{prompt_path}"',
-                    "--tools", "inherit",
-                ])
-
-        self.assertEqual(name, "alice")
-        self.assertEqual(profile.prompt, "WINDOWS EMPLOYEE PROMPT")
-        self.assertIsNone(profile.tool_policy.allowed_tools)
-
     def test_station_task_starts_assignment_without_switching_manager(self):
         agent_loop.close_all_agents()
         manager = agent_loop.register_agent(name="primary", role="primary")
@@ -510,36 +496,6 @@ class SlashRegistryTests(unittest.TestCase):
                              (employee.id, "fix login race"))
             self.assertEqual(agent_loop.get_current_agent().id, manager.id)
         finally:
-            agent_loop.close_all_agents()
-
-    def test_station_task_uses_logical_terminal_on_windows(self):
-        agent_loop.close_all_agents()
-        agent_loop.close_all_terminals()
-        manager = agent_loop.register_agent(name="primary", role="primary")
-        employee = agent_loop.register_agent(name="alice", depth=1, role="pool")
-        agent_loop.set_current_agent_id(manager.id)
-        assignment = mock.Mock(task="fix login race")
-        try:
-            with mock.patch.object(laintas_cli, "IS_WINDOWS", True), \
-                    mock.patch.object(laintas_cli, "DEFAULT_SHELL", "cmd.exe"), \
-                    mock.patch.object(laintas_cli, "SubTerminalSession") as subterm, \
-                    mock.patch.object(
-                        laintas_cli, "start_agent_assignment",
-                        return_value=(True, "started", assignment)) as start:
-                laintas_cli.handle_meta_command(
-                    '/station alice win-work --task "fix login race"',
-                    _Registry(), {})
-
-            subterm.assert_not_called()
-            station = agent_loop.get_terminal("win-work")
-            self.assertIsNotNone(station)
-            self.assertIsNone(station.session)
-            self.assertEqual(employee.stationed_terminal, "win-work")
-            self.assertEqual(start.call_args.args[:2],
-                             (employee.id, "fix login race"))
-            self.assertEqual(agent_loop.get_current_agent().id, manager.id)
-        finally:
-            agent_loop.close_all_terminals()
             agent_loop.close_all_agents()
 
     def test_json_args_preserve_quotes(self):

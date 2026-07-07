@@ -73,7 +73,7 @@ Both `.laintas/commands.py` and `.laintas/loop.py` are **mtime-cached** — edit
 
 ### PTY Model
 
-`InteractiveSession` is the workhorse: `os.fork()` + `pty.openpty()` + non-blocking `fcntl` reads + `termios` restore. Unix-only stdlib imports (`pty`, `fcntl`, `termios`, `tty`, `select`) are unconditional top-level imports in `laintas_cli.py` (Linux-only; Windows is no longer supported).
+`InteractiveSession` is the workhorse: `os.fork()` + `pty.openpty()` + non-blocking `fcntl` reads + `termios` restore. Unix stdlib imports (`pty`, `fcntl`, `termios`, `tty`, `select`) are unconditional top-level imports in `laintas_cli.py`.
 
 `SubTerminalSession` inside tmux spawns a new tmux window (`tmux new-window -d`) so interactive programs (`vim`, `claude`, REPLs) get native passthrough while the AI loop keeps running in the main pane. Outside tmux it degrades to a backgrounded `InteractiveSession`.
 

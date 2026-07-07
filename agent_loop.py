@@ -86,6 +86,7 @@ _DEFAULT_CONFIG = {
     "staleness_limit": 3,         # consecutive no-tool steps before auto-exit
     "repetition_threshold": 3,    # consecutive no-progress steps before force-exit (mirrors TokenBudgetTracker)
     "warning_force_limit": 5,     # consecutive same-warning fires before force-exit (circuit breaker)
+    "deterministic_repeat_limit": 3, # identical (tool+args) call that has FAILED this many times is hard-blocked from re-running — catches non-consecutive repeat-failure loops the windowed detectors miss
     "output_similarity": 0.85,    # Jaccard threshold for "same" output (0.0-1.0)
     "microcompact_keep": 8,       # recent entries to keep full output in microcompact
     "microcompact_read_budget": 24000,  # chars of older file-read content kept verbatim (deduped, newest-first) instead of wiped — prevents re-read amnesia
@@ -267,6 +268,7 @@ _RUNTIME_CONFIG_DESCRIPTIONS = {
     "staleness_limit": "Consecutive idle steps before exit",
     "repetition_threshold": "Consecutive repeated-output steps before exit",
     "warning_force_limit": "Repeated warning limit before forced exit",
+    "deterministic_repeat_limit": "Identical failing tool call attempts before it is hard-blocked",
     "output_similarity": "Repeated-output similarity threshold (0-1)",
     "detail": "Show full per-line tool detail (True) or simplified progress (False)",
     "deny_exits_loop": "Terminate the agent loop immediately when the user denies an approval prompt",
@@ -281,7 +283,8 @@ _RUNTIME_NONNEGATIVE = {
 _RUNTIME_POSITIVE = {
     "max_loops", "max_tokens", "max_debug_entries", "output_truncate",
     "terminal_tail_lines", "staleness_limit", "repetition_threshold",
-    "warning_force_limit", "microcompact_keep", "microcompact_read_budget",
+    "warning_force_limit", "deterministic_repeat_limit",
+    "microcompact_keep", "microcompact_read_budget",
     "history_max_messages", "message_truncate", "short_memory_max_chars",
     "model_context_window",
 }
@@ -386,6 +389,7 @@ _MAX_CONFIG = {
     "staleness_limit": 100000,      # never auto-exit on idle
     "repetition_threshold": 100000, # disable repetition circuit breaker
     "warning_force_limit": 100000,  # disable warning circuit breaker
+    "deterministic_repeat_limit": 100000,  # disable repeat-failure hard block
     "output_similarity": 1.0,       # only byte-identical output counts as repeat
     "microcompact_keep": 200,       # keep far more full outputs
     "microcompact_read_budget": 2000000,  # effectively keep all file-read content
@@ -714,6 +718,7 @@ def stop_trigger_scanner() -> None:
 _SESSION_TURNS_TO_SAVE = 8     # recent chat turns included in snapshot
 _SESSION_MEMORY_MAX   = 2000   # chars of shortTermMemory saved
 _SESSION_CONTENT_MAX  = 300    # chars per turn content in snapshot
+_LAST_RESUME_WRITE_FINGERPRINTS: dict[str, str] = {}
 
 
 def _session_key(cwd: str) -> str:
@@ -734,12 +739,40 @@ def _ensure_session_id(state: dict) -> str:
 
 
 def _atomic_write_json(dest, payload: dict) -> None:
+    _atomic_write_json_if_changed(dest, payload, skip_if_unchanged=False)
+
+
+def _fingerprint_payload(payload: dict) -> str:
+    stable = copy.deepcopy(payload)
+    if isinstance(stable, dict):
+        stable.pop("timestamp", None)
+    raw = json.dumps(
+        stable, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _atomic_write_json_if_changed(
+        dest, payload: dict, *, skip_if_unchanged: bool = True) -> bool:
     """Atomically replace one JSON file so an interrupted save stays readable."""
     dest.parent.mkdir(parents=True, exist_ok=True)
+    cache_key = str(dest)
+    if skip_if_unchanged:
+        fp = _fingerprint_payload(payload)
+        if _LAST_RESUME_WRITE_FINGERPRINTS.get(cache_key) == fp:
+            return False
     tmp = dest.with_name(f".{dest.name}.{uuid.uuid4().hex}.tmp")
     try:
-        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.write_text(
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
+        )
         os.replace(str(tmp), str(dest))
+        if skip_if_unchanged:
+            _LAST_RESUME_WRITE_FINGERPRINTS[cache_key] = fp
+        return True
     finally:
         try:
             tmp.unlink(missing_ok=True)
@@ -780,7 +813,10 @@ def save_session_snapshot(state: dict, chat_history: list, cwd: str) -> None:
         }
         dest = paths.SESSIONS_DIR / f"{_session_key(cwd)}.json"
         paths.SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
-        dest.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        dest.write_text(
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
+        )
     except Exception:
         pass
 
@@ -888,8 +924,9 @@ def save_resume_state(state: dict, chat_history: list, cwd: str) -> None:
         paths.SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
         # The per-session file is authoritative. The legacy per-cwd file remains
         # a latest-session index for backward-compatible /resume behavior.
-        _atomic_write_json(_resume_session_path(cwd, payload["session_id"]), payload)
-        _atomic_write_json(_resume_latest_path(cwd), payload)
+        _atomic_write_json_if_changed(
+            _resume_session_path(cwd, payload["session_id"]), payload)
+        _atomic_write_json_if_changed(_resume_latest_path(cwd), payload)
     except Exception:
         pass
 
@@ -2906,6 +2943,19 @@ def _command_fingerprint(cmd: str) -> str:
     return c
 
 
+def _call_fingerprint(name: str, salient: str) -> str:
+    """Exact identity of one tool call: tool name + its salient argument label.
+
+    Unlike _command_fingerprint (which normalizes variable parts to catch
+    *near*-repeats), this is a strict identity used by the repeat-FAILURE ledger:
+    two calls share a fingerprint only when they target the exact same thing
+    (same tool, same path/args). Re-issuing this exact call after it has already
+    failed is deterministically pointless, so the ledger blocks it regardless of
+    whether the attempts were consecutive.
+    """
+    return f"{name}\x00{(salient or '').strip()}"
+
+
 def _output_fingerprint(text: str) -> str:
     """Normalize command output for similarity detection.
 
@@ -3056,6 +3106,14 @@ def _detect_loop_warnings(state: dict, original_input: str) -> list[str]:
 
 
 _FS_PATH_TOOLS = {"fs.read", "fs.write", "fs.edit", "fs.multi_edit", "fs.diff"}
+
+# Tools exempt from the deterministic repeat-FAILURE ledger/hard-block: control
+# and completion tools whose "failure" is a normal control-flow signal, not a
+# stuck action, plus lifecycle tools that are meant to be polled repeatedly.
+_LEDGER_EXEMPT_TOOLS = {
+    "task.complete", "plan.submit", "plan.update", "session.continue",
+    "time.now", "agent.wait", "agent.spawn", "agent.tell",
+}
 
 
 def _track_files_in_command(name: str, cmd: str, seen: list) -> None:
@@ -4061,6 +4119,16 @@ def run_agent_loop(
     _warning_streaks: dict[str, int] = {}  # warning_type -> consecutive count
     _warning_force_limit = int(get_runtime_config("warning_force_limit"))
     _force_exit = False                    # set by circuit breaker to break out of nested logic
+    # ── Deterministic repeat-FAILURE ledger ─────────────────────────
+    # Cumulative (NOT windowed) count of how many times each exact call
+    # fingerprint has FAILED this session. A success resets its entry. Once a
+    # fingerprint reaches `deterministic_repeat_limit` failures, further
+    # identical attempts are hard-blocked (never executed) so a non-consecutive
+    # repeat-failure loop can't spin forever or re-run destructive no-ops.
+    _fail_ledger: dict[str, int] = {}
+    _fail_ledger_err: dict[str, str] = {}  # fingerprint -> last error text (for the block message)
+    _repeat_block_limit = int(get_runtime_config("deterministic_repeat_limit"))
+    _repeat_blocked_this_turn = False      # a doomed call was blocked this turn → force-exit after flushing
     self_info = _runtime_info
     if depth == 0 and agent_id:
         wf = workflow_engine.get_active_workflow()
@@ -4925,6 +4993,56 @@ def run_agent_loop(
                     loop=loop + 1,
                 )
 
+                # ── Deterministic repeat-FAILURE hard block ──────────────
+                # If this EXACT call (tool + salient args) has already failed
+                # `_repeat_block_limit` times this session, re-running it is
+                # pointless (missing path, non-matching edit, dead URL, …) and,
+                # for destructive tools, actively dangerous. Refuse to execute
+                # it and hand the model a blunt, un-truncated error so it stops
+                # re-emitting the same doomed call. Unlike the windowed loop
+                # detectors, this fires even when the repeats are interleaved
+                # with other (succeeding) calls — the exact pattern that let a
+                # goal-less loop retry `fs.delete` ~10× in the incident log.
+                # Scope: non-shell registry tools only (shell commands are
+                # legitimately re-run after fixes) and never control tools.
+                _ledger_fp = _call_fingerprint(name, salient)
+                _ledger_eligible = (
+                    not is_shell_flavored
+                    and name not in _LEDGER_EXEMPT_TOOLS
+                )
+                if (_ledger_eligible
+                        and _fail_ledger.get(_ledger_fp, 0) >= _repeat_block_limit):
+                    _prev_n = _fail_ledger[_ledger_fp]
+                    _last_err = _fail_ledger_err.get(_ledger_fp, "(no error text)")
+                    result = {
+                        "ok": False,
+                        "error": (
+                            f"BLOCKED: you have already called `{name}` on "
+                            f"`{salient[:100]}` {_prev_n} times and it failed every "
+                            f"time with the same deterministic error:\n{_last_err[:300]}\n"
+                            f"Re-running it will fail identically. Stop repeating this "
+                            f"call — either fix the underlying cause with a DIFFERENT "
+                            f"action, or if this sub-goal is impossible, move on / call "
+                            f"task.complete and report it."
+                        ),
+                        "tool": name, "returncode": -1, "_repeat_blocked": True,
+                    }
+                    formatted_outputs.append(
+                        _format_tool_result_for_loop(
+                            name, result,
+                            int(get_runtime_config("output_truncate") or 3000)))
+                    per_call_rows.append({
+                        "command": salient, "output": result["error"],
+                        "returncode": -1, "tool": name, "call_id": call_id,
+                        "_repeat_blocked": True,
+                    })
+                    _repeat_blocked_this_turn = True
+                    if events_cb is not None:
+                        deps.console.print(
+                            f"[red]⚠ Blocked repeated failing call `{name} {salient[:60]}` "
+                            f"(failed {_prev_n}× already).[/red]")
+                    continue
+
                 # Prompt Lab workers must never gain side effects in the real
                 # workspace. Diagnosis workers get read-only inspection plus
                 # the draft recorder.
@@ -5400,6 +5518,25 @@ def run_agent_loop(
                                  run_id=_run_id,
                                  loop=loop + 1)
 
+        # ── Update the deterministic repeat-FAILURE ledger ──────────────
+        # Per eligible call this turn: a failure bumps its fingerprint's count
+        # (and records the error for the eventual block message); a SUCCESS
+        # clears it (the call is no longer deterministically doomed). Rows the
+        # ledger itself blocked are skipped so the block never self-perpetuates.
+        _SHELL_TOOLS = ("shell.exec", "terminal.send", "terminal.exec")
+        for _row in per_call_rows:
+            _rtool = _row.get("tool", "")
+            if (not _rtool or _rtool in _LEDGER_EXEMPT_TOOLS
+                    or _rtool in _SHELL_TOOLS or _row.get("_repeat_blocked")):
+                continue
+            _rfp = _call_fingerprint(_rtool, _row.get("command", ""))
+            if _step_failed(_row.get("returncode")):
+                _fail_ledger[_rfp] = _fail_ledger.get(_rfp, 0) + 1
+                _fail_ledger_err[_rfp] = str(_row.get("output") or "")[:300]
+            else:
+                _fail_ledger.pop(_rfp, None)
+                _fail_ledger_err.pop(_rfp, None)
+
         # Completion must describe the outcome of the whole emitted batch.
         # If the model called task.complete alongside a failed operation, keep
         # the loop alive so it can inspect and repair the failure.
@@ -5554,6 +5691,27 @@ def run_agent_loop(
             _output_fingerprints.append(_current_fp)
             if len(_output_fingerprints) > 5:
                 _output_fingerprints = _output_fingerprints[-5:]
+
+        # ── Deterministic repeat-failure breaker ─────────────────────────
+        # A doomed call was hard-blocked this turn: the model has already burned
+        # `_repeat_block_limit` identical failures on it and is not adapting.
+        # The block message is now in the thread; exit rather than let a
+        # goal-less loop keep grinding (and spending) against a wall.
+        if _repeat_blocked_this_turn:
+            _exit_reason = TRANSITION_WARNING_FORCE
+            if events_cb is not None:
+                deps.console.print(
+                    "[red]⚠ Exiting: a tool call kept failing identically and was "
+                    "blocked. The task appears stuck.[/red]"
+                )
+            _append_short_memory(state, (
+                "\n  ⚠ Loop force-exited: a tool call failed identically "
+                f"{_repeat_block_limit}+ times and was hard-blocked."
+            ))
+            if events_cb is not None and pending_events:
+                events_cb(pending_events)
+                pending_events.clear()
+            break
 
         # ── Repetition circuit breaker (mirrors TokenBudgetTracker stop decision) ──
         if _no_progress_count >= _repetition_threshold:

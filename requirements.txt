@@ -26,7 +26,7 @@ mcp>=1.0
 # Optional — enables the headless-browser live-view stack (browser.* tools).
 # The CLI runs without this; browser._debug_open will report the missing dep.
 # Requires system packages: Xvfb, x11vnc, google-chrome (or chromium).
-#   apt install xvfb x11vnc   (Linux only — no Xvfb on Windows)
+#   apt install xvfb x11vnc
 # websockets is the WS↔RFB bridge to the backend /vnc relay.
 websockets>=12.0
 

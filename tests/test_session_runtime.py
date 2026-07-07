@@ -455,6 +455,70 @@ class EventLogTests(unittest.TestCase):
 
 
 class SessionStoreTests(unittest.TestCase):
+    def test_atomic_write_skips_semantically_identical_payload(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session_store._LAST_WRITE_FINGERPRINTS.clear()
+            target = Path(tmp) / "session.json"
+            first = {"session_id": "s1", "timestamp": 1, "state": {"x": 1}}
+            second = {"session_id": "s1", "timestamp": 2, "state": {"x": 1}}
+
+            self.assertTrue(
+                session_store._atomic_write_json_if_changed(target, first))
+            self.assertFalse(
+                session_store._atomic_write_json_if_changed(target, second))
+            raw = target.read_text(encoding="utf-8")
+            self.assertNotIn("\n  ", raw)
+            self.assertEqual(json.loads(raw)["state"]["x"], 1)
+
+    def test_current_session_pointer_is_instance_scoped(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(paths, "SESSIONS_DIR", Path(tmp)):
+            with mock.patch.object(paths, "INSTANCE_ID", "term-a"):
+                session_a = session_store.create_session(
+                    "/work", {"objective": "A"}, [])
+                path_a = session_store._current_path("/work")
+            with mock.patch.object(paths, "INSTANCE_ID", "term-b"):
+                session_b = session_store.create_session(
+                    "/work", {"objective": "B"}, [])
+                path_b = session_store._current_path("/work")
+
+            self.assertNotEqual(path_a, path_b)
+            self.assertTrue(path_a.exists())
+            self.assertTrue(path_b.exists())
+            self.assertEqual(
+                json.loads(path_a.read_text(encoding="utf-8"))["session_id"],
+                session_a["session_id"],
+            )
+            self.assertEqual(
+                json.loads(path_b.read_text(encoding="utf-8"))["session_id"],
+                session_b["session_id"],
+            )
+
+    def test_legacy_current_pointer_is_claimed_by_current_instance(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(paths, "SESSIONS_DIR", Path(tmp)), \
+                mock.patch.object(paths, "INSTANCE_ID", "term-a"):
+            legacy_session = {
+                "id": "legacy",
+                "session_id": "legacy",
+                "kind": "live",
+                "cwd": "/work",
+                "closed_at": None,
+                "chat_history": [],
+                "state": {"objective": "legacy"},
+                "agent_state": {"objective": "legacy"},
+            }
+            legacy_path = session_store._legacy_current_path("/work")
+            legacy_path.parent.mkdir(parents=True, exist_ok=True)
+            legacy_path.write_text(
+                json.dumps(legacy_session), encoding="utf-8")
+
+            loaded = session_store.load_current_session("/work")
+
+            self.assertEqual(loaded["session_id"], "legacy")
+            self.assertFalse(legacy_path.exists())
+            self.assertTrue(session_store._current_path("/work").exists())
+
     def test_explicit_empty_state_does_not_restore_stale_agent_state(self):
         with tempfile.TemporaryDirectory() as tmp, \
                 mock.patch.object(paths, "SESSIONS_DIR", Path(tmp)):
@@ -483,7 +547,7 @@ class SessionStoreTests(unittest.TestCase):
             self.assertEqual(recovered["session_id"], session["session_id"])
             self.assertEqual(recovered["state"]["objective"], "recover me")
             self.assertIn("recovered", warning.lower())
-            self.assertTrue(list(Path(tmp).glob("*_current.json.corrupt-*")))
+            self.assertTrue(list(Path(tmp).glob("*_current_*.json.corrupt-*")))
 
     def test_closed_current_does_not_resurrect_older_orphan(self):
         with tempfile.TemporaryDirectory() as tmp, \
@@ -498,6 +562,97 @@ class SessionStoreTests(unittest.TestCase):
                 session_store._session_path(
                     "/work", orphan["session_id"]).exists())
             self.assertIsNone(session_store.load_current_session("/work"))
+
+
+class RemoteAgentIdentityTests(unittest.TestCase):
+    def test_remote_poll_includes_instance_id(self):
+        with mock.patch.object(paths, "INSTANCE_ID", "term-a"), \
+                mock.patch.object(laintas_cli, "get_backend_url",
+                                  return_value="https://laintas.com"), \
+                mock.patch.object(laintas_cli.time, "sleep"), \
+                mock.patch.object(laintas_cli.requests, "get") as get:
+            registry = laintas_cli.AgentRegistry()
+            registry.agent_id = "agent-1"
+            registry.agent_secret = "secret-1"
+            registry._running = True
+
+            response = mock.Mock(status_code=200)
+            response.json.return_value = {"inputs": []}
+
+            def _get(*args, **kwargs):
+                registry._running = False
+                return response
+
+            get.side_effect = _get
+            registry._poll_loop(lambda: {}, lambda: [])
+
+            self.assertEqual(
+                get.call_args.kwargs["params"], {"instanceId": "term-a"})
+
+    def test_remote_heartbeat_includes_instance_id(self):
+        with mock.patch.object(paths, "INSTANCE_ID", "term-a"), \
+                mock.patch.object(laintas_cli, "get_backend_url",
+                                  return_value="https://laintas.com"), \
+                mock.patch.object(laintas_cli, "get_all_terminals",
+                                  return_value=[]), \
+                mock.patch.object(laintas_cli.time, "sleep"), \
+                mock.patch.object(laintas_cli.requests, "post") as post:
+            registry = laintas_cli.AgentRegistry()
+            registry.agent_id = "agent-1"
+            registry.agent_secret = "secret-1"
+            registry._running = True
+
+            response = mock.Mock(status_code=200)
+
+            def _post(*args, **kwargs):
+                registry._running = False
+                return response
+
+            post.side_effect = _post
+            registry._heartbeat_loop()
+
+            self.assertEqual(
+                post.call_args.kwargs["json"]["instanceId"], "term-a")
+
+    def test_remote_register_events_and_unregister_include_instance_id(self):
+        profile = laintas_cli.backend_profiles.BackendProfile(
+            "test", "official", "https://laintas.com")
+        session = {
+            "headers": {"Authorization": "Bearer token"},
+            "cookies": {},
+            "userEmail": "user@example.com",
+            "userName": "User",
+        }
+
+        with mock.patch.object(paths, "INSTANCE_ID", "term-a"), \
+                mock.patch.object(laintas_cli, "get_backend_profile",
+                                  return_value=profile), \
+                mock.patch.object(laintas_cli, "get_backend_url",
+                                  return_value="https://laintas.com"), \
+                mock.patch.object(laintas_cli.requests, "post") as post:
+            register_resp = mock.Mock(status_code=200)
+            register_resp.json.return_value = {
+                "agentId": "agent-1",
+                "agentSecret": "secret-1",
+            }
+            event_resp = mock.Mock(status_code=200)
+            unregister_resp = mock.Mock(status_code=200)
+            post.side_effect = [register_resp, event_resp, unregister_resp]
+
+            registry = laintas_cli.AgentRegistry()
+            self.assertEqual(registry.instance_id, "term-a")
+            self.assertTrue(registry.register(session, name="primary", quiet=True))
+            registry._do_post_events([{"type": "user", "content": "hello"}])
+            registry.unregister()
+
+            register_payload = post.call_args_list[0].kwargs["json"]
+            events_payload = post.call_args_list[1].kwargs["json"]
+            unregister_payload = post.call_args_list[2].kwargs["json"]
+
+        self.assertEqual(register_payload["instanceId"], "term-a")
+        self.assertEqual(events_payload["instanceId"], "term-a")
+        self.assertEqual(events_payload["state"]["instanceId"], "term-a")
+        self.assertEqual(unregister_payload["instanceId"], "term-a")
 
 
 @contextmanager
