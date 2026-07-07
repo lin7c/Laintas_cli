@@ -2873,98 +2873,10 @@ def build_login_payload(username: str, password: str, captcha_response: str) -> 
 
 
 def login_interactive() -> Optional[dict]:
-    """Retained API shim: direct password/token login is intentionally disabled."""
+    """Compatibility shim: direct password/token login is disabled."""
     console.print(
         "[yellow]Direct terminal password login is disabled. "
         "Use browser OAuth with PKCE instead.[/yellow]")
-    return None
-
-    # Legacy implementation below is unreachable and retained temporarily so
-    # old source patches fail closed while packaged releases migrate.
-    console.print(Panel(
-        "[bold]Login to Laintas[/bold]\n\n"
-        "Enter your laintas.com username and password.\n"
-        f"Don't have an account? Visit [link={ACCOUNTS_BASE}/register]{ACCOUNTS_BASE}/register[/link] to sign up.",
-        title="Laintas Auth"
-    ))
-
-    # ── Method 1: Username + Password ──
-    username = input("Username: ").strip()
-    if not username.strip():
-        return None
-
-    import getpass
-    password = getpass.getpass("Password: ")
-    if not password.strip():
-        return None
-
-    try:
-        captcha_response = solve_captcha_challenge()
-        if not captcha_response:
-            console.print("[red]Login failed: could not fetch or solve captcha challenge.[/red]")
-            console.print(
-                "[dim]Run /login and choose Remote login, or paste a browser "
-                "session token below.[/dim]")
-            raise RuntimeError("captcha unavailable")
-
-        headers = {"Content-Type": "application/json", "Origin": f"{ACCOUNTS_BASE}"}
-        headers["X-Captcha-Response"] = captcha_response
-
-        resp = requests.post(
-            f"{ACCOUNTS_BASE}/api/auth/sign-in/username",
-            json=build_login_payload(username, password, captcha_response),
-            headers=headers,
-            timeout=10,
-            allow_redirects=False,
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            token = data.get("token", "")
-            user = data.get("user", {})
-            user_id = user.get("id", "")
-            if token:
-                # Get the actual signed cookie from response (token in JSON is unsigned)
-                cookie_val = (resp.cookies.get("__Secure-laintas-v2.session_token", "")
-                              or resp.cookies.get("laintas-v2.session_token", "")
-                              or resp.cookies.get("__Secure-better-auth.session_token", ""))
-                session = {
-                    "token": token,
-                    "userId": user_id,
-                    "userName": user.get("name", ""),
-                    "userEmail": user.get("email", ""),
-                    "cookies": {"__Secure-laintas-v2.session_token": cookie_val} if cookie_val else {"laintas-v2.session_token": token},
-                    "headers": {},
-                }
-                save_session(session)
-                console.print(f"[green]Logged in as {username.strip()} ({user.get('email', '')})[/green]")
-                return session
-        else:
-            try:
-                err = resp.json()
-                msg = err.get("message", "") or err.get("error", "") or resp.text[:200]
-            except Exception:
-                msg = resp.text[:200]
-            console.print(f"[red]Login failed: {msg}[/red]")
-    except RuntimeError:
-        pass
-    except requests.RequestException as e:
-        console.print(f"[yellow]Cannot reach {ACCOUNTS_BASE}: {e}[/yellow]")
-
-    # ── Method 2: Paste session token (fallback) ──
-    console.print("\n[dim]Or paste a session token from your browser cookies.[/dim]")
-    token = input("Session token (or press Enter to cancel): ").strip()
-    if not token.strip():
-        return None
-
-    session = resolve_session_from_token(token)
-    if session:
-        save_session(session)
-        display = (session.get("userEmail") or session.get("userName")
-                   or session.get("userId"))
-        console.print(f"[green]Logged in as {display}[/green]")
-        return session
-
-    console.print("[red]Invalid session token.[/red]")
     return None
 
 
