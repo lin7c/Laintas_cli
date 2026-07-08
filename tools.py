@@ -2866,7 +2866,7 @@ def _bi_session_continue(params: dict, ctx: ToolCtx) -> dict:
     """Signal that the user wants to resume prior session work.
 
     Unlike task.continue (a generic keep-looping no-op), this is called when
-    the AI determines the user's input (e.g. "继续", "continue", "接着做") is a
+    the AI determines the user's input is a
     request to resume the current session's pending task — not a new task.
 
     The agent loop detects the _session_continue marker and:
@@ -4135,9 +4135,12 @@ def register_builtin_tools() -> None:
         ),
         Tool(
             name="fs.delete",
-            description="Delete one file, symlink, or directory through the security policy. "
-                        "Non-empty directories require recursive=true. The target is inspected "
-                        "again after approval and deletion is cancelled if it changed.",
+            description="Delete one file, symlink, or directory through the security policy ONLY "
+                        "when the user explicitly requested that exact deletion or approved a "
+                        "plan containing it. Do not use as inferred cleanup or secret handling. "
+                        "Non-empty directories require recursive=true. "
+                        "The target is inspected again after approval and deletion is cancelled "
+                        "if it changed.",
             schema={
                 "type": "object",
                 "properties": {
@@ -5036,7 +5039,7 @@ def register_builtin_tools() -> None:
             name="session.continue",
             description=(
                 "Signal that the user is resuming prior work in the current live "
-                "session (e.g. they said \"继续\", \"continue\", \"接着\"). Call this "
+                "session. Call this "
                 "when you determine from <active_tasks> or <objective> that the user "
                 "wants to pick up an unfinished task, NOT start a new one. After "
                 "calling, proceed with the actual task steps in subsequent turns. "

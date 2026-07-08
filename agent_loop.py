@@ -3325,10 +3325,10 @@ def _build_user_message(original_input: str, state: dict, memory_entries: list,
     if objective or tasks_snapshot:
         continuation_block = (
             "\n<continuation>\n"
-            "If the user is asking to resume/continue prior work (e.g. \"继续\", "
-            "\"continue\", \"接着\"), call `session.continue` to signal it, then "
-            "resume the in_progress item in <active_tasks>; if none, work on "
-            "<objective>. If the user is starting a new task, proceed normally.\n"
+            "If the user is asking to resume or continue prior work, call "
+            "`session.continue` to signal it, then resume the in_progress item "
+            "in <active_tasks>; if none, work on <objective>. If the user is "
+            "starting a new task, proceed normally.\n"
             "</continuation>\n"
         )
 
@@ -5626,7 +5626,7 @@ def run_agent_loop(
         if not _nudge_needed:
             # Record the ACTION and its RESULT only — never the model's own reply
             # prose. Echoing the reply back into shortTermMemory (which is rendered
-            # into the next prompt) makes the model read its own "让我继续…" lines
+            # into the next prompt) makes the model read its own continuation filler
             # as step history and few-shot-mimic them, amplifying filler. Keep step
             # memory to what's actually useful for resuming: what ran, what happened.
             _step_note = action_desc_short or "(no tool call)"

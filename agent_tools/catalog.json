@@ -91,7 +91,7 @@
     },
     {
       "name": "delete", "category": "fs", "execContext": "host",
-      "description": "Delete a file or directory.",
+      "description": "Delete a file or directory only when the user explicitly requested that exact deletion or approved a plan containing it. Do not use as inferred cleanup or secret handling.",
       "params": {"type": "object", "properties": {
         "path": {"type": "string"}
       }, "required": ["path"]},

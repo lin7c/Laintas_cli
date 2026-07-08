@@ -84,9 +84,9 @@ FAILURE_TEMPLATE = """\
 Prompt version: v3
 
 Failure case:
-用户任务：____
-期望行为：____
-实际行为：____
+User task: ____
+Expected behavior: ____
+Actual behavior: ____
 
 Failure category:
 [ ] Objective unclear
