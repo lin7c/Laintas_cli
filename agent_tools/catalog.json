@@ -136,7 +136,7 @@
       "name": "agent_return", "category": "agent", "execContext": "either",
       "description": "Terminate the current agent and return an explicit result to its caller.",
       "params": {"type": "object", "properties": {
-        "value": {"type": "string"}
+        "value": {"description": "String or structured object. Use an object when the HWO agent declares out(...)."}
       }, "required": ["value"]},
       "aliases": {"laintas_cli": "agent_return", "helpwo": "agent_return"}
     },
@@ -230,7 +230,10 @@
       "name": "hwo", "category": "hwo", "execContext": "backend",
       "description": "Run / manage an HWO multi-agent workflow.",
       "params": {"type": "object", "properties": {
-        "action": {"type": "string"}, "name": {"type": "string"}
+        "action": {"type": "string"},
+        "path": {"type": "string"},
+        "name": {"type": "string"},
+        "inputs": {"type": "object", "additionalProperties": true}
       }, "required": ["action"]},
       "aliases": {"laintas_cli": "hwo", "helpwo": "hwo"}
     }

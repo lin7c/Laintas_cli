@@ -13,12 +13,13 @@ Distribution (vendored):
   Helpwo      -> src/tools/hwg-core.ts      (the TS canonical source)
 
 Canonical AST (JSON):
-  node     : {"type": "node",     "id": str, "file": str, "manual": bool}
+  node     : {"type": "node",     "id": str, "file": str, "manual": bool, "policy"?: dict}
   edge     : {"type": "edge",     "from": str, "to": str, "on": str|None, "maxLoops": int|None}
   schedule : {"type": "schedule", "days": list[str]|None, "start": str|None, "deadline": str|None, "tz": str|None}
 
 Grammar:
   (find.hwo)#find#                  a node bound to a .hwo file (its "body")
+  (find.hwo)#find# { retry: 2, timeout: "10m", cache: "1h" }   node policy
   !(review.hwo)#review#             a manual (human) node — run pauses here
   #find# -> #analyze#               an edge: find then analyze
   #review# -> { on: PASS } #report#                  conditional edge
@@ -51,16 +52,110 @@ class HwgParseError(Exception):
 
 # ── Metadata extractors ─────────────────────────────────────────────────
 
-_ON_RE = re.compile(r'on\s*:\s*(?:"([^"]*)"|\'([^\']*)\'|([A-Za-z_][A-Za-z0-9_-]*))')
 _MAXLOOPS_RE = re.compile(r'maxLoops\s*:\s*(\d+)')
 _DAYS_RE = re.compile(r'days\s*:\s*\[([^\]]*)\]')
+_RETRY_RE = re.compile(r'\bretry\s*:\s*(\d+)')
 
 
 def _extract_on(content: str) -> Optional[str]:
-    m = _ON_RE.search(content)
+    # Split metadata into top-level key/value pairs (respecting brackets and
+    # quotes) so a value like `status in [PASS, FAIL]` is not split at its
+    # inner comma. The `on:` key is matched anchored at the start of a pair so
+    # it cannot be confused with a substring of another key (e.g. `action:`).
+    for part in _split_top_level(content):
+        m = re.match(r'^on\s*:\s*(.+)$', part, re.I)
+        if m:
+            val = m.group(1).strip()
+            if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
+                val = val[1:-1]
+            return val or None
+    return None
+
+
+def _split_top_level(value: str, sep: str = ",") -> list[str]:
+    parts: list[str] = []
+    cur = ""
+    depth = 0
+    quote = ""
+    for ch in value:
+        if quote:
+            cur += ch
+            if ch == quote:
+                quote = ""
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            cur += ch
+            continue
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth = max(0, depth - 1)
+        if ch == sep and depth == 0:
+            if cur.strip():
+                parts.append(cur.strip())
+            cur = ""
+        else:
+            cur += ch
+    if cur.strip():
+        parts.append(cur.strip())
+    return parts
+
+
+def _parse_param(raw: str) -> dict:
+    s = raw.strip()
+    source = None
+    default = None
+    if "=" in s:
+        left, right = s.split("=", 1)
+        s = left.strip()
+        default = right.strip() or None
+        if default and (default.startswith("#") or default.startswith("$")):
+            source = default
+    if ":" in s:
+        left, typ = s.split(":", 1)
+        typ = typ.strip() or None
+    else:
+        left, typ = s, None
+    left = left.strip()
+    optional = left.endswith("?")
+    name = (left[:-1] if optional else left).strip()
+    return {"name": name, "type": typ, "optional": optional, "default": default, "source": source}
+
+
+def _extract_call(content: str, keyword: str) -> Optional[str]:
+    m = re.search(r"\b" + re.escape(keyword) + r"\s*\(", content)
     if not m:
         return None
-    return m.group(1) or m.group(2) or m.group(3) or None
+    i = m.end()
+    start = i
+    depth = 1
+    quote = ""
+    while i < len(content):
+        ch = content[i]
+        if quote:
+            if ch == quote:
+                quote = ""
+        elif ch in ("'", '"'):
+            quote = ch
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return content[start:i]
+        i += 1
+    return None
+
+
+def _parse_io_block(content: str) -> dict:
+    def read(kind: str) -> list:
+        inner = _extract_call(content, kind)
+        if inner is None:
+            return []
+        return [p for p in (_parse_param(x) for x in _split_top_level(inner)) if p["name"]]
+
+    return {"in": read("in"), "out": read("out")}
 
 
 def _extract_max_loops(content: str) -> Optional[int]:
@@ -69,6 +164,27 @@ def _extract_max_loops(content: str) -> Optional[int]:
         return None
     n = int(m.group(1))
     return n if (isinstance(n, int) and n > 0) else None
+
+
+def _extract_retry(content: str) -> Optional[int]:
+    m = _RETRY_RE.search(content)
+    if not m:
+        return None
+    return max(0, int(m.group(1)))
+
+
+def _extract_policy(content: str) -> dict:
+    policy: dict[str, Any] = {}
+    retry = _extract_retry(content)
+    timeout = _extract_string(content, "timeout")
+    cache = _extract_string(content, "cache")
+    if retry is not None:
+        policy["retry"] = retry
+    if timeout:
+        policy["timeout"] = timeout
+    if cache:
+        policy["cache"] = cache
+    return policy
 
 
 def _extract_string(content: str, key: str) -> Optional[str]:
@@ -83,8 +199,58 @@ def _extract_days(content: str) -> Optional[list[str]]:
     m = _DAYS_RE.search(content)
     if not m:
         return None
-    parts = m.group(1).split(",")
-    return [p.strip().strip('"\x27') for p in parts if p.strip()] or None
+    days: list[str] = []
+    for p in m.group(1).split(","):
+        p = p.strip()
+        p = re.sub(r'^["\']|["\']$', '', p)
+        if p:
+            days.append(p)
+    return days or None
+
+
+def _validate_io_params(statements: list) -> list[str]:
+    errors: list[str] = []
+
+    def check(io: Optional[dict], path: str) -> None:
+        if not io:
+            return
+        for kind in ("in", "out"):
+            seen: set = set()
+            for p in io.get(kind, []):
+                name = p.get("name", "")
+                if not re.match(r"^[A-Za-z_][A-Za-z0-9_-]*$", name):
+                    errors.append(f'{path}: invalid {kind} parameter name "{name}".')
+                if name in seen:
+                    errors.append(f'{path}: duplicate {kind} parameter "{name}".')
+                seen.add(name)
+
+    for s in statements:
+        if s["type"] == "graph":
+            check(s.get("io"), "@graph")
+        if s["type"] == "node":
+            check(s.get("io"), f'#{s["id"]}#')
+    return errors
+
+
+def _node_outs(node: Optional[dict]) -> set:
+    return {p.get("name") for p in (node or {}).get("io", {}).get("out", [])}
+
+
+def _refs_from_io(io: Optional[dict]) -> list[tuple[str, str, bool]]:
+    refs: list[tuple[str, str, bool]] = []
+    for p in (io or {}).get("in", []):
+        src = p.get("source") or p.get("default") or ""
+        m = re.match(r"^#([A-Za-z_][A-Za-z0-9_-]*)\.([A-Za-z_][A-Za-z0-9_-]*)(\[-1\])?#$", src)
+        if m:
+            refs.append((m.group(1), m.group(2), bool(m.group(3))))
+    return refs
+
+
+def _condition_field(on: Optional[str]) -> Optional[str]:
+    if not on:
+        return None
+    m = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_-]*)\s*(?:==|!=|in\b|>=|<=|>|<)", on)
+    return m.group(1) if m else None
 
 
 # ── Parser ──────────────────────────────────────────────────────────────
@@ -105,6 +271,9 @@ class _Parser:
 
             if self._starts("```"):
                 self._skip_comment_block()
+                continue
+            if self._starts("@graph"):
+                statements.append(self._parse_graph())
                 continue
             if self._starts("->"):
                 self.i += 2
@@ -148,7 +317,27 @@ class _Parser:
         self._expect("#")
         if not file:
             raise HwgParseError("Empty file binding — use (file.hwo)#name#", start)
-        return {"type": "node", "id": name, "file": file, "manual": manual}
+        self._skip_ws()
+        io = None
+        if self._peek() == "[":
+            io = _parse_io_block(self._read_bracket_content())
+        self._skip_ws()
+        policy = None
+        if self._peek() == "{":
+            policy = _extract_policy(self._read_brace_content())
+        node = {"type": "node", "id": name, "file": file, "manual": manual}
+        if io is not None:
+            node["io"] = io
+        if policy:
+            node["policy"] = policy
+        return node
+
+    def _parse_graph(self) -> dict:
+        self._expect("@graph")
+        self._skip_ws()
+        if self._peek() != "[":
+            raise HwgParseError("@graph must be followed by [in(...), out(...)]", self.i)
+        return {"type": "graph", "io": _parse_io_block(self._read_bracket_content())}
 
     # ── Edges ──
     def _parse_edge(self) -> dict:
@@ -240,6 +429,30 @@ class _Parser:
         self._expect("}")
         return content
 
+    def _read_bracket_content(self) -> str:
+        start = self.i
+        self._expect("[")
+        inner_start = self.i
+        depth = 1
+        quote = ""
+        while not self._eof():
+            ch = self._peek()
+            if quote:
+                if ch == quote:
+                    quote = ""
+            elif ch in ("'", '"'):
+                quote = ch
+            elif ch == "[":
+                depth += 1
+            elif ch == "]":
+                depth -= 1
+                if depth == 0:
+                    content = self.source[inner_start:self.i]
+                    self._expect("]")
+                    return content
+            self.i += 1
+        raise HwgParseError("Unclosed [, expected ]", start)
+
     def _read_name(self, start: int) -> str:
         name_start = self.i
         while not self._eof() and self._peek() != "#":
@@ -293,6 +506,7 @@ def validate(statements: list) -> list[str]:
     nodes = [s for s in statements if s["type"] == "node"]
     edges = [s for s in statements if s["type"] == "edge"]
     schedules = [s for s in statements if s["type"] == "schedule"]
+    errors.extend(_validate_io_params(statements))
 
     # Unique node ids.
     by_id: dict[str, dict] = {}
@@ -301,6 +515,9 @@ def validate(statements: list) -> list[str]:
             errors.append(f'Duplicate node id "#{node["id"]}#" — node ids must be unique.')
         else:
             by_id[node["id"]] = node
+        policy = node.get("policy") or {}
+        if policy.get("retry") is not None and (not isinstance(policy["retry"], int) or policy["retry"] < 0):
+            errors.append(f'#{node["id"]}#: retry policy must be a non-negative integer.')
 
     # At most one schedule block.
     if len(schedules) > 1:
@@ -312,6 +529,39 @@ def validate(statements: list) -> list[str]:
             errors.append(f'Edge from #{edge["from"]}# references an undeclared node.')
         if edge["to"] not in by_id:
             errors.append(f'Edge to #{edge["to"]}# references an undeclared node.')
+
+    # I/O references: a node input may read another node's declared output, but
+    # only if that node can execute earlier on some path (i.e. it can reach this
+    # node via edges). Source declaration order is NOT required - the runtime
+    # walks the graph by edges, not by source order, so a node declared later in
+    # the source may legitimately be the start that runs first. A self-reference
+    # needs `[-1]` (previous iteration); the current iteration's output does not
+    # exist until the node finishes.
+    ancestors = _ancestors(nodes, edges)
+    for node in nodes:
+        for ref_node, ref_field, previous in _refs_from_io(node.get("io")):
+            if ref_node == node["id"]:
+                if previous:
+                    if ref_field not in _node_outs(node):
+                        errors.append(f'#{node["id"]}#: input references undeclared previous output #{ref_node}.{ref_field}[-1].')
+                else:
+                    errors.append(f'#{node["id"]}#: input references its own current output #{ref_node}.{ref_field} - use #{ref_node}.{ref_field}[-1] to read the previous iteration.')
+                continue
+            ref = by_id.get(ref_node)
+            if ref is None:
+                errors.append(f'#{node["id"]}#: input references undeclared node #{ref_node}.')
+            elif ref_field not in _node_outs(ref):
+                errors.append(f'#{node["id"]}#: input references undeclared output #{ref_node}.{ref_field}.')
+            elif ref_node not in ancestors.get(node["id"], set()):
+                errors.append(f'#{node["id"]}#: input references #{ref_node}.{ref_field}, but #{ref_node}# cannot execute before #{node["id"]}# (no path #{ref_node}# -> ... -> #{node["id"]}#).')
+
+    for edge in edges:
+        field = _condition_field(edge.get("on"))
+        if not field:
+            continue
+        from_node = by_id.get(edge["from"])
+        if from_node and field not in _node_outs(from_node):
+            errors.append(f'Edge #{edge["from"]}# -> #{edge["to"]}# condition references "{field}", but #{edge["from"]}# does not declare it in out(...).')
 
     # Self-loops require maxLoops.
     for edge in edges:
@@ -360,6 +610,33 @@ def validate(statements: list) -> list[str]:
             errors.append("No end node — every node has an outgoing edge (cycle with no exit point).")
 
     return errors
+
+
+def _ancestors(nodes: list, edges: list) -> dict[str, set]:
+    """Map each node id to the set of node ids that can reach it via edges.
+
+    Used to validate that a node input referencing ``#X.field`` can actually
+    have seen X's output at runtime (X must be able to execute before this node
+    on some path). Computed via forward reachability: for each node N, every
+    descendant of N has N as an ancestor.
+    """
+    fwd: dict[str, list[str]] = {n["id"]: [] for n in nodes}
+    for e in edges:
+        if e["from"] in fwd and e["to"] in fwd:
+            fwd[e["from"]].append(e["to"])
+    anc: dict[str, set] = {n["id"]: set() for n in nodes}
+    for n in nodes:
+        seen: set = set()
+        stack = [n["id"]]
+        while stack:
+            x = stack.pop()
+            for y in fwd.get(x, ()):
+                if y not in seen:
+                    seen.add(y)
+                    stack.append(y)
+        for d in seen:
+            anc[d].add(n["id"])
+    return anc
 
 
 def _has_unbounded_cycle(nodes: list, edges: list) -> bool:

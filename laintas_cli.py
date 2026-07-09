@@ -1846,6 +1846,7 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec("/tell", "Send a message to an agent", "Agents & Terminals", "/tell <agent-id> <message|json>"),
     CommandSpec("/abort", "Abort an agent", "Agents & Terminals", "/abort <agent-id>"),
     CommandSpec("/hwo", "Open or run an orchestration workflow", "Planning & Tasks", "/hwo [file|run <file>|compile <file>]", subcommands=("run", "compile")),
+    CommandSpec("/hwg", "Compile, run, or resume an HWO graph workflow", "Planning & Tasks", "/hwg {run|compile|resume|status|cancel} ...", subcommands=("run", "compile", "resume", "status", "cancel")),
     CommandSpec("/mode", "Show, switch, or create agent modes", "Planning & Tasks", "/mode [act|plan [task]|review|list|create|delete]", subcommands=("act", "plan", "review", "list", "create", "delete")),
     CommandSpec("/plan", "Create, revise, review, or approve versioned plans", "Planning & Tasks", "/plan {enter|submit|revise|approve|exit|status|list}", subcommands=("enter", "submit", "revise", "approve", "exit", "status", "list")),
     CommandSpec("/prompt", "Open Prompt Lab or manage tested prompt overlays", "Planning & Tasks", "/prompt [issue|subcommand]", subcommands=("status", "branches", "open", "chat", "review", "test", "activate", "disable", "patches", "profiles", "profile", "use", "rollback", "feedback", "fail", "optimize", "apply", "discard", "list", "skill", "export", "install", "publish")),
@@ -6763,6 +6764,8 @@ _SLASH_ARG_RULES: dict[tuple[str, ...], SlashArgRule] = {
     ("/work", "list"): _arg_rule(1, "/work list"),
     ("/work", "resume"): _arg_rule(2, "/work resume <id>"),
     ("/work", "history"): _arg_rule(1, "/work history"),
+    ("/hwg", "status"): _arg_rule(2, "/hwg status [runId]"),
+    ("/hwg", "cancel"): _arg_rule(2, "/hwg cancel <runId>"),
     ("/task", "list"): _arg_rule(1, "/task list"),
     ("/task", "show"): _arg_rule(2, "/task show <id>"),
     ("/task", "start"): _arg_rule(2, "/task start <id>"),
@@ -11265,6 +11268,62 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
                 session_data=session,
                 parent_id=current.id if current else None,
             )
+
+    elif action == "/hwg":
+        import hwg_runner
+        sub = parts[1].lower() if len(parts) > 1 else "status"
+        current = get_current_agent()
+        if sub in ("run", "compile") and len(parts) >= 3:
+            path = " ".join(parts[2:])
+            if sub == "compile":
+                r = hwg_runner.compile_hwg_file(path)
+            else:
+                r = hwg_runner.run_hwg_file(
+                    path=path,
+                    deps=get_loop_deps(),
+                    session=session,
+                    parent_id=current.id if current else None,
+                )
+        elif sub == "resume" and len(parts) >= 3:
+            run_id = parts[2]
+            verdict = parts[3] if len(parts) >= 4 else "PASS"
+            outputs = {}
+            if len(parts) >= 5:
+                raw = " ".join(parts[4:])
+                try:
+                    parsed = json.loads(raw)
+                    if isinstance(parsed, dict):
+                        outputs = parsed
+                    else:
+                        console.print("[yellow]resume outputs must be a JSON object; ignoring.[/yellow]")
+                except Exception:
+                    console.print("[yellow]Could not parse resume outputs JSON; ignoring.[/yellow]")
+            r = hwg_runner.resume_hwg_run(
+                run_id,
+                deps=get_loop_deps(),
+                session=session,
+                parent_id=current.id if current else None,
+                verdict=verdict,
+                outputs=outputs,
+            )
+        elif sub == "status":
+            r = hwg_runner.status(parts[2] if len(parts) >= 3 else None)
+        elif sub == "cancel" and len(parts) >= 3:
+            r = hwg_runner.cancel(parts[2])
+        else:
+            r = {
+                "ok": False,
+                "msg": (
+                    "Usage:\n"
+                    "  /hwg compile <file.hwg>\n"
+                    "  /hwg run <file.hwg>\n"
+                    "  /hwg resume <runId> [PASS|FAIL|verdict] [outputs-json]\n"
+                    "  /hwg status [runId]\n"
+                    "  /hwg cancel <runId>"
+                ),
+            }
+        style = "[green]" if r.get("ok") else ("[yellow]" if r.get("paused") else "[red]")
+        console.print(f"{style}{r.get('msg', '')}[/]")
 
     elif action in ("/v", "/version", "/update"):
         # /v, /version → show version + check; /update is shorthand for /v update.

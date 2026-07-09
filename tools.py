@@ -2393,8 +2393,12 @@ def _bi_hwo(params: dict, ctx: ToolCtx) -> dict:
             deps=ctx.deps,
             session=ctx.session,
             parent_id=ctx.agent_id,
+            inputs=params.get("inputs") if isinstance(params.get("inputs"), dict) else None,
         )
-    return {"ok": r.get("ok", False), "result": r.get("msg", "")}
+    out = {"ok": r.get("ok", False), "result": r.get("msg", "")}
+    if r.get("outputs"):
+        out["outputs"] = r.get("outputs")
+    return out
 
 
 def _hwo_is_sibling_or_ancestor(caller_id: str, target_id: str) -> bool:
@@ -2469,7 +2473,7 @@ def _bi_hwo_agent_receive(params: dict, ctx: ToolCtx) -> dict:
 
 
 def _bi_hwo_agent_return(params: dict, ctx: ToolCtx) -> dict:
-    """Record an explicit HWO return value that overrides this step's natural reply."""
+    """Record structured HWO outputs for the current agent."""
     value = params.get("value", "")
     if value == "":
         return {"ok": False, "error": "missing 'value'"}
@@ -2478,10 +2482,14 @@ def _bi_hwo_agent_return(params: dict, ctx: ToolCtx) -> dict:
     info = ctx.get_agent(ctx.agent_id)
     if info is None:
         return {"ok": False, "error": "current agent not found in registry"}
-    info.state['_hwo_return'] = str(value)
+    if isinstance(value, (dict, list)):
+        import json
+        info.state['_hwo_return'] = json.dumps(value, ensure_ascii=False)
+    else:
+        info.state['_hwo_return'] = str(value)
     return {
         "ok": True,
-        "result": "Return value recorded. Give a brief final reply now and make no more tool calls this turn.",
+        "result": "Outputs submitted. Continue the remaining workflow steps.",
     }
 
 
@@ -4855,6 +4863,11 @@ def register_builtin_tools() -> None:
                         "description": "Whether to execute or only parse/validate the workflow.",
                     },
                     "path": {"type": "string", "description": "Path to a .hwo workflow file."},
+                    "inputs": {
+                        "type": "object",
+                        "description": "Optional structured inputs for @line in(...).",
+                        "additionalProperties": True,
+                    },
                 },
                 "required": ["path"],
             },
@@ -4894,16 +4907,15 @@ def register_builtin_tools() -> None:
         Tool(
             name="agent_return",
             description=(
-                "Record an explicit return value for this HWO step, overriding its natural "
-                "reply. Use this to report a result to your parent without leaking it into "
-                "[WORKFLOW CONTEXT] for later siblings — e.g. a private vote or decision that "
-                "only the parent should see. After calling this, give a brief final reply and "
-                "make no more tool calls."
+                "Submit declared HWO output values for the current agent. This stores "
+                "variables for later #agent.output references; it does not terminate the agent."
             ),
             schema={
                 "type": "object",
                 "properties": {
-                    "value": {"type": "string", "description": "The value to report back to the parent."},
+                    "value": {
+                        "description": "Output values to submit. Use an object whose keys match declared out(...).",
+                    },
                 },
                 "required": ["value"],
             },

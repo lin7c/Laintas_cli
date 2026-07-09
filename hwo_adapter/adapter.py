@@ -35,8 +35,94 @@ from typing import Optional
 # AST nodes are plain dicts (see module docstring). Aliased for readability.
 HwoNode = dict
 
-_LOOKS_LIKE_AGENT = re.compile(r"^#[^#{}\n\r]+#\s*(?:\([^)]*\)\s*)?\{")
-_LOOKS_LIKE_PREFIX = re.compile(r"^\([^)]+\)\s*#[^#{}\n\r]+#\s*\{")
+_LOOKS_LIKE_AGENT = re.compile(r"^#[^#{}\n\r]+#\s*(?:\([^)]*\)\s*)?(?:\[[\s\S]*?\]\s*)?\{")
+_LOOKS_LIKE_PREFIX = re.compile(r"^\([^)]+\)\s*#[^#{}\n\r]+#\s*(?:\[[\s\S]*?\]\s*)?\{")
+
+
+def _split_top_level(value: str, sep: str = ",") -> list[str]:
+    parts: list[str] = []
+    cur = ""
+    depth = 0
+    quote = ""
+    for ch in value:
+        if quote:
+            cur += ch
+            if ch == quote:
+                quote = ""
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            cur += ch
+            continue
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth = max(0, depth - 1)
+        if ch == sep and depth == 0:
+            if cur.strip():
+                parts.append(cur.strip())
+            cur = ""
+        else:
+            cur += ch
+    if cur.strip():
+        parts.append(cur.strip())
+    return parts
+
+
+def _parse_param(raw: str) -> dict:
+    s = raw.strip()
+    source = None
+    default = None
+    if "=" in s:
+        left, right = s.split("=", 1)
+        s = left.strip()
+        default = right.strip() or None
+        if default and (default.startswith("#") or default.startswith("$")):
+            source = default
+    if ":" in s:
+        left, typ = s.split(":", 1)
+        typ = typ.strip() or None
+    else:
+        left, typ = s, None
+    left = left.strip()
+    optional = left.endswith("?")
+    name = (left[:-1] if optional else left).strip()
+    return {"name": name, "type": typ, "optional": optional, "default": default, "source": source}
+
+
+def _extract_call(content: str, keyword: str) -> Optional[str]:
+    m = re.search(r"\b" + re.escape(keyword) + r"\s*\(", content)
+    if not m:
+        return None
+    i = m.end()
+    start = i
+    depth = 1
+    quote = ""
+    while i < len(content):
+        ch = content[i]
+        if quote:
+            if ch == quote:
+                quote = ""
+        elif ch in ("'", '"'):
+            quote = ch
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return content[start:i]
+        i += 1
+    return None
+
+
+def _parse_io_block(content: str) -> dict:
+    def read(kind: str) -> list:
+        inner = _extract_call(content, kind)
+        if inner is None:
+            return []
+        return [p for p in (_parse_param(x) for x in _split_top_level(inner)) if p["name"]]
+
+    return {"in": read("in"), "out": read("out")}
 
 
 class HwoParseError(Exception):
@@ -68,12 +154,15 @@ class _Parser:
             self._skip_ws()
             if self._eof():
                 break
-            if stop == "brace" and self._peek() == "}":
+            if stop == "brace" and self._peek() == "}" and self._is_closing_brace():
                 break
             if stop == "parallel" and self._at_parallel_marker():
                 break
             if self._starts("```"):
                 self._skip_comment_block()
+                continue
+            if stop is None and self._starts("@line"):
+                steps.append(self._parse_workflow())
                 continue
             if self._starts("->"):
                 self.i += 2
@@ -102,6 +191,13 @@ class _Parser:
             )
         self._expect("//")
         return {"type": "parallel", "body": body}
+
+    def _parse_workflow(self) -> HwoNode:
+        self._expect("@line")
+        self._skip_ws()
+        if self._peek() != "[":
+            raise HwoParseError("@line must be followed by [in(...), out(...)]", self.i)
+        return {"type": "workflow", "io": _parse_io_block(self._read_bracket_content())}
 
     def _parse_agent(self) -> HwoNode:
         start = self.i
@@ -138,6 +234,11 @@ class _Parser:
             prompt_file = self._read_prompt_prefix(start)
             self._skip_ws()
 
+        io = None
+        if self._peek() == "[":
+            io = _parse_io_block(self._read_bracket_content())
+            self._skip_ws()
+
         if self._peek() != "{":
             raise HwoParseError(
                 f'Agent "{name}" must be followed by {{ — the prompt prefix goes either before '
@@ -149,7 +250,34 @@ class _Parser:
         if self._peek() != "}":
             raise HwoParseError(f'Unclosed body for agent "{name}", expected }}', self.i)
         self._expect("}")
-        return {"type": "agent", "name": name, "promptFile": prompt_file, "model": model, "body": body}
+        node = {"type": "agent", "name": name, "promptFile": prompt_file, "model": model, "body": body}
+        if io is not None:
+            node["io"] = io
+        return node
+
+    def _read_bracket_content(self) -> str:
+        start = self.i
+        self._expect("[")
+        inner_start = self.i
+        depth = 1
+        quote = ""
+        while not self._eof():
+            ch = self._peek()
+            if quote:
+                if ch == quote:
+                    quote = ""
+            elif ch in ("'", '"'):
+                quote = ch
+            elif ch == "[":
+                depth += 1
+            elif ch == "]":
+                depth -= 1
+                if depth == 0:
+                    content = self.source[inner_start:self.i]
+                    self._expect("]")
+                    return content
+            self.i += 1
+        raise HwoParseError("Unclosed [, expected ]", start)
 
     def _read_prompt_prefix(self, start: int) -> Optional[str]:
         self._expect("(")
@@ -171,7 +299,7 @@ class _Parser:
                 break
             if self._at_parallel_marker():
                 break
-            if stop == "brace" and self._peek() == "}":
+            if stop == "brace" and self._peek() == "}" and self._is_closing_brace():
                 break
             if self._peek() == "(" and self._looks_like_prompt_prefix():
                 break
@@ -201,6 +329,12 @@ class _Parser:
             return True
         prev = self.source[self.i - 1]
         return prev in ("\n", " ", "\t", "\r", "{", "}")
+
+    def _is_closing_brace(self) -> bool:
+        if self._peek() != "}":
+            return False
+        nxt = self.source[self.i + 1] if self.i + 1 < len(self.source) else ""
+        return (not nxt) or nxt.isspace() or nxt in ("/", "}")
 
     # ── primitives ──
     def _skip_ws(self) -> None:
@@ -276,6 +410,149 @@ def _validate_unique_names(steps: list) -> list:
     return errors
 
 
+def _validate_io_params(steps: list) -> list:
+    errors: list = []
+
+    def check(io: Optional[dict], path: str) -> None:
+        if not io:
+            return
+        for kind in ("in", "out"):
+            seen: set = set()
+            for p in io.get(kind, []):
+                name = p.get("name", "")
+                if not re.match(r"^[A-Za-z_][A-Za-z0-9_-]*$", name):
+                    errors.append(f'{path}: invalid {kind} parameter name "{name}".')
+                if name in seen:
+                    errors.append(f'{path}: duplicate {kind} parameter "{name}".')
+                seen.add(name)
+
+    def walk(items: list, path: str) -> None:
+        for item in items:
+            if item["type"] == "workflow":
+                check(item.get("io"), "@line")
+            elif item["type"] == "agent":
+                check(item.get("io"), f'{path}#{item["name"]}#')
+                walk(item["body"], f'{path}#{item["name"]}#')
+            elif item["type"] == "parallel":
+                walk(item["body"], f"{path}//")
+
+    walk(steps, "root")
+    return errors
+
+
+def _collect_out_names(agent: dict) -> set:
+    return {p.get("name") for p in (agent.get("io") or {}).get("out", [])}
+
+
+def _refs_from_io(io: Optional[dict]) -> list[tuple[str, str]]:
+    refs: list[tuple[str, str]] = []
+    for p in (io or {}).get("in", []):
+        src = p.get("source") or p.get("default") or ""
+        m = re.match(r"^#([A-Za-z_][A-Za-z0-9_-]*)\.([A-Za-z_][A-Za-z0-9_-]*)(?:\[-1\])?$", src)
+        if m:
+            refs.append((m.group(1), m.group(2)))
+    return refs
+
+
+def _validate_io_references(steps: list) -> list:
+    errors: list = []
+
+    def validate_scope(items: list, path: str) -> None:
+        available: dict[str, set] = {}
+        for item in items:
+            if item["type"] == "agent":
+                for ref_agent, ref_field in _refs_from_io(item.get("io")):
+                    outs = available.get(ref_agent)
+                    if outs is None:
+                        errors.append(f'{path}#{item["name"]}#: input references #{ref_agent}.{ref_field} before that agent has completed in this scope.')
+                    elif ref_field not in outs:
+                        errors.append(f'{path}#{item["name"]}#: input references undeclared output #{ref_agent}.{ref_field}.')
+                validate_scope(item["body"], f'{path}#{item["name"]}#')
+                available[item["name"]] = _collect_out_names(item)
+            elif item["type"] == "parallel":
+                parallel_agents = [n for n in item["body"] if n["type"] == "agent"]
+                parallel_names = {a["name"] for a in parallel_agents}
+                for agent in parallel_agents:
+                    for ref_agent, ref_field in _refs_from_io(agent.get("io")):
+                        if ref_agent in parallel_names:
+                            errors.append(f'{path}//#{agent["name"]}#: parallel agents cannot read sibling output #{ref_agent}.{ref_field}; use agent_send/agent_receive during the block, or read outputs after the block.')
+                        else:
+                            outs = available.get(ref_agent)
+                            if outs is None:
+                                errors.append(f'{path}//#{agent["name"]}#: input references #{ref_agent}.{ref_field} before that agent has completed in this scope.')
+                            elif ref_field not in outs:
+                                errors.append(f'{path}//#{agent["name"]}#: input references undeclared output #{ref_agent}.{ref_field}.')
+                    validate_scope(agent["body"], f'{path}//#{agent["name"]}#')
+                for agent in parallel_agents:
+                    available[agent["name"]] = _collect_out_names(agent)
+
+    validate_scope(steps, "root")
+    return errors
+
+
+def _is_relative_prompt_path(path: str) -> bool:
+    s = path.strip()
+    if not s:
+        return False
+    if s.startswith("/") or s.startswith("\\"):
+        return False
+    if re.match(r"^[A-Za-z]:[\\/]", s):
+        return False
+    if "://" in s:
+        return False
+    return True
+
+
+def _validate_prompt_paths(steps: list) -> list:
+    errors = []
+
+    def walk(items: list, path: str) -> None:
+        for item in items:
+            if item["type"] == "agent":
+                prompt_file = item.get("promptFile")
+                if prompt_file and not _is_relative_prompt_path(prompt_file):
+                    errors.append(
+                        f'{path}#{item["name"]}#: prompt file path must be relative; '
+                        "use ../ to reference a parent directory."
+                    )
+                walk(item["body"], f'{path}#{item["name"]}#')
+            elif item["type"] == "parallel":
+                walk(item["body"], f"{path}//")
+
+    walk(steps, "root")
+    return errors
+
+
+def _validate_body_variable_misuse(steps: list) -> list:
+    errors: list = []
+    bad_re = re.compile(r"\bin\s*\(\s*([A-Za-z_][A-Za-z0-9_-]*)\s*\)")
+
+    def walk(items: list, path: str) -> None:
+        for item in items:
+            if item["type"] == "task":
+                m = bad_re.search(item.get("text", ""))
+                if m:
+                    name = m.group(1)
+                    errors.append(
+                        f'{path}: body text uses in({name}), but in(...) is declaration syntax only; '
+                        f'use $input.{name} or bind it with [in({name} = $input.{name})] and read $self.{name}.'
+                    )
+            elif item["type"] == "agent":
+                walk(item["body"], f'{path}#{item["name"]}#')
+            elif item["type"] == "parallel":
+                walk(item["body"], f"{path}//")
+
+    walk(steps, "root")
+    return errors
+
+
 def validate(steps: list) -> list:
     """Return a list of human-readable validation error strings (empty = OK)."""
-    return _validate_parallel_blocks(steps) + _validate_unique_names(steps)
+    return (
+        _validate_parallel_blocks(steps)
+        + _validate_unique_names(steps)
+        + _validate_io_params(steps)
+        + _validate_io_references(steps)
+        + _validate_prompt_paths(steps)
+        + _validate_body_variable_misuse(steps)
+    )
