@@ -134,6 +134,8 @@ export default function DownloadSection() {
           </div>
         </motion.div>
 
+        <CompatibilityGuide content={t.compatibility} />
+
         <motion.div
           className="mt-12 grid gap-4 border-t border-[#d8dbd3] pt-6 lg:grid-cols-[1fr_1fr]"
           initial={{ opacity: 0, y: 12 }}
@@ -246,6 +248,59 @@ function Signal({ icon: Icon, label, value }) {
       </div>
       <p className="mt-2 text-[14px] font-semibold text-[#10110f]">{value}</p>
     </div>
+  );
+}
+
+function CompatibilityGuide({ content }) {
+  return (
+    <section className="mt-8 rounded-[8px] border border-[#d8dbd3] bg-white p-5 shadow-[0_18px_42px_rgba(16,17,15,0.05)] sm:p-6">
+      <div className="flex flex-col gap-1 border-b border-[#e3e5df] pb-4 sm:flex-row sm:items-end sm:justify-between">
+        <div>
+          <h2 className="text-[22px] font-semibold text-[#10110f]">{content.title}</h2>
+          <p className="mt-1 text-[14px] text-[#696d65]">{content.subtitle}</p>
+        </div>
+        <code className="font-mono text-[12px] text-[#74776f]">v1.7.1</code>
+      </div>
+
+      <div className="mt-5 overflow-x-auto">
+        <table className="w-full min-w-[680px] border-collapse text-left text-[13px]">
+          <thead>
+            <tr className="border-b border-[#e3e5df] text-[#74776f]">
+              <th className="pb-3 pr-4 font-mono text-[11px] uppercase tracking-[0.14em]">Platform</th>
+              <th className="pb-3 pr-4 font-mono text-[11px] uppercase tracking-[0.14em]">Architecture</th>
+              <th className="pb-3 pr-4 font-mono text-[11px] uppercase tracking-[0.14em]">Requirements</th>
+              <th className="pb-3 font-mono text-[11px] uppercase tracking-[0.14em]">Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            {content.rows.map((row) => (
+              <tr key={row.name} className="border-b border-[#eef0eb] last:border-0">
+                <td className="py-3 pr-4 font-semibold text-[#10110f]">{row.name}</td>
+                <td className="py-3 pr-4 font-mono text-[#555951]">{row.arch}</td>
+                <td className="py-3 pr-4 text-[#696d65]">{row.detail}</td>
+                <td className="py-3 font-semibold text-[#0f8f62]">{row.status}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <div className="mt-5 grid gap-4 border-t border-[#e3e5df] pt-5 lg:grid-cols-2">
+        <div>
+          <p className="mb-2 text-[12px] font-semibold uppercase tracking-[0.14em] text-[#74776f]">{content.detectTitle}</p>
+          <CodeBlock code={content.detectCommand} />
+        </div>
+        <div>
+          <p className="mb-2 text-[12px] font-semibold uppercase tracking-[0.14em] text-[#74776f]">{content.installTitle}</p>
+          <CodeBlock code={content.installCommand} />
+        </div>
+      </div>
+
+      <div className="mt-4 rounded-[8px] border border-[#f0d6d1] bg-[#fff8f6] px-4 py-3">
+        <p className="text-[13px] font-semibold text-[#9e342c]">{content.legacyTitle}</p>
+        <p className="mt-1 text-[13px] leading-6 text-[#71443e]">{content.legacyDetail}</p>
+      </div>
+    </section>
   );
 }
 
