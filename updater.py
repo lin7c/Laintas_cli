@@ -144,10 +144,56 @@ def fetch_manifest() -> dict:
     return data
 
 
-def _download(url: str) -> bytes:
-    resp = requests.get(url, timeout=_TIMEOUT, verify=_CA_BUNDLE)
+def _download(url: str, label: str = "downloading", console=None) -> bytes:
+    """Download ``url`` into memory, showing a curl-style progress bar.
+
+    Streams the body so a rich progress bar (percent · size · speed · ETA) can
+    render as bytes arrive. Falls back to a plain buffered read when there is no
+    interactive console (non-TTY, rich unavailable, or unknown length is fine —
+    rich shows a pulsing bar). ``console`` should be the caller's rich Console
+    so the bar renders inline with the rest of the update output.
+    """
+    resp = requests.get(url, timeout=_TIMEOUT, verify=_CA_BUNDLE, stream=True)
     resp.raise_for_status()
-    return resp.content
+    _len = resp.headers.get("Content-Length")
+    total = int(_len) if _len and _len.isdigit() else None
+
+    try:
+        from rich.progress import (Progress, TextColumn, BarColumn,
+                                   DownloadColumn, TransferSpeedColumn,
+                                   TimeRemainingColumn)
+        from rich.console import Console as _Console
+    except Exception:
+        return resp.content
+
+    con = console if console is not None else _Console()
+    # No animated bar on a non-interactive stream — print a breadcrumb + buffer.
+    if not getattr(con, "is_terminal", False):
+        try:
+            con.print(f"  ↓ {label}")
+        except Exception:
+            pass
+        return resp.content
+
+    buf = bytearray()
+    with Progress(
+        TextColumn("  [#3fb950]↓[/#3fb950] [#6b7d6b]{task.description}[/#6b7d6b]"),
+        BarColumn(bar_width=None, complete_style="#3fb950",
+                  finished_style="#4ade80", pulse_style="#3fb950"),
+        DownloadColumn(),
+        TransferSpeedColumn(),
+        TimeRemainingColumn(),
+        console=con, transient=True,
+    ) as progress:
+        task = progress.add_task(label, total=total)
+        for chunk in resp.iter_content(chunk_size=65536):
+            if chunk:
+                buf.extend(chunk)
+                progress.update(task, advance=len(chunk))
+        # Content-Length missing → finalize the bar at the true size.
+        if total is None:
+            progress.update(task, total=len(buf), completed=len(buf))
+    return bytes(buf)
 
 
 # ── update planning ──────────────────────────────────────────────────────
@@ -211,9 +257,9 @@ def apply_source_update(manifest: dict, changed_files: list, channel_dir: str,
     tmpdir = tempfile.mkdtemp(prefix="laintas-update-")
     try:
         # 1) download + extract the source bundle
-        log("  ↓ src_manifest.zip")
         try:
-            data = _download(src_zip_url(channel_dir))
+            data = _download(src_zip_url(channel_dir), label="src_manifest.zip",
+                             console=getattr(log, "__self__", None))
         except Exception as e:
             log(f"[red]Could not download source bundle: {e}[/red]")
             return False
@@ -294,8 +340,7 @@ def apply_frozen_update(manifest: dict, channel_dir: str, log) -> Optional[str]:
     asset = f"laintas-cli_linux_{arch}.tar.gz"
     url = _asset_url(channel_dir, asset)
 
-    log(f"  ↓ {asset}")
-    data = _download(url)
+    data = _download(url, label=asset, console=getattr(log, "__self__", None))
 
     tmpdir = tempfile.mkdtemp(prefix="laintas-update-")
     try:
