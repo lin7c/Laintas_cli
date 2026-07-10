@@ -2371,9 +2371,11 @@ def _render_rprompt():
     _mode_label = (
         "PLAN" if _is_plan else mode_manager.get_active_mode()["name"].upper()
     )
-    # Auto-edit indicator: when file writes are auto-approved for this session
-    # (chose "Always" on a write prompt), suffix the mode with * — e.g. ACT*.
-    if not _is_plan and _session_approval_state.get("all_writes"):
+    # Auto-approve indicator: suffix the mode with * whenever writes or commands
+    # are being auto-approved this session — via a mode's auto_approve posture or
+    # an explicit "Always" choice. E.g. ACT*, OPS*.
+    if not _is_plan and (_session_approval_state.get("all_writes")
+                         or _session_approval_state.get("all_commands")):
         _mode_label += "*"
     _mode_cls = "rprompt-mode-plan" if _is_plan else "rprompt-mode-act"
     _model = _status_cache.get("model", "") or "default"
@@ -8418,25 +8420,58 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
             for item in mode_manager.list_modes():
                 marker = "[green]*[/green]" if item["name"] == active_name else " "
                 source = "built-in" if item["builtin"] else "custom"
+                _bits = [item["description"], source]
+                _allow = item.get("allowed_tools")
+                if _allow is not None:
+                    _bits.append(f"tools: {', '.join(_allow[:4])}"
+                                 + ("…" if len(_allow) > 4 else ""))
+                if item.get("denied_tools"):
+                    _bits.append(f"deny: {', '.join(item['denied_tools'][:3])}")
+                if item.get("auto_approve", "none") != "none":
+                    _bits.append(f"auto-approve: {item['auto_approve']}")
                 console.print(
                     f"{marker} [cyan]{item['name']}[/cyan] "
-                    f"[dim]{item['description']} · {source}[/dim]")
+                    f"[dim]{_escape(' · '.join(_bits))}[/dim]")
 
         elif sub == "create":
             if len(parts) < 4:
                 console.print(
-                    "[yellow]Usage: /mode create <name> [--read-only] "
-                    "<instructions>[/yellow]")
+                    "[yellow]Usage: /mode create <name> [--tools \"fs.*,web.search\"] "
+                    "[--deny \"shell.*\"] [--read-only] "
+                    "[--auto-approve none|writes|commands|all] <instructions>[/yellow]")
             else:
                 name = parts[2]
-                read_only = "--read-only" in parts[3:]
-                instructions = " ".join(
-                    item for item in parts[3:] if item != "--read-only")
+                _cargs = parts[3:]
+                _allowed = _denied = None
+                _auto = "none"
+                _read_only = False
+                _rest = []
+                _i = 0
+                while _i < len(_cargs):
+                    _a = _cargs[_i]
+                    if _a == "--read-only":
+                        _read_only = True; _i += 1
+                    elif _a == "--tools" and _i + 1 < len(_cargs):
+                        _allowed = [t.strip() for t in _cargs[_i + 1].split(",") if t.strip()]; _i += 2
+                    elif _a == "--deny" and _i + 1 < len(_cargs):
+                        _denied = [t.strip() for t in _cargs[_i + 1].split(",") if t.strip()]; _i += 2
+                    elif _a == "--auto-approve" and _i + 1 < len(_cargs):
+                        _auto = _cargs[_i + 1].strip().lower(); _i += 2
+                    else:
+                        _rest.append(_a); _i += 1
+                instructions = " ".join(_rest)
                 ok, msg = mode_manager.create_mode(
-                    name, instructions, read_only=read_only)
+                    name, instructions, read_only=_read_only,
+                    allowed_tools=_allowed, denied_tools=_denied,
+                    auto_approve=_auto)
                 console.print(
                     f"[{'green' if ok else 'red'}]{_escape(msg)}"
                     f"[/{'green' if ok else 'red'}]")
+                if ok and _auto != "none":
+                    console.print(
+                        f"[yellow]⚠ Mode '{name}' auto-approves {_auto} — "
+                        f"file writes/commands run without confirmation while it's "
+                        f"active (shown as {name.upper()}*). Hard deny rules still apply.[/yellow]")
 
         elif sub == "delete":
             mode_name = parts[2] if len(parts) == 3 else ""
@@ -8481,9 +8516,15 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
                 if _in_plan:
                     _pm_mode.exit_plan_mode(approve=False)
                 ok, msg = mode_manager.activate(sub)
+                if ok:
+                    _sync_session_approval_from_mode()
             console.print(
                 f"[{'green' if ok else 'red'}]{_escape(msg)}"
                 f"[/{'green' if ok else 'red'}]")
+            if ok and mode_manager.get_auto_approve() != "none":
+                console.print(
+                    f"[dim]↳ {sub.upper()}* — auto-approving "
+                    f"{mode_manager.get_auto_approve()} this session.[/dim]")
 
         else:
             active = mode_manager.get_active_mode()
@@ -8539,10 +8580,10 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
                     if _in_plan:
                         _pm_mode.exit_plan_mode(approve=False)
                     ok, msg = mode_manager.activate(target)
-                    # Selecting plain ACT clears any session auto-approve.
-                    if target == "act":
-                        _session_approval_state["all_writes"] = False
-                        _session_approval_state["all_commands"] = False
+                    # Sync session auto-approve to the mode's posture (a plain
+                    # mode with auto_approve=none clears any prior auto-approve).
+                    if ok:
+                        _sync_session_approval_from_mode()
                     console.print(
                         f"[{'green' if ok else 'red'}]{_escape(msg)}"
                         f"[/{'green' if ok else 'red'}]")
@@ -12055,6 +12096,21 @@ def _reset_session_approvals():
     """Clear session-level auto-approve (called on /exit, /reload)."""
     _session_approval_state["all_commands"] = False
     _session_approval_state["all_writes"] = False
+
+
+def _sync_session_approval_from_mode():
+    """Set session auto-approve flags from the active mode's auto_approve posture.
+
+    Called after switching modes so a mode's declared auto-approve (none/writes/
+    commands/all) takes effect immediately — and switching to a plain mode
+    (auto_approve=none) clears any prior auto-approve.
+    """
+    try:
+        aa = mode_manager.get_auto_approve()
+    except Exception:
+        aa = "none"
+    _session_approval_state["all_writes"] = aa in ("writes", "all")
+    _session_approval_state["all_commands"] = aa in ("commands", "all")
 
 
 def _arrow_approval_prompt(title: str, body_lines: list[str],

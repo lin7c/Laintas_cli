@@ -3875,13 +3875,14 @@ def _render_tool_catalog_enhanced(
     """
     role_name = state.get("_role_name")
     wf_active = workflow_engine.get_active_workflow() is not None
-    mode_allowed = (
-        None if plan_mode.is_plan_mode()
-        else mode_manager.get_active_mode().get("allowed_tools")
-    )
+    _active_mode = (None if plan_mode.is_plan_mode()
+                    else mode_manager.get_active_mode())
+    mode_restricts = bool(_active_mode) and (
+        _active_mode.get("allowed_tools") is not None
+        or _active_mode.get("denied_tools"))
 
     # If neither workflow nor role is active, use the standard catalog
-    if not wf_active and not role_name and mode_allowed is None:
+    if not wf_active and not role_name and not mode_restricts:
         base = _render_tool_catalog(state, loop, allowed_names)
         # Append role catalog for sub-agents
         if depth > 0:
@@ -3903,8 +3904,11 @@ def _render_tool_catalog_enhanced(
         current_phase = workflow_engine.get_active_workflow().current
         if current_phase and current_phase.allowed_tools:
             allowed = set(current_phase.allowed_tools)
-    if mode_allowed is not None:
-        mode_tools = set(mode_allowed)
+    if mode_restricts:
+        # Match enforcement exactly: is_tool_allowed applies the active mode's
+        # allow globs + deny-first rules against real tool names.
+        mode_tools = {t.name for t in all_tools
+                      if mode_manager.is_tool_allowed(t.name)}
         allowed = mode_tools if allowed is None else allowed & mode_tools
     if role_name:
         role = agent_roles.get_role(role_name)
