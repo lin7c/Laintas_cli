@@ -39,7 +39,16 @@ if [ "$INSTALL_MODE" = "linux" ]; then
     tar xzf "$TMP_DIR/$ASSET" -C "$TMP_DIR"
 
     echo "  Installing to /usr/local/bin…"
-    "$TMP_DIR/laintas-cli/install.sh"
+    # v1.7+ archives place install.sh beside the binary; older archives
+    # nested both files under a laintas-cli directory.
+    if [ -x "$TMP_DIR/install.sh" ]; then
+        "$TMP_DIR/install.sh"
+    elif [ -x "$TMP_DIR/laintas-cli/install.sh" ]; then
+        "$TMP_DIR/laintas-cli/install.sh"
+    else
+        echo "Invalid package: install.sh was not found after extraction"
+        exit 1
+    fi
 
     printf '\n  Done! Run `laintas-cli` to start.\n\n'
 fi
