@@ -55,6 +55,12 @@ echo "[*] Pushing to origin main + tags"
 git push origin main
 git push origin "$TAG"
 
+# 3b. Publish the self-hosted /v update assets to the cli.laintas.com docroot.
+# /v reads from cli.laintas.com (not GitHub) at runtime, so regenerate the
+# manifest.json + src_manifest.zip for `latest/` and `v$VERSION/` on this box.
+echo "[*] Publishing self-hosted update assets to cli.laintas.com"
+python3 "$PROJECT_DIR/scripts/build_release_assets.py"
+
 # 4. Watch CI
 echo "[*] CI triggered. Watching run..."
 if command -v gh >/dev/null 2>&1; then
