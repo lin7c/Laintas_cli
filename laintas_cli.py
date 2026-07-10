@@ -2401,24 +2401,6 @@ def _render_bottom_toolbar():
 
 _prompt_session: Optional[PromptSession] = None
 
-# ── Animated caret ────────────────────────────────────────────────────
-# The prompt ❯ visibly "rotates" (up→down) one frame per keystroke while the
-# user types, then rests at ❯ when idle. All frames are single narrow columns
-# so the cursor never shifts. Advanced purely on buffer text-change events —
-# no threads, no timers, so it can't wedge the REPL.
-_PROMPT_GLYPH_FRAMES = ("❯", "⌄", "❮", "⌃")
-_prompt_glyph_frame = 0
-
-
-def _advance_prompt_glyph(_buf=None) -> None:
-    """Rotate the caret one frame (called on every buffer text change)."""
-    global _prompt_glyph_frame
-    _prompt_glyph_frame = (_prompt_glyph_frame + 1) % len(_PROMPT_GLYPH_FRAMES)
-
-
-def _current_prompt_glyph() -> str:
-    return _PROMPT_GLYPH_FRAMES[_prompt_glyph_frame]
-
 
 def _interrupt_prompt():
     """Force prompt_toolkit to return from another thread.
@@ -2460,11 +2442,6 @@ def get_prompt_session() -> PromptSession:
             _prompt_session.default_buffer.__class__ = _PasteGuardBuffer
         except TypeError:
             pass
-        # Rotate the caret glyph on every keystroke (see _PROMPT_GLYPH_FRAMES).
-        try:
-            _prompt_session.default_buffer.on_text_changed += _advance_prompt_glyph
-        except Exception:
-            pass
     return _prompt_session
 
 
@@ -2472,9 +2449,6 @@ def pt_prompt(cwd: str) -> str:
     """Read user input with prompt_toolkit (PTY-based terminal input)."""
     session = get_prompt_session()
     disp = _shorten_path(cwd, max_len=60)
-    # Rest the caret at ❯ at the start of each fresh prompt.
-    global _prompt_glyph_frame
-    _prompt_glyph_frame = 0
     # Plan mode drives the gutter colour (hollow amber) vs Act (solid green).
     try:
         import plan_mode as _pm
@@ -2483,15 +2457,15 @@ def pt_prompt(cwd: str) -> str:
     except Exception:
         _gutter_cls, _gutter_ch = "class:prompt-gutter", "▐ "
 
-    def _prompt_message():
-        # Re-evaluated on every redraw, so the caret animates as text changes.
-        return [
-            (_gutter_cls, _gutter_ch),
-            ("class:prompt-path", disp),
-            ("", "\n"),
-            (_gutter_cls, _gutter_ch),
-            ("class:prompt-caret", _current_prompt_glyph() + " "),
-        ]
+    # Static green caret (rotation animation removed — redrawing every
+    # keystroke felt laggy).
+    _prompt_message = [
+        (_gutter_cls, _gutter_ch),
+        ("class:prompt-path", disp),
+        ("", "\n"),
+        (_gutter_cls, _gutter_ch),
+        ("class:prompt-caret", "❯ "),
+    ]
 
     try:
         user_input = session.prompt(
