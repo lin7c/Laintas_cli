@@ -35,7 +35,7 @@ if [ "$INSTALL_MODE" = "linux" ]; then
     echo "  Downloading $ASSET…"
     curl --fail --location --show-error --progress-bar \
         --retry 2 --retry-delay 2 --connect-timeout 15 --max-time 900 \
-        "$BASE_URL/releases/v1.7.3/$ASSET" -o "$TMP_DIR/$ASSET"
+        "$BASE_URL/releases/latest/$ASSET" -o "$TMP_DIR/$ASSET"
     echo "  Download complete."
 
     # Extract

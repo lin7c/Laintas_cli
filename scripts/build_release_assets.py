@@ -26,6 +26,15 @@ import tempfile
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DIST_RELEASES = os.path.join(REPO, "laintas_cli_download", "dist", "releases")
 
+# Binary/install assets self-hosted alongside the source-update assets. They are
+# built by CI and live on the GitHub Release; we mirror them onto cli.laintas.com
+# so install.sh (and any future frozen /v update) never touches GitHub at runtime.
+BINARY_ASSETS = (
+    "laintas-cli_linux_amd64.tar.gz",
+    "laintas-cli_linux_arm64.tar.gz",
+    "SHA256SUMS.txt",
+)
+
 
 def _gen_src_out(dst: str) -> dict:
     """Replicate the CI source staging + manifest into ``dst`` (a src_out dir)."""
@@ -79,16 +88,51 @@ def main() -> int:
         subprocess.run(["zip", "-qr", zip_path, "."], cwd=src_out, check=True)
         manifest_path = os.path.join(src_out, "manifest.json")
 
+        # Mirror the CI-built binary/install assets from the GitHub Release for
+        # this version into a staging dir (best-effort — source assets still
+        # publish even if gh or the release is unavailable).
+        bins_dir = os.path.join(tmp, "bins")
+        os.makedirs(bins_dir, exist_ok=True)
+        got_bins = _fetch_binaries(f"v{version}", bins_dir)
+
         for channel in ("latest", f"v{version}"):
             outdir = os.path.join(DIST_RELEASES, channel)
             os.makedirs(outdir, exist_ok=True)
             shutil.copy(manifest_path, os.path.join(outdir, "manifest.json"))
             shutil.copy(zip_path, os.path.join(outdir, "src_manifest.zip"))
-            print(f"  → {outdir}/manifest.json,src_manifest.zip")
+            for name in got_bins:
+                shutil.copy(os.path.join(bins_dir, name), os.path.join(outdir, name))
+            print(f"  → {outdir}: manifest.json, src_manifest.zip"
+                  + (", " + ", ".join(got_bins) if got_bins else ""))
 
     nfiles = len(manifest["files"])
-    print(f"Published v{version} assets ({nfiles} source files) to {DIST_RELEASES}")
+    print(f"Published v{version} assets ({nfiles} source files"
+          + (f" + {len(got_bins)} binaries" if got_bins else ", no binaries")
+          + f") to {DIST_RELEASES}")
+    if not got_bins:
+        print("  [!] binary/install assets NOT self-hosted — install.sh would 404.\n"
+              "      Ensure `gh` is authed and the GitHub release exists, then re-run.")
     return 0
+
+
+def _fetch_binaries(tag: str, dst: str) -> list:
+    """Download the CI-built binary assets for ``tag`` from the GitHub Release.
+
+    Returns the list of asset names actually fetched (empty on failure).
+    """
+    if not shutil.which("gh"):
+        return []
+    patterns = []
+    for name in BINARY_ASSETS:
+        patterns += ["--pattern", name]
+    try:
+        subprocess.run(["gh", "release", "download", tag, "--dir", dst,
+                        "--clobber", *patterns],
+                       cwd=REPO, check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    except subprocess.CalledProcessError:
+        return []
+    return [n for n in BINARY_ASSETS if os.path.isfile(os.path.join(dst, n))]
 
 
 if __name__ == "__main__":
