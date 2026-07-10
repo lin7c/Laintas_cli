@@ -2371,6 +2371,10 @@ def _render_rprompt():
     _mode_label = (
         "PLAN" if _is_plan else mode_manager.get_active_mode()["name"].upper()
     )
+    # Auto-edit indicator: when file writes are auto-approved for this session
+    # (chose "Always" on a write prompt), suffix the mode with * — e.g. ACT*.
+    if not _is_plan and _session_approval_state.get("all_writes"):
+        _mode_label += "*"
     _mode_cls = "rprompt-mode-plan" if _is_plan else "rprompt-mode-act"
     _model = _status_cache.get("model", "") or "default"
     return [
