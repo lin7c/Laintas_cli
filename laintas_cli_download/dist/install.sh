@@ -29,10 +29,14 @@ if [ "$INSTALL_MODE" = "linux" ]; then
     esac
     echo "  Detected: Linux $ARCH"
 
-    # Download tarball
-    echo "  Downloading…"
+    # Download tarball. Keep progress visible and fail instead of hanging forever
+    # when DNS, IPv6, or the route to the download host is unhealthy.
     ASSET="laintas-cli_linux_${ARCH}.tar.gz"
-    curl -fsSL "$BASE_URL/releases/v1.7.1/$ASSET" -o "$TMP_DIR/$ASSET"
+    echo "  Downloading $ASSET…"
+    curl --fail --location --show-error --progress-bar \
+        --retry 2 --retry-delay 2 --connect-timeout 15 --max-time 900 \
+        "$BASE_URL/releases/v1.7.1/$ASSET" -o "$TMP_DIR/$ASSET"
+    echo "  Download complete."
 
     # Extract
     echo "  Extracting package…"
