@@ -134,8 +134,6 @@ export default function DownloadSection() {
           </div>
         </motion.div>
 
-        <CompatibilityGuide content={t.compatibility} />
-
         <motion.div
           className="mt-12 grid gap-4 border-t border-[#d8dbd3] pt-6 lg:grid-cols-[1fr_1fr]"
           initial={{ opacity: 0, y: 12 }}
@@ -145,6 +143,8 @@ export default function DownloadSection() {
           <InstallGuide guide={t.linuxGuide} asset={ASSETS[0]} />
           <InstallGuide guide={t.sourceGuide} asset={ASSETS[1]} />
         </motion.div>
+
+        <CompatibilityGuide content={t.compatibility} />
       </section>
     </main>
   );
