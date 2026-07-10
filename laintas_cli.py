@@ -12139,6 +12139,12 @@ def authorize_direct_command(command: str, cwd: str = None) -> tuple[bool, str]:
     if decision.action == "deny":
         return False, f"Blocked by policy: {decision.reason}"
     if decision.action == "needs_approval":
+        # Commands the USER types directly at the REPL run like a normal
+        # terminal — no confirmation box — since the human is the trusted
+        # actor here (the approval gate exists to supervise the AI agent).
+        # Set /config confirm_direct_commands true to restore the prompt.
+        if not get_runtime_config("confirm_direct_commands"):
+            return True, ""
         if not request_command_approval(command, decision.reason):
             return False, f"User denied: {decision.reason}"
     return True, ""

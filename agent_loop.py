@@ -110,6 +110,7 @@ _DEFAULT_CONFIG = {
     "detail": False,                   # False = simplified progress rendering; True = full per-line detail (/detail on|off)
     "deny_exits_loop": True,           # True = terminate the agent loop the moment the user denies an approval prompt; False = old behavior (feed denial back as a tool error and keep looping)
     "enable_mouse": False,             # REPL input box: click-to-position the cursor. Off by default: terminal mouse reporting hijacks native drag-to-select of scrollback (Shift+drag is the only workaround), which costs more than click-to-position gains
+    "confirm_direct_commands": False,  # False = commands the USER types directly at the REPL run like a normal terminal (no policy approval prompt, e.g. rm); True = subject direct commands to the same needs_approval prompt as AI-issued ones. Hard `deny` policy rules always apply regardless.
 }
 
 # ── Typed Error Classes ───────────────────────────────────────────────
@@ -323,6 +324,7 @@ _RUNTIME_CONFIG_DESCRIPTIONS = {
     "output_similarity": "Repeated-output similarity threshold (0-1)",
     "detail": "Show full per-line tool detail (True) or simplified progress (False)",
     "deny_exits_loop": "Terminate the agent loop immediately when the user denies an approval prompt",
+    "confirm_direct_commands": "Ask for approval on commands YOU type directly at the REPL (False = run like a normal terminal; hard deny rules still apply)",
     "enable_mouse": "Enable mouse click-to-position in the REPL input box",
 }
 
