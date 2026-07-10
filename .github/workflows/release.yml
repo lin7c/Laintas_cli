@@ -120,6 +120,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
+      - name: Install fpm
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ruby ruby-dev
+          sudo gem install fpm
       - name: Build amd64 Debian package
         run: bash build/linux/build_deb.sh
       - name: Stage Debian package
