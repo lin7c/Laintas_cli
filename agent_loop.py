@@ -170,6 +170,33 @@ def _diag(message: str, **context) -> None:
         _debug_log.pop(0)
 
 
+# ── Thinking shimmer (流光) ────────────────────────────────────────────
+# A bright green highlight band sweeps left→right across the status label
+# while the agent is thinking/streaming. Recomputed every Live draw from the
+# elapsed clock, so it flows smoothly without any extra timer.
+_SHIMMER_BASE = "#1f7a3f"
+_SHIMMER_GRAD = (
+    "#2ea043", "#3fb950", "#4ade80", "#7ee787",
+    "#b7f7c0", "#7ee787", "#4ade80", "#3fb950",
+)
+
+
+def _shimmer_label(label: str, elapsed: float):
+    """Return a rich Text of `label` with a moving green highlight band."""
+    from rich.text import Text
+    txt = Text()
+    span = len(_SHIMMER_GRAD)
+    # Sweep head advances ~14 columns/sec; wraps past the end for a gap.
+    head = (elapsed * 14.0) % (len(label) + span)
+    for i, ch in enumerate(label):
+        d = head - i
+        if 0 <= d < span:
+            txt.append(ch, style=f"bold {_SHIMMER_GRAD[int(d)]}")
+        else:
+            txt.append(ch, style=_SHIMMER_BASE)
+    return txt
+
+
 def _emit_simple_diff(console, diff_text: str, depth: int = 0, cap: int = 6) -> None:
     """Render a minimal diff: changed (+/-) lines only, capped at `cap` lines.
 
@@ -179,24 +206,40 @@ def _emit_simple_diff(console, diff_text: str, depth: int = 0, cap: int = 6) -> 
     """
     if not diff_text:
         return
-    changed = []
-    total_changed = 0
+    from rich.markup import escape as _esc
+    _hunk = re.compile(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+    changed = []          # (kind, lineno, text)
+    total_changed = adds = dels = 0
+    old_no = new_no = 0
     for ln in diff_text.splitlines():
+        m = _hunk.match(ln)
+        if m:
+            old_no, new_no = int(m.group(1)), int(m.group(2))
+            continue
         if ln.startswith("+") and not ln.startswith("+++"):
+            adds += 1
             total_changed += 1
             if len(changed) < cap:
-                changed.append(("success", ln))
+                changed.append(("success", "┃+", new_no, ln[1:]))
+            new_no += 1
         elif ln.startswith("-") and not ln.startswith("---"):
+            dels += 1
             total_changed += 1
             if len(changed) < cap:
-                changed.append(("error", ln))
+                changed.append(("error", "┃-", old_no, ln[1:]))
+            old_no += 1
+        elif ln.startswith(" "):
+            old_no += 1
+            new_no += 1
     if not changed:
         return
-    inner = "  " * depth + "    "
-    for style, ln in changed:
-        console.print(f"{inner}[{style}]{ln[:100]}[/{style}]")
+    inner = "  " * depth + "  "
+    console.print(f"{inner}[accent]▍[/accent] [success]+{adds}[/success] [error]−{dels}[/error]", highlight=False)
+    for style, mark, no, text in changed:
+        console.print(f"{inner}[muted]{no:>4}[/muted] "
+                      f"[{style}]{mark}{_esc(text[:96])}[/{style}]", highlight=False)
     if total_changed > cap:
-        console.print(f"{inner}[muted]… {total_changed - cap} more change(s) · /detail on for full[/muted]")
+        console.print(f"{inner}     [muted]… {total_changed - cap} more change(s) · /detail on for full[/muted]", highlight=False)
 
 
 # ── Transition Labels ─────────────────────────────────────────────
@@ -4605,7 +4648,7 @@ def run_agent_loop(
 
                 # Create the Spinner ONCE — a fresh Spinner resets start_time
                 # on each draw, freezing the animation on frame 0.
-                _spinner = Spinner("dots", style="#7aa2f7")
+                _spinner = Spinner("dots", style="#3fb950")
 
                 def _fmt_tokens(n: int) -> str:
                     if n >= 1_000_000:
@@ -4651,16 +4694,19 @@ def run_agent_loop(
                     else:
                         _label = "thinking…"
                     # Update the shared spinner's text (keeps animation
-                    # continuity — start_time is preserved).
-                    _spinner.text = Text(
-                        f"{_label} {_elapsed:.1f}s · ↑{_fmt_tokens(_cur_in_est)} ↓{_fmt_tokens(_cur_out_est)} · {_spin_model} · {_spin_mode}",
-                        style="#7aa2f7")
+                    # continuity — start_time is preserved). The label shimmers
+                    # (流光); the trailing metrics stay a calm dim green.
+                    _txt = _shimmer_label(_label, _elapsed)
+                    _txt.append(
+                        f" {_elapsed:.1f}s · ↑{_fmt_tokens(_cur_in_est)} ↓{_fmt_tokens(_cur_out_est)} · {_spin_model} · {_spin_mode}",
+                        style="#2ea043")
+                    _spinner.text = _txt
                     parts.append(_spinner)
                     if stream_state["command"] and _detail:
                         cmd_preview = stream_state["command"]
                         if len(cmd_preview) > 120:
                             cmd_preview = cmd_preview[:117] + "..."
-                        parts.append(Text(f"→ {cmd_preview}", style="#5a7bbf"))
+                        parts.append(Text(f"→ {cmd_preview}", style="#2ea043"))
                     return Group(*parts)
 
                 # Wrapper that re-computes _render() on every draw so the
@@ -4723,7 +4769,7 @@ def run_agent_loop(
                     try: live.refresh()
                     except Exception: pass
             except ImportError:
-                with deps.console.status(f"[#7aa2f7]thinking… · {_spin_model} · {_spin_mode}[/#7aa2f7]", spinner="dots"):
+                with deps.console.status(f"[#3fb950]thinking… · {_spin_model} · {_spin_mode}[/#3fb950]", spinner="dots"):
                     try:
                         response = deps.call_backend(
                             session=session,
@@ -5447,17 +5493,20 @@ def run_agent_loop(
                 })
 
                 if events_cb is not None:
-                    ok_mark = "[green]✓[/green]" if result.get("ok") else "[red]✗[/red]"
-                    _hint = salient[:80] if salient else display_name
+                    from rich.markup import escape as _esc_hint
+                    # Green dot = quiet success; loud red ✕ is reserved for a
+                    # call that actually failed, so red still *means* something.
+                    ok_mark = "[success]●[/success]" if result.get("ok") else "[error]✕[/error]"
+                    _hint = _esc_hint((salient[:80] if salient else display_name) or "")
                     if _detail:
                         deps.console.print(
-                            f"  {ok_mark} [dim cyan]{display_name}[/dim cyan] [dim]{_hint}[/dim]")
+                            f"  {ok_mark} [accent.dim]{display_name}[/accent.dim] [dim]{_hint}[/dim]")
                     else:
                         # Simplified: one clean, aligned line per tool. A short
                         # trailing meta carries the essentials (line count / exit
                         # code); failures point to /debug. Full output stays in
                         # terminalHistory / /debug.
-                        _mark2 = "[success]✓[/success]" if result.get("ok") else "[error]✗[/error]"
+                        _mark2 = "[success]●[/success]" if result.get("ok") else "[error]✕[/error]"
                         _meta2 = ""
                         if name in ("shell.exec", "terminal.send", "terminal.exec"):
                             _nlines = len((formatted or "").split("\n")) if formatted else 0
@@ -5470,7 +5519,7 @@ def run_agent_loop(
                         _line = f"  {_mark2} [accent.dim]{display_name:<9}[/accent.dim] [muted]{_hint}[/muted]"
                         if _meta2:
                             _line += f"   [muted]{_meta2}[/muted]"
-                        deps.console.print(_line)
+                        deps.console.print(_line, highlight=False)
                     pending_events.append({"type": "system", "kind": "tool",
                                             "content": display_name,
                                             "meta": {"ok": result.get("ok", False),

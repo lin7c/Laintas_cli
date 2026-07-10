@@ -86,16 +86,16 @@ from prompt_toolkit.filters import Condition
 # Minimal palette: one accent, muted secondaries, semantic status colors.
 # Use these names instead of inline literals so the whole UI restyles here.
 LAINTAS_THEME = Theme({
-    "accent":   "#7aa2f7",          # primary brand-ish accent (soft blue)
-    "accent.dim": "#5a7bbf",
-    "success":  "#9ece6a",
-    "error":    "bold #f7768e",
-    "warning":  "#e0af68",
-    "muted":    "#6b7280",
-    "agent":    "#bb9af7",          # agent / orchestration (soft violet)
-    "path":     "bold #7aa2f7",
-    "glyph":    "#7aa2f7",
-    "rule":     "#3b4261",
+    "accent":   "#3fb950",          # primary accent — terminal green (青红 theme)
+    "accent.dim": "#2ea043",
+    "success":  "#4ade80",
+    "error":    "bold #f85149",
+    "warning":  "#e3b341",
+    "muted":    "#6b7d6b",          # green-biased grey
+    "agent":    "#a78bfa",          # agent / orchestration (soft violet, kept distinct)
+    "path":     "bold #3fb950",
+    "glyph":    "#3fb950",
+    "rule":     "#233323",
 })
 
 console = Console(theme=LAINTAS_THEME)
@@ -1763,28 +1763,60 @@ def display_sub_terminal_preview(command: str, output: str, depth: int = 0, aliv
     _emit_block(command, status_label, status_style, meta, preview, depth)
 
 
+def _md_escape(s: str) -> str:
+    """Escape Rich markup so diff/code content with [..] can't corrupt styling."""
+    from rich.markup import escape as _escape
+    return _escape(s)
+
+
+_DIFF_HUNK_RE = re.compile(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+
+
 def display_file_diff(path: str, diff_text: str, depth: int = 0) -> None:
-    """Display a compact, borderless unified diff preview (+/- colorized)."""
+    """Framed unified-diff preview: a +adds/−dels ribbon, real line numbers in
+    a gutter, and a green/red left rail so changed blocks read as shapes."""
     diff_lines = diff_text.splitlines() if diff_text else []
-    line_count = len(diff_lines)
-    preview_limit = 40
-    shown = diff_lines[:preview_limit]
+    adds = sum(1 for l in diff_lines
+               if l.startswith("+") and not l.startswith("+++"))
+    dels = sum(1 for l in diff_lines
+               if l.startswith("-") and not l.startswith("---"))
 
     pad = "  " * depth
-    console.print(f"{pad}[accent]▍[/accent] [bold]{path[:80]}[/bold]  "
-                  f"[accent]DIFF[/accent]  [muted]{line_count}L[/muted]")
-    inner = pad + "  "
-    for ln in shown:
-        if ln.startswith("+") and not ln.startswith("+++"):
-            console.print(f"{inner}[success]{ln}[/success]")
-        elif ln.startswith("-") and not ln.startswith("---"):
-            console.print(f"{inner}[error]{ln}[/error]")
-        elif ln.startswith("@@"):
-            console.print(f"{inner}[accent.dim]{ln}[/accent.dim]")
+    console.print(
+        f"{pad}[accent]▍[/accent] [bold]{_md_escape(path[:70])}[/bold]  "
+        f"[success]+{adds}[/success] [error]−{dels}[/error]", highlight=False)
+
+    preview_limit = 60
+    shown = 0
+    old_no = new_no = 0
+    for ln in diff_lines:
+        if shown >= preview_limit:
+            break
+        m = _DIFF_HUNK_RE.match(ln)
+        if m:
+            old_no, new_no = int(m.group(1)), int(m.group(2))
+            continue
+        if ln.startswith(("+++", "---", "diff ", "index ", "@@")):
+            continue
+        body = _md_escape(ln[:118])
+        if ln.startswith("+"):
+            console.print(f"{pad}[accent.dim]{new_no:>4}[/accent.dim] "
+                          f"[success]┃{body}[/success]", highlight=False)
+            new_no += 1
+        elif ln.startswith("-"):
+            console.print(f"{pad}[error]{old_no:>4} ┃{body}[/error]", highlight=False)
+            old_no += 1
         else:
-            console.print(f"{inner}[muted]{ln}[/muted]")
-    if line_count > preview_limit:
-        console.print(f"{inner}[muted]… {line_count - preview_limit} more lines[/muted]")
+            text = _md_escape(ln[1:119] if ln.startswith(" ") else ln[:118])
+            console.print(f"{pad}[muted]{new_no:>4}[/muted] "
+                          f"[rule]│[/rule] [muted]{text}[/muted]", highlight=False)
+            old_no += 1
+            new_no += 1
+        shown += 1
+    remaining = len([l for l in diff_lines
+                     if not l.startswith(("+++", "---", "diff ", "index ", "@@"))]) - shown
+    if remaining > 0:
+        console.print(f"{pad}[muted]     … {remaining} more line(s)[/muted]", highlight=False)
 
 
 # ── prompt_toolkit Input Setup ──────────────────────────────────────────
@@ -2060,30 +2092,33 @@ class MetaCompleter(Completer):
 def _build_prompt_style() -> Style:
     """Build prompt_toolkit Style for the prompt, completion menu, and status bar."""
     return Style.from_dict({
-        "prompt-path": "bold #7aa2f7",
-        "separator": "#bb9af7",
-        "paste-placeholder": "bold #7aa2f7 bg:#2a2a37",
-        # Completion menu (Tokyo Night palette)
-        "completion-menu": "bg:#1a1b26",
-        "completion-menu.completion": "bg:#1a1b26 #c0caf5",
-        "completion-menu.completion.current": "bg:#364a82 #1a1b26 bold",
-        "completion-menu.meta.completion": "bg:#16161e #565f89",
-        "completion-menu.meta.completion.current": "bg:#16161e #7aa2f7",
+        "prompt-path": "bold #3fb950",
+        "prompt-gutter": "#2ea043 bold",     # green status gutter (Act mode)
+        "prompt-gutter-plan": "#e3b341 bold", # hollow amber gutter (Plan mode)
+        "prompt-caret": "#4ade80 bold",       # the animated green ❯
+        "separator": "#3fb950",
+        "paste-placeholder": "bold #4ade80 bg:#16211a",
+        # Completion menu (青红 green palette)
+        "completion-menu": "bg:#0e140e",
+        "completion-menu.completion": "bg:#0e140e #c9d4c5",
+        "completion-menu.completion.current": "bg:#1f5f30 #dffbe6 bold",
+        "completion-menu.meta.completion": "bg:#0b0f0b #6b7d6b",
+        "completion-menu.meta.completion.current": "bg:#0b0f0b #4ade80",
         # Bottom status bar
-        "bottom-toolbar": "bg:#16161e #9aa5ce",
-        "stbar-sep": "bg:#16161e #2a2a37",
-        "stbar-model": "bg:#16161e #7aa2f7 bold",
-        "stbar-mode-act": "bg:#16161e #9ece6a bold",
-        "stbar-mode-plan": "bg:#16161e #e0af68 bold",
-        "stbar-tokens": "bg:#16161e #bb9af7",
-        "stbar-time": "bg:#16161e #565f89",
-        "stbar-dot-act": "bg:#16161e #9ece6a bold",
-        "stbar-dot-plan": "bg:#16161e #e0af68 bold",
+        "bottom-toolbar": "bg:#0b0f0b #9aab97",
+        "stbar-sep": "bg:#0b0f0b #233323",
+        "stbar-model": "bg:#0b0f0b #3fb950 bold",
+        "stbar-mode-act": "bg:#0b0f0b #4ade80 bold",
+        "stbar-mode-plan": "bg:#0b0f0b #e3b341 bold",
+        "stbar-tokens": "bg:#0b0f0b #2ea043",
+        "stbar-time": "bg:#0b0f0b #6b7d6b",
+        "stbar-dot-act": "bg:#0b0f0b #4ade80 bold",
+        "stbar-dot-plan": "bg:#0b0f0b #e3b341 bold",
         # rprompt (right side of prompt line — no background)
-        "rprompt-mode-act": "#9ece6a bold",
-        "rprompt-mode-plan": "#e0af68 bold",
-        "rprompt-sep": "#2a2a37",
-        "rprompt-model": "#7aa2f7",
+        "rprompt-mode-act": "#4ade80 bold",
+        "rprompt-mode-plan": "#e3b341 bold",
+        "rprompt-sep": "#233323",
+        "rprompt-model": "#3fb950",
     })
 
 
@@ -2366,6 +2401,24 @@ def _render_bottom_toolbar():
 
 _prompt_session: Optional[PromptSession] = None
 
+# ── Animated caret ────────────────────────────────────────────────────
+# The prompt ❯ visibly "rotates" (up→down) one frame per keystroke while the
+# user types, then rests at ❯ when idle. All frames are single narrow columns
+# so the cursor never shifts. Advanced purely on buffer text-change events —
+# no threads, no timers, so it can't wedge the REPL.
+_PROMPT_GLYPH_FRAMES = ("❯", "⌄", "❮", "⌃")
+_prompt_glyph_frame = 0
+
+
+def _advance_prompt_glyph(_buf=None) -> None:
+    """Rotate the caret one frame (called on every buffer text change)."""
+    global _prompt_glyph_frame
+    _prompt_glyph_frame = (_prompt_glyph_frame + 1) % len(_PROMPT_GLYPH_FRAMES)
+
+
+def _current_prompt_glyph() -> str:
+    return _PROMPT_GLYPH_FRAMES[_prompt_glyph_frame]
+
 
 def _interrupt_prompt():
     """Force prompt_toolkit to return from another thread.
@@ -2407,6 +2460,11 @@ def get_prompt_session() -> PromptSession:
             _prompt_session.default_buffer.__class__ = _PasteGuardBuffer
         except TypeError:
             pass
+        # Rotate the caret glyph on every keystroke (see _PROMPT_GLYPH_FRAMES).
+        try:
+            _prompt_session.default_buffer.on_text_changed += _advance_prompt_glyph
+        except Exception:
+            pass
     return _prompt_session
 
 
@@ -2414,11 +2472,30 @@ def pt_prompt(cwd: str) -> str:
     """Read user input with prompt_toolkit (PTY-based terminal input)."""
     session = get_prompt_session()
     disp = _shorten_path(cwd, max_len=60)
+    # Rest the caret at ❯ at the start of each fresh prompt.
+    global _prompt_glyph_frame
+    _prompt_glyph_frame = 0
+    # Plan mode drives the gutter colour (hollow amber) vs Act (solid green).
+    try:
+        import plan_mode as _pm
+        _gutter_cls = "class:prompt-gutter-plan" if _pm.is_plan_mode() else "class:prompt-gutter"
+        _gutter_ch = "▏ " if _pm.is_plan_mode() else "▐ "
+    except Exception:
+        _gutter_cls, _gutter_ch = "class:prompt-gutter", "▐ "
+
+    def _prompt_message():
+        # Re-evaluated on every redraw, so the caret animates as text changes.
+        return [
+            (_gutter_cls, _gutter_ch),
+            ("class:prompt-path", disp),
+            ("", "\n"),
+            (_gutter_cls, _gutter_ch),
+            ("class:prompt-caret", _current_prompt_glyph() + " "),
+        ]
+
     try:
         user_input = session.prompt(
-            [("class:prompt-path", disp),
-             ("", "\n"),
-             ("class:separator", "❯ ")],
+            _prompt_message,
             style=_build_prompt_style(),
             multiline=False,
             rprompt=_render_rprompt(),
