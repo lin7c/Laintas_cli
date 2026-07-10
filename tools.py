@@ -2394,6 +2394,7 @@ def _bi_hwo(params: dict, ctx: ToolCtx) -> dict:
             session=ctx.session,
             parent_id=ctx.agent_id,
             inputs=params.get("inputs") if isinstance(params.get("inputs"), dict) else None,
+            events_cb=ctx.events_cb,
         )
     out = {"ok": r.get("ok", False), "result": r.get("msg", "")}
     if r.get("outputs"):

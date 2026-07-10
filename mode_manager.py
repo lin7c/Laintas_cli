@@ -25,6 +25,7 @@ _NAME = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 _CACHE_LOCK = threading.RLock()
 _CACHE_KEY: tuple[str, Optional[int]] | None = None
 _CACHE_CONFIG: Optional[dict] = None
+_INSTANCE_ACTIVE_MODE: Optional[str] = None
 
 _READ_ONLY_TOOLS = [
     "fs.read", "fs.ls", "fs.grep", "fs.glob",
@@ -59,6 +60,48 @@ _BUILTINS = {
 
 def config_path() -> Path:
     return paths.project_file("modes.json")
+
+
+def _instance_mode_path() -> Path:
+    """Store the selected mode per CLI instance, not in project config."""
+    instance_id = getattr(paths, "INSTANCE_ID", f"pid-{os.getpid()}")
+    return paths.SESSIONS_DIR / f"{instance_id}_mode.json"
+
+
+def _load_instance_active_mode() -> Optional[str]:
+    global _INSTANCE_ACTIVE_MODE
+    if _INSTANCE_ACTIVE_MODE is not None:
+        return _INSTANCE_ACTIVE_MODE
+    path = _instance_mode_path()
+    try:
+        if not path.exists() or not paths.ensure_private_file(path):
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+        value = data.get("active") if isinstance(data, dict) else None
+        _INSTANCE_ACTIVE_MODE = value if isinstance(value, str) else ""
+    except (OSError, ValueError):
+        _INSTANCE_ACTIVE_MODE = ""
+    return _INSTANCE_ACTIVE_MODE or None
+
+
+def _save_instance_active_mode(name: str) -> None:
+    global _INSTANCE_ACTIVE_MODE
+    path = _instance_mode_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump({"version": 1, "active": name}, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, 0o600)
+        tmp.replace(path)
+        _INSTANCE_ACTIVE_MODE = name
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _default_config() -> dict:
@@ -163,7 +206,7 @@ def list_modes() -> list[dict]:
         normalized = _normalize_mode(name, value)
         if normalized:
             result.append(normalized)
-    active = config["active"]
+    active = _load_instance_active_mode() or "act"
     for item in result:
         item["active"] = item["name"] == active
     return result
@@ -178,18 +221,15 @@ def get_mode(name: str) -> Optional[dict]:
 
 
 def get_active_mode() -> dict:
-    config = load_config()
-    return get_mode(config["active"]) or dict(_BUILTINS["act"])
+    return get_mode(_load_instance_active_mode() or "act") or dict(_BUILTINS["act"])
 
 
 def activate(name: str) -> tuple[bool, str]:
     name = (name or "").strip().lower()
     if get_mode(name) is None:
         return False, f"Unknown mode: {name}"
-    config = load_config()
-    config["active"] = name
     try:
-        _save_config(config)
+        _save_instance_active_mode(name)
     except OSError as exc:
         return False, f"Could not activate mode: {exc}"
     return True, f"Switched to {name.upper()} mode."
@@ -227,8 +267,11 @@ def delete_mode(name: str) -> tuple[bool, str]:
     if name not in config["modes"]:
         return False, f"Unknown mode: {name}"
     del config["modes"][name]
-    if config["active"] == name:
-        config["active"] = "act"
+    if _load_instance_active_mode() == name:
+        try:
+            _save_instance_active_mode("act")
+        except OSError as exc:
+            return False, f"Could not reset active mode: {exc}"
     try:
         _save_config(config)
     except OSError as exc:

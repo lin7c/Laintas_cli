@@ -82,6 +82,10 @@ _DEFAULT_CONFIG = {
     # Every remote command/delegation requires an explicit Helpwo approval by
     # default. Advanced users may opt out locally, never from the remote UI.
     "allow_remote_exec_without_approval": False,
+    "remote_max_workers": 8,      # concurrently running remote tasks
+    "remote_queue_size": 16,      # queued remote tasks beyond workers
+    "remote_control_workers": 2,  # concurrently running abort/approval controls
+    "remote_control_queue_size": 8,  # queued remote control messages
     "heartbeat_interval": 30,     # seconds — agent heartbeat
     "staleness_limit": 3,         # consecutive no-tool steps before auto-exit
     "repetition_threshold": 3,    # consecutive no-progress steps before force-exit (mirrors TokenBudgetTracker)
@@ -264,6 +268,10 @@ _RUNTIME_CONFIG_DESCRIPTIONS = {
     "terminal_tail_lines": "Terminal snapshot line count",
     "disable_remote_terminal": "Disable remote interactive terminal access",
     "allow_remote_exec_without_approval": "Allow remote execution without local approval",
+    "remote_max_workers": "Maximum concurrently running remote tasks",
+    "remote_queue_size": "Maximum queued remote tasks beyond active workers",
+    "remote_control_workers": "Maximum concurrently running remote control messages",
+    "remote_control_queue_size": "Maximum queued remote control messages",
     "heartbeat_interval": "Agent heartbeat interval in seconds",
     "staleness_limit": "Consecutive idle steps before exit",
     "repetition_threshold": "Consecutive repeated-output steps before exit",
@@ -279,6 +287,7 @@ _RUNTIME_NONNEGATIVE = {
     "loop_delay", "poll_timeout", "heartbeat_interval",
     "browser_action_delay_min", "browser_action_delay_max",
     "browser_post_action_wait",
+    "remote_queue_size", "remote_control_queue_size",
 }
 _RUNTIME_POSITIVE = {
     "max_loops", "max_tokens", "max_debug_entries", "output_truncate",
@@ -286,7 +295,14 @@ _RUNTIME_POSITIVE = {
     "warning_force_limit", "deterministic_repeat_limit",
     "microcompact_keep", "microcompact_read_budget",
     "history_max_messages", "message_truncate", "short_memory_max_chars",
-    "model_context_window",
+    "model_context_window", "remote_max_workers", "remote_control_workers",
+}
+
+_RUNTIME_LIMITS = {
+    "remote_max_workers": (1, 64),
+    "remote_queue_size": (0, 128),
+    "remote_control_workers": (1, 4),
+    "remote_control_queue_size": (0, 16),
 }
 
 
@@ -327,6 +343,10 @@ def _coerce_runtime_config_value(key: str, value):
         raise ValueError(f"{key} must be 0 or greater")
     if key == "output_similarity" and not 0 <= parsed <= 1:
         raise ValueError("output_similarity must be between 0 and 1")
+    if key in _RUNTIME_LIMITS:
+        low, high = _RUNTIME_LIMITS[key]
+        if not low <= parsed <= high:
+            raise ValueError(f"{key} must be between {low} and {high}")
     if (key == "browser_action_delay_min"
             and parsed > float(get_runtime_config("browser_action_delay_max"))):
         raise ValueError("browser_action_delay_min cannot exceed browser_action_delay_max")
@@ -396,6 +416,10 @@ _MAX_CONFIG = {
     "history_max_messages": 500,
     "message_truncate": 100000,
     "short_memory_max_chars": 200000,
+    "remote_max_workers": 64,
+    "remote_queue_size": 128,
+    "remote_control_workers": 4,
+    "remote_control_queue_size": 16,
 }
 
 

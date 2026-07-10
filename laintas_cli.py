@@ -29,6 +29,7 @@ import platform
 import webbrowser
 import threading
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 import difflib
 from contextlib import nullcontext
 from pathlib import Path
@@ -1337,11 +1338,13 @@ class InteractiveSession:
     drop-in replacement for the old execute_command_pty().
     """
 
-    def __init__(self, command: str, timeout: int = 120, stream_output: bool = False, persistent: bool = False):
+    def __init__(self, command: str, timeout: int = 120, stream_output: bool = False,
+                 persistent: bool = False, cwd: str = None):
         self.command = command
         self.timeout = timeout
         self.stream_output = stream_output
         self.persistent = persistent
+        self.cwd = os.path.abspath(cwd) if cwd else None
 
         self.pid: int = -1
         self.master_fd: int = -1
@@ -1400,6 +1403,11 @@ class InteractiveSession:
                 termios.tcsetwinsize(0, s)
             except (termios.error, OSError):
                 pass
+            if self.cwd:
+                try:
+                    os.chdir(self.cwd)
+                except OSError:
+                    os._exit(126)
             if self.persistent:
                 os.execve(DEFAULT_SHELL, [DEFAULT_SHELL], _child_env())
             else:
@@ -2562,38 +2570,71 @@ def _atomic_private_json(path: Path, payload: dict) -> None:
             pass
 
 
+_instance_preferences: Optional[dict] = None
+
+
+def _instance_preferences_path() -> Path:
+    """Return the private preference file for this CLI process instance."""
+    instance_id = getattr(paths, "INSTANCE_ID", f"pid-{os.getpid()}")
+    return paths.SESSIONS_DIR / f"{instance_id}_preferences.json"
+
+
+def _load_instance_preferences() -> dict:
+    """Load process-local UI preferences once, never from global config."""
+    global _instance_preferences
+    if _instance_preferences is not None:
+        return _instance_preferences
+
+    _instance_preferences = {}
+    path = _instance_preferences_path()
+    if not path.exists() or not paths.ensure_private_file(path):
+        return _instance_preferences
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            _instance_preferences = data
+    except (OSError, json.JSONDecodeError):
+        pass
+    return _instance_preferences
+
+
+def _save_instance_preferences() -> None:
+    """Atomically save process-local UI preferences with private permissions."""
+    _atomic_private_json(_instance_preferences_path(), _load_instance_preferences())
+
+
 def get_selected_model() -> str:
-    """Return the configured model name, if any."""
-    val = load_config().get("model", "")
+    """Return this CLI instance's selected model, if any."""
+    val = _load_instance_preferences().get("model", "")
     return str(val).strip() if val else ""
 
 
 def set_selected_model(model: str) -> None:
-    """Persist the selected backend model name."""
-    config = load_config()
+    """Persist the selected model for this CLI instance only."""
+    preferences = _load_instance_preferences()
     model = model.strip()
     if model:
-        config["model"] = model
+        preferences["model"] = model
     else:
-        config.pop("model", None)
-    save_config(config)
+        preferences.pop("model", None)
+    _save_instance_preferences()
 
 
 def get_selected_provider() -> str:
-    """Return the configured provider id, if any."""
-    val = load_config().get("provider", "")
+    """Return this CLI instance's selected provider, if any."""
+    val = _load_instance_preferences().get("provider", "")
     return str(val).strip() if val else ""
 
 
 def set_selected_provider(provider: str) -> None:
-    """Persist the selected provider id."""
-    config = load_config()
+    """Persist the selected provider for this CLI instance only."""
+    preferences = _load_instance_preferences()
     provider = provider.strip()
     if provider:
-        config["provider"] = provider
+        preferences["provider"] = provider
     else:
-        config.pop("provider", None)
-    save_config(config)
+        preferences.pop("provider", None)
+    _save_instance_preferences()
 
 
 def _normalize_model_entry(item) -> dict:
@@ -4449,6 +4490,17 @@ class TerminalSession:
 class AgentRegistry:
     """Manages remote agent registration with Helpwo backend."""
 
+    # Bound both active work and queued work. A remote client must not be able
+    # to turn the polling loop into an unbounded thread/PTY factory.
+    # The executor ceilings are deliberately higher than the defaults. The
+    # user-facing values live in agent_loop's /config registry and are
+    # enforced by the bounded scheduler below.
+    REMOTE_EXECUTOR_THREADS = 64
+    REMOTE_CONTROL_EXECUTOR_THREADS = 4
+    REMOTE_CONTROL_KINDS = frozenset({
+        "abort", "approval-response", "disconnect", "term-close",
+    })
+
     def __init__(self):
         self.agent_id: Optional[str] = None
         self.agent_secret: str = ""
@@ -4479,6 +4531,15 @@ class AgentRegistry:
         self._last_agent_id: str = ""
         # Serializes background Helpwo chats (they share the REPL history).
         self._chat_run_lock = threading.Lock()
+        self._remote_executor = self._new_remote_executor()
+        self._remote_control_executor = ThreadPoolExecutor(
+            max_workers=self.REMOTE_CONTROL_EXECUTOR_THREADS,
+            thread_name_prefix="laintas-remote-control",
+        )
+        self._remote_capacity_lock = threading.Condition(threading.RLock())
+        self._remote_accepted = {"task": 0, "control": 0}
+        self._remote_running = {"task": 0, "control": 0}
+        self._remote_stopping = threading.Event()
 
         # ── Async event bus (Phase 1) ───────────────────────────────────
         # _event_q holds batches of events (each item is a list[dict]).
@@ -4498,6 +4559,57 @@ class AgentRegistry:
 
         # ── WebRTC peer-to-peer file channel (lazy) ─────────────────────
         self._webrtc = None  # WebrtcManager | False(unavailable) | None(not yet)
+
+    def _new_remote_executor(self):
+        return ThreadPoolExecutor(
+            max_workers=self.REMOTE_EXECUTOR_THREADS,
+            thread_name_prefix="laintas-remote",
+        )
+
+    @staticmethod
+    def _remote_limits(control: bool) -> tuple[int, int]:
+        """Read the live /config limits for one remote work class."""
+        from agent_loop import get_runtime_config
+        if control:
+            return (
+                int(get_runtime_config("remote_control_workers")),
+                int(get_runtime_config("remote_control_queue_size")),
+            )
+        return (
+            int(get_runtime_config("remote_max_workers")),
+            int(get_runtime_config("remote_queue_size")),
+        )
+
+    def _reserve_remote_capacity(self, control: bool) -> bool:
+        group = "control" if control else "task"
+        workers, queued = self._remote_limits(control)
+        with self._remote_capacity_lock:
+            if self._remote_accepted[group] >= workers + queued:
+                return False
+            self._remote_accepted[group] += 1
+            return True
+
+    def _run_bounded_remote(self, message: dict, agent_state_cb,
+                            chat_history_cb, control: bool) -> None:
+        group = "control" if control else "task"
+        try:
+            with self._remote_capacity_lock:
+                while (not self._remote_stopping.is_set()
+                       and self._remote_running[group] >= self._remote_limits(control)[0]):
+                    self._remote_capacity_lock.wait(timeout=0.25)
+                if self._remote_stopping.is_set():
+                    return
+                self._remote_running[group] += 1
+            try:
+                self._handle_remote_message(message, agent_state_cb, chat_history_cb)
+            finally:
+                with self._remote_capacity_lock:
+                    self._remote_running[group] -= 1
+                    self._remote_capacity_lock.notify_all()
+        finally:
+            with self._remote_capacity_lock:
+                self._remote_accepted[group] -= 1
+                self._remote_capacity_lock.notify_all()
 
     def _ensure_webrtc(self):
         """Lazily create the WebRTC manager. Returns it, or None if aiortc is
@@ -4540,6 +4652,16 @@ class AgentRegistry:
 
     def register(self, session: dict, name: str = None, quiet: bool = False) -> bool:
         """Register this CLI as a remote agent with Helpwo backend."""
+        # A disconnect shuts down the old pool; allow a later /connect to
+        # create a fresh one on the same registry instance.
+        if self._remote_executor is None:
+            self._remote_executor = self._new_remote_executor()
+        if self._remote_control_executor is None:
+            self._remote_control_executor = ThreadPoolExecutor(
+                max_workers=self.REMOTE_CONTROL_EXECUTOR_THREADS,
+                thread_name_prefix="laintas-remote-control",
+            )
+        self._remote_stopping.clear()
         self._session = session
         hostname = socket.gethostname()
         cwd = os.getcwd()
@@ -4822,12 +4944,30 @@ class AgentRegistry:
                         # (chat/delegate can run for minutes) never stalls
                         # the poll loop — term-new/term-close/abort from
                         # Helpwo must stay responsive throughout.
-                        threading.Thread(
-                            target=self._handle_remote_message,
-                            args=(msg, agent_state_cb, chat_history_cb),
-                            daemon=True,
-                            name=f"laintas-remote-{msg.get('kind', 'chat')}",
-                        ).start()
+                        kind = msg.get("kind")
+                        control = kind in self.REMOTE_CONTROL_KINDS
+                        executor = self._remote_control_executor if control else self._remote_executor
+                        if not self._reserve_remote_capacity(control):
+                            req_id = msg.get("reqId") or msg.get("id")
+                            self._push_final(
+                                req_id, "busy",
+                                "remote task capacity is full; retry later",
+                            )
+                            continue
+
+                        try:
+                            executor.submit(
+                                self._run_bounded_remote, msg,
+                                agent_state_cb, chat_history_cb, control)
+                        except RuntimeError:
+                            group = "control" if control else "task"
+                            with self._remote_capacity_lock:
+                                self._remote_accepted[group] -= 1
+                                self._remote_capacity_lock.notify_all()
+                            req_id = msg.get("reqId") or msg.get("id")
+                            self._push_final(
+                                req_id, "busy", "remote task executor is stopping",
+                            )
                 elif resp.status_code in (403, 404):
                     self._recover_registration()
             except requests.RequestException:
@@ -5026,22 +5166,18 @@ class AgentRegistry:
         ))
 
         self._push(req_id, "cmd-start", "", {"command": cmd, "cwd": cwd})
-        sess = InteractiveSession(cmd, timeout=timeout)
-        old_cwd = os.getcwd()
+        try:
+            cwd = os.path.abspath(cwd)
+            if not os.path.isdir(cwd):
+                raise OSError(f"not a directory: {cwd}")
+        except (TypeError, OSError) as e:
+            self._push_final(req_id, "fail", f"invalid cwd: {e}")
+            return
+
+        sess = InteractiveSession(cmd, timeout=timeout, cwd=cwd)
         start = time.time()
         try:
-            try:
-                os.chdir(cwd)
-            except OSError as e:
-                self._push_final(req_id, "fail", f"cd {cwd} failed: {e}")
-                return
-            try:
-                sess.start()
-            finally:
-                try:
-                    os.chdir(old_cwd)
-                except OSError:
-                    pass
+            sess.start()
 
             # Line-buffered streaming: hold a partial-line buffer between
             # PTY reads so the UI never displays a half-formed line.
@@ -5948,6 +6084,15 @@ class AgentRegistry:
         finals/outputs make it to the backend before the process exits.
         """
         self._running = False
+        self._remote_stopping.set()
+        with self._remote_capacity_lock:
+            self._remote_capacity_lock.notify_all()
+        if self._remote_executor is not None:
+            self._remote_executor.shutdown(wait=False, cancel_futures=True)
+            self._remote_executor = None
+        if self._remote_control_executor is not None:
+            self._remote_control_executor.shutdown(wait=False, cancel_futures=True)
+            self._remote_control_executor = None
 
         # Flush queued events (≤2s) then stop the sender thread so the
         # final unregister POST is the last thing we do.
@@ -11229,18 +11374,39 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
     elif action == "/hwo":
         sub = parts[1].lower() if len(parts) > 1 else ""
         current = get_current_agent()
-        if sub in ("run", "compile") and len(parts) >= 3:
+        if sub == "status":
+            import hwo_runner
+            r = hwo_runner.status(parts[2] if len(parts) >= 3 else None)
+            console.print(r.get("msg", ""))
+        elif sub in ("run", "compile") and len(parts) >= 3:
             # /hwo run <path>  or  /hwo compile <path>
             import hwo_runner
             path = " ".join(parts[2:])
             if sub == "compile":
                 r = hwo_runner.compile_hwo_file(path)
             else:
+                def _hwo_progress(event):
+                    if isinstance(event, list):
+                        for item in event:
+                            _hwo_progress(item)
+                        return
+                    kind = event.get("type")
+                    if kind == "workflow_started":
+                        console.print(f"[dim]HWO {event.get('runId')} started[/dim]")
+                    elif kind == "step_started":
+                        console.print(f"[cyan]▶ {event.get('stepId', '?')} started[/cyan]")
+                    elif kind == "step_completed":
+                        console.print(f"[green]✓ {event.get('stepId', '?')} completed[/green]")
+                    elif kind == "step_failed":
+                        console.print(f"[red]✗ {event.get('stepId', '?')} failed[/red]")
+                    elif kind == "workflow_completed":
+                        console.print(f"[green]HWO {event.get('runId')} completed[/green]")
                 r = hwo_runner.run_hwo_file(
                     path=path,
                     deps=get_loop_deps(),
                     session=session,
                     parent_id=current.id if current else None,
+                    events_cb=_hwo_progress,
                 )
             style = "[green]" if r.get("ok") else "[red]"
             console.print(f"{style}{r.get('msg', '')}[/]")
@@ -11273,6 +11439,20 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
         import hwg_runner
         sub = parts[1].lower() if len(parts) > 1 else "status"
         current = get_current_agent()
+        def _hwg_progress(event):
+            if isinstance(event, list):
+                for item in event:
+                    _hwg_progress(item)
+                return
+            kind = event.get("type")
+            if kind == "node_started":
+                console.print(f"[cyan]▶ HWG node #{event.get('node', '?')} started[/cyan]")
+            elif kind == "node_completed":
+                console.print(f"[green]✓ HWG node #{event.get('node', '?')} completed[/green]")
+            elif kind == "node_failed":
+                console.print(f"[red]✗ HWG node #{event.get('node', '?')} failed[/red]")
+            elif kind == "workflow_paused":
+                console.print(f"[yellow]HWG paused at node #{event.get('node', '?')}[/yellow]")
         if sub in ("run", "compile") and len(parts) >= 3:
             path = " ".join(parts[2:])
             if sub == "compile":
@@ -11283,6 +11463,7 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
                     deps=get_loop_deps(),
                     session=session,
                     parent_id=current.id if current else None,
+                    events_cb=_hwg_progress,
                 )
         elif sub == "resume" and len(parts) >= 3:
             run_id = parts[2]
@@ -11305,6 +11486,7 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
                 parent_id=current.id if current else None,
                 verdict=verdict,
                 outputs=outputs,
+                events_cb=_hwg_progress,
             )
         elif sub == "status":
             r = hwg_runner.status(parts[2] if len(parts) >= 3 else None)
@@ -12246,7 +12428,9 @@ def main():
     # Load or create config
     config = load_config()
     agent_name = args.name or config.get("agentName", socket.gethostname())
-    _update_status_cache(model=config.get("model", ""))
+    # Model/provider selection is instance-local, so opening another CLI
+    # process cannot overwrite this process's status or request defaults.
+    _update_status_cache(model=get_selected_model())
 
     # Official mode uses the Laintas account. Custom/local backends are a
     # separate trust and billing domain and must not require or receive it.

@@ -13,9 +13,9 @@ import {
 } from 'lucide-react';
 import { useLanguage } from '@/contexts/LanguageContext';
 
-const DOWNLOAD_BASE = 'https://cli.laintas.com/releases/v1.7.1';
+const DOWNLOAD_BASE = 'https://cli.laintas.com/releases/v1.7.3';
 const BASE_URL = DOWNLOAD_BASE;
-const RELEASE_VERSION = 'v1.7.1';
+const RELEASE_VERSION = 'v1.7.3';
 
 const ASSETS = [
   {
@@ -259,7 +259,7 @@ function CompatibilityGuide({ content }) {
           <h2 className="text-[22px] font-semibold text-[#10110f]">{content.title}</h2>
           <p className="mt-1 text-[14px] text-[#696d65]">{content.subtitle}</p>
         </div>
-        <code className="font-mono text-[12px] text-[#74776f]">v1.7.1</code>
+        <code className="font-mono text-[12px] text-[#74776f]">v1.7.3</code>
       </div>
 
       <div className="mt-5 overflow-x-auto">
