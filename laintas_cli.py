@@ -1887,7 +1887,7 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec("/abort", "Abort an agent", "Agents & Terminals", "/abort <agent-id>"),
     CommandSpec("/hwo", "Open or run an orchestration workflow", "Planning & Tasks", "/hwo [file|run <file>|compile <file>]", subcommands=("run", "compile")),
     CommandSpec("/hwg", "Compile, run, or resume an HWO graph workflow", "Planning & Tasks", "/hwg {run|compile|resume|status|cancel} ...", subcommands=("run", "compile", "resume", "status", "cancel")),
-    CommandSpec("/mode", "Show, switch, or create agent modes", "Planning & Tasks", "/mode [act|plan [task]|review|list|create|delete]", subcommands=("act", "plan", "review", "list", "create", "delete")),
+    CommandSpec("/mode", "Show, switch, or create agent modes", "Planning & Tasks", "/mode [act [always]|plan [task]|review|list|create|delete]", subcommands=("act", "always", "plan", "review", "list", "create", "delete")),
     CommandSpec("/plan", "Create, revise, review, or approve versioned plans", "Planning & Tasks", "/plan {enter|submit|revise|approve|exit|status|list}", subcommands=("enter", "submit", "revise", "approve", "exit", "status", "list")),
     CommandSpec("/prompt", "Open Prompt Lab or manage tested prompt overlays", "Planning & Tasks", "/prompt [issue|subcommand]", subcommands=("status", "branches", "open", "chat", "review", "test", "activate", "disable", "patches", "profiles", "profile", "use", "rollback", "feedback", "fail", "optimize", "apply", "discard", "list", "skill", "export", "install", "publish")),
     CommandSpec("/evolve", "Create, improve, test, and hot-load project extensions", "Planning & Tasks", "/evolve [idea|subcommand]", subcommands=("status", "branches", "open", "chat", "review", "test", "activate", "disable", "candidates", "profiles", "profile", "use", "rollback", "list", "help")),
@@ -6942,7 +6942,8 @@ _SLASH_ARG_RULES: dict[tuple[str, ...], SlashArgRule] = {
     ("/model", "reset"): _arg_rule(1, "/model reset"),
     ("/model", "clear"): _arg_rule(1, "/model clear"),
     ("/model", "default"): _arg_rule(1, "/model default"),
-    ("/mode", "act"): _arg_rule(1, "/mode act"),
+    ("/mode", "act"): _arg_rule(2, "/mode act [always]"),
+    ("/mode", "always"): _arg_rule(1, "/mode always"),
     ("/mode", "review"): _arg_rule(1, "/mode review"),
     ("/mode", "approve"): _arg_rule(1, "/mode approve"),
     ("/mode", "list"): _arg_rule(1, "/mode list"),
@@ -8358,14 +8359,30 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
                 title="Plan Mode", border_style="green",
             ))
 
-        elif sub == "act":
+        elif sub in ("act", "always", "act-always"):
+            # `/mode act always` (or `/mode always`) → ACT with every file write
+            # and command auto-approved for this session (shown as ACT*). Plain
+            # `/mode act` restores confirmations by clearing that session state,
+            # giving a mid-session way to turn auto-approve back off.
+            _always = (sub in ("always", "act-always")
+                       or any(p.lower() == "always" for p in parts[2:]))
             if _in_plan:
                 _pm_mode.exit_plan_mode(approve=False)
             ok, msg = mode_manager.activate("act")
-            console.print(
-                f"[{'green' if ok else 'red'}]{_escape(msg)}"
-                f"[/{'green' if ok else 'red'}]"
-                + (" [dim](draft plan saved)[/dim]" if _cur_plan else ""))
+            if _always:
+                _session_approval_state["all_writes"] = True
+                _session_approval_state["all_commands"] = True
+                console.print(
+                    "[green]ACT [bold]always-approve[/bold] — file writes and "
+                    "commands are auto-approved this session ([bold]ACT*[/bold]).[/green]\n"
+                    "[dim]Run /mode act to turn confirmations back on.[/dim]")
+            else:
+                _session_approval_state["all_writes"] = False
+                _session_approval_state["all_commands"] = False
+                console.print(
+                    f"[{'green' if ok else 'red'}]{_escape(msg)}"
+                    f"[/{'green' if ok else 'red'}]"
+                    + (" [dim](draft plan saved)[/dim]" if _cur_plan else ""))
 
         elif sub == "approve":
             # Backward compatibility. Approval is a plan action, not a mode.
@@ -8474,7 +8491,18 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
                 "name": "plan",
                 "description": "Reviewed, read-only planning",
             }, *mode_manager.list_modes()]
-            active_name = "plan" if _in_plan else active["name"]
+            # Offer the always-approve variant right after act.
+            _act_i = next((i for i, o in enumerate(options)
+                           if o["name"] == "act"), None)
+            if _act_i is not None:
+                options.insert(_act_i + 1, {
+                    "name": "act-always",
+                    "description": "ACT with file writes & commands auto-approved (ACT*)",
+                })
+            _auto = _session_approval_state.get("all_writes")
+            active_name = ("plan" if _in_plan
+                           else ("act-always" if _auto and active["name"] == "act"
+                                 else active["name"]))
             selected_index = next(
                 (i for i, item in enumerate(options)
                  if item["name"] == active_name), 0)
@@ -8497,10 +8525,24 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
                         console.print(
                             "[green]PLAN mode armed.[/green] "
                             "[dim]Describe the task in your next message.[/dim]")
+                elif target == "act-always":
+                    if _in_plan:
+                        _pm_mode.exit_plan_mode(approve=False)
+                    mode_manager.activate("act")
+                    _session_approval_state["all_writes"] = True
+                    _session_approval_state["all_commands"] = True
+                    console.print(
+                        "[green]ACT [bold]always-approve[/bold] — writes & commands "
+                        "auto-approved this session ([bold]ACT*[/bold]).[/green]\n"
+                        "[dim]Pick ACT to turn confirmations back on.[/dim]")
                 else:
                     if _in_plan:
                         _pm_mode.exit_plan_mode(approve=False)
                     ok, msg = mode_manager.activate(target)
+                    # Selecting plain ACT clears any session auto-approve.
+                    if target == "act":
+                        _session_approval_state["all_writes"] = False
+                        _session_approval_state["all_commands"] = False
                     console.print(
                         f"[{'green' if ok else 'red'}]{_escape(msg)}"
                         f"[/{'green' if ok else 'red'}]")
