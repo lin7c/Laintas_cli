@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version to release (e.g. 1.3.0). If empty, reads version.py."
+        description: "Version to release (e.g. 1.7.0). If empty, reads version.py."
         required: false
         default: ""
   push:
@@ -15,24 +15,31 @@ permissions:
   contents: write
 
 jobs:
-  # ──────────────────────────────────────────────────────────────────────
   linux:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+          - arch: arm64
+            platform: linux/arm64
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
+      - name: Enable cross-architecture containers
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: all
 
-      - name: Build Linux binary in old-glibc container
-        run: bash build/linux/build_linux_compat.sh
+      - name: Build Linux binary
+        run: bash build/linux/build_linux_compat.sh "${{ matrix.arch }}"
 
-      - name: Stage artifact
+      - name: Stage Linux package
         run: |
           mkdir -p staging
-          cp build/linux/dist-compat/laintas-cli staging/
+          cp "build/linux/dist-compat/${{ matrix.arch }}/laintas-cli" staging/
           cat > staging/install.sh <<'EOF'
           #!/usr/bin/env bash
           set -euo pipefail
@@ -47,90 +54,23 @@ jobs:
           echo "Run: laintas-cli"
           EOF
           chmod 755 staging/install.sh
-          cd staging && tar -czf ../laintas-cli_linux.tar.gz .
+          tar -C staging -czf "laintas-cli_linux_${{ matrix.arch }}.tar.gz" .
 
       - uses: actions/upload-artifact@v4
         with:
-          name: linux
-          path: laintas-cli_linux.tar.gz
+          name: linux-${{ matrix.arch }}
+          path: "laintas-cli_linux_${{ matrix.arch }}.tar.gz"
 
-  # ──────────────────────────────────────────────────────────────────────
-  macos:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
-
-      - name: Build macOS source bundle
-        run: |
-          python3 - <<'PY'
-          import json, os, shutil
-          pm = json.load(open("package_manifest.json"))
-          top = [m + ".py" for m in pm["modules"]] + pm["extra_files"]
-          dirs = pm["packages"] + pm["data_dirs"]
-          os.makedirs("bundle/laintas-cli", exist_ok=True)
-          for f in top:
-              shutil.copy(f, "bundle/laintas-cli/")
-          for d in dirs:
-              shutil.copytree(d, f"bundle/laintas-cli/{d}")
-          PY
-          cat > bundle/laintas-cli/install.sh <<'INSTALLER'
-          #!/usr/bin/env bash
-          set -euo pipefail
-          SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-          INSTALL_DIR="/usr/local/lib/laintas_cli"
-          BIN_PATH="/usr/local/bin/laintas-cli"
-          if ! command -v python3 >/dev/null 2>&1; then echo "python3 is required"; exit 1; fi
-          if [ "$(id -u)" -eq 0 ]; then
-            mkdir -p "$INSTALL_DIR"
-            cp -r "$SCRIPT_DIR"/*.py "$INSTALL_DIR/"
-            cp -r "$SCRIPT_DIR"/agent_tools "$SCRIPT_DIR"/context_policy \
-                  "$SCRIPT_DIR"/diagnostics_adapter "$SCRIPT_DIR"/format_adapter \
-                  "$SCRIPT_DIR"/patch_adapter "$SCRIPT_DIR"/default_skills "$INSTALL_DIR/" 2>/dev/null || true
-            cp "$SCRIPT_DIR"/requirements.txt "$INSTALL_DIR/"
-            printf '%s\n' '#!/usr/bin/env bash' 'exec python3 /usr/local/lib/laintas_cli/laintas_cli.py "$@"' > "$BIN_PATH"
-            chmod 755 "$BIN_PATH"
-          else
-            sudo mkdir -p "$INSTALL_DIR"
-            sudo cp -r "$SCRIPT_DIR"/*.py "$INSTALL_DIR/"
-            sudo cp -r "$SCRIPT_DIR"/agent_tools "$SCRIPT_DIR"/context_policy \
-                     "$SCRIPT_DIR"/diagnostics_adapter "$SCRIPT_DIR"/format_adapter \
-                     "$SCRIPT_DIR"/patch_adapter "$SCRIPT_DIR"/default_skills "$INSTALL_DIR/" 2>/dev/null || true
-            sudo cp "$SCRIPT_DIR"/requirements.txt "$INSTALL_DIR/"
-            printf '%s\n' '#!/usr/bin/env bash' 'exec python3 /usr/local/lib/laintas_cli/laintas_cli.py "$@"' | sudo tee "$BIN_PATH" >/dev/null
-            sudo chmod 755 "$BIN_PATH"
-          fi
-          python3 -m pip install -r "$SCRIPT_DIR"/requirements.txt
-          echo "Installed to $BIN_PATH"
-          echo "Run: laintas-cli"
-          INSTALLER
-          chmod 755 bundle/laintas-cli/install.sh
-          cd bundle && tar -czf ../laintas-cli_macos.tar.gz laintas-cli
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: macos
-          path: laintas-cli_macos.tar.gz
-
-  # ──────────────────────────────────────────────────────────────────────
   source:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
-
-      - name: Build source zip + manifest
+      - name: Build source package and update manifest
         run: |
           python3 - <<'PY'
-          import json, os, shutil, hashlib, datetime
+          import datetime, hashlib, json, os, shutil, sys
           pm = json.load(open("package_manifest.json"))
           top = [m + ".py" for m in pm["modules"]] + pm["extra_files"]
           dirs = pm["packages"] + pm["data_dirs"]
@@ -139,43 +79,34 @@ jobs:
               shutil.copy(f, "bundle/laintas-cli-source/")
           for d in dirs:
               shutil.copytree(d, f"bundle/laintas-cli-source/{d}")
-          PY
-          cd bundle && zip -qr ../laintas-cli_source.zip laintas-cli-source && cd ..
-
-          # Build src/ + manifest.json for self-updater
-          mkdir -p src_out
-          python3 - <<'PY'
-          import json, os, shutil, hashlib, datetime, sys
-          pm = json.load(open("package_manifest.json"))
-          top = [m + ".py" for m in pm["modules"]] + pm["extra_files"]
-          dirs = pm["packages"] + pm["data_dirs"]
+          os.system("cd bundle && zip -qr ../laintas-cli_source.zip laintas-cli-source")
+          os.makedirs("src_out", exist_ok=True)
           for f in top:
               if os.path.isfile(f) and f.endswith((".py", ".json", ".txt")):
                   shutil.copy(f, "src_out/")
           for d in dirs:
               if os.path.isdir(d):
-                  os.makedirs(f"src_out/{d}", exist_ok=True)
                   for root, subdirs, files in os.walk(d):
                       subdirs[:] = [x for x in subdirs if x != "__pycache__"]
                       for fn in files:
                           if fn.endswith((".py", ".json")):
-                              shutil.copy(os.path.join(root, fn), f"src_out/{os.path.relpath(root, '.')}/")
-          # manifest
+                              target = os.path.join("src_out", os.path.relpath(root, "."))
+                              os.makedirs(target, exist_ok=True)
+                              shutil.copy(os.path.join(root, fn), target)
           sys.path.insert(0, ".")
           from version import __version__
           manifest = {"version": __version__, "released": datetime.date.today().isoformat(), "files": {}}
           for root, subdirs, files in os.walk("src_out"):
               subdirs[:] = [x for x in subdirs if x != "__pycache__"]
               for fn in files:
-                  p = os.path.join(root, fn)
-                  rel = os.path.relpath(p, "src_out")
-                  data = open(p, "rb").read()
+                  path = os.path.join(root, fn)
+                  rel = os.path.relpath(path, "src_out")
+                  data = open(path, "rb").read()
                   manifest["files"][rel] = {"sha256": hashlib.sha256(data).hexdigest(), "size": len(data)}
           with open("src_out/manifest.json", "w") as fh:
               json.dump(manifest, fh, indent=2)
-          print(f"manifest: v{__version__}, {len(manifest['files'])} files")
+          os.system("cd src_out && zip -qr ../src_manifest.zip .")
           PY
-          cd src_out && zip -qr ../src_manifest.zip . && cd ..
 
       - uses: actions/upload-artifact@v4
         with:
@@ -184,108 +115,59 @@ jobs:
             laintas-cli_source.zip
             src_manifest.zip
 
-  # ──────────────────────────────────────────────────────────────────────
   deb:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
-
-      - name: Install fpm
-        run: |
-          sudo apt-get update && sudo apt-get install -y ruby ruby-dev
-          sudo gem install fpm
-
-      - name: Build .deb
+      - name: Build amd64 Debian package
         run: bash build/linux/build_deb.sh
-
-      - name: Rename deb with version
-        run: |
-          DEB=$(ls dist/laintas-cli_*_amd64.deb | head -1)
-          cp "$DEB" laintas-cli.deb
-
+      - name: Stage Debian package
+        run: cp "$(ls dist/laintas-cli_*_amd64.deb | head -1)" laintas-cli.deb
       - uses: actions/upload-artifact@v4
         with:
           name: deb
           path: laintas-cli.deb
 
-  # ──────────────────────────────────────────────────────────────────────
   publish:
-    needs: [linux, macos, source, deb]
+    needs: [linux, source, deb]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
-
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
       - name: Determine version
         id: ver
         run: |
-          if [ -n "${{ github.event.inputs.version }}" ]; then
-            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
-            echo "tag=v${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
-          else
-            V=$(python3 -c "import sys; sys.path.insert(0,'.'); from version import __version__ as v; print(v)")
-            echo "version=$V" >> $GITHUB_OUTPUT
-            # Use the tag that triggered this (for push: tags), else construct it.
-            TAG="${GITHUB_REF#refs/tags/}"
-            echo "tag=${TAG:-v$V}" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-
-      - name: Stage release files
+          V=$(python3 -c "import sys; sys.path.insert(0,'.'); from version import __version__ as v; print(v)")
+          echo "version=${V}" >> "$GITHUB_OUTPUT"
+          TAG="${GITHUB_REF#refs/tags/}"
+          echo "tag=${TAG:-v$V}" >> "$GITHUB_OUTPUT"
+      - name: Stage release files and checksums
         run: |
           mkdir -p release
-          cp artifacts/linux/laintas-cli_linux.tar.gz release/
-          cp artifacts/macos/laintas-cli_macos.tar.gz release/
+          cp artifacts/linux-amd64/laintas-cli_linux_amd64.tar.gz release/
+          cp artifacts/linux-arm64/laintas-cli_linux_arm64.tar.gz release/
           cp artifacts/source/laintas-cli_source.zip release/
-          cp artifacts/source/src_manifest.zip release/src_manifest.zip
+          cp artifacts/source/src_manifest.zip release/
           cp artifacts/deb/laintas-cli.deb "release/laintas-cli_${{ steps.ver.outputs.version }}_amd64.deb"
-
-          # Generate SHA256SUMS.txt
           cd release
-          sha256sum \
-            laintas-cli_linux.tar.gz \
-            laintas-cli_macos.tar.gz \
-            laintas-cli_source.zip \
-            "laintas-cli_${{ steps.ver.outputs.version }}_amd64.deb" \
-            > SHA256SUMS.txt
-          # Unzip the src manifest for upload
-          unzip -o src_manifest.zip -d src/
+          sha256sum laintas-cli_linux_amd64.tar.gz laintas-cli_linux_arm64.tar.gz \
+            laintas-cli_source.zip "laintas-cli_${{ steps.ver.outputs.version }}_amd64.deb" > SHA256SUMS.txt
+          unzip -o src_manifest.zip -d src/ >/dev/null
           cp src/manifest.json .
-          cat SHA256SUMS.txt
-
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release create "${{ steps.ver.outputs.tag }}" \
             --title "${{ steps.ver.outputs.tag }}" \
-            --notes "Release ${{ steps.ver.outputs.version }}" \
+            --notes "Linux amd64 and arm64 binaries, Debian amd64 package, and source package." \
             --generate-notes \
-            release/laintas-cli_linux.tar.gz \
-            release/laintas-cli_macos.tar.gz \
+            release/laintas-cli_linux_amd64.tar.gz \
+            release/laintas-cli_linux_arm64.tar.gz \
             release/laintas-cli_source.zip \
             "release/laintas-cli_${{ steps.ver.outputs.version }}_amd64.deb" \
-            release/SHA256SUMS.txt \
-            release/manifest.json \
-            release/src_manifest.zip
-
-      - name: Smoke test — version check
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          echo "Release ${{ steps.ver.outputs.tag }} created."
-          echo "Artifacts:"
-          gh release view "${{ steps.ver.outputs.tag }}" --json assets -q '.assets[].name'
+            release/SHA256SUMS.txt release/manifest.json release/src_manifest.zip

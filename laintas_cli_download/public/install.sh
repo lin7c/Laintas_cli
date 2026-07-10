@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BASE_URL="https://cli.laintas.com"
+BASE_URL="https://github.com/lin7c/Laintas_cli/releases/latest/download"
 TMP_DIR=$(mktemp -d)
 trap 'rm -rf "$TMP_DIR"' EXIT
 
 echo ""
 echo "── Laintas CLI Installer ─────────────────────────────────────"
 
-# Detect OS
+# Detect OS and CPU architecture before downloading a native binary.
 UNAME_S=$(uname -s)
 if [ "$UNAME_S" = "Linux" ]; then
     INSTALL_MODE="linux"
@@ -18,15 +18,25 @@ else
 fi
 
 if [ "$INSTALL_MODE" = "linux" ]; then
-    echo "  Detected: Linux"
+    case "$(uname -m)" in
+        x86_64|amd64) ARCH="amd64" ;;
+        aarch64|arm64) ARCH="arm64" ;;
+        *)
+            echo "Unsupported Linux architecture: $(uname -m)"
+            echo "Supported architectures: x86_64/amd64 and aarch64/arm64"
+            exit 1
+            ;;
+    esac
+    echo "  Detected: Linux $ARCH"
 
     # Download tarball
     echo "  Downloading…"
-    curl -fsSL "$BASE_URL/releases/v1.6/laintas-cli_linux.tar.gz" -o "$TMP_DIR/laintas-cli_linux.tar.gz"
+    ASSET="laintas-cli_linux_${ARCH}.tar.gz"
+    curl -fsSL "$BASE_URL/$ASSET" -o "$TMP_DIR/$ASSET"
 
     # Extract
     echo "  Extracting package…"
-    tar xzf "$TMP_DIR/laintas-cli_linux.tar.gz" -C "$TMP_DIR"
+    tar xzf "$TMP_DIR/$ASSET" -C "$TMP_DIR"
 
     echo "  Installing to /usr/local/bin…"
     "$TMP_DIR/laintas-cli/install.sh"

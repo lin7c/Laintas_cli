@@ -1,3 +1,0 @@
-31a5e8cbd8ae3a2a5f8e2f8e4c9b542a39ce5ac35a142c29d1fc2c5600f48549  laintas-cli_linux.tar.gz
-d742ab82be7ba71a0810b203643e31b0d64d9ecaa202a20fc5ee642b0b86092c  laintas-cli_macos.tar.gz
-7a81e93639819967ea2cbc6f3260a37975266748abde720dc81b43f97b2f26db  laintas-cli_source.zip

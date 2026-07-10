@@ -29,7 +29,7 @@ per-file download, so the whole source bundle is fetched as one zip — still on
 when something actually changed.)
 
 For **frozen (PyInstaller) installs** the individual ``.py`` files don't exist on
-disk, so the updater replaces the whole binary from the platform tarball/exe
+disk, so the updater replaces the whole Linux binary from the matching architecture
 asset.
 """
 
@@ -283,10 +283,15 @@ def apply_frozen_update(manifest: dict, channel_dir: str, log) -> Optional[str]:
     On POSIX the running executable can be unlinked and rewritten in place.
     """
     target = os.path.abspath(sys.executable)
-    if sys.platform == "darwin":
-        asset = "laintas-cli_macos.tar.gz"
+    machine = os.uname().machine.lower() if hasattr(os, "uname") else ""
+    if machine in ("x86_64", "amd64"):
+        arch = "amd64"
+    elif machine in ("aarch64", "arm64"):
+        arch = "arm64"
     else:
-        asset = "laintas-cli_linux.tar.gz"
+        log(f"[red]Unsupported Linux architecture: {machine or 'unknown'}[/red]")
+        return None
+    asset = f"laintas-cli_linux_{arch}.tar.gz"
     url = _asset_url(channel_dir, asset)
 
     log(f"  ↓ {asset}")

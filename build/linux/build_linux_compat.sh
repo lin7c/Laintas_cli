@@ -8,18 +8,25 @@
 # buster = Debian 10 = glibc 2.28 (covers CentOS 8 / Anolis 8 / Aliyun Linux 3 /
 # Ubuntu 20.04+). Falls back to bullseye (glibc 2.31) if buster is unavailable.
 #
-# Usage (from project root):  bash build/linux/build_linux_compat.sh
-# Output: build/linux/dist-compat/laintas-cli
+# Usage (from project root):  bash build/linux/build_linux_compat.sh [amd64|arm64]
+# Output: build/linux/dist-compat/<arch>/laintas-cli
 set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
-OUT_DIR="$PROJECT_DIR/build/linux/dist-compat"
-IMAGE="${1:-python:3.11-slim-buster}"
+ARCH="${1:-amd64}"
+case "$ARCH" in
+  amd64) PLATFORM="linux/amd64" ;;
+  arm64) PLATFORM="linux/arm64" ;;
+  *) echo "Unsupported architecture: $ARCH (expected amd64 or arm64)" >&2; exit 2 ;;
+esac
+OUT_DIR="$PROJECT_DIR/build/linux/dist-compat/$ARCH"
+IMAGE="${BUILD_IMAGE:-python:3.11-slim-buster}"
 
 mkdir -p "$OUT_DIR"
 
 echo "== building in $IMAGE =="
 docker run --rm \
+  --platform "$PLATFORM" \
   -v "$PROJECT_DIR":/src \
   -v "$OUT_DIR":/out \
   -w /src \
