@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BASE_URL="https://github.com/lin7c/Laintas_cli/releases/latest/download"
+BASE_URL="https://cli.laintas.com"
 TMP_DIR=$(mktemp -d)
 trap 'rm -rf "$TMP_DIR"' EXIT
 
@@ -32,7 +32,7 @@ if [ "$INSTALL_MODE" = "linux" ]; then
     # Download tarball
     echo "  Downloading…"
     ASSET="laintas-cli_linux_${ARCH}.tar.gz"
-    curl -fsSL "$BASE_URL/$ASSET" -o "$TMP_DIR/$ASSET"
+    curl -fsSL "$BASE_URL/releases/v1.7.1/$ASSET" -o "$TMP_DIR/$ASSET"
 
     # Extract
     echo "  Extracting package…"
