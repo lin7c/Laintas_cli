@@ -996,15 +996,18 @@ def _mail_sender_identity() -> tuple[str, str]:
             getattr(current, "name", None) or "Laintas CLI")
 
 
-def _mail_send_raw(ctx: ToolCtx, subject: str, body: str, kind: str = "Message") -> dict:
-    """The actual send, shared by the explicit mail.send_to_user tool and
-    the mail-mode auto-send-on-task-complete hook. Caller is responsible for
-    any policy check — this just talks to the gateway."""
+_MAIL_RATE_LIMIT_MAX_AUTO_WAIT = 90  # seconds — only worth auto-waiting out a short cooldown
+
+
+def _mail_send_attempt(ctx: ToolCtx, subject: str, body: str, kind: str) -> dict:
+    """One send attempt. Returns {"ok", "error", "retry_after"} — retry_after
+    is only set when the gateway reports a short, bounded rate-limit cooldown
+    (never the hourly cap) worth automatically waiting out."""
     try:
         import requests
         backend_profiles, profile = _resolve_backend_profile()
     except ImportError as exc:
-        return {"ok": False, "error": f"missing dependency: {exc}"}
+        return {"ok": False, "error": f"missing dependency: {exc}", "retry_after": None}
 
     terminal, agent_name = _mail_sender_identity()
     headers, cookies = backend_profiles.request_auth(profile, ctx.session)
@@ -1017,16 +1020,38 @@ def _mail_send_raw(ctx: ToolCtx, subject: str, body: str, kind: str = "Message")
             headers=headers, cookies=cookies, timeout=10,
         )
     except requests.RequestException as exc:
-        return {"ok": False, "error": f"could not reach backend: {exc}"}
+        return {"ok": False, "error": f"could not reach backend: {exc}", "retry_after": None}
 
     if resp.status_code >= 300:
         try:
-            detail = resp.json().get("detail") or resp.text[:200]
+            data = resp.json()
+            detail = data.get("detail") or resp.text[:200]
+            retry_after = data.get("retryAfter")
         except Exception:
             detail = resp.text[:200]
-        return {"ok": False, "error": f"send failed: {detail}"}
+            retry_after = None
+        return {"ok": False, "error": f"send failed: {detail}", "retry_after": retry_after}
 
-    return {"ok": True, "result": "Email sent to your verified account address."}
+    return {"ok": True, "result": "Email sent to your verified account address.", "retry_after": None}
+
+
+def _mail_send_raw(ctx: ToolCtx, subject: str, body: str, kind: str = "Message") -> dict:
+    """The actual send, shared by the explicit mail.send_to_user tool and
+    the mail-mode auto-send-on-task-complete hook. Caller is responsible for
+    any policy check — this just talks to the gateway.
+
+    On a short, bounded rate-limit cooldown (not the hourly cap), waits it
+    out and retries once automatically rather than failing outright — the
+    caller asked to send an email and a 60s wait is cheaper than making the
+    AI give up and the user have to ask again."""
+    result = _mail_send_attempt(ctx, subject, body, kind)
+    if result["ok"]:
+        return result
+    retry_after = result.get("retry_after")
+    if isinstance(retry_after, (int, float)) and 0 < retry_after <= _MAIL_RATE_LIMIT_MAX_AUTO_WAIT:
+        time.sleep(retry_after + 1)
+        result = _mail_send_attempt(ctx, subject, body, kind)
+    return result
 
 
 def _bi_mail_send_to_user(params: dict, ctx: ToolCtx) -> dict:
