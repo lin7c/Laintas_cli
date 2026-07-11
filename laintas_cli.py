@@ -12654,6 +12654,72 @@ def _blocking_approval_prompt(title: str, body: str, question: str,
     return "no"
 
 
+_APPROVAL_POLL_INTERVAL = 5  # seconds between status checks
+
+
+def _request_email_approval(kind: str, summary: str, detail: str = "") -> bool:
+    """Mail mode's substitute for _blocking_approval_prompt: email a
+    confirm-page link and poll for the human's decision instead of blocking
+    on local terminal input. Denies (fails closed) on any error, and on
+    timeout — an unattended agent must never treat "no response yet" as
+    permission."""
+    session = load_session() or {}
+    if not session.get("userId"):
+        console.print("[yellow]Mail mode approval needed but not logged in — denying.[/yellow]")
+        return False
+
+    profile = get_backend_profile()
+    current = get_current_agent()
+    terminal = (getattr(current, "home_terminal", None) or "") if current else ""
+    agent_name = (getattr(current, "name", None) or "Laintas CLI") if current else "Laintas CLI"
+    headers, cookies = backend_profiles.request_auth(profile, session)
+
+    try:
+        resp = requests.post(
+            f"{profile.base_url}/api/agent/request-approval",
+            json={"kind": kind, "summary": summary, "detail": detail,
+                  "system": "laintas_cli", "terminal": terminal, "agent": agent_name},
+            headers=headers, cookies=cookies, timeout=10,
+        )
+    except requests.RequestException as e:
+        console.print(f"[red]Mail mode: could not request email approval ({e}) — denying.[/red]")
+        return False
+    if resp.status_code != 200:
+        console.print(f"[red]Mail mode: approval request failed (HTTP {resp.status_code}) — denying.[/red]")
+        return False
+
+    data = resp.json()
+    token = data.get("token")
+    timeout_s = int(data.get("expires_in") or 900)
+    if not token:
+        console.print("[red]Mail mode: no approval token returned — denying.[/red]")
+        return False
+
+    console.print(f"[cyan]Mail mode: emailed an approval request for {kind}. "
+                  f"Waiting up to {timeout_s // 60} min for your decision…[/cyan]")
+    deadline = time.time() + timeout_s
+    with console.status("[dim]Waiting for email approval…[/dim]"):
+        while time.time() < deadline:
+            try:
+                status_resp = requests.get(
+                    f"{profile.base_url}/api/agent/approval/{token}/status",
+                    headers=headers, cookies=cookies, timeout=10,
+                )
+                if status_resp.status_code == 200:
+                    status = status_resp.json().get("status")
+                    if status == "approved":
+                        console.print("[green]Mail mode: approved by email.[/green]")
+                        return True
+                    if status in ("denied", "expired"):
+                        console.print(f"[yellow]Mail mode: {status} by email.[/yellow]")
+                        return False
+            except requests.RequestException:
+                pass  # transient — keep polling until the deadline
+            time.sleep(_APPROVAL_POLL_INTERVAL)
+    console.print("[yellow]Mail mode: no response within the time limit — denying.[/yellow]")
+    return False
+
+
 def request_command_approval(command: str, reason: str) -> bool:
     """Block and ask the user to approve a command that matched a needs_approval
     policy rule. Wired as LoopDeps.request_command_approval for the local REPL."""
@@ -12664,6 +12730,9 @@ def request_command_approval(command: str, reason: str) -> bool:
             f"DELETE via shell command\n{command}",
             reason,
         )
+
+    if command.startswith("browser.evaluate ") and mode_manager.is_mail_mode():
+        return _request_email_approval("browser.evaluate", command, reason)
     if _session_approval_state["all_commands"] or command in _session_approval_state["approved_commands"]:
         return True
     choice = _blocking_approval_prompt(
@@ -12739,6 +12808,9 @@ def request_file_write_approval(path: str, diff_preview: str, reason: str) -> bo
 
 def request_file_delete_approval(path: str, preview: str, reason: str) -> bool:
     """Require a fresh confirmation for every destructive delete operation."""
+    if mode_manager.is_mail_mode():
+        detail = "\n".join(part for part in (reason, "", preview) if part)
+        return _request_email_approval("fs.delete", f"Delete: {path}", detail)
     body = "\n".join(part for part in (path, reason, "", preview) if part)
     choice = _blocking_approval_prompt(
         "Deletion approval required",
