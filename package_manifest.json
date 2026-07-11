@@ -33,7 +33,15 @@
     "version",
     "browser_session",
     "snapshot",
-    "webrtc_channel"
+    "webrtc_channel",
+    "json_store",
+    "mode_manager",
+    "event_log",
+    "session_store",
+    "usage_tracker",
+    "workflow_state",
+    "hwg_runner",
+    "worktree_manager"
   ],
 
   "packages": [
