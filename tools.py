@@ -930,6 +930,58 @@ def _resolve_backend_profile():
     return backend_profiles, profile
 
 
+_MAIL_TOOL_NAMES = ("mail.send_to_user", "mail.check_inbox")
+_mail_tool_base_descriptions: dict[str, str] = {}
+_mail_hint_cache = {"text": None, "fetched_at": 0.0}
+_MAIL_HINT_TTL = 3600  # re-fetch at most once an hour per process
+
+
+def refresh_mail_tool_hint(session: dict) -> None:
+    """Append a short, gateway-served usage nudge (notifications.MAIL_PROMPT_HINT)
+    to the mail tools' own catalog descriptions — kept there rather than as a
+    separate prompt section, since the guidance belongs to the tool, not a
+    standalone template variable. This is how gateway can reword the nudge
+    without a CLI release. No-op (clears back to the base description) for
+    logged-out sessions, since the tools it describes would just 401."""
+    registry = get_registry()
+    for name in _MAIL_TOOL_NAMES:
+        tool = registry.get(name)
+        if tool is None:
+            continue
+        _mail_tool_base_descriptions.setdefault(name, tool.description)
+
+    hint = _fetch_mail_prompt_hint(session)
+    for name in _MAIL_TOOL_NAMES:
+        tool = registry.get(name)
+        if tool is None:
+            continue
+        base = _mail_tool_base_descriptions[name]
+        tool.description = base + (f"\n{hint}" if hint else "")
+
+
+def _fetch_mail_prompt_hint(session: dict) -> str:
+    """Best-effort fetch of the gateway-served mail-tool usage hint. Empty
+    string if logged out, unreachable, or on any error: this is a prompt
+    nudge, never something the loop should block on or surface an error for."""
+    if not (session or {}).get("userId"):
+        return ""
+    now = time.time()
+    if _mail_hint_cache["text"] is not None and now - _mail_hint_cache["fetched_at"] < _MAIL_HINT_TTL:
+        return _mail_hint_cache["text"]
+    hint = _mail_hint_cache["text"] or ""
+    try:
+        import requests
+        _, profile = _resolve_backend_profile()
+        resp = requests.get(f"{profile.base_url}/api/agent/mail-prompt", timeout=3)
+        if resp.status_code == 200:
+            hint = str((resp.json() or {}).get("hint") or "")
+    except Exception:
+        pass  # keep last-known-good (or "") on any transient failure
+    _mail_hint_cache["text"] = hint
+    _mail_hint_cache["fetched_at"] = now
+    return hint
+
+
 def _bi_mail_send_to_user(params: dict, ctx: ToolCtx) -> dict:
     """Email the current account's own verified Laintas address (never an
     arbitrary recipient — the gateway resolves the address server-side).

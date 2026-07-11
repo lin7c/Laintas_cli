@@ -1907,6 +1907,7 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec("/mcp", "Manage MCP servers", "Config & Tools", "/mcp {list|trust|revoke|connect|disconnect|reload|tools|init|config}", subcommands=("list", "trust", "revoke", "connect", "disconnect", "reload", "tools", "init", "config")),
     CommandSpec("/bash", "Run a command through term0", "Config & Tools", "/bash <command>|list|add <command>|remove <command>", subcommands=("list", "add", "remove")),
     CommandSpec("/memory", "Inspect project and persistent memory", "Config & Tools", "/memory [project|persistent|show <id|name>]", subcommands=("project", "persistent", "global", "show")),
+    CommandSpec("/mail", "Check or send mail to/from your Laintas account", "Config & Tools", "/mail [inbox [--all]|read <n>|send [subject]]", subcommands=("inbox", "read", "send")),
     CommandSpec("/prop", "View .laintas/cli.prop prompt template", "Config & Tools"),
     CommandSpec("/debug", "Browse or export debug entries", "Config & Tools", "/debug [clear|N|N <file> [--raw]]", subcommands=("clear",)),
     CommandSpec("/detail", "Toggle full vs simplified progress rendering", "Config & Tools", "/detail [on|off]", subcommands=("on", "off")),
@@ -2797,6 +2798,63 @@ def fetch_available_models(session: dict) -> tuple[list[dict], str]:
         return models, endpoint
 
     raise RuntimeError(last_error or "No model endpoint responded")
+
+
+# ── Mail: /mail command support (thin client over the gateway's mailbox) ──
+
+def fetch_mail_inbox(session: dict, unread_only: bool = False) -> tuple[list[dict], str]:
+    """Returns (messages, error). error is "" on success."""
+    profile = get_backend_profile()
+    headers, cookies = backend_profiles.request_auth(profile, session)
+    try:
+        resp = requests.get(
+            f"{profile.base_url}/api/agent/inbox",
+            params={"unread_only": "true" if unread_only else "false"},
+            headers=headers, cookies=cookies, timeout=10,
+        )
+    except requests.RequestException as e:
+        return [], str(e)
+    if resp.status_code != 200:
+        return [], f"HTTP {resp.status_code}: {resp.text[:200]}"
+    try:
+        return resp.json().get("messages", []), ""
+    except ValueError:
+        return [], "Non-JSON response from /api/agent/inbox"
+
+
+def ack_mail_read(session: dict, email_ids: list[str]) -> None:
+    """Best-effort — a failed ack just means the message shows up again."""
+    profile = get_backend_profile()
+    headers, cookies = backend_profiles.request_auth(profile, session)
+    try:
+        requests.post(
+            f"{profile.base_url}/api/agent/inbox/ack",
+            json={"email_ids": email_ids},
+            headers=headers, cookies=cookies, timeout=10,
+        )
+    except requests.RequestException:
+        pass
+
+
+def send_mail(session: dict, subject: str, body: str) -> tuple[bool, str]:
+    """Returns (ok, error). error is "" on success."""
+    profile = get_backend_profile()
+    headers, cookies = backend_profiles.request_auth(profile, session)
+    try:
+        resp = requests.post(
+            f"{profile.base_url}/api/agent/send-email",
+            json={"subject": subject[:200], "body": body[:5000]},
+            headers=headers, cookies=cookies, timeout=10,
+        )
+    except requests.RequestException as e:
+        return False, str(e)
+    if resp.status_code >= 300:
+        try:
+            detail = resp.json().get("detail") or resp.text[:200]
+        except ValueError:
+            detail = resp.text[:200]
+        return False, detail
+    return True, ""
 
 
 def show_model_selector(models: list[dict], current: str = "") -> Optional[dict]:
@@ -6961,6 +7019,9 @@ _SLASH_ARG_RULES: dict[tuple[str, ...], SlashArgRule] = {
     ("/memory", "persistent"): _arg_rule(1, "/memory persistent"),
     ("/memory", "global"): _arg_rule(1, "/memory global"),
     ("/memory", "show"): _arg_rule(2, "/memory show <id|name>"),
+    ("/mail", "inbox"): _arg_rule(
+        2, "/mail inbox [--all]", flag_start=1, allowed_flags=("--all",)),
+    ("/mail", "read"): _arg_rule(2, "/mail read <n>"),
     ("/backend", "status"): _arg_rule(1, "/backend status"),
     ("/backend", "list"): _arg_rule(1, "/backend list"),
     ("/backend", "use"): _arg_rule(2, "/backend use <name>"),
@@ -8256,6 +8317,113 @@ def _cmd_memory(parts: list) -> None:
                 )
     else:
         console.print("[yellow]Usage: /memory [project|persistent|show <id|name>][/yellow]")
+
+
+# Last `/mail inbox` listing, so `/mail read <n>` can resolve a position to
+# an email_id without a second round trip. Session-lifetime only — reset by
+# the next `/mail inbox` call, not persisted.
+_last_mail_inbox: list[dict] = []
+
+
+def _fmt_mail_time(ts) -> str:
+    try:
+        return datetime.fromtimestamp(float(ts)).strftime("%Y-%m-%d %H:%M")
+    except (TypeError, ValueError, OSError):
+        return "?"
+
+
+def _cmd_mail(parts: list, raw_args: str, session: dict) -> None:
+    global _last_mail_inbox
+
+    if not session.get("userId"):
+        console.print("[yellow]Not logged in.[/yellow] Run [bold]/login[/bold] to use mail — "
+                      "it only works for a verified Laintas account.")
+        return
+
+    sub = parts[1].lower() if len(parts) > 1 else ""
+
+    if sub in ("", "help"):
+        console.print("Usage: [bold]/mail[/bold] [inbox [--all]|read <n>|send [subject]]")
+        console.print("[dim]inbox: list mail sent to your account's AI agent address. "
+                      "send: email yourself (needs your approval to actually send).[/dim]")
+
+    elif sub == "inbox":
+        show_all = "--all" in parts[2:]
+        with console.status("[dim]Checking inbox…[/dim]"):
+            messages, error = fetch_mail_inbox(session, unread_only=not show_all)
+        if error:
+            console.print(f"[red]Could not reach backend: {error}[/red]")
+            return
+        _last_mail_inbox = messages
+        if not messages:
+            console.print("[dim]No mail." + (
+                "" if show_all else " (use /mail inbox --all to include read messages)") + "[/dim]")
+            return
+        table = Table(title=f"Mail Inbox ({len(messages)})")
+        table.add_column("#", style="dim")
+        table.add_column("", width=1)  # unread marker
+        table.add_column("From", style="cyan")
+        table.add_column("Subject")
+        table.add_column("Received", style="dim")
+        for idx, m in enumerate(messages, start=1):
+            table.add_row(
+                str(idx),
+                "" if m.get("read") else "[green]*[/green]",
+                m.get("from", "?"),
+                m.get("subject", "(no subject)"),
+                _fmt_mail_time(m.get("received_at")),
+            )
+        console.print(table)
+        console.print("[dim]Use /mail read <n> to view one in full (marks it read).[/dim]")
+
+    elif sub == "read":
+        if len(parts) < 3 or not parts[2].isdigit():
+            console.print("[yellow]Usage: /mail read <n>[/yellow] (n from the last /mail inbox)")
+            return
+        n = int(parts[2])
+        if not _last_mail_inbox:
+            console.print("[dim]Run /mail inbox first.[/dim]")
+            return
+        if n < 1 or n > len(_last_mail_inbox):
+            console.print(f"[red]No message #{n} in the last /mail inbox listing.[/red]")
+            return
+        message = _last_mail_inbox[n - 1]
+        _print_long_panel(
+            message.get("body", ""),
+            f"From {message.get('from', '?')} · {message.get('subject', '(no subject)')}",
+        )
+        email_id = message.get("email_id")
+        if email_id and not message.get("read"):
+            ack_mail_read(session, [email_id])
+            message["read"] = True
+
+    elif sub == "send":
+        _, subject_arg = _raw_tail_after_word(raw_args)
+        subject = _decode_text_arg(subject_arg) if subject_arg else ""
+        if not subject:
+            try:
+                subject = input("Subject: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                subject = ""
+        if not subject:
+            console.print("[dim]Mail cancelled.[/dim]")
+            return
+        try:
+            body = input("Body: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            body = ""
+        if not body:
+            console.print("[dim]Mail cancelled.[/dim]")
+            return
+        with console.status("[dim]Sending…[/dim]"):
+            ok, error = send_mail(session, subject, body)
+        if ok:
+            console.print("[green]Sent to your verified account address.[/green]")
+        else:
+            console.print(f"[red]Send failed: {error}[/red]")
+
+    else:
+        console.print("[yellow]Usage: /mail [inbox [--all]|read <n>|send [subject]][/yellow]")
 
 
 def _cmd_prop() -> None:
@@ -11791,6 +11959,9 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
 
     elif action == "/memory":
         _cmd_memory(parts)
+
+    elif action == "/mail":
+        _cmd_mail(parts, raw_args, session)
 
     elif action == "/prop":
         _cmd_prop()

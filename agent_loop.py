@@ -4521,6 +4521,12 @@ def run_agent_loop(
             _prompt_lab_section = prompt_lab.get_prompt_lab_section()
         _prompt_lab_has_slot = "{{promptOpt}}" in prompt_template
 
+        # The mail tools' own catalog descriptions carry the gateway-served
+        # usage nudge (see tools.refresh_mail_tool_hint) — no separate
+        # template variable, since the guidance belongs to the tool, not a
+        # standalone prompt section. Empty/no-op for logged-out sessions.
+        tools_mod.refresh_mail_tool_hint(session)
+
         system_prompt = prompt_template \
             .replace("{{globalMemory}}", global_memory_str) \
             .replace("{{persistentMemory}}", memory_system.get_memory_context()) \
