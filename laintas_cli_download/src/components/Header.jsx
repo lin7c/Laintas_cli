@@ -5,6 +5,7 @@ import { useLanguage } from '../contexts/LanguageContext';
 import { useTheme } from '../contexts/ThemeContext';
 import { useAuth } from '../contexts/AuthContext';
 
+
 export default function Header() {
   const { lang, toggleLang, t } = useLanguage();
   const { theme, toggleTheme } = useTheme();
@@ -55,12 +56,14 @@ export default function Header() {
         style={{ border: '1px solid var(--card-border)' }}>
         {/* Left: Brand */}
         <Link to="/" className="flex items-center gap-2 flex-shrink-0 group">
-          <span style={{
-            display: 'inline-block', width: '7px', height: '7px',
-            borderRadius: '50%', background: 'var(--accent-soft)',
-            boxShadow: '0 0 8px var(--accent-glow)',
-          }} />
-          <span className="font-display text-lg font-semibold tracking-tight italic"
+          <span
+            className="inline-flex h-8 w-8 items-center justify-center rounded-lg border bg-white font-mono text-[18px] font-black leading-none shadow-sm"
+            style={{ borderColor: 'var(--border-strong)' }}
+          >
+            <span style={{ color: '#d83b32' }}>&gt;</span>
+            <span style={{ color: '#18a266' }}>/</span>
+          </span>
+          <span className="font-display text-lg font-semibold tracking-tight"
             style={{ color: 'var(--text-primary)' }}>
             laintas_cli
           </span>

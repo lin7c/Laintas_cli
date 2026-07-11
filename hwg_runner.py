@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import operator
 import re
 import threading
 import time
@@ -22,6 +21,50 @@ from hwg_adapter import HwgParseError, as_graph, parse as parse_hwg, validate as
 
 
 MAX_GRAPH_STEPS = 200
+
+
+def _prepare_node_tasks(run: dict, nodes: list[dict], cwd: str) -> dict:
+    """Create one stable Todo per HWG node and persist the mapping in the run."""
+    mapping = dict(run.get("nodeTasks") or {})
+    try:
+        import task_manager
+        for node in nodes:
+            node_id = str(node.get("id"))
+            if node_id in mapping:
+                continue
+            task = task_manager.create_task(
+                f"HWG node #{node_id}# ({node.get('file', '')})"[:200],
+                metadata={
+                    "workflowRunId": run.get("runId"),
+                    "nodeId": node_id,
+                    "kind": "hwg-node",
+                    "file": node.get("file", ""),
+                },
+                session_only=True,
+                cwd=cwd,
+            )
+            mapping[node_id] = {"taskId": task["id"], "cwd": cwd}
+    except Exception:
+        return mapping
+    run["nodeTasks"] = mapping
+    return mapping
+
+
+def _update_node_task(run: dict, node_id: str, status: str,
+                      progress: int = None, notes: str = None) -> None:
+    entry = (run.get("nodeTasks") or {}).get(str(node_id))
+    if not isinstance(entry, dict):
+        return
+    try:
+        import task_manager
+        fields = {"status": status}
+        if progress is not None:
+            fields["progress"] = max(0, min(100, int(progress)))
+        if notes:
+            fields["notes"] = notes[:400]
+        task_manager.update_task(entry["taskId"], cwd=entry.get("cwd"), **fields)
+    except Exception:
+        pass
 
 
 def _duration_seconds(value) -> Optional[float]:
@@ -54,20 +97,24 @@ def _literal_value(raw: str):
     return s
 
 
-def _resolve_ref(ref: str, graph_inputs: dict, node_outputs: dict):
+def _resolve_ref(ref: str, graph_inputs: dict, node_outputs: dict, node_output_history: Optional[dict] = None):
     if ref.startswith("$input."):
         return graph_inputs.get(ref[len("$input."):])
-    m = re.match(r"^#([A-Za-z_][A-Za-z0-9_-]*)\.([A-Za-z_][A-Za-z0-9_-]*)(?:\[-1\])?$", ref)
+    m = re.match(r"^#([A-Za-z_][A-Za-z0-9_-]*)\.([A-Za-z_][A-Za-z0-9_-]*)(\[-1\])?#$", ref)
     if m:
-        return (node_outputs.get(m.group(1)) or {}).get(m.group(2))
+        node_id, field, previous = m.group(1), m.group(2), bool(m.group(3))
+        if previous:
+            history = (node_output_history or {}).get(node_id) or []
+            return (history[-1] if history else {}).get(field)
+        return (node_outputs.get(node_id) or {}).get(field)
     return _literal_value(ref)
 
 
-def _build_node_inputs(node: dict, graph_inputs: dict, node_outputs: dict) -> dict:
+def _build_node_inputs(node: dict, graph_inputs: dict, node_outputs: dict, node_output_history: Optional[dict] = None) -> dict:
     values = {}
     for p in (node.get("io") or {}).get("in", []):
         src = p.get("source") or p.get("default")
-        values[p.get("name", "")] = _resolve_ref(src, graph_inputs, node_outputs) if src else None
+        values[p.get("name", "")] = _resolve_ref(src, graph_inputs, node_outputs, node_output_history) if src else None
     return values
 
 
@@ -111,6 +158,19 @@ def _extract_verdict(output: str, ok: bool, outputs: dict) -> str:
     return "PASS" if ok else "FAIL"
 
 
+def _coerce_compare(left, right):
+    """Coerce two values for ordering comparison. Returns (a, b) as floats if
+    both are numeric, as strings if both are non-numeric, or None if
+    incomparable (e.g. None vs int)."""
+    if left is None or right is None:
+        return None
+    try:
+        return float(left), float(right)
+    except (ValueError, TypeError):
+        pass
+    return str(left), str(right)
+
+
 def _edge_matches(edge: dict, verdict: str, outputs: dict) -> bool:
     on = (edge.get("on") or "").strip()
     if not on:
@@ -119,16 +179,26 @@ def _edge_matches(edge: dict, verdict: str, outputs: dict) -> bool:
     if eq:
         left = outputs.get(eq.group(1))
         right = _literal_value(eq.group(3))
-        op = {
-            "==": lambda a, b: str(a).upper() == str(b).upper(),
-            "!=": lambda a, b: str(a).upper() != str(b).upper(),
-            ">": operator.gt,
-            "<": operator.lt,
-            ">=": operator.ge,
-            "<=": operator.le,
-        }[eq.group(2)]
+        op_str = eq.group(2)
+        if op_str in ("==", "!="):
+            op = (lambda a, b: str(a).upper() == str(b).upper()) if op_str == "==" else (lambda a, b: str(a).upper() != str(b).upper())
+            try:
+                return bool(op(left, right))
+            except Exception:
+                return False
+        coerced = _coerce_compare(left, right)
+        if coerced is None:
+            return False
+        a, b = coerced
         try:
-            return bool(op(left, right))
+            if op_str == ">":
+                return a > b
+            if op_str == "<":
+                return a < b
+            if op_str == ">=":
+                return a >= b
+            if op_str == "<=":
+                return a <= b
         except Exception:
             return False
     in_match = re.match(r"^([A-Za-z_][A-Za-z0-9_-]*)\s+in\s+\[([^\]]*)\]$", on)
@@ -144,11 +214,12 @@ def _cache_key(path: str, node: dict, inputs: dict) -> str:
         source_hash = hashlib.sha256(Path(path).read_bytes()).hexdigest()
     except OSError:
         source_hash = ""
-    payload = json.dumps({"path": path, "node": node.get("id"), "inputs": inputs, "source": source_hash}, sort_keys=True, default=str)
+    payload = json.dumps({"path": path, "node": node.get("id"), "inputs": inputs, "source": source_hash, "io": node.get("io"), "policy": node.get("policy")}, sort_keys=True, default=str)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def _run_hwo_with_policy(node: dict, deps, session: dict, parent_id: Optional[str], inputs: dict) -> dict:
+def _run_hwo_with_policy(node: dict, deps, session: dict, parent_id: Optional[str], inputs: dict,
+                         events_cb=None) -> dict:
     policy = node.get("policy") or {}
     attempts = int(policy.get("retry") or 0) + 1
     timeout = _duration_seconds(policy.get("timeout"))
@@ -162,6 +233,7 @@ def _run_hwo_with_policy(node: dict, deps, session: dict, parent_id: Optional[st
     last = {"ok": False, "msg": "not run"}
     for attempt in range(1, max(1, attempts) + 1):
         holder: dict = {}
+        abort_event = threading.Event()
 
         def target():
             holder.update(hwo_runner.run_hwo_file(
@@ -170,15 +242,19 @@ def _run_hwo_with_policy(node: dict, deps, session: dict, parent_id: Optional[st
                 session=session,
                 parent_id=parent_id,
                 inputs=inputs,
+                abort_event=abort_event,
+                events_cb=events_cb,
             ))
 
         t = threading.Thread(target=target, daemon=True, name=f"hwg-node-{node['id']}")
         t.start()
         t.join(timeout=timeout)
         if t.is_alive():
+            abort_event.set()
+            t.join(timeout=2.0)
             last = {"ok": False, "msg": f"HWG node #{node['id']}# timed out after {timeout:g}s."}
-        else:
-            last = holder or {"ok": False, "msg": f"HWG node #{node['id']}# returned no result."}
+            break
+        last = holder or {"ok": False, "msg": f"HWG node #{node['id']}# returned no result."}
         if last.get("ok"):
             if cache_key:
                 workflow_state.cache_set(cache_key, last, cache_ttl)
@@ -225,7 +301,19 @@ def compile_hwg_file(path: str) -> dict:
     return {"ok": True, "msg": "\n".join(lines)}
 
 
-def run_hwg_file(path: str, deps, session: dict, parent_id: Optional[str] = None, inputs: Optional[dict] = None, resume_run: Optional[dict] = None) -> dict:
+def _emit_run(run: dict, event_type: str, payload: dict, events_cb=None) -> dict:
+    run = workflow_state.emit(run, event_type, payload)
+    if callable(events_cb):
+        try:
+            events_cb([{"runId": run.get("runId"), "type": event_type, **payload}])
+        except Exception:
+            pass
+    return run
+
+
+def run_hwg_file(path: str, deps, session: dict, parent_id: Optional[str] = None,
+                 inputs: Optional[dict] = None, resume_run: Optional[dict] = None,
+                 events_cb=None) -> dict:
     statements, err = _read_and_validate(path)
     if err:
         return {"ok": False, "msg": err}
@@ -245,18 +333,23 @@ def run_hwg_file(path: str, deps, session: dict, parent_id: Optional[str] = None
         has_incoming = {e["to"] for e in edges}
         starts = [n for n in nodes if n["id"] not in has_incoming]
         current = starts[0] if starts else None
+    _prepare_node_tasks(run, nodes, str(Path.cwd()))
     run = workflow_state.checkpoint(run, "run_started" if not resume_run else "run_resumed", {"path": path})
+    run = _emit_run(run, "workflow_started", {"path": path, "kind": "hwg"}, events_cb)
 
     outputs_text = []
-    steps = 0
+    steps = run.get("stepCount", 0) if resume_run else 0
     while current:
         if steps > MAX_GRAPH_STEPS:
             run["status"] = "failed"
             workflow_state.checkpoint(run, "step_limit_exceeded", {"limit": MAX_GRAPH_STEPS})
             return {"ok": False, "msg": f"HWG run exceeded {MAX_GRAPH_STEPS} steps.", "runId": run["runId"]}
         steps += 1
+        run["stepCount"] = steps
         run["currentNode"] = current["id"]
         run = workflow_state.checkpoint(run, "node_started", {"node": current["id"]})
+        _update_node_task(run, current["id"], "in_progress", 0)
+        run = _emit_run(run, "node_started", {"node": current["id"], "file": current["file"]}, events_cb)
 
         if current.get("manual"):
             interrupt = {
@@ -268,7 +361,9 @@ def run_hwg_file(path: str, deps, session: dict, parent_id: Optional[str] = None
             }
             run["status"] = "paused"
             run["pendingInterrupt"] = interrupt
+            _update_node_task(run, current["id"], "blocked", notes="Manual node requires human action")
             workflow_state.checkpoint(run, "interrupt", interrupt)
+            run = _emit_run(run, "workflow_paused", interrupt, events_cb)
             return {
                 "ok": False,
                 "paused": True,
@@ -279,22 +374,33 @@ def run_hwg_file(path: str, deps, session: dict, parent_id: Optional[str] = None
                 ),
             }
 
-        node_inputs = _build_node_inputs(current, run.get("inputs") or {}, run.get("nodeOutputs") or {})
-        result = _run_hwo_with_policy(current, deps, session, parent_id, node_inputs)
+        node_inputs = _build_node_inputs(current, run.get("inputs") or {}, run.get("nodeOutputs") or {}, run.get("nodeOutputHistory"))
+        result = _run_hwo_with_policy(current, deps, session, parent_id, node_inputs, events_cb)
         raw_outputs = _parse_structured_return(result.get("msg", ""))
         raw_outputs.update(result.get("outputs") or {})
         current_outputs = _declared_node_outputs(current, raw_outputs)
         verdict = _extract_verdict(result.get("msg", ""), bool(result.get("ok")), current_outputs)
         current_outputs.setdefault("verdict", verdict)
+        run.setdefault("nodeOutputHistory", {}).setdefault(current["id"], []).append(current_outputs)
         run.setdefault("nodeOutputs", {})[current["id"]] = current_outputs
         run.setdefault("history", []).append(current["id"])
         outputs_text.append(f"[#{current['id']}# -> {verdict}]\n{result.get('msg', '')}")
+        _update_node_task(
+            run, current["id"], "completed" if result.get("ok") else "blocked",
+            100 if result.get("ok") else None,
+            None if result.get("ok") else result.get("msg", ""),
+        )
         run = workflow_state.checkpoint(run, "node_finished", {"node": current["id"], "verdict": verdict, "outputs": current_outputs})
+        run = _emit_run(run, "node_completed" if result.get("ok") else "node_failed", {
+            "node": current["id"], "file": current["file"],
+            "verdict": verdict, "outputs": current_outputs,
+        }, events_cb)
 
         next_node = _choose_next(current, outgoing.get(current["id"], []), verdict, current_outputs, run)
         if isinstance(next_node, dict) and next_node.get("error"):
             run["status"] = "failed"
             workflow_state.checkpoint(run, "routing_failed", next_node)
+            run = _emit_run(run, "workflow_failed", next_node, events_cb)
             return {"ok": False, "msg": next_node["error"] + "\n\n" + "\n\n".join(outputs_text), "runId": run["runId"]}
         current = node_by_id.get(next_node) if next_node else None
 
@@ -302,6 +408,7 @@ def run_hwg_file(path: str, deps, session: dict, parent_id: Optional[str] = None
     run["currentNode"] = None
     run["pendingInterrupt"] = None
     workflow_state.checkpoint(run, "run_completed", {"history": run.get("history", [])})
+    run = _emit_run(run, "workflow_completed", {"history": run.get("history", [])}, events_cb)
     return {
         "ok": True,
         "runId": run["runId"],
@@ -331,7 +438,9 @@ def _choose_next(current: dict, outs: list, verdict: str, outputs: dict, run: di
     return {"error": f"HWG stopped at #{current['id']}#: all matching edges exhausted maxLoops."}
 
 
-def resume_hwg_run(run_id: str, deps, session: dict, parent_id: Optional[str] = None, verdict: str = "PASS", outputs: Optional[dict] = None) -> dict:
+def resume_hwg_run(run_id: str, deps, session: dict, parent_id: Optional[str] = None,
+                   verdict: str = "PASS", outputs: Optional[dict] = None,
+                   events_cb=None) -> dict:
     run = workflow_state.load_run(run_id)
     if not run:
         return {"ok": False, "msg": f"HWG run not found: {run_id}"}
@@ -342,6 +451,7 @@ def resume_hwg_run(run_id: str, deps, session: dict, parent_id: Optional[str] = 
     node_id = run["pendingInterrupt"]["node"]
     node_outputs = dict(outputs or {})
     node_outputs.setdefault("verdict", verdict.upper())
+    run.setdefault("nodeOutputHistory", {}).setdefault(node_id, []).append(node_outputs)
     run.setdefault("nodeOutputs", {})[node_id] = node_outputs
     run.setdefault("history", []).append(node_id)
     run["status"] = "running"
@@ -355,14 +465,23 @@ def resume_hwg_run(run_id: str, deps, session: dict, parent_id: Optional[str] = 
     node_by_id = {n["id"]: n for n in graph["nodes"]}
     for edge in graph["edges"]:
         outgoing.setdefault(edge["from"], []).append(edge)
-    next_id = _choose_next(node_by_id[node_id], outgoing.get(node_id, []), node_outputs["verdict"], node_outputs, run)
+    node = node_by_id.get(node_id)
+    if node is None:
+        run["status"] = "failed"
+        workflow_state.checkpoint(run, "resume_node_missing", {"node": node_id})
+        return {"ok": False, "msg": f"HWG run {run_id} paused at node #{node_id}#, but that node no longer exists in the source file. Update the .hwg file or cancel the run."}
+    next_id = _choose_next(node, outgoing.get(node_id, []), node_outputs["verdict"], node_outputs, run)
     if isinstance(next_id, dict) and next_id.get("error"):
         run["status"] = "failed"
         workflow_state.checkpoint(run, "resume_routing_failed", next_id)
         return {"ok": False, "msg": next_id["error"], "runId": run_id}
     run["currentNode"] = next_id
     workflow_state.checkpoint(run, "interrupt_resumed", {"node": node_id, "verdict": node_outputs["verdict"]})
-    return run_hwg_file(run["source"], deps, session, parent_id=parent_id, inputs=run.get("inputs") or {}, resume_run=run)
+    return run_hwg_file(
+        run["source"], deps, session, parent_id=parent_id,
+        inputs=run.get("inputs") or {}, resume_run=run,
+        events_cb=events_cb,
+    )
 
 
 def status(run_id: Optional[str] = None) -> dict:

@@ -110,6 +110,23 @@ def checkpoint(run: dict, label: str, payload: Optional[dict] = None, cwd: Optio
     return save_run(run, cwd=cwd)
 
 
+def emit(run: dict, event_type: str, payload: Optional[dict] = None,
+         cwd: Optional[str] = None) -> dict:
+    """Append a structured workflow event and persist the run atomically."""
+    event = {
+        "type": str(event_type),
+        "payload": dict(payload or {}),
+        "createdAt": time.time(),
+    }
+    updated = dict(run)
+    events = list(updated.get("events") or [])
+    event["seq"] = len(events) + 1
+    events.append(event)
+    # Keep the durable run bounded; checkpoints remain the compact recovery log.
+    updated["events"] = events[-500:]
+    return save_run(updated, cwd=cwd)
+
+
 def cache_get(key: str, cwd: Optional[str] = None) -> Optional[dict]:
     store = _read_json(_cache_path(cwd), {"entries": {}})
     entry = (store.get("entries") or {}).get(key)

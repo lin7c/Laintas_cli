@@ -29,6 +29,7 @@ import platform
 import webbrowser
 import threading
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 import difflib
 from contextlib import nullcontext
 from pathlib import Path
@@ -85,16 +86,16 @@ from prompt_toolkit.filters import Condition
 # Minimal palette: one accent, muted secondaries, semantic status colors.
 # Use these names instead of inline literals so the whole UI restyles here.
 LAINTAS_THEME = Theme({
-    "accent":   "#7aa2f7",          # primary brand-ish accent (soft blue)
-    "accent.dim": "#5a7bbf",
-    "success":  "#9ece6a",
-    "error":    "bold #f7768e",
-    "warning":  "#e0af68",
-    "muted":    "#6b7280",
-    "agent":    "#bb9af7",          # agent / orchestration (soft violet)
-    "path":     "bold #7aa2f7",
-    "glyph":    "#7aa2f7",
-    "rule":     "#3b4261",
+    "accent":   "#3fb950",          # primary accent — terminal green (青红 theme)
+    "accent.dim": "#2ea043",
+    "success":  "#4ade80",
+    "error":    "bold #f85149",
+    "warning":  "#e3b341",
+    "muted":    "#6b7d6b",          # green-biased grey
+    "agent":    "#a78bfa",          # agent / orchestration (soft violet, kept distinct)
+    "path":     "bold #3fb950",
+    "glyph":    "#3fb950",
+    "rule":     "#233323",
 })
 
 console = Console(theme=LAINTAS_THEME)
@@ -1337,11 +1338,13 @@ class InteractiveSession:
     drop-in replacement for the old execute_command_pty().
     """
 
-    def __init__(self, command: str, timeout: int = 120, stream_output: bool = False, persistent: bool = False):
+    def __init__(self, command: str, timeout: int = 120, stream_output: bool = False,
+                 persistent: bool = False, cwd: str = None):
         self.command = command
         self.timeout = timeout
         self.stream_output = stream_output
         self.persistent = persistent
+        self.cwd = os.path.abspath(cwd) if cwd else None
 
         self.pid: int = -1
         self.master_fd: int = -1
@@ -1400,6 +1403,11 @@ class InteractiveSession:
                 termios.tcsetwinsize(0, s)
             except (termios.error, OSError):
                 pass
+            if self.cwd:
+                try:
+                    os.chdir(self.cwd)
+                except OSError:
+                    os._exit(126)
             if self.persistent:
                 os.execve(DEFAULT_SHELL, [DEFAULT_SHELL], _child_env())
             else:
@@ -1755,28 +1763,60 @@ def display_sub_terminal_preview(command: str, output: str, depth: int = 0, aliv
     _emit_block(command, status_label, status_style, meta, preview, depth)
 
 
+def _md_escape(s: str) -> str:
+    """Escape Rich markup so diff/code content with [..] can't corrupt styling."""
+    from rich.markup import escape as _escape
+    return _escape(s)
+
+
+_DIFF_HUNK_RE = re.compile(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+
+
 def display_file_diff(path: str, diff_text: str, depth: int = 0) -> None:
-    """Display a compact, borderless unified diff preview (+/- colorized)."""
+    """Framed unified-diff preview: a +adds/−dels ribbon, real line numbers in
+    a gutter, and a green/red left rail so changed blocks read as shapes."""
     diff_lines = diff_text.splitlines() if diff_text else []
-    line_count = len(diff_lines)
-    preview_limit = 40
-    shown = diff_lines[:preview_limit]
+    adds = sum(1 for l in diff_lines
+               if l.startswith("+") and not l.startswith("+++"))
+    dels = sum(1 for l in diff_lines
+               if l.startswith("-") and not l.startswith("---"))
 
     pad = "  " * depth
-    console.print(f"{pad}[accent]▍[/accent] [bold]{path[:80]}[/bold]  "
-                  f"[accent]DIFF[/accent]  [muted]{line_count}L[/muted]")
-    inner = pad + "  "
-    for ln in shown:
-        if ln.startswith("+") and not ln.startswith("+++"):
-            console.print(f"{inner}[success]{ln}[/success]")
-        elif ln.startswith("-") and not ln.startswith("---"):
-            console.print(f"{inner}[error]{ln}[/error]")
-        elif ln.startswith("@@"):
-            console.print(f"{inner}[accent.dim]{ln}[/accent.dim]")
+    console.print(
+        f"{pad}[accent]▍[/accent] [bold]{_md_escape(path[:70])}[/bold]  "
+        f"[success]+{adds}[/success] [error]−{dels}[/error]", highlight=False)
+
+    preview_limit = 60
+    shown = 0
+    old_no = new_no = 0
+    for ln in diff_lines:
+        if shown >= preview_limit:
+            break
+        m = _DIFF_HUNK_RE.match(ln)
+        if m:
+            old_no, new_no = int(m.group(1)), int(m.group(2))
+            continue
+        if ln.startswith(("+++", "---", "diff ", "index ", "@@")):
+            continue
+        body = _md_escape(ln[:118])
+        if ln.startswith("+"):
+            console.print(f"{pad}[accent.dim]{new_no:>4}[/accent.dim] "
+                          f"[success]┃{body}[/success]", highlight=False)
+            new_no += 1
+        elif ln.startswith("-"):
+            console.print(f"{pad}[error]{old_no:>4} ┃{body}[/error]", highlight=False)
+            old_no += 1
         else:
-            console.print(f"{inner}[muted]{ln}[/muted]")
-    if line_count > preview_limit:
-        console.print(f"{inner}[muted]… {line_count - preview_limit} more lines[/muted]")
+            text = _md_escape(ln[1:119] if ln.startswith(" ") else ln[:118])
+            console.print(f"{pad}[muted]{new_no:>4}[/muted] "
+                          f"[rule]│[/rule] [muted]{text}[/muted]", highlight=False)
+            old_no += 1
+            new_no += 1
+        shown += 1
+    remaining = len([l for l in diff_lines
+                     if not l.startswith(("+++", "---", "diff ", "index ", "@@"))]) - shown
+    if remaining > 0:
+        console.print(f"{pad}[muted]     … {remaining} more line(s)[/muted]", highlight=False)
 
 
 # ── prompt_toolkit Input Setup ──────────────────────────────────────────
@@ -1847,7 +1887,7 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec("/abort", "Abort an agent", "Agents & Terminals", "/abort <agent-id>"),
     CommandSpec("/hwo", "Open or run an orchestration workflow", "Planning & Tasks", "/hwo [file|run <file>|compile <file>]", subcommands=("run", "compile")),
     CommandSpec("/hwg", "Compile, run, or resume an HWO graph workflow", "Planning & Tasks", "/hwg {run|compile|resume|status|cancel} ...", subcommands=("run", "compile", "resume", "status", "cancel")),
-    CommandSpec("/mode", "Show, switch, or create agent modes", "Planning & Tasks", "/mode [act|plan [task]|review|list|create|delete]", subcommands=("act", "plan", "review", "list", "create", "delete")),
+    CommandSpec("/mode", "Show, switch, or create agent modes", "Planning & Tasks", "/mode [act [always]|plan [task]|review|list|create|delete]", subcommands=("act", "always", "plan", "review", "list", "create", "delete")),
     CommandSpec("/plan", "Create, revise, review, or approve versioned plans", "Planning & Tasks", "/plan {enter|submit|revise|approve|exit|status|list}", subcommands=("enter", "submit", "revise", "approve", "exit", "status", "list")),
     CommandSpec("/prompt", "Open Prompt Lab or manage tested prompt overlays", "Planning & Tasks", "/prompt [issue|subcommand]", subcommands=("status", "branches", "open", "chat", "review", "test", "activate", "disable", "patches", "profiles", "profile", "use", "rollback", "feedback", "fail", "optimize", "apply", "discard", "list", "skill", "export", "install", "publish")),
     CommandSpec("/evolve", "Create, improve, test, and hot-load project extensions", "Planning & Tasks", "/evolve [idea|subcommand]", subcommands=("status", "branches", "open", "chat", "review", "test", "activate", "disable", "candidates", "profiles", "profile", "use", "rollback", "list", "help")),
@@ -2052,30 +2092,33 @@ class MetaCompleter(Completer):
 def _build_prompt_style() -> Style:
     """Build prompt_toolkit Style for the prompt, completion menu, and status bar."""
     return Style.from_dict({
-        "prompt-path": "bold #7aa2f7",
-        "separator": "#bb9af7",
-        "paste-placeholder": "bold #7aa2f7 bg:#2a2a37",
-        # Completion menu (Tokyo Night palette)
-        "completion-menu": "bg:#1a1b26",
-        "completion-menu.completion": "bg:#1a1b26 #c0caf5",
-        "completion-menu.completion.current": "bg:#364a82 #1a1b26 bold",
-        "completion-menu.meta.completion": "bg:#16161e #565f89",
-        "completion-menu.meta.completion.current": "bg:#16161e #7aa2f7",
+        "prompt-path": "bold #3fb950",
+        "prompt-gutter": "#2ea043 bold",     # green status gutter (Act mode)
+        "prompt-gutter-plan": "#e3b341 bold", # hollow amber gutter (Plan mode)
+        "prompt-caret": "#4ade80 bold",       # the animated green ❯
+        "separator": "#3fb950",
+        "paste-placeholder": "bold #4ade80 bg:#16211a",
+        # Completion menu (青红 green palette)
+        "completion-menu": "bg:#0e140e",
+        "completion-menu.completion": "bg:#0e140e #c9d4c5",
+        "completion-menu.completion.current": "bg:#1f5f30 #dffbe6 bold",
+        "completion-menu.meta.completion": "bg:#0b0f0b #6b7d6b",
+        "completion-menu.meta.completion.current": "bg:#0b0f0b #4ade80",
         # Bottom status bar
-        "bottom-toolbar": "bg:#16161e #9aa5ce",
-        "stbar-sep": "bg:#16161e #2a2a37",
-        "stbar-model": "bg:#16161e #7aa2f7 bold",
-        "stbar-mode-act": "bg:#16161e #9ece6a bold",
-        "stbar-mode-plan": "bg:#16161e #e0af68 bold",
-        "stbar-tokens": "bg:#16161e #bb9af7",
-        "stbar-time": "bg:#16161e #565f89",
-        "stbar-dot-act": "bg:#16161e #9ece6a bold",
-        "stbar-dot-plan": "bg:#16161e #e0af68 bold",
+        "bottom-toolbar": "bg:#0b0f0b #9aab97",
+        "stbar-sep": "bg:#0b0f0b #233323",
+        "stbar-model": "bg:#0b0f0b #3fb950 bold",
+        "stbar-mode-act": "bg:#0b0f0b #4ade80 bold",
+        "stbar-mode-plan": "bg:#0b0f0b #e3b341 bold",
+        "stbar-tokens": "bg:#0b0f0b #2ea043",
+        "stbar-time": "bg:#0b0f0b #6b7d6b",
+        "stbar-dot-act": "bg:#0b0f0b #4ade80 bold",
+        "stbar-dot-plan": "bg:#0b0f0b #e3b341 bold",
         # rprompt (right side of prompt line — no background)
-        "rprompt-mode-act": "#9ece6a bold",
-        "rprompt-mode-plan": "#e0af68 bold",
-        "rprompt-sep": "#2a2a37",
-        "rprompt-model": "#7aa2f7",
+        "rprompt-mode-act": "#4ade80 bold",
+        "rprompt-mode-plan": "#e3b341 bold",
+        "rprompt-sep": "#233323",
+        "rprompt-model": "#3fb950",
     })
 
 
@@ -2328,6 +2371,12 @@ def _render_rprompt():
     _mode_label = (
         "PLAN" if _is_plan else mode_manager.get_active_mode()["name"].upper()
     )
+    # Auto-approve indicator: suffix the mode with * whenever writes or commands
+    # are being auto-approved this session — via a mode's auto_approve posture or
+    # an explicit "Always" choice. E.g. ACT*, OPS*.
+    if not _is_plan and (_session_approval_state.get("all_writes")
+                         or _session_approval_state.get("all_commands")):
+        _mode_label += "*"
     _mode_cls = "rprompt-mode-plan" if _is_plan else "rprompt-mode-act"
     _model = _status_cache.get("model", "") or "default"
     return [
@@ -2406,11 +2455,27 @@ def pt_prompt(cwd: str) -> str:
     """Read user input with prompt_toolkit (PTY-based terminal input)."""
     session = get_prompt_session()
     disp = _shorten_path(cwd, max_len=60)
+    # Plan mode drives the gutter colour (hollow amber) vs Act (solid green).
+    try:
+        import plan_mode as _pm
+        _gutter_cls = "class:prompt-gutter-plan" if _pm.is_plan_mode() else "class:prompt-gutter"
+        _gutter_ch = "▏ " if _pm.is_plan_mode() else "▐ "
+    except Exception:
+        _gutter_cls, _gutter_ch = "class:prompt-gutter", "▐ "
+
+    # Static green caret (rotation animation removed — redrawing every
+    # keystroke felt laggy).
+    _prompt_message = [
+        (_gutter_cls, _gutter_ch),
+        ("class:prompt-path", disp),
+        ("", "\n"),
+        (_gutter_cls, _gutter_ch),
+        ("class:prompt-caret", "❯ "),
+    ]
+
     try:
         user_input = session.prompt(
-            [("class:prompt-path", disp),
-             ("", "\n"),
-             ("class:separator", "❯ ")],
+            _prompt_message,
             style=_build_prompt_style(),
             multiline=False,
             rprompt=_render_rprompt(),
@@ -2562,38 +2627,71 @@ def _atomic_private_json(path: Path, payload: dict) -> None:
             pass
 
 
+_instance_preferences: Optional[dict] = None
+
+
+def _instance_preferences_path() -> Path:
+    """Return the private preference file for this CLI process instance."""
+    instance_id = getattr(paths, "INSTANCE_ID", f"pid-{os.getpid()}")
+    return paths.SESSIONS_DIR / f"{instance_id}_preferences.json"
+
+
+def _load_instance_preferences() -> dict:
+    """Load process-local UI preferences once, never from global config."""
+    global _instance_preferences
+    if _instance_preferences is not None:
+        return _instance_preferences
+
+    _instance_preferences = {}
+    path = _instance_preferences_path()
+    if not path.exists() or not paths.ensure_private_file(path):
+        return _instance_preferences
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            _instance_preferences = data
+    except (OSError, json.JSONDecodeError):
+        pass
+    return _instance_preferences
+
+
+def _save_instance_preferences() -> None:
+    """Atomically save process-local UI preferences with private permissions."""
+    _atomic_private_json(_instance_preferences_path(), _load_instance_preferences())
+
+
 def get_selected_model() -> str:
-    """Return the configured model name, if any."""
-    val = load_config().get("model", "")
+    """Return this CLI instance's selected model, if any."""
+    val = _load_instance_preferences().get("model", "")
     return str(val).strip() if val else ""
 
 
 def set_selected_model(model: str) -> None:
-    """Persist the selected backend model name."""
-    config = load_config()
+    """Persist the selected model for this CLI instance only."""
+    preferences = _load_instance_preferences()
     model = model.strip()
     if model:
-        config["model"] = model
+        preferences["model"] = model
     else:
-        config.pop("model", None)
-    save_config(config)
+        preferences.pop("model", None)
+    _save_instance_preferences()
 
 
 def get_selected_provider() -> str:
-    """Return the configured provider id, if any."""
-    val = load_config().get("provider", "")
+    """Return this CLI instance's selected provider, if any."""
+    val = _load_instance_preferences().get("provider", "")
     return str(val).strip() if val else ""
 
 
 def set_selected_provider(provider: str) -> None:
-    """Persist the selected provider id."""
-    config = load_config()
+    """Persist the selected provider for this CLI instance only."""
+    preferences = _load_instance_preferences()
     provider = provider.strip()
     if provider:
-        config["provider"] = provider
+        preferences["provider"] = provider
     else:
-        config.pop("provider", None)
-    save_config(config)
+        preferences.pop("provider", None)
+    _save_instance_preferences()
 
 
 def _normalize_model_entry(item) -> dict:
@@ -4449,6 +4547,17 @@ class TerminalSession:
 class AgentRegistry:
     """Manages remote agent registration with Helpwo backend."""
 
+    # Bound both active work and queued work. A remote client must not be able
+    # to turn the polling loop into an unbounded thread/PTY factory.
+    # The executor ceilings are deliberately higher than the defaults. The
+    # user-facing values live in agent_loop's /config registry and are
+    # enforced by the bounded scheduler below.
+    REMOTE_EXECUTOR_THREADS = 64
+    REMOTE_CONTROL_EXECUTOR_THREADS = 4
+    REMOTE_CONTROL_KINDS = frozenset({
+        "abort", "approval-response", "disconnect", "term-close",
+    })
+
     def __init__(self):
         self.agent_id: Optional[str] = None
         self.agent_secret: str = ""
@@ -4479,6 +4588,15 @@ class AgentRegistry:
         self._last_agent_id: str = ""
         # Serializes background Helpwo chats (they share the REPL history).
         self._chat_run_lock = threading.Lock()
+        self._remote_executor = self._new_remote_executor()
+        self._remote_control_executor = ThreadPoolExecutor(
+            max_workers=self.REMOTE_CONTROL_EXECUTOR_THREADS,
+            thread_name_prefix="laintas-remote-control",
+        )
+        self._remote_capacity_lock = threading.Condition(threading.RLock())
+        self._remote_accepted = {"task": 0, "control": 0}
+        self._remote_running = {"task": 0, "control": 0}
+        self._remote_stopping = threading.Event()
 
         # ── Async event bus (Phase 1) ───────────────────────────────────
         # _event_q holds batches of events (each item is a list[dict]).
@@ -4498,6 +4616,57 @@ class AgentRegistry:
 
         # ── WebRTC peer-to-peer file channel (lazy) ─────────────────────
         self._webrtc = None  # WebrtcManager | False(unavailable) | None(not yet)
+
+    def _new_remote_executor(self):
+        return ThreadPoolExecutor(
+            max_workers=self.REMOTE_EXECUTOR_THREADS,
+            thread_name_prefix="laintas-remote",
+        )
+
+    @staticmethod
+    def _remote_limits(control: bool) -> tuple[int, int]:
+        """Read the live /config limits for one remote work class."""
+        from agent_loop import get_runtime_config
+        if control:
+            return (
+                int(get_runtime_config("remote_control_workers")),
+                int(get_runtime_config("remote_control_queue_size")),
+            )
+        return (
+            int(get_runtime_config("remote_max_workers")),
+            int(get_runtime_config("remote_queue_size")),
+        )
+
+    def _reserve_remote_capacity(self, control: bool) -> bool:
+        group = "control" if control else "task"
+        workers, queued = self._remote_limits(control)
+        with self._remote_capacity_lock:
+            if self._remote_accepted[group] >= workers + queued:
+                return False
+            self._remote_accepted[group] += 1
+            return True
+
+    def _run_bounded_remote(self, message: dict, agent_state_cb,
+                            chat_history_cb, control: bool) -> None:
+        group = "control" if control else "task"
+        try:
+            with self._remote_capacity_lock:
+                while (not self._remote_stopping.is_set()
+                       and self._remote_running[group] >= self._remote_limits(control)[0]):
+                    self._remote_capacity_lock.wait(timeout=0.25)
+                if self._remote_stopping.is_set():
+                    return
+                self._remote_running[group] += 1
+            try:
+                self._handle_remote_message(message, agent_state_cb, chat_history_cb)
+            finally:
+                with self._remote_capacity_lock:
+                    self._remote_running[group] -= 1
+                    self._remote_capacity_lock.notify_all()
+        finally:
+            with self._remote_capacity_lock:
+                self._remote_accepted[group] -= 1
+                self._remote_capacity_lock.notify_all()
 
     def _ensure_webrtc(self):
         """Lazily create the WebRTC manager. Returns it, or None if aiortc is
@@ -4540,6 +4709,16 @@ class AgentRegistry:
 
     def register(self, session: dict, name: str = None, quiet: bool = False) -> bool:
         """Register this CLI as a remote agent with Helpwo backend."""
+        # A disconnect shuts down the old pool; allow a later /connect to
+        # create a fresh one on the same registry instance.
+        if self._remote_executor is None:
+            self._remote_executor = self._new_remote_executor()
+        if self._remote_control_executor is None:
+            self._remote_control_executor = ThreadPoolExecutor(
+                max_workers=self.REMOTE_CONTROL_EXECUTOR_THREADS,
+                thread_name_prefix="laintas-remote-control",
+            )
+        self._remote_stopping.clear()
         self._session = session
         hostname = socket.gethostname()
         cwd = os.getcwd()
@@ -4822,12 +5001,30 @@ class AgentRegistry:
                         # (chat/delegate can run for minutes) never stalls
                         # the poll loop — term-new/term-close/abort from
                         # Helpwo must stay responsive throughout.
-                        threading.Thread(
-                            target=self._handle_remote_message,
-                            args=(msg, agent_state_cb, chat_history_cb),
-                            daemon=True,
-                            name=f"laintas-remote-{msg.get('kind', 'chat')}",
-                        ).start()
+                        kind = msg.get("kind")
+                        control = kind in self.REMOTE_CONTROL_KINDS
+                        executor = self._remote_control_executor if control else self._remote_executor
+                        if not self._reserve_remote_capacity(control):
+                            req_id = msg.get("reqId") or msg.get("id")
+                            self._push_final(
+                                req_id, "busy",
+                                "remote task capacity is full; retry later",
+                            )
+                            continue
+
+                        try:
+                            executor.submit(
+                                self._run_bounded_remote, msg,
+                                agent_state_cb, chat_history_cb, control)
+                        except RuntimeError:
+                            group = "control" if control else "task"
+                            with self._remote_capacity_lock:
+                                self._remote_accepted[group] -= 1
+                                self._remote_capacity_lock.notify_all()
+                            req_id = msg.get("reqId") or msg.get("id")
+                            self._push_final(
+                                req_id, "busy", "remote task executor is stopping",
+                            )
                 elif resp.status_code in (403, 404):
                     self._recover_registration()
             except requests.RequestException:
@@ -5026,22 +5223,18 @@ class AgentRegistry:
         ))
 
         self._push(req_id, "cmd-start", "", {"command": cmd, "cwd": cwd})
-        sess = InteractiveSession(cmd, timeout=timeout)
-        old_cwd = os.getcwd()
+        try:
+            cwd = os.path.abspath(cwd)
+            if not os.path.isdir(cwd):
+                raise OSError(f"not a directory: {cwd}")
+        except (TypeError, OSError) as e:
+            self._push_final(req_id, "fail", f"invalid cwd: {e}")
+            return
+
+        sess = InteractiveSession(cmd, timeout=timeout, cwd=cwd)
         start = time.time()
         try:
-            try:
-                os.chdir(cwd)
-            except OSError as e:
-                self._push_final(req_id, "fail", f"cd {cwd} failed: {e}")
-                return
-            try:
-                sess.start()
-            finally:
-                try:
-                    os.chdir(old_cwd)
-                except OSError:
-                    pass
+            sess.start()
 
             # Line-buffered streaming: hold a partial-line buffer between
             # PTY reads so the UI never displays a half-formed line.
@@ -5948,6 +6141,15 @@ class AgentRegistry:
         finals/outputs make it to the backend before the process exits.
         """
         self._running = False
+        self._remote_stopping.set()
+        with self._remote_capacity_lock:
+            self._remote_capacity_lock.notify_all()
+        if self._remote_executor is not None:
+            self._remote_executor.shutdown(wait=False, cancel_futures=True)
+            self._remote_executor = None
+        if self._remote_control_executor is not None:
+            self._remote_control_executor.shutdown(wait=False, cancel_futures=True)
+            self._remote_control_executor = None
 
         # Flush queued events (≤2s) then stop the sender thread so the
         # final unregister POST is the last thing we do.
@@ -6742,7 +6944,8 @@ _SLASH_ARG_RULES: dict[tuple[str, ...], SlashArgRule] = {
     ("/model", "reset"): _arg_rule(1, "/model reset"),
     ("/model", "clear"): _arg_rule(1, "/model clear"),
     ("/model", "default"): _arg_rule(1, "/model default"),
-    ("/mode", "act"): _arg_rule(1, "/mode act"),
+    ("/mode", "act"): _arg_rule(2, "/mode act [always]"),
+    ("/mode", "always"): _arg_rule(1, "/mode always"),
     ("/mode", "review"): _arg_rule(1, "/mode review"),
     ("/mode", "approve"): _arg_rule(1, "/mode approve"),
     ("/mode", "list"): _arg_rule(1, "/mode list"),
@@ -8158,14 +8361,30 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
                 title="Plan Mode", border_style="green",
             ))
 
-        elif sub == "act":
+        elif sub in ("act", "always", "act-always"):
+            # `/mode act always` (or `/mode always`) → ACT with every file write
+            # and command auto-approved for this session (shown as ACT*). Plain
+            # `/mode act` restores confirmations by clearing that session state,
+            # giving a mid-session way to turn auto-approve back off.
+            _always = (sub in ("always", "act-always")
+                       or any(p.lower() == "always" for p in parts[2:]))
             if _in_plan:
                 _pm_mode.exit_plan_mode(approve=False)
             ok, msg = mode_manager.activate("act")
-            console.print(
-                f"[{'green' if ok else 'red'}]{_escape(msg)}"
-                f"[/{'green' if ok else 'red'}]"
-                + (" [dim](draft plan saved)[/dim]" if _cur_plan else ""))
+            if _always:
+                _session_approval_state["all_writes"] = True
+                _session_approval_state["all_commands"] = True
+                console.print(
+                    "[green]ACT [bold]always-approve[/bold] — file writes and "
+                    "commands are auto-approved this session ([bold]ACT*[/bold]).[/green]\n"
+                    "[dim]Run /mode act to turn confirmations back on.[/dim]")
+            else:
+                _session_approval_state["all_writes"] = False
+                _session_approval_state["all_commands"] = False
+                console.print(
+                    f"[{'green' if ok else 'red'}]{_escape(msg)}"
+                    f"[/{'green' if ok else 'red'}]"
+                    + (" [dim](draft plan saved)[/dim]" if _cur_plan else ""))
 
         elif sub == "approve":
             # Backward compatibility. Approval is a plan action, not a mode.
@@ -8201,25 +8420,58 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
             for item in mode_manager.list_modes():
                 marker = "[green]*[/green]" if item["name"] == active_name else " "
                 source = "built-in" if item["builtin"] else "custom"
+                _bits = [item["description"], source]
+                _allow = item.get("allowed_tools")
+                if _allow is not None:
+                    _bits.append(f"tools: {', '.join(_allow[:4])}"
+                                 + ("…" if len(_allow) > 4 else ""))
+                if item.get("denied_tools"):
+                    _bits.append(f"deny: {', '.join(item['denied_tools'][:3])}")
+                if item.get("auto_approve", "none") != "none":
+                    _bits.append(f"auto-approve: {item['auto_approve']}")
                 console.print(
                     f"{marker} [cyan]{item['name']}[/cyan] "
-                    f"[dim]{item['description']} · {source}[/dim]")
+                    f"[dim]{_escape(' · '.join(_bits))}[/dim]")
 
         elif sub == "create":
             if len(parts) < 4:
                 console.print(
-                    "[yellow]Usage: /mode create <name> [--read-only] "
-                    "<instructions>[/yellow]")
+                    "[yellow]Usage: /mode create <name> [--tools \"fs.*,web.search\"] "
+                    "[--deny \"shell.*\"] [--read-only] "
+                    "[--auto-approve none|writes|commands|all] <instructions>[/yellow]")
             else:
                 name = parts[2]
-                read_only = "--read-only" in parts[3:]
-                instructions = " ".join(
-                    item for item in parts[3:] if item != "--read-only")
+                _cargs = parts[3:]
+                _allowed = _denied = None
+                _auto = "none"
+                _read_only = False
+                _rest = []
+                _i = 0
+                while _i < len(_cargs):
+                    _a = _cargs[_i]
+                    if _a == "--read-only":
+                        _read_only = True; _i += 1
+                    elif _a == "--tools" and _i + 1 < len(_cargs):
+                        _allowed = [t.strip() for t in _cargs[_i + 1].split(",") if t.strip()]; _i += 2
+                    elif _a == "--deny" and _i + 1 < len(_cargs):
+                        _denied = [t.strip() for t in _cargs[_i + 1].split(",") if t.strip()]; _i += 2
+                    elif _a == "--auto-approve" and _i + 1 < len(_cargs):
+                        _auto = _cargs[_i + 1].strip().lower(); _i += 2
+                    else:
+                        _rest.append(_a); _i += 1
+                instructions = " ".join(_rest)
                 ok, msg = mode_manager.create_mode(
-                    name, instructions, read_only=read_only)
+                    name, instructions, read_only=_read_only,
+                    allowed_tools=_allowed, denied_tools=_denied,
+                    auto_approve=_auto)
                 console.print(
                     f"[{'green' if ok else 'red'}]{_escape(msg)}"
                     f"[/{'green' if ok else 'red'}]")
+                if ok and _auto != "none":
+                    console.print(
+                        f"[yellow]⚠ Mode '{name}' auto-approves {_auto} — "
+                        f"file writes/commands run without confirmation while it's "
+                        f"active (shown as {name.upper()}*). Hard deny rules still apply.[/yellow]")
 
         elif sub == "delete":
             mode_name = parts[2] if len(parts) == 3 else ""
@@ -8264,9 +8516,15 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
                 if _in_plan:
                     _pm_mode.exit_plan_mode(approve=False)
                 ok, msg = mode_manager.activate(sub)
+                if ok:
+                    _sync_session_approval_from_mode()
             console.print(
                 f"[{'green' if ok else 'red'}]{_escape(msg)}"
                 f"[/{'green' if ok else 'red'}]")
+            if ok and mode_manager.get_auto_approve() != "none":
+                console.print(
+                    f"[dim]↳ {sub.upper()}* — auto-approving "
+                    f"{mode_manager.get_auto_approve()} this session.[/dim]")
 
         else:
             active = mode_manager.get_active_mode()
@@ -8274,7 +8532,18 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
                 "name": "plan",
                 "description": "Reviewed, read-only planning",
             }, *mode_manager.list_modes()]
-            active_name = "plan" if _in_plan else active["name"]
+            # Offer the always-approve variant right after act.
+            _act_i = next((i for i, o in enumerate(options)
+                           if o["name"] == "act"), None)
+            if _act_i is not None:
+                options.insert(_act_i + 1, {
+                    "name": "act-always",
+                    "description": "ACT with file writes & commands auto-approved (ACT*)",
+                })
+            _auto = _session_approval_state.get("all_writes")
+            active_name = ("plan" if _in_plan
+                           else ("act-always" if _auto and active["name"] == "act"
+                                 else active["name"]))
             selected_index = next(
                 (i for i, item in enumerate(options)
                  if item["name"] == active_name), 0)
@@ -8297,10 +8566,24 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
                         console.print(
                             "[green]PLAN mode armed.[/green] "
                             "[dim]Describe the task in your next message.[/dim]")
+                elif target == "act-always":
+                    if _in_plan:
+                        _pm_mode.exit_plan_mode(approve=False)
+                    mode_manager.activate("act")
+                    _session_approval_state["all_writes"] = True
+                    _session_approval_state["all_commands"] = True
+                    console.print(
+                        "[green]ACT [bold]always-approve[/bold] — writes & commands "
+                        "auto-approved this session ([bold]ACT*[/bold]).[/green]\n"
+                        "[dim]Pick ACT to turn confirmations back on.[/dim]")
                 else:
                     if _in_plan:
                         _pm_mode.exit_plan_mode(approve=False)
                     ok, msg = mode_manager.activate(target)
+                    # Sync session auto-approve to the mode's posture (a plain
+                    # mode with auto_approve=none clears any prior auto-approve).
+                    if ok:
+                        _sync_session_approval_from_mode()
                     console.print(
                         f"[{'green' if ok else 'red'}]{_escape(msg)}"
                         f"[/{'green' if ok else 'red'}]")
@@ -11229,18 +11512,39 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
     elif action == "/hwo":
         sub = parts[1].lower() if len(parts) > 1 else ""
         current = get_current_agent()
-        if sub in ("run", "compile") and len(parts) >= 3:
+        if sub == "status":
+            import hwo_runner
+            r = hwo_runner.status(parts[2] if len(parts) >= 3 else None)
+            console.print(r.get("msg", ""))
+        elif sub in ("run", "compile") and len(parts) >= 3:
             # /hwo run <path>  or  /hwo compile <path>
             import hwo_runner
             path = " ".join(parts[2:])
             if sub == "compile":
                 r = hwo_runner.compile_hwo_file(path)
             else:
+                def _hwo_progress(event):
+                    if isinstance(event, list):
+                        for item in event:
+                            _hwo_progress(item)
+                        return
+                    kind = event.get("type")
+                    if kind == "workflow_started":
+                        console.print(f"[dim]HWO {event.get('runId')} started[/dim]")
+                    elif kind == "step_started":
+                        console.print(f"[cyan]▶ {event.get('stepId', '?')} started[/cyan]")
+                    elif kind == "step_completed":
+                        console.print(f"[green]✓ {event.get('stepId', '?')} completed[/green]")
+                    elif kind == "step_failed":
+                        console.print(f"[red]✗ {event.get('stepId', '?')} failed[/red]")
+                    elif kind == "workflow_completed":
+                        console.print(f"[green]HWO {event.get('runId')} completed[/green]")
                 r = hwo_runner.run_hwo_file(
                     path=path,
                     deps=get_loop_deps(),
                     session=session,
                     parent_id=current.id if current else None,
+                    events_cb=_hwo_progress,
                 )
             style = "[green]" if r.get("ok") else "[red]"
             console.print(f"{style}{r.get('msg', '')}[/]")
@@ -11273,6 +11577,20 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
         import hwg_runner
         sub = parts[1].lower() if len(parts) > 1 else "status"
         current = get_current_agent()
+        def _hwg_progress(event):
+            if isinstance(event, list):
+                for item in event:
+                    _hwg_progress(item)
+                return
+            kind = event.get("type")
+            if kind == "node_started":
+                console.print(f"[cyan]▶ HWG node #{event.get('node', '?')} started[/cyan]")
+            elif kind == "node_completed":
+                console.print(f"[green]✓ HWG node #{event.get('node', '?')} completed[/green]")
+            elif kind == "node_failed":
+                console.print(f"[red]✗ HWG node #{event.get('node', '?')} failed[/red]")
+            elif kind == "workflow_paused":
+                console.print(f"[yellow]HWG paused at node #{event.get('node', '?')}[/yellow]")
         if sub in ("run", "compile") and len(parts) >= 3:
             path = " ".join(parts[2:])
             if sub == "compile":
@@ -11283,6 +11601,7 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
                     deps=get_loop_deps(),
                     session=session,
                     parent_id=current.id if current else None,
+                    events_cb=_hwg_progress,
                 )
         elif sub == "resume" and len(parts) >= 3:
             run_id = parts[2]
@@ -11305,6 +11624,7 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
                 parent_id=current.id if current else None,
                 verdict=verdict,
                 outputs=outputs,
+                events_cb=_hwg_progress,
             )
         elif sub == "status":
             r = hwg_runner.status(parts[2] if len(parts) >= 3 else None)
@@ -11778,6 +12098,21 @@ def _reset_session_approvals():
     _session_approval_state["all_writes"] = False
 
 
+def _sync_session_approval_from_mode():
+    """Set session auto-approve flags from the active mode's auto_approve posture.
+
+    Called after switching modes so a mode's declared auto-approve (none/writes/
+    commands/all) takes effect immediately — and switching to a plain mode
+    (auto_approve=none) clears any prior auto-approve.
+    """
+    try:
+        aa = mode_manager.get_auto_approve()
+    except Exception:
+        aa = "none"
+    _session_approval_state["all_writes"] = aa in ("writes", "all")
+    _session_approval_state["all_commands"] = aa in ("commands", "all")
+
+
 def _arrow_approval_prompt(title: str, body_lines: list[str],
                            options: list[str]) -> Optional[str]:
     """Inline arrow-key approval selector.
@@ -11906,6 +12241,12 @@ def authorize_direct_command(command: str, cwd: str = None) -> tuple[bool, str]:
     if decision.action == "deny":
         return False, f"Blocked by policy: {decision.reason}"
     if decision.action == "needs_approval":
+        # Commands the USER types directly at the REPL run like a normal
+        # terminal — no confirmation box — since the human is the trusted
+        # actor here (the approval gate exists to supervise the AI agent).
+        # Set /config confirm_direct_commands true to restore the prompt.
+        if not get_runtime_config("confirm_direct_commands"):
+            return True, ""
         if not request_command_approval(command, decision.reason):
             return False, f"User denied: {decision.reason}"
     return True, ""
@@ -12246,7 +12587,9 @@ def main():
     # Load or create config
     config = load_config()
     agent_name = args.name or config.get("agentName", socket.gethostname())
-    _update_status_cache(model=config.get("model", ""))
+    # Model/provider selection is instance-local, so opening another CLI
+    # process cannot overwrite this process's status or request defaults.
+    _update_status_cache(model=get_selected_model())
 
     # Official mode uses the Laintas account. Custom/local backends are a
     # separate trust and billing domain and must not require or receive it.
