@@ -8,14 +8,14 @@ when the user explicitly trusts the current executable file hashes.
 from __future__ import annotations
 
 import hashlib
-import json
-import os
-import tempfile
 import time
 from pathlib import Path
 from typing import Optional
 
+import json_store
 import paths
+
+_DEFAULT_TRUST = {"version": 1, "projects": {}, "generated": {}, "files": {}, "extensions": {}}
 
 
 EXECUTABLE_PROJECT_FILES = (paths.CWD_COMMANDS, paths.CWD_LOOP)
@@ -35,37 +35,17 @@ def _project_key(project_dir: Path) -> str:
 
 def _load() -> dict:
     if paths.TRUST_FILE.exists() and not paths.ensure_private_file(paths.TRUST_FILE):
-        return {"version": 1, "projects": {}, "generated": {}, "files": {}, "extensions": {}}
-    try:
-        data = json.loads(paths.TRUST_FILE.read_text(encoding="utf-8"))
-        if isinstance(data, dict):
-            data.setdefault("version", 1)
-            data.setdefault("projects", {})
-            data.setdefault("generated", {})
-            data.setdefault("files", {})
-            data.setdefault("extensions", {})
-            return data
-    except (OSError, ValueError):
-        pass
-    return {"version": 1, "projects": {}, "generated": {}, "files": {}, "extensions": {}}
+        return dict(_DEFAULT_TRUST)
+    data = json_store.load_json(paths.TRUST_FILE, default=lambda: dict(_DEFAULT_TRUST))
+    if isinstance(data, dict):
+        for key, val in _DEFAULT_TRUST.items():
+            data.setdefault(key, dict(val) if isinstance(val, dict) else val)
+        return data
+    return dict(_DEFAULT_TRUST)
 
 
 def _save(data: dict) -> None:
-    paths.TRUST_FILE.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(
-        prefix="trust-", suffix=".tmp", dir=str(paths.TRUST_FILE.parent))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(data, handle, ensure_ascii=False, indent=2)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.chmod(tmp_name, 0o600)
-        os.replace(tmp_name, paths.TRUST_FILE)
-    finally:
-        try:
-            os.unlink(tmp_name)
-        except OSError:
-            pass
+    json_store.save_json_atomic(paths.TRUST_FILE, data, mode=0o600)
 
 
 def record_generated_file(path: Path, expected_content: str) -> None:

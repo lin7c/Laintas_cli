@@ -13,13 +13,13 @@ keyed by repo working directory.
 """
 from __future__ import annotations
 
-import json
 import os
 import subprocess
 import tempfile
 import time
 from typing import List, Optional
 
+import json_store
 import paths
 
 _MAX_PER_REPO = 25
@@ -49,20 +49,18 @@ def _store_path():
 
 
 def _load_store() -> dict:
-    p = _store_path()
-    if not p.exists():
-        return {}
-    try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+    return json_store.load_json(_store_path(), default=dict)
 
 
 def _save_store(store: dict) -> None:
+    # Atomic (temp file + fsync + rename) via json_store — this used to be a
+    # direct write_text(), which could truncate/corrupt checkpoints.json if
+    # the process died mid-write. That would be particularly bad here since
+    # this file backs the "undo my agent's damage" safety net.
     try:
         paths.ensure_home()
-        _store_path().write_text(json.dumps(store, indent=2), encoding="utf-8")
-    except Exception:
+        json_store.save_json_atomic(_store_path(), store)
+    except OSError:
         pass
 
 

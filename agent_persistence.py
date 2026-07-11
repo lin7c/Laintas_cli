@@ -24,7 +24,6 @@ What is NOT persisted (runtime-only):
 
 from __future__ import annotations
 
-import json
 import os
 import stat
 import time
@@ -35,6 +34,7 @@ if TYPE_CHECKING:
     from agent_loop import AgentInfo
 
 
+import json_store
 import paths
 
 AGENTS_DIR = paths.AGENTS_DIR
@@ -84,38 +84,18 @@ def save_agent_state(agent: "AgentInfo") -> bool:
         "last_saved": time.time(),
     }
 
-    target = _agent_file(agent.id)
-    tmp = target.with_suffix(".tmp")
     try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, target)
-        try:
-            os.chmod(target, stat.S_IRUSR | stat.S_IWUSR)
-        except OSError:
-            pass
+        json_store.save_json_atomic(_agent_file(agent.id), data,
+                                    mode=stat.S_IRUSR | stat.S_IWUSR)
         return True
     except (OSError, TypeError, ValueError):
-        try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
         return False
 
 
 def load_agent_state(agent_id: str) -> Optional[dict]:
     """Read and return the persisted dict; None if not found or unreadable."""
-    target = _agent_file(agent_id)
-    if not target.exists():
-        return None
-    try:
-        with open(target, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, dict):
-            return None
-        return data
-    except (OSError, ValueError):
-        return None
+    data = json_store.load_json(_agent_file(agent_id))
+    return data if isinstance(data, dict) else None
 
 
 def delete_agent_state(agent_id: str) -> bool:
@@ -172,15 +152,11 @@ def list_persisted_agents() -> list[dict]:
         return []
     out = []
     for p in sorted(AGENTS_DIR.glob("*.json")):
-        try:
-            with open(p, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict) and data.get("id"):
-                meta = {k: v for k, v in data.items() if k != "chat_history"}
-                meta["history_turns"] = len(data.get("chat_history", []))
-                out.append(meta)
-        except (OSError, ValueError):
-            continue
+        data = json_store.load_json(p)
+        if isinstance(data, dict) and data.get("id"):
+            meta = {k: v for k, v in data.items() if k != "chat_history"}
+            meta["history_turns"] = len(data.get("chat_history", []))
+            out.append(meta)
     return out
 
 

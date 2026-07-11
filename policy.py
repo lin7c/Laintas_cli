@@ -357,6 +357,21 @@ def evaluate(command: str, cwd: str = None,
                 # In audit mode, deny rules still block
                 return PolicyDecision("deny", rule.pattern, reason)
 
+    # ── Destructive delete utilities: always-ask tier ───────────────────
+    # rm/rmdir/unlink/shred (direct or via xargs) are treated like
+    # evaluate_file_delete() — approval is required in BOTH audit and
+    # enforce mode, not just enforce. Previously audit mode folded this
+    # into the "advisory" needs_approval loop below and silently allowed
+    # it; that let a shell-issued `rm -rf` slip through with zero prompt
+    # the same way the fs.delete tool did (2026-07-11 incident). "disabled"
+    # mode still bypasses everything, same as every other check in this
+    # function (mode == "disabled" never matches an "enforce"/"audit"
+    # branch, so it silently falls through to allow).
+    if mode != "disabled" and is_delete_command(stripped):
+        reason = "delete command always requires approval (audit and enforce modes alike)"
+        _write_audit(_audit_entry(command, "needs_approval", reason, cwd, req_id, agent_id))
+        return PolicyDecision("needs_approval", "", reason)
+
     # ── Check needs_approval list ──────────────────────────────────────
     # Deny rules take precedence over sudo approval.  Otherwise approving
     # `sudo rm -rf /` would bypass the destructive-command deny list.
@@ -566,10 +581,12 @@ def evaluate_file_delete(path: str, cwd: str | None = None,
                          agent_id: str | None = None) -> PolicyDecision:
     """Evaluate deletion of one filesystem target.
 
-    Sensitive credential/config targets remain denied.  In enforce mode every
-    other deletion requires explicit confirmation, including targets inside
-    the current project.  Audit mode records the decision and allows it;
-    disabled mode bypasses policy entirely.
+    Deletion is an always-ask tier, decoupled from the general audit/enforce
+    posture: sensitive credential/config targets remain denied, and every
+    other deletion requires explicit confirmation in BOTH audit and enforce
+    mode (previously audit mode silently auto-allowed deletions — see the
+    2026-07-11 incident where a goal-less agent turn deleted a project file
+    with zero prompt). Only "disabled" mode bypasses policy entirely.
     """
     cfg = _load_config()
     mode = cfg.get("mode", "audit")
@@ -595,15 +612,19 @@ def evaluate_file_delete(path: str, cwd: str | None = None,
                 label, "deny", reason, cwd, req_id, agent_id))
             return PolicyDecision("deny", pattern, reason)
 
-    if mode == "enforce":
-        reason = "enforce mode requires approval for all file deletions"
-        _write_audit(_audit_entry(
-            label, "needs_approval", reason, cwd, req_id, agent_id))
-        return PolicyDecision("needs_approval", "", reason)
-
+    reason = "deletion always requires approval (audit and enforce modes alike)"
     _write_audit(_audit_entry(
-        label, "allow", "audit mode allows deletion", cwd, req_id, agent_id))
-    return PolicyDecision("allow")
+        label, "needs_approval", reason, cwd, req_id, agent_id))
+    return PolicyDecision("needs_approval", "", reason)
+
+
+# `evaluate` runs arbitrary JS in the page context — the browser-automation
+# analog of shell.exec's "run anything", not a routine testing action like
+# navigate/click/type. Unlike those (left mode-dependent so automated test
+# flows aren't interrupted by a prompt on every click), `evaluate` is always
+# an always-ask tier regardless of audit/enforce, matching the fs.delete /
+# shell-delete-command treatment.
+_ALWAYS_ASK_BROWSER_ACTIONS = {"evaluate"}
 
 
 def evaluate_browser_action(action: str, params: dict,
@@ -614,12 +635,14 @@ def evaluate_browser_action(action: str, params: dict,
     Counterpart to evaluate() / evaluate_file_write(), but for headless-browser
     automation.  Same three-tier model:
       - allow: proceed immediately
-      - needs_approval: ask the user (in enforce mode)
+      - needs_approval: ask the user (enforce mode always; audit mode only
+        for the always-ask tier — see _ALWAYS_ASK_BROWSER_ACTIONS)
       - deny: block entirely
 
     Read-only actions (snapshot, query, get_url, get_title, screenshot,
     wait_for, scroll, go_back, go_forward) are always allowed.
-    Actions in browserApprovalActions need approval in enforce mode.
+    Actions in browserApprovalActions need approval in enforce mode (plus
+    always-ask actions in audit mode too).
     URL and JS deny patterns always block (except in disabled mode).
     """
     cfg = _load_config()
@@ -686,9 +709,9 @@ def evaluate_browser_action(action: str, params: dict,
 
         reason = f"browser.{action} needs approval ({summary})"
         _write_audit(_audit_entry(label, "needs_approval", reason, None, req_id, agent_id))
-        if mode == "enforce":
+        if mode == "enforce" or action in _ALWAYS_ASK_BROWSER_ACTIONS:
             return PolicyDecision("needs_approval", "", reason)
-        # audit mode: log but allow
+        # audit mode: log but allow (except always-ask actions handled above)
 
     # ── Allow by default ────────────────────────────────────────────────
     _write_audit(_audit_entry(label, "allow", "default allow", None, req_id, agent_id))

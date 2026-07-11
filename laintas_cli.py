@@ -2372,10 +2372,12 @@ def _render_rprompt():
         "PLAN" if _is_plan else mode_manager.get_active_mode()["name"].upper()
     )
     # Auto-approve indicator: suffix the mode with * whenever writes or commands
-    # are being auto-approved this session — via a mode's auto_approve posture or
-    # an explicit "Always" choice. E.g. ACT*, OPS*.
+    # are being auto-approved this session — via a mode's auto_approve posture,
+    # or at least one remembered per-target "Always" approval. E.g. ACT*, OPS*.
     if not _is_plan and (_session_approval_state.get("all_writes")
-                         or _session_approval_state.get("all_commands")):
+                         or _session_approval_state.get("all_commands")
+                         or _session_approval_state.get("approved_write_paths")
+                         or _session_approval_state.get("approved_commands")):
         _mode_label += "*"
     _mode_cls = "rprompt-mode-plan" if _is_plan else "rprompt-mode-act"
     _model = _status_cache.get("model", "") or "default"
@@ -7973,3691 +7975,3951 @@ def _show_usage_command(args: list, session: dict) -> None:
     ))
 
 
-def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: dict, interactive_session=None) -> bool:
-    """Handle meta commands. Returns True if should exit."""
-    action, raw_args, parts = _parse_slash_command(cmd)
-    _validate_slash_args(action, parts[1:])
+# ── Meta-command handlers ──────────────────────────────────────────────
+# _handle_meta_command_impl is a big elif-chain dispatcher (one branch per
+# slash command). Extracting each branch's body into its own _cmd_* function
+# is a gradual, mechanical decomposition of that function — each extraction
+# preserves the exact original control flow (explicit `return` where the
+# original branch returned early, none where it originally fell through to
+# the dispatcher's final `return False`), it just gives the branch body a
+# name and moves it out of the growing elif chain.
 
-    if action == "/":
-        selected = show_command_palette()
-        if selected:
-            if not _enqueue_user_input(selected):
-                console.print("[red]Could not queue the selected command. Please run it directly.[/red]")
+def _cmd_palette() -> bool:
+    selected = show_command_palette()
+    if selected:
+        if not _enqueue_user_input(selected):
+            console.print("[red]Could not queue the selected command. Please run it directly.[/red]")
+    return False
+
+
+def _cmd_exit(raw_args: str, agent_registry: AgentRegistry) -> bool:
+    if raw_args:
+        console.print("[yellow]Usage: /exit[/yellow]")
         return False
+    stop_trigger_scanner()
+    close_all_terminals()
+    browser_mod.close_all_browser_sessions()
+    agent_registry.unregister()
+    clear_session()
+    console.print("[green]Logged out. Goodbye![/green]")
+    return True
 
-    if action == "/exit":
-        if raw_args:
-            console.print("[yellow]Usage: /exit[/yellow]")
-            return False
-        stop_trigger_scanner()
-        close_all_terminals()
-        browser_mod.close_all_browser_sessions()
-        agent_registry.unregister()
-        clear_session()
-        console.print("[green]Logged out. Goodbye![/green]")
-        return True
 
-    if action in ("/quit", "/q"):
-        if raw_args:
-            console.print(f"[yellow]Usage: {action}[/yellow]")
-            return False
-        if _IN_SUB_TERMINAL:
-            # Running inside a sub-terminal — detach like /back instead of quitting
-            sys.stdout.write("\x1b]777;LAINTAS_DETACH\x07")
-            sys.stdout.flush()
-            console.print("[green]Detaching...[/green]")
-            return False
-        stop_trigger_scanner()
-        close_all_terminals()
-        browser_mod.close_all_browser_sessions()
-        agent_registry.unregister()
-        console.print("[green]Goodbye![/green]")
-        return True
-
-    elif action == "/back":
-        if raw_args:
-            console.print("[yellow]Usage: /back[/yellow]")
-            return False
-        if not _IN_SUB_TERMINAL:
-            console.print("[dim]/back only detaches from a sub-terminal.[/dim]")
-            return False
-        # Signal parent enter_session to detach without closing this terminal
+def _cmd_quit(action: str, raw_args: str, agent_registry: AgentRegistry) -> bool:
+    if raw_args:
+        console.print(f"[yellow]Usage: {action}[/yellow]")
+        return False
+    if _IN_SUB_TERMINAL:
+        # Running inside a sub-terminal — detach like /back instead of quitting
         sys.stdout.write("\x1b]777;LAINTAS_DETACH\x07")
         sys.stdout.flush()
         console.print("[green]Detaching...[/green]")
         return False
+    stop_trigger_scanner()
+    close_all_terminals()
+    browser_mod.close_all_browser_sessions()
+    agent_registry.unregister()
+    console.print("[green]Goodbye![/green]")
+    return True
 
-    elif action == "/help":
-        show_help(parts[1] if len(parts) > 1 else "")
 
-    elif action == "/resume":
-        console.print("[yellow]/resume is handled by the main REPL. Type it at the prompt to resume a saved session.[/yellow]")
+def _cmd_back(raw_args: str) -> bool:
+    if raw_args:
+        console.print("[yellow]Usage: /back[/yellow]")
+        return False
+    if not _IN_SUB_TERMINAL:
+        console.print("[dim]/back only detaches from a sub-terminal.[/dim]")
+        return False
+    # Signal parent enter_session to detach without closing this terminal
+    sys.stdout.write("\x1b]777;LAINTAS_DETACH\x07")
+    sys.stdout.flush()
+    console.print("[green]Detaching...[/green]")
+    return False
 
-    elif action in _NEW_SESSION_COMMANDS:
-        console.print("[yellow]/new is handled by the main REPL. Type it at the prompt to start a new session.[/yellow]")
 
-    elif action == "/login":
-        choice = choose_login_method()
-        if choice == "remote":
-            new_session = login_via_browser()
+def _cmd_help(parts: list) -> None:
+    show_help(parts[1] if len(parts) > 1 else "")
+
+
+def _cmd_resume() -> None:
+    console.print("[yellow]/resume is handled by the main REPL. Type it at the prompt to resume a saved session.[/yellow]")
+
+
+def _cmd_new_session_notice() -> None:
+    console.print("[yellow]/new is handled by the main REPL. Type it at the prompt to start a new session.[/yellow]")
+
+
+def _cmd_login(session: dict, agent_registry: AgentRegistry) -> None:
+    choice = choose_login_method()
+    if choice == "remote":
+        new_session = login_via_browser()
+    else:
+        new_session = None
+        console.print("[dim]Login cancelled.[/dim]")
+    if new_session:
+        session.clear()
+        session.update(new_session)
+        # Refresh the Helpwo link only if this terminal was already
+        # /connect-ed — logging in never auto-links (two-end handshake).
+        if agent_registry.agent_id:
+            agent_registry.register(session, quiet=True)
+        console.print(f"[green]Logged in as {new_session.get('userEmail') or new_session.get('userName') or new_session['userId']}[/green]")
+
+
+def _cmd_model(parts: list, raw_args: str, session: dict) -> None:
+    if len(parts) >= 2 and parts[1].lower() in ("reset", "clear", "default"):
+        set_selected_model("")
+        set_selected_provider("")
+        _update_status_cache(model="")
+        console.print("[green]Model reset. Backend default will be used.[/green]")
+    elif len(parts) >= 2:
+        model = _decode_text_arg(raw_args)
+        set_selected_model(model)
+        _update_status_cache(model=model)
+        console.print(f"[green]Model set to: [bold]{model}[/bold][/green]")
+    else:
+        current = get_selected_model()
+        current_provider = get_selected_provider()
+        try:
+            with console.status("[dim]Fetching available models…[/dim]"):
+                models, endpoint = fetch_available_models(session)
+        except Exception as e:
+            console.print(f"[red]Failed to fetch models: {e}[/red]")
+            console.print(f"Current model: [bold]{current or 'backend default'}[/bold]")
+            console.print("Usage: /model <model-id>  or  /model reset")
         else:
-            new_session = None
-            console.print("[dim]Login cancelled.[/dim]")
-        if new_session:
-            session.clear()
-            session.update(new_session)
-            # Refresh the Helpwo link only if this terminal was already
-            # /connect-ed — logging in never auto-links (two-end handshake).
-            if agent_registry.agent_id:
-                agent_registry.register(session, quiet=True)
-            console.print(f"[green]Logged in as {new_session.get('userEmail') or new_session.get('userName') or new_session['userId']}[/green]")
-
-    elif action == "/model":
-        if len(parts) >= 2 and parts[1].lower() in ("reset", "clear", "default"):
-            set_selected_model("")
-            set_selected_provider("")
-            _update_status_cache(model="")
-            console.print("[green]Model reset. Backend default will be used.[/green]")
-        elif len(parts) >= 2:
-            model = _decode_text_arg(raw_args)
-            set_selected_model(model)
-            _update_status_cache(model=model)
-            console.print(f"[green]Model set to: [bold]{model}[/bold][/green]")
-        else:
-            current = get_selected_model()
-            current_provider = get_selected_provider()
-            try:
-                with console.status("[dim]Fetching available models…[/dim]"):
-                    models, endpoint = fetch_available_models(session)
-            except Exception as e:
-                console.print(f"[red]Failed to fetch models: {e}[/red]")
-                console.print(f"Current model: [bold]{current or 'backend default'}[/bold]")
-                console.print("Usage: /model <model-id>  or  /model reset")
-            else:
-                if models and sys.stdin.isatty():
-                    selected = show_model_selector(models, current)
-                    if selected:
-                        model_id = selected.get("id", "") if isinstance(selected, dict) else selected
-                        provider_id = selected.get("provider", "") if isinstance(selected, dict) else ""
-                        set_selected_model(model_id)
-                        set_selected_provider(provider_id)
-                        _update_status_cache(model=model_id)
-                        info = f"[bold]{model_id}[/bold]"
-                        if provider_id:
-                            info += f" ([dim]{provider_id}[/dim])"
-                        console.print(f"[green]Model set to: {info}[/green]")
-                    else:
-                        console.print("[dim]Model selection cancelled.[/dim]")
+            if models and sys.stdin.isatty():
+                selected = show_model_selector(models, current)
+                if selected:
+                    model_id = selected.get("id", "") if isinstance(selected, dict) else selected
+                    provider_id = selected.get("provider", "") if isinstance(selected, dict) else ""
+                    set_selected_model(model_id)
+                    set_selected_provider(provider_id)
+                    _update_status_cache(model=model_id)
+                    info = f"[bold]{model_id}[/bold]"
+                    if provider_id:
+                        info += f" ([dim]{provider_id}[/dim])"
+                    console.print(f"[green]Model set to: {info}[/green]")
                 else:
-                    table = Table(title=f"Available Models ({endpoint})")
-                    table.add_column("#", style="dim")
-                    table.add_column("Current", style="green")
-                    table.add_column("Model ID", style="cyan")
-                    table.add_column("Name")
-                    table.add_column("Provider")
-                    for idx, m in enumerate(models, start=1):
-                        marker = "*" if current and m["id"] == current else ""
-                        table.add_row(
-                            str(idx),
-                            marker,
-                            m["id"],
-                            m.get("name", ""),
-                            m.get("provider", ""),
-                        )
-                    if not models:
-                        table.add_row("", "", "(none)", "", "")
-                    console.print(table)
-                    console.print(f"Current model: [bold]{current or 'backend default'}[/bold]" +
-                                  (f" ([dim]{current_provider}[/dim])" if current_provider else ""))
-                    if models and not sys.stdin.isatty():
-                        console.print(
-                            "[dim]Non-interactive terminal: select explicitly with "
-                            "/model <model-id>.[/dim]")
-                console.print("Set directly with [bold]/model <model-id>[/bold], reset with [bold]/model reset[/bold].")
-
-    elif action == "/name":
-        if raw_args:
-            name = _decode_text_arg(raw_args)
-            config = load_config()
-            config["agentName"] = name
-            save_config(config)
-            console.print(f"[green]Agent name set to: {name}[/green]")
-            # Re-register under the new name only if already /connect-ed —
-            # renaming never auto-links (two-end handshake).
-            if agent_registry.agent_id:
-                agent_registry.unregister()
-                agent_registry.agent_id = None
-                agent_registry.agent_secret = ""
-                agent_registry.register(session, name=name, quiet=True)
-                agent_registry.start_heartbeat()
-                agent_registry.start_message_poll(
-                    agent_registry._state_cb or (lambda: {}),
-                    agent_registry._chat_cb or (lambda: []),
-                )
-        else:
-            config = load_config()
-            current = config.get("agentName", socket.gethostname())
-            console.print(f"Current agent name: [bold]{current}[/bold]")
-            console.print("Usage: /name <new-name>")
-            console.print("       /term rename <old> <new>  (rename a terminal)")
-
-    elif action == "/memory":
-        import memory_system
-        sub = parts[1].lower() if len(parts) > 1 else ""
-        project_entries, project_errors, _ = _load_project_memory_entries()
-        persistent_entries = memory_system.list_memories()
-
-        if sub in ("", "project"):
-            if project_errors:
-                console.print(Panel(
-                    "\n".join(f"[red]- {error}[/red]" for error in project_errors)
-                    + f"\n\n[dim]Fix {paths.project_file(paths.CWD_MEMORY)} and retry /memory project.[/dim]",
-                    title="Project Memory: invalid", border_style="red",
-                ))
-            elif project_entries:
-                lines = [
-                    f"[bold]{entry.get('id')}.[/bold] {entry.get('content', '')}"
-                    for entry in project_entries
-                ]
-                console.print(Panel(
-                    "\n".join(lines),
-                    title=f"Project memory ({len(project_entries)} entries)",
-                    border_style="cyan",
-                ))
+                    console.print("[dim]Model selection cancelled.[/dim]")
             else:
-                console.print("[dim]Project memory is empty.[/dim]")
-            if sub == "":
-                console.print(
-                    f"[dim]Persistent memory: {len(persistent_entries)} visible entr"
-                    f"{'y' if len(persistent_entries) == 1 else 'ies'}. "
-                    "Use /memory persistent to list them.[/dim]")
-
-        elif sub in ("persistent", "global"):
-            if not persistent_entries:
-                console.print("[dim]No persistent memories are visible in this scope.[/dim]")
-            else:
-                table = Table(title="Persistent Memory", show_lines=False)
-                table.add_column("Name", style="cyan")
-                table.add_column("Type")
-                table.add_column("Scope", style="dim")
-                table.add_column("Description")
-                for entry in persistent_entries:
+                table = Table(title=f"Available Models ({endpoint})")
+                table.add_column("#", style="dim")
+                table.add_column("Current", style="green")
+                table.add_column("Model ID", style="cyan")
+                table.add_column("Name")
+                table.add_column("Provider")
+                for idx, m in enumerate(models, start=1):
+                    marker = "*" if current and m["id"] == current else ""
                     table.add_row(
-                        entry.get("name", "?"), entry.get("type", "unknown"),
-                        entry.get("scope", "?"), entry.get("description", ""),
+                        str(idx),
+                        marker,
+                        m["id"],
+                        m.get("name", ""),
+                        m.get("provider", ""),
                     )
+                if not models:
+                    table.add_row("", "", "(none)", "", "")
                 console.print(table)
-                console.print("[dim]Run /memory show to choose an entry, or pass its name directly.[/dim]")
+                console.print(f"Current model: [bold]{current or 'backend default'}[/bold]" +
+                              (f" ([dim]{current_provider}[/dim])" if current_provider else ""))
+                if models and not sys.stdin.isatty():
+                    console.print(
+                        "[dim]Non-interactive terminal: select explicitly with "
+                        "/model <model-id>.[/dim]")
+            console.print("Set directly with [bold]/model <model-id>[/bold], reset with [bold]/model reset[/bold].")
 
-        elif sub == "show":
-            selector = parts[2] if len(parts) >= 3 else ""
-            selected_kind = ""
-            if not selector and sys.stdin.isatty():
-                choices = [
-                    {"kind": "project", **entry}
-                    for entry in project_entries
-                ] + [
-                    {"kind": "persistent", **entry}
-                    for entry in persistent_entries
-                ]
-                chosen = choose_record(
-                    choices,
-                    title="View Memory",
-                    label=lambda item: (
-                        f"project #{item.get('id')}" if item["kind"] == "project"
-                        else f"persistent · {item.get('name', '?')}"),
-                    description=lambda item: (
-                        str(item.get("content") or "")[:100]
-                        if item["kind"] == "project"
-                        else item.get("description", "")),
-                    search=True,
-                )
-                if chosen:
-                    selected_kind = chosen["kind"]
-                    selector = (str(chosen.get("id"))
-                                if selected_kind == "project"
-                                else chosen.get("name", ""))
-            if not selector:
-                console.print("[dim]Memory selection cancelled.[/dim]")
-                return False
-            project = next(
-                (entry for entry in project_entries
-                 if str(entry.get("id")) == selector), None)
-            if selected_kind == "persistent":
-                project = None
-            if project is not None:
-                _print_long_panel(
-                    project.get("content", ""), f"Project memory #{selector}")
-            else:
-                persistent = memory_system.read_memory(selector)
-                if persistent is None:
-                    console.print(f"[red]Memory '{selector}' not found.[/red]")
-                    console.print("[dim]Use /memory project or /memory persistent to list valid entries.[/dim]")
-                else:
-                    _print_long_panel(
-                        persistent.get("body", ""),
-                        f"Persistent memory: {selector}",
-                    )
-        else:
-            console.print("[yellow]Usage: /memory [project|persistent|show <id|name>][/yellow]")
 
-    elif action == "/prop":
-        prop = read_file(str(paths.project_file(paths.CWD_CLI_PROP)))
-        if prop:
-            console.print(Panel(prop[:2000], title=".laintas/cli.prop Prompt Template"))
-        else:
-            console.print("[dim]No .laintas/cli.prop found.[/dim]")
+def _cmd_name(raw_args: str, session: dict, agent_registry: AgentRegistry) -> None:
+    if raw_args:
+        name = _decode_text_arg(raw_args)
+        config = load_config()
+        config["agentName"] = name
+        save_config(config)
+        console.print(f"[green]Agent name set to: {name}[/green]")
+        # Re-register under the new name only if already /connect-ed —
+        # renaming never auto-links (two-end handshake).
+        if agent_registry.agent_id:
+            agent_registry.unregister()
+            agent_registry.agent_id = None
+            agent_registry.agent_secret = ""
+            agent_registry.register(session, name=name, quiet=True)
+            agent_registry.start_heartbeat()
+            agent_registry.start_message_poll(
+                agent_registry._state_cb or (lambda: {}),
+                agent_registry._chat_cb or (lambda: []),
+            )
+    else:
+        config = load_config()
+        current = config.get("agentName", socket.gethostname())
+        console.print(f"Current agent name: [bold]{current}[/bold]")
+        console.print("Usage: /name <new-name>")
+        console.print("       /term rename <old> <new>  (rename a terminal)")
 
-    elif action == "/scan":
-        user_cmds = list_path_commands()
-        console.print(f"[bold]{len(user_cmds)} user-facing commands on PATH:[/bold]\n")
-        groups: dict = {}
-        for c in user_cmds:
-            groups.setdefault(c[0], []).append(c)
-        for letter in sorted(groups):
-            console.print(f"  [cyan]{letter}[/cyan]: {', '.join(groups[letter][:40])}")
-            if len(groups[letter]) > 40:
-                console.print(f"       [dim](+{len(groups[letter]) - 40} more)[/dim]")
 
-    elif action == "/cwd":
-        console.print(f"Working directory: [bold]{os.getcwd()}[/bold]")
+def _cmd_memory(parts: list) -> None:
+    import memory_system
+    sub = parts[1].lower() if len(parts) > 1 else ""
+    project_entries, project_errors, _ = _load_project_memory_entries()
+    persistent_entries = memory_system.list_memories()
 
-    elif action == "/usage":
-        _show_usage_command(parts[1:], session)
-
-    elif action == "/bash":
-        bash_sub = parts[1].lower() if len(parts) > 1 else ""
-        if len(parts) < 2:
-            wl = ", ".join(sorted(get_interactive_commands()))
+    if sub in ("", "project"):
+        if project_errors:
             console.print(Panel(
-                "[bold]/bash <command>[/bold]        run <command> directly via term0's real bash "
-                "(marker-poll + cwd sync), bypassing the interactive whitelist below\n"
-                "[bold]/bash list[/bold]              show the interactive-terminal whitelist\n"
-                "[bold]/bash add <command>[/bold]     force <command> through full PTY passthrough "
-                "(vim-style — use for full-screen/raw-keystroke programs)\n"
-                "[bold]/bash remove <command>[/bold]  let <command> use term0/marker-poll instead\n\n"
-                f"[dim]Current whitelist: {wl}[/dim]",
-                title="/bash", border_style="cyan",
+                "\n".join(f"[red]- {error}[/red]" for error in project_errors)
+                + f"\n\n[dim]Fix {paths.project_file(paths.CWD_MEMORY)} and retry /memory project.[/dim]",
+                title="Project Memory: invalid", border_style="red",
             ))
-        elif bash_sub == "list":
-            wl = sorted(get_interactive_commands())
-            console.print(Panel("\n".join(wl) or "(empty)",
-                                title="Interactive-terminal whitelist", border_style="cyan"))
-        elif bash_sub == "add":
-            if len(parts) < 3:
-                console.print("[yellow]Usage: /bash add <command>[/yellow]")
-            elif not re.fullmatch(r"[A-Za-z0-9._+/-]+", parts[2]):
-                console.print("[red]Command must be one executable token without shell operators.[/red]")
-            else:
-                _modify_interactive_commands(parts[2], add=True)
-                console.print(f"[green]'{parts[2]}' now uses full PTY passthrough (native terminal).[/green]")
-        elif bash_sub == "remove":
-            if len(parts) < 3:
-                console.print("[yellow]Usage: /bash remove <command>[/yellow]")
-            elif not re.fullmatch(r"[A-Za-z0-9._+/-]+", parts[2]):
-                console.print("[red]Command must be one executable token without shell operators.[/red]")
-            else:
-                _modify_interactive_commands(parts[2], add=False)
-                console.print(f"[green]'{parts[2]}' now routes through term0/marker-poll.[/green]")
+        elif project_entries:
+            lines = [
+                f"[bold]{entry.get('id')}.[/bold] {entry.get('content', '')}"
+                for entry in project_entries
+            ]
+            console.print(Panel(
+                "\n".join(lines),
+                title=f"Project memory ({len(project_entries)} entries)",
+                border_style="cyan",
+            ))
         else:
-            raw_cmd = raw_args
-            allowed, denial = authorize_direct_command(raw_cmd, os.getcwd())
-            if not allowed:
-                console.print(f"[red]{denial}[/red]")
-                return False
-            _ensure_term0_alive()
-            _t0 = get_terminal("term0")
-            if _t0 is None or _t0.session is None or not _t0.session.is_alive():
-                console.print("[red]term0 session unavailable.[/red]")
+            console.print("[dim]Project memory is empty.[/dim]")
+        if sub == "":
+            console.print(
+                f"[dim]Persistent memory: {len(persistent_entries)} visible entr"
+                f"{'y' if len(persistent_entries) == 1 else 'ies'}. "
+                "Use /memory persistent to list them.[/dim]")
+
+    elif sub in ("persistent", "global"):
+        if not persistent_entries:
+            console.print("[dim]No persistent memories are visible in this scope.[/dim]")
+        else:
+            table = Table(title="Persistent Memory", show_lines=False)
+            table.add_column("Name", style="cyan")
+            table.add_column("Type")
+            table.add_column("Scope", style="dim")
+            table.add_column("Description")
+            for entry in persistent_entries:
+                table.add_row(
+                    entry.get("name", "?"), entry.get("type", "unknown"),
+                    entry.get("scope", "?"), entry.get("description", ""),
+                )
+            console.print(table)
+            console.print("[dim]Run /memory show to choose an entry, or pass its name directly.[/dim]")
+
+    elif sub == "show":
+        selector = parts[2] if len(parts) >= 3 else ""
+        selected_kind = ""
+        if not selector and sys.stdin.isatty():
+            choices = [
+                {"kind": "project", **entry}
+                for entry in project_entries
+            ] + [
+                {"kind": "persistent", **entry}
+                for entry in persistent_entries
+            ]
+            chosen = choose_record(
+                choices,
+                title="View Memory",
+                label=lambda item: (
+                    f"project #{item.get('id')}" if item["kind"] == "project"
+                    else f"persistent · {item.get('name', '?')}"),
+                description=lambda item: (
+                    str(item.get("content") or "")[:100]
+                    if item["kind"] == "project"
+                    else item.get("description", "")),
+                search=True,
+            )
+            if chosen:
+                selected_kind = chosen["kind"]
+                selector = (str(chosen.get("id"))
+                            if selected_kind == "project"
+                            else chosen.get("name", ""))
+        if not selector:
+            console.print("[dim]Memory selection cancelled.[/dim]")
+            return
+        project = next(
+            (entry for entry in project_entries
+             if str(entry.get("id")) == selector), None)
+        if selected_kind == "persistent":
+            project = None
+        if project is not None:
+            _print_long_panel(
+                project.get("content", ""), f"Project memory #{selector}")
+        else:
+            persistent = memory_system.read_memory(selector)
+            if persistent is None:
+                console.print(f"[red]Memory '{selector}' not found.[/red]")
+                console.print("[dim]Use /memory project or /memory persistent to list valid entries.[/dim]")
             else:
-                result = _marker_poll_exec(_t0.session, raw_cmd, strip_ansi_codes=False)
-                _sync_cwd_from_term0(_t0.session)
-                stdout = result.get("stdout", "")
-                if stdout:
-                    console.print(stdout)
-                returncode = result.get("returncode")
-                rc_text = f" · exit {returncode}" if returncode is not None else ""
-                console.print(f"[dim]cwd → {os.getcwd()}{rc_text}[/dim]")
+                _print_long_panel(
+                    persistent.get("body", ""),
+                    f"Persistent memory: {selector}",
+                )
+    else:
+        console.print("[yellow]Usage: /memory [project|persistent|show <id|name>][/yellow]")
 
-    elif action == "/mode":
-        import plan_mode as _pm_mode
-        from rich.markup import escape as _escape
-        sub = parts[1].lower() if len(parts) > 1 else ""
-        _, mode_args_raw = _raw_tail_after_word(raw_args)
 
-        # Gather current state
-        _in_plan = _pm_mode.is_plan_mode()
-        _cur_plan = _pm_mode.get_current_plan()
+def _cmd_prop() -> None:
+    prop = read_file(str(paths.project_file(paths.CWD_CLI_PROP)))
+    if prop:
+        console.print(Panel(prop[:2000], title=".laintas/cli.prop Prompt Template"))
+    else:
+        console.print("[dim]No .laintas/cli.prop found.[/dim]")
 
-        if sub == "plan":
-            task = _decode_text_arg(mode_args_raw)
-            if not task:
-                if _in_plan:
-                    console.print("[dim]Already in PLAN mode.[/dim]")
-                    return False
-                mode_manager.activate("act")
-                _pm_mode.arm_plan_mode()
-                console.print(Panel(
-                    "[bold]PLAN mode[/bold]\n\n"
-                    "Describe the task in your next message. The agent will plan "
-                    "without modifying files or the system.",
-                    title="Mode changed", border_style="green",
-                ))
-                return False
+
+def _cmd_scan() -> None:
+    user_cmds = list_path_commands()
+    console.print(f"[bold]{len(user_cmds)} user-facing commands on PATH:[/bold]\n")
+    groups: dict = {}
+    for c in user_cmds:
+        groups.setdefault(c[0], []).append(c)
+    for letter in sorted(groups):
+        console.print(f"  [cyan]{letter}[/cyan]: {', '.join(groups[letter][:40])}")
+        if len(groups[letter]) > 40:
+            console.print(f"       [dim](+{len(groups[letter]) - 40} more)[/dim]")
+
+
+def _cmd_cwd() -> None:
+    console.print(f"Working directory: [bold]{os.getcwd()}[/bold]")
+
+
+def _cmd_bash(parts: list, raw_args: str) -> bool:
+    bash_sub = parts[1].lower() if len(parts) > 1 else ""
+    if len(parts) < 2:
+        wl = ", ".join(sorted(get_interactive_commands()))
+        console.print(Panel(
+            "[bold]/bash <command>[/bold]        run <command> directly via term0's real bash "
+            "(marker-poll + cwd sync), bypassing the interactive whitelist below\n"
+            "[bold]/bash list[/bold]              show the interactive-terminal whitelist\n"
+            "[bold]/bash add <command>[/bold]     force <command> through full PTY passthrough "
+            "(vim-style — use for full-screen/raw-keystroke programs)\n"
+            "[bold]/bash remove <command>[/bold]  let <command> use term0/marker-poll instead\n\n"
+            f"[dim]Current whitelist: {wl}[/dim]",
+            title="/bash", border_style="cyan",
+        ))
+    elif bash_sub == "list":
+        wl = sorted(get_interactive_commands())
+        console.print(Panel("\n".join(wl) or "(empty)",
+                            title="Interactive-terminal whitelist", border_style="cyan"))
+    elif bash_sub == "add":
+        if len(parts) < 3:
+            console.print("[yellow]Usage: /bash add <command>[/yellow]")
+        elif not re.fullmatch(r"[A-Za-z0-9._+/-]+", parts[2]):
+            console.print("[red]Command must be one executable token without shell operators.[/red]")
+        else:
+            _modify_interactive_commands(parts[2], add=True)
+            console.print(f"[green]'{parts[2]}' now uses full PTY passthrough (native terminal).[/green]")
+    elif bash_sub == "remove":
+        if len(parts) < 3:
+            console.print("[yellow]Usage: /bash remove <command>[/yellow]")
+        elif not re.fullmatch(r"[A-Za-z0-9._+/-]+", parts[2]):
+            console.print("[red]Command must be one executable token without shell operators.[/red]")
+        else:
+            _modify_interactive_commands(parts[2], add=False)
+            console.print(f"[green]'{parts[2]}' now routes through term0/marker-poll.[/green]")
+    else:
+        raw_cmd = raw_args
+        allowed, denial = authorize_direct_command(raw_cmd, os.getcwd())
+        if not allowed:
+            console.print(f"[red]{denial}[/red]")
+            return False
+        _ensure_term0_alive()
+        _t0 = get_terminal("term0")
+        if _t0 is None or _t0.session is None or not _t0.session.is_alive():
+            console.print("[red]term0 session unavailable.[/red]")
+        else:
+            result = _marker_poll_exec(_t0.session, raw_cmd, strip_ansi_codes=False)
+            _sync_cwd_from_term0(_t0.session)
+            stdout = result.get("stdout", "")
+            if stdout:
+                console.print(stdout)
+            returncode = result.get("returncode")
+            rc_text = f" · exit {returncode}" if returncode is not None else ""
+            console.print(f"[dim]cwd → {os.getcwd()}{rc_text}[/dim]")
+    return False
+
+
+def _cmd_mode(raw_args: str, parts: list) -> bool:
+    import plan_mode as _pm_mode
+    from rich.markup import escape as _escape
+    sub = parts[1].lower() if len(parts) > 1 else ""
+    _, mode_args_raw = _raw_tail_after_word(raw_args)
+
+    # Gather current state
+    _in_plan = _pm_mode.is_plan_mode()
+    _cur_plan = _pm_mode.get_current_plan()
+
+    if sub == "plan":
+        task = _decode_text_arg(mode_args_raw)
+        if not task:
             if _in_plan:
-                console.print(
-                    "[yellow]A plan is already active. Use /plan status, "
-                    "/plan approve, or /plan exit before starting another.[/yellow]")
+                console.print("[dim]Already in PLAN mode.[/dim]")
                 return False
             mode_manager.activate("act")
-            plan = _pm_mode.enter_plan_mode(task)
-            _enqueue_user_input(task)
+            _pm_mode.arm_plan_mode()
             console.print(Panel(
-                f"[bold]Plan Mode: [green]ENTERED[/green][/bold]\n\n"
-                f"Task: {task}\n"
-                f"Plan file: {plan['file']}\n\n"
-                f"[dim]The AI will explore and design — no code will be executed.[/dim]\n"
-                f"[dim]When ready, the review menu will offer execute, revise, or exit.[/dim]",
-                title="Plan Mode", border_style="green",
+                "[bold]PLAN mode[/bold]\n\n"
+                "Describe the task in your next message. The agent will plan "
+                "without modifying files or the system.",
+                title="Mode changed", border_style="green",
             ))
-
-        elif sub in ("act", "always", "act-always"):
-            # `/mode act always` (or `/mode always`) → ACT with every file write
-            # and command auto-approved for this session (shown as ACT*). Plain
-            # `/mode act` restores confirmations by clearing that session state,
-            # giving a mid-session way to turn auto-approve back off.
-            _always = (sub in ("always", "act-always")
-                       or any(p.lower() == "always" for p in parts[2:]))
-            if _in_plan:
-                _pm_mode.exit_plan_mode(approve=False)
-            ok, msg = mode_manager.activate("act")
-            if _always:
-                _session_approval_state["all_writes"] = True
-                _session_approval_state["all_commands"] = True
-                console.print(
-                    "[green]ACT [bold]always-approve[/bold] — file writes and "
-                    "commands are auto-approved this session ([bold]ACT*[/bold]).[/green]\n"
-                    "[dim]Run /mode act to turn confirmations back on.[/dim]")
-            else:
-                _session_approval_state["all_writes"] = False
-                _session_approval_state["all_commands"] = False
-                console.print(
-                    f"[{'green' if ok else 'red'}]{_escape(msg)}"
-                    f"[/{'green' if ok else 'red'}]"
-                    + (" [dim](draft plan saved)[/dim]" if _cur_plan else ""))
-
-        elif sub == "approve":
-            # Backward compatibility. Approval is a plan action, not a mode.
-            console.print("[yellow]/mode approve is deprecated; use /plan approve.[/yellow]")
-            if not _in_plan or not _cur_plan:
-                console.print("[yellow]No active plan to approve.[/yellow]")
-            else:
-                approved = _review_and_approve_current_plan()
-                queued = False
-                if approved:
-                    followup = (
-                        f"Execute approved WorkGraph {approved['work_id']} revision "
-                        f"{approved['revision']} SHA {approved['content_sha']} for task: "
-                        f"{approved['task']}. Follow the injected approved_work_plan exactly."
-                    )
-                    queued = _enqueue_user_input(followup)
-                console.print(Panel(
-                    f"[bold]Plan [{'green' if approved else 'yellow'}]"
-                    f"{'APPROVED' if approved else 'NOT APPROVED'}"
-                    f"[/{'green' if approved else 'yellow'}][/bold]\n\n"
-                    f"File: {_cur_plan['file']}\n\n"
-                    + ("[dim]Execution request queued.[/dim]" if queued else
-                       "[dim]No execution was queued.[/dim]"),
-                    title="Plan Approved", border_style="green",
-                ))
-
-        elif sub == "list":
-            active_name = "plan" if _in_plan else mode_manager.get_active_mode()["name"]
-            console.print("[bold]Agent modes[/bold]")
+            return False
+        if _in_plan:
             console.print(
-                f"{'[green]*[/green]' if active_name == 'plan' else ' '} "
-                "[cyan]plan[/cyan] [dim]Reviewed, read-only planning[/dim]")
-            for item in mode_manager.list_modes():
-                marker = "[green]*[/green]" if item["name"] == active_name else " "
-                source = "built-in" if item["builtin"] else "custom"
-                _bits = [item["description"], source]
-                _allow = item.get("allowed_tools")
-                if _allow is not None:
-                    _bits.append(f"tools: {', '.join(_allow[:4])}"
-                                 + ("…" if len(_allow) > 4 else ""))
-                if item.get("denied_tools"):
-                    _bits.append(f"deny: {', '.join(item['denied_tools'][:3])}")
-                if item.get("auto_approve", "none") != "none":
-                    _bits.append(f"auto-approve: {item['auto_approve']}")
-                console.print(
-                    f"{marker} [cyan]{item['name']}[/cyan] "
-                    f"[dim]{_escape(' · '.join(_bits))}[/dim]")
+                "[yellow]A plan is already active. Use /plan status, "
+                "/plan approve, or /plan exit before starting another.[/yellow]")
+            return False
+        mode_manager.activate("act")
+        plan = _pm_mode.enter_plan_mode(task)
+        _enqueue_user_input(task)
+        console.print(Panel(
+            f"[bold]Plan Mode: [green]ENTERED[/green][/bold]\n\n"
+            f"Task: {task}\n"
+            f"Plan file: {plan['file']}\n\n"
+            f"[dim]The AI will explore and design — no code will be executed.[/dim]\n"
+            f"[dim]When ready, the review menu will offer execute, revise, or exit.[/dim]",
+            title="Plan Mode", border_style="green",
+        ))
 
-        elif sub == "create":
-            if len(parts) < 4:
-                console.print(
-                    "[yellow]Usage: /mode create <name> [--tools \"fs.*,web.search\"] "
-                    "[--deny \"shell.*\"] [--read-only] "
-                    "[--auto-approve none|writes|commands|all] <instructions>[/yellow]")
-            else:
-                name = parts[2]
-                _cargs = parts[3:]
-                _allowed = _denied = None
-                _auto = "none"
-                _read_only = False
-                _rest = []
-                _i = 0
-                while _i < len(_cargs):
-                    _a = _cargs[_i]
-                    if _a == "--read-only":
-                        _read_only = True; _i += 1
-                    elif _a == "--tools" and _i + 1 < len(_cargs):
-                        _allowed = [t.strip() for t in _cargs[_i + 1].split(",") if t.strip()]; _i += 2
-                    elif _a == "--deny" and _i + 1 < len(_cargs):
-                        _denied = [t.strip() for t in _cargs[_i + 1].split(",") if t.strip()]; _i += 2
-                    elif _a == "--auto-approve" and _i + 1 < len(_cargs):
-                        _auto = _cargs[_i + 1].strip().lower(); _i += 2
-                    else:
-                        _rest.append(_a); _i += 1
-                instructions = " ".join(_rest)
-                ok, msg = mode_manager.create_mode(
-                    name, instructions, read_only=_read_only,
-                    allowed_tools=_allowed, denied_tools=_denied,
-                    auto_approve=_auto)
-                console.print(
-                    f"[{'green' if ok else 'red'}]{_escape(msg)}"
-                    f"[/{'green' if ok else 'red'}]")
-                if ok and _auto != "none":
-                    console.print(
-                        f"[yellow]⚠ Mode '{name}' auto-approves {_auto} — "
-                        f"file writes/commands run without confirmation while it's "
-                        f"active (shown as {name.upper()}*). Hard deny rules still apply.[/yellow]")
+    elif sub in ("act", "always", "act-always"):
+        # `/mode act always` (or `/mode always`) → ACT with every file write
+        # and command auto-approved for this session (shown as ACT*). Plain
+        # `/mode act` restores confirmations by clearing that session state,
+        # giving a mid-session way to turn auto-approve back off.
+        _always = (sub in ("always", "act-always")
+                   or any(p.lower() == "always" for p in parts[2:]))
+        if _in_plan:
+            _pm_mode.exit_plan_mode(approve=False)
+        ok, msg = mode_manager.activate("act")
+        if _always:
+            _session_approval_state["all_writes"] = True
+            _session_approval_state["all_commands"] = True
+            console.print(
+                "[green]ACT [bold]always-approve[/bold] — file writes and "
+                "commands are auto-approved this session ([bold]ACT*[/bold]).[/green]\n"
+                "[dim]Run /mode act to turn confirmations back on.[/dim]")
+        else:
+            _session_approval_state["all_writes"] = False
+            _session_approval_state["all_commands"] = False
+            console.print(
+                f"[{'green' if ok else 'red'}]{_escape(msg)}"
+                f"[/{'green' if ok else 'red'}]"
+                + (" [dim](draft plan saved)[/dim]" if _cur_plan else ""))
 
-        elif sub == "delete":
-            mode_name = parts[2] if len(parts) == 3 else ""
-            if not mode_name and sys.stdin.isatty():
-                custom_modes = [
-                    item for item in mode_manager.list_modes()
-                    if not item.get("builtin")
-                ]
-                chosen = choose_record(
-                    custom_modes,
-                    title="Delete Custom Mode",
-                    label=lambda item: item["name"],
-                    description=lambda item: item.get("description", ""),
-                    full_screen=False,
+    elif sub == "approve":
+        # Backward compatibility. Approval is a plan action, not a mode.
+        console.print("[yellow]/mode approve is deprecated; use /plan approve.[/yellow]")
+        if not _in_plan or not _cur_plan:
+            console.print("[yellow]No active plan to approve.[/yellow]")
+        else:
+            approved = _review_and_approve_current_plan()
+            queued = False
+            if approved:
+                followup = (
+                    f"Execute approved WorkGraph {approved['work_id']} revision "
+                    f"{approved['revision']} SHA {approved['content_sha']} for task: "
+                    f"{approved['task']}. Follow the injected approved_work_plan exactly."
                 )
-                mode_name = chosen["name"] if chosen else ""
-            if not mode_name:
-                console.print("[dim]Mode selection cancelled.[/dim]")
-            else:
-                ok, msg = mode_manager.delete_mode(mode_name)
-                console.print(
-                    f"[{'green' if ok else 'red'}]{_escape(msg)}"
-                    f"[/{'green' if ok else 'red'}]")
-
-        elif sub == "status":
-            active = mode_manager.get_active_mode()
-            _mode_name = "PLAN" if _in_plan else active["name"].upper()
-            _mode_desc = (
-                "Waiting for a task" if _pm_mode.is_pending_task() else
-                (_cur_plan.get("task", "") if _cur_plan else active["description"])
-            )
+                queued = _enqueue_user_input(followup)
             console.print(Panel(
-                f"Mode: [accent]{_mode_name}[/accent]\n"
-                f"[dim]{_escape(_mode_desc[:120])}[/dim]",
-                title="Current Mode", border_style="cyan",
+                f"[bold]Plan [{'green' if approved else 'yellow'}]"
+                f"{'APPROVED' if approved else 'NOT APPROVED'}"
+                f"[/{'green' if approved else 'yellow'}][/bold]\n\n"
+                f"File: {_cur_plan['file']}\n\n"
+                + ("[dim]Execution request queued.[/dim]" if queued else
+                   "[dim]No execution was queued.[/dim]"),
+                title="Plan Approved", border_style="green",
             ))
 
-        elif sub:
-            if mode_manager.get_mode(sub) is None:
-                ok, msg = False, f"Unknown mode: {sub}"
-            else:
-                if _in_plan:
-                    _pm_mode.exit_plan_mode(approve=False)
-                ok, msg = mode_manager.activate(sub)
-                if ok:
-                    _sync_session_approval_from_mode()
+    elif sub == "list":
+        active_name = "plan" if _in_plan else mode_manager.get_active_mode()["name"]
+        console.print("[bold]Agent modes[/bold]")
+        console.print(
+            f"{'[green]*[/green]' if active_name == 'plan' else ' '} "
+            "[cyan]plan[/cyan] [dim]Reviewed, read-only planning[/dim]")
+        for item in mode_manager.list_modes():
+            marker = "[green]*[/green]" if item["name"] == active_name else " "
+            source = "built-in" if item["builtin"] else "custom"
+            _bits = [item["description"], source]
+            _allow = item.get("allowed_tools")
+            if _allow is not None:
+                _bits.append(f"tools: {', '.join(_allow[:4])}"
+                             + ("…" if len(_allow) > 4 else ""))
+            if item.get("denied_tools"):
+                _bits.append(f"deny: {', '.join(item['denied_tools'][:3])}")
+            if item.get("auto_approve", "none") != "none":
+                _bits.append(f"auto-approve: {item['auto_approve']}")
+            console.print(
+                f"{marker} [cyan]{item['name']}[/cyan] "
+                f"[dim]{_escape(' · '.join(_bits))}[/dim]")
+
+    elif sub == "create":
+        if len(parts) < 4:
+            console.print(
+                "[yellow]Usage: /mode create <name> [--tools \"fs.*,web.search\"] "
+                "[--deny \"shell.*\"] [--read-only] "
+                "[--auto-approve none|writes|commands|all] <instructions>[/yellow]")
+        else:
+            name = parts[2]
+            _cargs = parts[3:]
+            _allowed = _denied = None
+            _auto = "none"
+            _read_only = False
+            _rest = []
+            _i = 0
+            while _i < len(_cargs):
+                _a = _cargs[_i]
+                if _a == "--read-only":
+                    _read_only = True; _i += 1
+                elif _a == "--tools" and _i + 1 < len(_cargs):
+                    _allowed = [t.strip() for t in _cargs[_i + 1].split(",") if t.strip()]; _i += 2
+                elif _a == "--deny" and _i + 1 < len(_cargs):
+                    _denied = [t.strip() for t in _cargs[_i + 1].split(",") if t.strip()]; _i += 2
+                elif _a == "--auto-approve" and _i + 1 < len(_cargs):
+                    _auto = _cargs[_i + 1].strip().lower(); _i += 2
+                else:
+                    _rest.append(_a); _i += 1
+            instructions = " ".join(_rest)
+            ok, msg = mode_manager.create_mode(
+                name, instructions, read_only=_read_only,
+                allowed_tools=_allowed, denied_tools=_denied,
+                auto_approve=_auto)
             console.print(
                 f"[{'green' if ok else 'red'}]{_escape(msg)}"
                 f"[/{'green' if ok else 'red'}]")
-            if ok and mode_manager.get_auto_approve() != "none":
+            if ok and _auto != "none":
                 console.print(
-                    f"[dim]↳ {sub.upper()}* — auto-approving "
-                    f"{mode_manager.get_auto_approve()} this session.[/dim]")
+                    f"[yellow]⚠ Mode '{name}' auto-approves {_auto} — "
+                    f"file writes/commands run without confirmation while it's "
+                    f"active (shown as {name.upper()}*). Hard deny rules still apply.[/yellow]")
 
-        else:
-            active = mode_manager.get_active_mode()
-            options = [{
-                "name": "plan",
-                "description": "Reviewed, read-only planning",
-            }, *mode_manager.list_modes()]
-            # Offer the always-approve variant right after act.
-            _act_i = next((i for i, o in enumerate(options)
-                           if o["name"] == "act"), None)
-            if _act_i is not None:
-                options.insert(_act_i + 1, {
-                    "name": "act-always",
-                    "description": "ACT with file writes & commands auto-approved (ACT*)",
-                })
-            _auto = _session_approval_state.get("all_writes")
-            active_name = ("plan" if _in_plan
-                           else ("act-always" if _auto and active["name"] == "act"
-                                 else active["name"]))
-            selected_index = next(
-                (i for i, item in enumerate(options)
-                 if item["name"] == active_name), 0)
+    elif sub == "delete":
+        mode_name = parts[2] if len(parts) == 3 else ""
+        if not mode_name and sys.stdin.isatty():
+            custom_modes = [
+                item for item in mode_manager.list_modes()
+                if not item.get("builtin")
+            ]
             chosen = choose_record(
-                options,
-                title="Select Agent Mode",
-                label=lambda item: (
-                    f"{'●' if item['name'] == active_name else '○'} "
-                    f"{item['name']}"),
+                custom_modes,
+                title="Delete Custom Mode",
+                label=lambda item: item["name"],
                 description=lambda item: item.get("description", ""),
-                selected_index=selected_index,
                 full_screen=False,
             )
-            if chosen:
-                target = chosen["name"]
-                if target == "plan":
-                    if not _in_plan:
-                        mode_manager.activate("act")
-                        _pm_mode.arm_plan_mode()
-                        console.print(
-                            "[green]PLAN mode armed.[/green] "
-                            "[dim]Describe the task in your next message.[/dim]")
-                elif target == "act-always":
-                    if _in_plan:
-                        _pm_mode.exit_plan_mode(approve=False)
-                    mode_manager.activate("act")
-                    _session_approval_state["all_writes"] = True
-                    _session_approval_state["all_commands"] = True
-                    console.print(
-                        "[green]ACT [bold]always-approve[/bold] — writes & commands "
-                        "auto-approved this session ([bold]ACT*[/bold]).[/green]\n"
-                        "[dim]Pick ACT to turn confirmations back on.[/dim]")
-                else:
-                    if _in_plan:
-                        _pm_mode.exit_plan_mode(approve=False)
-                    ok, msg = mode_manager.activate(target)
-                    # Sync session auto-approve to the mode's posture (a plain
-                    # mode with auto_approve=none clears any prior auto-approve).
-                    if ok:
-                        _sync_session_approval_from_mode()
-                    console.print(
-                        f"[{'green' if ok else 'red'}]{_escape(msg)}"
-                        f"[/{'green' if ok else 'red'}]")
-            elif not sys.stdin.isatty():
-                console.print(
-                    f"[dim]Current mode: {'plan' if _in_plan else active['name']}[/dim]")
+            mode_name = chosen["name"] if chosen else ""
+        if not mode_name:
+            console.print("[dim]Mode selection cancelled.[/dim]")
+        else:
+            ok, msg = mode_manager.delete_mode(mode_name)
+            console.print(
+                f"[{'green' if ok else 'red'}]{_escape(msg)}"
+                f"[/{'green' if ok else 'red'}]")
 
-    elif action == "/trust":
-        sub = parts[1].lower() if len(parts) > 1 else "status"
-        if sub == "status":
-            status = trust_store.project_status()
-            style = "green" if status.get("trusted") else "yellow"
-            hashes = status.get("hashes") or {}
-            details = "\n".join(
-                f"  {name}: {digest[:16]}…" for name, digest in sorted(hashes.items())
-            ) or "  (no executable project customization)"
-            console.print(Panel(
-                f"Project: {status.get('realpath', os.getcwd())}\n"
-                f"Trusted: {status.get('trusted', False)}\n"
-                f"Reason: {status.get('reason', '')}\n"
-                f"Executable hashes:\n{details}",
-                title="Workspace Trust", border_style=style,
-            ))
-        elif sub == "allow":
-            status = trust_store.project_status()
-            hashes = status.get("hashes") or {}
-            preview = "\n".join(
-                f"{name}: {digest}" for name, digest in sorted(hashes.items())
-            ) or "No executable files are currently present."
-            approved = "--yes" in parts[2:]
-            if not approved and sys.stdin.isatty():
-                approved = _blocking_approval_prompt(
-                    "Trust workspace executable customization",
-                    f"Project: {Path.cwd().resolve()}\n\n{preview}\n\n"
-                    "Trusted Python runs with your full local account permissions.",
-                    "Trust these exact file hashes?",
-                    allow_always=False,
-                ) == "yes"
-            if not approved:
+    elif sub == "status":
+        active = mode_manager.get_active_mode()
+        _mode_name = "PLAN" if _in_plan else active["name"].upper()
+        _mode_desc = (
+            "Waiting for a task" if _pm_mode.is_pending_task() else
+            (_cur_plan.get("task", "") if _cur_plan else active["description"])
+        )
+        console.print(Panel(
+            f"Mode: [accent]{_mode_name}[/accent]\n"
+            f"[dim]{_escape(_mode_desc[:120])}[/dim]",
+            title="Current Mode", border_style="cyan",
+        ))
+
+    elif sub:
+        if mode_manager.get_mode(sub) is None:
+            ok, msg = False, f"Unknown mode: {sub}"
+        else:
+            if _in_plan:
+                _pm_mode.exit_plan_mode(approve=False)
+            ok, msg = mode_manager.activate(sub)
+            if ok:
+                _sync_session_approval_from_mode()
+        console.print(
+            f"[{'green' if ok else 'red'}]{_escape(msg)}"
+            f"[/{'green' if ok else 'red'}]")
+        if ok and mode_manager.get_auto_approve() != "none":
+            console.print(
+                f"[dim]↳ {sub.upper()}* — auto-approving "
+                f"{mode_manager.get_auto_approve()} this session.[/dim]")
+
+    else:
+        active = mode_manager.get_active_mode()
+        options = [{
+            "name": "plan",
+            "description": "Reviewed, read-only planning",
+        }, *mode_manager.list_modes()]
+        # Offer the always-approve variant right after act.
+        _act_i = next((i for i, o in enumerate(options)
+                       if o["name"] == "act"), None)
+        if _act_i is not None:
+            options.insert(_act_i + 1, {
+                "name": "act-always",
+                "description": "ACT with file writes & commands auto-approved (ACT*)",
+            })
+        _auto = _session_approval_state.get("all_writes")
+        active_name = ("plan" if _in_plan
+                       else ("act-always" if _auto and active["name"] == "act"
+                             else active["name"]))
+        selected_index = next(
+            (i for i, item in enumerate(options)
+             if item["name"] == active_name), 0)
+        chosen = choose_record(
+            options,
+            title="Select Agent Mode",
+            label=lambda item: (
+                f"{'●' if item['name'] == active_name else '○'} "
+                f"{item['name']}"),
+            description=lambda item: item.get("description", ""),
+            selected_index=selected_index,
+            full_screen=False,
+        )
+        if chosen:
+            target = chosen["name"]
+            if target == "plan":
+                if not _in_plan:
+                    mode_manager.activate("act")
+                    _pm_mode.arm_plan_mode()
+                    console.print(
+                        "[green]PLAN mode armed.[/green] "
+                        "[dim]Describe the task in your next message.[/dim]")
+            elif target == "act-always":
+                if _in_plan:
+                    _pm_mode.exit_plan_mode(approve=False)
+                mode_manager.activate("act")
+                _session_approval_state["all_writes"] = True
+                _session_approval_state["all_commands"] = True
                 console.print(
-                    "[yellow]Workspace not trusted. In non-interactive mode use "
-                    "/trust allow --yes after reviewing the files.[/yellow]")
+                    "[green]ACT [bold]always-approve[/bold] — writes & commands "
+                    "auto-approved this session ([bold]ACT*[/bold]).[/green]\n"
+                    "[dim]Pick ACT to turn confirmations back on.[/dim]")
             else:
-                trusted = trust_store.trust_project()
-                clear_loop_command_cache()
-                global _extra_cmd_handler_cache, _extra_cmd_mtime_cache
-                _extra_cmd_handler_cache = None
-                _extra_cmd_mtime_cache = 0
+                if _in_plan:
+                    _pm_mode.exit_plan_mode(approve=False)
+                ok, msg = mode_manager.activate(target)
+                # Sync session auto-approve to the mode's posture (a plain
+                # mode with auto_approve=none clears any prior auto-approve).
+                if ok:
+                    _sync_session_approval_from_mode()
                 console.print(
-                    f"[green]Trusted executable customization for "
-                    f"{trusted['realpath']} at the current hashes.[/green]")
-        elif sub == "revoke":
-            removed = trust_store.revoke_project()
+                    f"[{'green' if ok else 'red'}]{_escape(msg)}"
+                    f"[/{'green' if ok else 'red'}]")
+        elif not sys.stdin.isatty():
+            console.print(
+                f"[dim]Current mode: {'plan' if _in_plan else active['name']}[/dim]")
+    return False
+
+
+def _cmd_trust(parts: list) -> None:
+    global _extra_cmd_handler_cache, _extra_cmd_mtime_cache
+    sub = parts[1].lower() if len(parts) > 1 else "status"
+    if sub == "status":
+        status = trust_store.project_status()
+        style = "green" if status.get("trusted") else "yellow"
+        hashes = status.get("hashes") or {}
+        details = "\n".join(
+            f"  {name}: {digest[:16]}…" for name, digest in sorted(hashes.items())
+        ) or "  (no executable project customization)"
+        console.print(Panel(
+            f"Project: {status.get('realpath', os.getcwd())}\n"
+            f"Trusted: {status.get('trusted', False)}\n"
+            f"Reason: {status.get('reason', '')}\n"
+            f"Executable hashes:\n{details}",
+            title="Workspace Trust", border_style=style,
+        ))
+    elif sub == "allow":
+        status = trust_store.project_status()
+        hashes = status.get("hashes") or {}
+        preview = "\n".join(
+            f"{name}: {digest}" for name, digest in sorted(hashes.items())
+        ) or "No executable files are currently present."
+        approved = "--yes" in parts[2:]
+        if not approved and sys.stdin.isatty():
+            approved = _blocking_approval_prompt(
+                "Trust workspace executable customization",
+                f"Project: {Path.cwd().resolve()}\n\n{preview}\n\n"
+                "Trusted Python runs with your full local account permissions.",
+                "Trust these exact file hashes?",
+                allow_always=False,
+            ) == "yes"
+        if not approved:
+            console.print(
+                "[yellow]Workspace not trusted. In non-interactive mode use "
+                "/trust allow --yes after reviewing the files.[/yellow]")
+        else:
+            trusted = trust_store.trust_project()
             clear_loop_command_cache()
             _extra_cmd_handler_cache = None
             _extra_cmd_mtime_cache = 0
             console.print(
-                "[green]Workspace trust revoked.[/green]" if removed
-                else "[dim]Workspace was not explicitly trusted.[/dim]")
-        else:
-            console.print("[yellow]Usage: /trust [status|allow|revoke][/yellow]")
+                f"[green]Trusted executable customization for "
+                f"{trusted['realpath']} at the current hashes.[/green]")
+    elif sub == "revoke":
+        removed = trust_store.revoke_project()
+        clear_loop_command_cache()
+        _extra_cmd_handler_cache = None
+        _extra_cmd_mtime_cache = 0
+        console.print(
+            "[green]Workspace trust revoked.[/green]" if removed
+            else "[dim]Workspace was not explicitly trusted.[/dim]")
+    else:
+        console.print("[yellow]Usage: /trust [status|allow|revoke][/yellow]")
 
-    elif action == "/backend":
-        sub = parts[1].lower() if len(parts) > 1 else "status"
-        if sub == "status":
-            profile = get_backend_profile()
-            console.print(Panel(
-                f"Profile: {profile.name}\nKind: {profile.kind}\n"
-                f"URL: {profile.base_url}\nBilling: {profile.billing_label}\n"
-                f"Sends Laintas credentials: {profile.sends_laintas_credentials}",
-                title="Backend", border_style=(
-                    "green" if profile.sends_laintas_credentials else "yellow"),
-            ))
-        elif sub == "list":
-            active = get_backend_profile().name
-            for profile in backend_profiles.list_profiles():
-                marker = "*" if profile.name == active else " "
-                console.print(
-                    f"{marker} [bold]{profile.name}[/bold] [{profile.kind}] "
-                    f"{profile.base_url} [dim]{profile.billing_label}[/dim]")
-        elif sub == "use":
-            profile_name = parts[2] if len(parts) >= 3 else ""
-            if not profile_name and sys.stdin.isatty():
-                profiles = backend_profiles.list_profiles()
-                active_name = get_backend_profile().name
-                selected_index = next(
-                    (i for i, item in enumerate(profiles)
-                     if item.name == active_name), 0)
-                chosen = choose_record(
-                    profiles,
-                    title="Select Backend",
-                    label=lambda item: (
-                        f"{'●' if item.name == active_name else '○'} {item.name}"),
-                    description=lambda item: (
-                        f"{item.kind} · {item.base_url} · {item.billing_label}"),
-                    selected_index=selected_index,
-                    search=True,
-                )
-                profile_name = chosen.name if chosen else ""
-            if not profile_name:
-                console.print("[dim]Backend selection cancelled.[/dim]")
-            elif os.environ.get("LAINTAS_BACKEND"):
-                console.print(
-                    "[red]LAINTAS_BACKEND currently overrides profiles; unset it first.[/red]")
-            else:
-                ok, msg = backend_profiles.set_active(profile_name)
-                console.print(f"[{'green' if ok else 'red'}]{msg}[/{'green' if ok else 'red'}]")
-        elif sub == "config":
-            console.print(str(backend_profiles.ensure_template()))
-        else:
-            console.print("[yellow]Usage: /backend [status|list|use <name>|config][/yellow]")
 
-    elif action == "/hooks":
-        sub = parts[1].lower() if len(parts) > 1 else "status"
-        hook_path = paths.PYTHON_HOOKS_FILE
-        if sub == "status":
-            py_status = (
-                trust_store.extension_status("hooks", "python", hook_path)
-                if hook_path.is_file() else {"trusted": False, "reason": "no hooks.py"}
-            )
-            config_status = (
-                trust_store.extension_status(
-                    "hooks", "config", paths.HOOKS_FILE)
-                if paths.HOOKS_FILE.is_file()
-                else {"trusted": False, "reason": "no hooks.json"}
-            )
-            info = hooks_mod.reload()
-            console.print(Panel(
-                f"Python hooks: {hook_path}\n"
-                f"Trusted: {py_status.get('trusted', False)}\n"
-                f"Reason: {py_status.get('reason', '')}\n"
-                f"Config hooks: {paths.HOOKS_FILE}\n"
-                f"Trusted: {config_status.get('trusted', False)}\n"
-                f"Reason: {config_status.get('reason', '')}\n"
-                f"Loaded functions: {', '.join(info.get('python_hooks', [])) or '(none)'}\n"
-                f"Configured argv hooks: {info.get('shell_hooks', 0)}",
-                title="Hooks", border_style="cyan",
-            ))
-        elif sub == "trust":
-            targets = []
-            if hook_path.is_file():
-                targets.append(("python", hook_path))
-            if paths.HOOKS_FILE.is_file():
-                targets.append(("config", paths.HOOKS_FILE))
-            if not targets:
-                console.print("[red]No hooks.py or hooks.json exists.[/red]")
-            else:
-                statuses = [
-                    (name, path, trust_store.extension_status("hooks", name, path))
-                    for name, path in targets
-                ]
-                details = "\n".join(
-                    f"{name}: {path} SHA-256={status.get('sha256', 'unavailable')}"
-                    for name, path, status in statuses)
-                approved = "--yes" in parts[2:]
-                if not approved and sys.stdin.isatty():
-                    approved = _blocking_approval_prompt(
-                        "Trust executable hooks",
-                        f"{details}\n\nThese hooks execute processes or Python "
-                        "with your local account permissions.",
-                        "Trust these exact hook hashes?", allow_always=False,
-                    ) == "yes"
-                if approved:
-                    trusted = []
-                    for name, path, _ in statuses:
-                        trusted.append(trust_store.trust_extension(
-                            "hooks", name, path))
-                    hooks_mod.reload()
-                    console.print(
-                        f"[green]Trusted {len(trusted)} hook file(s) at their current hashes.[/green]")
-                else:
-                    console.print("[yellow]Hooks not trusted.[/yellow]")
-        elif sub == "revoke":
-            removed = trust_store.revoke_extension("hooks", "python")
-            removed = trust_store.revoke_extension("hooks", "config") or removed
-            hooks_mod.reload()
-            console.print("[green]Hook trust revoked.[/green]" if removed
-                          else "[dim]Hooks were not trusted.[/dim]")
-        elif sub == "reload":
-            info = hooks_mod.reload()
-            console.print(json.dumps(info, ensure_ascii=False, indent=2))
-        else:
-            console.print("[yellow]Usage: /hooks [status|trust|revoke|reload][/yellow]")
-
-    elif action == "/policy":
-        import policy as _pol_cmd
-        sub = parts[1].lower() if len(parts) > 1 else ""
-        _valid = {"audit", "enforce", "disabled"}
-        if not sub and sys.stdin.isatty():
-            current_mode = _pol_cmd.get_config().get("mode", "audit")
-            choices = [
-                {"name": "audit", "description": "Deny rules block; approvals are advisory"},
-                {"name": "enforce", "description": "Require approval for protected actions"},
-                {"name": "disabled", "description": "Bypass policy checks (unsafe)"},
-            ]
+def _cmd_backend(parts: list) -> None:
+    sub = parts[1].lower() if len(parts) > 1 else "status"
+    if sub == "status":
+        profile = get_backend_profile()
+        console.print(Panel(
+            f"Profile: {profile.name}\nKind: {profile.kind}\n"
+            f"URL: {profile.base_url}\nBilling: {profile.billing_label}\n"
+            f"Sends Laintas credentials: {profile.sends_laintas_credentials}",
+            title="Backend", border_style=(
+                "green" if profile.sends_laintas_credentials else "yellow"),
+        ))
+    elif sub == "list":
+        active = get_backend_profile().name
+        for profile in backend_profiles.list_profiles():
+            marker = "*" if profile.name == active else " "
+            console.print(
+                f"{marker} [bold]{profile.name}[/bold] [{profile.kind}] "
+                f"{profile.base_url} [dim]{profile.billing_label}[/dim]")
+    elif sub == "use":
+        profile_name = parts[2] if len(parts) >= 3 else ""
+        if not profile_name and sys.stdin.isatty():
+            profiles = backend_profiles.list_profiles()
+            active_name = get_backend_profile().name
             selected_index = next(
-                (i for i, item in enumerate(choices)
-                 if item["name"] == current_mode), 0)
+                (i for i, item in enumerate(profiles)
+                 if item.name == active_name), 0)
             chosen = choose_record(
-                choices,
-                title="Select Security Policy",
+                profiles,
+                title="Select Backend",
                 label=lambda item: (
-                    f"{'●' if item['name'] == current_mode else '○'} "
-                    f"{item['name']}"),
-                description=lambda item: item["description"],
+                    f"{'●' if item.name == active_name else '○'} {item.name}"),
+                description=lambda item: (
+                    f"{item.kind} · {item.base_url} · {item.billing_label}"),
                 selected_index=selected_index,
-                full_screen=False,
+                search=True,
             )
-            sub = chosen["name"] if chosen else "status"
-        if sub in _valid:
-            if sub == "disabled" and "--yes" not in parts[2:]:
-                if not sys.stdin.isatty():
-                    console.print(
-                        "[red]Disabling policy in a non-interactive shell requires "
-                        "/policy disabled --yes.[/red]")
-                    return False
-                choice = _blocking_approval_prompt(
-                    "Disable security policy",
-                    "This bypasses policy checks and approval rules for commands.",
-                    "Disable policy?",
-                )
-                if choice != "yes":
-                    console.print("[dim]Policy change cancelled.[/dim]")
-                    return False
-            ok, msg = _pol_cmd.set_mode(sub)
-            style = "green" if ok else "red"
-            console.print(f"[{style}]{msg}[/{style}]")
-            if ok:
-                if sub == "enforce":
-                    console.print("[dim]Commands matching approval rules will now prompt before execution.[/dim]")
-                elif sub == "disabled":
-                    console.print("[yellow]⚠ All policy checks bypassed — commands run without approval.[/yellow]")
-                elif sub == "audit":
-                    console.print("[dim]Policy advisory only — deny rules still block, approvals are advisory.[/dim]")
-        elif sub == "reset":
-            _reset_session_approvals()
-            console.print("[green]Session auto-approvals cleared.[/green]")
+            profile_name = chosen.name if chosen else ""
+        if not profile_name:
+            console.print("[dim]Backend selection cancelled.[/dim]")
+        elif os.environ.get("LAINTAS_BACKEND"):
+            console.print(
+                "[red]LAINTAS_BACKEND currently overrides profiles; unset it first.[/red]")
         else:
-            _cfg = _pol_cmd.get_config()
-            _mode = _cfg.get("mode", "audit")
-            _mode_style = {"audit": "cyan", "enforce": "yellow",
-                           "disabled": "red"}.get(_mode, "cyan")
-            _n_allow = len(_cfg.get("allow", []))
-            _n_deny = len(_cfg.get("deny", []))
-            _n_appr = len(_cfg.get("needs_approval", []))
-            console.print(Panel(
-                f"Mode:           [{_mode_style}]{_mode}[/{_mode_style}]\n"
-                f"Allow rules:    {_n_allow}\n"
-                f"Deny rules:     {_n_deny}\n"
-                f"Approval rules: {_n_appr}\n"
-                f"Config file:    [dim]{_pol_cmd.CONFIG_PATH}[/dim]\n\n"
-                f"[dim]Session auto-approve:[/dim]  "
-                f"commands={'[green]on[/green]' if _session_approval_state['all_commands'] else 'off'}  "
-                f"writes={'[green]on[/green]' if _session_approval_state['all_writes'] else 'off'}\n\n"
-                f"[dim]Run /policy to choose a mode, or pass audit/enforce/disabled directly.[/dim]\n"
-                f"[dim]Reset session approvals:[/dim]  [bold]/policy reset[/bold]",
-                title="Security Policy", border_style="cyan",
-            ))
+            ok, msg = backend_profiles.set_active(profile_name)
+            console.print(f"[{'green' if ok else 'red'}]{msg}[/{'green' if ok else 'red'}]")
+    elif sub == "config":
+        console.print(str(backend_profiles.ensure_template()))
+    else:
+        console.print("[yellow]Usage: /backend [status|list|use <name>|config][/yellow]")
 
-    elif action == "/plan":
-        import plan_mode as _pm
-        sub = parts[1].lower() if len(parts) > 1 else ""
-        _, plan_args_raw = _raw_tail_after_word(raw_args)
-        if sub == "enter" and plan_args_raw:
-            task = _decode_text_arg(plan_args_raw)
-            if _pm.is_plan_mode():
+
+def _cmd_hooks(parts: list) -> None:
+    sub = parts[1].lower() if len(parts) > 1 else "status"
+    hook_path = paths.PYTHON_HOOKS_FILE
+    if sub == "status":
+        py_status = (
+            trust_store.extension_status("hooks", "python", hook_path)
+            if hook_path.is_file() else {"trusted": False, "reason": "no hooks.py"}
+        )
+        config_status = (
+            trust_store.extension_status(
+                "hooks", "config", paths.HOOKS_FILE)
+            if paths.HOOKS_FILE.is_file()
+            else {"trusted": False, "reason": "no hooks.json"}
+        )
+        info = hooks_mod.reload()
+        console.print(Panel(
+            f"Python hooks: {hook_path}\n"
+            f"Trusted: {py_status.get('trusted', False)}\n"
+            f"Reason: {py_status.get('reason', '')}\n"
+            f"Config hooks: {paths.HOOKS_FILE}\n"
+            f"Trusted: {config_status.get('trusted', False)}\n"
+            f"Reason: {config_status.get('reason', '')}\n"
+            f"Loaded functions: {', '.join(info.get('python_hooks', [])) or '(none)'}\n"
+            f"Configured argv hooks: {info.get('shell_hooks', 0)}",
+            title="Hooks", border_style="cyan",
+        ))
+    elif sub == "trust":
+        targets = []
+        if hook_path.is_file():
+            targets.append(("python", hook_path))
+        if paths.HOOKS_FILE.is_file():
+            targets.append(("config", paths.HOOKS_FILE))
+        if not targets:
+            console.print("[red]No hooks.py or hooks.json exists.[/red]")
+        else:
+            statuses = [
+                (name, path, trust_store.extension_status("hooks", name, path))
+                for name, path in targets
+            ]
+            details = "\n".join(
+                f"{name}: {path} SHA-256={status.get('sha256', 'unavailable')}"
+                for name, path, status in statuses)
+            approved = "--yes" in parts[2:]
+            if not approved and sys.stdin.isatty():
+                approved = _blocking_approval_prompt(
+                    "Trust executable hooks",
+                    f"{details}\n\nThese hooks execute processes or Python "
+                    "with your local account permissions.",
+                    "Trust these exact hook hashes?", allow_always=False,
+                ) == "yes"
+            if approved:
+                trusted = []
+                for name, path, _ in statuses:
+                    trusted.append(trust_store.trust_extension(
+                        "hooks", name, path))
+                hooks_mod.reload()
                 console.print(
-                    "[yellow]A plan is already active. Approve or exit it before "
-                    "starting another.[/yellow]")
+                    f"[green]Trusted {len(trusted)} hook file(s) at their current hashes.[/green]")
+            else:
+                console.print("[yellow]Hooks not trusted.[/yellow]")
+    elif sub == "revoke":
+        removed = trust_store.revoke_extension("hooks", "python")
+        removed = trust_store.revoke_extension("hooks", "config") or removed
+        hooks_mod.reload()
+        console.print("[green]Hook trust revoked.[/green]" if removed
+                      else "[dim]Hooks were not trusted.[/dim]")
+    elif sub == "reload":
+        info = hooks_mod.reload()
+        console.print(json.dumps(info, ensure_ascii=False, indent=2))
+    else:
+        console.print("[yellow]Usage: /hooks [status|trust|revoke|reload][/yellow]")
+
+
+def _cmd_policy(parts: list) -> bool:
+    import policy as _pol_cmd
+    sub = parts[1].lower() if len(parts) > 1 else ""
+    _valid = {"audit", "enforce", "disabled"}
+    if not sub and sys.stdin.isatty():
+        current_mode = _pol_cmd.get_config().get("mode", "audit")
+        choices = [
+            {"name": "audit", "description": "Deny rules block; approvals are advisory"},
+            {"name": "enforce", "description": "Require approval for protected actions"},
+            {"name": "disabled", "description": "Bypass policy checks (unsafe)"},
+        ]
+        selected_index = next(
+            (i for i, item in enumerate(choices)
+             if item["name"] == current_mode), 0)
+        chosen = choose_record(
+            choices,
+            title="Select Security Policy",
+            label=lambda item: (
+                f"{'●' if item['name'] == current_mode else '○'} "
+                f"{item['name']}"),
+            description=lambda item: item["description"],
+            selected_index=selected_index,
+            full_screen=False,
+        )
+        sub = chosen["name"] if chosen else "status"
+    if sub in _valid:
+        if sub == "disabled" and "--yes" not in parts[2:]:
+            if not sys.stdin.isatty():
+                console.print(
+                    "[red]Disabling policy in a non-interactive shell requires "
+                    "/policy disabled --yes.[/red]")
                 return False
-            mode_manager.activate("act")
-            plan = _pm.enter_plan_mode(task)
-            _enqueue_user_input(task)
+            choice = _blocking_approval_prompt(
+                "Disable security policy",
+                "This bypasses policy checks and approval rules for commands.",
+                "Disable policy?",
+            )
+            if choice != "yes":
+                console.print("[dim]Policy change cancelled.[/dim]")
+                return False
+        ok, msg = _pol_cmd.set_mode(sub)
+        style = "green" if ok else "red"
+        console.print(f"[{style}]{msg}[/{style}]")
+        if ok:
+            if sub == "enforce":
+                console.print("[dim]Commands matching approval rules will now prompt before execution.[/dim]")
+            elif sub == "disabled":
+                console.print("[yellow]⚠ All policy checks bypassed — commands run without approval.[/yellow]")
+            elif sub == "audit":
+                console.print("[dim]Policy advisory only — deny rules still block, approvals are advisory.[/dim]")
+    elif sub == "reset":
+        _reset_session_approvals()
+        console.print("[green]Session auto-approvals cleared.[/green]")
+    else:
+        _cfg = _pol_cmd.get_config()
+        _mode = _cfg.get("mode", "audit")
+        _mode_style = {"audit": "cyan", "enforce": "yellow",
+                       "disabled": "red"}.get(_mode, "cyan")
+        _n_allow = len(_cfg.get("allow", []))
+        _n_deny = len(_cfg.get("deny", []))
+        _n_appr = len(_cfg.get("needs_approval", []))
+        console.print(Panel(
+            f"Mode:           [{_mode_style}]{_mode}[/{_mode_style}]\n"
+            f"Allow rules:    {_n_allow}\n"
+            f"Deny rules:     {_n_deny}\n"
+            f"Approval rules: {_n_appr}\n"
+            f"Config file:    [dim]{_pol_cmd.CONFIG_PATH}[/dim]\n\n"
+            f"[dim]Session auto-approve:[/dim]  "
+            f"commands={'[green]on[/green]' if _session_approval_state['all_commands'] else 'off'}  "
+            f"writes={'[green]on[/green]' if _session_approval_state['all_writes'] else 'off'}\n\n"
+            f"[dim]Run /policy to choose a mode, or pass audit/enforce/disabled directly.[/dim]\n"
+            f"[dim]Reset session approvals:[/dim]  [bold]/policy reset[/bold]",
+            title="Security Policy", border_style="cyan",
+        ))
+    return False
+
+
+def _cmd_plan(raw_args: str, parts: list) -> None:
+    import plan_mode as _pm
+    sub = parts[1].lower() if len(parts) > 1 else ""
+    _, plan_args_raw = _raw_tail_after_word(raw_args)
+    if sub == "enter" and plan_args_raw:
+        task = _decode_text_arg(plan_args_raw)
+        if _pm.is_plan_mode():
+            console.print(
+                "[yellow]A plan is already active. Approve or exit it before "
+                "starting another.[/yellow]")
+            return
+        mode_manager.activate("act")
+        plan = _pm.enter_plan_mode(task)
+        _enqueue_user_input(task)
+        console.print(Panel(
+            f"[bold]Plan Mode: [green]ENTERED[/green][/bold]\n\n"
+            f"Task: {task}\n"
+            f"Plan file: {plan['file']}\n\n"
+            f"[dim]The AI will now explore and design — no code will be executed.[/dim]\n"
+            f"[dim]When the plan is ready, run [bold]/plan approve[/bold].[/dim]",
+            title="Plan Mode",
+            border_style="green",
+        ))
+    elif sub == "approve":
+        plan = _review_and_approve_current_plan()
+        if plan:
+            followup = (
+                f"Execute approved WorkGraph {plan['work_id']} revision "
+                f"{plan['revision']} SHA {plan['content_sha']} for task: "
+                f"{plan['task']}. Follow the injected approved_work_plan exactly."
+            )
+            queued = _enqueue_user_input(followup)
             console.print(Panel(
-                f"[bold]Plan Mode: [green]ENTERED[/green][/bold]\n\n"
-                f"Task: {task}\n"
-                f"Plan file: {plan['file']}\n\n"
-                f"[dim]The AI will now explore and design — no code will be executed.[/dim]\n"
-                f"[dim]When the plan is ready, run [bold]/plan approve[/bold].[/dim]",
-                title="Plan Mode",
+                f"[bold]Plan [green]APPROVED[/green][/bold]\n\n"
+                f"File: {plan['file']}\n\n"
+                + ("[dim]Execution request queued.[/dim]" if queued else
+                   "[yellow]Could not queue execution; submit a task referencing this plan.[/yellow]"),
+                title="Plan Approved",
                 border_style="green",
             ))
-        elif sub == "approve":
-            plan = _review_and_approve_current_plan()
-            if plan:
-                followup = (
-                    f"Execute approved WorkGraph {plan['work_id']} revision "
-                    f"{plan['revision']} SHA {plan['content_sha']} for task: "
-                    f"{plan['task']}. Follow the injected approved_work_plan exactly."
-                )
-                queued = _enqueue_user_input(followup)
-                console.print(Panel(
-                    f"[bold]Plan [green]APPROVED[/green][/bold]\n\n"
-                    f"File: {plan['file']}\n\n"
-                    + ("[dim]Execution request queued.[/dim]" if queued else
-                       "[yellow]Could not queue execution; submit a task referencing this plan.[/yellow]"),
-                    title="Plan Approved",
-                    border_style="green",
-                ))
-            else:
-                console.print("[yellow]Plan was not approved.[/yellow]")
-        elif sub == "submit":
-            snapshot = _pm.submit_current_plan()
-            if snapshot is None:
-                console.print("[red]Plan is not ready to submit.[/red]")
-            else:
-                _review_and_approve_current_plan()
-        elif sub == "revise":
-            feedback = _decode_text_arg(plan_args_raw)
-            plan = _pm.get_current_plan()
-            if plan is None and feedback:
-                plan = _pm.begin_amendment()
-            if not plan or not feedback:
-                console.print("[yellow]Usage: /plan revise <feedback>[/yellow]")
-            else:
-                snapshot = _pm.get_review_snapshot()
-                if snapshot and snapshot["work"].get("status") == "REVIEW_PENDING":
-                    rev = snapshot["revision"]
-                    _pm.reject_submitted_plan(rev["revision"], rev["content_sha"])
-                queued = _enqueue_user_input(
-                    f"Revise WorkGraph {plan.get('work_id')} plan using this user feedback: "
-                    f"{feedback}. Update the plan, then call plan.submit again.")
-                console.print(
-                    "[green]Revision feedback queued for the planning AI.[/green]"
-                    if queued else "[red]Could not queue revision feedback.[/red]")
-        elif sub == "exit":
-            plan = _pm.exit_plan_mode(approve=False)
-            if plan:
-                console.print("[dim]Exited plan mode; the draft remains in the plans directory.[/dim]")
-            else:
-                console.print("[yellow]No active plan to exit.[/yellow]")
-        elif sub == "status":
-            plan = _pm.get_current_plan()
-            if plan:
-                content = _pm.read_plan() or "(empty)"
-                _print_long_panel(content, f"Plan: {plan['task'][:60]}")
-            else:
-                console.print("[dim]Not in plan mode.[/dim]")
-        elif sub == "list":
-            plans = _pm.list_plans()
-            if plans:
-                console.print(f"[bold]Saved Plans:[/bold]")
-                for p in plans:
-                    console.print(f"  [cyan]{p['name']}[/cyan] — {p['title'][:80]}")
-            else:
-                console.print("[dim]No saved plans.[/dim]")
         else:
-            console.print("Usage:\n"
-                          "  [bold]/plan enter <task>[/bold] — Enter plan mode\n"
-                          "  [bold]/plan submit[/bold]       — Submit immutable revision for review\n"
-                          "  [bold]/plan revise <feedback>[/bold] — Ask AI to revise\n"
-                          "  [bold]/plan approve[/bold]      — Approve and execute\n"
-                          "  [bold]/plan exit[/bold]         — Exit without approving\n"
-                          "  [bold]/plan status[/bold]       — Show current plan\n"
-                          "  [bold]/plan list[/bold]         — List saved plans")
+            console.print("[yellow]Plan was not approved.[/yellow]")
+    elif sub == "submit":
+        snapshot = _pm.submit_current_plan()
+        if snapshot is None:
+            console.print("[red]Plan is not ready to submit.[/red]")
+        else:
+            _review_and_approve_current_plan()
+    elif sub == "revise":
+        feedback = _decode_text_arg(plan_args_raw)
+        plan = _pm.get_current_plan()
+        if plan is None and feedback:
+            plan = _pm.begin_amendment()
+        if not plan or not feedback:
+            console.print("[yellow]Usage: /plan revise <feedback>[/yellow]")
+        else:
+            snapshot = _pm.get_review_snapshot()
+            if snapshot and snapshot["work"].get("status") == "REVIEW_PENDING":
+                rev = snapshot["revision"]
+                _pm.reject_submitted_plan(rev["revision"], rev["content_sha"])
+            queued = _enqueue_user_input(
+                f"Revise WorkGraph {plan.get('work_id')} plan using this user feedback: "
+                f"{feedback}. Update the plan, then call plan.submit again.")
+            console.print(
+                "[green]Revision feedback queued for the planning AI.[/green]"
+                if queued else "[red]Could not queue revision feedback.[/red]")
+    elif sub == "exit":
+        plan = _pm.exit_plan_mode(approve=False)
+        if plan:
+            console.print("[dim]Exited plan mode; the draft remains in the plans directory.[/dim]")
+        else:
+            console.print("[yellow]No active plan to exit.[/yellow]")
+    elif sub == "status":
+        plan = _pm.get_current_plan()
+        if plan:
+            content = _pm.read_plan() or "(empty)"
+            _print_long_panel(content, f"Plan: {plan['task'][:60]}")
+        else:
+            console.print("[dim]Not in plan mode.[/dim]")
+    elif sub == "list":
+        plans = _pm.list_plans()
+        if plans:
+            console.print(f"[bold]Saved Plans:[/bold]")
+            for p in plans:
+                console.print(f"  [cyan]{p['name']}[/cyan] — {p['title'][:80]}")
+        else:
+            console.print("[dim]No saved plans.[/dim]")
+    else:
+        console.print("Usage:\n"
+                      "  [bold]/plan enter <task>[/bold] — Enter plan mode\n"
+                      "  [bold]/plan submit[/bold]       — Submit immutable revision for review\n"
+                      "  [bold]/plan revise <feedback>[/bold] — Ask AI to revise\n"
+                      "  [bold]/plan approve[/bold]      — Approve and execute\n"
+                      "  [bold]/plan exit[/bold]         — Exit without approving\n"
+                      "  [bold]/plan status[/bold]       — Show current plan\n"
+                      "  [bold]/plan list[/bold]         — List saved plans")
 
-    elif action == "/evolve":
-        sub = parts[1].lower() if len(parts) > 1 else ""
-        _, evolve_args_raw = _raw_tail_after_word(raw_args)
-        commands = {
-            "status", "branches", "open", "chat", "review", "test",
-            "activate", "disable", "candidates", "list", "profiles",
-            "profile", "use", "rollback", "help",
-        }
-        runtime = extension_runtime.get_runtime()
-        if not sub or sub not in commands:
-            idea = (_decode_text_arg(raw_args) if raw_args
-                    else "Create a useful project extension")
-            branch = evolution_lab.create_branch(idea)
-            worker = _evolution_lab_start_worker(branch["id"], session)
-            if worker:
-                branch = evolution_lab.read_branch(branch["id"]) or branch
+
+def _cmd_evolve(raw_args: str, parts: list, session: dict) -> None:
+    sub = parts[1].lower() if len(parts) > 1 else ""
+    _, evolve_args_raw = _raw_tail_after_word(raw_args)
+    commands = {
+        "status", "branches", "open", "chat", "review", "test",
+        "activate", "disable", "candidates", "list", "profiles",
+        "profile", "use", "rollback", "help",
+    }
+    runtime = extension_runtime.get_runtime()
+    if not sub or sub not in commands:
+        idea = (_decode_text_arg(raw_args) if raw_args
+                else "Create a useful project extension")
+        branch = evolution_lab.create_branch(idea)
+        worker = _evolution_lab_start_worker(branch["id"], session)
+        if worker:
+            branch = evolution_lab.read_branch(branch["id"]) or branch
+        console.print(Panel(
+            f"[bold]Evolution Lab branch created[/bold]\n\n"
+            f"Branch: [cyan]{branch['id']}[/cyan]\n"
+            f"Intent: [bold]{branch.get('intent')}[/bold]\n"
+            f"Status: [bold]{branch.get('status')}[/bold]\n"
+            f"Idea: {branch.get('description')}\n"
+            + (f"Worker: [cyan]{worker}[/cyan]" if worker else
+               "[yellow]Snapshot saved; no active parent agent was available.[/yellow]"),
+            title="Evolution Lab", border_style="cyan",
+        ))
+    elif sub == "status":
+        branch = evolution_lab.read_branch()
+        profile = evolution_lab.get_active_profile()
+        if branch is None:
+            console.print("[dim]No active Evolution Lab branch.[/dim]")
+        else:
             console.print(Panel(
-                f"[bold]Evolution Lab branch created[/bold]\n\n"
-                f"Branch: [cyan]{branch['id']}[/cyan]\n"
-                f"Intent: [bold]{branch.get('intent')}[/bold]\n"
-                f"Status: [bold]{branch.get('status')}[/bold]\n"
-                f"Idea: {branch.get('description')}\n"
-                + (f"Worker: [cyan]{worker}[/cyan]" if worker else
-                   "[yellow]Snapshot saved; no active parent agent was available.[/yellow]"),
-                title="Evolution Lab", border_style="cyan",
-            ))
-        elif sub == "status":
-            branch = evolution_lab.read_branch()
-            profile = evolution_lab.get_active_profile()
-            if branch is None:
-                console.print("[dim]No active Evolution Lab branch.[/dim]")
+                f"Branch: {branch.get('id')}\nIntent: {branch.get('intent')}\n"
+                f"Status: {branch.get('status')}\n"
+                f"Candidate: {branch.get('candidate_id') or '(none)'}\n"
+                f"Profile: {profile.get('name', 'default')}\n"
+                f"Loaded extensions: {len(runtime.list())}",
+                title="Evolution Lab Status", border_style="cyan"))
+    elif sub == "branches":
+        for branch in evolution_lab.list_branches():
+            console.print(
+                f"  [cyan]{branch.get('id')}[/cyan] "
+                f"[{branch.get('intent')}] [dim]{branch.get('status')}[/dim] "
+                f"— {str(branch.get('description') or '')[:80]}")
+    elif sub == "open":
+        branch_id = parts[2] if len(parts) > 2 else ""
+        if not branch_id and sys.stdin.isatty():
+            chosen = choose_record(
+                evolution_lab.list_branches(),
+                title="Open Evolution Branch",
+                label=lambda item: item.get("id", ""),
+                description=lambda item: (
+                    f"{item.get('status')} · "
+                    f"{str(item.get('description') or '')[:100]}"),
+                search=True,
+            )
+            branch_id = chosen.get("id", "") if chosen else ""
+        if not branch_id:
+            console.print("[dim]Branch selection cancelled.[/dim]")
+        else:
+            ok, message = evolution_lab.set_active_branch(branch_id)
+            console.print(f"[{'green' if ok else 'red'}]{message}[/{'green' if ok else 'red'}]")
+    elif sub == "chat":
+        branch = evolution_lab.read_branch()
+        feedback = _decode_text_arg(evolve_args_raw) if evolve_args_raw else ""
+        if branch is None or not feedback:
+            console.print("[yellow]Usage: /evolve chat <refinement>[/yellow]")
+        else:
+            evolution_lab.add_branch_note(branch["id"], feedback)
+            worker = _evolution_lab_start_worker(branch["id"], session, feedback)
+            console.print(f"[green]Refinement worker: {worker}[/green]" if worker
+                          else "[red]Could not start refinement worker.[/red]")
+    elif sub in ("candidates", "list"):
+        candidates = evolution_lab.list_candidates()
+        if not candidates:
+            console.print("[dim]No Evolution Lab candidates.[/dim]")
+        for candidate in candidates:
+            console.print(
+                f"  [cyan]{candidate.get('id')}[/cyan] "
+                f"[{candidate.get('intent')}] [dim]{candidate.get('status')}[/dim] "
+                f"— {candidate.get('target_type')}:{candidate.get('name')}")
+    elif sub == "review":
+        candidate_id = parts[2] if len(parts) > 2 else evolution_lab.active_candidate_id()
+        candidate = evolution_lab.read_candidate(candidate_id)
+        if candidate is None:
+            console.print("[red]Evolution candidate not found.[/red]")
+        else:
+            files = "\n\n".join(
+                f"--- {item.get('path')} ---\n{item.get('content', '')}"
+                for item in candidate.get("files") or [])
+            runs = candidate.get("test_runs") or []
+            report = json.dumps(runs[-1].get("report"), ensure_ascii=False, indent=2) \
+                if runs else "(not tested)"
+            _print_long_panel(
+                f"Candidate: {candidate.get('id')}\n"
+                f"Intent: {candidate.get('intent')}\n"
+                f"Target: {candidate.get('target_type')}:{candidate.get('name')}\n"
+                f"SHA-256: {candidate.get('candidate_sha256')}\n"
+                f"Dependencies: {candidate.get('dependencies') or '(none)'}\n\n"
+                f"Description\n{candidate.get('description', '')}\n\n"
+                f"Files\n{files}\n\nLatest test\n{report}",
+                title="Evolution Candidate", border_style="blue")
+    elif sub == "test":
+        candidate_id = parts[2] if len(parts) > 2 else evolution_lab.active_candidate_id()
+        if not candidate_id:
+            console.print("[red]No candidate to test.[/red]")
+        else:
+            ok, message, run = evolution_lab.test_candidate(candidate_id)
+            detail = json.dumps((run or {}).get("report"), ensure_ascii=False, indent=2)
+            console.print(Panel(detail, title=message,
+                                border_style="green" if ok else "red"))
+    elif sub == "activate":
+        candidate_id = next((item for item in parts[2:] if item != "--force"), None)
+        candidate_id = candidate_id or evolution_lab.active_candidate_id()
+        candidate = evolution_lab.read_candidate(candidate_id)
+        if candidate is None:
+            console.print("[red]Evolution candidate not found.[/red]")
+        else:
+            preview = (
+                f"Candidate: {candidate_id}\n"
+                f"Target: {candidate.get('target_type')}:{candidate.get('name')}\n"
+                f"SHA-256: {candidate.get('candidate_sha256')}\n"
+                f"Files: {', '.join(item.get('path', '') for item in candidate.get('files') or [])}"
+            )
+            choice = _blocking_approval_prompt(
+                "Evolution activation", preview,
+                "Activate and hot-load this feature candidate?", allow_always=False)
+            if choice != "yes":
+                console.print("[yellow]Evolution activation cancelled.[/yellow]")
             else:
-                console.print(Panel(
-                    f"Branch: {branch.get('id')}\nIntent: {branch.get('intent')}\n"
-                    f"Status: {branch.get('status')}\n"
-                    f"Candidate: {branch.get('candidate_id') or '(none)'}\n"
-                    f"Profile: {profile.get('name', 'default')}\n"
-                    f"Loaded extensions: {len(runtime.list())}",
-                    title="Evolution Lab Status", border_style="cyan"))
-        elif sub == "branches":
-            for branch in evolution_lab.list_branches():
+                ok, message = evolution_lab.activate_candidate(
+                    candidate_id, runtime=runtime, force="--force" in parts[2:])
+                console.print(f"[{'green' if ok else 'red'}]{message}[/{'green' if ok else 'red'}]")
+    elif sub == "disable":
+        extension_name = parts[2] if len(parts) >= 3 else ""
+        if not extension_name and sys.stdin.isatty():
+            chosen = choose_record(
+                runtime.list(),
+                title="Disable Extension",
+                label=lambda item: item.get("name", ""),
+                description=lambda item: (
+                    f"v{item.get('version') or '?'} · {item.get('path', '')}"),
+                search=True,
+            )
+            extension_name = chosen.get("name", "") if chosen else ""
+        if not extension_name:
+            console.print("[dim]Extension selection cancelled.[/dim]")
+        else:
+            choice = _blocking_approval_prompt(
+                "Disable extension", f"Extension: {extension_name}",
+                "Disable and unload this extension?", allow_always=False)
+            if choice == "yes":
+                ok, message = evolution_lab.disable_extension(extension_name, runtime)
+                console.print(f"[{'green' if ok else 'red'}]{message}[/{'green' if ok else 'red'}]")
+    elif sub == "profiles":
+        for profile in evolution_lab.list_profiles():
+            marker = "*" if profile.get("active") else " "
+            console.print(
+                f"{marker} [cyan]{profile.get('name')}[/cyan] "
+                f"[dim]{len(profile.get('extensions') or {})} extension(s)[/dim]")
+    elif sub == "profile":
+        if len(parts) < 4 or parts[2].lower() != "create":
+            console.print("[yellow]Usage: /evolve profile create <name> [candidate-id ...][/yellow]")
+        else:
+            ok, message = evolution_lab.create_profile(parts[3], parts[4:])
+            console.print(f"[{'green' if ok else 'red'}]{message}[/{'green' if ok else 'red'}]")
+    elif sub == "use":
+        profile_name = parts[2] if len(parts) >= 3 else ""
+        if not profile_name and sys.stdin.isatty():
+            chosen = choose_record(
+                evolution_lab.list_profiles(),
+                title="Select Evolution Profile",
+                label=lambda item: item.get("name", ""),
+                description=lambda item: (
+                    f"{len(item.get('extensions') or {})} extension(s)"),
+                search=True,
+            )
+            profile_name = chosen.get("name", "") if chosen else ""
+        if not profile_name:
+            console.print("[dim]Profile selection cancelled.[/dim]")
+        else:
+            choice = _blocking_approval_prompt(
+                "Evolution profile", f"Profile: {profile_name}",
+                "Switch extension profile and hot-reload?", allow_always=False)
+            if choice == "yes":
+                ok, message = evolution_lab.switch_profile(profile_name, runtime)
+                console.print(f"[{'green' if ok else 'red'}]{message}[/{'green' if ok else 'red'}]")
+    elif sub == "rollback":
+        choice = _blocking_approval_prompt(
+            "Evolution rollback", "Restore the previous feature state.",
+            "Roll back and hot-reload now?", allow_always=False)
+        if choice == "yes":
+            ok, message = evolution_lab.rollback(runtime)
+            console.print(f"[{'green' if ok else 'red'}]{message}[/{'green' if ok else 'red'}]")
+    else:
+        console.print(
+            "[bold]Evolution Lab[/bold]\n"
+            "  /evolve <idea>\n  /evolve status|branches|candidates\n"
+            "  /evolve chat <refinement>\n  /evolve review|test|activate [id]\n"
+            "  /evolve disable <extension>\n"
+            "  /evolve profiles|profile create|use|rollback")
+
+
+def _cmd_prompt(raw_args: str, parts: list, session: dict) -> None:
+    import prompt_opt as _po
+    from rich.markup import escape as _escape
+    sub = parts[1].lower() if len(parts) > 1 else ""
+    _, prompt_args_raw = _raw_tail_after_word(raw_args)
+    _legacy_prompt_commands = {
+        "feedback", "fail", "optimize", "apply", "discard", "list",
+        "skill", "export", "install", "publish",
+    }
+    _lab_prompt_commands = {
+        "status", "branches", "open", "chat", "review", "test",
+        "activate", "disable", "patches", "profiles", "profile",
+        "use", "rollback", "help",
+    }
+
+    # `/prompt` and `/prompt <natural language>` are the primary UX. They
+    # capture an immutable incident and launch an isolated diagnosis worker.
+    if not sub or sub not in (_legacy_prompt_commands | _lab_prompt_commands):
+        description = (_decode_text_arg(raw_args) if raw_args
+                       else "Review the latest AI behavior and identify what should improve")
+        branch = _prompt_lab_create(description, session)
+        worker = branch.get("worker_agent_id")
+        console.print(Panel(
+            f"[bold]Prompt Lab branch created[/bold]\n\n"
+            f"Branch: [cyan]{branch['id']}[/cyan]\n"
+            f"Status: [bold]{branch.get('status', 'CAPTURED')}[/bold]\n"
+            f"Issue: {_escape(branch.get('description', ''))}\n"
+            + (f"Worker: [cyan]{worker}[/cyan]\n" if worker else
+               "[yellow]No active parent agent; snapshot saved without a worker.[/yellow]\n")
+            + "\n[dim]The main task and active prompt are unchanged. Use "
+              "/prompt status, /prompt chat <message>, and /prompt review.[/dim]",
+            title="Prompt Lab", border_style="cyan",
+        ))
+    elif sub == "branches":
+        branches = prompt_lab.list_branches()
+        if not branches:
+            console.print("[dim]No Prompt Lab branches in this project.[/dim]")
+        else:
+            console.print("[bold]Prompt Lab branches[/bold]")
+            for branch in branches:
                 console.print(
                     f"  [cyan]{branch.get('id')}[/cyan] "
-                    f"[{branch.get('intent')}] [dim]{branch.get('status')}[/dim] "
-                    f"— {str(branch.get('description') or '')[:80]}")
-        elif sub == "open":
-            branch_id = parts[2] if len(parts) > 2 else ""
-            if not branch_id and sys.stdin.isatty():
-                chosen = choose_record(
-                    evolution_lab.list_branches(),
-                    title="Open Evolution Branch",
-                    label=lambda item: item.get("id", ""),
-                    description=lambda item: (
-                        f"{item.get('status')} · "
-                        f"{str(item.get('description') or '')[:100]}"),
-                    search=True,
-                )
-                branch_id = chosen.get("id", "") if chosen else ""
-            if not branch_id:
-                console.print("[dim]Branch selection cancelled.[/dim]")
-            else:
-                ok, message = evolution_lab.set_active_branch(branch_id)
-                console.print(f"[{'green' if ok else 'red'}]{message}[/{'green' if ok else 'red'}]")
-        elif sub == "chat":
-            branch = evolution_lab.read_branch()
-            feedback = _decode_text_arg(evolve_args_raw) if evolve_args_raw else ""
-            if branch is None or not feedback:
-                console.print("[yellow]Usage: /evolve chat <refinement>[/yellow]")
-            else:
-                evolution_lab.add_branch_note(branch["id"], feedback)
-                worker = _evolution_lab_start_worker(branch["id"], session, feedback)
-                console.print(f"[green]Refinement worker: {worker}[/green]" if worker
-                              else "[red]Could not start refinement worker.[/red]")
-        elif sub in ("candidates", "list"):
-            candidates = evolution_lab.list_candidates()
-            if not candidates:
-                console.print("[dim]No Evolution Lab candidates.[/dim]")
-            for candidate in candidates:
-                console.print(
-                    f"  [cyan]{candidate.get('id')}[/cyan] "
-                    f"[{candidate.get('intent')}] [dim]{candidate.get('status')}[/dim] "
-                    f"— {candidate.get('target_type')}:{candidate.get('name')}")
-        elif sub == "review":
-            candidate_id = parts[2] if len(parts) > 2 else evolution_lab.active_candidate_id()
-            candidate = evolution_lab.read_candidate(candidate_id)
-            if candidate is None:
-                console.print("[red]Evolution candidate not found.[/red]")
-            else:
-                files = "\n\n".join(
-                    f"--- {item.get('path')} ---\n{item.get('content', '')}"
-                    for item in candidate.get("files") or [])
-                runs = candidate.get("test_runs") or []
-                report = json.dumps(runs[-1].get("report"), ensure_ascii=False, indent=2) \
-                    if runs else "(not tested)"
-                _print_long_panel(
-                    f"Candidate: {candidate.get('id')}\n"
-                    f"Intent: {candidate.get('intent')}\n"
-                    f"Target: {candidate.get('target_type')}:{candidate.get('name')}\n"
-                    f"SHA-256: {candidate.get('candidate_sha256')}\n"
-                    f"Dependencies: {candidate.get('dependencies') or '(none)'}\n\n"
-                    f"Description\n{candidate.get('description', '')}\n\n"
-                    f"Files\n{files}\n\nLatest test\n{report}",
-                    title="Evolution Candidate", border_style="blue")
-        elif sub == "test":
-            candidate_id = parts[2] if len(parts) > 2 else evolution_lab.active_candidate_id()
-            if not candidate_id:
-                console.print("[red]No candidate to test.[/red]")
-            else:
-                ok, message, run = evolution_lab.test_candidate(candidate_id)
-                detail = json.dumps((run or {}).get("report"), ensure_ascii=False, indent=2)
-                console.print(Panel(detail, title=message,
-                                    border_style="green" if ok else "red"))
-        elif sub == "activate":
-            candidate_id = next((item for item in parts[2:] if item != "--force"), None)
-            candidate_id = candidate_id or evolution_lab.active_candidate_id()
-            candidate = evolution_lab.read_candidate(candidate_id)
-            if candidate is None:
-                console.print("[red]Evolution candidate not found.[/red]")
-            else:
-                preview = (
-                    f"Candidate: {candidate_id}\n"
-                    f"Target: {candidate.get('target_type')}:{candidate.get('name')}\n"
-                    f"SHA-256: {candidate.get('candidate_sha256')}\n"
-                    f"Files: {', '.join(item.get('path', '') for item in candidate.get('files') or [])}"
-                )
-                choice = _blocking_approval_prompt(
-                    "Evolution activation", preview,
-                    "Activate and hot-load this feature candidate?", allow_always=False)
-                if choice != "yes":
-                    console.print("[yellow]Evolution activation cancelled.[/yellow]")
-                else:
-                    ok, message = evolution_lab.activate_candidate(
-                        candidate_id, runtime=runtime, force="--force" in parts[2:])
-                    console.print(f"[{'green' if ok else 'red'}]{message}[/{'green' if ok else 'red'}]")
-        elif sub == "disable":
-            extension_name = parts[2] if len(parts) >= 3 else ""
-            if not extension_name and sys.stdin.isatty():
-                chosen = choose_record(
-                    runtime.list(),
-                    title="Disable Extension",
-                    label=lambda item: item.get("name", ""),
-                    description=lambda item: (
-                        f"v{item.get('version') or '?'} · {item.get('path', '')}"),
-                    search=True,
-                )
-                extension_name = chosen.get("name", "") if chosen else ""
-            if not extension_name:
-                console.print("[dim]Extension selection cancelled.[/dim]")
-            else:
-                choice = _blocking_approval_prompt(
-                    "Disable extension", f"Extension: {extension_name}",
-                    "Disable and unload this extension?", allow_always=False)
-                if choice == "yes":
-                    ok, message = evolution_lab.disable_extension(extension_name, runtime)
-                    console.print(f"[{'green' if ok else 'red'}]{message}[/{'green' if ok else 'red'}]")
-        elif sub == "profiles":
-            for profile in evolution_lab.list_profiles():
-                marker = "*" if profile.get("active") else " "
-                console.print(
-                    f"{marker} [cyan]{profile.get('name')}[/cyan] "
-                    f"[dim]{len(profile.get('extensions') or {})} extension(s)[/dim]")
-        elif sub == "profile":
-            if len(parts) < 4 or parts[2].lower() != "create":
-                console.print("[yellow]Usage: /evolve profile create <name> [candidate-id ...][/yellow]")
-            else:
-                ok, message = evolution_lab.create_profile(parts[3], parts[4:])
-                console.print(f"[{'green' if ok else 'red'}]{message}[/{'green' if ok else 'red'}]")
-        elif sub == "use":
-            profile_name = parts[2] if len(parts) >= 3 else ""
-            if not profile_name and sys.stdin.isatty():
-                chosen = choose_record(
-                    evolution_lab.list_profiles(),
-                    title="Select Evolution Profile",
-                    label=lambda item: item.get("name", ""),
-                    description=lambda item: (
-                        f"{len(item.get('extensions') or {})} extension(s)"),
-                    search=True,
-                )
-                profile_name = chosen.get("name", "") if chosen else ""
-            if not profile_name:
-                console.print("[dim]Profile selection cancelled.[/dim]")
-            else:
-                choice = _blocking_approval_prompt(
-                    "Evolution profile", f"Profile: {profile_name}",
-                    "Switch extension profile and hot-reload?", allow_always=False)
-                if choice == "yes":
-                    ok, message = evolution_lab.switch_profile(profile_name, runtime)
-                    console.print(f"[{'green' if ok else 'red'}]{message}[/{'green' if ok else 'red'}]")
-        elif sub == "rollback":
-            choice = _blocking_approval_prompt(
-                "Evolution rollback", "Restore the previous feature state.",
-                "Roll back and hot-reload now?", allow_always=False)
-            if choice == "yes":
-                ok, message = evolution_lab.rollback(runtime)
-                console.print(f"[{'green' if ok else 'red'}]{message}[/{'green' if ok else 'red'}]")
+                    f"[dim]{branch.get('status')}[/dim] — "
+                    f"{_escape(str(branch.get('description') or '')[:80])}")
+    elif sub == "open":
+        branch_id = parts[2] if len(parts) >= 3 else ""
+        if not branch_id and sys.stdin.isatty():
+            chosen = choose_record(
+                prompt_lab.list_branches(),
+                title="Open Prompt Lab Branch",
+                label=lambda item: item.get("id", ""),
+                description=lambda item: (
+                    f"{item.get('status')} · "
+                    f"{str(item.get('description') or '')[:100]}"),
+                search=True,
+            )
+            branch_id = chosen.get("id", "") if chosen else ""
+        if not branch_id:
+            console.print("[dim]Branch selection cancelled.[/dim]")
         else:
-            console.print(
-                "[bold]Evolution Lab[/bold]\n"
-                "  /evolve <idea>\n  /evolve status|branches|candidates\n"
-                "  /evolve chat <refinement>\n  /evolve review|test|activate [id]\n"
-                "  /evolve disable <extension>\n"
-                "  /evolve profiles|profile create|use|rollback")
-
-    elif action == "/prompt":
-        import prompt_opt as _po
-        from rich.markup import escape as _escape
-        sub = parts[1].lower() if len(parts) > 1 else ""
-        _, prompt_args_raw = _raw_tail_after_word(raw_args)
-        _legacy_prompt_commands = {
-            "feedback", "fail", "optimize", "apply", "discard", "list",
-            "skill", "export", "install", "publish",
-        }
-        _lab_prompt_commands = {
-            "status", "branches", "open", "chat", "review", "test",
-            "activate", "disable", "patches", "profiles", "profile",
-            "use", "rollback", "help",
-        }
-
-        # `/prompt` and `/prompt <natural language>` are the primary UX. They
-        # capture an immutable incident and launch an isolated diagnosis worker.
-        if not sub or sub not in (_legacy_prompt_commands | _lab_prompt_commands):
-            description = (_decode_text_arg(raw_args) if raw_args
-                           else "Review the latest AI behavior and identify what should improve")
-            branch = _prompt_lab_create(description, session)
-            worker = branch.get("worker_agent_id")
-            console.print(Panel(
-                f"[bold]Prompt Lab branch created[/bold]\n\n"
-                f"Branch: [cyan]{branch['id']}[/cyan]\n"
-                f"Status: [bold]{branch.get('status', 'CAPTURED')}[/bold]\n"
-                f"Issue: {_escape(branch.get('description', ''))}\n"
-                + (f"Worker: [cyan]{worker}[/cyan]\n" if worker else
-                   "[yellow]No active parent agent; snapshot saved without a worker.[/yellow]\n")
-                + "\n[dim]The main task and active prompt are unchanged. Use "
-                  "/prompt status, /prompt chat <message>, and /prompt review.[/dim]",
-                title="Prompt Lab", border_style="cyan",
-            ))
-        elif sub == "branches":
-            branches = prompt_lab.list_branches()
-            if not branches:
-                console.print("[dim]No Prompt Lab branches in this project.[/dim]")
+            ok, msg = prompt_lab.set_active_branch(branch_id)
+            console.print(f"[{'green' if ok else 'red'}]{_escape(msg)}[/{'green' if ok else 'red'}]")
+    elif sub == "chat":
+        branch = prompt_lab.read_branch()
+        message = _decode_text_arg(prompt_args_raw) if prompt_args_raw else ""
+        if branch is None:
+            console.print("[yellow]No active Prompt Lab branch. Run /prompt <issue> first.[/yellow]")
+        elif not message:
+            console.print("[yellow]Usage: /prompt chat <feedback or refinement>[/yellow]")
+        else:
+            prompt_lab.add_branch_note(branch["id"], message, kind="user-feedback")
+            child_id = _prompt_lab_start_worker(branch["id"], session, message)
+            if child_id:
+                console.print(f"[green]Prompt Lab refinement worker started: {child_id}[/green]")
             else:
-                console.print("[bold]Prompt Lab branches[/bold]")
-                for branch in branches:
-                    console.print(
-                        f"  [cyan]{branch.get('id')}[/cyan] "
-                        f"[dim]{branch.get('status')}[/dim] — "
-                        f"{_escape(str(branch.get('description') or '')[:80])}")
-        elif sub == "open":
-            branch_id = parts[2] if len(parts) >= 3 else ""
-            if not branch_id and sys.stdin.isatty():
-                chosen = choose_record(
-                    prompt_lab.list_branches(),
-                    title="Open Prompt Lab Branch",
-                    label=lambda item: item.get("id", ""),
-                    description=lambda item: (
-                        f"{item.get('status')} · "
-                        f"{str(item.get('description') or '')[:100]}"),
-                    search=True,
-                )
-                branch_id = chosen.get("id", "") if chosen else ""
-            if not branch_id:
-                console.print("[dim]Branch selection cancelled.[/dim]")
-            else:
-                ok, msg = prompt_lab.set_active_branch(branch_id)
-                console.print(f"[{'green' if ok else 'red'}]{_escape(msg)}[/{'green' if ok else 'red'}]")
-        elif sub == "chat":
-            branch = prompt_lab.read_branch()
-            message = _decode_text_arg(prompt_args_raw) if prompt_args_raw else ""
-            if branch is None:
-                console.print("[yellow]No active Prompt Lab branch. Run /prompt <issue> first.[/yellow]")
-            elif not message:
-                console.print("[yellow]Usage: /prompt chat <feedback or refinement>[/yellow]")
-            else:
-                prompt_lab.add_branch_note(branch["id"], message, kind="user-feedback")
-                child_id = _prompt_lab_start_worker(branch["id"], session, message)
-                if child_id:
-                    console.print(f"[green]Prompt Lab refinement worker started: {child_id}[/green]")
-                else:
-                    console.print("[red]Could not start refinement worker; no active parent agent.[/red]")
-        elif sub == "status" and prompt_lab.read_branch() is not None:
-            branch = prompt_lab.read_branch() or {}
-            patch = prompt_lab.read_patch(str(branch.get("candidate_patch_id") or ""))
-            profile = prompt_lab.get_active_profile()
-            test_status = "not run"
-            if patch and patch.get("test_runs"):
-                test_status = "passed" if patch["test_runs"][-1].get("passed") else "FAILED"
-            console.print(Panel(
-                f"Branch: [cyan]{branch.get('id', '?')}[/cyan]\n"
-                f"Status: [bold]{branch.get('status', '?')}[/bold]\n"
-                f"Candidate: [cyan]{branch.get('candidate_patch_id') or '(none)'}[/cyan]\n"
-                f"Tests: [bold]{test_status}[/bold]\n"
-                f"Active profile: [cyan]{profile.get('name', 'default')}[/cyan]\n"
-                f"Active overlays: {len(profile.get('patches') or [])}",
-                title="Prompt Lab Status", border_style="cyan",
-            ))
-        elif sub == "patches":
-            patches = prompt_lab.list_patches()
-            if not patches:
-                console.print("[dim]No Prompt Lab patches in this project.[/dim]")
-            else:
-                console.print("[bold]Prompt Lab patches[/bold]")
-                for patch in patches:
-                    console.print(
-                        f"  [cyan]{patch.get('id')}[/cyan] "
-                        f"[dim]{patch.get('status')}[/dim] — "
-                        f"{_escape(str(patch.get('title') or ''))}")
-        elif sub == "review":
-            patch_id = parts[2] if len(parts) >= 3 else prompt_lab.active_patch_id()
-            patch = prompt_lab.read_patch(patch_id or "") if patch_id else None
-            if patch is None:
-                # Fall through to the legacy candidate reader for compatibility.
-                cid = parts[2] if len(parts) >= 3 else None
-                cand = _po.read_candidate(cid)
-                if not cand:
-                    console.print("[yellow]No Prompt Lab or legacy candidate found.[/yellow]")
-                else:
-                    _print_long_panel(
-                        f"[bold]Legacy candidate:[/bold] {cand.get('id', '?')}\n\n"
-                        f"{cand.get('body', '')}",
-                        title="Legacy Prompt Candidate", border_style="blue")
-            else:
-                runs = patch.get("test_runs") or []
-                last_report = runs[-1].get("report", "") if runs else "(not tested)"
-                test_cases = "\n".join(
-                    f"- {case.get('name')}: {case.get('expected')}"
-                    for case in patch.get("tests") or []) or "(none)"
-                _print_long_panel(
-                    f"[bold]Patch:[/bold] {patch.get('id')}\n"
-                    f"[bold]Status:[/bold] {patch.get('status')}\n\n"
-                    f"[bold]Diagnosis[/bold]\n{patch.get('diagnosis', '')}\n\n"
-                    f"[bold]Rationale[/bold]\n{patch.get('rationale', '')}\n\n"
-                    f"[bold]Overlay[/bold]\n{patch.get('content', '')}\n\n"
-                    f"[bold]Regression cases[/bold]\n{test_cases}\n\n"
-                    f"[bold]Latest test report[/bold]\n{last_report}",
-                    title="Prompt Lab Review", border_style="blue")
-        elif sub == "test":
-            patch_id = parts[2] if len(parts) >= 3 else prompt_lab.active_patch_id()
-            if not patch_id:
-                console.print("[yellow]No candidate patch. Wait for diagnosis or run /prompt chat.[/yellow]")
-            else:
-                ok, msg = _prompt_lab_start_test(patch_id, session)
-                console.print(f"[{'green' if ok else 'red'}]{_escape(msg)}[/{'green' if ok else 'red'}]")
-        elif sub == "activate":
-            patch_id = next((item for item in parts[2:] if item != "--force"), None)
-            patch_id = patch_id or prompt_lab.active_patch_id()
-            patch = prompt_lab.read_patch(patch_id or "") if patch_id else None
-            if patch is None:
-                console.print("[red]Prompt Lab patch not found.[/red]")
-            else:
-                runs = patch.get("test_runs") or []
-                passed = bool(runs and runs[-1].get("passed"))
-                if not passed and "--force" not in parts[2:]:
-                    console.print("[red]The latest regression run has not passed. Run /prompt test first, or explicitly use --force.[/red]")
-                else:
-                    ok, preview = prompt_lab.preview_activation(patch_id)
-                    if not ok:
-                        console.print(f"[red]{_escape(preview)}[/red]")
-                    else:
-                        if not passed:
-                            preview = "WARNING: activating without a passing test.\n\n" + preview
-                        choice = _blocking_approval_prompt(
-                            "Prompt Lab activation",
-                            preview,
-                            "Activate this prompt overlay and hot-reload now?",
-                            allow_always=False,
-                        )
-                        if choice != "yes":
-                            console.print("[yellow]Prompt activation cancelled.[/yellow]")
-                        else:
-                            ok, msg = prompt_lab.activate_patch(patch_id)
-                            console.print(f"[{'green' if ok else 'red'}]{_escape(msg)}[/{'green' if ok else 'red'}]")
-        elif sub == "disable":
-            patch_id = parts[2] if len(parts) >= 3 else ""
-            if not patch_id and sys.stdin.isatty():
-                enabled = [
-                    item for item in prompt_lab.list_patches()
-                    if item.get("status") == "ACTIVE"
-                ]
-                chosen = choose_record(
-                    enabled,
-                    title="Disable Prompt Overlay",
-                    label=lambda item: item.get("id", ""),
-                    description=lambda item: str(item.get("title") or ""),
-                    search=True,
-                )
-                patch_id = chosen.get("id", "") if chosen else ""
-            if not patch_id:
-                console.print("[dim]Prompt overlay selection cancelled.[/dim]")
-            else:
-                choice = _blocking_approval_prompt(
-                    "Prompt Lab change",
-                    f"Patch: {patch_id}",
-                    "Disable this overlay and hot-reload now?",
-                    allow_always=False,
-                )
-                if choice != "yes":
-                    console.print("[yellow]Prompt change cancelled.[/yellow]")
-                else:
-                    ok, msg = prompt_lab.disable_patch(patch_id)
-                    console.print(f"[{'green' if ok else 'red'}]{_escape(msg)}[/{'green' if ok else 'red'}]")
-        elif sub == "profiles":
-            for profile in prompt_lab.list_profiles():
-                marker = "[green]*[/green]" if profile.get("active") else " "
+                console.print("[red]Could not start refinement worker; no active parent agent.[/red]")
+    elif sub == "status" and prompt_lab.read_branch() is not None:
+        branch = prompt_lab.read_branch() or {}
+        patch = prompt_lab.read_patch(str(branch.get("candidate_patch_id") or ""))
+        profile = prompt_lab.get_active_profile()
+        test_status = "not run"
+        if patch and patch.get("test_runs"):
+            test_status = "passed" if patch["test_runs"][-1].get("passed") else "FAILED"
+        console.print(Panel(
+            f"Branch: [cyan]{branch.get('id', '?')}[/cyan]\n"
+            f"Status: [bold]{branch.get('status', '?')}[/bold]\n"
+            f"Candidate: [cyan]{branch.get('candidate_patch_id') or '(none)'}[/cyan]\n"
+            f"Tests: [bold]{test_status}[/bold]\n"
+            f"Active profile: [cyan]{profile.get('name', 'default')}[/cyan]\n"
+            f"Active overlays: {len(profile.get('patches') or [])}",
+            title="Prompt Lab Status", border_style="cyan",
+        ))
+    elif sub == "patches":
+        patches = prompt_lab.list_patches()
+        if not patches:
+            console.print("[dim]No Prompt Lab patches in this project.[/dim]")
+        else:
+            console.print("[bold]Prompt Lab patches[/bold]")
+            for patch in patches:
                 console.print(
-                    f"{marker} [cyan]{profile.get('name')}[/cyan] "
-                    f"[dim]{len(profile.get('patches') or [])} patch(es)[/dim]")
-        elif sub == "profile":
-            if len(parts) < 4 or parts[2].lower() != "create":
-                console.print("[yellow]Usage: /prompt profile create <name> [patch-id ...][/yellow]")
+                    f"  [cyan]{patch.get('id')}[/cyan] "
+                    f"[dim]{patch.get('status')}[/dim] — "
+                    f"{_escape(str(patch.get('title') or ''))}")
+    elif sub == "review":
+        patch_id = parts[2] if len(parts) >= 3 else prompt_lab.active_patch_id()
+        patch = prompt_lab.read_patch(patch_id or "") if patch_id else None
+        if patch is None:
+            # Fall through to the legacy candidate reader for compatibility.
+            cid = parts[2] if len(parts) >= 3 else None
+            cand = _po.read_candidate(cid)
+            if not cand:
+                console.print("[yellow]No Prompt Lab or legacy candidate found.[/yellow]")
             else:
-                ok, msg = prompt_lab.create_profile(parts[3], parts[4:])
-                console.print(f"[{'green' if ok else 'red'}]{_escape(msg)}[/{'green' if ok else 'red'}]")
-        elif sub == "use":
-            profile_name = parts[2] if len(parts) >= 3 else ""
-            if not profile_name and sys.stdin.isatty():
-                chosen = choose_record(
-                    prompt_lab.list_profiles(),
-                    title="Select Prompt Profile",
-                    label=lambda item: item.get("name", ""),
-                    description=lambda item: (
-                        f"{len(item.get('patches') or [])} patch(es)"),
-                    search=True,
-                )
-                profile_name = chosen.get("name", "") if chosen else ""
-            if not profile_name:
-                console.print("[dim]Profile selection cancelled.[/dim]")
+                _print_long_panel(
+                    f"[bold]Legacy candidate:[/bold] {cand.get('id', '?')}\n\n"
+                    f"{cand.get('body', '')}",
+                    title="Legacy Prompt Candidate", border_style="blue")
+        else:
+            runs = patch.get("test_runs") or []
+            last_report = runs[-1].get("report", "") if runs else "(not tested)"
+            test_cases = "\n".join(
+                f"- {case.get('name')}: {case.get('expected')}"
+                for case in patch.get("tests") or []) or "(none)"
+            _print_long_panel(
+                f"[bold]Patch:[/bold] {patch.get('id')}\n"
+                f"[bold]Status:[/bold] {patch.get('status')}\n\n"
+                f"[bold]Diagnosis[/bold]\n{patch.get('diagnosis', '')}\n\n"
+                f"[bold]Rationale[/bold]\n{patch.get('rationale', '')}\n\n"
+                f"[bold]Overlay[/bold]\n{patch.get('content', '')}\n\n"
+                f"[bold]Regression cases[/bold]\n{test_cases}\n\n"
+                f"[bold]Latest test report[/bold]\n{last_report}",
+                title="Prompt Lab Review", border_style="blue")
+    elif sub == "test":
+        patch_id = parts[2] if len(parts) >= 3 else prompt_lab.active_patch_id()
+        if not patch_id:
+            console.print("[yellow]No candidate patch. Wait for diagnosis or run /prompt chat.[/yellow]")
+        else:
+            ok, msg = _prompt_lab_start_test(patch_id, session)
+            console.print(f"[{'green' if ok else 'red'}]{_escape(msg)}[/{'green' if ok else 'red'}]")
+    elif sub == "activate":
+        patch_id = next((item for item in parts[2:] if item != "--force"), None)
+        patch_id = patch_id or prompt_lab.active_patch_id()
+        patch = prompt_lab.read_patch(patch_id or "") if patch_id else None
+        if patch is None:
+            console.print("[red]Prompt Lab patch not found.[/red]")
+        else:
+            runs = patch.get("test_runs") or []
+            passed = bool(runs and runs[-1].get("passed"))
+            if not passed and "--force" not in parts[2:]:
+                console.print("[red]The latest regression run has not passed. Run /prompt test first, or explicitly use --force.[/red]")
             else:
-                profile = next((p for p in prompt_lab.list_profiles()
-                                if p.get("name") == profile_name), None)
-                if profile is None:
-                    console.print(f"[red]Profile {profile_name} not found.[/red]")
+                ok, preview = prompt_lab.preview_activation(patch_id)
+                if not ok:
+                    console.print(f"[red]{_escape(preview)}[/red]")
                 else:
-                    body = (f"Profile: {profile_name}\nPatches:\n" +
-                            "\n".join(f"  - {p}" for p in profile.get("patches") or []))
+                    if not passed:
+                        preview = "WARNING: activating without a passing test.\n\n" + preview
                     choice = _blocking_approval_prompt(
-                        "Prompt Lab profile switch", body,
-                        "Switch profile and hot-reload now?", allow_always=False)
+                        "Prompt Lab activation",
+                        preview,
+                        "Activate this prompt overlay and hot-reload now?",
+                        allow_always=False,
+                    )
                     if choice != "yes":
-                        console.print("[yellow]Profile switch cancelled.[/yellow]")
+                        console.print("[yellow]Prompt activation cancelled.[/yellow]")
                     else:
-                        ok, msg = prompt_lab.switch_profile(profile_name)
+                        ok, msg = prompt_lab.activate_patch(patch_id)
                         console.print(f"[{'green' if ok else 'red'}]{_escape(msg)}[/{'green' if ok else 'red'}]")
-        elif sub == "rollback":
+    elif sub == "disable":
+        patch_id = parts[2] if len(parts) >= 3 else ""
+        if not patch_id and sys.stdin.isatty():
+            enabled = [
+                item for item in prompt_lab.list_patches()
+                if item.get("status") == "ACTIVE"
+            ]
+            chosen = choose_record(
+                enabled,
+                title="Disable Prompt Overlay",
+                label=lambda item: item.get("id", ""),
+                description=lambda item: str(item.get("title") or ""),
+                search=True,
+            )
+            patch_id = chosen.get("id", "") if chosen else ""
+        if not patch_id:
+            console.print("[dim]Prompt overlay selection cancelled.[/dim]")
+        else:
             choice = _blocking_approval_prompt(
-                "Prompt Lab rollback",
-                "The latest prompt activation, disable, or profile switch will be reverted.",
-                "Roll back and hot-reload now?",
+                "Prompt Lab change",
+                f"Patch: {patch_id}",
+                "Disable this overlay and hot-reload now?",
                 allow_always=False,
             )
             if choice != "yes":
-                console.print("[yellow]Prompt rollback cancelled.[/yellow]")
+                console.print("[yellow]Prompt change cancelled.[/yellow]")
             else:
-                ok, msg = prompt_lab.rollback()
+                ok, msg = prompt_lab.disable_patch(patch_id)
                 console.print(f"[{'green' if ok else 'red'}]{_escape(msg)}[/{'green' if ok else 'red'}]")
-        elif sub == "help":
+    elif sub == "profiles":
+        for profile in prompt_lab.list_profiles():
+            marker = "[green]*[/green]" if profile.get("active") else " "
             console.print(
-                "[bold]Prompt Lab[/bold]\n"
-                "  /prompt [issue]                  Capture an incident and start diagnosis\n"
-                "  /prompt chat <message>           Refine with AI in the active branch\n"
-                "  /prompt status|branches|patches  Inspect project state\n"
-                "  /prompt review [patch-id]        Review diagnosis, overlay, and tests\n"
-                "  /prompt test [patch-id]          Run an isolated AI regression evaluation\n"
-                "  /prompt activate [id] [--force]  Confirm, activate, and hot-reload\n"
-                "  /prompt disable <id>             Confirm and disable an overlay\n"
-                "  /prompt profiles|use <name>      Manage switchable prompt profiles\n"
-                "  /prompt rollback                 Confirm and undo latest prompt change")
-        elif sub == "feedback" and len(parts) >= 3:
-            desc = _decode_text_arg(prompt_args_raw)
-            entry = _po.capture_feedback(desc)
-            parent = get_current_agent()
-            if parent:
-                child_id = _po.spawn_optimizer(
-                    entry["id"], parent.id, get_loop_deps(), session)
-                if child_id:
-                    console.print(Panel(
-                        f"[bold]Feedback captured.[/bold] Optimizer spawned in background.\n\n"
-                        f"Feedback ID: [cyan]{entry['id']}[/cyan]\n"
-                        f"Optimizer agent: [cyan]{child_id}[/cyan]\n\n"
-                        f"[dim]The main task continues uninterrupted. The candidate will\n"
-                        f"arrive via inbox when ready. Run [bold]/prompt status[/bold] to check.[/dim]",
-                        title="Prompt Optimization", border_style="green"))
+                f"{marker} [cyan]{profile.get('name')}[/cyan] "
+                f"[dim]{len(profile.get('patches') or [])} patch(es)[/dim]")
+    elif sub == "profile":
+        if len(parts) < 4 or parts[2].lower() != "create":
+            console.print("[yellow]Usage: /prompt profile create <name> [patch-id ...][/yellow]")
+        else:
+            ok, msg = prompt_lab.create_profile(parts[3], parts[4:])
+            console.print(f"[{'green' if ok else 'red'}]{_escape(msg)}[/{'green' if ok else 'red'}]")
+    elif sub == "use":
+        profile_name = parts[2] if len(parts) >= 3 else ""
+        if not profile_name and sys.stdin.isatty():
+            chosen = choose_record(
+                prompt_lab.list_profiles(),
+                title="Select Prompt Profile",
+                label=lambda item: item.get("name", ""),
+                description=lambda item: (
+                    f"{len(item.get('patches') or [])} patch(es)"),
+                search=True,
+            )
+            profile_name = chosen.get("name", "") if chosen else ""
+        if not profile_name:
+            console.print("[dim]Profile selection cancelled.[/dim]")
+        else:
+            profile = next((p for p in prompt_lab.list_profiles()
+                            if p.get("name") == profile_name), None)
+            if profile is None:
+                console.print(f"[red]Profile {profile_name} not found.[/red]")
+            else:
+                body = (f"Profile: {profile_name}\nPatches:\n" +
+                        "\n".join(f"  - {p}" for p in profile.get("patches") or []))
+                choice = _blocking_approval_prompt(
+                    "Prompt Lab profile switch", body,
+                    "Switch profile and hot-reload now?", allow_always=False)
+                if choice != "yes":
+                    console.print("[yellow]Profile switch cancelled.[/yellow]")
                 else:
-                    console.print(Panel(
-                        f"[bold]Feedback captured.[/bold] (ID: {entry['id']})\n\n"
-                        f"[yellow]Optimizer spawn failed — max depth may be reached.[/yellow]\n"
-                        f"[dim]Run [bold]/prompt optimize {entry['id']}[/bold] later from the REPL.[/dim]",
-                        title="Prompt Optimization", border_style="yellow"))
+                    ok, msg = prompt_lab.switch_profile(profile_name)
+                    console.print(f"[{'green' if ok else 'red'}]{_escape(msg)}[/{'green' if ok else 'red'}]")
+    elif sub == "rollback":
+        choice = _blocking_approval_prompt(
+            "Prompt Lab rollback",
+            "The latest prompt activation, disable, or profile switch will be reverted.",
+            "Roll back and hot-reload now?",
+            allow_always=False,
+        )
+        if choice != "yes":
+            console.print("[yellow]Prompt rollback cancelled.[/yellow]")
+        else:
+            ok, msg = prompt_lab.rollback()
+            console.print(f"[{'green' if ok else 'red'}]{_escape(msg)}[/{'green' if ok else 'red'}]")
+    elif sub == "help":
+        console.print(
+            "[bold]Prompt Lab[/bold]\n"
+            "  /prompt [issue]                  Capture an incident and start diagnosis\n"
+            "  /prompt chat <message>           Refine with AI in the active branch\n"
+            "  /prompt status|branches|patches  Inspect project state\n"
+            "  /prompt review [patch-id]        Review diagnosis, overlay, and tests\n"
+            "  /prompt test [patch-id]          Run an isolated AI regression evaluation\n"
+            "  /prompt activate [id] [--force]  Confirm, activate, and hot-reload\n"
+            "  /prompt disable <id>             Confirm and disable an overlay\n"
+            "  /prompt profiles|use <name>      Manage switchable prompt profiles\n"
+            "  /prompt rollback                 Confirm and undo latest prompt change")
+    elif sub == "feedback" and len(parts) >= 3:
+        desc = _decode_text_arg(prompt_args_raw)
+        entry = _po.capture_feedback(desc)
+        parent = get_current_agent()
+        if parent:
+            child_id = _po.spawn_optimizer(
+                entry["id"], parent.id, get_loop_deps(), session)
+            if child_id:
+                console.print(Panel(
+                    f"[bold]Feedback captured.[/bold] Optimizer spawned in background.\n\n"
+                    f"Feedback ID: [cyan]{entry['id']}[/cyan]\n"
+                    f"Optimizer agent: [cyan]{child_id}[/cyan]\n\n"
+                    f"[dim]The main task continues uninterrupted. The candidate will\n"
+                    f"arrive via inbox when ready. Run [bold]/prompt status[/bold] to check.[/dim]",
+                    title="Prompt Optimization", border_style="green"))
             else:
                 console.print(Panel(
                     f"[bold]Feedback captured.[/bold] (ID: {entry['id']})\n\n"
-                    f"[dim]No active agent to spawn the optimizer from. Run\n"
-                    f"[bold]/prompt optimize {entry['id']}[/bold] when an agent is active.[/dim]",
-                    title="Prompt Optimization", border_style="cyan"))
-        elif sub == "optimize" and len(parts) >= 3:
-            fid = parts[2]
-            parent = get_current_agent()
-            if not parent:
-                console.print("[red]No active agent. /hire one first.[/red]")
+                    f"[yellow]Optimizer spawn failed — max depth may be reached.[/yellow]\n"
+                    f"[dim]Run [bold]/prompt optimize {entry['id']}[/bold] later from the REPL.[/dim]",
+                    title="Prompt Optimization", border_style="yellow"))
+        else:
+            console.print(Panel(
+                f"[bold]Feedback captured.[/bold] (ID: {entry['id']})\n\n"
+                f"[dim]No active agent to spawn the optimizer from. Run\n"
+                f"[bold]/prompt optimize {entry['id']}[/bold] when an agent is active.[/dim]",
+                title="Prompt Optimization", border_style="cyan"))
+    elif sub == "optimize" and len(parts) >= 3:
+        fid = parts[2]
+        parent = get_current_agent()
+        if not parent:
+            console.print("[red]No active agent. /hire one first.[/red]")
+        else:
+            child_id = _po.spawn_optimizer(fid, parent.id, get_loop_deps(), session)
+            if child_id:
+                console.print(f"[green]Optimizer spawned: {child_id}[/green]")
             else:
-                child_id = _po.spawn_optimizer(fid, parent.id, get_loop_deps(), session)
-                if child_id:
-                    console.print(f"[green]Optimizer spawned: {child_id}[/green]")
-                else:
-                    console.print("[red]Spawn failed (max depth reached?)[/red]")
-        elif sub == "status":
-            state = _po.get_optimization_state(
-                parts[2] if len(parts) >= 3 else None)
-            if not state:
-                console.print("[dim]No active prompt optimization.[/dim]")
-            else:
-                status = state.get("status", "?")
-                cid = state.get("candidate_id") or "(none)"
-                fid = state.get("feedback_id") or "(none)"
-                console.print(Panel(
-                    f"Status: [bold]{status}[/bold]\n"
-                    f"Feedback: [cyan]{fid}[/cyan]\n"
-                    f"Candidate: [cyan]{cid}[/cyan]",
-                    title="Prompt Optimization Status", border_style="cyan"))
-        elif sub == "review":
-            cid = parts[2] if len(parts) >= 3 else None
-            cand = _po.read_candidate(cid)
-            if not cand:
-                console.print("[yellow]No candidate found. Run /prompt feedback first.[/yellow]")
-            else:
-                patch = cand.get("patch", "")
-                rationale = cand.get("body", "")
-                _print_long_panel(
-                    f"[bold]Candidate:[/bold] {cand.get('id', '?')}\n\n"
-                    f"[dim]Rationale:[/dim]\n{rationale}\n\n"
-                    f"[dim]Patch (to be appended to cli.prop):[/dim]\n{patch}",
-                    title="Prompt Candidate Review", border_style="blue")
-                console.print("\n[dim]Run [bold]/prompt apply[/bold] to activate, "
-                              "[bold]/prompt discard[/bold] to reject.[/dim]")
-        elif sub == "apply":
-            cid = next((item for item in parts[2:] if item != "--force"), None)
-            cand = _po.read_candidate(cid)
-            if not cand:
-                console.print("[red]No legacy candidate found to apply.[/red]")
-            else:
-                choice = _blocking_approval_prompt(
-                    "Legacy prompt activation",
-                    f"Candidate: {cand.get('id', '?')}\n\n{cand.get('patch', '')}",
-                    "Modify cli.prop and hot-reload this legacy patch?",
-                    allow_always=False,
-                )
-                if choice != "yes":
-                    console.print("[yellow]Legacy prompt activation cancelled.[/yellow]")
-                else:
-                    ok, msg = _po.apply_candidate(cid, force="--force" in parts[2:])
-                    color = "green" if ok else "red"
-                    console.print(f"[{color}]{msg}[/{color}]")
-        elif sub == "discard":
-            cid = parts[2] if len(parts) >= 3 else None
+                console.print("[red]Spawn failed (max depth reached?)[/red]")
+    elif sub == "status":
+        state = _po.get_optimization_state(
+            parts[2] if len(parts) >= 3 else None)
+        if not state:
+            console.print("[dim]No active prompt optimization.[/dim]")
+        else:
+            status = state.get("status", "?")
+            cid = state.get("candidate_id") or "(none)"
+            fid = state.get("feedback_id") or "(none)"
+            console.print(Panel(
+                f"Status: [bold]{status}[/bold]\n"
+                f"Feedback: [cyan]{fid}[/cyan]\n"
+                f"Candidate: [cyan]{cid}[/cyan]",
+                title="Prompt Optimization Status", border_style="cyan"))
+    elif sub == "review":
+        cid = parts[2] if len(parts) >= 3 else None
+        cand = _po.read_candidate(cid)
+        if not cand:
+            console.print("[yellow]No candidate found. Run /prompt feedback first.[/yellow]")
+        else:
+            patch = cand.get("patch", "")
+            rationale = cand.get("body", "")
+            _print_long_panel(
+                f"[bold]Candidate:[/bold] {cand.get('id', '?')}\n\n"
+                f"[dim]Rationale:[/dim]\n{rationale}\n\n"
+                f"[dim]Patch (to be appended to cli.prop):[/dim]\n{patch}",
+                title="Prompt Candidate Review", border_style="blue")
+            console.print("\n[dim]Run [bold]/prompt apply[/bold] to activate, "
+                          "[bold]/prompt discard[/bold] to reject.[/dim]")
+    elif sub == "apply":
+        cid = next((item for item in parts[2:] if item != "--force"), None)
+        cand = _po.read_candidate(cid)
+        if not cand:
+            console.print("[red]No legacy candidate found to apply.[/red]")
+        else:
             choice = _blocking_approval_prompt(
-                "Legacy prompt rollback",
-                f"Candidate: {cid or '(active legacy candidate)'}",
-                "Remove the active legacy patch and hot-reload?",
+                "Legacy prompt activation",
+                f"Candidate: {cand.get('id', '?')}\n\n{cand.get('patch', '')}",
+                "Modify cli.prop and hot-reload this legacy patch?",
                 allow_always=False,
             )
             if choice != "yes":
-                console.print("[yellow]Legacy prompt rollback cancelled.[/yellow]")
+                console.print("[yellow]Legacy prompt activation cancelled.[/yellow]")
             else:
-                ok, msg = _po.discard_candidate(cid)
+                ok, msg = _po.apply_candidate(cid, force="--force" in parts[2:])
                 color = "green" if ok else "red"
                 console.print(f"[{color}]{msg}[/{color}]")
-        elif sub == "list":
-            cands = _po.list_candidates()
-            if cands:
-                console.print("[bold]All candidates:[/bold]")
-                for c in cands:
-                    ctype = c.get("type", "cli_prop")
-                    extra = ""
-                    if ctype == "skill_patch":
-                        extra = f" [{c.get('skill_name', '')}/{c.get('skill_file', '')}]"
-                    console.print(f"  [cyan]{c['id']}[/cyan] "
-                                  f"[dim]{c['status']}[/dim] "
-                                  f"{ctype}{extra} "
-                                  f"— {c.get('feedback', '')[:40]}")
-            else:
-                console.print("[dim]No candidates. Run /prompt feedback or /prompt fail to start.[/dim]")
-        elif sub == "export" and len(parts) >= 3:
-            cid = parts[2]
-            out = parts[3] if len(parts) >= 4 else None
-            ok, res = _po.export_pack(cid, out)
-            color = "green" if ok else "red"
-            console.print(f"[{color}]{res}[/{color}]")
-        elif sub == "install" and len(parts) >= 3:
-            src = parts[2]
-            ok, msg, new_cid = _po.install_pack(src)
-            color = "green" if ok else "red"
-            console.print(f"[{color}]{msg}[/{color}]")
-        elif sub == "publish" and len(parts) >= 3:
-            cid = parts[2]
-            ok, msg = _po.publish_pack(cid, session)
-            color = "green" if ok else "yellow"
-            console.print(f"[{color}]{msg}[/{color}]")
-        elif sub == "fail":
-            fields = None
-            if prompt_args_raw:
-                try:
-                    fields = None
-                    last_error = None
-                    for candidate in _json_arg_candidates(prompt_args_raw):
-                        try:
-                            fields = json.loads(candidate)
-                            break
-                        except json.JSONDecodeError as exc:
-                            last_error = exc
-                    if fields is None and last_error is not None:
-                        raise last_error
-                except json.JSONDecodeError as exc:
-                    console.print(f"[red]Invalid failure-report JSON: {exc}[/red]")
-                    console.print("[dim]Use /prompt fail with no arguments for an interactive form.[/dim]")
-                    fields = None
-                if fields is not None and not isinstance(fields, dict):
-                    console.print("[red]Failure report must be a JSON object.[/red]")
-                    fields = None
-            elif sys.stdin.isatty():
-                _stop_bg_input_reader()
-                try:
-                    console.print(Panel(
-                        "Enter a concise failure report. Task and actual behavior are required.",
-                        title="Prompt Failure Report", border_style="cyan"))
-                    task_text = input("Task: ").strip()
-                    expected = input("Expected behavior: ").strip()
-                    actual = input("Actual behavior: ").strip()
-                    category_options = ["Unspecified", *_po.FAILURE_CATEGORIES]
-                    category_choice = select_dialog(
-                        category_options,
-                        title="Failure category",
-                        full_screen=False,
-                        selected_index=0,
-                        hint="↑↓ navigate  ↵ select  Esc/q keep unspecified",
-                    )
-                    category = ("" if category_choice in (None, "Unspecified")
-                                else category_choice)
-                    minimal_fix = input("Minimal fix (optional): ").strip()
-                    regression = input("Regression tests (optional): ").strip()
-                    fields = {
-                        "task": task_text, "expected": expected,
-                        "actual": actual, "category": category,
-                        "minimal_fix": minimal_fix,
-                        "regression_tests": regression,
-                    }
-                except (EOFError, KeyboardInterrupt):
-                    fields = None
-                finally:
-                    _start_bg_input_reader(get_user_message_queue())
-            else:
-                console.print(Panel(
-                    _po.get_failure_template(),
-                    title="Failure Report Template (v3)",
-                    border_style="cyan"))
-                console.print(
-                    "[dim]In a non-interactive shell pass a JSON object, for example: "
-                    "/prompt fail '{\"task\":\"...\",\"actual\":\"...\"}'[/dim]")
-
-            if fields is not None:
-                if not fields.get("task") and not fields.get("actual"):
-                    console.print("[red]Task or actual behavior is required; report not saved.[/red]")
-                elif (fields.get("category")
-                      and fields.get("category") not in _po.FAILURE_CATEGORIES):
-                    console.print(f"[red]Invalid category: {fields.get('category')}[/red]")
-                    console.print("[dim]Use one of: " + "; ".join(_po.FAILURE_CATEGORIES) + "[/dim]")
-                else:
-                    entry = _po.capture_structured_failure(fields)
-                    parent = get_current_agent()
-                    child_id = (_po.spawn_optimizer(
-                        entry["id"], parent.id, get_loop_deps(), session)
-                        if parent else None)
-                    console.print(Panel(
-                        f"Feedback ID: [cyan]{entry['id']}[/cyan]\n"
-                        + (f"Optimizer: [cyan]{child_id}[/cyan]" if child_id
-                           else "Optimizer not started (no active agent)."),
-                        title="Failure report saved", border_style="green",
-                    ))
-        elif sub == "skill":
-            sub2 = parts[2].lower() if len(parts) > 2 else ""
-            if sub2 == "list":
-                patches = _po.list_skill_patches()
-                if patches:
-                    console.print("[bold]Skill patches:[/bold]")
-                    for p in patches:
-                        console.print(
-                            f"  [cyan]{p['id']}[/cyan] "
-                            f"[dim]{p['status']}[/dim] "
-                            f"— {p.get('skill_name', '?')}/"
-                            f"{p.get('skill_file', '?')} "
-                            f"({p.get('mode', '?')})")
-                else:
-                    console.print("[dim]No skill patches. Run /prompt fail to start diagnosis.[/dim]")
-            elif sub2 == "review":
-                cid = parts[3] if len(parts) > 3 else None
-                if not cid and sys.stdin.isatty():
-                    chosen = choose_record(
-                        _po.list_skill_patches(),
-                        title="Review Skill Patch",
-                        label=lambda item: item.get("id", ""),
-                        description=lambda item: (
-                            f"{item.get('status')} · {item.get('skill_name', '?')}/"
-                            f"{item.get('skill_file', '?')}"),
-                        search=True,
-                    )
-                    cid = chosen.get("id") if chosen else None
-                patch = _po.read_skill_patch(cid)
-                if not patch:
-                    console.print("[yellow]No skill patch found. Run /prompt skill list for ids.[/yellow]")
-                else:
-                    mode = patch.get("mode", "?")
-                    if mode == "append":
-                        patch_preview = patch.get("patch", "")
-                    else:
-                        patch_preview = (
-                            f"OLD:\n{patch.get('old_string', '')}\n\n"
-                            f"NEW:\n{patch.get('new_string', '')}"
-                        )
-                    _print_long_panel(
-                        f"[bold]Skill Patch:[/bold] {patch.get('id', '?')}\n"
-                        f"[bold]Skill:[/bold] {patch.get('skill_name', '?')}/{patch.get('skill_file', '?')}\n"
-                        f"[bold]Mode:[/bold] {mode}\n\n"
-                        f"[dim]Rationale:[/dim]\n{patch.get('body', '')}\n\n"
-                        f"[dim]Patch:[/dim]\n{patch_preview}",
-                        title="Skill Patch Review", border_style="blue")
-                    console.print("\n[dim]Run [bold]/prompt skill apply <id>[/bold] to activate, "
-                                  "[bold]/prompt skill discard <id>[/bold] to reject.[/dim]")
-            elif sub2 == "apply":
-                cid = next((item for item in parts[3:] if item != "--force"), None)
-                if not cid and sys.stdin.isatty():
-                    chosen = choose_record(
-                        _po.list_skill_patches(),
-                        title="Apply Skill Patch",
-                        label=lambda item: item.get("id", ""),
-                        description=lambda item: (
-                            f"{item.get('status')} · {item.get('skill_name', '?')}/"
-                            f"{item.get('skill_file', '?')}"),
-                        search=True,
-                    )
-                    cid = chosen.get("id") if chosen else None
-                if not cid:
-                    console.print("[dim]Skill patch selection cancelled.[/dim]")
-                else:
-                    candidate = _po.read_skill_patch(cid)
-                    preview = (
-                        f"Patch: {cid}\nSkill: "
-                        f"{(candidate or {}).get('skill_name', '?')}/"
-                        f"{(candidate or {}).get('skill_file', '?')}\n\n"
-                        f"{(candidate or {}).get('patch', '')}"
-                    )
-                    choice = _blocking_approval_prompt(
-                        "Skill prompt activation", preview,
-                        "Modify this skill and hot-reload it?", allow_always=False)
-                    if choice != "yes":
-                        console.print("[yellow]Skill patch activation cancelled.[/yellow]")
-                    else:
-                        ok, msg = _po.apply_skill_patch(
-                            cid, force="--force" in parts[3:])
-                        color = "green" if ok else "red"
-                        console.print(f"[{color}]{msg}[/{color}]")
-            elif sub2 == "discard":
-                cid = parts[3] if len(parts) > 3 else None
-                if not cid and sys.stdin.isatty():
-                    chosen = choose_record(
-                        _po.list_skill_patches(),
-                        title="Discard Skill Patch",
-                        label=lambda item: item.get("id", ""),
-                        description=lambda item: (
-                            f"{item.get('status')} · {item.get('skill_name', '?')}/"
-                            f"{item.get('skill_file', '?')}"),
-                        search=True,
-                    )
-                    cid = chosen.get("id") if chosen else None
-                if not cid:
-                    console.print("[dim]Skill patch selection cancelled.[/dim]")
-                else:
-                    choice = _blocking_approval_prompt(
-                        "Skill prompt rollback", f"Patch: {cid}",
-                        "Restore the skill backup and hot-reload it?", allow_always=False)
-                    if choice != "yes":
-                        console.print("[yellow]Skill patch rollback cancelled.[/yellow]")
-                    else:
-                        ok, msg = _po.discard_skill_patch(cid)
-                        color = "green" if ok else "red"
-                        console.print(f"[{color}]{msg}[/{color}]")
-            else:
-                console.print("Usage:\n"
-                              "  [bold]/prompt skill list[/bold]            — List skill patches\n"
-                              "  [bold]/prompt skill review <id>[/bold]     — Review a skill patch\n"
-                              "  [bold]/prompt skill apply <id> [--force][/bold] — Apply a skill patch\n"
-                              "  [bold]/prompt skill discard <id>[/bold]    — Discard a skill patch")
+    elif sub == "discard":
+        cid = parts[2] if len(parts) >= 3 else None
+        choice = _blocking_approval_prompt(
+            "Legacy prompt rollback",
+            f"Candidate: {cid or '(active legacy candidate)'}",
+            "Remove the active legacy patch and hot-reload?",
+            allow_always=False,
+        )
+        if choice != "yes":
+            console.print("[yellow]Legacy prompt rollback cancelled.[/yellow]")
         else:
-            console.print("Usage:\n"
-                          "  [bold]/prompt feedback <desc>[/bold]    — Capture feedback & spawn optimizer\n"
-                          "  [bold]/prompt fail[/bold]                — Show failure template (v3)\n"
-                          "  [bold]/prompt optimize <id>[/bold]       — Spawn optimizer for a feedback id\n"
-                          "  [bold]/prompt status[/bold]              — Show optimization status\n"
-                          "  [bold]/prompt review [id][/bold]         — Review cli.prop candidate patch\n"
-                          "  [bold]/prompt apply [id] [--force][/bold] — Apply candidate to cli.prop\n"
-                          "  [bold]/prompt discard [id][/bold]        — Strip applied cli.prop patch\n"
-                          "  [bold]/prompt list[/bold]                — List all candidates (cli.prop + skill)\n"
-                          "  [bold]/prompt skill list|review|apply|discard <id>[/bold] — Manage skill patches\n"
-                          "  [bold]/prompt export <id> [path][/bold]  — Export portable pack\n"
-                          "  [bold]/prompt install <path|url>[/bold]  — Import a shared pack\n"
-                          "  [bold]/prompt publish <id>[/bold]        — Publish to community")
-
-    elif action == "/work":
-        sub = parts[1].lower() if len(parts) > 1 else "status"
-        if sub == "status":
-            work = workgraph.get_active_work()
-            if not work:
-                console.print("[dim]No active WorkGraph in this project.[/dim]")
-            else:
-                steps = workgraph.list_steps(work["id"])
-                done = sum(1 for step in steps if step.get("status") in {"completed", "skipped"})
+            ok, msg = _po.discard_candidate(cid)
+            color = "green" if ok else "red"
+            console.print(f"[{color}]{msg}[/{color}]")
+    elif sub == "list":
+        cands = _po.list_candidates()
+        if cands:
+            console.print("[bold]All candidates:[/bold]")
+            for c in cands:
+                ctype = c.get("type", "cli_prop")
+                extra = ""
+                if ctype == "skill_patch":
+                    extra = f" [{c.get('skill_name', '')}/{c.get('skill_file', '')}]"
+                console.print(f"  [cyan]{c['id']}[/cyan] "
+                              f"[dim]{c['status']}[/dim] "
+                              f"{ctype}{extra} "
+                              f"— {c.get('feedback', '')[:40]}")
+        else:
+            console.print("[dim]No candidates. Run /prompt feedback or /prompt fail to start.[/dim]")
+    elif sub == "export" and len(parts) >= 3:
+        cid = parts[2]
+        out = parts[3] if len(parts) >= 4 else None
+        ok, res = _po.export_pack(cid, out)
+        color = "green" if ok else "red"
+        console.print(f"[{color}]{res}[/{color}]")
+    elif sub == "install" and len(parts) >= 3:
+        src = parts[2]
+        ok, msg, new_cid = _po.install_pack(src)
+        color = "green" if ok else "red"
+        console.print(f"[{color}]{msg}[/{color}]")
+    elif sub == "publish" and len(parts) >= 3:
+        cid = parts[2]
+        ok, msg = _po.publish_pack(cid, session)
+        color = "green" if ok else "yellow"
+        console.print(f"[{color}]{msg}[/{color}]")
+    elif sub == "fail":
+        fields = None
+        if prompt_args_raw:
+            try:
+                fields = None
+                last_error = None
+                for candidate in _json_arg_candidates(prompt_args_raw):
+                    try:
+                        fields = json.loads(candidate)
+                        break
+                    except json.JSONDecodeError as exc:
+                        last_error = exc
+                if fields is None and last_error is not None:
+                    raise last_error
+            except json.JSONDecodeError as exc:
+                console.print(f"[red]Invalid failure-report JSON: {exc}[/red]")
+                console.print("[dim]Use /prompt fail with no arguments for an interactive form.[/dim]")
+                fields = None
+            if fields is not None and not isinstance(fields, dict):
+                console.print("[red]Failure report must be a JSON object.[/red]")
+                fields = None
+        elif sys.stdin.isatty():
+            _stop_bg_input_reader()
+            try:
                 console.print(Panel(
-                    f"ID: [cyan]{work['id']}[/cyan]\n"
-                    f"Objective: {work['objective']}\n"
-                    f"Status: [bold]{work['status']}[/bold]\n"
-                    f"Revision: {work.get('current_revision') or 0}\n"
-                    f"Approved: {work.get('approved_revision') or '(none)'}\n"
-                    f"Workflow: {work.get('workflow_template') or '(none)'} / "
-                    f"{work.get('workflow_phase') or '(none)'}\n"
-                    f"Steps: {done}/{len(steps)} complete",
-                    title="Active WorkGraph", border_style="cyan"))
-        elif sub == "list":
-            items = workgraph.list_work()
-            if not items:
-                console.print("[dim]No WorkGraph history in this project.[/dim]")
-            for item in items:
-                console.print(
-                    f"  [cyan]{item['id']}[/cyan] [dim]{item['status']}[/dim] — "
-                    f"{item['objective'][:100]}")
-        elif sub == "resume":
-            work_id = parts[2] if len(parts) >= 3 else ""
-            if not work_id and sys.stdin.isatty():
+                    "Enter a concise failure report. Task and actual behavior are required.",
+                    title="Prompt Failure Report", border_style="cyan"))
+                task_text = input("Task: ").strip()
+                expected = input("Expected behavior: ").strip()
+                actual = input("Actual behavior: ").strip()
+                category_options = ["Unspecified", *_po.FAILURE_CATEGORIES]
+                category_choice = select_dialog(
+                    category_options,
+                    title="Failure category",
+                    full_screen=False,
+                    selected_index=0,
+                    hint="↑↓ navigate  ↵ select  Esc/q keep unspecified",
+                )
+                category = ("" if category_choice in (None, "Unspecified")
+                            else category_choice)
+                minimal_fix = input("Minimal fix (optional): ").strip()
+                regression = input("Regression tests (optional): ").strip()
+                fields = {
+                    "task": task_text, "expected": expected,
+                    "actual": actual, "category": category,
+                    "minimal_fix": minimal_fix,
+                    "regression_tests": regression,
+                }
+            except (EOFError, KeyboardInterrupt):
+                fields = None
+            finally:
+                _start_bg_input_reader(get_user_message_queue())
+        else:
+            console.print(Panel(
+                _po.get_failure_template(),
+                title="Failure Report Template (v3)",
+                border_style="cyan"))
+            console.print(
+                "[dim]In a non-interactive shell pass a JSON object, for example: "
+                "/prompt fail '{\"task\":\"...\",\"actual\":\"...\"}'[/dim]")
+
+        if fields is not None:
+            if not fields.get("task") and not fields.get("actual"):
+                console.print("[red]Task or actual behavior is required; report not saved.[/red]")
+            elif (fields.get("category")
+                  and fields.get("category") not in _po.FAILURE_CATEGORIES):
+                console.print(f"[red]Invalid category: {fields.get('category')}[/red]")
+                console.print("[dim]Use one of: " + "; ".join(_po.FAILURE_CATEGORIES) + "[/dim]")
+            else:
+                entry = _po.capture_structured_failure(fields)
+                parent = get_current_agent()
+                child_id = (_po.spawn_optimizer(
+                    entry["id"], parent.id, get_loop_deps(), session)
+                    if parent else None)
+                console.print(Panel(
+                    f"Feedback ID: [cyan]{entry['id']}[/cyan]\n"
+                    + (f"Optimizer: [cyan]{child_id}[/cyan]" if child_id
+                       else "Optimizer not started (no active agent)."),
+                    title="Failure report saved", border_style="green",
+                ))
+    elif sub == "skill":
+        sub2 = parts[2].lower() if len(parts) > 2 else ""
+        if sub2 == "list":
+            patches = _po.list_skill_patches()
+            if patches:
+                console.print("[bold]Skill patches:[/bold]")
+                for p in patches:
+                    console.print(
+                        f"  [cyan]{p['id']}[/cyan] "
+                        f"[dim]{p['status']}[/dim] "
+                        f"— {p.get('skill_name', '?')}/"
+                        f"{p.get('skill_file', '?')} "
+                        f"({p.get('mode', '?')})")
+            else:
+                console.print("[dim]No skill patches. Run /prompt fail to start diagnosis.[/dim]")
+        elif sub2 == "review":
+            cid = parts[3] if len(parts) > 3 else None
+            if not cid and sys.stdin.isatty():
                 chosen = choose_record(
-                    workgraph.list_work(),
-                    title="Resume WorkGraph",
-                    label=lambda item: item["id"],
+                    _po.list_skill_patches(),
+                    title="Review Skill Patch",
+                    label=lambda item: item.get("id", ""),
                     description=lambda item: (
-                        f"{item['status']} · {item['objective'][:100]}"),
+                        f"{item.get('status')} · {item.get('skill_name', '?')}/"
+                        f"{item.get('skill_file', '?')}"),
                     search=True,
                 )
-                work_id = chosen["id"] if chosen else ""
-            if not work_id:
-                console.print("[dim]WorkGraph selection cancelled.[/dim]")
+                cid = chosen.get("id") if chosen else None
+            patch = _po.read_skill_patch(cid)
+            if not patch:
+                console.print("[yellow]No skill patch found. Run /prompt skill list for ids.[/yellow]")
             else:
-                work = workgraph.get_work(work_id)
-                if not work:
-                    console.print(f"[red]WorkGraph {work_id} not found.[/red]")
+                mode = patch.get("mode", "?")
+                if mode == "append":
+                    patch_preview = patch.get("patch", "")
                 else:
-                    workgraph.set_active_work(work["id"])
-                    if work["status"] in {"DRAFT", "REVIEW_PENDING", "NEEDS_USER", "BLOCKED"}:
-                        import plan_mode as _work_pm
-                        _work_pm.attach_work(work["id"])
-                    console.print(f"[green]Resumed WorkGraph {work['id']}.[/green]")
-        elif sub == "history":
-            work = workgraph.get_active_work()
-            if not work:
-                console.print("[dim]No active WorkGraph.[/dim]")
+                    patch_preview = (
+                        f"OLD:\n{patch.get('old_string', '')}\n\n"
+                        f"NEW:\n{patch.get('new_string', '')}"
+                    )
+                _print_long_panel(
+                    f"[bold]Skill Patch:[/bold] {patch.get('id', '?')}\n"
+                    f"[bold]Skill:[/bold] {patch.get('skill_name', '?')}/{patch.get('skill_file', '?')}\n"
+                    f"[bold]Mode:[/bold] {mode}\n\n"
+                    f"[dim]Rationale:[/dim]\n{patch.get('body', '')}\n\n"
+                    f"[dim]Patch:[/dim]\n{patch_preview}",
+                    title="Skill Patch Review", border_style="blue")
+                console.print("\n[dim]Run [bold]/prompt skill apply <id>[/bold] to activate, "
+                              "[bold]/prompt skill discard <id>[/bold] to reject.[/dim]")
+        elif sub2 == "apply":
+            cid = next((item for item in parts[3:] if item != "--force"), None)
+            if not cid and sys.stdin.isatty():
+                chosen = choose_record(
+                    _po.list_skill_patches(),
+                    title="Apply Skill Patch",
+                    label=lambda item: item.get("id", ""),
+                    description=lambda item: (
+                        f"{item.get('status')} · {item.get('skill_name', '?')}/"
+                        f"{item.get('skill_file', '?')}"),
+                    search=True,
+                )
+                cid = chosen.get("id") if chosen else None
+            if not cid:
+                console.print("[dim]Skill patch selection cancelled.[/dim]")
             else:
-                for event in reversed(workgraph.list_events(work["id"], limit=30)):
-                    console.print(
-                        f"  [dim]{event['id']}[/dim] {event['event_type']} "
-                        f"[dim]{json.dumps(event['payload'], ensure_ascii=False)[:120]}[/dim]")
+                candidate = _po.read_skill_patch(cid)
+                preview = (
+                    f"Patch: {cid}\nSkill: "
+                    f"{(candidate or {}).get('skill_name', '?')}/"
+                    f"{(candidate or {}).get('skill_file', '?')}\n\n"
+                    f"{(candidate or {}).get('patch', '')}"
+                )
+                choice = _blocking_approval_prompt(
+                    "Skill prompt activation", preview,
+                    "Modify this skill and hot-reload it?", allow_always=False)
+                if choice != "yes":
+                    console.print("[yellow]Skill patch activation cancelled.[/yellow]")
+                else:
+                    ok, msg = _po.apply_skill_patch(
+                        cid, force="--force" in parts[3:])
+                    color = "green" if ok else "red"
+                    console.print(f"[{color}]{msg}[/{color}]")
+        elif sub2 == "discard":
+            cid = parts[3] if len(parts) > 3 else None
+            if not cid and sys.stdin.isatty():
+                chosen = choose_record(
+                    _po.list_skill_patches(),
+                    title="Discard Skill Patch",
+                    label=lambda item: item.get("id", ""),
+                    description=lambda item: (
+                        f"{item.get('status')} · {item.get('skill_name', '?')}/"
+                        f"{item.get('skill_file', '?')}"),
+                    search=True,
+                )
+                cid = chosen.get("id") if chosen else None
+            if not cid:
+                console.print("[dim]Skill patch selection cancelled.[/dim]")
+            else:
+                choice = _blocking_approval_prompt(
+                    "Skill prompt rollback", f"Patch: {cid}",
+                    "Restore the skill backup and hot-reload it?", allow_always=False)
+                if choice != "yes":
+                    console.print("[yellow]Skill patch rollback cancelled.[/yellow]")
+                else:
+                    ok, msg = _po.discard_skill_patch(cid)
+                    color = "green" if ok else "red"
+                    console.print(f"[{color}]{msg}[/{color}]")
         else:
-            console.print("[yellow]Usage: /work [status|list|resume <id>|history][/yellow]")
+            console.print("Usage:\n"
+                          "  [bold]/prompt skill list[/bold]            — List skill patches\n"
+                          "  [bold]/prompt skill review <id>[/bold]     — Review a skill patch\n"
+                          "  [bold]/prompt skill apply <id> [--force][/bold] — Apply a skill patch\n"
+                          "  [bold]/prompt skill discard <id>[/bold]    — Discard a skill patch")
+    else:
+        console.print("Usage:\n"
+                      "  [bold]/prompt feedback <desc>[/bold]    — Capture feedback & spawn optimizer\n"
+                      "  [bold]/prompt fail[/bold]                — Show failure template (v3)\n"
+                      "  [bold]/prompt optimize <id>[/bold]       — Spawn optimizer for a feedback id\n"
+                      "  [bold]/prompt status[/bold]              — Show optimization status\n"
+                      "  [bold]/prompt review [id][/bold]         — Review cli.prop candidate patch\n"
+                      "  [bold]/prompt apply [id] [--force][/bold] — Apply candidate to cli.prop\n"
+                      "  [bold]/prompt discard [id][/bold]        — Strip applied cli.prop patch\n"
+                      "  [bold]/prompt list[/bold]                — List all candidates (cli.prop + skill)\n"
+                      "  [bold]/prompt skill list|review|apply|discard <id>[/bold] — Manage skill patches\n"
+                      "  [bold]/prompt export <id> [path][/bold]  — Export portable pack\n"
+                      "  [bold]/prompt install <path|url>[/bold]  — Import a shared pack\n"
+                      "  [bold]/prompt publish <id>[/bold]        — Publish to community")
 
-    elif action == "/task":
-        sub = parts[1].lower() if len(parts) > 1 else ""
-        _, task_args_raw = _raw_tail_after_word(raw_args)
-        _cwd = os.getcwd()
 
-        def _pick_task(title: str, statuses: Optional[set[str]] = None):
-            candidates = [
-                item for item in task_manager.list_tasks(cwd=_cwd)
-                if item.get("status") != "deleted"
-                and (statuses is None or item.get("status") in statuses)
-            ]
-            return choose_record(
-                candidates,
-                title=title,
-                label=lambda item: f"{item['id']} · {item.get('subject', '(untitled)')}",
+
+def _cmd_work(parts: list) -> None:
+    sub = parts[1].lower() if len(parts) > 1 else "status"
+    if sub == "status":
+        work = workgraph.get_active_work()
+        if not work:
+            console.print("[dim]No active WorkGraph in this project.[/dim]")
+        else:
+            steps = workgraph.list_steps(work["id"])
+            done = sum(1 for step in steps if step.get("status") in {"completed", "skipped"})
+            console.print(Panel(
+                f"ID: [cyan]{work['id']}[/cyan]\n"
+                f"Objective: {work['objective']}\n"
+                f"Status: [bold]{work['status']}[/bold]\n"
+                f"Revision: {work.get('current_revision') or 0}\n"
+                f"Approved: {work.get('approved_revision') or '(none)'}\n"
+                f"Workflow: {work.get('workflow_template') or '(none)'} / "
+                f"{work.get('workflow_phase') or '(none)'}\n"
+                f"Steps: {done}/{len(steps)} complete",
+                title="Active WorkGraph", border_style="cyan"))
+    elif sub == "list":
+        items = workgraph.list_work()
+        if not items:
+            console.print("[dim]No WorkGraph history in this project.[/dim]")
+        for item in items:
+            console.print(
+                f"  [cyan]{item['id']}[/cyan] [dim]{item['status']}[/dim] — "
+                f"{item['objective'][:100]}")
+    elif sub == "resume":
+        work_id = parts[2] if len(parts) >= 3 else ""
+        if not work_id and sys.stdin.isatty():
+            chosen = choose_record(
+                workgraph.list_work(),
+                title="Resume WorkGraph",
+                label=lambda item: item["id"],
                 description=lambda item: (
-                    f"{item.get('status', 'pending')} · "
-                    f"{item.get('progress', 0)}%"),
+                    f"{item['status']} · {item['objective'][:100]}"),
                 search=True,
             )
-
-        if sub in ("", "list"):
-            _tasks = [t for t in task_manager.list_tasks(cwd=_cwd)
-                      if t.get("status") != "deleted"]
-            if not _tasks:
-                console.print("[dim]No tasks. Use [bold]/task add <subject>[/bold] to create one.[/dim]")
-            else:
-                _n_pending = sum(1 for t in _tasks if t.get("status") == "pending")
-                _n_progress = sum(1 for t in _tasks if t.get("status") == "in_progress")
-                _n_done = sum(1 for t in _tasks if t.get("status") == "completed")
-                console.print(f"\n[bold]Tasks[/bold] · {_cwd}    "
-                               f"[cyan]{_n_pending} pending[/cyan] · "
-                               f"[yellow]{_n_progress} in_progress[/yellow] · "
-                               f"[green]{_n_done} done[/green]\n")
-                _t = Table(show_header=True, header_style="dim", show_lines=False)
-                _t.add_column("", width=2)
-                _t.add_column("ID", width=5)
-                _t.add_column("Subject")
-                _t.add_column("Prog", width=5, justify="right")
-                _status_by_id = {
-                    str(item.get("id")): item.get("status", "pending")
-                    for item in _tasks
-                }
-                for _tk in _tasks:
-                    st = _tk.get("status", "pending")
-                    mark = "▶" if st == "in_progress" else ("✓" if st == "completed" else "○")
-                    style = "yellow" if st == "in_progress" else ("green" if st == "completed" else "cyan")
-                    prog = _tk.get("progress", 0)
-                    prog_str = f"{prog}%" if prog > 0 else ""
-                    blocked = [
-                        str(blocker) for blocker in _tk.get("blockedBy", [])
-                        if _status_by_id.get(str(blocker), "pending")
-                        not in ("completed", "deleted")
-                    ]
-                    subj = _tk.get("subject", "(untitled task)")
-                    if blocked:
-                        subj += f" [dim][blocked: {', '.join(blocked)}][/dim]"
-                    _t.add_row(f"[{style}]{mark}[/{style}]", _tk["id"], subj, prog_str)
-                console.print(_t)
-                console.print()
-
-        elif sub == "add":
-            subject = _decode_text_arg(task_args_raw)
-            if not subject:
-                console.print("[yellow]Usage: /task add <subject>[/yellow]")
-            else:
-                _tk = task_manager.create_task(subject, cwd=_cwd)
-                console.print(f"[green]Created task [bold]{_tk['id']}[/bold]: {subject}[/green]")
-
-        elif sub == "show":
-            task_id = parts[2] if len(parts) >= 3 else ""
-            if not task_id and sys.stdin.isatty():
-                chosen = _pick_task("View Task")
-                task_id = chosen["id"] if chosen else ""
-            if not task_id:
-                console.print("[dim]Task selection cancelled.[/dim]")
-            else:
-                _tk = task_manager.get_task(task_id, cwd=_cwd)
-                if _tk is None:
-                    console.print(f"[red]Task '{task_id}' not found.[/red]")
-                else:
-                    notes = "\n".join(_tk.get("notes", [])) or "(none)"
-                    console.print(Panel(
-                        f"Status: {_tk.get('status', 'pending')}\n"
-                        f"Progress: {_tk.get('progress', 0)}%\n"
-                        f"Blocked by: {', '.join(_tk.get('blockedBy', [])) or '(none)'}\n"
-                        f"Blocks: {', '.join(_tk.get('blocks', [])) or '(none)'}\n\n"
-                        f"{_tk.get('description', '') or '(no description)'}\n\n"
-                        f"[dim]Notes[/dim]\n{notes}",
-                        title=f"Task {_tk.get('id')}: {_tk.get('subject', '(untitled)')}",
-                        border_style="cyan",
-                    ))
-
-        elif sub == "start":
-            task_id = parts[2] if len(parts) >= 3 else ""
-            if not task_id and sys.stdin.isatty():
-                chosen = _pick_task("Start Task", {"pending"})
-                task_id = chosen["id"] if chosen else ""
-            if not task_id:
-                console.print("[dim]Task selection cancelled.[/dim]")
-            else:
-                ok, msg, _tk = task_manager.update_task(task_id, cwd=_cwd, status="in_progress")
-                if ok:
-                    console.print(f"[yellow]Started task [bold]{_tk['id']}[/bold]: {_tk['subject']}[/yellow]")
-                else:
-                    console.print(f"[red]{msg}[/red]")
-
-        elif sub == "done":
-            task_id = parts[2] if len(parts) >= 3 else ""
-            if not task_id and sys.stdin.isatty():
-                chosen = _pick_task("Complete Task", {"pending", "in_progress"})
-                task_id = chosen["id"] if chosen else ""
-            if not task_id:
-                console.print("[dim]Task selection cancelled.[/dim]")
-            else:
-                ok, msg, _tk = task_manager.update_task(task_id, cwd=_cwd, status="completed", progress=100)
-                if ok:
-                    console.print(f"[green]Completed task [bold]{_tk['id']}[/bold]: {_tk['subject']}[/green]")
-                else:
-                    console.print(f"[red]{msg}[/red]")
-
-        elif sub == "del":
-            task_id = parts[2] if len(parts) >= 3 else ""
-            if not task_id and sys.stdin.isatty():
-                chosen = _pick_task("Delete Task")
-                task_id = chosen["id"] if chosen else ""
-            if not task_id:
-                console.print("[dim]Task selection cancelled.[/dim]")
-            else:
-                ok, msg, _tk = task_manager.update_task(task_id, cwd=_cwd, status="deleted")
-                if ok:
-                    console.print(f"[dim]Deleted task [bold]{_tk['id']}[/bold]: {_tk['subject']}[/dim]")
-                else:
-                    console.print(f"[red]{msg}[/red]")
-
-        elif sub == "progress":
-            task_id = parts[2] if len(parts) >= 3 else ""
-            progress_value = parts[3] if len(parts) >= 4 else ""
-            if not task_id and sys.stdin.isatty():
-                chosen = _pick_task("Update Task Progress")
-                task_id = chosen["id"] if chosen else ""
-            if task_id and not progress_value and sys.stdin.isatty():
-                try:
-                    progress_value = input("Progress (0-100): ").strip()
-                except (EOFError, KeyboardInterrupt):
-                    progress_value = ""
-            if not task_id or not progress_value:
-                console.print("[dim]Progress update cancelled.[/dim]")
-            else:
-                ok, msg, _tk = task_manager.update_task(
-                    task_id, cwd=_cwd, progress=progress_value)
-                if ok:
-                    console.print(
-                        f"[green]Task {_tk['id']} progress: {_tk.get('progress', 0)}%[/green]")
-                else:
-                    console.print(f"[red]{msg}[/red]")
-
-        elif sub == "note":
-            task_id, note_raw = _raw_tail_after_word(task_args_raw)
-            note = _decode_text_arg(note_raw)
-            if not task_id and sys.stdin.isatty():
-                chosen = _pick_task("Add Task Note")
-                task_id = chosen["id"] if chosen else ""
-            if task_id and not note and sys.stdin.isatty():
-                try:
-                    note = input("Note: ").strip()
-                except (EOFError, KeyboardInterrupt):
-                    note = ""
-            if not task_id or not note:
-                console.print("[dim]Task note cancelled.[/dim]")
-            else:
-                ok, msg, _tk = task_manager.update_task(
-                    task_id, cwd=_cwd, notes=note)
-                if ok:
-                    console.print(f"[green]Note added to task {_tk['id']}.[/green]")
-                else:
-                    console.print(f"[red]{msg}[/red]")
-
-        elif sub == "subtask":
-            parent_id, subject_raw = _raw_tail_after_word(task_args_raw)
-            subject = _decode_text_arg(subject_raw)
-            if not parent_id and sys.stdin.isatty():
-                chosen = _pick_task("Select Parent Task")
-                parent_id = chosen["id"] if chosen else ""
-            if parent_id and not subject and sys.stdin.isatty():
-                try:
-                    subject = input("Subtask subject: ").strip()
-                except (EOFError, KeyboardInterrupt):
-                    subject = ""
-            if not parent_id or not subject:
-                console.print("[dim]Subtask creation cancelled.[/dim]")
-            else:
-                ok, msg, _tk = task_manager.update_task(
-                    parent_id, cwd=_cwd, addSubtask=subject)
-                if ok:
-                    child_id = _tk.get("blocks", ["?"])[-1]
-                    console.print(
-                        f"[green]Created subtask {child_id} under task {_tk['id']}.[/green]")
-                else:
-                    console.print(f"[red]{msg}[/red]")
-
+            work_id = chosen["id"] if chosen else ""
+        if not work_id:
+            console.print("[dim]WorkGraph selection cancelled.[/dim]")
         else:
-            console.print("[yellow]Usage: [bold]/task[/bold] [list|add|show|start|done|del|progress|note|subtask][/yellow]\n"
-                          "  [bold]/task[/bold]               — list all tasks\n"
-                          "  [bold]/task add <subject>[/bold] — create a task\n"
-                          "  [bold]/task show <id>[/bold]      — show task details\n"
-                          "  [bold]/task start <id>[/bold]    — mark as in_progress\n"
-                          "  [bold]/task done <id>[/bold]     — mark as completed\n"
-                          "  [bold]/task progress <id> <n>[/bold] — update progress\n"
-                          "  [bold]/task note <id> <text>[/bold]  — append a note\n"
-                          "  [bold]/task subtask <id> <subject>[/bold] — create child task\n"
-                          "  [bold]/task del <id>[/bold]      — delete a task")
+            work = workgraph.get_work(work_id)
+            if not work:
+                console.print(f"[red]WorkGraph {work_id} not found.[/red]")
+            else:
+                workgraph.set_active_work(work["id"])
+                if work["status"] in {"DRAFT", "REVIEW_PENDING", "NEEDS_USER", "BLOCKED"}:
+                    import plan_mode as _work_pm
+                    _work_pm.attach_work(work["id"])
+                console.print(f"[green]Resumed WorkGraph {work['id']}.[/green]")
+    elif sub == "history":
+        work = workgraph.get_active_work()
+        if not work:
+            console.print("[dim]No active WorkGraph.[/dim]")
+        else:
+            for event in reversed(workgraph.list_events(work["id"], limit=30)):
+                console.print(
+                    f"  [dim]{event['id']}[/dim] {event['event_type']} "
+                    f"[dim]{json.dumps(event['payload'], ensure_ascii=False)[:120]}[/dim]")
+    else:
+        console.print("[yellow]Usage: /work [status|list|resume <id>|history][/yellow]")
 
-    elif action == "/workflow":
-        import workflow_engine as _we
-        sub = parts[1].lower() if len(parts) > 1 else "status"
-        if sub == "start":
-            _, start_raw = _raw_tail_after_word(raw_args)
-            replace = False
-            first, rest = _raw_tail_after_word(start_raw)
-            if first == "--replace":
-                replace = True
-                first, rest = _raw_tail_after_word(rest)
-            wf_name = first
-            wf_desc = _decode_text_arg(rest)
-            if not wf_name and sys.stdin.isatty():
-                templates = _we.list_workflow_templates()
-                chosen = choose_record(
-                    templates,
-                    title="Select Workflow Template",
-                    label=lambda item: item,
-                    description=lambda item: "Workflow template",
-                    full_screen=False,
-                )
-                wf_name = chosen or ""
-            if wf_name and not wf_desc and sys.stdin.isatty():
-                try:
-                    wf_desc = input("Workflow objective: ").strip()
-                except (EOFError, KeyboardInterrupt):
-                    wf_desc = ""
-            if not wf_name or not wf_desc:
-                console.print("[dim]Workflow creation cancelled. You can also use "
-                              "/workflow start [--replace] <name> \"<description>\".[/dim]")
+
+
+def _cmd_task(raw_args: str, parts: list) -> None:
+    sub = parts[1].lower() if len(parts) > 1 else ""
+    _, task_args_raw = _raw_tail_after_word(raw_args)
+    _cwd = os.getcwd()
+
+    def _pick_task(title: str, statuses: Optional[set[str]] = None):
+        candidates = [
+            item for item in task_manager.list_tasks(cwd=_cwd)
+            if item.get("status") != "deleted"
+            and (statuses is None or item.get("status") in statuses)
+        ]
+        return choose_record(
+            candidates,
+            title=title,
+            label=lambda item: f"{item['id']} · {item.get('subject', '(untitled)')}",
+            description=lambda item: (
+                f"{item.get('status', 'pending')} · "
+                f"{item.get('progress', 0)}%"),
+            search=True,
+        )
+
+    if sub in ("", "list"):
+        _tasks = [t for t in task_manager.list_tasks(cwd=_cwd)
+                  if t.get("status") != "deleted"]
+        if not _tasks:
+            console.print("[dim]No tasks. Use [bold]/task add <subject>[/bold] to create one.[/dim]")
+        else:
+            _n_pending = sum(1 for t in _tasks if t.get("status") == "pending")
+            _n_progress = sum(1 for t in _tasks if t.get("status") == "in_progress")
+            _n_done = sum(1 for t in _tasks if t.get("status") == "completed")
+            console.print(f"\n[bold]Tasks[/bold] · {_cwd}    "
+                           f"[cyan]{_n_pending} pending[/cyan] · "
+                           f"[yellow]{_n_progress} in_progress[/yellow] · "
+                           f"[green]{_n_done} done[/green]\n")
+            _t = Table(show_header=True, header_style="dim", show_lines=False)
+            _t.add_column("", width=2)
+            _t.add_column("ID", width=5)
+            _t.add_column("Subject")
+            _t.add_column("Prog", width=5, justify="right")
+            _status_by_id = {
+                str(item.get("id")): item.get("status", "pending")
+                for item in _tasks
+            }
+            for _tk in _tasks:
+                st = _tk.get("status", "pending")
+                mark = "▶" if st == "in_progress" else ("✓" if st == "completed" else "○")
+                style = "yellow" if st == "in_progress" else ("green" if st == "completed" else "cyan")
+                prog = _tk.get("progress", 0)
+                prog_str = f"{prog}%" if prog > 0 else ""
+                blocked = [
+                    str(blocker) for blocker in _tk.get("blockedBy", [])
+                    if _status_by_id.get(str(blocker), "pending")
+                    not in ("completed", "deleted")
+                ]
+                subj = _tk.get("subject", "(untitled task)")
+                if blocked:
+                    subj += f" [dim][blocked: {', '.join(blocked)}][/dim]"
+                _t.add_row(f"[{style}]{mark}[/{style}]", _tk["id"], subj, prog_str)
+            console.print(_t)
+            console.print()
+
+    elif sub == "add":
+        subject = _decode_text_arg(task_args_raw)
+        if not subject:
+            console.print("[yellow]Usage: /task add <subject>[/yellow]")
+        else:
+            _tk = task_manager.create_task(subject, cwd=_cwd)
+            console.print(f"[green]Created task [bold]{_tk['id']}[/bold]: {subject}[/green]")
+
+    elif sub == "show":
+        task_id = parts[2] if len(parts) >= 3 else ""
+        if not task_id and sys.stdin.isatty():
+            chosen = _pick_task("View Task")
+            task_id = chosen["id"] if chosen else ""
+        if not task_id:
+            console.print("[dim]Task selection cancelled.[/dim]")
+        else:
+            _tk = task_manager.get_task(task_id, cwd=_cwd)
+            if _tk is None:
+                console.print(f"[red]Task '{task_id}' not found.[/red]")
             else:
-                existing = _we.get_active_workflow()
-                wf = _we.start_workflow(wf_name, wf_desc, replace=replace)
-                if wf is None:
-                    if wf_name not in _we.list_workflow_templates():
-                        console.print(f"[red]Unknown workflow: {wf_name}[/red]")
-                        console.print(f"[dim]Available: {', '.join(_we.list_workflow_templates())}[/dim]")
-                    elif existing and not existing.completed:
-                        console.print(
-                            f"[yellow]Workflow '{existing.name}' is already active. "
-                            "End it first or pass --replace.[/yellow]")
-                else:
-                    current = wf.current
-                    cur_name = current.name if current else "?"
-                    console.print(Panel(
-                        f"[bold]Workflow Started: [green]{wf_name}[/green][/bold]\n\n"
-                        f"Task: {wf_desc}\n"
-                        f"Phases: {len(wf.phases)}\n"
-                        f"Progress: {wf.progress_str}\n\n"
-                        f"[dim]Current phase: [bold]{cur_name}[/bold][/dim]",
-                        title="Workflow",
-                        border_style="green",
-                    ))
-        elif sub == "status":
-            wf = _we.get_active_workflow()
-            if wf is None:
-                console.print("[dim]No active workflow.[/dim]")
-                console.print(f"[dim]Start one with: /workflow start <name> \"description\"[/dim]")
-                console.print(f"[dim]Available: {', '.join(_we.list_workflow_templates())}[/dim]")
-            else:
-                current = wf.current
-                phase_info = ""
-                if current:
-                    phase_info = f"\nCurrent: [bold]{current.name}[/bold] — {current.description}"
-                    if current.allowed_tools:
-                        phase_info += f"\nAllowed tools: {', '.join(current.allowed_tools)}"
-                    if current.spawn_agents:
-                        phase_info += f"\nAuto-spawn roles: {', '.join(current.spawn_agents)}"
-                    if current.exit_condition == "user_confirm":
-                        phase_info += "\nNext transition: explicit /workflow approve required"
-                history = []
-                for phase in wf.phases[:wf.current_phase]:
-                    summary = wf.phase_states.get(phase.name, {}).get("summary", "")
-                    history.append(f"  {phase.name}: {summary or '(completed)'}")
-                history_text = ("\n\nCompleted phases:\n" + "\n".join(history)) if history else ""
+                notes = "\n".join(_tk.get("notes", [])) or "(none)"
                 console.print(Panel(
-                    f"[bold]{wf.name}[/bold] — {wf.description}\n\n"
-                    f"Progress: {wf.progress_str}{phase_info}{history_text}",
-                    title="Active Workflow",
+                    f"Status: {_tk.get('status', 'pending')}\n"
+                    f"Progress: {_tk.get('progress', 0)}%\n"
+                    f"Blocked by: {', '.join(_tk.get('blockedBy', [])) or '(none)'}\n"
+                    f"Blocks: {', '.join(_tk.get('blocks', [])) or '(none)'}\n\n"
+                    f"{_tk.get('description', '') or '(no description)'}\n\n"
+                    f"[dim]Notes[/dim]\n{notes}",
+                    title=f"Task {_tk.get('id')}: {_tk.get('subject', '(untitled)')}",
                     border_style="cyan",
                 ))
-        elif sub == "advance":
-            _, summary_raw = _raw_tail_after_word(raw_args)
-            summary = _decode_text_arg(summary_raw)
+
+    elif sub == "start":
+        task_id = parts[2] if len(parts) >= 3 else ""
+        if not task_id and sys.stdin.isatty():
+            chosen = _pick_task("Start Task", {"pending"})
+            task_id = chosen["id"] if chosen else ""
+        if not task_id:
+            console.print("[dim]Task selection cancelled.[/dim]")
+        else:
+            ok, msg, _tk = task_manager.update_task(task_id, cwd=_cwd, status="in_progress")
+            if ok:
+                console.print(f"[yellow]Started task [bold]{_tk['id']}[/bold]: {_tk['subject']}[/yellow]")
+            else:
+                console.print(f"[red]{msg}[/red]")
+
+    elif sub == "done":
+        task_id = parts[2] if len(parts) >= 3 else ""
+        if not task_id and sys.stdin.isatty():
+            chosen = _pick_task("Complete Task", {"pending", "in_progress"})
+            task_id = chosen["id"] if chosen else ""
+        if not task_id:
+            console.print("[dim]Task selection cancelled.[/dim]")
+        else:
+            ok, msg, _tk = task_manager.update_task(task_id, cwd=_cwd, status="completed", progress=100)
+            if ok:
+                console.print(f"[green]Completed task [bold]{_tk['id']}[/bold]: {_tk['subject']}[/green]")
+            else:
+                console.print(f"[red]{msg}[/red]")
+
+    elif sub == "del":
+        task_id = parts[2] if len(parts) >= 3 else ""
+        if not task_id and sys.stdin.isatty():
+            chosen = _pick_task("Delete Task")
+            task_id = chosen["id"] if chosen else ""
+        if not task_id:
+            console.print("[dim]Task selection cancelled.[/dim]")
+        else:
+            ok, msg, _tk = task_manager.update_task(task_id, cwd=_cwd, status="deleted")
+            if ok:
+                console.print(f"[dim]Deleted task [bold]{_tk['id']}[/bold]: {_tk['subject']}[/dim]")
+            else:
+                console.print(f"[red]{msg}[/red]")
+
+    elif sub == "progress":
+        task_id = parts[2] if len(parts) >= 3 else ""
+        progress_value = parts[3] if len(parts) >= 4 else ""
+        if not task_id and sys.stdin.isatty():
+            chosen = _pick_task("Update Task Progress")
+            task_id = chosen["id"] if chosen else ""
+        if task_id and not progress_value and sys.stdin.isatty():
             try:
-                new_phase = _we.advance_phase(summary, force=True)
+                progress_value = input("Progress (0-100): ").strip()
+            except (EOFError, KeyboardInterrupt):
+                progress_value = ""
+        if not task_id or not progress_value:
+            console.print("[dim]Progress update cancelled.[/dim]")
+        else:
+            ok, msg, _tk = task_manager.update_task(
+                task_id, cwd=_cwd, progress=progress_value)
+            if ok:
+                console.print(
+                    f"[green]Task {_tk['id']} progress: {_tk.get('progress', 0)}%[/green]")
+            else:
+                console.print(f"[red]{msg}[/red]")
+
+    elif sub == "note":
+        task_id, note_raw = _raw_tail_after_word(task_args_raw)
+        note = _decode_text_arg(note_raw)
+        if not task_id and sys.stdin.isatty():
+            chosen = _pick_task("Add Task Note")
+            task_id = chosen["id"] if chosen else ""
+        if task_id and not note and sys.stdin.isatty():
+            try:
+                note = input("Note: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                note = ""
+        if not task_id or not note:
+            console.print("[dim]Task note cancelled.[/dim]")
+        else:
+            ok, msg, _tk = task_manager.update_task(
+                task_id, cwd=_cwd, notes=note)
+            if ok:
+                console.print(f"[green]Note added to task {_tk['id']}.[/green]")
+            else:
+                console.print(f"[red]{msg}[/red]")
+
+    elif sub == "subtask":
+        parent_id, subject_raw = _raw_tail_after_word(task_args_raw)
+        subject = _decode_text_arg(subject_raw)
+        if not parent_id and sys.stdin.isatty():
+            chosen = _pick_task("Select Parent Task")
+            parent_id = chosen["id"] if chosen else ""
+        if parent_id and not subject and sys.stdin.isatty():
+            try:
+                subject = input("Subtask subject: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                subject = ""
+        if not parent_id or not subject:
+            console.print("[dim]Subtask creation cancelled.[/dim]")
+        else:
+            ok, msg, _tk = task_manager.update_task(
+                parent_id, cwd=_cwd, addSubtask=subject)
+            if ok:
+                child_id = _tk.get("blocks", ["?"])[-1]
+                console.print(
+                    f"[green]Created subtask {child_id} under task {_tk['id']}.[/green]")
+            else:
+                console.print(f"[red]{msg}[/red]")
+
+    else:
+        console.print("[yellow]Usage: [bold]/task[/bold] [list|add|show|start|done|del|progress|note|subtask][/yellow]\n"
+                      "  [bold]/task[/bold]               — list all tasks\n"
+                      "  [bold]/task add <subject>[/bold] — create a task\n"
+                      "  [bold]/task show <id>[/bold]      — show task details\n"
+                      "  [bold]/task start <id>[/bold]    — mark as in_progress\n"
+                      "  [bold]/task done <id>[/bold]     — mark as completed\n"
+                      "  [bold]/task progress <id> <n>[/bold] — update progress\n"
+                      "  [bold]/task note <id> <text>[/bold]  — append a note\n"
+                      "  [bold]/task subtask <id> <subject>[/bold] — create child task\n"
+                      "  [bold]/task del <id>[/bold]      — delete a task")
+
+
+
+def _cmd_workflow(raw_args: str, parts: list) -> None:
+    import workflow_engine as _we
+    sub = parts[1].lower() if len(parts) > 1 else "status"
+    if sub == "start":
+        _, start_raw = _raw_tail_after_word(raw_args)
+        replace = False
+        first, rest = _raw_tail_after_word(start_raw)
+        if first == "--replace":
+            replace = True
+            first, rest = _raw_tail_after_word(rest)
+        wf_name = first
+        wf_desc = _decode_text_arg(rest)
+        if not wf_name and sys.stdin.isatty():
+            templates = _we.list_workflow_templates()
+            chosen = choose_record(
+                templates,
+                title="Select Workflow Template",
+                label=lambda item: item,
+                description=lambda item: "Workflow template",
+                full_screen=False,
+            )
+            wf_name = chosen or ""
+        if wf_name and not wf_desc and sys.stdin.isatty():
+            try:
+                wf_desc = input("Workflow objective: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                wf_desc = ""
+        if not wf_name or not wf_desc:
+            console.print("[dim]Workflow creation cancelled. You can also use "
+                          "/workflow start [--replace] <name> \"<description>\".[/dim]")
+        else:
+            existing = _we.get_active_workflow()
+            wf = _we.start_workflow(wf_name, wf_desc, replace=replace)
+            if wf is None:
+                if wf_name not in _we.list_workflow_templates():
+                    console.print(f"[red]Unknown workflow: {wf_name}[/red]")
+                    console.print(f"[dim]Available: {', '.join(_we.list_workflow_templates())}[/dim]")
+                elif existing and not existing.completed:
+                    console.print(
+                        f"[yellow]Workflow '{existing.name}' is already active. "
+                        "End it first or pass --replace.[/yellow]")
+            else:
+                current = wf.current
+                cur_name = current.name if current else "?"
+                console.print(Panel(
+                    f"[bold]Workflow Started: [green]{wf_name}[/green][/bold]\n\n"
+                    f"Task: {wf_desc}\n"
+                    f"Phases: {len(wf.phases)}\n"
+                    f"Progress: {wf.progress_str}\n\n"
+                    f"[dim]Current phase: [bold]{cur_name}[/bold][/dim]",
+                    title="Workflow",
+                    border_style="green",
+                ))
+    elif sub == "status":
+        wf = _we.get_active_workflow()
+        if wf is None:
+            console.print("[dim]No active workflow.[/dim]")
+            console.print(f"[dim]Start one with: /workflow start <name> \"description\"[/dim]")
+            console.print(f"[dim]Available: {', '.join(_we.list_workflow_templates())}[/dim]")
+        else:
+            current = wf.current
+            phase_info = ""
+            if current:
+                phase_info = f"\nCurrent: [bold]{current.name}[/bold] — {current.description}"
+                if current.allowed_tools:
+                    phase_info += f"\nAllowed tools: {', '.join(current.allowed_tools)}"
+                if current.spawn_agents:
+                    phase_info += f"\nAuto-spawn roles: {', '.join(current.spawn_agents)}"
+                if current.exit_condition == "user_confirm":
+                    phase_info += "\nNext transition: explicit /workflow approve required"
+            history = []
+            for phase in wf.phases[:wf.current_phase]:
+                summary = wf.phase_states.get(phase.name, {}).get("summary", "")
+                history.append(f"  {phase.name}: {summary or '(completed)'}")
+            history_text = ("\n\nCompleted phases:\n" + "\n".join(history)) if history else ""
+            console.print(Panel(
+                f"[bold]{wf.name}[/bold] — {wf.description}\n\n"
+                f"Progress: {wf.progress_str}{phase_info}{history_text}",
+                title="Active Workflow",
+                border_style="cyan",
+            ))
+    elif sub == "advance":
+        _, summary_raw = _raw_tail_after_word(raw_args)
+        summary = _decode_text_arg(summary_raw)
+        try:
+            new_phase = _we.advance_phase(summary, force=True)
+        except _we.WorkflowTransitionError as exc:
+            console.print(f"[yellow]{exc}[/yellow]")
+        else:
+            wf = _we.get_active_workflow()
+            if new_phase is None:
+                if wf and wf.completed:
+                    console.print(f"[green]Workflow '{wf.name}' completed![/green]")
+                else:
+                    console.print("[yellow]No active workflow or already completed.[/yellow]")
+            else:
+                console.print(f"[green]Advanced to phase: [bold]{new_phase.name}[/bold] — {new_phase.description}[/green]")
+    elif sub == "approve":
+        _, summary_raw = _raw_tail_after_word(raw_args)
+        summary = _decode_text_arg(summary_raw)
+        wf = _we.get_active_workflow()
+        if wf is None or wf.completed:
+            console.print("[yellow]No active workflow to approve.[/yellow]")
+        else:
+            try:
+                new_phase = _we.advance_phase(summary, user_confirmed=True)
             except _we.WorkflowTransitionError as exc:
                 console.print(f"[yellow]{exc}[/yellow]")
             else:
-                wf = _we.get_active_workflow()
                 if new_phase is None:
-                    if wf and wf.completed:
-                        console.print(f"[green]Workflow '{wf.name}' completed![/green]")
-                    else:
-                        console.print("[yellow]No active workflow or already completed.[/yellow]")
+                    console.print(f"[green]Workflow '{wf.name}' completed.[/green]")
                 else:
-                    console.print(f"[green]Advanced to phase: [bold]{new_phase.name}[/bold] — {new_phase.description}[/green]")
-        elif sub == "approve":
-            _, summary_raw = _raw_tail_after_word(raw_args)
-            summary = _decode_text_arg(summary_raw)
-            wf = _we.get_active_workflow()
-            if wf is None or wf.completed:
-                console.print("[yellow]No active workflow to approve.[/yellow]")
-            else:
-                try:
-                    new_phase = _we.advance_phase(summary, user_confirmed=True)
-                except _we.WorkflowTransitionError as exc:
-                    console.print(f"[yellow]{exc}[/yellow]")
+                    console.print(
+                        f"[green]Approved; advanced to [bold]{new_phase.name}[/bold] "
+                        f"— {new_phase.description}[/green]")
+    elif sub == "end":
+        _, summary_raw = _raw_tail_after_word(raw_args)
+        summary = _decode_text_arg(summary_raw)
+        wf = _we.get_active_workflow()
+        if wf:
+            _we.end_workflow(summary)
+            console.print(f"[dim]Workflow '{wf.name}' ended.[/dim]")
+        else:
+            console.print("[dim]No active workflow.[/dim]")
+    elif sub == "list":
+        templates = _we.list_workflow_templates()
+        console.print("[bold]Available workflow templates:[/bold]")
+        for t in templates:
+            console.print(f"  [cyan]{t}[/cyan]")
+    else:
+        console.print("Usage:\n"
+                      "  [bold]/workflow start <name> \"<desc>\"[/bold] — Start a workflow\n"
+                      "  [bold]/workflow status[/bold]                — Show current workflow\n"
+                      "  [bold]/workflow advance [summary][/bold]    — Advance to next phase\n"
+                      "  [bold]/workflow approve [summary][/bold]    — Confirm a gated phase\n"
+                      "  [bold]/workflow end [summary][/bold]        — End workflow\n"
+                      "  [bold]/workflow list[/bold]                  — List available workflows")
+
+
+
+def _cmd_debug(parts: list) -> None:
+    if len(parts) > 1:
+        sub = parts[1].lower()
+        if sub == "clear":
+            clear_debug_logs()
+            console.print("[green]Debug log cleared.[/green]")
+        elif len(parts) >= 3 and sub.isdigit():
+            # /debug <N> <filename> — save latest N entries to file
+            try:
+                n = int(sub)
+                if n <= 0:
+                    raise ValueError("N must be greater than 0")
+                filename = parts[2]
+                raw_export = "--raw" in parts[3:]
+                entries = get_debug_logs()[:n]
+                if not entries:
+                    console.print("[yellow]No debug entries to save.[/yellow]")
                 else:
-                    if new_phase is None:
-                        console.print(f"[green]Workflow '{wf.name}' completed.[/green]")
+                    filepath = Path(filename).expanduser()
+                    lines = []
+                    for i, e in enumerate(entries, 1):
+                        lines.append(f"{'='*60}")
+                        lines.append(f"Entry #{i}  Loop #{e.loop}  {e.timestamp}  Path: {e.current_path}")
+                        lines.append(f"{'='*60}")
+                        if e.user_input:
+                            lines.append(f"\n[User Input]\n{e.user_input[:3000]}")
+                        if e.request_body:
+                            lines.append(f"\n[Context Sizes] terminal={e.context_sizes.get('terminal', 0)} conversation={e.context_sizes.get('conversation', 0)} memory={e.context_sizes.get('memory', 0)} terminals={e.context_sizes.get('terminals', 0)} prompt={e.context_sizes.get('prompt', 0)}")
+                            lines.append(f"\n[Prompt Preview]\n{e.request_body.get('promptPreview', '')[:500]}")
+                        if e.reply:
+                            lines.append(f"\n[AI Reply]\n{e.reply[:1500]}")
+                        if e.command:
+                            lines.append(f"\n[Command]\n{e.command}")
+                        lines.append(f"\n[Done] {e.done}")
+                        if e.error:
+                            lines.append("\n[Error] true")
+                        if e.billing:
+                            cost = e.billing.get("costCents") or 0
+                            balance = e.billing.get("balanceCents") or 0
+                            lines.append(f"\n[Billing] ${cost / 100:.2f} (balance ${balance / 100:.2f})")
+                        if e.exec_command:
+                            lines.append(f"\n[Executed] {e.exec_command}")
+                            lines.append(f"[Return Code] {e.exec_returncode}")
+                            if e.exec_stdout:
+                                lines.append(f"\n[Stdout]\n{e.exec_stdout}")
+                            if e.exec_stderr:
+                                lines.append(f"\n[Stderr]\n{e.exec_stderr}")
+                        if e.response_raw:
+                            try:
+                                raw_json = json.dumps(e.response_raw, ensure_ascii=False, indent=2)
+                            except Exception:
+                                raw_json = str(e.response_raw)
+                            lines.append(f"\n[Raw Response]\n{raw_json[:2000]}")
+                        lines.append("")
+                    try:
+                        filepath.parent.mkdir(parents=True, exist_ok=True)
+                        export_text = '\n'.join(lines)
+                        if not raw_export:
+                            export_text = _redact_sensitive_text(export_text)
+                        filepath.write_text(export_text, encoding='utf-8')
+                    except OSError as exc:
+                        console.print(f"[red]Could not save debug entries to {filepath}: {exc}[/red]")
                     else:
                         console.print(
-                            f"[green]Approved; advanced to [bold]{new_phase.name}[/bold] "
-                            f"— {new_phase.description}[/green]")
-        elif sub == "end":
-            _, summary_raw = _raw_tail_after_word(raw_args)
-            summary = _decode_text_arg(summary_raw)
-            wf = _we.get_active_workflow()
-            if wf:
-                _we.end_workflow(summary)
-                console.print(f"[dim]Workflow '{wf.name}' ended.[/dim]")
-            else:
-                console.print("[dim]No active workflow.[/dim]")
-        elif sub == "list":
-            templates = _we.list_workflow_templates()
-            console.print("[bold]Available workflow templates:[/bold]")
-            for t in templates:
-                console.print(f"  [cyan]{t}[/cyan]")
-        else:
-            console.print("Usage:\n"
-                          "  [bold]/workflow start <name> \"<desc>\"[/bold] — Start a workflow\n"
-                          "  [bold]/workflow status[/bold]                — Show current workflow\n"
-                          "  [bold]/workflow advance [summary][/bold]    — Advance to next phase\n"
-                          "  [bold]/workflow approve [summary][/bold]    — Confirm a gated phase\n"
-                          "  [bold]/workflow end [summary][/bold]        — End workflow\n"
-                          "  [bold]/workflow list[/bold]                  — List available workflows")
-
-    elif action == "/debug":
-        if len(parts) > 1:
-            sub = parts[1].lower()
-            if sub == "clear":
-                clear_debug_logs()
-                console.print("[green]Debug log cleared.[/green]")
-            elif len(parts) >= 3 and sub.isdigit():
-                # /debug <N> <filename> — save latest N entries to file
-                try:
-                    n = int(sub)
-                    if n <= 0:
-                        raise ValueError("N must be greater than 0")
-                    filename = parts[2]
-                    raw_export = "--raw" in parts[3:]
-                    entries = get_debug_logs()[:n]
-                    if not entries:
-                        console.print("[yellow]No debug entries to save.[/yellow]")
-                    else:
-                        filepath = Path(filename).expanduser()
-                        lines = []
-                        for i, e in enumerate(entries, 1):
-                            lines.append(f"{'='*60}")
-                            lines.append(f"Entry #{i}  Loop #{e.loop}  {e.timestamp}  Path: {e.current_path}")
-                            lines.append(f"{'='*60}")
-                            if e.user_input:
-                                lines.append(f"\n[User Input]\n{e.user_input[:3000]}")
-                            if e.request_body:
-                                lines.append(f"\n[Context Sizes] terminal={e.context_sizes.get('terminal', 0)} conversation={e.context_sizes.get('conversation', 0)} memory={e.context_sizes.get('memory', 0)} terminals={e.context_sizes.get('terminals', 0)} prompt={e.context_sizes.get('prompt', 0)}")
-                                lines.append(f"\n[Prompt Preview]\n{e.request_body.get('promptPreview', '')[:500]}")
-                            if e.reply:
-                                lines.append(f"\n[AI Reply]\n{e.reply[:1500]}")
-                            if e.command:
-                                lines.append(f"\n[Command]\n{e.command}")
-                            lines.append(f"\n[Done] {e.done}")
-                            if e.error:
-                                lines.append("\n[Error] true")
-                            if e.billing:
-                                cost = e.billing.get("costCents") or 0
-                                balance = e.billing.get("balanceCents") or 0
-                                lines.append(f"\n[Billing] ${cost / 100:.2f} (balance ${balance / 100:.2f})")
-                            if e.exec_command:
-                                lines.append(f"\n[Executed] {e.exec_command}")
-                                lines.append(f"[Return Code] {e.exec_returncode}")
-                                if e.exec_stdout:
-                                    lines.append(f"\n[Stdout]\n{e.exec_stdout}")
-                                if e.exec_stderr:
-                                    lines.append(f"\n[Stderr]\n{e.exec_stderr}")
-                            if e.response_raw:
-                                try:
-                                    raw_json = json.dumps(e.response_raw, ensure_ascii=False, indent=2)
-                                except Exception:
-                                    raw_json = str(e.response_raw)
-                                lines.append(f"\n[Raw Response]\n{raw_json[:2000]}")
-                            lines.append("")
-                        try:
-                            filepath.parent.mkdir(parents=True, exist_ok=True)
-                            export_text = '\n'.join(lines)
-                            if not raw_export:
-                                export_text = _redact_sensitive_text(export_text)
-                            filepath.write_text(export_text, encoding='utf-8')
-                        except OSError as exc:
-                            console.print(f"[red]Could not save debug entries to {filepath}: {exc}[/red]")
+                            f"[green]Saved {len(entries)} debug entr"
+                            f"{'y' if len(entries) == 1 else 'ies'} to {filepath.absolute()}[/green]")
+                        if raw_export:
+                            console.print("[yellow]Raw export may contain credentials or private content.[/yellow]")
                         else:
-                            console.print(
-                                f"[green]Saved {len(entries)} debug entr"
-                                f"{'y' if len(entries) == 1 else 'ies'} to {filepath.absolute()}[/green]")
-                            if raw_export:
-                                console.print("[yellow]Raw export may contain credentials or private content.[/yellow]")
-                            else:
-                                console.print("[dim]Common credential fields were redacted. Use --raw only when necessary.[/dim]")
-                except (ValueError, IndexError) as exc:
-                    console.print(f"[red]Error: {exc}[/red]")
-                    console.print("Usage: [bold]/debug <N> <filename>[/bold]")
-            else:
-                try:
-                    idx = int(sub) - 1
-                    show_debug_detail(idx)
-                except (ValueError, IndexError):
-                    console.print(f"[red]Invalid entry number: {sub}[/red]")
-                    console.print("Use [bold]/debug[/bold] to browse entries. [bold]/debug <N> <file>[/bold] to save to file.")
+                            console.print("[dim]Common credential fields were redacted. Use --raw only when necessary.[/dim]")
+            except (ValueError, IndexError) as exc:
+                console.print(f"[red]Error: {exc}[/red]")
+                console.print("Usage: [bold]/debug <N> <filename>[/bold]")
         else:
-            show_debug_browser_interactive()
+            try:
+                idx = int(sub) - 1
+                show_debug_detail(idx)
+            except (ValueError, IndexError):
+                console.print(f"[red]Invalid entry number: {sub}[/red]")
+                console.print("Use [bold]/debug[/bold] to browse entries. [bold]/debug <N> <file>[/bold] to save to file.")
+    else:
+        show_debug_browser_interactive()
 
-    elif action == "/detail":
-        # Toggle full vs simplified progress rendering. Off (default) shows a
-        # clean one-line-per-tool transcript; on restores full per-line output.
-        if len(parts) == 1:
-            _cur = bool(get_runtime_config("detail"))
-            if sys.stdin.isatty():
-                options = [
-                    ("Off", "Compact one-line tool progress"),
-                    ("On", "Full command output and detailed panels"),
-                ]
-                chosen = select_dialog(
-                    options,
-                    title="Tool Output Detail",
-                    full_screen=False,
-                    selected_index=1 if _cur else 0,
-                    hint="↑↓ navigate  ↵ select  Esc/q cancel",
-                    letter_shortcuts=True,
-                )
-                if chosen is not None:
-                    enabled = chosen == options[1]
-                    set_runtime_config("detail", enabled)
-                    console.print(
-                        f"[green]Detail mode {'on' if enabled else 'off'}.[/green]")
-            else:
+
+
+def _cmd_detail(parts: list) -> None:
+    # Toggle full vs simplified progress rendering. Off (default) shows a
+    # clean one-line-per-tool transcript; on restores full per-line output.
+    if len(parts) == 1:
+        _cur = bool(get_runtime_config("detail"))
+        if sys.stdin.isatty():
+            options = [
+                ("Off", "Compact one-line tool progress"),
+                ("On", "Full command output and detailed panels"),
+            ]
+            chosen = select_dialog(
+                options,
+                title="Tool Output Detail",
+                full_screen=False,
+                selected_index=1 if _cur else 0,
+                hint="↑↓ navigate  ↵ select  Esc/q cancel",
+                letter_shortcuts=True,
+            )
+            if chosen is not None:
+                enabled = chosen == options[1]
+                set_runtime_config("detail", enabled)
                 console.print(
-                    f"[dim]Detail mode is [bold]{'on' if _cur else 'off'}[/bold].[/dim]")
+                    f"[green]Detail mode {'on' if enabled else 'off'}.[/green]")
         else:
-            _sub = parts[1].lower()
-            if _sub in ("on", "off"):
-                set_runtime_config("detail", _sub == "on")
-                console.print(f"[green]Detail mode {_sub}.[/green]")
-            else:
-                console.print("[red]Usage: /detail [on|off][/red]")
+            console.print(
+                f"[dim]Detail mode is [bold]{'on' if _cur else 'off'}[/bold].[/dim]")
+    else:
+        _sub = parts[1].lower()
+        if _sub in ("on", "off"):
+            set_runtime_config("detail", _sub == "on")
+            console.print(f"[green]Detail mode {_sub}.[/green]")
+        else:
+            console.print("[red]Usage: /detail [on|off][/red]")
 
-    elif action in ("/station", "/st"):
-        station_args = [_normalize_slash_arg(item) for item in parts[1:]]
-        task = ""
-        task_marker = next(
-            (i for i, item in enumerate(station_args)
-             if item in {"--task", "--"}), None)
-        if task_marker is not None:
-            task = " ".join(station_args[task_marker + 1:]).strip()
-            station_args = station_args[:task_marker]
-            if not task:
-                console.print(
-                    "[yellow]Usage: /station <agent-id> [terminal] "
-                    "--task <work>[/yellow]")
-                return False
-        if not station_args or len(station_args) > 2:
+
+
+def _cmd_station(parts: list, agent_registry: AgentRegistry, session: dict) -> bool:
+    station_args = [_normalize_slash_arg(item) for item in parts[1:]]
+    task = ""
+    task_marker = next(
+        (i for i, item in enumerate(station_args)
+         if item in {"--task", "--"}), None)
+    if task_marker is not None:
+        task = " ".join(station_args[task_marker + 1:]).strip()
+        station_args = station_args[:task_marker]
+        if not task:
             console.print(
                 "[yellow]Usage: /station <agent-id> [terminal] "
-                "[--task <work>][/yellow]")
+                "--task <work>[/yellow]")
             return False
+    if not station_args or len(station_args) > 2:
+        console.print(
+            "[yellow]Usage: /station <agent-id> [terminal] "
+            "[--task <work>][/yellow]")
+        return False
 
-        agent_id_arg = station_args[0]
-        target_agent = get_agent(agent_id_arg)
-        if target_agent is None:
+    agent_id_arg = station_args[0]
+    target_agent = get_agent(agent_id_arg)
+    if target_agent is None:
+        console.print(
+            f"[red]Agent '{agent_id_arg}' not found. Use /hire to create one.[/red]")
+        return False
+    name = (station_args[1] if len(station_args) == 2
+            else (f"work-{target_agent.id}" if task else "term0"))
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", name):
+        console.print("[red]Invalid terminal name.[/red]")
+        return False
+    if task and name.lower() in {"current", "here", "term0"}:
+        console.print(
+            "[red]Assignments require a dedicated terminal; omit the terminal "
+            "to create one automatically.[/red]")
+        return False
+    if name.lower() in ("current", "here", "term0"):
+        name = "term0"
+
+    # If the agent is already deployed somewhere else, refuse so the user is explicit
+    existing_home = getattr(target_agent, "home_terminal", None)
+    if existing_home and existing_home != name:
+        console.print(f"[yellow]Agent {target_agent.id} is already deployed to '{existing_home}'. "
+                      f"Use /terminate {existing_home} first.[/yellow]")
+        return False
+
+    # Special case: deploy to the parent REPL (term0). Term0 should
+    # already have a real persistent bash session created at startup.
+    # If it doesn't (crashed or not created), recreate it.
+    if name == "term0":
+        term0_info = get_terminal("term0")
+        if (term0_info is None
+                or term0_info.session is None
+                or not term0_info.session.is_alive()):
+            try:
+                _term0 = InteractiveSession(
+                    DEFAULT_SHELL, timeout=0, stream_output=False,
+                    persistent=True)
+                _term0.start()
+                time.sleep(0.08)
+                if _term0.is_alive():
+                    _term0.read_output(timeout=0.1)
+                register_terminal(_term0, DEFAULT_SHELL, 0, name="term0")
+            except Exception:
+                register_terminal(None, "parent-repl", 0, name="term0")
+        target_agent.home_terminal = "term0"
+        target_agent.stationed_terminal = "term0"
+        if target_agent.role != "primary":
+            target_agent.role = "deployed"
+        console.print(f"[green]Stationed [bold]{target_agent.id}[/bold] in this REPL (term0)[/green]")
+        return False
+
+    # Sub-terminal path: inspect existing terminal
+    existing = get_terminal(name)
+    if existing and existing.session and existing.session.is_alive():
+        # Re-using an existing live terminal — just attach the agent,
+        # don't respawn anything. The agent's shell.exec will route via
+        # send_keys + marker-poll into that terminal's PTY.
+        station_agent(target_agent.id, name)
+        console.print(f"[green]Stationed [bold]{target_agent.id}[/bold] → terminal [bold]{name}[/bold] (existing)[/green]")
+    else:
+        if existing:
+            unregister_terminal(name)
+
+        # A station is a work place, not another CLI identity.  The employee
+        # loop stays in-process; POSIX uses a dedicated PTY.
+        shell_cmd = DEFAULT_SHELL
+        sub = SubTerminalSession(shell_cmd)
+        sub.start()
+        time.sleep(0.1)
+        if not sub.is_alive():
+            console.print(f"[red]Could not start terminal '{name}'.[/red]")
+            return False
+        sub.read_output(timeout=0.1)
+        register_terminal(sub, shell_cmd, 0, name=name)
+        station_agent(target_agent.id, name)
+        console.print(
+            f"[green]Stationed [bold]{target_agent.id}[/bold] → "
+            f"terminal [bold]{name}[/bold] "
+            f"(shell)[/green]")
+
+    if task:
+        assignment_events = (
+            (lambda events: agent_registry._push_events(events))
+            if agent_registry and agent_registry.agent_id else None
+        )
+        ok, message, assignment = start_agent_assignment(
+            target_agent.id, task, get_loop_deps(),
+            session=session, events_cb=assignment_events)
+        style = "green" if ok else "red"
+        console.print(f"[{style}]{message}[/{style}]")
+        if ok and assignment:
             console.print(
-                f"[red]Agent '{agent_id_arg}' not found. Use /hire to create one.[/red]")
-            return False
-        name = (station_args[1] if len(station_args) == 2
-                else (f"work-{target_agent.id}" if task else "term0"))
-        if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", name):
-            console.print("[red]Invalid terminal name.[/red]")
-            return False
-        if task and name.lower() in {"current", "here", "term0"}:
-            console.print(
-                "[red]Assignments require a dedicated terminal; omit the terminal "
-                "to create one automatically.[/red]")
-            return False
-        if name.lower() in ("current", "here", "term0"):
-            name = "term0"
+                f"[dim]Task: {assignment.task}\n"
+                f"Inspect with /agents {target_agent.id}; send updates with "
+                f"/tell {target_agent.id} <message>.[/dim]")
+    else:
+        console.print(
+            f"[dim]Assign work with /station {target_agent.id} {name} "
+            "--task \"...\"[/dim]")
 
-        # If the agent is already deployed somewhere else, refuse so the user is explicit
-        existing_home = getattr(target_agent, "home_terminal", None)
-        if existing_home and existing_home != name:
-            console.print(f"[yellow]Agent {target_agent.id} is already deployed to '{existing_home}'. "
-                          f"Use /terminate {existing_home} first.[/yellow]")
-            return False
+    return False
 
-        # Special case: deploy to the parent REPL (term0). Term0 should
-        # already have a real persistent bash session created at startup.
-        # If it doesn't (crashed or not created), recreate it.
-        if name == "term0":
-            term0_info = get_terminal("term0")
-            if (term0_info is None
-                    or term0_info.session is None
-                    or not term0_info.session.is_alive()):
-                try:
-                    _term0 = InteractiveSession(
-                        DEFAULT_SHELL, timeout=0, stream_output=False,
-                        persistent=True)
-                    _term0.start()
-                    time.sleep(0.08)
-                    if _term0.is_alive():
-                        _term0.read_output(timeout=0.1)
-                    register_terminal(_term0, DEFAULT_SHELL, 0, name="term0")
-                except Exception:
-                    register_terminal(None, "parent-repl", 0, name="term0")
-            target_agent.home_terminal = "term0"
-            target_agent.stationed_terminal = "term0"
-            if target_agent.role != "primary":
-                target_agent.role = "deployed"
-            console.print(f"[green]Stationed [bold]{target_agent.id}[/bold] in this REPL (term0)[/green]")
-            return False
 
-        # Sub-terminal path: inspect existing terminal
-        existing = get_terminal(name)
-        if existing and existing.session and existing.session.is_alive():
-            # Re-using an existing live terminal — just attach the agent,
-            # don't respawn anything. The agent's shell.exec will route via
-            # send_keys + marker-poll into that terminal's PTY.
-            station_agent(target_agent.id, name)
-            console.print(f"[green]Stationed [bold]{target_agent.id}[/bold] → terminal [bold]{name}[/bold] (existing)[/green]")
+def _cmd_terminate(parts: list) -> None:
+    name = parts[1] if len(parts) >= 2 else ""
+    if not name and sys.stdin.isatty():
+        terminals = [item for item in get_all_terminals()
+                     if item.name != "term0"]
+        chosen = choose_record(
+            terminals,
+            title="Terminate Terminal",
+            label=lambda item: item.name,
+            description=lambda item: (
+                f"{'alive' if item.session and item.session.is_alive() else 'stopped'}"
+                f" · {item.command[:80]}"),
+            search=True,
+        )
+        name = chosen.name if chosen else ""
+    if not name:
+        console.print("[dim]Terminal selection cancelled.[/dim]")
+    else:
+        term = get_terminal(name)
+        returned: list[str] = []
+        if term:
+            for aid in list(term.stationed_agent_ids):
+                employee = get_agent(aid)
+                if employee and employee.active_assignment is not None:
+                    abort_agent(aid)
+                unstation_agent(aid)
+                returned.append(aid)
+        if unregister_terminal(name):
+            if returned:
+                console.print(f"[green]Terminated [bold]{name}[/bold]; returned {', '.join(returned)} to pool[/green]")
+            else:
+                console.print(f"[green]Terminated [bold]{name}[/bold][/green]")
         else:
-            if existing:
-                unregister_terminal(name)
+            console.print(f"[red]Terminal '{name}' not found.[/red]")
 
-            # A station is a work place, not another CLI identity.  The employee
-            # loop stays in-process; POSIX uses a dedicated PTY.
-            shell_cmd = DEFAULT_SHELL
-            sub = SubTerminalSession(shell_cmd)
+
+
+def _cmd_send(raw_args: str) -> bool:
+    name, send_raw = _raw_tail_after_word(raw_args)
+    if not name and sys.stdin.isatty():
+        terminals = [
+            item for item in get_all_terminals()
+            if item.session is not None and item.session.is_alive()
+        ]
+        chosen = choose_record(
+            terminals,
+            title="Send Command to Terminal",
+            label=lambda item: item.name,
+            description=lambda item: item.command[:100],
+            search=True,
+        )
+        name = chosen.name if chosen else ""
+        if name:
+            try:
+                send_raw = input("Command: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                name = ""
+    wait_seconds = 0.8
+    if send_raw.startswith("--wait"):
+        match = re.match(r"--wait(?:\s+([^\s]+))?\s+(.*)$", send_raw, re.DOTALL)
+        if match is None:
+            console.print("[yellow]Usage: /send <name> [--wait <seconds>] <command>[/yellow]")
+            return False
+        try:
+            wait_seconds = max(0.0, min(float(match.group(1) or "0.8"), 30.0))
+        except ValueError:
+            console.print("[red]--wait expects a number between 0 and 30 seconds.[/red]")
+            return False
+        send_raw = match.group(2)
+    cmd = send_raw
+    if not name or not cmd:
+        console.print("[yellow]Usage: /send <name> <command>[/yellow]")
+    else:
+        term = get_terminal(name)
+        if term is None:
+            console.print(f"[red]Terminal '{name}' not found.[/red]")
+        elif term.session is None or not term.session.is_alive():
+            console.print(f"[yellow]Terminal '{name}' has no active session.[/yellow]")
+        else:
+            allowed, denial = authorize_direct_command(cmd, os.getcwd())
+            if not allowed:
+                console.print(f"[red]{denial}[/red]")
+                return False
+            command_lock = getattr(term.session, "command_lock", None)
+            with (command_lock if command_lock is not None else nullcontext()):
+                old_len = len(term.session.full_output)
+                term.session.send_keys(cmd + "\n")
+                console.print(f"[dim]Sent to [bold]{name}[/bold]: {cmd[:80]}[/dim]")
+                if wait_seconds >= 0.3:
+                    console.print(
+                        f"[dim]Waiting up to {wait_seconds:g}s for new output…[/dim]")
+                deadline = time.time() + wait_seconds
+                while time.time() < deadline:
+                    remaining = deadline - time.time()
+                    term.session.read_output(timeout=min(0.2, max(0.01, remaining)))
+                output = term.session.full_output[old_len:]
+            if output.strip():
+                preview = output[-2000:]
+                suffix = "" if len(output) <= 2000 else f"\n[dim]… {len(output) - 2000} earlier new chars omitted[/dim]"
+                console.print(Panel(preview + suffix, title=f"{name} new output"))
+            elif wait_seconds == 0:
+                console.print("[dim]Sent asynchronously; use /term to inspect later output.[/dim]")
+            else:
+                console.print("[dim]No new output arrived within the wait window.[/dim]")
+
+    return False
+
+
+def _cmd_hire(parts: list) -> bool:
+    import agent_persistence
+    hire_name, employee_profile = _parse_hire_profile(parts[1:])
+    if hire_name and not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", hire_name):
+        console.print(
+            "[red]Employee names may contain only letters, numbers, dot, "
+            "underscore, and hyphen (max 64).[/red]")
+        return False
+    if hire_name and get_agent(hire_name) is not None:
+        console.print(f"[red]Agent '{hire_name}' already exists.[/red]")
+        return False
+    agent_info = register_agent(
+        name=hire_name, depth=1, role="pool", profile=employee_profile)
+    if (not agent_info.profile.prompt.strip()
+            and not agent_info.profile.specialist_role):
+        agent_info.profile.prompt = (
+            f"You are {agent_info.name}, a hired employee of this project. "
+            "Use only your assigned capabilities, work only on the current "
+            "station assignment, and report concrete results to the manager."
+        )
+    agent_info.parent_terminal = "term0"
+    agent_persistence.save_agent_state(agent_info)
+    console.print(Panel(
+        _employee_capability_text(agent_info),
+        title=f"Hired employee: {agent_info.name}",
+        border_style="green",
+    ))
+    console.print(
+        f"[dim]Assign work with /station {agent_info.id} "
+        "[terminal] --task \"...\"[/dim]")
+
+    return False
+
+
+def _cmd_agents(parts: list) -> None:
+    if len(parts) == 1:
+        agents = get_all_agents()
+        current = get_current_agent()
+        if not agents:
+            console.print("[dim]No agents.[/dim]")
+        else:
+            # Categorize by role
+            buckets = {"primary": [], "pool": [], "deployed": [], "subagent": [], "other": []}
+            for a in agents:
+                role = getattr(a, "role", "pool")
+                if role in buckets:
+                    buckets[role].append(a)
+                else:
+                    buckets["other"].append(a)
+
+            def _render(a):
+                marker = " [bold cyan]← current[/bold cyan]" if (current and a.id == current.id) else ""
+                status_str = f" [dim]({a.status})[/dim]" if a.status != "idle" else ""
+                inbox_str = f" [dim yellow]inbox={a.inbox.qsize()}[/dim yellow]" if a.inbox.qsize() else ""
+                name_part = f" {a.name}" if a.name and a.name != a.id else ""
+                return marker, status_str, inbox_str, name_part
+
+            if buckets["primary"]:
+                console.print("[bold]── Primary ──[/bold]")
+                for a in buckets["primary"]:
+                    marker, st_s, inb, np = _render(a)
+                    console.print(f"  [bold]{a.id}[/bold]{np}{st_s}{inb}{marker}")
+            if buckets["pool"]:
+                console.print(f"[bold]── Pool ({len(buckets['pool'])} idle) ──[/bold]")
+                for a in buckets["pool"]:
+                    marker, st_s, inb, np = _render(a)
+                    console.print(f"  [bold]{a.id}[/bold]{np}{st_s}{inb}{marker}")
+            if buckets["deployed"]:
+                console.print(f"[bold]── Deployed ({len(buckets['deployed'])}) ──[/bold]")
+                for a in buckets["deployed"]:
+                    marker, st_s, inb, np = _render(a)
+                    home = getattr(a, "home_terminal", None) or a.stationed_terminal or "?"
+                    parent_term = getattr(a, "parent_terminal", None) or "?"
+                    console.print(f"  [bold]{a.id}[/bold]{np} → [cyan]{home}[/cyan] [dim](parent={parent_term})[/dim]{st_s}{inb}{marker}")
+            if buckets["subagent"]:
+                console.print(f"[bold]── Subagents ({len(buckets['subagent'])}) ──[/bold]")
+                for a in buckets["subagent"]:
+                    marker, st_s, inb, np = _render(a)
+                    parent = a.parent_id or "?"
+                    console.print(f"  [bold]{a.id}[/bold]{np} [dim](depth={a.depth}, parent={parent})[/dim]{st_s}{inb}{marker}")
+            if buckets["other"]:
+                console.print("[bold]── Other ──[/bold]")
+                for a in buckets["other"]:
+                    marker, st_s, inb, np = _render(a)
+                    console.print(f"  [bold]{a.id}[/bold]{np}{st_s}{inb}{marker}")
+    elif len(parts) == 2 and parts[1].lower() == "tree":
+        console.print(build_agents_tree())
+    elif len(parts) == 2:
+        agent_id = parts[1]
+        agent = get_agent(agent_id)
+        if agent is None:
+            console.print(f"[red]Agent '{agent_id}' not found. Use /hire to create one.[/red]")
+        else:
+            console.print(Panel(
+                _employee_capability_text(agent),
+                title=f"Employee: {agent.name}", border_style="cyan"))
+    else:
+        console.print("[yellow]Usage: /agents [tree|agent-id][/yellow]")
+
+
+
+def _cmd_spawn(raw_args: str, session: dict, agent_registry: AgentRegistry) -> None:
+    if not raw_args:
+        console.print("[yellow]Usage: /spawn [name:] <task...>[/yellow]")
+    else:
+        # Parse optional "name:" prefix
+        rest = raw_args
+        m = re.match(r'^(\S+):\s+(.+)$', rest)
+        child_name = m.group(1) if m else None
+        task = m.group(2) if m else rest
+        parent = get_current_agent()
+        if parent is None:
+            console.print("[red]No current agent. /hire one first.[/red]")
+        else:
+            child_id = spawn_subagent(
+                parent_id=parent.id, task=task, deps=get_loop_deps(),
+                name=child_name, session=session,
+                events_cb=(lambda evs: agent_registry._push_events(evs))
+                            if agent_registry.agent_id else None,
+            )
+            if child_id is None:
+                console.print(f"[red]Spawn failed (parent={parent.id})[/red]")
+            else:
+                console.print(f"[green]Spawned [bold]{child_id}[/bold][/green] "
+                              f"[dim](parent={parent.id}, task={task[:60]})[/dim]")
+
+
+
+def _cmd_tell(raw_args: str) -> None:
+    target_id, message_raw = _raw_tail_after_word(raw_args)
+    if not target_id and sys.stdin.isatty():
+        chosen = choose_record(
+            get_all_agents(),
+            title="Send Message to Agent",
+            label=lambda item: item.id,
+            description=lambda item: (
+                f"{item.status} · {item.name} · role={item.role}"),
+            search=True,
+        )
+        target_id = chosen.id if chosen else ""
+        if target_id:
+            try:
+                message_raw = input("Message: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                target_id = ""
+    if not target_id or not message_raw:
+        console.print("[dim]Agent message cancelled.[/dim]")
+    else:
+        raw = message_raw.strip()
+        decoded = _decode_text_arg(message_raw)
+        for candidate in (raw, decoded):
+            try:
+                body = json.loads(candidate)
+                if not isinstance(body, dict):
+                    body = {"kind": "msg", "text": decoded}
+                break
+            except (ValueError, TypeError):
+                body = None
+        if body is None:
+            raw = decoded
+            body = {"kind": "msg", "text": raw}
+        else:
+            raw = decoded if raw != decoded and not raw.lstrip().startswith(("{", "[")) else raw
+        body.setdefault("from", "user")
+        if send_to_agent(target_id, body):
+            console.print(f"[green]→ {target_id}:[/green] {raw[:120]}")
+        else:
+            console.print(f"[red]Agent '{target_id}' not found or inbox full.[/red]")
+
+
+
+def _cmd_abort(parts: list) -> None:
+    target_id = parts[1] if len(parts) >= 2 else ""
+    if not target_id and sys.stdin.isatty():
+        abortable = [
+            item for item in get_all_agents()
+            if item.status not in {"done", "aborted", "error"}
+        ]
+        chosen = choose_record(
+            abortable,
+            title="Abort Agent",
+            label=lambda item: item.id,
+            description=lambda item: (
+                f"{item.status} · {item.name} · role={item.role}"),
+            search=True,
+        )
+        target_id = chosen.id if chosen else ""
+    if not target_id:
+        console.print("[dim]Agent selection cancelled.[/dim]")
+    else:
+        if abort_agent(target_id):
+            console.print(f"[yellow]Abort signaled to [bold]{target_id}[/bold][/yellow]")
+        else:
+            console.print(f"[red]Agent '{target_id}' not found.[/red]")
+
+
+
+def _cmd_tools() -> None:
+    registry = tools_mod.get_registry()
+    groups = registry.list_by_source()
+    if not groups:
+        console.print("[dim]No tools registered.[/dim]")
+    else:
+        for src in sorted(groups):
+            console.print(f"[bold]{src}[/bold]")
+            for t in groups[src]:
+                console.print(f"  [cyan]{t.name}[/cyan] — {t.description}")
+
+
+
+def _cmd_tool(raw_args: str, session: dict, agent_registry: AgentRegistry) -> None:
+    tool_name, tool_params_raw = _raw_tail_after_word(raw_args)
+    if not tool_name and sys.stdin.isatty():
+        chosen = choose_record(
+            tools_mod.get_registry().list(),
+            title="Run Tool",
+            label=lambda item: item.name,
+            description=lambda item: (
+                f"{item.source} · {item.description[:100]}"),
+            search=True,
+        )
+        tool_name = chosen.name if chosen else ""
+        if tool_name:
+            try:
+                tool_params_raw = input(
+                    "JSON parameters (Enter for {}): ").strip()
+            except (EOFError, KeyboardInterrupt):
+                tool_name = ""
+    if not tool_name:
+        console.print("[dim]Tool selection cancelled.[/dim]")
+    else:
+        raw = tool_params_raw.strip()
+        try:
+            params = {}
+            last_error = None
+            if raw:
+                params = None
+                for candidate in _json_arg_candidates(raw):
+                    try:
+                        params = json.loads(candidate)
+                        break
+                    except json.JSONDecodeError as exc:
+                        last_error = exc
+                if params is None and last_error is not None:
+                    raise last_error
+            if not isinstance(params, dict):
+                params = {"value": params}
+        except (ValueError, TypeError):
+            params = {"raw": raw}
+        ctx = tools_mod.ToolCtx(
+            deps=get_loop_deps(),
+            agent_id=(get_current_agent().id if get_current_agent() else None),
+            session=session,
+            events_cb=(lambda evs: agent_registry._push_events(evs))
+                      if agent_registry.agent_id else None,
+            cwd=os.getcwd(),
+        )
+        result = tools_mod.get_registry().invoke(tool_name, params, ctx)
+        try:
+            console.print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+        except (TypeError, ValueError):
+            console.print(repr(result))
+
+
+
+def _cmd_skill(parts: list) -> bool:
+    # No subcommand → open the interactive manager (same style as /term).
+    sub = (parts[1].lower() if len(parts) > 1 else "manager")
+    if sub == "manager":
+        show_skill_manager()
+    elif sub == "list":
+        metas = skills_mod.get_all_metadata()
+        if not metas:
+            console.print(f"[dim]No skills in {skills_mod.SKILLS_DIR}[/dim]")
+            console.print("[dim]Create one with: /skill new <name>[/dim]")
+        else:
+            groups = tools_mod.get_registry().list_by_source()
+            for name, meta in sorted(metas.items()):
+                src = f"skill:{name}"
+                tools = groups.get(src, [])
+                console.print(f"[bold]{name}[/bold] [dim]({meta.dir_path})[/dim]")
+                if meta.description:
+                    console.print(f"  [dim]{meta.description}[/dim]")
+                for t in tools:
+                    console.print(f"  [cyan]{t.name}[/cyan] — {t.description}")
+                if not tools:
+                    console.print("  [yellow](standby/documentation-only)[/yellow]")
+    elif sub in ("trust", "revoke"):
+        skill_name = parts[2] if len(parts) >= 3 else ""
+        if not skill_name and sys.stdin.isatty():
+            skill_rows = list(skills_mod.get_all_metadata().items())
+            chosen = choose_record(
+                skill_rows,
+                title=f"{sub.title()} Skill",
+                label=lambda item: item[0],
+                description=lambda item: item[1].description or "(no description)",
+                search=True,
+            )
+            skill_name = chosen[0] if chosen else ""
+        if not skill_name:
+            console.print("[dim]Skill selection cancelled.[/dim]")
+        else:
+            meta = skills_mod.get_all_metadata().get(skill_name)
+            if meta is None:
+                console.print(f"[red]Unknown skill: {skill_name}[/red]")
+            else:
+                entrypoint = Path(meta.dir_path) / "skill.py"
+                if not entrypoint.is_file():
+                    console.print("[dim]Documentation-only skills do not require executable trust.[/dim]")
+                elif sub == "revoke":
+                    skills_mod.unload_skill(skill_name)
+                    removed = trust_store.revoke_extension("skill", skill_name)
+                    console.print("[green]Skill trust revoked.[/green]" if removed
+                                  else "[dim]Skill was not trusted.[/dim]")
+                else:
+                    manifest, manifest_error = skills_mod.load_skill_manifest(
+                        Path(meta.dir_path), skill_name)
+                    if manifest is None:
+                        console.print(f"[red]{manifest_error}[/red]")
+                        return False
+                    status = trust_store.extension_status(
+                        "skill", skill_name, entrypoint,
+                        (Path(meta.dir_path) / skills_mod.SKILL_MANIFEST,))
+                    approved = "--yes" in parts[3:]
+                    if not approved and sys.stdin.isatty():
+                        approved = _blocking_approval_prompt(
+                            "Trust executable skill",
+                            f"Skill: {skill_name}\nFile: {entrypoint.resolve()}\n"
+                            f"SHA-256: {status.get('sha256', 'unavailable')}\n\n"
+                            f"Capabilities: {manifest.get('capabilities', [])}\n\n"
+                            "This Python executes with your local account permissions.",
+                            "Trust this exact skill hash?", allow_always=False,
+                        ) == "yes"
+                    if approved:
+                        trusted = trust_store.trust_extension(
+                            "skill", skill_name, entrypoint,
+                            (Path(meta.dir_path) / skills_mod.SKILL_MANIFEST,))
+                        console.print(
+                            f"[green]Trusted {skill_name} at "
+                            f"{trusted['sha256'][:16]}…[/green]")
+                    else:
+                        console.print("[yellow]Skill not trusted.[/yellow]")
+    elif sub in ("load", "unload"):
+        skill_name = parts[2] if len(parts) >= 3 else ""
+        if not skill_name and sys.stdin.isatty():
+            skills = skills_mod.list_skills()
+            eligible = [
+                item for item in skills
+                if bool(item.get("loaded")) == (sub == "unload")
+            ]
+            chosen = choose_record(
+                eligible,
+                title=f"{sub.title()} Skill",
+                label=lambda item: item["name"],
+                description=lambda item: item.get("description", ""),
+                search=True,
+            )
+            skill_name = chosen["name"] if chosen else ""
+        if not skill_name:
+            console.print("[dim]Skill selection cancelled.[/dim]")
+        else:
+            fn = skills_mod.load_skill if sub == "load" else skills_mod.unload_skill
+            ok, msg = fn(skill_name)
+            console.print(f"[{'green' if ok else 'red'}]{msg}[/{'green' if ok else 'red'}]")
+    elif sub == "reload":
+        results = skills_mod.reload_all()
+        for name, ok, msg in results:
+            style = "green" if ok else "red"
+            console.print(f"[{style}]{msg}[/{style}]")
+        if not results:
+            console.print(f"[dim]No skills in {skills_mod.SKILLS_DIR}[/dim]")
+    elif sub == "new":
+        if len(parts) < 3:
+            console.print("[yellow]Usage: /skill new <name>[/yellow]")
+        else:
+            ok, msg = skills_mod.install_template(parts[2])
+            style = "green" if ok else "red"
+            console.print(f"[{style}]{msg}[/{style}]")
+            if ok:
+                console.print("[dim]Edit skill.py and extension.json, then run /skill trust <name> and /skill load <name>[/dim]")
+    elif sub == "dir":
+        console.print(str(skills_mod.SKILLS_DIR))
+    else:
+        console.print("[yellow]Usage: /skill [manager|list|trust <name>|revoke <name>|load <name>|unload <name>|reload|new <name>|dir][/yellow]")
+
+    return False
+
+
+def _cmd_mcp(parts: list) -> bool:
+    if not _get_mcp_mod().MCP_AVAILABLE:
+        console.print(f"[yellow]mcp SDK not installed: {_get_mcp_mod().MCP_IMPORT_ERROR}[/yellow]")
+        console.print("[dim]Install with:  pip install mcp[/dim]")
+        return False
+    sub = (parts[1].lower() if len(parts) > 1 else "list")
+    mgr = _get_mcp_mod().get_manager()
+
+    def _pick_mcp_server(title: str, predicate=None) -> str:
+        server_rows = list(mgr.load_config().get("servers", {}).items())
+        if predicate is not None:
+            server_rows = [item for item in server_rows if predicate(*item)]
+        chosen = choose_record(
+            server_rows,
+            title=title,
+            label=lambda item: item[0],
+            description=lambda item: (
+                f"{(mgr.servers.get(item[0]).status if mgr.servers.get(item[0]) else 'offline')}"
+                f" · {item[1].get('command', '?')}"),
+            search=True,
+        )
+        return chosen[0] if chosen else ""
+
+    if sub == "list":
+        cfg = mgr.load_config().get("servers", {})
+        if not cfg:
+            console.print(f"[dim]No servers in {_get_mcp_mod().CONFIG_PATH}[/dim]")
+            console.print("[dim]Create one with: /mcp init[/dim]")
+        else:
+            for name, sc in cfg.items():
+                srv = mgr.servers.get(name)
+                enabled = sc.get("enabled", True)
+                if srv is None:
+                    status = "(not connected)" if enabled else "(disabled)"
+                    style = "dim"
+                else:
+                    status = f"({srv.status}, {len(srv.tools)} tools)"
+                    style = "green" if srv.status == "up" else "yellow"
+                cmd_str = sc.get("command", "?")
+                console.print(f"  [{style}]{name}[/{style}] {status} [dim]{cmd_str}[/dim]")
+                if srv and srv.last_error and srv.status != "up":
+                    console.print(f"    [red]{srv.last_error}[/red]")
+    elif sub in ("trust", "revoke"):
+        server_name = parts[2] if len(parts) >= 3 else ""
+        if not server_name and sys.stdin.isatty():
+            server_name = _pick_mcp_server(f"{sub.title()} MCP Server")
+        if not server_name:
+            console.print("[dim]MCP server selection cancelled.[/dim]")
+        else:
+            server_cfg = mgr.load_config().get("servers", {}).get(server_name)
+            if server_cfg is None:
+                console.print(f"[red]Unknown MCP server: {server_name}[/red]")
+            elif sub == "revoke":
+                mgr.disconnect(server_name)
+                removed = trust_store.revoke_extension("mcp", server_name)
+                console.print("[green]MCP trust revoked.[/green]" if removed
+                              else "[dim]MCP server was not trusted.[/dim]")
+            else:
+                cfg_path = _get_mcp_mod().CONFIG_PATH
+                status = trust_store.extension_status(
+                    "mcp", server_name, cfg_path)
+                argv = [server_cfg.get("command")] + list(server_cfg.get("args") or [])
+                approved = "--yes" in parts[3:]
+                if not approved and sys.stdin.isatty():
+                    approved = _blocking_approval_prompt(
+                        "Trust MCP server process",
+                        f"Server: {server_name}\nCommand: {argv}\n"
+                        f"CWD: {server_cfg.get('cwd') or os.getcwd()}\n"
+                        f"Explicit env keys: {sorted((server_cfg.get('env') or {}).keys())}\n"
+                        f"Capabilities: {server_cfg.get('capabilities', ['core.other'])}\n"
+                        f"Config SHA-256: {status.get('sha256', 'unavailable')}",
+                        "Trust this server at the current config hash?",
+                        allow_always=False,
+                    ) == "yes"
+                if approved:
+                    trusted = trust_store.trust_extension(
+                        "mcp", server_name, cfg_path)
+                    console.print(
+                        f"[green]Trusted MCP server {server_name} at "
+                        f"{trusted['sha256'][:16]}…[/green]")
+                else:
+                    console.print("[yellow]MCP server not trusted.[/yellow]")
+    elif sub == "tools":
+        srv_name = parts[2] if len(parts) >= 3 else ""
+        if not srv_name and sys.stdin.isatty():
+            srv_name = _pick_mcp_server("View MCP Tools")
+        if not srv_name:
+            console.print("[dim]MCP server selection cancelled.[/dim]")
+        else:
+            groups = tools_mod.get_registry().list_by_source()
+            ts = groups.get(f"mcp:{srv_name}", [])
+            if not ts:
+                console.print(f"[dim]No tools for mcp:{srv_name} (not connected?)[/dim]")
+            else:
+                for t in ts:
+                    console.print(f"  [cyan]{t.name}[/cyan] — {t.description}")
+    elif sub == "connect":
+        server_name = parts[2] if len(parts) >= 3 else ""
+        if not server_name and sys.stdin.isatty():
+            server_name = _pick_mcp_server(
+                "Connect MCP Server",
+                lambda name, cfg: bool(cfg.get("enabled", True)))
+        if not server_name:
+            console.print("[dim]MCP server selection cancelled.[/dim]")
+        else:
+            ok, msg = mgr.connect(server_name)
+            style = "green" if ok else "red"
+            console.print(f"[{style}]{server_name}: {msg}[/{style}]")
+    elif sub == "disconnect":
+        server_name = parts[2] if len(parts) >= 3 else ""
+        if not server_name and sys.stdin.isatty():
+            server_name = _pick_mcp_server(
+                "Disconnect MCP Server",
+                lambda name, _cfg: name in mgr.servers)
+        if not server_name:
+            console.print("[dim]MCP server selection cancelled.[/dim]")
+        else:
+            ok, msg = mgr.disconnect(server_name)
+            style = "green" if ok else "red"
+            console.print(f"[{style}]{server_name}: {msg}[/{style}]")
+    elif sub == "reload":
+        results = mgr.reload()
+        for n, ok, m in results:
+            if n == "(none)":
+                console.print(f"[yellow]{m}[/yellow]")
+                continue
+            style = "green" if ok else "yellow"
+            console.print(f"[{style}]{n}: {m}[/{style}]")
+    elif sub == "init":
+        ok, msg = _get_mcp_mod().MCPManager.write_template_config()
+        style = "green" if ok else "red"
+        console.print(f"[{style}]{msg}[/{style}]")
+        if ok:
+            console.print("[dim]Edit the file, enable a server, then /mcp reload[/dim]")
+    elif sub == "config":
+        console.print(str(_get_mcp_mod().CONFIG_PATH))
+    else:
+        console.print("[yellow]Usage: /mcp {list|trust <n>|revoke <n>|connect <n>|disconnect <n>|reload|tools <n>|init|config}[/yellow]")
+
+    return False
+
+
+def _cmd_connect(parts: list, agent_registry: AgentRegistry, session: dict) -> None:
+    # /connect [name] — link THIS terminal to Helpwo (primary or sub);
+    # optional name customizes how it appears in Helpwo.
+    if agent_registry is None:
+        console.print("[red]No agent registry available.[/red]")
+    else:
+        custom_name = parts[1] if len(parts) >= 2 else None
+        if custom_name and not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", custom_name):
+            console.print("[red]Invalid name. Use letters, numbers, dot, "
+                          "underscore, or hyphen (max 64).[/red]")
+        elif custom_name and custom_name.lower() == "term0":
+            console.print("[red]'term0' is reserved.[/red]")
+        else:
+            connect_terminal_to_helpwo(agent_registry, session, name=custom_name)
+
+
+
+def _cmd_disconnect(agent_registry: AgentRegistry) -> None:
+    if agent_registry is None or not agent_registry.agent_id:
+        console.print("[dim]This terminal is not connected to Helpwo.[/dim]")
+    elif getattr(agent_registry, "depth", 0) == 0:
+        name = agent_registry.agent_name
+        agent_registry._last_agent_id = ""  # explicit — don't resurrect
+        agent_registry.unregister()
+        agent_registry.agent_id = None
+        agent_registry.agent_secret = ""
+        console.print(f"[yellow]Primary CLI [bold]{name}[/bold] is now offline in Helpwo "
+                      f"(sub-terminal creation from the UI is disabled). "
+                      f"Run /connect to link again.[/yellow]")
+    else:
+        name = (agent_registry.terminal_meta or {}).get("name", agent_registry.agent_name)
+        agent_registry._last_agent_id = ""  # explicit — don't resurrect
+        agent_registry.unregister()
+        agent_registry.agent_id = None
+        agent_registry.agent_secret = ""
+        console.print(f"[yellow]Sub-terminal [bold]{name}[/bold] withdrawn from Helpwo. "
+                      f"Run /connect to hand it over again.[/yellow]")
+
+
+
+def _cmd_term(parts: list, agent_registry: AgentRegistry, interactive_session) -> bool:
+    if len(parts) >= 2 and parts[1].lower() == "rename":
+        if len(parts) != 4:
+            console.print("[yellow]Usage: /term rename <old> <new>[/yellow]")
+        elif not re.fullmatch(r"[A-Za-z0-9._-]+", parts[3]):
+            console.print("[red]Terminal names may contain only letters, numbers, dot, underscore, and hyphen.[/red]")
+        elif parts[2].lower() == "term0":
+            console.print("[red]The primary terminal term0 cannot be renamed.[/red]")
+        elif rename_terminal(parts[2], parts[3]):
+            console.print(
+                f"[green]Terminal renamed: [bold]{parts[2]}[/bold] → "
+                f"[bold]{parts[3]}[/bold][/green]")
+        else:
+            console.print(
+                f"[red]Could not rename '{parts[2]}': source missing or target already exists.[/red]")
+    elif len(parts) == 2:
+        # /t <name> or /term <name> — create sub-terminal (no agent stationed)
+        name = parts[1]
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", name) or name.lower() == "term0":
+            console.print(
+                "[red]Invalid terminal name. Use letters, numbers, dot, "
+                "underscore, or hyphen; term0 is reserved.[/red]")
+            return False
+        existing = get_terminal(name)
+        if existing and existing.session and not existing.session.is_alive():
+            unregister_terminal(name)
+            existing = None
+        if existing is not None:
+            console.print(f"[yellow]Terminal '{name}' already exists. /t to view, /terminate {name} to remove.[/yellow]")
+        else:
+            lain_cmd = _build_connected_subterminal_cmd(
+                name,
+                agent_registry.agent_id if agent_registry else None,
+            )
+            sub = SubTerminalSession(lain_cmd)
             sub.start()
             time.sleep(0.1)
             if not sub.is_alive():
                 console.print(f"[red]Could not start terminal '{name}'.[/red]")
                 return False
             sub.read_output(timeout=0.1)
-            register_terminal(sub, shell_cmd, 0, name=name)
-            station_agent(target_agent.id, name)
-            console.print(
-                f"[green]Stationed [bold]{target_agent.id}[/bold] → "
-                f"terminal [bold]{name}[/bold] "
-                f"(shell)[/green]")
-
-        if task:
-            assignment_events = (
-                (lambda events: agent_registry._push_events(events))
-                if agent_registry and agent_registry.agent_id else None
-            )
-            ok, message, assignment = start_agent_assignment(
-                target_agent.id, task, get_loop_deps(),
-                session=session, events_cb=assignment_events)
-            style = "green" if ok else "red"
-            console.print(f"[{style}]{message}[/{style}]")
-            if ok and assignment:
-                console.print(
-                    f"[dim]Task: {assignment.task}\n"
-                    f"Inspect with /agents {target_agent.id}; send updates with "
-                    f"/tell {target_agent.id} <message>.[/dim]")
+            register_terminal(sub, "laintas-cli", 0, name=name)
+            console.print(f"[green]Created sub-terminal [bold]{name}[/bold] (no agent stationed)[/green]")
+    elif len(parts) > 2:
+        console.print("[yellow]Usage: /term [name|rename <old> <new>][/yellow]")
+    else:
+        # /t or /term (no args) — list terminals browser
+        terminals = get_all_terminals()
+        has_primary = interactive_session is not None and interactive_session.is_alive()
+        if not terminals and not has_primary:
+            console.print("[dim]No active sub-terminal sessions. "
+                          "Use /station <agent-id> or let the AI spawn a command.[/dim]")
+        elif not terminals and has_primary:
+            # Only term0 exists — entering it is redundant (already in REPL).
+            console.print("[dim]No sub-terminals. You are already in term0 (primary).[/dim]")
         else:
-            console.print(
-                f"[dim]Assign work with /station {target_agent.id} {name} "
-                "--task \"...\"[/dim]")
+            show_terminal_manager(interactive_session)
 
-    elif action == "/terminate":
-        name = parts[1] if len(parts) >= 2 else ""
-        if not name and sys.stdin.isatty():
-            terminals = [item for item in get_all_terminals()
-                         if item.name != "term0"]
-            chosen = choose_record(
-                terminals,
-                title="Terminate Terminal",
-                label=lambda item: item.name,
+    return False
+
+
+def _cmd_reload(raw_args: str) -> None:
+    if raw_args:
+        console.print("[yellow]Usage: /reload[/yellow]")
+    else:
+        reload_default_files()
+
+
+
+def _cmd_undo(action: str, raw_args: str, parts: list) -> bool:
+    import snapshot as _snap
+    cwd = os.getcwd()
+    if action == "/snapshots":
+        cps = _snap.list_for(cwd)
+        if not cps:
+            console.print("[dim]No checkpoints for this repository "
+                          "(not a git repo, or none taken yet).[/dim]")
+        else:
+            console.print(f"[bold]Checkpoints[/bold] ({len(cps)}, newest last):")
+            for i, c in enumerate(cps):
+                ago = _format_time_ago(c.get("ts", 0))
+                console.print(f"  [cyan]{c['sha'][:10]}[/cyan]  {c.get('label','') or '(no label)'}  [dim]{ago}[/dim]")
+            console.print("[dim]Run /undo to choose a checkpoint, or /undo <sha> directly.[/dim]")
+    elif action == "/snapshot":
+        label = _decode_text_arg(raw_args) if raw_args else "manual"
+        cp = _snap.create(cwd, label)
+        if cp:
+            console.print(f"[green]Checkpoint saved: {cp['sha'][:10]} ({label})[/green]")
+        else:
+            console.print("[yellow]Could not snapshot (not a git repository?).[/yellow]")
+    else:  # /undo
+        sha = parts[1] if len(parts) > 1 else None
+        chosen_checkpoint = None
+        if sha is None and sys.stdin.isatty():
+            checkpoints = list(reversed(_snap.list_for(cwd)))
+            chosen_checkpoint = choose_record(
+                checkpoints,
+                title="Restore Checkpoint",
+                label=lambda item: item["sha"][:10],
                 description=lambda item: (
-                    f"{'alive' if item.session and item.session.is_alive() else 'stopped'}"
-                    f" · {item.command[:80]}"),
+                    f"{item.get('label') or '(no label)'} · "
+                    f"{_format_time_ago(item.get('ts', 0))}"),
                 search=True,
             )
-            name = chosen.name if chosen else ""
-        if not name:
-            console.print("[dim]Terminal selection cancelled.[/dim]")
-        else:
-            term = get_terminal(name)
-            returned: list[str] = []
-            if term:
-                for aid in list(term.stationed_agent_ids):
-                    employee = get_agent(aid)
-                    if employee and employee.active_assignment is not None:
-                        abort_agent(aid)
-                    unstation_agent(aid)
-                    returned.append(aid)
-            if unregister_terminal(name):
-                if returned:
-                    console.print(f"[green]Terminated [bold]{name}[/bold]; returned {', '.join(returned)} to pool[/green]")
-                else:
-                    console.print(f"[green]Terminated [bold]{name}[/bold][/green]")
-            else:
-                console.print(f"[red]Terminal '{name}' not found.[/red]")
-
-    elif action == "/send":
-        name, send_raw = _raw_tail_after_word(raw_args)
-        if not name and sys.stdin.isatty():
-            terminals = [
-                item for item in get_all_terminals()
-                if item.session is not None and item.session.is_alive()
-            ]
-            chosen = choose_record(
-                terminals,
-                title="Send Command to Terminal",
-                label=lambda item: item.name,
-                description=lambda item: item.command[:100],
-                search=True,
-            )
-            name = chosen.name if chosen else ""
-            if name:
-                try:
-                    send_raw = input("Command: ").strip()
-                except (EOFError, KeyboardInterrupt):
-                    name = ""
-        wait_seconds = 0.8
-        if send_raw.startswith("--wait"):
-            match = re.match(r"--wait(?:\s+([^\s]+))?\s+(.*)$", send_raw, re.DOTALL)
-            if match is None:
-                console.print("[yellow]Usage: /send <name> [--wait <seconds>] <command>[/yellow]")
-                return False
-            try:
-                wait_seconds = max(0.0, min(float(match.group(1) or "0.8"), 30.0))
-            except ValueError:
-                console.print("[red]--wait expects a number between 0 and 30 seconds.[/red]")
-                return False
-            send_raw = match.group(2)
-        cmd = send_raw
-        if not name or not cmd:
-            console.print("[yellow]Usage: /send <name> <command>[/yellow]")
-        else:
-            term = get_terminal(name)
-            if term is None:
-                console.print(f"[red]Terminal '{name}' not found.[/red]")
-            elif term.session is None or not term.session.is_alive():
-                console.print(f"[yellow]Terminal '{name}' has no active session.[/yellow]")
-            else:
-                allowed, denial = authorize_direct_command(cmd, os.getcwd())
-                if not allowed:
-                    console.print(f"[red]{denial}[/red]")
-                    return False
-                command_lock = getattr(term.session, "command_lock", None)
-                with (command_lock if command_lock is not None else nullcontext()):
-                    old_len = len(term.session.full_output)
-                    term.session.send_keys(cmd + "\n")
-                    console.print(f"[dim]Sent to [bold]{name}[/bold]: {cmd[:80]}[/dim]")
-                    if wait_seconds >= 0.3:
-                        console.print(
-                            f"[dim]Waiting up to {wait_seconds:g}s for new output…[/dim]")
-                    deadline = time.time() + wait_seconds
-                    while time.time() < deadline:
-                        remaining = deadline - time.time()
-                        term.session.read_output(timeout=min(0.2, max(0.01, remaining)))
-                    output = term.session.full_output[old_len:]
-                if output.strip():
-                    preview = output[-2000:]
-                    suffix = "" if len(output) <= 2000 else f"\n[dim]… {len(output) - 2000} earlier new chars omitted[/dim]"
-                    console.print(Panel(preview + suffix, title=f"{name} new output"))
-                elif wait_seconds == 0:
-                    console.print("[dim]Sent asynchronously; use /term to inspect later output.[/dim]")
-                else:
-                    console.print("[dim]No new output arrived within the wait window.[/dim]")
-
-    elif action == "/hire":
-        import agent_persistence
-        hire_name, employee_profile = _parse_hire_profile(parts[1:])
-        if hire_name and not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", hire_name):
-            console.print(
-                "[red]Employee names may contain only letters, numbers, dot, "
-                "underscore, and hyphen (max 64).[/red]")
+            sha = chosen_checkpoint.get("sha") if chosen_checkpoint else ""
+        if sha == "":
+            console.print("[dim]Checkpoint selection cancelled.[/dim]")
             return False
-        if hire_name and get_agent(hire_name) is not None:
-            console.print(f"[red]Agent '{hire_name}' already exists.[/red]")
+        approved = True
+        if sys.stdin.isatty():
+            label = ((chosen_checkpoint or {}).get("label") or "explicit checkpoint")
+            approved = _blocking_approval_prompt(
+                "Restore working tree",
+                f"Checkpoint: {(sha or 'latest')[:10]}\nLabel: {label}\n\n"
+                "Modified and deleted files will be restored. New files are kept.",
+                "Restore this checkpoint?",
+                allow_always=False,
+            ) == "yes"
+        if not approved:
+            console.print("[dim]Checkpoint restore cancelled.[/dim]")
             return False
-        agent_info = register_agent(
-            name=hire_name, depth=1, role="pool", profile=employee_profile)
-        if (not agent_info.profile.prompt.strip()
-                and not agent_info.profile.specialist_role):
-            agent_info.profile.prompt = (
-                f"You are {agent_info.name}, a hired employee of this project. "
-                "Use only your assigned capabilities, work only on the current "
-                "station assignment, and report concrete results to the manager."
+        ok, msg = _snap.restore(cwd, sha)
+        console.print((f"[green]{msg}[/green]" if ok else f"[yellow]{msg}[/yellow]"))
+        if ok:
+            console.print("[dim]Files created since the checkpoint were kept. "
+                          "A pre-undo checkpoint was saved (undo the undo with /undo).[/dim]")
+
+    return False
+
+
+def _cmd_config(parts: list) -> None:
+    # Built-in config command (doesn't require .laintas/commands.py)
+    if len(parts) == 1:
+        table = Table(title="Runtime Configuration", show_lines=False)
+        table.add_column("Key", style="cyan")
+        table.add_column("Value")
+        table.add_column("Type", style="dim")
+        table.add_column("Source", style="dim")
+        table.add_column("Description", style="dim")
+        for key, meta in sorted(describe_runtime_config().items()):
+            table.add_row(
+                key, repr(meta["value"]), meta["type"],
+                "override" if meta["overridden"] else "default",
+                meta["description"],
             )
-        agent_info.parent_terminal = "term0"
-        agent_persistence.save_agent_state(agent_info)
-        console.print(Panel(
-            _employee_capability_text(agent_info),
-            title=f"Hired employee: {agent_info.name}",
-            border_style="green",
-        ))
-        console.print(
-            f"[dim]Assign work with /station {agent_info.id} "
-            "[terminal] --task \"...\"[/dim]")
-
-    elif action == "/agents":
-        if len(parts) == 1:
-            agents = get_all_agents()
-            current = get_current_agent()
-            if not agents:
-                console.print("[dim]No agents.[/dim]")
-            else:
-                # Categorize by role
-                buckets = {"primary": [], "pool": [], "deployed": [], "subagent": [], "other": []}
-                for a in agents:
-                    role = getattr(a, "role", "pool")
-                    if role in buckets:
-                        buckets[role].append(a)
-                    else:
-                        buckets["other"].append(a)
-
-                def _render(a):
-                    marker = " [bold cyan]← current[/bold cyan]" if (current and a.id == current.id) else ""
-                    status_str = f" [dim]({a.status})[/dim]" if a.status != "idle" else ""
-                    inbox_str = f" [dim yellow]inbox={a.inbox.qsize()}[/dim yellow]" if a.inbox.qsize() else ""
-                    name_part = f" {a.name}" if a.name and a.name != a.id else ""
-                    return marker, status_str, inbox_str, name_part
-
-                if buckets["primary"]:
-                    console.print("[bold]── Primary ──[/bold]")
-                    for a in buckets["primary"]:
-                        marker, st_s, inb, np = _render(a)
-                        console.print(f"  [bold]{a.id}[/bold]{np}{st_s}{inb}{marker}")
-                if buckets["pool"]:
-                    console.print(f"[bold]── Pool ({len(buckets['pool'])} idle) ──[/bold]")
-                    for a in buckets["pool"]:
-                        marker, st_s, inb, np = _render(a)
-                        console.print(f"  [bold]{a.id}[/bold]{np}{st_s}{inb}{marker}")
-                if buckets["deployed"]:
-                    console.print(f"[bold]── Deployed ({len(buckets['deployed'])}) ──[/bold]")
-                    for a in buckets["deployed"]:
-                        marker, st_s, inb, np = _render(a)
-                        home = getattr(a, "home_terminal", None) or a.stationed_terminal or "?"
-                        parent_term = getattr(a, "parent_terminal", None) or "?"
-                        console.print(f"  [bold]{a.id}[/bold]{np} → [cyan]{home}[/cyan] [dim](parent={parent_term})[/dim]{st_s}{inb}{marker}")
-                if buckets["subagent"]:
-                    console.print(f"[bold]── Subagents ({len(buckets['subagent'])}) ──[/bold]")
-                    for a in buckets["subagent"]:
-                        marker, st_s, inb, np = _render(a)
-                        parent = a.parent_id or "?"
-                        console.print(f"  [bold]{a.id}[/bold]{np} [dim](depth={a.depth}, parent={parent})[/dim]{st_s}{inb}{marker}")
-                if buckets["other"]:
-                    console.print("[bold]── Other ──[/bold]")
-                    for a in buckets["other"]:
-                        marker, st_s, inb, np = _render(a)
-                        console.print(f"  [bold]{a.id}[/bold]{np}{st_s}{inb}{marker}")
-        elif len(parts) == 2 and parts[1].lower() == "tree":
-            console.print(build_agents_tree())
-        elif len(parts) == 2:
-            agent_id = parts[1]
-            agent = get_agent(agent_id)
-            if agent is None:
-                console.print(f"[red]Agent '{agent_id}' not found. Use /hire to create one.[/red]")
-            else:
-                console.print(Panel(
-                    _employee_capability_text(agent),
-                    title=f"Employee: {agent.name}", border_style="cyan"))
+        console.print(table)
+        console.print("[dim]Set with /config <key> <value>; restore with /config reset.[/dim]")
+    elif len(parts) == 2 and parts[1].lower() == "reset":
+        reset_runtime_config()
+        console.print("[green]Runtime config reset to defaults.[/green]")
+    elif len(parts) == 2:
+        # /config <key> — show one
+        key = parts[1]
+        meta = describe_runtime_config().get(key)
+        if meta is None:
+            console.print(f"[red]Unknown config key: {key}[/red]")
+            console.print("[dim]Run /config to list valid keys.[/dim]")
         else:
-            console.print("[yellow]Usage: /agents [tree|agent-id][/yellow]")
-
-    elif action == "/spawn":
-        if not raw_args:
-            console.print("[yellow]Usage: /spawn [name:] <task...>[/yellow]")
-        else:
-            # Parse optional "name:" prefix
-            rest = raw_args
-            m = re.match(r'^(\S+):\s+(.+)$', rest)
-            child_name = m.group(1) if m else None
-            task = m.group(2) if m else rest
-            parent = get_current_agent()
-            if parent is None:
-                console.print("[red]No current agent. /hire one first.[/red]")
-            else:
-                child_id = spawn_subagent(
-                    parent_id=parent.id, task=task, deps=get_loop_deps(),
-                    name=child_name, session=session,
-                    events_cb=(lambda evs: agent_registry._push_events(evs))
-                                if agent_registry.agent_id else None,
-                )
-                if child_id is None:
-                    console.print(f"[red]Spawn failed (parent={parent.id})[/red]")
-                else:
-                    console.print(f"[green]Spawned [bold]{child_id}[/bold][/green] "
-                                  f"[dim](parent={parent.id}, task={task[:60]})[/dim]")
-
-    elif action == "/tell":
-        target_id, message_raw = _raw_tail_after_word(raw_args)
-        if not target_id and sys.stdin.isatty():
-            chosen = choose_record(
-                get_all_agents(),
-                title="Send Message to Agent",
-                label=lambda item: item.id,
-                description=lambda item: (
-                    f"{item.status} · {item.name} · role={item.role}"),
-                search=True,
-            )
-            target_id = chosen.id if chosen else ""
-            if target_id:
-                try:
-                    message_raw = input("Message: ").strip()
-                except (EOFError, KeyboardInterrupt):
-                    target_id = ""
-        if not target_id or not message_raw:
-            console.print("[dim]Agent message cancelled.[/dim]")
-        else:
-            raw = message_raw.strip()
-            decoded = _decode_text_arg(message_raw)
-            for candidate in (raw, decoded):
-                try:
-                    body = json.loads(candidate)
-                    if not isinstance(body, dict):
-                        body = {"kind": "msg", "text": decoded}
-                    break
-                except (ValueError, TypeError):
-                    body = None
-            if body is None:
-                raw = decoded
-                body = {"kind": "msg", "text": raw}
-            else:
-                raw = decoded if raw != decoded and not raw.lstrip().startswith(("{", "[")) else raw
-            body.setdefault("from", "user")
-            if send_to_agent(target_id, body):
-                console.print(f"[green]→ {target_id}:[/green] {raw[:120]}")
-            else:
-                console.print(f"[red]Agent '{target_id}' not found or inbox full.[/red]")
-
-    elif action == "/abort":
-        target_id = parts[1] if len(parts) >= 2 else ""
-        if not target_id and sys.stdin.isatty():
-            abortable = [
-                item for item in get_all_agents()
-                if item.status not in {"done", "aborted", "error"}
-            ]
-            chosen = choose_record(
-                abortable,
-                title="Abort Agent",
-                label=lambda item: item.id,
-                description=lambda item: (
-                    f"{item.status} · {item.name} · role={item.role}"),
-                search=True,
-            )
-            target_id = chosen.id if chosen else ""
-        if not target_id:
-            console.print("[dim]Agent selection cancelled.[/dim]")
-        else:
-            if abort_agent(target_id):
-                console.print(f"[yellow]Abort signaled to [bold]{target_id}[/bold][/yellow]")
-            else:
-                console.print(f"[red]Agent '{target_id}' not found.[/red]")
-
-    elif action == "/tools":
-        registry = tools_mod.get_registry()
-        groups = registry.list_by_source()
-        if not groups:
-            console.print("[dim]No tools registered.[/dim]")
-        else:
-            for src in sorted(groups):
-                console.print(f"[bold]{src}[/bold]")
-                for t in groups[src]:
-                    console.print(f"  [cyan]{t.name}[/cyan] — {t.description}")
-
-    elif action == "/tool":
-        tool_name, tool_params_raw = _raw_tail_after_word(raw_args)
-        if not tool_name and sys.stdin.isatty():
-            chosen = choose_record(
-                tools_mod.get_registry().list(),
-                title="Run Tool",
-                label=lambda item: item.name,
-                description=lambda item: (
-                    f"{item.source} · {item.description[:100]}"),
-                search=True,
-            )
-            tool_name = chosen.name if chosen else ""
-            if tool_name:
-                try:
-                    tool_params_raw = input(
-                        "JSON parameters (Enter for {}): ").strip()
-                except (EOFError, KeyboardInterrupt):
-                    tool_name = ""
-        if not tool_name:
-            console.print("[dim]Tool selection cancelled.[/dim]")
-        else:
-            raw = tool_params_raw.strip()
-            try:
-                params = {}
-                last_error = None
-                if raw:
-                    params = None
-                    for candidate in _json_arg_candidates(raw):
-                        try:
-                            params = json.loads(candidate)
-                            break
-                        except json.JSONDecodeError as exc:
-                            last_error = exc
-                    if params is None and last_error is not None:
-                        raise last_error
-                if not isinstance(params, dict):
-                    params = {"value": params}
-            except (ValueError, TypeError):
-                params = {"raw": raw}
-            ctx = tools_mod.ToolCtx(
-                deps=get_loop_deps(),
-                agent_id=(get_current_agent().id if get_current_agent() else None),
-                session=session,
-                events_cb=(lambda evs: agent_registry._push_events(evs))
-                          if agent_registry.agent_id else None,
-                cwd=os.getcwd(),
-            )
-            result = tools_mod.get_registry().invoke(tool_name, params, ctx)
-            try:
-                console.print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
-            except (TypeError, ValueError):
-                console.print(repr(result))
-
-    elif action == "/skill":
-        # No subcommand → open the interactive manager (same style as /term).
-        sub = (parts[1].lower() if len(parts) > 1 else "manager")
-        if sub == "manager":
-            show_skill_manager()
-        elif sub == "list":
-            metas = skills_mod.get_all_metadata()
-            if not metas:
-                console.print(f"[dim]No skills in {skills_mod.SKILLS_DIR}[/dim]")
-                console.print("[dim]Create one with: /skill new <name>[/dim]")
-            else:
-                groups = tools_mod.get_registry().list_by_source()
-                for name, meta in sorted(metas.items()):
-                    src = f"skill:{name}"
-                    tools = groups.get(src, [])
-                    console.print(f"[bold]{name}[/bold] [dim]({meta.dir_path})[/dim]")
-                    if meta.description:
-                        console.print(f"  [dim]{meta.description}[/dim]")
-                    for t in tools:
-                        console.print(f"  [cyan]{t.name}[/cyan] — {t.description}")
-                    if not tools:
-                        console.print("  [yellow](standby/documentation-only)[/yellow]")
-        elif sub in ("trust", "revoke"):
-            skill_name = parts[2] if len(parts) >= 3 else ""
-            if not skill_name and sys.stdin.isatty():
-                skill_rows = list(skills_mod.get_all_metadata().items())
-                chosen = choose_record(
-                    skill_rows,
-                    title=f"{sub.title()} Skill",
-                    label=lambda item: item[0],
-                    description=lambda item: item[1].description or "(no description)",
-                    search=True,
-                )
-                skill_name = chosen[0] if chosen else ""
-            if not skill_name:
-                console.print("[dim]Skill selection cancelled.[/dim]")
-            else:
-                meta = skills_mod.get_all_metadata().get(skill_name)
-                if meta is None:
-                    console.print(f"[red]Unknown skill: {skill_name}[/red]")
-                else:
-                    entrypoint = Path(meta.dir_path) / "skill.py"
-                    if not entrypoint.is_file():
-                        console.print("[dim]Documentation-only skills do not require executable trust.[/dim]")
-                    elif sub == "revoke":
-                        skills_mod.unload_skill(skill_name)
-                        removed = trust_store.revoke_extension("skill", skill_name)
-                        console.print("[green]Skill trust revoked.[/green]" if removed
-                                      else "[dim]Skill was not trusted.[/dim]")
-                    else:
-                        manifest, manifest_error = skills_mod.load_skill_manifest(
-                            Path(meta.dir_path), skill_name)
-                        if manifest is None:
-                            console.print(f"[red]{manifest_error}[/red]")
-                            return False
-                        status = trust_store.extension_status(
-                            "skill", skill_name, entrypoint,
-                            (Path(meta.dir_path) / skills_mod.SKILL_MANIFEST,))
-                        approved = "--yes" in parts[3:]
-                        if not approved and sys.stdin.isatty():
-                            approved = _blocking_approval_prompt(
-                                "Trust executable skill",
-                                f"Skill: {skill_name}\nFile: {entrypoint.resolve()}\n"
-                                f"SHA-256: {status.get('sha256', 'unavailable')}\n\n"
-                                f"Capabilities: {manifest.get('capabilities', [])}\n\n"
-                                "This Python executes with your local account permissions.",
-                                "Trust this exact skill hash?", allow_always=False,
-                            ) == "yes"
-                        if approved:
-                            trusted = trust_store.trust_extension(
-                                "skill", skill_name, entrypoint,
-                                (Path(meta.dir_path) / skills_mod.SKILL_MANIFEST,))
-                            console.print(
-                                f"[green]Trusted {skill_name} at "
-                                f"{trusted['sha256'][:16]}…[/green]")
-                        else:
-                            console.print("[yellow]Skill not trusted.[/yellow]")
-        elif sub in ("load", "unload"):
-            skill_name = parts[2] if len(parts) >= 3 else ""
-            if not skill_name and sys.stdin.isatty():
-                skills = skills_mod.list_skills()
-                eligible = [
-                    item for item in skills
-                    if bool(item.get("loaded")) == (sub == "unload")
-                ]
-                chosen = choose_record(
-                    eligible,
-                    title=f"{sub.title()} Skill",
-                    label=lambda item: item["name"],
-                    description=lambda item: item.get("description", ""),
-                    search=True,
-                )
-                skill_name = chosen["name"] if chosen else ""
-            if not skill_name:
-                console.print("[dim]Skill selection cancelled.[/dim]")
-            else:
-                fn = skills_mod.load_skill if sub == "load" else skills_mod.unload_skill
-                ok, msg = fn(skill_name)
-                console.print(f"[{'green' if ok else 'red'}]{msg}[/{'green' if ok else 'red'}]")
-        elif sub == "reload":
-            results = skills_mod.reload_all()
-            for name, ok, msg in results:
-                style = "green" if ok else "red"
-                console.print(f"[{style}]{msg}[/{style}]")
-            if not results:
-                console.print(f"[dim]No skills in {skills_mod.SKILLS_DIR}[/dim]")
-        elif sub == "new":
-            if len(parts) < 3:
-                console.print("[yellow]Usage: /skill new <name>[/yellow]")
-            else:
-                ok, msg = skills_mod.install_template(parts[2])
-                style = "green" if ok else "red"
-                console.print(f"[{style}]{msg}[/{style}]")
-                if ok:
-                    console.print("[dim]Edit skill.py and extension.json, then run /skill trust <name> and /skill load <name>[/dim]")
-        elif sub == "dir":
-            console.print(str(skills_mod.SKILLS_DIR))
-        else:
-            console.print("[yellow]Usage: /skill [manager|list|trust <name>|revoke <name>|load <name>|unload <name>|reload|new <name>|dir][/yellow]")
-
-    elif action == "/mcp":
-        if not _get_mcp_mod().MCP_AVAILABLE:
-            console.print(f"[yellow]mcp SDK not installed: {_get_mcp_mod().MCP_IMPORT_ERROR}[/yellow]")
-            console.print("[dim]Install with:  pip install mcp[/dim]")
-            return False
-        sub = (parts[1].lower() if len(parts) > 1 else "list")
-        mgr = _get_mcp_mod().get_manager()
-
-        def _pick_mcp_server(title: str, predicate=None) -> str:
-            server_rows = list(mgr.load_config().get("servers", {}).items())
-            if predicate is not None:
-                server_rows = [item for item in server_rows if predicate(*item)]
-            chosen = choose_record(
-                server_rows,
-                title=title,
-                label=lambda item: item[0],
-                description=lambda item: (
-                    f"{(mgr.servers.get(item[0]).status if mgr.servers.get(item[0]) else 'offline')}"
-                    f" · {item[1].get('command', '?')}"),
-                search=True,
-            )
-            return chosen[0] if chosen else ""
-
-        if sub == "list":
-            cfg = mgr.load_config().get("servers", {})
-            if not cfg:
-                console.print(f"[dim]No servers in {_get_mcp_mod().CONFIG_PATH}[/dim]")
-                console.print("[dim]Create one with: /mcp init[/dim]")
-            else:
-                for name, sc in cfg.items():
-                    srv = mgr.servers.get(name)
-                    enabled = sc.get("enabled", True)
-                    if srv is None:
-                        status = "(not connected)" if enabled else "(disabled)"
-                        style = "dim"
-                    else:
-                        status = f"({srv.status}, {len(srv.tools)} tools)"
-                        style = "green" if srv.status == "up" else "yellow"
-                    cmd_str = sc.get("command", "?")
-                    console.print(f"  [{style}]{name}[/{style}] {status} [dim]{cmd_str}[/dim]")
-                    if srv and srv.last_error and srv.status != "up":
-                        console.print(f"    [red]{srv.last_error}[/red]")
-        elif sub in ("trust", "revoke"):
-            server_name = parts[2] if len(parts) >= 3 else ""
-            if not server_name and sys.stdin.isatty():
-                server_name = _pick_mcp_server(f"{sub.title()} MCP Server")
-            if not server_name:
-                console.print("[dim]MCP server selection cancelled.[/dim]")
-            else:
-                server_cfg = mgr.load_config().get("servers", {}).get(server_name)
-                if server_cfg is None:
-                    console.print(f"[red]Unknown MCP server: {server_name}[/red]")
-                elif sub == "revoke":
-                    mgr.disconnect(server_name)
-                    removed = trust_store.revoke_extension("mcp", server_name)
-                    console.print("[green]MCP trust revoked.[/green]" if removed
-                                  else "[dim]MCP server was not trusted.[/dim]")
-                else:
-                    cfg_path = _get_mcp_mod().CONFIG_PATH
-                    status = trust_store.extension_status(
-                        "mcp", server_name, cfg_path)
-                    argv = [server_cfg.get("command")] + list(server_cfg.get("args") or [])
-                    approved = "--yes" in parts[3:]
-                    if not approved and sys.stdin.isatty():
-                        approved = _blocking_approval_prompt(
-                            "Trust MCP server process",
-                            f"Server: {server_name}\nCommand: {argv}\n"
-                            f"CWD: {server_cfg.get('cwd') or os.getcwd()}\n"
-                            f"Explicit env keys: {sorted((server_cfg.get('env') or {}).keys())}\n"
-                            f"Capabilities: {server_cfg.get('capabilities', ['core.other'])}\n"
-                            f"Config SHA-256: {status.get('sha256', 'unavailable')}",
-                            "Trust this server at the current config hash?",
-                            allow_always=False,
-                        ) == "yes"
-                    if approved:
-                        trusted = trust_store.trust_extension(
-                            "mcp", server_name, cfg_path)
-                        console.print(
-                            f"[green]Trusted MCP server {server_name} at "
-                            f"{trusted['sha256'][:16]}…[/green]")
-                    else:
-                        console.print("[yellow]MCP server not trusted.[/yellow]")
-        elif sub == "tools":
-            srv_name = parts[2] if len(parts) >= 3 else ""
-            if not srv_name and sys.stdin.isatty():
-                srv_name = _pick_mcp_server("View MCP Tools")
-            if not srv_name:
-                console.print("[dim]MCP server selection cancelled.[/dim]")
-            else:
-                groups = tools_mod.get_registry().list_by_source()
-                ts = groups.get(f"mcp:{srv_name}", [])
-                if not ts:
-                    console.print(f"[dim]No tools for mcp:{srv_name} (not connected?)[/dim]")
-                else:
-                    for t in ts:
-                        console.print(f"  [cyan]{t.name}[/cyan] — {t.description}")
-        elif sub == "connect":
-            server_name = parts[2] if len(parts) >= 3 else ""
-            if not server_name and sys.stdin.isatty():
-                server_name = _pick_mcp_server(
-                    "Connect MCP Server",
-                    lambda name, cfg: bool(cfg.get("enabled", True)))
-            if not server_name:
-                console.print("[dim]MCP server selection cancelled.[/dim]")
-            else:
-                ok, msg = mgr.connect(server_name)
-                style = "green" if ok else "red"
-                console.print(f"[{style}]{server_name}: {msg}[/{style}]")
-        elif sub == "disconnect":
-            server_name = parts[2] if len(parts) >= 3 else ""
-            if not server_name and sys.stdin.isatty():
-                server_name = _pick_mcp_server(
-                    "Disconnect MCP Server",
-                    lambda name, _cfg: name in mgr.servers)
-            if not server_name:
-                console.print("[dim]MCP server selection cancelled.[/dim]")
-            else:
-                ok, msg = mgr.disconnect(server_name)
-                style = "green" if ok else "red"
-                console.print(f"[{style}]{server_name}: {msg}[/{style}]")
-        elif sub == "reload":
-            results = mgr.reload()
-            for n, ok, m in results:
-                if n == "(none)":
-                    console.print(f"[yellow]{m}[/yellow]")
-                    continue
-                style = "green" if ok else "yellow"
-                console.print(f"[{style}]{n}: {m}[/{style}]")
-        elif sub == "init":
-            ok, msg = _get_mcp_mod().MCPManager.write_template_config()
-            style = "green" if ok else "red"
-            console.print(f"[{style}]{msg}[/{style}]")
-            if ok:
-                console.print("[dim]Edit the file, enable a server, then /mcp reload[/dim]")
-        elif sub == "config":
-            console.print(str(_get_mcp_mod().CONFIG_PATH))
-        else:
-            console.print("[yellow]Usage: /mcp {list|trust <n>|revoke <n>|connect <n>|disconnect <n>|reload|tools <n>|init|config}[/yellow]")
-
-    elif action == "/connect":
-        # /connect [name] — link THIS terminal to Helpwo (primary or sub);
-        # optional name customizes how it appears in Helpwo.
-        if agent_registry is None:
-            console.print("[red]No agent registry available.[/red]")
-        else:
-            custom_name = parts[1] if len(parts) >= 2 else None
-            if custom_name and not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", custom_name):
-                console.print("[red]Invalid name. Use letters, numbers, dot, "
-                              "underscore, or hyphen (max 64).[/red]")
-            elif custom_name and custom_name.lower() == "term0":
-                console.print("[red]'term0' is reserved.[/red]")
-            else:
-                connect_terminal_to_helpwo(agent_registry, session, name=custom_name)
-
-    elif action == "/disconnect":
-        if agent_registry is None or not agent_registry.agent_id:
-            console.print("[dim]This terminal is not connected to Helpwo.[/dim]")
-        elif getattr(agent_registry, "depth", 0) == 0:
-            name = agent_registry.agent_name
-            agent_registry._last_agent_id = ""  # explicit — don't resurrect
-            agent_registry.unregister()
-            agent_registry.agent_id = None
-            agent_registry.agent_secret = ""
-            console.print(f"[yellow]Primary CLI [bold]{name}[/bold] is now offline in Helpwo "
-                          f"(sub-terminal creation from the UI is disabled). "
-                          f"Run /connect to link again.[/yellow]")
-        else:
-            name = (agent_registry.terminal_meta or {}).get("name", agent_registry.agent_name)
-            agent_registry._last_agent_id = ""  # explicit — don't resurrect
-            agent_registry.unregister()
-            agent_registry.agent_id = None
-            agent_registry.agent_secret = ""
-            console.print(f"[yellow]Sub-terminal [bold]{name}[/bold] withdrawn from Helpwo. "
-                          f"Run /connect to hand it over again.[/yellow]")
-
-    elif action in ("/t", "/term"):
-        if len(parts) >= 2 and parts[1].lower() == "rename":
-            if len(parts) != 4:
-                console.print("[yellow]Usage: /term rename <old> <new>[/yellow]")
-            elif not re.fullmatch(r"[A-Za-z0-9._-]+", parts[3]):
-                console.print("[red]Terminal names may contain only letters, numbers, dot, underscore, and hyphen.[/red]")
-            elif parts[2].lower() == "term0":
-                console.print("[red]The primary terminal term0 cannot be renamed.[/red]")
-            elif rename_terminal(parts[2], parts[3]):
-                console.print(
-                    f"[green]Terminal renamed: [bold]{parts[2]}[/bold] → "
-                    f"[bold]{parts[3]}[/bold][/green]")
-            else:
-                console.print(
-                    f"[red]Could not rename '{parts[2]}': source missing or target already exists.[/red]")
-        elif len(parts) == 2:
-            # /t <name> or /term <name> — create sub-terminal (no agent stationed)
-            name = parts[1]
-            if not re.fullmatch(r"[A-Za-z0-9._-]+", name) or name.lower() == "term0":
-                console.print(
-                    "[red]Invalid terminal name. Use letters, numbers, dot, "
-                    "underscore, or hyphen; term0 is reserved.[/red]")
-                return False
-            existing = get_terminal(name)
-            if existing and existing.session and not existing.session.is_alive():
-                unregister_terminal(name)
-                existing = None
-            if existing is not None:
-                console.print(f"[yellow]Terminal '{name}' already exists. /t to view, /terminate {name} to remove.[/yellow]")
-            else:
-                lain_cmd = _build_connected_subterminal_cmd(
-                    name,
-                    agent_registry.agent_id if agent_registry else None,
-                )
-                sub = SubTerminalSession(lain_cmd)
-                sub.start()
-                time.sleep(0.1)
-                if not sub.is_alive():
-                    console.print(f"[red]Could not start terminal '{name}'.[/red]")
-                    return False
-                sub.read_output(timeout=0.1)
-                register_terminal(sub, "laintas-cli", 0, name=name)
-                console.print(f"[green]Created sub-terminal [bold]{name}[/bold] (no agent stationed)[/green]")
-        elif len(parts) > 2:
-            console.print("[yellow]Usage: /term [name|rename <old> <new>][/yellow]")
-        else:
-            # /t or /term (no args) — list terminals browser
-            terminals = get_all_terminals()
-            has_primary = interactive_session is not None and interactive_session.is_alive()
-            if not terminals and not has_primary:
-                console.print("[dim]No active sub-terminal sessions. "
-                              "Use /station <agent-id> or let the AI spawn a command.[/dim]")
-            elif not terminals and has_primary:
-                # Only term0 exists — entering it is redundant (already in REPL).
-                console.print("[dim]No sub-terminals. You are already in term0 (primary).[/dim]")
-            else:
-                show_terminal_manager(interactive_session)
-
-    elif action == "/reload":
-        if raw_args:
-            console.print("[yellow]Usage: /reload[/yellow]")
-        else:
-            reload_default_files()
-
-    elif action in ("/undo", "/snapshot", "/snapshots"):
-        import snapshot as _snap
-        cwd = os.getcwd()
-        if action == "/snapshots":
-            cps = _snap.list_for(cwd)
-            if not cps:
-                console.print("[dim]No checkpoints for this repository "
-                              "(not a git repo, or none taken yet).[/dim]")
-            else:
-                console.print(f"[bold]Checkpoints[/bold] ({len(cps)}, newest last):")
-                for i, c in enumerate(cps):
-                    ago = _format_time_ago(c.get("ts", 0))
-                    console.print(f"  [cyan]{c['sha'][:10]}[/cyan]  {c.get('label','') or '(no label)'}  [dim]{ago}[/dim]")
-                console.print("[dim]Run /undo to choose a checkpoint, or /undo <sha> directly.[/dim]")
-        elif action == "/snapshot":
-            label = _decode_text_arg(raw_args) if raw_args else "manual"
-            cp = _snap.create(cwd, label)
-            if cp:
-                console.print(f"[green]Checkpoint saved: {cp['sha'][:10]} ({label})[/green]")
-            else:
-                console.print("[yellow]Could not snapshot (not a git repository?).[/yellow]")
-        else:  # /undo
-            sha = parts[1] if len(parts) > 1 else None
-            chosen_checkpoint = None
-            if sha is None and sys.stdin.isatty():
-                checkpoints = list(reversed(_snap.list_for(cwd)))
-                chosen_checkpoint = choose_record(
-                    checkpoints,
-                    title="Restore Checkpoint",
-                    label=lambda item: item["sha"][:10],
-                    description=lambda item: (
-                        f"{item.get('label') or '(no label)'} · "
-                        f"{_format_time_ago(item.get('ts', 0))}"),
-                    search=True,
-                )
-                sha = chosen_checkpoint.get("sha") if chosen_checkpoint else ""
-            if sha == "":
-                console.print("[dim]Checkpoint selection cancelled.[/dim]")
-                return False
-            approved = True
-            if sys.stdin.isatty():
-                label = ((chosen_checkpoint or {}).get("label") or "explicit checkpoint")
-                approved = _blocking_approval_prompt(
-                    "Restore working tree",
-                    f"Checkpoint: {(sha or 'latest')[:10]}\nLabel: {label}\n\n"
-                    "Modified and deleted files will be restored. New files are kept.",
-                    "Restore this checkpoint?",
-                    allow_always=False,
-                ) == "yes"
-            if not approved:
-                console.print("[dim]Checkpoint restore cancelled.[/dim]")
-                return False
-            ok, msg = _snap.restore(cwd, sha)
-            console.print((f"[green]{msg}[/green]" if ok else f"[yellow]{msg}[/yellow]"))
-            if ok:
-                console.print("[dim]Files created since the checkpoint were kept. "
-                              "A pre-undo checkpoint was saved (undo the undo with /undo).[/dim]")
-
-    elif action == "/config":
-        # Built-in config command (doesn't require .laintas/commands.py)
-        if len(parts) == 1:
-            table = Table(title="Runtime Configuration", show_lines=False)
-            table.add_column("Key", style="cyan")
-            table.add_column("Value")
-            table.add_column("Type", style="dim")
-            table.add_column("Source", style="dim")
-            table.add_column("Description", style="dim")
-            for key, meta in sorted(describe_runtime_config().items()):
-                table.add_row(
-                    key, repr(meta["value"]), meta["type"],
-                    "override" if meta["overridden"] else "default",
-                    meta["description"],
-                )
-            console.print(table)
-            console.print("[dim]Set with /config <key> <value>; restore with /config reset.[/dim]")
-        elif len(parts) == 2 and parts[1].lower() == "reset":
-            reset_runtime_config()
-            console.print("[green]Runtime config reset to defaults.[/green]")
-        elif len(parts) == 2:
-            # /config <key> — show one
-            key = parts[1]
-            meta = describe_runtime_config().get(key)
-            if meta is None:
+            console.print(Panel(
+                f"Value: [bold]{meta['value']!r}[/bold]\n"
+                f"Default: {meta['default']!r}\n"
+                f"Type: {meta['type']}\n"
+                f"Source: {'override' if meta['overridden'] else 'default'}\n\n"
+                f"[dim]{meta['description']}[/dim]",
+                title=key, border_style="cyan",
+            ))
+    elif len(parts) == 3:
+        # /config <key> <value>
+        key = parts[1]
+        try:
+            if not set_runtime_config(key, parts[2]):
                 console.print(f"[red]Unknown config key: {key}[/red]")
                 console.print("[dim]Run /config to list valid keys.[/dim]")
             else:
-                console.print(Panel(
-                    f"Value: [bold]{meta['value']!r}[/bold]\n"
-                    f"Default: {meta['default']!r}\n"
-                    f"Type: {meta['type']}\n"
-                    f"Source: {'override' if meta['overridden'] else 'default'}\n\n"
-                    f"[dim]{meta['description']}[/dim]",
-                    title=key, border_style="cyan",
-                ))
-        elif len(parts) == 3:
-            # /config <key> <value>
-            key = parts[1]
-            try:
-                if not set_runtime_config(key, parts[2]):
-                    console.print(f"[red]Unknown config key: {key}[/red]")
-                    console.print("[dim]Run /config to list valid keys.[/dim]")
-                else:
-                    value = get_runtime_config(key)
-                    console.print(
-                        f"[green]{key} = {value!r} ({type(value).__name__})[/green]")
-            except (ValueError, KeyError) as e:
-                console.print(f"[red]{e}[/red]")
-                console.print(f"[dim]Run /config {key} to inspect the expected type.[/dim]")
-        else:
-            console.print("[yellow]Usage: /config [key [value]] | /config reset[/yellow]")
+                value = get_runtime_config(key)
+                console.print(
+                    f"[green]{key} = {value!r} ({type(value).__name__})[/green]")
+        except (ValueError, KeyError) as e:
+            console.print(f"[red]{e}[/red]")
+            console.print(f"[dim]Run /config {key} to inspect the expected type.[/dim]")
+    else:
+        console.print("[yellow]Usage: /config [key [value]] | /config reset[/yellow]")
 
-    elif action == "/max":
-        # Crank every capacity knob to its ceiling and lift every auto-exit
-        # circuit breaker. Process-global → applies to all agents. /config reset reverts.
-        applied = apply_max_config()
-        console.print("[green]⚡ MAX mode — all limits lifted (applies to every agent):[/green]")
-        for k, v in applied.items():
-            console.print(f"  [cyan]{k}[/cyan] = {v}")
-        console.print("[dim]Note: max_tokens may be capped lower by the provider. Revert with /config reset.[/dim]")
 
-    elif action == "/compact":
-        compact_arg = parts[1].lower() if len(parts) > 1 else ""
-        if len(parts) > 2 or compact_arg not in ("", "status", "--force", "force"):
-            console.print("[yellow]Usage: /compact [status|--force][/yellow]")
-            return False
 
-        compact_state = getattr(handle_meta_command, '_last_agent_state', None)
-        compact_chat = getattr(handle_meta_command, '_last_chat_history', None)
-        compact_deps = getattr(handle_meta_command, '_last_deps', None) or get_loop_deps()
-        compact_session = getattr(handle_meta_command, '_last_session', None) or session
-        if not isinstance(compact_state, dict):
-            console.print("[yellow]No current session context to compact.[/yellow]")
-            return False
+def _cmd_max() -> None:
+    # Crank every capacity knob to its ceiling and lift every auto-exit
+    # circuit breaker. Process-global → applies to all agents. /config reset reverts.
+    applied = apply_max_config()
+    console.print("[green]⚡ MAX mode — all limits lifted (applies to every agent):[/green]")
+    for k, v in applied.items():
+        console.print(f"  [cyan]{k}[/cyan] = {v}")
+    console.print("[dim]Note: max_tokens may be capped lower by the provider. Revert with /config reset.[/dim]")
 
-        if compact_arg == "status":
-            info = session_context_status(compact_state)
-            ratio = (info["tokens"] / info["usable"] * 100
-                     if info["usable"] else 0)
-            console.print(
-                f"[bold]Context[/bold]  {_fmt_tokens(info['tokens'])} tokens · "
-                f"{info['messages']} messages · {ratio:.0f}% of "
-                f"{_fmt_tokens(info['usable'])} usable"
-                + (" · summarized" if info["summary"] else ""))
-            return False
 
-        with console.status("[dim]Compacting session context…[/dim]", spinner="dots"):
-            result = compact_session_context(
-                compact_deps, compact_session, compact_state,
-                compact_chat if isinstance(compact_chat, list) else [])
-        if not result.get("ok"):
-            console.print(f"[red]Context compaction failed: {result.get('error', 'unknown error')}[/red]")
-            return False
-        if not result.get("changed"):
-            console.print(
-                f"[dim]Context unchanged: {result.get('reason', 'nothing to compact')} "
-                f"({_fmt_tokens(result['tokens'])} tokens).[/dim]")
-            return False
 
-        handle_meta_command._last_agent_state = compact_state
-        current_live = getattr(handle_meta_command, '_current_live_session', None)
-        cwd = ((current_live or {}).get("cwd") or os.getcwd())
-        if current_live:
-            current_live = session_store.sync_runtime(
-                current_live, compact_state,
-                compact_chat if isinstance(compact_chat, list) else [],
-                cwd=cwd,
-                tasks=task_manager.export_active_tasks(cwd=cwd),
-            )
-            handle_meta_command._current_live_session = current_live
-        save_resume_state(
-            compact_state,
-            compact_chat if isinstance(compact_chat, list) else [], cwd)
-        event_log.append(
-            "context_compacted",
-            before_tokens=result["tokens"],
-            after_tokens=result["after_tokens"],
-            session_id=str(compact_state.get("_session_id") or ""),
-        )
+def _cmd_compact(parts: list, session: dict) -> bool:
+    compact_arg = parts[1].lower() if len(parts) > 1 else ""
+    if len(parts) > 2 or compact_arg not in ("", "status", "--force", "force"):
+        console.print("[yellow]Usage: /compact [status|--force][/yellow]")
+        return False
+
+    compact_state = getattr(handle_meta_command, '_last_agent_state', None)
+    compact_chat = getattr(handle_meta_command, '_last_chat_history', None)
+    compact_deps = getattr(handle_meta_command, '_last_deps', None) or get_loop_deps()
+    compact_session = getattr(handle_meta_command, '_last_session', None) or session
+    if not isinstance(compact_state, dict):
+        console.print("[yellow]No current session context to compact.[/yellow]")
+        return False
+
+    if compact_arg == "status":
+        info = session_context_status(compact_state)
+        ratio = (info["tokens"] / info["usable"] * 100
+                 if info["usable"] else 0)
         console.print(
-            f"[green]Context compacted: {_fmt_tokens(result['tokens'])} → "
-            f"{_fmt_tokens(result['after_tokens'])} tokens"
-            f" · {result['messages']} → {result['after_messages']} messages[/green]")
+            f"[bold]Context[/bold]  {_fmt_tokens(info['tokens'])} tokens · "
+            f"{info['messages']} messages · {ratio:.0f}% of "
+            f"{_fmt_tokens(info['usable'])} usable"
+            + (" · summarized" if info["summary"] else ""))
         return False
 
-    elif action == "/continue":
-        _current_live = getattr(handle_meta_command, '_current_live_session', None)
-        _prev_state = getattr(handle_meta_command, '_last_agent_state', None)
-        _prev_chat = getattr(handle_meta_command, '_last_chat_history', None)
-        _prev_input = getattr(handle_meta_command, '_last_original_input', None)
-        _prev_deps = getattr(handle_meta_command, '_last_deps', None) or get_loop_deps()
-        _prev_session = getattr(handle_meta_command, '_last_session', None) or session
-        _prev_events_cb = getattr(handle_meta_command, '_last_events_cb', None)
-        _prev_existing_session = getattr(handle_meta_command, '_last_existing_session', None)
+    with console.status("[dim]Compacting session context…[/dim]", spinner="dots"):
+        result = compact_session_context(
+            compact_deps, compact_session, compact_state,
+            compact_chat if isinstance(compact_chat, list) else [])
+    if not result.get("ok"):
+        console.print(f"[red]Context compaction failed: {result.get('error', 'unknown error')}[/red]")
+        return False
+    if not result.get("changed"):
+        console.print(
+            f"[dim]Context unchanged: {result.get('reason', 'nothing to compact')} "
+            f"({_fmt_tokens(result['tokens'])} tokens).[/dim]")
+        return False
 
-        if _current_live:
-            # Prefer the mutable objects used by the main REPL.  The persisted
-            # live-session payload is a restart fallback, not a second runtime
-            # source of truth.
-            if _prev_state is None:
-                _prev_state = (_current_live.get("state")
-                               or _current_live.get("agent_state"))
-            if _prev_chat is None:
-                _prev_chat = _current_live.get("chat_history") or []
-            _prev_input = (_current_live.get("last_original_input")
-                           or _current_live.get("last_user_input")
-                           or _prev_input
-                           or _current_live.get("objective"))
-
-        if _prev_state is None or _prev_input is None:
-            console.print("[yellow]No previous agent loop to continue.[/yellow]")
-            return False
-
-        if _current_live and not _current_live.get("pending_continuation"):
-            console.print("[yellow]The current session has no pending continuation.[/yellow]")
-            return False
-
-        if not _prev_events_cb:
-            def _prev_events_cb(events: list):
-                if agent_registry.agent_id:
-                    agent_registry._push_events(events)
-
-        _prev_state.pop("_max_loops_exhausted", None)
-        _prev_state.pop("_exhaustion_loop_count", None)
-
-        console.print("[green]Continuing current session...[/green]")
-
-        response = _run_agent_loop_with_interrupt(
-            _prev_deps, _prev_input, _prev_session, _prev_state,
-            _prev_chat if _prev_chat is not None else [],
-            events_cb=_prev_events_cb,
-            existing_session=_prev_existing_session,
-            continue_thread=True,
+    handle_meta_command._last_agent_state = compact_state
+    current_live = getattr(handle_meta_command, '_current_live_session', None)
+    cwd = ((current_live or {}).get("cwd") or os.getcwd())
+    if current_live:
+        current_live = session_store.sync_runtime(
+            current_live, compact_state,
+            compact_chat if isinstance(compact_chat, list) else [],
+            cwd=cwd,
+            tasks=task_manager.export_active_tasks(cwd=cwd),
         )
+        handle_meta_command._current_live_session = current_live
+    save_resume_state(
+        compact_state,
+        compact_chat if isinstance(compact_chat, list) else [], cwd)
+    event_log.append(
+        "context_compacted",
+        before_tokens=result["tokens"],
+        after_tokens=result["after_tokens"],
+        session_id=str(compact_state.get("_session_id") or ""),
+    )
+    console.print(
+        f"[green]Context compacted: {_fmt_tokens(result['tokens'])} → "
+        f"{_fmt_tokens(result['after_tokens'])} tokens"
+        f" · {result['messages']} → {result['after_messages']} messages[/green]")
+    return False
 
-        _continued_state = prepare_state_for_repl(
-            response.get("state", _prev_state))
-        if isinstance(_prev_state, dict):
-            _prev_state.clear()
-            _prev_state.update(_continued_state)
-            _continued_state = _prev_state
 
-        handle_meta_command._last_agent_state = _continued_state
-        handle_meta_command._last_chat_history = _prev_chat
-        handle_meta_command._last_original_input = _prev_input
-        handle_meta_command._last_deps = _prev_deps
-        handle_meta_command._last_session = _prev_session
-        handle_meta_command._last_events_cb = _prev_events_cb
-        handle_meta_command._last_existing_session = response.get("session")
-        if response.get("msg"):
-            console.print(_prev_deps.Markdown(response["msg"]) if hasattr(_prev_deps, 'Markdown') else response["msg"])
-            (_prev_chat if _prev_chat is not None else []).append(
-                {"role": "assistant", "content": response["msg"]}
-            )
-        if _current_live:
-            try:
-                updated = session_store.sync_runtime(
-                    _current_live,
-                    _continued_state,
-                    _prev_chat if _prev_chat is not None else [],
-                    cwd=_current_live.get("cwd") or os.getcwd(),
-                    objective=_prev_input,
-                    last_user_input=_prev_input,
-                    exit_reason=response.get("exit_reason"),
-                    tasks=task_manager.export_active_tasks(cwd=_current_live.get("cwd") or os.getcwd()),
-                )
-                handle_meta_command._current_live_session = updated
-            except Exception:
-                pass
+def _cmd_continue(session: dict, agent_registry: AgentRegistry) -> bool:
+    _current_live = getattr(handle_meta_command, '_current_live_session', None)
+    _prev_state = getattr(handle_meta_command, '_last_agent_state', None)
+    _prev_chat = getattr(handle_meta_command, '_last_chat_history', None)
+    _prev_input = getattr(handle_meta_command, '_last_original_input', None)
+    _prev_deps = getattr(handle_meta_command, '_last_deps', None) or get_loop_deps()
+    _prev_session = getattr(handle_meta_command, '_last_session', None) or session
+    _prev_events_cb = getattr(handle_meta_command, '_last_events_cb', None)
+    _prev_existing_session = getattr(handle_meta_command, '_last_existing_session', None)
 
+    if _current_live:
+        # Prefer the mutable objects used by the main REPL.  The persisted
+        # live-session payload is a restart fallback, not a second runtime
+        # source of truth.
+        if _prev_state is None:
+            _prev_state = (_current_live.get("state")
+                           or _current_live.get("agent_state"))
+        if _prev_chat is None:
+            _prev_chat = _current_live.get("chat_history") or []
+        _prev_input = (_current_live.get("last_original_input")
+                       or _current_live.get("last_user_input")
+                       or _prev_input
+                       or _current_live.get("objective"))
+
+    if _prev_state is None or _prev_input is None:
+        console.print("[yellow]No previous agent loop to continue.[/yellow]")
         return False
 
-    elif action == "/told":
-        from rich.markup import escape
-        sub = parts[1].lower() if len(parts) > 1 else ""
-        _chat = getattr(handle_meta_command, '_last_chat_history', None) or []
-        _user_msgs = [m.get("content", "") for m in _chat
-                      if isinstance(m, dict) and m.get("role") == "user"]
+    if _current_live and not _current_live.get("pending_continuation"):
+        console.print("[yellow]The current session has no pending continuation.[/yellow]")
+        return False
 
-        def _parse_n(token, default):
-            try:
-                n = int(token)
-                return n if n > 0 else default
-            except (TypeError, ValueError):
-                return default
+    if not _prev_events_cb:
+        def _prev_events_cb(events: list):
+            if agent_registry.agent_id:
+                agent_registry._push_events(events)
 
-        if sub == "":
-            if _user_msgs:
+    _prev_state.pop("_max_loops_exhausted", None)
+    _prev_state.pop("_exhaustion_loop_count", None)
+
+    console.print("[green]Continuing current session...[/green]")
+
+    response = _run_agent_loop_with_interrupt(
+        _prev_deps, _prev_input, _prev_session, _prev_state,
+        _prev_chat if _prev_chat is not None else [],
+        events_cb=_prev_events_cb,
+        existing_session=_prev_existing_session,
+        continue_thread=True,
+    )
+
+    _continued_state = prepare_state_for_repl(
+        response.get("state", _prev_state))
+    if isinstance(_prev_state, dict):
+        _prev_state.clear()
+        _prev_state.update(_continued_state)
+        _continued_state = _prev_state
+
+    handle_meta_command._last_agent_state = _continued_state
+    handle_meta_command._last_chat_history = _prev_chat
+    handle_meta_command._last_original_input = _prev_input
+    handle_meta_command._last_deps = _prev_deps
+    handle_meta_command._last_session = _prev_session
+    handle_meta_command._last_events_cb = _prev_events_cb
+    handle_meta_command._last_existing_session = response.get("session")
+    if response.get("msg"):
+        console.print(_prev_deps.Markdown(response["msg"]) if hasattr(_prev_deps, 'Markdown') else response["msg"])
+        (_prev_chat if _prev_chat is not None else []).append(
+            {"role": "assistant", "content": response["msg"]}
+        )
+    if _current_live:
+        try:
+            updated = session_store.sync_runtime(
+                _current_live,
+                _continued_state,
+                _prev_chat if _prev_chat is not None else [],
+                cwd=_current_live.get("cwd") or os.getcwd(),
+                objective=_prev_input,
+                last_user_input=_prev_input,
+                exit_reason=response.get("exit_reason"),
+                tasks=task_manager.export_active_tasks(cwd=_current_live.get("cwd") or os.getcwd()),
+            )
+            handle_meta_command._current_live_session = updated
+        except Exception:
+            pass
+
+    return False
+
+
+def _cmd_told(parts: list) -> bool:
+    from rich.markup import escape
+    sub = parts[1].lower() if len(parts) > 1 else ""
+    _chat = getattr(handle_meta_command, '_last_chat_history', None) or []
+    _user_msgs = [m.get("content", "") for m in _chat
+                  if isinstance(m, dict) and m.get("role") == "user"]
+
+    def _parse_n(token, default):
+        try:
+            n = int(token)
+            return n if n > 0 else default
+        except (TypeError, ValueError):
+            return default
+
+    if sub == "":
+        if _user_msgs:
+            console.print("[bold]You last asked:[/bold]")
+            console.print(f"  [cyan]{escape(_user_msgs[-1])}[/cyan]")
+        else:
+            _fallback = getattr(handle_meta_command, '_last_original_input', None)
+            if _fallback:
                 console.print("[bold]You last asked:[/bold]")
-                console.print(f"  [cyan]{escape(_user_msgs[-1])}[/cyan]")
+                console.print(f"  [cyan]{escape(_fallback)}[/cyan]")
             else:
-                _fallback = getattr(handle_meta_command, '_last_original_input', None)
-                if _fallback:
-                    console.print("[bold]You last asked:[/bold]")
-                    console.print(f"  [cyan]{escape(_fallback)}[/cyan]")
-                else:
-                    console.print("[yellow]You haven't asked anything yet this session.[/yellow]")
-                    console.print("[dim]Tip: /told log shows prompts from the on-disk journal "
-                                  "(survives /new and restarts).[/dim]")
+                console.print("[yellow]You haven't asked anything yet this session.[/yellow]")
+                console.print("[dim]Tip: /told log shows prompts from the on-disk journal "
+                              "(survives /new and restarts).[/dim]")
 
-        elif sub == "all":
-            if not _user_msgs:
-                console.print("[yellow]No user messages in this session yet.[/yellow]")
-                console.print("[dim]Tip: /told log reads the durable per-cwd journal.[/dim]")
-            else:
-                console.print(f"[bold]All your messages ({len(_user_msgs)}):[/bold]")
-                for i, msg in enumerate(_user_msgs, 1):
-                    console.print(f"  [dim][{i}][/dim] {escape(msg)}")
+    elif sub == "all":
+        if not _user_msgs:
+            console.print("[yellow]No user messages in this session yet.[/yellow]")
+            console.print("[dim]Tip: /told log reads the durable per-cwd journal.[/dim]")
+        else:
+            console.print(f"[bold]All your messages ({len(_user_msgs)}):[/bold]")
+            for i, msg in enumerate(_user_msgs, 1):
+                console.print(f"  [dim][{i}][/dim] {escape(msg)}")
 
-        elif sub == "reply":
-            n = _parse_n(parts[2] if len(parts) > 2 else "", 1)
-            _turns = []
-            i = 0
-            while i < len(_chat):
-                m = _chat[i]
-                if isinstance(m, dict) and m.get("role") == "user":
-                    asst = None
-                    j = i + 1
-                    while j < len(_chat):
-                        am = _chat[j]
-                        if isinstance(am, dict) and am.get("role") == "assistant":
-                            asst = am.get("content", "")
-                            break
-                        if isinstance(am, dict) and am.get("role") == "user":
-                            break
-                        j += 1
-                    _turns.append((m.get("content", ""), asst or "[no reply]"))
-                    i = j + 1 if asst is not None else j
-                else:
-                    i += 1
-            if not _turns:
-                console.print("[yellow]No conversation turns to replay.[/yellow]")
-                console.print("[dim]Tip: /told log reads the durable per-cwd journal.[/dim]")
+    elif sub == "reply":
+        n = _parse_n(parts[2] if len(parts) > 2 else "", 1)
+        _turns = []
+        i = 0
+        while i < len(_chat):
+            m = _chat[i]
+            if isinstance(m, dict) and m.get("role") == "user":
+                asst = None
+                j = i + 1
+                while j < len(_chat):
+                    am = _chat[j]
+                    if isinstance(am, dict) and am.get("role") == "assistant":
+                        asst = am.get("content", "")
+                        break
+                    if isinstance(am, dict) and am.get("role") == "user":
+                        break
+                    j += 1
+                _turns.append((m.get("content", ""), asst or "[no reply]"))
+                i = j + 1 if asst is not None else j
             else:
-                recent = _turns[-n:] if n < len(_turns) else _turns
-                label = "Last turn" if len(recent) == 1 else f"Last {len(recent)} turns"
-                console.print(f"[bold]── {label} ──[/bold]")
-                for idx, (u, a) in enumerate(recent, 1):
-                    console.print(f"[bold]You:[/bold]        [cyan]{escape(u)}[/cyan]")
-                    console.print(f"[bold]Assistant:[/bold]   [green]{escape(a)}[/green]")
-                    if idx < len(recent):
-                        console.print()
+                i += 1
+        if not _turns:
+            console.print("[yellow]No conversation turns to replay.[/yellow]")
+            console.print("[dim]Tip: /told log reads the durable per-cwd journal.[/dim]")
+        else:
+            recent = _turns[-n:] if n < len(_turns) else _turns
+            label = "Last turn" if len(recent) == 1 else f"Last {len(recent)} turns"
+            console.print(f"[bold]── {label} ──[/bold]")
+            for idx, (u, a) in enumerate(recent, 1):
+                console.print(f"[bold]You:[/bold]        [cyan]{escape(u)}[/cyan]")
+                console.print(f"[bold]Assistant:[/bold]   [green]{escape(a)}[/green]")
+                if idx < len(recent):
+                    console.print()
 
-        elif sub == "log":
-            n = _parse_n(parts[2] if len(parts) > 2 else "", 10)
-            _log_path = paths.project_dir() / "events.jsonl"
-            _entries = []
-            try:
-                if _log_path.exists():
-                    with open(_log_path, "r", encoding="utf-8") as f:
-                        for line in f:
-                            line = line.strip()
-                            if not line:
-                                continue
-                            try:
-                                evt = json.loads(line)
-                            except (ValueError, TypeError):
-                                continue
-                            if isinstance(evt, dict) and evt.get("type") == "prompt_admitted":
-                                _entries.append(evt)
-            except OSError:
-                pass
-            if not _entries:
-                console.print("[yellow]No prompts recorded in the journal yet.[/yellow]")
-                console.print(f"[dim]Journal: {escape(str(_log_path))}[/dim]")
-            else:
-                recent = _entries[-n:] if n < len(_entries) else _entries
-                console.print(f"[bold]Recent prompts (from journal):[/bold]")
-                for evt in recent:
-                    ts = evt.get("ts")
-                    tstr = ""
-                    if isinstance(ts, (int, float)) and ts > 0:
+    elif sub == "log":
+        n = _parse_n(parts[2] if len(parts) > 2 else "", 10)
+        _log_path = paths.project_dir() / "events.jsonl"
+        _entries = []
+        try:
+            if _log_path.exists():
+                with open(_log_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
                         try:
-                            tstr = datetime.fromtimestamp(ts).strftime("%H:%M:%S")
-                        except (OSError, ValueError, OverflowError):
-                            tstr = ""
-                    text = evt.get("text", "") or ""
-                    if tstr:
-                        console.print(f"  [dim]{tstr}[/dim]  {escape(text)}")
-                    else:
-                        console.print(f"  {escape(text)}")
-
+                            evt = json.loads(line)
+                        except (ValueError, TypeError):
+                            continue
+                        if isinstance(evt, dict) and evt.get("type") == "prompt_admitted":
+                            _entries.append(evt)
+        except OSError:
+            pass
+        if not _entries:
+            console.print("[yellow]No prompts recorded in the journal yet.[/yellow]")
+            console.print(f"[dim]Journal: {escape(str(_log_path))}[/dim]")
         else:
-            try:
-                n = int(sub)
-            except ValueError:
-                console.print(f"[red]Unknown subcommand: {escape(sub)}[/red]")
-                console.print("[yellow]Usage: /told [N|all|reply [N]|log [N]][/yellow]")
-                return False
-            if n <= 0:
-                console.print("[yellow]N must be a positive integer.[/yellow]")
-                return False
-            if not _user_msgs:
-                console.print("[yellow]No user messages in this session yet.[/yellow]")
-                console.print("[dim]Tip: /told log reads the durable per-cwd journal.[/dim]")
-            else:
-                recent = _user_msgs[-n:] if n < len(_user_msgs) else _user_msgs
-                label = "Last message" if len(recent) == 1 else f"Last {len(recent)} messages"
-                console.print(f"[bold]{label}:[/bold]")
-                for i, msg in enumerate(recent, 1):
-                    console.print(f"  [dim][{i}][/dim] {escape(msg)}")
+            recent = _entries[-n:] if n < len(_entries) else _entries
+            console.print(f"[bold]Recent prompts (from journal):[/bold]")
+            for evt in recent:
+                ts = evt.get("ts")
+                tstr = ""
+                if isinstance(ts, (int, float)) and ts > 0:
+                    try:
+                        tstr = datetime.fromtimestamp(ts).strftime("%H:%M:%S")
+                    except (OSError, ValueError, OverflowError):
+                        tstr = ""
+                text = evt.get("text", "") or ""
+                if tstr:
+                    console.print(f"  [dim]{tstr}[/dim]  {escape(text)}")
+                else:
+                    console.print(f"  {escape(text)}")
 
-    elif action == "/hwo":
-        sub = parts[1].lower() if len(parts) > 1 else ""
-        current = get_current_agent()
-        if sub == "status":
-            import hwo_runner
-            r = hwo_runner.status(parts[2] if len(parts) >= 3 else None)
-            console.print(r.get("msg", ""))
-        elif sub in ("run", "compile") and len(parts) >= 3:
-            # /hwo run <path>  or  /hwo compile <path>
-            import hwo_runner
-            path = " ".join(parts[2:])
-            if sub == "compile":
-                r = hwo_runner.compile_hwo_file(path)
-            else:
-                def _hwo_progress(event):
-                    if isinstance(event, list):
-                        for item in event:
-                            _hwo_progress(item)
-                        return
-                    kind = event.get("type")
-                    if kind == "workflow_started":
-                        console.print(f"[dim]HWO {event.get('runId')} started[/dim]")
-                    elif kind == "step_started":
-                        console.print(f"[cyan]▶ {event.get('stepId', '?')} started[/cyan]")
-                    elif kind == "step_completed":
-                        console.print(f"[green]✓ {event.get('stepId', '?')} completed[/green]")
-                    elif kind == "step_failed":
-                        console.print(f"[red]✗ {event.get('stepId', '?')} failed[/red]")
-                    elif kind == "workflow_completed":
-                        console.print(f"[green]HWO {event.get('runId')} completed[/green]")
-                r = hwo_runner.run_hwo_file(
-                    path=path,
-                    deps=get_loop_deps(),
-                    session=session,
-                    parent_id=current.id if current else None,
-                    events_cb=_hwo_progress,
-                )
-            style = "[green]" if r.get("ok") else "[red]"
-            console.print(f"{style}{r.get('msg', '')}[/]")
-        elif len(parts) >= 2 and sub not in ("run", "compile"):
-            # /hwo <file>  — load .hwo into TUI
-            file_path = " ".join(parts[1:])
-            loaded, err = hwo_ui_mod.load_hwo_file(file_path)
-            if err:
-                console.print(f"[red]hwo: {err}[/]")
-            else:
-                root_name = current.name if current else "primary"
-                hwo_ui_mod.run_hwo_ui(
-                    root_name,
-                    deps=get_loop_deps(),
-                    session_data=session,
-                    parent_id=current.id if current else None,
-                    initial_session=loaded,
-                )
+    else:
+        try:
+            n = int(sub)
+        except ValueError:
+            console.print(f"[red]Unknown subcommand: {escape(sub)}[/red]")
+            console.print("[yellow]Usage: /told [N|all|reply [N]|log [N]][/yellow]")
+            return False
+        if n <= 0:
+            console.print("[yellow]N must be a positive integer.[/yellow]")
+            return False
+        if not _user_msgs:
+            console.print("[yellow]No user messages in this session yet.[/yellow]")
+            console.print("[dim]Tip: /told log reads the durable per-cwd journal.[/dim]")
         else:
-            # /hwo  — blank TUI
+            recent = _user_msgs[-n:] if n < len(_user_msgs) else _user_msgs
+            label = "Last message" if len(recent) == 1 else f"Last {len(recent)} messages"
+            console.print(f"[bold]{label}:[/bold]")
+            for i, msg in enumerate(recent, 1):
+                console.print(f"  [dim][{i}][/dim] {escape(msg)}")
+
+    return False
+
+
+def _cmd_hwo(parts: list, session: dict) -> None:
+    sub = parts[1].lower() if len(parts) > 1 else ""
+    current = get_current_agent()
+    if sub == "status":
+        import hwo_runner
+        r = hwo_runner.status(parts[2] if len(parts) >= 3 else None)
+        console.print(r.get("msg", ""))
+    elif sub in ("run", "compile") and len(parts) >= 3:
+        # /hwo run <path>  or  /hwo compile <path>
+        import hwo_runner
+        path = " ".join(parts[2:])
+        if sub == "compile":
+            r = hwo_runner.compile_hwo_file(path)
+        else:
+            def _hwo_progress(event):
+                if isinstance(event, list):
+                    for item in event:
+                        _hwo_progress(item)
+                    return
+                kind = event.get("type")
+                if kind == "workflow_started":
+                    console.print(f"[dim]HWO {event.get('runId')} started[/dim]")
+                elif kind == "step_started":
+                    console.print(f"[cyan]▶ {event.get('stepId', '?')} started[/cyan]")
+                elif kind == "step_completed":
+                    console.print(f"[green]✓ {event.get('stepId', '?')} completed[/green]")
+                elif kind == "step_failed":
+                    console.print(f"[red]✗ {event.get('stepId', '?')} failed[/red]")
+                elif kind == "workflow_completed":
+                    console.print(f"[green]HWO {event.get('runId')} completed[/green]")
+            r = hwo_runner.run_hwo_file(
+                path=path,
+                deps=get_loop_deps(),
+                session=session,
+                parent_id=current.id if current else None,
+                events_cb=_hwo_progress,
+            )
+        style = "[green]" if r.get("ok") else "[red]"
+        console.print(f"{style}{r.get('msg', '')}[/]")
+    elif len(parts) >= 2 and sub not in ("run", "compile"):
+        # /hwo <file>  — load .hwo into TUI
+        file_path = " ".join(parts[1:])
+        loaded, err = hwo_ui_mod.load_hwo_file(file_path)
+        if err:
+            console.print(f"[red]hwo: {err}[/]")
+        else:
             root_name = current.name if current else "primary"
             hwo_ui_mod.run_hwo_ui(
                 root_name,
                 deps=get_loop_deps(),
                 session_data=session,
                 parent_id=current.id if current else None,
+                initial_session=loaded,
             )
+    else:
+        # /hwo  — blank TUI
+        root_name = current.name if current else "primary"
+        hwo_ui_mod.run_hwo_ui(
+            root_name,
+            deps=get_loop_deps(),
+            session_data=session,
+            parent_id=current.id if current else None,
+        )
 
-    elif action == "/hwg":
-        import hwg_runner
-        sub = parts[1].lower() if len(parts) > 1 else "status"
-        current = get_current_agent()
-        def _hwg_progress(event):
-            if isinstance(event, list):
-                for item in event:
-                    _hwg_progress(item)
-                return
-            kind = event.get("type")
-            if kind == "node_started":
-                console.print(f"[cyan]▶ HWG node #{event.get('node', '?')} started[/cyan]")
-            elif kind == "node_completed":
-                console.print(f"[green]✓ HWG node #{event.get('node', '?')} completed[/green]")
-            elif kind == "node_failed":
-                console.print(f"[red]✗ HWG node #{event.get('node', '?')} failed[/red]")
-            elif kind == "workflow_paused":
-                console.print(f"[yellow]HWG paused at node #{event.get('node', '?')}[/yellow]")
-        if sub in ("run", "compile") and len(parts) >= 3:
-            path = " ".join(parts[2:])
-            if sub == "compile":
-                r = hwg_runner.compile_hwg_file(path)
-            else:
-                r = hwg_runner.run_hwg_file(
-                    path=path,
-                    deps=get_loop_deps(),
-                    session=session,
-                    parent_id=current.id if current else None,
-                    events_cb=_hwg_progress,
-                )
-        elif sub == "resume" and len(parts) >= 3:
-            run_id = parts[2]
-            verdict = parts[3] if len(parts) >= 4 else "PASS"
-            outputs = {}
-            if len(parts) >= 5:
-                raw = " ".join(parts[4:])
-                try:
-                    parsed = json.loads(raw)
-                    if isinstance(parsed, dict):
-                        outputs = parsed
-                    else:
-                        console.print("[yellow]resume outputs must be a JSON object; ignoring.[/yellow]")
-                except Exception:
-                    console.print("[yellow]Could not parse resume outputs JSON; ignoring.[/yellow]")
-            r = hwg_runner.resume_hwg_run(
-                run_id,
+
+
+def _cmd_hwg(parts: list, session: dict) -> None:
+    import hwg_runner
+    sub = parts[1].lower() if len(parts) > 1 else "status"
+    current = get_current_agent()
+    def _hwg_progress(event):
+        if isinstance(event, list):
+            for item in event:
+                _hwg_progress(item)
+            return
+        kind = event.get("type")
+        if kind == "node_started":
+            console.print(f"[cyan]▶ HWG node #{event.get('node', '?')} started[/cyan]")
+        elif kind == "node_completed":
+            console.print(f"[green]✓ HWG node #{event.get('node', '?')} completed[/green]")
+        elif kind == "node_failed":
+            console.print(f"[red]✗ HWG node #{event.get('node', '?')} failed[/red]")
+        elif kind == "workflow_paused":
+            console.print(f"[yellow]HWG paused at node #{event.get('node', '?')}[/yellow]")
+    if sub in ("run", "compile") and len(parts) >= 3:
+        path = " ".join(parts[2:])
+        if sub == "compile":
+            r = hwg_runner.compile_hwg_file(path)
+        else:
+            r = hwg_runner.run_hwg_file(
+                path=path,
                 deps=get_loop_deps(),
                 session=session,
                 parent_id=current.id if current else None,
-                verdict=verdict,
-                outputs=outputs,
                 events_cb=_hwg_progress,
             )
-        elif sub == "status":
-            r = hwg_runner.status(parts[2] if len(parts) >= 3 else None)
-        elif sub == "cancel" and len(parts) >= 3:
-            r = hwg_runner.cancel(parts[2])
+    elif sub == "resume" and len(parts) >= 3:
+        run_id = parts[2]
+        verdict = parts[3] if len(parts) >= 4 else "PASS"
+        outputs = {}
+        if len(parts) >= 5:
+            raw = " ".join(parts[4:])
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    outputs = parsed
+                else:
+                    console.print("[yellow]resume outputs must be a JSON object; ignoring.[/yellow]")
+            except Exception:
+                console.print("[yellow]Could not parse resume outputs JSON; ignoring.[/yellow]")
+        r = hwg_runner.resume_hwg_run(
+            run_id,
+            deps=get_loop_deps(),
+            session=session,
+            parent_id=current.id if current else None,
+            verdict=verdict,
+            outputs=outputs,
+            events_cb=_hwg_progress,
+        )
+    elif sub == "status":
+        r = hwg_runner.status(parts[2] if len(parts) >= 3 else None)
+    elif sub == "cancel" and len(parts) >= 3:
+        r = hwg_runner.cancel(parts[2])
+    else:
+        r = {
+            "ok": False,
+            "msg": (
+                "Usage:\n"
+                "  /hwg compile <file.hwg>\n"
+                "  /hwg run <file.hwg>\n"
+                "  /hwg resume <runId> [PASS|FAIL|verdict] [outputs-json]\n"
+                "  /hwg status [runId]\n"
+                "  /hwg cancel <runId>"
+            ),
+        }
+    style = "[green]" if r.get("ok") else ("[yellow]" if r.get("paused") else "[red]")
+    console.print(f"{style}{r.get('msg', '')}[/]")
+
+
+
+def _cmd_version(action: str, parts: list) -> None:
+    # /v, /version → show version + check; /update is shorthand for /v update.
+    if action == "/update":
+        if not parts[1:]:
+            handle_version_command(["/v", "update"])
+        elif parts[1].lower() in ("--force", "-f"):
+            handle_version_command(["/v", "update"] + parts[1:])
+        elif len(parts) == 2 and parts[1].lower() == "check":
+            handle_version_command(["/v", "check"])
         else:
-            r = {
-                "ok": False,
-                "msg": (
-                    "Usage:\n"
-                    "  /hwg compile <file.hwg>\n"
-                    "  /hwg run <file.hwg>\n"
-                    "  /hwg resume <runId> [PASS|FAIL|verdict] [outputs-json]\n"
-                    "  /hwg status [runId]\n"
-                    "  /hwg cancel <runId>"
-                ),
-            }
-        style = "[green]" if r.get("ok") else ("[yellow]" if r.get("paused") else "[red]")
-        console.print(f"{style}{r.get('msg', '')}[/]")
+            console.print("[yellow]Usage: /update [--force]  |  /update check[/yellow]")
+    else:
+        handle_version_command(parts)
+
+
+def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: dict, interactive_session=None) -> bool:
+    """Handle meta commands. Returns True if should exit."""
+    action, raw_args, parts = _parse_slash_command(cmd)
+    _validate_slash_args(action, parts[1:])
+
+    if action == "/":
+        return _cmd_palette()
+
+    if action == "/exit":
+        return _cmd_exit(raw_args, agent_registry)
+
+    if action in ("/quit", "/q"):
+        return _cmd_quit(action, raw_args, agent_registry)
+
+    elif action == "/back":
+        return _cmd_back(raw_args)
+
+    elif action == "/help":
+        _cmd_help(parts)
+
+    elif action == "/resume":
+        _cmd_resume()
+
+    elif action in _NEW_SESSION_COMMANDS:
+        _cmd_new_session_notice()
+
+    elif action == "/login":
+        _cmd_login(session, agent_registry)
+
+    elif action == "/model":
+        _cmd_model(parts, raw_args, session)
+
+    elif action == "/name":
+        _cmd_name(raw_args, session, agent_registry)
+
+    elif action == "/memory":
+        _cmd_memory(parts)
+
+    elif action == "/prop":
+        _cmd_prop()
+
+    elif action == "/scan":
+        _cmd_scan()
+
+    elif action == "/cwd":
+        _cmd_cwd()
+
+    elif action == "/usage":
+        _show_usage_command(parts[1:], session)
+
+    elif action == "/bash":
+        return _cmd_bash(parts, raw_args)
+
+    elif action == "/mode":
+        return _cmd_mode(raw_args, parts)
+
+    elif action == "/trust":
+        _cmd_trust(parts)
+
+    elif action == "/backend":
+        _cmd_backend(parts)
+
+    elif action == "/hooks":
+        _cmd_hooks(parts)
+
+    elif action == "/policy":
+        return _cmd_policy(parts)
+
+    elif action == "/plan":
+        _cmd_plan(raw_args, parts)
+
+    elif action == "/evolve":
+        _cmd_evolve(raw_args, parts, session)
+
+    elif action == "/prompt":
+        _cmd_prompt(raw_args, parts, session)
+
+    elif action == "/work":
+        _cmd_work(parts)
+
+    elif action == "/task":
+        _cmd_task(raw_args, parts)
+
+    elif action == "/workflow":
+        _cmd_workflow(raw_args, parts)
+
+    elif action == "/debug":
+        _cmd_debug(parts)
+
+    elif action == "/detail":
+        _cmd_detail(parts)
+
+    elif action in ("/station", "/st"):
+        return _cmd_station(parts, agent_registry, session)
+
+    elif action == "/terminate":
+        _cmd_terminate(parts)
+
+    elif action == "/send":
+        return _cmd_send(raw_args)
+
+    elif action == "/hire":
+        return _cmd_hire(parts)
+
+    elif action == "/agents":
+        _cmd_agents(parts)
+
+    elif action == "/spawn":
+        _cmd_spawn(raw_args, session, agent_registry)
+
+    elif action == "/tell":
+        _cmd_tell(raw_args)
+
+    elif action == "/abort":
+        _cmd_abort(parts)
+
+    elif action == "/tools":
+        _cmd_tools()
+
+    elif action == "/tool":
+        _cmd_tool(raw_args, session, agent_registry)
+
+    elif action == "/skill":
+        return _cmd_skill(parts)
+
+    elif action == "/mcp":
+        return _cmd_mcp(parts)
+
+    elif action == "/connect":
+        _cmd_connect(parts, agent_registry, session)
+
+    elif action == "/disconnect":
+        _cmd_disconnect(agent_registry)
+
+    elif action in ("/t", "/term"):
+        return _cmd_term(parts, agent_registry, interactive_session)
+
+    elif action == "/reload":
+        _cmd_reload(raw_args)
+
+    elif action in ("/undo", "/snapshot", "/snapshots"):
+        return _cmd_undo(action, raw_args, parts)
+
+    elif action == "/config":
+        _cmd_config(parts)
+
+    elif action == "/max":
+        _cmd_max()
+
+    elif action == "/compact":
+        return _cmd_compact(parts, session)
+
+    elif action == "/continue":
+        return _cmd_continue(session, agent_registry)
+
+    elif action == "/told":
+        return _cmd_told(parts)
+
+    elif action == "/hwo":
+        _cmd_hwo(parts, session)
+
+    elif action == "/hwg":
+        _cmd_hwg(parts, session)
 
     elif action in ("/v", "/version", "/update"):
-        # /v, /version → show version + check; /update is shorthand for /v update.
-        if action == "/update":
-            if not parts[1:]:
-                handle_version_command(["/v", "update"])
-            elif parts[1].lower() in ("--force", "-f"):
-                handle_version_command(["/v", "update"] + parts[1:])
-            elif len(parts) == 2 and parts[1].lower() == "check":
-                handle_version_command(["/v", "check"])
-            else:
-                console.print("[yellow]Usage: /update [--force]  |  /update check[/yellow]")
-        else:
-            handle_version_command(parts)
+        _cmd_version(action, parts)
 
     else:
         # Evolution Lab extensions register project-local slash commands here.
@@ -12086,9 +12348,20 @@ def _stop_bg_input_reader():
 # Lets the user pick "always" at an approval prompt to auto-approve the rest
 # of the session — mirrors Claude Code / Cursor's "yes, and don't ask again".
 # Reset on /exit, /reload, or a fresh process start.
+#
+# "all_commands"/"all_writes" are a deliberate, visible BLANKET override —
+# only ever set by an explicit mode choice (`/mode act always`, or a custom
+# mode's `auto_approve` posture), never by a one-off prompt. Approving a
+# single write/command with "Always" instead records that exact target in
+# approved_write_paths/approved_commands, so it doesn't silently generalize
+# to unrelated files/commands the user never saw (mirrors opencode's
+# per-(permission, pattern) remembered-approval model instead of one global
+# session-wide toggle).
 _session_approval_state = {
-    "all_commands": False,   # approve all shell commands this session
-    "all_writes": False,     # approve all file writes this session
+    "all_commands": False,        # explicit mode-level auto-approve
+    "all_writes": False,          # explicit mode-level auto-approve
+    "approved_write_paths": set(),   # exact paths remembered via a prompt's "Always"
+    "approved_commands": set(),      # exact commands remembered via a prompt's "Always"
 }
 
 
@@ -12096,6 +12369,8 @@ def _reset_session_approvals():
     """Clear session-level auto-approve (called on /exit, /reload)."""
     _session_approval_state["all_commands"] = False
     _session_approval_state["all_writes"] = False
+    _session_approval_state["approved_write_paths"] = set()
+    _session_approval_state["approved_commands"] = set()
 
 
 def _sync_session_approval_from_mode():
@@ -12214,7 +12489,7 @@ def request_command_approval(command: str, reason: str) -> bool:
             f"DELETE via shell command\n{command}",
             reason,
         )
-    if _session_approval_state["all_commands"]:
+    if _session_approval_state["all_commands"] or command in _session_approval_state["approved_commands"]:
         return True
     choice = _blocking_approval_prompt(
         "Approval required",
@@ -12223,8 +12498,12 @@ def request_command_approval(command: str, reason: str) -> bool:
         allow_always=True,
     )
     if choice == "always":
-        _session_approval_state["all_commands"] = True
-        console.print("[dim]↳ All commands auto-approved for this session.[/dim]")
+        # Remember this EXACT command, not a blanket "approve everything" —
+        # a one-off approval shouldn't silently cover unrelated commands the
+        # user never saw. Use `/mode act always` for a deliberate blanket
+        # auto-approve instead.
+        _session_approval_state["approved_commands"].add(command)
+        console.print(f"[dim]↳ `{command}` auto-approved for this session.[/dim]")
         return True
     return choice == "yes"
 
@@ -12255,7 +12534,7 @@ def authorize_direct_command(command: str, cwd: str = None) -> tuple[bool, str]:
 def request_file_write_approval(path: str, diff_preview: str, reason: str) -> bool:
     """Block and ask the user to approve a file write/edit before it's applied.
     Wired as LoopDeps.request_file_write_approval for the local REPL."""
-    if _session_approval_state["all_writes"]:
+    if _session_approval_state["all_writes"] or path in _session_approval_state["approved_write_paths"]:
         return True
     # Build body: header + reason + full diff. The diff is embedded so it
     # renders (and scrolls) inside the full-screen approval UI rather than
@@ -12273,8 +12552,12 @@ def request_file_write_approval(path: str, diff_preview: str, reason: str) -> bo
         allow_always=True,
     )
     if choice == "always":
-        _session_approval_state["all_writes"] = True
-        console.print("[dim]↳ All file writes auto-approved for this session.[/dim]")
+        # Remember this EXACT path, not a blanket "approve everything" — a
+        # one-off approval shouldn't silently cover every other file the
+        # user never saw a diff for. Use `/mode act always` for a
+        # deliberate blanket auto-approve instead.
+        _session_approval_state["approved_write_paths"].add(path)
+        console.print(f"[dim]↳ Writes to {path} auto-approved for this session.[/dim]")
         return True
     return choice == "yes"
 

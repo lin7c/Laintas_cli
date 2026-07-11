@@ -22,13 +22,13 @@ Enhancements:
 
 from __future__ import annotations
 
-import json
-import os
 import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+
+import json_store
 
 
 import paths
@@ -144,48 +144,32 @@ def _project_path(cwd: str) -> Path:
 def _load(cwd: str = None) -> list[dict]:
     """Load tasks from disk. cwd selects project-level file; None uses global."""
     path = _project_path(cwd) if cwd else TASKS_PATH
-    if not path.exists():
+    data = json_store.load_json(path, default=list)
+    if not isinstance(data, list):
         return []
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, list):
-            return []
-        normalized = []
-        for item in data:
-            if not isinstance(item, dict) or "id" not in item:
-                continue
-            task = dict(item)
-            task.setdefault("subject", "(untitled task)")
-            task.setdefault("description", "")
-            task.setdefault("status", "pending")
-            task.setdefault("metadata", {})
-            task.setdefault("blocks", [])
-            task.setdefault("blockedBy", [])
-            task.setdefault("progress", 0)
-            task.setdefault("notes", [])
-            normalized.append(task)
-        return normalized
-    except (OSError, json.JSONDecodeError):
-        return []
+    normalized = []
+    for item in data:
+        if not isinstance(item, dict) or "id" not in item:
+            continue
+        task = dict(item)
+        task.setdefault("subject", "(untitled task)")
+        task.setdefault("description", "")
+        task.setdefault("status", "pending")
+        task.setdefault("metadata", {})
+        task.setdefault("blocks", [])
+        task.setdefault("blockedBy", [])
+        task.setdefault("progress", 0)
+        task.setdefault("notes", [])
+        normalized.append(task)
+    return normalized
 
 
 def _save(tasks: list[dict], cwd: str = None) -> None:
     """Atomically write tasks to disk. cwd selects project-level file."""
     path = _project_path(cwd) if cwd else TASKS_PATH
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
     try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(tasks, f, ensure_ascii=False, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        tmp.replace(path)
+        json_store.save_json_atomic(path, tasks)
     except OSError as exc:
-        try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
         raise TaskStorageError(f"Failed to save tasks to {path}: {exc}") from exc
 
 

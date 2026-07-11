@@ -1844,6 +1844,26 @@ def spawn_subagent(parent_id: str, task: str, deps,
     child.chain_step_index = chain_step_index
     child.group_id = group_id
 
+    # ── Isolate the child's file edits in their own git worktree ─────────
+    # Every spawned agent used to share the parent's literal os.getcwd() —
+    # a process-global value, identical for every thread. Two sub-agents
+    # (or a sub-agent racing its own parent) editing overlapping files had
+    # no isolation: last write silently wins. When the effective spawn cwd
+    # is inside a git repo, give the child its own worktree seeded from
+    # that state (including uncommitted WIP, not just HEAD) and merge its
+    # changes back file-by-file when it finishes — see worktree_manager.py.
+    _worktree_info = None
+    if not child.state.get("cwd"):
+        _base_cwd = parent.state.get("cwd") or os.getcwd()
+        try:
+            import worktree_manager
+            if worktree_manager.is_git_repo(_base_cwd):
+                _worktree_info = worktree_manager.create_isolated_worktree(
+                    _base_cwd, label=name or role or "agent")
+                child.state["cwd"] = _worktree_info.path
+        except Exception as _wt_err:
+            _worktree_info = None  # fall back to the shared cwd silently
+
     # Inject role into child state so run_agent_loop picks it up
     effective_task = task
     if role:
@@ -1857,9 +1877,42 @@ def spawn_subagent(parent_id: str, task: str, deps,
     if spawn_context:
         effective_task = f"{spawn_context}\n\n{effective_task}"
 
+    def _merge_worktree_note() -> str:
+        """Merge the child's isolated worktree back into the parent tree
+        (if one was created) and return a short note describing the outcome,
+        or "" if no worktree was involved. Never raises."""
+        if _worktree_info is None:
+            return ""
+        try:
+            import worktree_manager
+            merge_result = worktree_manager.merge_worktree_back(_worktree_info)
+            applied, conflicts = merge_result["applied"], merge_result["conflicts"]
+            if conflicts:
+                # Parent tree moved on these exact paths while the child was
+                # working — leave the worktree in place for manual review
+                # instead of guessing which side should win.
+                return (
+                    f"\n\n[worktree] {len(applied)} file(s) merged back; "
+                    f"{len(conflicts)} conflict(s) left untouched at "
+                    f"{_worktree_info.path} (parent tree changed the same "
+                    f"path since spawn): {', '.join(conflicts[:10])}"
+                )
+            worktree_manager.remove_worktree(_worktree_info)
+            if applied:
+                return f"\n\n[worktree] {len(applied)} file(s) merged back cleanly: {', '.join(applied[:10])}"
+            return ""
+        except Exception as _merge_err:
+            return f"\n\n[worktree] merge failed, changes left at {_worktree_info.path}: {_merge_err}"
+
     def _runner(ok: bool):
         if not ok:
             child.status = "aborted"
+            if _worktree_info is not None:
+                try:
+                    import worktree_manager
+                    worktree_manager.remove_worktree(_worktree_info)
+                except Exception:
+                    pass
             if report_to_parent:
                 send_to_agent(parent_id, {
                     "from": child.id,
@@ -1877,6 +1930,7 @@ def spawn_subagent(parent_id: str, task: str, deps,
                 agent_id=child.id,
             )
             reply = (result.get("state") or {}).get("lastReply", "") if isinstance(result, dict) else ""
+            reply = (reply or "") + _merge_worktree_note()
             child.last_reply = reply
             status = "aborted" if child.abort_event.is_set() else "done"
             mark_agent_finished(child.id, result=reply)
@@ -1889,13 +1943,14 @@ def spawn_subagent(parent_id: str, task: str, deps,
                     "summary": reply or "(no reply)",
                 })
         except Exception as e:
-            mark_agent_finished(child.id, error=repr(e))
+            error_text = repr(e) + _merge_worktree_note()
+            mark_agent_finished(child.id, error=error_text)
             if report_to_parent:
                 send_to_agent(parent_id, {
                     "from": child.id,
                     "kind": "child-error",
                     "role": role or "general",
-                    "error": repr(e),
+                    "error": error_text,
                 })
 
     t = threading.Thread(target=lambda: schedule_agent(child.id, _runner),
@@ -3644,7 +3699,7 @@ def _sync_cwd_from_session(session) -> None:
 
 def _check_policy(command: str, agent_id: str = None,
                   req_id: str = None, events_cb=None,
-                  deps=None) -> tuple:
+                  deps=None, cwd: str = None) -> tuple:
     """Evaluate security policy for a command before execution.
 
     Returns (allowed: bool, reason: str, needs_approval: bool, user_denied: bool).
@@ -3662,7 +3717,7 @@ def _check_policy(command: str, agent_id: str = None,
     or a missing approval channel. The agent loop uses this to terminate the
     task immediately (see ``deny_exits_loop`` runtime config).
     """
-    decision = policy_mod.evaluate(command, os.getcwd(),
+    decision = policy_mod.evaluate(command, cwd or os.getcwd(),
                                    req_id=req_id, agent_id=agent_id)
     if decision.action == "deny":
         msg = f"[bold red]BLOCKED:[/bold red] {decision.reason}"
@@ -4616,7 +4671,7 @@ def run_agent_loop(
             timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             loop=_loop_id,
             user_input=user_input[:2000],
-            current_path=os.getcwd(),
+            current_path=state.get("cwd") or os.getcwd(),
             context_sizes={
                 "memory": len(memory_section),
                 "terminal": len(terminal_section),
@@ -4626,7 +4681,7 @@ def run_agent_loop(
             },
             request_body={
                 "message": user_input[:2000],
-                "currentPath": os.getcwd(),
+                "currentPath": state.get("cwd") or os.getcwd(),
                 "history": history_for_backend,
                 "loadedSkills": [s["name"] for s in skills_mod.list_skills() if s.get("loaded")],
                 "promptLen": len(system_prompt),
@@ -4746,7 +4801,7 @@ def run_agent_loop(
                             session=session,
                             message=user_input,
                             system_prompt=system_prompt,
-                            current_path=os.getcwd(),
+                            current_path=state.get("cwd") or os.getcwd(),
                             history=history_for_backend,
                             on_chunk=_on_chunk,
                             lang=lang,
@@ -4761,7 +4816,7 @@ def run_agent_loop(
                             session=session,
                             message=user_input,
                             system_prompt=system_prompt,
-                            current_path=os.getcwd(),
+                            current_path=state.get("cwd") or os.getcwd(),
                             history=history_for_backend,
                             lang=lang,
                         )
@@ -4781,7 +4836,7 @@ def run_agent_loop(
                             session=session,
                             message=user_input,
                             system_prompt=system_prompt,
-                            current_path=os.getcwd(),
+                            current_path=state.get("cwd") or os.getcwd(),
                             history=history_for_backend,
                             lang=lang,
                             interrupt_event=_interrupt,
@@ -4793,7 +4848,7 @@ def run_agent_loop(
                             session=session,
                             message=user_input,
                             system_prompt=system_prompt,
-                            current_path=os.getcwd(),
+                            current_path=state.get("cwd") or os.getcwd(),
                             history=history_for_backend,
                             lang=lang,
                         )
@@ -4812,7 +4867,7 @@ def run_agent_loop(
                     session=session,
                     message=user_input,
                     system_prompt=system_prompt,
-                    current_path=os.getcwd(),
+                    current_path=state.get("cwd") or os.getcwd(),
                     history=history_for_backend,
                     lang=lang,
                     interrupt_event=_interrupt,
@@ -4824,7 +4879,7 @@ def run_agent_loop(
                     session=session,
                     message=user_input,
                     system_prompt=system_prompt,
-                    current_path=os.getcwd(),
+                    current_path=state.get("cwd") or os.getcwd(),
                     history=history_for_backend,
                     lang=lang,
                 )
@@ -5272,7 +5327,8 @@ def run_agent_loop(
                     if is_shell_flavored:
                         policy_cmd = _policy_command_arg(name, arguments) or salient
                         policy_ok, policy_reason, policy_approval, policy_user_denied = _check_policy(
-                            policy_cmd, agent_id=agent_id, events_cb=events_cb, deps=deps)
+                            policy_cmd, agent_id=agent_id, events_cb=events_cb, deps=deps,
+                            cwd=state.get("cwd"))
                         if not policy_ok:
                             result = {"ok": False, "error": f"BLOCKED: {policy_reason}",
                                       "tool": name, "returncode": -1, "policy": "deny"}
@@ -5333,7 +5389,7 @@ def run_agent_loop(
                             try:
                                 _extension_override = extension_runtime.get_runtime().intercept_loop(
                                     salient, {
-                                        "cwd": os.getcwd(), "depth": depth,
+                                        "cwd": state.get("cwd") or os.getcwd(), "depth": depth,
                                         "agent_id": agent_id, "state": state,
                                     })
                             except Exception as e:
@@ -5349,7 +5405,7 @@ def run_agent_loop(
                         # Build ToolCtx with all loop context, including stationed
                         tool_ctx = tools_mod.ToolCtx(
                             deps=deps, agent_id=agent_id, session=session,
-                            events_cb=events_cb, cwd=os.getcwd(),
+                            events_cb=events_cb, cwd=state.get("cwd") or os.getcwd(),
                             interactive_session=interactive_session,
                             stationed_terminal=_stationed_session,
                             get_terminal=get_terminal,

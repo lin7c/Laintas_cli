@@ -17,8 +17,6 @@ Plans are persistent — they survive crashes and sessions.
 
 from __future__ import annotations
 
-import os
-import json
 import threading
 import uuid
 from datetime import datetime, timezone
@@ -26,6 +24,7 @@ from pathlib import Path
 from typing import Optional
 
 
+import json_store
 import paths
 import workgraph
 
@@ -51,22 +50,16 @@ def _load_state() -> dict:
     project_state = workgraph.get_project_value("plan_mode_state")
     if isinstance(project_state, dict):
         return project_state
-    if not _STATE_PATH.exists():
-        return {}
-    try:
-        with open(_STATE_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, dict) and isinstance(data.get("projects"), dict):
-            return data["projects"].get(str(Path.cwd().resolve()), {})
-        # Backward compatibility with the original single-project state.
-        if isinstance(data, dict):
-            plan = data.get("current_plan") or {}
-            plan_cwd = plan.get("cwd") if isinstance(plan, dict) else None
-            if not plan_cwd or Path(plan_cwd).resolve() == Path.cwd().resolve():
-                return data
-        return {}
-    except (OSError, json.JSONDecodeError):
-        return {}
+    data = json_store.load_json(_STATE_PATH, default=dict)
+    if isinstance(data, dict) and isinstance(data.get("projects"), dict):
+        return data["projects"].get(str(Path.cwd().resolve()), {})
+    # Backward compatibility with the original single-project state.
+    if isinstance(data, dict):
+        plan = data.get("current_plan") or {}
+        plan_cwd = plan.get("cwd") if isinstance(plan, dict) else None
+        if not plan_cwd or Path(plan_cwd).resolve() == Path.cwd().resolve():
+            return data
+    return {}
 
 
 def _save_state(state: dict) -> bool:
@@ -76,29 +69,15 @@ def _save_state(state: dict) -> bool:
     except workgraph.WorkGraphError:
         pass
     ensure_plans_dir()
-    tmp = _STATE_PATH.with_name(f".{_STATE_PATH.name}.{uuid.uuid4().hex}.tmp")
-    try:
+    all_state = json_store.load_json(_STATE_PATH, default=dict)
+    if not (isinstance(all_state, dict) and isinstance(all_state.get("projects"), dict)):
         all_state = {}
-        if _STATE_PATH.exists():
-            try:
-                loaded = json.loads(_STATE_PATH.read_text(encoding="utf-8"))
-                if isinstance(loaded, dict) and isinstance(loaded.get("projects"), dict):
-                    all_state = loaded
-            except (OSError, json.JSONDecodeError):
-                pass
-        projects = all_state.setdefault("projects", {})
-        projects[str(Path.cwd().resolve())] = state
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(all_state, f, ensure_ascii=False, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        tmp.replace(_STATE_PATH)
+    projects = all_state.setdefault("projects", {})
+    projects[str(Path.cwd().resolve())] = state
+    try:
+        json_store.save_json_atomic(_STATE_PATH, all_state)
         return True
     except OSError:
-        try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
         return False
 
 

@@ -15,10 +15,10 @@ import json
 import os
 import re
 import threading
-import uuid
 from pathlib import Path
 from typing import Optional
 
+import json_store
 import paths
 
 
@@ -118,22 +118,8 @@ def _load_instance_active_mode() -> Optional[str]:
 
 def _save_instance_active_mode(name: str) -> None:
     global _INSTANCE_ACTIVE_MODE
-    path = _instance_mode_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    try:
-        with open(tmp, "w", encoding="utf-8") as handle:
-            json.dump({"version": 1, "active": name}, handle)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.chmod(tmp, 0o600)
-        tmp.replace(path)
-        _INSTANCE_ACTIVE_MODE = name
-    finally:
-        try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
+    json_store.save_json_atomic(_instance_mode_path(), {"version": 1, "active": name}, mode=0o600)
+    _INSTANCE_ACTIVE_MODE = name
 
 
 def _default_config() -> dict:
@@ -219,25 +205,12 @@ def load_config() -> dict:
 def _save_config(config: dict) -> None:
     global _CACHE_KEY, _CACHE_CONFIG
     path = config_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
     if path.is_symlink():
         raise OSError("refusing to replace symlinked modes.json")
-    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    try:
-        with open(tmp, "w", encoding="utf-8") as handle:
-            json.dump(config, handle, ensure_ascii=False, indent=2)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        tmp.replace(path)
-        with _CACHE_LOCK:
-            _CACHE_KEY = None
-            _CACHE_CONFIG = None
-    finally:
-        try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
+    json_store.save_json_atomic(path, config)
+    with _CACHE_LOCK:
+        _CACHE_KEY = None
+        _CACHE_CONFIG = None
 
 
 def list_modes() -> list[dict]:
@@ -360,10 +333,17 @@ def get_auto_approve(mode: Optional[dict] = None) -> str:
     return aa if aa in _AUTO_APPROVE else "none"
 
 
+_DESTRUCTIVE_ACTION_REMINDER = (
+    "Deletion (fs.delete, shell rm/rmdir/unlink/shred) always requires a "
+    "fresh user approval, regardless of the active mode's auto-approve "
+    "posture — there is no bulk/auto-approve tier for destructive actions."
+)
+
+
 def render_prompt_section() -> str:
     mode = get_active_mode()
     if mode["name"] == "act":
-        return ""
+        return _DESTRUCTIVE_ACTION_REMINDER
     allowed = mode.get("allowed_tools")
     denied = mode.get("denied_tools")
     parts = []
