@@ -87,6 +87,32 @@ _BUILTINS = {
         "auto_approve": "none",
         "builtin": True,
     },
+    "mail": {
+        "name": "mail",
+        "description": "Auto-approve execution; report progress and get approvals by email",
+        "instructions": (
+            "You are running unattended — assume no one is watching this terminal. "
+            "Whenever you finish a task, or would otherwise hand control back to the "
+            "user (including calling task_complete), send a concise summary email "
+            "first via mail.send_to_user: what you did, what changed, and what — if "
+            "anything — you need from them next. The user replies by email; check "
+            "mail.check_inbox at the start of a new task, or when you are waiting on "
+            "an answer before continuing. Deletion and other always-ask actions still "
+            "require approval, but that approval now happens by email automatically — "
+            "call the tool as usual and wait for the result; no special handling is "
+            "needed on your part, and mail.send_to_user itself no longer needs "
+            "approval in this mode."
+        ),
+        "allowed_tools": None,
+        "denied_tools": None,
+        "auto_approve": "all",
+        "builtin": True,
+        # Distinguishes this from a plain custom auto_approve="all" mode:
+        # policy.py exempts mail.send_to_user, and the approval channel for
+        # remaining always-ask actions (fs.delete, browser.evaluate) routes
+        # through email instead of blocking on terminal input.
+        "mail_approvals": True,
+    },
 }
 
 
@@ -331,6 +357,14 @@ def get_auto_approve(mode: Optional[dict] = None) -> str:
     m = mode if mode is not None else get_active_mode()
     aa = (m or {}).get("auto_approve", "none")
     return aa if aa in _AUTO_APPROVE else "none"
+
+
+def is_mail_mode(mode: Optional[dict] = None) -> bool:
+    """True when the active (or given) mode routes its remaining always-ask
+    approvals (fs.delete, browser.evaluate) and mail.send_to_user through
+    email instead of a blocking terminal prompt."""
+    m = mode if mode is not None else get_active_mode()
+    return bool((m or {}).get("mail_approvals"))
 
 
 _DESTRUCTIVE_ACTION_REMINDER = (
