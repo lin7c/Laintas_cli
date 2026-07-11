@@ -982,6 +982,20 @@ def _fetch_mail_prompt_hint(session: dict) -> str:
     return hint
 
 
+def _mail_sender_identity() -> tuple[str, str]:
+    """Best-effort (terminal, agent name) for the branded email header.
+    Never raises — worst case the email just says "(none)"/"Laintas CLI"."""
+    try:
+        from laintas_cli import get_current_agent
+        current = get_current_agent()
+    except Exception:
+        current = None
+    if current is None:
+        return "", "Laintas CLI"
+    return (getattr(current, "home_terminal", None) or "",
+            getattr(current, "name", None) or "Laintas CLI")
+
+
 def _bi_mail_send_to_user(params: dict, ctx: ToolCtx) -> dict:
     """Email the current account's own verified Laintas address (never an
     arbitrary recipient — the gateway resolves the address server-side).
@@ -1002,11 +1016,13 @@ def _bi_mail_send_to_user(params: dict, ctx: ToolCtx) -> dict:
     except ImportError as exc:
         return {"ok": False, "error": f"missing dependency: {exc}"}
 
+    terminal, agent_name = _mail_sender_identity()
     headers, cookies = backend_profiles.request_auth(profile, ctx.session)
     try:
         resp = requests.post(
             f"{profile.base_url}/api/agent/send-email",
-            json={"subject": subject[:200], "body": body[:5000]},
+            json={"subject": subject[:200], "body": body[:5000],
+                  "system": "laintas_cli", "terminal": terminal, "agent": agent_name},
             headers=headers, cookies=cookies, timeout=10,
         )
     except requests.RequestException as exc:

@@ -2839,11 +2839,15 @@ def ack_mail_read(session: dict, email_ids: list[str]) -> None:
 def send_mail(session: dict, subject: str, body: str) -> tuple[bool, str]:
     """Returns (ok, error). error is "" on success."""
     profile = get_backend_profile()
+    current = get_current_agent()
+    terminal = (getattr(current, "home_terminal", None) or "") if current else ""
+    agent_name = (getattr(current, "name", None) or "Laintas CLI") if current else "Laintas CLI"
     headers, cookies = backend_profiles.request_auth(profile, session)
     try:
         resp = requests.post(
             f"{profile.base_url}/api/agent/send-email",
-            json={"subject": subject[:200], "body": body[:5000]},
+            json={"subject": subject[:200], "body": body[:5000],
+                  "system": "laintas_cli", "terminal": terminal, "agent": agent_name},
             headers=headers, cookies=cookies, timeout=10,
         )
     except requests.RequestException as e:
