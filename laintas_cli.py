@@ -2862,6 +2862,68 @@ def send_mail(session: dict, subject: str, body: str) -> tuple[bool, str]:
     return True, ""
 
 
+# ── Mail-mode watcher: wake the idle loop on new mail, don't wait for the ──
+# ── user to start an unrelated task and happen to check the inbox then.  ──
+_MAIL_WATCHER_POLL_INTERVAL = 25  # seconds
+_mail_watcher_thread: Optional[threading.Thread] = None
+_mail_watcher_stop = threading.Event()
+
+
+def _start_mail_watcher(session: dict):
+    """Background poller: while /mode mail is active, new mail should start
+    a turn on its own — not sit until the user separately begins some other
+    task and the AI happens to check mail.check_inbox then. Runs for the
+    whole process lifetime (self-gates on the active mode each cycle) so it
+    doesn't need wiring into every /mode switch branch; only does anything
+    while mode=mail and logged in."""
+    global _mail_watcher_thread
+    if _mail_watcher_thread is not None and _mail_watcher_thread.is_alive():
+        return
+    _mail_watcher_stop.clear()
+    seen_ids: set[str] = set()
+
+    def _watch():
+        while not _mail_watcher_stop.wait(_MAIL_WATCHER_POLL_INTERVAL):
+            try:
+                if not mode_manager.is_mail_mode():
+                    continue
+                current_session = load_session() or session
+                if not current_session.get("userId"):
+                    continue
+                messages, error = fetch_mail_inbox(current_session, unread_only=True)
+                if error:
+                    continue
+                new_messages = [m for m in messages
+                                if m.get("email_id") and m["email_id"] not in seen_ids]
+                if not new_messages:
+                    continue
+                for m in new_messages:
+                    seen_ids.add(m["email_id"])
+                block = "\n\n".join(
+                    f"From: {m.get('from', '?')}\n"
+                    f"Subject: {m.get('subject', '(no subject)')}\n"
+                    f"{m.get('body', '')}"
+                    for m in new_messages
+                )
+                plural = "s" if len(new_messages) != 1 else ""
+                task_text = (
+                    f"[Mail mode] {len(new_messages)} new email{plural} arrived while idle "
+                    f"— read it below and respond appropriately (reply via mail.send_to_user "
+                    f"if needed, or act on the request):\n\n{block}"
+                )
+                _enqueue_user_input(task_text)
+            except Exception:
+                continue  # a watcher hiccup must never take down the process
+
+    _mail_watcher_thread = threading.Thread(
+        target=_watch, daemon=True, name="mail-watcher")
+    _mail_watcher_thread.start()
+
+
+def _stop_mail_watcher():
+    _mail_watcher_stop.set()
+
+
 def show_model_selector(models: list[dict], current: str = "") -> Optional[dict]:
     """Interactive model selector. Returns the complete model row or None."""
     if not models:
@@ -13309,6 +13371,13 @@ def main():
                     f"[dim](run /v update)[/dim]")
         except Exception:
             pass
+
+        # Mail mode's watcher runs for the whole process lifetime and
+        # self-gates on the active mode each poll — started once here rather
+        # than wired into every /mode switch branch. No-ops until /mode mail
+        # is actually active.
+        if session:
+            _start_mail_watcher(session)
 
     # Register as remote agent (only if authenticated)
     agent_registry = AgentRegistry()
