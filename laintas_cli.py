@@ -12867,6 +12867,20 @@ def main():
     ensure_files_exist()
     evolution_lab.reconcile_workspace()
 
+    # Hint (never auto-overwrite — see ensure_files_exist) when the saved
+    # cli.prop no longer matches what this version would generate, so an
+    # upgraded default prompt template doesn't silently go unused.
+    if args.depth == 0:
+        try:
+            _prop_path = paths.project_file(paths.CWD_CLI_PROP)
+            if (_prop_path.exists()
+                    and _prop_path.read_text(encoding="utf-8") != generate_cli_prop_template()):
+                console.print(
+                    "[dim]Your prompt template differs from this version's default. "
+                    "Run [bold]/reload[/bold] to sync (this deletes .laintas/ overrides).[/dim]")
+        except OSError:
+            pass
+
     # Load or create config
     config = load_config()
     agent_name = args.name or config.get("agentName", socket.gethostname())
@@ -12923,6 +12937,17 @@ def main():
     # Show banner (skip in child terminals to avoid Rich output in PTY)
     if args.depth == 0:
         show_banner(agent_name, session if session else None)
+        # Best-effort, short-timeout update check — never blocks startup for
+        # more than ~1.5s and stays silent on any network/parse failure.
+        try:
+            import updater as _updater_check
+            _remote_ver = _updater_check.check_update_available()
+            if _remote_ver:
+                console.print(
+                    f"[green]Update available: v{_remote_ver}[/green] "
+                    f"[dim](run /v update)[/dim]")
+        except Exception:
+            pass
 
     # Register as remote agent (only if authenticated)
     agent_registry = AgentRegistry()

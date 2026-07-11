@@ -123,6 +123,22 @@ def is_newer(remote: str, local: str) -> bool:
     return _version_tuple(remote) > _version_tuple(local)
 
 
+def check_update_available(timeout: float = 1.5) -> Optional[str]:
+    """Best-effort startup check: return the remote version string if it's
+    newer than LOCAL_VERSION, else None. Never raises and never blocks for
+    long — a short dedicated timeout, independent of the 30s used for actual
+    downloads, so a slow/unreachable network can't delay CLI startup."""
+    try:
+        resp = requests.get(manifest_url(), timeout=timeout, verify=_CA_BUNDLE)
+        resp.raise_for_status()
+        remote_ver = resp.json().get("version")
+        if remote_ver and is_newer(remote_ver, LOCAL_VERSION):
+            return remote_ver
+    except Exception:
+        pass
+    return None
+
+
 # ── hashing / http ───────────────────────────────────────────────────────
 
 def _sha256_file(path: str) -> str:
