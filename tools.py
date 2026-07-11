@@ -996,6 +996,39 @@ def _mail_sender_identity() -> tuple[str, str]:
             getattr(current, "name", None) or "Laintas CLI")
 
 
+def _mail_send_raw(ctx: ToolCtx, subject: str, body: str, kind: str = "Message") -> dict:
+    """The actual send, shared by the explicit mail.send_to_user tool and
+    the mail-mode auto-send-on-task-complete hook. Caller is responsible for
+    any policy check — this just talks to the gateway."""
+    try:
+        import requests
+        backend_profiles, profile = _resolve_backend_profile()
+    except ImportError as exc:
+        return {"ok": False, "error": f"missing dependency: {exc}"}
+
+    terminal, agent_name = _mail_sender_identity()
+    headers, cookies = backend_profiles.request_auth(profile, ctx.session)
+    try:
+        resp = requests.post(
+            f"{profile.base_url}/api/agent/send-email",
+            json={"subject": subject[:200], "body": body[:5000],
+                  "system": "laintas_cli", "terminal": terminal, "agent": agent_name,
+                  "kind": kind},
+            headers=headers, cookies=cookies, timeout=10,
+        )
+    except requests.RequestException as exc:
+        return {"ok": False, "error": f"could not reach backend: {exc}"}
+
+    if resp.status_code >= 300:
+        try:
+            detail = resp.json().get("detail") or resp.text[:200]
+        except Exception:
+            detail = resp.text[:200]
+        return {"ok": False, "error": f"send failed: {detail}"}
+
+    return {"ok": True, "result": "Email sent to your verified account address."}
+
+
 def _bi_mail_send_to_user(params: dict, ctx: ToolCtx) -> dict:
     """Email the current account's own verified Laintas address (never an
     arbitrary recipient — the gateway resolves the address server-side).
@@ -1010,32 +1043,7 @@ def _bi_mail_send_to_user(params: dict, ctx: ToolCtx) -> dict:
     if blocked is not None:
         return blocked
 
-    try:
-        import requests
-        backend_profiles, profile = _resolve_backend_profile()
-    except ImportError as exc:
-        return {"ok": False, "error": f"missing dependency: {exc}"}
-
-    terminal, agent_name = _mail_sender_identity()
-    headers, cookies = backend_profiles.request_auth(profile, ctx.session)
-    try:
-        resp = requests.post(
-            f"{profile.base_url}/api/agent/send-email",
-            json={"subject": subject[:200], "body": body[:5000],
-                  "system": "laintas_cli", "terminal": terminal, "agent": agent_name},
-            headers=headers, cookies=cookies, timeout=10,
-        )
-    except requests.RequestException as exc:
-        return {"ok": False, "error": f"could not reach backend: {exc}"}
-
-    if resp.status_code >= 300:
-        try:
-            detail = resp.json().get("detail") or resp.text[:200]
-        except Exception:
-            detail = resp.text[:200]
-        return {"ok": False, "error": f"send failed: {detail}"}
-
-    return {"ok": True, "result": "Email sent to your verified account address."}
+    return _mail_send_raw(ctx, subject, body, kind="Message")
 
 
 def _bi_mail_check_inbox(params: dict, ctx: ToolCtx) -> dict:
@@ -3098,12 +3106,23 @@ def _bi_task_complete(params: dict, ctx: ToolCtx) -> dict:
     longer infers "done" from a turn that simply lacks a tool call.
     """
     summary = (params.get("summary") or "").strip()
-    return {
+    result = {
         "ok": True,
         "result": summary or "Task marked complete.",
         "_task_complete": True,
         "summary": summary,
     }
+    if summary:
+        try:
+            import mode_manager
+            if mode_manager.is_mail_mode():
+                subject = (summary.splitlines()[0] or "Task complete")[:120]
+                mail_result = _mail_send_raw(ctx, subject, summary, kind="Report")
+                if not mail_result.get("ok"):
+                    result["mail_error"] = mail_result.get("error")
+        except Exception:
+            pass  # a notification failure must never break task completion itself
+    return result
 
 
 # ── Shell execution tool ──────────────────────────────────────────────
