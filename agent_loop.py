@@ -82,10 +82,6 @@ _DEFAULT_CONFIG = {
     # Every remote command/delegation requires an explicit Helpwo approval by
     # default. Advanced users may opt out locally, never from the remote UI.
     "allow_remote_exec_without_approval": False,
-    "remote_max_workers": 8,      # concurrently running remote tasks
-    "remote_queue_size": 16,      # queued remote tasks beyond workers
-    "remote_control_workers": 2,  # concurrently running abort/approval controls
-    "remote_control_queue_size": 8,  # queued remote control messages
     "heartbeat_interval": 30,     # seconds — agent heartbeat
     "staleness_limit": 3,         # consecutive no-tool steps before auto-exit
     "repetition_threshold": 3,    # consecutive no-progress steps before force-exit (mirrors TokenBudgetTracker)
@@ -110,7 +106,6 @@ _DEFAULT_CONFIG = {
     "detail": False,                   # False = simplified progress rendering; True = full per-line detail (/detail on|off)
     "deny_exits_loop": True,           # True = terminate the agent loop the moment the user denies an approval prompt; False = old behavior (feed denial back as a tool error and keep looping)
     "enable_mouse": False,             # REPL input box: click-to-position the cursor. Off by default: terminal mouse reporting hijacks native drag-to-select of scrollback (Shift+drag is the only workaround), which costs more than click-to-position gains
-    "confirm_direct_commands": False,  # False = commands the USER types directly at the REPL run like a normal terminal (no policy approval prompt, e.g. rm); True = subject direct commands to the same needs_approval prompt as AI-issued ones. Hard `deny` policy rules always apply regardless.
 }
 
 # ── Typed Error Classes ───────────────────────────────────────────────
@@ -171,33 +166,6 @@ def _diag(message: str, **context) -> None:
         _debug_log.pop(0)
 
 
-# ── Thinking shimmer (流光) ────────────────────────────────────────────
-# A bright green highlight band sweeps left→right across the status label
-# while the agent is thinking/streaming. Recomputed every Live draw from the
-# elapsed clock, so it flows smoothly without any extra timer.
-_SHIMMER_BASE = "#1f7a3f"
-_SHIMMER_GRAD = (
-    "#2ea043", "#3fb950", "#4ade80", "#7ee787",
-    "#b7f7c0", "#7ee787", "#4ade80", "#3fb950",
-)
-
-
-def _shimmer_label(label: str, elapsed: float):
-    """Return a rich Text of `label` with a moving green highlight band."""
-    from rich.text import Text
-    txt = Text()
-    span = len(_SHIMMER_GRAD)
-    # Sweep head advances ~14 columns/sec; wraps past the end for a gap.
-    head = (elapsed * 14.0) % (len(label) + span)
-    for i, ch in enumerate(label):
-        d = head - i
-        if 0 <= d < span:
-            txt.append(ch, style=f"bold {_SHIMMER_GRAD[int(d)]}")
-        else:
-            txt.append(ch, style=_SHIMMER_BASE)
-    return txt
-
-
 def _emit_simple_diff(console, diff_text: str, depth: int = 0, cap: int = 6) -> None:
     """Render a minimal diff: changed (+/-) lines only, capped at `cap` lines.
 
@@ -207,40 +175,24 @@ def _emit_simple_diff(console, diff_text: str, depth: int = 0, cap: int = 6) -> 
     """
     if not diff_text:
         return
-    from rich.markup import escape as _esc
-    _hunk = re.compile(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@")
-    changed = []          # (kind, lineno, text)
-    total_changed = adds = dels = 0
-    old_no = new_no = 0
+    changed = []
+    total_changed = 0
     for ln in diff_text.splitlines():
-        m = _hunk.match(ln)
-        if m:
-            old_no, new_no = int(m.group(1)), int(m.group(2))
-            continue
         if ln.startswith("+") and not ln.startswith("+++"):
-            adds += 1
             total_changed += 1
             if len(changed) < cap:
-                changed.append(("success", "┃+", new_no, ln[1:]))
-            new_no += 1
+                changed.append(("success", ln))
         elif ln.startswith("-") and not ln.startswith("---"):
-            dels += 1
             total_changed += 1
             if len(changed) < cap:
-                changed.append(("error", "┃-", old_no, ln[1:]))
-            old_no += 1
-        elif ln.startswith(" "):
-            old_no += 1
-            new_no += 1
+                changed.append(("error", ln))
     if not changed:
         return
-    inner = "  " * depth + "  "
-    console.print(f"{inner}[accent]▍[/accent] [success]+{adds}[/success] [error]−{dels}[/error]", highlight=False)
-    for style, mark, no, text in changed:
-        console.print(f"{inner}[muted]{no:>4}[/muted] "
-                      f"[{style}]{mark}{_esc(text[:96])}[/{style}]", highlight=False)
+    inner = "  " * depth + "    "
+    for style, ln in changed:
+        console.print(f"{inner}[{style}]{ln[:100]}[/{style}]")
     if total_changed > cap:
-        console.print(f"{inner}     [muted]… {total_changed - cap} more change(s) · /detail on for full[/muted]", highlight=False)
+        console.print(f"{inner}[muted]… {total_changed - cap} more change(s) · /detail on for full[/muted]")
 
 
 # ── Transition Labels ─────────────────────────────────────────────
@@ -312,10 +264,6 @@ _RUNTIME_CONFIG_DESCRIPTIONS = {
     "terminal_tail_lines": "Terminal snapshot line count",
     "disable_remote_terminal": "Disable remote interactive terminal access",
     "allow_remote_exec_without_approval": "Allow remote execution without local approval",
-    "remote_max_workers": "Maximum concurrently running remote tasks",
-    "remote_queue_size": "Maximum queued remote tasks beyond active workers",
-    "remote_control_workers": "Maximum concurrently running remote control messages",
-    "remote_control_queue_size": "Maximum queued remote control messages",
     "heartbeat_interval": "Agent heartbeat interval in seconds",
     "staleness_limit": "Consecutive idle steps before exit",
     "repetition_threshold": "Consecutive repeated-output steps before exit",
@@ -324,7 +272,6 @@ _RUNTIME_CONFIG_DESCRIPTIONS = {
     "output_similarity": "Repeated-output similarity threshold (0-1)",
     "detail": "Show full per-line tool detail (True) or simplified progress (False)",
     "deny_exits_loop": "Terminate the agent loop immediately when the user denies an approval prompt",
-    "confirm_direct_commands": "Ask for approval on commands YOU type directly at the REPL (False = run like a normal terminal; hard deny rules still apply)",
     "enable_mouse": "Enable mouse click-to-position in the REPL input box",
 }
 
@@ -332,7 +279,6 @@ _RUNTIME_NONNEGATIVE = {
     "loop_delay", "poll_timeout", "heartbeat_interval",
     "browser_action_delay_min", "browser_action_delay_max",
     "browser_post_action_wait",
-    "remote_queue_size", "remote_control_queue_size",
 }
 _RUNTIME_POSITIVE = {
     "max_loops", "max_tokens", "max_debug_entries", "output_truncate",
@@ -340,14 +286,7 @@ _RUNTIME_POSITIVE = {
     "warning_force_limit", "deterministic_repeat_limit",
     "microcompact_keep", "microcompact_read_budget",
     "history_max_messages", "message_truncate", "short_memory_max_chars",
-    "model_context_window", "remote_max_workers", "remote_control_workers",
-}
-
-_RUNTIME_LIMITS = {
-    "remote_max_workers": (1, 64),
-    "remote_queue_size": (0, 128),
-    "remote_control_workers": (1, 4),
-    "remote_control_queue_size": (0, 16),
+    "model_context_window",
 }
 
 
@@ -388,10 +327,6 @@ def _coerce_runtime_config_value(key: str, value):
         raise ValueError(f"{key} must be 0 or greater")
     if key == "output_similarity" and not 0 <= parsed <= 1:
         raise ValueError("output_similarity must be between 0 and 1")
-    if key in _RUNTIME_LIMITS:
-        low, high = _RUNTIME_LIMITS[key]
-        if not low <= parsed <= high:
-            raise ValueError(f"{key} must be between {low} and {high}")
     if (key == "browser_action_delay_min"
             and parsed > float(get_runtime_config("browser_action_delay_max"))):
         raise ValueError("browser_action_delay_min cannot exceed browser_action_delay_max")
@@ -461,10 +396,6 @@ _MAX_CONFIG = {
     "history_max_messages": 500,
     "message_truncate": 100000,
     "short_memory_max_chars": 200000,
-    "remote_max_workers": 64,
-    "remote_queue_size": 128,
-    "remote_control_workers": 4,
-    "remote_control_queue_size": 16,
 }
 
 
@@ -3875,14 +3806,13 @@ def _render_tool_catalog_enhanced(
     """
     role_name = state.get("_role_name")
     wf_active = workflow_engine.get_active_workflow() is not None
-    _active_mode = (None if plan_mode.is_plan_mode()
-                    else mode_manager.get_active_mode())
-    mode_restricts = bool(_active_mode) and (
-        _active_mode.get("allowed_tools") is not None
-        or _active_mode.get("denied_tools"))
+    mode_allowed = (
+        None if plan_mode.is_plan_mode()
+        else mode_manager.get_active_mode().get("allowed_tools")
+    )
 
     # If neither workflow nor role is active, use the standard catalog
-    if not wf_active and not role_name and not mode_restricts:
+    if not wf_active and not role_name and mode_allowed is None:
         base = _render_tool_catalog(state, loop, allowed_names)
         # Append role catalog for sub-agents
         if depth > 0:
@@ -3904,11 +3834,8 @@ def _render_tool_catalog_enhanced(
         current_phase = workflow_engine.get_active_workflow().current
         if current_phase and current_phase.allowed_tools:
             allowed = set(current_phase.allowed_tools)
-    if mode_restricts:
-        # Match enforcement exactly: is_tool_allowed applies the active mode's
-        # allow globs + deny-first rules against real tool names.
-        mode_tools = {t.name for t in all_tools
-                      if mode_manager.is_tool_allowed(t.name)}
+    if mode_allowed is not None:
+        mode_tools = set(mode_allowed)
         allowed = mode_tools if allowed is None else allowed & mode_tools
     if role_name:
         role = agent_roles.get_role(role_name)
@@ -4654,7 +4581,7 @@ def run_agent_loop(
 
                 # Create the Spinner ONCE — a fresh Spinner resets start_time
                 # on each draw, freezing the animation on frame 0.
-                _spinner = Spinner("dots", style="#3fb950")
+                _spinner = Spinner("dots", style="#7aa2f7")
 
                 def _fmt_tokens(n: int) -> str:
                     if n >= 1_000_000:
@@ -4700,19 +4627,16 @@ def run_agent_loop(
                     else:
                         _label = "thinking…"
                     # Update the shared spinner's text (keeps animation
-                    # continuity — start_time is preserved). The label shimmers
-                    # (流光); the trailing metrics stay a calm dim green.
-                    _txt = _shimmer_label(_label, _elapsed)
-                    _txt.append(
-                        f" {_elapsed:.1f}s · ↑{_fmt_tokens(_cur_in_est)} ↓{_fmt_tokens(_cur_out_est)} · {_spin_model} · {_spin_mode}",
-                        style="#2ea043")
-                    _spinner.text = _txt
+                    # continuity — start_time is preserved).
+                    _spinner.text = Text(
+                        f"{_label} {_elapsed:.1f}s · ↑{_fmt_tokens(_cur_in_est)} ↓{_fmt_tokens(_cur_out_est)} · {_spin_model} · {_spin_mode}",
+                        style="#7aa2f7")
                     parts.append(_spinner)
                     if stream_state["command"] and _detail:
                         cmd_preview = stream_state["command"]
                         if len(cmd_preview) > 120:
                             cmd_preview = cmd_preview[:117] + "..."
-                        parts.append(Text(f"→ {cmd_preview}", style="#2ea043"))
+                        parts.append(Text(f"→ {cmd_preview}", style="#5a7bbf"))
                     return Group(*parts)
 
                 # Wrapper that re-computes _render() on every draw so the
@@ -4775,7 +4699,7 @@ def run_agent_loop(
                     try: live.refresh()
                     except Exception: pass
             except ImportError:
-                with deps.console.status(f"[#3fb950]thinking… · {_spin_model} · {_spin_mode}[/#3fb950]", spinner="dots"):
+                with deps.console.status(f"[#7aa2f7]thinking… · {_spin_model} · {_spin_mode}[/#7aa2f7]", spinner="dots"):
                     try:
                         response = deps.call_backend(
                             session=session,
@@ -5499,20 +5423,17 @@ def run_agent_loop(
                 })
 
                 if events_cb is not None:
-                    from rich.markup import escape as _esc_hint
-                    # Green dot = quiet success; loud red ✕ is reserved for a
-                    # call that actually failed, so red still *means* something.
-                    ok_mark = "[success]●[/success]" if result.get("ok") else "[error]✕[/error]"
-                    _hint = _esc_hint((salient[:80] if salient else display_name) or "")
+                    ok_mark = "[green]✓[/green]" if result.get("ok") else "[red]✗[/red]"
+                    _hint = salient[:80] if salient else display_name
                     if _detail:
                         deps.console.print(
-                            f"  {ok_mark} [accent.dim]{display_name}[/accent.dim] [dim]{_hint}[/dim]")
+                            f"  {ok_mark} [dim cyan]{display_name}[/dim cyan] [dim]{_hint}[/dim]")
                     else:
                         # Simplified: one clean, aligned line per tool. A short
                         # trailing meta carries the essentials (line count / exit
                         # code); failures point to /debug. Full output stays in
                         # terminalHistory / /debug.
-                        _mark2 = "[success]●[/success]" if result.get("ok") else "[error]✕[/error]"
+                        _mark2 = "[success]✓[/success]" if result.get("ok") else "[error]✗[/error]"
                         _meta2 = ""
                         if name in ("shell.exec", "terminal.send", "terminal.exec"):
                             _nlines = len((formatted or "").split("\n")) if formatted else 0
@@ -5525,7 +5446,7 @@ def run_agent_loop(
                         _line = f"  {_mark2} [accent.dim]{display_name:<9}[/accent.dim] [muted]{_hint}[/muted]"
                         if _meta2:
                             _line += f"   [muted]{_meta2}[/muted]"
-                        deps.console.print(_line, highlight=False)
+                        deps.console.print(_line)
                     pending_events.append({"type": "system", "kind": "tool",
                                             "content": display_name,
                                             "meta": {"ok": result.get("ok", False),

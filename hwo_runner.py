@@ -564,10 +564,6 @@ class HwoCtx:
     self_scope: Optional[dict] = None           # current agent's resolved inputs and submitted outputs
     self_types: Optional[dict] = None
     run_state: Optional[dict] = None
-    run_id: Optional[str] = None
-    workflow_tasks: dict = field(default_factory=dict)
-    events_cb: Optional[object] = None
-    event_lock: object = field(default_factory=threading.RLock)
 
 
 # ── Execution ─────────────────────────────────────────────────────────────
@@ -589,17 +585,10 @@ def run_sequence(steps: list, ctx: HwoCtx) -> dict:
             return None
         group = pending_tasks
         pending_tasks = []
-        texts = [item.text for item in group]
-        for item in group:
-            _step_started(ctx, item)
-        result = _run_task_group(texts, ctx, context)
+        result = _run_task_group(group, ctx, context)
         outputs.append(result.get("msg", ""))
         if not result.get("ok"):
-            for item in group:
-                _step_finished(ctx, item, False, {"error": result.get("msg", "")})
             return result
-        for item in group:
-            _step_finished(ctx, item, True)
         structured_outputs.update(result.get("outputs") or {})
         label = f"todo group: {len(group)} step{'s' if len(group) != 1 else ''}"
         context = _append_context(context, label, result.get("msg", ""))
@@ -610,26 +599,25 @@ def run_sequence(steps: list, ctx: HwoCtx) -> dict:
             return {"ok": False, "msg": "HWO run cancelled."}
 
         if step.kind == 'task':
-            pending_tasks.append(step)
+            pending_tasks.append(step.text)
             continue
         elif step.kind == 'agent':
             task_failure = flush_tasks()
             if task_failure:
                 return task_failure
-            _step_started(ctx, step, {"agent": step.name})
+            _checkpoint(ctx, f"agent_started:{step.name}", {"agent": step.name})
             result = _run_agent(step, ctx, context)
         elif step.kind == 'parallel':
             task_failure = flush_tasks()
             if task_failure:
                 return task_failure
-            _step_started(ctx, step, {"agents": [a.name for a in step.body if a.kind == "agent"]})
+            _checkpoint(ctx, "parallel_started", {"agents": [a.name for a in step.body if a.kind == "agent"]})
             result = _run_parallel(step, ctx, context)
         else:
             continue
 
         outputs.append(result.get("msg", ""))
         if not result.get("ok"):
-            _step_finished(ctx, step, False, {"error": result.get("msg", "")})
             _checkpoint(ctx, "step_failed", {"step": _step_label(step), "msg": result.get("msg", "")})
             return result
         structured_outputs.update(result.get("outputs") or {})
@@ -642,7 +630,6 @@ def run_sequence(steps: list, ctx: HwoCtx) -> dict:
                 output_scope[name] = own
                 agent_outputs[name] = own
         context = _append_context(context, _step_label(step), result.get("msg", ""))
-        _step_finished(ctx, step, True, {"outputs": result.get("outputs") or {}})
         _checkpoint(ctx, "step_finished", {"step": _step_label(step), "outputs": result.get("outputs") or {}})
 
     task_failure = flush_tasks()
@@ -662,108 +649,9 @@ def _checkpoint(ctx: HwoCtx, label: str, payload: Optional[dict] = None) -> None
         return
     try:
         import workflow_state
-        with ctx.event_lock:
-            ctx.run_state = workflow_state.checkpoint(ctx.run_state, label, payload or {})
+        ctx.run_state = workflow_state.checkpoint(ctx.run_state, label, payload or {})
     except Exception:
         pass
-
-
-def _step_id(ctx: HwoCtx, step: HwoStep) -> Optional[str]:
-    entry = ctx.workflow_tasks.get(id(step)) if ctx.workflow_tasks else None
-    return entry.get("stepId") if isinstance(entry, dict) else None
-
-
-def _emit(ctx: HwoCtx, event_type: str, payload: Optional[dict] = None) -> None:
-    body = {"runId": ctx.run_id, "type": event_type, **(payload or {})}
-    try:
-        with ctx.event_lock:
-            if ctx.run_state:
-                import workflow_state
-                ctx.run_state = workflow_state.emit(ctx.run_state, event_type, body)
-            if callable(ctx.events_cb):
-                ctx.events_cb([body])
-    except Exception:
-        # Progress reporting must never change workflow execution semantics.
-        pass
-
-
-def _forward_agent_events(ctx: HwoCtx, events) -> None:
-    """Attach workflow identity to nested agent-loop events."""
-    if not callable(ctx.events_cb) or not isinstance(events, list):
-        return
-    enriched = []
-    for event in events:
-        item = dict(event) if isinstance(event, dict) else {"content": str(event)}
-        item.setdefault("runId", ctx.run_id)
-        enriched.append(item)
-    try:
-        ctx.events_cb(enriched)
-    except Exception:
-        pass
-
-
-def _update_step(ctx: HwoCtx, step: HwoStep, status: str,
-                 progress: Optional[int] = None, notes: Optional[str] = None) -> None:
-    entry = ctx.workflow_tasks.get(id(step)) if ctx.workflow_tasks else None
-    if not isinstance(entry, dict):
-        return
-    try:
-        import task_manager
-        fields = {"status": status}
-        if progress is not None:
-            fields["progress"] = max(0, min(100, int(progress)))
-        if notes:
-            fields["notes"] = notes
-        task_manager.update_task(entry["taskId"], cwd=entry.get("cwd"), **fields)
-    except Exception:
-        pass
-
-
-def _step_started(ctx: HwoCtx, step: HwoStep, payload: Optional[dict] = None) -> None:
-    _update_step(ctx, step, "in_progress", 0)
-    _emit(ctx, "step_started", {"stepId": _step_id(ctx, step), **(payload or {})})
-
-
-def _step_finished(ctx: HwoCtx, step: HwoStep, ok: bool,
-                   payload: Optional[dict] = None) -> None:
-    status = "completed" if ok else "blocked"
-    _update_step(ctx, step, status, 100 if ok else None)
-    _emit(ctx, "step_completed" if ok else "step_failed", {
-        "stepId": _step_id(ctx, step), **(payload or {})
-    })
-
-
-def _prepare_workflow_tasks(steps: list, run_id: str, cwd: str) -> dict:
-    """Create one durable task per executable HWO step before execution."""
-    mapping = {}
-    try:
-        import task_manager
-        counter = 0
-
-        def walk(items, path, parent_id=None):
-            nonlocal counter
-            for index, step in enumerate(items):
-                step_path = f"{path}.{index}" if path else str(index)
-                if step.kind in ("task", "agent"):
-                    counter += 1
-                    title = step.text if step.kind == "task" else f"Agent #{step.name}#"
-                    task = task_manager.create_task(
-                        title.replace("\\n", " ")[:200],
-                        metadata={"workflowRunId": run_id, "stepId": step_path,
-                                  "kind": step.kind, "agent": getattr(step, "name", "")},
-                        session_only=True, parent_task_id=parent_id, cwd=cwd)
-                    mapping[id(step)] = {"taskId": task["id"], "stepId": step_path, "cwd": cwd}
-                    child_parent = task["id"]
-                else:
-                    child_parent = parent_id
-                if step.kind == "agent":
-                    walk(step.body, step_path, child_parent)
-                elif step.kind == "parallel":
-                    walk(step.body, step_path, parent_id)
-        walk(steps, "")
-    except Exception:
-        return {}
-    return mapping
 
 
 def _run_task_group(texts: list[str], ctx: HwoCtx, inherited: str = "") -> dict:
@@ -803,7 +691,6 @@ def _run_task_group(texts: list[str], ctx: HwoCtx, inherited: str = "") -> dict:
             r = run_agent_loop(
                 ctx.deps, full_input, ctx.session, child.state, child.chat_history,
                 depth=child.depth, agent_id=child.id,
-                events_cb=lambda events: _forward_agent_events(ctx, events),
             )
             reply = (r.get("state") or {}).get("lastReply", "") if isinstance(r, dict) else ""
             hwo_return = child.state.pop('_hwo_return', None)
@@ -924,16 +811,11 @@ def _run_agent(agent_step: HwoAgent, ctx: HwoCtx, inherited: str = "") -> dict:
                     self_scope=self_scope,
                     self_types=self_types,
                     run_state=ctx.run_state,
-                    run_id=ctx.run_id,
-                    workflow_tasks=ctx.workflow_tasks,
-                    events_cb=ctx.events_cb,
-                    event_lock=ctx.event_lock,
                 )
                 full_input = _format_hwo_todo_goal([step.text for step in agent_step.body], task_ctx, body_context)
                 r = run_agent_loop(
                     ctx.deps, full_input, ctx.session, child.state, child.chat_history,
                     depth=child.depth, agent_id=child.id,
-                    events_cb=lambda events: _forward_agent_events(ctx, events),
                 )
                 reply = (r.get("state") or {}).get("lastReply", "") if isinstance(r, dict) else ""
                 hwo_return = child.state.pop('_hwo_return', None)
@@ -970,10 +852,6 @@ def _run_agent(agent_step: HwoAgent, ctx: HwoCtx, inherited: str = "") -> dict:
                     self_scope=self_scope,
                     self_types=self_types,
                     run_state=ctx.run_state,
-                    run_id=ctx.run_id,
-                    workflow_tasks=ctx.workflow_tasks,
-                    events_cb=ctx.events_cb,
-                    event_lock=ctx.event_lock,
                 )
                 result = run_sequence(agent_step.body, sub_ctx)
                 msg = result.get("msg", "")
@@ -1087,7 +965,6 @@ def run_hwo_file(
     abort_event=None,
     caller_context: str = "",
     inputs: Optional[dict] = None,
-    events_cb=None,
 ) -> dict:
     """Parse and execute a .hwo workflow file.
 
@@ -1131,8 +1008,6 @@ def run_hwo_file(
 
     summary = "\n".join(summarize_steps(steps))
     manifest = build_workflow_manifest(steps)
-    run_id = run_state.get("runId") if run_state else f"hwo-{uuid.uuid4().hex[:12]}"
-    workflow_tasks = _prepare_workflow_tasks(steps, run_id, str(Path.cwd()))
 
     ctx = HwoCtx(
         deps=deps,
@@ -1146,21 +1021,13 @@ def run_hwo_file(
         output_scope={},
         agent_output_types=agent_output_types,
         run_state=run_state,
-        run_id=run_id,
-        workflow_tasks=workflow_tasks,
-        events_cb=events_cb,
     )
-    _emit(ctx, "workflow_started", {"path": path, "stepCount": len(workflow_tasks)})
     result = run_sequence(steps, ctx)
-    cancelled = bool(abort_event is not None and abort_event.is_set()) or bool(result.get("cancelled"))
-    status = "cancelled" if cancelled else ("completed" if result.get("ok") else "failed")
+    status = "completed" if result.get("ok") else "failed"
     if run_state and workflow_state:
         run_state["status"] = status
         run_state["agentOutputs"] = result.get("agent_outputs") or {}
         run_state = workflow_state.checkpoint(run_state, f"run_{status}", {"outputs": result.get("outputs") or {}})
-    _emit(ctx, "workflow_cancelled" if cancelled else ("workflow_completed" if result.get("ok") else "workflow_failed"), {
-        "path": path, "status": status, "outputs": result.get("outputs") or {}
-    })
     return {
         "ok": result.get("ok", False),
         "msg": f"HWO run {status}: {path}\n\n{summary}\n\n{result.get('msg', '')}",
@@ -1190,29 +1057,3 @@ def compile_hwo_file(path: str) -> dict:
 
     summary = "\n".join(summarize_steps(steps))
     return {"ok": True, "msg": f"HWO compile OK\n{summary}", "summary": summary}
-
-
-def status(run_id: Optional[str] = None) -> dict:
-    """Return the latest durable HWO run state for local inspection."""
-    import workflow_state
-    if run_id:
-        run = workflow_state.load_run(run_id)
-        if not run or run.get("kind") != "hwo":
-            return {"ok": False, "msg": f"HWO run not found: {run_id}"}
-        return {"ok": True, "run": run, "msg": _format_status(run)}
-    runs = [r for r in workflow_state.list_runs() if r.get("kind") == "hwo"]
-    if not runs:
-        return {"ok": True, "msg": "No HWO workflow runs."}
-    return {"ok": True, "runs": runs, "msg": "\n".join(_format_status(r, True) for r in runs[:20])}
-
-
-def _format_status(run: dict, one_line: bool = False) -> str:
-    if one_line:
-        return f"{run.get('runId')}  {run.get('status')}  {run.get('source')}  events={len(run.get('events') or [])}"
-    return (
-        f"Run: {run.get('runId')}\n"
-        f"Status: {run.get('status')}\n"
-        f"Source: {run.get('source')}\n"
-        f"Events: {len(run.get('events') or [])}\n"
-        f"Updated: {run.get('updatedAt')}"
-    )

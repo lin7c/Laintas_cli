@@ -1,401 +1,604 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { motion } from 'framer-motion';
-import {
-  ArrowRight,
-  Check,
-  Copy,
-  Download,
-  ExternalLink,
-  FileCode2,
-  Package,
-  ShieldCheck,
-  Terminal,
-} from 'lucide-react';
+import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { Button } from '@/components/ui/button';
+import { Card } from '@/components/ui/card';
+import { Badge } from '@/components/ui/badge';
 import { useLanguage } from '@/contexts/LanguageContext';
+import { useTheme } from '@/contexts/ThemeContext';
 
-const DOWNLOAD_BASE = 'https://cli.laintas.com/releases/v1.7.3';
-const BASE_URL = DOWNLOAD_BASE;
-const RELEASE_VERSION = 'v1.7.3';
-
-const ASSETS = [
+const PLATFORMS = [
   {
     id: 'linux',
-    label: { zh: 'Linux 版本', en: 'Linux Build' },
-    eyebrow: { zh: '独立二进制', en: 'Standalone binary' },
-    downloads: [
-      {
-        id: 'amd64',
-        filename: 'laintas-cli_linux_amd64.tar.gz',
-        label: { zh: '下载 amd64', en: 'Download amd64' },
-      },
-      {
-        id: 'arm64',
-        filename: 'laintas-cli_linux_arm64.tar.gz',
-        label: { zh: '下载 arm64', en: 'Download arm64' },
-      },
-    ],
-    meta: { zh: 'amd64 / arm64 · 无需 Python · glibc 2.28+', en: 'amd64 / arm64 · no Python required · glibc 2.28+' },
-    icon: Package,
-    accent: '#0f9f6e',
+    labels: { zh: 'Linux', en: 'Linux' },
+    filename: 'laintas-cli_linux.tar.gz',
+    arch: 'x86-64 · standalone',
+    icon: LinuxIcon,
+    desc: 'Ubuntu / Debian / RHEL · 无需 Python',
+  },
+  {
+    id: 'macos',
+    labels: { zh: 'macOS', en: 'macOS' },
+    filename: 'laintas-cli_macos.tar.gz',
+    arch: 'Apple Silicon · Intel',
+    icon: MacIcon,
+    desc: 'macOS 12+ · 需要 Python 3.10+',
   },
   {
     id: 'source',
-    label: { zh: '源码包', en: 'Source' },
-    eyebrow: { zh: '可审计、可修改', en: 'Auditable and editable' },
+    labels: { zh: '源码', en: 'Source' },
     filename: 'laintas-cli_source.zip',
-    meta: { zh: 'Python 3.10+ · 适合调试和二次开发', en: 'Python 3.10+ · best for debugging and modification' },
-    icon: FileCode2,
-    accent: '#c9382f',
+    arch: 'macOS · Linux',
+    icon: SourceIcon,
+    desc: 'Python 3.10+ · source package',
   },
 ];
 
+const DOWNLOAD_BASE = '/releases/v1.6';
+
+function detectOS() {
+  if (typeof navigator === 'undefined') return 'linux';
+  const p = navigator.platform || '';
+  const ua = navigator.userAgent || '';
+  if (p.includes('Mac') || ua.includes('Mac OS X') || ua.includes('Macintosh')) return 'macos';
+  return 'linux';
+}
+
 export default function DownloadSection() {
   const { t, lang } = useLanguage();
+  const { theme } = useTheme();
+  const isDark = theme === 'dark';
+  const [selectedOS, setSelectedOS] = useState(() => {
+    try { return localStorage.getItem('laintas-os') || detectOS(); }
+    catch { return detectOS(); }
+  });
   const [assetSizes, setAssetSizes] = useState({});
 
   useEffect(() => {
+    try { localStorage.setItem('laintas-os', selectedOS); } catch {}
+  }, [selectedOS]);
+
+  useEffect(() => {
     let active = true;
+
     Promise.all(
-      ASSETS.flatMap((asset) => (asset.downloads || [{ id: 'default', filename: asset.filename }])
-        .map(async (download) => {
-          const size = await fetchAssetSize(`${DOWNLOAD_BASE}/${download.filename}`);
-          return [`${asset.id}:${download.id}`, size];
-        }))
+      PLATFORMS.map(async (platform) => {
+        const size = await fetchAssetSize(`${DOWNLOAD_BASE}/${platform.filename}`);
+        return [platform.id, size];
+      })
     ).then((entries) => {
-      if (active) setAssetSizes(Object.fromEntries(entries));
+      if (!active) return;
+      setAssetSizes(Object.fromEntries(entries));
     }).catch(() => {});
-    return () => { active = false; };
+
+    return () => {
+      active = false;
+    };
   }, []);
 
+  const current = PLATFORMS.find((p) => p.id === selectedOS) || PLATFORMS[0];
+  const currentLabel = getPlatformLabel(current, lang);
+  const currentSize = formatBytes(assetSizes[current.id]);
+
   return (
-    <main className="download-page relative min-h-screen overflow-hidden bg-white text-[#10110f]">
-      <BackgroundGrid />
-
-      <section className="relative mx-auto flex min-h-screen w-full max-w-[1180px] flex-col px-5 pb-16 pt-28 sm:px-8 lg:px-10">
+    <section className="relative">
+      <div className="relative z-10 max-w-[960px] mx-auto px-4 pt-36 pb-20">
+        {/* Hero */}
         <motion.div
-          className="grid flex-1 items-center gap-12 lg:grid-cols-[0.96fr_1.04fr]"
-          initial={{ opacity: 0, y: 18 }}
+          className="text-center mb-16"
+          initial={{ opacity: 0, y: 24 }}
           animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.55, ease: [0.22, 0.61, 0.36, 1] }}
+          transition={{ duration: 0.6, ease: [0.22, 0.61, 0.36, 1] }}
         >
-          <div className="max-w-[620px]">
-            <BrandMark size="large" />
-            <p className="mt-9 font-mono text-[12px] uppercase tracking-[0.34em] text-[#74776f]">
-              {t.hero.kicker}
-            </p>
-            <h1 className="mt-5 max-w-[760px] font-display text-[54px] font-semibold leading-[0.92] tracking-normal text-[#10110f] sm:text-[76px] lg:text-[96px]">
-              {t.hero.title}
-            </h1>
-            <p className="mt-7 max-w-[540px] text-[18px] leading-8 text-[#555951] sm:text-[20px]">
-              {t.hero.subtitle}
-            </p>
+          <h1 className="font-display text-[28px] sm:text-[38px] md:text-[52px] font-bold italic leading-[1.08] tracking-[-0.03em] mb-4"
+            style={{ color: 'var(--text-primary)' }}>
+            {t.hero.title}
+          </h1>
+          <p className="text-[17px] leading-relaxed max-w-[520px] mx-auto"
+            style={{ color: 'var(--text-tertiary)', fontFamily: 'var(--font-sans)' }}>
+            {t.hero.subtitle}
+          </p>
+        </motion.div>
 
-            <div className="mt-10 flex flex-wrap items-center gap-3">
-              <a
-                href="https://laintas.com"
-                target="_blank"
-                rel="noopener noreferrer"
-                className="group inline-flex h-13 items-center gap-3 rounded-[8px] bg-[#10110f] px-6 text-[15px] font-semibold text-white shadow-[0_20px_48px_rgba(16,17,15,0.18)] transition duration-200 hover:-translate-y-0.5 hover:bg-[#20221f]"
-              >
-                <ExternalLink size={18} strokeWidth={2.2} />
-                {t.hero.primaryCta}
-                <ArrowRight size={17} className="transition group-hover:translate-x-0.5" />
-              </a>
-              <a
-                href="https://github.com/lin7c/Laintas_cli"
-                target="_blank"
-                rel="noopener noreferrer"
-                className="inline-flex h-13 items-center gap-3 rounded-[8px] border border-[#d7d9d2] bg-white px-6 text-[15px] font-semibold text-[#10110f] transition duration-200 hover:-translate-y-0.5 hover:border-[#10110f]"
-              >
-                <FileCode2 size={18} />
-                {t.hero.sourceCta}
-              </a>
+        {/* Tabs */}
+        <motion.div
+          className="flex justify-center mb-10"
+          initial={{ opacity: 0, y: 12 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.4, delay: 0.16 }}
+        >
+          <Tabs value={selectedOS} onValueChange={setSelectedOS}>
+            <TabsList
+              className="relative rounded-xl p-1 gap-0.5"
+              style={{
+                background: isDark ? 'rgba(255,255,255,0.03)' : 'rgba(0,0,0,0.03)',
+                border: '0.5px solid rgba(255,255,255,0.06)',
+              }}
+            >
+              {PLATFORMS.map((os) => (
+                <TabsTrigger
+                  key={os.id}
+                  value={os.id}
+                  className="relative flex items-center gap-2 px-5 py-2.5 rounded-lg text-[14px] font-medium data-[state=active]:text-foreground"
+                  style={{
+                    color: os.id === selectedOS ? 'var(--text-primary)' : 'var(--text-tertiary)',
+                    background: 'transparent',
+                    letterSpacing: '-0.01em',
+                  }}
+                >
+                  <os.icon />
+                  <span className="hidden sm:inline">{getPlatformLabel(os, lang)}</span>
+                  {os.id === selectedOS && (
+                    <motion.div
+                      layoutId="platform-indicator"
+                      className="absolute inset-0 rounded-lg"
+                      style={{
+                        background: isDark ? 'rgba(255,255,255,0.04)' : 'rgba(0,0,0,0.04)',
+                        border: '0.5px solid rgba(255,255,255,0.10)',
+                      }}
+                      transition={{ type: 'spring', stiffness: 420, damping: 30 }}
+                    />
+                  )}
+                </TabsTrigger>
+              ))}
+            </TabsList>
+          </Tabs>
+        </motion.div>
+
+        {/* Bento Grid */}
+        <motion.div
+          className="grid grid-cols-1 md:grid-cols-[1fr_300px] gap-3 mb-8"
+          initial={{ opacity: 0, y: 16 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.45, delay: 0.22 }}
+        >
+          {/* Main Card — large */}
+          <Card
+            className="rounded-2xl overflow-hidden p-0"
+            style={{
+              background: isDark
+                ? 'linear-gradient(160deg, rgba(255,255,255,0.02) 0%, rgba(255,255,255,0.005) 40%, rgba(255,255,255,0.01) 100%)'
+                : 'linear-gradient(160deg, rgba(0,0,0,0.01) 0%, rgba(0,0,0,0.005) 40%, transparent 100%)',
+              border: '0.5px solid rgba(255,255,255,0.06)',
+              backdropFilter: 'blur(24px)',
+            }}
+          >
+            <div className="p-5 sm:p-8 md:p-10">
+              <div className="flex items-center gap-3.5 mb-5">
+                <div
+                  className="w-10 h-10 rounded-xl flex items-center justify-center"
+                  style={{
+                    background: 'linear-gradient(135deg, rgba(255,255,255,0.06) 0%, rgba(255,255,255,0.02) 100%)',
+                    border: '0.5px solid rgba(255,255,255,0.06)',
+                  }}
+                >
+                  <current.icon />
+                </div>
+                <div>
+                  <h2 className="text-[15px] font-semibold tracking-[-0.01em]" style={{ color: 'var(--text-primary)' }}>
+                    {t.desktop.title}
+                  </h2>
+                  <p className="text-[13px] font-mono mt-0.5" style={{ color: 'var(--text-muted)' }}>
+                    {currentLabel} · {current.arch}
+                  </p>
+                </div>
+              </div>
+
+              <p className="text-[14px] leading-relaxed mb-6" style={{ color: 'var(--text-tertiary)' }}>
+                {t.desktop.desc}
+              </p>
+
+              <div className="flex flex-wrap items-center gap-3">
+                <Button
+                  size="lg"
+                  className="rounded-xl text-[15px] font-semibold tracking-[-0.01em] px-7 h-[46px]"
+                  style={{
+                    background: 'linear-gradient(180deg, rgba(255,255,255,0.95) 0%, rgba(255,255,255,0.88) 100%)',
+                    color: '#0c0c0c',
+                    border: '0.5px solid rgba(255,255,255,0.15)',
+                    boxShadow: '0 1px 2px rgba(0,0,0,0.2), inset 0 1px 0 rgba(255,255,255,0.1)',
+                  }}
+                  onMouseEnter={(e) => {
+                    e.currentTarget.style.background = 'linear-gradient(180deg, #fff 0%, rgba(255,255,255,0.95) 100%)';
+                    e.currentTarget.style.boxShadow = '0 4px 20px rgba(255,255,255,0.12), 0 1px 2px rgba(0,0,0,0.2)';
+                    e.currentTarget.style.transform = 'translateY(-1px)';
+                  }}
+                  onMouseLeave={(e) => {
+                    e.currentTarget.style.background = 'linear-gradient(180deg, rgba(255,255,255,0.95) 0%, rgba(255,255,255,0.88) 100%)';
+                    e.currentTarget.style.boxShadow = '0 1px 2px rgba(0,0,0,0.2), inset 0 1px 0 rgba(255,255,255,0.1)';
+                    e.currentTarget.style.transform = '';
+                  }}
+                  onClick={() => {
+                    window.open(`${DOWNLOAD_BASE}/${current.filename}`, '_self');
+                  }}
+                >
+                  <DownloadIcon />
+                  {t.download} for {currentLabel}
+                </Button>
+                <Badge
+                  variant="outline"
+                  className="rounded-lg py-1.5 px-3 text-[11px] font-mono font-medium"
+                  style={{
+                    background: 'transparent',
+                    border: '0.5px solid rgba(255,255,255,0.06)',
+                    color: 'var(--text-muted)',
+                  }}
+                >
+                  {currentSize}
+                </Badge>
+              </div>
+            </div>
+
+            <div
+              className="px-5 sm:px-8 md:px-10 py-3 flex items-center gap-2 text-[12px] font-mono"
+              style={{
+                background: isDark ? 'rgba(255,255,255,0.015)' : 'rgba(0,0,0,0.015)',
+                borderTop: '0.5px solid rgba(255,255,255,0.05)',
+                color: 'var(--text-muted)',
+              }}
+            >
+              <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+                <path d="M3 6l2 2 4-4" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+              SHA256 checksum available
+            </div>
+          </Card>
+
+          {/* Side Card — web app link */}
+          <div className="flex flex-col gap-3">
+            <a
+              href="https://helpwo.laintas.com"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="flex-1 rounded-2xl p-5 text-left transition-all duration-200 group"
+              style={{
+                background: isDark
+                  ? 'linear-gradient(160deg, rgba(255,255,255,0.015) 0%, rgba(255,255,255,0.005) 100%)'
+                  : 'linear-gradient(160deg, rgba(0,0,0,0.01) 0%, transparent 100%)',
+                border: '0.5px solid rgba(255,255,255,0.06)',
+                backdropFilter: 'blur(24px)',
+              }}
+              onMouseEnter={(e) => {
+                e.currentTarget.style.borderColor = 'rgba(255,255,255,0.12)';
+                e.currentTarget.style.background = isDark
+                  ? 'linear-gradient(160deg, rgba(255,255,255,0.03) 0%, rgba(255,255,255,0.01) 100%)'
+                  : 'linear-gradient(160deg, rgba(0,0,0,0.02) 0%, transparent 100%)';
+              }}
+              onMouseLeave={(e) => {
+                e.currentTarget.style.borderColor = 'rgba(255,255,255,0.06)';
+                e.currentTarget.style.background = isDark
+                  ? 'linear-gradient(160deg, rgba(255,255,255,0.015) 0%, rgba(255,255,255,0.005) 100%)'
+                  : 'linear-gradient(160deg, rgba(0,0,0,0.01) 0%, transparent 100%)';
+              }}
+            >
+              <div className="flex items-center gap-3 mb-3">
+                <div
+                  className="w-9 h-9 rounded-lg flex items-center justify-center"
+                  style={{
+                    background: 'linear-gradient(135deg, rgba(255,255,255,0.04) 0%, rgba(255,255,255,0.01) 100%)',
+                    border: '0.5px solid rgba(255,255,255,0.06)',
+                  }}
+                >
+                  <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+                    <path d="M2 3.5h5.5l2 2H14v7H2V3.5z" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round"/>
+                    <path d="M6 8l2 2 4-4" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round"/>
+                  </svg>
+                </div>
+                <div>
+                  <p className="text-[14px] font-semibold tracking-[-0.01em]" style={{ color: 'var(--text-primary)' }}>
+                    {t.hero.webApp}
+                  </p>
+                  <p className="text-[11px] font-mono mt-0.5" style={{ color: 'var(--text-muted)' }}>
+                    helpwo.laintas.com
+                  </p>
+                </div>
+              </div>
+              <div className="flex items-center justify-between">
+                <span className="text-[12px] font-mono" style={{ color: 'var(--text-muted)' }}>
+                  {t.hero.webApp}
+                </span>
+                <svg
+                  width="13"
+                  height="13"
+                  viewBox="0 0 13 13"
+                  fill="none"
+                  className="transition-transform duration-200 group-hover:translate-x-0.5"
+                >
+                  <path
+                    d="M4.5 2.5l4 4-4 4"
+                    stroke="currentColor"
+                    strokeWidth="1.2"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    style={{ color: 'var(--text-muted)' }}
+                  />
+                </svg>
+              </div>
+            </a>
+          </div>
+        </motion.div>
+
+        {/* Curl download command */}
+        <CurlCommands isDark={isDark} selectedOS={selectedOS} />
+
+        {/* Platform Installation Guide */}
+        {selectedOS === 'macos' && <MacGuide isDark={isDark} />}
+        {selectedOS === 'linux' && <LinuxGuide isDark={isDark} />}
+        {selectedOS === 'source' && <SourceGuide isDark={isDark} />}
+      </div>
+    </section>
+  );
+}
+
+/* Curl download commands */
+const BASE_URL = 'https://cli.laintas.com/releases/v1.6';
+
+function CurlCommands({ isDark, selectedOS }) {
+  const [copied, setCopied] = useState(false);
+  const os = PLATFORMS.find((p) => p.id === selectedOS) || PLATFORMS[0];
+  const curlCmd = `curl -o ${os.filename} ${BASE_URL}/${os.filename}`;
+
+  const handleCopy = useCallback(() => {
+    navigator.clipboard.writeText(curlCmd).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    });
+  }, [curlCmd]);
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 12 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: 0.4, delay: 0.3 }}
+    >
+      <button
+        onClick={handleCopy}
+        className="flex items-center gap-3 p-4 rounded-xl transition-all duration-200 group text-left w-full cursor-pointer"
+        style={{
+          background: isDark
+            ? 'linear-gradient(160deg, rgba(255,255,255,0.015) 0%, rgba(255,255,255,0.005) 100%)'
+            : 'linear-gradient(160deg, rgba(0,0,0,0.01) 0%, transparent 100%)',
+          border: '0.5px solid rgba(255,255,255,0.06)',
+          backdropFilter: 'blur(24px)',
+        }}
+        onMouseEnter={(e) => {
+          e.currentTarget.style.borderColor = 'rgba(255,255,255,0.12)';
+          e.currentTarget.style.background = isDark
+            ? 'linear-gradient(160deg, rgba(255,255,255,0.025) 0%, rgba(255,255,255,0.01) 100%)'
+            : '';
+        }}
+        onMouseLeave={(e) => {
+          e.currentTarget.style.borderColor = 'rgba(255,255,255,0.06)';
+          e.currentTarget.style.background = isDark
+            ? 'linear-gradient(160deg, rgba(255,255,255,0.015) 0%, rgba(255,255,255,0.005) 100%)'
+            : '';
+        }}
+      >
+        <div
+          className="w-9 h-9 rounded-lg flex items-center justify-center flex-shrink-0"
+          style={{
+            background: 'linear-gradient(135deg, rgba(255,255,255,0.04) 0%, rgba(255,255,255,0.01) 100%)',
+            border: '0.5px solid rgba(255,255,255,0.06)',
+          }}
+        >
+          <os.icon />
+        </div>
+        <div className="min-w-0 flex-1">
+          <p className="text-[12px] font-mono leading-relaxed break-all" style={{ color: 'var(--text-primary)' }}>
+            {curlCmd}
+          </p>
+        </div>
+        {copied ? (
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" className="flex-shrink-0">
+            <path d="M3 8l3 3 6-6" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" style={{ color: '#10b981' }} />
+          </svg>
+        ) : (
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" className="flex-shrink-0" style={{ color: 'var(--text-muted)' }}>
+            <rect x="5.5" y="3.5" width="8" height="10" rx="1" stroke="currentColor" strokeWidth="1.2" />
+            <path d="M3 5.5h-.5a1 1 0 00-1 1v6a1 1 0 001 1h7a1 1 0 001-1v-.5" stroke="currentColor" strokeWidth="1.1" />
+          </svg>
+        )}
+      </button>
+    </motion.div>
+  );
+}
+
+/* Shared installation guide card (used by all three platforms) */
+function InstallGuide({ isDark, guide }) {
+  const [expanded, setExpanded] = useState(false);
+
+  const cardStyle = {
+    background: isDark
+      ? 'linear-gradient(160deg, rgba(255,255,255,0.015) 0%, rgba(255,255,255,0.005) 100%)'
+      : 'linear-gradient(160deg, rgba(0,0,0,0.01) 0%, transparent 100%)',
+    border: '0.5px solid rgba(255,255,255,0.06)',
+    backdropFilter: 'blur(24px)',
+  };
+
+  const stepNumStyle = {
+    background: 'linear-gradient(135deg, rgba(255,255,255,0.06) 0%, rgba(255,255,255,0.02) 100%)',
+    border: '0.5px solid rgba(255,255,255,0.08)',
+    color: 'var(--text-primary)',
+  };
+
+  const codeStyle = {
+    background: isDark ? 'rgba(0,0,0,0.4)' : 'rgba(0,0,0,0.06)',
+    border: `0.5px solid ${isDark ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.08)'}`,
+    color: 'var(--text-secondary)',
+    fontFamily: 'var(--font-mono)',
+  };
+
+  const dividerStyle = `0.5px solid ${isDark ? 'rgba(255,255,255,0.05)' : 'rgba(0,0,0,0.06)'}`;
+
+  return (
+    <motion.div
+      className="mt-6"
+      initial={{ opacity: 0, y: 12 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: 0.4, delay: 0.1 }}
+    >
+      <Card className="rounded-2xl overflow-hidden" style={cardStyle}>
+        {/* Header — clickable to toggle */}
+        <button
+          onClick={() => setExpanded(!expanded)}
+          className="w-full px-5 sm:px-8 md:px-10 py-5 flex items-center justify-between text-left cursor-pointer transition-colors duration-150"
+          style={{ borderBottom: expanded ? dividerStyle : 'none' }}
+        >
+          <div className="flex items-center gap-3.5">
+            <div className="w-9 h-9 rounded-lg flex items-center justify-center" style={stepNumStyle}>
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+                <path d="M8 1v14M1 8h14" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+              </svg>
+            </div>
+            <div>
+              <h3 className="text-[15px] font-semibold tracking-[-0.01em]" style={{ color: 'var(--text-primary)' }}>
+                {guide.title}
+              </h3>
+              <p className="text-[12px] font-mono mt-0.5" style={{ color: 'var(--text-muted)' }}>
+                {guide.subtitle}
+              </p>
             </div>
           </div>
+          <svg
+            width="16" height="16" viewBox="0 0 16 16" fill="none"
+            className="transition-transform duration-200 flex-shrink-0"
+            style={{ transform: expanded ? 'rotate(180deg)' : 'rotate(0deg)', color: 'var(--text-muted)' }}
+          >
+            <path d="M4 6l4 4 4-4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
+        </button>
 
-          <div className="relative">
-            <div className="absolute -left-8 top-10 hidden h-[calc(100%-80px)] w-px bg-[#d8dbd3] lg:block" />
-            <div className="space-y-4">
-              {ASSETS.map((asset, index) => (
-                <DownloadPanel
-                  key={asset.id}
-                  asset={asset}
-                  lang={lang}
-                  size={formatBytes(assetSizes[asset.id])}
-                  delay={0.14 + index * 0.08}
-                />
+        {/* Steps — collapsible */}
+        {expanded && (
+          <motion.div
+            initial={{ opacity: 0, height: 0 }}
+            animate={{ opacity: 1, height: 'auto' }}
+            transition={{ duration: 0.25 }}
+          >
+            <div className="px-5 sm:px-8 md:px-10 py-6 space-y-5">
+              {guide.steps.map((step, i) => (
+                <div key={i} className="flex gap-4">
+                  <div
+                    className="w-7 h-7 rounded-lg flex items-center justify-center flex-shrink-0 text-[12px] font-mono font-semibold mt-0.5"
+                    style={stepNumStyle}
+                  >
+                    {i + 1}
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <p className="text-[14px] font-medium mb-1" style={{ color: 'var(--text-primary)' }}>
+                      {step.title}
+                    </p>
+                    <p className="text-[13px] leading-relaxed" style={{ color: 'var(--text-tertiary)' }}>
+                      {step.desc}
+                    </p>
+                    {step.code && (
+                      <CodeBlock className="mt-2" code={step.code} style={codeStyle} />
+                    )}
+                  </div>
+                </div>
               ))}
             </div>
 
-            <div className="mt-5 grid gap-4 sm:grid-cols-2">
-              <Signal icon={Terminal} label={t.signals.terminal} value="curl / tar / python" />
-              <Signal icon={ShieldCheck} label={t.signals.checksum} value="SHA256" />
-            </div>
-          </div>
-        </motion.div>
-
-        <motion.div
-          className="mt-12 grid gap-4 border-t border-[#d8dbd3] pt-6 lg:grid-cols-[1fr_1fr]"
-          initial={{ opacity: 0, y: 12 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.45, delay: 0.28 }}
-        >
-          <InstallGuide guide={t.linuxGuide} asset={ASSETS[0]} />
-          <InstallGuide guide={t.sourceGuide} asset={ASSETS[1]} />
-        </motion.div>
-
-        <CompatibilityGuide content={t.compatibility} />
-      </section>
-    </main>
-  );
-}
-
-function BackgroundGrid() {
-  return (
-    <div aria-hidden="true" className="pointer-events-none absolute inset-0">
-      <div
-        className="absolute inset-0 opacity-[0.42]"
-        style={{
-          backgroundImage:
-            'linear-gradient(#e8ebe3 1px, transparent 1px), linear-gradient(90deg, #e8ebe3 1px, transparent 1px)',
-          backgroundSize: '44px 44px',
-          maskImage: 'linear-gradient(to bottom, black, transparent 78%)',
-        }}
-      />
-      <div className="absolute right-[-16vw] top-[10vh] h-[38vw] w-[38vw] rounded-full border border-[#e3e5df]" />
-      <div className="absolute bottom-[8vh] left-[-9vw] h-[28vw] w-[28vw] rounded-full border border-[#e3e5df]" />
-    </div>
-  );
-}
-
-function BrandMark({ size = 'normal' }) {
-  const large = size === 'large';
-  return (
-    <div
-      className={`inline-flex items-center justify-center rounded-[8px] border border-[#d8dbd3] bg-white font-mono font-black shadow-[0_18px_42px_rgba(16,17,15,0.08)] ${large ? 'h-20 w-20 text-[42px]' : 'h-10 w-10 text-[22px]'}`}
-      aria-label="Laintas CLI"
-    >
-      <span className="text-[#d83b32]">&gt;</span>
-      <span className="text-[#18a266]">/</span>
-    </div>
-  );
-}
-
-function DownloadPanel({ asset, lang, size, delay }) {
-  const { t } = useLanguage();
-  const Icon = asset.icon;
-  const label = localize(asset.label, lang);
-  const eyebrow = localize(asset.eyebrow, lang);
-  const meta = localize(asset.meta, lang);
-
-  return (
-    <motion.article
-      className="group relative overflow-hidden rounded-[8px] border border-[#d8dbd3] bg-white p-6 shadow-[0_18px_60px_rgba(16,17,15,0.08)] transition duration-200 hover:-translate-y-1 hover:border-[#10110f]"
-      initial={{ opacity: 0, x: 18 }}
-      animate={{ opacity: 1, x: 0 }}
-      transition={{ duration: 0.45, delay }}
-    >
-      <div className="absolute right-0 top-0 h-full w-1.5" style={{ background: asset.accent }} />
-      <div className="flex items-start justify-between gap-5">
-        <div className="flex min-w-0 gap-4">
-          <div
-            className="flex h-12 w-12 flex-shrink-0 items-center justify-center rounded-[8px]"
-            style={{ background: `${asset.accent}12`, color: asset.accent }}
-          >
-            <Icon size={23} strokeWidth={2.1} />
-          </div>
-          <div className="min-w-0">
-            <p className="font-mono text-[11px] uppercase tracking-[0.22em] text-[#74776f]">
-              {eyebrow}
-            </p>
-            <h2 className="mt-1 text-[25px] font-semibold tracking-normal text-[#10110f]">
-              {label}
-            </h2>
-            <p className="mt-2 text-[14px] leading-6 text-[#5b5f56]">
-              {meta}
-            </p>
-          </div>
-        </div>
-        <span className="rounded-[6px] border border-[#e0e2dc] px-2.5 py-1 font-mono text-[11px] text-[#74776f]">
-          {RELEASE_VERSION}
-        </span>
-      </div>
-
-      <div className="mt-7 flex flex-wrap items-center gap-3">
-        {(asset.downloads || [{ id: 'default', filename: asset.filename, label: { zh: t.download, en: t.download } }]).map((download) => (
-          <div key={download.id} className="flex items-center gap-2">
-            <a
-              href={`${DOWNLOAD_BASE}/${download.filename}`}
-              className="inline-flex h-11 items-center gap-2 rounded-[8px] bg-[#10110f] px-4 text-[14px] font-semibold text-white transition hover:bg-[#20221f]"
+            {/* Shell one-liner */}
+            <div
+              className="px-5 sm:px-8 md:px-10 py-5"
+              style={{
+                background: isDark ? 'rgba(255,255,255,0.015)' : 'rgba(0,0,0,0.015)',
+                borderTop: dividerStyle,
+              }}
             >
-              <Download size={16} />
-              {localize(download.label, lang)}
-            </a>
-            <CopyCommand command={`curl -fL -o ${download.filename} ${BASE_URL}/${download.filename}`} compact />
-          </div>
-        ))}
-      </div>
-    </motion.article>
+              <p className="text-[12px] font-medium mb-2" style={{ color: 'var(--text-secondary)' }}>
+                {guide.shellLabel}
+              </p>
+              <CodeBlock code={guide.shellCmd} style={codeStyle} textClassName="text-[11px] leading-relaxed whitespace-pre-wrap break-all" />
+            </div>
+
+            {/* Troubleshooting */}
+            <div className="px-5 sm:px-8 md:px-10 py-5" style={{ borderTop: dividerStyle }}>
+              <p className="text-[12px] font-medium mb-3" style={{ color: 'var(--text-secondary)' }}>
+                {guide.troubleshootTitle}
+              </p>
+              <div className="space-y-2">
+                {guide.troubleshootItems.map((item, i) => (
+                  <div key={i} className="text-[12px] leading-relaxed" style={{ color: 'var(--text-tertiary)' }}>
+                    <span className="font-mono" style={{ color: 'var(--text-secondary)' }}>{item.problem}</span>
+                    <span style={{ color: 'var(--text-muted)' }}> — {item.solution}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </motion.div>
+        )}
+      </Card>
+    </motion.div>
   );
 }
 
-function Signal({ icon: Icon, label, value }) {
+function MacGuide({ isDark }) {
+  const { t } = useLanguage();
+  return <InstallGuide isDark={isDark} guide={t.macGuide} />;
+}
+
+function LinuxGuide({ isDark }) {
+  const { t } = useLanguage();
+  return <InstallGuide isDark={isDark} guide={t.linuxGuide} />;
+}
+
+function SourceGuide({ isDark }) {
+  const { t } = useLanguage();
+  return <InstallGuide isDark={isDark} guide={t.sourceGuide} />;
+}
+
+function CodeBlock({ className = '', code, style, textClassName = 'text-[12px] leading-relaxed whitespace-pre-wrap break-all' }) {
   return (
-    <div className="rounded-[8px] border border-[#d8dbd3] bg-white px-4 py-3">
-      <div className="flex items-center gap-2 text-[#74776f]">
-        <Icon size={15} />
-        <span className="font-mono text-[11px] uppercase tracking-[0.18em]">{label}</span>
+    <div className={`mt-2 rounded-lg px-4 py-2.5 ${className}`.trim()} style={style}>
+      <div className="flex items-start justify-between gap-3">
+        <pre className={`min-w-0 flex-1 overflow-x-auto ${textClassName}`}>{code}</pre>
+        <CopyButton text={code} />
       </div>
-      <p className="mt-2 text-[14px] font-semibold text-[#10110f]">{value}</p>
     </div>
   );
 }
 
-function CompatibilityGuide({ content }) {
-  return (
-    <section className="mt-8 rounded-[8px] border border-[#d8dbd3] bg-white p-5 shadow-[0_18px_42px_rgba(16,17,15,0.05)] sm:p-6">
-      <div className="flex flex-col gap-1 border-b border-[#e3e5df] pb-4 sm:flex-row sm:items-end sm:justify-between">
-        <div>
-          <h2 className="text-[22px] font-semibold text-[#10110f]">{content.title}</h2>
-          <p className="mt-1 text-[14px] text-[#696d65]">{content.subtitle}</p>
-        </div>
-        <code className="font-mono text-[12px] text-[#74776f]">v1.7.3</code>
-      </div>
-
-      <div className="mt-5 overflow-x-auto">
-        <table className="w-full min-w-[680px] border-collapse text-left text-[13px]">
-          <thead>
-            <tr className="border-b border-[#e3e5df] text-[#74776f]">
-              <th className="pb-3 pr-4 font-mono text-[11px] uppercase tracking-[0.14em]">Platform</th>
-              <th className="pb-3 pr-4 font-mono text-[11px] uppercase tracking-[0.14em]">Architecture</th>
-              <th className="pb-3 pr-4 font-mono text-[11px] uppercase tracking-[0.14em]">Requirements</th>
-              <th className="pb-3 font-mono text-[11px] uppercase tracking-[0.14em]">Status</th>
-            </tr>
-          </thead>
-          <tbody>
-            {content.rows.map((row) => (
-              <tr key={row.name} className="border-b border-[#eef0eb] last:border-0">
-                <td className="py-3 pr-4 font-semibold text-[#10110f]">{row.name}</td>
-                <td className="py-3 pr-4 font-mono text-[#555951]">{row.arch}</td>
-                <td className="py-3 pr-4 text-[#696d65]">{row.detail}</td>
-                <td className="py-3 font-semibold text-[#0f8f62]">{row.status}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-
-      <div className="mt-5 grid gap-4 border-t border-[#e3e5df] pt-5 lg:grid-cols-2">
-        <div>
-          <p className="mb-2 text-[12px] font-semibold uppercase tracking-[0.14em] text-[#74776f]">{content.detectTitle}</p>
-          <CodeBlock code={content.detectCommand} />
-        </div>
-        <div>
-          <p className="mb-2 text-[12px] font-semibold uppercase tracking-[0.14em] text-[#74776f]">{content.installTitle}</p>
-          <CodeBlock code={content.installCommand} />
-        </div>
-      </div>
-
-      <div className="mt-4 rounded-[8px] border border-[#f0d6d1] bg-[#fff8f6] px-4 py-3">
-        <p className="text-[13px] font-semibold text-[#9e342c]">{content.legacyTitle}</p>
-        <p className="mt-1 text-[13px] leading-6 text-[#71443e]">{content.legacyDetail}</p>
-      </div>
-    </section>
-  );
-}
-
-function InstallGuide({ guide, asset }) {
-  const [open, setOpen] = useState(false);
-  const visibleSteps = useMemo(() => open ? guide.steps : guide.steps.slice(0, 2), [guide.steps, open]);
-  const Icon = asset.icon;
-
-  return (
-    <section className="rounded-[8px] border border-[#d8dbd3] bg-white p-5">
-      <div className="flex items-start gap-3">
-        <div
-          className="flex h-10 w-10 flex-shrink-0 items-center justify-center rounded-[8px]"
-          style={{ background: `${asset.accent}12`, color: asset.accent }}
-        >
-          <Icon size={19} />
-        </div>
-        <div className="min-w-0">
-          <h3 className="text-[18px] font-semibold text-[#10110f]">{guide.title}</h3>
-          <p className="mt-1 text-[13px] leading-6 text-[#696d65]">{guide.subtitle}</p>
-        </div>
-      </div>
-
-      <div className="mt-5 space-y-4">
-        {visibleSteps.map((step, index) => (
-          <div key={`${step.title}-${index}`} className="grid grid-cols-[28px_1fr] gap-3">
-            <div className="flex h-7 w-7 items-center justify-center rounded-[6px] bg-[#f2f3ef] font-mono text-[12px] font-semibold text-[#555951]">
-              {index + 1}
-            </div>
-            <div className="min-w-0">
-              <p className="text-[14px] font-semibold text-[#10110f]">{step.title}</p>
-              <p className="mt-1 text-[13px] leading-6 text-[#696d65]">{step.desc}</p>
-              {step.code && <CodeBlock code={step.code} />}
-            </div>
-          </div>
-        ))}
-      </div>
-
-      <div className="mt-5 border-t border-[#e3e5df] pt-4">
-        <p className="mb-2 text-[12px] font-semibold uppercase tracking-[0.16em] text-[#74776f]">
-          {guide.shellLabel}
-        </p>
-        <CodeBlock code={guide.shellCmd} />
-      </div>
-
-      {guide.steps.length > 2 && (
-        <button
-          onClick={() => setOpen((value) => !value)}
-          className="mt-4 inline-flex h-9 items-center gap-2 rounded-[8px] border border-[#d8dbd3] px-3 text-[13px] font-semibold text-[#10110f] transition hover:border-[#10110f]"
-        >
-          {open ? guide.lessLabel : guide.moreLabel}
-          <ArrowRight size={14} className={open ? '-rotate-90' : 'rotate-90'} />
-        </button>
-      )}
-    </section>
-  );
-}
-
-function CodeBlock({ code }) {
-  return (
-    <div className="mt-2 flex items-start gap-2 rounded-[8px] border border-[#d8dbd3] bg-[#f7f8f4] px-3 py-2.5">
-      <pre className="min-w-0 flex-1 overflow-x-auto whitespace-pre-wrap break-all font-mono text-[12px] leading-5 text-[#333630]">
-        {code}
-      </pre>
-      <CopyCommand command={code} compact />
-    </div>
-  );
-}
-
-function CopyCommand({ command, compact = false }) {
+function CopyButton({ text }) {
   const { t } = useLanguage();
   const [copied, setCopied] = useState(false);
 
   const handleCopy = useCallback(() => {
-    navigator.clipboard.writeText(command).then(() => {
+    navigator.clipboard.writeText(text).then(() => {
       setCopied(true);
-      setTimeout(() => setCopied(false), 1600);
+      setTimeout(() => setCopied(false), 2000);
     });
-  }, [command]);
+  }, [text]);
 
   return (
     <button
-      type="button"
       onClick={handleCopy}
-      className={`inline-flex items-center gap-2 rounded-[8px] border border-[#d8dbd3] bg-white font-semibold text-[#10110f] transition hover:border-[#10110f] ${compact ? 'h-8 px-2 text-[12px]' : 'h-11 px-4 text-[13px]'}`}
-      title={t.common.copy}
+      className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-[11px] font-mono transition-colors flex-shrink-0"
+      style={{ color: copied ? '#10b981' : 'var(--text-muted)' }}
     >
-      {copied ? <Check size={compact ? 14 : 16} color="#18a266" /> : <Copy size={compact ? 14 : 16} />}
-      {!compact && (copied ? t.common.copied : t.common.copy)}
+      {copied ? (
+        <>
+          <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+            <path d="M2 6l3 3 5-6" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
+          {t.common.copied}
+        </>
+      ) : (
+        <>
+          <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+            <rect x="4" y="4" width="7" height="7" rx="1" stroke="currentColor" strokeWidth="1.2" />
+            <path d="M1 8V2a1 1 0 011-1h6" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" />
+          </svg>
+          {t.common.copy}
+        </>
+      )}
     </button>
   );
 }
 
-function localize(value, lang) {
-  return value?.[lang] || value?.en || '';
+function getPlatformLabel(platform, lang) {
+  return platform.labels?.[lang] || platform.labels?.en || platform.id;
 }
 
 async function fetchAssetSize(url) {
@@ -412,4 +615,44 @@ function formatBytes(bytes) {
   if (bytes < 1000) return `${bytes} B`;
   if (bytes < 1000 * 1000) return `${(bytes / 1000).toFixed(1)} KB`;
   return `${(bytes / (1000 * 1000)).toFixed(1)} MB`;
+}
+
+/* Icons */
+function SourceIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+      <path d="M8 2v8M5 7l3 3 3-3" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
+      <path d="M3 11.5v1a1 1 0 001 1h8a1 1 0 001-1v-1" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" />
+      <path d="M3 4.5l5-2 5 2" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+function LinuxIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+      <path d="M8 1c-.5 0-1 .2-1.3.5-.2.2-.4.5-.4.8 0 .3.1.6.2.9-.5.2-1 .5-1.3 1-.2.3-.4.6-.4 1s.2.7.4 1c.3.5.7.8 1.2 1-.1.3-.1.5 0 .8.2.3.5.5.9.5.4 0 .7-.2.9-.5.1-.3.1-.5 0-.8.5-.2.9-.5 1.2-1 .2-.3.4-.6.4-1s-.2-.7-.4-1c-.3-.5-.8-.8-1.3-1 .1-.3.2-.6.2-.9 0-.3-.1-.6-.4-.8C9 1.2 8.5 1 8 1z" />
+      <circle cx="7" cy="6.5" r="1" />
+      <circle cx="9" cy="6.5" r="1" />
+      <path d="M7.5 8c-.3 0-.5.2-.5.5v1c0 .3.2.5.5.5s.5-.2.5-.5v-1c0-.3-.2-.5-.5-.5z" />
+      <path d="M4 11c-.5 1.5.5 3 2 3h4c1.5 0 2.5-1.5 2-3" stroke="currentColor" strokeWidth="1.1" fill="none" />
+    </svg>
+  );
+}
+
+function MacIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+      <path d="M11.2 1.6c-.7.8-1.8 1.4-2.9 1.3-.1-1.1.4-2.2 1-2.9.7-.8 1.9-1.4 2.8-1.4.1 1.1-.3 2.2-.9 3zM12.8 4.4c-1.6-.1-3 .9-3.7.9-.8 0-1.9-.9-3.2-.8-1.6 0-3.1.9-4 2.4-1.7 2.9-.4 7.2 1.2 9.6.8 1.2 1.8 2.5 3.1 2.4 1.2-.1 1.7-.8 3.2-.8s1.9.8 3.2.8c1.3 0 2.2-1.2 3-2.4.6-.9 1-1.8 1.3-2.8-3.1-1.2-3.6-5.7-.5-7.4-.9-1.2-2.3-1.9-3.6-1.9z" transform="translate(1.5, 3.5) scale(0.72)" />
+    </svg>
+  );
+}
+
+function DownloadIcon({ className }) {
+  return (
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" className={className}>
+      <path d="M8 2v8M4 7l4 4 4-4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+      <path d="M2 11.5v1a1 1 0 001 1h10a1 1 0 001-1v-1" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round"/>
+    </svg>
+  );
 }

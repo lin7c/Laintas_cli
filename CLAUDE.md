@@ -28,7 +28,7 @@ The .deb launcher (`/usr/bin/laintas-cli`) lazy-installs `requirements.txt` via 
 
 A companion React/Vite download site lives in `laintas_cli_download/` (separate build, not part of the Python package).
 
-**To publish a release, use `.github/workflows/release.yml`** — it builds Linux amd64/arm64 binaries and a source package, then publishes checksums and update manifests to GitHub Releases.
+**To publish a release to the download page, read `build/RELEASE.md`** — it documents the full flow for the download artifacts (Linux binary + macOS/source bundles built locally via `build/release/build_download_assets.sh`).
 
 ## Architecture (read PROJECT.md for full detail)
 

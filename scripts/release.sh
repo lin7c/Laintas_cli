@@ -9,7 +9,7 @@
 #   3. Commit + tag + push to main (triggers .github/workflows/release.yml).
 #   4. Watch the CI run and print the GitHub Release URL when done.
 #
-# CI then builds Linux amd64/arm64 artifacts and the source package in parallel,
+# CI then builds all 3 artifacts (Linux/macOS/source) in parallel,
 # publishes them to a GitHub Release, and uploads the self-update src/ manifest.
 # No binaries are committed to the repo — they live in the Release assets.
 set -euo pipefail
@@ -54,12 +54,6 @@ git tag "$TAG"
 echo "[*] Pushing to origin main + tags"
 git push origin main
 git push origin "$TAG"
-
-# 3b. Publish the self-hosted /v update assets to the cli.laintas.com docroot.
-# /v reads from cli.laintas.com (not GitHub) at runtime, so regenerate the
-# manifest.json + src_manifest.zip for `latest/` and `v$VERSION/` on this box.
-echo "[*] Publishing self-hosted update assets to cli.laintas.com"
-python3 "$PROJECT_DIR/scripts/build_release_assets.py"
 
 # 4. Watch CI
 echo "[*] CI triggered. Watching run..."

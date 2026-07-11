@@ -52,24 +52,17 @@ class HwgParseError(Exception):
 
 # ── Metadata extractors ─────────────────────────────────────────────────
 
+_ON_RE = re.compile(r'on\s*:\s*(?:"([^"]*)"|\'([^\']*)\'|([A-Za-z_][A-Za-z0-9_-]*))')
 _MAXLOOPS_RE = re.compile(r'maxLoops\s*:\s*(\d+)')
 _DAYS_RE = re.compile(r'days\s*:\s*\[([^\]]*)\]')
 _RETRY_RE = re.compile(r'\bretry\s*:\s*(\d+)')
 
 
 def _extract_on(content: str) -> Optional[str]:
-    # Split metadata into top-level key/value pairs (respecting brackets and
-    # quotes) so a value like `status in [PASS, FAIL]` is not split at its
-    # inner comma. The `on:` key is matched anchored at the start of a pair so
-    # it cannot be confused with a substring of another key (e.g. `action:`).
-    for part in _split_top_level(content):
-        m = re.match(r'^on\s*:\s*(.+)$', part, re.I)
-        if m:
-            val = m.group(1).strip()
-            if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
-                val = val[1:-1]
-            return val or None
-    return None
+    m = re.search(r'on\s*:\s*(?:"([^"]*)"|\'([^\']*)\'|([^,}]+))', content)
+    if not m:
+        return None
+    return (m.group(1) or m.group(2) or m.group(3) or "").strip() or None
 
 
 def _split_top_level(value: str, sep: str = ",") -> list[str]:
@@ -199,13 +192,8 @@ def _extract_days(content: str) -> Optional[list[str]]:
     m = _DAYS_RE.search(content)
     if not m:
         return None
-    days: list[str] = []
-    for p in m.group(1).split(","):
-        p = p.strip()
-        p = re.sub(r'^["\']|["\']$', '', p)
-        if p:
-            days.append(p)
-    return days or None
+    parts = m.group(1).split(",")
+    return [p.strip().strip('"\x27') for p in parts if p.strip()] or None
 
 
 def _validate_io_params(statements: list) -> list[str]:
@@ -240,7 +228,7 @@ def _refs_from_io(io: Optional[dict]) -> list[tuple[str, str, bool]]:
     refs: list[tuple[str, str, bool]] = []
     for p in (io or {}).get("in", []):
         src = p.get("source") or p.get("default") or ""
-        m = re.match(r"^#([A-Za-z_][A-Za-z0-9_-]*)\.([A-Za-z_][A-Za-z0-9_-]*)(\[-1\])?#$", src)
+        m = re.match(r"^#([A-Za-z_][A-Za-z0-9_-]*)\.([A-Za-z_][A-Za-z0-9_-]*)(\[-1\])?$", src)
         if m:
             refs.append((m.group(1), m.group(2), bool(m.group(3))))
     return refs
@@ -530,30 +518,18 @@ def validate(statements: list) -> list[str]:
         if edge["to"] not in by_id:
             errors.append(f'Edge to #{edge["to"]}# references an undeclared node.')
 
-    # I/O references: a node input may read another node's declared output, but
-    # only if that node can execute earlier on some path (i.e. it can reach this
-    # node via edges). Source declaration order is NOT required - the runtime
-    # walks the graph by edges, not by source order, so a node declared later in
-    # the source may legitimately be the start that runs first. A self-reference
-    # needs `[-1]` (previous iteration); the current iteration's output does not
-    # exist until the node finishes.
-    ancestors = _ancestors(nodes, edges)
+    available: dict[str, set] = {}
     for node in nodes:
         for ref_node, ref_field, previous in _refs_from_io(node.get("io")):
-            if ref_node == node["id"]:
-                if previous:
-                    if ref_field not in _node_outs(node):
-                        errors.append(f'#{node["id"]}#: input references undeclared previous output #{ref_node}.{ref_field}[-1].')
-                else:
-                    errors.append(f'#{node["id"]}#: input references its own current output #{ref_node}.{ref_field} - use #{ref_node}.{ref_field}[-1] to read the previous iteration.')
-                continue
-            ref = by_id.get(ref_node)
-            if ref is None:
-                errors.append(f'#{node["id"]}#: input references undeclared node #{ref_node}.')
-            elif ref_field not in _node_outs(ref):
+            outs = available.get(ref_node)
+            if ref_node == node["id"] and previous:
+                if ref_field not in _node_outs(node):
+                    errors.append(f'#{node["id"]}#: input references undeclared previous output #{ref_node}.{ref_field}[-1].')
+            elif outs is None:
+                errors.append(f'#{node["id"]}#: input references #{ref_node}.{ref_field} before that node has completed.')
+            elif ref_field not in outs:
                 errors.append(f'#{node["id"]}#: input references undeclared output #{ref_node}.{ref_field}.')
-            elif ref_node not in ancestors.get(node["id"], set()):
-                errors.append(f'#{node["id"]}#: input references #{ref_node}.{ref_field}, but #{ref_node}# cannot execute before #{node["id"]}# (no path #{ref_node}# -> ... -> #{node["id"]}#).')
+        available[node["id"]] = _node_outs(node)
 
     for edge in edges:
         field = _condition_field(edge.get("on"))
@@ -610,33 +586,6 @@ def validate(statements: list) -> list[str]:
             errors.append("No end node — every node has an outgoing edge (cycle with no exit point).")
 
     return errors
-
-
-def _ancestors(nodes: list, edges: list) -> dict[str, set]:
-    """Map each node id to the set of node ids that can reach it via edges.
-
-    Used to validate that a node input referencing ``#X.field`` can actually
-    have seen X's output at runtime (X must be able to execute before this node
-    on some path). Computed via forward reachability: for each node N, every
-    descendant of N has N as an ancestor.
-    """
-    fwd: dict[str, list[str]] = {n["id"]: [] for n in nodes}
-    for e in edges:
-        if e["from"] in fwd and e["to"] in fwd:
-            fwd[e["from"]].append(e["to"])
-    anc: dict[str, set] = {n["id"]: set() for n in nodes}
-    for n in nodes:
-        seen: set = set()
-        stack = [n["id"]]
-        while stack:
-            x = stack.pop()
-            for y in fwd.get(x, ()):
-                if y not in seen:
-                    seen.add(y)
-                    stack.append(y)
-        for d in seen:
-            anc[d].add(n["id"])
-    return anc
 
 
 def _has_unbounded_cycle(nodes: list, edges: list) -> bool:

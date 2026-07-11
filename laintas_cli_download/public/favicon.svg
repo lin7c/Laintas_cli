@@ -1,7 +1,15 @@
-<svg width="256" height="256" viewBox="0 0 256 256" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Laintas CLI">
-  <rect width="256" height="256" rx="48" fill="#ffffff"/>
-  <rect x="16" y="16" width="224" height="224" rx="38" fill="none" stroke="#d8dbd3" stroke-width="8"/>
-  <text x="58" y="166" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="106" font-weight="900" letter-spacing="-10">
-    <tspan fill="#d83b32">&gt;</tspan><tspan fill="#18a266">/</tspan>
-  </text>
+<svg width="256" height="256" viewBox="0 0 256 256" xmlns="http://www.w3.org/2000/svg">
+  <!-- Laintas CLI brand mark: "L-CLI" wordmark, green L + red -CLI -->
+  <rect x="0" y="0" width="256" height="256" rx="56" ry="56" fill="#1a1a17"/>
+  <!-- L (green) -->
+  <g fill="none" stroke="#3ddc84" stroke-width="13" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M34 90 V164 H60"/>
+  </g>
+  <!-- -CLI (red) -->
+  <g fill="none" stroke="#ff4d4d" stroke-width="13" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M74 128 H100"/>
+    <path d="M150 108 A 24 24 0 1 0 150 148"/>
+    <path d="M180 90 V164 H206"/>
+    <path d="M226 90 V164"/>
+  </g>
 </svg>
