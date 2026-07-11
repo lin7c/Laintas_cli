@@ -732,6 +732,15 @@ def evaluate_email_send(req_id: str = None, agent_id: str = None) -> PolicyDecis
         _write_audit(_audit_entry("mail.send_to_user", "allow", "disabled mode", None, req_id, agent_id))
         return PolicyDecision("allow")
 
+    try:
+        import mode_manager as _mode_manager
+        if _mode_manager.is_mail_mode():
+            _write_audit(_audit_entry(
+                "mail.send_to_user", "allow", "mail mode auto-approves sending", None, req_id, agent_id))
+            return PolicyDecision("allow")
+    except ImportError:
+        pass
+
     reason = "sending email always requires approval (audit and enforce modes alike)"
     _write_audit(_audit_entry("mail.send_to_user", "needs_approval", reason, None, req_id, agent_id))
     return PolicyDecision("needs_approval", "", reason)
