@@ -1054,6 +1054,14 @@ def _mail_send_raw(ctx: ToolCtx, subject: str, body: str, kind: str = "Message")
     return result
 
 
+# Tracks whether mail.send_to_user already fired for the current task, so
+# task_complete's mail-mode auto-send (see _bi_task_complete) doesn't send a
+# second, redundant email for the same turn. Keyed by agent_id (falls back
+# to a shared key for callers with none) and popped/consumed exactly once by
+# task_complete, regardless of mode, so it never leaks across runs.
+_mail_sent_this_task: dict[str, bool] = {}
+
+
 def _bi_mail_send_to_user(params: dict, ctx: ToolCtx) -> dict:
     """Email the current account's own verified Laintas address (never an
     arbitrary recipient — the gateway resolves the address server-side).
@@ -1068,7 +1076,10 @@ def _bi_mail_send_to_user(params: dict, ctx: ToolCtx) -> dict:
     if blocked is not None:
         return blocked
 
-    return _mail_send_raw(ctx, subject, body, kind="Message")
+    result = _mail_send_raw(ctx, subject, body, kind="Message")
+    if result.get("ok"):
+        _mail_sent_this_task[ctx.agent_id or "_default"] = True
+    return result
 
 
 def _bi_mail_check_inbox(params: dict, ctx: ToolCtx) -> dict:
@@ -3137,7 +3148,10 @@ def _bi_task_complete(params: dict, ctx: ToolCtx) -> dict:
         "_task_complete": True,
         "summary": summary,
     }
-    if summary:
+    # Consumed exactly once per task_complete regardless of mode, so a stale
+    # flag never leaks into some later, unrelated task for the same agent_id.
+    already_sent = _mail_sent_this_task.pop(ctx.agent_id or "_default", False)
+    if summary and not already_sent:
         try:
             import mode_manager
             if mode_manager.is_mail_mode():
