@@ -916,6 +916,20 @@ def _check_email_send_policy(ctx: ToolCtx) -> Optional[dict]:
     return None
 
 
+def _resolve_backend_profile():
+    """Import + resolve the active backend profile, following the same
+    fail-closed fallback as laintas_cli.get_backend_profile() (not imported
+    directly to avoid a circular import with the entry-point module)."""
+    import backend_profiles
+    backend_url = os.environ.get("LAINTAS_BACKEND", "https://laintas.com")
+    try:
+        profile = backend_profiles.resolve(backend_url)
+    except ValueError:
+        profile = backend_profiles.BackendProfile(
+            "safe-fallback", "official", "https://laintas.com")
+    return backend_profiles, profile
+
+
 def _bi_mail_send_to_user(params: dict, ctx: ToolCtx) -> dict:
     """Email the current account's own verified Laintas address (never an
     arbitrary recipient — the gateway resolves the address server-side).
@@ -932,16 +946,9 @@ def _bi_mail_send_to_user(params: dict, ctx: ToolCtx) -> dict:
 
     try:
         import requests
-        import backend_profiles
+        backend_profiles, profile = _resolve_backend_profile()
     except ImportError as exc:
         return {"ok": False, "error": f"missing dependency: {exc}"}
-
-    backend_url = os.environ.get("LAINTAS_BACKEND", "https://laintas.com")
-    try:
-        profile = backend_profiles.resolve(backend_url)
-    except ValueError:
-        profile = backend_profiles.BackendProfile(
-            "safe-fallback", "official", "https://laintas.com")
 
     headers, cookies = backend_profiles.request_auth(profile, ctx.session)
     try:
@@ -961,6 +968,53 @@ def _bi_mail_send_to_user(params: dict, ctx: ToolCtx) -> dict:
         return {"ok": False, "error": f"send failed: {detail}"}
 
     return {"ok": True, "result": "Email sent to your verified account address."}
+
+
+def _bi_mail_check_inbox(params: dict, ctx: ToolCtx) -> dict:
+    """Check for emails the user sent to their own AI agent (via the account's
+    verified Laintas address). Read-only — no approval tier, since it can't
+    take any action by itself; use mail.send_to_user to reply."""
+    unread_only = params.get("unread_only", True)
+    ack = bool(params.get("mark_read", True))
+
+    try:
+        import requests
+        backend_profiles, profile = _resolve_backend_profile()
+    except ImportError as exc:
+        return {"ok": False, "error": f"missing dependency: {exc}"}
+
+    headers, cookies = backend_profiles.request_auth(profile, ctx.session)
+    try:
+        resp = requests.get(
+            f"{profile.base_url}/api/agent/inbox",
+            params={"unread_only": "true" if unread_only else "false"},
+            headers=headers, cookies=cookies, timeout=10,
+        )
+    except requests.RequestException as exc:
+        return {"ok": False, "error": f"could not reach backend: {exc}"}
+
+    if resp.status_code >= 300:
+        try:
+            detail = resp.json().get("detail") or resp.text[:200]
+        except Exception:
+            detail = resp.text[:200]
+        return {"ok": False, "error": f"inbox check failed: {detail}"}
+
+    messages = (resp.json() or {}).get("messages", [])
+
+    if ack and messages:
+        email_ids = [m["email_id"] for m in messages if m.get("email_id")]
+        if email_ids:
+            try:
+                requests.post(
+                    f"{profile.base_url}/api/agent/inbox/ack",
+                    json={"email_ids": email_ids},
+                    headers=headers, cookies=cookies, timeout=10,
+                )
+            except requests.RequestException:
+                pass  # best-effort; next check will just see them again
+
+    return {"ok": True, "result": f"{len(messages)} message(s)", "messages": messages}
 
 
 def _bi_fs_write(params: dict, ctx: ToolCtx) -> dict:
@@ -4254,6 +4308,23 @@ def register_builtin_tools() -> None:
                 "required": ["subject", "body"],
             },
             invoke=_bi_mail_send_to_user,
+        ),
+        Tool(
+            name="mail.check_inbox",
+            description="Check for emails the user sent to their AI agent (their own verified Laintas "
+                        "address). Read-only, no approval needed. By default marks returned messages as "
+                        "read, so treat each result as something to act on now (e.g. reply via "
+                        "mail.send_to_user), not to re-poll later.",
+            schema={
+                "type": "object",
+                "properties": {
+                    "unread_only": {"type": "boolean", "default": True,
+                                     "description": "only return messages not yet marked read"},
+                    "mark_read": {"type": "boolean", "default": True,
+                                   "description": "mark returned messages as read"},
+                },
+            },
+            invoke=_bi_mail_check_inbox,
         ),
         Tool(
             name="fs.ls",
