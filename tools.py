@@ -888,6 +888,81 @@ def _bi_fs_delete(params: dict, ctx: ToolCtx) -> dict:
             "entries_deleted": before["count"]}
 
 
+def _check_email_send_policy(ctx: ToolCtx) -> Optional[dict]:
+    """Authorize mail.send_to_user before the outbound HTTP call. Always-ask
+    tier (mirrors _check_file_delete_policy / browser.evaluate) — there is no
+    risky-target dimension to weigh since the recipient is always the
+    caller's own verified account email, resolved server-side by the gateway."""
+    try:
+        import policy as _policy
+    except ImportError:
+        return None
+    try:
+        decision = _policy.evaluate_email_send(agent_id=ctx.agent_id)
+    except Exception as exc:
+        return {"ok": False, "error": f"Email policy check failed: {exc}"}
+    if decision.action == "deny":
+        return {"ok": False, "error": f"blocked by policy: {decision.reason}"}
+    if decision.action == "needs_approval":
+        approve_fn = getattr(ctx.deps, "request_command_approval", None) if ctx.deps else None
+        if approve_fn is None:
+            return {"ok": False, "error": "sending email requires approval but no approval callback is available"}
+        try:
+            approved = approve_fn("mail.send_to_user", decision.reason)
+        except Exception:
+            approved = False
+        if not approved:
+            return {"ok": False, "error": "user denied sending this email", "_user_denied": True}
+    return None
+
+
+def _bi_mail_send_to_user(params: dict, ctx: ToolCtx) -> dict:
+    """Email the current account's own verified Laintas address (never an
+    arbitrary recipient — the gateway resolves the address server-side).
+    Useful for reporting long-running task results or asking the human a
+    question when they're not watching the terminal."""
+    subject = str(params.get("subject") or "").strip()
+    body = str(params.get("body") or "").strip()
+    if not subject or not body:
+        return {"ok": False, "error": "'subject' and 'body' are both required"}
+
+    blocked = _check_email_send_policy(ctx)
+    if blocked is not None:
+        return blocked
+
+    try:
+        import requests
+        import backend_profiles
+    except ImportError as exc:
+        return {"ok": False, "error": f"missing dependency: {exc}"}
+
+    backend_url = os.environ.get("LAINTAS_BACKEND", "https://laintas.com")
+    try:
+        profile = backend_profiles.resolve(backend_url)
+    except ValueError:
+        profile = backend_profiles.BackendProfile(
+            "safe-fallback", "official", "https://laintas.com")
+
+    headers, cookies = backend_profiles.request_auth(profile, ctx.session)
+    try:
+        resp = requests.post(
+            f"{profile.base_url}/api/agent/send-email",
+            json={"subject": subject[:200], "body": body[:5000]},
+            headers=headers, cookies=cookies, timeout=10,
+        )
+    except requests.RequestException as exc:
+        return {"ok": False, "error": f"could not reach backend: {exc}"}
+
+    if resp.status_code >= 300:
+        try:
+            detail = resp.json().get("detail") or resp.text[:200]
+        except Exception:
+            detail = resp.text[:200]
+        return {"ok": False, "error": f"send failed: {detail}"}
+
+    return {"ok": True, "result": "Email sent to your verified account address."}
+
+
 def _bi_fs_write(params: dict, ctx: ToolCtx) -> dict:
     path = params.get("path")
     content = params.get("content", "")
@@ -4161,6 +4236,24 @@ def register_builtin_tools() -> None:
                 "required": ["path"],
             },
             invoke=_bi_fs_delete,
+        ),
+        Tool(
+            name="mail.send_to_user",
+            description="Email the current session's own account — e.g. to report a long-running "
+                        "task's result or ask a question when the user isn't watching the terminal. "
+                        "There is no 'to' parameter: the recipient is always resolved server-side to "
+                        "the caller's own verified Laintas account email, and can never be an "
+                        "arbitrary address. Always requires the user's fresh approval before sending, "
+                        "and is subject to a rate limit — do not use for routine chatter.",
+            schema={
+                "type": "object",
+                "properties": {
+                    "subject": {"type": "string", "description": "email subject, max 200 chars"},
+                    "body": {"type": "string", "description": "plain-text email body, max 5000 chars"},
+                },
+                "required": ["subject", "body"],
+            },
+            invoke=_bi_mail_send_to_user,
         ),
         Tool(
             name="fs.ls",

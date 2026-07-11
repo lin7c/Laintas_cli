@@ -718,6 +718,25 @@ def evaluate_browser_action(action: str, params: dict,
     return PolicyDecision("allow")
 
 
+def evaluate_email_send(req_id: str = None, agent_id: str = None) -> PolicyDecision:
+    """Evaluate a mail.send_to_user tool call. There is no risky-target
+    dimension to check (recipient is always the caller's own verified
+    account email, resolved server-side) — this is purely an always-ask
+    tier, same treatment as fs.delete / browser.evaluate, since it's an
+    irreversible action with an external, human-facing side effect.
+    """
+    cfg = _load_config()
+    mode = cfg.get("mode", "audit")
+
+    if mode == "disabled":
+        _write_audit(_audit_entry("mail.send_to_user", "allow", "disabled mode", None, req_id, agent_id))
+        return PolicyDecision("allow")
+
+    reason = "sending email always requires approval (audit and enforce modes alike)"
+    _write_audit(_audit_entry("mail.send_to_user", "needs_approval", reason, None, req_id, agent_id))
+    return PolicyDecision("needs_approval", "", reason)
+
+
 def needs_approval(command: str, cwd: str = None) -> bool:
     """Quick check: does this command need user approval?"""
     decision = evaluate(command, cwd)
