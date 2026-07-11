@@ -1292,6 +1292,7 @@ def _strip_ansi(text: str) -> str:
 # ── Interactive Session (PTY with stdin support) ─────────────────────────
 
 import codecs
+import unicodedata
 
 
 def _decode_send_keys(text: str) -> str:
@@ -12462,19 +12463,144 @@ def _get_input(cwd: str):
 
 
 # ── Background stdin reader for supplementary input during agent loop ──
-# When the agent loop is running, the user can type additional instructions.
-# A background thread reads stdin lines and queues them for injection at
-# the next iteration boundary of the agent loop.
+# When the agent loop is running, the user can type additional instructions,
+# or press Esc to interrupt (the same soft-interrupt Ctrl+C triggers — no
+# separate cancel path to keep in sync). A background thread owns stdin in
+# cbreak mode (no line buffering, so Esc doesn't need Enter to register) and
+# hand-rolls just enough line editing — echo, backspace, Enter-submit — to
+# keep queuing supplementary text working the way it did with readline().
 _bg_reader_thread: Optional[threading.Thread] = None
 _bg_reader_stop = threading.Event()
 
 
-def _start_bg_input_reader(target_queue: queue.Queue):
-    """Start a background thread that reads stdin for supplementary messages.
+def _bg_reader_line_mode(target_queue: queue.Queue):
+    """Fallback for non-tty stdin (pipes, tests): no Esc detection possible
+    without a real terminal, so just queue whole lines like before."""
+    while not _bg_reader_stop.is_set():
+        try:
+            r, _, _ = select.select([sys.stdin], [], [], 0.5)
+            if not r:
+                continue
+        except (select.error, ValueError, OSError):
+            time.sleep(0.5)
+            continue
+        try:
+            line = sys.stdin.readline()
+        except Exception:
+            break
+        if not line:
+            break  # EOF
+        line = line.strip()
+        if line:
+            target_queue.put(line)
+            console.print(f"[dim cyan]📝 Queued: {line[:80]}[/dim cyan]")
 
-    Only active during run_agent_loop() — the normal REPL prompt uses
-    prompt_toolkit which owns stdin. The background reader uses select()
-    on stdin.
+
+def _bg_reader_cbreak_mode(target_queue: queue.Queue):
+    """cbreak-mode reader: detects a bare Esc keypress immediately (no Enter
+    needed) and raises SIGINT so it goes through the exact same soft/hard
+    interrupt escalation as Ctrl+C. Also hand-rolls basic line editing for
+    supplementary text, using an incremental UTF-8 decoder so multi-byte
+    input (e.g. Chinese) is never corrupted mid-character."""
+    fd = sys.stdin.fileno()
+    try:
+        old_tcattr = termios.tcgetattr(fd)
+    except (termios.error, OSError):
+        _bg_reader_line_mode(target_queue)
+        return
+    try:
+        tty.setcbreak(fd)
+    except (termios.error, OSError):
+        _bg_reader_line_mode(target_queue)
+        return
+
+    decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
+    buf: list[str] = []
+
+    def _clear_visible_line():
+        if buf:
+            width = sum(2 if unicodedata.east_asian_width(c) in ('W', 'F') else 1
+                        for c in buf)
+            sys.stdout.write('\r' + ' ' * width + '\r')
+            sys.stdout.flush()
+        buf.clear()
+        decoder.reset()
+
+    try:
+        while not _bg_reader_stop.is_set():
+            try:
+                r, _, _ = select.select([fd], [], [], 0.3)
+            except (select.error, ValueError, OSError):
+                break
+            if not r:
+                continue
+            try:
+                chunk = os.read(fd, 1)
+            except (BlockingIOError, InterruptedError):
+                continue
+            except OSError:
+                break
+            if not chunk:
+                break  # EOF
+
+            if chunk == b'\x1b':
+                # Disambiguate a bare Esc from an escape sequence (arrow
+                # keys, Home/End, ...) which also starts with 0x1b — a real
+                # sequence's remaining bytes arrive within a few ms; a lone
+                # Esc press has nothing following it.
+                try:
+                    r2, _, _ = select.select([fd], [], [], 0.05)
+                except (select.error, ValueError, OSError):
+                    r2 = []
+                if r2:
+                    try:
+                        os.read(fd, 32)  # drain and discard the sequence
+                    except OSError:
+                        pass
+                    continue
+                _clear_visible_line()
+                try:
+                    signal.raise_signal(signal.SIGINT)
+                except (ValueError, OSError):
+                    pass
+                continue
+
+            if chunk in (b'\r', b'\n'):
+                if buf:
+                    line = ''.join(buf)
+                    sys.stdout.write('\n')
+                    sys.stdout.flush()
+                    _clear_visible_line()
+                    target_queue.put(line)
+                    console.print(f"[dim cyan]📝 Queued: {line[:80]}[/dim cyan]")
+                continue
+
+            if chunk in (b'\x7f', b'\x08'):  # Backspace/Delete
+                if buf:
+                    removed = buf.pop()
+                    cells = 2 if unicodedata.east_asian_width(removed) in ('W', 'F') else 1
+                    sys.stdout.write('\b \b' * cells)
+                    sys.stdout.flush()
+                continue
+
+            text = decoder.decode(chunk)
+            if text:  # complete character(s) — echo + accumulate
+                sys.stdout.write(text)
+                sys.stdout.flush()
+                buf.extend(text)
+    finally:
+        try:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_tcattr)
+        except (termios.error, OSError):
+            pass
+
+
+def _start_bg_input_reader(target_queue: queue.Queue):
+    """Start a background thread that reads stdin for supplementary messages
+    and Esc-to-interrupt during run_agent_loop().
+
+    Only active during the agent loop — the normal REPL prompt uses
+    prompt_toolkit which owns stdin.
 
     target_queue: the queue to put supplementary messages into (should be
     the same queue that run_agent_loop() drains between iterations).
@@ -12485,25 +12611,13 @@ def _start_bg_input_reader(target_queue: queue.Queue):
     _bg_reader_stop.clear()
 
     def _reader():
-        while not _bg_reader_stop.is_set():
-            try:
-                if hasattr(sys.stdin, 'fileno'):
-                    try:
-                        r, _, _ = select.select([sys.stdin], [], [], 0.5)
-                        if not r:
-                            continue
-                    except (select.error, ValueError, OSError):
-                        time.sleep(0.5)
-                        continue
-                line = sys.stdin.readline()
-                if not line:
-                    break  # EOF
-                line = line.strip()
-                if line:
-                    target_queue.put(line)
-                    console.print(f"[dim cyan]📝 Queued: {line[:80]}[/dim cyan]")
-            except Exception:
-                break
+        try:
+            if sys.stdin.isatty():
+                _bg_reader_cbreak_mode(target_queue)
+            else:
+                _bg_reader_line_mode(target_queue)
+        except Exception:
+            pass
 
     _bg_reader_thread = threading.Thread(
         target=_reader, daemon=True, name="bg-input-reader")
@@ -12959,7 +13073,7 @@ def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
 
     def _soft_interrupt(signum, frame):
         if _interrupt_event.is_set():
-            # Double Ctrl+C → force exit (escape hatch)
+            # Double Ctrl+C/Esc → force exit (escape hatch)
             console.print("\n[red]Force exit.[/red]")
             _stop_bg_input_reader()
             # Restore and call original handler
@@ -12967,7 +13081,7 @@ def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
             _old_sigint(signum, frame)
             return
         _interrupt_event.set()
-        console.print("\n[dim]⚡ Interrupting... (press Ctrl+C again to force exit)[/dim]")
+        console.print("\n[dim]⚡ Interrupting... (press Ctrl+C or Esc again to force exit)[/dim]")
 
     signal.signal(signal.SIGINT, _soft_interrupt)
 
