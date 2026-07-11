@@ -12997,97 +12997,6 @@ def request_file_delete_approval(path: str, preview: str, reason: str) -> bool:
     return choice == "yes"
 
 
-def _looks_complex(task: str) -> bool:
-    """Heuristic: should this task offer a plan-first menu?
-
-    Scores the input on signals that correlate with multi-step work:
-    action verbs, multi-clause sentences, and length. Returns True when
-    the score crosses a threshold — tuned to be conservative so simple
-    questions and one-liners go straight to the agent loop.
-    """
-    t = task.strip()
-    if len(t) < 25:
-        return False
-    score = 0
-    low = t.lower()
-
-    # Multi-step connector phrases
-    for phrase in (" and then ", " after that ", " step by step",
-                   " first ", " then ", " next ", " finally ", " multiple "):
-        if phrase in low:
-            score += 2
-
-    # Strong action verbs
-    for verb in ("implement", "refactor", "restructure", "migrate", "rewrite",
-                 "integrate", "architect", "build ", "create ", "add ",
-                 "set up", "wire up", "plumb", "overhaul"):
-        if verb in low:
-            score += 1
-
-    # Sentence count
-    sentences = [s for s in low.replace("!", ".").replace("?", ".").split(".") if len(s.strip()) > 10]
-    if len(sentences) >= 2:
-        score += 1
-    if len(sentences) >= 4:
-        score += 1
-
-    # Long input
-    if len(t) > 120:
-        score += 1
-    if len(t) > 300:
-        score += 1
-
-    return score >= 3
-
-
-def _maybe_offer_plan_mode(user_input: str) -> bool:
-    """Before running the agent loop, offer plan-first for complex tasks.
-
-    Returns True if the user chose plan mode (loop will be entered in plan
-    mode), False if they chose to act directly (or the prompt was skipped).
-    Only triggers in interactive TTY sessions and when not already in plan
-    mode.
-    """
-    if not sys.stdin.isatty():
-        return False
-    import plan_mode as _pm
-    if _pm.is_plan_mode():
-        return False
-    if not _looks_complex(user_input):
-        return False
-
-    _stop_bg_input_reader()
-    try:
-        console.print(Panel(
-            f"[dim]This looks like it might be a multi-step task.[/dim]\n"
-            f"[dim]Plan first to let the AI explore & design before executing, or act directly.[/dim]",
-            title="Approach?", border_style="accent", expand=False,
-        ))
-        try:
-            options = [
-                ("Plan first", "Explore and design before making changes"),
-                ("Act directly", "Start execution immediately"),
-            ]
-            choice = select_dialog(
-                options,
-                full_screen=False,
-                selected_index=1,
-                hint="↑↓ navigate  ↵ select  Esc/q act directly",
-                letter_shortcuts=True,
-            )
-        except (EOFError, KeyboardInterrupt):
-            choice = None
-    finally:
-        _start_bg_input_reader(get_user_message_queue())
-
-    if choice and choice[0] == "Plan first":
-        mode_manager.activate("act")
-        plan = _pm.enter_plan_mode(user_input)
-        console.print(f"[green]Entered plan mode.[/green] [dim](plan file: {plan['file']})[/dim]")
-        return True
-    return False
-
-
 def _show_plan_approval_menu() -> bool:
     """Review a submitted immutable plan revision; loop completion is not readiness."""
     import plan_mode as _pm
@@ -14116,9 +14025,6 @@ def main():
                     injected_done.set()
                 continue
             console.print("[dim]Not a system command, asking AI...[/dim]")
-
-            # Offer plan-first for complex tasks (only in interactive mode)
-            _maybe_offer_plan_mode(user_input)
 
             # Build event callback for real-time streaming
             def local_events_cb(events: list):
