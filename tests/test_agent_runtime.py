@@ -52,6 +52,40 @@ def _deps(response=None):
     )
 
 
+class _FakeInteractiveSession:
+    instances = []
+
+    def __init__(self, command, timeout=120, stream_output=False, cwd=None):
+        self.command = command
+        self.timeout = timeout
+        self.cwd = cwd
+        self.sent = []
+        self.full_output = ""
+        self.returncode = -1
+        self.alive = False
+        self.closed = False
+        type(self).instances.append(self)
+
+    def start(self):
+        self.alive = True
+        self.full_output += "ready\n"
+
+    def send_keys(self, keys):
+        self.sent.append(keys)
+        self.full_output += keys
+
+    def read_output(self, timeout=0.1):
+        return ""
+
+    def is_alive(self):
+        return self.alive and not self.closed
+
+    def close(self):
+        self.closed = True
+        self.alive = False
+        self.returncode = 0
+
+
 class AgentSchedulerTests(unittest.TestCase):
     def setUp(self):
         agent_loop.close_all_agents()
@@ -114,9 +148,67 @@ class AgentSchedulerTests(unittest.TestCase):
         self.assertEqual(agent_loop._running_count, 0)
         self.assertEqual(agent_loop._wait_queue, [])
 
+    def test_named_child_never_replaces_existing_agent(self):
+        parent = agent_loop.register_agent(name="parent", role="primary")
+        employee = agent_loop.register_agent(name="worker", role="pool")
+        with mock.patch("worktree_manager.is_git_repo", return_value=False), \
+                mock.patch.object(
+                    agent_loop, "run_agent_loop",
+                    return_value={"state": {"lastReply": "ok"}}):
+            child_id = agent_loop.spawn_subagent(
+                parent.id, "task", _deps(), name="worker")
+            info = agent_loop.wait_for_agent(child_id, timeout=2)
+
+        self.assertEqual(employee.id, "worker")
+        self.assertIs(agent_loop.get_agent("worker"), employee)
+        self.assertEqual(child_id, "worker-2")
+        self.assertEqual(info.status, "done")
+
+    def test_worktree_failure_is_explicit_not_shared_cwd_fallback(self):
+        parent = agent_loop.register_agent(name="parent", role="primary")
+        with mock.patch("worktree_manager.is_git_repo", return_value=True), \
+                mock.patch("worktree_manager.create_isolated_worktree",
+                           side_effect=RuntimeError("no worktree")):
+            child_id = agent_loop.spawn_subagent(parent.id, "task", _deps())
+
+        child = agent_loop.get_agent(child_id)
+        self.assertEqual(child.status, "error")
+        self.assertIn("Worktree isolation failed", child.error)
+        self.assertIsNone(child.thread)
+        message = agent_loop.recv_from_inbox(parent.id)
+        self.assertEqual(message["kind"], "child-error")
+
+    def test_structured_parallel_uses_canonical_spawner(self):
+        parent = agent_loop.register_agent(name="parent", role="primary")
+        ctx = tools.ToolCtx(
+            deps=_deps(), agent_id=parent.id, session={}, events_cb=None)
+        with mock.patch("worktree_manager.is_git_repo", return_value=False), \
+                mock.patch.object(
+                    agent_loop, "run_agent_loop",
+                    return_value={"state": {"lastReply": "complete"}}):
+            result = tools._bi_spawn_parallel({"tasks": [
+                {"goal": "first"}, {"goal": "second", "hint": "be brief"},
+            ]}, ctx)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(result["child_ids"]), 2)
+        children = [agent_loop.get_agent(cid) for cid in result["child_ids"]]
+        self.assertTrue(all(child.status == "done" for child in children))
+        self.assertEqual(len({child.group_id for child in children}), 1)
+
+    def test_finished_task_children_are_bounded(self):
+        for index in range(105):
+            child = agent_loop.register_agent(
+                name=f"finished-{index}", role="subagent")
+            agent_loop.mark_agent_finished(child.id, result="done")
+        retained = [a for a in agent_loop.get_all_agents()
+                    if a.role == "subagent" and a.status == "done"]
+        self.assertEqual(len(retained), 100)
+
 
 class AgentIsolationTests(unittest.TestCase):
     def setUp(self):
+        agent_loop.close_all_terminals()
         agent_loop.close_all_agents()
         agent_loop.reset_runtime_config()
         agent_loop.set_runtime_config("loop_delay", 0)
@@ -125,6 +217,7 @@ class AgentIsolationTests(unittest.TestCase):
     def tearDown(self):
         while not agent_loop.get_user_message_queue().empty():
             agent_loop.get_user_message_queue().get_nowait()
+        agent_loop.close_all_terminals()
         agent_loop.close_all_agents()
         agent_loop.reset_runtime_config()
 
@@ -164,11 +257,19 @@ class AgentIsolationTests(unittest.TestCase):
         self.assertEqual(primary.name, "primary")
 
     def test_agent_hire_tool_defines_profile_without_starting_work(self):
+        primary = agent_loop.register_agent(name="primary", role="primary")
+        primary.home_terminal = "term0"
+        terminal_session = mock.Mock()
+        terminal_session.is_alive.return_value = True
+        agent_loop.register_terminal(
+            terminal_session, "/bin/sh", 0, name="term0")
         ctx = tools.ToolCtx(
             agent_id="primary",
             depth=0,
             register_agent_fn=agent_loop.register_agent,
             get_agent=agent_loop.get_agent,
+            get_terminal=agent_loop.get_terminal,
+            station_agent=agent_loop.station_agent,
         )
         with tempfile.TemporaryDirectory() as tmp, \
                 mock.patch.object(agent_persistence, "AGENTS_DIR", Path(tmp)):
@@ -181,7 +282,11 @@ class AgentIsolationTests(unittest.TestCase):
         self.assertEqual(employee.profile.specialist_role, "reviewer")
         self.assertIsNone(employee.active_assignment)
         self.assertEqual(employee.status, "idle")
+        self.assertEqual(employee.role, "deployed")
+        self.assertEqual(employee.stationed_terminal, "term0")
+        self.assertIn(employee.id, agent_loop.get_terminal("term0").stationed_agent_ids)
         self.assertIsNone(tools.get_registry().get("agent.switch"))
+        employee.state["_persisted_employee"] = False
 
     def test_read_only_roles_cannot_escape_through_shell(self):
         for role in ("explorer", "architect", "reviewer",
@@ -208,6 +313,12 @@ class AgentIsolationTests(unittest.TestCase):
     def test_assignment_uses_employee_prompt_and_fresh_context(self):
         prompts = []
         deps = _deps()
+        deps.generate_prompt = lambda: (
+            "<environment>\n"
+            "Terminal: {{terminalName}} | "
+            "Parent terminal: {{parentTerminal}}\n"
+            "</environment>"
+        )
 
         def backend(**kwargs):
             prompts.append(kwargs["system_prompt"])
@@ -229,8 +340,22 @@ class AgentIsolationTests(unittest.TestCase):
         )
         employee.state["shortTermMemory"] = "old assignment memory"
         employee.chat_history.append({"role": "user", "content": "old task"})
-        employee.stationed_terminal = "alice-work"
-        employee.home_terminal = "alice-work"
+        root_session = mock.Mock()
+        root_session.is_alive.return_value = True
+        root_session.full_output = ""
+        root_session.command = "/bin/sh"
+        work_session = mock.Mock()
+        work_session.is_alive.return_value = True
+        work_session.full_output = ""
+        work_session.command = "/bin/sh"
+        work_session.returncode = -1
+        work_session.command_lock = threading.RLock()
+        agent_loop.register_terminal(
+            root_session, "/bin/sh", 0, name="term0")
+        agent_loop.register_terminal(
+            work_session, "/bin/sh", 0, name="alice-work",
+            parent_terminal="term0")
+        self.assertTrue(agent_loop.station_agent(employee.id, "alice-work"))
 
         with tempfile.TemporaryDirectory() as tmp, _chdir(tmp), \
                 mock.patch.object(agent_persistence, "AGENTS_DIR", Path(tmp) / "agents"):
@@ -249,6 +374,15 @@ class AgentIsolationTests(unittest.TestCase):
             {"role": "user", "content": "old task"}, employee.chat_history)
         self.assertTrue(any("ALICE-ONLY-PROMPT" in prompt for prompt in prompts))
         self.assertTrue(any("implement feature X" in prompt for prompt in prompts))
+        self.assertTrue(any(
+            "Terminal: alice-work | Parent terminal: term0" in prompt
+            for prompt in prompts))
+        self.assertTrue(any(
+            '<runtime_ownership authoritative="true">' in prompt
+            for prompt in prompts))
+        self.assertTrue(any(
+            "agent.hire` creates a persistent employee and deploys it directly"
+            in prompt for prompt in prompts))
 
     def test_employee_profile_persistence_round_trip(self):
         profile = agent_loop.EmployeeProfile(
@@ -276,6 +410,246 @@ class AgentIsolationTests(unittest.TestCase):
         self.assertEqual(restored.profile.tool_policy.allowed_tools, ["fs.read"])
         self.assertEqual(restored.profile.tool_policy.denied_tools, ["shell.exec"])
         self.assertEqual(restored.assignment_history[-1]["id"], "job-1")
+
+
+class PersistentOwnershipTests(unittest.TestCase):
+    def setUp(self):
+        agent_loop.close_all_terminals()
+        agent_loop.close_all_agents()
+
+    def tearDown(self):
+        agent_loop.close_all_terminals()
+        agent_loop.close_all_agents()
+
+    @staticmethod
+    def _session():
+        session = mock.Mock()
+        session.is_alive.return_value = True
+        return session
+
+    def _terminal(self, name, parent=None):
+        session = self._session()
+        agent_loop.register_terminal(
+            session, "/bin/sh", 0, name=name, parent_terminal=parent)
+        return session
+
+    def test_terminal_tree_cascades_agents_and_descendants(self):
+        root = self._terminal("term0")
+        child = self._terminal("child", "term0")
+        grandchild = self._terminal("grandchild", "child")
+        alice = agent_loop.register_agent(name="alice", role="deployed")
+        bob = agent_loop.register_agent(name="bob", role="deployed")
+        alice.state["_persisted_employee"] = True
+        bob.state["_persisted_employee"] = True
+        self.assertTrue(agent_loop.station_agent(alice.id, "child"))
+        self.assertTrue(agent_loop.station_agent(bob.id, "child"))
+        worker = agent_loop.register_agent(
+            name="alice-child", role="subagent", parent_id=alice.id)
+        self.assertEqual(worker.parent_terminal, "child")
+
+        with mock.patch.object(
+                agent_persistence, "delete_agent_state", return_value=True) as delete:
+            self.assertTrue(agent_loop.unregister_terminal("child"))
+
+        self.assertIsNotNone(agent_loop.get_terminal("term0"))
+        self.assertIsNone(agent_loop.get_terminal("child"))
+        self.assertIsNone(agent_loop.get_terminal("grandchild"))
+        self.assertIsNone(agent_loop.get_agent("alice"))
+        self.assertIsNone(agent_loop.get_agent("bob"))
+        self.assertIsNone(agent_loop.get_agent("alice-child"))
+        self.assertTrue(alice.abort_event.is_set())
+        self.assertTrue(bob.abort_event.is_set())
+        self.assertTrue(worker.abort_event.is_set())
+        self.assertEqual(
+            {call.args[0] for call in delete.call_args_list}, {"alice", "bob"})
+        self.assertFalse(root.close.called)
+        self.assertTrue(child.close.called)
+        self.assertTrue(grandchild.close.called)
+
+    def test_many_agents_per_terminal_but_one_terminal_per_agent(self):
+        self._terminal("term0")
+        self._terminal("left", "term0")
+        self._terminal("right", "term0")
+        alice = agent_loop.register_agent(name="alice", role="deployed")
+        bob = agent_loop.register_agent(name="bob", role="deployed")
+
+        self.assertTrue(agent_loop.station_agent(alice.id, "left"))
+        self.assertTrue(agent_loop.station_agent(bob.id, "left"))
+        self.assertEqual(
+            agent_loop.get_terminal("left").stationed_agent_ids,
+            ["alice", "bob"])
+
+        self.assertTrue(agent_loop.station_agent(alice.id, "right"))
+        self.assertNotIn("alice", agent_loop.get_terminal("left").stationed_agent_ids)
+        self.assertIn("bob", agent_loop.get_terminal("left").stationed_agent_ids)
+        self.assertEqual(
+            agent_loop.get_terminal("right").stationed_agent_ids, ["alice"])
+        self.assertEqual(alice.stationed_terminal, "right")
+        self.assertEqual(alice.home_terminal, "right")
+
+    def test_terminal_rename_updates_children_and_agent_binding(self):
+        self._terminal("term0")
+        self._terminal("parent", "term0")
+        self._terminal("child", "parent")
+        alice = agent_loop.register_agent(name="alice", role="deployed")
+        self.assertTrue(agent_loop.station_agent(alice.id, "parent"))
+
+        self.assertTrue(agent_loop.rename_terminal("parent", "renamed"))
+
+        self.assertEqual(
+            agent_loop.get_terminal("child").parent_terminal, "renamed")
+        self.assertEqual(alice.stationed_terminal, "renamed")
+        self.assertEqual(alice.home_terminal, "renamed")
+        self.assertIn(
+            "alice", agent_loop.get_terminal("renamed").stationed_agent_ids)
+
+    def test_child_terminal_requires_live_registered_parent_and_unique_name(self):
+        orphan = self._session()
+        with self.assertRaisesRegex(ValueError, "Parent terminal"):
+            agent_loop.register_terminal(
+                orphan, "/bin/sh", 0, name="orphan",
+                parent_terminal="missing")
+        self.assertFalse(orphan.close.called)
+
+        original = self._terminal("term0")
+        replacement = self._session()
+        with self.assertRaisesRegex(ValueError, "already exists"):
+            agent_loop.register_terminal(
+                replacement, "/bin/sh", 0, name="term0")
+        self.assertIs(agent_loop.get_terminal("term0").session, original)
+        self.assertFalse(original.close.called)
+
+    def test_ai_terminal_create_uses_cli_entry_and_callers_terminal_as_parent(self):
+        self._terminal("term0")
+        owner = agent_loop.register_agent(name="primary", role="primary")
+        owner.home_terminal = "term0"
+        deps = _deps()
+        deps.SubTerminalSession = _FakeInteractiveSession
+        ctx = tools.ToolCtx(
+            deps=deps, agent_id=owner.id, depth=0,
+            get_agent=agent_loop.get_agent,
+            get_terminal=agent_loop.get_terminal,
+            register_terminal=agent_loop.register_terminal,
+            unregister_terminal=agent_loop.unregister_terminal,
+        )
+
+        result = tools._bi_terminal_create({"name": "worker-cli"}, ctx)
+
+        self.assertTrue(result["ok"])
+        terminal = agent_loop.get_terminal("worker-cli")
+        self.assertEqual(terminal.parent_terminal, "term0")
+        self.assertIn("laintas_cli.py", terminal.session.command)
+        self.assertIn("--terminal-name worker-cli", terminal.session.command)
+
+
+class EphemeralSessionTests(unittest.TestCase):
+    def setUp(self):
+        agent_loop.close_all_agents()
+        agent_loop.close_all_terminals()
+        _FakeInteractiveSession.instances = []
+
+    def tearDown(self):
+        agent_loop.close_all_agents()
+        agent_loop.close_all_terminals()
+
+    def _ctx(self):
+        deps = _deps()
+        deps.InteractiveSession = _FakeInteractiveSession
+        return tools.ToolCtx(deps=deps, agent_id="child", cwd="/tmp")
+
+    def test_private_session_start_keys_read_status_and_close(self):
+        ctx = self._ctx()
+        before = list(agent_loop.get_all_terminals())
+
+        started = tools._bi_session_start(
+            {"command": "python", "cwd": "/tmp", "timeout": 20}, ctx)
+        self.assertTrue(started["ok"])
+        session = ctx.interactive_session
+        self.assertEqual(session.command, "python")
+        self.assertEqual(agent_loop.get_all_terminals(), before)
+
+        raw = tools._bi_session_keys({"keys": " x ", "mode": "raw"}, ctx)
+        line = tools._bi_session_keys({"keys": "print(2)", "mode": "line"}, ctx)
+        self.assertTrue(raw["ok"])
+        self.assertTrue(line["ok"])
+        self.assertEqual(session.sent, [" x ", "print(2)\r"])
+
+        session.full_output += "answer\n"
+        read = tools._bi_session_read({}, ctx)
+        self.assertEqual(read["new_output"], "answer\n")
+        self.assertTrue(tools._bi_session_status({}, ctx)["alive"])
+
+        closed = tools._bi_session_close({}, ctx)
+        self.assertTrue(closed["ok"])
+        self.assertTrue(session.closed)
+        self.assertIsNone(ctx.interactive_session)
+
+    def test_abort_immediately_closes_agent_private_session(self):
+        child = agent_loop.register_agent(
+            name="pty-owner", depth=1, role="subagent")
+        session = _FakeInteractiveSession("python")
+        session.start()
+        child.ephemeral_session = session
+
+        self.assertTrue(agent_loop.abort_agent(child.id))
+        self.assertTrue(session.closed)
+        self.assertIsNone(child.ephemeral_session)
+
+    def test_agent_loop_auto_closes_unowned_private_session(self):
+        responses = iter([
+            {
+                "reply": "starting",
+                "tool_calls": [{
+                    "name": "session.start",
+                    "arguments": {"command": "python"},
+                }],
+                "finish_reason": "tool_calls", "done": False, "error": False,
+            },
+            {
+                "reply": "finished",
+                "tool_calls": [{
+                    "name": "task.complete",
+                    "arguments": {"summary": "finished"},
+                }],
+                "finish_reason": "tool_calls", "done": False, "error": False,
+            },
+        ])
+        deps = _deps()
+        deps.InteractiveSession = _FakeInteractiveSession
+        deps.call_backend = lambda **kwargs: next(responses)
+        child = agent_loop.register_agent(
+            name="ephemeral-child", depth=1, role="subagent")
+
+        with tempfile.TemporaryDirectory() as tmp, _chdir(tmp), \
+                mock.patch.object(agent_persistence, "AGENTS_DIR", Path(tmp) / "agents"):
+            Path(".laintas").mkdir()
+            result = agent_loop.run_agent_loop(
+                deps, "use a temporary repl", {}, child.state,
+                child.chat_history, depth=1, agent_id=child.id,
+                max_loops_override=2)
+
+        self.assertEqual(len(_FakeInteractiveSession.instances), 1)
+        self.assertTrue(_FakeInteractiveSession.instances[0].closed)
+        self.assertIsNone(result["session"])
+        self.assertEqual(agent_loop.get_all_terminals(), [])
+
+    def test_shell_exec_abort_terminates_process_group(self):
+        child = agent_loop.register_agent(
+            name="cancel-shell", depth=1, role="subagent")
+        ctx = tools.ToolCtx(
+            agent_id=child.id, cwd="/tmp", get_agent=agent_loop.get_agent)
+        holder = {}
+        thread = threading.Thread(
+            target=lambda: holder.update(tools._bi_shell_exec(
+                {"command": "sleep 10", "timeout": 20}, ctx)))
+        thread.start()
+        time.sleep(0.2)
+        child.abort_event.set()
+        thread.join(timeout=3)
+
+        self.assertFalse(thread.is_alive())
+        self.assertFalse(holder["ok"])
+        self.assertEqual(holder["error"], "Command aborted")
 
     def test_employee_tool_policy_blocks_forged_tool_call_at_dispatch(self):
         calls = []

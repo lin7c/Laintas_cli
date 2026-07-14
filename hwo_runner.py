@@ -771,7 +771,7 @@ def _run_task_group(texts: list[str], ctx: HwoCtx, inherited: str = "") -> dict:
     import agent_loop as _al
     from agent_loop import (
         register_agent, mark_agent_finished, enter_waiting, exit_waiting,
-        run_agent_loop, schedule_agent, send_to_agent, can_spawn,
+        run_agent_loop, schedule_agent, send_to_agent, can_spawn, abort_agent,
     )
 
     parent_id = ctx.parent_id
@@ -831,9 +831,9 @@ def _run_task_group(texts: list[str], ctx: HwoCtx, inherited: str = "") -> dict:
             exit_waiting(parent_id)
 
     if not result_holder:
-        mark_agent_finished(child.id, error="timeout")
+        abort_agent(child.id)
         first = texts[0] if texts else ""
-        return {"ok": False, "msg": f"Task timed out: {first[:80]}"}
+        return {"ok": False, "msg": f"Task timed out; cancellation requested: {first[:80]}"}
     return result_holder
 
 
@@ -855,7 +855,7 @@ def _run_agent(agent_step: HwoAgent, ctx: HwoCtx, inherited: str = "") -> dict:
     import agent_loop as _al
     from agent_loop import (
         register_agent, mark_agent_finished, enter_waiting, exit_waiting,
-        run_agent_loop, schedule_agent, can_spawn,
+        run_agent_loop, schedule_agent, can_spawn, abort_agent,
     )
 
     parent_id = ctx.parent_id
@@ -866,9 +866,19 @@ def _run_agent(agent_step: HwoAgent, ctx: HwoCtx, inherited: str = "") -> dict:
     depth = (parent.depth + 1) if parent else 0
     full_name = "/".join([*ctx.name_path, agent_step.name])
 
-    child = register_agent(
-        name=agent_step.name, depth=depth, parent_id=parent_id, role="subagent"
-    )
+    try:
+        child = register_agent(
+            name=agent_step.name, depth=depth, parent_id=parent_id,
+            role="subagent", replace_existing=False,
+        )
+    except ValueError:
+        return {
+            "ok": False,
+            "msg": (
+                f"Cannot spawn #{full_name}#: agent id '{agent_step.name}' "
+                "is already in use. Rename the workflow agent."
+            ),
+        }
 
     # Resolve this agent's system prompt override: its own (file) prefix wins,
     # else it inherits whatever override (if any) its parent was running under.
@@ -1017,8 +1027,8 @@ def _run_agent(agent_step: HwoAgent, ctx: HwoCtx, inherited: str = "") -> dict:
             exit_waiting(parent_id)
 
     if not result_holder:
-        mark_agent_finished(child.id, error="timeout")
-        return {"ok": False, "msg": f"#{full_name}# timed out."}
+        abort_agent(child.id)
+        return {"ok": False, "msg": f"#{full_name}# timed out; cancellation requested."}
 
     ok = result_holder.get("ok", False)
     nested_outputs = result_holder.get("outputs") or {}

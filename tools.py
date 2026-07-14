@@ -21,8 +21,10 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import hashlib
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -42,8 +44,8 @@ from hwo_adapter import HWO_TOOL_DESCRIPTION
 class ToolCtx:
     """Runtime context passed to every tool invocation.
 
-    Tools should treat ctx as read-only inputs; mutations to deps/session
-    are not propagated back to the caller's state."""
+    Most fields are read-only inputs. ``interactive_session`` is deliberately
+    mutable: the agent loop synchronizes it back after tool invocation."""
     deps: Any = None                  # LoopDeps instance (read_file, etc.)
     agent_id: Optional[str] = None    # the agent calling this tool
     session: dict = field(default_factory=dict)
@@ -90,7 +92,7 @@ def infer_capabilities(name: str) -> frozenset[str]:
         caps.add("fs.read")
     if name.startswith(("fs.write", "fs.edit", "fs.multi_edit", "fs.delete")):
         caps.add("fs.write")
-    if name.startswith(("shell.", "terminal.", "session.keys")):
+    if name.startswith(("shell.", "terminal.", "session.")):
         caps.add("process.exec")
     if name.startswith(("web.", "browser.")):
         caps.add("network")
@@ -2278,273 +2280,147 @@ def _bi_agent_spawn(params: dict, ctx: ToolCtx) -> dict:
 
 
 def _bi_spawn(params: dict, ctx: ToolCtx) -> dict:
-    """Blocking single spawn — mirrors Helpwo spawn tool."""
+    """Blocking single spawn through the canonical task-child lifecycle."""
     import agent_loop as _al
-    import threading
 
     goal = (params.get("goal") or "").strip()
     if not goal:
         return {"ok": False, "error": "missing 'goal'"}
     context = (params.get("context") or "").strip()
-
     parent_id = ctx.agent_id
-    if parent_id and not _al.can_spawn(parent_id):
-        return {"ok": False, "error": "Cannot spawn: maximum agent depth reached."}
-
-    parent = _al.get_agent(parent_id) if parent_id else None
-    depth = (parent.depth + 1) if parent else 0
-
-    child = _al.register_agent(depth=depth, parent_id=parent_id, role="subagent")
-    spawn_ctx = context or ""
-
-    done_evt = threading.Event()
-    result_holder = {}
-
-    def _runner(ok: bool):
-        if not ok:
-            result_holder.update({"ok": False, "result": f"[{child.id}] cancelled while queued."})
-            done_evt.set()
-            return
-        try:
-            r = _al.run_agent_loop(
-                ctx.deps, goal, ctx.session, child.state, child.chat_history,
-                depth=child.depth, agent_id=child.id,
-            )
-            reply = (r.get("state") or {}).get("lastReply", "") if isinstance(r, dict) else ""
-            _al.mark_agent_finished(child.id, result=reply)
-            result_holder.update({"ok": True, "result": f"[{child.id}] {reply or '(done)'}"})
-        except Exception as e:
-            _al.mark_agent_finished(child.id, error=repr(e))
-            result_holder.update({"ok": False, "result": repr(e)})
-        finally:
-            done_evt.set()
-
-    if parent_id:
-        _al.enter_waiting(parent_id)
+    if not parent_id:
+        return {"ok": False, "error": "no current agent"}
+    child_id = _al.spawn_subagent(
+        parent_id=parent_id, task=goal, deps=ctx.deps,
+        session=ctx.session, events_cb=ctx.events_cb,
+        spawn_context=context,
+    )
+    if child_id is None:
+        return {"ok": False, "error": "Cannot spawn child agent."}
+    _al.enter_waiting(parent_id)
     try:
-        t = threading.Thread(
-            target=lambda: _al.schedule_agent(child.id, _runner),
-            daemon=True, name=f"spawn-{child.id}",
-        )
-        t.start()
-        done_evt.wait(timeout=300)
+        info = _al.wait_for_agent(child_id, timeout=300)
     finally:
-        if parent_id:
-            _al.exit_waiting(parent_id)
-
-    if not result_holder:
-        # Timeout is cancellation, not completion. Signal the live loop and
-        # leave its scheduler lease intact until the runner actually exits.
-        _al.abort_agent(child.id)
+        _al.exit_waiting(parent_id)
+    if info is None:
+        _al.abort_agent(child_id)
         return {"ok": False, "error": f"spawn timed out: {goal[:80]}"}
-    return result_holder
+    if info.status != "done":
+        return {"ok": False, "result": f"[{child_id}] {info.error or info.status}"}
+    return {"ok": True, "result": f"[{child_id}] {info.result or info.last_reply or '(done)'}",
+            "child_id": child_id}
 
 
 def _bi_spawn_parallel(params: dict, ctx: ToolCtx) -> dict:
-    """Fan-out + join — mirrors Helpwo spawn_parallel."""
+    """Fan out through ``spawn_subagent`` and join all canonical children."""
     import agent_loop as _al
-    import threading
 
     tasks = params.get("tasks") or []
     if not tasks:
         return {"ok": False, "error": "spawn_parallel requires at least one task"}
     if len(tasks) > 6:
         return {"ok": False, "error": "spawn_parallel: maximum 6 tasks"}
-
     parent_id = ctx.agent_id
-    if parent_id and not _al.can_spawn(parent_id):
-        return {"ok": False, "error": "Cannot spawn: maximum agent depth reached."}
+    if not parent_id:
+        return {"ok": False, "error": "no current agent"}
 
-    parent = _al.get_agent(parent_id) if parent_id else None
-    depth = (parent.depth + 1) if parent else 0
-    group_id = f"group-{int(time.time() * 1000)}"
+    normalized = []
+    for task in tasks:
+        goal = str(task.get("goal") or task.get("task") or "").strip()
+        if not goal:
+            return {"ok": False, "error": "every parallel task requires a goal"}
+        normalized.append({**task, "task": goal})
+    child_ids = _al.spawn_subagents_parallel(
+        parent_id, normalized, ctx.deps,
+        session=ctx.session, events_cb=ctx.events_cb)
+    if len(child_ids) != len(normalized):
+        return {"ok": False, "error": "one or more child agents could not be spawned"}
 
-    children = []
-    for t in tasks:
-        child = _al.register_agent(depth=depth, parent_id=parent_id, role="subagent")
-        child.group_id = group_id
-        children.append((child, t))
-
-    results = [None] * len(children)
-    done_events = [threading.Event() for _ in children]
-
-    def _make_runner(idx, child, task):
-        goal = (task.get("goal") or "").strip()
-        hint = (task.get("hint") or "").strip()
-        spawn_ctx = hint or ""
-
-        def _runner(ok: bool):
-            if not ok:
-                results[idx] = {"ok": False, "result": f"[{child.id}] cancelled."}
-                done_events[idx].set()
-                return
-            try:
-                r = _al.run_agent_loop(
-                    ctx.deps, goal, ctx.session, child.state, child.chat_history,
-                    depth=child.depth, agent_id=child.id,
-                )
-                reply = (r.get("state") or {}).get("lastReply", "") if isinstance(r, dict) else ""
-                _al.mark_agent_finished(child.id, result=reply)
-                results[idx] = {"ok": True, "result": reply or "(done)"}
-            except Exception as e:
-                _al.mark_agent_finished(child.id, error=repr(e))
-                results[idx] = {"ok": False, "result": repr(e)}
-            finally:
-                done_events[idx].set()
-        return _runner
-
-    if parent_id:
-        _al.enter_waiting(parent_id)
+    _al.enter_waiting(parent_id)
     try:
-        threads = []
-        for i, (child, task) in enumerate(children):
-            runner = _make_runner(i, child, task)
-            t = threading.Thread(
-                target=lambda r=runner: _al.schedule_agent(child.id, r),
-                daemon=True, name=f"par-{child.id}",
-            )
-            threads.append(t)
-            t.start()
-        for evt in done_events:
-            evt.wait(timeout=600)
+        infos = [_al.wait_for_agent(cid, timeout=600) for cid in child_ids]
     finally:
-        if parent_id:
-            _al.exit_waiting(parent_id)
+        _al.exit_waiting(parent_id)
 
-    for (child, _), result in zip(children, results):
-        if result is None:
-            _al.abort_agent(child.id)
-
-    ok = all(r and r.get("ok") for r in results)
-    succeeded = sum(1 for r in results if r and r.get("ok"))
-    lines = [f"═══ Parallel Results ({len(children)} agents) ═══"]
-    for i, ((child, task), r) in enumerate(zip(children, results)):
-        icon = "✓" if (r and r.get("ok")) else "✗"
-        goal = (task.get("goal") or "")[:80]
-        msg = (r.get("result") or "(timeout)") if r else "(timeout)"
-        lines.append(f"\n─── [{icon}] {child.id} ───\nGoal: {goal}\nResult: {msg[:400]}")
-    lines.append(f"\n═══ Summary: {succeeded}/{len(children)} succeeded ═══")
-
-    return {"ok": ok, "result": "\n".join(lines)}
+    lines = [f"═══ Parallel Results ({len(child_ids)} agents) ═══"]
+    succeeded = 0
+    for cid, task, info in zip(child_ids, normalized, infos):
+        if info is None:
+            _al.abort_agent(cid)
+            ok, message = False, "timed out; cancellation requested"
+        else:
+            ok = info.status == "done"
+            message = info.result or info.last_reply or info.error or info.status
+        succeeded += int(ok)
+        lines.append(
+            f"\n─── [{'✓' if ok else '✗'}] {cid} ───\n"
+            f"Goal: {task['task'][:80]}\nResult: {message[:400]}"
+        )
+    lines.append(f"\n═══ Summary: {succeeded}/{len(child_ids)} succeeded ═══")
+    return {"ok": succeeded == len(child_ids), "result": "\n".join(lines),
+            "child_ids": child_ids}
 
 
 def _bi_spawn_chain(params: dict, ctx: ToolCtx) -> dict:
-    """Sequential pipeline with handoff — mirrors Helpwo spawn_chain."""
+    """Run a sequential handoff pipeline through canonical task children."""
     import agent_loop as _al
-    import threading
 
     steps = params.get("steps") or []
     if len(steps) < 2:
         return {"ok": False, "error": "spawn_chain requires at least 2 steps"}
     if len(steps) > 6:
         return {"ok": False, "error": "spawn_chain: maximum 6 steps"}
-
     parent_id = ctx.agent_id
-    if parent_id and not _al.can_spawn(parent_id):
-        return {"ok": False, "error": "Cannot spawn: maximum agent depth reached."}
+    if not parent_id:
+        return {"ok": False, "error": "no current agent"}
 
-    parent = _al.get_agent(parent_id) if parent_id else None
-    depth = (parent.depth + 1) if parent else 0
     chain_id = f"chain-{int(time.time() * 1000)}"
-
-    # Register all steps upfront so they're visible immediately
-    children = []
-    for i, step in enumerate(steps):
-        child = _al.register_agent(depth=depth, parent_id=parent_id, role="subagent")
-        child.chain_id = chain_id
-        child.chain_step_index = i
-        if i > 0:
-            child.status = "queued"   # visually show as queued
-        children.append((child, step))
-
     summaries = []
-
-    if parent_id:
+    child_ids = []
+    handoff = ""
+    for index, step in enumerate(steps):
+        goal = str(step.get("goal") or "").strip()
+        if not goal:
+            return {"ok": False, "error": f"chain step {index + 1} requires a goal"}
+        last = index == len(steps) - 1
+        context_parts = [
+            f"[PIPELINE STEP {index + 1}/{len(steps)}] "
+            + ("Return the final deliverable." if last else
+               "Return a concise handoff with findings, files touched, and open issues.")
+        ]
+        if handoff:
+            context_parts.append(f"[HANDOFF FROM PREVIOUS STEP]\n{handoff}")
+        if step.get("hint"):
+            context_parts.append(f"[STEP HINT] {step['hint']}")
+        cid = _al.spawn_subagent(
+            parent_id=parent_id, task=goal, deps=ctx.deps,
+            session=ctx.session, events_cb=ctx.events_cb,
+            name=step.get("name"), role=step.get("role"),
+            chain_id=chain_id, chain_step_index=index,
+            spawn_context="\n\n".join(context_parts),
+        )
+        if cid is None:
+            return {"ok": False, "result": f"Chain {chain_id} could not spawn step {index + 1}"}
+        child_ids.append(cid)
         _al.enter_waiting(parent_id)
-    try:
-        handoff = ""
-        for i, (child, step) in enumerate(children):
-            goal = (step.get("goal") or "").strip()
-            hint = (step.get("hint") or "").strip()
-            is_last = i == len(steps) - 1
-
-            pipeline_note = (
-                f"[PIPELINE STEP {i+1}/{len(steps)}] You are one step of a sequential pipeline. "
-            )
-            if not is_last:
-                pipeline_note += (
-                    "The next step depends on your output. End with a handoff document:\n"
-                    "## Done\n## Key findings\n## Files touched\n## Notes for next step\n## Open issues"
-                )
-            else:
-                pipeline_note += "You are the LAST step — your final message is the deliverable."
-
-            sections = [pipeline_note]
-            if handoff:
-                sections.append(f"[HANDOFF FROM PREVIOUS STEP]\n{handoff}")
-            if hint:
-                sections.append(f"[STEP HINT] {hint}")
-
-            spawn_ctx = "\n\n".join(sections)
-
-            done_evt = threading.Event()
-            result_holder = {}
-
-            def _runner(ok, child=child, goal=goal, spawn_ctx=spawn_ctx):
-                if not ok:
-                    result_holder.update({"ok": False, "result": "Cancelled while queued."})
-                    done_evt.set()
-                    return
-                try:
-                    full_goal = f"{spawn_ctx}\n\n{goal}"
-                    r = _al.run_agent_loop(
-                        ctx.deps, full_goal, ctx.session, child.state, child.chat_history,
-                        depth=child.depth, agent_id=child.id,
-                    )
-                    reply = (r.get("state") or {}).get("lastReply", "") if isinstance(r, dict) else ""
-                    _al.mark_agent_finished(child.id, result=reply)
-                    result_holder.update({"ok": True, "result": reply or "(done)"})
-                except Exception as e:
-                    _al.mark_agent_finished(child.id, error=repr(e))
-                    result_holder.update({"ok": False, "result": repr(e)})
-                finally:
-                    done_evt.set()
-
-            t = threading.Thread(
-                target=lambda r=_runner: _al.schedule_agent(child.id, r),
-                daemon=True, name=f"chain-{child.id}",
-            )
-            t.start()
-            done_evt.wait(timeout=300)
-
-            if not result_holder:
-                _al.abort_agent(child.id)
-                # abort remaining
-                for j, (c2, _) in enumerate(children):
-                    if j > i:
-                        _al.abort_agent(c2.id)
-                return {"ok": False, "result": f"Chain {chain_id} timed out at step {i+1}"}
-
-            if not result_holder.get("ok"):
-                for j, (c2, _) in enumerate(children):
-                    if j > i:
-                        _al.abort_agent(c2.id)
-                done_steps = "\n".join(summaries)
-                return {
-                    "ok": False,
-                    "result": (
-                        f"═══ Chain {chain_id} FAILED at step {i+1}/{len(steps)} ═══\n"
-                        f"Goal: {goal[:120]}\nError: {result_holder['result'][:400]}"
-                        + (f"\n\nCompleted:\n{done_steps}" if done_steps else "")
-                    ),
-                }
-
-            handoff = result_holder["result"]
-            summaries.append(f"  ✓ Step {i+1}: {goal[:80]}")
-
-    finally:
-        if parent_id:
+        try:
+            info = _al.wait_for_agent(cid, timeout=300)
+        finally:
             _al.exit_waiting(parent_id)
+        if info is None:
+            _al.abort_agent(cid)
+            return {"ok": False, "result": f"Chain {chain_id} timed out at step {index + 1}"}
+        if info.status != "done":
+            return {
+                "ok": False,
+                "result": (
+                    f"Chain {chain_id} failed at step {index + 1}: "
+                    f"{info.error or info.status}"
+                ),
+                "child_ids": child_ids,
+            }
+        handoff = info.result or info.last_reply or "(done)"
+        summaries.append(f"  ✓ Step {index + 1}: {goal[:80]}")
 
     return {
         "ok": True,
@@ -2553,6 +2429,7 @@ def _bi_spawn_chain(params: dict, ctx: ToolCtx) -> dict:
             + "\n".join(summaries)
             + f"\n\n─── Final step output ───\n{handoff}"
         ),
+        "child_ids": child_ids,
     }
 
 
@@ -2758,7 +2635,6 @@ def _bi_agent_tell(params: dict, ctx: ToolCtx) -> dict:
 
 def _bi_agent_station(params: dict, ctx: ToolCtx) -> dict:
     """Station the current agent at a named terminal (bash sub-shell)."""
-    name = (params.get("name") or "main").strip() or "main"
     target_agent = (
         ctx.get_agent(ctx.agent_id)
         if ctx.get_agent is not None and ctx.agent_id
@@ -2766,13 +2642,19 @@ def _bi_agent_station(params: dict, ctx: ToolCtx) -> dict:
     )
     if target_agent is None:
         return {"ok": False, "error": "no current agent to station"}
+    current_terminal = (
+        target_agent.stationed_terminal or target_agent.home_terminal
+        or target_agent.parent_terminal or "term0")
+    name = (params.get("name") or current_terminal).strip() or current_terminal
 
     if ctx.get_terminal is not None and ctx.register_terminal is not None:
         existing = ctx.get_terminal(name)
         if existing and existing.session and existing.session.is_alive():
             # Re-use existing live terminal — just attach the agent
             if ctx.station_agent is not None:
-                ctx.station_agent(target_agent.id, name)
+                if not ctx.station_agent(target_agent.id, name):
+                    return {"ok": False,
+                            "error": "agent has an active assignment and cannot move"}
             return {"ok": True, "result": f"Stationed {target_agent.id} in existing terminal {name}"}
         if existing and ctx.unregister_terminal:
             ctx.unregister_terminal(name)
@@ -2784,9 +2666,18 @@ def _bi_agent_station(params: dict, ctx: ToolCtx) -> dict:
         if not sub.is_alive():
             return {"ok": False, "error": f"failed to start terminal '{name}'"}
         sub.read_output(timeout=0.1)
-        ctx.register_terminal(sub, shell_cmd, ctx.depth, name=name)
+        try:
+            ctx.register_terminal(
+                sub, shell_cmd, ctx.depth, name=name,
+                parent_terminal=current_terminal)
+        except Exception as exc:
+            sub.close()
+            return {"ok": False, "error": f"could not register terminal '{name}': {exc}"}
     if ctx.station_agent is not None:
-        ctx.station_agent(target_agent.id, name)
+        if not ctx.station_agent(target_agent.id, name):
+            if ctx.unregister_terminal is not None:
+                ctx.unregister_terminal(name)
+            return {"ok": False, "error": f"could not deploy agent to '{name}'"}
     return {"ok": True, "result": f"Stationed {target_agent.id} in terminal {name}"}
 
 
@@ -2825,7 +2716,7 @@ def _bi_agent_wait(params: dict, ctx: ToolCtx) -> dict:
 
 
 def _bi_agent_hire(params: dict, ctx: ToolCtx) -> dict:
-    """Define an available employee capability profile; do not start work."""
+    """Hire an employee and deploy it to the caller's current terminal."""
     if ctx.register_agent_fn is None:
         return {"ok": False, "error": "hire not available"}
     import agent_loop as _al
@@ -2861,20 +2752,51 @@ def _bi_agent_hire(params: dict, ctx: ToolCtx) -> dict:
         capability_tags=([role.name] if role else ["general"]),
         tool_policy=_al.AgentToolPolicy(allowed_tools=allowed_tools),
     )
-    info = ctx.register_agent_fn(
-        name=name, depth=max(1, ctx.depth + 1), role="pool", profile=profile)
+    owner = (
+        ctx.get_agent(ctx.agent_id)
+        if ctx.get_agent is not None and ctx.agent_id else None
+    )
+    terminal_name = (
+        (owner.stationed_terminal or owner.home_terminal or owner.parent_terminal)
+        if owner is not None else "term0"
+    ) or "term0"
+    terminal = ctx.get_terminal(terminal_name) if ctx.get_terminal else None
+    if terminal is None or terminal.session is None or not terminal.session.is_alive():
+        return {
+            "ok": False,
+            "error": (
+                f"current terminal '{terminal_name}' is unavailable; "
+                "a persistent agent requires a live deployment terminal"
+            ),
+        }
+    try:
+        info = ctx.register_agent_fn(
+            name=name, depth=max(1, ctx.depth + 1), role="deployed",
+            profile=profile, replace_existing=False)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    info.state["_persisted_employee"] = True
     if not info.profile.prompt and not info.profile.specialist_role:
         info.profile.prompt = (
-            f"You are {info.name}, a hired employee. Work only on explicit "
-            "station assignments and report concrete results to the manager.")
+            f"You are {info.name}, a persistent hired employee deployed to "
+            "the current terminal. Your lifetime is owned by that terminal. "
+            "Work only on explicit assignments delivered through your "
+            "deployment terminal or agent messaging, and report concrete "
+            "results to the manager.")
+    info.parent_terminal = terminal_name
+    if ctx.station_agent is None or not ctx.station_agent(info.id, terminal_name):
+        _al.unregister_agent(info.id, delete_persisted=True)
+        return {"ok": False,
+                "error": f"could not deploy agent '{info.id}' to '{terminal_name}'"}
     _ap.save_agent_state(info)
     return {
         "ok": True,
         "result": (
-            f"Hired available employee {info.id} ({info.profile.title}). "
-            "No work has started; assign it with /station --task."
+            f"Hired employee {info.id} ({info.profile.title}) and deployed it "
+            f"to {terminal_name}. No assignment has started."
         ),
         "agent_id": info.id,
+        "terminal": terminal_name,
     }
 
 
@@ -2943,15 +2865,13 @@ def _bi_terminal_terminate(params: dict, ctx: ToolCtx) -> dict:
     target = (params.get("name") or "").strip()
     if not target:
         return {"ok": False, "error": "missing 'name'"}
+    if target == "term0":
+        return {"ok": False, "error": "term0 is owned by the current CLI; exit the CLI to close it"}
     if ctx.unregister_terminal is None:
         return {"ok": False, "error": "terminate not available"}
-    if ctx.get_terminal is not None:
-        term = ctx.get_terminal(target)
-        if term and ctx.unstation_agent is not None:
-            for aid in list(term.stationed_agent_ids):
-                ctx.unstation_agent(aid)
     if ctx.unregister_terminal(target):
-        return {"ok": True, "result": f"Terminated {target}"}
+        return {"ok": True,
+                "result": f"Terminated {target}, its child terminals, and deployed agents"}
     return {"ok": False, "error": f"terminal '{target}' not found"}
 
 
@@ -2970,14 +2890,31 @@ def _bi_terminal_create(params: dict, ctx: ToolCtx) -> dict:
         if existing is not None:
             return {"ok": False, "error": f"terminal '{name}' already exists"}
 
-    lain_cmd = f"{sys.executable} {os.path.abspath(__file__)} --depth {ctx.depth + 1}"
+    owner = ctx.get_agent(ctx.agent_id) if ctx.get_agent and ctx.agent_id else None
+    parent_terminal = (
+        (owner.stationed_terminal or owner.home_terminal or owner.parent_terminal)
+        if owner is not None else "term0"
+    ) or "term0"
+    cli_entry = os.path.join(os.path.dirname(os.path.abspath(__file__)), "laintas_cli.py")
+    lain_cmd = " ".join([
+        shlex.quote(sys.executable), shlex.quote(cli_entry),
+        "--depth", str(ctx.depth + 1),
+        "--terminal-name", shlex.quote(name),
+        "--parent-terminal", shlex.quote(parent_terminal),
+    ])
     sub = ctx.deps.SubTerminalSession(lain_cmd)
     sub.start()
     time.sleep(0.15)
     if not sub.is_alive():
         return {"ok": False, "error": f"failed to start terminal '{name}'"}
     sub.read_output(timeout=0.1)
-    ctx.register_terminal(sub, "laintas-cli", ctx.depth, name=name)
+    try:
+        ctx.register_terminal(
+            sub, "laintas-cli", ctx.depth, name=name,
+            parent_terminal=parent_terminal)
+    except Exception as exc:
+        sub.close()
+        return {"ok": False, "error": f"could not register terminal '{name}': {exc}"}
     return {"ok": True, "result": f"Created sub-terminal {name}", "terminal": name}
 
 
@@ -2994,7 +2931,9 @@ def _bi_terminal_list(params: dict, ctx: ToolCtx) -> dict:
         status = "alive" if alive else "dead"
         stationed = f" [stationed: {', '.join(t.stationed_agent_ids)}]" if t.stationed_agent_ids else ""
         trigger = f" [trigger: {t.trigger_pattern!r}]" if t.trigger_pattern else ""
-        lines.append(f"  {t.name} ({t.command}) [{status}]{stationed}{trigger}")
+        parent = f" [parent: {t.parent_terminal}]" if t.parent_terminal else " [root]"
+        lines.append(
+            f"  {t.name} ({t.command}) [{status}]{parent}{stationed}{trigger}")
     return {"ok": True, "result": "\n".join(lines)}
 
 
@@ -3022,11 +2961,21 @@ def _bi_terminal_exec(params: dict, ctx: ToolCtx) -> dict:
     time.sleep(0.2)
     if sub.is_alive():
         sub.read_output(timeout=0.1)
-    ctx.register_terminal(
-        sub, command, ctx.depth, name=name,
-        trigger=trigger or None,
-        trigger_agent_id=ctx.agent_id if trigger else None,
-    )
+    owner = ctx.get_agent(ctx.agent_id) if ctx.get_agent and ctx.agent_id else None
+    parent_terminal = (
+        (owner.stationed_terminal or owner.home_terminal or owner.parent_terminal)
+        if owner is not None else "term0"
+    ) or "term0"
+    try:
+        ctx.register_terminal(
+            sub, command, ctx.depth, name=name,
+            trigger=trigger or None,
+            trigger_agent_id=ctx.agent_id if trigger else None,
+            parent_terminal=parent_terminal,
+        )
+    except Exception as exc:
+        sub.close()
+        return {"ok": False, "error": f"could not register terminal '{name}': {exc}"}
     msg = f"Started sub-terminal '{name}': {command}"
     if trigger:
         msg += f"\nTrigger active — pattern {trigger!r} will push events to your inbox."
@@ -3058,35 +3007,141 @@ def _bi_terminal_watch(params: dict, ctx: ToolCtx) -> dict:
     return {"ok": True, "result": f"Trigger cleared on '{name}'"}
 
 
+def _session_output(session, ctx: ToolCtx) -> str:
+    """Return normalized output without assuming a concrete PTY class."""
+    try:
+        output = session.full_output
+        return ctx.deps.strip_ansi(output) if ctx.deps else output
+    except Exception:
+        return getattr(session, "full_output", "") or ""
+
+
+def _bi_session_start(params: dict, ctx: ToolCtx) -> dict:
+    """Start one private temporary PTY owned by the current agent run."""
+    command = str(params.get("command") or "").strip()
+    if not command:
+        return {"ok": False, "error": "missing 'command'"}
+    factory = getattr(ctx.deps, "InteractiveSession", None) if ctx.deps else None
+    if factory is None:
+        return {"ok": False, "error": "temporary PTY sessions are unavailable"}
+
+    current = ctx.interactive_session
+    if current is not None:
+        try:
+            if current.is_alive():
+                return {"ok": False,
+                        "error": "an interactive session is already active; close it first"}
+            current.close()
+        except Exception:
+            pass
+        ctx.interactive_session = None
+
+    cwd = str(params.get("cwd") or ctx.cwd or os.getcwd())
+    try:
+        timeout = max(1, int(params.get("timeout", 300)))
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "timeout must be an integer"}
+
+    session = None
+    try:
+        session = factory(command, timeout=timeout, stream_output=False, cwd=cwd)
+        session.start()
+        time.sleep(0.05)
+        session.read_output(timeout=0.05)
+    except Exception as exc:
+        if session is not None:
+            try:
+                session.close()
+            except Exception:
+                pass
+        return {"ok": False, "error": f"failed to start interactive session: {exc}"}
+
+    setattr(session, "_laintas_read_cursor", len(_session_output(session, ctx)))
+    ctx.interactive_session = session
+    return {
+        "ok": True,
+        "result": _session_output(session, ctx).strip() or "(started; no output yet)",
+        "command": command,
+        "cwd": cwd,
+        "alive": bool(session.is_alive()),
+        "returncode": session.returncode,
+    }
+
+
+def _bi_session_read(params: dict, ctx: ToolCtx) -> dict:
+    """Read output added since the previous session read."""
+    session = ctx.interactive_session
+    if session is None:
+        return {"ok": False, "error": "no active interactive session"}
+    try:
+        wait = max(0.0, min(float(params.get("wait", 0.1)), 5.0))
+        tail_lines = max(0, min(int(params.get("tail_lines", 0)), 2000))
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "wait and tail_lines must be numbers"}
+    try:
+        session.read_output(timeout=wait)
+    except Exception:
+        pass
+    full = _session_output(session, ctx)
+    cursor = int(getattr(session, "_laintas_read_cursor", 0) or 0)
+    if cursor > len(full):
+        cursor = 0
+    new_output = full[cursor:]
+    setattr(session, "_laintas_read_cursor", len(full))
+    result = "\n".join(full.splitlines()[-tail_lines:]) if tail_lines else new_output
+    return {
+        "ok": True,
+        "result": result or "(no new output)",
+        "new_output": new_output,
+        "alive": bool(session.is_alive()),
+        "returncode": session.returncode,
+    }
+
+
+def _bi_session_status(params: dict, ctx: ToolCtx) -> dict:
+    session = ctx.interactive_session
+    if session is None:
+        return {"ok": True, "result": "No active interactive session", "active": False}
+    alive = bool(session.is_alive())
+    return {
+        "ok": True,
+        "result": f"{'running' if alive else 'exited'}: {session.command}",
+        "active": True,
+        "alive": alive,
+        "command": session.command,
+        "returncode": session.returncode,
+    }
+
+
 def _bi_session_close(params: dict, ctx: ToolCtx) -> dict:
     """Close the current interactive PTY session."""
     if ctx.interactive_session is None:
         return {"ok": True, "result": "No active session to close"}
     session = ctx.interactive_session
     session.close()
-    try:
-        output = ctx.deps.strip_ansi(session.full_output) if ctx.deps else session.full_output
-    except Exception:
-        output = session.full_output
+    output = _session_output(session, ctx)
     ctx.interactive_session = None
-    return {"ok": True, "result": output.strip() or "(no output)", "command": session.command[:120]}
+    return {"ok": True, "result": output.strip() or "(no output)",
+            "command": session.command[:120]}
 
 
 def _bi_session_keys(params: dict, ctx: ToolCtx) -> dict:
-    """Send keystrokes to the current interactive PTY session."""
-    keys = (params.get("keys") or "").strip()
-    if not keys:
+    """Send raw bytes or one complete line to the current temporary PTY."""
+    keys = params.get("keys")
+    if keys is None or str(keys) == "":
         return {"ok": False, "error": "missing 'keys'"}
+    keys = str(keys)
+    mode = str(params.get("mode") or "raw").lower()
+    if mode not in {"raw", "line"}:
+        return {"ok": False, "error": "mode must be 'raw' or 'line'"}
     if ctx.interactive_session is None:
-        return {"ok": False, "error": "no active session — run a long-lived command first"}
+        return {"ok": False, "error": "no active session — call session.start first"}
     session = ctx.interactive_session
-    session.send_keys(keys)
+    session.send_keys(keys + ("\r" if mode == "line" else ""))
     time.sleep(0.3)
     new_output = session.read_output(timeout=0.5)
-    try:
-        full = ctx.deps.strip_ansi(session.full_output) if ctx.deps else session.full_output
-    except Exception:
-        full = session.full_output
+    full = _session_output(session, ctx)
+    setattr(session, "_laintas_read_cursor", len(full))
     return {"ok": True, "result": full.strip() or "(no output)",
             "new_output": (new_output or "").strip()[:500],
             "alive": session.is_alive()}
@@ -3192,6 +3247,9 @@ def _bi_shell_exec(params: dict, ctx: ToolCtx) -> dict:
 
     cwd = params.get("cwd") or ctx.cwd or os.getcwd()
     timeout = int(params.get("timeout", 60))
+    owner = (ctx.get_agent(ctx.agent_id)
+             if ctx.get_agent is not None and ctx.agent_id else None)
+    abort_event = getattr(owner, "abort_event", None)
 
     # cd / clear short-circuit: only when there's no live PTY session to
     # route through. When stationed to a bash terminal, cd MUST go through
@@ -3259,6 +3317,11 @@ def _bi_shell_exec(params: dict, ctx: ToolCtx) -> dict:
             returncode = -1
             poll_budget = max(timeout, 10.0)
             while time.time() - poll_start < poll_budget:
+                if abort_event is not None and abort_event.is_set():
+                    session.send_keys("\x03")
+                    return {"ok": False, "error": "Command aborted",
+                            "returncode": -1,
+                            "via": "stationed" if ctx.stationed_terminal else "interactive"}
                 time.sleep(0.08)
                 session.read_output(timeout=0.1)
                 try:
@@ -3319,19 +3382,48 @@ def _bi_shell_exec(params: dict, ctx: ToolCtx) -> dict:
         except Exception:
             pass  # Fall through to subprocess
 
-    # Direct subprocess execution
+    # Direct subprocess execution. Use a process group and poll the owning
+    # agent's abort event so cancelling a task also cancels the command and its
+    # descendants instead of waiting for subprocess.run's timeout.
     try:
         import subprocess as _sp
-        result = _sp.run(
-            command, shell=True, capture_output=True, text=True,
-            timeout=timeout, cwd=cwd,
+        process = _sp.Popen(
+            command, shell=True, stdout=_sp.PIPE, stderr=_sp.PIPE, text=True,
+            cwd=cwd, start_new_session=True,
         )
-        output = (result.stdout + result.stderr).strip()
-        return {"ok": result.returncode == 0, "result": output or "(no output)",
-                "returncode": result.returncode, "via": "subprocess"}
-    except _sp.TimeoutExpired:
-        return {"ok": False, "error": f"Command timed out ({timeout}s): {command[:120]}",
-                "returncode": -1}
+        deadline = time.monotonic() + timeout
+        cancelled = False
+        timed_out = False
+        while True:
+            try:
+                stdout, stderr = process.communicate(timeout=0.1)
+                break
+            except _sp.TimeoutExpired:
+                if abort_event is not None and abort_event.is_set():
+                    cancelled = True
+                elif time.monotonic() >= deadline:
+                    timed_out = True
+                else:
+                    continue
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                    stdout, stderr = process.communicate(timeout=0.5)
+                except _sp.TimeoutExpired:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    stdout, stderr = process.communicate()
+                except ProcessLookupError:
+                    stdout, stderr = process.communicate()
+                break
+        output = ((stdout or "") + (stderr or "")).strip()
+        if cancelled:
+            return {"ok": False, "error": "Command aborted", "result": output,
+                    "returncode": -1, "via": "subprocess"}
+        if timed_out:
+            return {"ok": False,
+                    "error": f"Command timed out ({timeout}s): {command[:120]}",
+                    "result": output, "returncode": -1, "via": "subprocess"}
+        return {"ok": process.returncode == 0, "result": output or "(no output)",
+                "returncode": process.returncode, "via": "subprocess"}
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}", "returncode": -1}
 
@@ -4540,8 +4632,8 @@ def register_builtin_tools() -> None:
             description="Run a non-interactive shell command via subprocess (no PTY). "
                         "Returns stdout, stderr, exit code, duration. Use for one-shot "
                         "commands that need structured output (jq, grep with parsing, "
-                        "python -c). Prefer the bare `command` field for interactive or "
-                        "PTY-driven work — that path streams output and supports more.",
+                        "python -c). For REPLs or commands that need keystrokes, start an "
+                        "agent-private PTY with session.start instead.",
             schema={
                 "type": "object",
                 "properties": {
@@ -4921,8 +5013,9 @@ def register_builtin_tools() -> None:
         # ── Agent tools ─────────────────────────────────────────────
         Tool(
             name="agent.spawn",
-            description="Spawn an in-process child agent to handle a sub-task. "
-                        "The child runs in its own thread and posts results to your inbox. "
+            description="Spawn a disposable in-process child agent for one sub-task. "
+                        "It has an isolated context, runs in its own thread, posts results "
+                        "to your inbox, and is not a hired employee. "
                         "Supports specialized roles (explorer, architect, reviewer, "
                         "silent-failure-hunter, simplifier, tester) and parallel spawning "
                         "via the 'tasks' parameter.",
@@ -5010,8 +5103,9 @@ def register_builtin_tools() -> None:
         Tool(
             name="agent.hire",
             description=(
-                "Define an available employee with an independent prompt/tool policy. "
-                "This does not start work; /station --task creates an assignment."),
+                "Hire an employee with an independent prompt/tool policy and deploy it "
+                "to the caller's current terminal. This does not start an assignment. "
+                "The employee ends when that deployment terminal ends."),
             schema={
                 "type": "object",
                 "properties": {
@@ -5048,10 +5142,9 @@ def register_builtin_tools() -> None:
         Tool(
             name="spawn",
             description=(
-                "Spawn a sub-agent for a delegated task and WAIT for it to complete (blocking). "
+                "Spawn a disposable sub-agent for one delegated task and WAIT for it to complete. "
                 "If the concurrency cap is reached the sub-agent queues and starts when a slot frees. "
-                "Give COMPLETE instructions in goal: file paths, conventions, constraints. "
-                "10-loop limit per sub-agent."
+                "Give COMPLETE instructions in goal: file paths, conventions, constraints."
             ),
             schema={
                 "type": "object",
@@ -5228,7 +5321,10 @@ def register_builtin_tools() -> None:
         ),
         Tool(
             name="terminal.terminate",
-            description="Terminate and destroy a named sub-terminal.",
+            description=(
+                "Terminate a named sub-terminal, recursively ending its child "
+                "terminals and every agent deployed under that terminal subtree."
+            ),
             schema={
                 "type": "object",
                 "properties": {
@@ -5240,7 +5336,12 @@ def register_builtin_tools() -> None:
         ),
         Tool(
             name="terminal.create",
-            description="Create a new named sub-terminal running a laintas-cli instance.",
+            description=(
+                "Create a named managed laintas-cli terminal. It remains available for "
+                "later sends/stationing while its parent terminal is alive. Terminating "
+                "a parent recursively ends child terminals and their deployed agents; "
+                "use session.start for a disposable agent-private PTY."
+            ),
             schema={
                 "type": "object",
                 "properties": {
@@ -5296,6 +5397,41 @@ def register_builtin_tools() -> None:
         ),
         # ── Session tools ───────────────────────────────────────────
         Tool(
+            name="session.start",
+            description=(
+                "Start one agent-private temporary PTY for an interactive command. "
+                "It is not a named terminal and closes with the agent run."
+            ),
+            schema={
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "Interactive command"},
+                    "cwd": {"type": "string", "description": "Working directory"},
+                    "timeout": {"type": "integer", "default": 300},
+                },
+                "required": ["command"],
+            },
+            invoke=_bi_session_start,
+        ),
+        Tool(
+            name="session.read",
+            description="Read new output from the current temporary PTY, or return a full tail.",
+            schema={
+                "type": "object",
+                "properties": {
+                    "wait": {"type": "number", "default": 0.1},
+                    "tail_lines": {"type": "integer", "default": 0},
+                },
+            },
+            invoke=_bi_session_read,
+        ),
+        Tool(
+            name="session.status",
+            description="Inspect the current agent-private temporary PTY.",
+            schema={"type": "object", "properties": {}},
+            invoke=_bi_session_status,
+        ),
+        Tool(
             name="session.close",
             description="Close the current one-off interactive PTY session and capture its output.",
             schema={"type": "object", "properties": {}},
@@ -5308,6 +5444,12 @@ def register_builtin_tools() -> None:
                 "type": "object",
                 "properties": {
                     "keys": {"type": "string", "description": "Keystroke sequence to send"},
+                    "mode": {
+                        "type": "string",
+                        "enum": ["raw", "line"],
+                        "default": "raw",
+                        "description": "raw sends exactly the keys; line appends Enter",
+                    },
                 },
                 "required": ["keys"],
             },

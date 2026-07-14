@@ -15,6 +15,21 @@ Default to doing the work yourself. Delegate only when it reduces real wall-cloc
 - Use terminals for stateful interactive processes; use agents for reasoning and task execution.
 - Keep depth shallow. At depth 2 or more, prefer finishing locally unless delegation is clearly valuable.
 
+## Temporary agents and hired employees
+
+- `agent.spawn` creates a disposable child for one bounded task. It inherits the
+  caller's terminal ownership and ends when that terminal subtree ends.
+- `agent.hire` creates a persistent employee and deploys it directly to the
+  caller's current terminal. Hiring defines identity and capabilities; it does
+  not start work by itself.
+- Give hired employees work through an explicit assignment or agent message.
+  Use `agent.station` only to move an idle employee to another live terminal;
+  it is not a required second step after hiring.
+- A terminal may host multiple employees, but each employee has exactly one
+  deployment terminal and ends when that terminal ends.
+- Use spawned agents for one-off delegation and hired employees for reusable,
+  terminal-scoped roles.
+
 ## Parallel and chained spawns
 
 For batches of related work, prefer the structured spawn tools over hand-managed

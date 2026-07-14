@@ -103,6 +103,8 @@ class DirectCommandApprovalTests(unittest.TestCase):
         needs = policy.PolicyDecision(
             "needs_approval", "rm", "delete confirmation")
         with mock.patch.object(policy, "evaluate", return_value=needs), \
+                mock.patch.object(laintas_cli, "get_runtime_config",
+                                  return_value=True), \
                 mock.patch.object(laintas_cli, "request_command_approval",
                                   return_value=False) as prompt:
             allowed, reason = laintas_cli.authorize_direct_command(

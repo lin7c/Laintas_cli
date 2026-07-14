@@ -771,8 +771,7 @@ class BrowserSession:
         base = self.backend_url
         base = base.replace("https://", "wss://").replace("http://", "ws://")
         return (f"{base}/api/agents/{self.agent_id}/vnc"
-                f"?sessionId={self.session_id}&role=host"
-                f"&agentSecret={self.agent_secret}")
+                f"?sessionId={self.session_id}&role=host")
 
     def _ws_bridge_loop(self) -> None:
         """Connect to backend /vnc, then shuttle RFB bytes both ways.
@@ -786,10 +785,31 @@ class BrowserSession:
         except ImportError:
             return  # websockets not installed → no relay; host stack still up
 
+        # Same certifi-vs-OS-trust-store gap as TerminalSession._run: requests
+        # (used elsewhere for backend HTTP calls) bundles its own certifi CA
+        # store and works even when the OS trust store is broken/missing;
+        # websockets has no such fallback and fails CERTIFICATE_VERIFY_FAILED
+        # in that situation unless given an explicit ssl context.
+        ssl_context = None
+        if self._ws_url().startswith("wss://"):
+            try:
+                import ssl as _ssl_module
+                import certifi
+                ssl_context = _ssl_module.create_default_context(cafile=certifi.where())
+            except Exception:
+                ssl_context = None
+
         while not self._closed.is_set():
             try:
-                self._ws = _ws_connect(self._ws_url(), open_timeout=10,
-                                       max_size=None)
+                # Browser-shaped UA — see TerminalSession._run for why: the
+                # library default reads as a bot to CF/WAF layers and can get
+                # the WS upgrade blocked before it reaches the backend.
+                self._ws = _ws_connect(
+                    self._ws_url(), open_timeout=10, max_size=None, ssl=ssl_context,
+                    additional_headers={"Authorization": f"Agent {self.agent_secret}"},
+                    user_agent_header="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                                      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                )
             except Exception:
                 # Backend may not have deployed /vnc yet. Retry.
                 if self._closed.wait(timeout=3):

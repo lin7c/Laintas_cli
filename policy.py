@@ -746,6 +746,36 @@ def evaluate_email_send(req_id: str = None, agent_id: str = None) -> PolicyDecis
     return PolicyDecision("needs_approval", "", reason)
 
 
+def evaluate_terminal_open(cwd: str = None, req_id: str = None, agent_id: str = None) -> PolicyDecision:
+    """Evaluate a term-open request (Helpwo asking to attach a real, raw PTY).
+
+    Follows the SAME audit-vs-enforce semantics as evaluate(): in the default
+    "audit" mode this is advisory — it writes an audit-log record and allows,
+    so the terminal opens seamlessly (which is the point of the feature). Only
+    in "enforce" mode does it return needs_approval.
+
+    Why not always-ask by default (reverted 2026-07-12): the standing gate for
+    this feature is `disable_remote_terminal` on the CLI plus the local-console
+    "Browser opened a terminal" panel — both out-of-band from any web session.
+    A per-open approval *rendered in the Helpwo UI* adds nothing against the
+    real threat (a stolen Helpwo session can approve its own request in that
+    same UI), while blocking the handler past the browser's connect timeout —
+    so by default it only broke the UX without buying security. Users who want
+    the extra friction can set policy mode to "enforce"; the audit trail is
+    written in every mode regardless.
+    """
+    cfg = _load_config()
+    mode = cfg.get("mode", "audit")
+    label = "terminal.open"
+    if mode == "enforce":
+        reason = "interactive terminal open requires approval (policy mode=enforce)"
+        _write_audit(_audit_entry(label, "needs_approval", reason, cwd, req_id, agent_id))
+        return PolicyDecision("needs_approval", "", reason)
+    # disabled + audit (default): record and allow.
+    _write_audit(_audit_entry(label, "allow", f"{mode} mode (advisory)", cwd, req_id, agent_id))
+    return PolicyDecision("allow")
+
+
 def needs_approval(command: str, cwd: str = None) -> bool:
     """Quick check: does this command need user approval?"""
     decision = evaluate(command, cwd)

@@ -1,9 +1,8 @@
 """Agent state persistence — survives across sessions.
 
-Each agent is serialized to `~/.laintas/agents/<agent_id>.json` after every
-significant state change (chat turn, station/unstation, terminate). Sub-terminal
-processes load their assigned agent's state at startup, so re-stationing a
-previously-deployed agent restores its conversation history.
+Each hired agent is serialized to `~/.laintas/agents/<agent_id>.json` after
+significant state changes. A hired agent is owned by exactly one deployment
+terminal; ending that terminal ends the agent and removes its persisted record.
 
 Threading model:
 - Only the process that owns the agent (parent for pool agents, child for
@@ -179,6 +178,10 @@ def apply_persisted_state(agent: "AgentInfo", data: dict) -> None:
         merged = dict(agent.state or {})
         merged.update(data["state"])
         agent.state = merged
+    if str(data.get("role") or "") in {"pool", "deployed"}:
+        # Legacy employee files predate the explicit lifecycle marker. Once
+        # restored, they follow the deployment terminal just like new hires.
+        agent.state.setdefault("_persisted_employee", True)
     profile_data = data.get("profile")
     if isinstance(profile_data, dict) and profile_data:
         # Import lazily to keep this persistence module free of an import cycle.

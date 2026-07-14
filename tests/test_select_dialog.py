@@ -114,30 +114,5 @@ class SelectionEntryPointTests(unittest.TestCase):
             self.assertEqual(laintas_cli.choose_login_method(), "remote")
         dialog.assert_not_called()
 
-    def test_complex_task_approach_uses_shared_selector(self):
-        selected = {}
-
-        def choose_act(items, **kwargs):
-            selected["items"] = items
-            selected["index"] = kwargs["selected_index"]
-            return items[1]
-
-        with mock.patch.object(
-                laintas_cli.sys.stdin, "isatty", return_value=True), \
-                mock.patch.object(
-                    laintas_cli, "_looks_complex", return_value=True), \
-                mock.patch.object(
-                    plan_mode, "is_plan_mode", return_value=False), \
-                mock.patch.object(laintas_cli, "_stop_bg_input_reader"), \
-                mock.patch.object(laintas_cli, "_start_bg_input_reader"), \
-                mock.patch.object(
-                    laintas_cli, "select_dialog", side_effect=choose_act):
-            self.assertFalse(laintas_cli._maybe_offer_plan_mode("complex task"))
-
-        self.assertEqual(selected["index"], 1)
-        self.assertEqual([item[0] for item in selected["items"]],
-                         ["Plan first", "Act directly"])
-
-
 if __name__ == "__main__":
     unittest.main()

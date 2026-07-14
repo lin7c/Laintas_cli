@@ -111,6 +111,41 @@ class AgentTerminationTests(unittest.TestCase):
         self.assertIn("partial output", result["msg"])
         self.assertIn("final output", result["msg"])
 
+    def test_interactive_history_preserves_assistant_tool_chronology(self):
+        deps, _ = _deps([
+            {
+                "reply": "我先继续检查。",
+                "tool_calls": [{
+                    "name": "session.continue", "arguments": {},
+                }],
+                "finish_reason": "tool_calls", "done": False,
+                "error": False,
+            },
+            {
+                "reply": "检查完成。", "tool_calls": [],
+                "finish_reason": "stop", "done": False, "error": False,
+            },
+        ])
+        history = [{
+            "role": "user", "content": "检查", "input_kind": "prompt",
+        }]
+        with tempfile.TemporaryDirectory() as tmp, _chdir(tmp):
+            Path(".laintas").mkdir()
+            result = agent_loop.run_agent_loop(
+                deps, "检查", {}, {}, history,
+                events_cb=lambda _events: None,
+                max_loops_override=3,
+            )
+
+        self.assertTrue(result["_history_recorded"])
+        self.assertEqual(
+            [message["role"] for message in history],
+            ["user", "assistant", "tool", "assistant"],
+        )
+        self.assertEqual(history[1]["content"], "我先继续检查。")
+        self.assertEqual(history[2]["tool_name"], "session.continue")
+        self.assertEqual(history[3]["content"], "检查完成。")
+
     def test_empty_provider_turn_is_not_success(self):
         result, calls, _ = self._run([{
             "reply": "",

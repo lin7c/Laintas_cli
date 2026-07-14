@@ -827,6 +827,8 @@ def _ensure_term0_alive() -> None:
     term0_info = get_terminal("term0")
     if term0_info is None or term0_info.session is None or not term0_info.session.is_alive():
         try:
+            if term0_info is not None:
+                unregister_terminal("term0")
             _term0 = InteractiveSession(
                 DEFAULT_SHELL, timeout=0, stream_output=False, persistent=True)
             _term0.start()
@@ -1130,38 +1132,10 @@ class SubTerminalSession:
         return -1
 
 
-def _build_subterminal_cmd(agent_id: Optional[str] = None,
-                           agent_name: Optional[str] = None,
-                           agent_role: Optional[str] = None,
-                           terminal_name: Optional[str] = None,
-                           parent_terminal: Optional[str] = None,
-                           parent_agent_id: Optional[str] = None) -> str:
-    """Build the laintas-cli command string for spawning a sub-terminal.
-
-    All identity is passed via CLI flags so the child process can register
-    its agent with the right context.
-    """
-    parts = [shlex.quote(sys.executable),
-             shlex.quote(os.path.abspath(__file__)),
-             "--simple-prompt"]
-    if agent_id:
-        parts += ["--agent-id", shlex.quote(agent_id)]
-    if agent_name and agent_name != agent_id:
-        parts += ["--agent-name", shlex.quote(agent_name)]
-    if agent_role:
-        parts += ["--agent-role", shlex.quote(agent_role)]
-    if terminal_name:
-        parts += ["--terminal-name", shlex.quote(terminal_name)]
-    if parent_terminal:
-        parts += ["--parent-terminal", shlex.quote(parent_terminal)]
-    if parent_agent_id:
-        parts += ["--parent-agent-id", shlex.quote(parent_agent_id)]
-    return " ".join(parts)
-
-
 def _build_connected_subterminal_cmd(terminal_name: str,
                                      remote_parent_id: Optional[str] = None,
-                                     auto_connect: bool = False) -> str:
+                                     auto_connect: bool = False,
+                                     parent_terminal: str = "term0") -> str:
     """Command line for a user-facing sub-terminal running a nested CLI.
 
     Carries the terminal's identity (name + remote parent agent id) so that
@@ -1172,7 +1146,7 @@ def _build_connected_subterminal_cmd(terminal_name: str,
              shlex.quote(os.path.abspath(__file__)),
              "--depth", "1",
              "--terminal-name", shlex.quote(terminal_name),
-             "--parent-terminal", "term0"]
+             "--parent-terminal", shlex.quote(parent_terminal or "term0")]
     if remote_parent_id:
         parts += ["--remote-parent-id", shlex.quote(remote_parent_id)]
     if auto_connect:
@@ -1181,14 +1155,17 @@ def _build_connected_subterminal_cmd(terminal_name: str,
 
 
 def connect_terminal_to_helpwo(agent_registry: "AgentRegistry", session: dict,
-                               quiet: bool = False, name: str = None) -> bool:
+                               quiet: bool = False, name: str = None,
+                               workspace: str = None) -> bool:
     """CLI side of the two-end handshake with Helpwo.
 
     Works in BOTH terminals: at depth 0 it links the primary CLI itself
     (Helpwo needs the linked primary before it can create sub-terminals from
     its UI); at depth ≥ 1 it hands this sub-terminal over. `name` optionally
-    sets a custom display/terminal name; if already connected under a
-    different name, the agent reconnects under the new one.
+    sets a custom display/terminal name (kept for internal/sub-terminal callers;
+    the user-facing custom name now lives in /name). `workspace` is the absolute
+    folder to SHARE as Helpwo's remote workspace — bare /connect passes None, so
+    linking alone shares nothing; Helpwo only goes remote once a folder is set.
     Starts heartbeat + message poll so Helpwo can chat / term-new / term-close.
     """
     if (get_backend_profile().sends_laintas_credentials
@@ -1201,22 +1178,29 @@ def connect_terminal_to_helpwo(agent_registry: "AgentRegistry", session: dict,
     current = (meta or {}).get("name") if is_sub else agent_registry.agent_name
 
     if agent_registry.agent_id:
-        if not name or name == current:
+        name_same = (not name or name == current)
+        workspace_changed = workspace is not None and workspace != agent_registry.workspace_path
+        if name_same and not workspace_changed:
             if not quiet:
+                shared = agent_registry.workspace_path
                 console.print(Panel(
                     f"[green]Already connected to Helpwo[/green]\n"
                     f"{'Terminal' if is_sub else 'Primary CLI'}: [bold]{current}[/bold]\n"
-                    f"Agent ID: {agent_registry.agent_id}\n\n"
-                    f"[dim]/connect <name> reconnects under a custom name; "
-                    f"/disconnect withdraws.[/dim]",
+                    f"Agent ID: {agent_registry.agent_id}\n"
+                    f"Shared workspace: [bold]{shared or 'none (link only)'}[/bold]\n\n"
+                    f"[dim]/connect <folder> shares that folder as Helpwo's remote "
+                    f"workspace; /name renames; /disconnect withdraws.[/dim]",
                     title="Connected", border_style="green",
                 ))
             return True
-        # Custom name given while connected — reconnect under the new name.
+        # Name or shared workspace changed — reconnect to carry the new values
+        # (previousAgentId resurrects the same agentId, so Helpwo tabs survive).
         agent_registry.unregister()
         agent_registry.agent_id = None
         agent_registry.agent_secret = ""
 
+    if workspace is not None:
+        agent_registry.workspace_path = workspace
     if name and is_sub and meta is not None:
         meta["name"] = name
     reg_name = name or ((meta or {}).get("name") if is_sub else None)
@@ -1236,16 +1220,24 @@ def connect_terminal_to_helpwo(agent_registry: "AgentRegistry", session: dict,
                 f"[green]Sub-terminal handed over to Helpwo[/green]\n"
                 f"Terminal: [bold]{(meta or {}).get('name', agent_registry.agent_name)}[/bold]\n"
                 f"Created by: {(meta or {}).get('createdBy', 'term0')}\n"
-                f"Agent ID: {agent_registry.agent_id}\n\n"
+                f"Agent ID: {agent_registry.agent_id}\n"
+                f"Remote terminal: [bold]explicit opt-in required[/bold]\n\n"
                 f"[dim]Helpwo can now read this terminal, send it input, and close it.\n"
                 f"Run /disconnect to withdraw it.[/dim]",
                 title="Connected", border_style="green",
             ))
         else:
+            shared = agent_registry.workspace_path
+            ws_line = (f"Shared workspace: [bold]{shared}[/bold]\n"
+                       f"[dim]→ Helpwo's build page is now this folder (files ride P2P).[/dim]\n"
+                       if shared else
+                       "Shared workspace: [bold]none[/bold] "
+                       "[dim](run /connect <folder> to share one)[/dim]\n")
             console.print(Panel(
                 f"[green]Primary CLI linked to Helpwo[/green]\n"
                 f"Name: [bold]{agent_registry.agent_name}[/bold]\n"
-                f"Agent ID: {agent_registry.agent_id}\n\n"
+                f"Agent ID: {agent_registry.agent_id}\n"
+                f"{ws_line}\n"
                 f"[dim]Helpwo can now create sub-terminals here from its UI.\n"
                 f"Share an existing one: /term <name>, then /connect inside it.\n"
                 f"Run /disconnect to go offline.[/dim]",
@@ -1846,7 +1838,7 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec("/scan", "List user-facing PATH commands", "Basics"),
     CommandSpec("/login", "Re-authenticate with Laintas", "Account & Session"),
     CommandSpec("/usage", "Show AI usage — local token stats + Laintas backend usage", "Account & Session", "/usage [7d|30d|90d|local]", subcommands=("local",)),
-    CommandSpec("/resume", "Resume a saved session (picker; echo last N messages, default 20)", "Account & Session", "/resume [N|all|latest]"),
+    CommandSpec("/resume", "Resume a saved session (picker; echo last N events, default 20)", "Account & Session", "/resume [N|all|latest]"),
     CommandSpec("/new", "Start a new live session", "Account & Session", "/new", aliases=("/clear",)),
     CommandSpec("/exit", "Log out and exit", "Account & Session"),
     CommandSpec("/quit", "Exit without logging out", "Account & Session", aliases=("/q",)),
@@ -1854,13 +1846,14 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec("/version", "Show version or update", "Account & Session", "/version [check|update [--force]]", aliases=("/v", "/update"), subcommands=("check", "update")),
     CommandSpec("/name", "Show or set the current agent name", "Agents & Terminals", "/name [new-name]"),
     CommandSpec(
-        "/hire", "Define an available employee; does not start work",
+        "/hire", "Hire an employee into the current terminal; does not start an assignment",
         "Agents & Terminals",
         "/hire [name] [--profile role] [--prompt file] [--tools name,...|inherit]",
         subcommands=("--profile", "--prompt", "--tools"),
         help_text=(
-            "Creates a persistent employee identity with its own prompt and tool policy. "
-            "Use /station <agent> [terminal] --task <work> to start an assignment."
+            "Creates a persistent employee identity with its own prompt and tool policy, "
+            "then deploys it to the current terminal. Use /station <agent> [terminal] "
+            "--task <work> to start an assignment or move it explicitly."
         )),
     CommandSpec(
         "/agents", "List employees or inspect capabilities and assignment history",
@@ -1870,18 +1863,18 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
             "and latest result; it does not switch the manager identity."
         )),
     CommandSpec("/term", "List, create, or rename terminals", "Agents & Terminals", "/term [name|rename <old> <new>]", aliases=("/t",), subcommands=("rename",)),
-    CommandSpec("/connect", "Link this terminal to Helpwo (primary or sub-terminal; optional custom name)", "Agents & Terminals", "/connect [name]"),
+    CommandSpec("/connect", "Link this terminal to Helpwo; with a folder, share it as Helpwo's remote workspace", "Agents & Terminals", "/connect [folder]"),
     CommandSpec("/disconnect", "Withdraw this terminal from Helpwo", "Agents & Terminals"),
     CommandSpec(
         "/station", "Bind an employee to a terminal and optionally start work",
         "Agents & Terminals", "/station <agent-id> [terminal] [--task <work>]",
         aliases=("/st",),
         help_text=(
-            "Without --task, only prepares the station. With --task, starts a fresh "
+            "Without --task, deploys or moves the employee. With --task, starts a fresh "
             "background Assignment with isolated state/history. Omitting the terminal "
-            "creates work-<agent-id> (a dedicated PTY)."
+            "uses the employee's existing deployment, or the manager's current terminal."
         )),
-    CommandSpec("/terminate", "Close a terminal", "Agents & Terminals", "/terminate <name>"),
+    CommandSpec("/terminate", "Close a terminal and all child resources", "Agents & Terminals", "/terminate <name>"),
     CommandSpec("/send", "Send input to a terminal", "Agents & Terminals", "/send <name> [--wait <seconds>] <command>"),
     CommandSpec("/spawn", "Spawn a sub-agent", "Agents & Terminals", "/spawn [name:] <task>"),
     CommandSpec("/tell", "Send a message to an agent", "Agents & Terminals", "/tell <agent-id> <message|json>"),
@@ -3713,10 +3706,17 @@ def _format_time_ago(ts: float) -> str:
 
 
 def _resume_turn_count(blob: Optional[dict]) -> int:
-    """Count user turns in a resume blob for user-facing status text."""
+    """Count actual user-to-agent prompt turns for status text."""
     if not blob:
         return 0
-    return len([m for m in (blob.get("chat_history") or []) if m.get("role") == "user"])
+    stored = blob.get("turn_count")
+    if isinstance(stored, int):
+        return stored
+    return len([
+        m for m in (blob.get("chat_history") or [])
+        if m.get("role") == "user"
+        and m.get("input_kind") not in {"shell", "interactive", "slash"}
+    ])
 
 
 def _restore_resume_blob(blob: dict, chat_history: list) -> dict:
@@ -3863,12 +3863,10 @@ def _show_resume_detail(item: dict) -> None:
                   f"[dim]When:[/dim] {_format_time_ago(item.get('timestamp', 0))}   "
                   f"[dim]Turns:[/dim] {item.get('turn_count') or _resume_turn_count(item)}")
     history = item.get("chat_history") or []
-    console.print(f"[dim]Messages:[/dim] {len(history)}\n")
+    console.print(f"[dim]Events:[/dim] {len(history)}\n")
     for msg in history[-6:]:
-        role = msg.get("role", "?")
-        text = str(msg.get("content") or "").replace("\n", " ")[:100]
-        color = "green" if role == "user" else "blue"
-        console.print(f"  [{color}]{role:>9}[/{color}]  [dim]{text}[/dim]")
+        _print_resume_event(msg)
+        console.print()
 
 
 def _resume_role_style(role: str) -> str:
@@ -3880,6 +3878,89 @@ def _resume_role_style(role: str) -> str:
     if role == "knowledge":
         return "yellow"
     return "cyan"
+
+
+_LEGACY_TOOL_EVENT_RE = re.compile(
+    r"^\[(?P<call>call_[^\]]+)\]\s+"
+    r"(?P<name>[^\s(]+)\((?P<summary>.*?)\)\s+→\s+(?P<result>.*)$",
+    re.DOTALL,
+)
+
+
+def _resume_tool_event(message: dict) -> Optional[dict]:
+    """Normalize new typed tools and legacy knowledge-tool records."""
+    if message.get("role") == "tool":
+        return {
+            "name": str(message.get("display_name")
+                        or message.get("tool_name") or "tool"),
+            "summary": str(message.get("summary") or ""),
+            "result": str(message.get("content") or ""),
+            "ok": message.get("ok"),
+            "legacy": False,
+        }
+    if message.get("role") != "knowledge":
+        return None
+    match = _LEGACY_TOOL_EVENT_RE.match(str(message.get("content") or ""))
+    if not match:
+        return None
+    data = match.groupdict()
+    summary = data["summary"].strip()
+    duplicate_prefix = data["name"] + " "
+    if summary.startswith(duplicate_prefix):
+        summary = summary[len(duplicate_prefix):].strip()
+    return {
+        "name": data["name"],
+        "summary": summary,
+        "result": data["result"].strip(),
+        "ok": None,
+        "legacy": True,
+    }
+
+
+def _print_resume_event(message: dict) -> None:
+    """Render one saved event with the same visual vocabulary as the REPL."""
+    tool = _resume_tool_event(message)
+    if tool is not None:
+        status = "[success]●[/success]" if tool["ok"] is not False else "[error]✕[/error]"
+        summary = _md_escape(tool["summary"][:160])
+        suffix = f"  [muted]{summary}[/muted]" if summary else ""
+        console.print(
+            f"  {status} [accent.dim]{_md_escape(tool['name'])}[/accent.dim]{suffix}",
+            highlight=False,
+        )
+        result = tool["result"].strip()
+        if result:
+            result_style = (
+                "error" if tool["ok"] is False or "error" in result.lower()
+                else "muted"
+            )
+            console.print(Padding(
+                Text(result[:500], style=result_style), (0, 0, 0, 4)
+            ))
+        return
+
+    role = str(message.get("role") or "?")
+    content = str(message.get("content") or "")
+    if role == "user":
+        input_kind = message.get("input_kind") or "prompt"
+        if input_kind == "shell":
+            console.print(f"[muted]$ {_md_escape(content)}[/muted]", highlight=False)
+        elif input_kind == "interactive":
+            console.print(f"[muted]› {_md_escape(content)}[/muted]", highlight=False)
+        else:
+            console.print(f"[accent]❯[/accent] {_md_escape(content)}", highlight=False)
+    elif role == "assistant":
+        console.print(Markdown(content or "*(empty)*"))
+    elif role == "knowledge":
+        console.print("[warning]context[/warning]")
+        console.print(Padding(Text(content or "(empty)", style="muted"), (0, 0, 0, 2)))
+    elif role == "shell":
+        rc = message.get("returncode")
+        style = "error" if isinstance(rc, int) and rc != 0 else "muted"
+        console.print(Padding(Text(content or "(no output)", style=style), (0, 0, 0, 2)))
+    else:
+        console.print(f"[muted]{_md_escape(role)} · {_md_escape(content)}[/muted]",
+                      highlight=False)
 
 
 def _print_resume_transcript(blob: dict, limit: Optional[int]) -> None:
@@ -3902,18 +3983,14 @@ def _print_resume_transcript(blob: dict, limit: Optional[int]) -> None:
         at_start = len(window) >= total
     console.print()
     console.print(
-        f"[dim]── conversation ── {len(window)}/{total} message(s) "
+        f"[dim]── conversation ── {len(window)}/{total} event(s) "
         f"{'(all)' if at_start else '(most recent)'} ──[/dim]"
     )
     older = (blob.get("older_summary") or "").strip()
     if at_start and older:
         console.print(f"[dim yellow][earlier session context]\n{older}[/dim yellow]\n")
     for msg in window:
-        role = str(msg.get("role", "?"))
-        content = str(msg.get("content") or "")
-        color = _resume_role_style(role)
-        console.print(f"[bold {color}]{role}[/bold {color}]")
-        console.print(content or "[dim](empty)[/dim]")
+        _print_resume_event(msg)
         console.print()
 
 
@@ -4540,7 +4617,8 @@ class TerminalSession:
       browser → host : {"t":"i","d":<b64>}  input     {"t":"resize","cols","rows"}
     """
 
-    def __init__(self, backend_url, agent_id, agent_secret, session_id, cols, rows):
+    def __init__(self, backend_url, agent_id, agent_secret, session_id, cols, rows,
+                 on_closed=None):
         self.backend_url = backend_url
         self.agent_id = agent_id
         self.agent_secret = agent_secret
@@ -4551,6 +4629,7 @@ class TerminalSession:
         self.pid = None
         self._ws = None
         self._closed = threading.Event()
+        self._on_closed = on_closed
 
     def _ws_url(self):
         base = self.backend_url.replace("https://", "wss://").replace("http://", "ws://")
@@ -4571,13 +4650,36 @@ class TerminalSession:
         threading.Thread(target=self._run, daemon=True,
                          name=f"laintas-term-{self.session_id}").start()
 
+    def close(self):
+        """Revoke the relay and terminate the shell, if still active."""
+        self._cleanup()
+
     def _run(self):
-        import pty
+        if self._closed.is_set():
+            return
+        import pty, ssl
         from websockets.sync.client import connect
+
+        # requests (used for /connect's HTTP registration) bundles its own
+        # certifi CA store, so it works even when the OS trust store is
+        # missing/broken — a common state on minimal Linux installs. The
+        # websockets library has no such fallback: left to its default
+        # ssl.create_default_context(), it trusts the OS store only, and
+        # fails with CERTIFICATE_VERIFY_FAILED in exactly that situation.
+        # Build the same certifi-backed context requests effectively uses.
+        ssl_context = None
+        if self._ws_url().startswith("wss://"):
+            try:
+                import certifi
+                ssl_context = ssl.create_default_context(cafile=certifi.where())
+            except Exception:
+                ssl_context = None  # fall back to the library default
 
         shell = os.environ.get("SHELL") or "/bin/bash"
         self.pid, self.fd = pty.fork()
         if self.pid == 0:
+            if self._closed.is_set():
+                os._exit(0)
             # Child: become the shell with a sane terminal identity.
             os.environ["TERM"] = "xterm-256color"
             try:
@@ -4587,16 +4689,46 @@ class TerminalSession:
             return
 
         # Parent: size the PTY, then connect the relay.
+        if self._closed.is_set():
+            self._cleanup()
+            return
         self._set_winsize(self.cols, self.rows)
-        try:
-            self._ws = connect(
-                self._ws_url(),
-                additional_headers={"Authorization": f"Agent {self.agent_secret}"},
-                open_timeout=10,
-                max_size=64 * 1024,
-            )
-        except Exception as e:
-            console.print(f"[red]Terminal relay connect failed: {e}[/red]")
+        # A CDN/WAF in front of the backend (Cloudflare Free, in our case)
+        # intermittently rejects the WebSocket *upgrade* from this non-browser
+        # client with HTTP 400 — the plain-HTTPS siblings (register/heartbeat
+        # via `requests`) sail through, but the WS handshake gets fingerprinted
+        # and flaked ~1-in-N. It succeeds on retry the vast majority of the
+        # time, so retry a few times with short backoff instead of failing the
+        # whole open on the first flaky rejection. (The browser-shaped UA below
+        # cuts the reject rate but doesn't eliminate it, since CF also
+        # fingerprints the TLS/handshake, not just the UA.)
+        last_err = None
+        for attempt in range(5):
+            if self._closed.is_set():
+                self._cleanup()
+                return
+            try:
+                self._ws = connect(
+                    self._ws_url(),
+                    additional_headers={"Authorization": f"Agent {self.agent_secret}"},
+                    open_timeout=10,
+                    max_size=64 * 1024,
+                    ssl=ssl_context,
+                    user_agent_header="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                                      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                )
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+                if attempt < 4:
+                    time.sleep(0.6 * (attempt + 1))
+        if last_err is not None:
+            console.print(f"[red]Terminal relay connect failed after retries: {last_err}[/red]")
+            self._cleanup()
+            return
+
+        if self._closed.is_set():
             self._cleanup()
             return
 
@@ -4669,6 +4801,11 @@ class TerminalSession:
                 self._ws.close()
             except Exception:
                 pass
+        if self._on_closed is not None:
+            try:
+                self._on_closed(self.session_id)
+            except Exception:
+                pass
 
 
 class AgentRegistry:
@@ -4698,6 +4835,14 @@ class AgentRegistry:
         self.depth: int = 0
         self.parent_remote_id: Optional[str] = None
         self.terminal_meta: Optional[dict] = None
+        # Absolute host path the user chose to SHARE as Helpwo's remote
+        # workspace via `/connect <folder>`. None = link only, share nothing
+        # (Helpwo keeps its virtual workspace). Only meaningful at depth 0.
+        self.workspace_path: Optional[str] = None
+        # Raw PTY relay sessions are tracked separately from nested CLI
+        # terminals so disconnect/unregister can revoke them all.
+        self._remote_terminal_lock = threading.RLock()
+        self._remote_terminals: dict[str, "TerminalSession"] = {}
         # REPL state callbacks, stashed by main() so /connect can start the
         # message poll outside main's scope.
         self._state_cb = None
@@ -4874,6 +5019,10 @@ class AgentRegistry:
             payload["userName"] = user_name
         if self.parent_remote_id:
             payload["parentId"] = self.parent_remote_id
+        if self.workspace_path:
+            # The one folder the user opted to share; Helpwo mounts this as the
+            # remote workspace root (file bytes ride P2P, off this server).
+            payload["workspacePath"] = self.workspace_path
         if self._last_agent_id:
             # Ask the gateway to resurrect the same agentId so Helpwo tabs
             # and sub-terminal parent links survive re-registration.
@@ -5831,33 +5980,116 @@ class AgentRegistry:
         """Spawn a real PTY shell and dial into the backend terminal relay.
 
         Gives the Helpwo browser a live shell (vim/htop/colors/Ctrl-C all
-        work) — same trust level as remote_exec, which already runs arbitrary
-        commands. It is disabled by default and can only be enabled in the
-        CLI's local runtime configuration.
+        work). It is disabled by default and can only be enabled in the CLI's
+        local runtime configuration (disable_remote_terminal).
+
+        On top of that standing gate, EVERY open also goes through the same
+        policy-engine + approval flow as remote_exec (see _handle_exec) —
+        keystrokes inside the PTY aren't filterable per-command the way a
+        single shell.exec call is, so the moment of granting the session is
+        the only place left to supervise it.
         """
         if get_runtime_config("disable_remote_terminal"):
             console.print("[yellow]Remote terminal request ignored (disable_remote_terminal is set).[/yellow]")
+            self._push_final(req_id, "fail", "disable_remote_terminal is set on this CLI")
             return
         session_id = (payload.get("sessionId") or "").strip()
-        if not session_id:
+        if not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", session_id):
+            self._push_final(req_id, "fail", "invalid sessionId")
             return
+        with self._remote_terminal_lock:
+            if session_id in self._remote_terminals:
+                self._push_final(req_id, "fail", "terminal session is already open")
+                return
         try:
             cols = max(1, int(payload.get("cols") or 80))
             rows = max(1, int(payload.get("rows") or 24))
         except (TypeError, ValueError):
             cols, rows = 80, 24
 
+        # Policy gate. In the default audit mode this only audit-logs and
+        # allows (seamless open — the real controls are disable_remote_terminal
+        # above + the local console panel below). Only policy mode=enforce
+        # returns needs_approval and blocks. Note: an approval here blocks the
+        # handler until the user responds, and the browser's own WS has a
+        # bounded wait — enforce-mode users should approve promptly (the
+        # browser now stays attached on WS-open rather than hard-timing-out at
+        # 10s, so a reasonably prompt approval still connects fine).
+        cwd = os.getcwd()
+        import policy as _policy
+        decision = _policy.evaluate_terminal_open(cwd, req_id=req_id, agent_id=self.agent_id)
+        if decision.action == "deny":
+            self._push_final(req_id, "fail", f"Blocked by policy: {decision.reason}")
+            return
+        if decision.action == "needs_approval":
+            approval = self._request_approval(
+                req_id, f"[open interactive terminal] session {session_id}", cwd, timeout=120)
+            if approval != "approve":
+                self._push_final(req_id, "aborted", f"User {approval}: open interactive terminal")
+                return
+
+        # Another request may have passed its approval concurrently. Recheck
+        # under the lock so one relay session ID can never acquire two PTYs.
+        with self._remote_terminal_lock:
+            if session_id in self._remote_terminals:
+                self._push_final(req_id, "fail", "terminal session is already open")
+                return
+
+        # The relay must be dialed at the SAME Helpwo host the browser is on —
+        # that host's nginx carries the /term WebSocket-upgrade config and
+        # reaches the same gateway. The CLI's own get_backend_url() may point
+        # at a different laintas origin (e.g. the main site) whose nginx has
+        # no /term WS location and would 400 the upgrade. Trust the browser's
+        # host only if it's a laintas.com origin; otherwise fall back.
+        # Exact allow-list, NOT a "*.laintas.com" suffix match. The CLI dials
+        # this host carrying `Authorization: Agent <secret>` (its long-lived
+        # host credential); a suffix match would let anyone who can send a
+        # term-open (i.e. already holds the Helpwo session) name an
+        # attacker-controlled *.laintas.com subdomain and exfiltrate that
+        # secret / hijack the PTY to a rogue relay. Only known Helpwo origins
+        # (or an env override for self-hosters) are accepted; anything else
+        # falls back to the CLI's own configured backend.
         backend_url = get_backend_url()
+        allowed_relay_hosts = {
+            h.strip().lower() for h in os.environ.get(
+                "LAINTAS_RELAY_HOSTS", "helpwo.laintas.com,localhost:5173,127.0.0.1:5173"
+            ).split(",") if h.strip()
+        }
+        raw_host = str(payload.get("host") or "").strip().lower()
+        if raw_host in allowed_relay_hosts and re.fullmatch(r"[a-z0-9.:-]{1,253}", raw_host):
+            scheme = "http" if raw_host.split(":", 1)[0] in ("localhost", "127.0.0.1") else "https"
+            backend_url = f"{scheme}://{raw_host}"
         console.print(Panel(
-            f"[bold cyan]Browser opened a terminal[/bold cyan]\n[dim]session {session_id} · {cols}×{rows}[/dim]",
+            f"[bold cyan]Browser opened a terminal[/bold cyan]\n[dim]session {session_id} · {cols}×{rows}[/dim]\n[dim]relay: {backend_url}[/dim]",
             title="Remote Terminal", border_style="cyan",
         ))
         try:
             term = TerminalSession(backend_url, self.agent_id, self.agent_secret,
-                                   session_id, cols, rows)
+                                   session_id, cols, rows,
+                                   on_closed=self._remove_remote_terminal)
+            with self._remote_terminal_lock:
+                self._remote_terminals[session_id] = term
             term.start()
+            self._push_final(req_id, "success", f"opened terminal session {session_id}")
         except Exception as e:
+            with self._remote_terminal_lock:
+                self._remote_terminals.pop(session_id, None)
             console.print(f"[red]Failed to open remote terminal: {e}[/red]")
+            self._push_final(req_id, "fail", f"failed to open terminal: {e}")
+
+    def _remove_remote_terminal(self, session_id: str) -> None:
+        with self._remote_terminal_lock:
+            self._remote_terminals.pop(session_id, None)
+
+    def _close_remote_terminals(self) -> None:
+        with self._remote_terminal_lock:
+            terminals = list(self._remote_terminals.values())
+            self._remote_terminals.clear()
+        for term in terminals:
+            try:
+                term.close()
+            except Exception:
+                pass
 
     def _handle_term_new(self, req_id: str, payload: dict):
         """Helpwo's 添加终端 → create a named sub-terminal here (same path as
@@ -5892,7 +6124,14 @@ class AgentRegistry:
             self._push_final(req_id, "fail", f"could not start terminal '{name}'")
             return
         sub.read_output(timeout=0.1)
-        register_terminal(sub, "laintas-cli", 0, name=name)
+        try:
+            register_terminal(
+                sub, "laintas-cli", 0, name=name,
+                parent_terminal="term0")
+        except Exception as exc:
+            sub.close()
+            self._push_final(req_id, "fail", f"could not register terminal '{name}': {exc}")
+            return
         console.print(Panel(
             f"[bold cyan]Helpwo created sub-terminal [bold]{name}[/bold][/bold cyan]\n"
             f"[dim]It will hand itself over to Helpwo once it finishes starting.[/dim]",
@@ -5964,6 +6203,7 @@ class AgentRegistry:
             generate_prompt=generate_cli_prop_template,
             call_backend=lambda **kw: call_backend_stream(**kw),
             SubTerminalSession=SubTerminalSession,
+            InteractiveSession=InteractiveSession,
             display_command_output=display_command_output,
             display_sub_terminal_preview=display_sub_terminal_preview,
             display_file_diff=display_file_diff,
@@ -6277,6 +6517,7 @@ class AgentRegistry:
         if self._remote_control_executor is not None:
             self._remote_control_executor.shutdown(wait=False, cancel_futures=True)
             self._remote_control_executor = None
+        self._close_remote_terminals()
 
         # Flush queued events (≤2s) then stop the sender thread so the
         # final unregister POST is the last thing we do.
@@ -6432,9 +6673,20 @@ def _show_terminal_detail(name: str, cmd: str, sess, created: float, alive: bool
 
     output = sess.full_output if sess else ""
     output_preview = output[-1000:] if len(output) > 1000 else output
+    registry_name = "term0" if name == "term0 (primary)" else name
+    info = get_terminal(registry_name)
+    parent = info.parent_terminal if info else None
+    agents = list(info.stationed_agent_ids) if info else []
+    children = [
+        item.name for item in get_all_terminals()
+        if item.parent_terminal == registry_name
+    ]
 
     detail_text = (
         f"[bold]Name:[/bold] {name}\n"
+        f"[bold]Parent:[/bold] {parent or '(root)'}\n"
+        f"[bold]Child terminals:[/bold] {', '.join(children) or '(none)'}\n"
+        f"[bold]Deployed agents:[/bold] {', '.join(agents) or '(none)'}\n"
         f"[bold]Command:[/bold] {cmd[:200]}\n"
         f"[bold]Status:[/bold] {'[green]Alive[/green]' if alive else '[red]Dead[/red]'}\n"
         f"[bold]Uptime:[/bold] {uptime_str}\n"
@@ -6479,8 +6731,15 @@ def show_terminal_manager(primary_session=None) -> None:
                 else:
                     uptime_str = f" {uptime / 3600:.1f}h"
             cmd_preview = cmd[:60].replace("\n", " ")
+            registry_name = "term0" if name == "term0 (primary)" else name
+            info = get_terminal(registry_name)
+            owner = (
+                f" parent={info.parent_terminal or 'root'}"
+                f" agents={len(info.stationed_agent_ids)}"
+                if info else ""
+            )
             labels.append(f"[bold]{name}[/bold]  {status}{uptime_str}  "
-                          f"[dim]{cmd_preview}[/dim]")
+                          f"[dim]{cmd_preview}{owner}[/dim]")
         return labels
 
     sel_idx = 0
@@ -7063,7 +7322,7 @@ _SLASH_ARG_RULES: dict[tuple[str, ...], SlashArgRule] = {
         )
     },
     ("/help",): _arg_rule(1, "/help [command]"),
-    ("/connect",): _arg_rule(1, "/connect [name]"),
+    ("/connect",): _arg_rule(1, "/connect [folder]"),
     ("/terminate",): _arg_rule(1, "/terminate <name>"),
     ("/abort",): _arg_rule(1, "/abort <agent-id>"),
     ("/undo",): _arg_rule(1, "/undo [sha]"),
@@ -10576,25 +10835,20 @@ def _cmd_station(parts: list, agent_registry: AgentRegistry, session: dict) -> b
         console.print(
             f"[red]Agent '{agent_id_arg}' not found. Use /hire to create one.[/red]")
         return False
+    manager = get_current_agent()
+    manager_terminal = (
+        (manager.stationed_terminal or manager.home_terminal or manager.parent_terminal)
+        if manager is not None else "term0"
+    ) or "term0"
     name = (station_args[1] if len(station_args) == 2
-            else (f"work-{target_agent.id}" if task else "term0"))
+            else (target_agent.stationed_terminal
+                  or target_agent.home_terminal
+                  or manager_terminal))
     if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", name):
         console.print("[red]Invalid terminal name.[/red]")
         return False
-    if task and name.lower() in {"current", "here", "term0"}:
-        console.print(
-            "[red]Assignments require a dedicated terminal; omit the terminal "
-            "to create one automatically.[/red]")
-        return False
     if name.lower() in ("current", "here", "term0"):
         name = "term0"
-
-    # If the agent is already deployed somewhere else, refuse so the user is explicit
-    existing_home = getattr(target_agent, "home_terminal", None)
-    if existing_home and existing_home != name:
-        console.print(f"[yellow]Agent {target_agent.id} is already deployed to '{existing_home}'. "
-                      f"Use /terminate {existing_home} first.[/yellow]")
-        return False
 
     # Special case: deploy to the parent REPL (term0). Term0 should
     # already have a real persistent bash session created at startup.
@@ -10604,6 +10858,13 @@ def _cmd_station(parts: list, agent_registry: AgentRegistry, session: dict) -> b
         if (term0_info is None
                 or term0_info.session is None
                 or not term0_info.session.is_alive()):
+            if term0_info is not None:
+                unregister_terminal("term0")
+                if get_agent(target_agent.id) is None:
+                    console.print(
+                        f"[red]Agent '{target_agent.id}' ended with its previous "
+                        "deployment terminal.[/red]")
+                    return False
             try:
                 _term0 = InteractiveSession(
                     DEFAULT_SHELL, timeout=0, stream_output=False,
@@ -10612,14 +10873,29 @@ def _cmd_station(parts: list, agent_registry: AgentRegistry, session: dict) -> b
                 time.sleep(0.08)
                 if _term0.is_alive():
                     _term0.read_output(timeout=0.1)
+                if not _term0.is_alive():
+                    console.print("[red]Could not start term0.[/red]")
+                    return False
                 register_terminal(_term0, DEFAULT_SHELL, 0, name="term0")
-            except Exception:
-                register_terminal(None, "parent-repl", 0, name="term0")
-        target_agent.home_terminal = "term0"
-        target_agent.stationed_terminal = "term0"
-        if target_agent.role != "primary":
-            target_agent.role = "deployed"
+            except Exception as exc:
+                console.print(f"[red]Could not start term0: {exc}[/red]")
+                return False
+        if not station_agent(target_agent.id, "term0"):
+            console.print(
+                f"[red]Could not deploy agent '{target_agent.id}' to term0. "
+                "Finish or cancel its active assignment first.[/red]")
+            return False
         console.print(f"[green]Stationed [bold]{target_agent.id}[/bold] in this REPL (term0)[/green]")
+        if task:
+            assignment_events = (
+                (lambda events: agent_registry._push_events(events))
+                if agent_registry and agent_registry.agent_id else None
+            )
+            ok, message, assignment = start_agent_assignment(
+                target_agent.id, task, get_loop_deps(),
+                session=session, events_cb=assignment_events)
+            style = "green" if ok else "red"
+            console.print(f"[{style}]{message}[/{style}]")
         return False
 
     # Sub-terminal path: inspect existing terminal
@@ -10628,11 +10904,20 @@ def _cmd_station(parts: list, agent_registry: AgentRegistry, session: dict) -> b
         # Re-using an existing live terminal — just attach the agent,
         # don't respawn anything. The agent's shell.exec will route via
         # send_keys + marker-poll into that terminal's PTY.
-        station_agent(target_agent.id, name)
+        if not station_agent(target_agent.id, name):
+            console.print(
+                f"[red]Could not deploy agent '{target_agent.id}' to '{name}'. "
+                "Finish or cancel its active assignment first.[/red]")
+            return False
         console.print(f"[green]Stationed [bold]{target_agent.id}[/bold] → terminal [bold]{name}[/bold] (existing)[/green]")
     else:
         if existing:
             unregister_terminal(name)
+            if get_agent(target_agent.id) is None:
+                console.print(
+                    f"[red]Agent '{target_agent.id}' ended with its previous "
+                    "deployment terminal.[/red]")
+                return False
 
         # A station is a work place, not another CLI identity.  The employee
         # loop stays in-process; POSIX uses a dedicated PTY.
@@ -10644,8 +10929,19 @@ def _cmd_station(parts: list, agent_registry: AgentRegistry, session: dict) -> b
             console.print(f"[red]Could not start terminal '{name}'.[/red]")
             return False
         sub.read_output(timeout=0.1)
-        register_terminal(sub, shell_cmd, 0, name=name)
-        station_agent(target_agent.id, name)
+        try:
+            register_terminal(
+                sub, shell_cmd, 0, name=name,
+                parent_terminal=manager_terminal)
+        except Exception as exc:
+            sub.close()
+            console.print(f"[red]Could not register terminal '{name}': {exc}[/red]")
+            return False
+        if not station_agent(target_agent.id, name):
+            unregister_terminal(name)
+            console.print(
+                f"[red]Could not deploy agent '{target_agent.id}' to '{name}'.[/red]")
+            return False
         console.print(
             f"[green]Stationed [bold]{target_agent.id}[/bold] → "
             f"terminal [bold]{name}[/bold] "
@@ -10691,21 +10987,19 @@ def _cmd_terminate(parts: list) -> None:
         name = chosen.name if chosen else ""
     if not name:
         console.print("[dim]Terminal selection cancelled.[/dim]")
+    elif name == "term0":
+        console.print("[red]term0 is owned by this CLI; use /exit to close it.[/red]")
     else:
         term = get_terminal(name)
-        returned: list[str] = []
-        if term:
-            for aid in list(term.stationed_agent_ids):
-                employee = get_agent(aid)
-                if employee and employee.active_assignment is not None:
-                    abort_agent(aid)
-                unstation_agent(aid)
-                returned.append(aid)
+        terminated_agents = list(term.stationed_agent_ids) if term else []
         if unregister_terminal(name):
-            if returned:
-                console.print(f"[green]Terminated [bold]{name}[/bold]; returned {', '.join(returned)} to pool[/green]")
+            if terminated_agents:
+                console.print(
+                    f"[green]Terminated [bold]{name}[/bold] and its child "
+                    f"resources; agents ended: {', '.join(terminated_agents)}[/green]")
             else:
-                console.print(f"[green]Terminated [bold]{name}[/bold][/green]")
+                console.print(
+                    f"[green]Terminated [bold]{name}[/bold] and its child resources[/green]")
         else:
             console.print(f"[red]Terminal '{name}' not found.[/red]")
 
@@ -10793,25 +11087,51 @@ def _cmd_hire(parts: list) -> bool:
     if hire_name and get_agent(hire_name) is not None:
         console.print(f"[red]Agent '{hire_name}' already exists.[/red]")
         return False
-    agent_info = register_agent(
-        name=hire_name, depth=1, role="pool", profile=employee_profile)
+    owner = get_current_agent()
+    terminal_name = (
+        (owner.stationed_terminal or owner.home_terminal or owner.parent_terminal)
+        if owner is not None else "term0"
+    ) or "term0"
+    terminal = get_terminal(terminal_name)
+    if terminal is None or terminal.session is None or not terminal.session.is_alive():
+        console.print(
+            f"[red]Current terminal '{terminal_name}' is unavailable; "
+            "cannot hire an agent without a live deployment terminal.[/red]")
+        return False
+    try:
+        agent_info = register_agent(
+            name=hire_name, depth=1, role="deployed",
+            profile=employee_profile, replace_existing=False)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        return False
+    agent_info.state["_persisted_employee"] = True
     if (not agent_info.profile.prompt.strip()
             and not agent_info.profile.specialist_role):
         agent_info.profile.prompt = (
             f"You are {agent_info.name}, a hired employee of this project. "
-            "Use only your assigned capabilities, work only on the current "
-            "station assignment, and report concrete results to the manager."
+            "You are deployed to the current terminal and your lifetime is "
+            "owned by that terminal. Use only your assigned capabilities, "
+            "work only on explicit assignments delivered through your "
+            "deployment terminal or agent messaging, and report concrete "
+            "results to the manager."
         )
-    agent_info.parent_terminal = "term0"
+    agent_info.parent_terminal = terminal_name
+    if not station_agent(agent_info.id, terminal_name):
+        unregister_agent(agent_info.id, delete_persisted=True)
+        console.print(
+            f"[red]Could not deploy agent '{agent_info.id}' to "
+            f"terminal '{terminal_name}'.[/red]")
+        return False
     agent_persistence.save_agent_state(agent_info)
     console.print(Panel(
         _employee_capability_text(agent_info),
-        title=f"Hired employee: {agent_info.name}",
+        title=f"Hired employee: {agent_info.name} → {terminal_name}",
         border_style="green",
     ))
     console.print(
-        f"[dim]Assign work with /station {agent_info.id} "
-        "[terminal] --task \"...\"[/dim]")
+        f"[dim]Agent is deployed to {terminal_name}. Start work with "
+        f"/station {agent_info.id} --task \"...\"[/dim]")
 
     return False
 
@@ -11313,19 +11633,24 @@ def _cmd_mcp(parts: list) -> bool:
 
 
 def _cmd_connect(parts: list, agent_registry: AgentRegistry, session: dict) -> None:
-    # /connect [name] — link THIS terminal to Helpwo (primary or sub);
-    # optional name customizes how it appears in Helpwo.
+    # /connect [folder] — link THIS terminal to Helpwo (primary or sub).
+    # With a folder, that folder is SHARED as Helpwo's remote workspace (build
+    # page goes remote; file bytes ride P2P). Bare /connect links only and
+    # shares nothing. The display name now lives in /name, not here.
     if agent_registry is None:
         console.print("[red]No agent registry available.[/red]")
-    else:
-        custom_name = parts[1] if len(parts) >= 2 else None
-        if custom_name and not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", custom_name):
-            console.print("[red]Invalid name. Use letters, numbers, dot, "
-                          "underscore, or hyphen (max 64).[/red]")
-        elif custom_name and custom_name.lower() == "term0":
-            console.print("[red]'term0' is reserved.[/red]")
-        else:
-            connect_terminal_to_helpwo(agent_registry, session, name=custom_name)
+        return
+    workspace = None
+    if len(parts) >= 2:
+        raw = " ".join(parts[1:]).strip().strip('"').strip("'")
+        candidate = os.path.abspath(os.path.expanduser(raw))
+        if not os.path.isdir(candidate):
+            console.print(f"[red]Not a directory: {raw}[/red]\n"
+                          f"[dim]/connect <folder> shares an existing folder as "
+                          f"Helpwo's remote workspace; bare /connect links only.[/dim]")
+            return
+        workspace = candidate
+    connect_terminal_to_helpwo(agent_registry, session, workspace=workspace)
 
 
 
@@ -11335,6 +11660,7 @@ def _cmd_disconnect(agent_registry: AgentRegistry) -> None:
     elif getattr(agent_registry, "depth", 0) == 0:
         name = agent_registry.agent_name
         agent_registry._last_agent_id = ""  # explicit — don't resurrect
+        agent_registry.workspace_path = None  # bare /connect later shares nothing
         agent_registry.unregister()
         agent_registry.agent_id = None
         agent_registry.agent_secret = ""
@@ -11382,9 +11708,14 @@ def _cmd_term(parts: list, agent_registry: AgentRegistry, interactive_session) -
         if existing is not None:
             console.print(f"[yellow]Terminal '{name}' already exists. /t to view, /terminate {name} to remove.[/yellow]")
         else:
+            parent_identity = (
+                (agent_registry.terminal_meta or {}).get("name")
+                if agent_registry and agent_registry.depth > 0 else "term0"
+            ) or "term0"
             lain_cmd = _build_connected_subterminal_cmd(
                 name,
                 agent_registry.agent_id if agent_registry else None,
+                parent_terminal=parent_identity,
             )
             sub = SubTerminalSession(lain_cmd)
             sub.start()
@@ -11393,7 +11724,15 @@ def _cmd_term(parts: list, agent_registry: AgentRegistry, interactive_session) -
                 console.print(f"[red]Could not start terminal '{name}'.[/red]")
                 return False
             sub.read_output(timeout=0.1)
-            register_terminal(sub, "laintas-cli", 0, name=name)
+            try:
+                register_terminal(
+                    sub, "laintas-cli", 0, name=name,
+                    parent_terminal="term0")
+            except Exception as exc:
+                sub.close()
+                console.print(
+                    f"[red]Could not register terminal '{name}': {exc}[/red]")
+                return False
             console.print(f"[green]Created sub-terminal [bold]{name}[/bold] (no agent stationed)[/green]")
     elif len(parts) > 2:
         console.print("[yellow]Usage: /term [name|rename <old> <new>][/yellow]")
@@ -12327,13 +12666,13 @@ def get_loop_deps() -> LoopDeps:
             generate_prompt=generate_cli_prop_template,
             call_backend=call_backend_stream,
             SubTerminalSession=SubTerminalSession,
+            InteractiveSession=InteractiveSession,
             display_command_output=display_command_output,
             display_sub_terminal_preview=display_sub_terminal_preview,
             display_file_diff=display_file_diff,
             console=console,
             Markdown=Markdown,
             pty_passthrough=pty_passthrough,
-            build_subterminal_cmd=_build_subterminal_cmd,
             request_command_approval=request_command_approval,
             request_file_write_approval=request_file_write_approval,
             request_file_delete_approval=request_file_delete_approval,
@@ -13089,8 +13428,8 @@ def run_execute_mode(task: str, session: dict, depth: int, session_id: str = Non
     """Non-interactive single-task execution.
 
     Called when laintas-cli is invoked with --execute. Runs one agent loop,
-    prints the result to stdout, and returns the exit code.
-    Used by parent laintas-cli instances to delegate subtasks.
+    prints the result to stdout, and returns the exit code. Local subagents run
+    in-process; this entry point remains for scripts, CI, and external callers.
     """
     agent_state = {
         "shortTermMemory": "",
@@ -13104,7 +13443,9 @@ def run_execute_mode(task: str, session: dict, depth: int, session_id: str = Non
             agent_state = _restore_resume_blob(saved, chat_history)
         else:
             agent_state["_session_id"] = session_id
-    chat_history.append({"role": "user", "content": task})
+    chat_history.append({
+        "role": "user", "content": task, "input_kind": "prompt",
+    })
 
     response = run_agent_loop(
         get_loop_deps(),
@@ -13118,7 +13459,7 @@ def run_execute_mode(task: str, session: dict, depth: int, session_id: str = Non
     )
 
     result = response.get("msg", "")
-    if result:
+    if result and not response.get("_history_recorded"):
         chat_history.append({"role": "assistant", "content": result})
     if session_id:
         save_resume_state(prepare_state_for_repl(response.get("state", agent_state)),
@@ -13408,9 +13749,9 @@ def main():
             # Two-end handshake: NO auto-link. The primary CLI goes online in
             # Helpwo only when the user runs /connect here; sub-terminals only
             # when /connect runs inside them.
-            console.print("[dim]Not linked to Helpwo. Run [bold]/connect \\[name][/bold] "
-                          "to bring this CLI online (Helpwo can then create "
-                          "sub-terminals here from its UI).[/dim]")
+            console.print("[dim]Not linked to Helpwo. Run [bold]/connect[/bold] to bring this "
+                          "CLI online, or [bold]/connect <folder>[/bold] to also share that "
+                          "folder as Helpwo's remote build workspace.[/dim]")
         else:
             console.print("[dim]Run [bold]/connect \\[name][/bold] to hand this "
                           "sub-terminal over to Helpwo.[/dim]")
@@ -13727,9 +14068,12 @@ def main():
                 injected_done.set()
             continue
 
-        if (args.depth == 0
-                and len(user_input.strip().split()) == 1
-                and user_input.strip().split()[0].lower() in ("/q", "/quit")):
+        _is_top_level_quit = (
+            args.depth == 0
+            and len(user_input.strip().split()) == 1
+            and user_input.strip().split()[0].lower() in ("/q", "/quit")
+        )
+        if _is_top_level_quit:
             save_session_snapshot(agent_state, chat_history, _session_start_cwd)
             _checkpoint = save_resume_checkpoint(agent_state, chat_history, _session_start_cwd)
             if current_live_session:
@@ -13752,7 +14096,10 @@ def main():
             should_exit = handle_meta_command(user_input, agent_registry, session, interactive_session)
             current_live_session = getattr(handle_meta_command, '_current_live_session', current_live_session)
             if should_exit:
-                if args.depth == 0:
+                # /q already finalized this logical session as a checkpoint.
+                # Writing a generic autosave here used to create a duplicate
+                # picker entry with the same conversation and a different id.
+                if args.depth == 0 and not _is_top_level_quit:
                     save_session_snapshot(agent_state, chat_history, _session_start_cwd)
                     save_resume_state(agent_state, chat_history, _session_start_cwd)
                     if current_live_session:
@@ -13775,7 +14122,10 @@ def main():
 
         if interactive_session and interactive_session.is_alive():
             console.print(f"[dim yellow]> {user_input}[/dim yellow]")
-            chat_history.append({"role": "user", "content": user_input})
+            chat_history.append({
+                "role": "user", "content": user_input,
+                "input_kind": "interactive",
+            })
             if agent_registry.agent_id:
                 agent_registry._push_events([{"type": "user", "content": user_input}])
 
@@ -13826,7 +14176,8 @@ def main():
                     response = {"success": True, "msg": "", "state": agent_state, "session": interactive_session}
 
             # Save reply
-            if response.get("msg"):
+            if (response.get("msg")
+                    and not response.get("_history_recorded")):
                 chat_history.append({"role": "assistant", "content": response["msg"]})
             # ── Cross-interaction state preservation ──
             agent_state = prepare_state_for_repl(response.get("state", {}))
@@ -13851,9 +14202,15 @@ def main():
 
         # ── Normal input routing ───────────────────────────────────
 
-        # Add to chat history
-        chat_history.append({"role": "user", "content": user_input})
         _system_input = is_system_command(user_input)
+        # Preserve input semantics in the resume record. Shell commands are
+        # terminal activity, not user-to-agent prompts, even though both are
+        # physically typed by the user.
+        chat_history.append({
+            "role": "user",
+            "content": user_input,
+            "input_kind": "shell" if _system_input else "prompt",
+        })
         if not _system_input:
             import plan_mode as _pending_pm
             if _pending_pm.is_pending_task():
@@ -14010,6 +14367,16 @@ def main():
                 done=True,
             ))
 
+            _saved_shell_output = strip_ansi(
+                (result.get("stdout", "") or "")
+                + (result.get("stderr", "") or "")
+            ).strip()
+            if _saved_shell_output:
+                chat_history.append({
+                    "role": "shell",
+                    "content": _saved_shell_output[:4000],
+                    "returncode": result.get("returncode", -1),
+                })
             agent_state["lastOutput"] = result.get("stdout", "")
             response = {
                 "success": result.get("success", False),
@@ -14071,7 +14438,7 @@ def main():
                     _sync_cwd_from_term0(_t0.session)
 
         # Save AI reply to chat history
-        if response.get("msg"):
+        if response.get("msg") and not response.get("_history_recorded"):
             chat_history.append({"role": "assistant", "content": response["msg"]})
 
         # ── Cross-interaction state preservation ──

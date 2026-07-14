@@ -74,7 +74,8 @@ class SlashRegistryTests(unittest.TestCase):
         self.assertIn(employee.id, [item.text for item in completions])
         self.assertIn("reviewer", [item.text for item in profile_completions])
         text = output.getvalue()
-        self.assertIn("does not start work", text)
+        self.assertIn("does not start an assignment", text)
+        self.assertIn("deploys it to the current terminal", text)
         self.assertIn("background Assignment", text)
         self.assertIn("isolated state/history", text)
 
@@ -408,7 +409,7 @@ class SlashRegistryTests(unittest.TestCase):
     def test_declared_slash_leaves_reject_ignored_arguments(self):
         cases = (
             ("/help task extra", "/help [command]"),
-            ("/connect worker extra", "/connect [name]"),
+            ("/connect worker extra", "/connect [folder]"),
             ("/terminate term1 extra", "/terminate <name>"),
             ("/abort agent1 extra", "/abort <agent-id>"),
             ("/task done 1 extra", "/task done <id>"),
@@ -452,23 +453,37 @@ class SlashRegistryTests(unittest.TestCase):
                 laintas_cli._validate_slash_args(action, parts[1:])
 
     def test_hire_defines_employee_profile_without_starting_work(self):
+        agent_loop.close_all_terminals()
         agent_loop.close_all_agents()
         output = io.StringIO()
         old_console = laintas_cli.console
         laintas_cli.console = Console(file=output, force_terminal=False)
         try:
-            with mock.patch("agent_persistence.save_agent_state", return_value=True):
+            primary = agent_loop.register_agent(name="primary", role="primary")
+            primary.home_terminal = "term0"
+            agent_loop.set_current_agent_id(primary.id)
+            terminal_session = mock.Mock()
+            terminal_session.is_alive.return_value = True
+            agent_loop.register_terminal(
+                terminal_session, "/bin/sh", 0, name="term0")
+            with mock.patch("agent_persistence.save_agent_state", return_value=True), \
+                    mock.patch("agent_persistence.delete_agent_state", return_value=True):
                 laintas_cli.handle_meta_command(
                     "/hire alice --profile reviewer", _Registry(), {})
-            employee = agent_loop.get_agent("alice")
-            self.assertIsNotNone(employee)
-            self.assertEqual(employee.profile.specialist_role, "reviewer")
-            self.assertEqual(employee.status, "idle")
-            self.assertIsNone(employee.active_assignment)
-            self.assertNotIn(
-                "shell.exec", employee.profile.tool_policy.allowed_tools)
+                employee = agent_loop.get_agent("alice")
+                self.assertIsNotNone(employee)
+                self.assertEqual(employee.profile.specialist_role, "reviewer")
+                self.assertEqual(employee.status, "idle")
+                self.assertEqual(employee.role, "deployed")
+                self.assertEqual(employee.stationed_terminal, "term0")
+                self.assertIn("alice", agent_loop.get_terminal("term0").stationed_agent_ids)
+                self.assertIsNone(employee.active_assignment)
+                self.assertNotIn(
+                    "shell.exec", employee.profile.tool_policy.allowed_tools)
+                agent_loop.close_all_terminals()
         finally:
             laintas_cli.console = old_console
+            agent_loop.close_all_terminals()
             agent_loop.close_all_agents()
         self.assertIn("Hired employee: alice", output.getvalue())
 
@@ -925,6 +940,53 @@ class ResumeStateTests(unittest.TestCase):
             self.assertEqual(choices[0]["kind"], "autosave")
             self.assertEqual(choices[1]["kind"], "checkpoint")
 
+    def test_resume_payload_title_and_turns_ignore_shell_input(self):
+        history = [
+            {"role": "user", "content": "修复恢复逻辑", "input_kind": "prompt"},
+            {"role": "assistant", "content": "处理中"},
+            {"role": "user", "content": "clear", "input_kind": "shell"},
+            {"role": "user", "content": "ls", "input_kind": "shell"},
+            {"role": "shell", "content": "a.py\nb.py", "returncode": 0},
+        ]
+
+        payload = agent_loop._build_resume_payload({}, history, "/fake/project", "checkpoint")
+
+        self.assertEqual(payload["title"], "修复恢复逻辑")
+        self.assertEqual(payload["turn_count"], 1)
+
+    def test_identical_quit_autosave_and_checkpoint_are_collapsed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            cwd = "/fake/project"
+            key = agent_loop._session_key(cwd)
+            base = {
+                "session_id": "sid-quit", "cwd": cwd,
+                "title": "meaningful task", "turn_count": 1,
+                "chat_history": [{
+                    "role": "user", "content": "meaningful task",
+                    "input_kind": "prompt",
+                }],
+                "state": {}, "tasks": [],
+            }
+            checkpoint = {
+                **base, "id": "chk-quit", "kind": "checkpoint",
+                "timestamp": time.time() - 0.1,
+            }
+            autosave = {
+                **base, "id": "sid-quit", "kind": "autosave",
+                "timestamp": time.time(),
+            }
+            (tmp_path / f"{key}_resume_chk-quit.json").write_text(
+                json.dumps(checkpoint), encoding="utf-8")
+            (tmp_path / f"{key}_session_sid-quit.json").write_text(
+                json.dumps(autosave), encoding="utf-8")
+
+            with mock.patch.object(agent_loop.paths, "SESSIONS_DIR", tmp_path):
+                states = agent_loop.list_resume_states(cwd)
+
+            self.assertEqual(len(states), 1)
+            self.assertEqual(states[0]["kind"], "checkpoint")
+
     def test_delete_resume_state_removes_all_related_files(self):
         """Deleting a checkpoint must remove checkpoint + session + latest files."""
         with tempfile.TemporaryDirectory() as tmp:
@@ -1027,14 +1089,14 @@ class ResumeTranscriptTests(unittest.TestCase):
 
     def test_default_limit_shows_last_20(self):
         text = self._render(self._blob(30), 20)
-        self.assertIn("20/30 message(s)", text)
+        self.assertIn("20/30 event(s)", text)
         self.assertIn("most recent", text)
         self.assertIn("message 29", text)
         self.assertNotIn("message 9", text)
 
     def test_all_shows_every_message(self):
         text = self._render(self._blob(30), None)
-        self.assertIn("30/30 message(s)", text)
+        self.assertIn("30/30 event(s)", text)
         self.assertIn("(all)", text)
         self.assertIn("message 0", text)
         self.assertIn("message 29", text)
@@ -1042,7 +1104,7 @@ class ResumeTranscriptTests(unittest.TestCase):
 
     def test_custom_n_shows_last_n(self):
         text = self._render(self._blob(30), 5)
-        self.assertIn("5/30 message(s)", text)
+        self.assertIn("5/30 event(s)", text)
         self.assertIn("message 29", text)
         self.assertNotIn("message 24", text)
         self.assertIn("message 25", text)
@@ -1054,6 +1116,31 @@ class ResumeTranscriptTests(unittest.TestCase):
     def test_older_summary_only_when_window_reaches_start(self):
         text = self._render(self._blob(30), 5)
         self.assertNotIn("earlier goals digest", text)
+
+    def test_structured_events_use_prompt_shell_and_tool_styles(self):
+        blob = {
+            "chat_history": [
+                {"role": "user", "content": "检查项目", "input_kind": "prompt"},
+                {"role": "assistant", "content": "我先检查。"},
+                {"role": "tool", "tool_name": "terminal.create",
+                 "display_name": "terminal.create", "summary": "worker",
+                 "content": "Created worker", "ok": True},
+                {"role": "user", "content": "ls", "input_kind": "shell"},
+                {"role": "shell", "content": "a.py", "returncode": 0},
+            ],
+            "older_summary": "", "turn_count": 1,
+        }
+
+        text = self._render(blob, None)
+
+        self.assertIn("❯ 检查项目", text)
+        self.assertIn("我先检查。", text)
+        self.assertIn("terminal.create", text)
+        self.assertIn("worker", text)
+        self.assertIn("Created worker", text)
+        self.assertIn("$ ls", text)
+        self.assertIn("a.py", text)
+        self.assertNotIn("\nknowledge\n", text)
 
 
 class _chdir:

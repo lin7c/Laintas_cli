@@ -180,18 +180,21 @@ def _ensure_terminal(role: str):
         if not sub.is_alive():
             return None
         sub.read_output(timeout=0.1)
-        _al.register_terminal(sub, _cli.DEFAULT_SHELL, 0, name=name)
+        _al.register_terminal(
+            sub, _cli.DEFAULT_SHELL, 0, name=name,
+            parent_terminal="term0")
     except Exception:
         return None
     return name
 
 
 def _run_stage(role: str, persona: str, task: str, deps, session, events_cb, abort_ev) -> dict:
-    _ensure_employee(role, persona)
     term = _ensure_terminal(role)
     if not term:
         return {"ok": False, "output": f"could not station employee '{role}' on a terminal"}
-    _al.station_agent(role, term)
+    employee = _ensure_employee(role, persona)
+    if not _al.station_agent(employee.id, term):
+        return {"ok": False, "output": f"could not deploy employee '{role}' to terminal '{term}'"}
     ok, msg, assignment = _al.start_agent_assignment(role, task, deps, session=session, events_cb=events_cb)
     if not ok or assignment is None:
         return {"ok": False, "output": msg}

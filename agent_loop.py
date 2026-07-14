@@ -530,6 +530,7 @@ class TerminalInfo:
     session: Any  # SubTerminalSession
     created_at: float
     created_by: str  # "depth=0"
+    parent_terminal: Optional[str] = None
     stationed_agent_id: Optional[str] = None  # deprecated, use stationed_agent_ids
     stationed_agent_ids: list = field(default_factory=list)
     trigger_pattern: Optional[str] = None    # regex; None = no trigger
@@ -542,6 +543,9 @@ _debug_loop_counter: int = 0
 # Terminal registry — persistent named sub-terminals
 _terminal_registry: dict[str, TerminalInfo] = {}
 _terminal_counter: int = 0
+# One ownership lock covers both terminal and agent registries. Terminal
+# teardown cascades into agents, while deployment mutates both structures.
+_registry_lock = threading.RLock()
 
 
 def add_debug_log(entry: DebugEntry) -> None:
@@ -575,86 +579,156 @@ def get_debug_logs() -> list:
 # ── Terminal Registry ──────────────────────────────────────────────────
 
 def register_terminal(session, command: str, depth: int, name: str = None,
-                      trigger: str = None, trigger_agent_id: str = None) -> str:
-    """Register a persistent sub-terminal. Auto-generates name as 'term<N>' if none given.
-    If the name already exists, closes the old terminal and replaces it.
-    Returns the assigned name.
-    """
+                      trigger: str = None, trigger_agent_id: str = None,
+                      parent_terminal: str = None) -> str:
+    """Register a terminal under one parent; names are never replaced implicitly."""
     global _terminal_registry, _terminal_counter
-    _terminal_counter += 1
-    if name is None:
-        name = f"term{_terminal_counter}"
-    if name in _terminal_registry:
-        try:
-            _terminal_registry[name].session.close()
-        except Exception:
-            pass
-        _trigger_scan_cursors.pop(name, None)
-    info = TerminalInfo(
-        name=name,
-        command=command,
-        session=session,
-        created_at=time.time(),
-        created_by=f"depth={depth}",
-        trigger_pattern=trigger or None,
-        trigger_agent_id=trigger_agent_id or None,
-    )
-    _terminal_registry[name] = info
-    if trigger:
-        start_trigger_scanner()
+    with _registry_lock:
+        _terminal_counter += 1
+        if name is None:
+            name = f"term{_terminal_counter}"
+        if name in _terminal_registry:
+            raise ValueError(f"Terminal '{name}' already exists")
+        if name == "term0":
+            parent_terminal = None
+        else:
+            parent_terminal = parent_terminal or (
+                "term0" if "term0" in _terminal_registry else None)
+            if not parent_terminal or parent_terminal not in _terminal_registry:
+                raise ValueError(
+                    f"Parent terminal '{parent_terminal or '(none)'}' does not exist")
+            parent_info = _terminal_registry[parent_terminal]
+            if (parent_info.session is None
+                    or not parent_info.session.is_alive()):
+                raise ValueError(
+                    f"Parent terminal '{parent_terminal}' is not running")
+            if parent_terminal == name:
+                raise ValueError("A terminal cannot be its own parent")
+        info = TerminalInfo(
+            name=name,
+            command=command,
+            session=session,
+            created_at=time.time(),
+            created_by=f"depth={depth}",
+            parent_terminal=parent_terminal,
+            trigger_pattern=trigger or None,
+            trigger_agent_id=trigger_agent_id or None,
+        )
+        _terminal_registry[name] = info
+    start_trigger_scanner()
     return name
 
 
 def unregister_terminal(name: str) -> bool:
-    """Close and remove a terminal by name. Returns True if it existed."""
-    info = _terminal_registry.pop(name, None)
-    if info is None:
-        return False
-    if info.session is not None:
-        try:
-            info.session.close()
-        except Exception:
-            pass
+    """Recursively close a terminal, its descendants, and its deployed agents."""
+    with _registry_lock:
+        info = _terminal_registry.get(name)
+        if info is None:
+            return False
+
+        children = [
+            child.name for child in list(_terminal_registry.values())
+            if child.parent_terminal == name
+        ]
+        for child_name in children:
+            unregister_terminal(child_name)
+
+        owned_agent_ids = list(info.stationed_agent_ids)
+        for owned in list(_agent_registry.values()):
+            if (owned.role != "primary"
+                    and name in {
+                        owned.stationed_terminal,
+                        owned.home_terminal,
+                        owned.parent_terminal,
+                    }
+                    and owned.id not in owned_agent_ids):
+                owned_agent_ids.append(owned.id)
+        for agent_id in owned_agent_ids:
+            agent = get_agent(agent_id)
+            if agent is None:
+                continue
+            if agent.role == "primary":
+                unstation_agent(agent_id)
+                continue
+            try:
+                abort_agent(agent_id)
+            except Exception:
+                pass
+            delete_persisted = bool(agent.state.get("_persisted_employee"))
+            unregister_agent(agent_id, delete_persisted=delete_persisted)
+
+        _terminal_registry.pop(name, None)
+        _trigger_scan_cursors.pop(name, None)
+        if info.session is not None:
+            try:
+                info.session.close()
+            except Exception:
+                pass
     return True
 
 
 def get_terminal(name: str) -> Optional[TerminalInfo]:
     """Get a terminal by name, or None."""
-    return _terminal_registry.get(name)
+    with _registry_lock:
+        return _terminal_registry.get(name)
 
 
 def get_all_terminals() -> list:
     """Return all registered terminals sorted by creation time."""
-    return sorted(_terminal_registry.values(), key=lambda t: t.created_at)
+    with _registry_lock:
+        return sorted(_terminal_registry.values(), key=lambda t: t.created_at)
 
 
 def close_all_terminals() -> None:
     """Close and remove ALL registered terminals (cascading cleanup)."""
-    for info in list(_terminal_registry.values()):
-        try:
-            info.session.close()
-        except Exception:
-            pass
-    _terminal_registry.clear()
-    _trigger_scan_cursors.clear()
+    with _registry_lock:
+        roots = [
+            info.name for info in list(_terminal_registry.values())
+            if info.parent_terminal is None
+        ]
+        for name in roots:
+            unregister_terminal(name)
+        for name in list(_terminal_registry):
+            unregister_terminal(name)
+        _trigger_scan_cursors.clear()
 
 
 def rename_terminal(old_name: str, new_name: str) -> bool:
     """Rename a terminal without overwriting an existing target."""
-    if not old_name or not new_name:
-        return False
-    if old_name == new_name:
-        return old_name in _terminal_registry
-    if new_name in _terminal_registry:
-        return False
-    info = _terminal_registry.pop(old_name, None)
-    if info is None:
-        return False
-    old_cursor = _trigger_scan_cursors.pop(old_name, None)
-    if old_cursor is not None:
-        _trigger_scan_cursors[new_name] = old_cursor
-    info.name = new_name
-    _terminal_registry[new_name] = info
+    with _registry_lock:
+        if not old_name or not new_name:
+            return False
+        if old_name == new_name:
+            return old_name in _terminal_registry
+        if new_name in _terminal_registry:
+            return False
+        info = _terminal_registry.pop(old_name, None)
+        if info is None:
+            return False
+        old_cursor = _trigger_scan_cursors.pop(old_name, None)
+        if old_cursor is not None:
+            _trigger_scan_cursors[new_name] = old_cursor
+        info.name = new_name
+        _terminal_registry[new_name] = info
+        for child in _terminal_registry.values():
+            if child.parent_terminal == old_name:
+                child.parent_terminal = new_name
+        for agent in get_all_agents():
+            changed = False
+            if agent.stationed_terminal == old_name:
+                agent.stationed_terminal = new_name
+                changed = True
+            if agent.home_terminal == old_name:
+                agent.home_terminal = new_name
+                changed = True
+            if agent.parent_terminal == old_name:
+                agent.parent_terminal = new_name
+                changed = True
+            if agent.active_assignment and agent.active_assignment.terminal_name == old_name:
+                agent.active_assignment.terminal_name = new_name
+                changed = True
+            if changed and agent.state.get("_persisted_employee"):
+                agent_persistence.save_agent_state(agent)
     return True
 
 
@@ -663,20 +737,21 @@ def set_terminal_trigger(name: str, pattern: str, agent_id: str) -> bool:
 
     Pass an empty pattern to clear. Returns False if the terminal doesn't exist.
     """
-    info = _terminal_registry.get(name)
-    if info is None:
-        return False
-    if pattern:
-        info.trigger_pattern = pattern
-        info.trigger_agent_id = agent_id or None
-        _trigger_scan_cursors.setdefault(
-            name, info.session.full_output if info.session else ""
-        )
-        start_trigger_scanner()
-    else:
-        info.trigger_pattern = None
-        info.trigger_agent_id = None
-        _trigger_scan_cursors.pop(name, None)
+    with _registry_lock:
+        info = _terminal_registry.get(name)
+        if info is None:
+            return False
+        if pattern:
+            info.trigger_pattern = pattern
+            info.trigger_agent_id = agent_id or None
+            _trigger_scan_cursors.setdefault(
+                name, info.session.full_output if info.session else ""
+            )
+            start_trigger_scanner()
+        else:
+            info.trigger_pattern = None
+            info.trigger_agent_id = None
+            _trigger_scan_cursors.pop(name, None)
     return True
 
 
@@ -737,7 +812,12 @@ def _terminal_snapshot_delta(previous: str, current: str) -> str:
 
 def _trigger_scanner_loop() -> None:
     while not _trigger_scanner_stop.wait(0.5):
-        for info in list(_terminal_registry.values()):
+        for info in get_all_terminals():
+            if (info.session is not None
+                    and not info.session.is_alive()
+                    and get_terminal(info.name) is info):
+                unregister_terminal(info.name)
+                continue
             if not info.trigger_pattern or not info.session:
                 continue
             try:
@@ -769,17 +849,25 @@ def _trigger_scanner_loop() -> None:
 
 def start_trigger_scanner() -> None:
     global _trigger_scanner_thread
-    if _trigger_scanner_thread and _trigger_scanner_thread.is_alive():
-        return
-    _trigger_scanner_stop.clear()
-    _trigger_scanner_thread = threading.Thread(
-        target=_trigger_scanner_loop, daemon=True, name="trigger-scanner"
-    )
-    _trigger_scanner_thread.start()
+    with _registry_lock:
+        if _trigger_scanner_thread and _trigger_scanner_thread.is_alive():
+            return
+        _trigger_scanner_stop.clear()
+        _trigger_scanner_thread = threading.Thread(
+            target=_trigger_scanner_loop, daemon=True, name="trigger-scanner"
+        )
+        _trigger_scanner_thread.start()
 
 
 def stop_trigger_scanner() -> None:
+    global _trigger_scanner_thread
     _trigger_scanner_stop.set()
+    thread = _trigger_scanner_thread
+    if (thread is not None and thread.is_alive()
+            and thread is not threading.current_thread()):
+        thread.join(timeout=1.0)
+    if thread is None or not thread.is_alive():
+        _trigger_scanner_thread = None
 
 
 # ── Session Snapshot ───────────────────────────────────────────────────
@@ -922,15 +1010,45 @@ def _summarize_dropped_turns(dropped: list) -> str:
     return f"{head}\n{prefix}{bullets}"
 
 
+def _resume_prompt_messages(chat_history: list) -> list:
+    """Return user-to-agent prompts, excluding typed shell/program input.
+
+    Older resume blobs predate ``input_kind``; their user messages remain
+    eligible for compatibility. New records mark shell and interactive input
+    explicitly so commands such as ``ls`` and ``clear`` cannot become a
+    session title or inflate the conversation turn count.
+    """
+    return [
+        message for message in (chat_history or [])
+        if message.get("role") == "user"
+        and message.get("input_kind") not in {"shell", "interactive", "slash"}
+    ]
+
+
 def _build_resume_payload(state: dict, chat_history: list, cwd: str, kind: str) -> Optional[dict]:
-    user_turns = [m for m in (chat_history or []) if m.get("role") == "user"]
-    if not user_turns:
+    all_user_turns = [
+        m for m in (chat_history or []) if m.get("role") == "user"
+    ]
+    if not all_user_turns:
         return None
+    prompt_turns = _resume_prompt_messages(chat_history)
+    explicit_prompt_turns = [
+        m for m in prompt_turns if m.get("input_kind") == "prompt"
+    ]
     all_history = list(chat_history or [])
     history = all_history[-_RESUME_MAX_TURNS:]
     dropped = all_history[:-_RESUME_MAX_TURNS] if len(all_history) > _RESUME_MAX_TURNS else []
-    last_user = str(user_turns[-1].get("content") or "").strip()
-    title = re.sub(r"\s+", " ", last_user)[:80] or "Untitled session"
+    title_source = (
+        str(explicit_prompt_turns[-1].get("content") or "").strip()
+        if explicit_prompt_turns
+        else str((state or {}).get("objective") or "").strip()
+    )
+    if not title_source and prompt_turns:
+        title_source = str(prompt_turns[-1].get("content") or "").strip()
+    if not title_source:
+        project_name = Path(cwd).name or cwd
+        title_source = f"Terminal session · {project_name}"
+    title = re.sub(r"\s+", " ", title_source)[:80] or "Untitled session"
     session_id = _ensure_session_id(state)
     return {
         "id": session_id if kind == "autosave" else uuid.uuid4().hex[:12],
@@ -939,7 +1057,7 @@ def _build_resume_payload(state: dict, chat_history: list, cwd: str, kind: str) 
         "cwd": cwd,
         "timestamp": time.time(),
         "title": title,
-        "turn_count": len(user_turns),
+        "turn_count": len(prompt_turns),
         "chat_history": history,
         "older_summary": _summarize_dropped_turns(dropped),
         "tasks": task_manager.export_active_tasks(cwd=cwd),
@@ -1045,7 +1163,31 @@ def list_resume_states(cwd: str) -> list:
     except Exception:
         return []
     states.sort(key=lambda item: item.get("timestamp", 0), reverse=True)
-    return states
+
+    # A historical /q path wrote a checkpoint and then an identical autosave.
+    # Collapse exact same-session snapshots while preserving genuinely newer
+    # autosaves whose conversation or working state changed after a checkpoint.
+    unique = []
+    by_snapshot = {}
+    for item in states:
+        stable = {
+            "session_id": item.get("session_id"),
+            "title": item.get("title"),
+            "turn_count": item.get("turn_count"),
+            "chat_history": item.get("chat_history") or [],
+            "tasks": item.get("tasks") or [],
+            "state": item.get("state") or {},
+        }
+        snapshot_key = _fingerprint_payload(stable)
+        previous_index = by_snapshot.get(snapshot_key)
+        if previous_index is None:
+            by_snapshot[snapshot_key] = len(unique)
+            unique.append(item)
+        elif (item.get("kind") == "checkpoint"
+              and unique[previous_index].get("kind") != "checkpoint"):
+            unique[previous_index] = item
+    unique.sort(key=lambda item: item.get("timestamp", 0), reverse=True)
+    return unique
 
 
 def load_resume_state(cwd: str, session_id: str = None) -> Optional[dict]:
@@ -1213,6 +1355,8 @@ class AgentInfo:
     abort_event: Any = field(default_factory=threading.Event)
     message_queue: Any = field(default_factory=queue.Queue)
     slot_held: bool = False                    # scheduler lease; independent of status
+    ephemeral_session: Any = None              # agent-private PTY; never in terminal registry
+    lifecycle_terminated: bool = False         # owning terminal ended; never persist again
     # ── Pool architecture fields ───────────────────────────────────────
     role: str = "pool"                        # pool | deployed | primary | subagent
     parent_terminal: Optional[str] = None     # terminal that spawned this agent
@@ -1232,9 +1376,6 @@ class AgentInfo:
 _agent_registry: dict[str, AgentInfo] = {}
 _agent_counter: int = 0
 _current_agent_id: Optional[str] = None
-# RLock so a method that takes the lock may call another locked method.
-_registry_lock = threading.RLock()
-
 # ── HWO concurrency scheduler ──────────────────────────────────────────
 _max_concurrent: int = 8                         # hard cap on running agents
 _running_count: int = 0                          # agents currently in 'running' state
@@ -1245,7 +1386,8 @@ def register_agent(name: str = None, depth: int = 0,
                    parent_id: Optional[str] = None,
                    role: str = "pool",
                    load_existing: bool = False,
-                   profile: Optional[EmployeeProfile] = None) -> AgentInfo:
+                   profile: Optional[EmployeeProfile] = None,
+                   replace_existing: bool = True) -> AgentInfo:
     """Create and register a new AI agent. Returns the AgentInfo.
 
     If load_existing=True and a persisted state file exists for the given
@@ -1257,6 +1399,8 @@ def register_agent(name: str = None, depth: int = 0,
         _agent_counter += 1
         agent_id = name if name else f"AI-{_agent_counter}"
         if agent_id in _agent_registry:
+            if not replace_existing:
+                raise ValueError(f"Agent '{agent_id}' already exists")
             unregister_agent(agent_id)
         info = AgentInfo(
             id=agent_id,
@@ -1269,6 +1413,11 @@ def register_agent(name: str = None, depth: int = 0,
             role=role,
             profile=profile or EmployeeProfile(),
         )
+        if parent_id and parent_id in _agent_registry:
+            owner = _agent_registry[parent_id]
+            info.parent_terminal = (
+                owner.stationed_terminal or owner.home_terminal
+                or owner.parent_terminal)
         if load_existing:
             data = agent_persistence.load_agent_state(agent_id)
             if data is not None:
@@ -1284,15 +1433,20 @@ def register_agent(name: str = None, depth: int = 0,
         return info
 
 
-def unregister_agent(agent_id: str) -> bool:
+def unregister_agent(agent_id: str, delete_persisted: bool = False) -> bool:
     """Remove an agent. Returns True if it existed."""
     global _current_agent_id, _running_count
     with _registry_lock:
+        existing = _agent_registry.get(agent_id)
+        if existing is None:
+            return False
+        for child_id in list(existing.child_ids):
+            unregister_agent(child_id, delete_persisted=False)
         if _current_agent_id == agent_id:
             _current_agent_id = None
         info = _agent_registry.pop(agent_id, None)
-        if info is None:
-            return False
+        info.lifecycle_terminated = True
+        info.abort_event.set()
         # Release concurrency slot if it held one. Status may already be
         # "aborted", so the lease cannot be inferred from status.
         if info.slot_held:
@@ -1303,6 +1457,21 @@ def unregister_agent(agent_id: str) -> bool:
             parent = _agent_registry[info.parent_id]
             if agent_id in parent.child_ids:
                 parent.child_ids.remove(agent_id)
+        terminal_name = info.stationed_terminal or info.home_terminal
+        if terminal_name and terminal_name in _terminal_registry:
+            term = _terminal_registry[terminal_name]
+            if agent_id in term.stationed_agent_ids:
+                term.stationed_agent_ids.remove(agent_id)
+            term.stationed_agent_id = (
+                term.stationed_agent_ids[0] if term.stationed_agent_ids else None)
+        info.stationed_terminal = None
+        info.home_terminal = None
+        info.parent_terminal = None
+    if delete_persisted:
+        try:
+            agent_persistence.delete_agent_state(agent_id)
+        except Exception:
+            pass
     _pump_queue()   # a slot may have freed
     return True
 
@@ -1354,6 +1523,28 @@ def mark_agent_finished(agent_id: str, result: str = "", error: str = "") -> Non
         if held_slot:
             _running_count = max(0, _running_count - 1)
     _pump_queue()
+    prune_finished_subagents()
+
+
+def prune_finished_subagents(max_kept: int = 100) -> int:
+    """Bound retained task-child history without touching hired employees."""
+    removed = 0
+    with _registry_lock:
+        finished = sorted(
+            (a for a in _agent_registry.values()
+             if a.role == "subagent"
+             and a.status in {"done", "error", "aborted"}),
+            key=lambda a: a.created_at,
+        )
+        excess = finished[:-max_kept] if max_kept > 0 else finished
+        for info in excess:
+            _agent_registry.pop(info.id, None)
+            if info.parent_id and info.parent_id in _agent_registry:
+                parent = _agent_registry[info.parent_id]
+                if info.id in parent.child_ids:
+                    parent.child_ids.remove(info.id)
+            removed += 1
+    return removed
 
 
 def enter_waiting(agent_id: str) -> None:
@@ -1464,11 +1655,15 @@ def get_deployed_agents() -> list:
 
 
 def get_or_hire_pool_agent() -> AgentInfo:
-    """Return the first available pool agent; auto-hire one if pool is empty."""
-    pool = get_pool_agents()
-    if pool:
-        return pool[0]
-    return register_agent(depth=0, role="pool")
+    """Legacy selector: return an idle deployed employee, never create an orphan."""
+    available = [
+        agent for agent in get_deployed_agents()
+        if agent.status == "idle" and agent.active_assignment is None
+    ]
+    if available:
+        return available[0]
+    raise RuntimeError(
+        "No deployed employee is available; hire one from a live terminal first")
 
 
 def start_agent_assignment(agent_id: str, task: str, deps,
@@ -1493,6 +1688,15 @@ def start_agent_assignment(agent_id: str, task: str, deps,
     terminal_name = employee.stationed_terminal or employee.home_terminal
     if not terminal_name:
         return False, f"Agent '{agent_id}' is not stationed at a terminal.", None
+    terminal = get_terminal(terminal_name)
+    if (terminal is None or terminal.session is None
+            or not terminal.session.is_alive()):
+        if terminal is not None:
+            unregister_terminal(terminal_name)
+        return False, (
+            f"Agent '{agent_id}' deployment terminal '{terminal_name}' "
+            "is not running."
+        ), None
 
     assignment = AgentAssignment(
         id=f"job-{uuid.uuid4().hex[:10]}",
@@ -1536,10 +1740,11 @@ def start_agent_assignment(agent_id: str, task: str, deps,
         employee.assignment_history = employee.assignment_history[-100:]
         employee.active_assignment = None
         employee.status = "idle"
-        try:
-            agent_persistence.save_agent_state(employee)
-        except Exception:
-            pass
+        if not employee.lifecycle_terminated:
+            try:
+                agent_persistence.save_agent_state(employee)
+            except Exception:
+                pass
 
     def _runner(ok: bool) -> None:
         if not ok:
@@ -1590,6 +1795,17 @@ def _format_deployment(a: Optional["AgentInfo"]) -> str:
     return role
 
 
+_RUNTIME_OWNERSHIP_PROMPT = """<runtime_ownership authoritative="true">
+- `session.*` and `agent.spawn` create temporary resources.
+- `terminal.*` manages named persistent terminals arranged in a parent-child tree.
+- Every non-root terminal belongs to one live parent terminal. Ending a terminal recursively ends its child terminals.
+- `agent.hire` creates a persistent employee and deploys it directly to the caller's current terminal; hiring does not start an assignment.
+- One terminal may host multiple deployed agents. One agent may be deployed to exactly one terminal.
+- Ending a terminal ends all agents deployed to it and all temporary agents owned by its terminal subtree.
+- Use `agent.spawn` for disposable delegation. Use `agent.hire` for a terminal-scoped employee identity, and use `agent.station` only to move an idle employee to another live terminal.
+</runtime_ownership>"""
+
+
 def get_current_agent() -> Optional[AgentInfo]:
     with _registry_lock:
         if _current_agent_id:
@@ -1623,11 +1839,19 @@ def rename_agent(agent_id: str, new_name: str) -> bool:
 
 
 def station_agent(agent_id: str, terminal_name: str) -> bool:
-    """Station an agent in a terminal. Multiple agents can share one terminal."""
+    """Deploy one agent to exactly one terminal; terminals may host many agents."""
     with _registry_lock:
         agent = _agent_registry.get(agent_id)
         term = _terminal_registry.get(terminal_name)
         if agent is None or term is None:
+            return False
+        if term.session is None or not term.session.is_alive():
+            return False
+        if agent.role == "primary" and terminal_name != "term0":
+            return False
+        if (agent.active_assignment is not None
+                and agent.stationed_terminal
+                and agent.stationed_terminal != terminal_name):
             return False
         # Remove from old terminal's list
         if agent.stationed_terminal and agent.stationed_terminal in _terminal_registry:
@@ -1637,7 +1861,8 @@ def station_agent(agent_id: str, terminal_name: str) -> bool:
             old_term.stationed_agent_id = old_term.stationed_agent_ids[0] if old_term.stationed_agent_ids else None
         agent.stationed_terminal = terminal_name
         agent.home_terminal = terminal_name
-        if agent.role != "primary":
+        agent.parent_terminal = None if agent.role == "primary" else terminal_name
+        if agent.role in {"pool", "deployed"}:
             agent.role = "deployed"
         if agent_id not in term.stationed_agent_ids:
             term.stationed_agent_ids.append(agent_id)
@@ -1650,6 +1875,14 @@ def station_agent(agent_id: str, terminal_name: str) -> bool:
 
 
 def unstation_agent(agent_id: str) -> None:
+    agent = get_agent(agent_id)
+    if agent is not None and agent.role == "deployed":
+        abort_agent(agent_id)
+        unregister_agent(
+            agent_id,
+            delete_persisted=bool(agent.state.get("_persisted_employee")),
+        )
+        return
     with _registry_lock:
         agent = _agent_registry.get(agent_id)
         if agent and agent.stationed_terminal:
@@ -1660,8 +1893,8 @@ def unstation_agent(agent_id: str) -> None:
                 term.stationed_agent_id = term.stationed_agent_ids[0] if term.stationed_agent_ids else None
             agent.stationed_terminal = None
             agent.home_terminal = None
+            agent.parent_terminal = None
             if agent.role == "deployed":
-                agent.role = "pool"
                 agent.status = "idle"
         else:
             agent = None
@@ -1676,17 +1909,34 @@ def close_all_agents() -> None:
     """Clean up all agent registrations. Signals abort to running children first."""
     global _current_agent_id, _running_count, _wait_queue
     cancelled = []
+    ephemeral_sessions = []
     with _registry_lock:
         for info in list(_agent_registry.values()):
+            info.lifecycle_terminated = True
             try:
                 info.abort_event.set()
             except Exception:
                 pass
+            terminal_name = info.stationed_terminal or info.home_terminal
+            term = _terminal_registry.get(terminal_name) if terminal_name else None
+            if term and info.id in term.stationed_agent_ids:
+                term.stationed_agent_ids.remove(info.id)
+                term.stationed_agent_id = (
+                    term.stationed_agent_ids[0]
+                    if term.stationed_agent_ids else None)
+            if info.ephemeral_session is not None:
+                ephemeral_sessions.append(info.ephemeral_session)
+                info.ephemeral_session = None
         cancelled = [start_fn for _, start_fn in _wait_queue]
         _wait_queue = []
         _running_count = 0
         _agent_registry.clear()
         _current_agent_id = None
+    for session in ephemeral_sessions:
+        try:
+            session.close()
+        except Exception:
+            pass
     for start_fn in cancelled:
         threading.Thread(target=start_fn, args=(False,), daemon=True).start()
 
@@ -1738,18 +1988,17 @@ def drain_inbox(agent_id: str) -> list:
 
 
 def abort_agent(agent_id: str) -> bool:
-    """Signal the target agent to stop at the next loop iteration boundary.
-
-    Does not kill subprocesses started by the agent — those need a separate
-    cleanup pass via the terminal registry.
-    """
+    """Signal an agent to stop and immediately close its private PTY, if any."""
     global _wait_queue
     cancelled_callbacks = []
+    ephemeral_session = None
     with _registry_lock:
         info = _agent_registry.get(agent_id)
         if info is None:
             return False
         info.abort_event.set()
+        ephemeral_session = info.ephemeral_session
+        info.ephemeral_session = None
         # A running agent owns a scheduler lease until its loop observes the
         # abort and exits. Changing status here used to leak that lease.
         if info.status in ("idle", "queued", "waiting"):
@@ -1762,6 +2011,11 @@ def abort_agent(agent_id: str) -> bool:
                 else:
                     kept.append((queued_id, start_fn))
             _wait_queue = kept
+    if ephemeral_session is not None:
+        try:
+            ephemeral_session.close()
+        except Exception:
+            pass
     for start_fn in cancelled_callbacks:
         threading.Thread(target=start_fn, args=(False,), daemon=True).start()
     _pump_queue()
@@ -1826,13 +2080,24 @@ def spawn_subagent(parent_id: str, task: str, deps,
             })
         return None
 
-    # Auto-generate name from role if not provided
+    # Auto-generate a readable id from role if requested, but never replace an
+    # existing employee or running child. Agent ids are routing identities;
+    # silently reusing one lets an old runner finish into a new registry entry.
     if not name and role:
         role_instance = agent_roles.get_role(role)
         name = f"{role}-{parent.depth + 1}-{_agent_counter + 1}" if role_instance else name
-
-    child = register_agent(name=name, depth=parent.depth + 1,
-                           parent_id=parent_id, role="subagent")
+    with _registry_lock:
+        if name:
+            base_name = str(name)
+            candidate = base_name
+            suffix = 2
+            while candidate in _agent_registry:
+                candidate = f"{base_name}-{suffix}"
+                suffix += 1
+            name = candidate
+        child = register_agent(
+            name=name, depth=parent.depth + 1,
+            parent_id=parent_id, role="subagent", replace_existing=False)
     if state_overrides:
         child.state.update(dict(state_overrides))
     child.parent_terminal = (
@@ -1862,7 +2127,18 @@ def spawn_subagent(parent_id: str, task: str, deps,
                     _base_cwd, label=name or role or "agent")
                 child.state["cwd"] = _worktree_info.path
         except Exception as _wt_err:
-            _worktree_info = None  # fall back to the shared cwd silently
+            # Isolation was promised for a git-backed task. Never disguise a
+            # failed worktree as a safe spawn in the parent's shared checkout.
+            error_text = f"Worktree isolation failed: {_wt_err}"
+            mark_agent_finished(child.id, error=error_text)
+            if report_to_parent:
+                send_to_agent(parent_id, {
+                    "from": child.id,
+                    "kind": "child-error",
+                    "role": role or "general",
+                    "error": error_text,
+                })
+            return child.id
 
     # Inject role into child state so run_agent_loop picks it up
     effective_task = task
@@ -1969,15 +2245,19 @@ def spawn_subagents_parallel(parent_id: str, tasks: list[dict], deps,
     Returns list of child agent IDs.
     """
     child_ids = []
+    group_id = f"group-{uuid.uuid4().hex[:10]}"
     for t in tasks:
+        task_text = t.get("task") or t.get("goal") or ""
         cid = spawn_subagent(
             parent_id=parent_id,
-            task=t.get("task", ""),
+            task=task_text,
             deps=deps,
             name=t.get("name"),
             session=session,
             events_cb=events_cb,
             role=t.get("role"),
+            group_id=group_id,
+            spawn_context=t.get("hint") or "",
         )
         if cid:
             child_ids.append(cid)
@@ -2035,8 +2315,10 @@ class LoopDeps:
     display_file_diff: Callable[..., None]
     console: Any  # rich.console.Console
     Markdown: type  # rich.markdown.Markdown
+    # Agent-private, one-off PTY sessions. These are never registered as
+    # named persistent terminals and are closed with their owning agent run.
+    InteractiveSession: Optional[type] = None
     pty_passthrough: Optional[Callable[..., dict]] = None
-    build_subterminal_cmd: Optional[Callable[..., str]] = None
     request_command_approval: Optional[Callable[[str, str], bool]] = None
     request_file_write_approval: Optional[Callable[[str, str, str], bool]] = None
     request_file_delete_approval: Optional[Callable[[str, str, str], bool]] = None
@@ -2833,9 +3115,15 @@ def _prepare_history_for_backend(chat_history: list) -> list:
     result = []
     for msg in compacted[-(max_messages + 1):]:
         role = msg.get("role", "user")
-        if role == "knowledge":
+        if role in ("knowledge", "tool", "shell"):
             role = "assistant"
-        content = _trim_text(_stringify_message_content(msg.get("content", "")), msg_limit)
+        content = _stringify_message_content(msg.get("content", ""))
+        if msg.get("role") == "tool":
+            tool_name = str(msg.get("tool_name") or msg.get("name") or "tool")
+            content = f"Tool result ({tool_name}): {content}"
+        elif msg.get("role") == "shell":
+            content = f"Terminal output: {content}"
+        content = _trim_text(content, msg_limit)
         if content.strip():
             result.append({"role": role, "content": content})
     return result
@@ -2990,7 +3278,10 @@ def _build_conversation_section(chat_history: list) -> str:
         if isinstance(content, list):
             content = ' '.join(str(c.get('text', c)) for c in content if isinstance(c, dict))
         content = str(content)[:300]
-        label = "User" if role == "user" else ("Context" if role == "knowledge" else "AI")
+        label = ("User" if role == "user" else
+                 "Context" if role == "knowledge" else
+                 "Tool" if role == "tool" else
+                 "Terminal" if role == "shell" else "AI")
         lines.append(f"  [{label}] {content}")
     return '\n'.join(lines) if lines else "(no history)"
 
@@ -3774,6 +4065,14 @@ def _salient_arg(name: str, arguments: dict) -> str:
         return arguments.get("command", "") or ""
     if name == "terminal.send":
         return f'{arguments.get("name", "?")}: {arguments.get("command", "")}'
+    if name == "terminal.exec":
+        return f'{arguments.get("name", "?")}: {arguments.get("command", "")}'
+    if name in ("terminal.create", "terminal.terminate"):
+        return str(arguments.get("name", "") or "")
+    if name == "terminal.watch":
+        return f'{arguments.get("name", "?")}: {arguments.get("pattern", "")}'
+    if name == "terminal.list":
+        return ""
     if name == "fs.read":
         # Include offset when set: fs.read is the standard way to page
         # through large files in chunks (offset/limit), and dropping the
@@ -4177,6 +4476,7 @@ def run_agent_loop(
             pass
 
     step_replies = []
+    history_events_recorded = False
     user_input = original_input
     # Native message thread (Stage B): committed turns as OpenAI messages
     # (user -> assistant(tool_calls) -> tool(result) -> ...). Opt-in via config;
@@ -4440,7 +4740,10 @@ def run_agent_loop(
             supp_text = "\n".join(_supplementary)
             deps.console.print(f"\n[cyan]📝 补充信息: {supp_text}[/cyan]")
             supp_message = f"[Supplementary instruction from user]: {supp_text}"
-            chat_history.append({"role": "user", "content": supp_message})
+            chat_history.append({
+                "role": "user", "content": supp_message,
+                "input_kind": "prompt",
+            })
             if _thread_mode:
                 thread_messages.append({"role": "user", "content": supp_message})
             _append_short_memory(state, f"\n  - User supplementary: {supp_text}")
@@ -4511,9 +4814,16 @@ def run_agent_loop(
             or (current_agent.stationed_terminal if current_agent else None)
             or "(none)"
         )
+        # AgentInfo.parent_terminal records the terminal that owns/spawned the
+        # agent. It is not the parent node in the terminal tree. Resolve the
+        # latter from TerminalInfo so the prompt never reports a terminal as
+        # its own parent for deployed employees.
+        terminal_info = (
+            get_terminal(terminal_name_str)
+            if terminal_name_str != "(none)" else None
+        )
         parent_terminal_str = (
-            getattr(current_agent, "parent_terminal", None)
-            if current_agent else None
+            terminal_info.parent_terminal if terminal_info else None
         ) or "(none)"
         deployment_status_str = _format_deployment(current_agent)
 
@@ -4555,8 +4865,14 @@ def run_agent_loop(
             system_prompt = system_prompt.rstrip() + "\n\n" + mode_section
         if _prompt_lab_section and not _prompt_lab_has_slot:
             system_prompt = system_prompt.rstrip() + "\n\n" + _prompt_lab_section
+        # Runtime lifecycle invariants are appended independently of cli.prop:
+        # project/user templates may customize behavior, but cannot
+        # accidentally omit the resource-ownership contract.
+        system_prompt = (
+            system_prompt.rstrip() + "\n\n" + _RUNTIME_OWNERSHIP_PROMPT
+        )
         # Hired employees keep a persistent capability/persona overlay.  A
-        # station assignment is a fresh work context layered on top of it.
+        # deployment assignment is a fresh work context layered on top of it.
         employee_profile = getattr(current_agent, "profile", None)
         if employee_profile and employee_profile.prompt.strip():
             system_prompt += (
@@ -5015,6 +5331,19 @@ def run_agent_loop(
                     deps.console.print(deps.Markdown(display_reply))
             step_replies.append(display_reply)
             state["lastReply"] = display_reply
+            # Preserve the real sequence. Historically intermediate assistant
+            # narration was buffered until the whole run ended while tool
+            # results were appended immediately, producing a persisted order
+            # of "all tools, then all assistant text".
+            if events_cb is not None:
+                chat_history.append({
+                    "role": "assistant",
+                    "content": display_reply,
+                    "message_kind": (
+                        "intermediate" if tool_calls else "final"
+                    ),
+                })
+                history_events_recorded = True
             if events_cb is not None:
                 if _ui_streamed:
                     # Streaming chunks already sent; signal end-of-stream so
@@ -5457,6 +5786,11 @@ def run_agent_loop(
                         # Sync back interactive_session (tools may create/close sessions)
                         if tool_ctx.interactive_session != interactive_session:
                             interactive_session = tool_ctx.interactive_session
+                            if existing_session is None and agent_id:
+                                with _registry_lock:
+                                    _owner = _agent_registry.get(agent_id)
+                                    if _owner is not None:
+                                        _owner.ephemeral_session = interactive_session
 
                         # __PARENT_CMD__ marker handling for shell.exec via session
                         if name == "shell.exec" and result.get("via") in ("stationed", "interactive"):
@@ -5537,14 +5871,22 @@ def run_agent_loop(
                 # Track files this call read/touched
                 _track_files_in_command(name, salient, state.setdefault("_files_seen", []))
 
-                # Echo into chat_history as a knowledge entry (interactive mode only;
-                # gives the model a structured record of past tool calls without
-                # bloating execute-mode history).
+                # Persist a typed tool event in its actual chronological
+                # position. ``knowledge`` is reserved for learned/context
+                # material; treating tool output as knowledge made resume
+                # transcripts both noisy and semantically wrong.
                 if events_cb is not None:
                     chat_history.append({
-                        "role": "knowledge",
-                        "content": f"[{call_id}] {display_name}({salient[:60]}) → {formatted[:400]}",
+                        "role": "tool",
+                        "content": formatted[:2000],
+                        "tool_name": name,
+                        "display_name": display_name,
+                        "summary": salient[:200],
+                        "call_id": call_id,
+                        "ok": bool(result.get("ok", False)),
+                        "returncode": _rc,
                     })
+                    history_events_recorded = True
 
                 # ── Debug + events ──
                 debug_entry.exec_command = f"/tool {name}"
@@ -6070,6 +6412,12 @@ def run_agent_loop(
     # When REPL manages the session, it handles lifecycle externally.
     if existing_session is None and interactive_session is not None:
         interactive_session.close()
+        interactive_session = None
+    if existing_session is None and agent_id:
+        with _registry_lock:
+            _owner = _agent_registry.get(agent_id)
+            if _owner is not None:
+                _owner.ephemeral_session = None
 
     # Safety flush: push any remaining pending events (e.g. if loop exited
     # via staleness, interrupt, or max_loops without reaching the done-block flush)
@@ -6117,14 +6465,26 @@ def run_agent_loop(
                         _work["id"], cwd=os.getcwd(), status="COMPLETED")
         except workgraph.WorkGraphError:
             pass
+    result_msg = "\n\n".join(step_replies) if step_replies else reply
+    # task.complete can synthesize a final summary after the response-display
+    # phase. Record that final text after its tool result so chronology remains
+    # correct, but never duplicate replies already stored above.
+    if (events_cb is not None and result_msg and not step_replies):
+        chat_history.append({
+            "role": "assistant",
+            "content": result_msg,
+            "message_kind": "final",
+        })
+        history_events_recorded = True
     result = {
         "success": _clean_end,
-        "msg": "\n\n".join(step_replies) if step_replies else reply,
+        "msg": result_msg,
         "state": state,
         "session": interactive_session,
         "exit_reason": _exit_reason,
         "turn_status": _turn_status,
         "task_status": _task_status,
         "completion_source": _completion_source,
+        "_history_recorded": history_events_recorded,
     }
     return result
