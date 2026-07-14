@@ -52,10 +52,13 @@ def _gen_src_out(dst: str) -> dict:
             for root, subdirs, files in os.walk(srcd):
                 subdirs[:] = [x for x in subdirs if x != "__pycache__"]
                 for fn in files:
-                    if fn.endswith((".py", ".json")):
-                        target = os.path.join(dst, os.path.relpath(root, REPO))
-                        os.makedirs(target, exist_ok=True)
-                        shutil.copy(os.path.join(root, fn), target)
+                    # package_manifest.json is the packaging source of truth.
+                    # Keep every declared package/data file in the source-update
+                    # bundle as well; filtering by extension silently omitted
+                    # default_skills/*/SKILL.md from /v updates.
+                    target = os.path.join(dst, os.path.relpath(root, REPO))
+                    os.makedirs(target, exist_ok=True)
+                    shutil.copy(os.path.join(root, fn), target)
 
     sys.path.insert(0, REPO)
     from version import __version__
