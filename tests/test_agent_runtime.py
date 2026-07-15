@@ -89,10 +89,15 @@ class _FakeInteractiveSession:
 class AgentSchedulerTests(unittest.TestCase):
     def setUp(self):
         agent_loop.close_all_agents()
+        agent_loop.close_all_terminals()
+        root = mock.Mock()
+        root.is_alive.return_value = True
+        agent_loop.register_terminal(root, "/bin/sh", 0, name="term0")
         agent_loop._max_concurrent = 8
 
     def tearDown(self):
         agent_loop.close_all_agents()
+        agent_loop.close_all_terminals()
         agent_loop._max_concurrent = 8
 
     def test_running_abort_releases_scheduler_lease_on_exit(self):
@@ -259,6 +264,7 @@ class AgentIsolationTests(unittest.TestCase):
     def test_agent_hire_tool_defines_profile_without_starting_work(self):
         primary = agent_loop.register_agent(name="primary", role="primary")
         primary.home_terminal = "term0"
+        primary.deployment_terminal = "term0"
         terminal_session = mock.Mock()
         terminal_session.is_alive.return_value = True
         agent_loop.register_terminal(
@@ -309,6 +315,17 @@ class AgentIsolationTests(unittest.TestCase):
             employee.state, employee.id)
 
         self.assertEqual(allowed, {"fs.read"})
+
+    def test_legacy_terminal_fields_migrate_to_deployment_terminal(self):
+        employee = agent_loop.register_agent(name="legacy", role="deployed")
+
+        agent_persistence.apply_persisted_state(employee, {
+            "home_terminal": "term0", "role": "deployed",
+        })
+
+        self.assertEqual(employee.deployment_terminal, "term0")
+        self.assertEqual(employee.stationed_terminal, "term0")
+        self.assertEqual(employee.home_terminal, "term0")
 
     def test_assignment_uses_employee_prompt_and_fresh_context(self):
         prompts = []
@@ -446,6 +463,8 @@ class PersistentOwnershipTests(unittest.TestCase):
         worker = agent_loop.register_agent(
             name="alice-child", role="subagent", parent_id=alice.id)
         self.assertEqual(worker.parent_terminal, "child")
+        self.assertEqual(worker.deployment_terminal, "child")
+        self.assertIn("alice-child", agent_loop.get_terminal("child").stationed_agent_ids)
 
         with mock.patch.object(
                 agent_persistence, "delete_agent_state", return_value=True) as delete:
@@ -486,6 +505,7 @@ class PersistentOwnershipTests(unittest.TestCase):
             agent_loop.get_terminal("right").stationed_agent_ids, ["alice"])
         self.assertEqual(alice.stationed_terminal, "right")
         self.assertEqual(alice.home_terminal, "right")
+        self.assertEqual(alice.deployment_terminal, "right")
 
     def test_terminal_rename_updates_children_and_agent_binding(self):
         self._terminal("term0")
@@ -500,6 +520,7 @@ class PersistentOwnershipTests(unittest.TestCase):
             agent_loop.get_terminal("child").parent_terminal, "renamed")
         self.assertEqual(alice.stationed_terminal, "renamed")
         self.assertEqual(alice.home_terminal, "renamed")
+        self.assertEqual(alice.deployment_terminal, "renamed")
         self.assertIn(
             "alice", agent_loop.get_terminal("renamed").stationed_agent_ids)
 
@@ -650,6 +671,73 @@ class EphemeralSessionTests(unittest.TestCase):
         self.assertFalse(thread.is_alive())
         self.assertFalse(holder["ok"])
         self.assertEqual(holder["error"], "Command aborted")
+
+    def test_shell_exec_does_not_reuse_deployment_terminal_pty(self):
+        stationed = mock.Mock()
+        stationed.is_alive.return_value = True
+        ctx = tools.ToolCtx(
+            cwd="/tmp", stationed_terminal=stationed,
+            interactive_session=_FakeInteractiveSession("python"))
+
+        result = tools._bi_shell_exec({"command": "printf isolated"}, ctx)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["result"], "isolated")
+        self.assertEqual(result["via"], "subprocess")
+        stationed.send_keys.assert_not_called()
+        self.assertEqual(ctx.interactive_session.sent, [])
+
+    def test_failed_shell_output_is_preserved_for_the_ai(self):
+        result = tools._bi_shell_exec({
+            "command": "printf 'missing package' >&2; exit 1",
+        }, tools.ToolCtx(cwd="/tmp"))
+
+        formatted = agent_loop._format_tool_result_for_loop(
+            "shell.exec", result, 3000)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["returncode"], 1)
+        self.assertIn("[command exit 1]", formatted)
+        self.assertIn("missing package", formatted)
+        self.assertNotIn("no error message", formatted)
+
+    def test_terminal_send_returns_delta_without_fake_exit_code(self):
+        session = _FakeInteractiveSession("bash")
+        session.start()
+        session.full_output += "old output\n"
+        terminal = mock.Mock(session=session)
+        ctx = tools.ToolCtx(
+            agent_id="primary", deps=_deps(),
+            get_terminal=lambda name: terminal if name == "term0" else None)
+
+        result = tools._bi_terminal_send({
+            "name": "term0", "input": "echo new", "mode": "line",
+        }, ctx)
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["completed"])
+        self.assertNotIn("returncode", result)
+        self.assertNotIn("old output", result["result"])
+        self.assertIn("echo new", result["new_output"])
+        self.assertEqual(session.sent[-1], "echo new\r")
+
+    def test_terminal_read_uses_per_agent_cursor(self):
+        session = _FakeInteractiveSession("bash")
+        session.start()
+        terminal = mock.Mock(session=session)
+        ctx = tools.ToolCtx(
+            agent_id="reader", deps=_deps(),
+            get_terminal=lambda name: terminal)
+
+        first = tools._bi_terminal_read({"name": "term0"}, ctx)
+        session.full_output += "later\n"
+        second = tools._bi_terminal_read({"name": "term0"}, ctx)
+        third = tools._bi_terminal_read({"name": "term0"}, ctx)
+
+        self.assertIn("ready", first["new_output"])
+        self.assertEqual(second["new_output"], "later")
+        self.assertEqual(third["new_output"], "")
+        self.assertFalse(second["completed"])
 
     def test_employee_tool_policy_blocks_forged_tool_call_at_dispatch(self):
         calls = []

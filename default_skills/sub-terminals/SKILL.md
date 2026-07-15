@@ -18,10 +18,16 @@ Tools:
   background sub-terminal. Set `trigger` (a regex) to have any matching output
   line push a `watch.trigger` event to your inbox — use this to react to
   "Compiled successfully", "Listening on", error lines, etc. without polling.
-- `terminal.send({ name, command })` — send a command/keystrokes to a running
-  terminal (e.g. answer a prompt, drive a REPL).
+- `terminal.send({ name, input, mode? })` — send interactive input/keystrokes
+  to a running terminal (e.g. answer a prompt or drive a REPL). `mode` is
+  `line` (default, appends Enter) or `raw`. Success means the bytes were sent;
+  it does not mean a shell command completed and carries no exit code. The
+  legacy `command` parameter remains accepted for compatibility.
 - `terminal.watch({ name, pattern })` — set/replace the trigger on an existing
   terminal; empty `pattern` clears it.
+- `terminal.read({ name, cursor?, max_chars? })` — read only output added since
+  this agent's previous send/read cursor. It observes progress and does not
+  imply completion or provide an exit code.
 - `terminal.list()` — list terminals and their status.
 - `terminal.terminate({ name })` — stop and destroy a terminal subtree. This
   recursively ends its child terminals, deployed agents, and owned temporary
@@ -45,3 +51,6 @@ Discipline:
 - Use `terminal.terminate` for persistent terminals and `session.close` for
   temporary sessions once their work is done.
 - Keep one terminal per logical process; don't multiplex unrelated commands.
+- Never use `terminal.send` for a one-shot probe or to infer a process exit
+  code. Use `shell.exec`; use `terminal.watch`/`terminal.read` semantics for
+  asynchronous progress instead of sending repeated `echo` probes.

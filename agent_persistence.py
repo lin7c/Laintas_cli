@@ -12,7 +12,7 @@ Threading model:
 
 What is persisted:
 - id, name, role, depth, parent_id
-- parent_terminal, home_terminal, stationed_terminal
+- deployment_terminal (plus legacy terminal aliases during migration)
 - chat_history, state (shortTermMemory / lastReply / lastOutput)
 - employee profile, tool policy, assignment history
 - created_at, last_saved
@@ -70,6 +70,7 @@ def save_agent_state(agent: "AgentInfo") -> bool:
         "depth": getattr(agent, "depth", 0),
         "parent_id": getattr(agent, "parent_id", None),
         "parent_terminal": getattr(agent, "parent_terminal", None),
+        "deployment_terminal": getattr(agent, "deployment_terminal", None),
         "home_terminal": getattr(agent, "home_terminal", None),
         "stationed_terminal": getattr(agent, "stationed_terminal", None),
         "chat_history": history,
@@ -166,12 +167,23 @@ def apply_persisted_state(agent: "AgentInfo", data: dict) -> None:
     fields (inbox, thread, abort_event, status) are left at their defaults.
     """
     for key in ("name", "role", "parent_id", "parent_terminal",
-                "home_terminal", "stationed_terminal", "created_at"):
+                "deployment_terminal", "home_terminal", "stationed_terminal",
+                "created_at"):
         if key in data and data[key] is not None:
             try:
                 setattr(agent, key, data[key])
             except AttributeError:
                 pass
+    deployment = (
+        data.get("deployment_terminal")
+        or data.get("stationed_terminal")
+        or data.get("home_terminal")
+        or data.get("parent_terminal")
+    )
+    if deployment:
+        agent.deployment_terminal = deployment
+        agent.stationed_terminal = deployment
+        agent.home_terminal = deployment
     if isinstance(data.get("chat_history"), list):
         agent.chat_history = list(data["chat_history"])
     if isinstance(data.get("state"), dict):

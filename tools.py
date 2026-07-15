@@ -53,7 +53,7 @@ class ToolCtx:
     cwd: str = ""
     # ── Loop-local context (populated by agent_loop at dispatch time) ──
     interactive_session: Any = None
-    stationed_terminal: Any = None    # SubTerminalSession of the agent's stationed terminal
+    stationed_terminal: Any = None    # deprecated execution hook; deployment is metadata only
     get_terminal: Optional[Callable] = None
     get_all_terminals: Optional[Callable] = None
     register_terminal: Optional[Callable] = None
@@ -994,7 +994,12 @@ def _mail_sender_identity() -> tuple[str, str]:
         current = None
     if current is None:
         return "", "Laintas CLI"
-    return (getattr(current, "home_terminal", None) or "",
+    terminal = (
+        getattr(current, "deployment_terminal", None)
+        or getattr(current, "stationed_terminal", None)
+        or getattr(current, "home_terminal", None)
+    )
+    return (terminal or "",
             getattr(current, "name", None) or "Laintas CLI")
 
 
@@ -2642,9 +2647,8 @@ def _bi_agent_station(params: dict, ctx: ToolCtx) -> dict:
     )
     if target_agent is None:
         return {"ok": False, "error": "no current agent to station"}
-    current_terminal = (
-        target_agent.stationed_terminal or target_agent.home_terminal
-        or target_agent.parent_terminal or "term0")
+    import agent_loop as _al
+    current_terminal = _al.agent_deployment_terminal(target_agent) or "term0"
     name = (params.get("name") or current_terminal).strip() or current_terminal
 
     if ctx.get_terminal is not None and ctx.register_terminal is not None:
@@ -2756,10 +2760,7 @@ def _bi_agent_hire(params: dict, ctx: ToolCtx) -> dict:
         ctx.get_agent(ctx.agent_id)
         if ctx.get_agent is not None and ctx.agent_id else None
     )
-    terminal_name = (
-        (owner.stationed_terminal or owner.home_terminal or owner.parent_terminal)
-        if owner is not None else "term0"
-    ) or "term0"
+    terminal_name = _al.agent_deployment_terminal(owner) or "term0"
     terminal = ctx.get_terminal(terminal_name) if ctx.get_terminal else None
     if terminal is None or terminal.session is None or not terminal.session.is_alive():
         return {
@@ -2783,7 +2784,6 @@ def _bi_agent_hire(params: dict, ctx: ToolCtx) -> dict:
             "Work only on explicit assignments delivered through your "
             "deployment terminal or agent messaging, and report concrete "
             "results to the manager.")
-    info.parent_terminal = terminal_name
     if ctx.station_agent is None or not ctx.station_agent(info.id, terminal_name):
         _al.unregister_agent(info.id, delete_persisted=True)
         return {"ok": False,
@@ -2833,13 +2833,23 @@ def _bi_agent_rename(params: dict, ctx: ToolCtx) -> dict:
 
 
 def _bi_terminal_send(params: dict, ctx: ToolCtx) -> dict:
-    """Send a command/keystrokes to a named terminal."""
+    """Send interactive input to a terminal and return only newly read output.
+
+    Sending bytes is not synchronous command execution: a successful result
+    means the input reached the PTY, not that a foreground program completed.
+    """
     target = (params.get("name") or "").strip()
-    cmd = (params.get("command") or "").strip()
+    raw_input = params.get("input")
+    if raw_input is None:
+        raw_input = params.get("command")
+    cmd = str(raw_input or "")
+    mode = str(params.get("mode") or "line").strip().lower()
     if not target:
         return {"ok": False, "error": "missing 'name'"}
     if not cmd:
-        return {"ok": False, "error": "missing 'command'"}
+        return {"ok": False, "error": "missing 'input' (or legacy 'command')"}
+    if mode not in {"line", "raw"}:
+        return {"ok": False, "error": "mode must be 'line' or 'raw'"}
     if ctx.get_terminal is None:
         return {"ok": False, "error": "terminal access not available"}
     term = ctx.get_terminal(target)
@@ -2847,17 +2857,88 @@ def _bi_terminal_send(params: dict, ctx: ToolCtx) -> dict:
         return {"ok": False, "error": f"terminal '{target}' not found"}
     if not (term.session and term.session.is_alive()):
         return {"ok": False, "error": f"terminal '{target}' is dead"}
-    # Use CR (\r) as the Enter keystroke — that's what a real keyboard sends,
-    # and what raw-mode apps (prompt_toolkit, codex, claude, vim, …) expect.
-    # Cooked-mode shells (bash) also accept CR via the ICRNL line discipline.
-    term.session.send_keys(cmd + "\r")
+    try:
+        before = term.session.raw_output
+        output_attr = "raw_output"
+    except AttributeError:
+        before = getattr(term.session, "full_output", "") or ""
+        output_attr = "full_output"
+    old_len = len(before)
+    # CR is a real Enter keystroke. Raw mode is for Ctrl+C, escape sequences,
+    # and applications where the caller controls every byte.
+    term.session.send_keys(cmd + ("\r" if mode == "line" else ""))
     time.sleep(0.3)
     term.session.read_output(timeout=0.5)
+    full = getattr(term.session, output_attr, "") or ""
+    delta = full[old_len:] if len(full) >= old_len else full
+    cursors = getattr(term.session, "_laintas_terminal_read_cursors", None)
+    if not isinstance(cursors, dict):
+        cursors = {}
+        setattr(term.session, "_laintas_terminal_read_cursors", cursors)
+    cursors[ctx.agent_id or "_default"] = len(full)
     try:
-        output = ctx.deps.strip_ansi(term.session.full_output) if ctx.deps else term.session.full_output
+        output = ctx.deps.strip_ansi(delta) if ctx.deps else delta
     except Exception:
-        output = term.session.full_output
-    return {"ok": True, "result": output.strip() or "(no output)", "terminal": target}
+        output = delta
+    new_output = output.strip()
+    return {
+        "ok": True,
+        "status": "sent",
+        "completed": False,
+        "result": new_output or "(input sent; no new output yet)",
+        "new_output": new_output,
+        "terminal": target,
+        "mode": mode,
+    }
+
+
+def _bi_terminal_read(params: dict, ctx: ToolCtx) -> dict:
+    """Read output added since this agent's previous terminal cursor."""
+    target = (params.get("name") or "").strip()
+    if not target:
+        return {"ok": False, "error": "missing 'name'"}
+    if ctx.get_terminal is None:
+        return {"ok": False, "error": "terminal access not available"}
+    term = ctx.get_terminal(target)
+    if term is None:
+        return {"ok": False, "error": f"terminal '{target}' not found"}
+    if term.session is None:
+        return {"ok": False, "error": f"terminal '{target}' has no session"}
+    term.session.read_output(timeout=0.2)
+    try:
+        full = term.session.raw_output
+    except AttributeError:
+        full = getattr(term.session, "full_output", "") or ""
+    cursors = getattr(term.session, "_laintas_terminal_read_cursors", None)
+    if not isinstance(cursors, dict):
+        cursors = {}
+        setattr(term.session, "_laintas_terminal_read_cursors", cursors)
+    key = ctx.agent_id or "_default"
+    requested_cursor = params.get("cursor")
+    try:
+        cursor = (int(requested_cursor) if requested_cursor is not None
+                  else int(cursors.get(key, 0)))
+        max_chars = max(1, min(int(params.get("max_chars", 4000)), 20000))
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "cursor and max_chars must be integers"}
+    cursor = max(0, min(cursor, len(full)))
+    delta = full[cursor:]
+    cursors[key] = len(full)
+    try:
+        output = ctx.deps.strip_ansi(delta) if ctx.deps else delta
+    except Exception:
+        output = delta
+    truncated = len(output) > max_chars
+    if truncated:
+        output = output[-max_chars:]
+    new_output = output.strip()
+    return {
+        "ok": True, "status": "read", "completed": False,
+        "result": new_output or "(no new output)",
+        "new_output": new_output, "cursor": len(full),
+        "truncated": truncated, "alive": bool(term.session.is_alive()),
+        "terminal": target,
+    }
 
 
 def _bi_terminal_terminate(params: dict, ctx: ToolCtx) -> dict:
@@ -2891,10 +2972,8 @@ def _bi_terminal_create(params: dict, ctx: ToolCtx) -> dict:
             return {"ok": False, "error": f"terminal '{name}' already exists"}
 
     owner = ctx.get_agent(ctx.agent_id) if ctx.get_agent and ctx.agent_id else None
-    parent_terminal = (
-        (owner.stationed_terminal or owner.home_terminal or owner.parent_terminal)
-        if owner is not None else "term0"
-    ) or "term0"
+    import agent_loop as _al
+    parent_terminal = _al.agent_deployment_terminal(owner) or "term0"
     cli_entry = os.path.join(os.path.dirname(os.path.abspath(__file__)), "laintas_cli.py")
     lain_cmd = " ".join([
         shlex.quote(sys.executable), shlex.quote(cli_entry),
@@ -2962,10 +3041,8 @@ def _bi_terminal_exec(params: dict, ctx: ToolCtx) -> dict:
     if sub.is_alive():
         sub.read_output(timeout=0.1)
     owner = ctx.get_agent(ctx.agent_id) if ctx.get_agent and ctx.agent_id else None
-    parent_terminal = (
-        (owner.stationed_terminal or owner.home_terminal or owner.parent_terminal)
-        if owner is not None else "term0"
-    ) or "term0"
+    import agent_loop as _al
+    parent_terminal = _al.agent_deployment_terminal(owner) or "term0"
     try:
         ctx.register_terminal(
             sub, command, ctx.depth, name=name,
@@ -3224,11 +3301,10 @@ def _bi_task_complete(params: dict, ctx: ToolCtx) -> dict:
 def _bi_shell_exec(params: dict, ctx: ToolCtx) -> dict:
     """Execute a shell command.
 
-    Priority order:
-      1. cd/clear → run in parent process (side effects stick).
-      2. ctx.stationed_terminal → marker-poll inside the agent's stationed PTY.
-      3. ctx.interactive_session → marker-poll inside an ad-hoc one-shot PTY.
-      4. subprocess.run fallback.
+    Deployment is lifecycle ownership, not a shared command byte stream.  This
+    tool therefore always runs a synchronous non-interactive subprocess. Use
+    session.* for a private interactive PTY and terminal.send only for input to
+    an already-running interactive program.
 
     Policy is enforced by the dispatch loop, not here (single source of truth).
     """
@@ -3251,136 +3327,39 @@ def _bi_shell_exec(params: dict, ctx: ToolCtx) -> dict:
              if ctx.get_agent is not None and ctx.agent_id else None)
     abort_event = getattr(owner, "abort_event", None)
 
-    # cd / clear short-circuit: only when there's no live PTY session to
-    # route through. When stationed to a bash terminal, cd MUST go through
-    # marker-poll so bash's own cwd changes (mutating parent cwd would
-    # diverge from the stationed shell's state). Also, this short-circuit
-    # only matches bare `cd <path>` / `clear` — never compound commands
-    # like `cd /tmp && pwd` (those need real shell parsing).
-    has_live_session = (
-        (ctx.stationed_terminal is not None and
-         getattr(ctx.stationed_terminal, "is_alive", lambda: False)())
-        or
-        (ctx.interactive_session is not None and
-         getattr(ctx.interactive_session, "is_alive", lambda: False)())
+    stripped = command.strip()
+    _is_bare_cd = stripped == "cd" or (
+        stripped.startswith("cd ")
+        and not any(op in stripped for op in ("&&", "||", ";", "|", ">", "<", "`", "$("))
     )
-    if not has_live_session:
-        stripped = command.strip()
-        _is_bare_cd = stripped == "cd" or (
-            stripped.startswith("cd ")
-            and not any(op in stripped for op in ("&&", "||", ";", "|", ">", "<", "`", "$("))
-        )
-        _is_bare_clear = stripped == "clear" or (
-            stripped.startswith("clear ")
-            and not any(op in stripped for op in ("&&", "||", ";", "|"))
-        )
-        if _is_bare_cd:
-            path = stripped[3:].strip() if stripped.startswith("cd ") else os.path.expanduser("~")
-            if ctx.depth > 0:
-                return {
-                    "ok": False,
-                    "error": (
-                        "A sub-agent cannot change the process-global cwd. "
-                        "Pass cwd to shell.exec or use 'cd <path> && <command>'."
-                    ),
-                    "returncode": -1,
-                }
-            try:
-                os.chdir(path)
-                return {"ok": True, "result": f"cd → {os.getcwd()}", "returncode": 0}
-            except Exception as e:
-                return {"ok": False, "error": f"cd error: {e}", "returncode": -1}
-        if _is_bare_clear:
-            import sys as _sys
-            _sys.stdout.write("\033[2J\033[H")
-            _sys.stdout.flush()
-            return {"ok": True, "result": "", "returncode": 0}
-
-    # Marker-poll inside an existing PTY session.
-    # Used by stationed terminals (preferred) or one-shot interactive sessions.
-    session = ctx.stationed_terminal or ctx.interactive_session
-    if session is not None:
-        import uuid as _uuid
-        import re as _re
+    _is_bare_clear = stripped == "clear" or (
+        stripped.startswith("clear ")
+        and not any(op in stripped for op in ("&&", "||", ";", "|"))
+    )
+    if _is_bare_cd:
+        path = stripped[3:].strip() if stripped.startswith("cd ") else os.path.expanduser("~")
+        if ctx.depth > 0:
+            return {
+                "ok": False,
+                "error": (
+                    "A sub-agent cannot change the process-global cwd. "
+                    "Pass cwd to shell.exec or use 'cd <path> && <command>'."
+                ),
+                "returncode": -1,
+            }
         try:
-            marker_id = _uuid.uuid4().hex[:8]
-            start_marker = f"__CMD_BEGIN_{marker_id}__"
-            end_marker = f"__CMD_END_{marker_id}__"
-            wrapped = f"echo {start_marker}; {command} 2>&1; __laintas_rc=$?; echo {end_marker}:$__laintas_rc"
-            try:
-                old_len = len(session.raw_output)
-            except AttributeError:
-                old_len = len(session.full_output)
-            session.send_keys(wrapped + "\n")
-            poll_start = time.time()
-            cmd_output = ""
-            returncode = -1
-            poll_budget = max(timeout, 10.0)
-            while time.time() - poll_start < poll_budget:
-                if abort_event is not None and abort_event.is_set():
-                    session.send_keys("\x03")
-                    return {"ok": False, "error": "Command aborted",
-                            "returncode": -1,
-                            "via": "stationed" if ctx.stationed_terminal else "interactive"}
-                time.sleep(0.08)
-                session.read_output(timeout=0.1)
-                try:
-                    raw = session.raw_output
-                except AttributeError:
-                    raw = session.full_output
-                new_content = raw[old_len:] if old_len > 0 else raw
-                # The end marker is preceded by an echoed `:$rc` literal in the
-                # input line (variable name, not expanded). The real output
-                # has `:<digits>` after expansion. Match digits to skip the
-                # echoed input line.
-                end_match = _re.search(
-                    rf'{_re.escape(end_marker)}:(\d+)', new_content
-                )
-                if end_match:
-                    returncode = int(end_match.group(1))
-                    # The echoed input line has the start_marker followed by `;`.
-                    # The real output has it followed by \r, \n, or \r\n.
-                    # We look for the marker followed by a line break or end of
-                    # buffer, falling back to the last occurrence to skip the
-                    # echoed input.
-                    starts = list(_re.finditer(
-                        rf'{_re.escape(start_marker)}(?=[\r\n]|$)', new_content
-                    ))
-                    if starts:
-                        # Prefer occurrence that comes before end_match
-                        valid = [m for m in starts if m.end() < end_match.start()]
-                        chosen = valid[-1] if valid else starts[-1]
-                        # Skip any trailing whitespace/CR/LF after the marker
-                        body_start = chosen.end()
-                        while body_start < len(new_content) and new_content[body_start] in '\r\n':
-                            body_start += 1
-                        cmd_output = new_content[body_start:end_match.start()]
-                        # Strip trailing CR/LF before end marker
-                        cmd_output = cmd_output.rstrip('\r\n').strip()
-                    else:
-                        # Fallback: split on start_marker, take everything
-                        # between the LAST start and the end marker
-                        parts = new_content.rsplit(start_marker, 1)
-                        if len(parts) > 1:
-                            tail = parts[1].split(end_marker, 1)[0]
-                            cmd_output = tail.strip('\r\n').strip()
-                    break
-                if not session.is_alive():
-                    cmd_output = new_content
-                    break
-            # Only use the full buffer as fallback when we never found the
-            # markers (returncode == -1). When markers were found and the
-            # extracted output is legitimately empty (e.g., `cd /tmp` has no
-            # stdout), keep cmd_output empty.
-            if returncode == -1 and not cmd_output:
-                cmd_output = new_content if 'new_content' in locals() else ""
-            if ctx.deps:
-                cmd_output = ctx.deps.strip_ansi(cmd_output)
-            return {"ok": returncode == 0, "result": cmd_output.strip() or "(no output)",
-                    "returncode": returncode,
-                    "via": "stationed" if ctx.stationed_terminal else "interactive"}
-        except Exception:
-            pass  # Fall through to subprocess
+            os.chdir(path)
+            return {"ok": True, "result": f"cd → {os.getcwd()}",
+                    "returncode": 0, "via": "subprocess", "cwd": os.getcwd()}
+        except Exception as e:
+            return {"ok": False, "error": f"cd error: {e}", "returncode": -1,
+                    "via": "subprocess"}
+    if _is_bare_clear:
+        import sys as _sys
+        _sys.stdout.write("\033[2J\033[H")
+        _sys.stdout.flush()
+        return {"ok": True, "result": "", "returncode": 0,
+                "via": "subprocess"}
 
     # Direct subprocess execution. Use a process group and poll the owning
     # agent's abort event so cancelling a task also cancels the command and its
@@ -5308,14 +5287,20 @@ def register_builtin_tools() -> None:
         # ── Terminal tools ──────────────────────────────────────────
         Tool(
             name="terminal.send",
-            description="Send a command/keystrokes to a named sub-terminal.",
+            description=(
+                "Send interactive input/keystrokes to a named terminal and return only "
+                "newly observed output. This reports delivery, not command completion, "
+                "and has no process exit code. Use shell.exec for one-shot commands."
+            ),
             schema={
                 "type": "object",
                 "properties": {
                     "name": {"type": "string", "description": "Terminal name"},
-                    "command": {"type": "string", "description": "Command or keystrokes to send"},
+                    "input": {"type": "string", "description": "Interactive input to send"},
+                    "command": {"type": "string", "description": "Legacy alias for input"},
+                    "mode": {"type": "string", "enum": ["line", "raw"], "default": "line"},
                 },
-                "required": ["name", "command"],
+                "required": ["name"],
             },
             invoke=_bi_terminal_send,
         ),
@@ -5333,6 +5318,24 @@ def register_builtin_tools() -> None:
                 "required": ["name"],
             },
             invoke=_bi_terminal_terminate,
+        ),
+        Tool(
+            name="terminal.read",
+            description=(
+                "Read only output added since this agent's previous read/send cursor. "
+                "This observes asynchronous progress and does not imply completion "
+                "or provide a process exit code."
+            ),
+            schema={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Terminal name"},
+                    "cursor": {"type": "integer", "description": "Optional explicit cursor"},
+                    "max_chars": {"type": "integer", "default": 4000},
+                },
+                "required": ["name"],
+            },
+            invoke=_bi_terminal_read,
         ),
         Tool(
             name="terminal.create",

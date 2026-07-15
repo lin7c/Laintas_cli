@@ -636,11 +636,7 @@ def unregister_terminal(name: str) -> bool:
         owned_agent_ids = list(info.stationed_agent_ids)
         for owned in list(_agent_registry.values()):
             if (owned.role != "primary"
-                    and name in {
-                        owned.stationed_terminal,
-                        owned.home_terminal,
-                        owned.parent_terminal,
-                    }
+                    and agent_deployment_terminal(owned) == name
                     and owned.id not in owned_agent_ids):
                 owned_agent_ids.append(owned.id)
         for agent_id in owned_agent_ids:
@@ -720,6 +716,9 @@ def rename_terminal(old_name: str, new_name: str) -> bool:
                 changed = True
             if agent.home_terminal == old_name:
                 agent.home_terminal = new_name
+                changed = True
+            if agent.deployment_terminal == old_name:
+                agent.deployment_terminal = new_name
                 changed = True
             if agent.parent_terminal == old_name:
                 agent.parent_terminal = new_name
@@ -1359,8 +1358,9 @@ class AgentInfo:
     lifecycle_terminated: bool = False         # owning terminal ended; never persist again
     # ── Pool architecture fields ───────────────────────────────────────
     role: str = "pool"                        # pool | deployed | primary | subagent
+    deployment_terminal: Optional[str] = None # authoritative lifecycle owner
     parent_terminal: Optional[str] = None     # terminal that spawned this agent
-    home_terminal: Optional[str] = None       # terminal this agent is deployed to
+    home_terminal: Optional[str] = None       # legacy alias of deployment_terminal
     # ── HWO scheduling fields ──────────────────────────────────────────
     chain_id: Optional[str] = None            # serial pipeline this agent belongs to
     chain_step_index: int = -1                # 0-based position in chain (-1 = not in chain)
@@ -1380,6 +1380,18 @@ _current_agent_id: Optional[str] = None
 _max_concurrent: int = 8                         # hard cap on running agents
 _running_count: int = 0                          # agents currently in 'running' state
 _wait_queue: list = []                           # FIFO: (agent_id, start_fn) pairs
+
+
+def agent_deployment_terminal(agent: Optional[AgentInfo]) -> Optional[str]:
+    """Return an agent's lifecycle owner, accepting pre-1.8.2 state files."""
+    if agent is None:
+        return None
+    return (
+        getattr(agent, "deployment_terminal", None)
+        or getattr(agent, "stationed_terminal", None)
+        or getattr(agent, "home_terminal", None)
+        or getattr(agent, "parent_terminal", None)
+    )
 
 
 def register_agent(name: str = None, depth: int = 0,
@@ -1413,11 +1425,22 @@ def register_agent(name: str = None, depth: int = 0,
             role=role,
             profile=profile or EmployeeProfile(),
         )
+        inherited_terminal = None
+        if role == "primary" and "term0" in _terminal_registry:
+            root = _terminal_registry["term0"]
+            if root.session is not None and root.session.is_alive():
+                inherited_terminal = "term0"
+                info.deployment_terminal = "term0"
+                info.stationed_terminal = "term0"
+                info.home_terminal = "term0"
         if parent_id and parent_id in _agent_registry:
             owner = _agent_registry[parent_id]
-            info.parent_terminal = (
-                owner.stationed_terminal or owner.home_terminal
-                or owner.parent_terminal)
+            inherited_terminal = agent_deployment_terminal(owner)
+            info.deployment_terminal = inherited_terminal
+            # Keep aliases populated while old extensions migrate.
+            info.stationed_terminal = inherited_terminal
+            info.home_terminal = inherited_terminal
+            info.parent_terminal = inherited_terminal
         if load_existing:
             data = agent_persistence.load_agent_state(agent_id)
             if data is not None:
@@ -1426,6 +1449,16 @@ def register_agent(name: str = None, depth: int = 0,
                 if role and role != "pool":
                     info.role = role
         _agent_registry[agent_id] = info
+        # Temporary children inherit the terminal lifecycle immediately.  This
+        # is ownership metadata only; shell.exec does not reuse the terminal's
+        # PTY byte stream.
+        inherited_terminal = agent_deployment_terminal(info)
+        inherited_info = _terminal_registry.get(inherited_terminal) if inherited_terminal else None
+        if (inherited_info is not None and inherited_info.session is not None
+                and inherited_info.session.is_alive()
+                and agent_id not in inherited_info.stationed_agent_ids):
+            inherited_info.stationed_agent_ids.append(agent_id)
+            inherited_info.stationed_agent_id = inherited_info.stationed_agent_ids[0]
         if parent_id and parent_id in _agent_registry:
             parent = _agent_registry[parent_id]
             if agent_id not in parent.child_ids:
@@ -1457,7 +1490,7 @@ def unregister_agent(agent_id: str, delete_persisted: bool = False) -> bool:
             parent = _agent_registry[info.parent_id]
             if agent_id in parent.child_ids:
                 parent.child_ids.remove(agent_id)
-        terminal_name = info.stationed_terminal or info.home_terminal
+        terminal_name = agent_deployment_terminal(info)
         if terminal_name and terminal_name in _terminal_registry:
             term = _terminal_registry[terminal_name]
             if agent_id in term.stationed_agent_ids:
@@ -1466,6 +1499,7 @@ def unregister_agent(agent_id: str, delete_persisted: bool = False) -> bool:
                 term.stationed_agent_ids[0] if term.stationed_agent_ids else None)
         info.stationed_terminal = None
         info.home_terminal = None
+        info.deployment_terminal = None
         info.parent_terminal = None
     if delete_persisted:
         try:
@@ -1685,7 +1719,7 @@ def start_agent_assignment(agent_id: str, task: str, deps,
         active = employee.active_assignment
         suffix = f" ({active.id})" if active else ""
         return False, f"Agent '{agent_id}' is already working{suffix}.", active
-    terminal_name = employee.stationed_terminal or employee.home_terminal
+    terminal_name = agent_deployment_terminal(employee)
     if not terminal_name:
         return False, f"Agent '{agent_id}' is not stationed at a terminal.", None
     terminal = get_terminal(terminal_name)
@@ -1783,7 +1817,7 @@ def _format_deployment(a: Optional["AgentInfo"]) -> str:
     if a is None:
         return "unknown"
     role = getattr(a, "role", "pool")
-    home = getattr(a, "home_terminal", None) or a.stationed_terminal
+    home = agent_deployment_terminal(a)
     if role == "primary":
         return "primary"
     if role == "deployed":
@@ -1802,6 +1836,7 @@ _RUNTIME_OWNERSHIP_PROMPT = """<runtime_ownership authoritative="true">
 - `agent.hire` creates a persistent employee and deploys it directly to the caller's current terminal; hiring does not start an assignment.
 - One terminal may host multiple deployed agents. One agent may be deployed to exactly one terminal.
 - Ending a terminal ends all agents deployed to it and all temporary agents owned by its terminal subtree.
+- Deployment is lifecycle ownership, not a shared shell byte stream. Use `shell.exec` for synchronous one-shot commands, `session.*` for a private interactive PTY, and `terminal.send` only to interact with an already-running terminal program; a successful send does not mean that program completed.
 - Use `agent.spawn` for disposable delegation. Use `agent.hire` for a terminal-scoped employee identity, and use `agent.station` only to move an idle employee to another live terminal.
 </runtime_ownership>"""
 
@@ -1849,28 +1884,35 @@ def station_agent(agent_id: str, terminal_name: str) -> bool:
             return False
         if agent.role == "primary" and terminal_name != "term0":
             return False
+        old_terminal_name = agent_deployment_terminal(agent)
         if (agent.active_assignment is not None
-                and agent.stationed_terminal
-                and agent.stationed_terminal != terminal_name):
+                and old_terminal_name
+                and old_terminal_name != terminal_name):
             return False
         # Remove from old terminal's list
-        if agent.stationed_terminal and agent.stationed_terminal in _terminal_registry:
-            old_term = _terminal_registry[agent.stationed_terminal]
+        if old_terminal_name and old_terminal_name in _terminal_registry:
+            old_term = _terminal_registry[old_terminal_name]
             if agent_id in old_term.stationed_agent_ids:
                 old_term.stationed_agent_ids.remove(agent_id)
             old_term.stationed_agent_id = old_term.stationed_agent_ids[0] if old_term.stationed_agent_ids else None
         agent.stationed_terminal = terminal_name
         agent.home_terminal = terminal_name
-        agent.parent_terminal = None if agent.role == "primary" else terminal_name
+        agent.deployment_terminal = terminal_name
+        if agent.role == "primary":
+            agent.parent_terminal = None
         if agent.role in {"pool", "deployed"}:
             agent.role = "deployed"
         if agent_id not in term.stationed_agent_ids:
             term.stationed_agent_ids.append(agent_id)
         term.stationed_agent_id = term.stationed_agent_ids[0]  # keep first as legacy
-    try:
-        agent_persistence.save_agent_state(agent)
-    except Exception:
-        pass
+    # Deployment metadata is durable only for explicitly hired employees.
+    # Temporary children and the primary agent have separate session state;
+    # persisting them here would leak one JSON file per spawned task.
+    if agent.state.get("_persisted_employee"):
+        try:
+            agent_persistence.save_agent_state(agent)
+        except Exception:
+            pass
     return True
 
 
@@ -1885,14 +1927,16 @@ def unstation_agent(agent_id: str) -> None:
         return
     with _registry_lock:
         agent = _agent_registry.get(agent_id)
-        if agent and agent.stationed_terminal:
-            term = _terminal_registry.get(agent.stationed_terminal)
+        terminal_name = agent_deployment_terminal(agent)
+        if agent and terminal_name:
+            term = _terminal_registry.get(terminal_name)
             if term:
                 if agent_id in term.stationed_agent_ids:
                     term.stationed_agent_ids.remove(agent_id)
                 term.stationed_agent_id = term.stationed_agent_ids[0] if term.stationed_agent_ids else None
             agent.stationed_terminal = None
             agent.home_terminal = None
+            agent.deployment_terminal = None
             agent.parent_terminal = None
             if agent.role == "deployed":
                 agent.status = "idle"
@@ -1917,7 +1961,7 @@ def close_all_agents() -> None:
                 info.abort_event.set()
             except Exception:
                 pass
-            terminal_name = info.stationed_terminal or info.home_terminal
+            terminal_name = agent_deployment_terminal(info)
             term = _terminal_registry.get(terminal_name) if terminal_name else None
             if term and info.id in term.stationed_agent_ids:
                 term.stationed_agent_ids.remove(info.id)
@@ -2100,11 +2144,21 @@ def spawn_subagent(parent_id: str, task: str, deps,
             parent_id=parent_id, role="subagent", replace_existing=False)
     if state_overrides:
         child.state.update(dict(state_overrides))
-    child.parent_terminal = (
-        getattr(parent, "home_terminal", None)
-        or getattr(parent, "parent_terminal", None)
-        or "term0"
-    )
+    child.deployment_terminal = agent_deployment_terminal(parent) or "term0"
+    child.stationed_terminal = child.deployment_terminal
+    child.home_terminal = child.deployment_terminal
+    if not station_agent(child.id, child.deployment_terminal):
+        error_text = (
+            f"Cannot spawn: deployment terminal "
+            f"'{child.deployment_terminal}' is unavailable."
+        )
+        unregister_agent(child.id)
+        if report_to_parent:
+            send_to_agent(parent_id, {
+                "from": "scheduler", "kind": "child-error",
+                "role": role or "general", "error": error_text,
+            })
+        return None
     child.chain_id = chain_id
     child.chain_step_index = chain_step_index
     child.group_id = group_id
@@ -3435,7 +3489,9 @@ def _detect_loop_warnings_typed(state: dict, original_input: str) -> list[tuple[
 
     # 1. Same exact command 3+ consecutive times
     last_cmds = [(h.get("command") or "").strip() for h in history[-3:]]
-    if last_cmds[0] and last_cmds[0] == last_cmds[1] == last_cmds[2]:
+    last_tools = [h.get("tool", "") for h in history[-3:]]
+    if (last_cmds[0] and last_cmds[0] == last_cmds[1] == last_cmds[2]
+            and not all(t in {"terminal.read", "agent.wait"} for t in last_tools)):
         warnings.append(("same_command_repeat",
             f"You have run `{last_cmds[0][:80]}` 3 times in a row with the same result. "
             f"The task is done. Return tool_calls: [] and state your final answer in reply."
@@ -3460,6 +3516,7 @@ def _detect_loop_warnings_typed(state: dict, original_input: str) -> list[tuple[
         last5_tools = [(h.get("tool", ""), (h.get("command") or "")[:60]) for h in history[-5:]]
         if (all(t[0] == last5_tools[0][0] for t in last5_tools)
                 and last5_tools[0][0]
+                and last5_tools[0][0] not in {"terminal.read", "agent.wait"}
                 and len(set(t[1] for t in last5_tools)) <= 2):
             warnings.append(("tool_stagnation",
                 f"Tool stagnation: you've used `{last5_tools[0][0]}` 5 times "
@@ -3501,7 +3558,9 @@ def _detect_loop_warnings_typed(state: dict, original_input: str) -> list[tuple[
     if len(history) >= 4:
         last4_fps = [_command_fingerprint((h.get("command") or "").strip()) for h in history[-4:]]
         non_empty = [fp for fp in last4_fps if fp]
-        if len(non_empty) >= 4 and len(set(non_empty)) == 1:
+        last4_tools = [h.get("tool", "") for h in history[-4:]]
+        if (len(non_empty) >= 4 and len(set(non_empty)) == 1
+                and not all(t in {"terminal.read", "agent.wait"} for t in last4_tools)):
             warnings.append(("near_repeat_command",
                 f"Near-repeat detected: last 4 commands have the same semantic pattern "
                 f"`{non_empty[0][:60]}`. You're varying arguments but not changing strategy. "
@@ -3527,7 +3586,7 @@ _FS_PATH_TOOLS = {"fs.read", "fs.write", "fs.edit", "fs.multi_edit", "fs.diff"}
 # stuck action, plus lifecycle tools that are meant to be polled repeatedly.
 _LEDGER_EXEMPT_TOOLS = {
     "task.complete", "plan.submit", "plan.update", "session.continue",
-    "time.now", "agent.wait", "agent.spawn", "agent.tell",
+    "time.now", "agent.wait", "agent.spawn", "agent.tell", "terminal.read",
 }
 
 
@@ -4064,9 +4123,15 @@ def _salient_arg(name: str, arguments: dict) -> str:
     if name == "shell.exec":
         return arguments.get("command", "") or ""
     if name == "terminal.send":
-        return f'{arguments.get("name", "?")}: {arguments.get("command", "")}'
+        payload = arguments.get("input")
+        if payload is None:
+            payload = arguments.get("command", "")
+        return f'{arguments.get("name", "?")}: {payload}'
     if name == "terminal.exec":
         return f'{arguments.get("name", "?")}: {arguments.get("command", "")}'
+    if name == "terminal.read":
+        cursor = arguments.get("cursor")
+        return f'{arguments.get("name", "?")}@{cursor if cursor is not None else "next"}'
     if name in ("terminal.create", "terminal.terminate"):
         return str(arguments.get("name", "") or "")
     if name == "terminal.watch":
@@ -4135,7 +4200,11 @@ def _policy_command_arg(name: str, arguments: dict) -> str:
     if not isinstance(arguments, dict):
         return ""
     if name in ("shell.exec", "terminal.exec", "terminal.send"):
-        command = arguments.get("command", "") or ""
+        command = (arguments.get("input") if name == "terminal.send"
+                   else arguments.get("command"))
+        if command is None and name == "terminal.send":
+            command = arguments.get("command")
+        command = command or ""
         # parent(<command>) executes the nested text in the parent process.
         # Evaluate that text so anchored rules cannot be bypassed by the
         # harmless-looking wrapper.
@@ -4160,8 +4229,21 @@ def _format_tool_result_for_loop(tool_name: str, result: dict, max_chars: int) -
         return str(result)[:max_chars]
 
     if not result.get("ok", True):
-        err = result.get("error") or "(no error message)"
-        return f"[tool error] {tool_name}: {err}"
+        err = str(result.get("error") or "").strip()
+        payload = result.get("result")
+        output = str(payload).strip() if payload is not None else ""
+        rc = result.get("returncode")
+        # A process that ran and exited non-zero is a command failure, not a
+        # broken executor. Preserve its stdout/stderr for the model; discarding
+        # it made normal grep/pip/python failures look like shell-tool crashes.
+        if rc is not None and output:
+            prefix = f"[command exit {rc}]"
+            if err:
+                return f"{prefix} {err}\n{output}"[:max_chars]
+            return f"{prefix}\n{output}"[:max_chars]
+        if err:
+            return f"[tool error] {tool_name}: {err}"[:max_chars]
+        return f"[tool error] {tool_name}: (no error message)"[:max_chars]
 
     payload = result.get("result")
     if payload is None:
@@ -5411,13 +5493,6 @@ def run_agent_loop(
         _user_denied = False          # set when the user rejects an approval prompt
 
         if tool_calls:
-            # Resolve stationed terminal for this agent (if any)
-            _stationed_session = None
-            if current_agent and getattr(current_agent, "stationed_terminal", None):
-                _stationed_term_info = get_terminal(current_agent.stationed_terminal)
-                if _stationed_term_info and _stationed_term_info.session and _stationed_term_info.session.is_alive():
-                    _stationed_session = _stationed_term_info.session
-
             for idx, tc in enumerate(tool_calls):
                 # ── Soft-interrupt check before each tool call ──
                 if _interrupt.is_set():
@@ -5742,7 +5817,10 @@ def run_agent_loop(
                             deps=deps, agent_id=agent_id, session=session,
                             events_cb=events_cb, cwd=state.get("cwd") or os.getcwd(),
                             interactive_session=interactive_session,
-                            stationed_terminal=_stationed_session,
+                            # Deployment is lifecycle ownership only. Never
+                            # expose the shared deployment PTY as shell.exec's
+                            # execution channel.
+                            stationed_terminal=None,
                             get_terminal=get_terminal,
                             get_all_terminals=get_all_terminals,
                             register_terminal=register_terminal,
@@ -5766,9 +5844,7 @@ def run_agent_loop(
                         # marker-poll commands and direct sends targeting the
                         # same session so outputs cannot cross-contaminate.
                         _command_session = None
-                        if name == "shell.exec":
-                            _command_session = _stationed_session or interactive_session
-                        elif name == "terminal.send":
+                        if name == "terminal.send":
                             _target_term = get_terminal(
                                 (arguments.get("name") or "").strip()
                             )
@@ -5783,6 +5859,10 @@ def run_agent_loop(
                                 name, arguments, tool_ctx
                             )
 
+                        if (name == "shell.exec" and result.get("ok")
+                                and result.get("cwd")):
+                            state["cwd"] = str(result["cwd"])
+
                         # Sync back interactive_session (tools may create/close sessions)
                         if tool_ctx.interactive_session != interactive_session:
                             interactive_session = tool_ctx.interactive_session
@@ -5791,15 +5871,6 @@ def run_agent_loop(
                                     _owner = _agent_registry.get(agent_id)
                                     if _owner is not None:
                                         _owner.ephemeral_session = interactive_session
-
-                        # __PARENT_CMD__ marker handling for shell.exec via session
-                        if name == "shell.exec" and result.get("via") in ("stationed", "interactive"):
-                            _cleaned, _parent_result = _process_parent_cmd_marker(
-                                result.get("result", "") or "",
-                                deps=deps, agent_id=agent_id,
-                            )
-                            if _parent_result is not None:
-                                result["result"] = (_cleaned or "").rstrip() + f"\n[parent] {_parent_result}"
 
                 # ── Affirmative completion signal ──
                 # task.complete returns the _task_complete marker; that is the
@@ -5843,7 +5914,11 @@ def run_agent_loop(
                 if "not found" in _err and "tool" in _err.lower():
                     state["_force_full_catalog_next"] = True
 
-                _rc = result.get("returncode", 0 if result.get("ok") else -1)
+                if (name == "terminal.send" and result.get("ok")
+                        and "returncode" not in result):
+                    _rc = None
+                else:
+                    _rc = result.get("returncode", 0 if result.get("ok") else -1)
 
                 # ── post_tool hook (universal) ──
                 hooks_mod.trigger("post_tool", {
@@ -5918,7 +5993,10 @@ def run_agent_loop(
                         # terminalHistory / /debug.
                         _mark2 = "[success]●[/success]" if result.get("ok") else "[error]✕[/error]"
                         _meta2 = ""
-                        if name in ("shell.exec", "terminal.send", "terminal.exec"):
+                        if name == "terminal.send" and result.get("ok"):
+                            _nlines = len((formatted or "").split("\n")) if formatted else 0
+                            _meta2 = f"sent · {_nlines}L" if _nlines else "sent"
+                        elif name in ("shell.exec", "terminal.exec"):
                             _nlines = len((formatted or "").split("\n")) if formatted else 0
                             if result.get("ok"):
                                 _meta2 = f"{_nlines}L · exit {_rc}" if _nlines else f"exit {_rc}"
@@ -5943,15 +6021,7 @@ def run_agent_loop(
                     if _detail:
                         # Display panels for shell.exec (mirror old UX)
                         if name == "shell.exec":
-                            if result.get("via") in ("stationed", "interactive"):
-                                try:
-                                    _alive = (_stationed_session.is_alive() if _stationed_session
-                                              else (interactive_session.is_alive() if interactive_session else False))
-                                    deps.display_sub_terminal_preview(
-                                        salient, formatted[:2000],
-                                        depth=depth + 1, alive=_alive)
-                                except Exception as _e: _diag("display_sub_terminal_failed", tool=name, error=str(_e))
-                            elif result.get("via") in ("subprocess", "parent", "loop_command"):
+                            if result.get("via") in ("subprocess", "parent", "loop_command"):
                                 try:
                                     deps.display_command_output(salient, _rc, formatted, depth=depth + 1)
                                 except Exception as _e: _diag("display_command_output_failed", tool=name, error=str(_e))
@@ -6157,8 +6227,20 @@ def run_agent_loop(
         # repeating the same sentence with no tools). Fully idle steps (no output,
         # no reply) carry no signal and are left to stale_count below.
         _sim_threshold = float(get_runtime_config("output_similarity"))
-        if formatted_outputs:
-            _step_signal = state.get("lastOutput", "")
+        # terminal.send is a delivery primitive, not a completed operation.
+        # Its output can be empty or an async screen fragment and must not trip
+        # the generic consecutive-output breaker. Exact repeated sends are
+        # still covered by the command-pattern warning circuit breaker.
+        _similarity_rows = [
+            row for row in per_call_rows
+            if row.get("tool") not in {"terminal.send", "terminal.read"}
+        ]
+        if _similarity_rows:
+            _step_signal = "\n---\n".join(
+                str(row.get("output") or "") for row in _similarity_rows
+            )
+        elif per_call_rows:
+            _step_signal = None
         elif reply:
             _step_signal = reply
         else:

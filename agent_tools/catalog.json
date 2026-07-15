@@ -3,7 +3,7 @@
   "description": "Canonical, language-neutral agent tool catalog shared across agent products (laintas_cli, Helpwo, future agents). Single source of truth for tool NAMES, parameter JSON Schemas, and execution context. Per-language adapters (Python/TS) consume this. Names are flat snake_case with NO dots (DeepSeek and other providers reject '.' in function names). Product-specific legacy names are recorded under `aliases` to support a migration window.",
   "conventions": {
     "naming": "flat snake_case, no dots, no namespaces; extensions use a source prefix (e.g. mcp__server__tool), the core stays unprefixed",
-    "execContext": "host = runs where the OS/files live (CLI local PTY, remote agent); backend = runs server-side (gateway); either = location-agnostic / logical",
+    "execContext": "host = runs where the OS/files live (CLI local subprocess/private session, remote agent); backend = runs server-side (gateway); either = location-agnostic / logical",
     "result_envelope": "{ ok: bool, result?: any, error?: string, diff?: string } — every executor returns this shape"
   },
   "tools": [
@@ -100,7 +100,7 @@
 
     {
       "name": "shell", "category": "shell", "execContext": "host",
-      "description": "Run a shell command and capture stdout/stderr/exit code. The SAME tool regardless of host: the local CLI runs it on a local PTY (through the security policy gateway); a backend-driven agent routes it to a remote agent. Executor is swapped per host; the model sees one `shell`.",
+      "description": "Run a synchronous non-interactive shell command and capture stdout/stderr/exit code. Deployment terminals are lifecycle containers, not shared command streams. Use session tools for a private interactive PTY and terminal.send only for input to an already-running program.",
       "params": {"type": "object", "properties": {
         "command": {"type": "string"},
         "cwd": {"type": "string", "description": "working directory"},

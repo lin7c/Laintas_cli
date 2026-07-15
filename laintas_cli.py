@@ -59,12 +59,14 @@ import requests
 from rich.console import Console, Group
 from rich.panel import Panel
 from rich.padding import Padding
-from rich.markdown import Markdown
+from rich.markdown import Markdown as RichMarkdown
 from rich.table import Table
 from rich.live import Live
 from rich.spinner import Spinner
 from rich.text import Text
 from rich.theme import Theme
+from rich.style import Style as RichStyle
+from rich.syntax import SyntaxTheme
 from rich import box
 
 from prompt_toolkit import PromptSession
@@ -96,9 +98,39 @@ LAINTAS_THEME = Theme({
     "path":     "bold #3fb950",
     "glyph":    "#3fb950",
     "rule":     "#233323",
+    # Rich's default Markdown inline-code style is cyan on black. Keep all
+    # ordinary/model text on the terminal's default background instead.
+    "markdown.code": "white",
+    "markdown.code_block": "white",
 })
 
-console = Console(theme=LAINTAS_THEME)
+
+class _PlainWhiteSyntaxTheme(SyntaxTheme):
+    """Code blocks use plain white text and inherit the terminal background."""
+
+    def get_style_for_token(self, token_type) -> RichStyle:
+        return RichStyle(color="white")
+
+    def get_background_style(self) -> RichStyle:
+        return RichStyle()
+
+
+_PLAIN_WHITE_SYNTAX = _PlainWhiteSyntaxTheme()
+
+
+class LaintasMarkdown(RichMarkdown):
+    """Markdown renderer with no baked-in black/blue code treatment."""
+
+    def __init__(self, markup: str, **kwargs):
+        kwargs.setdefault("code_theme", _PLAIN_WHITE_SYNTAX)
+        kwargs.setdefault("inline_code_theme", _PLAIN_WHITE_SYNTAX)
+        kwargs.setdefault("style", "white")
+        super().__init__(markup, **kwargs)
+
+
+# Keep the existing dependency-injection surface (`deps.Markdown`) stable.
+Markdown = LaintasMarkdown
+console = Console(theme=LAINTAS_THEME, style="white")
 
 
 def _ptk_fragments(pairs):
@@ -291,7 +323,7 @@ def select_dialog(
     def _build_lines():
         lines = []
         if title:
-            lines.append(("bold cyan", f"{title}\n"))
+            lines.append(("bold #ffffff", f"{title}\n"))
 
         vis = _clamp_sel()
 
@@ -486,8 +518,8 @@ def select_dialog(
 
     layout = Layout(HSplit(layout_panes))
     style = Style.from_dict({
-        "selected": "reverse",
-        "option": "",
+        "selected": "bold #ffffff",
+        "option": "#ffffff",
     })
 
     app = Application(
@@ -544,6 +576,7 @@ from agent_loop import (
     rename_terminal,
     register_agent, unregister_agent,
     get_agent, get_all_agents, get_current_agent,
+    agent_deployment_terminal,
     get_pool_agents, get_deployed_agents, get_or_hire_pool_agent,
     start_agent_assignment,
     switch_to_agent, set_current_agent_id,
@@ -2092,23 +2125,23 @@ def _build_prompt_style() -> Style:
         "prompt-gutter-plan": "#e3b341 bold", # hollow amber gutter (Plan mode)
         "prompt-caret": "#4ade80 bold",       # the animated green ❯
         "separator": "#3fb950",
-        "paste-placeholder": "bold #4ade80 bg:#16211a",
-        # Completion menu (青红 green palette)
+        "paste-placeholder": "bold #4ade80",
+        # Slash-command completion menu keeps its established visual identity.
         "completion-menu": "bg:#0e140e",
         "completion-menu.completion": "bg:#0e140e #c9d4c5",
         "completion-menu.completion.current": "bg:#1f5f30 #dffbe6 bold",
         "completion-menu.meta.completion": "bg:#0b0f0b #6b7d6b",
         "completion-menu.meta.completion.current": "bg:#0b0f0b #4ade80",
-        # Bottom status bar
-        "bottom-toolbar": "bg:#0b0f0b #9aab97",
-        "stbar-sep": "bg:#0b0f0b #233323",
-        "stbar-model": "bg:#0b0f0b #3fb950 bold",
-        "stbar-mode-act": "bg:#0b0f0b #4ade80 bold",
-        "stbar-mode-plan": "bg:#0b0f0b #e3b341 bold",
-        "stbar-tokens": "bg:#0b0f0b #2ea043",
-        "stbar-time": "bg:#0b0f0b #6b7d6b",
-        "stbar-dot-act": "bg:#0b0f0b #4ade80 bold",
-        "stbar-dot-plan": "bg:#0b0f0b #e3b341 bold",
+        # Bottom status bar also inherits the terminal background.
+        "bottom-toolbar": "#ffffff",
+        "stbar-sep": "#6b7d6b",
+        "stbar-model": "#3fb950 bold",
+        "stbar-mode-act": "#4ade80 bold",
+        "stbar-mode-plan": "#e3b341 bold",
+        "stbar-tokens": "#ffffff",
+        "stbar-time": "#6b7d6b",
+        "stbar-dot-act": "#4ade80 bold",
+        "stbar-dot-plan": "#e3b341 bold",
         # rprompt (right side of prompt line — no background)
         "rprompt-mode-act": "#4ade80 bold",
         "rprompt-mode-plan": "#e3b341 bold",
@@ -3681,6 +3714,11 @@ The catalog below documents each tool's purpose and parameters:
 - If you have nothing concrete to run this turn but the task is NOT finished (still reasoning or planning), call `task_continue` so the loop keeps going. Never end mid-task with no tool call.
 - Ending your turn with no tool call is only for asking the user something or handing back a final answer. It does not by itself mean the task is done.
 </output_rules>
+
+<terminal_output_style>
+- Ordinary user-facing output must be plain text/Markdown with no forced background; laintas-cli renders it as normal white text on the user's terminal background.
+- Use special color only when it carries real semantic value. In that exceptional case, choose the foreground AND background yourself with explicit ANSI 24-bit SGR (`ESC[38;2;R;G;Bm` and `ESC[48;2;R;G;Bm`), keep the span short, and reset with `ESC[0m`. Never assume or force a fixed black background, and never use the old blue-on-black treatment.
+</terminal_output_style>
 
 <safety>
 Do not bypass policy.py decisions. Do not invent paths, APIs, files, or results. (General safety — reversibility/blast-radius, destructive-action confirmation, investigate-before-overwrite, no-vulnerabilities — is in the injected <agent_conduct> block.)
@@ -10333,6 +10371,103 @@ def _cmd_work(parts: list) -> None:
 
 
 
+def _task_ui_source(task: dict) -> tuple[str, str]:
+    """Return a compact source badge and style for TODO/HWO/HWG tasks."""
+    metadata = task.get("metadata") or {}
+    kind = str(metadata.get("kind") or "")
+    if kind == "hwg-node" or metadata.get("nodeId") is not None:
+        return "HWG", "agent"
+    if metadata.get("workflowRunId"):
+        return "HWO", "warning"
+    return "TODO", "muted"
+
+
+def _task_ui_progress(value) -> Text:
+    """Small background-free progress meter suitable for every workflow kind."""
+    try:
+        progress = max(0, min(100, int(value or 0)))
+    except (TypeError, ValueError):
+        progress = 0
+    width = 10
+    filled = width if progress >= 100 else int(progress / 100 * width)
+    meter = Text()
+    meter.append("━" * filled, style="success" if progress >= 100 else "accent")
+    meter.append("─" * (width - filled), style="muted")
+    meter.append(f" {progress:>3}%", style="white")
+    return meter
+
+
+def _render_task_todolist(tasks: list[dict], cwd: str) -> None:
+    """Render the shared TODO/HWO/HWG execution view without colored backgrounds."""
+    rank = {"in_progress": 0, "pending": 1, "blocked": 2,
+            "completed": 3, "skipped": 4}
+    ordered = sorted(
+        tasks,
+        key=lambda item: (rank.get(item.get("status", "pending"), 9),
+                          str(item.get("id", ""))),
+    )
+    counts = {
+        status: sum(1 for item in tasks if item.get("status") == status)
+        for status in ("in_progress", "pending", "blocked", "completed")
+    }
+    heading = Text("Tasks", style="bold white")
+    heading.append(f"  {cwd}", style="muted")
+    console.print(heading)
+    summary = Text()
+    summary.append(f"{counts['in_progress']} active", style="warning")
+    summary.append("  ·  ", style="muted")
+    summary.append(f"{counts['pending']} pending", style="white")
+    if counts["blocked"]:
+        summary.append("  ·  ", style="muted")
+        summary.append(f"{counts['blocked']} blocked", style="error")
+    summary.append("  ·  ", style="muted")
+    summary.append(f"{counts['completed']} done", style="success")
+    console.print(summary)
+
+    table = Table(
+        box=box.SIMPLE, show_edge=False, show_lines=False,
+        header_style="bold white", padding=(0, 1), expand=True,
+    )
+    table.add_column("", width=2, no_wrap=True)
+    table.add_column("ID", width=7, style="white", no_wrap=True)
+    table.add_column("TYPE", width=6, no_wrap=True)
+    table.add_column("TASK", ratio=1, style="white")
+    table.add_column("PROGRESS", width=15, no_wrap=True)
+    status_by_id = {
+        str(item.get("id")): item.get("status", "pending") for item in tasks
+    }
+    status_ui = {
+        "in_progress": ("▶", "warning"),
+        "completed": ("✓", "success"),
+        "blocked": ("!", "error"),
+        "skipped": ("–", "muted"),
+        "pending": ("○", "white"),
+    }
+    for task in ordered:
+        status = task.get("status", "pending")
+        mark, mark_style = status_ui.get(status, ("·", "white"))
+        source, source_style = _task_ui_source(task)
+        blocked = [
+            str(blocker) for blocker in task.get("blockedBy", [])
+            if status_by_id.get(str(blocker), "pending")
+            not in ("completed", "deleted", "skipped")
+        ]
+        subject = Text()
+        if task.get("parent_id") or task.get("parentId"):
+            subject.append("↳ ", style="muted")
+        subject.append(str(task.get("subject") or "(untitled task)"), style="white")
+        if blocked:
+            subject.append(f"  blocked by {', '.join(blocked)}", style="muted")
+        table.add_row(
+            Text(mark, style=mark_style),
+            Text(str(task.get("id", "")), style="white"),
+            Text(source, style=source_style),
+            subject,
+            _task_ui_progress(task.get("progress", 0)),
+        )
+    console.print(table)
+
+
 def _cmd_task(raw_args: str, parts: list) -> None:
     sub = parts[1].lower() if len(parts) > 1 else ""
     _, task_args_raw = _raw_tail_after_word(raw_args)
@@ -10360,39 +10495,7 @@ def _cmd_task(raw_args: str, parts: list) -> None:
         if not _tasks:
             console.print("[dim]No tasks. Use [bold]/task add <subject>[/bold] to create one.[/dim]")
         else:
-            _n_pending = sum(1 for t in _tasks if t.get("status") == "pending")
-            _n_progress = sum(1 for t in _tasks if t.get("status") == "in_progress")
-            _n_done = sum(1 for t in _tasks if t.get("status") == "completed")
-            console.print(f"\n[bold]Tasks[/bold] · {_cwd}    "
-                           f"[cyan]{_n_pending} pending[/cyan] · "
-                           f"[yellow]{_n_progress} in_progress[/yellow] · "
-                           f"[green]{_n_done} done[/green]\n")
-            _t = Table(show_header=True, header_style="dim", show_lines=False)
-            _t.add_column("", width=2)
-            _t.add_column("ID", width=5)
-            _t.add_column("Subject")
-            _t.add_column("Prog", width=5, justify="right")
-            _status_by_id = {
-                str(item.get("id")): item.get("status", "pending")
-                for item in _tasks
-            }
-            for _tk in _tasks:
-                st = _tk.get("status", "pending")
-                mark = "▶" if st == "in_progress" else ("✓" if st == "completed" else "○")
-                style = "yellow" if st == "in_progress" else ("green" if st == "completed" else "cyan")
-                prog = _tk.get("progress", 0)
-                prog_str = f"{prog}%" if prog > 0 else ""
-                blocked = [
-                    str(blocker) for blocker in _tk.get("blockedBy", [])
-                    if _status_by_id.get(str(blocker), "pending")
-                    not in ("completed", "deleted")
-                ]
-                subj = _tk.get("subject", "(untitled task)")
-                if blocked:
-                    subj += f" [dim][blocked: {', '.join(blocked)}][/dim]"
-                _t.add_row(f"[{style}]{mark}[/{style}]", _tk["id"], subj, prog_str)
-            console.print(_t)
-            console.print()
+            _render_task_todolist(_tasks, _cwd)
 
     elif sub == "add":
         subject = _decode_text_arg(task_args_raw)
@@ -10836,14 +10939,9 @@ def _cmd_station(parts: list, agent_registry: AgentRegistry, session: dict) -> b
             f"[red]Agent '{agent_id_arg}' not found. Use /hire to create one.[/red]")
         return False
     manager = get_current_agent()
-    manager_terminal = (
-        (manager.stationed_terminal or manager.home_terminal or manager.parent_terminal)
-        if manager is not None else "term0"
-    ) or "term0"
+    manager_terminal = agent_deployment_terminal(manager) or "term0"
     name = (station_args[1] if len(station_args) == 2
-            else (target_agent.stationed_terminal
-                  or target_agent.home_terminal
-                  or manager_terminal))
+            else (agent_deployment_terminal(target_agent) or manager_terminal))
     if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", name):
         console.print("[red]Invalid terminal name.[/red]")
         return False
@@ -10901,9 +10999,8 @@ def _cmd_station(parts: list, agent_registry: AgentRegistry, session: dict) -> b
     # Sub-terminal path: inspect existing terminal
     existing = get_terminal(name)
     if existing and existing.session and existing.session.is_alive():
-        # Re-using an existing live terminal — just attach the agent,
-        # don't respawn anything. The agent's shell.exec will route via
-        # send_keys + marker-poll into that terminal's PTY.
+        # Re-use the existing lifecycle container. shell.exec remains an
+        # independent synchronous subprocess and never shares this PTY.
         if not station_agent(target_agent.id, name):
             console.print(
                 f"[red]Could not deploy agent '{target_agent.id}' to '{name}'. "
@@ -11088,10 +11185,7 @@ def _cmd_hire(parts: list) -> bool:
         console.print(f"[red]Agent '{hire_name}' already exists.[/red]")
         return False
     owner = get_current_agent()
-    terminal_name = (
-        (owner.stationed_terminal or owner.home_terminal or owner.parent_terminal)
-        if owner is not None else "term0"
-    ) or "term0"
+    terminal_name = agent_deployment_terminal(owner) or "term0"
     terminal = get_terminal(terminal_name)
     if terminal is None or terminal.session is None or not terminal.session.is_alive():
         console.print(
@@ -11116,7 +11210,6 @@ def _cmd_hire(parts: list) -> bool:
             "deployment terminal or agent messaging, and report concrete "
             "results to the manager."
         )
-    agent_info.parent_terminal = terminal_name
     if not station_agent(agent_info.id, terminal_name):
         unregister_agent(agent_info.id, delete_persisted=True)
         console.print(
@@ -12173,6 +12266,30 @@ def _cmd_told(parts: list) -> bool:
     return False
 
 
+def _workflow_event_line(symbol: str, message: str, style: str) -> None:
+    line = Text()
+    line.append(f"{symbol} ", style=style)
+    line.append(message, style="white")
+    console.print(line)
+
+
+def _workflow_result(kind: str, result: dict) -> None:
+    ok = bool(result.get("ok"))
+    paused = bool(result.get("paused"))
+    symbol, status, style = (
+        ("✓", "complete", "success") if ok
+        else (("Ⅱ", "paused", "warning") if paused
+              else ("✗", "failed", "error"))
+    )
+    heading = Text()
+    heading.append(f"{symbol} ", style=style)
+    heading.append(f"{kind} {status}", style="bold white")
+    console.print(heading)
+    message = str(result.get("msg") or "").strip()
+    if message:
+        console.print(Text(message, style="white"))
+
+
 def _cmd_hwo(parts: list, session: dict) -> None:
     sub = parts[1].lower() if len(parts) > 1 else ""
     current = get_current_agent()
@@ -12196,13 +12313,13 @@ def _cmd_hwo(parts: list, session: dict) -> None:
                 if kind == "workflow_started":
                     console.print(f"[dim]HWO {event.get('runId')} started[/dim]")
                 elif kind == "step_started":
-                    console.print(f"[cyan]▶ {event.get('stepId', '?')} started[/cyan]")
+                    _workflow_event_line("▶", f"{event.get('stepId', '?')} started", "warning")
                 elif kind == "step_completed":
-                    console.print(f"[green]✓ {event.get('stepId', '?')} completed[/green]")
+                    _workflow_event_line("✓", f"{event.get('stepId', '?')} completed", "success")
                 elif kind == "step_failed":
-                    console.print(f"[red]✗ {event.get('stepId', '?')} failed[/red]")
+                    _workflow_event_line("✗", f"{event.get('stepId', '?')} failed", "error")
                 elif kind == "workflow_completed":
-                    console.print(f"[green]HWO {event.get('runId')} completed[/green]")
+                    _workflow_event_line("✓", f"HWO {event.get('runId')} completed", "success")
             r = hwo_runner.run_hwo_file(
                 path=path,
                 deps=get_loop_deps(),
@@ -12210,8 +12327,7 @@ def _cmd_hwo(parts: list, session: dict) -> None:
                 parent_id=current.id if current else None,
                 events_cb=_hwo_progress,
             )
-        style = "[green]" if r.get("ok") else "[red]"
-        console.print(f"{style}{r.get('msg', '')}[/]")
+        _workflow_result("HWO", r)
     elif len(parts) >= 2 and sub not in ("run", "compile"):
         # /hwo <file>  — load .hwo into TUI
         file_path = " ".join(parts[1:])
@@ -12250,13 +12366,13 @@ def _cmd_hwg(parts: list, session: dict) -> None:
             return
         kind = event.get("type")
         if kind == "node_started":
-            console.print(f"[cyan]▶ HWG node #{event.get('node', '?')} started[/cyan]")
+            _workflow_event_line("▶", f"HWG node #{event.get('node', '?')} started", "warning")
         elif kind == "node_completed":
-            console.print(f"[green]✓ HWG node #{event.get('node', '?')} completed[/green]")
+            _workflow_event_line("✓", f"HWG node #{event.get('node', '?')} completed", "success")
         elif kind == "node_failed":
-            console.print(f"[red]✗ HWG node #{event.get('node', '?')} failed[/red]")
+            _workflow_event_line("✗", f"HWG node #{event.get('node', '?')} failed", "error")
         elif kind == "workflow_paused":
-            console.print(f"[yellow]HWG paused at node #{event.get('node', '?')}[/yellow]")
+            _workflow_event_line("Ⅱ", f"HWG paused at node #{event.get('node', '?')}", "warning")
     if sub in ("run", "compile") and len(parts) >= 3:
         path = " ".join(parts[2:])
         if sub == "compile":
@@ -12308,8 +12424,7 @@ def _cmd_hwg(parts: list, session: dict) -> None:
                 "  /hwg cancel <runId>"
             ),
         }
-    style = "[green]" if r.get("ok") else ("[yellow]" if r.get("paused") else "[red]")
-    console.print(f"{style}{r.get('msg', '')}[/]")
+    _workflow_result("HWG", r)
 
 
 
@@ -13774,6 +13889,7 @@ def main():
             sub.name = args.agent_name
         sub.parent_terminal = args.parent_terminal or "term0"
         if args.terminal_name:
+            sub.deployment_terminal = args.terminal_name
             sub.home_terminal = args.terminal_name
             sub.stationed_terminal = args.terminal_name
         # A pre-assigned child process owns this employee's persisted context;
@@ -13784,6 +13900,8 @@ def main():
     else:
         primary = register_agent(name="primary", depth=0, role="primary",
                                  load_existing=True)
+        primary.deployment_terminal = "term0"
+        primary.stationed_terminal = "term0"
         primary.home_terminal = "term0"
         primary.parent_terminal = None
         set_current_agent_id("primary")
@@ -13866,8 +13984,9 @@ def main():
     signal.signal(signal.SIGHUP, shutdown)
 
     # ── Create term0: a real persistent bash session ──
-    # All system commands and stationed-agent shell.exec route through this
-    # via marker-poll, identical to how named sub-terminals work.
+    # Direct user terminal commands route through this via marker-poll.
+    # Agent shell.exec stays an isolated synchronous subprocess; deployment is
+    # lifecycle ownership and never grants a shared PTY command channel.
     # Created for ALL interactive REPL instances (depth 0 and depth > 0),
     # so sub-terminals have the same capabilities as the main terminal.
     _term0_session = None
@@ -13879,6 +13998,10 @@ def main():
         if _term0_session.is_alive():
             _term0_session.read_output(timeout=0.1)
         register_terminal(_term0_session, DEFAULT_SHELL, 0, name="term0")
+        if not args.agent_id:
+            # Complete the lifecycle binding only after the root terminal is
+            # live. Deployment does not make shell.exec share this PTY.
+            station_agent("primary", "term0")
     except Exception as _e:
         console.print(f"[dim yellow]term0 bash session init failed: {_e}[/dim yellow]")
         _term0_session = None
@@ -14412,12 +14535,15 @@ def main():
             handle_meta_command._last_events_cb = local_events_cb
             handle_meta_command._last_existing_session = interactive_session
 
-            # Sync CWD after AI loop — the AI may have run shell.exec("cd ...")
-            # which changed term0's bash CWD. Sync so the next prompt shows
-            # the correct directory.
+            # shell.exec is an isolated subprocess executor. A bare primary
+            # `cd` updates the agent/CLI cwd; mirror only that directory into
+            # term0 so the next direct user command starts in the same place.
+            _desired_cwd = (response.get("state") or {}).get("cwd")
             _t0 = get_terminal("term0")
-            if _t0 and _t0.session and _t0.session.is_alive():
-                _sync_cwd_from_term0(_t0.session)
+            if (_desired_cwd and os.path.isdir(_desired_cwd)
+                    and _t0 and _t0.session and _t0.session.is_alive()):
+                _marker_poll_exec(
+                    _t0.session, f"cd -- {shlex.quote(_desired_cwd)}")
 
             # ── Plan approval menu ──
             # If the agent ran in plan mode, offer a rich review menu.
@@ -14433,9 +14559,12 @@ def main():
                 interactive_session = response.get("session")
                 handle_meta_command._last_agent_state = response.get("state", agent_state)
                 handle_meta_command._last_existing_session = interactive_session
+                _desired_cwd = (response.get("state") or {}).get("cwd")
                 _t0 = get_terminal("term0")
-                if _t0 and _t0.session and _t0.session.is_alive():
-                    _sync_cwd_from_term0(_t0.session)
+                if (_desired_cwd and os.path.isdir(_desired_cwd)
+                        and _t0 and _t0.session and _t0.session.is_alive()):
+                    _marker_poll_exec(
+                        _t0.session, f"cd -- {shlex.quote(_desired_cwd)}")
 
         # Save AI reply to chat history
         if response.get("msg") and not response.get("_history_recorded"):

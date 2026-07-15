@@ -12,6 +12,7 @@ from rich.theme import Theme
 
 import agent_loop
 import backend_profiles
+import hwo_ui
 import laintas_cli
 import mode_manager
 import plan_mode
@@ -1141,6 +1142,88 @@ class ResumeTranscriptTests(unittest.TestCase):
         self.assertIn("$ ls", text)
         self.assertIn("a.py", text)
         self.assertNotIn("\nknowledge\n", text)
+
+
+class TerminalOutputStyleTests(unittest.TestCase):
+    def test_markdown_and_code_inherit_terminal_background(self):
+        output = io.StringIO()
+        test_console = Console(
+            file=output,
+            force_terminal=True,
+            color_system="truecolor",
+            width=100,
+            theme=laintas_cli.LAINTAS_THEME,
+            style="white",
+        )
+
+        test_console.print(laintas_cli.Markdown(
+            "ordinary `inline`\n\n```python\nprint('white')\n```"))
+
+        rendered = output.getvalue()
+        self.assertIn("ordinary", rendered)
+        self.assertIn("print", rendered)
+        self.assertNotIn("\x1b[48;", rendered)
+        self.assertNotIn("\x1b[44m", rendered)
+
+    def test_prompt_toolkit_chrome_preserves_slash_menu_only(self):
+        style = laintas_cli._build_prompt_style()
+        for style_name in ("bottom-toolbar", "paste-placeholder"):
+            attrs = style.get_attrs_for_style_str(f"class:{style_name}")
+            self.assertFalse(attrs.bgcolor, style_name)
+
+        for style_name in (
+                "completion-menu",
+                "completion-menu.completion.current"):
+            attrs = style.get_attrs_for_style_str(f"class:{style_name}")
+            self.assertTrue(attrs.bgcolor, style_name)
+
+        for style_name in ("task.text", "task.run", "task.done", "task.err"):
+            attrs = hwo_ui._STYLE.get_attrs_for_style_str(
+                f"class:{style_name}")
+            self.assertFalse(attrs.bgcolor, style_name)
+
+    def test_todolist_distinguishes_todo_hwo_and_hwg_without_background(self):
+        output = io.StringIO()
+        old_console = laintas_cli.console
+        laintas_cli.console = Console(
+            file=output,
+            force_terminal=True,
+            color_system="truecolor",
+            width=140,
+            theme=laintas_cli.LAINTAS_THEME,
+            style="white",
+        )
+        tasks = [
+            {"id": "1", "subject": "plain item", "status": "pending",
+             "progress": 0, "metadata": {}},
+            {"id": "2", "subject": "workflow step", "status": "in_progress",
+             "progress": 40, "metadata": {"workflowRunId": "run-1"}},
+            {"id": "3", "subject": "graph node", "status": "completed",
+             "progress": 100,
+             "metadata": {"workflowRunId": "run-2", "nodeId": "n1",
+                          "kind": "hwg-node"}},
+        ]
+        try:
+            laintas_cli._render_task_todolist(tasks, "/workspace")
+        finally:
+            laintas_cli.console = old_console
+
+        rendered = output.getvalue()
+        for expected in ("TODO", "HWO", "HWG", "plain item",
+                         "workflow step", "graph node"):
+            self.assertIn(expected, rendered)
+        self.assertNotIn("\x1b[48;", rendered)
+
+    def test_terminal_style_instruction_is_laintas_prompt_local_and_small(self):
+        prompt = laintas_cli.generate_cli_prop_template()
+        start = prompt.index("<terminal_output_style>")
+        end = prompt.index("</terminal_output_style>")
+        section = prompt[start:end]
+
+        self.assertIn("normal white text", section)
+        self.assertIn("ANSI 24-bit SGR", section)
+        self.assertIn("foreground AND background", section)
+        self.assertLess(len(section), 900)
 
 
 class _chdir:
