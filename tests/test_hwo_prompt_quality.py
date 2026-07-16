@@ -8,6 +8,7 @@ from hwo_adapter import parse, validate
 import hwo_runner
 import workflow_state
 import task_manager
+import workgraph
 
 
 class HwoPromptQualityTests(unittest.TestCase):
@@ -44,6 +45,7 @@ class HwoPromptQualityTests(unittest.TestCase):
                 run = workflow_state.new_run("hwo", "task.hwo")
                 mapping = hwo_runner._prepare_workflow_tasks(
                     steps, run["runId"], tmp)
+                task_manager.detach_active_tasks(cwd=tmp)
                 ctx = hwo_runner.HwoCtx(
                     deps=object(), session={}, run_state=run,
                     run_id=run["runId"], workflow_tasks=mapping,
@@ -54,9 +56,17 @@ class HwoPromptQualityTests(unittest.TestCase):
                         return_value={"ok": True, "msg": "done", "outputs": {}}):
                     result = hwo_runner.run_sequence(steps, ctx)
                 self.assertTrue(result["ok"])
-                tasks = task_manager.list_tasks(cwd=tmp)
+                tasks = [
+                    workgraph.get_step(
+                        entry["workId"], entry["taskId"], cwd=tmp)
+                    for entry in mapping.values()
+                ]
                 self.assertEqual(len(tasks), 2)
                 self.assertTrue(all(t["status"] == "completed" for t in tasks))
+                self.assertTrue(all(not t["session_only"] for t in tasks))
+                self.assertTrue(all(
+                    t["metadata"].get("scopeType") == "hwo-run"
+                    for t in tasks))
                 self.assertEqual([e["type"] for e in events], [
                     "step_started", "step_started",
                     "step_completed", "step_completed",

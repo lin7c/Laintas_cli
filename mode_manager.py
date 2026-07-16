@@ -12,7 +12,6 @@ from __future__ import annotations
 import copy
 import fnmatch
 import json
-import os
 import re
 import threading
 from pathlib import Path
@@ -20,6 +19,7 @@ from typing import Optional
 
 import json_store
 import paths
+import terminal_preferences
 
 
 _NAME = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
@@ -53,7 +53,6 @@ def _matches_tool(name: str, patterns: Optional[list[str]]) -> bool:
 _CACHE_LOCK = threading.RLock()
 _CACHE_KEY: tuple[str, Optional[int]] | None = None
 _CACHE_CONFIG: Optional[dict] = None
-_INSTANCE_ACTIVE_MODE: Optional[str] = None
 
 _READ_ONLY_TOOLS = [
     "fs.read", "fs.ls", "fs.grep", "fs.glob",
@@ -183,31 +182,17 @@ def config_path() -> Path:
 
 
 def _instance_mode_path() -> Path:
-    """Store the selected mode per CLI instance, not in project config."""
-    instance_id = getattr(paths, "INSTANCE_ID", f"pid-{os.getpid()}")
-    return paths.SESSIONS_DIR / f"{instance_id}_mode.json"
+    """Compatibility wrapper for the unified terminal preference file."""
+    return terminal_preferences.preference_path()
 
 
 def _load_instance_active_mode() -> Optional[str]:
-    global _INSTANCE_ACTIVE_MODE
-    if _INSTANCE_ACTIVE_MODE is not None:
-        return _INSTANCE_ACTIVE_MODE
-    path = _instance_mode_path()
-    try:
-        if not path.exists() or not paths.ensure_private_file(path):
-            return None
-        data = json.loads(path.read_text(encoding="utf-8"))
-        value = data.get("active") if isinstance(data, dict) else None
-        _INSTANCE_ACTIVE_MODE = value if isinstance(value, str) else ""
-    except (OSError, ValueError):
-        _INSTANCE_ACTIVE_MODE = ""
-    return _INSTANCE_ACTIVE_MODE or None
+    value = terminal_preferences.get("mode", "")
+    return value if isinstance(value, str) and value else None
 
 
 def _save_instance_active_mode(name: str) -> None:
-    global _INSTANCE_ACTIVE_MODE
-    json_store.save_json_atomic(_instance_mode_path(), {"version": 1, "active": name}, mode=0o600)
-    _INSTANCE_ACTIVE_MODE = name
+    terminal_preferences.set_value("mode", name)
 
 
 def _default_config() -> dict:
@@ -308,7 +293,7 @@ def list_modes() -> list[dict]:
         normalized = _normalize_mode(name, value)
         if normalized:
             result.append(normalized)
-    active = _load_instance_active_mode() or "act"
+    active = _active_mode_name()
     for item in result:
         item["active"] = item["name"] == active
     return result
@@ -322,8 +307,21 @@ def get_mode(name: str) -> Optional[dict]:
     return _normalize_mode(name, value) if value is not None else None
 
 
+def _active_mode_name() -> str:
+    name = _load_instance_active_mode() or "act"
+    if get_mode(name) is not None:
+        return name
+    # A project-scoped custom mode may have been removed by another process.
+    # Repair only this terminal's selection and fall back safely.
+    try:
+        _save_instance_active_mode("act")
+    except OSError:
+        pass
+    return "act"
+
+
 def get_active_mode() -> dict:
-    return get_mode(_load_instance_active_mode() or "act") or dict(_BUILTINS["act"])
+    return get_mode(_active_mode_name()) or dict(_BUILTINS["act"])
 
 
 def activate(name: str) -> tuple[bool, str]:

@@ -52,11 +52,14 @@ class ToolCtx:
     session: dict = field(default_factory=dict)
     events_cb: Optional[Callable] = None
     cwd: str = ""
+    task_cwd: str = ""                # shared TASK control plane; may differ in worktrees
     state: dict = field(default_factory=dict)
     run_id: str = ""
+    session_id: str = ""             # runtime-owned; never accepted from model input
+    parent_agent_id: Optional[str] = None
     # ── Loop-local context (populated by agent_loop at dispatch time) ──
     interactive_session: Any = None
-    stationed_terminal: Any = None    # deprecated execution hook; deployment is metadata only
+    stationed_terminal: Any = None    # TerminalInfo/session that owns deployed shell execution
     get_terminal: Optional[Callable] = None
     get_all_terminals: Optional[Callable] = None
     register_terminal: Optional[Callable] = None
@@ -1227,9 +1230,14 @@ def _bi_task_create(params: dict, ctx: ToolCtx) -> dict:
         task = _task_mgr.create_task(
             subject, description,
             metadata=params.get("metadata"),
-            session_only=params.get("session_only", False),
+            # TASK is deliberately session-scoped. HWO/HWG maintain their own
+            # durable run state and do not enter this path.
+            session_only=True,
             parent_task_id=params.get("parent_task_id"),
-            cwd=ctx.cwd or None,
+            cwd=ctx.task_cwd or ctx.cwd or None,
+            session_id=ctx.session_id or None,
+            owner_agent_id=ctx.agent_id,
+            parent_agent_id=ctx.parent_agent_id,
         )
     except _task_mgr.TaskStorageError as exc:
         return {"ok": False, "error": str(exc)}
@@ -1250,7 +1258,11 @@ def _bi_task_update(params: dict, ctx: ToolCtx) -> dict:
             kwargs[k] = params[k]
     try:
         ok, msg, task = _task_mgr.update_task(
-            str(task_id), cwd=ctx.cwd or None, **kwargs)
+            str(task_id), cwd=ctx.task_cwd or ctx.cwd or None,
+            session_id=ctx.session_id or None,
+            owner_agent_id=ctx.agent_id,
+            parent_agent_id=ctx.parent_agent_id,
+            **kwargs)
     except _task_mgr.TaskStorageError as exc:
         return {"ok": False, "result": None, "error": str(exc)}
     return {"ok": ok, "result": task if ok else None, "error": "" if ok else msg}
@@ -1262,9 +1274,15 @@ def _bi_task_list(params: dict, ctx: ToolCtx) -> dict:
     status = params.get("status") or None
     available = params.get("available", False)
     if available:
-        tasks = _task_mgr.get_available_tasks(cwd=ctx.cwd or None)
+        tasks = _task_mgr.get_available_tasks(
+            cwd=ctx.task_cwd or ctx.cwd or None,
+            session_id=ctx.session_id or None,
+            owner_agent_id=ctx.agent_id)
     else:
-        tasks = _task_mgr.list_tasks(status=status, cwd=ctx.cwd or None)
+        tasks = _task_mgr.list_tasks(
+            status=status, cwd=ctx.task_cwd or ctx.cwd or None,
+            session_id=ctx.session_id or None,
+            owner_agent_id=ctx.agent_id)
     return {"ok": True, "result": tasks, "count": len(tasks)}
 
 
@@ -1274,7 +1292,10 @@ def _bi_task_get(params: dict, ctx: ToolCtx) -> dict:
     task_id = params.get("id", "")
     if not task_id:
         return {"ok": False, "error": "missing 'id'"}
-    task = _task_mgr.get_task(str(task_id), cwd=ctx.cwd or None)
+    task = _task_mgr.get_task(
+        str(task_id), cwd=ctx.task_cwd or ctx.cwd or None,
+        session_id=ctx.session_id or None,
+        owner_agent_id=ctx.agent_id)
     if task is None:
         return {"ok": False, "error": f"Task '{task_id}' not found"}
     return {"ok": True, "result": task}
@@ -2528,6 +2549,53 @@ def _bi_hwo(params: dict, ctx: ToolCtx) -> dict:
     return out
 
 
+def _bi_hwg(params: dict, ctx: ToolCtx) -> dict:
+    """Compile, run, inspect, resume, or cancel a durable .hwg workflow."""
+    import hwg_runner
+
+    action = str(params.get("action") or "run").strip().lower()
+    path = str(params.get("path") or "").strip()
+    run_id = str(params.get("run_id") or "").strip()
+    if action in {"run", "compile"} and not path:
+        return {"ok": False, "error": "missing 'path'"}
+    if action in {"resume", "cancel"} and not run_id:
+        return {"ok": False, "error": "missing 'run_id'"}
+
+    if action == "compile":
+        result = hwg_runner.compile_hwg_file(path)
+    elif action == "run":
+        result = hwg_runner.run_hwg_file(
+            path, ctx.deps, ctx.session, parent_id=ctx.agent_id,
+            inputs=(params.get("inputs")
+                    if isinstance(params.get("inputs"), dict) else None),
+            events_cb=ctx.events_cb,
+        )
+    elif action == "resume":
+        result = hwg_runner.resume_hwg_run(
+            run_id, ctx.deps, ctx.session, parent_id=ctx.agent_id,
+            verdict=str(params.get("verdict") or "PASS"),
+            outputs=(params.get("outputs")
+                     if isinstance(params.get("outputs"), dict) else None),
+            events_cb=ctx.events_cb,
+        )
+    elif action == "status":
+        result = hwg_runner.status(run_id or None)
+    elif action == "cancel":
+        result = hwg_runner.cancel(run_id)
+    else:
+        return {"ok": False, "error": f"unsupported HWG action: {action}"}
+
+    out = {
+        "ok": bool(result.get("ok", False)),
+        "result": result.get("msg", ""),
+    }
+    if result.get("runId"):
+        out["run_id"] = result["runId"]
+    if result.get("outputs"):
+        out["outputs"] = result["outputs"]
+    return out
+
+
 def _hwo_is_sibling_or_ancestor(caller_id: str, target_id: str) -> bool:
     """True if target is a sibling of caller (shares a parent) or an ancestor."""
     import agent_loop as _al
@@ -2978,7 +3046,9 @@ def _bi_terminal_create(params: dict, ctx: ToolCtx) -> dict:
     import agent_loop as _al
     parent_terminal = _al.agent_deployment_terminal(owner) or "term0"
     cli_entry = os.path.join(os.path.dirname(os.path.abspath(__file__)), "laintas_cli.py")
+    terminal_id = paths.child_terminal_id(name, parent_terminal)
     lain_cmd = " ".join([
+        f"LAINTAS_TERMINAL_ID={shlex.quote(terminal_id)}",
         shlex.quote(sys.executable), shlex.quote(cli_entry),
         "--depth", str(ctx.depth + 1),
         "--terminal-name", shlex.quote(name),
@@ -3256,6 +3326,39 @@ def _bi_task_complete(params: dict, ctx: ToolCtx) -> dict:
     longer infers "done" from a turn that simply lacks a tool call.
     """
     summary = (params.get("summary") or "").strip()
+    if _task_mgr is not None and ctx.session_id:
+        scoped = _task_mgr.list_tasks(
+            cwd=ctx.task_cwd or ctx.cwd or None,
+            session_id=ctx.session_id)
+        descendants = {ctx.agent_id} if ctx.agent_id else {None}
+        changed = True
+        while changed:
+            changed = False
+            for item in scoped:
+                owner = item.get("owner_agent_id")
+                if (owner not in descendants
+                        and item.get("parent_agent_id") in descendants):
+                    descendants.add(owner)
+                    changed = True
+        open_items = [
+            item for item in scoped
+            if item.get("owner_agent_id") in descendants
+            and item.get("status") not in {
+                "completed", "skipped", "deleted"
+            }
+        ]
+        if open_items:
+            details = ", ".join(
+                f"[{item.get('id')}] {item.get('subject')}"
+                for item in open_items[:6])
+            return {
+                "ok": False,
+                "error": (
+                    "Task completion blocked: current agent tree still has "
+                    f"open TASK items: {details}. Update them before task_complete."
+                ),
+                "open_task_ids": [str(item.get("id")) for item in open_items],
+            }
     try:
         import workflow_engine
         wf = workflow_engine.get_active_workflow()
@@ -3379,13 +3482,112 @@ def _bi_workflow_phase_complete(params: dict, ctx: ToolCtx) -> dict:
 
 # ── Shell execution tool ──────────────────────────────────────────────
 
+def _deployed_shell_session(target: Any) -> Any:
+    """Return the live PTY session behind a deployment target, if any."""
+    if target is None:
+        return None
+    session = getattr(target, "session", None) or target
+    try:
+        return session if session.is_alive() else None
+    except Exception:
+        return None
+
+
+def _exec_in_deployed_shell(command: str, session: Any, timeout: int,
+                            abort_event: Any = None) -> dict:
+    """Execute in an agent's persistent deployment shell and return its final cwd."""
+    import uuid
+
+    marker_id = uuid.uuid4().hex
+    start_marker = f"__LAINTAS_SHELL_BEGIN_{marker_id}__"
+    cwd_marker = f"__LAINTAS_SHELL_CWD_{marker_id}__"
+    end_marker = f"__LAINTAS_SHELL_END_{marker_id}__"
+    wrapped = (
+        f"echo {start_marker}; {command} 2>&1; __laintas_rc=$?; "
+        f"printf '{cwd_marker}:%s\\n' \"$PWD\"; "
+        f"echo {end_marker}:$__laintas_rc"
+    )
+
+    try:
+        old_len = len(session.raw_output)
+    except AttributeError:
+        old_len = len(getattr(session, "full_output", ""))
+
+    lock = getattr(session, "command_lock", None)
+    entered = False
+    try:
+        if lock is not None:
+            lock.acquire()
+            entered = True
+        session.send_keys(wrapped + "\n")
+        deadline = time.monotonic() + timeout
+        new_content = ""
+        while time.monotonic() < deadline:
+            if abort_event is not None and abort_event.is_set():
+                try:
+                    session.send_keys("\x03")
+                except Exception:
+                    pass
+                return {"ok": False, "error": "Command aborted", "result": "",
+                        "returncode": -1, "via": "deployment_terminal"}
+            try:
+                session.read_output(timeout=0.1)
+                raw = getattr(session, "raw_output", None)
+                if raw is None:
+                    raw = getattr(session, "full_output", "")
+                new_content = raw[old_len:] if old_len else raw
+            except Exception:
+                new_content = ""
+
+            end_match = re.search(
+                rf"{re.escape(end_marker)}:(\d+)", new_content)
+            if end_match:
+                returncode = int(end_match.group(1))
+                before_end = new_content[:end_match.start()]
+                cwd_matches = list(re.finditer(
+                    rf"{re.escape(cwd_marker)}:([^\r\n]*)", before_end))
+                cwd = cwd_matches[-1].group(1).strip() if cwd_matches else ""
+                output_end = cwd_matches[-1].start() if cwd_matches else len(before_end)
+                before_cwd = before_end[:output_end]
+                starts = list(re.finditer(
+                    rf"{re.escape(start_marker)}(?=[\r\n]|$)", before_cwd))
+                if starts:
+                    body_start = starts[-1].end()
+                    while (body_start < len(before_cwd)
+                           and before_cwd[body_start] in "\r\n"):
+                        body_start += 1
+                    output = before_cwd[body_start:].strip("\r\n").strip()
+                else:
+                    output = before_cwd.strip("\r\n").strip()
+                result = {
+                    "ok": returncode == 0,
+                    "result": output or "(no output)",
+                    "returncode": returncode,
+                    "via": "deployment_terminal",
+                }
+                if cwd and os.path.isdir(cwd):
+                    result["cwd"] = cwd
+                return result
+            try:
+                if not session.is_alive():
+                    return {"ok": False, "error": "Deployment terminal exited",
+                            "result": new_content.strip(), "returncode": -1,
+                            "via": "deployment_terminal"}
+            except Exception:
+                pass
+            time.sleep(0.05)
+        return {"ok": False, "error": f"Command timed out ({timeout}s)",
+                "result": new_content.strip(), "returncode": -1,
+                "via": "deployment_terminal"}
+    finally:
+        if entered:
+            lock.release()
+
 def _bi_shell_exec(params: dict, ctx: ToolCtx) -> dict:
     """Execute a shell command.
 
-    Deployment is lifecycle ownership, not a shared command byte stream.  This
-    tool therefore always runs a synchronous non-interactive subprocess. Use
-    session.* for a private interactive PTY and terminal.send only for input to
-    an already-running interactive program.
+    A deployed agent executes on its persistent terminal. An undeployed agent
+    gets the existing synchronous, isolated subprocess behavior.
 
     Policy is enforced by the dispatch loop, not here (single source of truth).
     """
@@ -3402,45 +3604,27 @@ def _bi_shell_exec(params: dict, ctx: ToolCtx) -> dict:
     elif command == "shell.exec":
         return {"ok": False, "error": "missing shell command after 'shell.exec'"}
 
-    cwd = params.get("cwd") or ctx.cwd or os.getcwd()
     timeout = int(params.get("timeout", 60))
     owner = (ctx.get_agent(ctx.agent_id)
              if ctx.get_agent is not None and ctx.agent_id else None)
     abort_event = getattr(owner, "abort_event", None)
 
-    stripped = command.strip()
-    _is_bare_cd = stripped == "cd" or (
-        stripped.startswith("cd ")
-        and not any(op in stripped for op in ("&&", "||", ";", "|", ">", "<", "`", "$("))
-    )
-    _is_bare_clear = stripped == "clear" or (
-        stripped.startswith("clear ")
-        and not any(op in stripped for op in ("&&", "||", ";", "|"))
-    )
-    if _is_bare_cd:
-        path = stripped[3:].strip() if stripped.startswith("cd ") else os.path.expanduser("~")
-        if ctx.depth > 0:
-            return {
-                "ok": False,
-                "error": (
-                    "A sub-agent cannot change the process-global cwd. "
-                    "Pass cwd to shell.exec or use 'cd <path> && <command>'."
-                ),
-                "returncode": -1,
-            }
-        try:
-            os.chdir(path)
-            return {"ok": True, "result": f"cd → {os.getcwd()}",
-                    "returncode": 0, "via": "subprocess", "cwd": os.getcwd()}
-        except Exception as e:
-            return {"ok": False, "error": f"cd error: {e}", "returncode": -1,
-                    "via": "subprocess"}
-    if _is_bare_clear:
-        import sys as _sys
-        _sys.stdout.write("\033[2J\033[H")
-        _sys.stdout.flush()
-        return {"ok": True, "result": "", "returncode": 0,
-                "via": "subprocess"}
+    deployed_session = _deployed_shell_session(ctx.stationed_terminal)
+    if ctx.stationed_terminal is not None:
+        if deployed_session is None:
+            return {"ok": False, "error": "Deployment terminal is not running",
+                    "returncode": -1, "via": "deployment_terminal"}
+        # An explicit cwd is itself a request to move the persistent terminal.
+        # ctx.cwd is only the fallback for isolated subprocesses; the deployed
+        # terminal's real shell state remains authoritative.
+        explicit_cwd = str(params.get("cwd") or "").strip()
+        deployed_command = command
+        if explicit_cwd:
+            deployed_command = f"cd -- {shlex.quote(explicit_cwd)} && {command}"
+        return _exec_in_deployed_shell(
+            deployed_command, deployed_session, timeout, abort_event)
+
+    cwd = params.get("cwd") or ctx.cwd or os.getcwd()
 
     # Direct subprocess execution. Use a process group and poll the owning
     # agent's abort event so cancelling a task also cancels the command and its
@@ -4689,10 +4873,12 @@ def register_builtin_tools() -> None:
         ),
         Tool(
             name="shell.exec",
-            description="Run a non-interactive shell command via subprocess (no PTY). "
-                        "Returns stdout, stderr, exit code, duration. Use for one-shot "
-                        "commands that need structured output (jq, grep with parsing, "
-                        "python -c). For REPLs or commands that need keystrokes, start an "
+            description="Run a shell command in the current agent's execution scope. "
+                        "A deployed agent runs directly in its persistent deployment "
+                        "terminal, so cd, export, aliases, and compound-command shell "
+                        "state persist. An undeployed agent uses an isolated, non-PTY "
+                        "subprocess. Returns output and exit status. For REPLs or commands "
+                        "that need keystrokes without a deployment terminal, start an "
                         "agent-private PTY with session.start instead.",
             schema={
                 "type": "object",
@@ -4776,11 +4962,11 @@ def register_builtin_tools() -> None:
         Tool(
             name="task.create",
             description="Create an executable Step in the active WorkGraph. "
-                        "In ACT mode, decompose the approved plan into specific steps "
+                        "For medium work, decompose execution into specific steps "
                         "with clear names. Tasks have status (pending→in_progress→completed), "
                         "dependencies (blocks/blockedBy), progress (0-100), "
-                        "notes, and metadata. Use session_only=true for ephemeral "
-                        "tasks that won't persist across sessions.",
+                        "notes, and metadata. The runtime always scopes them to "
+                        "the calling session and agent.",
             schema={
                 "type": "object",
                 "properties": {
@@ -4789,8 +4975,6 @@ def register_builtin_tools() -> None:
                                     "description": "Detailed description of what needs to be done"},
                     "metadata": {"type": "object", "default": {},
                                  "description": "Arbitrary metadata (tags, priority, etc.)"},
-                    "session_only": {"type": "boolean", "default": False,
-                                     "description": "If true, task exists only in this session"},
                     "parent_task_id": {"type": "string",
                                        "description": "Optional hierarchy parent; does not create an execution dependency"},
                 },
@@ -5316,6 +5500,31 @@ def register_builtin_tools() -> None:
                 "required": ["path"],
             },
             invoke=_bi_hwo,
+        ),
+        Tool(
+            name="hwg",
+            description=(
+                "Compile, run, inspect, resume, or cancel a durable HWG graph. "
+                "Use HWG to connect HWO stages with conditional routing, bounded "
+                "cycles, retries, manual gates, and resumable checkpoints. Load "
+                "the hwo-workflows skill before authoring or changing .hwg files."
+            ),
+            schema={
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["run", "compile", "resume", "status", "cancel"],
+                        "default": "run",
+                    },
+                    "path": {"type": "string", "description": "Path to a .hwg graph file."},
+                    "run_id": {"type": "string", "description": "Durable HWG run id."},
+                    "inputs": {"type": "object", "additionalProperties": True},
+                    "verdict": {"type": "string", "default": "PASS"},
+                    "outputs": {"type": "object", "additionalProperties": True},
+                },
+            },
+            invoke=_bi_hwg,
         ),
         Tool(
             name="agent_send",

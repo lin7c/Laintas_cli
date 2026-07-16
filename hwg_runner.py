@@ -23,7 +23,8 @@ from hwg_adapter import HwgParseError, as_graph, parse as parse_hwg, validate as
 MAX_GRAPH_STEPS = 200
 
 
-def _prepare_node_tasks(run: dict, nodes: list[dict], cwd: str) -> dict:
+def _prepare_node_tasks(run: dict, nodes: list[dict], cwd: str,
+                        owner_agent_id: str = None) -> dict:
     """Create one stable Todo per HWG node and persist the mapping in the run."""
     mapping = dict(run.get("nodeTasks") or {})
     try:
@@ -36,14 +37,19 @@ def _prepare_node_tasks(run: dict, nodes: list[dict], cwd: str) -> dict:
                 f"HWG node #{node_id}# ({node.get('file', '')})"[:200],
                 metadata={
                     "workflowRunId": run.get("runId"),
+                    "scopeType": "hwg-run",
                     "nodeId": node_id,
                     "kind": "hwg-node",
                     "file": node.get("file", ""),
                 },
-                session_only=True,
+                session_only=False,
                 cwd=cwd,
+                owner_agent_id=owner_agent_id,
             )
-            mapping[node_id] = {"taskId": task["id"], "cwd": cwd}
+            mapping[node_id] = {
+                "workId": task["work_id"], "taskId": task["id"],
+                "cwd": cwd,
+            }
     except Exception:
         return mapping
     run["nodeTasks"] = mapping
@@ -57,12 +63,19 @@ def _update_node_task(run: dict, node_id: str, status: str,
         return
     try:
         import task_manager
+        import workgraph
         fields = {"status": status}
         if progress is not None:
             fields["progress"] = max(0, min(100, int(progress)))
         if notes:
             fields["notes"] = notes[:400]
-        task_manager.update_task(entry["taskId"], cwd=entry.get("cwd"), **fields)
+        if entry.get("workId"):
+            workgraph.update_step(
+                entry["workId"], entry["taskId"],
+                cwd=entry.get("cwd"), **fields)
+        else:  # resume mappings created before durable work ids were recorded
+            task_manager.update_task(
+                entry["taskId"], cwd=entry.get("cwd"), **fields)
     except Exception:
         pass
 
@@ -333,7 +346,8 @@ def run_hwg_file(path: str, deps, session: dict, parent_id: Optional[str] = None
         has_incoming = {e["to"] for e in edges}
         starts = [n for n in nodes if n["id"] not in has_incoming]
         current = starts[0] if starts else None
-    _prepare_node_tasks(run, nodes, str(Path.cwd()))
+    _prepare_node_tasks(
+        run, nodes, str(Path.cwd()), owner_agent_id=parent_id)
     run = workflow_state.checkpoint(run, "run_started" if not resume_run else "run_resumed", {"path": path})
     run = _emit_run(run, "workflow_started", {"path": path, "kind": "hwg"}, events_cb)
 

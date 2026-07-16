@@ -53,8 +53,12 @@ _session_key: str = uuid.uuid4().hex[:16]
 _LEGACY_IMPORT_KEY = "legacy_tasks_imported"
 
 
-def _active_work(cwd: str = None) -> dict:
-    work = workgraph.ensure_active_work(cwd=cwd)
+def _active_work(cwd: str = None, session_id: str = None) -> dict:
+    work = workgraph.ensure_active_work(cwd=cwd, session_id=session_id)
+    # Legacy tasks had no session identity.  Import them only through the
+    # compatibility (unscoped) API, never into a runtime session.
+    if session_id is not None:
+        return work
     # One-way compatibility import. The legacy file is retained as an archive;
     # a non-empty WorkGraph prevents repeated imports.
     legacy_imported = bool(workgraph.get_project_value(
@@ -99,13 +103,13 @@ def _active_work(cwd: str = None) -> dict:
     return work
 
 
-def _read_work(cwd: str = None) -> Optional[dict]:
-    work = workgraph.get_active_work(cwd=cwd)
+def _read_work(cwd: str = None, session_id: str = None) -> Optional[dict]:
+    work = workgraph.get_active_work(cwd=cwd, session_id=session_id)
     if work:
         return work
     # Reading must not create an empty WorkGraph, but it may trigger one-way
     # migration when real legacy tasks exist.
-    if (_load(cwd=cwd)
+    if (session_id is None and _load(cwd=cwd)
             and not workgraph.get_project_value(_LEGACY_IMPORT_KEY, cwd=cwd)):
         return _active_work(cwd)
     return None
@@ -210,7 +214,9 @@ def create_task(subject: str, description: str = "",
                 metadata: dict = None,
                 session_only: bool = False,
                 parent_task_id: str = None,
-                *, cwd: str = None) -> dict:
+                *, cwd: str = None, session_id: str = None,
+                owner_agent_id: str = None,
+                parent_agent_id: str = None) -> dict:
     """Create a new task. Returns the task dict.
 
     If session_only=True, the task lives only in memory (not persisted).
@@ -219,25 +225,33 @@ def create_task(subject: str, description: str = "",
     """
     with _lock:
         try:
-            work = _active_work(cwd)
+            work = _active_work(cwd, session_id)
             step = workgraph.create_step(
                 work["id"], subject, description, cwd=cwd,
                 metadata=({**(metadata or {}), "_session_key": _session_key}
                           if session_only else metadata), session_only=session_only,
-                parent_id=str(parent_task_id) if parent_task_id else None)
+                parent_id=str(parent_task_id) if parent_task_id else None,
+                session_id=session_id, owner_agent_id=owner_agent_id,
+                parent_agent_id=parent_agent_id)
             return _compat(step)
         except workgraph.WorkGraphError as exc:
             raise TaskStorageError(str(exc)) from exc
 
 
 def create_session_task(subject: str, description: str = "",
-                        parent_task_id: str = None) -> dict:
+                        parent_task_id: str = None, *, cwd: str = None,
+                        session_id: str = None, owner_agent_id: str = None,
+                        parent_agent_id: str = None) -> dict:
     """Create a session-only task (not persisted). Convenience wrapper."""
     return create_task(subject, description,
-                       session_only=True, parent_task_id=parent_task_id)
+                       session_only=True, parent_task_id=parent_task_id, cwd=cwd,
+                       session_id=session_id, owner_agent_id=owner_agent_id,
+                       parent_agent_id=parent_agent_id)
 
 
-def update_task(task_id: str, *, cwd: str = None, **kwargs) -> tuple[bool, str, Optional[dict]]:
+def update_task(task_id: str, *, cwd: str = None, session_id: str = None,
+                owner_agent_id: str = None, parent_agent_id: str = None,
+                **kwargs) -> tuple[bool, str, Optional[dict]]:
     """Update a task's fields. Validates status transitions.
 
     Accepted kwargs: status, subject, description, metadata,
@@ -248,8 +262,10 @@ def update_task(task_id: str, *, cwd: str = None, **kwargs) -> tuple[bool, str, 
     """
     with _lock:
         try:
-            work = _active_work(cwd)
-            target = workgraph.get_step(work["id"], str(task_id), cwd=cwd)
+            work = _active_work(cwd, session_id)
+            target = workgraph.get_step(
+                work["id"], str(task_id), cwd=cwd, session_id=session_id,
+                owner_agent_id=owner_agent_id)
             if target is None:
                 return False, f"Task '{task_id}' not found", None
 
@@ -261,7 +277,9 @@ def update_task(task_id: str, *, cwd: str = None, **kwargs) -> tuple[bool, str, 
                     work["id"], subject, description, cwd=cwd,
                     metadata=({"_session_key": _session_key}
                               if target.get("session_only") else None),
-                    session_only=bool(target.get("session_only")), parent_id=str(task_id))
+                    session_only=bool(target.get("session_only")), parent_id=str(task_id),
+                    session_id=session_id, owner_agent_id=owner_agent_id,
+                    parent_agent_id=parent_agent_id)
 
             for blocker in kwargs.get("addBlockedBy", []) or []:
                 workgraph.add_dependency(work["id"], str(task_id), str(blocker), cwd=cwd)
@@ -276,8 +294,12 @@ def update_task(task_id: str, *, cwd: str = None, **kwargs) -> tuple[bool, str, 
                       ("status", "subject", "description", "metadata", "progress", "notes")
                       if key in kwargs}
             updated = workgraph.update_step(
-                work["id"], str(task_id), cwd=cwd, **fields) if fields else (
-                    workgraph.get_step(work["id"], str(task_id), cwd=cwd) or {})
+                work["id"], str(task_id), cwd=cwd, session_id=session_id,
+                owner_agent_id=owner_agent_id, parent_agent_id=parent_agent_id,
+                **fields) if fields or parent_agent_id is not None else (
+                    workgraph.get_step(
+                        work["id"], str(task_id), cwd=cwd, session_id=session_id,
+                        owner_agent_id=owner_agent_id) or {})
             remaining = [item for item in workgraph.list_steps(work["id"], cwd=cwd)
                          if item.get("status") not in {"completed", "skipped", "deleted"}]
             if not remaining and work.get("status") == "EXECUTING":
@@ -287,23 +309,28 @@ def update_task(task_id: str, *, cwd: str = None, **kwargs) -> tuple[bool, str, 
             return False, str(exc), None
 
 
-def get_task(task_id: str, *, cwd: str = None) -> Optional[dict]:
+def get_task(task_id: str, *, cwd: str = None, session_id: str = None,
+             owner_agent_id: str = None) -> Optional[dict]:
     """Get a single task by ID (checks both persisted and session tasks)."""
-    work = _read_work(cwd)
+    work = _read_work(cwd, session_id)
     if not work:
         return None
-    step = workgraph.get_step(work["id"], str(task_id), cwd=cwd)
+    step = workgraph.get_step(
+        work["id"], str(task_id), cwd=cwd, session_id=session_id,
+        owner_agent_id=owner_agent_id)
     return _compat(step) if step else None
 
 
 def list_tasks(status: str = None, blocked_by: str = None,
-               include_session: bool = True, *, cwd: str = None) -> list[dict]:
+               include_session: bool = True, *, cwd: str = None,
+               session_id: str = None, owner_agent_id: str = None) -> list[dict]:
     """List tasks, optionally filtered by status or dependency."""
-    work = _read_work(cwd)
+    work = _read_work(cwd, session_id)
     if not work:
         return []
     tasks = [_compat(item) for item in workgraph.list_steps(
-        work["id"], cwd=cwd, include_deleted=True)]
+        work["id"], cwd=cwd, include_deleted=True, session_id=session_id,
+        owner_agent_id=owner_agent_id)]
     if not include_session:
         tasks = [task for task in tasks if not task.get("session_only")]
     else:
@@ -331,9 +358,11 @@ def list_tasks(status: str = None, blocked_by: str = None,
     return tasks
 
 
-def get_available_tasks(*, cwd: str = None) -> list[dict]:
+def get_available_tasks(*, cwd: str = None, session_id: str = None,
+                        owner_agent_id: str = None) -> list[dict]:
     """Get tasks ready to work on: pending, not blocked by any incomplete task."""
-    tasks = list_tasks(cwd=cwd)
+    tasks = list_tasks(cwd=cwd, session_id=session_id,
+                       owner_agent_id=owner_agent_id)
     status = {str(item["id"]): item.get("status") for item in tasks}
     return [item for item in tasks
             if item.get("status") == "pending"
@@ -341,21 +370,25 @@ def get_available_tasks(*, cwd: str = None) -> list[dict]:
                     for blocker in item.get("blockedBy", []))]
 
 
-def get_active_tasks_snapshot(*, cwd: str = None) -> str:
+def get_active_tasks_snapshot(*, cwd: str = None, session_id: str = None,
+                              owner_agent_id: str = None) -> str:
     """Render a compact summary of the open task list for prompt injection.
 
     Includes both in_progress (shown first) and pending tasks so the model's
     own plan stays visible every turn and can anchor a "continue" request.
     Returns empty string if nothing is open.
     """
-    all_tasks = list_tasks(cwd=cwd)
+    all_tasks = list_tasks(cwd=cwd, session_id=session_id,
+                           owner_agent_id=owner_agent_id)
     in_progress = [t for t in all_tasks if t.get("status") == "in_progress"]
     pending = [t for t in all_tasks if t.get("status") == "pending"]
     ordered = in_progress + pending
     if not ordered:
         return ""
 
-    lines = ["Open tasks (reference only — do not auto-resume; wait for the user to ask):"]
+    lines = [
+        "Current session tasks (authoritative execution progress; keep statuses current):"
+    ]
     for t in ordered[:10]:  # cap at 10
         status_mark = "▶" if t.get("status") == "in_progress" else "○"
         progress = t.get("progress", 0)
@@ -370,7 +403,8 @@ def get_active_tasks_snapshot(*, cwd: str = None) -> str:
     return "\n".join(lines)
 
 
-def clear_session_tasks(*, cwd: str = None) -> None:
+def clear_session_tasks(*, cwd: str = None, session_id: str = None,
+                        owner_agent_id: str = None) -> None:
     """Remove all session-level tasks."""
     global _session_tasks, _session_id_counter
     with _lock:
@@ -378,24 +412,28 @@ def clear_session_tasks(*, cwd: str = None) -> None:
         _session_id_counter = 0
         try:
             if workgraph.db_path(cwd).exists():
-                workgraph.clear_session_steps(cwd=cwd)
+                workgraph.clear_session_steps(
+                    cwd=cwd, session_id=session_id,
+                    owner_agent_id=owner_agent_id)
         except workgraph.WorkGraphError:
             pass
 
 
-def detach_active_tasks(*, cwd: str = None) -> None:
+def detach_active_tasks(*, cwd: str = None, session_id: str = None) -> None:
     """Detach all task context when starting a fresh session.
 
     Persisted WorkGraph history remains available for explicit /resume or
     /work resume, while the retained legacy tasks.json archive is marked as
     already migrated so it cannot silently reactivate the old task list.
     """
-    clear_session_tasks(cwd=cwd)
-    workgraph.set_project_value(_LEGACY_IMPORT_KEY, True, cwd=cwd)
-    workgraph.set_active_work(None, cwd=cwd)
+    clear_session_tasks(cwd=cwd, session_id=session_id)
+    if session_id is None:
+        workgraph.set_project_value(_LEGACY_IMPORT_KEY, True, cwd=cwd)
+    workgraph.set_active_work(None, cwd=cwd, session_id=session_id)
 
 
-def export_active_tasks(*, cwd: str = None) -> list[dict]:
+def export_active_tasks(*, cwd: str = None, session_id: str = None,
+                        owner_agent_id: str = None) -> list[dict]:
     """Export the open plan (in_progress + pending tasks, persisted + session).
 
     Used to snapshot the working plan into a /resume blob so it survives a
@@ -403,7 +441,8 @@ def export_active_tasks(*, cwd: str = None) -> list[dict]:
     Returns deep-ish copies so callers can serialize without mutating state.
     """
     with _lock:
-        all_tasks = list_tasks(cwd=cwd)
+        all_tasks = list_tasks(cwd=cwd, session_id=session_id,
+                               owner_agent_id=owner_agent_id)
     out = []
     for t in all_tasks:
         if t.get("status") in ("in_progress", "pending"):
@@ -411,7 +450,9 @@ def export_active_tasks(*, cwd: str = None) -> list[dict]:
     return out
 
 
-def import_session_tasks(tasks: list[dict], *, cwd: str = None) -> int:
+def import_session_tasks(tasks: list[dict], *, cwd: str = None,
+                         session_id: str = None, owner_agent_id: str = None,
+                         parent_agent_id: str = None) -> int:
     """Rehydrate a plan from a /resume blob as session tasks.
 
     Replaces the current session task list with the saved one (the resume blob
@@ -422,9 +463,14 @@ def import_session_tasks(tasks: list[dict], *, cwd: str = None) -> int:
     if not isinstance(tasks, list):
         return 0
     with _lock:
-        work = _active_work(cwd)
+        work = _active_work(cwd, session_id)
         try:
+            workgraph.clear_session_steps(
+                cwd=cwd, session_id=session_id,
+                owner_agent_id=owner_agent_id)
             return workgraph.import_session_steps(
-                work["id"], tasks, cwd=cwd, session_key=_session_key)
+                work["id"], tasks, cwd=cwd, session_key=_session_key,
+                session_id=session_id, owner_agent_id=owner_agent_id,
+                parent_agent_id=parent_agent_id)
         except workgraph.WorkGraphError:
             return 0

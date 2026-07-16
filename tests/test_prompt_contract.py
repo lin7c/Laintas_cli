@@ -23,6 +23,15 @@ class PromptContractTests(unittest.TestCase):
         self.assertNotIn("session_continue", prompt)
         self.assertNotIn("The session's full context", prompt)
 
+    def test_runtime_orchestration_prompt_routes_task_hwo_and_hwg(self):
+        prompt = agent_loop._WORK_ORCHESTRATION_PROMPT
+        compact = " ".join(prompt.split())
+        self.assertIn("three or more meaningful execution steps", prompt)
+        self.assertIn("current session and owning agent", compact)
+        self.assertIn("structured input/output hand-offs", prompt)
+        self.assertIn("conditional routing", prompt)
+        self.assertIn("Do not choose\n  HWG merely", prompt)
+
     def test_legacy_internal_tool_names_are_canonicalized(self):
         text = "Use `task.create`, fs.delete and agent_return."
         result = agent_loop._canonicalize_prompt_tool_names(text)

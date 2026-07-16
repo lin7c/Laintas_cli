@@ -19,7 +19,9 @@ import plan_mode
 import policy
 import prompt_opt
 import task_manager
+import terminal_preferences
 import workflow_engine
+import updater
 
 
 class _Registry:
@@ -36,6 +38,30 @@ class _Registry:
 
 
 class SlashRegistryTests(unittest.TestCase):
+    def setUp(self):
+        self._terminal_preferences_dir = tempfile.TemporaryDirectory()
+        self._sessions_patch = mock.patch.object(
+            laintas_cli.paths, "SESSIONS_DIR",
+            Path(self._terminal_preferences_dir.name))
+        self._terminal_patch = mock.patch.object(
+            laintas_cli.paths, "TERMINAL_ID", "slash-tests")
+        self._sessions_patch.start()
+        self._terminal_patch.start()
+        terminal_preferences.reset_cache()
+
+    def tearDown(self):
+        terminal_preferences.reset_cache()
+        self._terminal_patch.stop()
+        self._sessions_patch.stop()
+        self._terminal_preferences_dir.cleanup()
+
+    @staticmethod
+    def _complete(text):
+        return list(laintas_cli.MetaCompleter().get_completions(
+            laintas_cli.Document(text, len(text)),
+            mock.Mock(completion_requested=True),
+        ))
+
     def test_registry_is_unique_and_drives_palette_and_completion(self):
         names = [name for spec in laintas_cli.COMMAND_SPECS for name in spec.all_names]
         palette = [name for name, _ in laintas_cli._COMMANDS]
@@ -48,6 +74,68 @@ class SlashRegistryTests(unittest.TestCase):
         self.assertIn("/clear", laintas_cli._NEW_SESSION_COMMANDS)
         palette_descriptions = dict(laintas_cli._COMMANDS)
         self.assertIn("/station <agent-id>", palette_descriptions["/station"])
+
+    def test_exact_slash_command_keeps_a_visible_completion(self):
+        completions = self._complete("/task")
+
+        self.assertEqual([item.display_text for item in completions], ["/task"])
+        # A trailing-space insertion avoids prompt_toolkit dropping its sole
+        # exact/no-op completion while preserving the displayed command.
+        self.assertEqual(completions[0].text, "/task ")
+        self.assertEqual(completions[0].display_meta_text, "Track project tasks")
+
+    def test_backspace_from_exact_command_restarts_prefix_completion(self):
+        buffer = laintas_cli.Buffer()
+        buffer.text = "/task"
+        buffer.cursor_position = len(buffer.text)
+        buffer.start_completion = mock.Mock()
+        backspace = next(
+            binding for binding in laintas_cli._build_keybindings().bindings
+            if binding.keys == (laintas_cli.Keys.ControlH,)
+        )
+
+        backspace.handler(mock.Mock(current_buffer=buffer, arg=1))
+
+        self.assertEqual(buffer.text, "/tas")
+        buffer.start_completion.assert_called_once_with()
+        self.assertIn(
+            "/task", [item.display_text for item in self._complete(buffer.text)])
+
+    def test_forward_delete_restarts_slash_completion(self):
+        buffer = laintas_cli.Buffer()
+        buffer.text = "/taskx"
+        buffer.cursor_position = len("/task")
+        buffer.start_completion = mock.Mock()
+        delete = next(
+            binding for binding in laintas_cli._build_keybindings().bindings
+            if binding.keys == (laintas_cli.Keys.Delete,)
+        )
+
+        delete.handler(mock.Mock(current_buffer=buffer, arg=1))
+
+        self.assertEqual(buffer.text, "/task")
+        buffer.start_completion.assert_called_once_with()
+
+    def test_all_static_subcommands_have_contextual_descriptions(self):
+        for spec in laintas_cli.COMMAND_SPECS:
+            for entry in spec.contextual_completions:
+                self.assertTrue(entry.description.strip(), (spec.name, entry.value))
+        completions = self._complete("/task pro")
+
+        self.assertEqual([item.display_text for item in completions], ["progress"])
+        self.assertEqual(
+            completions[0].display_meta_text, "Update completion progress")
+
+    def test_invalid_slash_text_has_no_completions(self):
+        self.assertEqual(self._complete("/taskx"), [])
+        self.assertEqual(self._complete("/task unrelated"), [])
+
+    def test_alias_subcommand_completion_has_specific_description(self):
+        completions = self._complete("/v updat")
+
+        self.assertEqual([item.display_text for item in completions], ["update"])
+        self.assertIn("install", completions[0].display_meta_text)
+        self.assertIn("restart", completions[0].display_meta_text)
 
     def test_employee_help_and_completion_are_synchronized(self):
         output = io.StringIO()
@@ -338,6 +426,10 @@ class SlashRegistryTests(unittest.TestCase):
         }]
         with tempfile.TemporaryDirectory() as tmp, \
                 mock.patch.object(
+                    laintas_cli.paths, "SESSIONS_DIR", Path(tmp) / "sessions"), \
+                mock.patch.object(
+                    laintas_cli.paths, "TERMINAL_ID", "model-test"), \
+                mock.patch.object(
                     laintas_cli, "CONFIG_FILE", Path(tmp) / "config.json"), \
                 mock.patch.object(
                     laintas_cli, "fetch_available_models",
@@ -346,6 +438,7 @@ class SlashRegistryTests(unittest.TestCase):
                     laintas_cli, "show_model_selector", return_value=models[0]), \
                 mock.patch.object(
                     laintas_cli.sys.stdin, "isatty", return_value=True):
+            terminal_preferences.reset_cache()
             output = io.StringIO()
             old_console = laintas_cli.console
             laintas_cli.console = Console(file=output, force_terminal=False)
@@ -357,6 +450,25 @@ class SlashRegistryTests(unittest.TestCase):
             self.assertEqual(laintas_cli.get_selected_model(), "model-x")
             self.assertEqual(
                 laintas_cli.get_selected_provider(), "provider-a")
+
+    def test_explicit_model_clears_stale_provider(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(
+                    laintas_cli.paths, "SESSIONS_DIR", Path(tmp)), \
+                mock.patch.object(
+                    laintas_cli.paths, "TERMINAL_ID", "model-direct"):
+            terminal_preferences.reset_cache()
+            laintas_cli.set_model_selection("old-model", "old-provider")
+            output = io.StringIO()
+            old_console = laintas_cli.console
+            laintas_cli.console = Console(file=output, force_terminal=False)
+            try:
+                self.assertFalse(laintas_cli.handle_meta_command(
+                    "/model new-model", _Registry(), {}))
+            finally:
+                laintas_cli.console = old_console
+            self.assertEqual(laintas_cli.get_selected_model(), "new-model")
+            self.assertEqual(laintas_cli.get_selected_provider(), "")
 
     def test_dangerous_commands_reject_extra_args(self):
         output = io.StringIO()
@@ -394,6 +506,29 @@ class SlashRegistryTests(unittest.TestCase):
             mock.call(["/v", "update", "--force"]),
         ])
         self.assertNotIn("Usage: /update", output.getvalue())
+
+    def test_binary_update_restarts_from_replaced_executable(self):
+        installed_path = "/usr/local/bin/laintas-cli"
+        with mock.patch.object(updater, "is_frozen", return_value=True), \
+                mock.patch.object(updater, "fetch_manifest", return_value={
+                    "version": "999.0.0",
+                }), \
+                mock.patch.object(updater, "is_newer", return_value=True), \
+                mock.patch.object(
+                    updater, "apply_frozen_update", return_value=installed_path), \
+                mock.patch.object(laintas_cli, "stop_trigger_scanner"), \
+                mock.patch.object(laintas_cli, "close_all_terminals"), \
+                mock.patch.object(
+                    laintas_cli.browser_mod, "close_all_browser_sessions"), \
+                mock.patch.object(
+                    laintas_cli, "_LAUNCH_SCRIPT_PATH", "/workdir/laintas-cli"), \
+                mock.patch.object(
+                    laintas_cli.sys, "argv", ["laintas-cli", "--resume"]), \
+                mock.patch.object(laintas_cli.os, "execv") as execv_mock:
+            laintas_cli.handle_version_command(["/v", "update"])
+
+        execv_mock.assert_called_once_with(
+            installed_path, [installed_path, "--resume"])
 
     def test_term_rejects_extra_args(self):
         output = io.StringIO()
@@ -804,6 +939,23 @@ class PromptOptimizationTests(unittest.TestCase):
 
 
 class PlanAndWorkflowTests(unittest.TestCase):
+    def setUp(self):
+        self._terminal_preferences_dir = tempfile.TemporaryDirectory()
+        self._sessions_patch = mock.patch.object(
+            laintas_cli.paths, "SESSIONS_DIR",
+            Path(self._terminal_preferences_dir.name))
+        self._terminal_patch = mock.patch.object(
+            laintas_cli.paths, "TERMINAL_ID", "plan-tests")
+        self._sessions_patch.start()
+        self._terminal_patch.start()
+        terminal_preferences.reset_cache()
+
+    def tearDown(self):
+        terminal_preferences.reset_cache()
+        self._terminal_patch.stop()
+        self._sessions_patch.stop()
+        self._terminal_preferences_dir.cleanup()
+
     def test_auto_mode_has_autonomous_prompt_and_timed_confirmations(self):
         auto = mode_manager.get_mode("auto")
         self.assertIsNotNone(auto)
@@ -1241,6 +1393,44 @@ class TerminalOutputStyleTests(unittest.TestCase):
                          "workflow step", "graph node"):
             self.assertIn(expected, rendered)
         self.assertNotIn("\x1b[48;", rendered)
+
+    def test_task_command_shows_current_agent_tree_for_current_session(self):
+        output = io.StringIO()
+        old_console = laintas_cli.console
+        laintas_cli.console = Console(
+            file=output, force_terminal=False, width=160,
+            theme=laintas_cli.LAINTAS_THEME)
+        agent_loop.close_all_agents()
+        old_cwd = os.getcwd()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                os.chdir(tmp)
+                root = agent_loop.register_agent(name="root-task", role="primary")
+                root.state["_session_id"] = "session-visible"
+                child = agent_loop.register_agent(
+                    name="child-task", depth=1, parent_id=root.id,
+                    role="subagent")
+                agent_loop.set_current_agent_id(root.id)
+                task_manager.create_task(
+                    "root visible", cwd=tmp, session_id="session-visible",
+                    owner_agent_id=root.id)
+                task_manager.create_task(
+                    "child visible", cwd=tmp, session_id="session-visible",
+                    owner_agent_id=child.id, parent_agent_id=root.id)
+                task_manager.create_task(
+                    "other session hidden", cwd=tmp,
+                    session_id="session-hidden", owner_agent_id=root.id)
+
+                laintas_cli._cmd_task("", ["/task"])
+        finally:
+            os.chdir(old_cwd)
+            agent_loop.close_all_agents()
+            laintas_cli.console = old_console
+
+        rendered = output.getvalue()
+        self.assertIn("root visible", rendered)
+        self.assertIn("child visible", rendered)
+        self.assertNotIn("other session hidden", rendered)
 
     def test_terminal_style_instruction_is_laintas_prompt_local_and_small(self):
         prompt = laintas_cli.generate_cli_prop_template()

@@ -1062,8 +1062,11 @@ def _build_resume_payload(state: dict, chat_history: list, cwd: str, kind: str) 
         "chat_history": history,
         "older_summary": _summarize_dropped_turns(dropped),
         "durable_rules": durable_rules.list_rules(cwd, active_only=False),
-        "tasks": task_manager.export_active_tasks(cwd=cwd),
-        "active_work_id": (workgraph.get_active_work(cwd=cwd) or {}).get("id"),
+        "tasks": task_manager.export_active_tasks(
+            cwd=cwd, session_id=session_id),
+        "active_work_id": (
+            workgraph.get_active_work(cwd=cwd, session_id=session_id) or {}
+        ).get("id"),
         "state": prepare_state_for_repl(state or {}),
     }
 
@@ -1452,9 +1455,8 @@ def register_agent(name: str = None, depth: int = 0,
                 if role and role != "pool":
                     info.role = role
         _agent_registry[agent_id] = info
-        # Temporary children inherit the terminal lifecycle immediately.  This
-        # is ownership metadata only; shell.exec does not reuse the terminal's
-        # PTY byte stream.
+        # Temporary children inherit the terminal immediately. Their shell.exec
+        # calls use that terminal's serialized persistent shell state.
         inherited_terminal = agent_deployment_terminal(info)
         inherited_info = _terminal_registry.get(inherited_terminal) if inherited_terminal else None
         if (inherited_info is not None and inherited_info.session is not None
@@ -1839,7 +1841,7 @@ _RUNTIME_OWNERSHIP_PROMPT = """<runtime_ownership authoritative="true">
 - `agent_hire` creates a persistent employee and deploys it directly to the caller's current terminal; hiring does not start an assignment.
 - One terminal may host multiple deployed agents. One agent may be deployed to exactly one terminal.
 - Ending a terminal ends all agents deployed to it and all temporary agents owned by its terminal subtree.
-- Deployment is lifecycle ownership, not a shared shell byte stream. Use `shell` for synchronous one-shot commands, `session_*` for a private interactive PTY, and `terminal_send` only to interact with an already-running terminal program; a successful send does not mean that program completed.
+- A deployed agent's `shell` commands execute directly in its deployment terminal, so shell state such as cwd, exports, and aliases persists there. An undeployed agent's `shell` commands use isolated temporary subprocesses. Use `session_*` for a separate private interactive PTY and `terminal_send` only to interact with an already-running terminal program.
 - Use `agent_spawn` for disposable delegation. Use `agent_hire` for a terminal-scoped employee identity, and use `agent_station` only to move an idle employee to another live terminal.
 </runtime_ownership>"""
 
@@ -1853,6 +1855,34 @@ Durable user rules remain active until explicitly cancelled or superseded. Befor
 task_complete, satisfy every active before_task_completion hook and record that
 with rule_mark_satisfied. Do not infer a durable rule from isolated keywords.
 </laintas_product_protocol>"""
+
+_WORK_ORCHESTRATION_PROMPT = """<work_orchestration authoritative="true">
+Choose the lowest orchestration level that fully fits the work. Task length is
+only a secondary signal; coordination and durability requirements decide.
+
+- No tracker: use for a purely informational request or one or two
+  straightforward actions.
+- TASK: outside PLAN mode, use task_create/task_update for a medium task with
+  three or more meaningful execution steps that one agent can primarily finish
+  in the current session. Child agents may assist. Create specific actionable
+  items, keep exactly one in_progress item per agent, and update an item as soon
+  as its work and verification finish. TASK items belong to the current session
+  and owning agent; never read, update, or complete another session's items
+  implicitly.
+- HWO: use a durable .hwo workflow when two or more specialist agents need
+  explicit roles, structured input/output hand-offs, ordered stages, reusable
+  orchestration, or parallel independent branches. Load the hwo-workflows skill
+  before authoring or changing workflow files. The HWO runner owns its progress;
+  do not duplicate the same steps as manually maintained session TASK items.
+- HWG: use a durable .hwg graph when HWO stages require conditional routing,
+  retries or bounded cycles, manual intervention, resumable checkpoints, or a
+  long-lived multi-phase run across sessions or process restarts. Do not choose
+  HWG merely because a linear task has many steps.
+
+When uncertain, stay at the simpler level. Promote TASK -> HWO -> HWG only when
+new coordination or durability requirements appear, and retain exactly one
+authoritative source of progress after promotion.
+</work_orchestration>"""
 
 _TERMINAL_OUTPUT_STYLE_PROMPT = """<terminal_output_style>
 Ordinary user-facing output is plain text or Markdown with no forced background.
@@ -2211,6 +2241,13 @@ def spawn_subagent(parent_id: str, task: str, deps,
             parent_id=parent_id, role="subagent", replace_existing=False)
     if state_overrides:
         child.state.update(dict(state_overrides))
+    # TASK is a shared session control plane even when code edits are isolated
+    # in a child worktree. Runtime-owned identity cannot be overridden by a
+    # model-supplied child state.
+    child.state["_session_id"] = _ensure_session_id(parent.state)
+    child.state["_task_cwd"] = (
+        parent.state.get("_task_cwd")
+        or parent.state.get("cwd") or os.getcwd())
     child.deployment_terminal = agent_deployment_terminal(parent) or "term0"
     child.stationed_terminal = child.deployment_terminal
     child.home_terminal = child.deployment_terminal
@@ -2443,6 +2480,7 @@ class LoopDeps:
     request_command_approval: Optional[Callable[[str, str], bool]] = None
     request_file_write_approval: Optional[Callable[[str, str, str], bool]] = None
     request_file_delete_approval: Optional[Callable[[str, str, str], bool]] = None
+    display_task_list: Optional[Callable[[list, str], None]] = None
 
 
 # ── Legacy project context (.laintas/memory.json) ────────────────────────
@@ -3292,6 +3330,8 @@ def prepare_state_for_repl(state: dict) -> dict:
         # The native message thread is the authoritative cross-turn transcript.
         # Keep its structured assistant tool_calls + role:tool results intact.
         "_session_id": session_id,
+        "_task_cwd": str(
+            state.get("_task_cwd") or state.get("cwd") or os.getcwd()),
         "_thread_messages": copy.deepcopy(thread_messages),
         "_thread_summary": str(state.get("_thread_summary") or ""),
         "_thread_call_seq": int(state.get("_thread_call_seq") or 0),
@@ -3816,7 +3856,11 @@ def _build_user_message(original_input: str, state: dict, memory_entries: list,
     role_block = ""
 
     # Active tasks section
-    tasks_snapshot = task_manager.get_active_tasks_snapshot(cwd=os.getcwd())
+    tasks_snapshot = task_manager.get_active_tasks_snapshot(
+        cwd=state.get("_task_cwd") or state.get("cwd") or os.getcwd(),
+        session_id=str(state.get("_session_id") or "") or None,
+        owner_agent_id=state.get("_agent_id") or None,
+    )
     tasks_block = ""
     if tasks_snapshot:
         tasks_block = f"\n<active_tasks>\n{tasks_snapshot}\n</active_tasks>\n"
@@ -4458,6 +4502,10 @@ def run_agent_loop(
     )
     state = dict(state)  # copy
     _ensure_session_id(state)
+    state.setdefault("_task_cwd", state.get("cwd") or os.getcwd())
+    state["_agent_id"] = agent_id or ""
+    state["_parent_agent_id"] = (
+        _runtime_info.parent_id if _runtime_info is not None else None)
     state.setdefault("shortTermMemory", "")
     state.setdefault("lastReply", "")
     state.setdefault("lastOutput", "")
@@ -4497,7 +4545,10 @@ def run_agent_loop(
         if _orig:
             state["objective"] = _orig
         try:
-            _active_work = workgraph.get_active_work(cwd=os.getcwd())
+            _active_work = workgraph.get_active_work(
+                cwd=os.getcwd(),
+                session_id=str(state.get("_session_id") or "") or None,
+            )
             if _active_work:
                 state["_work_id"] = _active_work["id"]
                 if (_active_work.get("current_revision")
@@ -4990,7 +5041,11 @@ def run_agent_loop(
 
         # Product protocol is runtime-owned so stale project cli.prop files or
         # narrow HWO prompt overlays cannot omit current completion semantics.
-        system_prompt = system_prompt.rstrip() + "\n\n" + _PRODUCT_PROTOCOL_PROMPT
+        system_prompt = (
+            system_prompt.rstrip()
+            + "\n\n" + _PRODUCT_PROTOCOL_PROMPT
+            + "\n\n" + _WORK_ORCHESTRATION_PROMPT
+        )
         if not _terminal_style_has_block:
             system_prompt += "\n\n" + _TERMINAL_OUTPUT_STYLE_PROMPT
         system_prompt = _canonicalize_prompt_tool_names(system_prompt)
@@ -5800,12 +5855,14 @@ def run_agent_loop(
                         tool_ctx = tools_mod.ToolCtx(
                             deps=deps, agent_id=agent_id, session=session,
                             events_cb=events_cb, cwd=state.get("cwd") or os.getcwd(),
-                            state=state, run_id=_run_id,
+                            task_cwd=state.get("_task_cwd") or os.getcwd(),
+                            state=state, run_id=_run_id, session_id=_session_id,
+                            parent_agent_id=(self_info.parent_id if self_info else None),
                             interactive_session=interactive_session,
-                            # Deployment is lifecycle ownership only. Never
-                            # expose the shared deployment PTY as shell.exec's
-                            # execution channel.
-                            stationed_terminal=None,
+                            # A deployed agent executes shell commands in the
+                            # terminal that owns its deployment. Undeployed
+                            # agents retain isolated subprocess execution.
+                            stationed_terminal=terminal_info,
                             get_terminal=get_terminal,
                             get_all_terminals=get_all_terminals,
                             register_terminal=register_terminal,
@@ -5844,9 +5901,26 @@ def run_agent_loop(
                                 name, arguments, tool_ctx
                             )
 
-                        if (name == "shell.exec" and result.get("ok")
-                                and result.get("cwd")):
+                        if (name in {"task.create", "task.update"}
+                                and result.get("ok")
+                                and deps.display_task_list is not None
+                                and events_cb is not None):
+                            _foreground = get_current_agent()
+                            if (_foreground is not None
+                                    and _foreground.id == agent_id):
+                                _live_tasks = task_manager.list_tasks(
+                                    cwd=tool_ctx.task_cwd or tool_ctx.cwd or None,
+                                    session_id=_session_id or None,
+                                    owner_agent_id=agent_id,
+                                )
+                                deps.display_task_list(_live_tasks, agent_id or "current")
+
+                        if name == "shell.exec" and result.get("cwd"):
                             state["cwd"] = str(result["cwd"])
+                            # The primary agent owns the interactive CLI scope;
+                            # mirror its terminal cwd for prompt/path compatibility.
+                            if depth == 0 and os.path.isdir(state["cwd"]):
+                                os.chdir(state["cwd"])
 
                         # Sync back interactive_session (tools may create/close sessions)
                         if tool_ctx.interactive_session != interactive_session:
@@ -6500,13 +6574,18 @@ def run_agent_loop(
                     else "ended" if _clean_end else "incomplete")
     if depth == 0 and _task_status == "completed":
         try:
-            _work = workgraph.get_active_work(cwd=os.getcwd())
+            _work = workgraph.get_active_work(
+                cwd=state.get("cwd") or os.getcwd(),
+                session_id=_session_id or None)
             if _work and _work.get("status") in {"EXECUTING", "VERIFYING"}:
-                _steps = workgraph.list_steps(_work["id"], cwd=os.getcwd())
+                _steps = workgraph.list_steps(
+                    _work["id"], cwd=state.get("cwd") or os.getcwd(),
+                    session_id=_session_id or None)
                 if all(step.get("status") in {"completed", "skipped", "deleted"}
                        for step in _steps):
                     workgraph.update_work(
-                        _work["id"], cwd=os.getcwd(), status="COMPLETED")
+                        _work["id"], cwd=state.get("cwd") or os.getcwd(),
+                        status="COMPLETED")
         except workgraph.WorkGraphError:
             pass
     result_msg = "\n\n".join(step_replies) if step_replies else reply

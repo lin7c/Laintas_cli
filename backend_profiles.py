@@ -10,13 +10,13 @@ from __future__ import annotations
 
 import json
 import os
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Optional
 from urllib.parse import urlsplit, urlunsplit
 
 import paths
+import terminal_preferences
 
 
 BackendKind = Literal["official", "custom", "local"]
@@ -100,7 +100,12 @@ def resolve(default_url: str, selected: Optional[str] = None) -> BackendProfile:
 
     data = _load_profiles()
     profiles = data.get("profiles") if isinstance(data.get("profiles"), dict) else {}
-    active = selected or os.environ.get("LAINTAS_BACKEND_PROFILE") or data.get("active")
+    active = (
+        selected
+        or os.environ.get("LAINTAS_BACKEND_PROFILE")
+        or terminal_preferences.get("backend_profile", "")
+        or data.get("active")
+    )
     if active and active in profiles and isinstance(profiles[active], dict):
         entry = profiles[active]
         url = _normalize_url(str(entry.get("baseUrl") or ""))
@@ -204,19 +209,8 @@ def set_active(name: str) -> tuple[bool, str]:
         _kind_for_url(url)
     except (AttributeError, ValueError) as exc:
         return False, f"invalid backend profile '{name}': {exc}"
-    data["active"] = name
-    fd, tmp_name = tempfile.mkstemp(
-        prefix="backends-", suffix=".tmp", dir=str(paths.BACKENDS_FILE.parent))
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(data, handle, ensure_ascii=False, indent=2)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.chmod(tmp_name, 0o600)
-        os.replace(tmp_name, paths.BACKENDS_FILE)
-    finally:
-        try:
-            os.unlink(tmp_name)
-        except OSError:
-            pass
-    return True, f"active backend profile: {name} (restart required)"
+        terminal_preferences.set_value("backend_profile", name)
+    except OSError as exc:
+        return False, f"could not select backend profile: {exc}"
+    return True, f"active backend profile for this terminal: {name} (restart required)"

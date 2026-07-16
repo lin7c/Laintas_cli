@@ -41,12 +41,12 @@ def _safe_id(value: object) -> str:
     return safe or uuid.uuid4().hex[:16]
 
 
-def _instance_id(value: object = None) -> str:
-    return _safe_id(value or getattr(paths, "INSTANCE_ID", "default"))
+def _terminal_id(value: object = None) -> str:
+    return _safe_id(value or getattr(paths, "TERMINAL_ID", "terminal-default"))
 
 
 def _current_path(cwd: str):
-    return paths.SESSIONS_DIR / f"{_session_key(cwd)}_current_{_instance_id()}.json"
+    return paths.SESSIONS_DIR / f"{_session_key(cwd)}_current_{_terminal_id()}.json"
 
 
 def _legacy_current_path(cwd: str):
@@ -125,7 +125,9 @@ def _recover_latest_live(cwd: str) -> Optional[dict]:
     for candidate in candidates:
         try:
             data = json.loads(candidate.read_text(encoding="utf-8"))
-            if data.get("cwd") == cwd and not data.get("closed_at"):
+            owner = data.get("terminal_id") or data.get("instance_id")
+            if (data.get("cwd") == cwd and not data.get("closed_at")
+                    and owner == _terminal_id()):
                 return data
         except (OSError, json.JSONDecodeError, TypeError):
             continue
@@ -143,7 +145,8 @@ def create_session(cwd: str, state: Optional[dict] = None, chat_history: Optiona
         "id": session_id,
         "session_id": session_id,
         "kind": "live",
-        "instance_id": _instance_id(),
+        "instance_id": _terminal_id(),
+        "terminal_id": _terminal_id(),
         "cwd": cwd,
         "created_at": now,
         "updated_at": now,
@@ -198,7 +201,8 @@ def load_current_session(cwd: str) -> Optional[dict]:
         data.setdefault("id", data.get("session_id") or uuid.uuid4().hex[:16])
         data.setdefault("session_id", data.get("id"))
         data.setdefault("kind", "live")
-        data.setdefault("instance_id", _instance_id())
+        data.setdefault("terminal_id", _terminal_id())
+        data["instance_id"] = data["terminal_id"]
         data.setdefault("chat_history", [])
         data.setdefault("state", data.get("agent_state") or {})
         data.setdefault("agent_state", data.get("state") or {})
@@ -244,7 +248,8 @@ def save_session(session: dict) -> None:
     session_id = _safe_id(session.get("session_id") or session.get("id"))
     session["id"] = session_id
     session["session_id"] = session_id
-    session["instance_id"] = _instance_id(session.get("instance_id"))
+    session["terminal_id"] = _terminal_id(session.get("terminal_id"))
+    session["instance_id"] = session["terminal_id"]
     state = session.get("state")
     if state is None:
         state = session.get("agent_state")

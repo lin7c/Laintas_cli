@@ -35,6 +35,8 @@ STEP_TRANSITIONS = {
     "deleted": set(),
 }
 
+_RESERVED_METADATA_KEYS = {"session_id", "owner_agent_id", "parent_agent_id"}
+
 
 class WorkGraphError(RuntimeError):
     pass
@@ -95,6 +97,7 @@ def _init_schema(conn: sqlite3.Connection) -> None:
       progress INTEGER NOT NULL DEFAULT 0,
       parent_id TEXT,
       owner_agent_id TEXT,
+      parent_agent_id TEXT,
       metadata TEXT NOT NULL DEFAULT '{}',
       notes TEXT NOT NULL DEFAULT '[]',
       result TEXT NOT NULL DEFAULT '',
@@ -136,6 +139,15 @@ def _init_schema(conn: sqlite3.Connection) -> None:
     CREATE INDEX IF NOT EXISTS idx_steps_status ON steps(work_id, status);
     CREATE INDEX IF NOT EXISTS idx_events_work ON work_events(work_id, id);
     """)
+    # Existing databases predate parent-agent lineage.  The session and owner
+    # columns were already present, so this is the only additive migration.
+    columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(steps)")}
+    if "parent_agent_id" not in columns:
+        conn.execute("ALTER TABLE steps ADD COLUMN parent_agent_id TEXT")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_work_session ON work_items(session_id, updated_at)")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_steps_owner ON steps(work_id, owner_agent_id)")
 
 
 @contextmanager
@@ -166,6 +178,16 @@ def _decode(value: str, default: Any) -> Any:
         return default
 
 
+def _clean_metadata(value: Optional[dict]) -> dict:
+    """Keep runtime identity fields out of model-controlled metadata."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise WorkGraphError("metadata must be an object")
+    return {key: item for key, item in value.items()
+            if key not in _RESERVED_METADATA_KEYS}
+
+
 def _sha(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
@@ -193,19 +215,34 @@ def _event(conn: sqlite3.Connection, work_id: str, event_type: str,
     )
 
 
-def _active_id(conn: sqlite3.Connection) -> Optional[str]:
-    row = conn.execute("SELECT value FROM project_state WHERE key='active_work_id'").fetchone()
+def _active_key(session_id: Optional[str]) -> str:
+    if session_id is None:
+        return "active_work_id"
+    digest = hashlib.sha256(str(session_id).encode("utf-8")).hexdigest()
+    return f"active_work_id.session.{digest}"
+
+
+def _active_id(conn: sqlite3.Connection,
+               session_id: Optional[str] = None) -> Optional[str]:
+    row = conn.execute("SELECT value FROM project_state WHERE key=?",
+                       (_active_key(session_id),)).fetchone()
     return str(row[0]) if row and row[0] else None
 
 
-def set_active_work(work_id: Optional[str], cwd: Optional[str] = None) -> None:
+def set_active_work(work_id: Optional[str], cwd: Optional[str] = None, *,
+                    session_id: Optional[str] = None) -> None:
     with transaction(cwd) as conn:
-        if work_id and not conn.execute("SELECT 1 FROM work_items WHERE id=?", (work_id,)).fetchone():
-            raise WorkGraphError(f"Work item not found: {work_id}")
+        if work_id:
+            row = conn.execute("SELECT session_id FROM work_items WHERE id=?",
+                               (work_id,)).fetchone()
+            if not row:
+                raise WorkGraphError(f"Work item not found: {work_id}")
+            if session_id is not None and row[0] != session_id:
+                raise WorkGraphError(f"Work item not found in session: {work_id}")
         conn.execute(
-            "INSERT INTO project_state(key,value) VALUES('active_work_id',?) "
+            "INSERT INTO project_state(key,value) VALUES(?,?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (work_id or "",),
+            (_active_key(session_id), work_id or ""),
         )
 
 
@@ -242,48 +279,68 @@ def create_work(objective: str, *, cwd: Optional[str] = None,
         )
         if activate:
             conn.execute(
-                "INSERT INTO project_state(key,value) VALUES('active_work_id',?) "
-                "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (work_id,))
+                "INSERT INTO project_state(key,value) VALUES(?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (_active_key(session_id), work_id))
         _event(conn, work_id, "work.created", {"objective": objective})
-    return get_work(work_id, cwd=cwd) or {}
+    return get_work(work_id, cwd=cwd, session_id=session_id) or {}
 
 
-def get_work(work_id: str, *, cwd: Optional[str] = None) -> Optional[dict]:
+def get_work(work_id: str, *, cwd: Optional[str] = None,
+             session_id: Optional[str] = None) -> Optional[dict]:
     if not db_path(cwd).exists():
         return None
     with _connect(cwd) as conn:
-        return _row(conn.execute("SELECT * FROM work_items WHERE id=?", (work_id,)).fetchone())
+        query = "SELECT * FROM work_items WHERE id=?"
+        args: list[Any] = [work_id]
+        if session_id is not None:
+            query += " AND session_id=?"
+            args.append(session_id)
+        return _row(conn.execute(query, args).fetchone())
 
 
-def get_active_work(*, cwd: Optional[str] = None) -> Optional[dict]:
+def get_active_work(*, cwd: Optional[str] = None,
+                    session_id: Optional[str] = None) -> Optional[dict]:
     if not db_path(cwd).exists():
         return None
     with _connect(cwd) as conn:
-        work_id = _active_id(conn)
+        work_id = _active_id(conn, session_id)
         if not work_id:
             return None
-        return _row(conn.execute("SELECT * FROM work_items WHERE id=?", (work_id,)).fetchone())
+        query = "SELECT * FROM work_items WHERE id=?"
+        args: list[Any] = [work_id]
+        if session_id is not None:
+            query += " AND session_id=?"
+            args.append(session_id)
+        return _row(conn.execute(query, args).fetchone())
 
 
-def ensure_active_work(objective: str = "Project tasks", *, cwd: Optional[str] = None) -> dict:
-    active = get_active_work(cwd=cwd)
+def ensure_active_work(objective: str = "Project tasks", *, cwd: Optional[str] = None,
+                       session_id: Optional[str] = None) -> dict:
+    active = get_active_work(cwd=cwd, session_id=session_id)
     if active and active.get("status") not in {"COMPLETED", "CANCELLED", "FAILED"}:
         return active
-    work = create_work(objective, cwd=cwd)
+    work = create_work(objective, cwd=cwd, session_id=session_id)
     # Ad-hoc task collections execute immediately and do not require a plan review.
     with transaction(cwd) as conn:
         conn.execute("UPDATE work_items SET status='EXECUTING',updated_at=? WHERE id=?",
                      (time.time(), work["id"]))
         _event(conn, work["id"], "work.adhoc_started")
-    return get_work(work["id"], cwd=cwd) or work
+    return get_work(work["id"], cwd=cwd, session_id=session_id) or work
 
 
-def list_work(*, cwd: Optional[str] = None) -> list[dict]:
+def list_work(*, cwd: Optional[str] = None,
+              session_id: Optional[str] = None) -> list[dict]:
     if not db_path(cwd).exists():
         return []
     with _connect(cwd) as conn:
-        return [_row(row) for row in conn.execute(
-            "SELECT * FROM work_items ORDER BY updated_at DESC").fetchall()]
+        query = "SELECT * FROM work_items"
+        args: list[Any] = []
+        if session_id is not None:
+            query += " WHERE session_id=?"
+            args.append(session_id)
+        query += " ORDER BY updated_at DESC"
+        return [_row(row) for row in conn.execute(query, args).fetchall()]
 
 
 def list_events(work_id: str, *, cwd: Optional[str] = None,
@@ -509,12 +566,20 @@ def _next_step_id(conn: sqlite3.Connection, work_id: str, session_only: bool) ->
 
 def create_step(work_id: str, subject: str, description: str = "", *,
                 cwd: Optional[str] = None, metadata: Optional[dict] = None,
-                session_only: bool = False, parent_id: Optional[str] = None) -> dict:
+                session_only: bool = False, parent_id: Optional[str] = None,
+                owner_agent_id: Optional[str] = None,
+                parent_agent_id: Optional[str] = None,
+                session_id: Optional[str] = None) -> dict:
     subject = str(subject or "").strip()
     if not subject:
         raise WorkGraphError("step subject is required")
     with transaction(cwd) as conn:
-        if not conn.execute("SELECT 1 FROM work_items WHERE id=?", (work_id,)).fetchone():
+        work_query = "SELECT 1 FROM work_items WHERE id=?"
+        work_args: list[Any] = [work_id]
+        if session_id is not None:
+            work_query += " AND session_id=?"
+            work_args.append(session_id)
+        if not conn.execute(work_query, work_args).fetchone():
             raise WorkGraphError(f"Work item not found: {work_id}")
         if parent_id and not conn.execute(
                 "SELECT 1 FROM steps WHERE work_id=? AND id=?", (work_id, str(parent_id))).fetchone():
@@ -522,20 +587,34 @@ def create_step(work_id: str, subject: str, description: str = "", *,
         step_id = _next_step_id(conn, work_id, session_only)
         now = time.time()
         conn.execute(
-            "INSERT INTO steps(work_id,id,subject,description,parent_id,metadata,session_only,created_at,updated_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO steps(work_id,id,subject,description,parent_id,owner_agent_id,"
+            "parent_agent_id,metadata,session_only,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
             (work_id, step_id, subject, description, str(parent_id) if parent_id else None,
-             _json(metadata or {}), int(session_only), now, now))
+             owner_agent_id, parent_agent_id, _json(_clean_metadata(metadata)),
+             int(session_only), now, now))
         _event(conn, work_id, "step.created", {"id": step_id, "subject": subject})
-    return get_step(work_id, step_id, cwd=cwd) or {}
+    return get_step(work_id, step_id, cwd=cwd, session_id=session_id,
+                    owner_agent_id=owner_agent_id) or {}
 
 
-def get_step(work_id: str, step_id: str, *, cwd: Optional[str] = None) -> Optional[dict]:
+def get_step(work_id: str, step_id: str, *, cwd: Optional[str] = None,
+             session_id: Optional[str] = None,
+             owner_agent_id: Optional[str] = None) -> Optional[dict]:
     if not db_path(cwd).exists():
         return None
     with _connect(cwd) as conn:
-        row = conn.execute("SELECT * FROM steps WHERE work_id=? AND id=?",
-                           (work_id, str(step_id))).fetchone()
+        query = ("SELECT s.*,w.session_id AS session_id FROM steps s "
+                 "JOIN work_items w ON w.id=s.work_id "
+                 "WHERE s.work_id=? AND s.id=?")
+        args: list[Any] = [work_id, str(step_id)]
+        if session_id is not None:
+            query += " AND w.session_id=?"
+            args.append(session_id)
+        if owner_agent_id is not None:
+            query += " AND s.owner_agent_id=?"
+            args.append(owner_agent_id)
+        row = conn.execute(query, args).fetchone()
         return _step_projection(conn, row) if row else None
 
 
@@ -556,14 +635,24 @@ def _step_projection(conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
 
 
 def list_steps(work_id: str, *, cwd: Optional[str] = None,
-               include_deleted: bool = False) -> list[dict]:
+               include_deleted: bool = False,
+               session_id: Optional[str] = None,
+               owner_agent_id: Optional[str] = None) -> list[dict]:
     if not db_path(cwd).exists():
         return []
     with _connect(cwd) as conn:
-        query = "SELECT * FROM steps WHERE work_id=?"
+        query = ("SELECT s.*,w.session_id AS session_id FROM steps s "
+                 "JOIN work_items w ON w.id=s.work_id "
+                 "WHERE s.work_id=?")
         args: list[Any] = [work_id]
+        if session_id is not None:
+            query += " AND w.session_id=?"
+            args.append(session_id)
+        if owner_agent_id is not None:
+            query += " AND s.owner_agent_id=?"
+            args.append(owner_agent_id)
         if not include_deleted:
-            query += " AND status<>'deleted'"
+            query += " AND s.status<>'deleted'"
         rows = conn.execute(query, args).fetchall()
         items = [_step_projection(conn, row) for row in rows]
     def key(item: dict):
@@ -618,11 +707,23 @@ def remove_dependency(work_id: str, step_id: str, blocker_id: str,
 
 
 def update_step(work_id: str, step_id: str, *, cwd: Optional[str] = None,
+                session_id: Optional[str] = None,
+                owner_agent_id: Optional[str] = None,
+                parent_agent_id: Optional[str] = None,
                 **fields: Any) -> dict:
     step_id = str(step_id)
     with transaction(cwd) as conn:
-        row = conn.execute("SELECT * FROM steps WHERE work_id=? AND id=?",
-                           (work_id, step_id)).fetchone()
+        query = ("SELECT s.*,w.session_id AS session_id FROM steps s "
+                 "JOIN work_items w ON w.id=s.work_id "
+                 "WHERE s.work_id=? AND s.id=?")
+        args: list[Any] = [work_id, step_id]
+        if session_id is not None:
+            query += " AND w.session_id=?"
+            args.append(session_id)
+        if owner_agent_id is not None:
+            query += " AND s.owner_agent_id=?"
+            args.append(owner_agent_id)
+        row = conn.execute(query, args).fetchone()
         if not row:
             raise WorkGraphError(f"Step not found: {step_id}")
         status = fields.get("status", row["status"])
@@ -655,38 +756,59 @@ def update_step(work_id: str, step_id: str, *, cwd: Optional[str] = None,
                     "step is blocked by incomplete step(s): " + ", ".join(str(x[0]) for x in blockers))
         subject = str(fields.get("subject", row["subject"]))
         description = str(fields.get("description", row["description"]))
-        metadata = _decode(row["metadata"], {})
+        metadata = _clean_metadata(_decode(row["metadata"], {}))
         if fields.get("metadata") is not None:
             if not isinstance(fields["metadata"], dict):
                 raise WorkGraphError("metadata must be an object")
-            metadata.update(fields["metadata"])
+            metadata.update(_clean_metadata(fields["metadata"]))
         notes = _decode(row["notes"], [])
         if fields.get("notes"):
             notes.append({"at": time.time(), "text": str(fields["notes"])})
         conn.execute("""
-          UPDATE steps SET subject=?,description=?,status=?,progress=?,metadata=?,notes=?,updated_at=?
+          UPDATE steps SET subject=?,description=?,status=?,progress=?,metadata=?,notes=?,
+          parent_agent_id=?,updated_at=?
           WHERE work_id=? AND id=?
         """, (subject, description, status, progress, _json(metadata), _json(notes),
+              parent_agent_id if parent_agent_id is not None else row["parent_agent_id"],
               time.time(), work_id, step_id))
         _event(conn, work_id, "step.updated", {
             "id": step_id, "status": status, "progress": progress})
-    return get_step(work_id, step_id, cwd=cwd) or {}
+    return get_step(work_id, step_id, cwd=cwd, session_id=session_id,
+                    owner_agent_id=owner_agent_id) or {}
 
 
-def clear_session_steps(*, cwd: Optional[str] = None) -> None:
+def clear_session_steps(*, cwd: Optional[str] = None,
+                        session_id: Optional[str] = None,
+                        owner_agent_id: Optional[str] = None) -> None:
     with transaction(cwd) as conn:
-        conn.execute("DELETE FROM steps WHERE session_only=1")
+        query = "DELETE FROM steps WHERE session_only=1"
+        args: list[Any] = []
+        if owner_agent_id is not None:
+            query += " AND owner_agent_id=?"
+            args.append(owner_agent_id)
+        if session_id is not None:
+            query += " AND work_id IN (SELECT id FROM work_items WHERE session_id=?)"
+            args.append(session_id)
+        conn.execute(query, args)
 
 
 def import_session_steps(work_id: str, items: list[dict], *,
                          cwd: Optional[str] = None,
-                         session_key: str = "") -> int:
+                         session_key: str = "",
+                         session_id: Optional[str] = None,
+                         owner_agent_id: Optional[str] = None,
+                         parent_agent_id: Optional[str] = None) -> int:
     """Restore ephemeral steps without duplicating IDs or persisted subjects."""
     if not isinstance(items, list):
         return 0
     count = 0
     with transaction(cwd) as conn:
-        if not conn.execute("SELECT 1 FROM work_items WHERE id=?", (work_id,)).fetchone():
+        work_query = "SELECT 1 FROM work_items WHERE id=?"
+        work_args: list[Any] = [work_id]
+        if session_id is not None:
+            work_query += " AND session_id=?"
+            work_args.append(session_id)
+        if not conn.execute(work_query, work_args).fetchone():
             raise WorkGraphError(f"Work item not found: {work_id}")
         persisted_subjects = {
             str(row[0]).strip() for row in conn.execute(
@@ -719,15 +841,20 @@ def import_session_steps(work_id: str, items: list[dict], *,
             if status == "completed":
                 progress = 100
             now = time.time()
-            metadata = dict(item.get("metadata") or {})
+            metadata = _clean_metadata(item.get("metadata") or {})
             if session_key:
                 metadata["_session_key"] = session_key
+            item_owner_agent_id = (
+                item.get("owner_agent_id") or owner_agent_id)
+            item_parent_agent_id = (
+                item.get("parent_agent_id") or parent_agent_id)
             conn.execute("""
-              INSERT INTO steps(work_id,id,subject,description,status,progress,metadata,notes,
-                                session_only,created_at,updated_at)
-              VALUES(?,?,?,?,?,?,?,?,1,?,?)
+              INSERT INTO steps(work_id,id,subject,description,status,progress,owner_agent_id,
+                                parent_agent_id,metadata,notes,session_only,created_at,updated_at)
+              VALUES(?,?,?,?,?,?,?,?,?,?,1,?,?)
             """, (work_id, requested, subject, str(item.get("description") or ""),
-                  status, progress, _json(metadata),
+                  status, progress, item_owner_agent_id, item_parent_agent_id,
+                  _json(metadata),
                   _json(item.get("notes") or []), now, now))
             count += 1
         for item in items:

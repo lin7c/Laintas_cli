@@ -56,6 +56,12 @@ class HwgRunnerTests(unittest.TestCase):
             first = hwg_runner.run_hwg_file("flow.hwg", deps=object(), session={})
             self.assertTrue(first["paused"])
             run_id = first["runId"]
+            graph_tasks = [
+                task for task in __import__("task_manager").list_tasks(cwd=tmp)
+                if task.get("metadata", {}).get("scopeType") == "hwg-run"
+            ]
+            self.assertTrue(graph_tasks)
+            self.assertTrue(all(not task["session_only"] for task in graph_tasks))
 
             with mock.patch.object(hwg_runner.hwo_runner, "run_hwo_file", return_value={
                 "ok": True,

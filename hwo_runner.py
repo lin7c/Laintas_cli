@@ -709,12 +709,19 @@ def _update_step(ctx: HwoCtx, step: HwoStep, status: str,
         return
     try:
         import task_manager
+        import workgraph
         fields = {"status": status}
         if progress is not None:
             fields["progress"] = max(0, min(100, int(progress)))
         if notes:
             fields["notes"] = notes
-        task_manager.update_task(entry["taskId"], cwd=entry.get("cwd"), **fields)
+        if entry.get("workId"):
+            workgraph.update_step(
+                entry["workId"], entry["taskId"],
+                cwd=entry.get("cwd"), **fields)
+        else:  # compatibility with pre-run-scope mappings
+            task_manager.update_task(
+                entry["taskId"], cwd=entry.get("cwd"), **fields)
     except Exception:
         pass
 
@@ -733,7 +740,8 @@ def _step_finished(ctx: HwoCtx, step: HwoStep, ok: bool,
     })
 
 
-def _prepare_workflow_tasks(steps: list, run_id: str, cwd: str) -> dict:
+def _prepare_workflow_tasks(steps: list, run_id: str, cwd: str,
+                            owner_agent_id: str = None) -> dict:
     """Create one durable task per executable HWO step before execution."""
     mapping = {}
     try:
@@ -750,9 +758,14 @@ def _prepare_workflow_tasks(steps: list, run_id: str, cwd: str) -> dict:
                     task = task_manager.create_task(
                         title.replace("\\n", " ")[:200],
                         metadata={"workflowRunId": run_id, "stepId": step_path,
-                                  "kind": step.kind, "agent": getattr(step, "name", "")},
-                        session_only=True, parent_task_id=parent_id, cwd=cwd)
-                    mapping[id(step)] = {"taskId": task["id"], "stepId": step_path, "cwd": cwd}
+                                  "scopeType": "hwo-run", "kind": step.kind,
+                                  "agent": getattr(step, "name", "")},
+                        session_only=False, parent_task_id=parent_id, cwd=cwd,
+                        owner_agent_id=owner_agent_id)
+                    mapping[id(step)] = {
+                        "workId": task["work_id"], "taskId": task["id"],
+                        "stepId": step_path, "cwd": cwd,
+                    }
                     child_parent = task["id"]
                 else:
                     child_parent = parent_id
@@ -1142,7 +1155,8 @@ def run_hwo_file(
     summary = "\n".join(summarize_steps(steps))
     manifest = build_workflow_manifest(steps)
     run_id = run_state.get("runId") if run_state else f"hwo-{uuid.uuid4().hex[:12]}"
-    workflow_tasks = _prepare_workflow_tasks(steps, run_id, str(Path.cwd()))
+    workflow_tasks = _prepare_workflow_tasks(
+        steps, run_id, str(Path.cwd()), owner_agent_id=parent_id)
 
     ctx = HwoCtx(
         deps=deps,

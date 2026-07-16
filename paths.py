@@ -38,6 +38,7 @@ Layout:
     └── loop.py                          # User-defined loop command interceptor
 """
 
+import hashlib
 import os
 import stat
 import uuid
@@ -50,18 +51,78 @@ LAINTAS_HOME = Path(os.environ.get("LAINTAS_HOME", str(Path.home() / ".laintas")
 
 
 def _safe_instance_id(value: str) -> str:
-    """Return a short filesystem/API-safe id for this CLI process."""
+    """Return a short filesystem/API-safe process or terminal id."""
     safe = "".join(c if c.isalnum() or c in "._-" else "-" for c in value)
     safe = safe.strip(".-_")
     return safe[:64] or f"pid-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
 
-# Process-level identity. This separates concurrent terminals that share the
-# same user, cwd and ~/.laintas directory without changing the account session.
-INSTANCE_ID = _safe_instance_id(
+# A process id must remain unique across restarts because the remote agent API
+# uses it to distinguish registrations, heartbeats and unregister events.
+PROCESS_INSTANCE_ID = _safe_instance_id(
     os.environ.get("LAINTAS_INSTANCE_ID")
     or f"pid-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 )
+
+
+def _terminal_identity_source() -> str:
+    """Return a stable source string for the current logical terminal.
+
+    Terminal-emulator identifiers are preferred when available.  The tty and
+    POSIX session id remain stable when the CLI exits and is relaunched from
+    the same shell, while differing between concurrently open terminals.
+    """
+    explicit = os.environ.get("LAINTAS_TERMINAL_ID", "").strip()
+    if explicit:
+        return f"explicit:{explicit}"
+
+    for name in (
+        "TERM_SESSION_ID", "WT_SESSION", "TMUX_PANE", "WEZTERM_PANE",
+        "KITTY_WINDOW_ID",
+    ):
+        value = os.environ.get(name, "").strip()
+        if value:
+            return f"env:{name}:{value}"
+
+    try:
+        tty_name = os.ttyname(0)
+    except OSError:
+        tty_name = ""
+    try:
+        session_id = str(os.getsid(0))
+    except (AttributeError, OSError):
+        session_id = ""
+    if tty_name or session_id:
+        return f"tty:{tty_name}|sid:{session_id}"
+
+    # Non-interactive wrappers normally keep the same parent while repeatedly
+    # launching the CLI.  This fallback is intentionally not global: unrelated
+    # launchers must not share mutable terminal preferences.
+    return f"parent:{os.getppid()}"
+
+
+def _derive_terminal_id() -> str:
+    explicit = os.environ.get("LAINTAS_TERMINAL_ID", "").strip()
+    if explicit:
+        return _safe_instance_id(explicit)
+    digest = hashlib.sha256(_terminal_identity_source().encode("utf-8")).hexdigest()
+    return f"term-{digest[:24]}"
+
+
+# Stable for repeated CLI launches in one terminal, isolated across terminals.
+TERMINAL_ID = _derive_terminal_id()
+
+
+def child_terminal_id(name: str, parent: str = "term0") -> str:
+    """Derive a stable, collision-resistant id for a CLI-created child PTY."""
+    source = f"{TERMINAL_ID}\0{parent}\0{name}"
+    digest = hashlib.sha256(source.encode("utf-8")).hexdigest()
+    return f"term-{digest[:24]}"
+
+
+# Backward-compatible name for integrations that correctly need process-level
+# identity.  Durable terminal state must use TERMINAL_ID explicitly.
+INSTANCE_ID = PROCESS_INSTANCE_ID
 
 # Flat files
 CONFIG_FILE       = LAINTAS_HOME / "config.json"

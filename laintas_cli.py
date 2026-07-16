@@ -637,6 +637,7 @@ import tools as tools_mod    # noqa: E402 — load after agent_loop so registry 
 import skills as skills_mod  # noqa: E402
 import task_manager          # noqa: E402 — resume blob rehydrates the task plan
 import paths                 # Centralized path management
+import terminal_preferences  # durable choices isolated to this logical terminal
 import migrate as migrate_mod  # Auto-migration from old layout
 import hwo_ui as hwo_ui_mod  # /hwo orchestration UI
 import browser_session as browser_mod  # headless-browser live-view stack
@@ -1212,7 +1213,10 @@ def _build_connected_subterminal_cmd(terminal_name: str,
     running /connect inside it can hand exactly this terminal to Helpwo.
     auto_connect=True (used by Helpwo's term-new) registers at startup.
     """
-    parts = [shlex.quote(sys.executable),
+    terminal_id = paths.child_terminal_id(
+        terminal_name, parent_terminal or "term0")
+    parts = [f"LAINTAS_TERMINAL_ID={shlex.quote(terminal_id)}",
+             shlex.quote(sys.executable),
              shlex.quote(os.path.abspath(__file__)),
              "--depth", "1",
              "--terminal-name", shlex.quote(terminal_name),
@@ -1885,6 +1889,44 @@ def display_file_diff(path: str, diff_text: str, depth: int = 0) -> None:
 # ── prompt_toolkit Input Setup ──────────────────────────────────────────
 
 @dataclass(frozen=True)
+class CompletionSpec:
+    """A contextual slash-command completion and its menu description."""
+
+    value: str
+    description: str = ""
+
+
+_SUBCOMMAND_HINTS = {
+    "status": "Show current status",
+    "list": "List available entries",
+    "add": "Create a new entry",
+    "show": "Show details",
+    "start": "Start execution",
+    "done": "Mark the task completed",
+    "del": "Delete the selected entry",
+    "delete": "Delete the selected entry",
+    "progress": "Update completion progress",
+    "note": "Append a progress note",
+    "subtask": "Create a child task",
+    "run": "Execute the workflow",
+    "compile": "Validate and compile without executing",
+    "resume": "Resume an existing run",
+    "history": "Show execution history",
+    "check": "Check current state",
+    "update": "Apply the latest update",
+    "create": "Create a new entry",
+    "review": "Review the current result",
+    "approve": "Approve the current result",
+    "exit": "Exit the current mode",
+    "clear": "Clear the current selection",
+    "reset": "Restore the default setting",
+    "reload": "Reload the current configuration",
+    "on": "Enable this option",
+    "off": "Disable this option",
+}
+
+
+@dataclass(frozen=True)
 class CommandSpec:
     """Single source of truth for slash-command discovery and help."""
 
@@ -1896,10 +1938,25 @@ class CommandSpec:
     palette: bool = True
     subcommands: tuple[str, ...] = ()
     help_text: str = ""
+    completion_descriptions: tuple[tuple[str, str], ...] = ()
 
     @property
     def all_names(self) -> tuple[str, ...]:
         return (self.name, *self.aliases)
+
+    @property
+    def contextual_completions(self) -> tuple[CompletionSpec, ...]:
+        """Return subcommands as consistently described menu entries."""
+        descriptions = dict(self.completion_descriptions)
+        return tuple(
+            CompletionSpec(
+                item,
+                descriptions.get(item)
+                or _SUBCOMMAND_HINTS.get(item)
+                or f"{self.name} option · {self.usage or self.description}",
+            )
+            for item in self.subcommands
+        )
 
 
 COMMAND_SPECS: tuple[CommandSpec, ...] = (
@@ -1913,7 +1970,14 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec("/exit", "Log out and exit", "Account & Session"),
     CommandSpec("/quit", "Exit without logging out", "Account & Session", aliases=("/q",)),
     CommandSpec("/back", "Detach from a sub-terminal", "Account & Session"),
-    CommandSpec("/version", "Show version or update", "Account & Session", "/version [check|update [--force]]", aliases=("/v", "/update"), subcommands=("check", "update")),
+    CommandSpec(
+        "/version", "Show version or update", "Account & Session",
+        "/version [check|update [--force]]", aliases=("/v", "/update"),
+        subcommands=("check", "update"),
+        completion_descriptions=(
+            ("check", "Check whether a newer version is available"),
+            ("update", "Download, install, and restart on the latest version"),
+        )),
     CommandSpec("/name", "Show or set the current agent name", "Agents & Terminals", "/name [new-name]"),
     CommandSpec(
         "/hire", "Hire an employee into the current terminal; does not start an assignment",
@@ -2041,6 +2105,23 @@ class MetaCompleter(Completer):
         self._cmd_completer = WordCompleter(self._cmd_words, ignore_case=True, sentence=True)
         self._cmd_mtime = now
 
+    @staticmethod
+    def _completion(value: str, fragment: str, description: str = "") -> Completion:
+        """Build a menu entry that remains visible for an exact match.
+
+        prompt_toolkit suppresses a menu containing one no-op completion.  An
+        exact match therefore completes to the same value plus a space, while
+        its displayed value remains unchanged.  Selecting it naturally moves
+        the user into the command's next argument context.
+        """
+        exact = value.casefold() == fragment.casefold()
+        return Completion(
+            value + (" " if exact else ""),
+            start_position=-len(fragment),
+            display=value,
+            display_meta=description,
+        )
+
     def get_completions(self, document, complete_event):
         text = document.text_before_cursor.lstrip()
         if not text:
@@ -2069,10 +2150,8 @@ class MetaCompleter(Completer):
                             import agent_roles
                             for role in agent_roles.list_roles():
                                 if role.name.startswith(fragment.lower()):
-                                    yield Completion(
-                                        role.name,
-                                        start_position=-len(fragment),
-                                        display_meta=role.description)
+                                    yield self._completion(
+                                        role.name, fragment, role.description)
                             return
                 if head_lower in ("/agents", "/station", "/st"):
                     words = partial.split()
@@ -2089,9 +2168,7 @@ class MetaCompleter(Completer):
                         )
                         for value, meta in candidates:
                             if value.lower().startswith(fragment.lower()):
-                                yield Completion(
-                                    value, start_position=-len(fragment),
-                                    display_meta=meta)
+                                yield self._completion(value, fragment, meta)
                         return
                     if head_lower in ("/station", "/st"):
                         if "--task" in words or "--" in words:
@@ -2105,24 +2182,19 @@ class MetaCompleter(Completer):
                         )
                         for value, meta in candidates:
                             if value.lower().startswith(fragment.lower()):
-                                yield Completion(
-                                    value, start_position=-len(fragment),
-                                    display_meta=meta)
+                                yield self._completion(value, fragment, meta)
                         return
                 if spec and " " not in partial:
-                    for subcommand in spec.subcommands:
-                        if subcommand.startswith(partial.lower()):
-                            yield Completion(
-                                subcommand, start_position=-len(partial))
+                    for entry in spec.contextual_completions:
+                        if entry.value.casefold().startswith(partial.casefold()):
+                            yield self._completion(
+                                entry.value, partial, entry.description)
                 return
             for cmd in self.META_COMMANDS:
-                if cmd.startswith(text):
+                if cmd.casefold().startswith(text.casefold()):
                     _spec = _find_command_spec(cmd)
-                    yield Completion(
-                        cmd,
-                        start_position=-len(text),
-                        display_meta=_spec.description if _spec else "",
-                    )
+                    yield self._completion(
+                        cmd, text, _spec.description if _spec else "")
             return
 
         # For non-/-prefixed input, only show completions on explicit Tab —
@@ -2317,6 +2389,12 @@ class _PasteGuardBuffer(Buffer):
         Buffer.cursor_position.fset(self, value)
 
 
+def _refresh_slash_completion(buffer: Buffer) -> None:
+    """Restart slash completion after a deletion; invalid prefixes yield none."""
+    if buffer.document.text_before_cursor.lstrip().startswith("/"):
+        buffer.start_completion()
+
+
 def _build_keybindings() -> KeyBindings:
     """Build custom keybindings for the prompt."""
     kb = KeyBindings()
@@ -2333,7 +2411,7 @@ def _build_keybindings() -> KeyBindings:
 
     @kb.add("backspace")
     def _(event):
-        """Backspace: delete a paste placeholder as one unit, else normal."""
+        """Backspace: delete text and refresh valid slash completions."""
         buf = event.current_buffer
         span = _paste_span_at(buf.text, buf.cursor_position)
         if span is not None and span[1] == buf.cursor_position and span[0] != span[1]:
@@ -2342,10 +2420,12 @@ def _build_keybindings() -> KeyBindings:
             buf.cursor_position = start
         else:
             buf.delete_before_cursor(count=event.arg)
+        # prompt_toolkit autocompletes insertions, but not deletions.
+        _refresh_slash_completion(buf)
 
     @kb.add("delete")
     def _(event):
-        """Delete: remove a paste placeholder as one unit, else normal."""
+        """Delete: remove text and refresh valid slash completions."""
         buf = event.current_buffer
         span = _paste_span_at(buf.text, buf.cursor_position)
         if span is not None and span[0] == buf.cursor_position and span[0] != span[1]:
@@ -2354,6 +2434,7 @@ def _build_keybindings() -> KeyBindings:
             buf.cursor_position = start
         else:
             buf.delete(count=event.arg)
+        _refresh_slash_completion(buf)
 
     @kb.add("c-d")
     def _(event):
@@ -2694,71 +2775,64 @@ def _atomic_private_json(path: Path, payload: dict) -> None:
             pass
 
 
-_instance_preferences: Optional[dict] = None
-
-
 def _instance_preferences_path() -> Path:
-    """Return the private preference file for this CLI process instance."""
-    instance_id = getattr(paths, "INSTANCE_ID", f"pid-{os.getpid()}")
-    return paths.SESSIONS_DIR / f"{instance_id}_preferences.json"
+    """Compatibility wrapper for the current terminal preference path."""
+    return terminal_preferences.preference_path()
 
 
 def _load_instance_preferences() -> dict:
-    """Load process-local UI preferences once, never from global config."""
-    global _instance_preferences
-    if _instance_preferences is not None:
-        return _instance_preferences
-
-    _instance_preferences = {}
-    path = _instance_preferences_path()
-    if not path.exists() or not paths.ensure_private_file(path):
-        return _instance_preferences
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(data, dict):
-            _instance_preferences = data
-    except (OSError, json.JSONDecodeError):
-        pass
-    return _instance_preferences
+    """Compatibility wrapper returning this terminal's preferences."""
+    return terminal_preferences.load()
 
 
 def _save_instance_preferences() -> None:
-    """Atomically save process-local UI preferences with private permissions."""
-    _atomic_private_json(_instance_preferences_path(), _load_instance_preferences())
+    """Deprecated compatibility hook; mutations save through the shared store."""
+    terminal_preferences.update(_load_instance_preferences())
 
 
 def get_selected_model() -> str:
-    """Return this CLI instance's selected model, if any."""
-    val = _load_instance_preferences().get("model", "")
+    """Return this terminal's selected model, if any."""
+    val = terminal_preferences.get("model", "")
     return str(val).strip() if val else ""
 
 
 def set_selected_model(model: str) -> None:
-    """Persist the selected model for this CLI instance only."""
-    preferences = _load_instance_preferences()
+    """Persist the selected model for this terminal only."""
     model = model.strip()
     if model:
-        preferences["model"] = model
+        terminal_preferences.set_value("model", model)
     else:
-        preferences.pop("model", None)
-    _save_instance_preferences()
+        terminal_preferences.delete("model")
 
 
 def get_selected_provider() -> str:
-    """Return this CLI instance's selected provider, if any."""
-    val = _load_instance_preferences().get("provider", "")
+    """Return this terminal's selected provider, if any."""
+    val = terminal_preferences.get("provider", "")
     return str(val).strip() if val else ""
 
 
 def set_selected_provider(provider: str) -> None:
-    """Persist the selected provider for this CLI instance only."""
-    preferences = _load_instance_preferences()
+    """Persist the selected provider for this terminal only."""
     provider = provider.strip()
     if provider:
-        preferences["provider"] = provider
+        terminal_preferences.set_value("provider", provider)
     else:
-        preferences.pop("provider", None)
-    _save_instance_preferences()
+        terminal_preferences.delete("provider")
+
+
+def set_model_selection(model: str, provider: str = "") -> None:
+    """Atomically replace the model/provider pair for this terminal."""
+    model = str(model or "").strip()
+    provider = str(provider or "").strip()
+    values = {"model": model} if model else {}
+    if model and provider:
+        values["provider"] = provider
+    remove = tuple(
+        key for key, keep in (("model", bool(model)),
+                              ("provider", bool(model and provider)))
+        if not keep
+    )
+    terminal_preferences.update(values, remove=remove)
 
 
 def _normalize_model_entry(item) -> dict:
@@ -3739,7 +3813,7 @@ The native function schemas are authoritative for each tool's name, purpose and 
 </tools>
 
 <workflow>
-- Track approved work with steps. In ACT mode, use `task_create`/`task_update` for concrete execution steps. In PLAN mode, update the versioned plan and call `plan_submit`; do not create execution steps before approval. Keep one step in progress per agent (parallel owners may each hold one), and complete steps only after verification. `<approved_work_plan>` is authoritative; `<active_tasks>` is its execution view.
+- In PLAN mode, update the versioned plan and call `plan_submit`; do not create execution tasks before approval. Outside PLAN mode, follow the runtime-owned `<work_orchestration>` policy to choose TASK, HWO, or HWG. Keep one TASK item in progress per agent and complete it only after verification. `<approved_work_plan>` remains authoritative when present; `<active_tasks>` is the current session/agent execution view.
 - Follow-up messages in the current live context need no resume tool; proceed directly with the actual task. Interrupted or exhausted runs are resumed by the CLI's `/continue` command. Retained thread context may be compacted, so treat structured active state and durable rules as authoritative.
 - If the user asks a clear read/edit/build/test/investigate task, act with tools. Do not ask for permission to do exactly what was asked.
 - Ask one concise clarifying question only when the target or intent is genuinely ambiguous, destructive, impossible to infer safely, or blocked on information you cannot discover yourself.
@@ -3813,17 +3887,22 @@ def _restore_resume_blob(blob: dict, chat_history: list) -> dict:
     if older:
         chat_history.append({"role": "knowledge", "content": f"[resumed session context]\n{older}"})
     chat_history.extend(blob.get("chat_history") or [])
+    restored_session_id = str(
+        blob.get("session_id")
+        or (blob.get("state") or {}).get("_session_id") or "")
     try:
         if blob.get("active_work_id"):
             workgraph.set_active_work(
-                str(blob["active_work_id"]), cwd=blob.get("cwd"))
+                str(blob["active_work_id"]), cwd=blob.get("cwd"),
+                session_id=restored_session_id or None)
     except workgraph.WorkGraphError:
         pass
     # Rehydrate the plan (in_progress + pending tasks) as session tasks so
     # <active_tasks> shows it immediately and "continue" can resume it.
     try:
         task_manager.import_session_tasks(blob.get("tasks") or [],
-                                          cwd=blob.get("cwd"))
+                                          cwd=blob.get("cwd"),
+                                          session_id=restored_session_id or None)
     except Exception:
         pass
     return prepare_state_for_repl(blob.get("state") or {})
@@ -4906,7 +4985,10 @@ class AgentRegistry:
         self.agent_id: Optional[str] = None
         self.agent_secret: str = ""
         self.agent_name: str = ""
-        self.instance_id: str = getattr(paths, "INSTANCE_ID", f"pid-{os.getpid()}")
+        self.instance_id: str = getattr(
+            paths, "PROCESS_INSTANCE_ID",
+            getattr(paths, "INSTANCE_ID", f"pid-{os.getpid()}"),
+        )
         # ── Sub-terminal identity (two-end handshake with Helpwo) ────────
         # depth 0 = primary CLI (auto-registers = "online"). depth ≥ 1 = a
         # nested CLI inside a sub-terminal: it registers ONLY when the user
@@ -7342,7 +7424,10 @@ def handle_version_command(parts: list) -> None:
             stop_trigger_scanner()
             close_all_terminals()
             browser_mod.close_all_browser_sessions()
-            os.execv(_LAUNCH_SCRIPT_PATH, [_LAUNCH_SCRIPT_PATH] + sys.argv[1:])
+            # The updater returns the executable path it just replaced.  Do not
+            # use _LAUNCH_SCRIPT_PATH here: for a PATH-based launch argv[0] may
+            # be only "laintas-cli", which resolves against the launch cwd.
+            os.execv(new_path, [new_path] + sys.argv[1:])
         return
 
     changed = updater.plan_changed_files(manifest)
@@ -8538,13 +8623,14 @@ def _cmd_login(session: dict, agent_registry: AgentRegistry) -> None:
 
 def _cmd_model(parts: list, raw_args: str, session: dict) -> None:
     if len(parts) >= 2 and parts[1].lower() in ("reset", "clear", "default"):
-        set_selected_model("")
-        set_selected_provider("")
+        set_model_selection("")
         _update_status_cache(model="")
         console.print("[green]Model reset. Backend default will be used.[/green]")
     elif len(parts) >= 2:
         model = _decode_text_arg(raw_args)
-        set_selected_model(model)
+        # An explicitly entered model has no verified provider metadata.  Clear
+        # the prior provider instead of sending a stale model/provider pair.
+        set_model_selection(model)
         _update_status_cache(model=model)
         console.print(f"[green]Model set to: [bold]{model}[/bold][/green]")
     else:
@@ -8563,8 +8649,7 @@ def _cmd_model(parts: list, raw_args: str, session: dict) -> None:
                 if selected:
                     model_id = selected.get("id", "") if isinstance(selected, dict) else selected
                     provider_id = selected.get("provider", "") if isinstance(selected, dict) else ""
-                    set_selected_model(model_id)
-                    set_selected_provider(provider_id)
+                    set_model_selection(model_id, provider_id)
                     _update_status_cache(model=model_id)
                     info = f"[bold]{model_id}[/bold]"
                     if provider_id:
@@ -10465,6 +10550,59 @@ def _task_ui_progress(value) -> Text:
     return meter
 
 
+def display_live_task_list(tasks: list[dict], agent_id: str) -> None:
+    """Render the foreground agent's compact task list after each task change."""
+    tasks = [item for item in (tasks or [])
+             if item.get("status") not in {"deleted", "skipped"}]
+    if not tasks:
+        return
+    rank = {"in_progress": 0, "pending": 1, "blocked": 2, "completed": 3}
+    active = sorted(
+        tasks,
+        key=lambda item: (
+            rank.get(str(item.get("status") or "pending"), 9),
+            -float(item.get("updated_at") or item.get("updated") or 0)
+            if isinstance(item.get("updated_at") or item.get("updated"), (int, float))
+            else 0,
+            str(item.get("id") or ""),
+        ),
+    )
+    completed = sum(1 for item in tasks if item.get("status") == "completed")
+    header = Text("Tasks", style="bold white")
+    header.append(f" · {agent_id or 'current'}", style="agent")
+    header.append(f"  {completed}/{len(tasks)} done", style="muted")
+    console.print(header)
+    shown = 0
+    status_ui = {
+        "in_progress": ("▶", "warning"),
+        "pending": ("○", "white"),
+        "blocked": ("!", "error"),
+        "completed": ("✓", "success"),
+    }
+    # Keep the live surface compact: current/next work first and at most the
+    # two most recent completed items after that.
+    completed_shown = 0
+    for item in active:
+        status = str(item.get("status") or "pending")
+        if status == "completed":
+            completed_shown += 1
+            if completed_shown > 2:
+                continue
+        if shown >= 6:
+            break
+        mark, style = status_ui.get(status, ("·", "white"))
+        line = Text(f"  {mark} ", style=style)
+        line.append(str(item.get("subject") or "(untitled task)"), style="white")
+        progress = int(item.get("progress") or 0)
+        if status == "in_progress" and progress:
+            line.append(f"  {progress}%", style="muted")
+        console.print(line)
+        shown += 1
+    remaining = len(tasks) - shown
+    if remaining > 0:
+        console.print(f"  [muted]… {remaining} more[/muted]")
+
+
 def _render_task_todolist(tasks: list[dict], cwd: str) -> None:
     """Render the shared TODO/HWO/HWG execution view without colored backgrounds."""
     rank = {"in_progress": 0, "pending": 1, "blocked": 2,
@@ -10536,14 +10674,169 @@ def _render_task_todolist(tasks: list[dict], cwd: str) -> None:
     console.print(table)
 
 
+def _task_agent_order(current: Optional[AgentInfo], tasks: list[dict]) -> list[str]:
+    """Return current-agent-first DFS order, retaining finished task owners."""
+    if current is None:
+        owners = [str(item.get("owner_agent_id") or "") for item in tasks]
+        return list(dict.fromkeys(owner for owner in owners if owner))
+    order: list[str] = []
+
+    def walk(agent_id: str) -> None:
+        if not agent_id or agent_id in order:
+            return
+        order.append(agent_id)
+        info = get_agent(agent_id)
+        if info is not None:
+            for child_id in info.child_ids:
+                walk(str(child_id))
+
+    walk(current.id)
+    # A completed child may already have left the live registry. Its persisted
+    # owner id still belongs in this session view, after the live DFS tree.
+    changed = True
+    while changed:
+        changed = False
+        for item in tasks:
+            owner = str(item.get("owner_agent_id") or "")
+            parent = str(item.get("parent_agent_id") or "")
+            if (owner and (owner == current.id or parent in order)
+                    and owner not in order):
+                order.append(owner)
+                changed = True
+    return order
+
+
+def _render_task_agent_tree(tasks: list[dict], cwd: str,
+                            current: Optional[AgentInfo], session_id: str) -> None:
+    """Render current agent plus descendant task ownership for one session."""
+    order = _task_agent_order(current, tasks)
+    current_id = current.id if current is not None else ""
+    scoped = []
+    for item in tasks:
+        owner = str(item.get("owner_agent_id") or current_id)
+        if not order or owner in order:
+            copy_item = dict(item)
+            copy_item["owner_agent_id"] = owner
+            scoped.append(copy_item)
+    counts = {
+        status: sum(1 for item in scoped if item.get("status") == status)
+        for status in ("in_progress", "pending", "blocked", "completed")
+    }
+    heading = Text("Tasks", style="bold white")
+    if session_id:
+        heading.append(f" · session {session_id[:12]}", style="muted")
+    if current_id:
+        heading.append(f" · current {current_id}", style="agent")
+    heading.append(f"  {cwd}", style="muted")
+    console.print(heading)
+    console.print(
+        f"[warning]{counts['in_progress']} active[/warning]  [muted]·[/muted]  "
+        f"{counts['pending']} pending  [muted]·[/muted]  "
+        f"[error]{counts['blocked']} blocked[/error]  [muted]·[/muted]  "
+        f"[success]{counts['completed']} done[/success]"
+    )
+
+    if not scoped:
+        console.print("[dim]No tasks in this session and agent tree.[/dim]")
+        return
+    table = Table(
+        box=box.SIMPLE, show_edge=False, show_lines=False,
+        header_style="bold white", padding=(0, 1), expand=True,
+    )
+    table.add_column("AGENT", width=18, no_wrap=True)
+    table.add_column("", width=2, no_wrap=True)
+    table.add_column("ID", width=7, no_wrap=True)
+    table.add_column("TYPE", width=6, no_wrap=True)
+    table.add_column("TASK", ratio=1)
+    table.add_column("PROGRESS", width=15, no_wrap=True)
+    rank = {"in_progress": 0, "pending": 1, "blocked": 2,
+            "completed": 3, "skipped": 4}
+    status_ui = {
+        "in_progress": ("▶", "warning"), "completed": ("✓", "success"),
+        "blocked": ("!", "error"), "skipped": ("–", "muted"),
+        "pending": ("○", "white"),
+    }
+    parent_by_agent = {
+        str(item.get("owner_agent_id") or ""):
+        str(item.get("parent_agent_id") or "")
+        for item in scoped if item.get("owner_agent_id")
+    }
+    for agent_id in order:
+        info = get_agent(agent_id)
+        if info is not None and info.parent_id:
+            parent_by_agent[agent_id] = str(info.parent_id)
+
+    def agent_depth(agent_id: str) -> int:
+        depth = 0
+        seen = set()
+        cursor = agent_id
+        while cursor != current_id and cursor not in seen:
+            seen.add(cursor)
+            cursor = parent_by_agent.get(cursor, "")
+            if not cursor:
+                break
+            depth += 1
+        return depth if cursor == current_id else 0
+
+    for index, agent_id in enumerate(order or [current_id or "unowned"]):
+        owned = sorted(
+            [item for item in scoped if item.get("owner_agent_id") == agent_id],
+            key=lambda item: (rank.get(item.get("status", "pending"), 9),
+                              str(item.get("id", ""))),
+        )
+        if not owned:
+            continue
+        info = get_agent(agent_id)
+        agent_label = agent_id
+        if index > 0:
+            agent_label = "  " * max(0, agent_depth(agent_id) - 1) + "└─ " + agent_id
+        if info is not None and info.status:
+            agent_label += f" [{info.status}]"
+        for task_index, task in enumerate(owned):
+            status = task.get("status", "pending")
+            mark, mark_style = status_ui.get(status, ("·", "white"))
+            source, source_style = _task_ui_source(task)
+            table.add_row(
+                Text(agent_label if task_index == 0 else "", style="agent"),
+                Text(mark, style=mark_style),
+                Text(str(task.get("id", "")), style="white"),
+                Text(source, style=source_style),
+                Text(str(task.get("subject") or "(untitled task)"), style="white"),
+                _task_ui_progress(task.get("progress", 0)),
+            )
+    console.print(table)
+
+
 def _cmd_task(raw_args: str, parts: list) -> None:
     sub = parts[1].lower() if len(parts) > 1 else ""
     _, task_args_raw = _raw_tail_after_word(raw_args)
-    _cwd = os.getcwd()
+    _current = get_current_agent()
+    _cwd = str(
+        ((_current.state or {}).get("_task_cwd") if _current else "")
+        or os.getcwd())
+    _session_id = str(
+        ((_current.state or {}).get("_session_id") if _current else "") or ""
+    )
+    _owner_id = _current.id if _current else None
+    _parent_agent_id = _current.parent_id if _current else None
+
+    def _session_tasks():
+        return task_manager.list_tasks(
+            cwd=_cwd, session_id=_session_id or None)
+
+    def _update_scoped(task_id: str, **kwargs):
+        target = task_manager.get_task(
+            task_id, cwd=_cwd, session_id=_session_id or None)
+        if target is None:
+            return False, f"Task '{task_id}' not found", None
+        return task_manager.update_task(
+            task_id, cwd=_cwd, session_id=_session_id or None,
+            owner_agent_id=target.get("owner_agent_id"),
+            parent_agent_id=target.get("parent_agent_id"), **kwargs)
 
     def _pick_task(title: str, statuses: Optional[set[str]] = None):
         candidates = [
-            item for item in task_manager.list_tasks(cwd=_cwd)
+            item for item in _session_tasks()
             if item.get("status") != "deleted"
             and (statuses is None or item.get("status") in statuses)
         ]
@@ -10558,11 +10851,34 @@ def _cmd_task(raw_args: str, parts: list) -> None:
         )
 
     if sub in ("", "list"):
-        _tasks = [t for t in task_manager.list_tasks(cwd=_cwd)
+        _tasks = [t for t in _session_tasks()
                   if t.get("status") != "deleted"]
         if not _tasks:
             console.print("[dim]No tasks. Use [bold]/task add <subject>[/bold] to create one.[/dim]")
         else:
+            _render_task_agent_tree(_tasks, _cwd, _current, _session_id)
+
+    elif sub == "mine":
+        _tasks = [
+            t for t in task_manager.list_tasks(
+                cwd=_cwd, session_id=_session_id or None,
+                owner_agent_id=_owner_id)
+            if t.get("status") != "deleted"
+        ]
+        _render_task_todolist(_tasks, _cwd)
+
+    elif sub == "agent":
+        target_agent = parts[2] if len(parts) >= 3 else ""
+        allowed = set(_task_agent_order(_current, _session_tasks()))
+        if not target_agent or target_agent not in allowed:
+            console.print("[red]Agent must be the current agent or one of its descendants.[/red]")
+        else:
+            _tasks = [
+                t for t in task_manager.list_tasks(
+                    cwd=_cwd, session_id=_session_id or None,
+                    owner_agent_id=target_agent)
+                if t.get("status") != "deleted"
+            ]
             _render_task_todolist(_tasks, _cwd)
 
     elif sub == "add":
@@ -10570,7 +10886,10 @@ def _cmd_task(raw_args: str, parts: list) -> None:
         if not subject:
             console.print("[yellow]Usage: /task add <subject>[/yellow]")
         else:
-            _tk = task_manager.create_task(subject, cwd=_cwd)
+            _tk = task_manager.create_task(
+                subject, cwd=_cwd, session_id=_session_id or None,
+                owner_agent_id=_owner_id, parent_agent_id=_parent_agent_id,
+                session_only=True)
             console.print(f"[green]Created task [bold]{_tk['id']}[/bold]: {subject}[/green]")
 
     elif sub == "show":
@@ -10581,7 +10900,8 @@ def _cmd_task(raw_args: str, parts: list) -> None:
         if not task_id:
             console.print("[dim]Task selection cancelled.[/dim]")
         else:
-            _tk = task_manager.get_task(task_id, cwd=_cwd)
+            _tk = task_manager.get_task(
+                task_id, cwd=_cwd, session_id=_session_id or None)
             if _tk is None:
                 console.print(f"[red]Task '{task_id}' not found.[/red]")
             else:
@@ -10605,7 +10925,7 @@ def _cmd_task(raw_args: str, parts: list) -> None:
         if not task_id:
             console.print("[dim]Task selection cancelled.[/dim]")
         else:
-            ok, msg, _tk = task_manager.update_task(task_id, cwd=_cwd, status="in_progress")
+            ok, msg, _tk = _update_scoped(task_id, status="in_progress")
             if ok:
                 console.print(f"[yellow]Started task [bold]{_tk['id']}[/bold]: {_tk['subject']}[/yellow]")
             else:
@@ -10619,7 +10939,8 @@ def _cmd_task(raw_args: str, parts: list) -> None:
         if not task_id:
             console.print("[dim]Task selection cancelled.[/dim]")
         else:
-            ok, msg, _tk = task_manager.update_task(task_id, cwd=_cwd, status="completed", progress=100)
+            ok, msg, _tk = _update_scoped(
+                task_id, status="completed", progress=100)
             if ok:
                 console.print(f"[green]Completed task [bold]{_tk['id']}[/bold]: {_tk['subject']}[/green]")
             else:
@@ -10633,7 +10954,7 @@ def _cmd_task(raw_args: str, parts: list) -> None:
         if not task_id:
             console.print("[dim]Task selection cancelled.[/dim]")
         else:
-            ok, msg, _tk = task_manager.update_task(task_id, cwd=_cwd, status="deleted")
+            ok, msg, _tk = _update_scoped(task_id, status="deleted")
             if ok:
                 console.print(f"[dim]Deleted task [bold]{_tk['id']}[/bold]: {_tk['subject']}[/dim]")
             else:
@@ -10653,8 +10974,8 @@ def _cmd_task(raw_args: str, parts: list) -> None:
         if not task_id or not progress_value:
             console.print("[dim]Progress update cancelled.[/dim]")
         else:
-            ok, msg, _tk = task_manager.update_task(
-                task_id, cwd=_cwd, progress=progress_value)
+            ok, msg, _tk = _update_scoped(
+                task_id, progress=progress_value)
             if ok:
                 console.print(
                     f"[green]Task {_tk['id']} progress: {_tk.get('progress', 0)}%[/green]")
@@ -10675,8 +10996,7 @@ def _cmd_task(raw_args: str, parts: list) -> None:
         if not task_id or not note:
             console.print("[dim]Task note cancelled.[/dim]")
         else:
-            ok, msg, _tk = task_manager.update_task(
-                task_id, cwd=_cwd, notes=note)
+            ok, msg, _tk = _update_scoped(task_id, notes=note)
             if ok:
                 console.print(f"[green]Note added to task {_tk['id']}.[/green]")
             else:
@@ -10696,8 +11016,7 @@ def _cmd_task(raw_args: str, parts: list) -> None:
         if not parent_id or not subject:
             console.print("[dim]Subtask creation cancelled.[/dim]")
         else:
-            ok, msg, _tk = task_manager.update_task(
-                parent_id, cwd=_cwd, addSubtask=subject)
+            ok, msg, _tk = _update_scoped(parent_id, addSubtask=subject)
             if ok:
                 child_id = _tk.get("blocks", ["?"])[-1]
                 console.print(
@@ -10706,8 +11025,10 @@ def _cmd_task(raw_args: str, parts: list) -> None:
                 console.print(f"[red]{msg}[/red]")
 
     else:
-        console.print("[yellow]Usage: [bold]/task[/bold] [list|add|show|start|done|del|progress|note|subtask][/yellow]\n"
-                      "  [bold]/task[/bold]               — list all tasks\n"
+        console.print("[yellow]Usage: [bold]/task[/bold] [list|mine|agent|add|show|start|done|del|progress|note|subtask][/yellow]\n"
+                      "  [bold]/task[/bold]               — current agent + descendants\n"
+                      "  [bold]/task mine[/bold]          — current agent only\n"
+                      "  [bold]/task agent <id>[/bold]    — one descendant agent\n"
                       "  [bold]/task add <subject>[/bold] — create a task\n"
                       "  [bold]/task show <id>[/bold]      — show task details\n"
                       "  [bold]/task start <id>[/bold]    — mark as in_progress\n"
@@ -10965,6 +11286,7 @@ def _cmd_detail(parts: list) -> None:
             if chosen is not None:
                 enabled = chosen == options[1]
                 set_runtime_config("detail", enabled)
+                terminal_preferences.set_ui_preference("detail", enabled)
                 console.print(
                     f"[green]Detail mode {'on' if enabled else 'off'}.[/green]")
         else:
@@ -10973,7 +11295,9 @@ def _cmd_detail(parts: list) -> None:
     else:
         _sub = parts[1].lower()
         if _sub in ("on", "off"):
-            set_runtime_config("detail", _sub == "on")
+            enabled = _sub == "on"
+            set_runtime_config("detail", enabled)
+            terminal_preferences.set_ui_preference("detail", enabled)
             console.print(f"[green]Detail mode {_sub}.[/green]")
         else:
             console.print("[red]Usage: /detail [on|off][/red]")
@@ -12001,6 +12325,7 @@ def _cmd_config(parts: list) -> None:
         console.print("[dim]Set with /config <key> <value>; restore with /config reset.[/dim]")
     elif len(parts) == 2 and parts[1].lower() == "reset":
         reset_runtime_config()
+        terminal_preferences.clear_ui_preferences()
         console.print("[green]Runtime config reset to defaults.[/green]")
     elif len(parts) == 2:
         # /config <key> — show one
@@ -12027,6 +12352,8 @@ def _cmd_config(parts: list) -> None:
                 console.print("[dim]Run /config to list valid keys.[/dim]")
             else:
                 value = get_runtime_config(key)
+                if key in terminal_preferences.PERSISTED_UI_KEYS:
+                    terminal_preferences.set_ui_preference(key, value)
                 console.print(
                     f"[green]{key} = {value!r} ({type(value).__name__})[/green]")
         except (ValueError, KeyError) as e:
@@ -12094,7 +12421,9 @@ def _cmd_compact(parts: list, session: dict) -> bool:
             current_live, compact_state,
             compact_chat if isinstance(compact_chat, list) else [],
             cwd=cwd,
-            tasks=task_manager.export_active_tasks(cwd=cwd),
+            tasks=task_manager.export_active_tasks(
+                cwd=cwd,
+                session_id=str(compact_state.get("_session_id") or "") or None),
         )
         handle_meta_command._current_live_session = current_live
     save_resume_state(
@@ -12192,7 +12521,9 @@ def _cmd_continue(session: dict, agent_registry: AgentRegistry) -> bool:
                 objective=_prev_input,
                 last_user_input=_prev_input,
                 exit_reason=response.get("exit_reason"),
-                tasks=task_manager.export_active_tasks(cwd=_current_live.get("cwd") or os.getcwd()),
+                tasks=task_manager.export_active_tasks(
+                    cwd=_current_live.get("cwd") or os.getcwd(),
+                    session_id=str(_prev_state.get("_session_id") or "") or None),
             )
             handle_meta_command._current_live_session = updated
         except Exception:
@@ -12859,6 +13190,7 @@ def get_loop_deps() -> LoopDeps:
             request_command_approval=request_command_approval,
             request_file_write_approval=request_file_write_approval,
             request_file_delete_approval=request_file_delete_approval,
+            display_task_list=display_live_task_list,
         )
     return _loop_deps
 
@@ -12924,7 +13256,12 @@ def show_banner(agent_name: str, session: dict = None):
         pass
     status_parts = []
     try:
-        _open = [t for t in task_manager.list_tasks(cwd=os.getcwd())
+        _task_agent = get_current_agent()
+        _task_session = str(
+            ((_task_agent.state or {}).get("_session_id")
+             if _task_agent else "") or "")
+        _open = [t for t in task_manager.list_tasks(
+                     cwd=os.getcwd(), session_id=_task_session or None)
                  if t.get("status") in ("pending", "in_progress")]
         if _open:
             status_parts.append(f"tasks: [accent]{len(_open)} open[/accent]")
@@ -13755,8 +14092,15 @@ def main():
     # Load or create config
     config = load_config()
     agent_name = args.name or config.get("agentName", socket.gethostname())
-    # Model/provider selection is instance-local, so opening another CLI
-    # process cannot overwrite this process's status or request defaults.
+    # Restore display/input preferences for this logical terminal. Validation
+    # remains centralized in agent_loop; corrupt or obsolete values are ignored.
+    for _key, _value in terminal_preferences.get_ui_preferences().items():
+        try:
+            set_runtime_config(_key, _value)
+        except (KeyError, TypeError, ValueError):
+            continue
+    # Model/provider selection is terminal-local: it survives a relaunch in
+    # this shell without affecting another concurrently open terminal.
     _update_status_cache(model=get_selected_model())
 
     # Official mode uses the Laintas account. Custom/local backends are a
@@ -13835,6 +14179,11 @@ def main():
         "lastReply": "",
         "lastOutput": "",
     }
+    def _active_task_export() -> list[dict]:
+        return task_manager.export_active_tasks(
+            cwd=_session_start_cwd,
+            session_id=str(agent_state.get("_session_id") or "") or None)
+
     chat_history = []
     current_live_session = None
     # A normal launch starts clean. Live state is archived for explicit
@@ -14043,7 +14392,7 @@ def main():
                 session_store.sync_runtime(
                     current_live_session, agent_state, chat_history,
                     cwd=_session_start_cwd,
-                    tasks=task_manager.export_active_tasks(cwd=_session_start_cwd),
+                    tasks=_active_task_export(),
                 )
         stop_trigger_scanner()
         close_all_terminals()
@@ -14149,7 +14498,7 @@ def main():
                     session_store.sync_runtime(
                         current_live_session, agent_state, chat_history,
                         cwd=_session_start_cwd,
-                        tasks=task_manager.export_active_tasks(cwd=_session_start_cwd),
+                    tasks=_active_task_export(),
                     )
                     session_store.close_session(current_live_session)
                     handle_meta_command._current_live_session = None
@@ -14286,7 +14635,7 @@ def main():
                 session_store.sync_runtime(
                     current_live_session, agent_state, chat_history,
                     cwd=_session_start_cwd,
-                    tasks=task_manager.export_active_tasks(cwd=_session_start_cwd),
+                    tasks=_active_task_export(),
                 )
                 session_store.close_session(current_live_session)
                 handle_meta_command._current_live_session = None
@@ -14312,7 +14661,7 @@ def main():
                         session_store.sync_runtime(
                             current_live_session, agent_state, chat_history,
                             cwd=_session_start_cwd,
-                            tasks=task_manager.export_active_tasks(cwd=_session_start_cwd),
+                    tasks=_active_task_export(),
                         )
                 if interactive_session:
                     interactive_session.close()
@@ -14398,7 +14747,7 @@ def main():
                     objective=agent_state.get("objective"),
                     last_user_input=user_input,
                     exit_reason=response.get("exit_reason"),
-                    tasks=task_manager.export_active_tasks(cwd=_session_start_cwd),
+                    tasks=_active_task_export(),
                 )
                 handle_meta_command._current_live_session = current_live_session
                 save_resume_state(agent_state, chat_history, _session_start_cwd)
@@ -14432,7 +14781,7 @@ def main():
                 cwd=_session_start_cwd,
                 objective=None if _system_input else user_input,
                 last_user_input=None if _system_input else user_input,
-                tasks=task_manager.export_active_tasks(cwd=_session_start_cwd),
+                    tasks=_active_task_export(),
             )
             handle_meta_command._current_live_session = current_live_session
 
@@ -14462,8 +14811,7 @@ def main():
                     current_live_session = session_store.sync_runtime(
                         current_live_session, agent_state, chat_history,
                         cwd=_session_start_cwd,
-                        tasks=task_manager.export_active_tasks(
-                            cwd=_session_start_cwd),
+                        tasks=_active_task_export(),
                     )
                     handle_meta_command._current_live_session = current_live_session
                     save_resume_state(
@@ -14671,7 +15019,7 @@ def main():
                 objective=agent_state.get("objective") if not _system_input else None,
                 last_user_input=None if _system_input else user_input,
                 exit_reason=response.get("exit_reason") if not _system_input else None,
-                tasks=task_manager.export_active_tasks(cwd=_session_start_cwd),
+                    tasks=_active_task_export(),
             )
             handle_meta_command._current_live_session = current_live_session
             save_resume_state(agent_state, chat_history, _session_start_cwd)

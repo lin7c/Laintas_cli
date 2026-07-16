@@ -483,11 +483,11 @@ class SessionStoreTests(unittest.TestCase):
     def test_current_session_pointer_is_instance_scoped(self):
         with tempfile.TemporaryDirectory() as tmp, \
                 mock.patch.object(paths, "SESSIONS_DIR", Path(tmp)):
-            with mock.patch.object(paths, "INSTANCE_ID", "term-a"):
+            with mock.patch.object(paths, "TERMINAL_ID", "term-a"):
                 session_a = session_store.create_session(
                     "/work", {"objective": "A"}, [])
                 path_a = session_store._current_path("/work")
-            with mock.patch.object(paths, "INSTANCE_ID", "term-b"):
+            with mock.patch.object(paths, "TERMINAL_ID", "term-b"):
                 session_b = session_store.create_session(
                     "/work", {"objective": "B"}, [])
                 path_b = session_store._current_path("/work")
@@ -507,7 +507,7 @@ class SessionStoreTests(unittest.TestCase):
     def test_legacy_current_pointer_is_claimed_by_current_instance(self):
         with tempfile.TemporaryDirectory() as tmp, \
                 mock.patch.object(paths, "SESSIONS_DIR", Path(tmp)), \
-                mock.patch.object(paths, "INSTANCE_ID", "term-a"):
+                mock.patch.object(paths, "TERMINAL_ID", "term-a"):
             legacy_session = {
                 "id": "legacy",
                 "session_id": "legacy",
@@ -598,7 +598,7 @@ class RemoteAgentIdentityTests(unittest.TestCase):
         self.assertEqual(pushed[0]["meta"]["autoApproveAfter"], 0.01)
 
     def test_remote_poll_includes_instance_id(self):
-        with mock.patch.object(paths, "INSTANCE_ID", "term-a"), \
+        with mock.patch.object(paths, "PROCESS_INSTANCE_ID", "process-a"), \
                 mock.patch.object(laintas_cli, "get_backend_url",
                                   return_value="https://laintas.com"), \
                 mock.patch.object(laintas_cli.time, "sleep"), \
@@ -619,10 +619,10 @@ class RemoteAgentIdentityTests(unittest.TestCase):
             registry._poll_loop(lambda: {}, lambda: [])
 
             self.assertEqual(
-                get.call_args.kwargs["params"], {"instanceId": "term-a"})
+                get.call_args.kwargs["params"], {"instanceId": "process-a"})
 
     def test_remote_heartbeat_includes_instance_id(self):
-        with mock.patch.object(paths, "INSTANCE_ID", "term-a"), \
+        with mock.patch.object(paths, "PROCESS_INSTANCE_ID", "process-a"), \
                 mock.patch.object(laintas_cli, "get_backend_url",
                                   return_value="https://laintas.com"), \
                 mock.patch.object(laintas_cli, "get_all_terminals",
@@ -644,7 +644,7 @@ class RemoteAgentIdentityTests(unittest.TestCase):
             registry._heartbeat_loop()
 
             self.assertEqual(
-                post.call_args.kwargs["json"]["instanceId"], "term-a")
+                post.call_args.kwargs["json"]["instanceId"], "process-a")
 
     def test_remote_register_events_and_unregister_include_instance_id(self):
         profile = laintas_cli.backend_profiles.BackendProfile(
@@ -656,7 +656,7 @@ class RemoteAgentIdentityTests(unittest.TestCase):
             "userName": "User",
         }
 
-        with mock.patch.object(paths, "INSTANCE_ID", "term-a"), \
+        with mock.patch.object(paths, "PROCESS_INSTANCE_ID", "process-a"), \
                 mock.patch.object(laintas_cli, "get_backend_profile",
                                   return_value=profile), \
                 mock.patch.object(laintas_cli, "get_backend_url",
@@ -672,7 +672,7 @@ class RemoteAgentIdentityTests(unittest.TestCase):
             post.side_effect = [register_resp, event_resp, unregister_resp]
 
             registry = laintas_cli.AgentRegistry()
-            self.assertEqual(registry.instance_id, "term-a")
+            self.assertEqual(registry.instance_id, "process-a")
             self.assertTrue(registry.register(session, name="primary", quiet=True))
             registry._do_post_events([{"type": "user", "content": "hello"}])
             registry.unregister()
@@ -681,10 +681,10 @@ class RemoteAgentIdentityTests(unittest.TestCase):
             events_payload = post.call_args_list[1].kwargs["json"]
             unregister_payload = post.call_args_list[2].kwargs["json"]
 
-        self.assertEqual(register_payload["instanceId"], "term-a")
-        self.assertEqual(events_payload["instanceId"], "term-a")
-        self.assertEqual(events_payload["state"]["instanceId"], "term-a")
-        self.assertEqual(unregister_payload["instanceId"], "term-a")
+        self.assertEqual(register_payload["instanceId"], "process-a")
+        self.assertEqual(events_payload["instanceId"], "process-a")
+        self.assertEqual(events_payload["state"]["instanceId"], "process-a")
+        self.assertEqual(unregister_payload["instanceId"], "process-a")
 
 
 @contextmanager
@@ -728,7 +728,10 @@ class UserDenialTerminationTests(unittest.TestCase):
         agent_loop.set_runtime_config("deny_exits_loop", deny_exits_loop)
         history = [{"role": "user", "content": "delete a file"}]
         with tempfile.TemporaryDirectory() as tmp, _chdir(tmp), \
-                _isolated_policy(tmp):
+                _isolated_policy(tmp), \
+                mock.patch.object(
+                    agent_loop.mode_manager, "is_tool_allowed",
+                    return_value=True):
             Path(".laintas").mkdir()
             result = agent_loop.run_agent_loop(
                 deps, "delete a file", {}, {}, history,

@@ -1,6 +1,7 @@
 import io
 import os
 import queue
+import re
 import tempfile
 import threading
 import time
@@ -155,6 +156,8 @@ class AgentSchedulerTests(unittest.TestCase):
 
     def test_named_child_never_replaces_existing_agent(self):
         parent = agent_loop.register_agent(name="parent", role="primary")
+        parent.state["_session_id"] = "shared-session"
+        parent.state["_task_cwd"] = "/shared/task-control"
         employee = agent_loop.register_agent(name="worker", role="pool")
         with mock.patch("worktree_manager.is_git_repo", return_value=False), \
                 mock.patch.object(
@@ -168,6 +171,8 @@ class AgentSchedulerTests(unittest.TestCase):
         self.assertIs(agent_loop.get_agent("worker"), employee)
         self.assertEqual(child_id, "worker-2")
         self.assertEqual(info.status, "done")
+        self.assertEqual(info.state["_session_id"], "shared-session")
+        self.assertEqual(info.state["_task_cwd"], "/shared/task-control")
 
     def test_worktree_failure_is_explicit_not_shared_cwd_fallback(self):
         parent = agent_loop.register_agent(name="parent", role="primary")
@@ -561,6 +566,7 @@ class PersistentOwnershipTests(unittest.TestCase):
         self.assertEqual(terminal.parent_terminal, "term0")
         self.assertIn("laintas_cli.py", terminal.session.command)
         self.assertIn("--terminal-name worker-cli", terminal.session.command)
+        self.assertIn("LAINTAS_TERMINAL_ID=term-", terminal.session.command)
 
 
 class EphemeralSessionTests(unittest.TestCase):
@@ -654,6 +660,52 @@ class EphemeralSessionTests(unittest.TestCase):
         self.assertIsNone(result["session"])
         self.assertEqual(agent_loop.get_all_terminals(), [])
 
+    def test_foreground_task_changes_emit_current_agent_live_list(self):
+        responses = iter([
+            {
+                "reply": "planning", "tool_calls": [{
+                    "name": "task.create",
+                    "arguments": {"subject": "verify live list"},
+                }], "finish_reason": "tool_calls", "done": False,
+                "error": False,
+            },
+            {
+                "reply": "done", "tool_calls": [{
+                    "name": "task.update",
+                    "arguments": {"id": "s1", "status": "completed"},
+                }], "finish_reason": "tool_calls", "done": False,
+                "error": False,
+            },
+            {
+                "reply": "complete", "tool_calls": [{
+                    "name": "task.complete",
+                    "arguments": {"summary": "verified"},
+                }], "finish_reason": "tool_calls", "done": False,
+                "error": False,
+            },
+        ])
+        deps = _deps()
+        deps.call_backend = lambda **kwargs: next(responses)
+        rendered = []
+        deps.display_task_list = lambda tasks, owner: rendered.append(
+            (owner, [(task["subject"], task["status"]) for task in tasks]))
+        primary = agent_loop.register_agent(name="live-root", role="primary")
+        agent_loop.set_current_agent_id(primary.id)
+
+        with tempfile.TemporaryDirectory() as tmp, _chdir(tmp), \
+                mock.patch.object(
+                    agent_persistence, "AGENTS_DIR", Path(tmp) / "agents"):
+            Path(".laintas").mkdir()
+            result = agent_loop.run_agent_loop(
+                deps, "track this work", {}, primary.state,
+                primary.chat_history, depth=0, agent_id=primary.id,
+                events_cb=lambda events: None, max_loops_override=3)
+
+        self.assertEqual(result["exit_reason"], agent_loop.TRANSITION_COMPLETED)
+        self.assertEqual([owner for owner, _ in rendered], [primary.id, primary.id])
+        self.assertEqual(rendered[0][1], [("verify live list", "pending")])
+        self.assertEqual(rendered[1][1], [("verify live list", "completed")])
+
     def test_shell_exec_abort_terminates_process_group(self):
         child = agent_loop.register_agent(
             name="cancel-shell", depth=1, role="subagent")
@@ -672,20 +724,104 @@ class EphemeralSessionTests(unittest.TestCase):
         self.assertFalse(holder["ok"])
         self.assertEqual(holder["error"], "Command aborted")
 
-    def test_shell_exec_does_not_reuse_deployment_terminal_pty(self):
-        stationed = mock.Mock()
-        stationed.is_alive.return_value = True
+    def test_shell_exec_reuses_deployment_terminal_and_persists_cwd(self):
+        session = mock.Mock()
+        session.is_alive.return_value = True
+        session.command_lock = None
+        session.raw_output = ""
+
+        def execute_wrapped(command):
+            begin = re.search(
+                r"__LAINTAS_SHELL_BEGIN_[0-9a-f]+__", command).group(0)
+            cwd = re.search(
+                r"__LAINTAS_SHELL_CWD_[0-9a-f]+__", command).group(0)
+            end = re.search(
+                r"__LAINTAS_SHELL_END_[0-9a-f]+__", command).group(0)
+            session.raw_output += (
+                f"{begin}\n/tmp\n{cwd}:/tmp\n{end}:0\n"
+            )
+
+        session.send_keys.side_effect = execute_wrapped
+        stationed = mock.Mock(session=session)
         ctx = tools.ToolCtx(
             cwd="/tmp", stationed_terminal=stationed,
             interactive_session=_FakeInteractiveSession("python"))
 
-        result = tools._bi_shell_exec({"command": "printf isolated"}, ctx)
+        result = tools._bi_shell_exec({
+            "command": "cd /tmp && pwd",
+        }, ctx)
 
         self.assertTrue(result["ok"])
-        self.assertEqual(result["result"], "isolated")
-        self.assertEqual(result["via"], "subprocess")
-        stationed.send_keys.assert_not_called()
+        self.assertEqual(result["result"], "/tmp")
+        self.assertEqual(result["cwd"], "/tmp")
+        self.assertEqual(result["via"], "deployment_terminal")
+        session.send_keys.assert_called_once()
         self.assertEqual(ctx.interactive_session.sent, [])
+
+    def test_undeployed_shell_exec_remains_isolated(self):
+        with tempfile.TemporaryDirectory() as tmp, _chdir(tmp):
+            before = os.getcwd()
+            result = tools._bi_shell_exec(
+                {"command": "cd / && pwd"}, tools.ToolCtx(cwd=tmp))
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["result"], "/")
+            self.assertEqual(result["via"], "subprocess")
+            self.assertNotIn("cwd", result)
+            self.assertEqual(os.getcwd(), before)
+
+    def test_agent_loop_routes_deployed_shell_to_owning_terminal(self):
+        responses = iter([{
+            "reply": "moving",
+            "tool_calls": [{
+                "name": "shell.exec",
+                "arguments": {"command": "cd /tmp && pwd"},
+            }],
+            "finish_reason": "tool_calls", "done": False, "error": False,
+        }, {
+            "reply": "done",
+            "tool_calls": [{
+                "name": "task.complete",
+                "arguments": {"summary": "done"},
+            }],
+            "finish_reason": "tool_calls", "done": False, "error": False,
+        }])
+        deps = _deps()
+        deps.call_backend = lambda **kwargs: next(responses)
+        session = mock.Mock()
+        session.is_alive.return_value = True
+        session.command_lock = threading.RLock()
+        session.raw_output = ""
+        session.full_output = ""
+        session.command = "/bin/sh"
+
+        def execute_wrapped(command):
+            begin = re.search(
+                r"__LAINTAS_SHELL_BEGIN_[0-9a-f]+__", command).group(0)
+            cwd = re.search(
+                r"__LAINTAS_SHELL_CWD_[0-9a-f]+__", command).group(0)
+            end = re.search(
+                r"__LAINTAS_SHELL_END_[0-9a-f]+__", command).group(0)
+            session.raw_output += (
+                f"{begin}\n/tmp\n{cwd}:/tmp\n{end}:1\n"
+            )
+            session.full_output = session.raw_output
+
+        session.send_keys.side_effect = execute_wrapped
+        agent_loop.register_terminal(session, "/bin/sh", 0, name="term0")
+        primary = agent_loop.register_agent(name="primary", role="primary")
+
+        with _chdir(os.getcwd()):
+            result = agent_loop.run_agent_loop(
+                deps, "move", {}, primary.state, primary.chat_history,
+                depth=0, agent_id=primary.id, max_loops_override=2)
+
+        # The terminal really changed directory even though the compound
+        # command returned non-zero, so the agent cwd must still follow it.
+        self.assertEqual(result["state"]["cwd"], "/tmp")
+        self.assertEqual(primary.deployment_terminal, "term0")
+        self.assertTrue(any("cd /tmp && pwd" in call.args[0]
+                            for call in session.send_keys.call_args_list))
 
     def test_failed_shell_output_is_preserved_for_the_ai(self):
         result = tools._bi_shell_exec({

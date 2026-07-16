@@ -25,6 +25,7 @@
     "backend_profiles",
     "trust_store",
     "paths",
+    "terminal_preferences",
     "migrate",
     "cloud_provider",
     "hwo_runner",
