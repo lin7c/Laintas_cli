@@ -521,14 +521,12 @@ class SlashRegistryTests(unittest.TestCase):
                 mock.patch.object(
                     laintas_cli.browser_mod, "close_all_browser_sessions"), \
                 mock.patch.object(
-                    laintas_cli, "_LAUNCH_SCRIPT_PATH", "/workdir/laintas-cli"), \
-                mock.patch.object(
                     laintas_cli.sys, "argv", ["laintas-cli", "--resume"]), \
-                mock.patch.object(laintas_cli.os, "execv") as execv_mock:
+                mock.patch.object(
+                    laintas_cli, "_restart_process") as restart_mock:
             laintas_cli.handle_version_command(["/v", "update"])
 
-        execv_mock.assert_called_once_with(
-            installed_path, [installed_path, "--resume"])
+        restart_mock.assert_called_once_with(installed_path)
 
     def test_term_rejects_extra_args(self):
         output = io.StringIO()

@@ -21,6 +21,7 @@ import uuid
 import errno
 import queue
 import shlex
+import shutil
 import base64
 import hashlib
 import signal
@@ -43,12 +44,62 @@ from urllib.parse import urlparse, parse_qs, urlencode
 # ── OS Detection (must come before Unix-specific imports) ────────────────
 SYSTEM = platform.system()  # "Linux", "Darwin"
 
-# Resolved once, at import time, while cwd is still the launch directory.
-# sys.argv[0] is often relative (e.g. "laintas_cli.py") — os.execv() resolves
-# a relative path against the CURRENT cwd, not the launch cwd, so /reload
-# would break after a real `cd` moved the process elsewhere. Capturing the
-# absolute path now makes restart correct regardless of later cwd changes.
-_LAUNCH_SCRIPT_PATH = os.path.abspath(sys.argv[0]) if sys.argv else __file__
+# Capture restart identity before os.chdir() or an in-place update can alter
+# what argv[0] resolves to.  A PATH launch commonly has argv[0] ==
+# "laintas-cli"; joining that to the cwd creates a nonexistent file.
+_LAUNCH_CWD = os.getcwd()
+_LAUNCH_ARGV0 = sys.argv[0] if sys.argv else ""
+_LAUNCH_SCRIPT_PATH = os.path.abspath(__file__)
+
+
+def _resolve_launch_executable() -> str:
+    """Resolve the executable that launched this process to an absolute path."""
+    candidates = []
+    if getattr(sys, "frozen", False):
+        candidates.append(sys.executable)
+    if _LAUNCH_ARGV0:
+        if os.path.dirname(_LAUNCH_ARGV0):
+            candidates.append(os.path.abspath(
+                os.path.join(_LAUNCH_CWD, _LAUNCH_ARGV0)))
+        else:
+            found = shutil.which(_LAUNCH_ARGV0)
+            if found:
+                candidates.append(found)
+    candidates.append(sys.executable)
+    for candidate in candidates:
+        path = os.path.realpath(os.path.abspath(candidate))
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return os.path.realpath(os.path.abspath(candidates[0]))
+
+
+_LAUNCH_EXECUTABLE_PATH = _resolve_launch_executable()
+
+
+def _restart_process(executable: Optional[str] = None) -> None:
+    """Replace this process using a validated absolute restart command.
+
+    Frozen installs restart the replaced binary. Source/console-script installs
+    restart the module with the same Python interpreter, avoiding dependence on
+    a PATH shim or on argv[0] remaining valid after a cwd change.
+    """
+    args = list(sys.argv[1:])
+    if executable or getattr(sys, "frozen", False):
+        target = os.path.realpath(os.path.abspath(
+            executable or _LAUNCH_EXECUTABLE_PATH))
+        argv = [target, *args]
+    else:
+        target = os.path.realpath(os.path.abspath(sys.executable))
+        script = os.path.realpath(_LAUNCH_SCRIPT_PATH)
+        if not os.path.isfile(script):
+            raise FileNotFoundError(
+                f"restart script does not exist: {script}")
+        argv = [target, script, *args]
+    if not os.path.isfile(target):
+        raise FileNotFoundError(f"restart executable does not exist: {target}")
+    if not os.access(target, os.X_OK):
+        raise PermissionError(f"restart executable is not executable: {target}")
+    os.execv(target, argv)
 
 import pty
 import select
@@ -2646,8 +2697,6 @@ def pt_prompt(cwd: str) -> str:
 # snapshot — newly-installed binaries are picked up immediately.
 
 import re
-import shutil
-
 # bash/sh/zsh builtins that aren't on PATH but should still route as commands.
 _POSIX_SHELL_BUILTINS = {
     "alias", "bg", "break", "builtin", "case", "cd", "command", "compgen",
@@ -4234,7 +4283,7 @@ def reload_default_files() -> None:
     except OSError:
         pass
     console.print("[yellow]Restarting laintas_cli...[/yellow]")
-    os.execv(_LAUNCH_SCRIPT_PATH, [_LAUNCH_SCRIPT_PATH] + sys.argv[1:])
+    _restart_process()
 
 
 # ── Backend API ────────────────────────────────────────────────────────
@@ -7427,7 +7476,7 @@ def handle_version_command(parts: list) -> None:
             # The updater returns the executable path it just replaced.  Do not
             # use _LAUNCH_SCRIPT_PATH here: for a PATH-based launch argv[0] may
             # be only "laintas-cli", which resolves against the launch cwd.
-            os.execv(new_path, [new_path] + sys.argv[1:])
+            _restart_process(new_path)
         return
 
     changed = updater.plan_changed_files(manifest)
@@ -7446,7 +7495,7 @@ def handle_version_command(parts: list) -> None:
     stop_trigger_scanner()
     close_all_terminals()
     browser_mod.close_all_browser_sessions()
-    os.execv(_LAUNCH_SCRIPT_PATH, [_LAUNCH_SCRIPT_PATH] + sys.argv[1:])
+    _restart_process()
 
 
 class SlashCommandUsageError(ValueError):

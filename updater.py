@@ -368,27 +368,70 @@ def apply_frozen_update(manifest: dict, channel_dir: str, log) -> Optional[str]:
             fh.write(data)
         import tarfile
         with tarfile.open(archive, "r:gz") as tf:
-            tf.extractall(tmpdir)
-        # GitHub tarball lays the binary out at the archive root (./laintas-cli
-        # alongside ./install.sh); older layouts nested it one level deeper.
-        extracted = os.path.join(tmpdir, "laintas-cli")
-        if not os.path.exists(extracted):
-            extracted = os.path.join(tmpdir, "laintas-cli", "laintas-cli")
-        if not os.path.exists(extracted):
+            # Extract only the expected regular-file member.  Besides avoiding
+            # archive traversal/symlink tricks, this works consistently across
+            # Python versions without tarfile.extractall filter differences.
+            def _member_name(item):
+                name = item.name
+                while name.startswith("./"):
+                    name = name[2:]
+                return name
+
+            member = next((item for item in tf.getmembers()
+                           if item.isfile() and _member_name(item) in (
+                               "laintas-cli", "laintas-cli/laintas-cli")), None)
+            source = tf.extractfile(member) if member is not None else None
+            if source is None:
+                extracted = ""
+            else:
+                extracted = os.path.join(tmpdir, "laintas-cli.new")
+                with source, open(extracted, "wb") as out:
+                    shutil.copyfileobj(source, out)
+        if not extracted or not os.path.exists(extracted):
             log("[red]Unexpected tarball layout; aborting.[/red]")
             return None
         if not os.access(os.path.dirname(target), os.W_OK):
             log(f"[red]No write permission for {os.path.dirname(target)}.[/red]")
             log("[yellow]Re-run with sudo to replace the binary in place.[/yellow]")
             return None
-        # Replace in place: unlink the running file (the open fd keeps the
-        # current process alive), then move the new one into its path.
+        # Stage beside the installed executable, then atomically replace it.
+        # The old remove()+cross-directory move left a window where the launch
+        # path did not exist, which made the immediate exec restart fail with
+        # ENOENT on some installations/filesystems.
+        target_dir = os.path.dirname(target)
+        old_mode = None
         try:
-            os.remove(target)
+            old_mode = stat.S_IMODE(os.stat(target).st_mode)
         except OSError:
             pass
-        shutil.move(extracted, target)
-        os.chmod(target, os.stat(target).st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+        fd, staged = tempfile.mkstemp(
+            prefix=".laintas-cli-update-", dir=target_dir)
+        try:
+            with os.fdopen(fd, "wb") as out, open(extracted, "rb") as src:
+                shutil.copyfileobj(src, out)
+                out.flush()
+                os.fsync(out.fileno())
+            mode = (old_mode or 0o755) | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
+            os.chmod(staged, mode)
+            os.replace(staged, target)
+            staged = ""
+            try:
+                dir_fd = os.open(target_dir, os.O_RDONLY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except OSError:
+                pass
+        finally:
+            if staged:
+                try:
+                    os.remove(staged)
+                except OSError:
+                    pass
+        if not os.path.isfile(target):
+            raise FileNotFoundError(
+                f"updated executable is missing after atomic replace: {target}")
         return target
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
