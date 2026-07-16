@@ -10,6 +10,7 @@ Usage:
     laintas-cli --backend URL      # Custom backend URL
 """
 
+import asyncio
 import io
 import os
 import re
@@ -212,6 +213,8 @@ def select_dialog(
     enter_action: str = "",
     letter_shortcuts: bool = False,
     refresh_interval: float = 0.05,
+    auto_confirm_seconds: Optional[float] = None,
+    auto_confirm_index: Optional[int] = None,
 ):
     """Interactive arrow-key selector — single or multi-select.
 
@@ -255,6 +258,11 @@ def select_dialog(
         y/n/a approval gates).  Ignored in multi mode.
     refresh_interval : float
         Application refresh interval in seconds.
+    auto_confirm_seconds : float | None
+        When set, automatically confirm after this delay unless the user makes
+        a selection or cancels first.
+    auto_confirm_index : int | None
+        Row confirmed by the timer. Defaults to the initially selected row.
 
     Returns
     -------
@@ -290,6 +298,14 @@ def select_dialog(
             norm.append((str(it), ""))
 
     sel = [max(0, min(selected_index, len(norm) - 1))]
+    _auto_seconds = (float(auto_confirm_seconds)
+                     if auto_confirm_seconds is not None else None)
+    _auto_deadline = (time.monotonic() + max(0.0, _auto_seconds)
+                      if _auto_seconds is not None else None)
+    _auto_index = max(0, min(
+        selected_index if auto_confirm_index is None else auto_confirm_index,
+        len(norm) - 1,
+    ))
     chk: set[int] = set(checked) if (multi and checked) else set()
     filter_buf = Buffer() if search else None
     act_keys: dict[str, str] = action_keys or {}
@@ -376,6 +392,9 @@ def select_dialog(
             lines.append(("dim", "  " + "  ".join(parts)))
         else:
             lines.append(("dim", "  " + hint))
+        if _auto_deadline is not None:
+            remaining = max(0, int((_auto_deadline - time.monotonic()) + 0.999))
+            lines.append(("class:auto-confirm", f"  Auto-confirm in {remaining}s"))
         return lines
 
     # ── Key bindings ──────────────────────────────────────────────
@@ -520,6 +539,7 @@ def select_dialog(
     style = Style.from_dict({
         "selected": "bold #ffffff",
         "option": "#ffffff",
+        "auto-confirm": "#e3b341",
     })
 
     app = Application(
@@ -529,7 +549,24 @@ def select_dialog(
         full_screen=full_screen,
         refresh_interval=refresh_interval,
     )
-    return app.run()
+    async def _auto_confirm():
+        await asyncio.sleep(max(0.0, _auto_seconds or 0.0))
+        if app.is_done:
+            return
+        sel[0] = _auto_index
+        if multi:
+            result = [items[oi] for oi in sorted(chk) if oi < len(items)]
+        elif enter_action and act_keys:
+            result = (enter_action, sel[0])
+        else:
+            result = items[sel[0]]
+        app.exit(result=result)
+
+    def _pre_run():
+        if _auto_seconds is not None:
+            app.create_background_task(_auto_confirm())
+
+    return app.run(pre_run=_pre_run)
 
 
 def choose_record(records, *, title: str, label: Callable,
@@ -3703,7 +3740,7 @@ The native function schemas are authoritative for each tool's name, purpose and 
 
 <workflow>
 - Track approved work with steps. In ACT mode, use `task_create`/`task_update` for concrete execution steps. In PLAN mode, update the versioned plan and call `plan_submit`; do not create execution steps before approval. Keep one step in progress per agent (parallel owners may each hold one), and complete steps only after verification. `<approved_work_plan>` is authoritative; `<active_tasks>` is its execution view.
-- Resuming: when the current input semantically continues the same unfinished objective, call `session_continue` and resume the in_progress `<active_tasks>` item; do not decide this from a keyword. Retained thread context may be compacted, so treat structured active state and durable rules as authoritative.
+- Follow-up messages in the current live context need no resume tool; proceed directly with the actual task. Interrupted or exhausted runs are resumed by the CLI's `/continue` command. Retained thread context may be compacted, so treat structured active state and durable rules as authoritative.
 - If the user asks a clear read/edit/build/test/investigate task, act with tools. Do not ask for permission to do exactly what was asked.
 - Ask one concise clarifying question only when the target or intent is genuinely ambiguous, destructive, impossible to infer safely, or blocked on information you cannot discover yourself.
 - If there are multiple reasonable approaches with materially different tradeoffs, stop and present 2-3 labeled options. State the consequence of each option briefly, then wait for the user's choice.
@@ -5529,7 +5566,10 @@ class AgentRegistry:
             return
         if (decision.action == "needs_approval"
                 or not get_runtime_config("allow_remote_exec_without_approval")):
-            approval = self._request_approval(req_id, cmd, cwd, timeout=300)
+            approval = self._request_approval(
+                req_id, cmd, cwd, timeout=300,
+                destructive=_policy.is_delete_command(cmd),
+            )
             if approval != "approve":
                 self._push_final(req_id, "aborted",
                                  f"User {approval}: {cmd[:100]}")
@@ -6244,7 +6284,8 @@ class AgentRegistry:
             request_file_write_approval=lambda path, diff, reason: self._request_approval(
                 req_id, f"WRITE {path} — {reason}", os.getcwd()) == "approve",
             request_file_delete_approval=lambda path, preview, reason: self._request_approval(
-                req_id, f"DELETE {path} — {reason}\n{preview}", os.getcwd()) == "approve",
+                req_id, f"DELETE {path} — {reason}\n{preview}", os.getcwd(),
+                destructive=True) == "approve",
         )
 
     def _handle_disconnect(self, req_id: str, payload: dict):
@@ -6446,7 +6487,8 @@ class AgentRegistry:
         self._push_final(req_id, "success", f"approval {decision} applied to {target}")
 
     def _request_approval(self, req_id: str, command: str, cwd: str,
-                          timeout: float = 300.0) -> str:
+                          timeout: float = 300.0,
+                          destructive: bool = False) -> str:
         """Push needs-approval event and block until user responds.
 
         Returns "approve", "reject", or "modify". Timeout defaults to 5 min.
@@ -6457,6 +6499,8 @@ class AgentRegistry:
         with self._active_req_lock:
             self._pending_approvals[req_id] = (approval_ev, response_dict)
 
+        auto_confirm_seconds = mode_manager.get_auto_confirm_timeout(
+            destructive=destructive)
         self._push_events(
             [{
                 "type": "needs-approval",
@@ -6466,17 +6510,26 @@ class AgentRegistry:
                     "command": command,
                     "cwd": cwd,
                     "targetReqId": req_id,
+                    "autoApproveAfter": auto_confirm_seconds,
                 },
             }],
             req_id=req_id,
         )
 
-        approved = approval_ev.wait(timeout=timeout)
+        wait_timeout = (auto_confirm_seconds
+                        if auto_confirm_seconds is not None else timeout)
+        responded = approval_ev.wait(timeout=wait_timeout)
 
         with self._active_req_lock:
             self._pending_approvals.pop(req_id, None)
 
-        if not approved:
+        if not responded and auto_confirm_seconds is not None:
+            console.print(
+                f"[yellow]AUTO mode: approval window expired after "
+                f"{int(auto_confirm_seconds)} seconds; approving.[/yellow]"
+            )
+            return "approve"
+        if not responded:
             return "reject"  # timeout = reject
         return response_dict.get("decision", "reject")
 
@@ -8972,6 +9025,15 @@ def _cmd_mode(raw_args: str, parts: list) -> bool:
                 _bits.append(f"deny: {', '.join(item['denied_tools'][:3])}")
             if item.get("auto_approve", "none") != "none":
                 _bits.append(f"auto-approve: {item['auto_approve']}")
+            _confirm_timeout = mode_manager.get_auto_confirm_timeout(mode=item)
+            _delete_timeout = mode_manager.get_auto_confirm_timeout(
+                mode=item, destructive=True)
+            if _confirm_timeout is not None:
+                _bits.append(
+                    f"timed confirm: {int(_confirm_timeout)}s"
+                    + (f" / delete {int(_delete_timeout)}s"
+                       if _delete_timeout is not None else "")
+                )
             console.print(
                 f"{marker} [cyan]{item['name']}[/cyan] "
                 f"[dim]{_escape(' · '.join(_bits))}[/dim]")
@@ -9064,7 +9126,14 @@ def _cmd_mode(raw_args: str, parts: list) -> bool:
         console.print(
             f"[{'green' if ok else 'red'}]{_escape(msg)}"
             f"[/{'green' if ok else 'red'}]")
-        if ok and mode_manager.get_auto_approve() != "none":
+        if ok and mode_manager.get_auto_confirm_timeout() is not None:
+            console.print(
+                f"[yellow]↳ AUTO confirmation windows: "
+                f"{int(mode_manager.get_auto_confirm_timeout())}s ordinary, "
+                f"{int(mode_manager.get_auto_confirm_timeout(destructive=True) or 0)}s deletion."
+                f" Choose No before the timer expires to stop an action.[/yellow]"
+            )
+        elif ok and mode_manager.get_auto_approve() != "none":
             console.print(
                 f"[dim]↳ {sub.upper()}* — auto-approving "
                 f"{mode_manager.get_auto_approve()} this session.[/dim]")
@@ -9130,6 +9199,13 @@ def _cmd_mode(raw_args: str, parts: list) -> bool:
                 console.print(
                     f"[{'green' if ok else 'red'}]{_escape(msg)}"
                     f"[/{'green' if ok else 'red'}]")
+                if ok and mode_manager.get_auto_confirm_timeout() is not None:
+                    console.print(
+                        f"[yellow]↳ AUTO confirmation windows: "
+                        f"{int(mode_manager.get_auto_confirm_timeout())}s ordinary, "
+                        f"{int(mode_manager.get_auto_confirm_timeout(destructive=True) or 0)}s deletion."
+                        f" Choose No before the timer expires to stop an action.[/yellow]"
+                    )
         elif not sys.stdin.isatty():
             console.print(
                 f"[dim]Current mode: {'plan' if _in_plan else active['name']}[/dim]")
@@ -13186,7 +13262,8 @@ def _sync_session_approval_from_mode():
 
 
 def _arrow_approval_prompt(title: str, body_lines: list[str],
-                           options: list[str]) -> Optional[str]:
+                           options: list[str], *,
+                           auto_confirm_seconds: Optional[float] = None) -> Optional[str]:
     """Inline arrow-key approval selector.
 
     Prints *body_lines* (command / diff / reason content) into the normal
@@ -13229,11 +13306,14 @@ def _arrow_approval_prompt(title: str, body_lines: list[str],
         letter_shortcuts=True,
         hint="↑↓ choose  y/n/a shortcut  ↵ confirm  Esc cancel",
         refresh_interval=0.5,
+        auto_confirm_seconds=auto_confirm_seconds,
+        auto_confirm_index=0,
     )
 
 
 def _blocking_approval_prompt(title: str, body: str, question: str,
-                              allow_always: bool = False) -> str:
+                              allow_always: bool = False,
+                              destructive: bool = False) -> str:
     """Pause the background stdin reader and block on an arrow-key prompt.
 
     Returns "yes", "no", or "always". When *allow_always* is False the "always"
@@ -13257,12 +13337,22 @@ def _blocking_approval_prompt(title: str, body: str, question: str,
     body_lines = body.split("\n")
 
     options = ["Yes", "Always (this session)", "No"] if allow_always else ["Yes", "No"]
+    auto_confirm_seconds = mode_manager.get_auto_confirm_timeout(
+        destructive=destructive)
+    if auto_confirm_seconds is not None:
+        console.print(
+            f"[yellow]AUTO mode: this confirmation will be approved in "
+            f"{int(auto_confirm_seconds)} seconds unless you choose another option.[/yellow]"
+        )
 
     _reader_was_running = bool(
         _bg_reader_thread is not None and _bg_reader_thread.is_alive())
     _stop_bg_input_reader()
     try:
-        choice = _arrow_approval_prompt(f"{title} — {question}", body_lines, options)
+        choice = _arrow_approval_prompt(
+            f"{title} — {question}", body_lines, options,
+            auto_confirm_seconds=auto_confirm_seconds,
+        )
     except (EOFError, KeyboardInterrupt):
         choice = None
     finally:
@@ -13439,6 +13529,7 @@ def request_file_delete_approval(path: str, preview: str, reason: str) -> bool:
         body,
         "Delete this target?",
         allow_always=False,
+        destructive=True,
     )
     return choice == "yes"
 

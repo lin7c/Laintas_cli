@@ -20,17 +20,22 @@ class PromptContractTests(unittest.TestCase):
         prompt = laintas_cli.generate_cli_prop_template()
         self.assertIn("laintas-managed-prompt:v2", prompt)
         self.assertIn("{{durableRules}}", prompt)
-        self.assertIn("session_continue", prompt)
+        self.assertNotIn("session_continue", prompt)
         self.assertNotIn("The session's full context", prompt)
 
     def test_legacy_internal_tool_names_are_canonicalized(self):
-        text = "Use `task.create`, session.continue, fs.delete and agent_return."
+        text = "Use `task.create`, fs.delete and agent_return."
         result = agent_loop._canonicalize_prompt_tool_names(text)
         self.assertIn("task_create", result)
-        self.assertIn("session_continue", result)
         self.assertIn("delete", result)
         self.assertIn("agent_return", result)
         self.assertNotIn("task.create", result)
+
+    def test_session_continue_is_not_exposed_to_model(self):
+        names = {tool.name for tool in tools.get_registry().list()}
+        self.assertNotIn("session.continue", names)
+        catalog = json.loads(Path("agent_tools/catalog.json").read_text(encoding="utf-8"))
+        self.assertNotIn("session_continue", {tool["name"] for tool in catalog["tools"]})
 
     def test_workflow_prompts_have_no_legacy_done_true_protocol(self):
         source = Path(workflow_engine.__file__).read_text(encoding="utf-8")

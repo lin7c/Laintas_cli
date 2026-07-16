@@ -219,12 +219,6 @@
       "aliases": {"laintas_cli": "task.complete"}
     },
     {
-      "name": "session_continue", "category": "task", "execContext": "either",
-      "description": "Resume the unfinished active objective in the current live session.",
-      "params": {"type": "object", "properties": {"reason": {"type": "string"}}},
-      "aliases": {"laintas_cli": "session.continue"}
-    },
-    {
       "name": "workflow_phase_complete", "category": "task", "execContext": "either",
       "description": "Complete one non-gated workflow phase; this does not complete the overall user task.",
       "params": {"type": "object", "properties": {"summary": {"type": "string"}}, "required": ["summary"]},

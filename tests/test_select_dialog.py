@@ -77,6 +77,31 @@ class SelectDialogTests(unittest.TestCase):
                       letter_shortcuts=True),
             "No")
 
+    def test_auto_confirm_selects_requested_item(self):
+        with create_pipe_input() as pipe, \
+                create_app_session(input=pipe, output=DummyOutput()):
+            result = laintas_cli.select_dialog(
+                ["Yes", "No"],
+                selected_index=1,
+                full_screen=False,
+                auto_confirm_seconds=0.05,
+                auto_confirm_index=0,
+                refresh_interval=0.01,
+            )
+        self.assertEqual(result, "Yes")
+
+    def test_user_can_override_auto_confirm_before_timeout(self):
+        self.assertEqual(
+            self._run(
+                ["Yes", "No"], "n",
+                full_screen=False,
+                letter_shortcuts=True,
+                auto_confirm_seconds=1.0,
+                auto_confirm_index=0,
+            ),
+            "No",
+        )
+
 
 class SelectionEntryPointTests(unittest.TestCase):
     def test_choose_record_maps_rendered_row_back_to_record(self):

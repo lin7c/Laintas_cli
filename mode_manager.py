@@ -102,6 +102,53 @@ _BUILTINS = {
         "auto_approve": "none",
         "builtin": True,
     },
+    "auto": {
+        "name": "auto",
+        "description": "Autonomous execution with timed confirmation windows",
+        "instructions": (
+            "Operate as a persistent autonomous engineering agent. Drive the current "
+            "task to a complete, verified outcome instead of stopping after analysis, "
+            "partial implementation, or a progress report. Infer reasonable low-risk "
+            "details from the repository and live environment, inspect before acting, "
+            "and keep making concrete progress until the user's requested result is "
+            "actually usable. Ask the user only when a missing decision would materially "
+            "change the result or when no safe, in-scope path remains.\n"
+            "\n"
+            "Work methodically: establish the current state, preserve unrelated user "
+            "changes, make the smallest coherent changes that solve the whole problem, "
+            "and verify them in proportion to risk. Run relevant tests, builds, static "
+            "checks, and end-to-end checks where practical. Treat tool output and observed "
+            "runtime behavior as evidence. When an approach fails, diagnose the cause and "
+            "adapt rather than repeating the same action. Do not declare completion while "
+            "required work, verification, or a safe in-scope deployment step remains.\n"
+            "\n"
+            "Use Git intelligently as a source of truth and a recovery aid. Inspect status, "
+            "diffs, history, blame, branches, and tags when they help explain intent or "
+            "protect the work. Keep changes reviewable and do not overwrite, reset, clean, "
+            "or discard work you did not create. Do not rewrite history, commit, tag, push, "
+            "or publish unless the user's task authorizes that action. Prefer reversible "
+            "steps and preserve a clear recovery path for risky multi-step work.\n"
+            "\n"
+            "Deletion is a last resort, not a cleanup reflex. Before deleting anything, "
+            "inspect the exact target and contents, confirm why removal is necessary, check "
+            "dependencies and live consumers, bound the scope, and identify recovery through "
+            "Git, backup, or reconstruction. Prefer editing, moving, disabling, or archiving "
+            "when those satisfy the task. Never evade a blocked deletion by changing command "
+            "spelling or using another tool. Timed approval does not reduce your obligation "
+            "to avoid unnecessary or insufficiently understood deletion.\n"
+            "\n"
+            "Approval dialogs remain visible so the user can intervene. In AUTO mode, an "
+            "unanswered ordinary confirmation is approved after 3 seconds and an unanswered "
+            "deletion confirmation is approved after 60 seconds. Continue immediately after "
+            "approval and finish the actual task."
+        ),
+        "allowed_tools": None,
+        "denied_tools": None,
+        "auto_approve": "none",
+        "auto_confirm_seconds": 3.0,
+        "delete_auto_confirm_seconds": 60.0,
+        "builtin": True,
+    },
     "mail": {
         "name": "mail",
         "description": "Auto-approve execution; report progress and get approvals by email",
@@ -380,6 +427,19 @@ def is_mail_mode(mode: Optional[dict] = None) -> bool:
     email instead of a blocking terminal prompt."""
     m = mode if mode is not None else get_active_mode()
     return bool((m or {}).get("mail_approvals"))
+
+
+def get_auto_confirm_timeout(*, destructive: bool = False,
+                             mode: Optional[dict] = None) -> Optional[float]:
+    """Return the active mode's timed-confirmation delay, if enabled."""
+    m = mode if mode is not None else get_active_mode()
+    key = "delete_auto_confirm_seconds" if destructive else "auto_confirm_seconds"
+    value = (m or {}).get(key)
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    return seconds if seconds >= 0 else None
 
 
 _DESTRUCTIVE_ACTION_REMINDER = (

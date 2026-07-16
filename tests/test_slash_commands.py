@@ -804,6 +804,22 @@ class PromptOptimizationTests(unittest.TestCase):
 
 
 class PlanAndWorkflowTests(unittest.TestCase):
+    def test_auto_mode_has_autonomous_prompt_and_timed_confirmations(self):
+        auto = mode_manager.get_mode("auto")
+        self.assertIsNotNone(auto)
+        with mock.patch.object(mode_manager, "get_active_mode", return_value=auto):
+            section = mode_manager.render_prompt_section()
+            self.assertEqual(mode_manager.get_auto_confirm_timeout(), 3.0)
+            self.assertEqual(
+                mode_manager.get_auto_confirm_timeout(destructive=True), 60.0)
+
+        self.assertIn("persistent autonomous engineering agent", section)
+        self.assertIn("complete, verified outcome", section)
+        self.assertIn("Use Git intelligently", section)
+        self.assertIn("Deletion is a last resort", section)
+        self.assertIn("approved after 3 seconds", section)
+        self.assertIn("approved after 60 seconds", section)
+
     def test_act_mode_prompt_is_action_oriented_and_deletion_safe(self):
         act = mode_manager.get_mode("act")
         with mock.patch.object(mode_manager, "get_active_mode", return_value=act):

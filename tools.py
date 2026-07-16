@@ -3247,27 +3247,6 @@ def _bi_task_continue(params: dict, ctx: ToolCtx) -> dict:
     return {"ok": True, "result": "(continuing)"}
 
 
-def _bi_session_continue(params: dict, ctx: ToolCtx) -> dict:
-    """Signal that the user wants to resume prior session work.
-
-    Unlike task.continue (a generic keep-looping no-op), this is called when
-    the AI determines the user's input is a
-    request to resume the current session's pending task — not a new task.
-
-    The agent loop detects the _session_continue marker and:
-      - clears any max-loops exhaustion state so the loop can run fresh,
-      - preserves the active run objective instead of creating a new task.
-
-    The AI should call this BEFORE resuming work, then proceed with the actual
-    task steps (shell.exec, fs.write, etc.) in subsequent turns.
-    """
-    reason = (params.get("reason") or "").strip()
-    result = "Continuing current session. Resume the in_progress task in <active_tasks>; if none, work on <objective>."
-    if reason:
-        result += f" (reason: {reason})"
-    return {"ok": True, "result": result, "_session_continue": True}
-
-
 def _bi_task_complete(params: dict, ctx: ToolCtx) -> dict:
     """Affirmatively signal the user's task is finished.
 
@@ -5641,24 +5620,6 @@ def register_builtin_tools() -> None:
             ),
             schema={"type": "object", "properties": {}},
             invoke=_bi_task_continue,
-        ),
-        Tool(
-            name="session.continue",
-            description=(
-                "Signal that the user is resuming prior work in the current live "
-                "session. Call this "
-                "when you determine from <active_tasks> or <objective> that the user "
-                "wants to pick up an unfinished task, NOT start a new one. After "
-                "calling, proceed with the actual task steps in subsequent turns. "
-                "Optional 'reason' explains why you are continuing."
-            ),
-            schema={
-                "type": "object",
-                "properties": {
-                    "reason": {"type": "string", "description": "Why you are continuing (optional)."},
-                },
-            },
-            invoke=_bi_session_continue,
         ),
         Tool(
             name="task.complete",

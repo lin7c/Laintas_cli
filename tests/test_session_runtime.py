@@ -116,7 +116,7 @@ class AgentTerminationTests(unittest.TestCase):
             {
                 "reply": "我先继续检查。",
                 "tool_calls": [{
-                    "name": "session.continue", "arguments": {},
+                    "name": "task.continue", "arguments": {},
                 }],
                 "finish_reason": "tool_calls", "done": False,
                 "error": False,
@@ -143,7 +143,7 @@ class AgentTerminationTests(unittest.TestCase):
             ["user", "assistant", "tool", "assistant"],
         )
         self.assertEqual(history[1]["content"], "我先继续检查。")
-        self.assertEqual(history[2]["tool_name"], "session.continue")
+        self.assertEqual(history[2]["tool_name"], "task.continue")
         self.assertEqual(history[3]["content"], "检查完成。")
 
     def test_empty_provider_turn_is_not_success(self):
@@ -219,38 +219,12 @@ class AgentTerminationTests(unittest.TestCase):
         self.assertEqual(result["msg"], "recovered")
         self.assertEqual(result["task_status"], "completed")
 
-    def test_natural_continue_restores_previous_active_objective(self):
-        result, calls, _ = self._run([
-            {
-                "reply": "",
-                "tool_calls": [{
-                    "name": "session.continue",
-                    "arguments": {"reason": "user asked to continue"},
-                }],
-                "finish_reason": "tool_calls",
-                "done": False,
-                "error": False,
-            },
-            {
-                "reply": "",
-                "tool_calls": [{
-                    "name": "task.complete",
-                    "arguments": {"summary": "done"},
-                }],
-                "finish_reason": "tool_calls",
-                "done": False,
-                "error": False,
-            },
-        ], state={"objective": "task A"}, prompt="continue")
-        self.assertEqual(len(calls), 2)
-        self.assertEqual(result["state"]["objective"], "task A")
-
     def test_provider_done_does_not_skip_tool_result_round_trip(self):
         result, calls, _ = self._run([
             {
                 "reply": "",
                 "tool_calls": [{
-                    "name": "session.continue",
+                    "name": "task.continue",
                     "arguments": {},
                 }],
                 "finish_reason": "stop",
@@ -601,6 +575,28 @@ class SessionStoreTests(unittest.TestCase):
 
 
 class RemoteAgentIdentityTests(unittest.TestCase):
+    def test_auto_mode_remote_approval_uses_timed_default(self):
+        registry = laintas_cli.AgentRegistry()
+        pushed = []
+        try:
+            with mock.patch.object(
+                    laintas_cli.mode_manager, "get_auto_confirm_timeout",
+                    return_value=0.01) as timeout, \
+                    mock.patch.object(
+                        registry, "_push_events",
+                        side_effect=lambda events, req_id=None: pushed.extend(events)):
+                decision = registry._request_approval(
+                    "req-auto", "DELETE /tmp/old", "/tmp",
+                    destructive=True,
+                )
+        finally:
+            registry._remote_executor.shutdown(wait=False, cancel_futures=True)
+            registry._remote_control_executor.shutdown(wait=False, cancel_futures=True)
+
+        self.assertEqual(decision, "approve")
+        timeout.assert_called_once_with(destructive=True)
+        self.assertEqual(pushed[0]["meta"]["autoApproveAfter"], 0.01)
+
     def test_remote_poll_includes_instance_id(self):
         with mock.patch.object(paths, "INSTANCE_ID", "term-a"), \
                 mock.patch.object(laintas_cli, "get_backend_url",

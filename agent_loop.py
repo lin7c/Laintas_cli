@@ -3655,7 +3655,7 @@ _FS_PATH_TOOLS = {"fs.read", "fs.write", "fs.edit", "fs.multi_edit", "fs.diff"}
 # and completion tools whose "failure" is a normal control-flow signal, not a
 # stuck action, plus lifecycle tools that are meant to be polled repeatedly.
 _LEDGER_EXEMPT_TOOLS = {
-    "task.complete", "plan.submit", "plan.update", "session.continue",
+    "task.complete", "plan.submit", "plan.update",
     "time.now", "agent.wait", "agent.spawn", "agent.tell", "terminal.read",
 }
 
@@ -3832,22 +3832,6 @@ def _build_user_message(original_input: str, state: dict, memory_entries: list,
     if objective and objective != str(original_input or "").strip():
         objective_block = f"\n<objective>\n{objective}\n</objective>\n"
 
-    # Continuation guidance: shown whenever there is prior session context
-    # (an objective or active tasks). The AI decides whether the user's input
-    # is a continuation request and calls session.continue if so — no string
-    # matching in the REPL or prompt layer.
-    continuation_block = ""
-    if objective or tasks_snapshot:
-        continuation_block = (
-            "\n<continuation>\n"
-            "Determine from the user's meaning whether this input continues the "
-            "same unfinished objective; do not decide from matching an isolated "
-            "word. For the same objective, call `session_continue`, then resume "
-            "the in_progress item in <active_tasks>, or <objective> if none. For "
-            "a distinct objective, proceed as a new task.\n"
-            "</continuation>\n"
-        )
-
     # In thread mode the assistant/tool turns ARE the conversation and the tool
     # results ARE the terminal output — re-injecting them here would duplicate
     # the thread. So those two sections are dropped, and <task> is sent only on
@@ -3856,7 +3840,7 @@ def _build_user_message(original_input: str, state: dict, memory_entries: list,
     # "live state" injection (objective/tasks/warnings/memory) — see Stage C.
     if thread_mode:
         task_block = f"<task>\n{original_input}\n</task>\n" if first_turn else ""
-        return f"""{task_block}{objective_block}{continuation_block}{approved_plan_block}
+        return f"""{task_block}{objective_block}{approved_plan_block}
 <progress>
 step {loop+1}/{max_loops} — {n_steps} command(s) executed so far
 </progress>
@@ -3872,7 +3856,7 @@ step {loop+1}/{max_loops} — {n_steps} command(s) executed so far
     return f"""<task>
 {original_input}
 </task>
-{objective_block}{continuation_block}{approved_plan_block}
+{objective_block}{approved_plan_block}
 <progress>
 step {loop+1}/{max_loops} — {n_steps} command(s) executed so far
 </progress>
@@ -4508,7 +4492,6 @@ def run_agent_loop(
     # ── Pin the objective (durable goal anchor) ────────────────────────────
     # A session can contain multiple tasks.  This objective identifies the
     # active run; full continuity lives in chat_history/_thread_messages.
-    _prior_objective = str(state.get("objective") or "").strip()
     if depth == 0:
         _orig = (original_input or "").strip()
         if _orig:
@@ -5885,16 +5868,6 @@ def run_agent_loop(
                     _plan_submitted = True
                     _complete_summary = (
                         f"Plan revision {result.get('revision')} is ready for user review.")
-
-                # ── Session continuation signal ──
-                # session.continue was called: clear exhaustion state so the
-                # loop can run fresh. The caller passes the latest run input
-                # explicitly and the state retains its active objective.
-                if isinstance(result, dict) and result.get("_session_continue"):
-                    state.pop("_max_loops_exhausted", None)
-                    state.pop("_exhaustion_loop_count", None)
-                    if _prior_objective:
-                        state["objective"] = _prior_objective
 
                 # ── User-denial detection ──
                 # tools._check_file_write_policy / _check_file_delete_policy /

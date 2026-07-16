@@ -99,6 +99,21 @@ class DeletePolicyTests(unittest.TestCase):
 
 
 class DirectCommandApprovalTests(unittest.TestCase):
+    def test_auto_mode_delete_uses_destructive_timeout(self):
+        with mock.patch.object(
+                laintas_cli.mode_manager, "get_auto_confirm_timeout",
+                return_value=60.0) as timeout, \
+                mock.patch.object(laintas_cli.sys.stdin, "isatty", return_value=True), \
+                mock.patch.object(
+                    laintas_cli, "_arrow_approval_prompt",
+                    return_value="Yes") as prompt:
+            approved = laintas_cli.request_file_delete_approval(
+                "/tmp/old.txt", "DELETE file", "cleanup")
+
+        self.assertTrue(approved)
+        timeout.assert_called_once_with(destructive=True)
+        self.assertEqual(prompt.call_args.kwargs["auto_confirm_seconds"], 60.0)
+
     def test_direct_command_honors_approval_and_deny(self):
         needs = policy.PolicyDecision(
             "needs_approval", "rm", "delete confirmation")
