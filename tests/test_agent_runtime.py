@@ -398,7 +398,7 @@ class AgentIsolationTests(unittest.TestCase):
             '<runtime_ownership authoritative="true">' in prompt
             for prompt in prompts))
         self.assertTrue(any(
-            "agent.hire` creates a persistent employee and deploys it directly"
+            "agent_hire` creates a persistent employee and deploys it directly"
             in prompt for prompt in prompts))
 
     def test_employee_profile_persistence_round_trip(self):

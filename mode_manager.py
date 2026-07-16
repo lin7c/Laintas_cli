@@ -68,7 +68,22 @@ _BUILTINS = {
     "act": {
         "name": "act",
         "description": "Normal execution mode",
-        "instructions": "",
+        "instructions": (
+            "For ordinary reversible work already authorized by the user, act "
+            "without requesting redundant permission.\n"
+            "Before any dangerous or destructive operation, first perform a "
+            "comprehensive, systematic analysis of the target, purpose, blast "
+            "radius, live consumers and dependencies, reversibility or backup, "
+            "and safer alternatives. If any material uncertainty remains, stop "
+            "and ask the user.\n"
+            "Before any deletion, explain clearly to the user exactly what the "
+            "target is and contains, why it should be deleted, the exact deletion "
+            "scope and expected impact, and how it can be recovered; then obtain "
+            "the required fresh approval. A policy BLOCKED result forbids the "
+            "underlying operation, not merely that command spelling: never retry "
+            "it through find, xargs, a language runtime, or another equivalent "
+            "tool."
+        ),
         "allowed_tools": None,
         "denied_tools": None,
         "auto_approve": "none",
@@ -368,7 +383,7 @@ def is_mail_mode(mode: Optional[dict] = None) -> bool:
 
 
 _DESTRUCTIVE_ACTION_REMINDER = (
-    "Deletion (fs.delete, shell rm/rmdir/unlink/shred) always requires a "
+    "Deletion (`delete` or destructive `shell` operations) always requires a "
     "fresh user approval, regardless of the active mode's auto-approve "
     "posture — there is no bulk/auto-approve tier for destructive actions."
 )
@@ -377,7 +392,11 @@ _DESTRUCTIVE_ACTION_REMINDER = (
 def render_prompt_section() -> str:
     mode = get_active_mode()
     if mode["name"] == "act":
-        return _DESTRUCTIVE_ACTION_REMINDER
+        return (
+            "[AGENT MODE: ACT]\n"
+            f"{mode['instructions']}\n\n"
+            f"{_DESTRUCTIVE_ACTION_REMINDER}"
+        )
     allowed = mode.get("allowed_tools")
     denied = mode.get("denied_tools")
     parts = []

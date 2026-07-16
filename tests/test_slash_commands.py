@@ -804,6 +804,18 @@ class PromptOptimizationTests(unittest.TestCase):
 
 
 class PlanAndWorkflowTests(unittest.TestCase):
+    def test_act_mode_prompt_is_action_oriented_and_deletion_safe(self):
+        act = mode_manager.get_mode("act")
+        with mock.patch.object(mode_manager, "get_active_mode", return_value=act):
+            section = mode_manager.render_prompt_section()
+
+        self.assertIn("[AGENT MODE: ACT]", section)
+        self.assertIn("ordinary reversible work already authorized", section)
+        self.assertIn("comprehensive, systematic analysis", section)
+        self.assertIn("exactly what the target is and contains", section)
+        self.assertIn("policy BLOCKED result forbids the underlying operation", section)
+        self.assertIn("never retry it through find", section)
+
     def test_custom_agent_mode_persists_and_restricts_tools(self):
         with tempfile.TemporaryDirectory() as tmp, _chdir(tmp):
             ok, _ = mode_manager.create_mode(
@@ -1220,9 +1232,9 @@ class TerminalOutputStyleTests(unittest.TestCase):
         end = prompt.index("</terminal_output_style>")
         section = prompt[start:end]
 
-        self.assertIn("normal white text", section)
+        self.assertIn("user's terminal background", section)
         self.assertIn("ANSI 24-bit SGR", section)
-        self.assertIn("foreground AND background", section)
+        self.assertIn("foreground and background", section)
         self.assertLess(len(section), 900)
 
 

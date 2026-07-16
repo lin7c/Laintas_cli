@@ -104,7 +104,10 @@ CWD_CLI_PROP = "cli.prop"
 CWD_MEMORY   = "memory.json"
 CWD_COMMANDS  = "commands.py"
 CWD_LOOP      = "loop.py"
+CWD_RULES     = "rules.json"
 
+# /reload resets generated runtime customization only. Durable user rules are
+# explicit project state and must survive reloads just like WorkGraph data.
 _ALL_CWD_FILES = (CWD_CLI_PROP, CWD_MEMORY, CWD_COMMANDS, CWD_LOOP)
 
 # Old names (for migration and backward-compat detection)

@@ -370,6 +370,15 @@ def validate_patch_content(content: str) -> list[str]:
         errors.append("prompt_lab_patch wrappers are added by the compiler")
     if "{{" in content or "}}" in content:
         errors.append("patches may not introduce template placeholders")
+    lowered = content.lower()
+    if "<platform_safety_policy" in lowered or "<gateway_platform_policy" in lowered:
+        errors.append("patches may not redefine platform safety blocks")
+    if re.search(r"(?i)\bignore\b.{0,80}\b(?:safety|policy|higher[- ]priority|previous instructions?)\b", content):
+        errors.append("patch may not weaken or ignore higher-priority policy")
+    if re.search(r"(?i)\bdone\s*=\s*true\b", content):
+        errors.append("legacy done=true protocol is not allowed; use explicit completion tools")
+    if re.search(r"(?i)agent_return.{0,80}\bterminate", content):
+        errors.append("agent_return submits HWO outputs and must not be described as termination")
     return errors
 
 

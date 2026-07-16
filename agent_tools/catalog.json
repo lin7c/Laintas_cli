@@ -1,9 +1,9 @@
 {
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Canonical, language-neutral agent tool catalog shared across agent products (laintas_cli, Helpwo, future agents). Single source of truth for tool NAMES, parameter JSON Schemas, and execution context. Per-language adapters (Python/TS) consume this. Names are flat snake_case with NO dots (DeepSeek and other providers reject '.' in function names). Product-specific legacy names are recorded under `aliases` to support a migration window.",
   "conventions": {
     "naming": "flat snake_case, no dots, no namespaces; extensions use a source prefix (e.g. mcp__server__tool), the core stays unprefixed",
-    "execContext": "host = runs where the OS/files live (CLI local subprocess/private session, remote agent); backend = runs server-side (gateway); either = location-agnostic / logical",
+    "execContext": "host = runs where the OS/files live (CLI local PTY, remote agent); browser = runs in the user's browser/local workspace; backend = runs server-side (gateway); either = location-agnostic / logical",
     "result_envelope": "{ ok: bool, result?: any, error?: string, diff?: string } — every executor returns this shape"
   },
   "tools": [
@@ -95,7 +95,7 @@
       "params": {"type": "object", "properties": {
         "path": {"type": "string"}
       }, "required": ["path"]},
-      "aliases": {"helpwo": "destroy"}
+      "aliases": {"laintas_cli": "fs.delete", "helpwo": "destroy"}
     },
 
     {
@@ -134,7 +134,7 @@
     },
     {
       "name": "agent_return", "category": "agent", "execContext": "either",
-      "description": "Terminate the current agent and return an explicit result to its caller.",
+      "description": "Submit declared HWO output values to the caller. This records outputs and does not terminate the agent.",
       "params": {"type": "object", "properties": {
         "value": {"description": "String or structured object. Use an object when the HWO agent declares out(...)."}
       }, "required": ["value"]},
@@ -206,6 +206,54 @@
       "params": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]},
       "aliases": {"laintas_cli": "task.get"}
     },
+    {
+      "name": "task_continue", "category": "task", "execContext": "either",
+      "description": "Keep the current task active when more work remains but this turn has no other concrete action.",
+      "params": {"type": "object", "properties": {}},
+      "aliases": {"laintas_cli": "task.continue"}
+    },
+    {
+      "name": "task_complete", "category": "task", "execContext": "either",
+      "description": "Explicitly finish the current user task after verification and all durable completion hooks are satisfied.",
+      "params": {"type": "object", "properties": {"summary": {"type": "string"}}},
+      "aliases": {"laintas_cli": "task.complete"}
+    },
+    {
+      "name": "session_continue", "category": "task", "execContext": "either",
+      "description": "Resume the unfinished active objective in the current live session.",
+      "params": {"type": "object", "properties": {"reason": {"type": "string"}}},
+      "aliases": {"laintas_cli": "session.continue"}
+    },
+    {
+      "name": "workflow_phase_complete", "category": "task", "execContext": "either",
+      "description": "Complete one non-gated workflow phase; this does not complete the overall user task.",
+      "params": {"type": "object", "properties": {"summary": {"type": "string"}}, "required": ["summary"]},
+      "aliases": {"laintas_cli": "workflow.phase_complete"}
+    },
+    {
+      "name": "rule_save", "category": "memory", "execContext": "either",
+      "description": "Persist an explicit recurring or cross-session user rule without relying on keyword matching.",
+      "params": {"type": "object", "properties": {"text": {"type": "string"}, "scope": {"type": "string", "enum": ["project"]}, "kind": {"type": "string"}, "trigger": {"type": "string"}}, "required": ["text"]},
+      "aliases": {"laintas_cli": "rule.save"}
+    },
+    {
+      "name": "rule_list", "category": "memory", "execContext": "either",
+      "description": "List structured durable user rules.",
+      "params": {"type": "object", "properties": {"active_only": {"type": "boolean"}}},
+      "aliases": {"laintas_cli": "rule.list"}
+    },
+    {
+      "name": "rule_cancel", "category": "memory", "execContext": "either",
+      "description": "Cancel a durable rule after an explicit user withdrawal or replacement.",
+      "params": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]},
+      "aliases": {"laintas_cli": "rule.cancel"}
+    },
+    {
+      "name": "rule_mark_satisfied", "category": "memory", "execContext": "either",
+      "description": "Mark a durable completion hook fulfilled for the current task.",
+      "params": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]},
+      "aliases": {"laintas_cli": "rule.mark_satisfied"}
+    },
 
     {
       "name": "web_fetch", "category": "web", "execContext": "backend",
@@ -216,6 +264,16 @@
         "timeout": {"type": "integer", "default": 15}
       }, "required": ["url"]},
       "aliases": {"laintas_cli": "web.fetch"}
+    },
+    {
+      "name": "download_url", "category": "web", "execContext": "browser",
+      "description": "Download one CORS-enabled HTTP(S) file directly in the browser and save it to the current workspace without a server proxy.",
+      "params": {"type": "object", "properties": {
+        "url": {"type": "string", "description": "direct CORS-enabled HTTP(S) file URL"},
+        "filename": {"type": "string", "description": "optional destination filename"},
+        "max_mb": {"type": "integer", "minimum": 1, "maximum": 100, "default": 100}
+      }, "required": ["url"]},
+      "aliases": {"helpwo": "download_url"}
     },
     {
       "name": "web_search", "category": "web", "execContext": "backend",

@@ -294,6 +294,8 @@ def is_delete_command(command: str) -> bool:
     patterns = (
         r"(?:^|[;&|]\s*|\n\s*)(?:\S*/)?(?:rm|rmdir|unlink|shred)(?:\s|$)",
         r"\bxargs\s+(?:\S*/)?(?:rm|rmdir|unlink|shred)(?:\s|$)",
+        r"(?:^|[;&|]\s*|\n\s*)find(?:\s|$)[^\n;&|]*\s-delete(?:\s|$)",
+        r"(?:^|[;&|]\s*|\n\s*)find(?:\s|$)[^\n;&|]*\s-exec(?:dir)?\s+(?:\S*/)?(?:rm|rmdir|unlink|shred)(?:\s|$)",
     )
     return any(re.search(pattern, stripped) for pattern in patterns)
 
@@ -749,30 +751,20 @@ def evaluate_email_send(req_id: str = None, agent_id: str = None) -> PolicyDecis
 def evaluate_terminal_open(cwd: str = None, req_id: str = None, agent_id: str = None) -> PolicyDecision:
     """Evaluate a term-open request (Helpwo asking to attach a real, raw PTY).
 
-    Follows the SAME audit-vs-enforce semantics as evaluate(): in the default
-    "audit" mode this is advisory — it writes an audit-log record and allows,
-    so the terminal opens seamlessly (which is the point of the feature). Only
-    in "enforce" mode does it return needs_approval.
+    Opening is intentionally not a per-connection approval boundary. The user
+    already opted in locally with `disable_remote_terminal=false`; the gateway
+    independently verifies account ownership and issues a one-use browser
+    ticket. A prompt rendered in the same web session cannot protect against a
+    stolen web session and makes direct device-picker connections unreliable.
 
-    Why not always-ask by default (reverted 2026-07-12): the standing gate for
-    this feature is `disable_remote_terminal` on the CLI plus the local-console
-    "Browser opened a terminal" panel — both out-of-band from any web session.
-    A per-open approval *rendered in the Helpwo UI* adds nothing against the
-    real threat (a stolen Helpwo session can approve its own request in that
-    same UI), while blocking the handler past the browser's connect timeout —
-    so by default it only broke the UX without buying security. Users who want
-    the extra friction can set policy mode to "enforce"; the audit trail is
-    written in every mode regardless.
+    The open remains audit-logged in every policy mode. Commands dispatched by
+    AI/remote-exec and destructive file operations retain their own policy and
+    approval checks; this exception applies only to creating the interactive
+    PTY transport.
     """
-    cfg = _load_config()
-    mode = cfg.get("mode", "audit")
     label = "terminal.open"
-    if mode == "enforce":
-        reason = "interactive terminal open requires approval (policy mode=enforce)"
-        _write_audit(_audit_entry(label, "needs_approval", reason, cwd, req_id, agent_id))
-        return PolicyDecision("needs_approval", "", reason)
-    # disabled + audit (default): record and allow.
-    _write_audit(_audit_entry(label, "allow", f"{mode} mode (advisory)", cwd, req_id, agent_id))
+    mode = _load_config().get("mode", "audit")
+    _write_audit(_audit_entry(label, "allow", f"direct terminal connection ({mode} mode)", cwd, req_id, agent_id))
     return PolicyDecision("allow")
 
 

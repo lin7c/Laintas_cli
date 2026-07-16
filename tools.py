@@ -35,6 +35,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 import paths
+import durable_rules
 from hwo_adapter import HWO_TOOL_DESCRIPTION
 
 
@@ -51,6 +52,8 @@ class ToolCtx:
     session: dict = field(default_factory=dict)
     events_cb: Optional[Callable] = None
     cwd: str = ""
+    state: dict = field(default_factory=dict)
+    run_id: str = ""
     # ── Loop-local context (populated by agent_loop at dispatch time) ──
     interactive_session: Any = None
     stationed_terminal: Any = None    # deprecated execution hook; deployment is metadata only
@@ -3274,6 +3277,40 @@ def _bi_task_complete(params: dict, ctx: ToolCtx) -> dict:
     longer infers "done" from a turn that simply lacks a tool call.
     """
     summary = (params.get("summary") or "").strip()
+    try:
+        import workflow_engine
+        wf = workflow_engine.get_active_workflow()
+        if wf is not None and not wf.completed and wf.current is not None:
+            return {
+                "ok": False,
+                "error": (
+                    f"Task completion blocked: workflow phase '{wf.current.name}' "
+                    "is still active. Complete the phase with "
+                    "workflow_phase_complete, or obtain the required user approval "
+                    "for a gated phase."
+                ),
+            }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": f"Could not verify workflow completion state safely: {exc}",
+        }
+    satisfied = ctx.state.get("_satisfied_rule_ids", []) if ctx.state is not None else []
+    pending_hooks = (durable_rules.unsatisfied_completion_hooks(
+        satisfied, cwd=ctx.cwd or None) if ctx.depth == 0 else [])
+    if pending_hooks:
+        details = "\n".join(
+            f"- [{rule['id']}] {rule['text']}" for rule in pending_hooks)
+        return {
+            "ok": False,
+            "error": (
+                "Completion blocked: required durable completion hook(s) have "
+                "not been satisfied for this task:\n" + details +
+                "\nComplete each obligation, then call rule_mark_satisfied for "
+                "its id before task_complete."
+            ),
+            "pending_rule_ids": [rule["id"] for rule in pending_hooks],
+        }
     result = {
         "ok": True,
         "result": summary or "Task marked complete.",
@@ -3294,6 +3331,71 @@ def _bi_task_complete(params: dict, ctx: ToolCtx) -> dict:
         except Exception:
             pass  # a notification failure must never break task completion itself
     return result
+
+
+def _bi_rule_save(params: dict, ctx: ToolCtx) -> dict:
+    """Persist only an explicit, genuinely durable user instruction."""
+    try:
+        rule = durable_rules.save_rule(
+            params.get("text", ""),
+            scope=params.get("scope", "project"),
+            kind=params.get("kind", "constraint"),
+            trigger=params.get("trigger", "always"),
+            cwd=ctx.cwd or None,
+        )
+        return {"ok": True, "result": rule}
+    except (ValueError, OSError) as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def _bi_rule_list(params: dict, ctx: ToolCtx) -> dict:
+    rules = durable_rules.list_rules(
+        ctx.cwd or None, active_only=bool(params.get("active_only", True)))
+    return {"ok": True, "result": rules, "count": len(rules)}
+
+
+def _bi_rule_cancel(params: dict, ctx: ToolCtx) -> dict:
+    rule = durable_rules.cancel_rule(
+        str(params.get("id") or ""), cwd=ctx.cwd or None)
+    if rule is None:
+        return {"ok": False, "error": "durable rule not found"}
+    return {"ok": True, "result": rule}
+
+
+def _bi_rule_mark_satisfied(params: dict, ctx: ToolCtx) -> dict:
+    rule_id = str(params.get("id") or "")
+    active = {r["id"]: r for r in durable_rules.list_rules(
+        ctx.cwd or None, active_only=True)}
+    if rule_id not in active:
+        return {"ok": False, "error": "active durable rule not found"}
+    if ctx.state is None:
+        return {"ok": False, "error": "no task state is available to record rule satisfaction"}
+    done = ctx.state.setdefault("_satisfied_rule_ids", [])
+    if rule_id not in done:
+        done.append(rule_id)
+    return {"ok": True, "result": f"Marked durable rule {rule_id} satisfied for this task."}
+
+
+def _bi_workflow_phase_complete(params: dict, ctx: ToolCtx) -> dict:
+    """Advance exactly one non-gated workflow phase through an explicit signal."""
+    import workflow_engine
+    summary = (params.get("summary") or "").strip()
+    wf = workflow_engine.get_active_workflow()
+    if wf is None or wf.completed or wf.current is None:
+        return {"ok": False, "error": "no active workflow phase"}
+    if wf.current.exit_condition == "user_confirm":
+        return {
+            "ok": False,
+            "error": "this workflow phase requires explicit user confirmation; use the workflow approval UI",
+        }
+    transition = workflow_engine.handle_done_signal(summary)
+    return {
+        "ok": True,
+        "result": f"Workflow phase transition: {transition}.",
+        "_workflow_phase_complete": True,
+        "transition": transition,
+        "summary": summary,
+    }
 
 
 # ── Shell execution tool ──────────────────────────────────────────────
@@ -5470,6 +5572,63 @@ def register_builtin_tools() -> None:
                 "required": ["seconds"],
             },
             invoke=_bi_sleep,
+        ),
+        Tool(
+            name="rule.save",
+            description=(
+                "Persist an explicit long-lived user rule. Use only when the user "
+                "clearly establishes a recurring or cross-session requirement; "
+                "never infer durability from a keyword alone."
+            ),
+            schema={
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string"},
+                    "scope": {"type": "string", "enum": ["project"], "default": "project"},
+                    "kind": {"type": "string", "enum": ["constraint", "preference", "completion_hook", "safety_requirement", "output_requirement"], "default": "constraint"},
+                    "trigger": {"type": "string", "enum": ["always", "before_task_completion"], "default": "always"},
+                },
+                "required": ["text"],
+            },
+            invoke=_bi_rule_save,
+        ),
+        Tool(
+            name="rule.list",
+            description="List structured durable user rules for this project.",
+            schema={"type": "object", "properties": {
+                "active_only": {"type": "boolean", "default": True},
+            }},
+            invoke=_bi_rule_list,
+        ),
+        Tool(
+            name="rule.cancel",
+            description="Cancel a durable rule only when the user explicitly withdraws or replaces it.",
+            schema={"type": "object", "properties": {
+                "id": {"type": "string"},
+            }, "required": ["id"]},
+            invoke=_bi_rule_cancel,
+        ),
+        Tool(
+            name="rule.mark_satisfied",
+            description=(
+                "After actually fulfilling a before_task_completion durable rule, "
+                "mark that rule satisfied for the current task."
+            ),
+            schema={"type": "object", "properties": {
+                "id": {"type": "string"},
+            }, "required": ["id"]},
+            invoke=_bi_rule_mark_satisfied,
+        ),
+        Tool(
+            name="workflow.phase_complete",
+            description=(
+                "Explicitly complete the current non-gated workflow phase after its "
+                "requirements are satisfied. This is distinct from task_complete."
+            ),
+            schema={"type": "object", "properties": {
+                "summary": {"type": "string"},
+            }, "required": ["summary"]},
+            invoke=_bi_workflow_phase_complete,
         ),
         Tool(
             name="task.continue",

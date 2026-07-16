@@ -1254,7 +1254,7 @@ def connect_terminal_to_helpwo(agent_registry: "AgentRegistry", session: dict,
                 f"Terminal: [bold]{(meta or {}).get('name', agent_registry.agent_name)}[/bold]\n"
                 f"Created by: {(meta or {}).get('createdBy', 'term0')}\n"
                 f"Agent ID: {agent_registry.agent_id}\n"
-                f"Remote terminal: [bold]explicit opt-in required[/bold]\n\n"
+                f"Remote terminal: [bold green]available in Helpwo[/bold green]\n\n"
                 f"[dim]Helpwo can now read this terminal, send it input, and close it.\n"
                 f"Run /disconnect to withdraw it.[/dim]",
                 title="Connected", border_style="green",
@@ -3632,12 +3632,13 @@ def _forget(keep_n, ctx):
 def generate_cli_prop_template() -> str:
     """Generate the .laintas/cli.prop system prompt template for the current OS.
 
-    The template uses XML-style sections and teaches the
-    agent the full surface: shell, /tool dispatch, /term, /spawn, memory.
+    The template uses XML-style sections for product behavior. Native tool
+    schemas are authoritative for names and parameters; specialized terminal,
+    agent and workflow manuals are loaded progressively through skills.
 
     Variables substituted at run time (see agent_loop.run_agent_loop):
       {{agentName}} {{agentId}} {{currentPath}} {{depth}}
-      {{globalMemory}} {{persistentMemory}} {{lastSession}}
+      {{globalMemory}} {{persistentMemory}} {{durableRules}} {{lastSession}}
       {{planMode}} {{tools}} {{inbox}} {{parallelResults}} {{children}} {{parent}}
       {{terminalName}} {{parentTerminal}} {{deploymentStatus}}
       {{workflowPhase}} {{rolePrompt}} {{confidenceGuidance}}
@@ -3651,7 +3652,8 @@ def generate_cli_prop_template() -> str:
     """
     shell_info = SHELL_NAME
 
-    return f"""<role>
+    return f"""<!-- laintas-managed-prompt:v2 -->
+<role>
 You are {{{{agentName}}}} (id: {{{{agentId}}}}, role: {{{{deploymentStatus}}}}), an autonomous coding agent running in laintas-cli.
 Solve real engineering tasks by reading the repo, using tools, editing files, running commands, verifying results, and reporting briefly.
 </role>
@@ -3669,6 +3671,9 @@ Solve real engineering tasks by reading the repo, using tools, editing files, ru
 <memory>
 Persistent memory:
 {{{{persistentMemory}}}}
+
+Durable user rules (structured, active until explicitly cancelled or replaced):
+{{{{durableRules}}}}
 
 Project rules:
 {{{{globalMemory}}}}
@@ -3692,13 +3697,13 @@ Loaded skill instructions:
 Use `shell` for shell commands and meta-commands; use structured tools for file, memory, task, plan, web, agent, terminal, and time operations.
 How to use the shared core tools (reading/editing/verifying files, shell, memory, tasks, web) is in the injected <core_tool_usage> block; general operating discipline (act-first, batching, failure handling, scope, safety, verification, skills) is in the injected <agent_conduct> block — follow both.
 Tools beyond that core (sub-terminals, parallel agent orchestration, plan files, …) have their detailed usage in skills: call `skill_list` to see them and `skill_load` (with `name`) to load one before that specialized work.
-The catalog below documents each tool's purpose and parameters:
+The native function schemas are authoritative for each tool's name, purpose and parameters. The compact list below is only an availability reminder:
 {{{{tools}}}}
 </tools>
 
 <workflow>
-- Track approved work with steps. In ACT mode, use `task.create`/`task.update` for concrete execution steps. In PLAN mode, update the versioned plan and call `plan.submit`; do not create execution steps before approval. Keep one step in progress per agent (parallel owners may each hold one), and complete steps only after verification. `<approved_work_plan>` is authoritative; `<active_tasks>` is its execution view.
-- Resuming: the session stays alive until `/q`. If the user asks to continue or resume prior work, call `session.continue` to resume the latest interrupted run and in_progress `<active_tasks>` — do NOT create a new task. The session's full context is already in your thread; just keep going.
+- Track approved work with steps. In ACT mode, use `task_create`/`task_update` for concrete execution steps. In PLAN mode, update the versioned plan and call `plan_submit`; do not create execution steps before approval. Keep one step in progress per agent (parallel owners may each hold one), and complete steps only after verification. `<approved_work_plan>` is authoritative; `<active_tasks>` is its execution view.
+- Resuming: when the current input semantically continues the same unfinished objective, call `session_continue` and resume the in_progress `<active_tasks>` item; do not decide this from a keyword. Retained thread context may be compacted, so treat structured active state and durable rules as authoritative.
 - If the user asks a clear read/edit/build/test/investigate task, act with tools. Do not ask for permission to do exactly what was asked.
 - Ask one concise clarifying question only when the target or intent is genuinely ambiguous, destructive, impossible to infer safely, or blocked on information you cannot discover yourself.
 - If there are multiple reasonable approaches with materially different tradeoffs, stop and present 2-3 labeled options. State the consequence of each option briefly, then wait for the user's choice.
@@ -3716,8 +3721,8 @@ The catalog below documents each tool's purpose and parameters:
 </output_rules>
 
 <terminal_output_style>
-- Ordinary user-facing output must be plain text/Markdown with no forced background; laintas-cli renders it as normal white text on the user's terminal background.
-- Use special color only when it carries real semantic value. In that exceptional case, choose the foreground AND background yourself with explicit ANSI 24-bit SGR (`ESC[38;2;R;G;Bm` and `ESC[48;2;R;G;Bm`), keep the span short, and reset with `ESC[0m`. Never assume or force a fixed black background, and never use the old blue-on-black treatment.
+- Ordinary user-facing output must be plain text/Markdown with no forced background; laintas-cli renders it on the user's terminal background.
+- Use special color only when it carries real semantic value. In that exceptional case, choose the foreground and background yourself with explicit ANSI 24-bit SGR, keep the span short, and reset immediately. Never assume a fixed black background or use the former blue-on-black treatment.
 </terminal_output_style>
 
 <safety>
@@ -6018,14 +6023,13 @@ class AgentRegistry:
         """Spawn a real PTY shell and dial into the backend terminal relay.
 
         Gives the Helpwo browser a live shell (vim/htop/colors/Ctrl-C all
-        work). It is disabled by default and can only be enabled in the CLI's
-        local runtime configuration (disable_remote_terminal).
+        work). It can be disabled only from the CLI's local runtime
+        configuration (disable_remote_terminal).
 
-        On top of that standing gate, EVERY open also goes through the same
-        policy-engine + approval flow as remote_exec (see _handle_exec) —
-        keystrokes inside the PTY aren't filterable per-command the way a
-        single shell.exec call is, so the moment of granting the session is
-        the only place left to supervise it.
+        Connection itself is seamless after that standing opt-in. Account
+        ownership and the one-use browser ticket are checked by the gateway;
+        AI-issued commands and destructive operations retain their independent
+        policy approval paths.
         """
         if get_runtime_config("disable_remote_terminal"):
             console.print("[yellow]Remote terminal request ignored (disable_remote_terminal is set).[/yellow]")
@@ -6045,26 +6049,14 @@ class AgentRegistry:
         except (TypeError, ValueError):
             cols, rows = 80, 24
 
-        # Policy gate. In the default audit mode this only audit-logs and
-        # allows (seamless open — the real controls are disable_remote_terminal
-        # above + the local console panel below). Only policy mode=enforce
-        # returns needs_approval and blocks. Note: an approval here blocks the
-        # handler until the user responds, and the browser's own WS has a
-        # bounded wait — enforce-mode users should approve promptly (the
-        # browser now stays attached on WS-open rather than hard-timing-out at
-        # 10s, so a reasonably prompt approval still connects fine).
+        # Audit the connection. This evaluator deliberately always allows once
+        # the local disable_remote_terminal gate above has been opened.
         cwd = os.getcwd()
         import policy as _policy
         decision = _policy.evaluate_terminal_open(cwd, req_id=req_id, agent_id=self.agent_id)
         if decision.action == "deny":
             self._push_final(req_id, "fail", f"Blocked by policy: {decision.reason}")
             return
-        if decision.action == "needs_approval":
-            approval = self._request_approval(
-                req_id, f"[open interactive terminal] session {session_id}", cwd, timeout=120)
-            if approval != "approve":
-                self._push_final(req_id, "aborted", f"User {approval}: open interactive terminal")
-                return
 
         # Another request may have passed its approval concurrently. Recheck
         # under the lock so one relay session ID can never acquire two PTYs.

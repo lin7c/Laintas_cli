@@ -37,6 +37,7 @@ import workgraph             # Unified objective/plan/steps/workflow authority
 import paths                 # Centralized path management
 import skills as skills_mod   # Progressive skill metadata + context loading
 import event_log              # Durable prompt admission + turn event log
+import durable_rules         # Structured long-lived user obligations
 import trust_store            # workspace trust for executable project hooks
 import usage_tracker          # Local AI token/cost accounting
 try:
@@ -76,9 +77,10 @@ _DEFAULT_CONFIG = {
     "paste_summary": True,        # collapse large pastes into a [Pasted #N ~L lines] placeholder in the prompt (expanded on submit)
     "paste_summary_min_lines": 3, # paste line-count threshold that triggers the placeholder
     "paste_summary_min_chars": 150, # paste char-count threshold that triggers the placeholder
-    # A browser terminal is a full interactive shell. Keep it opt-in even when
-    # remote agent registration is enabled.
-    "disable_remote_terminal": True,
+    # `/connect` is the local opt-in that exposes this CLI to the user's Helpwo
+    # account. Remote terminal tabs therefore connect directly by default;
+    # security-conscious hosts can still opt out locally with this switch.
+    "disable_remote_terminal": False,
     # Every remote command/delegation requires an explicit Helpwo approval by
     # default. Advanced users may opt out locally, never from the remote UI.
     "allow_remote_exec_without_approval": False,
@@ -253,7 +255,7 @@ TRANSITION_PARSE_RETRY = "parse_retry"                  # parse-failure nudge
 TRANSITION_OVERFLOW_RETRY = "overflow_retry"            # context overflow → compact + retry
 
 # Exit reasons (loop will terminate):
-TRANSITION_COMPLETED = "completed"                      # model set done=true
+TRANSITION_COMPLETED = "completed"                      # explicit task/plan completion
 TRANSITION_END_TURN = "end_turn"                        # no tool_calls, model finished
 TRANSITION_MAX_LOOPS = "max_loops"                      # for-range exhausted
 TRANSITION_STALENESS = "staleness"                      # too many idle steps
@@ -1059,6 +1061,7 @@ def _build_resume_payload(state: dict, chat_history: list, cwd: str, kind: str) 
         "turn_count": len(prompt_turns),
         "chat_history": history,
         "older_summary": _summarize_dropped_turns(dropped),
+        "durable_rules": durable_rules.list_rules(cwd, active_only=False),
         "tasks": task_manager.export_active_tasks(cwd=cwd),
         "active_work_id": (workgraph.get_active_work(cwd=cwd) or {}).get("id"),
         "state": prepare_state_for_repl(state or {}),
@@ -1830,15 +1833,79 @@ def _format_deployment(a: Optional["AgentInfo"]) -> str:
 
 
 _RUNTIME_OWNERSHIP_PROMPT = """<runtime_ownership authoritative="true">
-- `session.*` and `agent.spawn` create temporary resources.
-- `terminal.*` manages named persistent terminals arranged in a parent-child tree.
+- `session_*` and `agent_spawn` create temporary resources.
+- `terminal_*` manages named persistent terminals arranged in a parent-child tree.
 - Every non-root terminal belongs to one live parent terminal. Ending a terminal recursively ends its child terminals.
-- `agent.hire` creates a persistent employee and deploys it directly to the caller's current terminal; hiring does not start an assignment.
+- `agent_hire` creates a persistent employee and deploys it directly to the caller's current terminal; hiring does not start an assignment.
 - One terminal may host multiple deployed agents. One agent may be deployed to exactly one terminal.
 - Ending a terminal ends all agents deployed to it and all temporary agents owned by its terminal subtree.
-- Deployment is lifecycle ownership, not a shared shell byte stream. Use `shell.exec` for synchronous one-shot commands, `session.*` for a private interactive PTY, and `terminal.send` only to interact with an already-running terminal program; a successful send does not mean that program completed.
-- Use `agent.spawn` for disposable delegation. Use `agent.hire` for a terminal-scoped employee identity, and use `agent.station` only to move an idle employee to another live terminal.
+- Deployment is lifecycle ownership, not a shared shell byte stream. Use `shell` for synchronous one-shot commands, `session_*` for a private interactive PTY, and `terminal_send` only to interact with an already-running terminal program; a successful send does not mean that program completed.
+- Use `agent_spawn` for disposable delegation. Use `agent_hire` for a terminal-scoped employee identity, and use `agent_station` only to move an idle employee to another live terminal.
 </runtime_ownership>"""
+
+_PRODUCT_PROTOCOL_PROMPT = """<laintas_product_protocol version="2" authoritative="true">
+Terminology is exact: a turn end only hands control back; task_complete finishes
+the current user task; workflow_phase_complete finishes one workflow phase;
+agent_return submits declared HWO outputs and does not terminate the agent.
+Use only the function names present in the current native tool schemas. A normal
+prose response never advances a workflow and never proves task completion.
+Durable user rules remain active until explicitly cancelled or superseded. Before
+task_complete, satisfy every active before_task_completion hook and record that
+with rule_mark_satisfied. Do not infer a durable rule from isolated keywords.
+</laintas_product_protocol>"""
+
+_TERMINAL_OUTPUT_STYLE_PROMPT = """<terminal_output_style>
+Ordinary user-facing output is plain text or Markdown with no forced background.
+Use ANSI color only for real semantic value. For such a short span, choose both
+foreground and background explicitly with 24-bit SGR and reset immediately;
+never assume a fixed black background or use the former blue-on-black style.
+</terminal_output_style>"""
+
+
+def _canonicalize_prompt_tool_names(text: str) -> str:
+    """Translate legacy internal dotted tool names to this request's wire names.
+
+    Existing cli.prop files, custom modes, roles and skills are user-owned and
+    may still use the pre-unified taxonomy.  Translation at the final assembly
+    boundary preserves those files while ensuring prose matches the native
+    function schemas the model actually receives.
+    """
+    try:
+        catalog = None
+        if get_runtime_config("use_unified_catalog"):
+            try:
+                from agent_tools import load as _load_catalog
+                catalog = _load_catalog()
+            except Exception:
+                catalog = None
+        mapping = {}
+        for tool in tools_mod.get_registry().list():
+            wire = catalog.canonical(tool.name, "laintas_cli") if catalog else None
+            mapping[tool.name] = wire or tool.name.replace(".", "_")
+        for internal in sorted(mapping, key=len, reverse=True):
+            wire = mapping[internal]
+            if internal == wire:
+                continue
+            text = re.sub(
+                rf"(?<![A-Za-z0-9_.-]){re.escape(internal)}(?![A-Za-z0-9_.-])",
+                wire,
+                text,
+            )
+        return text
+    except Exception:
+        return text
+
+
+def _canonicalize_messages_for_provider(messages: list) -> list:
+    """Return a wire-safe copy without rewriting user/assistant prose."""
+    result = copy.deepcopy(messages or [])
+    for message in result:
+        for call in message.get("tool_calls") or []:
+            function = call.get("function") or {}
+            name = function.get("name")
+            if name:
+                function["name"] = _canonicalize_prompt_tool_names(name)
+    return result
 
 
 def get_current_agent() -> Optional[AgentInfo]:
@@ -2896,8 +2963,10 @@ def _compact_thread_messages(thread_messages: list, deps, session, lang: str, st
     `role:tool` outputs to the policy char cap, protecting the recent tail and
     protected tools; (2) if still over, SUMMARIZE the head via one tool-less LLM
     call and replace it with a structured running summary (incrementally merged).
-    Always keeps thread_messages[0] (the task) and never splits an assistant
-    tool_call from its paired role:tool result. Returns True if it changed the
+    Summarizes obsolete initial tasks instead of pinning the first message
+    forever, and never splits an assistant tool_call from its paired role:tool
+    result. The current objective and durable rules are injected separately as
+    structured live state. Returns True if it changed the
     thread. Never raises — compaction must not break the loop.
 
     When ``force=True`` (reactive overflow recovery), skips the token-count gate
@@ -2956,7 +3025,7 @@ def _compact_thread_messages(thread_messages: list, deps, session, lang: str, st
             tail_start += 1
         if tail_start <= 1 or tail_start >= len(thread_messages):
             return changed
-        head = thread_messages[1:tail_start]
+        head = thread_messages[:tail_start]
         head_text = "\n".join(s for s in (_serialize_thread_msg(m) for m in head) if s)
         if not head_text.strip():
             return changed
@@ -2967,7 +3036,7 @@ def _compact_thread_messages(thread_messages: list, deps, session, lang: str, st
         state["_thread_summary"] = summary
         summary_msg = {"role": "user",
                        "content": f"[CONVERSATION SUMMARY — earlier turns compacted]\n{summary}"}
-        thread_messages[:] = [thread_messages[0], summary_msg] + thread_messages[tail_start:]
+        thread_messages[:] = [summary_msg] + thread_messages[tail_start:]
         return True
     except Exception:
         return False
@@ -3494,7 +3563,8 @@ def _detect_loop_warnings_typed(state: dict, original_input: str) -> list[tuple[
             and not all(t in {"terminal.read", "agent.wait"} for t in last_tools)):
         warnings.append(("same_command_repeat",
             f"You have run `{last_cmds[0][:80]}` 3 times in a row with the same result. "
-            f"The task is done. Return tool_calls: [] and state your final answer in reply."
+            f"Do not infer success from repetition. Inspect whether the objective is "
+            f"actually satisfied; if it is, call task_complete, otherwise change strategy."
         ))
 
     # 2. 3+ consecutive failures (any commands)
@@ -3739,40 +3809,11 @@ def _build_user_message(original_input: str, state: dict, memory_entries: list,
     if files_seen:
         files_block = f"\n<files_seen>\n  {', '.join(files_seen[-15:])}\n</files_seen>\n"
 
-    # Workflow phase section
+    # Workflow and role guidance are already rebuilt in the system prompt on
+    # every iteration. Repeating them in transient user state causes attention
+    # conflicts and doubles confidence/phase instructions.
     workflow_block = ""
-    wf = workflow_engine.get_active_workflow()
-    if wf and not wf.completed:
-        current = wf.current
-        if current:
-            workflow_block = (
-                f"\n<workflow_phase>\n"
-                f"  workflow: {wf.name} — {wf.description}\n"
-                f"  progress: {wf.progress_str}\n"
-                f"  current: {current.name} — {current.description}\n"
-            )
-            # Show auto-spawn hint if phase has spawn_agents
-            if current.spawn_agents:
-                workflow_block += f"  hint: consider spawning {', '.join(current.spawn_agents)} agent(s)\n"
-            if current.requires_user_input:
-                workflow_block += "  ⚠️  This phase requires user confirmation before advancing.\n"
-            workflow_block += "</workflow_phase>\n"
-
-    # Role identity section (for sub-agents)
     role_block = ""
-    role_name = state.get("_role_name")
-    if role_name:
-        role_obj = agent_roles.get_role(role_name)
-        if role_obj:
-            role_block = (
-                f"\n<role_identity>\n"
-                f"  You are operating as: {role_obj.name} ({role_obj.description})\n"
-            )
-            if role_obj.allowed_tools:
-                role_block += f"  Allowed tools: {', '.join(role_obj.allowed_tools)}\n"
-            if role_obj.confidence_threshold > 0:
-                role_block += f"  Confidence threshold: only report findings >= {role_obj.confidence_threshold}/100\n"
-            role_block += "</role_identity>\n"
 
     # Active tasks section
     tasks_snapshot = task_manager.get_active_tasks_snapshot(cwd=os.getcwd())
@@ -3799,10 +3840,11 @@ def _build_user_message(original_input: str, state: dict, memory_entries: list,
     if objective or tasks_snapshot:
         continuation_block = (
             "\n<continuation>\n"
-            "If the user is asking to resume or continue prior work, call "
-            "`session.continue` to signal it, then resume the in_progress item "
-            "in <active_tasks>; if none, work on <objective>. If the user is "
-            "starting a new task, proceed normally.\n"
+            "Determine from the user's meaning whether this input continues the "
+            "same unfinished objective; do not decide from matching an isolated "
+            "word. For the same objective, call `session_continue`, then resume "
+            "the in_progress item in <active_tasks>, or <objective> if none. For "
+            "a distinct objective, proceed as a new task.\n"
             "</continuation>\n"
         )
 
@@ -4289,12 +4331,12 @@ def _format_tool_result_for_loop(tool_name: str, result: dict, max_chars: int) -
 
 def _render_tool_catalog(state: dict, loop: int,
                          allowed_names: Optional[set[str]] = None) -> str:
-    """Full catalog on turn 1 (or after an unknown-tool error); short reminder
-    afterwards. Saves ~5KB × max_loops per task on follow-up turns."""
-    if loop == 0 or state.get("_force_full_catalog_next"):
-        state["_force_full_catalog_next"] = False
-        return tools_mod.get_registry().describe_for_prompt(
-            allowed_names=allowed_names)
+    """Render only a name reminder; native schemas are the authority.
+
+    Repeating every description and parameter in system prose duplicated the
+    OpenAI tool array, consumed attention, and allowed the two copies to drift.
+    """
+    state["_force_full_catalog_next"] = False
     return tools_mod.get_registry().describe_short_reminder(
         allowed_names=allowed_names)
 
@@ -4302,88 +4344,8 @@ def _render_tool_catalog(state: dict, loop: int,
 def _render_tool_catalog_enhanced(
         state: dict, loop: int, depth: int = 0,
         allowed_names: Optional[set[str]] = None) -> str:
-    """Layered tool catalog rendering:
-    - Tools allowed by current workflow phase / role: full description
-    - Other tools: name only
-    - Role catalog appended when at depth > 0
-
-    Falls back to the standard catalog when no workflow/role is active.
-    """
-    role_name = state.get("_role_name")
-    wf_active = workflow_engine.get_active_workflow() is not None
-    _active_mode = (None if plan_mode.is_plan_mode()
-                    else mode_manager.get_active_mode())
-    mode_restricts = bool(_active_mode) and (
-        _active_mode.get("allowed_tools") is not None
-        or _active_mode.get("denied_tools"))
-
-    # If neither workflow nor role is active, use the standard catalog
-    if not wf_active and not role_name and not mode_restricts:
-        base = _render_tool_catalog(state, loop, allowed_names)
-        # Append role catalog for sub-agents
-        if depth > 0:
-            role_section = agent_roles.describe_roles_for_prompt()
-            if role_section:
-                base += f"\n\n{role_section}"
-        return base
-
-    # Build layered rendering
-    registry = tools_mod.get_registry()
-    all_tools = [
-        tool for tool in registry.list()
-        if allowed_names is None or tool.name in allowed_names
-    ]
-
-    # Determine allowed tools from workflow + role
-    allowed = None  # None means all allowed
-    if wf_active:
-        current_phase = workflow_engine.get_active_workflow().current
-        if current_phase and current_phase.allowed_tools:
-            allowed = set(current_phase.allowed_tools)
-    if mode_restricts:
-        # Match enforcement exactly: is_tool_allowed applies the active mode's
-        # allow globs + deny-first rules against real tool names.
-        mode_tools = {t.name for t in all_tools
-                      if mode_manager.is_tool_allowed(t.name)}
-        allowed = mode_tools if allowed is None else allowed & mode_tools
-    if role_name:
-        role = agent_roles.get_role(role_name)
-        if role and role.allowed_tools:
-            role_tools = set(role.allowed_tools)
-            allowed = role_tools if allowed is None else allowed & role_tools
-
-    if allowed is None:
-        # No restrictions — full catalog
-        base = _render_tool_catalog(state, loop, allowed_names)
-    else:
-        # Layered: allowed tools get full description, others get name-only
-        lines = []
-        if loop == 0 or state.get("_force_full_catalog_next"):
-            state["_force_full_catalog_next"] = False
-            allowed_lines = []
-            other_lines = []
-            for t in all_tools:
-                if t.name in allowed:
-                    allowed_lines.append(f"  {t.name}: {t.description[:120]}")
-                else:
-                    other_lines.append(t.name)
-            lines.append("=== ALLOWED TOOLS (this phase/role) ===")
-            lines.extend(allowed_lines)
-            if other_lines:
-                lines.append(f"\n=== OTHER TOOLS (blocked) ===")
-                lines.append(f"  {', '.join(other_lines[:30])}")
-        else:
-            allowed_names = [t.name for t in all_tools if t.name in allowed]
-            lines.append(f"Allowed tools: {', '.join(allowed_names)}")
-        base = "\n".join(lines)
-
-    # Append role catalog for sub-agents
-    if depth > 0:
-        role_section = agent_roles.describe_roles_for_prompt()
-        if role_section:
-            base += f"\n\n{role_section}"
-
-    return base
+    """Compact reminder only; provider schemas already reflect authorization."""
+    return _render_tool_catalog(state, loop, allowed_names)
 
 
 def _format_parallel_results(inbox_msgs: list) -> str:
@@ -4531,6 +4493,10 @@ def run_agent_loop(
             except Exception as _e: _diag("snapshot_create_failed", error=str(_e))
         if state.get("terminalHistory"):
             state["terminalHistory"] = _trim_carried_outputs(state["terminalHistory"])
+        # Completion-hook satisfaction belongs to one top-level task. A later
+        # task must fulfill recurring hooks again instead of inheriting a stale
+        # success bit from an earlier run.
+        state["_satisfied_rule_ids"] = []
     state["shortTermMemory"] = _trim_short_term_memory(state.get("shortTermMemory", ""))
     state["lastOutput"] = _trim_text(
         state.get("lastOutput", ""),
@@ -4853,13 +4819,20 @@ def run_agent_loop(
         else:
             global_memory_str = "(empty)"
 
-        # 3. Read .laintas/cli.prop system prompt — an HWO (prompt.md) prefix override
-        # (stashed in this agent's own state by hwo_runner._run_agent/_run_task) wins.
-        prompt_template = (state.get('_prompt_override') or "").strip()
-        if not prompt_template:
-            prompt_template = deps.read_file(str(paths.project_file(paths.CWD_CLI_PROP))) or ""
+        # 3. Read the product prompt. HWO (prompt.md) is a role overlay, never a
+        # full replacement: replacing the base used to silently remove safety,
+        # lifecycle, tool and completion contracts from child agents.
+        prompt_template = deps.read_file(str(paths.project_file(paths.CWD_CLI_PROP))) or ""
         if not prompt_template:
             prompt_template = deps.generate_prompt()
+        prompt_override = (state.get('_prompt_override') or "").strip()
+        if prompt_override:
+            prompt_template = (
+                prompt_template.rstrip()
+                + "\n\n<hwo_prompt_overlay>\n"
+                + prompt_override
+                + "\n</hwo_prompt_overlay>"
+            )
 
         # 4. Build system prompt
         # Phase 2: prefer self_info (passed-in agent_id) over the global
@@ -4912,6 +4885,8 @@ def run_agent_loop(
         with prompt_lab.project_scope(state.get("_prompt_lab_root")):
             _prompt_lab_section = prompt_lab.get_prompt_lab_section()
         _prompt_lab_has_slot = "{{promptOpt}}" in prompt_template
+        _durable_rules_has_slot = "{{durableRules}}" in prompt_template
+        _terminal_style_has_block = "<terminal_output_style>" in prompt_template
 
         # The mail tools' own catalog descriptions carry the gateway-served
         # usage nudge (see tools.refresh_mail_tool_hint) — no separate
@@ -4922,6 +4897,7 @@ def run_agent_loop(
         system_prompt = prompt_template \
             .replace("{{globalMemory}}", global_memory_str) \
             .replace("{{persistentMemory}}", memory_system.get_memory_context()) \
+            .replace("{{durableRules}}", durable_rules.format_for_prompt(os.getcwd())) \
             .replace("{{planMode}}", plan_mode.get_plan_prompt()) \
             .replace("{{promptOpt}}", _prompt_lab_section) \
             .replace("{{agentName}}", agent_name) \
@@ -4947,6 +4923,23 @@ def run_agent_loop(
             system_prompt = system_prompt.rstrip() + "\n\n" + mode_section
         if _prompt_lab_section and not _prompt_lab_has_slot:
             system_prompt = system_prompt.rstrip() + "\n\n" + _prompt_lab_section
+        if not _durable_rules_has_slot:
+            system_prompt += (
+                "\n\n<durable_user_rules authoritative=\"true\">\n"
+                + durable_rules.format_for_prompt(os.getcwd())
+                + "\n</durable_user_rules>"
+            )
+        system_prompt += (
+            "\n\n<durable_rule_protocol>\n"
+            "Use rule_save only for an explicit recurring or cross-session user "
+            "instruction; determine durability from meaning and context, never from "
+            "matching words such as 'always' or 'every'. Use kind=completion_hook "
+            "and trigger=before_task_completion for an obligation that must run "
+            "before every completion. Use rule_cancel only when the user explicitly "
+            "withdraws or replaces a rule. After actually fulfilling a completion "
+            "hook, call rule_mark_satisfied with its id.\n"
+            "</durable_rule_protocol>"
+        )
         # Runtime lifecycle invariants are appended independently of cli.prop:
         # project/user templates may customize behavior, but cannot
         # accidentally omit the resource-ownership contract.
@@ -5012,6 +5005,13 @@ def run_agent_loop(
         # Keep the legacy template placeholder harmless for existing cli.prop files.
         system_prompt = system_prompt.replace("{{lastSession}}", "")
 
+        # Product protocol is runtime-owned so stale project cli.prop files or
+        # narrow HWO prompt overlays cannot omit current completion semantics.
+        system_prompt = system_prompt.rstrip() + "\n\n" + _PRODUCT_PROTOCOL_PROMPT
+        if not _terminal_style_has_block:
+            system_prompt += "\n\n" + _TERMINAL_OUTPUT_STYLE_PROMPT
+        system_prompt = _canonicalize_prompt_tool_names(system_prompt)
+
         # Employee and assignment instructions are workspace customization and
         # therefore remain inside the platform-safety boundary.
         system_prompt = (
@@ -5063,6 +5063,7 @@ def run_agent_loop(
                     "content": "<final_step>This is your last step — do NOT call more tools. "
                                "Give your final answer or summary now.</final_step>",
                 }]
+            _thread_to_send = _canonicalize_messages_for_provider(_thread_to_send)
         else:
             _live_state = None
             user_input = _build_user_message(
@@ -5564,7 +5565,7 @@ def run_agent_loop(
                             f"Re-running it will fail identically. Stop repeating this "
                             f"call — either fix the underlying cause with a DIFFERENT "
                             f"action, or if this sub-goal is impossible, move on / call "
-                            f"task.complete and report it."
+                            f"task_complete and report it."
                         ),
                         "tool": name, "returncode": -1, "_repeat_blocked": True,
                     }
@@ -5816,6 +5817,7 @@ def run_agent_loop(
                         tool_ctx = tools_mod.ToolCtx(
                             deps=deps, agent_id=agent_id, session=session,
                             events_cb=events_cb, cwd=state.get("cwd") or os.getcwd(),
+                            state=state, run_id=_run_id,
                             interactive_session=interactive_session,
                             # Deployment is lifecycle ownership only. Never
                             # expose the shared deployment PTY as shell.exec's
@@ -6101,7 +6103,7 @@ def run_agent_loop(
         if _explicit_complete and _failed_calls:
             _explicit_complete = False
             _append_short_memory(state, (
-                "\n  ⚠ task.complete was ignored because another tool in "
+                "\n  ⚠ task_complete was ignored because another tool in "
                 "the same turn failed. Inspect the failed result before "
                 "completing the task."
             ))
@@ -6166,8 +6168,8 @@ def run_agent_loop(
                 else:
                     done = False
                     _append_short_memory(state, (
-                        "\n  ⚠ Turn ended with no tool call and no task.complete. "
-                        "If the task is finished, call task.complete with a summary; "
+                        "\n  ⚠ Turn ended with no tool call and no task_complete. "
+                        "If the task is finished, call task_complete with a summary; "
                         "otherwise keep working."
                     ))
 
@@ -6364,19 +6366,6 @@ def run_agent_loop(
         # loop result so successful task.complete turns do not show Done False.
         debug_entry.done = done
         add_debug_log(debug_entry)
-
-        if done and depth == 0:
-            workflow_transition = workflow_engine.handle_done_signal(
-                reply or state.get("lastReply", ""))
-            if workflow_transition == "advanced":
-                done = False
-                debug_entry.done = False
-                _append_short_memory(
-                    state, "\n  - Workflow advanced to the next phase.")
-            elif workflow_transition == "awaiting_confirmation":
-                _append_short_memory(
-                    state,
-                    "\n  - Workflow phase is awaiting explicit user confirmation.")
 
         if done:
             # Close sub-terminal if still running, show final report

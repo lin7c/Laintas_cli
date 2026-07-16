@@ -318,9 +318,10 @@ class AgentTerminationTests(unittest.TestCase):
         self.assertTrue(result["summary_created"])
         self.assertEqual(len(calls), 1)
         compacted = state["_thread_messages"]
-        self.assertEqual(compacted[0]["content"], "initial task")
-        self.assertIn("anchored compact summary", compacted[1]["content"])
-        self.assertEqual(compacted[2]["role"], "user")
+        # The obsolete first task is summarized instead of permanently pinned;
+        # the live objective and durable rules are injected separately.
+        self.assertIn("anchored compact summary", compacted[0]["content"])
+        self.assertEqual(compacted[1]["role"], "user")
         self.assertLess(result["after_messages"], result["messages"])
 
     def test_manual_compaction_is_noop_for_short_context(self):

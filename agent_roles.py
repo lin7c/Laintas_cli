@@ -380,12 +380,9 @@ def get_role_system_prompt(name: str) -> str:
     parts = [role.system_prompt]
     if role.output_format:
         parts.append(f"\n## Required Output Format\n{role.output_format}")
-    if role.confidence_threshold > 0:
-        parts.append(
-            f"\n## Confidence Threshold\n"
-            f"Only report findings with confidence >= {role.confidence_threshold}/100. "
-            f"Quality over quantity — do not report low-confidence issues."
-        )
+    # Confidence filtering is injected once by agent_loop so roles that do not
+    # spell out a threshold in their prose receive the same authoritative rule
+    # without duplicating it for reviewer roles.
     return "\n".join(parts)
 
 

@@ -7,7 +7,7 @@ agent roles.
 
 Workflows are activated via `/workflow start <name> "description"` and drive
 the agent loop through sequential phases. Phase transitions happen when:
-  - The AI signals done=true with a phase summary
+  - The AI calls workflow_phase_complete with a phase summary
   - The user confirms (for phases with requires_user_input=True)
   - The engine auto-advances (for phases with exit_condition="auto")
 
@@ -98,7 +98,7 @@ def _feature_dev_phases() -> list[WorkflowPhase]:
                 "- What problem is being solved\n"
                 "- What the feature should do\n"
                 "- Any constraints or requirements\n"
-                "When ready, set done=true and provide a clear task summary."
+                "When ready, call workflow_phase_complete with a clear task summary."
             ),
             allowed_tools=list(_READ_ONLY_PHASE_TOOLS),
             exit_condition="done_signal",
@@ -114,7 +114,7 @@ def _feature_dev_phases() -> list[WorkflowPhase]:
                 "- Architecture layers and module boundaries\n"
                 "- Key files and entry points\n"
                 "Consider spawning explorer sub-agents for parallel exploration.\n"
-                "When ready, set done=true with a summary of findings and key files."
+                "When ready, call workflow_phase_complete with findings and key files."
             ),
             allowed_tools=[
                 "fs.read", "fs.ls", "fs.grep", "fs.glob",
@@ -133,7 +133,7 @@ def _feature_dev_phases() -> list[WorkflowPhase]:
                 "Review findings and identify all ambiguities, edge cases, and "
                 "underspecified behaviors. Present specific questions to the user.\n"
                 "**DO NOT proceed to design until all questions are answered.**\n"
-                "Wait for user responses, then set done=true with clarified requirements."
+                "Wait for user responses; this gated phase advances only through explicit user approval."
             ),
             requires_user_input=True,
             allowed_tools=list(_READ_ONLY_PHASE_TOOLS),
@@ -151,7 +151,7 @@ def _feature_dev_phases() -> list[WorkflowPhase]:
                 "- Build sequence (phased implementation steps)\n"
                 "Consider spawning architect sub-agents for different approaches.\n"
                 "Present your design to the user and wait for approval.\n"
-                "Set done=true when architecture is approved."
+                "This gated phase advances only after explicit user approval."
             ),
             allowed_tools=[
                 "fs.read", "fs.ls", "fs.grep", "fs.glob",
@@ -174,7 +174,7 @@ def _feature_dev_phases() -> list[WorkflowPhase]:
                 "- Follow codebase conventions strictly\n"
                 "- Write clean, well-structured code\n"
                 "- Update task progress as you work\n"
-                "Set done=true when implementation is complete."
+                "Call workflow_phase_complete when implementation is complete."
             ),
             exit_condition="done_signal",
             max_loops_override=50,  # allow more loops for implementation
@@ -189,7 +189,7 @@ def _feature_dev_phases() -> list[WorkflowPhase]:
                 "- Check for bugs, style compliance, silent failures\n"
                 "- Consolidate findings and identify high-priority issues\n"
                 "- Present findings to the user\n"
-                "Set done=true with a review summary."
+                "Call workflow_phase_complete with a review summary."
             ),
             allowed_tools=[
                 "fs.read", "fs.ls", "fs.grep", "fs.glob",
@@ -210,7 +210,7 @@ def _feature_dev_phases() -> list[WorkflowPhase]:
                 "- Key decisions made\n"
                 "- Files modified (list all)\n"
                 "- Suggested next steps\n"
-                "Set done=true with the complete summary."
+                "Call workflow_phase_complete with the complete summary."
             ),
             exit_condition="done_signal",
         ),
@@ -228,7 +228,7 @@ def _bug_fix_phases() -> list[WorkflowPhase]:
                 "- Read error messages and stack traces\n"
                 "- Trace the failing code path\n"
                 "- Identify the root cause hypothesis\n"
-                "Set done=true with bug description and root cause hypothesis."
+                "Call workflow_phase_complete with the bug description and root-cause hypothesis."
             ),
             allowed_tools=list(_READ_ONLY_PHASE_TOOLS),
             exit_condition="done_signal",
@@ -242,7 +242,7 @@ def _bug_fix_phases() -> list[WorkflowPhase]:
                 "- Read all relevant code paths\n"
                 "- Check for related issues (similar patterns elsewhere)\n"
                 "- Formulate a precise fix strategy\n"
-                "Set done=true with exact root cause and fix plan."
+                "Call workflow_phase_complete with the exact root cause and fix plan."
             ),
             allowed_tools=[
                 "fs.read", "fs.ls", "fs.grep", "fs.glob",
@@ -260,7 +260,7 @@ def _bug_fix_phases() -> list[WorkflowPhase]:
                 "- Apply minimal, targeted changes\n"
                 "- Follow existing code patterns\n"
                 "- Add regression test if applicable\n"
-                "Set done=true when fix is applied."
+                "Call workflow_phase_complete when the fix is applied."
             ),
             exit_condition="done_signal",
         ),
@@ -273,7 +273,7 @@ def _bug_fix_phases() -> list[WorkflowPhase]:
                 "- Re-run the failing scenario\n"
                 "- Check for regressions\n"
                 "- Review the fix for edge cases\n"
-                "Set done=true with verification results."
+                "Call workflow_phase_complete with verification results."
             ),
             exit_condition="done_signal",
         ),
@@ -291,7 +291,7 @@ def _code_review_phases() -> list[WorkflowPhase]:
                 "- Read all modified files\n"
                 "- Understand the intent of changes\n"
                 "- Spawn specialized reviewers in parallel\n"
-                "Set done=true when analysis is complete."
+                "Call workflow_phase_complete when analysis is complete."
             ),
             allowed_tools=[
                 "fs.read", "fs.ls", "fs.grep", "fs.glob",
@@ -310,7 +310,7 @@ def _code_review_phases() -> list[WorkflowPhase]:
                 "- Group by severity (Critical / Important / Minor)\n"
                 "- Include confidence scores\n"
                 "- Provide specific fix suggestions\n"
-                "Set done=true with the report."
+                "Call workflow_phase_complete with the report."
             ),
             exit_condition="done_signal",
         ),
@@ -322,7 +322,7 @@ def _code_review_phases() -> list[WorkflowPhase]:
                 "Provide actionable improvement suggestions:\n"
                 "- Prioritized list of recommended changes\n"
                 "- Optional: spawn simplifier agent for code improvements\n"
-                "Set done=true with final suggestions."
+                "Call workflow_phase_complete with final suggestions."
             ),
             exit_condition="done_signal",
         ),
@@ -645,7 +645,9 @@ def is_tool_allowed_in_workflow(tool_name: str) -> bool:
 
     Returns True if no active workflow or the phase has no tool restrictions.
     """
-    if tool_name in {"task.complete", "task.continue", "session.continue"}:
+    if tool_name in {"task.complete", "task.continue", "session.continue",
+                     "workflow.phase_complete", "rule.list",
+                     "rule.mark_satisfied"}:
         return True
     wf = get_active_workflow()
     if wf is None or wf.completed:

@@ -631,6 +631,13 @@ def apply_candidate(cid: Optional[str] = None,
                     "no patch to apply. Review its rationale instead."
                 )
             return False, "Candidate has no patch block."
+        try:
+            import prompt_lab
+            validation_errors = prompt_lab.validate_patch_content(patch)
+        except Exception as exc:
+            return False, f"Could not validate prompt patch safely: {exc}"
+        if validation_errors:
+            return False, "Unsafe or incompatible prompt patch: " + "; ".join(validation_errors)
 
         # Drift detection
         base_sha = cand.get("base_prop_sha")
