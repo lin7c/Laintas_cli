@@ -11,6 +11,7 @@ Usage:
 """
 
 import asyncio
+import copy
 import io
 import os
 import re
@@ -112,14 +113,61 @@ from rich.console import Console, Group
 from rich.panel import Panel
 from rich.padding import Padding
 from rich.markdown import Markdown as RichMarkdown
-from rich.table import Table
+from rich.table import Table as RichTable
 from rich.live import Live
 from rich.spinner import Spinner
 from rich.text import Text
 from rich.theme import Theme
 from rich.style import Style as RichStyle
+from rich.markup import escape
 from rich.syntax import SyntaxTheme
 from rich import box
+
+
+class InlineSection:
+    """Copy-friendly replacement for bordered Rich panels.
+
+    Claude-style terminal output keeps headings and content in normal
+    scrollback. Box borders are visually noisy and become unwanted text when
+    users copy a login URL, approval details, or diagnostic output.
+    """
+
+    def __init__(self, renderable="", *, title=None, **_kwargs):
+        self.renderable = renderable
+        self.title = str(title) if title else ""
+
+    def __rich_console__(self, _console, _options):
+        if self.title:
+            try:
+                title = Text.from_markup(self.title)
+                title.stylize("bold accent")
+            except Exception:
+                title = Text(self.title, style="bold accent")
+            yield title
+        if self.title and self.renderable:
+            yield Text("")
+        if isinstance(self.renderable, str):
+            try:
+                yield Text.from_markup(self.renderable)
+            except Exception:
+                yield Text(self.renderable)
+        elif self.renderable:
+            yield self.renderable
+
+
+# Keep existing call sites and extension compatibility while making every
+# former Panel copy-friendly. Constructor options such as border_style and
+# expand remain accepted and intentionally ignored by InlineSection.
+Panel = InlineSection
+
+
+def Table(*args, **kwargs):
+    """Create copy-friendly, borderless tabular output."""
+    kwargs["box"] = None
+    kwargs["show_lines"] = False
+    kwargs.setdefault("show_edge", False)
+    kwargs.setdefault("pad_edge", False)
+    return RichTable(*args, **kwargs)
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.application import Application
@@ -683,7 +731,14 @@ def select_dialog(
         if _auto_seconds is not None:
             app.create_background_task(_auto_confirm())
 
-    return app.run(pre_run=_pre_run)
+    # A selector is a cancellable UI component.  prompt_toolkit can still
+    # surface KeyboardInterrupt when the terminal is interrupted while the
+    # application is starting/stopping; convert that into the same ordinary
+    # cancel result as Esc/q instead of leaking a traceback to the user.
+    try:
+        return app.run(pre_run=_pre_run)
+    except (KeyboardInterrupt, EOFError):
+        return (None, -1) if act_keys else None
 
 
 def choose_record(records, *, title: str, label: Callable,
@@ -2234,6 +2289,7 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
             ("update", "Download, install, and restart on the latest version"),
         )),
     CommandSpec("/name", "Show or set the current agent name", "Agents & Terminals", "/name [new-name]"),
+    CommandSpec("/focus", "Focus a local Agent for the next input", "Agents & Terminals", "/focus [agent-id|next]", subcommands=("next",)),
     CommandSpec(
         "/hire", "Hire an undeployed employee; does not start an assignment",
         "Agents & Terminals",
@@ -2765,9 +2821,243 @@ _status_cache: dict = {
     "terminal": "term0",
     "deployment": "temporary",
     "run_input_state": "idle",
+    "running_agents": 0,
     "detail": False,
     "last_thinking_time": 0.0,
 }
+
+
+class _AgentConsoleProxy:
+    """Prefix background Agent output without changing Rich's shared Console."""
+
+    def __init__(self, base, label: str):
+        self._base = base
+        self._label = label
+
+    def print(self, *args, **kwargs):
+        if args:
+            args = (f"[agent]{escape(self._label)}[/agent]", *args)
+        else:
+            args = (f"[agent]{escape(self._label)}[/agent]",)
+        return self._base.print(*args, **kwargs)
+
+    def status(self, *args, **kwargs):
+        if args:
+            args = (f"[agent]{escape(self._label)}[/agent] {args[0]}", *args[1:])
+        return self._base.status(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._base, name)
+
+
+class AgentFocusManager:
+    """Owns the local multi-Agent input focus and concurrent AI runs.
+
+    The manager deliberately keeps focus separate from execution status. A
+    running Agent never receives new foreground input; the router selects a
+    same-terminal ready/idle Agent or hides the prompt until one is available.
+    """
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._changed = threading.Event()
+        self._runs: dict[str, threading.Thread] = {}
+        self._results: dict[str, dict] = {}
+        self._focused_id = "primary"
+        self._primary_state = None
+        self._primary_history = None
+        self._session = {}
+        self._agent_registry = None
+        self._deps = None
+        self._on_finished = None
+
+    def configure(self, *, primary_state, primary_history, session,
+                  agent_registry, deps, on_finished=None):
+        with self._lock:
+            self._primary_state = primary_state
+            self._primary_history = primary_history
+            self._session = session or {}
+            self._agent_registry = agent_registry
+            self._deps = deps
+            self._on_finished = on_finished
+            current = get_current_agent()
+            if current is not None and not self._focused_id:
+                self._focused_id = current.id
+        self._changed.set()
+
+    def _same_scope(self, agent) -> bool:
+        focused = get_agent(self._focused_id)
+        scope = agent_scope_terminal(focused) if focused else "term0"
+        return agent_scope_terminal(agent) == scope
+
+    def agents(self) -> list:
+        return [a for a in get_all_agents() if self._same_scope(a)]
+
+    def focused(self):
+        with self._lock:
+            focused_id = self._focused_id
+        return get_agent(focused_id)
+
+    def running(self) -> list:
+        with self._lock:
+            ids = set(self._runs)
+        return [a for a in self.agents() if a.id in ids or a.status in {"running", "waiting", "blocked", "aborting"}]
+
+    def _candidate(self, *, exclude: str = ""):
+        candidates = [a for a in self.agents()
+                      if a.id != exclude and a.status in {"idle", "ready", "error"}
+                      and a.id not in self._runs]
+        if not candidates:
+            return None
+        # Keep primary first for the initial prompt, then preserve registry order.
+        candidates.sort(key=lambda a: (0 if a.id == "primary" else 1, a.id))
+        return candidates[0]
+
+    def focus(self, agent_id: str, *, announce: bool = True) -> bool:
+        agent_id = str(agent_id or "").strip()
+        agent = get_agent(agent_id)
+        if agent is None or not self._same_scope(agent):
+            return False
+        with self._lock:
+            self._focused_id = agent.id
+        _sync_status_context()
+        self._changed.set()
+        if announce:
+            console.print(
+                f"[accent.dim]↳[/accent.dim] Focus: [agent]{escape(agent.name or agent.id)}[/agent]")
+        return True
+
+    def focus_next(self) -> Optional[object]:
+        available = [a for a in self.agents()
+                     if a.status in {"idle", "ready", "error"} and a.id not in self._runs]
+        if not available:
+            return None
+        with self._lock:
+            ids = [a.id for a in available]
+            current = ids.index(self._focused_id) if self._focused_id in ids else -1
+            target = available[(current + 1) % len(available)]
+            self._focused_id = target.id
+        _sync_status_context()
+        self._changed.set()
+        return target
+
+    def input_target(self):
+        focused = self.focused()
+        if focused is not None and focused.id not in self._runs and focused.status in {"idle", "ready", "error"}:
+            return focused
+        target = self._candidate(exclude=focused.id if focused else "")
+        if target is not None:
+            self.focus(target.id, announce=bool(focused and focused.id != target.id))
+        return target
+
+    def wait_for_change(self, timeout: float = 0.5):
+        self._changed.wait(timeout)
+        self._changed.clear()
+
+    def interrupt_focused(self) -> bool:
+        """Request a cooperative stop for the focused running Agent."""
+        focused = self.focused()
+        if focused is None or focused.id not in self._runs:
+            running = self.running()
+            focused = running[0] if running else None
+        if focused is None:
+            return False
+        focused.abort_event.set()
+        focused.status = "aborting"
+        self._changed.set()
+        return True
+
+    def submit(self, text: str, *, target_id: str = "") -> tuple[bool, str]:
+        with self._lock:
+            target = get_agent(target_id or self._focused_id)
+            if target is None:
+                return False, "Agent not found"
+            if target.id in self._runs or target.status in {"running", "waiting", "blocked"}:
+                return False, f"Agent '{target.name or target.id}' is busy"
+            if target.id == "primary":
+                state, history = self._primary_state, self._primary_history
+            else:
+                state, history = target.state, target.chat_history
+            if state is None or history is None:
+                return False, "Agent state is not initialized"
+            history.append({"role": "user", "content": text, "input_kind": "prompt"})
+            target.status = "running"
+            target.abort_event.clear()
+            target.error = ""
+            target.last_reply = ""
+            self._runs[target.id] = None
+            deps = copy.copy(self._deps)
+            label = target.name or target.id
+            deps.console = _AgentConsoleProxy(console, label)
+            deps.display_command_output = lambda *a, **kw: None
+            deps.display_sub_terminal_preview = lambda *a, **kw: None
+            deps.display_file_diff = lambda *a, **kw: None
+            session = self._session
+
+        if self.focused() and self.focused().id == target.id:
+            next_agent = self._candidate(exclude=target.id)
+            if next_agent is not None:
+                self.focus(next_agent.id, announce=True)
+        self._changed.set()
+
+        def _worker():
+            response = None
+            try:
+                def _events(events):
+                    if self._agent_registry and self._agent_registry.agent_id:
+                        self._agent_registry._push_events([
+                            {**event, "agent_id": target.id} for event in events])
+                response = run_agent_loop(
+                    deps, text, session, state, history,
+                    events_cb=_events,
+                    existing_session=None,
+                    depth=target.depth,
+                    agent_id=target.id,
+                    interrupt_event=target.abort_event,
+                    message_queue=target.message_queue,
+                )
+                returned_state = response.get("state") or state
+                state.clear()
+                state.update(prepare_state_for_repl(returned_state))
+                target.state = state
+                target.chat_history = history
+                target.last_reply = response.get("msg", "") or ""
+                target.status = "ready" if response.get("success") else "error"
+                target.error = "" if response.get("success") else str(response.get("exit_reason") or "Agent task failed")
+            except Exception as exc:
+                target.status = "error"
+                target.error = f"{type(exc).__name__}: {exc}"
+                response = {"success": False, "msg": "", "state": state, "error": target.error}
+            finally:
+                with self._lock:
+                    self._runs.pop(target.id, None)
+                    self._results[target.id] = response or {"success": False, "state": state}
+                self._changed.set()
+                if self._on_finished:
+                    try:
+                        self._on_finished(target, response or {})
+                    except Exception as exc:
+                        add_debug_log(DebugEntry(
+                            timestamp=datetime.now().isoformat(timespec="seconds"),
+                            reply=f"agent focus callback failed: {exc}",
+                            error=True,
+                        ))
+                if self.input_target() is not None:
+                    console.print(
+                        f"[accent.dim]↳[/accent.dim] [agent]{escape(label)}[/agent] is ready")
+
+        thread = threading.Thread(target=_worker, daemon=True, name=f"agent-run-{target.id}")
+        with self._lock:
+            self._runs[target.id] = thread
+        thread.start()
+        return True, target.id
+
+    def result(self, agent_id: str):
+        with self._lock:
+            return self._results.get(agent_id)
+
+
+_agent_focus_manager = AgentFocusManager()
 
 
 def _update_status_cache(**kwargs) -> None:
@@ -2786,7 +3076,9 @@ def _terminal_width() -> int:
 def _sync_status_context() -> None:
     """Refresh prompt context once per prompt, never on every keystroke."""
     try:
-        agent = get_current_agent()
+        agent = (_agent_focus_manager.focused()
+                 if _agent_focus_manager._deps is not None
+                 else get_current_agent())
         if agent is None:
             return
         deployment = agent_deployment_terminal(agent)
@@ -2808,6 +3100,8 @@ def _sync_status_context() -> None:
             model=model or "default",
             model_source=model_source,
             detail=bool(get_runtime_config("detail")),
+            running_agents=len(_agent_focus_manager.running())
+            if _agent_focus_manager._deps is not None else 0,
         )
     except Exception:
         return
@@ -2854,14 +3148,20 @@ def _render_rprompt():
         _mode_label += "*"
     _mode_cls = "rprompt-mode-plan" if _is_plan else "rprompt-mode-act"
     _model = _status_cache.get("model", "") or "default"
-    result = [("class:" + _mode_cls, _mode_label)]
     width = _terminal_width()
+    _agent_name = _status_cache.get("agent", "") or "primary"
     if width >= 62:
+        result = [("class:rprompt-context", _agent_name),
+                  ("class:rprompt-sep", " · "),
+                  ("class:" + _mode_cls, _mode_label)]
+    else:
+        result = [("class:" + _mode_cls, _mode_label)]
+    if width >= 78:
         result.extend([
             ("class:rprompt-sep", " · "),
             ("class:rprompt-model", _model),
         ])
-    if width >= 100:
+    if width >= 108:
         agent = _status_cache.get("agent", "")
         terminal = _status_cache.get("terminal", "")
         if agent and terminal:
@@ -2896,6 +3196,9 @@ def _render_bottom_toolbar():
         terminal = _status_cache.get("terminal", "term0")
         deployment = _status_cache.get("deployment", "temporary")
         context = f"{terminal} · {deployment}"
+        running_count = int(_status_cache.get("running_agents", 0) or 0)
+        if running_count:
+            context += f" · {running_count} running"
         if _status_cache.get("detail"):
             context += " · detail"
         result[:0] = [
@@ -3601,7 +3904,97 @@ def login_interactive() -> Optional[dict]:
     return None
 
 
+def _login_via_device() -> Optional[dict]:
+    """Authenticate through a browser on any device using device polling."""
+    try:
+        started = requests.post(
+            f"{ACCOUNTS_BASE}/api/auth/cli-device/start",
+            json={}, timeout=10, allow_redirects=False,
+        )
+        if started.status_code != 200:
+            console.print(f"[red]Could not start browser login (HTTP {started.status_code}).[/red]")
+            return None
+        payload = started.json()
+        device_id = str(payload.get("deviceId") or "")
+        device_secret = str(payload.get("deviceSecret") or "")
+        login_url = str(payload.get("verificationUri") or "")
+        if not device_id or not device_secret or not login_url:
+            console.print("[red]Browser login returned an incomplete device authorization.[/red]")
+            return None
+        expires = max(30, min(int(payload.get("expiresIn", 600)), 900))
+        interval = max(1.0, min(float(payload.get("interval", 2)), 10.0))
+    except (requests.RequestException, ValueError, TypeError) as exc:
+        console.print(f"[red]Cannot start browser login: {exc}[/red]")
+        return None
+
+    console.print(
+        "[bold]Open this URL in any browser to sign in:[/bold]\n"
+        f"[link={login_url}]{login_url}[/link]\n"
+        f"[dim]Waiting for approval (expires in {expires // 60} minutes)…[/dim]"
+    )
+    try:
+        webbrowser.open(login_url)
+    except Exception:
+        # The URL is already printed; headless/SSH environments can paste it
+        # into a browser without requiring a local GUI.
+        pass
+
+    deadline = time.monotonic() + expires
+    while time.monotonic() < deadline:
+        try:
+            response = requests.post(
+                f"{ACCOUNTS_BASE}/api/auth/cli-device/poll",
+                json={"deviceId": device_id, "deviceSecret": device_secret},
+                timeout=10, allow_redirects=False,
+            )
+            if response.status_code == 200:
+                data = response.json()
+                if data.get("status") == "approved":
+                    cookie = str(data.get("cookie") or "")
+                    cookie_pair = cookie.split(";", 1)[0]
+                    if "=" not in cookie_pair or not data.get("token"):
+                        console.print("[red]Browser login returned an incomplete session.[/red]")
+                        return None
+                    name, value = cookie_pair.split("=", 1)
+                    session = {
+                        "token": data["token"],
+                        "cookies": {name: value},
+                        "headers": {},
+                        "userId": (data.get("user") or {}).get("id", ""),
+                        "userName": (data.get("user") or {}).get("name", ""),
+                        "userEmail": (data.get("user") or {}).get("email", ""),
+                    }
+                    if not verify_session(session):
+                        console.print("[red]The new CLI session could not be verified.[/red]")
+                        return None
+                    save_session(session)
+                    display = session.get("userEmail") or session.get("userName") or "Laintas user"
+                    console.print(f"[green]Logged in as {display}[/green]")
+                    return session
+            elif response.status_code in (400, 401, 404):
+                console.print("[yellow]Browser login expired or was cancelled.[/yellow]")
+                return None
+        except (requests.RequestException, ValueError):
+            # A transient network failure should not invalidate a live device
+            # authorization; retry until the server-side expiry.
+            pass
+        time.sleep(interval)
+    console.print("[yellow]Browser login timed out.[/yellow]")
+    return None
+
+
 def login_via_browser() -> Optional[dict]:
+    # Device authorization works when CLI and browser are on different hosts.
+    # The legacy localhost implementation remains below for source-history
+    # compatibility, but is intentionally not selected: it cannot provide the
+    # cross-terminal guarantee this login path requires.
+    device_session = _login_via_device()
+    if device_session is not None:
+        return device_session
+    return None
+
+
+def _login_via_browser_local() -> Optional[dict]:
     """Authenticate through accounts.laintas.com using OAuth Code + PKCE."""
     # Find a free port
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -3679,8 +4072,15 @@ def login_via_browser() -> Optional[dict]:
 
     try:
         server.handle_request()
-    except Exception:
-        pass
+    except (KeyboardInterrupt, EOFError):
+        # Ctrl+C while waiting for the browser callback is a cancellation of
+        # login, not a process-level failure.  In particular, KeyboardInterrupt
+        # is a BaseException and is not caught by ``except Exception``.
+        result["error"] = "Login cancelled"
+    except OSError:
+        # The callback server may be closed by a concurrent shutdown/cleanup.
+        # Treat that as an unavailable login attempt and return to the REPL.
+        result["error"] = "Login cancelled"
     finally:
         server.server_close()
 
@@ -3759,7 +4159,7 @@ def login_via_browser() -> Optional[dict]:
 
 
 def ensure_auth() -> Optional[dict]:
-    """Ensure the user is authenticated. Returns session dict, None, or exits.
+    """Ensure the user is authenticated, returning a session or ``None``.
 
     Flow: cached session → return if valid.
           No cache → ask for login method → browser or terminal.
@@ -3779,20 +4179,32 @@ def ensure_auth() -> Optional[dict]:
             clear_session()
             return None
 
-    # 2. No cached account — browser OAuth + PKCE is the only login path.
-    for _ in range(3):
-        choice = choose_login_method()
-        if choice is None:
+    # 2. No cached account — perform one browser/device authorization attempt.
+    # Repeating a two-minute OAuth wait automatically is confusing and can
+    # open multiple browser tabs.  Users can explicitly retry with /login.
+    choice = choose_login_method()
+    if choice is None:
+        console.print("[dim]Login cancelled.[/dim]")
+        return None
+    if choice == "remote":
+        try:
+            session = login_via_browser()
+        except (KeyboardInterrupt, EOFError):
+            # A cancellation from browser launch/network setup is still a
+            # normal login cancellation; it must not escape into main().
             console.print("[dim]Login cancelled.[/dim]")
             return None
-        if choice == "remote":
-            session = login_via_browser()
-            if session:
-                return session
-            console.print("[yellow]Remote login failed. Retrying browser OAuth is required.[/yellow]")
+        if session:
+            return session
+        console.print("[yellow]Remote login failed. Run /login to retry.[/yellow]")
 
-    console.print("[red]Authentication failed. Exiting.[/red]")
-    sys.exit(1)
+    # Authentication is optional at startup (for example when the browser is
+    # unavailable or the user presses Ctrl+C).  Keep the CLI alive so the user
+    # can retry with /login or use a local backend instead of seeing an abrupt
+    # process exit.
+    console.print("[yellow]Authentication unavailable. Continuing without login; "
+                  "run /login to retry.[/yellow]")
+    return None
 
 
 # ── CLI Prompt Template (.laintas/cli.prop) ──────────────────────────────
@@ -12189,7 +12601,9 @@ def _cmd_hire(parts: list, session: dict) -> bool:
 def _cmd_agents(parts: list) -> None:
     if len(parts) == 1:
         agents = get_all_agents()
-        current = get_current_agent()
+        current = (_agent_focus_manager.focused()
+                   if _agent_focus_manager._deps is not None
+                   else get_current_agent())
         if not agents:
             console.print("[dim]No agents.[/dim]")
         else:
@@ -12250,6 +12664,33 @@ def _cmd_agents(parts: list) -> None:
                 title=f"Employee: {agent.name}", border_style="cyan"))
     else:
         console.print("[yellow]Usage: /agents [tree|agent-id][/yellow]")
+
+
+def _cmd_focus(parts: list) -> None:
+    """Select the Agent that receives the next foreground input."""
+    if _agent_focus_manager._deps is None:
+        console.print("[yellow]Multi-Agent focus is not initialized yet.[/yellow]")
+        return
+    target = parts[1].strip() if len(parts) > 1 else ""
+    if len(parts) > 2 or target.lower() == "next":
+        if len(parts) > 2:
+            console.print("[yellow]Usage: /focus [agent-id|next][/yellow]")
+            return
+        focused = _agent_focus_manager.focus_next()
+        if focused is None:
+            console.print("[yellow]No idle or ready Agent is available.[/yellow]")
+        return
+    if not target:
+        focused = _agent_focus_manager.focused()
+        if focused is None:
+            console.print("[yellow]No focused Agent.[/yellow]")
+        else:
+            console.print(
+                f"[muted]Focused Agent: [agent]{escape(focused.name or focused.id)}[/agent][/muted]")
+        return
+    if not _agent_focus_manager.focus(target):
+        console.print(
+            f"[error]Agent '{escape(target)}' is not available in this terminal.[/error]")
 
 
 
@@ -13445,6 +13886,9 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
     elif action == "/name":
         _cmd_name(raw_args, session, agent_registry)
 
+    elif action == "/focus":
+        _cmd_focus(parts)
+
     elif action == "/memory":
         _cmd_memory(parts)
 
@@ -13971,7 +14415,21 @@ def _get_input(cwd: str):
             except queue.Empty:
                 pass  # spurious wakeup — fall through to prompt
 
+    # When every Agent in the current terminal is busy, do not expose a line
+    # that could be routed nondeterministically. A worker completion wakes the
+    # condition and the next prompt selects a ready Agent.
+    if _agent_focus_manager._deps is not None and _agent_focus_manager.input_target() is None:
+        _agent_focus_manager.wait_for_change(timeout=0.5)
+        return ""
     return pt_prompt(cwd)
+
+
+def _parse_agent_target(text: str) -> tuple[str, str]:
+    """Parse an explicit ``@agent-id message`` route without altering prose."""
+    match = re.match(r"^@([A-Za-z0-9_.:-]+)(?:\s+|$)(.*)$", str(text or ""), re.S)
+    if not match:
+        return "", str(text or "")
+    return match.group(1), match.group(2).strip()
 
 
 # ── Background stdin reader for supplementary input during agent loop ──
@@ -14029,14 +14487,11 @@ def _bg_reader_prompt_mode(target_queue: queue.Queue):
 
     @bindings.add(Keys.Escape)
     def _escape(event):
-        if event.app.current_buffer.text:
-            event.app.current_buffer.reset()
-            _set_run_input_state("input_active")
-        else:
-            try:
-                signal.raise_signal(signal.SIGINT)
-            except (ValueError, OSError):
-                pass
+        # Esc cancels the current supplementary draft only.  It must never
+        # raise SIGINT: doing so used to terminate the whole CLI when the
+        # prompt was empty (and could interrupt unrelated login/IO waits).
+        event.app.current_buffer.reset()
+        _set_run_input_state("input_active")
 
     @bindings.add(Keys.ControlC)
     def _control_c(_event):
@@ -14153,11 +14608,11 @@ def _bg_reader_cbreak_mode(target_queue: queue.Queue):
                     except OSError:
                         pass
                     continue
+                # A bare Esc is a local cancel/clear action.  Ctrl+C remains
+                # the explicit interrupt gesture and follows the normal
+                # soft/hard escalation path through the signal handler.
                 _clear_visible_line()
-                try:
-                    signal.raise_signal(signal.SIGINT)
-                except (ValueError, OSError):
-                    pass
+                _set_run_input_state("input_active")
                 continue
 
             if chunk in (b'\r', b'\n'):
@@ -15022,6 +15477,43 @@ def main():
         primary.parent_terminal = None
         set_current_agent_id("primary")
 
+    def _on_focus_agent_finished(agent_info, result):
+        """Persist primary state and refresh the visible focus after a worker exits."""
+        try:
+            shutdown.interrupting = False
+        except (NameError, UnboundLocalError):
+            pass
+        _update_status_cache(
+            agent=agent_info.name or agent_info.id,
+            running_agents=len(_agent_focus_manager.running()),
+        )
+        if agent_info.id == "primary" and args.depth == 0:
+            try:
+                handle_meta_command._last_agent_state = agent_state
+                handle_meta_command._last_chat_history = chat_history
+                if current_live_session:
+                    session_store.sync_runtime(
+                        current_live_session, agent_state, chat_history,
+                        cwd=_session_start_cwd,
+                        objective=agent_state.get("objective"),
+                        tasks=_active_task_export(),
+                    )
+                save_resume_state(agent_state, chat_history, _session_start_cwd)
+            except Exception as exc:
+                add_debug_log(DebugEntry(
+                    timestamp=datetime.now().isoformat(timespec="seconds"),
+                    reply=f"agent state persistence failed: {exc}", error=True))
+
+    _agent_focus_manager.configure(
+        primary_state=agent_state,
+        primary_history=chat_history,
+        session=session,
+        agent_registry=agent_registry,
+        deps=get_loop_deps(),
+        on_finished=_on_focus_agent_finished,
+    )
+    _sync_status_context()
+
     # Load user skills from ~/.laintas/skills. Failures are surfaced
     # but never block startup.
     try:
@@ -15052,6 +15544,15 @@ def main():
 
     # Setup graceful shutdown
     def shutdown(signum=None, frame=None):
+        # While background Agent runs exist, the first Ctrl+C is a cooperative
+        # Agent interrupt. A second Ctrl+C falls through to process shutdown.
+        if _agent_focus_manager.running() and not getattr(shutdown, "interrupting", False):
+            shutdown.interrupting = True
+            if _agent_focus_manager.interrupt_focused():
+                console.print(
+                    "\n[yellow]Interrupt requested for the focused Agent. "
+                    "Press Ctrl+C again to exit.[/yellow]")
+                return
         if args.depth > 0:
             # Sub-terminal CLI: its console may already be a dead PTY (parent
             # closed it / tmux window killed), where console.print and the
@@ -15443,6 +15944,54 @@ def main():
             continue
 
         # ── Normal input routing ───────────────────────────────────
+        # Natural-language work is submitted asynchronously to the focused
+        # Agent. Shell commands retain the synchronous terminal path below.
+        explicit_agent_id, routed_input = _parse_agent_target(user_input)
+        import plan_mode as _focus_pm
+        if (not is_system_command(routed_input)
+                and _agent_focus_manager._deps is not None
+                and not _focus_pm.is_plan_mode()):
+            if (_active_backend.sends_laintas_credentials
+                    and not session.get("userId")):
+                console.print("[yellow]Not authenticated. Use /login first.[/yellow]")
+                if injected_done is not None:
+                    injected_done.set()
+                continue
+            target = (get_agent(explicit_agent_id)
+                      if explicit_agent_id else _agent_focus_manager.input_target())
+            if explicit_agent_id and (target is None or target not in _agent_focus_manager.agents()):
+                console.print(
+                    f"[error]Agent '{escape(explicit_agent_id)}' is not available in this terminal.[/error]")
+                if injected_done is not None:
+                    injected_done.set()
+                continue
+            if target is None:
+                console.print("[muted]All Agents are busy; input is paused until one is ready.[/muted]")
+                if injected_done is not None:
+                    injected_done.set()
+                continue
+            if routed_input.strip() == "":
+                console.print("[yellow]Message cannot be empty.[/yellow]")
+                if injected_done is not None:
+                    injected_done.set()
+                continue
+            if _focus_pm.is_pending_task():
+                _focus_pm.enter_plan_mode(routed_input)
+            ok, detail = _agent_focus_manager.submit(
+                routed_input, target_id=target.id)
+            if not ok:
+                console.print(f"[error]{escape(detail)}[/error]")
+            else:
+                console.print(
+                    f"[accent.dim]↳[/accent.dim] Sent to [agent]{escape(target.name or target.id)}[/agent]")
+                if agent_registry.agent_id:
+                    agent_registry._push_events([{
+                        "type": "user", "content": routed_input,
+                        "agent_id": target.id,
+                    }])
+            if injected_done is not None:
+                injected_done.set()
+            continue
 
         _system_input = is_system_command(user_input)
         # Preserve input semantics in the resume record. Shell commands are
@@ -15716,4 +16265,13 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # Final safety net for cancellation paths that occur below an interactive
+    # component (socket/select/third-party terminal code).  All expected
+    # cancellation points handle KeyboardInterrupt locally; this guard keeps
+    # an unexpected one from dumping a Python traceback into the TUI.  Explicit
+    # SystemExit calls (for /exit, --execute, or fatal startup modes) are left
+    # untouched.
+    try:
+        main()
+    except KeyboardInterrupt:
+        console.print("\n[dim]Cancelled. Returning to the terminal.[/dim]")

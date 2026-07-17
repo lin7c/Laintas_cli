@@ -1,4 +1,6 @@
 import io
+import queue
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -83,6 +85,69 @@ class ResponsiveTerminalChromeTests(unittest.TestCase):
         self.assertEqual(laintas_cli._status_cache["model"], "terminal-model")
         self.assertEqual(laintas_cli._status_cache["model_source"], "terminal")
         self.assertEqual(laintas_cli._status_cache["deployment"], "deployed")
+
+    def test_rprompt_places_agent_before_mode_on_medium_width(self):
+        laintas_cli._status_cache.update({
+            "agent": "agent1", "model": "glm-5.2", "terminal": "term0"})
+        with mock.patch.object(laintas_cli, "_terminal_width", return_value=80), \
+                mock.patch.object(laintas_cli.mode_manager, "get_active_mode",
+                                  return_value={"name": "act"}), \
+                mock.patch("plan_mode.is_plan_mode", return_value=False):
+            text = _text(laintas_cli._render_rprompt())
+        self.assertTrue(text.startswith("agent1 · ACT"))
+        self.assertIn("glm-5.2", text)
+
+    def test_agent_focus_manager_switches_and_hides_when_all_busy(self):
+        def make_agent(agent_id, status="idle"):
+            return SimpleNamespace(
+                id=agent_id, name=agent_id, role="primary" if agent_id == "primary" else "deployed",
+                status=status, state={}, chat_history=[], depth=0, error="",
+                last_reply="", abort_event=threading.Event(), message_queue=queue.Queue(),
+                home_terminal="term0", deployment_terminal="term0", stationed_terminal="term0",
+            )
+
+        primary = make_agent("primary")
+        agent2 = make_agent("agent2")
+        agents = {a.id: a for a in (primary, agent2)}
+        manager = laintas_cli.AgentFocusManager()
+        deps = laintas_cli.get_loop_deps()
+        done = threading.Event()
+
+        def fake_loop(*args, **kwargs):
+            done.wait(1)
+            return {"success": True, "msg": "done", "state": args[3]}
+
+        with mock.patch.object(laintas_cli, "get_agent", side_effect=agents.get), \
+                mock.patch.object(laintas_cli, "get_all_agents", return_value=list(agents.values())), \
+                mock.patch.object(laintas_cli, "run_agent_loop", side_effect=fake_loop):
+            manager.configure(
+                primary_state=primary.state, primary_history=primary.chat_history,
+                session={}, agent_registry=None, deps=deps)
+            ok, _ = manager.submit("inspect", target_id="primary")
+            self.assertTrue(ok)
+            self.assertEqual(manager.focused().id, "agent2")
+            agent2.status = "running"
+            self.assertIsNone(manager.input_target())
+            done.set()
+            worker = manager._runs["primary"]
+            worker.join(timeout=2)
+            self.assertEqual(primary.status, "ready")
+            self.assertEqual(manager.input_target().id, "primary")
+
+    def test_sections_and_tables_are_copy_friendly_without_borders(self):
+        output = io.StringIO()
+        c = Console(file=output, force_terminal=False, width=100)
+        c.print(laintas_cli.Panel("https://accounts.laintas.com/login", title="Laintas Auth"))
+        table = laintas_cli.Table(title="Models")
+        table.add_column("ID")
+        table.add_row("glm-5.2")
+        c.print(table)
+        rendered = output.getvalue()
+        self.assertIn("Laintas Auth", rendered)
+        self.assertIn("https://accounts.laintas.com/login", rendered)
+        self.assertIn("glm-5.2", rendered)
+        for border in ("╭", "╮", "╰", "╯", "┏", "┓", "┗", "┛"):
+            self.assertNotIn(border, rendered)
 
     def test_startup_banner_preserves_original_environment_summary(self):
         output = io.StringIO()
