@@ -164,7 +164,8 @@ class SlashRegistryTests(unittest.TestCase):
         self.assertIn("reviewer", [item.text for item in profile_completions])
         text = output.getvalue()
         self.assertIn("does not start an assignment", text)
-        self.assertIn("deploys it to the current terminal", text)
+        self.assertIn("It is not auto-deployed", text)
+        self.assertIn("private temporary terminal", text)
         self.assertIn("background Assignment", text)
         self.assertIn("isolated state/history", text)
 
@@ -438,6 +439,14 @@ class SlashRegistryTests(unittest.TestCase):
                     laintas_cli, "show_model_selector", return_value=models[0]), \
                 mock.patch.object(
                     laintas_cli.sys.stdin, "isatty", return_value=True):
+            agent_loop.close_all_terminals()
+            agent_loop.close_all_agents()
+            terminal_session = mock.Mock()
+            terminal_session.is_alive.return_value = True
+            agent_loop.register_terminal(
+                terminal_session, "/bin/sh", 0, name="term0")
+            primary = agent_loop.register_agent(name="primary", role="primary")
+            agent_loop.set_current_agent_id(primary.id)
             terminal_preferences.reset_cache()
             output = io.StringIO()
             old_console = laintas_cli.console
@@ -450,6 +459,8 @@ class SlashRegistryTests(unittest.TestCase):
             self.assertEqual(laintas_cli.get_selected_model(), "model-x")
             self.assertEqual(
                 laintas_cli.get_selected_provider(), "provider-a")
+            agent_loop.close_all_terminals()
+            agent_loop.close_all_agents()
 
     def test_explicit_model_clears_stale_provider(self):
         with tempfile.TemporaryDirectory() as tmp, \
@@ -457,6 +468,14 @@ class SlashRegistryTests(unittest.TestCase):
                     laintas_cli.paths, "SESSIONS_DIR", Path(tmp)), \
                 mock.patch.object(
                     laintas_cli.paths, "TERMINAL_ID", "model-direct"):
+            agent_loop.close_all_terminals()
+            agent_loop.close_all_agents()
+            terminal_session = mock.Mock()
+            terminal_session.is_alive.return_value = True
+            agent_loop.register_terminal(
+                terminal_session, "/bin/sh", 0, name="term0")
+            primary = agent_loop.register_agent(name="primary", role="primary")
+            agent_loop.set_current_agent_id(primary.id)
             terminal_preferences.reset_cache()
             laintas_cli.set_model_selection("old-model", "old-provider")
             output = io.StringIO()
@@ -469,6 +488,38 @@ class SlashRegistryTests(unittest.TestCase):
                 laintas_cli.console = old_console
             self.assertEqual(laintas_cli.get_selected_model(), "new-model")
             self.assertEqual(laintas_cli.get_selected_provider(), "")
+            agent_loop.close_all_terminals()
+            agent_loop.close_all_agents()
+
+    def test_model_can_target_terminal_without_mutating_agent_base(self):
+        agent_loop.close_all_terminals()
+        agent_loop.close_all_agents()
+        root_session = mock.Mock()
+        root_session.is_alive.return_value = True
+        work_session = mock.Mock()
+        work_session.is_alive.return_value = True
+        agent_loop.register_terminal(root_session, "/bin/sh", 0, name="term0")
+        primary = agent_loop.register_agent(name="primary", role="primary")
+        agent_loop.set_current_agent_id(primary.id)
+        agent_loop.register_terminal(
+            work_session, "/bin/sh", 0, name="work", parent_terminal="term0")
+        employee = agent_loop.register_agent(name="alice", role="pool")
+        employee.base_model = "base-model"
+        self.assertTrue(agent_loop.station_agent(employee.id, "work"))
+
+        try:
+            self.assertFalse(laintas_cli.handle_meta_command(
+                "/model work terminal-model", _Registry(), {}))
+            terminal = agent_loop.get_terminal("work")
+            self.assertEqual(terminal.model_override, "terminal-model")
+            self.assertEqual(employee.base_model, "base-model")
+            self.assertFalse(laintas_cli.handle_meta_command(
+                "/model work reset", _Registry(), {}))
+            self.assertIsNone(terminal.model_override)
+            self.assertEqual(employee.base_model, "base-model")
+        finally:
+            agent_loop.close_all_terminals()
+            agent_loop.close_all_agents()
 
     def test_dangerous_commands_reject_extra_args(self):
         output = io.StringIO()
@@ -608,9 +659,10 @@ class SlashRegistryTests(unittest.TestCase):
                 self.assertIsNotNone(employee)
                 self.assertEqual(employee.profile.specialist_role, "reviewer")
                 self.assertEqual(employee.status, "idle")
-                self.assertEqual(employee.role, "deployed")
-                self.assertEqual(employee.stationed_terminal, "term0")
-                self.assertIn("alice", agent_loop.get_terminal("term0").stationed_agent_ids)
+                self.assertEqual(employee.role, "pool")
+                self.assertIsNone(employee.stationed_terminal)
+                self.assertEqual(employee.home_terminal, "term0")
+                self.assertNotIn("alice", agent_loop.get_terminal("term0").stationed_agent_ids)
                 self.assertIsNone(employee.active_assignment)
                 self.assertNotIn(
                     "shell.exec", employee.profile.tool_policy.allowed_tools)

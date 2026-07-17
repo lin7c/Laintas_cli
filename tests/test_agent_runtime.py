@@ -2,6 +2,7 @@ import io
 import os
 import queue
 import re
+import shlex
 import tempfile
 import threading
 import time
@@ -85,6 +86,18 @@ class _FakeInteractiveSession:
         self.closed = True
         self.alive = False
         self.returncode = 0
+
+
+class _FiniteBackgroundSession(_FakeInteractiveSession):
+    """A job that emits its final bytes and exits during the first wait read."""
+
+    def read_output(self, timeout=0.1):
+        if self.alive and "sample-final" not in self.full_output:
+            self.full_output += "sample-final\n"
+            self.alive = False
+            self.returncode = 7
+            return "sample-final\n"
+        return ""
 
 
 class AgentSchedulerTests(unittest.TestCase):
@@ -293,10 +306,43 @@ class AgentIsolationTests(unittest.TestCase):
         self.assertEqual(employee.profile.specialist_role, "reviewer")
         self.assertIsNone(employee.active_assignment)
         self.assertEqual(employee.status, "idle")
-        self.assertEqual(employee.role, "deployed")
-        self.assertEqual(employee.stationed_terminal, "term0")
-        self.assertIn(employee.id, agent_loop.get_terminal("term0").stationed_agent_ids)
+        self.assertEqual(employee.role, "pool")
+        self.assertIsNone(employee.stationed_terminal)
+        self.assertEqual(employee.home_terminal, "term0")
+        self.assertNotIn(employee.id, agent_loop.get_terminal("term0").stationed_agent_ids)
         self.assertIsNone(tools.get_registry().get("agent.switch"))
+        employee.state["_persisted_employee"] = False
+
+    def test_agent_hire_verifies_and_freezes_requested_base_model(self):
+        import laintas_cli
+
+        terminal_session = mock.Mock()
+        terminal_session.is_alive.return_value = True
+        agent_loop.register_terminal(
+            terminal_session, "/bin/sh", 0, name="term0")
+        primary = agent_loop.register_agent(name="primary", role="primary")
+        ctx = tools.ToolCtx(
+            agent_id=primary.id, depth=0, session={"userId": "u"},
+            register_agent_fn=agent_loop.register_agent,
+            get_agent=agent_loop.get_agent,
+            get_terminal=agent_loop.get_terminal,
+            station_agent=agent_loop.station_agent,
+        )
+        models = [{"id": "model-x", "provider": "provider-a"}]
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(agent_persistence, "AGENTS_DIR", Path(tmp)), \
+                mock.patch.object(
+                    laintas_cli, "fetch_available_models",
+                    return_value=(models, "/api/models")):
+            result = tools._bi_agent_hire({
+                "name": "model-worker", "model": "model-x",
+            }, ctx)
+
+        self.assertTrue(result["ok"], result)
+        employee = agent_loop.get_agent("model-worker")
+        self.assertEqual(employee.base_model, "model-x")
+        self.assertEqual(employee.base_provider, "provider-a")
+        self.assertIsNone(employee.deployment_terminal)
         employee.state["_persisted_employee"] = False
 
     def test_read_only_roles_cannot_escape_through_shell(self):
@@ -403,7 +449,7 @@ class AgentIsolationTests(unittest.TestCase):
             '<runtime_ownership authoritative="true">' in prompt
             for prompt in prompts))
         self.assertTrue(any(
-            "agent_hire` creates a persistent employee and deploys it directly"
+            "agent_hire` creates a persistent undeployed employee"
             in prompt for prompt in prompts))
 
     def test_employee_profile_persistence_round_trip(self):
@@ -417,6 +463,9 @@ class AgentIsolationTests(unittest.TestCase):
         )
         employee = agent_loop.register_agent(
             name="persisted", role="pool", profile=profile)
+        employee.home_terminal = "term0"
+        employee.base_model = "model-x"
+        employee.base_provider = "provider-a"
         employee.assignment_history.append({
             "id": "job-1", "status": "completed", "result": "done"})
 
@@ -432,6 +481,10 @@ class AgentIsolationTests(unittest.TestCase):
         self.assertEqual(restored.profile.tool_policy.allowed_tools, ["fs.read"])
         self.assertEqual(restored.profile.tool_policy.denied_tools, ["shell.exec"])
         self.assertEqual(restored.assignment_history[-1]["id"], "job-1")
+        self.assertEqual(restored.home_terminal, "term0")
+        self.assertIsNone(restored.deployment_terminal)
+        self.assertEqual(restored.base_model, "model-x")
+        self.assertEqual(restored.base_provider, "provider-a")
 
 
 class PersistentOwnershipTests(unittest.TestCase):
@@ -464,12 +517,12 @@ class PersistentOwnershipTests(unittest.TestCase):
         alice.state["_persisted_employee"] = True
         bob.state["_persisted_employee"] = True
         self.assertTrue(agent_loop.station_agent(alice.id, "child"))
-        self.assertTrue(agent_loop.station_agent(bob.id, "child"))
+        self.assertTrue(agent_loop.station_agent(bob.id, "grandchild"))
         worker = agent_loop.register_agent(
             name="alice-child", role="subagent", parent_id=alice.id)
         self.assertEqual(worker.parent_terminal, "child")
-        self.assertEqual(worker.deployment_terminal, "child")
-        self.assertIn("alice-child", agent_loop.get_terminal("child").stationed_agent_ids)
+        self.assertIsNone(worker.deployment_terminal)
+        self.assertNotIn("alice-child", agent_loop.get_terminal("child").stationed_agent_ids)
 
         with mock.patch.object(
                 agent_persistence, "delete_agent_state", return_value=True) as delete:
@@ -490,7 +543,25 @@ class PersistentOwnershipTests(unittest.TestCase):
         self.assertTrue(child.close.called)
         self.assertTrue(grandchild.close.called)
 
-    def test_many_agents_per_terminal_but_one_terminal_per_agent(self):
+    def test_closing_home_terminal_reparents_undeployed_hired_employee(self):
+        self._terminal("term0")
+        self._terminal("child", "term0")
+        employee = agent_loop.register_agent(name="idle-hire", role="pool")
+        employee.home_terminal = "child"
+        employee.parent_terminal = "child"
+        employee.state["_persisted_employee"] = True
+
+        with mock.patch.object(
+                agent_persistence, "save_agent_state", return_value=True) as save:
+            self.assertTrue(agent_loop.unregister_terminal("child"))
+
+        self.assertIs(agent_loop.get_agent(employee.id), employee)
+        self.assertEqual(employee.home_terminal, "term0")
+        self.assertIsNone(employee.deployment_terminal)
+        save.assert_called_with(employee)
+        employee.state["_persisted_employee"] = False
+
+    def test_one_agent_per_terminal_and_one_terminal_per_agent(self):
         self._terminal("term0")
         self._terminal("left", "term0")
         self._terminal("right", "term0")
@@ -498,19 +569,120 @@ class PersistentOwnershipTests(unittest.TestCase):
         bob = agent_loop.register_agent(name="bob", role="deployed")
 
         self.assertTrue(agent_loop.station_agent(alice.id, "left"))
-        self.assertTrue(agent_loop.station_agent(bob.id, "left"))
+        self.assertFalse(agent_loop.station_agent(bob.id, "left"))
         self.assertEqual(
             agent_loop.get_terminal("left").stationed_agent_ids,
-            ["alice", "bob"])
+            ["alice"])
 
         self.assertTrue(agent_loop.station_agent(alice.id, "right"))
         self.assertNotIn("alice", agent_loop.get_terminal("left").stationed_agent_ids)
+        self.assertTrue(agent_loop.station_agent(bob.id, "left"))
         self.assertIn("bob", agent_loop.get_terminal("left").stationed_agent_ids)
         self.assertEqual(
             agent_loop.get_terminal("right").stationed_agent_ids, ["alice"])
         self.assertEqual(alice.stationed_terminal, "right")
-        self.assertEqual(alice.home_terminal, "right")
+        self.assertEqual(alice.home_terminal, "left")
         self.assertEqual(alice.deployment_terminal, "right")
+
+    def test_concurrent_station_claim_has_exactly_one_winner(self):
+        self._terminal("term0")
+        self._terminal("work", "term0")
+        alice = agent_loop.register_agent(name="alice", role="pool")
+        bob = agent_loop.register_agent(name="bob", role="pool")
+        barrier = threading.Barrier(3)
+        results = []
+
+        def claim(agent_id):
+            barrier.wait()
+            results.append(agent_loop.station_agent(agent_id, "work"))
+
+        threads = [
+            threading.Thread(target=claim, args=(alice.id,)),
+            threading.Thread(target=claim, args=(bob.id,)),
+        ]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join(timeout=2)
+
+        self.assertEqual(sorted(results), [False, True])
+        terminal = agent_loop.get_terminal("work")
+        self.assertEqual(len(terminal.stationed_agent_ids), 1)
+        self.assertEqual(terminal.stationed_agent_ids[0], terminal.stationed_agent_id)
+
+    def test_communication_is_limited_to_same_or_adjacent_terminal(self):
+        self._terminal("term0")
+        self._terminal("left", "term0")
+        self._terminal("left-child", "left")
+        self._terminal("right", "term0")
+        root = agent_loop.register_agent(name="root-agent", role="pool")
+        left = agent_loop.register_agent(name="left-agent", role="pool")
+        peer = agent_loop.register_agent(name="left-peer", role="pool")
+        child = agent_loop.register_agent(name="child-agent", role="pool")
+        right = agent_loop.register_agent(name="right-agent", role="pool")
+        root.home_terminal = "term0"
+        left.home_terminal = peer.home_terminal = "left"
+        child.home_terminal = "left-child"
+        right.home_terminal = "right"
+
+        self.assertTrue(agent_loop.can_agents_communicate(left.id, peer.id))
+        self.assertTrue(agent_loop.can_agents_communicate(root.id, left.id))
+        self.assertTrue(agent_loop.can_agents_communicate(left.id, child.id))
+        self.assertFalse(agent_loop.can_agents_communicate(left.id, right.id))
+        self.assertFalse(agent_loop.can_agents_communicate(root.id, child.id))
+
+    def test_dialog_routing_prefers_deployed_then_deterministic_local_idle(self):
+        self._terminal("term0")
+        self._terminal("work", "term0")
+        first = agent_loop.register_agent(name="first", role="pool")
+        second = agent_loop.register_agent(name="second", role="pool")
+        first.home_terminal = second.home_terminal = "work"
+
+        self.assertIs(
+            agent_loop.get_dialog_agent_for_terminal("work"), first)
+        self.assertTrue(agent_loop.station_agent(second.id, "work"))
+        self.assertIs(
+            agent_loop.get_dialog_agent_for_terminal("work"), second)
+
+    def test_agent_tell_attaches_freshness_provenance(self):
+        self._terminal("term0")
+        sender = agent_loop.register_agent(name="sender", role="pool")
+        receiver = agent_loop.register_agent(name="receiver", role="pool")
+        sender.home_terminal = receiver.home_terminal = "term0"
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = tools.ToolCtx(
+                agent_id=sender.id, cwd=tmp,
+                send_to_agent=agent_loop.send_to_agent)
+            result = tools._bi_agent_tell({
+                "agent_id": receiver.id,
+                "message": "directory analysis",
+            }, ctx)
+
+        self.assertTrue(result["ok"], result)
+        message = agent_loop.recv_from_inbox(receiver.id)
+        self.assertEqual(message["provenance"]["terminal"], "term0")
+        self.assertTrue(message["provenance"]["observed_at"] > 0)
+        self.assertTrue(message["provenance"]["cwd"])
+
+    def test_terminal_model_override_does_not_mutate_agent_base_model(self):
+        self._terminal("term0")
+        self._terminal("work", "term0")
+        employee = agent_loop.register_agent(name="alice", role="pool")
+        employee.base_model = "base-model"
+        employee.base_provider = "base-provider"
+        self.assertTrue(agent_loop.station_agent(employee.id, "work"))
+
+        self.assertTrue(agent_loop.set_terminal_model_selection(
+            "work", "terminal-model", "terminal-provider"))
+        self.assertEqual(
+            agent_loop.resolve_agent_model(employee),
+            ("terminal-model", "terminal-provider"))
+        self.assertEqual(employee.base_model, "base-model")
+        self.assertTrue(agent_loop.set_terminal_model_selection("work", ""))
+        self.assertEqual(
+            agent_loop.resolve_agent_model(employee),
+            ("base-model", "base-provider"))
 
     def test_terminal_rename_updates_children_and_agent_binding(self):
         self._terminal("term0")
@@ -758,6 +930,190 @@ class EphemeralSessionTests(unittest.TestCase):
         session.send_keys.assert_called_once()
         self.assertEqual(ctx.interactive_session.sent, [])
 
+    def test_shell_timeout_recovery_never_injects_printable_input(self):
+        import laintas_cli
+
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "recovery-input.txt"
+            session = laintas_cli.InteractiveSession(
+                laintas_cli.DEFAULT_SHELL, timeout=0, stream_output=False,
+                persistent=True, cwd=tmp)
+            session.start()
+            time.sleep(0.1)
+            session.read_output(timeout=0.1)
+            terminal = mock.Mock(session=session)
+            deps = _deps()
+            deps.InteractiveSession = laintas_cli.InteractiveSession
+            ctx = tools.ToolCtx(
+                deps=deps, cwd=tmp, stationed_terminal=terminal)
+            command = (
+                "IFS= read -r -n 1 ch; "
+                f"printf %s \"$ch\" > {shlex.quote(str(target))}; sleep 10"
+            )
+            try:
+                result = tools._bi_shell_exec({
+                    "command": command, "timeout": 1,
+                }, ctx)
+                self.assertFalse(result["ok"])
+                self.assertIn("terminal recovered", result["error"])
+                self.assertFalse(target.exists() and target.read_text())
+            finally:
+                terminal.session.close()
+
+    def test_noninteractive_environment_is_scoped_to_each_tool_command(self):
+        import laintas_cli
+
+        session = laintas_cli.InteractiveSession(
+            laintas_cli.DEFAULT_SHELL, timeout=0, stream_output=False,
+            persistent=True, cwd="/tmp")
+        session.start()
+        time.sleep(0.1)
+        session.read_output(timeout=0.1)
+        terminal = mock.Mock(session=session)
+        ctx = tools.ToolCtx(cwd="/tmp", stationed_terminal=terminal)
+        try:
+            set_start = len(session.raw_output)
+            session.send_keys(
+                "export GIT_EDITOR=sentinel-editor "
+                "GIT_TERMINAL_PROMPT=sentinel-prompt "
+                "DEBIAN_FRONTEND=sentinel-debian PAGER=sentinel-pager; "
+                "echo __SET_''DONE__\n"
+            )
+            set_deadline = time.monotonic() + 2
+            while (time.monotonic() < set_deadline
+                   and "__SET_DONE__" not in session.raw_output[set_start:]):
+                session.read_output(timeout=0.1)
+            self.assertIn("__SET_DONE__", session.raw_output[set_start:])
+
+            forced = tools._bi_shell_exec({
+                "command": (
+                    "printf '%s|%s|%s|%s' \"$GIT_EDITOR\" "
+                    "\"$GIT_TERMINAL_PROMPT\" \"$DEBIAN_FRONTEND\" \"$PAGER\""
+                ),
+            }, ctx)
+            self.assertEqual(forced["result"], "true|0|noninteractive|cat")
+
+            old_len = len(session.raw_output)
+            expected = (
+                "__RAW_ENV__sentinel-editor|sentinel-prompt|"
+                "sentinel-debian|sentinel-pager__END__"
+            )
+            session.send_keys(
+                "printf '__RAW''_ENV__%s|%s|%s|%s__END__\\n' "
+                '"$GIT_EDITOR" "$GIT_TERMINAL_PROMPT" '
+                '"$DEBIAN_FRONTEND" "$PAGER"\n'
+            )
+            deadline = time.monotonic() + 2
+            while (time.monotonic() < deadline
+                   and expected not in session.raw_output[old_len:]):
+                session.read_output(timeout=0.1)
+            self.assertIn(expected, session.raw_output[old_len:])
+
+            # A command may unset the temporary values, but the next tool
+            # call still receives a fresh non-interactive scope.
+            tools._bi_shell_exec({
+                "command": "unset GIT_PAGER PAGER GIT_EDITOR",
+            }, ctx)
+            again = tools._bi_shell_exec({
+                "command": "printf '%s|%s' \"$GIT_EDITOR\" \"$PAGER\"",
+            }, ctx)
+            self.assertEqual(again["result"], "true|cat")
+        finally:
+            terminal.session.close()
+
+    def test_direct_terminal_command_only_overrides_pager_variables(self):
+        import laintas_cli
+
+        session = laintas_cli.InteractiveSession(
+            laintas_cli.DEFAULT_SHELL, timeout=0, stream_output=False,
+            persistent=True, cwd="/tmp")
+        session.start()
+        time.sleep(0.1)
+        session.read_output(timeout=0.1)
+        try:
+            start = len(session.raw_output)
+            session.send_keys(
+                "export GIT_EDITOR=user-editor "
+                "GIT_TERMINAL_PROMPT=user-prompt "
+                "DEBIAN_FRONTEND=user-debian PAGER=user-pager; "
+                "echo __DIRECT_''READY__\n"
+            )
+            deadline = time.monotonic() + 2
+            while (time.monotonic() < deadline
+                   and "__DIRECT_READY__" not in session.raw_output[start:]):
+                session.read_output(timeout=0.1)
+
+            result = laintas_cli._marker_poll_exec(
+                session,
+                "printf '%s|%s|%s|%s' \"$GIT_EDITOR\" "
+                "\"$GIT_TERMINAL_PROMPT\" \"$DEBIAN_FRONTEND\" \"$PAGER\"",
+                timeout=2,
+            )
+            self.assertTrue(result["success"], result)
+            self.assertEqual(
+                result["stdout"],
+                "user-editor|user-prompt|user-debian|cat",
+            )
+        finally:
+            session.close()
+
+    def test_unrecoverable_deployment_shell_is_restarted(self):
+        import laintas_cli
+
+        session = laintas_cli.InteractiveSession(
+            laintas_cli.DEFAULT_SHELL, timeout=0, stream_output=False,
+            persistent=True, cwd="/tmp")
+        session.start()
+        time.sleep(0.1)
+        session.read_output(timeout=0.1)
+        old_pid = session.pid
+        terminal = mock.Mock(session=session)
+        deps = _deps()
+        deps.InteractiveSession = laintas_cli.InteractiveSession
+        ctx = tools.ToolCtx(
+            deps=deps, cwd="/tmp", stationed_terminal=terminal)
+        try:
+            result = tools._bi_shell_exec({
+                "command": 'trap "" INT TERM; IFS= read -r line; sleep 10',
+                "timeout": 1,
+            }, ctx)
+            self.assertFalse(result["ok"])
+            self.assertTrue(result.get("terminal_restarted"), result)
+            self.assertNotEqual(terminal.session.pid, old_pid)
+            self.assertTrue(terminal.session.is_alive())
+            health = tools._bi_shell_exec({
+                "command": "printf RESTARTED", "timeout": 2,
+            }, ctx)
+            self.assertTrue(health["ok"], health)
+            self.assertEqual(health["result"], "RESTARTED")
+        finally:
+            terminal.session.close()
+
+    def test_undeployed_worker_shell_uses_one_private_temporary_terminal(self):
+        import laintas_cli
+
+        worker = agent_loop.register_agent(name="temp-worker", depth=1, role="pool")
+        deps = _deps()
+        deps.InteractiveSession = laintas_cli.InteractiveSession
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = tools.ToolCtx(
+                deps=deps, agent_id=worker.id, depth=1, cwd=tmp,
+                get_agent=agent_loop.get_agent)
+            first = tools._bi_shell_exec({
+                "command": "mkdir -p nested && cd nested && pwd",
+            }, ctx)
+            first_session = ctx.interactive_session
+            second = tools._bi_shell_exec({"command": "pwd"}, ctx)
+            try:
+                self.assertTrue(first["ok"], first)
+                self.assertTrue(second["ok"], second)
+                self.assertEqual(first["via"], "temporary_terminal")
+                self.assertEqual(second["via"], "temporary_terminal")
+                self.assertTrue(second["result"].endswith("/nested"))
+                self.assertIs(ctx.interactive_session, first_session)
+            finally:
+                if ctx.interactive_session is not None:
+                    ctx.interactive_session.close()
     def test_undeployed_shell_exec_remains_isolated(self):
         with tempfile.TemporaryDirectory() as tmp, _chdir(tmp):
             before = os.getcwd()
@@ -875,6 +1231,91 @@ class EphemeralSessionTests(unittest.TestCase):
         self.assertEqual(third["new_output"], "")
         self.assertFalse(second["completed"])
 
+    def test_terminal_read_reports_completed_job_and_real_exit_code(self):
+        session = _FakeInteractiveSession("finite")
+        session.start()
+        session.full_output += "final sample\n"
+        session.alive = False
+        session.returncode = 9
+        terminal = agent_loop.TerminalInfo(
+            name="monitor", command="finite", session=session,
+            created_at=time.time(), created_by="depth=0",
+            retain_completed=True)
+        ctx = tools.ToolCtx(
+            agent_id="reader", deps=_deps(),
+            get_terminal=lambda name: terminal if name == "monitor" else None)
+
+        result = tools._bi_terminal_read({"name": "monitor"}, ctx)
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["completed"])
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["returncode"], 9)
+        self.assertIn("final sample", result["new_output"])
+        self.assertIsNotNone(terminal.completed_at)
+        formatted = agent_loop._format_tool_result_for_loop(
+            "terminal.read", result, 3000)
+        self.assertIn("status=completed", formatted)
+        self.assertIn("completed=true", formatted)
+        self.assertIn("returncode=9", formatted)
+
+    def test_terminal_wait_captures_final_output_without_sleep_polling(self):
+        session = _FiniteBackgroundSession("monitor")
+        session.start()
+        terminal = agent_loop.TerminalInfo(
+            name="monitor", command="monitor", session=session,
+            created_at=time.time(), created_by="depth=0",
+            retain_completed=True)
+        ctx = tools.ToolCtx(
+            agent_id="reader", deps=_deps(),
+            get_terminal=lambda name: terminal if name == "monitor" else None)
+
+        result = tools._bi_terminal_wait({
+            "name": "monitor", "timeout": 1, "poll_interval": 0.05,
+        }, ctx)
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["completed"])
+        self.assertFalse(result["timed_out"])
+        self.assertEqual(result["returncode"], 7)
+        self.assertIn("sample-final", result["new_output"])
+
+    def test_terminal_exec_running_result_has_no_fake_exit_code(self):
+        root_session = mock.Mock()
+        root_session.is_alive.return_value = True
+        root = agent_loop.TerminalInfo(
+            name="term0", command="bash", session=root_session,
+            created_at=time.time(), created_by="depth=0")
+        child = _FakeInteractiveSession("long-job")
+        deps = _deps()
+        deps.SubTerminalSession = lambda command: child
+        registered = {}
+
+        def register(session, command, depth, **kwargs):
+            registered.update(kwargs)
+            return kwargs["name"]
+
+        ctx = tools.ToolCtx(
+            agent_id="primary", deps=deps,
+            get_agent=lambda _id: None,
+            get_terminal=lambda name: root if name == "term0" else None,
+            register_terminal=register,
+            unregister_terminal=lambda name: True)
+
+        result = tools._bi_terminal_exec({
+            "name": "perf-monitor", "command": "vmstat 5 12",
+        }, ctx)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "running")
+        self.assertFalse(result["completed"])
+        self.assertNotIn("returncode", result)
+        self.assertTrue(registered["retain_completed"])
+        formatted = agent_loop._format_tool_result_for_loop(
+            "terminal.exec", result, 3000)
+        self.assertIn("status=running", formatted)
+        self.assertIn("returncode=pending", formatted)
+
     def test_employee_tool_policy_blocks_forged_tool_call_at_dispatch(self):
         calls = []
         responses = iter([
@@ -927,6 +1368,12 @@ class EphemeralSessionTests(unittest.TestCase):
 
 
 class TerminalTriggerTests(unittest.TestCase):
+    def setUp(self):
+        agent_loop.close_all_terminals()
+
+    def tearDown(self):
+        agent_loop.close_all_terminals()
+
     def test_snapshot_delta_handles_append_roll_and_clear(self):
         self.assertEqual(
             agent_loop._terminal_snapshot_delta("one\n", "one\ntwo\n"),
@@ -942,6 +1389,37 @@ class TerminalTriggerTests(unittest.TestCase):
         self.assertEqual(
             agent_loop._terminal_snapshot_delta("old screen", "fresh screen"),
             "fresh screen")
+
+    def test_completed_terminal_retains_final_output_and_dispatches_final_trigger(self):
+        root = mock.Mock()
+        root.is_alive.return_value = True
+        root.read_output.return_value = ""
+        root.full_output = ""
+        job = mock.Mock()
+        job.is_alive.return_value = False
+        job.read_output.return_value = ""
+        job.full_output = "last-line: READY\n"
+        job.returncode = 0
+        fired = threading.Event()
+
+        def capture(*_args, **_kwargs):
+            fired.set()
+            return True
+
+        with mock.patch.object(agent_loop, "send_to_agent", side_effect=capture) as send:
+            agent_loop.register_terminal(root, "bash", 0, name="term0")
+            agent_loop.register_terminal(
+                job, "probe", 0, name="probe", parent_terminal="term0",
+                trigger="READY", trigger_agent_id="primary",
+                retain_completed=True)
+            self.assertTrue(fired.wait(2.0))
+
+        info = agent_loop.get_terminal("probe")
+        self.assertIsNotNone(info)
+        self.assertEqual(info.returncode, 0)
+        self.assertIsNotNone(info.completed_at)
+        event = send.call_args.args[1]
+        self.assertEqual(event["line"], "last-line: READY")
 
 
 if __name__ == "__main__":

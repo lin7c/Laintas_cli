@@ -70,7 +70,7 @@ _DEFAULT_CONFIG = {
     "max_loops": 30,
     "max_tokens": 8192,
     "max_debug_entries": 50,
-    "loop_delay": 1.5,           # seconds between loop iterations
+    "loop_delay": 0.2,           # normal inter-iteration delay; failures back off adaptively
     "output_truncate": 3000,      # chars — lastOutput tail truncation
     "poll_timeout": 10.0,         # seconds — wait for first command output
     "terminal_tail_lines": 20,    # lines — sub-terminal snapshot
@@ -110,6 +110,8 @@ _DEFAULT_CONFIG = {
     "browser_post_action_wait": 0.5,   # seconds to wait for SPA DOM updates before auto-snapshot
     "browser_auto_snapshot": True,     # return page snapshot after state-changing browser actions
     "detail": False,                   # False = simplified progress rendering; True = full per-line detail (/detail on|off)
+    "stream_preview": "one",          # off / one / detail (three-line bounded tail)
+    "theme": "dark",                  # dark / light / mono semantic palette
     "deny_exits_loop": True,           # True = terminate the agent loop the moment the user denies an approval prompt; False = old behavior (feed denial back as a tool error and keep looping)
     "enable_mouse": False,             # REPL input box: click-to-position the cursor. Off by default: terminal mouse reporting hijacks native drag-to-select of scrollback (Shift+drag is the only workaround), which costs more than click-to-position gains
     "confirm_direct_commands": False,  # False = commands the USER types directly at the REPL run like a normal terminal (no policy approval prompt, e.g. rm); True = subject direct commands to the same needs_approval prompt as AI-issued ones. Hard `deny` policy rules always apply regardless.
@@ -157,6 +159,8 @@ class ParseError(AgentLoopError):
 
 # ── Diagnostic logging (uses debug ring buffer when available) ─────────
 _debug_log: list[dict] = []
+_recent_tool_failures: list[dict] = []
+_failure_lock = threading.RLock()
 
 def _diag(message: str, **context) -> None:
     """Log a diagnostic event to the in-memory debug ring buffer.
@@ -173,6 +177,38 @@ def _diag(message: str, **context) -> None:
         _debug_log.pop(0)
 
 
+def _remember_tool_failure(failure: dict) -> None:
+    """Keep a bounded, process-local failure index for the `/why` command."""
+    with _failure_lock:
+        _recent_tool_failures.append(copy.deepcopy(failure))
+        del _recent_tool_failures[:-50]
+
+
+def _redact_tool_text(value: str) -> str:
+    """Redact common credential forms before a failure enters process state."""
+    text = str(value or "")
+    text = re.sub(r"(?i)(authorization\s*[:=]\s*bearer\s+)[^\s]+", r"\1[REDACTED]", text)
+    text = re.sub(r"(?i)(\b(?:token|api[_-]?key|password|secret)\s*[:=]\s*)[^\s&]+", r"\1[REDACTED]", text)
+    text = re.sub(r"(?i)(https?://)([^/@\s:]+):([^/@\s]+)@", r"\1[REDACTED]@", text)
+    return text
+
+
+def get_recent_tool_failures(*, agent_id: str = "", terminal: str = "",
+                             tool: str = "") -> list[dict]:
+    """Return newest-first failure snapshots, optionally scoped."""
+    with _failure_lock:
+        rows = copy.deepcopy(_recent_tool_failures)
+    if agent_id:
+        rows = [row for row in rows if row.get("agent_id") == agent_id]
+    if terminal:
+        rows = [row for row in rows if row.get("terminal") == terminal]
+    if tool:
+        needle = tool.lower()
+        rows = [row for row in rows if needle in str(row.get("tool", "")).lower()
+                or needle in str(row.get("display_name", "")).lower()]
+    return list(reversed(rows))
+
+
 # ── Thinking shimmer (流光) ────────────────────────────────────────────
 # A bright green highlight band sweeps left→right across the status label
 # while the agent is thinking/streaming. Recomputed every Live draw from the
@@ -187,6 +223,8 @@ _SHIMMER_GRAD = (
 def _shimmer_label(label: str, elapsed: float):
     """Return a rich Text of `label` with a moving green highlight band."""
     from rich.text import Text
+    if get_runtime_config("theme") == "mono":
+        return Text(label)
     txt = Text()
     span = len(_SHIMMER_GRAD)
     # Sweep head advances ~14 columns/sec; wraps past the end for a gap.
@@ -198,6 +236,75 @@ def _shimmer_label(label: str, elapsed: float):
         else:
             txt.append(ch, style=_SHIMMER_BASE)
     return txt
+
+
+def _cell_len(value: str) -> int:
+    """Return terminal display-cell width (CJK/emoji aware)."""
+    try:
+        from rich.cells import cell_len
+        return cell_len(str(value or ""))
+    except Exception:
+        return len(str(value or ""))
+
+
+def _crop_cells(value: str, width: int, *, middle: bool = False) -> str:
+    """Crop plain text to exactly a display-cell budget without splitting glyphs."""
+    value = str(value or "")
+    width = max(0, int(width))
+    if _cell_len(value) <= width:
+        return value
+    if width <= 0:
+        return ""
+    if width == 1:
+        return "…"
+
+    def _take(text: str, budget: int, reverse: bool = False) -> str:
+        chars = reversed(text) if reverse else iter(text)
+        kept: list[str] = []
+        used = 0
+        for char in chars:
+            cells = max(0, _cell_len(char))
+            if used + cells > budget:
+                break
+            kept.append(char)
+            used += cells
+        if reverse:
+            kept.reverse()
+        return "".join(kept)
+
+    if not middle:
+        return _take(value, width - 1) + "…"
+    left_budget = (width - 1) // 2
+    right_budget = width - 1 - left_budget
+    return _take(value, left_budget) + "…" + _take(value, right_budget, reverse=True)
+
+
+def _compact_tool_line(display_name: str, hint: str, meta: str, width: int) -> tuple[str, str, str]:
+    """Fit a compact tool row, preserving status metadata before command prose."""
+    name = str(display_name or "tool")
+    hint = re.sub(r"\s+", " ", str(hint or "")).strip()
+    meta = re.sub(r"\s+", " ", str(meta or "")).strip()
+    fixed = 5 + _cell_len(name) + (2 if hint else 0) + (2 if meta else 0)
+    available = max(8, int(width or 80) - fixed)
+    if meta:
+        meta_budget = min(max(12, available // 2), max(12, _cell_len(meta)))
+        meta = _crop_cells(meta, meta_budget, middle=("/why" in meta or "/debug" in meta))
+        available -= _cell_len(meta)
+    hint = _crop_cells(hint, max(4, available), middle=True)
+    return name, hint, meta
+
+
+def _adaptive_loop_delay(base: float, *, failed: bool, retry_count: int = 0,
+                         repeated: bool = False) -> float:
+    """Fast normal turns; bounded exponential backoff only on repair paths."""
+    base = max(0.0, float(base))
+    if not failed and not repeated:
+        return min(base, 0.25)
+    exponent = min(max(0, int(retry_count)), 3)
+    delay = max(0.8, base) * (2 ** exponent)
+    if repeated:
+        delay = max(delay, 1.0)
+    return min(delay, 4.0)
 
 
 def _emit_simple_diff(console, diff_text: str, depth: int = 0, cap: int = 6) -> None:
@@ -325,6 +432,8 @@ _RUNTIME_CONFIG_DESCRIPTIONS = {
     "deterministic_repeat_limit": "Identical failing tool call attempts before it is hard-blocked",
     "output_similarity": "Repeated-output similarity threshold (0-1)",
     "detail": "Show full per-line tool detail (True) or simplified progress (False)",
+    "stream_preview": "Streaming prose preview: off, one, or detail",
+    "theme": "Terminal UI theme: dark, light, or mono",
     "deny_exits_loop": "Terminate the agent loop immediately when the user denies an approval prompt",
     "confirm_direct_commands": "Ask for approval on commands YOU type directly at the REPL (False = run like a normal terminal; hard deny rules still apply)",
     "enable_mouse": "Enable mouse click-to-position in the REPL input box",
@@ -383,6 +492,15 @@ def _coerce_runtime_config_value(key: str, value):
             raise ValueError(f"{key} expects a number, got {value!r}") from exc
     else:
         parsed = str(value)
+
+    if key == "stream_preview":
+        parsed = str(parsed).strip().lower()
+        if parsed not in {"off", "one", "detail"}:
+            raise ValueError("stream_preview expects off, one, or detail")
+    if key == "theme":
+        parsed = str(parsed).strip().lower()
+        if parsed not in {"dark", "light", "mono"}:
+            raise ValueError("theme expects dark, light, or mono")
 
     if key in _RUNTIME_POSITIVE and parsed <= 0:
         raise ValueError(f"{key} must be greater than 0")
@@ -533,10 +651,18 @@ class TerminalInfo:
     created_at: float
     created_by: str  # "depth=0"
     parent_terminal: Optional[str] = None
-    stationed_agent_id: Optional[str] = None  # deprecated, use stationed_agent_ids
+    # Exactly one agent may own a terminal's persistent shell.  The plural
+    # field remains as a compatibility mirror for pre-1.9 extensions/state.
+    stationed_agent_id: Optional[str] = None
     stationed_agent_ids: list = field(default_factory=list)
+    dialog_agent_id: Optional[str] = None
+    model_override: Optional[str] = None
+    provider_override: Optional[str] = None
     trigger_pattern: Optional[str] = None    # regex; None = no trigger
     trigger_agent_id: Optional[str] = None  # inbox target; fixed at registration time
+    retain_completed: bool = False
+    completed_at: Optional[float] = None
+    returncode: Optional[int] = None
 
 
 _debug_logs: list[DebugEntry] = []
@@ -582,7 +708,8 @@ def get_debug_logs() -> list:
 
 def register_terminal(session, command: str, depth: int, name: str = None,
                       trigger: str = None, trigger_agent_id: str = None,
-                      parent_terminal: str = None) -> str:
+                      parent_terminal: str = None,
+                      retain_completed: bool = False) -> str:
     """Register a terminal under one parent; names are never replaced implicitly."""
     global _terminal_registry, _terminal_counter
     with _registry_lock:
@@ -615,7 +742,21 @@ def register_terminal(session, command: str, depth: int, name: str = None,
             parent_terminal=parent_terminal,
             trigger_pattern=trigger or None,
             trigger_agent_id=trigger_agent_id or None,
+            retain_completed=bool(retain_completed),
         )
+        if name == "term0":
+            primaries = [
+                agent for agent in _agent_registry.values()
+                if agent.role == "primary"
+            ]
+            if len(primaries) == 1:
+                primary = primaries[0]
+                primary.home_terminal = "term0"
+                primary.deployment_terminal = "term0"
+                primary.stationed_terminal = "term0"
+                info.stationed_agent_id = primary.id
+                info.stationed_agent_ids = [primary.id]
+                info.dialog_agent_id = primary.id
         _terminal_registry[name] = info
     start_trigger_scanner()
     return name
@@ -655,6 +796,32 @@ def unregister_terminal(name: str) -> bool:
             delete_persisted = bool(agent.state.get("_persisted_employee"))
             unregister_agent(agent_id, delete_persisted=delete_persisted)
 
+        # Temporary agents belong to the terminal scope even without a shell
+        # lease. Persistent undeployed employees survive by moving to the
+        # direct parent scope; disposable subagents are terminated.
+        for scoped in list(_agent_registry.values()):
+            if scoped.home_terminal != name:
+                continue
+            if scoped.role == "primary":
+                scoped.home_terminal = info.parent_terminal
+                scoped.parent_terminal = info.parent_terminal
+                continue
+            if scoped.role == "subagent" or not scoped.state.get(
+                    "_persisted_employee"):
+                try:
+                    abort_agent(scoped.id)
+                except Exception:
+                    pass
+                unregister_agent(scoped.id, delete_persisted=False)
+                continue
+            scoped.home_terminal = info.parent_terminal
+            scoped.parent_terminal = info.parent_terminal
+            if scoped.state.get("_persisted_employee"):
+                try:
+                    agent_persistence.save_agent_state(scoped)
+                except Exception:
+                    pass
+
         _terminal_registry.pop(name, None)
         _trigger_scan_cursors.pop(name, None)
         if info.session is not None:
@@ -675,6 +842,69 @@ def get_all_terminals() -> list:
     """Return all registered terminals sorted by creation time."""
     with _registry_lock:
         return sorted(_terminal_registry.values(), key=lambda t: t.created_at)
+
+
+def set_terminal_model_selection(name: str, model: str = "",
+                                 provider: str = "") -> bool:
+    """Replace one live terminal's deployment model override atomically."""
+    with _registry_lock:
+        terminal = _terminal_registry.get(name)
+        if terminal is None:
+            return False
+        terminal.model_override = str(model or "").strip() or None
+        terminal.provider_override = (
+            str(provider or "").strip() or None
+            if terminal.model_override else None
+        )
+        return True
+
+
+def resolve_agent_model(agent: Optional["AgentInfo"],
+                        pinned_model: str = "",
+                        pinned_provider: str = "") -> tuple[str, str]:
+    """Resolve one request without mutating agent or terminal defaults."""
+    model = str(pinned_model or "").strip()
+    provider = str(pinned_provider or "").strip()
+    if model:
+        return model, provider
+    with _registry_lock:
+        deployment = agent_deployment_terminal(agent)
+        terminal = _terminal_registry.get(deployment) if deployment else None
+        if terminal and terminal.model_override:
+            return (
+                str(terminal.model_override),
+                str(terminal.provider_override or ""),
+            )
+        if agent is not None:
+            return (
+                str(getattr(agent, "base_model", "") or ""),
+                str(getattr(agent, "base_provider", "") or ""),
+            )
+    return "", ""
+
+
+def get_dialog_agent_for_terminal(name: str) -> Optional["AgentInfo"]:
+    """Deterministically choose the user-facing agent for a terminal."""
+    with _registry_lock:
+        terminal = _terminal_registry.get(name)
+        if terminal is None:
+            return None
+        for candidate_id in (
+                terminal.stationed_agent_id, terminal.dialog_agent_id):
+            candidate = _agent_registry.get(candidate_id) if candidate_id else None
+            if candidate is not None and agent_scope_terminal(candidate) == name:
+                return candidate
+        candidates = sorted(
+            (agent for agent in _agent_registry.values()
+             if agent_scope_terminal(agent) == name
+             and agent_deployment_terminal(agent) is None
+             and agent.status == "idle"),
+            key=lambda agent: (agent.created_at, agent.id),
+        )
+        if candidates:
+            terminal.dialog_agent_id = candidates[0].id
+            return candidates[0]
+        return None
 
 
 def close_all_terminals() -> None:
@@ -762,6 +992,11 @@ _trigger_scan_cursors: dict = {}          # terminal name → previous output sn
 _trigger_scanner_stop = threading.Event()
 _trigger_scanner_thread: Optional[threading.Thread] = None
 
+# A finished ``terminal.exec`` job remains addressable long enough for an
+# agent to inspect its final output and real exit status. Explicit termination
+# or reuse of the same name still removes it immediately.
+_COMPLETED_TERMINAL_RETENTION_SECONDS = 600.0
+
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]|\x1b[^[\\]")
 
 
@@ -811,41 +1046,66 @@ def _terminal_snapshot_delta(previous: str, current: str) -> str:
     return current
 
 
+def _scan_terminal_trigger_output(info: TerminalInfo) -> None:
+    """Drain and dispatch newly produced trigger lines for one terminal."""
+    if not info.trigger_pattern or not info.session:
+        return
+    full = info.session.full_output
+    previous = _trigger_scan_cursors.get(info.name, "")
+    new_text = _terminal_snapshot_delta(previous, full)
+    if not new_text:
+        return
+    _trigger_scan_cursors[info.name] = full
+    try:
+        pat = re.compile(info.trigger_pattern, re.IGNORECASE)
+    except re.error:
+        return
+    for line in _strip_ansi(new_text).splitlines():
+        match = pat.search(line)
+        if match and info.trigger_agent_id:
+            send_to_agent(info.trigger_agent_id, {
+                "type": "watch.trigger",
+                "terminal": info.name,
+                "line": line.strip(),
+                "match": match.group(0),
+                "pattern": info.trigger_pattern,
+            })
+
+
+def _terminal_returncode(session) -> Optional[int]:
+    try:
+        value = session.returncode
+        return int(value) if value is not None and int(value) >= 0 else None
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
 def _trigger_scanner_loop() -> None:
     while not _trigger_scanner_stop.wait(0.5):
+        now = time.time()
         for info in get_all_terminals():
-            if (info.session is not None
-                    and not info.session.is_alive()
-                    and get_terminal(info.name) is info):
-                unregister_terminal(info.name)
-                continue
-            if not info.trigger_pattern or not info.session:
+            if not info.session:
                 continue
             try:
-                # Drain PTY fd for non-tmux sessions (no-op for tmux)
+                # Drain before AND after liveness detection. PTY waitpid may
+                # discover process exit and drain the last bytes during
+                # is_alive(); those bytes must still participate in triggers.
                 info.session.read_output(timeout=0)
-                full = info.session.full_output
-                previous = _trigger_scan_cursors.get(info.name, "")
-                new_text = _terminal_snapshot_delta(previous, full)
-                if not new_text:
-                    continue
-                _trigger_scan_cursors[info.name] = full
-                try:
-                    pat = re.compile(info.trigger_pattern, re.IGNORECASE)
-                except re.error:
-                    continue
-                for line in _strip_ansi(new_text).splitlines():
-                    m = pat.search(line)
-                    if m and info.trigger_agent_id:
-                        send_to_agent(info.trigger_agent_id, {
-                            "type": "watch.trigger",
-                            "terminal": info.name,
-                            "line": line.strip(),
-                            "match": m.group(0),
-                            "pattern": info.trigger_pattern,
-                        })
+                alive = bool(info.session.is_alive())
+                info.session.read_output(timeout=0)
+                _scan_terminal_trigger_output(info)
             except Exception:
-                pass
+                continue
+
+            if alive:
+                continue
+            if info.completed_at is None:
+                info.completed_at = now
+                info.returncode = _terminal_returncode(info.session)
+            if (not info.retain_completed
+                    or now - info.completed_at >= _COMPLETED_TERMINAL_RETENTION_SECONDS):
+                if get_terminal(info.name) is info:
+                    unregister_terminal(info.name)
 
 
 def start_trigger_scanner() -> None:
@@ -1364,9 +1624,11 @@ class AgentInfo:
     lifecycle_terminated: bool = False         # owning terminal ended; never persist again
     # ── Pool architecture fields ───────────────────────────────────────
     role: str = "pool"                        # pool | deployed | primary | subagent
-    deployment_terminal: Optional[str] = None # authoritative lifecycle owner
-    parent_terminal: Optional[str] = None     # terminal that spawned this agent
-    home_terminal: Optional[str] = None       # legacy alias of deployment_terminal
+    deployment_terminal: Optional[str] = None # persistent shell currently owned
+    parent_terminal: Optional[str] = None     # legacy origin-terminal alias
+    home_terminal: Optional[str] = None       # logical terminal membership/origin
+    base_model: str = ""                     # immutable under /model
+    base_provider: str = ""
     # ── HWO scheduling fields ──────────────────────────────────────────
     chain_id: Optional[str] = None            # serial pipeline this agent belongs to
     chain_step_index: int = -1                # 0-based position in chain (-1 = not in chain)
@@ -1389,15 +1651,55 @@ _wait_queue: list = []                           # FIFO: (agent_id, start_fn) pa
 
 
 def agent_deployment_terminal(agent: Optional[AgentInfo]) -> Optional[str]:
-    """Return an agent's lifecycle owner, accepting pre-1.8.2 state files."""
+    """Return only the terminal whose persistent shell the agent owns.
+
+    New runtime state never infers deployment from home/parent membership.
+    Persisted legacy state is normalized by ``apply_persisted_state`` instead.
+    """
     if agent is None:
         return None
     return (
         getattr(agent, "deployment_terminal", None)
         or getattr(agent, "stationed_terminal", None)
-        or getattr(agent, "home_terminal", None)
-        or getattr(agent, "parent_terminal", None)
     )
+
+
+def agent_scope_terminal(agent: Optional[AgentInfo]) -> Optional[str]:
+    """Terminal used for topology/dialog routing, deployed or not."""
+    if agent is None:
+        return None
+    return agent_deployment_terminal(agent) or getattr(agent, "home_terminal", None)
+
+
+def can_agents_communicate(caller_id: str, target_id: str) -> bool:
+    """Authorize direct agent messaging within the local terminal tree.
+
+    Peers may communicate when they share a terminal, occupy directly adjacent
+    parent/child terminals, or have a direct agent parent/child relationship.
+    Sibling terminals, grandparents and arbitrary registry-wide sends are
+    intentionally excluded.
+    """
+    if not caller_id or not target_id or caller_id == target_id:
+        return False
+    with _registry_lock:
+        caller = _agent_registry.get(caller_id)
+        target = _agent_registry.get(target_id)
+        if caller is None or target is None:
+            return False
+        if caller.parent_id == target_id or target.parent_id == caller_id:
+            return True
+        caller_terminal = agent_scope_terminal(caller)
+        target_terminal = agent_scope_terminal(target)
+        if not caller_terminal or not target_terminal:
+            return False
+        if caller_terminal == target_terminal:
+            return True
+        caller_info = _terminal_registry.get(caller_terminal)
+        target_info = _terminal_registry.get(target_terminal)
+        return bool(
+            (caller_info and caller_info.parent_terminal == target_terminal)
+            or (target_info and target_info.parent_terminal == caller_terminal)
+        )
 
 
 def register_agent(name: str = None, depth: int = 0,
@@ -1441,10 +1743,9 @@ def register_agent(name: str = None, depth: int = 0,
                 info.home_terminal = "term0"
         if parent_id and parent_id in _agent_registry:
             owner = _agent_registry[parent_id]
-            inherited_terminal = agent_deployment_terminal(owner)
-            info.deployment_terminal = inherited_terminal
-            # Keep aliases populated while old extensions migrate.
-            info.stationed_terminal = inherited_terminal
+            inherited_terminal = agent_scope_terminal(owner)
+            # Children belong to the parent's terminal scope but never inherit
+            # its deployment lease. Their commands use a private temporary PTY.
             info.home_terminal = inherited_terminal
             info.parent_terminal = inherited_terminal
         if load_existing:
@@ -1455,15 +1756,19 @@ def register_agent(name: str = None, depth: int = 0,
                 if role and role != "pool":
                     info.role = role
         _agent_registry[agent_id] = info
-        # Temporary children inherit the terminal immediately. Their shell.exec
-        # calls use that terminal's serialized persistent shell state.
-        inherited_terminal = agent_deployment_terminal(info)
-        inherited_info = _terminal_registry.get(inherited_terminal) if inherited_terminal else None
-        if (inherited_info is not None and inherited_info.session is not None
-                and inherited_info.session.is_alive()
-                and agent_id not in inherited_info.stationed_agent_ids):
-            inherited_info.stationed_agent_ids.append(agent_id)
-            inherited_info.stationed_agent_id = inherited_info.stationed_agent_ids[0]
+        # Primary is the sole initial deployment in term0. All other agents are
+        # registered without taking a terminal lease.
+        if role == "primary" and inherited_terminal:
+            inherited_info = _terminal_registry.get(inherited_terminal)
+            if inherited_info is not None:
+                owner_id = inherited_info.stationed_agent_id
+                if owner_id not in (None, agent_id):
+                    raise ValueError(
+                        f"Terminal '{inherited_terminal}' is already deployed to "
+                        f"agent '{owner_id}'")
+                inherited_info.stationed_agent_id = agent_id
+                inherited_info.stationed_agent_ids = [agent_id]
+                inherited_info.dialog_agent_id = agent_id
         if parent_id and parent_id in _agent_registry:
             parent = _agent_registry[parent_id]
             if agent_id not in parent.child_ids:
@@ -1502,6 +1807,8 @@ def unregister_agent(agent_id: str, delete_persisted: bool = False) -> bool:
                 term.stationed_agent_ids.remove(agent_id)
             term.stationed_agent_id = (
                 term.stationed_agent_ids[0] if term.stationed_agent_ids else None)
+            if term.dialog_agent_id == agent_id:
+                term.dialog_agent_id = None
         info.stationed_terminal = None
         info.home_terminal = None
         info.deployment_terminal = None
@@ -1725,17 +2032,20 @@ def start_agent_assignment(agent_id: str, task: str, deps,
         suffix = f" ({active.id})" if active else ""
         return False, f"Agent '{agent_id}' is already working{suffix}.", active
     terminal_name = agent_deployment_terminal(employee)
-    if not terminal_name:
-        return False, f"Agent '{agent_id}' is not stationed at a terminal.", None
-    terminal = get_terminal(terminal_name)
-    if (terminal is None or terminal.session is None
-            or not terminal.session.is_alive()):
-        if terminal is not None:
-            unregister_terminal(terminal_name)
-        return False, (
-            f"Agent '{agent_id}' deployment terminal '{terminal_name}' "
-            "is not running."
-        ), None
+    if terminal_name:
+        terminal = get_terminal(terminal_name)
+        if (terminal is None or terminal.session is None
+                or not terminal.session.is_alive()):
+            if terminal is not None:
+                unregister_terminal(terminal_name)
+            return False, (
+                f"Agent '{agent_id}' deployment terminal '{terminal_name}' "
+                "is not running."
+            ), None
+    else:
+        # Undeployed employees use a run-owned private terminal and never join
+        # a named terminal's persistent byte stream.
+        terminal_name = f"temporary:{employee.id}"
 
     assignment = AgentAssignment(
         id=f"job-{uuid.uuid4().hex[:10]}",
@@ -1745,12 +2055,17 @@ def start_agent_assignment(agent_id: str, task: str, deps,
     )
     employee.active_assignment = assignment
     employee.abort_event.clear()
+    durable_runtime_state = {
+        key: value for key, value in employee.state.items()
+        if key in {"_persisted_employee", "_session_id", "_task_cwd"}
+    }
     employee.state = {
         "shortTermMemory": "",
         "lastReply": "",
         "lastOutput": "",
         "_assignment_id": assignment.id,
         "_assignment_task": task,
+        **durable_runtime_state,
     }
     if employee.profile.specialist_role:
         employee.state["_role_name"] = employee.profile.specialist_role
@@ -1838,11 +2153,13 @@ _RUNTIME_OWNERSHIP_PROMPT = """<runtime_ownership authoritative="true">
 - `session_*` and `agent_spawn` create temporary resources.
 - `terminal_*` manages named persistent terminals arranged in a parent-child tree.
 - Every non-root terminal belongs to one live parent terminal. Ending a terminal recursively ends its child terminals.
-- `agent_hire` creates a persistent employee and deploys it directly to the caller's current terminal; hiring does not start an assignment.
-- One terminal may host multiple deployed agents. One agent may be deployed to exactly one terminal.
+- `agent_hire` creates a persistent undeployed employee; deployment requires an explicit target and hiring never starts an assignment.
+- One terminal may host exactly one deployed agent. One agent may be deployed to at most one terminal.
 - Ending a terminal ends all agents deployed to it and all temporary agents owned by its terminal subtree.
-- A deployed agent's `shell` commands execute directly in its deployment terminal, so shell state such as cwd, exports, and aliases persists there. An undeployed agent's `shell` commands use isolated temporary subprocesses. Use `session_*` for a separate private interactive PTY and `terminal_send` only to interact with an already-running terminal program.
-- Use `agent_spawn` for disposable delegation. Use `agent_hire` for a terminal-scoped employee identity, and use `agent_station` only to move an idle employee to another live terminal.
+- A deployed agent's `shell` commands execute directly in its deployment terminal. An undeployed agent's commands use a private temporary PTY owned by that run; it never borrows another agent's deployed shell.
+- Agent messages are limited to the same terminal scope, directly adjacent parent/child terminals, or a direct agent parent/child edge.
+- Treat another agent's analysis as a knowledge claim, not ground truth. Check its provenance (cwd, git_head/worktree fingerprint, observed_at), compare it with current state, and re-verify stale or unsupported conclusions before acting.
+- `/model` changes only a terminal deployment override; it never mutates an employee's base model.
 </runtime_ownership>"""
 
 _PRODUCT_PROTOCOL_PROMPT = """<laintas_product_protocol version="2" authoritative="true">
@@ -1971,7 +2288,7 @@ def rename_agent(agent_id: str, new_name: str) -> bool:
 
 
 def station_agent(agent_id: str, terminal_name: str) -> bool:
-    """Deploy one agent to exactly one terminal; terminals may host many agents."""
+    """Atomically deploy one agent to one otherwise-unoccupied terminal."""
     with _registry_lock:
         agent = _agent_registry.get(agent_id)
         term = _terminal_registry.get(terminal_name)
@@ -1980,6 +2297,13 @@ def station_agent(agent_id: str, terminal_name: str) -> bool:
         if term.session is None or not term.session.is_alive():
             return False
         if agent.role == "primary" and terminal_name != "term0":
+            return False
+        occupant = term.stationed_agent_id
+        if occupant is None and term.stationed_agent_ids:
+            # Normalize legacy in-memory state conservatively. Never evict an
+            # existing owner merely because the singular mirror was empty.
+            occupant = term.stationed_agent_ids[0]
+        if occupant not in (None, agent_id):
             return False
         old_terminal_name = agent_deployment_terminal(agent)
         if (agent.active_assignment is not None
@@ -1993,15 +2317,17 @@ def station_agent(agent_id: str, terminal_name: str) -> bool:
                 old_term.stationed_agent_ids.remove(agent_id)
             old_term.stationed_agent_id = old_term.stationed_agent_ids[0] if old_term.stationed_agent_ids else None
         agent.stationed_terminal = terminal_name
-        agent.home_terminal = terminal_name
         agent.deployment_terminal = terminal_name
+        if not agent.home_terminal:
+            agent.home_terminal = terminal_name
+            agent.parent_terminal = term.parent_terminal
         if agent.role == "primary":
             agent.parent_terminal = None
         if agent.role in {"pool", "deployed"}:
             agent.role = "deployed"
-        if agent_id not in term.stationed_agent_ids:
-            term.stationed_agent_ids.append(agent_id)
-        term.stationed_agent_id = term.stationed_agent_ids[0]  # keep first as legacy
+        term.stationed_agent_id = agent_id
+        term.stationed_agent_ids = [agent_id]
+        term.dialog_agent_id = agent_id
     # Deployment metadata is durable only for explicitly hired employees.
     # Temporary children and the primary agent have separate session state;
     # persisting them here would leak one JSON file per spawned task.
@@ -2014,28 +2340,25 @@ def station_agent(agent_id: str, terminal_name: str) -> bool:
 
 
 def unstation_agent(agent_id: str) -> None:
-    agent = get_agent(agent_id)
-    if agent is not None and agent.role == "deployed":
-        abort_agent(agent_id)
-        unregister_agent(
-            agent_id,
-            delete_persisted=bool(agent.state.get("_persisted_employee")),
-        )
-        return
+    """Release a deployment lease without deleting the employee identity."""
     with _registry_lock:
         agent = _agent_registry.get(agent_id)
         terminal_name = agent_deployment_terminal(agent)
         if agent and terminal_name:
             term = _terminal_registry.get(terminal_name)
             if term:
-                if agent_id in term.stationed_agent_ids:
-                    term.stationed_agent_ids.remove(agent_id)
-                term.stationed_agent_id = term.stationed_agent_ids[0] if term.stationed_agent_ids else None
+                term.stationed_agent_ids = [
+                    item for item in term.stationed_agent_ids
+                    if item != agent_id
+                ]
+                if term.stationed_agent_id == agent_id:
+                    term.stationed_agent_id = None
+                if term.dialog_agent_id == agent_id:
+                    term.dialog_agent_id = None
             agent.stationed_terminal = None
-            agent.home_terminal = None
             agent.deployment_terminal = None
-            agent.parent_terminal = None
             if agent.role == "deployed":
+                agent.role = "pool"
                 agent.status = "idle"
         else:
             agent = None
@@ -2065,6 +2388,8 @@ def close_all_agents() -> None:
                 term.stationed_agent_id = (
                     term.stationed_agent_ids[0]
                     if term.stationed_agent_ids else None)
+                if term.dialog_agent_id == info.id:
+                    term.dialog_agent_id = None
             if info.ephemeral_session is not None:
                 ephemeral_sessions.append(info.ephemeral_session)
                 info.ephemeral_session = None
@@ -2248,21 +2573,12 @@ def spawn_subagent(parent_id: str, task: str, deps,
     child.state["_task_cwd"] = (
         parent.state.get("_task_cwd")
         or parent.state.get("cwd") or os.getcwd())
-    child.deployment_terminal = agent_deployment_terminal(parent) or "term0"
-    child.stationed_terminal = child.deployment_terminal
-    child.home_terminal = child.deployment_terminal
-    if not station_agent(child.id, child.deployment_terminal):
-        error_text = (
-            f"Cannot spawn: deployment terminal "
-            f"'{child.deployment_terminal}' is unavailable."
-        )
-        unregister_agent(child.id)
-        if report_to_parent:
-            send_to_agent(parent_id, {
-                "from": "scheduler", "kind": "child-error",
-                "role": role or "general", "error": error_text,
-            })
-        return None
+    # Children share topology with their parent, never the parent's persistent
+    # terminal lease. Their shell commands run in a private temporary PTY.
+    child.home_terminal = agent_scope_terminal(parent) or "term0"
+    child.parent_terminal = child.home_terminal
+    child.deployment_terminal = None
+    child.stationed_terminal = None
     child.chain_id = chain_id
     child.chain_step_index = chain_step_index
     child.group_id = group_id
@@ -2481,6 +2797,31 @@ class LoopDeps:
     request_file_write_approval: Optional[Callable[[str, str, str], bool]] = None
     request_file_delete_approval: Optional[Callable[[str, str, str], bool]] = None
     display_task_list: Optional[Callable[[list, str], None]] = None
+
+
+def _print_markdown_safely(deps: LoopDeps, content: str) -> None:
+    """Render Markdown without allowing an optional highlighter failure to
+    terminate the agent loop.
+
+    Frozen PyInstaller builds load Pygments lexers lazily. If the executable's
+    embedded archive is damaged, Rich can raise zlib/import errors only when a
+    fenced code block first appears. Preserve the response as plain text and
+    tell the user how to repair the binary instead of losing the whole session.
+    """
+    try:
+        deps.console.print(deps.Markdown(content))
+        return
+    except Exception:
+        deps.console.print(content, markup=False, highlight=False)
+
+    if getattr(deps, "_markdown_render_warning_shown", False):
+        return
+    setattr(deps, "_markdown_render_warning_shown", True)
+    deps.console.print(
+        "[yellow]Markdown highlighting failed; output was shown as plain text. "
+        "The installed binary may be damaged. Run /v update --force or "
+        "reinstall laintas-cli.[/yellow]"
+    )
 
 
 # ── Legacy project context (.laintas/memory.json) ────────────────────────
@@ -3600,7 +3941,8 @@ def _detect_loop_warnings_typed(state: dict, original_input: str) -> list[tuple[
     last_cmds = [(h.get("command") or "").strip() for h in history[-3:]]
     last_tools = [h.get("tool", "") for h in history[-3:]]
     if (last_cmds[0] and last_cmds[0] == last_cmds[1] == last_cmds[2]
-            and not all(t in {"terminal.read", "agent.wait"} for t in last_tools)):
+            and not all(t in {"terminal.read", "terminal.wait", "agent.wait"}
+                        for t in last_tools)):
         warnings.append(("same_command_repeat",
             f"You have run `{last_cmds[0][:80]}` 3 times in a row with the same result. "
             f"Do not infer success from repetition. Inspect whether the objective is "
@@ -3626,7 +3968,7 @@ def _detect_loop_warnings_typed(state: dict, original_input: str) -> list[tuple[
         last5_tools = [(h.get("tool", ""), (h.get("command") or "")[:60]) for h in history[-5:]]
         if (all(t[0] == last5_tools[0][0] for t in last5_tools)
                 and last5_tools[0][0]
-                and last5_tools[0][0] not in {"terminal.read", "agent.wait"}
+                and last5_tools[0][0] not in {"terminal.read", "terminal.wait", "agent.wait"}
                 and len(set(t[1] for t in last5_tools)) <= 2):
             warnings.append(("tool_stagnation",
                 f"Tool stagnation: you've used `{last5_tools[0][0]}` 5 times "
@@ -3670,7 +4012,8 @@ def _detect_loop_warnings_typed(state: dict, original_input: str) -> list[tuple[
         non_empty = [fp for fp in last4_fps if fp]
         last4_tools = [h.get("tool", "") for h in history[-4:]]
         if (len(non_empty) >= 4 and len(set(non_empty)) == 1
-                and not all(t in {"terminal.read", "agent.wait"} for t in last4_tools)):
+                and not all(t in {"terminal.read", "terminal.wait", "agent.wait"}
+                            for t in last4_tools)):
             warnings.append(("near_repeat_command",
                 f"Near-repeat detected: last 4 commands have the same semantic pattern "
                 f"`{non_empty[0][:60]}`. You're varying arguments but not changing strategy. "
@@ -3696,7 +4039,8 @@ _FS_PATH_TOOLS = {"fs.read", "fs.write", "fs.edit", "fs.multi_edit", "fs.diff"}
 # stuck action, plus lifecycle tools that are meant to be polled repeatedly.
 _LEDGER_EXEMPT_TOOLS = {
     "task.complete", "plan.submit", "plan.update",
-    "time.now", "agent.wait", "agent.spawn", "agent.tell", "terminal.read",
+    "time.now", "agent.wait", "agent.spawn", "agent.tell",
+    "terminal.read", "terminal.wait",
 }
 
 
@@ -4202,6 +4546,8 @@ def _salient_arg(name: str, arguments: dict) -> str:
     if name == "terminal.read":
         cursor = arguments.get("cursor")
         return f'{arguments.get("name", "?")}@{cursor if cursor is not None else "next"}'
+    if name == "terminal.wait":
+        return f'{arguments.get("name", "?")} up to {arguments.get("timeout", 60)}s'
     if name in ("terminal.create", "terminal.terminate"):
         return str(arguments.get("name", "") or "")
     if name == "terminal.watch":
@@ -4333,6 +4679,17 @@ def _format_tool_result_for_loop(tool_name: str, result: dict, max_chars: int) -
         "duration_ms", "count", "path", "url", "size",
     )
     meta_bits = []
+    if tool_name in {"terminal.exec", "terminal.read", "terminal.wait"}:
+        if result.get("status"):
+            meta_bits.append(f"status={result['status']}")
+        if "completed" in result:
+            meta_bits.append(f"completed={str(bool(result['completed'])).lower()}")
+        if "timed_out" in result:
+            meta_bits.append(f"timed_out={str(bool(result['timed_out'])).lower()}")
+        meta_bits.append(
+            f"returncode={result['returncode']}" if "returncode" in result
+            else "returncode=pending"
+        )
     for k in meta_keys:
         if k in result and result[k] not in (None, "", False, 0):
             v = result[k]
@@ -4353,7 +4710,11 @@ def _format_tool_result_for_loop(tool_name: str, result: dict, max_chars: int) -
 
     text = body + footer
     if len(text) > max_chars:
-        text = text[:max_chars] + f"\n...(truncated to {max_chars} chars)"
+        truncation = f"\n...(truncated to {max_chars} chars)"
+        # Metadata such as completion/exit status is often more important than
+        # another few output bytes. Preserve the footer when truncating.
+        body_budget = max(0, max_chars - len(truncation) - len(footer))
+        text = body[:body_budget] + truncation + footer
     return text
 
 
@@ -4820,7 +5181,9 @@ def run_agent_loop(
         _supplementary = _ordinary_supplementary
         if _supplementary:
             supp_text = "\n".join(_supplementary)
-            deps.console.print(f"\n[cyan]📝 补充信息: {supp_text}[/cyan]")
+            deps.console.print(
+                f"\n[accent.dim]↳[/accent.dim] [muted]Applied instruction: "
+                f"{supp_text}[/muted]")
             supp_message = f"[Supplementary instruction from user]: {supp_text}"
             chat_history.append({
                 "role": "user", "content": supp_message,
@@ -4898,21 +5261,19 @@ def run_agent_loop(
             parent_str = "(none)"
 
         # Terminal / deployment context
-        terminal_name_str = (
-            getattr(current_agent, "home_terminal", None)
-            or (current_agent.stationed_terminal if current_agent else None)
-            or "(none)"
-        )
+        terminal_name_str = agent_scope_terminal(current_agent) or "(none)"
         # AgentInfo.parent_terminal records the terminal that owns/spawned the
         # agent. It is not the parent node in the terminal tree. Resolve the
         # latter from TerminalInfo so the prompt never reports a terminal as
         # its own parent for deployed employees.
-        terminal_info = (
+        scope_terminal_info = (
             get_terminal(terminal_name_str)
             if terminal_name_str != "(none)" else None
         )
+        deployment_name = agent_deployment_terminal(current_agent)
+        terminal_info = get_terminal(deployment_name) if deployment_name else None
         parent_terminal_str = (
-            terminal_info.parent_terminal if terminal_info else None
+            scope_terminal_info.parent_terminal if scope_terminal_info else None
         ) or "(none)"
         deployment_status_str = _format_deployment(current_agent)
 
@@ -5171,41 +5532,34 @@ def run_agent_loop(
                     _elapsed = time.monotonic() - _thinking_t0
                     # Output tokens grow in real-time from the streamed reply.
                     _cur_out_est = usage_tracker.estimate_tokens(stream_state["reply"])
-                    # Show a SMALL plain-text tail preview (not Markdown).
-                    # Markdown rendering expands height unpredictably (list
-                    # padding, code-block borders, paragraph spacing) — 18 raw
-                    # lines easily become 30+ rendered lines, overflowing the
-                    # terminal viewport.  When the Live frame overflows,
-                    # rich switches from in-place redraw to append mode, and
-                    # transient=True can only clear the last frame, leaving
-                    # stale copies in the scrollback ("复读").  Plain Text with
-                    # a fixed 5-line cap + per-line width truncation keeps the
-                    # frame tiny and predictable, so transient clearing always
-                    # works.  The full reply is printed once as Markdown after
-                    # streaming finishes.
-                    _cap = 5
-                    _cw = (deps.console.width or 80) - 1
-                    if stream_state["reply"]:
-                        _rlines = stream_state["reply"].split("\n")
-                        if len(_rlines) > _cap:
-                            _tail = _rlines[-_cap:]
-                            _preview = f"… streaming ({len(_rlines)} lines) …\n" + "\n".join(
-                                (ln[:_cw - 3] + "…" if len(ln) > _cw else ln) for ln in _tail)
-                        else:
-                            _preview = stream_state["reply"]
-                        parts.append(Text(_preview, style="dim"))
-                        _label = "streaming…"
-                    else:
-                        _label = "thinking…"
-                    # Update the shared spinner's text (keeps animation
-                    # continuity — start_time is preserved). The label shimmers
-                    # (流光); the trailing metrics stay a calm dim green.
+                    _cw = max(20, (deps.console.width or 80) - 1)
+                    _preview_mode = str(get_runtime_config("stream_preview") or "one")
+                    _label = "Writing…" if stream_state["reply"] else "Thinking…"
+                    # Restore the moving highlight while keeping the Live
+                    # region fixed to one line in compact mode. Only glyph
+                    # styles change; text width and layout never change.
                     _txt = _shimmer_label(_label, _elapsed)
-                    _txt.append(
-                        f" {_elapsed:.1f}s · ↑{_fmt_tokens(_cur_in_est)} ↓{_fmt_tokens(_cur_out_est)} · {_spin_model} · {_spin_mode}",
-                        style="#2ea043")
+                    _txt.append(f" {_elapsed:.1f}s", style="#8b949e")
+                    if _detail:
+                        _txt.append(
+                            f" · ↑{_fmt_tokens(_cur_in_est)} ↓{_fmt_tokens(_cur_out_est)}",
+                            style="#8b949e",
+                        )
+                    if _cw >= 72:
+                        _txt.append(f" · {_spin_model} · {_spin_mode}", style="#8b949e")
                     _spinner.text = _txt
                     parts.append(_spinner)
+                    # Reserve a constant number of preview rows for the whole
+                    # Live lifetime. This prevents Rich from switching to
+                    # append/overflow rendering as prose grows (the source of
+                    # duplicated prompts and deletion flicker).
+                    _cap = 0 if _preview_mode == "off" else (3 if _preview_mode == "detail" else 1)
+                    if _cap:
+                        _rlines = stream_state["reply"].splitlines() if stream_state["reply"] else []
+                        _tail = _rlines[-_cap:]
+                        _rows = [_crop_cells(line, _cw - 2) for line in _tail]
+                        _rows = ([""] * (_cap - len(_rows))) + _rows
+                        parts.append(Text("\n".join(_rows), style="muted"))
                     if stream_state["command"] and _detail:
                         cmd_preview = stream_state["command"]
                         if len(cmd_preview) > 120:
@@ -5239,6 +5593,11 @@ def run_agent_loop(
                     # re-computes _render() on every auto-refresh tick.
 
                 def _do_stream_call():
+                    _request_model, _request_provider = resolve_agent_model(
+                        current_agent,
+                        state.get('_model_override', ''),
+                        state.get('_provider_override', ''),
+                    )
                     try:
                         return deps.call_backend(
                             session=session,
@@ -5251,20 +5610,37 @@ def run_agent_loop(
                             interrupt_event=_interrupt,
                             messages=_thread_to_send,
                             allowed_tool_names=_allowed_tool_names,
-                            model_override=state.get('_model_override'),
+                            model_override=_request_model or None,
+                            provider_override=_request_provider or None,
                         )
                     except TypeError:
-                        # Backend doesn't support on_chunk/interrupt_event — fall back
-                        return deps.call_backend(
-                            session=session,
-                            message=user_input,
-                            system_prompt=system_prompt,
-                            current_path=state.get("cwd") or os.getcwd(),
-                            history=history_for_backend,
-                            lang=lang,
-                        )
+                        # Compatibility with injected backends that support the
+                        # older model_override argument but not provider_override.
+                        try:
+                            return deps.call_backend(
+                                session=session,
+                                message=user_input,
+                                system_prompt=system_prompt,
+                                current_path=state.get("cwd") or os.getcwd(),
+                                history=history_for_backend,
+                                on_chunk=_on_chunk,
+                                lang=lang,
+                                interrupt_event=_interrupt,
+                                messages=_thread_to_send,
+                                allowed_tool_names=_allowed_tool_names,
+                                model_override=_request_model or None,
+                            )
+                        except TypeError:
+                            return deps.call_backend(
+                                session=session,
+                                message=user_input,
+                                system_prompt=system_prompt,
+                                current_path=state.get("cwd") or os.getcwd(),
+                                history=history_for_backend,
+                                lang=lang,
+                            )
 
-                with Live(_LiveWrapper(), console=deps.console, refresh_per_second=12.5,
+                with Live(_LiveWrapper(), console=deps.console, refresh_per_second=6.0,
                           auto_refresh=True, transient=True) as live:
                     _live_holder["live"] = live
                     response = _do_stream_call()
@@ -5449,7 +5825,7 @@ def run_agent_loop(
                         and not _prose_final):
                     deps.console.print(f"[accent]·[/accent] [dim]{_stripped}[/dim]")
                 else:
-                    deps.console.print(deps.Markdown(display_reply))
+                    _print_markdown_safely(deps, display_reply)
             step_replies.append(display_reply)
             state["lastReply"] = display_reply
             # Preserve the real sequence. Historically intermediate assistant
@@ -5526,10 +5902,37 @@ def run_agent_loop(
 
         formatted_outputs: list[str] = []
         per_call_rows: list[dict] = []
+        _compact_read_hints: list[tuple[str, str]] = []
         _explicit_complete = False    # set when task.complete is invoked
         _plan_submitted = False       # set when plan.submit is invoked
         _complete_summary = ""
         _user_denied = False          # set when the user rejects an approval prompt
+
+        def _flush_compact_reads() -> None:
+            """Render one consecutive read group without reordering the timeline."""
+            if events_cb is None or not _compact_read_hints:
+                return
+            category = _compact_read_hints[0][0]
+            unique_reads = list(dict.fromkeys(item for _kind, item in _compact_read_hints))
+            shown_reads = [
+                os.path.basename(item.rstrip("/")) or item
+                for item in unique_reads[:3]
+            ]
+            read_tail = " · ".join(shown_reads).replace("[", "\\[")
+            if len(unique_reads) > 3:
+                read_tail += f" · +{len(unique_reads) - 3}"
+            label, singular, plural = {
+                "Search": ("Search", "result", "results"),
+                "List": ("List", "location", "locations"),
+                "Memory": ("Memory", "source", "sources"),
+            }.get(category, ("Read", "source", "sources"))
+            noun = singular if len(unique_reads) == 1 else plural
+            deps.console.print(
+                f"  [success]●[/success] [accent.dim]{label}[/accent.dim]  "
+                f"[muted]{len(unique_reads)} {noun} · {read_tail}[/muted]",
+                highlight=False,
+            )
+            _compact_read_hints.clear()
 
         if tool_calls:
             for idx, tc in enumerate(tool_calls):
@@ -5557,6 +5960,7 @@ def run_agent_loop(
                         display_name = name
 
                 call_id = f"call_{loop+1:02d}_{idx+1:02d}"
+                _tool_t0 = time.monotonic()
                 salient = _salient_arg(name, arguments)
                 is_shell_flavored = name in ("shell.exec", "terminal.send", "terminal.exec")
                 _tool_definition = tools_mod.get_registry().get(name)
@@ -5931,6 +6335,10 @@ def run_agent_loop(
                                     if _owner is not None:
                                         _owner.ephemeral_session = interactive_session
 
+                _tool_elapsed = max(0.0, time.monotonic() - _tool_t0)
+                if isinstance(result, dict):
+                    result.setdefault("elapsed_seconds", round(_tool_elapsed, 3))
+
                 # ── Affirmative completion signal ──
                 # task.complete returns the _task_complete marker; that is the
                 # canonical "task finished" signal (see completion decision below).
@@ -5963,7 +6371,8 @@ def run_agent_loop(
                 if "not found" in _err and "tool" in _err.lower():
                     state["_force_full_catalog_next"] = True
 
-                if (name == "terminal.send" and result.get("ok")
+                if (name in {"terminal.send", "terminal.exec", "terminal.read", "terminal.wait"}
+                        and result.get("ok")
                         and "returncode" not in result):
                     _rc = None
                 else:
@@ -5990,7 +6399,34 @@ def run_agent_loop(
                     "returncode": _rc,
                     "tool": name,
                     "call_id": call_id,
+                    "elapsed_seconds": round(_tool_elapsed, 3),
                 })
+
+                if not result.get("ok", False):
+                    _failure = {
+                        "timestamp": datetime.now().isoformat(timespec="seconds"),
+                        "tool": name,
+                        "display_name": display_name,
+                        "command": _crop_cells(_redact_tool_text(salient), 500, middle=True),
+                        "error": _crop_cells(_redact_tool_text(str(result.get("error") or formatted or "Tool failed")), 1200),
+                        "output_tail": _redact_tool_text(str(formatted or ""))[-1200:],
+                        "returncode": _rc,
+                        "elapsed_seconds": round(_tool_elapsed, 3),
+                        "agent_id": agent_id or "primary",
+                        "terminal": deployment_name or getattr(current_agent, "home_terminal", None) or "temporary",
+                        "recovery": (
+                            "terminal restarted" if result.get("terminal_restarted")
+                            else "terminal recovered" if result.get("terminal_recovered")
+                            else "temporary terminal discarded" if result.get("terminal_discarded")
+                            else ""
+                        ),
+                    }
+                    _recent = state.setdefault("_recent_failures", [])
+                    if not isinstance(_recent, list):
+                        _recent = state["_recent_failures"] = []
+                    _recent.append(_failure)
+                    del _recent[:-10]
+                    _remember_tool_failure(_failure)
 
                 # Track files this call read/touched
                 _track_files_in_command(name, salient, state.setdefault("_files_seen", []))
@@ -6031,10 +6467,10 @@ def run_agent_loop(
                     # Green dot = quiet success; loud red ✕ is reserved for a
                     # call that actually failed, so red still *means* something.
                     ok_mark = "[success]●[/success]" if result.get("ok") else "[error]✕[/error]"
-                    _hint = _esc_hint((salient[:80] if salient else display_name) or "")
+                    _hint_plain = (salient if salient else display_name) or ""
                     if _detail:
                         deps.console.print(
-                            f"  {ok_mark} [accent.dim]{display_name}[/accent.dim] [dim]{_hint}[/dim]")
+                            f"  {ok_mark} [accent.dim]{display_name}[/accent.dim] [dim]{_esc_hint(_crop_cells(_hint_plain, max(20, deps.console.width - 20), middle=True))}[/dim]")
                     else:
                         # Simplified: one clean, aligned line per tool. A short
                         # trailing meta carries the essentials (line count / exit
@@ -6045,18 +6481,68 @@ def run_agent_loop(
                         if name == "terminal.send" and result.get("ok"):
                             _nlines = len((formatted or "").split("\n")) if formatted else 0
                             _meta2 = f"sent · {_nlines}L" if _nlines else "sent"
-                        elif name in ("shell.exec", "terminal.exec"):
+                        elif name == "terminal.exec" and result.get("ok"):
+                            if result.get("completed"):
+                                _meta2 = (f"completed · exit {_rc}" if _rc is not None
+                                          else "completed · exit unknown")
+                            else:
+                                _meta2 = "started · running"
+                        elif name in ("terminal.read", "terminal.wait") and result.get("ok"):
+                            _status = result.get("status", "running")
+                            if result.get("completed"):
+                                _meta2 = (f"completed · exit {_rc}" if _rc is not None
+                                          else "completed · exit unknown")
+                            else:
+                                _meta2 = _status.replace("_", " ")
+                        elif name == "shell.exec":
                             _nlines = len((formatted or "").split("\n")) if formatted else 0
                             if result.get("ok"):
                                 _meta2 = f"{_nlines}L · exit {_rc}" if _nlines else f"exit {_rc}"
                             else:
-                                _meta2 = f"exit {_rc} · /debug"
+                                _cause = str(result.get("error") or formatted or "").strip()
+                                _cause = re.sub(r"\s+", " ", _cause).replace("[", "\\[")
+                                _meta2 = f"exit {_rc}"
+                                if _cause:
+                                    _meta2 += f" · {_cause[:72]}"
+                                _meta2 += " · /why"
                         elif not result.get("ok"):
-                            _meta2 = "/debug"
-                        _line = f"  {_mark2} [accent.dim]{display_name:<9}[/accent.dim] [muted]{_hint}[/muted]"
-                        if _meta2:
-                            _line += f"   [muted]{_meta2}[/muted]"
-                        deps.console.print(_line, highlight=False)
+                            _cause = str(result.get("error") or formatted or "").strip()
+                            _cause = re.sub(r"\s+", " ", _cause).replace("[", "\\[")
+                            _meta2 = f"{_cause} · /why" if _cause else "/why"
+                        if _tool_elapsed >= 2.0:
+                            _meta2 = f"{_meta2} · {_tool_elapsed:.1f}s" if _meta2 else f"{_tool_elapsed:.1f}s"
+                        _quiet_read = (
+                            not _detail
+                            and bool(result.get("ok"))
+                            and name in {
+                                "fs.read", "fs.grep", "fs.list", "fs.ls",
+                                "memory.search", "memory.get",
+                            }
+                        )
+                        if _quiet_read:
+                            _read_category = (
+                                "Search" if name == "fs.grep"
+                                else "List" if name in {"fs.list", "fs.ls"}
+                                else "Memory" if name.startswith("memory.")
+                                else "Read"
+                            )
+                            _target = str(salient or _hint_plain or display_name).strip()
+                            if _target:
+                                if (_compact_read_hints
+                                        and _compact_read_hints[-1][0] != _read_category):
+                                    _flush_compact_reads()
+                                _compact_read_hints.append((_read_category, _target))
+                        else:
+                            _flush_compact_reads()
+                            _name2, _hint2, _meta2 = _compact_tool_line(
+                                display_name, _hint_plain, _meta2, deps.console.width)
+                            _line = (
+                                f"  {_mark2} [accent.dim]{_esc_hint(_name2)}[/accent.dim]"
+                                f"  [muted]{_esc_hint(_hint2)}[/muted]"
+                            )
+                            if _meta2:
+                                _line += f"  [muted]{_esc_hint(_meta2)}[/muted]"
+                            deps.console.print(_line, highlight=False)
                     pending_events.append({"type": "system", "kind": "tool",
                                             "content": display_name,
                                             "meta": {"ok": result.get("ok", False),
@@ -6091,6 +6577,8 @@ def run_agent_loop(
                 # outer loop will terminate immediately (see below).
                 if _user_denied:
                     break
+
+        _flush_compact_reads()
 
         # ── User-denied circuit breaker (outer loop) ──
         # When the user explicitly rejects an approval prompt (command, file
@@ -6282,7 +6770,7 @@ def run_agent_loop(
         # still covered by the command-pattern warning circuit breaker.
         _similarity_rows = [
             row for row in per_call_rows
-            if row.get("tool") not in {"terminal.send", "terminal.read"}
+            if row.get("tool") not in {"terminal.send", "terminal.read", "terminal.wait"}
         ]
         if _similarity_rows:
             _step_signal = "\n---\n".join(
@@ -6469,7 +6957,16 @@ def run_agent_loop(
         if loop < max_loops - 1:
             # Use interrupt event.wait() instead of time.sleep() so we can
             # wake up immediately on Ctrl+C rather than waiting for sleep to end.
-            _delay = float(get_runtime_config("loop_delay"))
+            _step_had_failure = any(
+                row.get("returncode") not in (None, 0)
+                for row in per_call_rows
+            )
+            _delay = _adaptive_loop_delay(
+                float(get_runtime_config("loop_delay")),
+                failed=_step_had_failure or bool(_nudge_needed),
+                retry_count=int(state.get("_retry_count", 0) or 0),
+                repeated=bool(_no_progress_count),
+            )
             if _interrupt.wait(timeout=_delay):
                 deps.console.print("\n[yellow]⚡ Agent loop interrupted during delay.[/yellow]")
                 _exit_reason = TRANSITION_INTERRUPTED

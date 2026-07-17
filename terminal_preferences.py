@@ -26,6 +26,8 @@ PERSISTED_UI_KEYS = frozenset({
     "paste_summary_min_lines",
     "paste_summary_min_chars",
     "show_billing",
+    "stream_preview",
+    "theme",
 })
 
 

@@ -1,6 +1,7 @@
 import io
 import copy
 import json
+import os
 import tempfile
 import unittest
 from contextlib import contextmanager
@@ -18,6 +19,33 @@ import paths
 import policy
 import session_store
 import task_manager
+
+
+class SubTerminalSessionTests(unittest.TestCase):
+    def test_tmux_exit_marker_preserves_real_status_but_is_hidden_from_output(self):
+        session = laintas_cli.SubTerminalSession("printf final; exit 13")
+        marker_line = f"{session._tmux_exit_marker}:13"
+        captured = f"final\n{marker_line}\n"
+
+        session._capture_tmux_returncode(captured)
+
+        self.assertEqual(session.returncode, 13)
+        self.assertEqual(session._clean_tmux_markers(captured), "final")
+
+    def test_tmux_start_sets_remain_on_exit_before_releasing_command(self):
+        completed = mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch.dict(os.environ, {"TMUX": "/tmp/tmux-test"}), \
+                mock.patch.object(laintas_cli.subprocess, "run",
+                                  side_effect=[completed, completed, completed]) as run:
+            session = laintas_cli.SubTerminalSession("exit 0")
+            session.start()
+
+        self.assertTrue(session._alive)
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertEqual(commands[0][:2], ["tmux", "new-window"])
+        self.assertEqual(commands[1][:2], ["tmux", "set-window-option"])
+        self.assertEqual(commands[2][:2], ["tmux", "send-keys"])
+        self.assertEqual(commands[2][-1], "Enter")
 
 
 @contextmanager

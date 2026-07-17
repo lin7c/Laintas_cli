@@ -32,7 +32,7 @@ stage pauses the run (a human must act); each run gets its own workspace under
 `company_runs/<process>/<timestamp>/`; the scheduler skips a missed window (no
 catch-up) and hard-stops at the `deadline`.
 
-Ownership: each role employee has exactly one deployment terminal; a role
-terminal may host multiple employees when needed. Terminating a role terminal
-also ends its deployed employees and descendant terminals, so process teardown
+Ownership: each role employee has at most one deployment terminal, and each
+role terminal hosts exactly one deployed employee. Terminating a role terminal
+also ends its deployed employee and descendant terminals, so process teardown
 should clean up the terminal tree instead of separately orphaning agents.

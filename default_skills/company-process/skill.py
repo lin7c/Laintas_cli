@@ -155,7 +155,7 @@ def _ensure_employee(role: str, persona: str):
     emp = _al.get_agent(role)
     if emp is None:
         prof = _al.EmployeeProfile(title=role, description=f"Company employee {role}", prompt=persona or "")
-        emp = _al.register_agent(name=role, role="deployed", profile=prof)
+        emp = _al.register_agent(name=role, role="pool", profile=prof)
     elif persona:
         try:
             emp.profile.prompt = persona

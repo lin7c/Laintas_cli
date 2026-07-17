@@ -69,6 +69,9 @@ class FrozenUpdateTests(unittest.TestCase):
             target = Path(tmp) / "laintas-cli"
             target.write_bytes(b"old-binary")
             target.chmod(0o751)
+            archive = self._archive(b"new-binary")
+            checksum = updater._sha256_bytes(archive)
+            sums = f"{checksum}  laintas-cli_linux_amd64.tar.gz\n".encode()
             real_replace = os.replace
             observed_old_target = []
 
@@ -82,7 +85,7 @@ class FrozenUpdateTests(unittest.TestCase):
                         return_value=SimpleNamespace(machine="x86_64")), \
                     mock.patch.object(
                         updater, "_download",
-                        return_value=self._archive(b"new-binary")), \
+                        side_effect=[sums, archive]), \
                     mock.patch.object(
                         updater.os, "replace", side_effect=checked_replace):
                 installed = updater.apply_frozen_update(
@@ -93,6 +96,28 @@ class FrozenUpdateTests(unittest.TestCase):
             self.assertEqual(target.read_bytes(), b"new-binary")
             self.assertTrue(target.stat().st_mode & stat.S_IXUSR)
             self.assertEqual(list(Path(tmp).glob(".laintas-cli-update-*")), [])
+
+    def test_binary_replacement_rejects_checksum_mismatch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "laintas-cli"
+            target.write_bytes(b"old-binary")
+            target.chmod(0o755)
+            archive = self._archive(b"corrupted-binary")
+            sums = ("0" * 64 + "  laintas-cli_linux_amd64.tar.gz\n").encode()
+            messages = []
+
+            with mock.patch.object(updater.sys, "executable", str(target)), \
+                    mock.patch.object(
+                        updater.os, "uname",
+                        return_value=SimpleNamespace(machine="x86_64")), \
+                    mock.patch.object(
+                        updater, "_download", side_effect=[sums, archive]):
+                installed = updater.apply_frozen_update(
+                    {"version": "9.9.9"}, "latest", messages.append)
+
+            self.assertIsNone(installed)
+            self.assertEqual(target.read_bytes(), b"old-binary")
+            self.assertTrue(any("Checksum mismatch" in message for message in messages))
 
 
 if __name__ == "__main__":

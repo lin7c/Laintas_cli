@@ -18,15 +18,17 @@ Default to doing the work yourself. Delegate only when it reduces real wall-cloc
 ## Temporary agents and hired employees
 
 - `agent.spawn` creates a disposable child for one bounded task. It inherits the
-  caller's terminal ownership and ends when that terminal subtree ends.
-- `agent.hire` creates a persistent employee and deploys it directly to the
-  caller's current terminal. Hiring defines identity and capabilities; it does
-  not start work by itself.
+  caller's terminal scope for communication, never the caller's deployment
+  lease or shell stream.
+- `agent.hire` creates a persistent, initially undeployed employee. Hiring
+  defines identity, capabilities, and a base model; it does not start work.
 - Give hired employees work through an explicit assignment or agent message.
-  Use `agent.station` only to move an idle employee to another live terminal;
-  it is not a required second step after hiring.
-- A terminal may host multiple employees, but each employee has exactly one
-  deployment terminal and ends when that terminal ends.
+  Without deployment, assignments use a private temporary terminal. Use
+  `agent.station` to claim a different live, unoccupied terminal explicitly.
+- A terminal may host exactly one deployed employee, and each employee has at
+  most one deployment terminal.
+- Direct messages are limited to same-terminal peers, direct parent/child
+  terminal neighbors, and direct agent parent/child relationships.
 - Use spawned agents for one-off delegation and hired employees for reusable,
   terminal-scoped roles.
 

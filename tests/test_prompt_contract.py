@@ -22,6 +22,8 @@ class PromptContractTests(unittest.TestCase):
         self.assertIn("{{durableRules}}", prompt)
         self.assertNotIn("session_continue", prompt)
         self.assertNotIn("The session's full context", prompt)
+        self.assertIn("an observed completion state", prompt)
+        self.assertIn("started background command is not evidence of success", prompt)
 
     def test_runtime_orchestration_prompt_routes_task_hwo_and_hwg(self):
         prompt = agent_loop._WORK_ORCHESTRATION_PROMPT

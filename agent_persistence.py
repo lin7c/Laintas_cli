@@ -1,8 +1,9 @@
 """Agent state persistence — survives across sessions.
 
 Each hired agent is serialized to `~/.laintas/agents/<agent_id>.json` after
-significant state changes. A hired agent is owned by exactly one deployment
-terminal; ending that terminal ends the agent and removes its persisted record.
+significant state changes. Home-terminal membership and an optional deployment
+lease are distinct; closing a home terminal reparents an undeployed employee,
+while closing its active deployment terminal ends that deployed identity.
 
 Threading model:
 - Only the process that owns the agent (parent for pool agents, child for
@@ -12,7 +13,7 @@ Threading model:
 
 What is persisted:
 - id, name, role, depth, parent_id
-- deployment_terminal (plus legacy terminal aliases during migration)
+- home_terminal, optional deployment_terminal, immutable base model/provider
 - chat_history, state (shortTermMemory / lastReply / lastOutput)
 - employee profile, tool policy, assignment history
 - created_at, last_saved
@@ -64,6 +65,7 @@ def save_agent_state(agent: "AgentInfo") -> bool:
         history = history[-_MAX_HISTORY_TURNS:]
 
     data = {
+        "schema_version": 2,
         "id": agent.id,
         "name": agent.name,
         "role": getattr(agent, "role", "pool"),
@@ -73,6 +75,8 @@ def save_agent_state(agent: "AgentInfo") -> bool:
         "deployment_terminal": getattr(agent, "deployment_terminal", None),
         "home_terminal": getattr(agent, "home_terminal", None),
         "stationed_terminal": getattr(agent, "stationed_terminal", None),
+        "base_model": getattr(agent, "base_model", ""),
+        "base_provider": getattr(agent, "base_provider", ""),
         "chat_history": history,
         "state": dict(getattr(agent, "state", {}) or {}),
         "profile": _serialize_profile(getattr(agent, "profile", None)),
@@ -168,22 +172,28 @@ def apply_persisted_state(agent: "AgentInfo", data: dict) -> None:
     """
     for key in ("name", "role", "parent_id", "parent_terminal",
                 "deployment_terminal", "home_terminal", "stationed_terminal",
-                "created_at"):
+                "base_model", "base_provider", "created_at"):
         if key in data and data[key] is not None:
             try:
                 setattr(agent, key, data[key])
             except AttributeError:
                 pass
-    deployment = (
-        data.get("deployment_terminal")
-        or data.get("stationed_terminal")
-        or data.get("home_terminal")
-        or data.get("parent_terminal")
-    )
+    deployment = data.get("deployment_terminal") or data.get("stationed_terminal")
+    if not data.get("schema_version") and data.get("role") == "deployed":
+        # Pre-v2 files conflated membership and deployment. Only a legacy
+        # explicitly-deployed role may recover deployment from those aliases.
+        deployment = (
+            deployment or data.get("home_terminal")
+            or data.get("parent_terminal")
+        )
     if deployment:
         agent.deployment_terminal = deployment
         agent.stationed_terminal = deployment
-        agent.home_terminal = deployment
+        if not getattr(agent, "home_terminal", None):
+            agent.home_terminal = deployment
+    else:
+        agent.deployment_terminal = None
+        agent.stationed_terminal = None
     if isinstance(data.get("chat_history"), list):
         agent.chat_history = list(data["chat_history"])
     if isinstance(data.get("state"), dict):

@@ -153,6 +153,31 @@ def _sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _release_checksums(data: bytes) -> dict[str, str]:
+    """Parse a release SHA256SUMS file into {asset: lowercase digest}."""
+    checksums = {}
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("SHA256SUMS.txt is not valid UTF-8") from exc
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        parts = line.split(None, 1)
+        if len(parts) != 2:
+            raise ValueError("SHA256SUMS.txt contains a malformed line")
+        digest, name = parts
+        name = name.lstrip("* ")
+        digest = digest.lower()
+        if (len(digest) != 64
+                or any(char not in "0123456789abcdef" for char in digest)
+                or not name):
+            raise ValueError("SHA256SUMS.txt contains an invalid entry")
+        checksums[name] = digest
+    return checksums
+
+
 def fetch_manifest() -> dict:
     """Fetch and parse the remote manifest. Raises on network/format error."""
     resp = requests.get(manifest_url(), timeout=_TIMEOUT, verify=_CA_BUNDLE)
@@ -359,7 +384,27 @@ def apply_frozen_update(manifest: dict, channel_dir: str, log) -> Optional[str]:
     asset = f"laintas-cli_linux_{arch}.tar.gz"
     url = _asset_url(channel_dir, asset)
 
-    data = _download(url, label=asset, console=getattr(log, "__self__", None))
+    try:
+        sums_data = _download(
+            _asset_url(channel_dir, "SHA256SUMS.txt"),
+            label="SHA256SUMS.txt",
+            console=getattr(log, "__self__", None),
+        )
+        expected = _release_checksums(sums_data).get(asset)
+        if not expected:
+            log(f"[red]SHA256SUMS.txt does not cover {asset}. Aborting.[/red]")
+            return None
+        data = _download(url, label=asset, console=getattr(log, "__self__", None))
+    except Exception as exc:
+        log(f"[red]Could not download or parse release checksums: {exc}[/red]")
+        return None
+    actual = _sha256_bytes(data)
+    if actual != expected:
+        log(
+            f"[red]Checksum mismatch for {asset}; the download may be "
+            "corrupted. Aborting.[/red]"
+        )
+        return None
 
     tmpdir = tempfile.mkdtemp(prefix="laintas-update-")
     try:

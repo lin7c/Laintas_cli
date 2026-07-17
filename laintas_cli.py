@@ -127,6 +127,7 @@ from prompt_toolkit.history import FileHistory
 from prompt_toolkit.completion import Completer, Completion, PathCompleter, WordCompleter
 from prompt_toolkit.document import Document
 from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.keys import Keys
 from prompt_toolkit.layout import Layout, HSplit, Window, FormattedTextControl
 from prompt_toolkit.styles import Style
@@ -140,16 +141,20 @@ from prompt_toolkit.filters import Condition
 # Minimal palette: one accent, muted secondaries, semantic status colors.
 # Use these names instead of inline literals so the whole UI restyles here.
 LAINTAS_THEME = Theme({
-    "accent":   "#3fb950",          # primary accent — terminal green (青红 theme)
+    "accent":   "#3fb950",          # primary action / active state
     "accent.dim": "#2ea043",
     "success":  "#4ade80",
     "error":    "bold #f85149",
     "warning":  "#e3b341",
-    "muted":    "#6b7d6b",          # green-biased grey
+    "foreground": "#e6edf3",
+    "muted":    "#8b949e",
+    "subtle":   "#6e7681",
+    "surface":  "on #161b22",
+    "selected": "bold #f0f6fc on #21262d",
     "agent":    "#a78bfa",          # agent / orchestration (soft violet, kept distinct)
-    "path":     "bold #3fb950",
+    "path":     "#c9d1d9",
     "glyph":    "#3fb950",
-    "rule":     "#233323",
+    "rule":     "#30363d",
     # Rich's default Markdown inline-code style is cyan on black. Keep all
     # ordinary/model text on the terminal's default background instead.
     "markdown.code": "white",
@@ -182,7 +187,54 @@ class LaintasMarkdown(RichMarkdown):
 
 # Keep the existing dependency-injection surface (`deps.Markdown`) stable.
 Markdown = LaintasMarkdown
-console = Console(theme=LAINTAS_THEME, style="white")
+
+
+def _no_color_requested() -> bool:
+    """Honor the conventional NO_COLOR environment flag, even when empty."""
+    return "NO_COLOR" in os.environ
+
+
+console = Console(
+    theme=LAINTAS_THEME,
+    style="foreground",
+    no_color=_no_color_requested(),
+)
+
+_THEME_VARIANTS = {
+    "dark": LAINTAS_THEME,
+    "light": Theme({
+        "accent": "#176f2c", "accent.dim": "#238636", "success": "#116329",
+        "error": "bold #cf222e", "warning": "#9a6700", "foreground": "#24292f",
+        "muted": "#57606a", "subtle": "#6e7781", "surface": "on #f6f8fa",
+        "selected": "bold #24292f on #d0d7de", "agent": "#8250df",
+        "path": "#24292f", "glyph": "#176f2c", "rule": "#d0d7de",
+        "markdown.code": "#24292f", "markdown.code_block": "#24292f",
+    }),
+    "mono": Theme({
+        "accent": "bold", "accent.dim": "dim", "success": "bold",
+        "error": "bold reverse", "warning": "bold", "foreground": "",
+        "muted": "dim", "subtle": "dim", "surface": "", "selected": "reverse",
+        "agent": "bold", "path": "", "glyph": "bold", "rule": "dim",
+        "markdown.code": "", "markdown.code_block": "",
+    }),
+}
+_console_theme_pushed = False
+
+
+def _apply_ui_theme(name: str) -> str:
+    """Apply a semantic Rich theme without replacing the shared Console."""
+    global _console_theme_pushed
+    normalized = str(name or "dark").strip().lower()
+    if normalized not in _THEME_VARIANTS:
+        raise ValueError("theme expects dark, light, or mono")
+    if _console_theme_pushed:
+        try:
+            console.pop_theme()
+        except Exception:
+            pass
+    console.push_theme(_THEME_VARIANTS[normalized], inherit=False)
+    _console_theme_pushed = True
+    return normalized
 
 
 def _ptk_fragments(pairs):
@@ -390,7 +442,7 @@ def select_dialog(
     def _build_lines():
         lines = []
         if title:
-            lines.append(("bold #ffffff", f"{title}\n"))
+            lines.append(("bold #e6edf3", f"{title}\n"))
 
         vis = _clamp_sel()
 
@@ -410,12 +462,15 @@ def select_dialog(
                 end = min(start + list_h, len(vis))
 
         if start > 0:
-            lines.append(("dim", f"  ... {start} more above ...\n"))
+            lines.append(("class:muted", f"  ↑ {start} more\n"))
+
+        if not vis:
+            lines.append(("class:muted", "  No matches\n"))
 
         for vi in range(start, end):
             oi, lab, desc = vis[vi]
             is_sel = (oi == sel[0])
-            prefix = "▶" if is_sel else " "
+            prefix = "›" if is_sel else " "
             if multi:
                 mark = "☑" if oi in chk else "☐"
                 row_text = f" {prefix} {mark}  {lab}"
@@ -427,7 +482,7 @@ def select_dialog(
             lines.append((style, row_text + "\n"))
 
         if end < len(vis):
-            lines.append(("dim", f"  ... {len(vis) - end} more below ...\n"))
+            lines.append(("class:muted", f"  ↓ {len(vis) - end} more\n"))
 
         # ── Footer hint ──
         lines.append(("", "\n"))
@@ -440,9 +495,9 @@ def select_dialog(
                 parts.insert(0, "Type to filter")
             if act_keys:
                 parts.insert(0, "  ".join(f"{k}={a}" for k, a in act_keys.items()))
-            lines.append(("dim", "  " + "  ".join(parts)))
+            lines.append(("class:muted", "  " + "  ·  ".join(parts)))
         else:
-            lines.append(("dim", "  " + hint))
+            lines.append(("class:muted", "  " + hint))
         if _auto_deadline is not None:
             remaining = max(0, int((_auto_deadline - time.monotonic()) + 0.999))
             lines.append(("class:auto-confirm", f"  Auto-confirm in {remaining}s"))
@@ -571,7 +626,15 @@ def select_dialog(
     # ── Layout ────────────────────────────────────────────────────
     layout_panes = []
     if search:
-        layout_panes.append(Window(content=BufferControl(buffer=filter_buf), height=1))
+        layout_panes.append(Window(
+            content=FormattedTextControl([("class:search-label", "  Filter")]),
+            height=1,
+        ))
+        layout_panes.append(Window(
+            content=BufferControl(buffer=filter_buf),
+            height=1,
+            style="class:search-input",
+        ))
     list_ctrl = FormattedTextControl(lambda: _ptk_fragments(_build_lines()))
     if full_screen:
         layout_panes.append(Window(content=list_ctrl))
@@ -588,8 +651,11 @@ def select_dialog(
 
     layout = Layout(HSplit(layout_panes))
     style = Style.from_dict({
-        "selected": "bold #ffffff",
-        "option": "#ffffff",
+        "selected": "bold #f0f6fc bg:#21262d",
+        "option": "#e6edf3",
+        "muted": "#8b949e",
+        "search-label": "bold #8b949e",
+        "search-input": "#e6edf3 bg:#161b22",
         "auto-confirm": "#e3b341",
     })
 
@@ -656,7 +722,7 @@ except Exception:
 from agent_loop import (
     MAX_LOOPS, MAX_TOKENS, MAX_DEBUG_ENTRIES,
     DebugEntry, TerminalInfo, AgentInfo, EmployeeProfile, AgentToolPolicy,
-    add_debug_log, clear_debug_logs,
+    add_debug_log, clear_debug_logs, get_recent_tool_failures,
     next_debug_loop, get_debug_logs,
     run_agent_loop, LoopDeps,
     register_terminal, unregister_terminal,
@@ -664,7 +730,8 @@ from agent_loop import (
     rename_terminal,
     register_agent, unregister_agent,
     get_agent, get_all_agents, get_current_agent,
-    agent_deployment_terminal,
+    agent_deployment_terminal, agent_scope_terminal,
+    set_terminal_model_selection,
     get_pool_agents, get_deployed_agents, get_or_hire_pool_agent,
     start_agent_assignment,
     switch_to_agent, set_current_agent_id,
@@ -862,13 +929,22 @@ def _marker_poll_exec_unlocked(session, command: str, timeout: int = 60,
     marker_id = _uuid.uuid4().hex[:8]
     start_marker = f"__CMD_BEGIN_{marker_id}__"
     end_marker = f"__CMD_END_{marker_id}__"
-    wrapped = f"echo {start_marker}; {command} 2>&1; __laintas_rc=$?; echo {end_marker}:$__laintas_rc"
+    payload = tools_mod.shell_payload_for_pty(
+        command, noninteractive=True, token=marker_id,
+        agent_automation=False)
+    wrapped = f"echo {start_marker}; {payload} 2>&1; __laintas_rc=$?; echo {end_marker}:$__laintas_rc"
 
     try:
         old_len = len(session.raw_output)
     except AttributeError:
         old_len = len(session.full_output)
 
+    if getattr(session, "_laintas_shell_dirty", None) is True:
+        if not tools_mod.recover_stuck_shell(session):
+            return {"stdout": "", "returncode": -1, "success": False,
+                    "stderr": ("terminal is stuck: a previous command is "
+                               "still running or an interactive program is "
+                               "holding the shell")}
     session.send_keys(wrapped + "\n")
     poll_start = time.time()
     cmd_output = ""
@@ -907,6 +983,23 @@ def _marker_poll_exec_unlocked(session, command: str, timeout: int = 60,
             cmd_output = new_content
             break
 
+    stderr_note = ""
+    if returncode == -1 and session.is_alive():
+        # The command never signalled completion (pager, prompt, or genuinely
+        # long-running). Reclaim the shell so the next command doesn't type
+        # into the stuck program and time out too.
+        if tools_mod.recover_stuck_shell(session):
+            stderr_note = (f"command timed out ({timeout}s); "
+                           "foreground process stopped, terminal recovered")
+        else:
+            stderr_note = (f"command timed out ({timeout}s); "
+                           "terminal still busy")
+    elif returncode != -1:
+        try:
+            session._laintas_shell_dirty = False
+        except Exception:
+            pass
+
     if returncode == -1 and not cmd_output:
         cmd_output = new_content
 
@@ -914,7 +1007,7 @@ def _marker_poll_exec_unlocked(session, command: str, timeout: int = 60,
         cmd_output = strip_ansi(cmd_output)
     return {
         "stdout": cmd_output,
-        "stderr": "",
+        "stderr": stderr_note,
         "returncode": returncode,
         "success": returncode == 0,
     }
@@ -945,21 +1038,51 @@ def _sync_cwd_from_term0(session) -> None:
 
 
 def _ensure_term0_alive() -> None:
-    """Health-check term0's bash session. Respawn if dead."""
+    """Health-check term0's bash session and replace dead/dirty PTYs in place."""
     term0_info = get_terminal("term0")
-    if term0_info is None or term0_info.session is None or not term0_info.session.is_alive():
-        try:
-            if term0_info is not None:
-                unregister_terminal("term0")
-            _term0 = InteractiveSession(
-                DEFAULT_SHELL, timeout=0, stream_output=False, persistent=True)
-            _term0.start()
-            time.sleep(0.08)
-            if _term0.is_alive():
-                _term0.read_output(timeout=0.1)
-            register_terminal(_term0, DEFAULT_SHELL, 0, name="term0")
-        except Exception:
-            pass
+    old_session = term0_info.session if term0_info is not None else None
+    try:
+        alive = bool(old_session and old_session.is_alive())
+    except Exception:
+        alive = False
+    dirty = bool(getattr(old_session, "_laintas_shell_dirty", False))
+    if alive and not dirty:
+        return
+    restart_cwd = str(
+        getattr(old_session, "_laintas_last_cwd", "") or os.getcwd())
+    if not os.path.isdir(restart_cwd):
+        restart_cwd = os.getcwd()
+    replacement = None
+    try:
+        replacement = InteractiveSession(
+            DEFAULT_SHELL, timeout=0, stream_output=False,
+            persistent=True, cwd=restart_cwd)
+        replacement.start()
+        time.sleep(0.08)
+        if replacement.is_alive():
+            replacement.read_output(timeout=0.1)
+        if not replacement.is_alive():
+            raise RuntimeError("replacement term0 exited during startup")
+        if term0_info is None:
+            register_terminal(replacement, DEFAULT_SHELL, 0, name="term0")
+        else:
+            # Preserve terminal ownership/dialog/model metadata. Unregistering
+            # term0 would cascade into its deployed primary agent.
+            term0_info.session = replacement
+            term0_info.command = DEFAULT_SHELL
+            term0_info.completed_at = None
+            term0_info.returncode = None
+        if old_session is not None:
+            try:
+                old_session.close()
+            except Exception:
+                pass
+    except Exception:
+        if replacement is not None:
+            try:
+                replacement.close()
+            except Exception:
+                pass
 
 
 # ── Interactive-terminal whitelist ──────────────────────────────────────
@@ -1063,6 +1186,8 @@ class SubTerminalSession:
         self._alive: bool = False
         self._output_buf: list[str] = []
         self._start_time: float = 0.0
+        self._returncode: int = -1
+        self._tmux_exit_marker = f"__LAINTAS_EXIT_{uuid.uuid4().hex}__"
         # Commands routed through one shell must be atomic. Without this,
         # marker-poll executions from multiple agents can interleave.
         self.command_lock = threading.RLock()
@@ -1079,17 +1204,52 @@ class SubTerminalSession:
             self._tmux_window = f"laintas-{os.getpid()}-{uuid.uuid4().hex[:6]}"
             # -d: don't switch to the new window (terminal 0 stays active)
             try:
+                # Gate the real command until remain-on-exit is configured.
+                # Setting it after launching the command races with fast jobs;
+                # setting it from inside the pane can target the wrong window
+                # on some tmux versions. The parent therefore creates a pane
+                # blocked on one input line, configures that exact window, then
+                # releases it with Enter.
+                wrapped = (
+                    "read -r __laintas_start_gate; "
+                    f"{shlex.quote(DEFAULT_SHELL)} -c {shlex.quote(self.command)}; "
+                    "__laintas_rc=$?; "
+                    f"printf '\\n{self._tmux_exit_marker}:%s\\n' \"$__laintas_rc\"; "
+                    "exit \"$__laintas_rc\""
+                )
                 result = subprocess.run(
                     ["tmux", "new-window", "-d", "-n", self._tmux_window,
-                     f"{shlex.quote(DEFAULT_SHELL)} -c {shlex.quote(self.command)}"],
+                     f"{shlex.quote(DEFAULT_SHELL)} -c {shlex.quote(wrapped)}"],
                     capture_output=True, text=True, timeout=5,
                 )
                 self._alive = result.returncode == 0
+                if self._alive:
+                    option_result = subprocess.run(
+                        ["tmux", "set-window-option", "-t", self._tmux_window,
+                         "remain-on-exit", "on"],
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    release_result = subprocess.run(
+                        ["tmux", "send-keys", "-t", self._tmux_window, "Enter"],
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    self._alive = (
+                        option_result.returncode == 0
+                        and release_result.returncode == 0
+                    )
             except (OSError, subprocess.SubprocessError):
                 self._alive = False
             if self._alive:
                 return
             else:
+                if self._tmux_window:
+                    try:
+                        subprocess.run(
+                            ["tmux", "kill-window", "-t", self._tmux_window],
+                            capture_output=True, timeout=5,
+                        )
+                    except (OSError, subprocess.SubprocessError):
+                        pass
                 self._tmux_window = ""
                 self._use_tmux = False
         if not self._use_tmux:
@@ -1101,9 +1261,9 @@ class SubTerminalSession:
 
     def read_output(self, timeout: float = 0.3) -> str:
         """Read current output. For tmux: captures pane content."""
-        if not self._alive:
-            return ""
         if self._use_tmux:
+            if not self._tmux_window:
+                return ""
             import subprocess as _sp
             try:
                 result = _sp.run(
@@ -1111,6 +1271,7 @@ class SubTerminalSession:
                     capture_output=True, text=True, timeout=5,
                 )
                 new_output = result.stdout or ""
+                self._capture_tmux_returncode(new_output)
             except Exception:
                 new_output = ""
             # Return only what's new since last read
@@ -1118,7 +1279,7 @@ class SubTerminalSession:
             if len(new_output) > old_len:
                 delta = new_output[old_len:]
                 self._output_buf.append(delta)
-                return delta
+                return self._clean_tmux_markers(delta)
             return ""
         else:
             if self._pty:
@@ -1165,13 +1326,34 @@ class SubTerminalSession:
             import subprocess as _sp
             try:
                 result = _sp.run(
-                    ["tmux", "list-windows", "-F", "#{window_name}"],
+                    ["tmux", "display-message", "-p", "-t", self._tmux_window,
+                     "#{pane_dead} #{pane_dead_status}"],
                     capture_output=True, text=True, timeout=5,
                 )
-                alive = self._tmux_window in result.stdout
-                if not alive:
+                if result.returncode != 0:
                     self._alive = False
-                return alive
+                    return False
+                fields = (result.stdout or "").strip().split()
+                dead = bool(fields and fields[0] == "1")
+                if dead:
+                    self._alive = False
+                    try:
+                        captured = _sp.run(
+                            ["tmux", "capture-pane", "-p", "-t", self._tmux_window,
+                             "-S", "-2000"],
+                            capture_output=True, text=True, timeout=5,
+                        ).stdout or ""
+                        self._capture_tmux_returncode(captured)
+                    except Exception:
+                        pass
+                    if len(fields) > 1:
+                        try:
+                            if self._returncode < 0:
+                                self._returncode = int(fields[1])
+                        except ValueError:
+                            pass
+                    return False
+                return True
             except Exception:
                 return False
         else:
@@ -1213,9 +1395,11 @@ class SubTerminalSession:
                     ["tmux", "capture-pane", "-p", "-t", self._tmux_window, "-S", "-2000"],
                     capture_output=True, text=True, timeout=5,
                 )
-                return result.stdout or ""
+                output = result.stdout or ""
+                self._capture_tmux_returncode(output)
+                return self._clean_tmux_markers(output)
             except Exception:
-                return "".join(self._output_buf)
+                return self._clean_tmux_markers("".join(self._output_buf))
         else:
             if self._pty:
                 return self._pty.full_output
@@ -1231,9 +1415,11 @@ class SubTerminalSession:
                     ["tmux", "capture-pane", "-p", "-t", self._tmux_window, "-S", "-2000"],
                     capture_output=True, text=True, timeout=5,
                 )
-                return result.stdout or ""
+                output = result.stdout or ""
+                self._capture_tmux_returncode(output)
+                return self._clean_tmux_markers(output)
             except Exception:
-                return "".join(self._output_buf)
+                return self._clean_tmux_markers("".join(self._output_buf))
         else:
             if self._pty:
                 return self._pty.raw_output
@@ -1246,12 +1432,30 @@ class SubTerminalSession:
             return self._pty.master_fd
         return -1
 
+    def _capture_tmux_returncode(self, output: str) -> None:
+        if not output or self._returncode >= 0:
+            return
+        match = re.search(
+            rf"{re.escape(self._tmux_exit_marker)}:(\d+)", output)
+        if match:
+            self._returncode = int(match.group(1))
+
+    def _clean_tmux_markers(self, output: str) -> str:
+        if not output:
+            return output
+        return re.sub(
+            rf"(?:\r?\n)?{re.escape(self._tmux_exit_marker)}:\d+\r?\n?",
+            "\n", output,
+        ).rstrip("\n")
+
     @property
     def returncode(self) -> int:
         """Return code. -1 while running."""
         if self._pty:
             return self._pty.returncode
-        return -1
+        if self._use_tmux and self._alive:
+            self.is_alive()
+        return self._returncode
 
 
 def _build_connected_subterminal_cmd(terminal_name: str,
@@ -2031,14 +2235,15 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
         )),
     CommandSpec("/name", "Show or set the current agent name", "Agents & Terminals", "/name [new-name]"),
     CommandSpec(
-        "/hire", "Hire an employee into the current terminal; does not start an assignment",
+        "/hire", "Hire an undeployed employee; does not start an assignment",
         "Agents & Terminals",
-        "/hire [name] [--profile role] [--prompt file] [--tools name,...|inherit]",
-        subcommands=("--profile", "--prompt", "--tools"),
+        "/hire [name] [--profile role] [--prompt file] [--tools name,...|inherit] [--model [id]] [--terminal name]",
+        subcommands=("--profile", "--prompt", "--tools", "--model", "--terminal"),
         help_text=(
             "Creates a persistent employee identity with its own prompt and tool policy, "
-            "then deploys it to the current terminal. Use /station <agent> [terminal] "
-            "--task <work> to start an assignment or move it explicitly."
+            "base model, and logical home terminal. It is not auto-deployed. Use "
+            "/station <agent> --task <work> for a private temporary terminal, or "
+            "/station <agent> <terminal> to deploy it explicitly."
         )),
     CommandSpec(
         "/agents", "List employees or inspect capabilities and assignment history",
@@ -2056,8 +2261,9 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
         aliases=("/st",),
         help_text=(
             "Without --task, deploys or moves the employee. With --task, starts a fresh "
-            "background Assignment with isolated state/history. Omitting the terminal "
-            "uses the employee's existing deployment, or the manager's current terminal."
+            "background Assignment with isolated state/history. For an undeployed "
+            "employee, omitting the terminal with --task uses a private temporary "
+            "terminal; deployment always requires an explicit target."
         )),
     CommandSpec("/terminate", "Close a terminal and all child resources", "Agents & Terminals", "/terminate <name>"),
     CommandSpec("/send", "Send input to a terminal", "Agents & Terminals", "/send <name> [--wait <seconds>] <command>"),
@@ -2073,7 +2279,7 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec("/task", "Track project tasks", "Planning & Tasks", "/task [list|add|show|start|done|del|progress|note|subtask]", subcommands=("list", "add", "show", "start", "done", "del", "progress", "note", "subtask")),
     CommandSpec("/work", "Inspect or resume unified WorkGraph state", "Planning & Tasks", "/work [status|list|resume|history]", subcommands=("status", "list", "resume", "history")),
     CommandSpec("/workflow", "Run a multi-phase workflow", "Planning & Tasks", "/workflow {start|status|advance|approve|end|list}", subcommands=("start", "status", "advance", "approve", "end", "list")),
-    CommandSpec("/model", "List or select the backend model", "Config & Tools", "/model [id|reset]", subcommands=("reset", "clear", "default")),
+    CommandSpec("/model", "List or select a deployed terminal model override", "Config & Tools", "/model [terminal] [id|reset]", subcommands=("reset", "clear", "default")),
     CommandSpec("/config", "View or set runtime configuration", "Config & Tools", "/config [key [value]|reset]", subcommands=("reset",)),
     CommandSpec("/policy", "Show or set security policy", "Config & Tools", "/policy [audit|enforce|disabled [--yes]|reset]", subcommands=("audit", "enforce", "disabled", "reset")),
     CommandSpec("/trust", "Review or change workspace trust", "Config & Tools", "/trust [status|allow|revoke]", subcommands=("status", "allow", "revoke")),
@@ -2089,6 +2295,9 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec("/mail", "Check or send mail to/from your Laintas account", "Config & Tools", "/mail [inbox [--all]|read <n>|send [subject]]", subcommands=("inbox", "read", "send")),
     CommandSpec("/prop", "View .laintas/cli.prop prompt template", "Config & Tools"),
     CommandSpec("/debug", "Browse or export debug entries", "Config & Tools", "/debug [clear|N|N <file> [--raw]]", subcommands=("clear",)),
+    CommandSpec("/why", "Explain a recent tool failure", "Config & Tools", "/why [N|tool|terminal|agent]"),
+    CommandSpec("/stream", "Set bounded streaming preview", "Config & Tools", "/stream [off|one|detail]", subcommands=("off", "one", "detail")),
+    CommandSpec("/theme", "Set terminal color theme", "Config & Tools", "/theme [dark|light|mono]", subcommands=("dark", "light", "mono")),
     CommandSpec("/detail", "Toggle full vs simplified progress rendering", "Config & Tools", "/detail [on|off]", subcommands=("on", "off")),
     CommandSpec("/undo", "Restore a git checkpoint", "History", "/undo [sha]"),
     CommandSpec("/snapshot", "Create a git checkpoint", "History", "/snapshot [label]"),
@@ -2279,34 +2488,45 @@ class MetaCompleter(Completer):
 
 def _build_prompt_style() -> Style:
     """Build prompt_toolkit Style for the prompt, completion menu, and status bar."""
+    mode = str(get_runtime_config("theme") or "dark")
+    palettes = {
+        "dark": ("#c9d1d9", "#2ea043", "#4ade80", "#e3b341", "#8b949e", "#6e7681", "#a78bfa", "#161b22", "#21262d"),
+        "light": ("#24292f", "#176f2c", "#116329", "#9a6700", "#57606a", "#6e7781", "#8250df", "#f6f8fa", "#d0d7de"),
+        "mono": ("", "", "", "", "", "", "", "", "reverse"),
+    }
+    path, accent, success, warning, muted, subtle, agent, menu, selected = palettes.get(mode, palettes["dark"])
+    menu_bg = f"bg:{menu}" if menu.startswith("#") else menu
+    selected_bg = f"bg:{selected}" if selected.startswith("#") else selected
     return Style.from_dict({
-        "prompt-path": "bold #3fb950",
-        "prompt-gutter": "#2ea043 bold",     # green status gutter (Act mode)
-        "prompt-gutter-plan": "#e3b341 bold", # hollow amber gutter (Plan mode)
-        "prompt-caret": "#4ade80 bold",       # the animated green ❯
-        "separator": "#3fb950",
-        "paste-placeholder": "bold #4ade80",
+        "prompt-path": path,
+        "prompt-gutter": f"{accent} bold",
+        "prompt-gutter-plan": f"{warning} bold",
+        "prompt-caret": success,
+        "separator": accent,
+        "paste-placeholder": f"bold {success}",
         # Slash-command completion menu keeps its established visual identity.
-        "completion-menu": "bg:#0e140e",
-        "completion-menu.completion": "bg:#0e140e #c9d4c5",
-        "completion-menu.completion.current": "bg:#1f5f30 #dffbe6 bold",
-        "completion-menu.meta.completion": "bg:#0b0f0b #6b7d6b",
-        "completion-menu.meta.completion.current": "bg:#0b0f0b #4ade80",
+        "completion-menu": menu_bg,
+        "completion-menu.completion": f"{menu_bg} {path}",
+        "completion-menu.completion.current": f"{selected_bg} {path} bold",
+        "completion-menu.meta.completion": f"{menu_bg} {muted}",
+        "completion-menu.meta.completion.current": f"{selected_bg} {muted}",
         # Bottom status bar also inherits the terminal background.
         "bottom-toolbar": "#ffffff",
-        "stbar-sep": "#6b7d6b",
-        "stbar-model": "#3fb950 bold",
-        "stbar-mode-act": "#4ade80 bold",
-        "stbar-mode-plan": "#e3b341 bold",
-        "stbar-tokens": "#ffffff",
-        "stbar-time": "#6b7d6b",
-        "stbar-dot-act": "#4ade80 bold",
-        "stbar-dot-plan": "#e3b341 bold",
+        "stbar-sep": subtle,
+        "stbar-model": f"{accent} bold",
+        "stbar-mode-act": f"{success} bold",
+        "stbar-mode-plan": f"{warning} bold",
+        "stbar-tokens": path,
+        "stbar-time": muted,
+        "stbar-context": muted,
+        "stbar-dot-act": f"{success} bold",
+        "stbar-dot-plan": f"{warning} bold",
         # rprompt (right side of prompt line — no background)
-        "rprompt-mode-act": "#4ade80 bold",
-        "rprompt-mode-plan": "#e3b341 bold",
-        "rprompt-sep": "#233323",
-        "rprompt-model": "#3fb950",
+        "rprompt-mode-act": f"{success} bold",
+        "rprompt-mode-plan": f"{warning} bold",
+        "rprompt-sep": subtle,
+        "rprompt-model": muted,
+        "rprompt-context": agent,
     })
 
 
@@ -2518,6 +2738,18 @@ def _build_keybindings() -> KeyBindings:
         if buf.suggestion:
             buf.insert_text(buf.suggestion.text)
 
+    @kb.add("c-o")
+    def _(event):
+        """Toggle compact/detail progress without leaving the prompt."""
+        enabled = not bool(get_runtime_config("detail"))
+        set_runtime_config("detail", enabled)
+        try:
+            terminal_preferences.set_ui_preference("detail", enabled)
+        except Exception:
+            pass
+        _update_status_cache(detail=enabled)
+        event.app.invalidate()
+
     return kb
 
 
@@ -2528,6 +2760,12 @@ def _build_keybindings() -> KeyBindings:
 # in-memory dict + usage_tracker._SESSION (also in-memory).
 _status_cache: dict = {
     "model": "",
+    "model_source": "default",
+    "agent": "",
+    "terminal": "term0",
+    "deployment": "temporary",
+    "run_input_state": "idle",
+    "detail": False,
     "last_thinking_time": 0.0,
 }
 
@@ -2535,6 +2773,44 @@ _status_cache: dict = {
 def _update_status_cache(**kwargs) -> None:
     """Patch one or more fields in the module-level status cache."""
     _status_cache.update(kwargs)
+
+
+def _terminal_width() -> int:
+    """Return a bounded terminal width for deterministic responsive chrome."""
+    try:
+        return max(20, int(shutil.get_terminal_size(fallback=(80, 24)).columns))
+    except Exception:
+        return 80
+
+
+def _sync_status_context() -> None:
+    """Refresh prompt context once per prompt, never on every keystroke."""
+    try:
+        agent = get_current_agent()
+        if agent is None:
+            return
+        deployment = agent_deployment_terminal(agent)
+        terminal_name = deployment or agent_scope_terminal(agent) or "term0"
+        terminal = get_terminal(deployment) if deployment else None
+        if terminal and terminal.model_override:
+            model = str(terminal.model_override)
+            model_source = "terminal"
+        elif getattr(agent, "base_model", ""):
+            model = str(agent.base_model)
+            model_source = "agent"
+        else:
+            model = get_selected_model() or _status_cache.get("model", "")
+            model_source = "default"
+        _update_status_cache(
+            agent=str(agent.name or agent.id),
+            terminal=terminal_name,
+            deployment="deployed" if deployment else "temporary",
+            model=model or "default",
+            model_source=model_source,
+            detail=bool(get_runtime_config("detail")),
+        )
+    except Exception:
+        return
 
 
 def _fmt_tokens(n: int) -> str:
@@ -2578,11 +2854,22 @@ def _render_rprompt():
         _mode_label += "*"
     _mode_cls = "rprompt-mode-plan" if _is_plan else "rprompt-mode-act"
     _model = _status_cache.get("model", "") or "default"
-    return [
-        ("class:" + _mode_cls, _mode_label),
-        ("class:rprompt-sep", " · "),
-        ("class:rprompt-model", _model),
-    ]
+    result = [("class:" + _mode_cls, _mode_label)]
+    width = _terminal_width()
+    if width >= 62:
+        result.extend([
+            ("class:rprompt-sep", " · "),
+            ("class:rprompt-model", _model),
+        ])
+    if width >= 100:
+        agent = _status_cache.get("agent", "")
+        terminal = _status_cache.get("terminal", "")
+        if agent and terminal:
+            result.extend([
+                ("class:rprompt-sep", " · "),
+                ("class:rprompt-context", f"{agent}@{terminal}"),
+            ])
+    return result
 
 
 def _render_bottom_toolbar():
@@ -2596,12 +2883,32 @@ def _render_bottom_toolbar():
     _think = _status_cache.get("last_thinking_time", 0.0)
     _think_str = _fmt_elapsed(_think) if _think > 0 else "—"
 
-    sep = ("class:stbar-sep", "  │  ")
-    return [
+    width = _terminal_width()
+    tokens = ("class:stbar-tokens", f"↑{_fmt_tokens(_tin)} ↓{_fmt_tokens(_tout)}")
+    if width < 54:
+        return [tokens]
+    result = [
         ("class:stbar-time", f"last {_think_str}"),
-        sep,
-        ("class:stbar-tokens", f"↑ {_fmt_tokens(_tin)}  ↓ {_fmt_tokens(_tout)}"),
+        ("class:stbar-sep", "  ·  "),
+        tokens,
     ]
+    if width >= 86:
+        terminal = _status_cache.get("terminal", "term0")
+        deployment = _status_cache.get("deployment", "temporary")
+        context = f"{terminal} · {deployment}"
+        if _status_cache.get("detail"):
+            context += " · detail"
+        result[:0] = [
+            ("class:stbar-context", context),
+            ("class:stbar-sep", "  │  "),
+        ]
+    input_state = _status_cache.get("run_input_state")
+    if input_state in {"queued", "input_active"} and width >= 72:
+        result.extend([
+            ("class:stbar-sep", "  ·  "),
+            ("class:stbar-context", "input " + ("queued" if input_state == "queued" else "ready")),
+        ])
+    return result
 
 
 _prompt_session: Optional[PromptSession] = None
@@ -2653,23 +2960,25 @@ def get_prompt_session() -> PromptSession:
 def pt_prompt(cwd: str) -> str:
     """Read user input with prompt_toolkit (PTY-based terminal input)."""
     session = get_prompt_session()
-    disp = _shorten_path(cwd, max_len=60)
+    _sync_status_context()
+    width = _terminal_width()
+    disp = _shorten_path(cwd, max_len=max(16, min(60, width - 8)))
     # Plan mode drives the gutter colour (hollow amber) vs Act (solid green).
     try:
         import plan_mode as _pm
         _gutter_cls = "class:prompt-gutter-plan" if _pm.is_plan_mode() else "class:prompt-gutter"
-        _gutter_ch = "▏ " if _pm.is_plan_mode() else "▐ "
+        _gutter_ch = "│ "
     except Exception:
-        _gutter_cls, _gutter_ch = "class:prompt-gutter", "▐ "
+        _gutter_cls, _gutter_ch = "class:prompt-gutter", "│ "
 
     # Static green caret (rotation animation removed — redrawing every
     # keystroke felt laggy).
     _prompt_message = [
-        (_gutter_cls, _gutter_ch),
+        ("class:stbar-sep", "  "),
         ("class:prompt-path", disp),
         ("", "\n"),
         (_gutter_cls, _gutter_ch),
-        ("class:prompt-caret", "❯ "),
+        ("class:prompt-caret", "› "),
     ]
 
     try:
@@ -3886,7 +4195,7 @@ The native function schemas are authoritative for each tool's name, purpose and 
 </terminal_output_style>
 
 <safety>
-Do not bypass policy.py decisions. Do not invent paths, APIs, files, or results. (General safety — reversibility/blast-radius, destructive-action confirmation, investigate-before-overwrite, no-vulnerabilities — is in the injected <agent_conduct> block.)
+Do not bypass policy.py decisions. Do not invent paths, APIs, files, or results. Claims about monitoring, tests, command success, or measured values must be grounded in returned tool output and an observed completion state; a started background command is not evidence of success. If collection fails, report the failure or rerun it instead of fabricating a plausible report. (General safety — reversibility/blast-radius, destructive-action confirmation, investigate-before-overwrite, no-vulnerabilities — is in the injected <agent_conduct> block.)
 </safety>
 {{{{promptOpt}}}}
 """
@@ -4437,6 +4746,7 @@ def call_backend_stream(
     tools_enabled: bool = True,
     allowed_tool_names: Optional[set[str]] = None,
     model_override: Optional[str] = None,
+    provider_override: Optional[str] = None,
 ) -> dict:
     """Call Helpwo backend /api/chat/stream, same as Helpwo frontend.
     Returns parsed {reply, command, memory, done, _billing} dict.
@@ -4476,10 +4786,10 @@ def call_backend_stream(
     selected_model = model_override or get_selected_model()
     if selected_model:
         payload["model"] = selected_model
-    # Only forward the globally-selected provider when the model is NOT pinned.
-    # A pinned model may belong to a different provider; forcing the global one
-    # would misroute it, so let the gateway resolve from the model name.
-    if not model_override:
+    if provider_override:
+        payload["provider"] = provider_override
+    # A pinned model without an explicitly paired provider is gateway-resolved.
+    elif not model_override:
         selected_provider = get_selected_provider()
         if selected_provider:
             payload["provider"] = selected_provider
@@ -7719,7 +8029,8 @@ def _json_arg_candidates(text: str) -> list[str]:
     return list(dict.fromkeys([raw, decoded]))
 
 
-def _parse_hire_profile(args: list[str]) -> tuple[Optional[str], EmployeeProfile]:
+def _parse_hire_profile(
+        args: list[str]) -> tuple[Optional[str], EmployeeProfile, dict]:
     """Parse /hire without coupling employee profiles to argparse globals."""
     import agent_roles
 
@@ -7729,14 +8040,25 @@ def _parse_hire_profile(args: list[str]) -> tuple[Optional[str], EmployeeProfile
     prompt = ""
     allowed_tools: Optional[list[str]] = None
     tools_explicit = False
+    options = {"model": "", "provider": "", "terminal": "",
+               "choose_model": False}
     i = 0
     while i < len(args):
         token = args[i]
-        if token in {"--profile", "--prompt", "--tools"}:
+        if token == "--model":
+            if i + 1 >= len(args) or args[i + 1].startswith("--"):
+                options["choose_model"] = True
+                i += 1
+            else:
+                options["model"] = args[i + 1]
+                i += 2
+            continue
+        if token in {"--profile", "--prompt", "--tools", "--terminal"}:
             if i + 1 >= len(args):
                 raise SlashCommandUsageError(
                     f"{token} requires a value. Usage: /hire [name] "
-                    "[--profile role] [--prompt file] [--tools name,...]")
+                    "[--profile role] [--prompt file] [--tools name,...] "
+                    "[--model [id]] [--terminal name]")
             value = args[i + 1]
             if token == "--profile":
                 role_name = value
@@ -7753,13 +8075,16 @@ def _parse_hire_profile(args: list[str]) -> tuple[Optional[str], EmployeeProfile
                     raise SlashCommandUsageError(
                         "Employee prompt exceeds the 100,000 character limit.")
             else:
-                tools_explicit = True
-                if value.lower() == "inherit":
-                    allowed_tools = None
+                if token == "--terminal":
+                    options["terminal"] = value
                 else:
-                    allowed_tools = [
-                        item.strip() for item in value.split(",") if item.strip()
-                    ]
+                    tools_explicit = True
+                    if value.lower() == "inherit":
+                        allowed_tools = None
+                    else:
+                        allowed_tools = [
+                            item.strip() for item in value.split(",") if item.strip()
+                        ]
             i += 2
             continue
         if token.startswith("--"):
@@ -7767,7 +8092,7 @@ def _parse_hire_profile(args: list[str]) -> tuple[Optional[str], EmployeeProfile
         if name is not None:
             raise SlashCommandUsageError(
                 "Usage: /hire [name] [--profile role] [--prompt file] "
-                "[--tools name,...]")
+                "[--tools name,...] [--model [id]] [--terminal name]")
         name = token
         i += 1
 
@@ -7800,7 +8125,7 @@ def _parse_hire_profile(args: list[str]) -> tuple[Optional[str], EmployeeProfile
         capability_tags=([role.name] if role else ["general"]),
         tool_policy=AgentToolPolicy(allowed_tools=allowed_tools),
     )
-    return name, profile
+    return name, profile, options
 
 
 def _employee_capability_text(agent: AgentInfo) -> str:
@@ -7831,7 +8156,10 @@ def _employee_capability_text(agent: AgentInfo) -> str:
         f"Capabilities: {', '.join(profile.capability_tags) or '(none)'}\n"
         f"Prompt: {prompt_text}\n"
         f"Tools: {tools_text}\n"
-        f"Station: {agent.home_terminal or '(not stationed)'}\n"
+        f"Home terminal: {agent.home_terminal or '(none)'}\n"
+        f"Deployment: {agent_deployment_terminal(agent) or '(temporary when assigned)'}\n"
+        f"Base model: {agent.base_model or 'backend default'}"
+        + (f" ({agent.base_provider})" if agent.base_provider else "") + "\n"
         f"Assignment: {assignment_text}\n"
         f"Completed assignments: {len(agent.assignment_history)}\n"
         f"Last result: {last_text}"
@@ -8671,20 +8999,59 @@ def _cmd_login(session: dict, agent_registry: AgentRegistry) -> None:
 
 
 def _cmd_model(parts: list, raw_args: str, session: dict) -> None:
-    if len(parts) >= 2 and parts[1].lower() in ("reset", "clear", "default"):
-        set_model_selection("")
-        _update_status_cache(model="")
-        console.print("[green]Model reset. Backend default will be used.[/green]")
-    elif len(parts) >= 2:
-        model = _decode_text_arg(raw_args)
-        # An explicitly entered model has no verified provider metadata.  Clear
-        # the prior provider instead of sending a stale model/provider pair.
-        set_model_selection(model)
-        _update_status_cache(model=model)
-        console.print(f"[green]Model set to: [bold]{model}[/bold][/green]")
+    """Manage deployment-model overrides without changing agent base models."""
+    args = [_normalize_slash_arg(item) for item in parts[1:]]
+    current_agent = get_current_agent()
+    current_terminal = agent_deployment_terminal(current_agent) or "term0"
+    target_terminal = current_terminal
+    if args and get_terminal(args[0]) is not None:
+        target_terminal = args.pop(0)
+
+    terminal = get_terminal(target_terminal)
+    if terminal is None:
+        console.print(f"[red]Terminal '{target_terminal}' not found.[/red]")
+        return
+    if not terminal.stationed_agent_id:
+        console.print(
+            f"[red]Terminal '{target_terminal}' has no deployed agent; /model "
+            "only changes a deployed terminal model.[/red]")
+        return
+
+    # Seed term0 from the durable legacy preference once. Named terminals live
+    # only for the process lifetime and keep their override on TerminalInfo.
+    if target_terminal == "term0" and terminal.model_override is None:
+        legacy_model = get_selected_model()
+        if legacy_model:
+            set_terminal_model_selection(
+                "term0", legacy_model, get_selected_provider())
+
+    def _apply(model: str, provider: str = "") -> None:
+        set_terminal_model_selection(target_terminal, model, provider)
+        if target_terminal == "term0":
+            set_model_selection(model, provider)
+        if target_terminal == current_terminal:
+            _update_status_cache(model=model)
+
+    if args and args[0].lower() in ("reset", "clear", "default"):
+        if len(args) != 1:
+            console.print("[yellow]Usage: /model [terminal] reset[/yellow]")
+            return
+        _apply("")
+        console.print(
+            f"[green]Model override reset for [bold]{target_terminal}[/bold]. "
+            "The deployed agent's base/default model will be used.[/green]")
+    elif args:
+        if len(args) != 1:
+            console.print("[yellow]Usage: /model [terminal] <model-id>[/yellow]")
+            return
+        model = args[0]
+        _apply(model)
+        console.print(
+            f"[green]Model for [bold]{target_terminal}[/bold] set to: "
+            f"[bold]{model}[/bold][/green]")
     else:
-        current = get_selected_model()
-        current_provider = get_selected_provider()
+        current = str(terminal.model_override or "")
+        current_provider = str(terminal.provider_override or "")
         try:
             with console.status("[dim]Fetching available models…[/dim]"):
                 models, endpoint = fetch_available_models(session)
@@ -8698,12 +9065,13 @@ def _cmd_model(parts: list, raw_args: str, session: dict) -> None:
                 if selected:
                     model_id = selected.get("id", "") if isinstance(selected, dict) else selected
                     provider_id = selected.get("provider", "") if isinstance(selected, dict) else ""
-                    set_model_selection(model_id, provider_id)
-                    _update_status_cache(model=model_id)
+                    _apply(model_id, provider_id)
                     info = f"[bold]{model_id}[/bold]"
                     if provider_id:
                         info += f" ([dim]{provider_id}[/dim])"
-                    console.print(f"[green]Model set to: {info}[/green]")
+                    console.print(
+                        f"[green]Model for [bold]{target_terminal}[/bold] "
+                        f"set to: {info}[/green]")
                 else:
                     console.print("[dim]Model selection cancelled.[/dim]")
             else:
@@ -8725,13 +9093,16 @@ def _cmd_model(parts: list, raw_args: str, session: dict) -> None:
                 if not models:
                     table.add_row("", "", "(none)", "", "")
                 console.print(table)
-                console.print(f"Current model: [bold]{current or 'backend default'}[/bold]" +
+                console.print(f"Terminal {target_terminal} override: [bold]{current or '(none)'}[/bold]" +
                               (f" ([dim]{current_provider}[/dim])" if current_provider else ""))
                 if models and not sys.stdin.isatty():
                     console.print(
                         "[dim]Non-interactive terminal: select explicitly with "
                         "/model <model-id>.[/dim]")
-            console.print("Set directly with [bold]/model <model-id>[/bold], reset with [bold]/model reset[/bold].")
+            console.print(
+                "Set with [bold]/model [terminal] <model-id>[/bold], reset with "
+                "[bold]/model [terminal] reset[/bold]. This never changes the "
+                "employee base model.")
 
 
 def _cmd_name(raw_args: str, session: dict, agent_registry: AgentRegistry) -> None:
@@ -11352,6 +11723,86 @@ def _cmd_detail(parts: list) -> None:
             console.print("[red]Usage: /detail [on|off][/red]")
 
 
+def _cmd_stream(parts: list) -> None:
+    """Configure a bounded, fixed-height streaming prose preview."""
+    if len(parts) == 1:
+        current = str(get_runtime_config("stream_preview") or "one")
+        console.print(
+            f"[muted]Streaming preview is [bold]{escape(current)}[/bold]. "
+            "Use /stream off|one|detail.[/muted]")
+        return
+    mode = parts[1].strip().lower()
+    if len(parts) != 2 or mode not in {"off", "one", "detail"}:
+        console.print("[error]Usage: /stream [off|one|detail][/error]")
+        return
+    set_runtime_config("stream_preview", mode)
+    terminal_preferences.set_ui_preference("stream_preview", mode)
+    description = {
+        "off": "status only",
+        "one": "one fixed preview row",
+        "detail": "three fixed preview rows",
+    }[mode]
+    console.print(f"[success]Streaming preview: {description}.[/success]")
+
+
+def _cmd_theme(parts: list) -> None:
+    if len(parts) == 1:
+        console.print(
+            f"[muted]Theme is [bold]{escape(str(get_runtime_config('theme')))}[/bold]. "
+            "Use /theme dark|light|mono.[/muted]")
+        return
+    name = parts[1].strip().lower()
+    if len(parts) != 2 or name not in {"dark", "light", "mono"}:
+        console.print("[error]Usage: /theme [dark|light|mono][/error]")
+        return
+    set_runtime_config("theme", name)
+    terminal_preferences.set_ui_preference("theme", name)
+    _apply_ui_theme(name)
+    global _prompt_session
+    if _prompt_session is not None:
+        _prompt_session.style = _build_prompt_style()
+    console.print(f"[success]Theme changed to {escape(name)}.[/success]")
+
+
+def _cmd_why(parts: list) -> None:
+    """Explain one recent tool failure without opening the full debug browser."""
+    selector = " ".join(parts[1:]).strip()
+    failures = get_recent_tool_failures()
+    if selector and not selector.isdigit():
+        needle = selector.lower()
+        failures = [row for row in failures if any(
+            needle in str(row.get(key, "")).lower()
+            for key in ("tool", "display_name", "terminal", "agent_id")
+        )]
+    if not failures:
+        console.print("[muted]No matching tool failure is available in this process.[/muted]")
+        return
+    index = int(selector) - 1 if selector.isdigit() else 0
+    if index < 0 or index >= len(failures):
+        console.print(f"[error]No failure #{index + 1}. There are {len(failures)} matching failures.[/error]")
+        return
+    row = failures[index]
+    command = _redact_sensitive_text(str(row.get("command") or "(none)"))
+    error = _redact_sensitive_text(str(row.get("error") or "Tool failed"))
+    output = _redact_sensitive_text(str(row.get("output_tail") or "")).strip()
+    recovery = str(row.get("recovery") or "none")
+    elapsed = float(row.get("elapsed_seconds") or 0.0)
+    lines = [
+        f"[muted]Tool[/muted]      {escape(str(row.get('display_name') or row.get('tool') or 'tool'))}",
+        f"[muted]Scope[/muted]     {escape(str(row.get('agent_id') or 'primary'))}@{escape(str(row.get('terminal') or 'temporary'))}",
+        f"[muted]Elapsed[/muted]   {elapsed:.1f}s",
+        f"[muted]Recovery[/muted]  {escape(recovery)}",
+        f"[muted]Command[/muted]   {escape(command)}",
+        f"[muted]Error[/muted]     {escape(error)}",
+    ]
+    if output and output != error:
+        tail_lines = output.splitlines()[-6:]
+        lines.append("[muted]Output tail[/muted]")
+        lines.extend(f"  {escape(line)}" for line in tail_lines)
+    console.print(Panel("\n".join(lines), title="Why the last tool failed",
+                        border_style="error", expand=False))
+
+
 
 def _cmd_station(parts: list, agent_registry: AgentRegistry, session: dict) -> bool:
     station_args = [_normalize_slash_arg(item) for item in parts[1:]]
@@ -11381,8 +11832,30 @@ def _cmd_station(parts: list, agent_registry: AgentRegistry, session: dict) -> b
         return False
     manager = get_current_agent()
     manager_terminal = agent_deployment_terminal(manager) or "term0"
-    name = (station_args[1] if len(station_args) == 2
-            else (agent_deployment_terminal(target_agent) or manager_terminal))
+    explicit_terminal = len(station_args) == 2
+    existing_deployment = agent_deployment_terminal(target_agent)
+    if task and not explicit_terminal and not existing_deployment:
+        assignment_events = (
+            (lambda events: agent_registry._push_events(events))
+            if agent_registry and agent_registry.agent_id else None
+        )
+        ok, message, assignment = start_agent_assignment(
+            target_agent.id, task, get_loop_deps(),
+            session=session, events_cb=assignment_events)
+        style = "green" if ok else "red"
+        console.print(f"[{style}]{message}[/{style}]")
+        if ok and assignment:
+            console.print(
+                f"[dim]Task runs in a private temporary terminal. Inspect with "
+                f"/agents {target_agent.id}; send updates with /tell "
+                f"{target_agent.id} <message>.[/dim]")
+        return False
+    if not explicit_terminal and not existing_deployment:
+        console.print(
+            "[yellow]An undeployed agent needs an explicit target terminal, or "
+            "use --task to run it in a private temporary terminal.[/yellow]")
+        return False
+    name = station_args[1] if explicit_terminal else existing_deployment
     if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", name):
         console.print("[red]Invalid terminal name.[/red]")
         return False
@@ -11614,9 +12087,9 @@ def _cmd_send(raw_args: str) -> bool:
     return False
 
 
-def _cmd_hire(parts: list) -> bool:
+def _cmd_hire(parts: list, session: dict) -> bool:
     import agent_persistence
-    hire_name, employee_profile = _parse_hire_profile(parts[1:])
+    hire_name, employee_profile, hire_options = _parse_hire_profile(parts[1:])
     if hire_name and not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", hire_name):
         console.print(
             "[red]Employee names may contain only letters, numbers, dot, "
@@ -11626,46 +12099,89 @@ def _cmd_hire(parts: list) -> bool:
         console.print(f"[red]Agent '{hire_name}' already exists.[/red]")
         return False
     owner = get_current_agent()
-    terminal_name = agent_deployment_terminal(owner) or "term0"
-    terminal = get_terminal(terminal_name)
-    if terminal is None or terminal.session is None or not terminal.session.is_alive():
+    home_terminal = agent_scope_terminal(owner) or "term0"
+    requested_terminal = str(hire_options.get("terminal") or "").strip()
+    if requested_terminal.lower() in {"current", "here"}:
+        requested_terminal = home_terminal
+    if requested_terminal == home_terminal:
         console.print(
-            f"[red]Current terminal '{terminal_name}' is unavailable; "
-            "cannot hire an agent without a live deployment terminal.[/red]")
+            "[red]A newly hired agent cannot be deployed directly into the "
+            "current terminal. Omit --terminal or choose a different terminal.[/red]")
         return False
+
+    base_model = str(hire_options.get("model") or "").strip()
+    base_provider = ""
+    if base_model or hire_options.get("choose_model"):
+        try:
+            with console.status("[dim]Fetching available models…[/dim]"):
+                models, _endpoint = fetch_available_models(session)
+        except Exception as exc:
+            console.print(f"[red]Failed to fetch models: {exc}[/red]")
+            return False
+        if hire_options.get("choose_model"):
+            if not sys.stdin.isatty():
+                console.print(
+                    "[red]Interactive model selection is unavailable; use "
+                    "/hire <name> --model <model-id>.[/red]")
+                return False
+            selected = show_model_selector(models, "")
+            if not selected:
+                console.print("[dim]Hiring cancelled.[/dim]")
+                return False
+            base_model = str(selected.get("id") or "")
+            base_provider = str(selected.get("provider") or "")
+        else:
+            matching = [item for item in models if item.get("id") == base_model]
+            if not matching:
+                console.print(
+                    f"[red]Model '{base_model}' is not in the backend's current "
+                    "available model list.[/red]")
+                return False
+            base_provider = str(matching[0].get("provider") or "")
     try:
         agent_info = register_agent(
-            name=hire_name, depth=1, role="deployed",
+            name=hire_name, depth=1, role="pool",
             profile=employee_profile, replace_existing=False)
     except ValueError as exc:
         console.print(f"[red]{exc}[/red]")
         return False
     agent_info.state["_persisted_employee"] = True
+    agent_info.home_terminal = home_terminal
+    agent_info.parent_terminal = home_terminal
+    agent_info.base_model = base_model
+    agent_info.base_provider = base_provider
     if (not agent_info.profile.prompt.strip()
             and not agent_info.profile.specialist_role):
         agent_info.profile.prompt = (
             f"You are {agent_info.name}, a hired employee of this project. "
-            "You are deployed to the current terminal and your lifetime is "
-            "owned by that terminal. Use only your assigned capabilities, "
+            f"You are registered under terminal {home_terminal}. Use only your "
+            "assigned capabilities, "
             "work only on explicit assignments delivered through your "
             "deployment terminal or agent messaging, and report concrete "
             "results to the manager."
         )
-    if not station_agent(agent_info.id, terminal_name):
+    if requested_terminal and not station_agent(agent_info.id, requested_terminal):
         unregister_agent(agent_info.id, delete_persisted=True)
         console.print(
-            f"[red]Could not deploy agent '{agent_info.id}' to "
-            f"terminal '{terminal_name}'.[/red]")
+            f"[red]Could not deploy agent '{agent_info.id}' to terminal "
+            f"'{requested_terminal}'; it must be live and unoccupied.[/red]")
         return False
     agent_persistence.save_agent_state(agent_info)
+    deployment_text = requested_terminal or "private temporary terminal on assignment"
     console.print(Panel(
         _employee_capability_text(agent_info),
-        title=f"Hired employee: {agent_info.name} → {terminal_name}",
+        title=f"Hired employee: {agent_info.name} → {deployment_text}",
         border_style="green",
     ))
-    console.print(
-        f"[dim]Agent is deployed to {terminal_name}. Start work with "
-        f"/station {agent_info.id} --task \"...\"[/dim]")
+    if requested_terminal:
+        console.print(
+            f"[dim]Agent is deployed to {requested_terminal}. Start work with "
+            f"/station {agent_info.id} --task \"...\"[/dim]")
+    else:
+        console.print(
+            f"[dim]Agent is undeployed. Start temporary isolated work with "
+            f"/station {agent_info.id} --task \"...\", or deploy explicitly "
+            f"with /station {agent_info.id} <terminal>.[/dim]")
 
     return False
 
@@ -11707,7 +12223,7 @@ def _cmd_agents(parts: list) -> None:
                 console.print(f"[bold]── Deployed ({len(buckets['deployed'])}) ──[/bold]")
                 for a in buckets["deployed"]:
                     marker, st_s, inb, np = _render(a)
-                    home = getattr(a, "home_terminal", None) or a.stationed_terminal or "?"
+                    home = agent_deployment_terminal(a) or "?"
                     parent_term = getattr(a, "parent_terminal", None) or "?"
                     console.print(f"  [bold]{a.id}[/bold]{np} → [cyan]{home}[/cyan] [dim](parent={parent_term})[/dim]{st_s}{inb}{marker}")
             if buckets["subagent"]:
@@ -12375,6 +12891,7 @@ def _cmd_config(parts: list) -> None:
     elif len(parts) == 2 and parts[1].lower() == "reset":
         reset_runtime_config()
         terminal_preferences.clear_ui_preferences()
+        _apply_ui_theme("dark")
         console.print("[green]Runtime config reset to defaults.[/green]")
     elif len(parts) == 2:
         # /config <key> — show one
@@ -12403,6 +12920,8 @@ def _cmd_config(parts: list) -> None:
                 value = get_runtime_config(key)
                 if key in terminal_preferences.PERSISTED_UI_KEYS:
                     terminal_preferences.set_ui_preference(key, value)
+                if key == "theme":
+                    _apply_ui_theme(str(value))
                 console.print(
                     f"[green]{key} = {value!r} ({type(value).__name__})[/green]")
         except (ValueError, KeyError) as e:
@@ -12983,8 +13502,17 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
     elif action == "/debug":
         _cmd_debug(parts)
 
+    elif action == "/why":
+        _cmd_why(parts)
+
     elif action == "/detail":
         _cmd_detail(parts)
+
+    elif action == "/stream":
+        _cmd_stream(parts)
+
+    elif action == "/theme":
+        _cmd_theme(parts)
 
     elif action in ("/station", "/st"):
         return _cmd_station(parts, agent_registry, session)
@@ -12996,7 +13524,7 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
         return _cmd_send(raw_args)
 
     elif action == "/hire":
-        return _cmd_hire(parts)
+        return _cmd_hire(parts, session)
 
     elif action == "/agents":
         _cmd_agents(parts)
@@ -13263,7 +13791,7 @@ def _shorten_path(p: str, max_len: int = 48) -> str:
 
 
 def show_banner(agent_name: str, session: dict = None):
-    """Display a minimal, art-font startup banner."""
+    """Display the original line-art startup banner and environment summary."""
     shell_info = SHELL_NAME
 
     for line in _LOGO_LINES:
@@ -13276,16 +13804,19 @@ def show_banner(agent_name: str, session: dict = None):
 
     rows = []
     if session:
-        acct = (session.get("userEmail") or session.get("userName")
-                or session.get("userId") or "")
-        if acct:
-            rows.append(("account", acct))
+        account = (session.get("userEmail") or session.get("userName")
+                   or session.get("userId") or "")
+        if account:
+            rows.append(("account", account))
     rows.append(("system", f"{SYSTEM} · {shell_info}"))
     rows.append(("cwd", _shorten_path(os.getcwd())))
-    _backend_profile = get_backend_profile()
-    rows.append(("backend", f"{_backend_profile.base_url} [{_backend_profile.kind}; {_backend_profile.billing_label}]"))
+    backend_profile = get_backend_profile()
+    rows.append((
+        "backend",
+        f"{backend_profile.base_url} "
+        f"[{backend_profile.kind}; {backend_profile.billing_label}]",
+    ))
 
-    # Agent behavior and security policy are separate concepts.
     try:
         import plan_mode as _pm
         agent_mode = (
@@ -13297,37 +13828,48 @@ def show_banner(agent_name: str, session: dict = None):
         pass
     try:
         import policy as _pol
-        _mode = _pol.get_config().get("mode", "audit")
-        _mode_style = {"audit": "cyan", "enforce": "yellow",
-                       "disabled": "red"}.get(_mode, "cyan")
-        rows.append(("policy", f"[{_mode_style}]{_mode}[/{_mode_style}]"))
+        policy_mode = _pol.get_config().get("mode", "audit")
+        mode_style = {"audit": "cyan", "enforce": "yellow",
+                      "disabled": "red"}.get(policy_mode, "cyan")
+        rows.append((
+            "policy",
+            f"[{mode_style}]{policy_mode}[/{mode_style}]",
+        ))
     except Exception:
         pass
+
     status_parts = []
     try:
-        _task_agent = get_current_agent()
-        _task_session = str(
-            ((_task_agent.state or {}).get("_session_id")
-             if _task_agent else "") or "")
-        _open = [t for t in task_manager.list_tasks(
-                     cwd=os.getcwd(), session_id=_task_session or None)
-                 if t.get("status") in ("pending", "in_progress")]
-        if _open:
-            status_parts.append(f"tasks: [accent]{len(_open)} open[/accent]")
+        task_agent = get_current_agent()
+        task_session = str(
+            ((task_agent.state or {}).get("_session_id")
+             if task_agent else "") or "")
+        open_tasks = [
+            task for task in task_manager.list_tasks(
+                cwd=os.getcwd(), session_id=task_session or None)
+            if task.get("status") in ("pending", "in_progress")
+        ]
+        if open_tasks:
+            status_parts.append(
+                f"tasks: [accent]{len(open_tasks)} open[/accent]")
     except Exception:
         pass
     if status_parts:
         rows.append(("status", "  ".join(status_parts)))
 
-    label_w = max(len(k) for k, _ in rows)
-    for k, v in rows:
-        console.print(f"  [muted]{k.rjust(label_w)}[/muted]  [accent.dim]│[/accent.dim] {v}")
+    label_width = max(len(key) for key, _value in rows)
+    for key, value in rows:
+        console.print(
+            f"  [muted]{key.rjust(label_width)}[/muted]  "
+            f"[accent.dim]│[/accent.dim] {value}"
+        )
 
     console.print()
     console.print(
         "  [muted]PATH commands run directly · plain text → AI · "
         "[/muted][accent]/help[/accent][muted] for commands · "
-        "[/muted][accent]/mode[/accent][muted] plan · [/muted][accent]/policy[/accent][muted] approvals[/muted]"
+        "[/muted][accent]/mode[/accent][muted] plan · "
+        "[/muted][accent]/policy[/accent][muted] approvals[/muted]"
     )
     console.print()
 
@@ -13441,6 +13983,90 @@ def _get_input(cwd: str):
 # keep queuing supplementary text working the way it did with readline().
 _bg_reader_thread: Optional[threading.Thread] = None
 _bg_reader_stop = threading.Event()
+_bg_prompt_session: Optional[PromptSession] = None
+_run_input_state = "idle"
+_run_input_state_lock = threading.RLock()
+
+
+def _set_run_input_state(value: str) -> None:
+    global _run_input_state
+    with _run_input_state_lock:
+        _run_input_state = value
+    _update_status_cache(run_input_state=value)
+
+
+def _queue_supplementary(target_queue: queue.Queue, line: str,
+                         source: str = "local") -> bool:
+    line = str(line or "").strip()
+    if not line:
+        return False
+    try:
+        target_queue.put_nowait(line)
+    except queue.Full:
+        console.print("[error]Supplementary instruction queue is full.[/error]")
+        return False
+    _set_run_input_state("queued")
+    console.print(
+        f"[accent.dim]↳[/accent.dim] [muted]Queued instruction"
+        f"{f' from {escape(source)}' if source != 'local' else ''}: "
+        f"{escape(agent_loop_crop_for_ui(line, 80))}[/muted]")
+    return True
+
+
+def agent_loop_crop_for_ui(value: str, width: int) -> str:
+    """Use the agent loop's CJK-safe cropper without exposing it as UI state."""
+    try:
+        from agent_loop import _crop_cells
+        return _crop_cells(value, width, middle=True)
+    except Exception:
+        return str(value or "")[:width]
+
+
+def _bg_reader_prompt_mode(target_queue: queue.Queue):
+    """Prompt-toolkit-owned supplementary input; safe beside Rich Live output."""
+    global _bg_prompt_session
+    bindings = KeyBindings()
+
+    @bindings.add(Keys.Escape)
+    def _escape(event):
+        if event.app.current_buffer.text:
+            event.app.current_buffer.reset()
+            _set_run_input_state("input_active")
+        else:
+            try:
+                signal.raise_signal(signal.SIGINT)
+            except (ValueError, OSError):
+                pass
+
+    @bindings.add(Keys.ControlC)
+    def _control_c(_event):
+        try:
+            signal.raise_signal(signal.SIGINT)
+        except (ValueError, OSError):
+            pass
+
+    _bg_prompt_session = PromptSession(key_bindings=bindings, multiline=False)
+    try:
+        with patch_stdout(raw=True):
+            while not _bg_reader_stop.is_set():
+                _set_run_input_state("input_active")
+                try:
+                    line = _bg_prompt_session.prompt(
+                        [("class:prompt-gutter", "  │ "),
+                         ("class:prompt-caret", "› ")],
+                        style=_build_prompt_style(),
+                        erase_when_done=True,
+                        complete_while_typing=False,
+                    )
+                except (EOFError, KeyboardInterrupt):
+                    if _bg_reader_stop.is_set():
+                        break
+                    continue
+                if _bg_reader_stop.is_set():
+                    break
+                _queue_supplementary(target_queue, line)
+    finally:
+        _bg_prompt_session = None
 
 
 def _bg_reader_line_mode(target_queue: queue.Queue):
@@ -13462,8 +14088,7 @@ def _bg_reader_line_mode(target_queue: queue.Queue):
             break  # EOF
         line = line.strip()
         if line:
-            target_queue.put(line)
-            console.print(f"[dim cyan]📝 Queued: {line[:80]}[/dim cyan]")
+            _queue_supplementary(target_queue, line)
 
 
 def _bg_reader_cbreak_mode(target_queue: queue.Queue):
@@ -13541,8 +14166,7 @@ def _bg_reader_cbreak_mode(target_queue: queue.Queue):
                     sys.stdout.write('\n')
                     sys.stdout.flush()
                     _clear_visible_line()
-                    target_queue.put(line)
-                    console.print(f"[dim cyan]📝 Queued: {line[:80]}[/dim cyan]")
+                    _queue_supplementary(target_queue, line)
                 continue
 
             if chunk in (b'\x7f', b'\x08'):  # Backspace/Delete
@@ -13583,7 +14207,7 @@ def _start_bg_input_reader(target_queue: queue.Queue):
     def _reader():
         try:
             if sys.stdin.isatty():
-                _bg_reader_cbreak_mode(target_queue)
+                _bg_reader_prompt_mode(target_queue)
             else:
                 _bg_reader_line_mode(target_queue)
         except Exception:
@@ -13596,11 +14220,19 @@ def _start_bg_input_reader(target_queue: queue.Queue):
 
 def _stop_bg_input_reader():
     """Stop the background input reader thread."""
-    global _bg_reader_thread
+    global _bg_reader_thread, _bg_prompt_session
     _bg_reader_stop.set()
+    if _bg_prompt_session is not None:
+        try:
+            app = _bg_prompt_session.app
+            if app.is_running:
+                app.exit(result="")
+        except Exception:
+            pass
     if _bg_reader_thread is not None:
         _bg_reader_thread.join(timeout=1.5)
         _bg_reader_thread = None
+    _set_run_input_state("idle")
 
 
 # ── Session-level approval state ─────────────────────────────────────────
@@ -13980,6 +14612,7 @@ def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
     signal.signal(signal.SIGINT, _soft_interrupt)
 
     # Start background stdin reader for supplementary input
+    _set_run_input_state("running")
     _start_bg_input_reader(_msg_queue)
 
     try:
@@ -14000,6 +14633,7 @@ def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
             continue_thread=continue_thread,
         )
     finally:
+        _set_run_input_state("finalizing")
         # Restore original SIGINT handler
         signal.signal(signal.SIGINT, _old_sigint)
         _interrupt_event.clear()
@@ -14148,6 +14782,7 @@ def main():
             set_runtime_config(_key, _value)
         except (KeyError, TypeError, ValueError):
             continue
+    _apply_ui_theme(str(get_runtime_config("theme") or "dark"))
     # Model/provider selection is terminal-local: it survives a relaunch in
     # this shell without affecting another concurrently open terminal.
     _update_status_cache(model=get_selected_model())
@@ -14479,10 +15114,13 @@ def main():
         if _term0_session.is_alive():
             _term0_session.read_output(timeout=0.1)
         register_terminal(_term0_session, DEFAULT_SHELL, 0, name="term0")
-        if not args.agent_id:
-            # Complete the lifecycle binding only after the root terminal is
-            # live. Deployment does not make shell.exec share this PTY.
-            station_agent("primary", "term0")
+        # Complete the local deployment binding only after this process's root
+        # terminal is live. A remotely named child terminal is still `term0`
+        # inside its own process; remote tree metadata remains in terminal_meta.
+        local_agent_id = args.agent_id or "primary"
+        if not station_agent(local_agent_id, "term0"):
+            raise RuntimeError(
+                f"could not bind agent '{local_agent_id}' to local term0")
     except Exception as _e:
         console.print(f"[dim yellow]term0 bash session init failed: {_e}[/dim yellow]")
         _term0_session = None

@@ -2231,6 +2231,23 @@ def _bi_web_fetch(params: dict, ctx: ToolCtx) -> dict:
 
 # ── Agent / Terminal / Session tools (replace meta-commands) ──────────
 
+def _runtime_parent_agent_id(ctx: ToolCtx) -> Optional[str]:
+    """Resolve the authoritative caller identity for agent-control tools.
+
+    The top-level primary loop deliberately passes ``agent_id=None`` to keep
+    its identity out of model-controlled request fields. Agent-control tools
+    still need that identity, so fall back to the runtime-owned registry
+    callback. Never accept an id from tool parameters as a substitute.
+    """
+    if ctx.agent_id:
+        return str(ctx.agent_id)
+    try:
+        current = ctx.get_current_agent() if ctx.get_current_agent else None
+        current_id = getattr(current, "id", None)
+        return str(current_id) if current_id else None
+    except Exception:
+        return None
+
 def _bi_agent_spawn(params: dict, ctx: ToolCtx) -> dict:
     """Spawn an in-process child agent to handle a sub-task.
 
@@ -2244,7 +2261,7 @@ def _bi_agent_spawn(params: dict, ctx: ToolCtx) -> dict:
     if tasks_list and isinstance(tasks_list, list):
         if ctx.spawn_subagent is None or ctx.deps is None:
             return {"ok": False, "error": "spawn not available in this context"}
-        parent_id = ctx.agent_id
+        parent_id = _runtime_parent_agent_id(ctx)
         if parent_id is None:
             return {"ok": False, "error": "no agent_id in context"}
 
@@ -2294,7 +2311,7 @@ def _bi_agent_spawn(params: dict, ctx: ToolCtx) -> dict:
     role = params.get("role") or None
     if ctx.spawn_subagent is None or ctx.deps is None:
         return {"ok": False, "error": "spawn not available in this context"}
-    parent_id = ctx.agent_id
+    parent_id = _runtime_parent_agent_id(ctx)
     if parent_id is None:
         return {"ok": False, "error": "no agent_id in context"}
     child_id = ctx.spawn_subagent(
@@ -2316,7 +2333,7 @@ def _bi_spawn(params: dict, ctx: ToolCtx) -> dict:
     if not goal:
         return {"ok": False, "error": "missing 'goal'"}
     context = (params.get("context") or "").strip()
-    parent_id = ctx.agent_id
+    parent_id = _runtime_parent_agent_id(ctx)
     if not parent_id:
         return {"ok": False, "error": "no current agent"}
     child_id = _al.spawn_subagent(
@@ -2349,7 +2366,7 @@ def _bi_spawn_parallel(params: dict, ctx: ToolCtx) -> dict:
         return {"ok": False, "error": "spawn_parallel requires at least one task"}
     if len(tasks) > 6:
         return {"ok": False, "error": "spawn_parallel: maximum 6 tasks"}
-    parent_id = ctx.agent_id
+    parent_id = _runtime_parent_agent_id(ctx)
     if not parent_id:
         return {"ok": False, "error": "no current agent"}
 
@@ -2399,7 +2416,7 @@ def _bi_spawn_chain(params: dict, ctx: ToolCtx) -> dict:
         return {"ok": False, "error": "spawn_chain requires at least 2 steps"}
     if len(steps) > 6:
         return {"ok": False, "error": "spawn_chain: maximum 6 steps"}
-    parent_id = ctx.agent_id
+    parent_id = _runtime_parent_agent_id(ctx)
     if not parent_id:
         return {"ok": False, "error": "no current agent"}
 
@@ -2466,7 +2483,7 @@ def _bi_await_spawns(params: dict, ctx: ToolCtx) -> dict:
     """Wait for sub-agents to finish and collect results."""
     import agent_loop as _al
 
-    parent_id = ctx.agent_id
+    parent_id = _runtime_parent_agent_id(ctx)
     agent_ids = params.get("agent_ids")
 
     if agent_ids:
@@ -2597,25 +2614,9 @@ def _bi_hwg(params: dict, ctx: ToolCtx) -> dict:
 
 
 def _hwo_is_sibling_or_ancestor(caller_id: str, target_id: str) -> bool:
-    """True if target is a sibling of caller (shares a parent) or an ancestor."""
+    """Compatibility wrapper for the runtime's topology authorization."""
     import agent_loop as _al
-    if not caller_id or not target_id or caller_id == target_id:
-        return False
-    caller = _al.get_agent(caller_id)
-    if caller is None:
-        return False
-    if caller.parent_id == target_id:
-        return True  # target is caller's direct parent
-    if caller.parent_id is not None:
-        parent = _al.get_agent(caller.parent_id)
-        if parent and target_id in parent.child_ids:
-            return True  # same parent -> sibling
-    cur = caller
-    while cur and cur.parent_id:
-        if cur.parent_id == target_id:
-            return True
-        cur = _al.get_agent(cur.parent_id)
-    return False
+    return _al.can_agents_communicate(caller_id, target_id)
 
 
 def _bi_hwo_agent_send(params: dict, ctx: ToolCtx) -> dict:
@@ -2637,8 +2638,11 @@ def _bi_hwo_agent_send(params: dict, ctx: ToolCtx) -> dict:
     if not _hwo_is_sibling_or_ancestor(caller_id, to):
         return {
             "ok": False,
-            "error": f"'{to}' is not a sibling or ancestor of '{caller_id}' — "
-                     "agent_send only reaches siblings or your parent, never descendants.",
+            "error": (
+                f"'{to}' is outside '{caller_id}' communication scope; only "
+                "same-terminal peers, direct parent/child terminals, and direct "
+                "agent parent/child links are reachable."
+            ),
         }
     ok = hwo_runner.hwo_send(to=to, from_=caller_id, text=str(message))
     if not ok:
@@ -2698,15 +2702,63 @@ def _bi_agent_tell(params: dict, ctx: ToolCtx) -> dict:
         return {"ok": False, "error": "missing 'message'"}
     if ctx.send_to_agent is None:
         return {"ok": False, "error": "send_to_agent not available"}
+    import agent_loop as _al
+    if not ctx.agent_id:
+        return {"ok": False, "error": "no current agent"}
+    if not _al.can_agents_communicate(ctx.agent_id, target_id):
+        return {
+            "ok": False,
+            "error": (
+                f"agent '{target_id}' is outside the caller's communication "
+                "scope (same terminal or direct terminal/agent neighbor only)"
+            ),
+        }
     if isinstance(msg, dict):
         body = dict(msg)
     else:
         body = {"kind": "msg", "text": str(msg)}
     body.setdefault("from", ctx.agent_id or "unknown")
+    body.setdefault("provenance", _agent_message_provenance(ctx))
     ok = ctx.send_to_agent(target_id, body)
     if not ok:
         return {"ok": False, "error": f"agent '{target_id}' not found or inbox full"}
     return {"ok": True, "result": f"Sent to {target_id}"}
+
+
+def _agent_message_provenance(ctx: ToolCtx) -> dict:
+    """Attach bounded freshness evidence to inter-agent knowledge transfers."""
+    import agent_loop as _al
+
+    cwd = os.path.abspath(ctx.cwd or os.getcwd())
+    git_head = ""
+    worktree_fingerprint = ""
+    try:
+        head = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=2)
+        if head.returncode == 0:
+            git_head = head.stdout.strip()
+            status = subprocess.run(
+                ["git", "-C", cwd, "status", "--porcelain=v1"],
+                capture_output=True, text=True, timeout=2)
+            diff = subprocess.run(
+                ["git", "-C", cwd, "diff", "--no-ext-diff", "--raw", "HEAD"],
+                capture_output=True, text=True, timeout=2)
+            if status.returncode == 0 and diff.returncode == 0:
+                worktree_fingerprint = hashlib.sha256(
+                    (status.stdout + "\n" + diff.stdout).encode(
+                        "utf-8", errors="replace")
+                ).hexdigest()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    sender = _al.get_agent(ctx.agent_id) if ctx.agent_id else None
+    return {
+        "observed_at": time.time(),
+        "terminal": _al.agent_scope_terminal(sender),
+        "cwd": cwd,
+        "git_head": git_head or None,
+        "worktree_fingerprint": worktree_fingerprint or None,
+    }
 
 
 def _bi_agent_station(params: dict, ctx: ToolCtx) -> dict:
@@ -2791,7 +2843,7 @@ def _bi_agent_wait(params: dict, ctx: ToolCtx) -> dict:
 
 
 def _bi_agent_hire(params: dict, ctx: ToolCtx) -> dict:
-    """Hire an employee and deploy it to the caller's current terminal."""
+    """Hire an employee without implicitly consuming the caller's terminal."""
     if ctx.register_agent_fn is None:
         return {"ok": False, "error": "hire not available"}
     import agent_loop as _al
@@ -2831,43 +2883,91 @@ def _bi_agent_hire(params: dict, ctx: ToolCtx) -> dict:
         ctx.get_agent(ctx.agent_id)
         if ctx.get_agent is not None and ctx.agent_id else None
     )
-    terminal_name = _al.agent_deployment_terminal(owner) or "term0"
-    terminal = ctx.get_terminal(terminal_name) if ctx.get_terminal else None
-    if terminal is None or terminal.session is None or not terminal.session.is_alive():
+    home_terminal = _al.agent_scope_terminal(owner) or "term0"
+    requested_terminal = str(params.get("terminal") or "").strip()
+    if requested_terminal in {"current", "here"}:
+        requested_terminal = home_terminal
+    if requested_terminal == home_terminal:
         return {
             "ok": False,
             "error": (
-                f"current terminal '{terminal_name}' is unavailable; "
-                "a persistent agent requires a live deployment terminal"
+                "a newly hired agent cannot be deployed directly into the "
+                "caller's current terminal; omit terminal or choose another "
+                "live, unoccupied terminal"
             ),
         }
+    requested_model = str(params.get("model") or "").strip()
+    requested_provider = str(params.get("provider") or "").strip()
+    if requested_model:
+        try:
+            from laintas_cli import fetch_available_models
+            models, _endpoint = fetch_available_models(ctx.session or {})
+        except Exception as exc:
+            return {"ok": False,
+                    "error": f"could not fetch the current model list: {exc}"}
+        matches = [row for row in models if row.get("id") == requested_model]
+        if not matches:
+            return {
+                "ok": False,
+                "error": (
+                    f"model '{requested_model}' is not in the backend's current "
+                    "available model list"
+                ),
+            }
+        verified_provider = str(matches[0].get("provider") or "")
+        if (requested_provider and verified_provider
+                and requested_provider != verified_provider):
+            return {
+                "ok": False,
+                "error": (
+                    f"model '{requested_model}' belongs to provider "
+                    f"'{verified_provider}', not '{requested_provider}'"
+                ),
+            }
+        requested_provider = requested_provider or verified_provider
     try:
         info = ctx.register_agent_fn(
-            name=name, depth=max(1, ctx.depth + 1), role="deployed",
+            name=name, depth=max(1, ctx.depth + 1), role="pool",
             profile=profile, replace_existing=False)
     except ValueError as exc:
         return {"ok": False, "error": str(exc)}
     info.state["_persisted_employee"] = True
+    info.home_terminal = home_terminal
+    info.parent_terminal = home_terminal
+    info.base_model = requested_model
+    info.base_provider = requested_provider
     if not info.profile.prompt and not info.profile.specialist_role:
         info.profile.prompt = (
-            f"You are {info.name}, a persistent hired employee deployed to "
-            "the current terminal. Your lifetime is owned by that terminal. "
+            f"You are {info.name}, a persistent hired employee registered under "
+            f"terminal {home_terminal}. "
             "Work only on explicit assignments delivered through your "
-            "deployment terminal or agent messaging, and report concrete "
+            "temporary or explicitly assigned deployment terminal and report concrete "
             "results to the manager.")
-    if ctx.station_agent is None or not ctx.station_agent(info.id, terminal_name):
-        _al.unregister_agent(info.id, delete_persisted=True)
-        return {"ok": False,
-                "error": f"could not deploy agent '{info.id}' to '{terminal_name}'"}
+    if requested_terminal:
+        if ctx.station_agent is None or not ctx.station_agent(
+                info.id, requested_terminal):
+            _al.unregister_agent(info.id, delete_persisted=True)
+            return {
+                "ok": False,
+                "error": (
+                    f"could not deploy agent '{info.id}' to "
+                    f"'{requested_terminal}'; it must be live and unoccupied"
+                ),
+            }
     _ap.save_agent_state(info)
     return {
         "ok": True,
         "result": (
-            f"Hired employee {info.id} ({info.profile.title}) and deployed it "
-            f"to {terminal_name}. No assignment has started."
+            f"Hired employee {info.id} ({info.profile.title}) "
+            + (f"and deployed it to {requested_terminal}. "
+               if requested_terminal else
+               "as undeployed; assignments will use a private temporary terminal. ")
+            + "No assignment has started."
         ),
         "agent_id": info.id,
-        "terminal": terminal_name,
+        "terminal": requested_terminal or None,
+        "home_terminal": home_terminal,
+        "model": info.base_model or "backend-default",
     }
 
 
@@ -2976,6 +3076,9 @@ def _bi_terminal_read(params: dict, ctx: ToolCtx) -> dict:
     if term.session is None:
         return {"ok": False, "error": f"terminal '{target}' has no session"}
     term.session.read_output(timeout=0.2)
+    alive = bool(term.session.is_alive())
+    # Liveness checks may reap a PTY and drain its last bytes.
+    term.session.read_output(timeout=0)
     try:
         full = term.session.raw_output
     except AttributeError:
@@ -3003,13 +3106,73 @@ def _bi_terminal_read(params: dict, ctx: ToolCtx) -> dict:
     if truncated:
         output = output[-max_chars:]
     new_output = output.strip()
-    return {
-        "ok": True, "status": "read", "completed": False,
+    completed = not alive
+    returncode = None
+    if completed:
+        try:
+            raw_returncode = term.session.returncode
+            if raw_returncode is not None and int(raw_returncode) >= 0:
+                returncode = int(raw_returncode)
+        except (AttributeError, TypeError, ValueError):
+            pass
+        if getattr(term, "completed_at", None) is None:
+            term.completed_at = time.time()
+        term.returncode = returncode
+    result = {
+        "ok": True, "status": "completed" if completed else "running",
+        "completed": completed,
         "result": new_output or "(no new output)",
         "new_output": new_output, "cursor": len(full),
-        "truncated": truncated, "alive": bool(term.session.is_alive()),
+        "truncated": truncated, "alive": alive,
         "terminal": target,
     }
+    if returncode is not None:
+        result["returncode"] = returncode
+    return result
+
+
+def _bi_terminal_wait(params: dict, ctx: ToolCtx) -> dict:
+    """Wait for a background terminal to finish, then return its final delta."""
+    target = (params.get("name") or "").strip()
+    if not target:
+        return {"ok": False, "error": "missing 'name'"}
+    if ctx.get_terminal is None:
+        return {"ok": False, "error": "terminal access not available"}
+    term = ctx.get_terminal(target)
+    if term is None or term.session is None:
+        return {"ok": False, "error": f"terminal '{target}' not found"}
+    try:
+        timeout = float(params.get("timeout", 60))
+        poll_interval = float(params.get("poll_interval", 0.2))
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "timeout and poll_interval must be numbers"}
+    if not (0.0 <= timeout <= 300.0):
+        return {"ok": False, "error": "timeout must be between 0 and 300 seconds"}
+    if not (0.05 <= poll_interval <= 2.0):
+        return {"ok": False, "error": "poll_interval must be between 0.05 and 2 seconds"}
+
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            term.session.read_output(timeout=min(poll_interval, 0.2))
+            if not term.session.is_alive():
+                term.session.read_output(timeout=0)
+                break
+        except Exception as exc:
+            return {"ok": False, "error": f"failed while waiting for '{target}': {exc}"}
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(poll_interval, remaining))
+
+    result = _bi_terminal_read(params, ctx)
+    if not result.get("ok"):
+        return result
+    result["waited"] = True
+    result["timed_out"] = not result.get("completed", False)
+    if result["timed_out"]:
+        result["status"] = "timed_out"
+    return result
 
 
 def _bi_terminal_terminate(params: dict, ctx: ToolCtx) -> dict:
@@ -3080,7 +3243,20 @@ def _bi_terminal_list(params: dict, ctx: ToolCtx) -> dict:
     lines = []
     for t in terminals:
         alive = t.session and t.session.is_alive()
-        status = "alive" if alive else "dead"
+        if alive:
+            status = "running"
+        elif getattr(t, "retain_completed", False):
+            returncode = getattr(t, "returncode", None)
+            if returncode is None and t.session is not None:
+                try:
+                    raw_returncode = t.session.returncode
+                    returncode = int(raw_returncode) if int(raw_returncode) >= 0 else None
+                except (AttributeError, TypeError, ValueError):
+                    pass
+            status = (f"completed, exit {returncode}" if returncode is not None
+                      else "completed, exit unknown")
+        else:
+            status = "dead"
         stationed = f" [stationed: {', '.join(t.stationed_agent_ids)}]" if t.stationed_agent_ids else ""
         trigger = f" [trigger: {t.trigger_pattern!r}]" if t.trigger_pattern else ""
         parent = f" [parent: {t.parent_terminal}]" if t.parent_terminal else " [root]"
@@ -3122,14 +3298,33 @@ def _bi_terminal_exec(params: dict, ctx: ToolCtx) -> dict:
             trigger=trigger or None,
             trigger_agent_id=ctx.agent_id if trigger else None,
             parent_terminal=parent_terminal,
+            retain_completed=True,
         )
     except Exception as exc:
         sub.close()
         return {"ok": False, "error": f"could not register terminal '{name}': {exc}"}
-    msg = f"Started sub-terminal '{name}': {command}"
+    alive = bool(sub.is_alive())
+    if not alive:
+        sub.read_output(timeout=0)
+    returncode = None
+    if not alive:
+        try:
+            if sub.returncode is not None and int(sub.returncode) >= 0:
+                returncode = int(sub.returncode)
+        except (TypeError, ValueError):
+            pass
+    msg = ((f"Started sub-terminal '{name}': {command}") if alive else
+           (f"Sub-terminal '{name}' completed: {command}"))
     if trigger:
         msg += f"\nTrigger active — pattern {trigger!r} will push events to your inbox."
-    return {"ok": True, "result": msg, "terminal": name}
+    result = {
+        "ok": True, "result": msg, "terminal": name,
+        "status": "running" if alive else "completed",
+        "completed": not alive, "alive": alive,
+    }
+    if returncode is not None:
+        result["returncode"] = returncode
+    return result
 
 
 def _bi_terminal_watch(params: dict, ctx: ToolCtx) -> dict:
@@ -3299,10 +3494,14 @@ def _bi_session_keys(params: dict, ctx: ToolCtx) -> dict:
 
 def _bi_sleep(params: dict, ctx: ToolCtx) -> dict:
     """Sleep for N seconds (e.g. after starting a server)."""
-    secs = float(params.get("seconds", 1))
-    secs = max(0.1, min(secs, 30))
+    try:
+        secs = float(params.get("seconds", 1))
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "seconds must be a number"}
+    if not (0.0 <= secs <= 300.0):
+        return {"ok": False, "error": "seconds must be between 0 and 300"}
     time.sleep(secs)
-    return {"ok": True, "result": f"Slept {secs:.1f}s"}
+    return {"ok": True, "result": f"Slept {secs:.1f}s", "seconds": secs}
 
 
 def _bi_task_continue(params: dict, ctx: ToolCtx) -> dict:
@@ -3482,6 +3681,178 @@ def _bi_workflow_phase_complete(params: dict, ctx: ToolCtx) -> dict:
 
 # ── Shell execution tool ──────────────────────────────────────────────
 
+# Applied only while one marker-wrapped command runs. A persistent PTY is a
+# real tty, so git/less/apt otherwise may open a pager or prompt indefinitely.
+# Function-call assignments are temporary in bash: cwd/ordinary exports made
+# by the payload persist, while these reserved non-interactive values do not
+# leak into the user's terminal or the next command.
+SHELL_PAGER_ASSIGNMENTS = (
+    "GIT_PAGER=cat PAGER=cat LESS=FRX SYSTEMD_PAGER=cat"
+)
+SHELL_AUTOMATION_ASSIGNMENTS = (
+    f"{SHELL_PAGER_ASSIGNMENTS} GIT_TERMINAL_PROMPT=0 GIT_EDITOR=true "
+    "DEBIAN_FRONTEND=noninteractive"
+)
+
+
+def shell_payload_for_pty(command: str, *, noninteractive: bool = False,
+                          token: str = "", agent_automation: bool = True) -> str:
+    """Return the command form safe to embed in a one-line marker wrapper.
+
+    Newlines, heredocs and `#` comments would swallow the trailing
+    `; echo <end-marker>` (a heredoc terminator must sit alone on its own
+    line; a comment eats the rest of the line), so the command would never
+    signal completion. Those go through base64+eval, which is semantically
+    transparent (eval runs in the current shell, so cd/export still persist).
+    Plain commands stay readable in the terminal stream.
+    """
+    payload = command
+    if "\n" in command or "#" in command or "<<" in command:
+        import base64
+        encoded = base64.b64encode(command.encode("utf-8")).decode("ascii")
+        payload = f'eval "$(printf %s {encoded} | base64 -d)"'
+    if not noninteractive:
+        return payload
+    safe_token = re.sub(r"[^A-Za-z0-9_]", "", token)[:32] or "command"
+    function_name = f"__laintas_run_{safe_token}"
+    rc_name = f"__laintas_payload_rc_{safe_token}"
+    assignments = (
+        SHELL_AUTOMATION_ASSIGNMENTS
+        if agent_automation else SHELL_PAGER_ASSIGNMENTS
+    )
+    return (
+        f"{function_name}() {{ {payload}; }}; "
+        f"{assignments} {function_name}; "
+        f"{rc_name}=$?; unset -f {function_name}; (exit \"${rc_name}\")"
+    )
+
+
+def recover_stuck_shell(session: Any, probe_timeout: float = 2.0) -> bool:
+    """Try to reclaim a PTY whose foreground program never returned.
+
+    Signals the PTY foreground process group, then verifies that the shell
+    answers a probe echo. No printable input is injected into the foreground
+    program: doing so can mutate files or confirm an unintended action.
+    """
+    import uuid
+    try:
+        try:
+            old_len = len(session.raw_output)
+        except AttributeError:
+            old_len = len(getattr(session, "full_output", ""))
+        master_fd = int(getattr(session, "master_fd", -1))
+        shell_pid = int(getattr(session, "pid", -1))
+        foreground_pgid = -1
+        shell_pgid = shell_pid
+        if shell_pid > 0:
+            try:
+                shell_pgid = os.getpgid(shell_pid)
+            except OSError:
+                pass
+        if master_fd >= 0:
+            try:
+                foreground_pgid = os.tcgetpgrp(master_fd)
+            except OSError:
+                foreground_pgid = -1
+
+        if foreground_pgid > 0:
+            # SIGINT is sufficient for normal commands. If an external
+            # foreground group ignores it, escalate without killing the
+            # persistent shell itself; an unresponsive shell is restarted by
+            # the caller instead.
+            signals = [signal.SIGINT]
+            if foreground_pgid != shell_pgid:
+                signals.extend([signal.SIGTERM, signal.SIGKILL])
+            for sig in signals:
+                try:
+                    os.killpg(foreground_pgid, sig)
+                except (OSError, ProcessLookupError):
+                    pass
+                wait_deadline = time.monotonic() + 0.3
+                while time.monotonic() < wait_deadline:
+                    try:
+                        session.read_output(timeout=0.05)
+                    except Exception:
+                        pass
+                    try:
+                        current = os.tcgetpgrp(master_fd)
+                    except OSError:
+                        current = shell_pgid
+                    if current == shell_pgid:
+                        foreground_pgid = current
+                        break
+                if foreground_pgid == shell_pgid:
+                    break
+        else:
+            # Compatibility fallback for injected/mock sessions without a
+            # real PTY descriptor. Ctrl-C is control input, never user data.
+            session.send_keys("\x03")
+            time.sleep(0.2)
+        probe = uuid.uuid4().hex[:8]
+        expected = f"__LAINTAS_PROBE_{probe}__"
+        # the '' split keeps the echoed input line from matching `expected`
+        session.send_keys(f"echo __LAINTAS_PROBE_''{probe}__\n")
+        deadline = time.monotonic() + probe_timeout
+        while time.monotonic() < deadline:
+            try:
+                session.read_output(timeout=0.1)
+                raw = getattr(session, "raw_output", None)
+                if raw is None:
+                    raw = getattr(session, "full_output", "")
+            except Exception:
+                raw = ""
+            if expected in raw[old_len:]:
+                try:
+                    session._laintas_shell_dirty = False
+                except Exception:
+                    pass
+                return True
+            time.sleep(0.05)
+    except Exception:
+        pass
+    try:
+        session._laintas_shell_dirty = True
+    except Exception:
+        pass
+    return False
+
+
+def _replace_persistent_shell(ctx: ToolCtx, old_session: Any,
+                              cwd: str) -> Any:
+    """Replace an unrecoverable deployed PTY without changing terminal ownership."""
+    factory = getattr(ctx.deps, "InteractiveSession", None) if ctx.deps else None
+    terminal = ctx.stationed_terminal
+    if factory is None or terminal is None or not hasattr(terminal, "session"):
+        return None
+    shell = os.environ.get("SHELL", "/bin/bash")
+    replacement = None
+    try:
+        try:
+            replacement = factory(
+                shell, timeout=0, stream_output=False,
+                persistent=True, cwd=cwd)
+        except TypeError:
+            replacement = factory(shell, timeout=0)
+        replacement.start()
+        time.sleep(0.05)
+        replacement.read_output(timeout=0.05)
+        if not replacement.is_alive():
+            raise RuntimeError("replacement shell exited during startup")
+        terminal.session = replacement
+        try:
+            old_session.close()
+        except Exception:
+            pass
+        return replacement
+    except Exception:
+        try:
+            if replacement is not None:
+                replacement.close()
+        except Exception:
+            pass
+        return None
+
+
 def _deployed_shell_session(target: Any) -> Any:
     """Return the live PTY session behind a deployment target, if any."""
     if target is None:
@@ -3494,7 +3865,8 @@ def _deployed_shell_session(target: Any) -> Any:
 
 
 def _exec_in_deployed_shell(command: str, session: Any, timeout: int,
-                            abort_event: Any = None) -> dict:
+                            abort_event: Any = None,
+                            via: str = "deployment_terminal") -> dict:
     """Execute in an agent's persistent deployment shell and return its final cwd."""
     import uuid
 
@@ -3503,15 +3875,12 @@ def _exec_in_deployed_shell(command: str, session: Any, timeout: int,
     cwd_marker = f"__LAINTAS_SHELL_CWD_{marker_id}__"
     end_marker = f"__LAINTAS_SHELL_END_{marker_id}__"
     wrapped = (
-        f"echo {start_marker}; {command} 2>&1; __laintas_rc=$?; "
+        f"echo {start_marker}; "
+        f"{shell_payload_for_pty(command, noninteractive=True, token=marker_id)} 2>&1; "
+        f"__laintas_rc=$?; "
         f"printf '{cwd_marker}:%s\\n' \"$PWD\"; "
         f"echo {end_marker}:$__laintas_rc"
     )
-
-    try:
-        old_len = len(session.raw_output)
-    except AttributeError:
-        old_len = len(getattr(session, "full_output", ""))
 
     lock = getattr(session, "command_lock", None)
     entered = False
@@ -3519,6 +3888,23 @@ def _exec_in_deployed_shell(command: str, session: Any, timeout: int,
         if lock is not None:
             lock.acquire()
             entered = True
+        try:
+            old_len = len(session.raw_output)
+        except AttributeError:
+            old_len = len(getattr(session, "full_output", ""))
+        if getattr(session, "_laintas_shell_dirty", None) is True:
+            if not recover_stuck_shell(session):
+                return {
+                    "ok": False,
+                    "error": (
+                        "Terminal is stuck: a previous command is still "
+                        "running or an interactive program is holding the "
+                        "shell. Interrupt it in the terminal, or wait and "
+                        "retry."
+                    ),
+                    "result": "", "returncode": -1, "via": via,
+                    "_shell_stuck": True,
+                }
         session.send_keys(wrapped + "\n")
         deadline = time.monotonic() + timeout
         new_content = ""
@@ -3529,7 +3915,7 @@ def _exec_in_deployed_shell(command: str, session: Any, timeout: int,
                 except Exception:
                     pass
                 return {"ok": False, "error": "Command aborted", "result": "",
-                        "returncode": -1, "via": "deployment_terminal"}
+                        "returncode": -1, "via": via}
             try:
                 session.read_output(timeout=0.1)
                 raw = getattr(session, "raw_output", None)
@@ -3563,22 +3949,36 @@ def _exec_in_deployed_shell(command: str, session: Any, timeout: int,
                     "ok": returncode == 0,
                     "result": output or "(no output)",
                     "returncode": returncode,
-                    "via": "deployment_terminal",
+                    "via": via,
                 }
                 if cwd and os.path.isdir(cwd):
                     result["cwd"] = cwd
+                try:
+                    session._laintas_shell_dirty = False
+                    if cwd and os.path.isdir(cwd):
+                        session._laintas_last_cwd = cwd
+                except Exception:
+                    pass
                 return result
             try:
                 if not session.is_alive():
                     return {"ok": False, "error": "Deployment terminal exited",
                             "result": new_content.strip(), "returncode": -1,
-                            "via": "deployment_terminal"}
+                            "via": via}
             except Exception:
                 pass
             time.sleep(0.05)
-        return {"ok": False, "error": f"Command timed out ({timeout}s)",
+        recovered = recover_stuck_shell(session)
+        if recovered:
+            hint = "; foreground process stopped, terminal recovered"
+        else:
+            hint = ("; the terminal is still busy — the command may be "
+                    "long-running or waiting on interactive input")
+        return {"ok": False,
+                "error": f"Command timed out ({timeout}s){hint}",
                 "result": new_content.strip(), "returncode": -1,
-                "via": "deployment_terminal"}
+                "via": via, "_shell_stuck": not recovered,
+                "terminal_recovered": bool(recovered)}
     finally:
         if entered:
             lock.release()
@@ -3586,8 +3986,8 @@ def _exec_in_deployed_shell(command: str, session: Any, timeout: int,
 def _bi_shell_exec(params: dict, ctx: ToolCtx) -> dict:
     """Execute a shell command.
 
-    A deployed agent executes on its persistent terminal. An undeployed agent
-    gets the existing synchronous, isolated subprocess behavior.
+    A deployed agent executes on its persistent terminal. An undeployed worker
+    gets one private temporary PTY for the lifetime of its run.
 
     Policy is enforced by the dispatch loop, not here (single source of truth).
     """
@@ -3621,8 +4021,90 @@ def _bi_shell_exec(params: dict, ctx: ToolCtx) -> dict:
         deployed_command = command
         if explicit_cwd:
             deployed_command = f"cd -- {shlex.quote(explicit_cwd)} && {command}"
-        return _exec_in_deployed_shell(
+        result = _exec_in_deployed_shell(
             deployed_command, deployed_session, timeout, abort_event)
+        if result.pop("_shell_stuck", False):
+            restart_cwd = str(
+                getattr(deployed_session, "_laintas_last_cwd", "")
+                or explicit_cwd or ctx.cwd or os.getcwd())
+            replacement = _replace_persistent_shell(
+                ctx, deployed_session, restart_cwd)
+            if replacement is not None:
+                result["error"] = (
+                    str(result.get("error") or "Terminal became unresponsive")
+                    + "; deployment shell restarted"
+                )
+                result["terminal_restarted"] = True
+        return result
+
+    # Background employees/subagents receive a private persistent shell. It is
+    # runtime-owned, never registered, and agent_loop closes it on completion
+    # or abort. This preserves cwd/exports within the assignment without
+    # sharing another agent's terminal stream.
+    if owner is not None and ctx.depth > 0:
+        temporary = ctx.interactive_session
+        if temporary is not None and not getattr(
+                temporary, "_laintas_temporary_shell", False):
+            return {
+                "ok": False,
+                "error": (
+                    "A private interactive session is already active; close it "
+                    "before using shell.exec."
+                ),
+                "returncode": -1,
+                "via": "temporary_terminal",
+            }
+        if _deployed_shell_session(temporary) is None:
+            factory = getattr(ctx.deps, "InteractiveSession", None) if ctx.deps else None
+            if factory is None:
+                return {"ok": False,
+                        "error": "temporary PTY sessions are unavailable",
+                        "returncode": -1, "via": "temporary_terminal"}
+            cwd = str(params.get("cwd") or ctx.cwd or os.getcwd())
+            shell = os.environ.get("SHELL", "/bin/bash")
+            try:
+                try:
+                    temporary = factory(
+                        shell, timeout=0, stream_output=False,
+                        persistent=True, cwd=cwd)
+                except TypeError:
+                    temporary = factory(shell, timeout=0)
+                setattr(temporary, "_laintas_temporary_shell", True)
+                temporary.start()
+                time.sleep(0.05)
+                temporary.read_output(timeout=0.05)
+                if not temporary.is_alive():
+                    raise RuntimeError("temporary shell exited during startup")
+            except Exception as exc:
+                try:
+                    temporary.close()
+                except Exception:
+                    pass
+                return {"ok": False,
+                        "error": f"failed to start temporary terminal: {exc}",
+                        "returncode": -1, "via": "temporary_terminal"}
+            ctx.interactive_session = temporary
+        explicit_cwd = str(params.get("cwd") or "").strip()
+        temporary_command = command
+        if explicit_cwd:
+            temporary_command = f"cd -- {shlex.quote(explicit_cwd)} && {command}"
+        result = _exec_in_deployed_shell(
+            temporary_command, temporary, timeout, abort_event,
+            via="temporary_terminal")
+        if result.pop("_shell_stuck", False):
+            # A private shell nobody else shares: discard it so the next
+            # shell.exec starts clean instead of typing into the stuck program.
+            try:
+                temporary.close()
+            except Exception:
+                pass
+            ctx.interactive_session = None
+            result["terminal_discarded"] = True
+            if result.get("error"):
+                result["error"] += (
+                    "; the private shell was discarded — the next command "
+                    "starts a fresh one")
+        return result
 
     cwd = params.get("cwd") or ctx.cwd or os.getcwd()
 
@@ -5347,15 +5829,19 @@ def register_builtin_tools() -> None:
         Tool(
             name="agent.hire",
             description=(
-                "Hire an employee with an independent prompt/tool policy and deploy it "
-                "to the caller's current terminal. This does not start an assignment. "
-                "The employee ends when that deployment terminal ends."),
+                "Hire a persistent employee with an independent base model, prompt, "
+                "and tool policy. It stays undeployed unless a different explicit "
+                "terminal is supplied; work while undeployed uses a private temporary "
+                "terminal. This does not start an assignment."),
             schema={
                 "type": "object",
                 "properties": {
                     "name": {"type": "string", "description": "Optional employee ID"},
                     "profile": {"type": "string", "description": "Optional specialist role"},
                     "prompt": {"type": "string", "description": "Employee prompt overlay"},
+                    "model": {"type": "string", "description": "Immutable base model (backend default when omitted)"},
+                    "provider": {"type": "string", "description": "Provider for the base model"},
+                    "terminal": {"type": "string", "description": "Optional live target terminal; cannot be the caller's current terminal"},
                     "tools": {
                         "type": "array", "items": {"type": "string"},
                         "description": "Explicit tool allowlist",
@@ -5613,8 +6099,8 @@ def register_builtin_tools() -> None:
             name="terminal.read",
             description=(
                 "Read only output added since this agent's previous read/send cursor. "
-                "This observes asynchronous progress and does not imply completion "
-                "or provide a process exit code."
+                "Returns running/completed state and a real process exit code once "
+                "known. Completed terminal.exec jobs remain readable for 10 minutes."
             ),
             schema={
                 "type": "object",
@@ -5626,6 +6112,26 @@ def register_builtin_tools() -> None:
                 "required": ["name"],
             },
             invoke=_bi_terminal_read,
+        ),
+        Tool(
+            name="terminal.wait",
+            description=(
+                "Wait until a terminal.exec background job completes or timeout expires. "
+                "Returns new output, completion state, and the real exit code when known. "
+                "Use this instead of sleep followed by terminal.read for finite jobs."
+            ),
+            schema={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Terminal name"},
+                    "timeout": {"type": "number", "default": 60, "description": "Wait seconds, capped at 300"},
+                    "poll_interval": {"type": "number", "default": 0.2},
+                    "cursor": {"type": "integer", "description": "Optional explicit output cursor"},
+                    "max_chars": {"type": "integer", "default": 4000},
+                },
+                "required": ["name"],
+            },
+            invoke=_bi_terminal_wait,
         ),
         Tool(
             name="terminal.create",
@@ -5655,7 +6161,9 @@ def register_builtin_tools() -> None:
             description=(
                 "Run an arbitrary shell command in a background sub-terminal. "
                 "Optionally set a trigger regex: any new output line matching the "
-                "pattern will push a watch.trigger event to the agent's inbox."
+                "pattern will push a watch.trigger event to the agent's inbox. This "
+                "call reports started/running, not a successful process exit; use "
+                "terminal.wait or terminal.read for completion and exit status."
             ),
             schema={
                 "type": "object",
@@ -5751,7 +6259,7 @@ def register_builtin_tools() -> None:
         # ── Utility tools ───────────────────────────────────────────
         Tool(
             name="sleep",
-            description="Sleep for N seconds (e.g., after starting a dev server). Cap: 30s.",
+            description="Sleep for exactly N seconds (e.g., after starting a dev server). Cap: 300s.",
             schema={
                 "type": "object",
                 "properties": {
