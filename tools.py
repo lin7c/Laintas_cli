@@ -3864,6 +3864,38 @@ def _deployed_shell_session(target: Any) -> Any:
         return None
 
 
+_MARKER_NOISE_RE = re.compile(
+    r"__LAINTAS_SHELL_(?:BEGIN|CWD|END)_|__CMD_(?:BEGIN|END)_"
+    r"|__laintas_run_|__laintas_rc")
+
+
+_MARKER_ECHO_RE = re.compile(r"echo __(?:LAINTAS_SHELL_BEGIN|CMD_BEGIN)"
+                             r"|__laintas_run_")
+
+
+def scrub_marker_noise(text: str) -> str:
+    """Drop internal marker/wrapper lines from raw PTY captures.
+
+    Fallback paths (dead shell, timeout, wrapped-line marker miss) return raw
+    terminal content; the echoed marker plumbing must never reach the user.
+    The PTY hard-wraps the echoed wrapper command, so its continuation lines
+    carry no marker token — an echo line therefore starts a bridge that drops
+    following lines until the next marker-bearing line. Real output cannot be
+    interleaved there: the shell only starts the command after the echo."""
+    if not text:
+        return text
+    out = []
+    bridging = False
+    for line in text.splitlines():
+        if _MARKER_NOISE_RE.search(line):
+            bridging = bool(_MARKER_ECHO_RE.search(line))
+            continue
+        if bridging:
+            continue
+        out.append(line)
+    return "\n".join(out)
+
+
 def _exec_in_deployed_shell(command: str, session: Any, timeout: int,
                             abort_event: Any = None,
                             via: str = "deployment_terminal") -> dict:
@@ -3944,7 +3976,8 @@ def _exec_in_deployed_shell(command: str, session: Any, timeout: int,
                         body_start += 1
                     output = before_cwd[body_start:].strip("\r\n").strip()
                 else:
-                    output = before_cwd.strip("\r\n").strip()
+                    output = scrub_marker_noise(
+                        before_cwd.strip("\r\n")).strip()
                 result = {
                     "ok": returncode == 0,
                     "result": output or "(no output)",
@@ -3963,8 +3996,8 @@ def _exec_in_deployed_shell(command: str, session: Any, timeout: int,
             try:
                 if not session.is_alive():
                     return {"ok": False, "error": "Deployment terminal exited",
-                            "result": new_content.strip(), "returncode": -1,
-                            "via": via}
+                            "result": scrub_marker_noise(new_content).strip(),
+                            "returncode": -1, "via": via}
             except Exception:
                 pass
             time.sleep(0.05)
@@ -3976,7 +4009,7 @@ def _exec_in_deployed_shell(command: str, session: Any, timeout: int,
                     "long-running or waiting on interactive input")
         return {"ok": False,
                 "error": f"Command timed out ({timeout}s){hint}",
-                "result": new_content.strip(), "returncode": -1,
+                "result": scrub_marker_noise(new_content).strip(), "returncode": -1,
                 "via": via, "_shell_stuck": not recovered,
                 "terminal_recovered": bool(recovered)}
     finally:

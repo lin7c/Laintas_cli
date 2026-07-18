@@ -31,6 +31,15 @@ import tempfile
 import platform
 import webbrowser
 import threading
+import warnings
+# The PTY model is fork()+exec on a dedicated pair (InteractiveSession); the
+# child execs a shell immediately, so CPython 3.12's multi-threaded-fork
+# DeprecationWarning is noise here — concurrent Agent workers always make
+# this process multi-threaded.
+warnings.filterwarnings(
+    "ignore",
+    message=r".*use of fork\(\) may lead to deadlocks in the child.*",
+    category=DeprecationWarning)
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 import difflib
@@ -1032,10 +1041,11 @@ def _marker_poll_exec_unlocked(session, command: str, timeout: int = 60,
                 parts = new_content.rsplit(start_marker, 1)
                 if len(parts) > 1:
                     tail = parts[1].split(end_marker, 1)[0]
-                    cmd_output = tail.strip('\r\n').strip()
+                    cmd_output = tools_mod.scrub_marker_noise(
+                        tail.strip('\r\n')).strip()
             break
         if not session.is_alive():
-            cmd_output = new_content
+            cmd_output = tools_mod.scrub_marker_noise(new_content)
             break
 
     stderr_note = ""
@@ -1056,7 +1066,7 @@ def _marker_poll_exec_unlocked(session, command: str, timeout: int = 60,
             pass
 
     if returncode == -1 and not cmd_output:
-        cmd_output = new_content
+        cmd_output = tools_mod.scrub_marker_noise(new_content)
 
     if strip_ansi_codes:
         cmd_output = strip_ansi(cmd_output)
@@ -2094,6 +2104,11 @@ def display_command_output(command: str, returncode: int, output: str, depth: in
     Shows command, exit status, elapsed time and a short preview. Full output
     is stored in agent state and viewable via /debug.
     """
+    # Last-resort scrub: raw PTY captures (dead shell, timeout, wrapped-line
+    # marker miss) can reach any caller — internal marker plumbing must never
+    # be displayed.
+    if output and "__" in output:
+        output = tools_mod.scrub_marker_noise(output)
     lines = output.split("\n") if output else []
     line_count = len(lines)
     byte_count = len(output.encode("utf-8", errors="replace"))
@@ -2289,7 +2304,6 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
             ("update", "Download, install, and restart on the latest version"),
         )),
     CommandSpec("/name", "Show or set the current agent name", "Agents & Terminals", "/name [new-name]"),
-    CommandSpec("/focus", "Focus a local Agent for the next input", "Agents & Terminals", "/focus [agent-id|next]", subcommands=("next",)),
     CommandSpec(
         "/hire", "Hire an undeployed employee; does not start an assignment",
         "Agents & Terminals",
@@ -2361,8 +2375,8 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec("/compact", "Compact the current session context", "History",
                 "/compact [status|--force]", subcommands=("status",)),
     CommandSpec("/continue", "Continue the current live session", "History"),
-    CommandSpec("/told", "Show what you last asked the AI", "History",
-                "/told [N|all|reply [N]|log [N]]",
+    CommandSpec("/told", "Replay prompts or a selected Agent's conversation", "History",
+                "/told [agent-id [reply [N]|all]|N|all|reply [N]|log [N]]",
                 subcommands=("all", "reply", "log")),
     # Keep /reload discoverable, but its existing handler and behavior stay untouched.
     CommandSpec("/reload", "Reload default files and restart", "History"),
@@ -2438,6 +2452,70 @@ class MetaCompleter(Completer):
             display_meta=description,
         )
 
+    @staticmethod
+    def _history_agent_completion_rows() -> list[tuple[str, str, str]]:
+        """Return Agent identities offered by `/told` history completion."""
+        try:
+            if _terminal_agents.configured:
+                rows = _terminal_agents.snapshot().get("agents", [])
+            else:
+                rows = [{
+                    "id": agent.id,
+                    "name": agent.name or agent.id,
+                    "phase": str(getattr(agent, "status", "idle")),
+                } for agent in get_all_agents()]
+        except Exception:
+            return []
+        result = []
+        for row in rows:
+            agent_id = str(row.get("id") or "")
+            if not agent_id:
+                continue
+            name = str(row.get("name") or agent_id)
+            phase = str(row.get("phase") or "idle")
+            identity = f"{name} · " if name != agent_id else ""
+            result.append((
+                agent_id, name, f"{identity}{phase} · history available"))
+        return result
+
+    def _told_completions(self, partial: str):
+        """Complete global `/told` modes and Agent-scoped history replay."""
+        words = partial.split()
+        trailing_space = partial.endswith(" ")
+        reserved = {
+            "all": "Show all prompts in the current primary session",
+            "reply": "Replay recent primary conversation turns",
+            "log": "Show prompts from the durable project journal",
+        }
+        if not words or (len(words) == 1 and not trailing_space):
+            fragment = words[0] if words else ""
+            for value, meta in reserved.items():
+                if value.startswith(fragment.casefold()):
+                    yield self._completion(value, fragment, meta)
+            for agent_id, name, meta in self._history_agent_completion_rows():
+                if (agent_id.casefold().startswith(fragment.casefold())
+                        or name.casefold().startswith(fragment.casefold())):
+                    yield self._completion(
+                        agent_id, fragment,
+                        meta.rsplit(" · ", 1)[0] + " · conversation history")
+            return
+
+        first = words[0].casefold()
+        if first in reserved or first.isdigit():
+            return
+        if len(words) == 1 and trailing_space:
+            for value, meta in (
+                    ("reply", "Replay recent turns for this Agent"),
+                    ("all", "Replay this Agent's complete local history")):
+                yield self._completion(value, "", meta)
+        elif len(words) == 2 and not trailing_space:
+            fragment = words[1] if len(words) == 2 else ""
+            for value, meta in (
+                    ("reply", "Replay recent turns for this Agent"),
+                    ("all", "Replay this Agent's complete local history")):
+                if value.startswith(fragment.casefold()):
+                    yield self._completion(value, fragment, meta)
+
     def get_completions(self, document, complete_event):
         text = document.text_before_cursor.lstrip()
         if not text:
@@ -2449,6 +2527,10 @@ class MetaCompleter(Completer):
                 spec = _find_command_spec(head)
                 partial = tail.lstrip()
                 head_lower = head.lower()
+
+                if head_lower == "/told":
+                    yield from self._told_completions(partial)
+                    return
 
                 # Context-aware employee command completion. These values are
                 # runtime data, so they cannot live in static CommandSpec.
@@ -2558,6 +2640,8 @@ def _build_prompt_style() -> Style:
         "prompt-gutter": f"{accent} bold",
         "prompt-gutter-plan": f"{warning} bold",
         "prompt-caret": success,
+        "prompt-agent": f"{agent} bold",
+        "prompt-agent-sup": muted,
         "separator": accent,
         "paste-placeholder": f"bold {success}",
         # Slash-command completion menu keeps its established visual identity.
@@ -2809,6 +2893,57 @@ def _build_keybindings() -> KeyBindings:
     return kb
 
 
+class _SingleForegroundAgentUI:
+    """Compatibility boundary after removing same-terminal shared rendering."""
+
+    configured = False
+
+    @staticmethod
+    def close() -> None:
+        return None
+
+    @staticmethod
+    def has_multiple() -> bool:
+        return False
+
+    @staticmethod
+    def snapshot() -> dict:
+        return {
+            "foreground_id": "",
+            "input_target_id": "",
+            "running_count": 0,
+            "agents": [],
+        }
+
+    @staticmethod
+    def process_pending_approval() -> bool:
+        return False
+
+    @staticmethod
+    def abort_foreground() -> bool:
+        return False
+
+    @staticmethod
+    def resolve_agent_id(reference: str) -> str:
+        needle = str(reference or "").strip()
+        direct = get_agent(needle)
+        if direct is not None:
+            return direct.id
+        matches = [
+            agent for agent in get_all_agents()
+            if str(agent.name or "").casefold() == needle.casefold()
+        ]
+        return matches[0].id if len(matches) == 1 else ""
+
+    @staticmethod
+    def chat_history_for(agent_id: str) -> list:
+        agent = get_agent(agent_id)
+        return agent.chat_history if agent is not None else []
+
+
+_terminal_agents = _SingleForegroundAgentUI()
+
+
 # ── Status bar (bottom toolbar) ───────────────────────────────────────
 # Lightweight session-status cache read by the bottom_toolbar callable.
 # Updated at key moments (startup, /model, after backend call, after agent
@@ -2824,240 +2959,10 @@ _status_cache: dict = {
     "running_agents": 0,
     "detail": False,
     "last_thinking_time": 0.0,
+    "foreground_agent": "",
+    "foreground_phase": "",
+    "multi_agent": False,
 }
-
-
-class _AgentConsoleProxy:
-    """Prefix background Agent output without changing Rich's shared Console."""
-
-    def __init__(self, base, label: str):
-        self._base = base
-        self._label = label
-
-    def print(self, *args, **kwargs):
-        if args:
-            args = (f"[agent]{escape(self._label)}[/agent]", *args)
-        else:
-            args = (f"[agent]{escape(self._label)}[/agent]",)
-        return self._base.print(*args, **kwargs)
-
-    def status(self, *args, **kwargs):
-        if args:
-            args = (f"[agent]{escape(self._label)}[/agent] {args[0]}", *args[1:])
-        return self._base.status(*args, **kwargs)
-
-    def __getattr__(self, name):
-        return getattr(self._base, name)
-
-
-class AgentFocusManager:
-    """Owns the local multi-Agent input focus and concurrent AI runs.
-
-    The manager deliberately keeps focus separate from execution status. A
-    running Agent never receives new foreground input; the router selects a
-    same-terminal ready/idle Agent or hides the prompt until one is available.
-    """
-
-    def __init__(self):
-        self._lock = threading.RLock()
-        self._changed = threading.Event()
-        self._runs: dict[str, threading.Thread] = {}
-        self._results: dict[str, dict] = {}
-        self._focused_id = "primary"
-        self._primary_state = None
-        self._primary_history = None
-        self._session = {}
-        self._agent_registry = None
-        self._deps = None
-        self._on_finished = None
-
-    def configure(self, *, primary_state, primary_history, session,
-                  agent_registry, deps, on_finished=None):
-        with self._lock:
-            self._primary_state = primary_state
-            self._primary_history = primary_history
-            self._session = session or {}
-            self._agent_registry = agent_registry
-            self._deps = deps
-            self._on_finished = on_finished
-            current = get_current_agent()
-            if current is not None and not self._focused_id:
-                self._focused_id = current.id
-        self._changed.set()
-
-    def _same_scope(self, agent) -> bool:
-        focused = get_agent(self._focused_id)
-        scope = agent_scope_terminal(focused) if focused else "term0"
-        return agent_scope_terminal(agent) == scope
-
-    def agents(self) -> list:
-        return [a for a in get_all_agents() if self._same_scope(a)]
-
-    def focused(self):
-        with self._lock:
-            focused_id = self._focused_id
-        return get_agent(focused_id)
-
-    def running(self) -> list:
-        with self._lock:
-            ids = set(self._runs)
-        return [a for a in self.agents() if a.id in ids or a.status in {"running", "waiting", "blocked", "aborting"}]
-
-    def _candidate(self, *, exclude: str = ""):
-        candidates = [a for a in self.agents()
-                      if a.id != exclude and a.status in {"idle", "ready", "error"}
-                      and a.id not in self._runs]
-        if not candidates:
-            return None
-        # Keep primary first for the initial prompt, then preserve registry order.
-        candidates.sort(key=lambda a: (0 if a.id == "primary" else 1, a.id))
-        return candidates[0]
-
-    def focus(self, agent_id: str, *, announce: bool = True) -> bool:
-        agent_id = str(agent_id or "").strip()
-        agent = get_agent(agent_id)
-        if agent is None or not self._same_scope(agent):
-            return False
-        with self._lock:
-            self._focused_id = agent.id
-        _sync_status_context()
-        self._changed.set()
-        if announce:
-            console.print(
-                f"[accent.dim]↳[/accent.dim] Focus: [agent]{escape(agent.name or agent.id)}[/agent]")
-        return True
-
-    def focus_next(self) -> Optional[object]:
-        available = [a for a in self.agents()
-                     if a.status in {"idle", "ready", "error"} and a.id not in self._runs]
-        if not available:
-            return None
-        with self._lock:
-            ids = [a.id for a in available]
-            current = ids.index(self._focused_id) if self._focused_id in ids else -1
-            target = available[(current + 1) % len(available)]
-            self._focused_id = target.id
-        _sync_status_context()
-        self._changed.set()
-        return target
-
-    def input_target(self):
-        focused = self.focused()
-        if focused is not None and focused.id not in self._runs and focused.status in {"idle", "ready", "error"}:
-            return focused
-        target = self._candidate(exclude=focused.id if focused else "")
-        if target is not None:
-            self.focus(target.id, announce=bool(focused and focused.id != target.id))
-        return target
-
-    def wait_for_change(self, timeout: float = 0.5):
-        self._changed.wait(timeout)
-        self._changed.clear()
-
-    def interrupt_focused(self) -> bool:
-        """Request a cooperative stop for the focused running Agent."""
-        focused = self.focused()
-        if focused is None or focused.id not in self._runs:
-            running = self.running()
-            focused = running[0] if running else None
-        if focused is None:
-            return False
-        focused.abort_event.set()
-        focused.status = "aborting"
-        self._changed.set()
-        return True
-
-    def submit(self, text: str, *, target_id: str = "") -> tuple[bool, str]:
-        with self._lock:
-            target = get_agent(target_id or self._focused_id)
-            if target is None:
-                return False, "Agent not found"
-            if target.id in self._runs or target.status in {"running", "waiting", "blocked"}:
-                return False, f"Agent '{target.name or target.id}' is busy"
-            if target.id == "primary":
-                state, history = self._primary_state, self._primary_history
-            else:
-                state, history = target.state, target.chat_history
-            if state is None or history is None:
-                return False, "Agent state is not initialized"
-            history.append({"role": "user", "content": text, "input_kind": "prompt"})
-            target.status = "running"
-            target.abort_event.clear()
-            target.error = ""
-            target.last_reply = ""
-            self._runs[target.id] = None
-            deps = copy.copy(self._deps)
-            label = target.name or target.id
-            deps.console = _AgentConsoleProxy(console, label)
-            deps.display_command_output = lambda *a, **kw: None
-            deps.display_sub_terminal_preview = lambda *a, **kw: None
-            deps.display_file_diff = lambda *a, **kw: None
-            session = self._session
-
-        if self.focused() and self.focused().id == target.id:
-            next_agent = self._candidate(exclude=target.id)
-            if next_agent is not None:
-                self.focus(next_agent.id, announce=True)
-        self._changed.set()
-
-        def _worker():
-            response = None
-            try:
-                def _events(events):
-                    if self._agent_registry and self._agent_registry.agent_id:
-                        self._agent_registry._push_events([
-                            {**event, "agent_id": target.id} for event in events])
-                response = run_agent_loop(
-                    deps, text, session, state, history,
-                    events_cb=_events,
-                    existing_session=None,
-                    depth=target.depth,
-                    agent_id=target.id,
-                    interrupt_event=target.abort_event,
-                    message_queue=target.message_queue,
-                )
-                returned_state = response.get("state") or state
-                state.clear()
-                state.update(prepare_state_for_repl(returned_state))
-                target.state = state
-                target.chat_history = history
-                target.last_reply = response.get("msg", "") or ""
-                target.status = "ready" if response.get("success") else "error"
-                target.error = "" if response.get("success") else str(response.get("exit_reason") or "Agent task failed")
-            except Exception as exc:
-                target.status = "error"
-                target.error = f"{type(exc).__name__}: {exc}"
-                response = {"success": False, "msg": "", "state": state, "error": target.error}
-            finally:
-                with self._lock:
-                    self._runs.pop(target.id, None)
-                    self._results[target.id] = response or {"success": False, "state": state}
-                self._changed.set()
-                if self._on_finished:
-                    try:
-                        self._on_finished(target, response or {})
-                    except Exception as exc:
-                        add_debug_log(DebugEntry(
-                            timestamp=datetime.now().isoformat(timespec="seconds"),
-                            reply=f"agent focus callback failed: {exc}",
-                            error=True,
-                        ))
-                if self.input_target() is not None:
-                    console.print(
-                        f"[accent.dim]↳[/accent.dim] [agent]{escape(label)}[/agent] is ready")
-
-        thread = threading.Thread(target=_worker, daemon=True, name=f"agent-run-{target.id}")
-        with self._lock:
-            self._runs[target.id] = thread
-        thread.start()
-        return True, target.id
-
-    def result(self, agent_id: str):
-        with self._lock:
-            return self._results.get(agent_id)
-
-
-_agent_focus_manager = AgentFocusManager()
 
 
 def _update_status_cache(**kwargs) -> None:
@@ -3076,9 +2981,26 @@ def _terminal_width() -> int:
 def _sync_status_context() -> None:
     """Refresh prompt context once per prompt, never on every keystroke."""
     try:
-        agent = (_agent_focus_manager.focused()
-                 if _agent_focus_manager._deps is not None
-                 else get_current_agent())
+        agent = get_current_agent()
+        foreground_name = ""
+        foreground_phase = ""
+        multi_agent = False
+        running_count = 0
+        if _terminal_agents.configured:
+            snap = _terminal_agents.snapshot()
+            multi_agent = len(snap.get("agents", [])) > 1
+            if multi_agent:
+                target_id = snap.get("input_target_id", "")
+                target = get_agent(target_id)
+                if target is not None:
+                    agent = target
+                foreground_id = snap.get("foreground_id", "")
+                foreground_row = next((row for row in snap.get("agents", [])
+                                       if row["id"] == foreground_id), None)
+                if foreground_row:
+                    foreground_name = foreground_row.get("name", "")
+                    foreground_phase = foreground_row.get("phase", "")
+                running_count = int(snap.get("running_count", 0))
         if agent is None:
             return
         deployment = agent_deployment_terminal(agent)
@@ -3100,8 +3022,12 @@ def _sync_status_context() -> None:
             model=model or "default",
             model_source=model_source,
             detail=bool(get_runtime_config("detail")),
-            running_agents=len(_agent_focus_manager.running())
-            if _agent_focus_manager._deps is not None else 0,
+            running_agents=running_count,
+            foreground_agent=foreground_name,
+            foreground_phase=foreground_phase,
+            multi_agent=multi_agent,
+            input_available=bool(
+                not multi_agent or snap.get("input_target_id", "")),
         )
     except Exception:
         return
@@ -3151,7 +3077,13 @@ def _render_rprompt():
     width = _terminal_width()
     _agent_name = _status_cache.get("agent", "") or "primary"
     if width >= 62:
-        result = [("class:rprompt-context", _agent_name),
+        if (_status_cache.get("multi_agent")
+                and not _status_cache.get("input_available", True)):
+            label = "all busy"
+        else:
+            label = (f"to {_agent_name}"
+                     if _status_cache.get("multi_agent") else _agent_name)
+        result = [("class:rprompt-context", label),
                   ("class:rprompt-sep", " · "),
                   ("class:" + _mode_cls, _mode_label)]
     else:
@@ -3161,7 +3093,7 @@ def _render_rprompt():
             ("class:rprompt-sep", " · "),
             ("class:rprompt-model", _model),
         ])
-    if width >= 108:
+    if width >= 108 and not _status_cache.get("multi_agent"):
         agent = _status_cache.get("agent", "")
         terminal = _status_cache.get("terminal", "")
         if agent and terminal:
@@ -3261,35 +3193,30 @@ def get_prompt_session() -> PromptSession:
 
 
 def pt_prompt(cwd: str) -> str:
-    """Read user input with prompt_toolkit (PTY-based terminal input)."""
+    """Read input for the terminal's one foreground Agent."""
     session = get_prompt_session()
-    _sync_status_context()
     width = _terminal_width()
     disp = _shorten_path(cwd, max_len=max(16, min(60, width - 8)))
-    # Plan mode drives the gutter colour (hollow amber) vs Act (solid green).
     try:
         import plan_mode as _pm
-        _gutter_cls = "class:prompt-gutter-plan" if _pm.is_plan_mode() else "class:prompt-gutter"
-        _gutter_ch = "│ "
+        gutter_cls = (
+            "class:prompt-gutter-plan"
+            if _pm.is_plan_mode() else "class:prompt-gutter")
     except Exception:
-        _gutter_cls, _gutter_ch = "class:prompt-gutter", "│ "
-
-    # Static green caret (rotation animation removed — redrawing every
-    # keystroke felt laggy).
-    _prompt_message = [
+        gutter_cls = "class:prompt-gutter"
+    message = [
         ("class:stbar-sep", "  "),
         ("class:prompt-path", disp),
         ("", "\n"),
-        (_gutter_cls, _gutter_ch),
+        (gutter_cls, "│ "),
         ("class:prompt-caret", "› "),
     ]
-
     try:
         user_input = session.prompt(
-            _prompt_message,
+            message,
             style=_build_prompt_style(),
             multiline=False,
-            rprompt=_render_rprompt(),
+            rprompt=_render_rprompt,
             complete_while_typing=True,
         )
         expanded = _expand_pastes(user_input) if user_input else user_input
@@ -8541,10 +8468,20 @@ def _parse_hire_profile(
 
 
 def _employee_capability_text(agent: AgentInfo) -> str:
+    """Render an employee summary as a styled, copy-friendly information card."""
     profile = agent.profile
     allowed = profile.tool_policy.allowed_tools
-    tools_text = "inherit current company policy" if allowed is None else (
-        ", ".join(allowed) if allowed else "none")
+    if allowed is None:
+        tools_text = "inherit current company policy"
+    elif not allowed:
+        tools_text = "none"
+    else:
+        # Keep the default card scannable.  The complete tool list remains
+        # available through /agents <id> and /detail on when inspecting runs.
+        visible_tools = list(allowed[:6])
+        tools_text = ", ".join(visible_tools)
+        if len(allowed) > len(visible_tools):
+            tools_text += f"  +{len(allowed) - len(visible_tools)} more"
     prompt_text = "custom overlay" if profile.prompt.strip() else (
         f"role:{profile.specialist_role}" if profile.specialist_role else
         "company default")
@@ -8560,21 +8497,31 @@ def _employee_capability_text(agent: AgentInfo) -> str:
         f"{str(last_assignment.get('result') or last_assignment.get('error') or '')[:240]}"
         if last_assignment else "(none)"
     )
+    def _v(value: object) -> str:
+        return escape(str(value or ""))
+
+    tags = " ".join(
+        f"[cyan]#{_v(tag)}[/cyan]" for tag in (profile.capability_tags or [])) or "[dim]none[/dim]"
+    model = _v(agent.base_model or "backend default")
+    if agent.base_provider:
+        model += f" [dim]({_v(agent.base_provider)})[/dim]"
     return (
-        f"ID: {agent.id}\n"
-        f"Name: {agent.name}\n"
-        f"Title: {profile.title}\n"
-        f"Description: {profile.description}\n"
-        f"Capabilities: {', '.join(profile.capability_tags) or '(none)'}\n"
-        f"Prompt: {prompt_text}\n"
-        f"Tools: {tools_text}\n"
-        f"Home terminal: {agent.home_terminal or '(none)'}\n"
-        f"Deployment: {agent_deployment_terminal(agent) or '(temporary when assigned)'}\n"
-        f"Base model: {agent.base_model or 'backend default'}"
-        + (f" ({agent.base_provider})" if agent.base_provider else "") + "\n"
-        f"Assignment: {assignment_text}\n"
-        f"Completed assignments: {len(agent.assignment_history)}\n"
-        f"Last result: {last_text}"
+        "[bold cyan]Identity[/bold cyan]\n"
+        f"  [muted]ID[/muted]          {_v(agent.id)}\n"
+        f"  [muted]Name[/muted]        [bold]{_v(agent.name)}[/bold]\n"
+        f"  [muted]Role[/muted]        {_v(profile.title)}\n"
+        f"  [muted]Description[/muted] {_v(profile.description)}\n\n"
+        "[bold cyan]Capabilities[/bold cyan]\n"
+        f"  {tags}\n"
+        f"  [muted]Tools[/muted]       {_v(tools_text)}\n"
+        f"  [muted]Prompt[/muted]      {_v(prompt_text)}\n\n"
+        "[bold cyan]Runtime[/bold cyan]\n"
+        f"  [muted]Home[/muted]        {_v(agent.home_terminal or '(none)')}\n"
+        f"  [muted]Deployment[/muted]  {_v(agent_deployment_terminal(agent) or '(temporary when assigned)')}\n"
+        f"  [muted]Model[/muted]       {model}\n"
+        f"  [muted]Assignment[/muted]  {_v(assignment_text)}\n"
+        f"  [muted]Completed[/muted]   {len(agent.assignment_history)}\n"
+        f"  [muted]Last result[/muted] {_v(last_text)}"
     )
 
 
@@ -11103,6 +11050,8 @@ def _cmd_prompt(raw_args: str, parts: list, session: dict) -> None:
                 console.print("[red]Failure report must be a JSON object.[/red]")
                 fields = None
         elif sys.stdin.isatty():
+            _reader_was_running = bool(
+                _bg_reader_thread is not None and _bg_reader_thread.is_alive())
             _stop_bg_input_reader()
             try:
                 console.print(Panel(
@@ -11132,7 +11081,8 @@ def _cmd_prompt(raw_args: str, parts: list, session: dict) -> None:
             except (EOFError, KeyboardInterrupt):
                 fields = None
             finally:
-                _start_bg_input_reader(get_user_message_queue())
+                if _reader_was_running:
+                    _start_bg_input_reader(get_user_message_queue())
         else:
             console.print(Panel(
                 _po.get_failure_template(),
@@ -12098,8 +12048,10 @@ def _cmd_debug(parts: list) -> None:
 
 
 def _cmd_detail(parts: list) -> None:
-    # Toggle full vs simplified progress rendering. Off (default) shows a
-    # clean one-line-per-tool transcript; on restores full per-line output.
+    # Toggle full vs simplified progress rendering. Off (default) folds
+    # successful read/search/list output into grouped one-line summaries;
+    # errors, writes and command status remain visible. On expands command
+    # output and file diffs for the current run.
     if len(parts) == 1:
         _cur = bool(get_runtime_config("detail"))
         if sys.stdin.isatty():
@@ -12123,14 +12075,18 @@ def _cmd_detail(parts: list) -> None:
                     f"[green]Detail mode {'on' if enabled else 'off'}.[/green]")
         else:
             console.print(
-                f"[dim]Detail mode is [bold]{'on' if _cur else 'off'}[/bold].[/dim]")
+                f"[dim]Detail mode is [bold]{'on' if _cur else 'off'}[/bold]. "
+                "Compact mode folds read/search/list output; use /detail on "
+                "to expand tool output.[/dim]")
     else:
         _sub = parts[1].lower()
         if _sub in ("on", "off"):
             enabled = _sub == "on"
             set_runtime_config("detail", enabled)
             terminal_preferences.set_ui_preference("detail", enabled)
-            console.print(f"[green]Detail mode {_sub}.[/green]")
+            console.print(
+                f"[green]Detail mode {_sub}. "
+                f"{'Compact mode folds read/search/list output.' if not enabled else 'Command output and file diffs are expanded.'}[/green]")
         else:
             console.print("[red]Usage: /detail [on|off][/red]")
 
@@ -12601,9 +12557,11 @@ def _cmd_hire(parts: list, session: dict) -> bool:
 def _cmd_agents(parts: list) -> None:
     if len(parts) == 1:
         agents = get_all_agents()
-        current = (_agent_focus_manager.focused()
-                   if _agent_focus_manager._deps is not None
-                   else get_current_agent())
+        ui_snapshot = (_terminal_agents.snapshot()
+                       if _terminal_agents.configured else {})
+        ui_rows = {row["id"]: row
+                   for row in ui_snapshot.get("agents", [])}
+        input_target_id = ui_snapshot.get("input_target_id", "")
         if not agents:
             console.print("[dim]No agents.[/dim]")
         else:
@@ -12617,8 +12575,16 @@ def _cmd_agents(parts: list) -> None:
                     buckets["other"].append(a)
 
             def _render(a):
-                marker = " [bold cyan]← current[/bold cyan]" if (current and a.id == current.id) else ""
-                status_str = f" [dim]({a.status})[/dim]" if a.status != "idle" else ""
+                markers = []
+                if a.id == input_target_id:
+                    markers.append("[bold green]← input[/bold green]")
+                row = ui_rows.get(a.id, {})
+                if row.get("unseen_output_events"):
+                    markers.append(
+                        f"[muted]{row['unseen_output_events']} new[/muted]")
+                marker = (" " + "  ".join(markers)) if markers else ""
+                phase = row.get("phase") or a.status
+                status_str = f" [dim]({phase})[/dim]" if phase != "idle" else ""
                 inbox_str = f" [dim yellow]inbox={a.inbox.qsize()}[/dim yellow]" if a.inbox.qsize() else ""
                 name_part = f" {a.name}" if a.name and a.name != a.id else ""
                 return marker, status_str, inbox_str, name_part
@@ -12629,7 +12595,9 @@ def _cmd_agents(parts: list) -> None:
                     marker, st_s, inb, np = _render(a)
                     console.print(f"  [bold]{a.id}[/bold]{np}{st_s}{inb}{marker}")
             if buckets["pool"]:
-                console.print(f"[bold]── Pool ({len(buckets['pool'])} idle) ──[/bold]")
+                idle_count = sum(a.status in {"idle", "ready", "error"}
+                                 for a in buckets["pool"])
+                console.print(f"[bold]── Pool ({idle_count} available) ──[/bold]")
                 for a in buckets["pool"]:
                     marker, st_s, inb, np = _render(a)
                     console.print(f"  [bold]{a.id}[/bold]{np}{st_s}{inb}{marker}")
@@ -12658,40 +12626,19 @@ def _cmd_agents(parts: list) -> None:
         agent = get_agent(agent_id)
         if agent is None:
             console.print(f"[red]Agent '{agent_id}' not found. Use /hire to create one.[/red]")
-        else:
-            console.print(Panel(
-                _employee_capability_text(agent),
-                title=f"Employee: {agent.name}", border_style="cyan"))
+            return
+        console.print(Panel(
+            _employee_capability_text(agent),
+            title=f"Employee: {agent.name}", border_style="cyan"))
     else:
         console.print("[yellow]Usage: /agents [tree|agent-id][/yellow]")
 
 
 def _cmd_focus(parts: list) -> None:
-    """Select the Agent that receives the next foreground input."""
-    if _agent_focus_manager._deps is None:
-        console.print("[yellow]Multi-Agent focus is not initialized yet.[/yellow]")
-        return
-    target = parts[1].strip() if len(parts) > 1 else ""
-    if len(parts) > 2 or target.lower() == "next":
-        if len(parts) > 2:
-            console.print("[yellow]Usage: /focus [agent-id|next][/yellow]")
-            return
-        focused = _agent_focus_manager.focus_next()
-        if focused is None:
-            console.print("[yellow]No idle or ready Agent is available.[/yellow]")
-        return
-    if not target:
-        focused = _agent_focus_manager.focused()
-        if focused is None:
-            console.print("[yellow]No focused Agent.[/yellow]")
-        else:
-            console.print(
-                f"[muted]Focused Agent: [agent]{escape(focused.name or focused.id)}[/agent][/muted]")
-        return
-    if not _agent_focus_manager.focus(target):
-        console.print(
-            f"[error]Agent '{escape(target)}' is not available in this terminal.[/error]")
-
+    """The shared-terminal focus UI was removed."""
+    console.print(
+        "[yellow]/focus is unavailable. Each terminal has one foreground Agent; "
+        "use /station to run another Agent in its own terminal.[/yellow]")
 
 
 def _cmd_spawn(raw_args: str, session: dict, agent_registry: AgentRegistry) -> None:
@@ -13543,8 +13490,43 @@ def _cmd_continue(session: dict, agent_registry: AgentRegistry) -> bool:
 
 def _cmd_told(parts: list) -> bool:
     from rich.markup import escape
-    sub = parts[1].lower() if len(parts) > 1 else ""
-    _chat = getattr(handle_meta_command, '_last_chat_history', None) or []
+    args = list(parts[1:])
+    scoped_agent_id = ""
+    scoped_agent_name = ""
+    reserved = {"all", "reply", "log"}
+    if (args and args[0].lower() not in reserved
+            and not args[0].isdigit()):
+        reference = args[0]
+        if _terminal_agents.configured:
+            scoped_agent_id = _terminal_agents.resolve_agent_id(reference)
+        else:
+            candidate = get_agent(reference)
+            if candidate is None:
+                matches = [agent for agent in get_all_agents()
+                           if str(agent.name or "").casefold()
+                           == reference.casefold()]
+                candidate = matches[0] if len(matches) == 1 else None
+            scoped_agent_id = candidate.id if candidate else ""
+        if not scoped_agent_id:
+            console.print(
+                f"[red]Agent '{escape(reference)}' is not available in this "
+                f"terminal.[/red]")
+            return False
+        agent = get_agent(scoped_agent_id)
+        scoped_agent_name = agent.name if agent else scoped_agent_id
+        args = args[1:]
+
+    sub = args[0].lower() if args else ("reply" if scoped_agent_id else "")
+    if scoped_agent_id:
+        if _terminal_agents.configured:
+            _chat = _terminal_agents.chat_history_for(scoped_agent_id)
+        elif scoped_agent_id == "primary":
+            _chat = getattr(handle_meta_command, '_last_chat_history', None) or []
+        else:
+            scoped_agent = get_agent(scoped_agent_id)
+            _chat = scoped_agent.chat_history if scoped_agent is not None else []
+    else:
+        _chat = getattr(handle_meta_command, '_last_chat_history', None) or []
     _user_msgs = [m.get("content", "") for m in _chat
                   if isinstance(m, dict) and m.get("role") == "user"]
 
@@ -13570,6 +13552,23 @@ def _cmd_told(parts: list) -> bool:
                               "(survives /new and restarts).[/dim]")
 
     elif sub == "all":
+        if scoped_agent_id:
+            replayable = [message for message in _chat
+                          if isinstance(message, dict)
+                          and message.get("role") in {
+                              "user", "assistant", "tool", "shell", "knowledge"}]
+            if not replayable:
+                console.print(
+                    f"[yellow]No conversation history for "
+                    f"{escape(scoped_agent_name)}.[/yellow]")
+            else:
+                console.print(
+                    f"[bold]── {escape(scoped_agent_name)} · complete "
+                    f"conversation ({len(replayable)} events) ──[/bold]")
+                for message in replayable:
+                    _print_resume_event(message)
+                    console.print()
+            return False
         if not _user_msgs:
             console.print("[yellow]No user messages in this session yet.[/yellow]")
             console.print("[dim]Tip: /told log reads the durable per-cwd journal.[/dim]")
@@ -13579,7 +13578,7 @@ def _cmd_told(parts: list) -> bool:
                 console.print(f"  [dim][{i}][/dim] {escape(msg)}")
 
     elif sub == "reply":
-        n = _parse_n(parts[2] if len(parts) > 2 else "", 1)
+        n = _parse_n(args[1] if len(args) > 1 else "", 1)
         _turns = []
         i = 0
         while i < len(_chat):
@@ -13604,7 +13603,9 @@ def _cmd_told(parts: list) -> bool:
             console.print("[dim]Tip: /told log reads the durable per-cwd journal.[/dim]")
         else:
             recent = _turns[-n:] if n < len(_turns) else _turns
-            label = "Last turn" if len(recent) == 1 else f"Last {len(recent)} turns"
+            owner = f"{scoped_agent_name} · " if scoped_agent_id else ""
+            label = (f"{owner}last turn" if len(recent) == 1
+                     else f"{owner}last {len(recent)} turns")
             console.print(f"[bold]── {label} ──[/bold]")
             for idx, (u, a) in enumerate(recent, 1):
                 console.print(f"[bold]You:[/bold]        [cyan]{escape(u)}[/cyan]")
@@ -13613,7 +13614,12 @@ def _cmd_told(parts: list) -> bool:
                     console.print()
 
     elif sub == "log":
-        n = _parse_n(parts[2] if len(parts) > 2 else "", 10)
+        if scoped_agent_id:
+            console.print(
+                "[yellow]The durable prompt journal is project-wide; use "
+                "/told log [N] without an Agent.[/yellow]")
+            return False
+        n = _parse_n(args[1] if len(args) > 1 else "", 10)
         _log_path = paths.project_dir() / "events.jsonl"
         _entries = []
         try:
@@ -13656,7 +13662,9 @@ def _cmd_told(parts: list) -> bool:
             n = int(sub)
         except ValueError:
             console.print(f"[red]Unknown subcommand: {escape(sub)}[/red]")
-            console.print("[yellow]Usage: /told [N|all|reply [N]|log [N]][/yellow]")
+            console.print(
+                "[yellow]Usage: /told [agent-id [reply [N]|all]|N|all|"
+                "reply [N]|log [N]][/yellow]")
             return False
         if n <= 0:
             console.print("[yellow]N must be a positive integer.[/yellow]")
@@ -14395,6 +14403,10 @@ def _get_input(cwd: str):
     between prompts are processed immediately. Does NOT block on stdin —
     prompt_toolkit handles its own blocking read after the prompt is shown.
     """
+    if (_terminal_agents.configured
+            and _terminal_agents.process_pending_approval()):
+        return ""
+
     # Already-queued message (fast path)
     try:
         return _injected_input_queue.get_nowait()
@@ -14415,13 +14427,7 @@ def _get_input(cwd: str):
             except queue.Empty:
                 pass  # spurious wakeup — fall through to prompt
 
-    # When every Agent in the current terminal is busy, do not expose a line
-    # that could be routed nondeterministically. A worker completion wakes the
-    # condition and the next prompt selects a ready Agent.
-    if _agent_focus_manager._deps is not None and _agent_focus_manager.input_target() is None:
-        _agent_focus_manager.wait_for_change(timeout=0.5)
-        return ""
-    return pt_prompt(cwd)
+    return _simple_prompt(cwd) if _IN_SUB_TERMINAL else pt_prompt(cwd)
 
 
 def _parse_agent_target(text: str) -> tuple[str, str]:
@@ -15028,12 +15034,11 @@ def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
                                    chat_history, events_cb=None,
                                    existing_session=None,
                                    continue_thread=False):
-    """Run agent loop with soft-interrupt (Ctrl+C) and supplementary input support.
+    """Run the foreground agent loop with soft-interrupt support.
 
     Wraps run_agent_loop() with:
     1. Temporary SIGINT handler: first Ctrl+C → soft interrupt, second → force exit.
-    2. Background stdin reader: user can type supplementary messages during execution.
-    3. Module-level interrupt event reset before/after each call.
+    2. Module-level interrupt event reset before/after each call.
 
     Returns the same dict as run_agent_loop().
     """
@@ -15066,9 +15071,7 @@ def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
 
     signal.signal(signal.SIGINT, _soft_interrupt)
 
-    # Start background stdin reader for supplementary input
     _set_run_input_state("running")
-    _start_bg_input_reader(_msg_queue)
 
     try:
         active_agent = get_current_agent()
@@ -15092,7 +15095,7 @@ def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
         # Restore original SIGINT handler
         signal.signal(signal.SIGINT, _old_sigint)
         _interrupt_event.clear()
-        _stop_bg_input_reader()
+        _set_run_input_state("idle")
 
     return response
 
@@ -15284,8 +15287,7 @@ def main():
     # ── Simple prompt (PTY subprocess mode) ──
     _use_simple_prompt = args.simple_prompt or not sys.stdin.isatty()
     if _use_simple_prompt:
-        global pt_prompt, _IN_SUB_TERMINAL
-        pt_prompt = _simple_prompt
+        global _IN_SUB_TERMINAL
         _IN_SUB_TERMINAL = True
 
     # Show banner (skip in child terminals to avoid Rich output in PTY)
@@ -15477,16 +15479,11 @@ def main():
         primary.parent_terminal = None
         set_current_agent_id("primary")
 
-    def _on_focus_agent_finished(agent_info, result):
-        """Persist primary state and refresh the visible focus after a worker exits."""
+    def _on_terminal_agent_finished(agent_info, _result):
         try:
             shutdown.interrupting = False
         except (NameError, UnboundLocalError):
             pass
-        _update_status_cache(
-            agent=agent_info.name or agent_info.id,
-            running_agents=len(_agent_focus_manager.running()),
-        )
         if agent_info.id == "primary" and args.depth == 0:
             try:
                 handle_meta_command._last_agent_state = agent_state
@@ -15496,22 +15493,18 @@ def main():
                         current_live_session, agent_state, chat_history,
                         cwd=_session_start_cwd,
                         objective=agent_state.get("objective"),
-                        tasks=_active_task_export(),
-                    )
-                save_resume_state(agent_state, chat_history, _session_start_cwd)
+                        tasks=_active_task_export())
+                save_resume_state(
+                    agent_state, chat_history, _session_start_cwd)
             except Exception as exc:
                 add_debug_log(DebugEntry(
                     timestamp=datetime.now().isoformat(timespec="seconds"),
-                    reply=f"agent state persistence failed: {exc}", error=True))
+                    reply=f"terminal Agent persistence failed: {exc}",
+                    error=True))
 
-    _agent_focus_manager.configure(
-        primary_state=agent_state,
-        primary_history=chat_history,
-        session=session,
-        agent_registry=agent_registry,
-        deps=get_loop_deps(),
-        on_finished=_on_focus_agent_finished,
-    )
+    # Same-terminal shared Agent rendering was removed. Keep the coordinator
+    # dormant for compatibility with persisted Agent metadata; natural
+    # language input follows the original single foreground-Agent REPL.
     _sync_status_context()
 
     # Load user skills from ~/.laintas/skills. Failures are surfaced
@@ -15544,13 +15537,13 @@ def main():
 
     # Setup graceful shutdown
     def shutdown(signum=None, frame=None):
-        # While background Agent runs exist, the first Ctrl+C is a cooperative
-        # Agent interrupt. A second Ctrl+C falls through to process shutdown.
-        if _agent_focus_manager.running() and not getattr(shutdown, "interrupting", False):
-            shutdown.interrupting = True
-            if _agent_focus_manager.interrupt_focused():
+        if (_terminal_agents.configured
+                and _terminal_agents.snapshot().get("running_count")
+                and not getattr(shutdown, "interrupting", False)):
+            if _terminal_agents.abort_foreground():
+                shutdown.interrupting = True
                 console.print(
-                    "\n[yellow]Interrupt requested for the focused Agent. "
+                    "\n[yellow]Foreground Agent interrupt requested. "
                     "Press Ctrl+C again to exit.[/yellow]")
                 return
         if args.depth > 0:
@@ -15580,6 +15573,7 @@ def main():
                     tasks=_active_task_export(),
                 )
         stop_trigger_scanner()
+        _terminal_agents.close()
         close_all_terminals()
         close_all_agents()
         browser_mod.close_all_browser_sessions()
@@ -15943,56 +15937,6 @@ def main():
                 injected_done.set()
             continue
 
-        # ── Normal input routing ───────────────────────────────────
-        # Natural-language work is submitted asynchronously to the focused
-        # Agent. Shell commands retain the synchronous terminal path below.
-        explicit_agent_id, routed_input = _parse_agent_target(user_input)
-        import plan_mode as _focus_pm
-        if (not is_system_command(routed_input)
-                and _agent_focus_manager._deps is not None
-                and not _focus_pm.is_plan_mode()):
-            if (_active_backend.sends_laintas_credentials
-                    and not session.get("userId")):
-                console.print("[yellow]Not authenticated. Use /login first.[/yellow]")
-                if injected_done is not None:
-                    injected_done.set()
-                continue
-            target = (get_agent(explicit_agent_id)
-                      if explicit_agent_id else _agent_focus_manager.input_target())
-            if explicit_agent_id and (target is None or target not in _agent_focus_manager.agents()):
-                console.print(
-                    f"[error]Agent '{escape(explicit_agent_id)}' is not available in this terminal.[/error]")
-                if injected_done is not None:
-                    injected_done.set()
-                continue
-            if target is None:
-                console.print("[muted]All Agents are busy; input is paused until one is ready.[/muted]")
-                if injected_done is not None:
-                    injected_done.set()
-                continue
-            if routed_input.strip() == "":
-                console.print("[yellow]Message cannot be empty.[/yellow]")
-                if injected_done is not None:
-                    injected_done.set()
-                continue
-            if _focus_pm.is_pending_task():
-                _focus_pm.enter_plan_mode(routed_input)
-            ok, detail = _agent_focus_manager.submit(
-                routed_input, target_id=target.id)
-            if not ok:
-                console.print(f"[error]{escape(detail)}[/error]")
-            else:
-                console.print(
-                    f"[accent.dim]↳[/accent.dim] Sent to [agent]{escape(target.name or target.id)}[/agent]")
-                if agent_registry.agent_id:
-                    agent_registry._push_events([{
-                        "type": "user", "content": routed_input,
-                        "agent_id": target.id,
-                    }])
-            if injected_done is not None:
-                injected_done.set()
-            continue
-
         _system_input = is_system_command(user_input)
         # Preserve input semantics in the resume record. Shell commands are
         # terminal activity, not user-to-agent prompts, even though both are
@@ -16182,7 +16126,6 @@ def main():
                     injected_done.set()
                 continue
             console.print("[dim]Not a system command, asking AI...[/dim]")
-
             # Build event callback for real-time streaming
             def local_events_cb(events: list):
                 if agent_registry.agent_id:

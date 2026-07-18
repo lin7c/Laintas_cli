@@ -74,6 +74,7 @@ class SlashRegistryTests(unittest.TestCase):
         self.assertIn("/clear", laintas_cli._NEW_SESSION_COMMANDS)
         palette_descriptions = dict(laintas_cli._COMMANDS)
         self.assertIn("/station <agent-id>", palette_descriptions["/station"])
+        self.assertNotIn("/agent", palette_descriptions)
 
     def test_exact_slash_command_keeps_a_visible_completion(self):
         completions = self._complete("/task")
@@ -125,6 +126,54 @@ class SlashRegistryTests(unittest.TestCase):
         self.assertEqual([item.display_text for item in completions], ["progress"])
         self.assertEqual(
             completions[0].display_meta_text, "Update completion progress")
+
+    def test_told_completion_supports_agent_history_without_input_routing(self):
+        coordinator = mock.Mock()
+        coordinator.configured = True
+        coordinator.snapshot.return_value = {
+            "agents": [
+                {"id": "primary", "name": "primary", "phase": "idle"},
+                {"id": "agent2", "name": "AI-2", "phase": "ready"},
+                {"id": "agent3", "name": "AI-3", "phase": "thinking"},
+            ],
+        }
+        with mock.patch.object(laintas_cli, "_terminal_agents", coordinator):
+            told_agents = self._complete("/told AI-")
+            replay = self._complete("/told agent2 ")
+
+        self.assertEqual(self._complete("/agent "), [])
+        self.assertEqual(
+            [item.display_text for item in told_agents], ["agent2", "agent3"])
+        self.assertEqual(
+            [item.display_text for item in replay], ["reply", "all"])
+
+    def test_told_replays_a_selected_agents_latest_reply(self):
+        history = [
+            {"role": "user", "content": "inspect src"},
+            {"role": "assistant", "content": "src contains three modules"},
+        ]
+        agent = mock.Mock()
+        agent.id = "agent2"
+        agent.name = "AI-2"
+        coordinator = mock.Mock()
+        coordinator.configured = True
+        coordinator.resolve_agent_id.return_value = "agent2"
+        coordinator.chat_history_for.return_value = history
+        output = io.StringIO()
+        old_console = laintas_cli.console
+        laintas_cli.console = Console(file=output, force_terminal=False)
+        try:
+            with mock.patch.object(laintas_cli, "_terminal_agents", coordinator), \
+                    mock.patch.object(laintas_cli, "get_agent",
+                                      return_value=agent):
+                laintas_cli._cmd_told(["/told", "AI-2"])
+        finally:
+            laintas_cli.console = old_console
+
+        rendered = output.getvalue()
+        self.assertIn("AI-2", rendered)
+        self.assertIn("inspect src", rendered)
+        self.assertIn("src contains three modules", rendered)
 
     def test_invalid_slash_text_has_no_completions(self):
         self.assertEqual(self._complete("/taskx"), [])

@@ -1,6 +1,7 @@
 import io
 import queue
 import threading
+import time
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -97,42 +98,26 @@ class ResponsiveTerminalChromeTests(unittest.TestCase):
         self.assertTrue(text.startswith("agent1 · ACT"))
         self.assertIn("glm-5.2", text)
 
-    def test_agent_focus_manager_switches_and_hides_when_all_busy(self):
-        def make_agent(agent_id, status="idle"):
-            return SimpleNamespace(
-                id=agent_id, name=agent_id, role="primary" if agent_id == "primary" else "deployed",
-                status=status, state={}, chat_history=[], depth=0, error="",
-                last_reply="", abort_event=threading.Event(), message_queue=queue.Queue(),
-                home_terminal="term0", deployment_terminal="term0", stationed_terminal="term0",
-            )
+    def test_prompt_uses_one_foreground_without_agent_routing(self):
+        prompt_session = mock.Mock()
+        prompt_session.prompt.return_value = "inspect another directory"
+        coordinator = mock.Mock()
+        coordinator.configured = True
+        with mock.patch.object(laintas_cli, "_terminal_agents", coordinator), \
+                mock.patch.object(laintas_cli, "get_prompt_session",
+                                  return_value=prompt_session), \
+                mock.patch.object(laintas_cli, "_sync_status_context"), \
+                mock.patch.object(laintas_cli, "_terminal_width",
+                                  return_value=80), \
+                mock.patch("plan_mode.is_plan_mode", return_value=False):
+            value = laintas_cli.pt_prompt("/tmp")
 
-        primary = make_agent("primary")
-        agent2 = make_agent("agent2")
-        agents = {a.id: a for a in (primary, agent2)}
-        manager = laintas_cli.AgentFocusManager()
-        deps = laintas_cli.get_loop_deps()
-        done = threading.Event()
-
-        def fake_loop(*args, **kwargs):
-            done.wait(1)
-            return {"success": True, "msg": "done", "state": args[3]}
-
-        with mock.patch.object(laintas_cli, "get_agent", side_effect=agents.get), \
-                mock.patch.object(laintas_cli, "get_all_agents", return_value=list(agents.values())), \
-                mock.patch.object(laintas_cli, "run_agent_loop", side_effect=fake_loop):
-            manager.configure(
-                primary_state=primary.state, primary_history=primary.chat_history,
-                session={}, agent_registry=None, deps=deps)
-            ok, _ = manager.submit("inspect", target_id="primary")
-            self.assertTrue(ok)
-            self.assertEqual(manager.focused().id, "agent2")
-            agent2.status = "running"
-            self.assertIsNone(manager.input_target())
-            done.set()
-            worker = manager._runs["primary"]
-            worker.join(timeout=2)
-            self.assertEqual(primary.status, "ready")
-            self.assertEqual(manager.input_target().id, "primary")
+        self.assertEqual(value, "inspect another directory")
+        coordinator.commit_input_target.assert_not_called()
+        coordinator.pin_input_target.assert_not_called()
+        prompt_kwargs = prompt_session.prompt.call_args.kwargs
+        self.assertIsInstance(prompt_session.prompt.call_args.args[0], list)
+        self.assertNotIn("refresh_interval", prompt_kwargs)
 
     def test_sections_and_tables_are_copy_friendly_without_borders(self):
         output = io.StringIO()

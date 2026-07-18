@@ -219,22 +219,46 @@ _SHIMMER_GRAD = (
     "#b7f7c0", "#7ee787", "#4ade80", "#3fb950",
 )
 
+_THINKING_SPINNER_FRAMES = tuple("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
+
+
+def _shimmer_segments(label: str, elapsed: float) -> list[tuple[str, str]]:
+    """Return renderer-neutral ``(style, text)`` shimmer segments.
+
+    Rich owns the synchronous Agent status while prompt_toolkit owns the
+    concurrent multi-Agent input area.  Sharing these segments keeps both
+    renderers visually identical without letting either renderer touch the
+    other's cursor region.
+    """
+    if get_runtime_config("theme") == "mono":
+        return [("", label)]
+    segments: list[tuple[str, str]] = []
+    span = len(_SHIMMER_GRAD)
+    head = (elapsed * 14.0) % (len(label) + span)
+    for index, char in enumerate(label):
+        distance = head - index
+        style = (f"bold {_SHIMMER_GRAD[int(distance)]}"
+                 if 0 <= distance < span else _SHIMMER_BASE)
+        if segments and segments[-1][0] == style:
+            old_style, old_text = segments[-1]
+            segments[-1] = (old_style, old_text + char)
+        else:
+            segments.append((style, char))
+    return segments
+
+
+def _thinking_spinner_frame(elapsed: float) -> str:
+    """Return the dots spinner frame used by the prompt-owned status row."""
+    index = int(max(0.0, float(elapsed)) * 10.0)
+    return _THINKING_SPINNER_FRAMES[index % len(_THINKING_SPINNER_FRAMES)]
+
 
 def _shimmer_label(label: str, elapsed: float):
     """Return a rich Text of `label` with a moving green highlight band."""
     from rich.text import Text
-    if get_runtime_config("theme") == "mono":
-        return Text(label)
     txt = Text()
-    span = len(_SHIMMER_GRAD)
-    # Sweep head advances ~14 columns/sec; wraps past the end for a gap.
-    head = (elapsed * 14.0) % (len(label) + span)
-    for i, ch in enumerate(label):
-        d = head - i
-        if 0 <= d < span:
-            txt.append(ch, style=f"bold {_SHIMMER_GRAD[int(d)]}")
-        else:
-            txt.append(ch, style=_SHIMMER_BASE)
+    for style, value in _shimmer_segments(label, elapsed):
+        txt.append(value, style=style or None)
     return txt
 
 
@@ -5640,14 +5664,18 @@ def run_agent_loop(
                                 lang=lang,
                             )
 
-                with Live(_LiveWrapper(), console=deps.console, refresh_per_second=6.0,
-                          auto_refresh=True, transient=True) as live:
-                    _live_holder["live"] = live
+                if getattr(deps.console, "_laintas_event_console", False):
                     response = _do_stream_call()
-                    # Final flush: the _LiveWrapper already re-computes
-                    # _render() on every draw, so a plain refresh is enough.
-                    try: live.refresh()
-                    except Exception: pass
+                else:
+                    with Live(_LiveWrapper(), console=deps.console,
+                              refresh_per_second=4.0, auto_refresh=True,
+                              transient=True) as live:
+                        _live_holder["live"] = live
+                        response = _do_stream_call()
+                        try:
+                            live.refresh()
+                        except Exception:
+                            pass
             except ImportError:
                 with deps.console.status(f"[#3fb950]thinking… · {_spin_model} · {_spin_mode}[/#3fb950]", spinner="dots"):
                     try:
@@ -6534,15 +6562,37 @@ def run_agent_loop(
                                 _compact_read_hints.append((_read_category, _target))
                         else:
                             _flush_compact_reads()
-                            _name2, _hint2, _meta2 = _compact_tool_line(
-                                display_name, _hint_plain, _meta2, deps.console.width)
-                            _line = (
-                                f"  {_mark2} [accent.dim]{_esc_hint(_name2)}[/accent.dim]"
-                                f"  [muted]{_esc_hint(_hint2)}[/muted]"
-                            )
-                            if _meta2:
-                                _line += f"  [muted]{_esc_hint(_meta2)}[/muted]"
-                            deps.console.print(_line, highlight=False)
+                            _expand_shell = bool(
+                                name == "shell.exec"
+                                and getattr(
+                                    deps.console,
+                                    "_laintas_expand_shell_calls", False))
+                            if _expand_shell:
+                                # The concurrent prompt owns terminal layout;
+                                # preserve the complete command and let Rich
+                                # wrap naturally instead of middle-cropping it.
+                                _full_hint = re.sub(
+                                    r"\s+", " ", str(_hint_plain or "")).strip()
+                                deps.console.print(
+                                    f"  {_mark2} "
+                                    f"[accent.dim]{_esc_hint(display_name)}[/accent.dim]"
+                                    f"  [muted]{_esc_hint(_full_hint)}[/muted]",
+                                    highlight=False)
+                                if _meta2:
+                                    deps.console.print(
+                                        f"      [muted]{_esc_hint(_meta2)}[/muted]",
+                                        highlight=False)
+                            else:
+                                _name2, _hint2, _meta2 = _compact_tool_line(
+                                    display_name, _hint_plain, _meta2,
+                                    deps.console.width)
+                                _line = (
+                                    f"  {_mark2} [accent.dim]{_esc_hint(_name2)}[/accent.dim]"
+                                    f"  [muted]{_esc_hint(_hint2)}[/muted]"
+                                )
+                                if _meta2:
+                                    _line += f"  [muted]{_esc_hint(_meta2)}[/muted]"
+                                deps.console.print(_line, highlight=False)
                     pending_events.append({"type": "system", "kind": "tool",
                                             "content": display_name,
                                             "meta": {"ok": result.get("ok", False),
@@ -6903,22 +6953,13 @@ def run_agent_loop(
         add_debug_log(debug_entry)
 
         if done:
-            # Close sub-terminal if still running, show final report
-            if interactive_session is not None:
-                cmd_output = interactive_session.full_output
-                debug_entry.exec_stdout = cmd_output
-                debug_entry.exec_returncode = interactive_session.returncode
-                state["lastOutput"] = cmd_output
-                interactive_session.close()
-                if events_cb is not None:
-                    pending_events.append({"type": "system", "kind": "output", "content": cmd_output[:2000]})
-                    deps.display_command_output(
-                        interactive_session.command,
-                        interactive_session.returncode,
-                        cmd_output,
-                        depth=depth + 1,
-                    )
-                interactive_session = None
+            # Do not present lifecycle cleanup of the reusable shell as a
+            # command result. InteractiveSession.close() intentionally ends a
+            # still-running bash (sometimes with SIGKILL, hence rc=137); the
+            # accumulated PTY transcript is also not the output of `/bin/bash`.
+            # Owned temporary sessions are closed once, silently, by the
+            # cleanup block after the loop. Caller-owned existing_session
+            # remains alive and is returned to the REPL.
             if events_cb is not None and pending_events:
                 events_cb(pending_events)
                 pending_events.clear()
