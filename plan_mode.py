@@ -116,7 +116,10 @@ def _restore_state() -> None:
                 "content_sha": revision["content_sha"],
             })
             _save_state({"plan_mode": True, "current_plan": plan})
-        except (OSError, workgraph.WorkGraphError):
+        except Exception:
+            # _restore_state runs at import time and must never crash the
+            # CLI. Any failure here (corrupted plan file, workgraph schema
+            # mismatch, permissions, ...) just leaves plan mode off.
             return
     _current_plan = dict(plan)
     _plan_mode = True

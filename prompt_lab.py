@@ -343,7 +343,8 @@ def update_branch(branch_id: str, **updates: Any) -> Optional[dict]:
         branch.update(updates)
         branch["updated_at"] = _now()
         path = _safe_path(_branches_dir(), branch_id)
-        assert path is not None
+        if path is None:
+            return None
         _atomic_json(path, branch)
         return branch
 
@@ -524,7 +525,8 @@ def activate_patch(patch_id: str) -> tuple[bool, str]:
         patch["status"] = "ACTIVE"
         patch["updated_at"] = _now()
         patch_path = _safe_path(_patches_dir(), patch_id)
-        assert patch_path is not None
+        if patch_path is None:
+            return False, f"Invalid patch id: {patch_id}"
         _atomic_json(patch_path, patch)
         branch_id = patch.get("branch_id")
         if branch_id:
@@ -548,14 +550,16 @@ def disable_patch(patch_id: str) -> tuple[bool, str]:
         profile["patches"] = after
         profile["updated_at"] = _now()
         path = _profile_path(str(profile.get("name") or "default"))
-        assert path is not None
+        if path is None:
+            return False, "Active profile has an invalid name."
         _atomic_json(path, profile)
         patch = read_patch(patch_id)
         if patch:
             patch["status"] = "DISABLED"
             patch["updated_at"] = _now()
             patch_path = _safe_path(_patches_dir(), patch_id)
-            assert patch_path is not None
+            if patch_path is None:
+                return False, f"Invalid patch id: {patch_id}"
             _atomic_json(patch_path, patch)
         _append_history({
             "action": "disable", "profile": profile.get("name"),
@@ -663,7 +667,8 @@ def rollback() -> tuple[bool, str]:
             profile["patches"] = list(last.get("before") or [])
             profile["updated_at"] = _now()
             path = _profile_path(profile_name)
-            assert path is not None
+            if path is None:
+                return False, f"Invalid profile name: {profile_name}"
             _atomic_json(path, profile)
             message = f"Rolled back the latest change in profile {profile_name}."
         _append_history({
@@ -690,7 +695,8 @@ def record_test_result(patch_id: str, passed: bool, report: str,
         patch["status"] = "TESTED" if passed else "TEST_FAILED"
         patch["updated_at"] = _now()
         path = _safe_path(_patches_dir(), patch_id)
-        assert path is not None
+        if path is None:
+            return None
         _atomic_json(path, patch)
         branch_id = patch.get("branch_id")
         if branch_id:

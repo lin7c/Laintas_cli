@@ -83,10 +83,10 @@ def _atomic_write_json_if_changed(
             return False
     tmp = dest.with_name(f".{dest.name}.{uuid.uuid4().hex}.tmp")
     try:
-        tmp.write_text(
-            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
-            encoding="utf-8",
-        )
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(str(tmp), str(dest))
         if skip_if_unchanged:
             _LAST_WRITE_FINGERPRINTS[cache_key] = fp

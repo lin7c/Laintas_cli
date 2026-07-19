@@ -129,8 +129,7 @@ def _parse_frontmatter(content: str) -> tuple[dict, str]:
                 section_stack.pop()
                 current_section = meta
                 for _, sec in section_stack:
-                    current_section = current_section.setdefault(
-                        section_stack[-1][1], {})
+                    current_section = current_section.setdefault(sec, {})
 
             if not value:  # This is a section header
                 current_section = current_section.setdefault(key, {})

@@ -22,7 +22,6 @@ from __future__ import annotations
 import json
 import os
 import time
-import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -347,7 +346,6 @@ def list_workflow_templates() -> list[str]:
 
 _active_workflow: Optional[WorkflowInstance] = None
 _active_workflow_cwd: Optional[str] = None
-_lock = threading.RLock()
 
 
 class WorkflowTransitionError(ValueError):

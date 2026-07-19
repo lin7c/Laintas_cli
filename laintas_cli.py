@@ -16281,6 +16281,13 @@ def main():
 
     # Setup graceful shutdown
     def shutdown(signum=None, frame=None):
+        # Reentry guard: a second Ctrl+C while the first shutdown is cleaning
+        # up can double-close terminals / agents / browser sessions and
+        # corrupt in-memory state. Hard-exit on the second signal.
+        if getattr(shutdown, "_in_progress", False):
+            console.print("\n[red]Forced exit.[/red]")
+            os._exit(1)
+        shutdown._in_progress = True
         if _agents_view_is_active():
             # Reclaim stdout so shutdown messages are visible, and ask the
             # view's app to close instead of leaving the tty in raw mode.
