@@ -179,12 +179,24 @@ def _release_checksums(data: bytes) -> dict[str, str]:
 
 
 def fetch_manifest() -> dict:
-    """Fetch and parse the remote manifest. Raises on network/format error."""
+    """Fetch and parse the remote manifest. Raises on network/format error.
+
+    Every file entry MUST have a sha256; entries without one are rejected
+    to prevent installing unverified files (previously, a missing sha256
+    silently skipped checksum verification).
+    """
     resp = requests.get(manifest_url(), timeout=_TIMEOUT, verify=_CA_BUNDLE)
     resp.raise_for_status()
     data = resp.json()
     if "version" not in data or "files" not in data:
         raise ValueError("manifest.json is missing required keys (version, files)")
+    files = data.get("files", {})
+    if not isinstance(files, dict) or not files:
+        raise ValueError("manifest.json has no files")
+    for name, meta in files.items():
+        sha = (meta or {}).get("sha256", "")
+        if not sha or not isinstance(sha, str) or len(sha) != 64:
+            raise ValueError(f"manifest entry '{name}' is missing a valid sha256")
     return data
 
 
@@ -268,6 +280,11 @@ def plan_changed_files(manifest: dict) -> list:
         if not _safe_name(name):
             continue
         remote_sha = (meta or {}).get("sha256", "")
+        if not remote_sha or not isinstance(remote_sha, str) or len(remote_sha) != 64:
+            # Skip files without a valid sha256 - they should have been
+            # rejected by fetch_manifest(), but guard against tampered
+            # manifests that slip through.
+            continue
         local_path = os.path.join(base, name)
         if not os.path.exists(local_path):
             changed.append((name, remote_sha))
@@ -323,7 +340,10 @@ def apply_source_update(manifest: dict, changed_files: list, channel_dir: str,
             if not os.path.exists(src_path):
                 log(f"[red]{name} is missing from the source bundle. Aborting.[/red]")
                 return False
-            if remote_sha and _sha256_file(src_path) != remote_sha:
+            if not remote_sha:
+                log(f"[red]{name} has no sha256 in manifest. Aborting.[/red]")
+                return False
+            if _sha256_file(src_path) != remote_sha:
                 log(f"[red]Checksum mismatch for {name}. Aborting.[/red]")
                 return False
             staged.append((name, src_path))
