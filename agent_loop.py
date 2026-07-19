@@ -60,11 +60,6 @@ This block is supplied by the runtime after loading user customization.
 </platform_safety_policy>"""
 
 
-# ── Constants ──────────────────────────────────────────────────────────
-MAX_LOOPS = 10
-MAX_TOKENS = 8192
-MAX_DEBUG_ENTRIES = 50
-
 # Mutable defaults — these are the "factory" values; runtime overrides stored in _runtime_config
 _DEFAULT_CONFIG = {
     "max_loops": 30,

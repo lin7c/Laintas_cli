@@ -801,7 +801,6 @@ except Exception:
 
 # ── Agent Loop (extracted module) ─────────────────────────────────────
 from agent_loop import (
-    MAX_LOOPS, MAX_TOKENS, MAX_DEBUG_ENTRIES,
     DebugEntry, TerminalInfo, AgentInfo, EmployeeProfile, AgentToolPolicy,
     add_debug_log, clear_debug_logs, get_recent_tool_failures,
     next_debug_loop, get_debug_logs,
