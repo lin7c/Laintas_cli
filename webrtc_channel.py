@@ -154,6 +154,27 @@ def _validate_exec_cmd(cmd: str) -> str | None:
     return None
 
 
+def _validate_exec_paths(cmd: str) -> str | None:
+    """Return an error message if any path argument in `cmd` is outside
+    the policy's allowedRoots, None if all paths are allowed (or no paths).
+
+    Extracts non-flag arguments and checks each one that looks like a path
+    (contains '/' or starts with '.'/'~') against _is_path_allowed().
+    """
+    import shlex
+    try:
+        parts = shlex.split(cmd)
+    except ValueError:
+        return None  # _validate_exec_cmd already catches malformed
+    for part in parts:
+        if part.startswith("-"):
+            continue  # flag
+        if "/" in part or part.startswith((".", "~")):
+            if not _is_path_allowed(part):
+                return f"path '{part}' outside allowed roots"
+    return None
+
+
 class WebrtcManager:
     """One per agent connection. Holds a dedicated asyncio loop in a daemon
     thread and a peer connection per signaling session (keyed by reqId)."""
@@ -289,6 +310,11 @@ class WebrtcManager:
         rid = msg.get("id")
         cmd = msg.get("cmd") or ""
         err = _validate_exec_cmd(cmd)
+        if err:
+            channel.send(json.dumps({"t": "exec-res", "id": rid, "ok": False,
+                                     "code": -1, "out": f"rejected: {err}"}))
+            return
+        err = _validate_exec_paths(cmd)
         if err:
             channel.send(json.dumps({"t": "exec-res", "id": rid, "ok": False,
                                      "code": -1, "out": f"rejected: {err}"}))
