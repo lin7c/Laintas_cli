@@ -282,13 +282,28 @@ def _write_default_config() -> None:
         pass
 
 
+_AUDIT_MAX_BYTES = 10 * 1024 * 1024  # 10MB; rotate to audit.log.1
+
+
 def _write_audit(entry: dict) -> None:
-    """Append a JSONL line to the audit log."""
+    """Append a JSONL line to the audit log, with size-based rotation."""
     with _audit_lock:
         try:
             AUDIT_PATH.parent.mkdir(parents=True, exist_ok=True)
-            if AUDIT_PATH.exists() and not paths.ensure_private_file(AUDIT_PATH):
-                return
+            if AUDIT_PATH.exists():
+                if not paths.ensure_private_file(AUDIT_PATH):
+                    return
+                # Rotate if over the size cap
+                try:
+                    if AUDIT_PATH.stat().st_size > _AUDIT_MAX_BYTES:
+                        rotated = AUDIT_PATH.with_suffix(".log.1")
+                        try:
+                            rotated.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                        AUDIT_PATH.rename(rotated)
+                except OSError:
+                    pass
             with open(AUDIT_PATH, "a", encoding="utf-8") as f:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
             paths.ensure_private_file(AUDIT_PATH)

@@ -1775,6 +1775,9 @@ def _decode_send_keys(text: str) -> str:
     return ''.join(result)
 
 
+_MAX_RETAINED_OUTPUT = 512 * 1024  # 512KB of recent output retained per session
+
+
 class InteractiveSession:
     """Manages an interactive process running in a pseudo-terminal (PTY).
 
@@ -1796,6 +1799,7 @@ class InteractiveSession:
         self.master_fd: int = -1
         self._output_chunks: list[str] = []
         self._output_total: int = 0
+        self._output_dropped: int = 0  # bytes dropped from beginning (cap eviction)
         self._returncode: int = -1
         self._start_time: float = 0.0
         self._old_tcattr = None
@@ -1932,6 +1936,7 @@ class InteractiveSession:
             new_chunks.append(decoded)
             self._output_chunks.append(decoded)
             self._output_total += len(decoded)
+            self._trim_output_chunks()
             if self.stream_output:
                 sys.stdout.write(decoded)
                 sys.stdout.flush()
@@ -1989,6 +1994,7 @@ class InteractiveSession:
                 decoded = data.decode("utf-8", errors="replace")
                 self._output_chunks.append(decoded)
                 self._output_total += len(decoded)
+                self._trim_output_chunks()
                 if self.stream_output:
                     sys.stdout.write(decoded)
                     sys.stdout.flush()
@@ -2003,6 +2009,21 @@ class InteractiveSession:
         return self._returncode == -1
 
     # ── properties ─────────────────────────────────────────────────~~~~
+
+    def _trim_output_chunks(self) -> None:
+        """Drop oldest chunks when retained output exceeds the cap.
+
+        Keeps at most _MAX_RETAINED_OUTPUT bytes of recent output so
+        long-lived persistent terminals don't leak memory. Tracks
+        _output_dropped so output_from() can handle stale offsets.
+        """
+        retained = self._output_total - self._output_dropped
+        if retained <= _MAX_RETAINED_OUTPUT:
+            return
+        while self._output_chunks and retained > _MAX_RETAINED_OUTPUT:
+            oldest = self._output_chunks.pop(0)
+            self._output_dropped += len(oldest)
+            retained -= len(oldest)
 
     @property
     def full_output(self) -> str:
@@ -2027,8 +2048,11 @@ class InteractiveSession:
         to cover the requested tail.  Used by marker-poll hot loops that
         poll a long-lived persistent shell so per-iteration cost stays
         bounded by new output, not by session lifetime.
+
+        If `offset` points into data that was evicted by _trim_output_chunks,
+        returns everything currently retained (the caller's offset is stale).
         """
-        if offset <= 0:
+        if offset <= self._output_dropped:
             return "".join(self._output_chunks)
         if offset >= self._output_total:
             return ""
@@ -2090,6 +2114,7 @@ class InteractiveSession:
                         decoded = data.decode("utf-8", errors="replace")
                         self._output_chunks.append(decoded)
                         self._output_total += len(decoded)
+                        self._trim_output_chunks()
                         if self.stream_output:
                             sys.stdout.write(decoded)
                             sys.stdout.flush()
@@ -16340,6 +16365,12 @@ def main():
         browser_mod.close_all_browser_sessions()
         try:
             _get_mcp_mod().get_manager().shutdown()
+        except Exception:
+            pass
+        try:
+            mgr = getattr(agent_registry, "_webrtc", None)
+            if mgr and mgr is not False and hasattr(mgr, "close"):
+                mgr.close()
         except Exception:
             pass
         nonlocal interactive_session

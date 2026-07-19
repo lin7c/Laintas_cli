@@ -435,3 +435,37 @@ class WebrtcManager:
                 await pc.close()
             except Exception:
                 pass
+
+    def close(self):
+        """Shut down all peer connections, VNC bridges, and the event loop.
+
+        Best-effort, idempotent. Called from the CLI shutdown cascade.
+        """
+        if self._loop is None:
+            return
+        try:
+            fut = asyncio.run_coroutine_threadsafe(
+                self._close_all(), self._loop)
+            fut.result(timeout=5.0)
+        except Exception:
+            pass
+        try:
+            self._loop.call_soon_threadsafe(self._loop.stop)
+        except Exception:
+            pass
+        self._thread.join(timeout=3.0)
+        self._loop = None
+
+    async def _close_all(self):
+        """Close every peer connection and VNC bridge."""
+        for sid in list(self._pcs):
+            await self._close(sid)
+        for channel in list(self._vnc):
+            self._close_vnc(channel)
+        for channel in list(self._puts):
+            st = self._puts.pop(channel, None)
+            if st and st.get("f"):
+                try:
+                    st["f"].close()
+                except Exception:
+                    pass
