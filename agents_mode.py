@@ -20,8 +20,10 @@ from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import HSplit, VSplit, Layout, Window, ConditionalContainer
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
 from prompt_toolkit.layout.processors import BeforeInput
+from prompt_toolkit.layout.utils import explode_text_fragments
 from prompt_toolkit.mouse_events import MouseEventType
 from prompt_toolkit.styles import Style
+from prompt_toolkit.utils import get_cwidth
 
 import agent_loop
 import agent_ui_events
@@ -165,6 +167,21 @@ class AgentsModeController:
             pass
         size = shutil.get_terminal_size(fallback=(100, 30))
         return size.columns, size.lines
+
+    def _focus_body_height(self) -> tuple[int, int]:
+        """Return (width, physical rows available below the Focus header)."""
+        width, height = self._terminal_size()
+        # Root layout rows outside `main`: top header + separator, input and
+        # notice, optional footer, and (on sufficiently large terminals) the
+        # two Feed separators plus its four rows. Focus itself adds a two-row
+        # title/divider. Keeping this calculation aligned with run() prevents
+        # prompt_toolkit from clipping the newest body row at the bottom.
+        reserved = 2 + 2 + 2
+        if height >= 16:
+            reserved += 1
+        if width >= 60 and height >= 18:
+            reserved += 6
+        return width, max(3, height - reserved)
 
     def _rail_page_size(self) -> int:
         _width, height = self._terminal_size()
@@ -502,10 +519,59 @@ class AgentsModeController:
                  "".join(reversed(parts)).splitlines() if line.strip()]
         return lines[-1] if lines else ""
 
+    @staticmethod
+    def _wrap_formatted_rows(fragments, width: int):
+        """Wrap styled fragments into physical terminal rows by cell width."""
+        width = max(1, int(width))
+        rows: list[list[tuple]] = [[]]
+        column = 0
+        for fragment in explode_text_fragments(list(fragments)):
+            style, char, *rest = fragment
+            if char == "\n":
+                rows.append([])
+                column = 0
+                continue
+            cell_width = max(0, get_cwidth(char))
+            if column and cell_width and column + cell_width > width:
+                rows.append([])
+                column = 0
+            row = rows[-1]
+            value = (style, char, *rest)
+            # Exploding is convenient for width accounting but expensive for
+            # rendering. Recombine adjacent characters with identical style
+            # and mouse metadata before handing them back to prompt_toolkit.
+            if (row and row[-1][0] == style
+                    and tuple(row[-1][2:]) == tuple(rest)):
+                row[-1] = (style, row[-1][1] + char, *rest)
+            else:
+                row.append(value)
+            column += cell_width
+        return rows
+
+    def _tail_mirror_rows(self, lines: list[str], width: int,
+                          row_limit: int) -> list[list[tuple]]:
+        """Return at most `row_limit` wrapped physical rows from the tail.
+
+        Work backwards so the 0.1s Agents Mode refresh never reparses the
+        whole 4000-line mirror merely to display the last screenful.
+        """
+        row_limit = max(1, int(row_limit))
+        reverse_rows: list[list[tuple]] = []
+        for line in reversed(lines):
+            try:
+                formatted = list(to_formatted_text(ANSI(line)))
+            except Exception:
+                formatted = [("", line)]
+            wrapped = self._wrap_formatted_rows(formatted, width)
+            for row in reversed(wrapped):
+                reverse_rows.append(row)
+                if len(reverse_rows) >= row_limit:
+                    return list(reversed(reverse_rows))
+        return list(reversed(reverse_rows))
+
     def _focus_mirror_fragments(self, agent_id: str, lines: list[str]):
         activity = self._activity_line(agent_id)
-        width, terminal_height = self._terminal_size()
-        height = max(3, terminal_height - (8 if terminal_height < 18 else 12))
+        width, height = self._focus_body_height()
         stream_tail = ""
         if activity:
             height = max(3, height - 1)
@@ -515,23 +581,25 @@ class AgentsModeController:
             if stream_tail:
                 height = max(3, height - 1)
         offset = max(0, self.focus_scroll[agent_id])
-        end = max(0, len(lines) - offset)
+        # `focus_scroll` is a physical-row offset. Long/CJK/ANSI lines are
+        # wrapped before slicing so follow=0 really means the visible bottom,
+        # rather than "the last N logical lines, clipped halfway on screen".
+        physical_rows = self._tail_mirror_rows(
+            lines, max(1, width - 2), height + offset)
+        end = max(0, len(physical_rows) - offset)
         start = max(0, end - height)
-        visible = lines[start:end]
+        visible = physical_rows[start:end]
         if self.follow[agent_id]:
             events = agent_ui_events.hub.agent_events(agent_id)
             if events:
                 self.read_seq[agent_id] = events[-1].seq
-        fragments = [("class:header", f"  {self._agent_name(agent_id)}\n"),
-                     ("class:separator", "  " + "─" * 50 + "\n")]
-        for line in visible:
+        header_name = self._crop(self._agent_name(agent_id), max(1, width - 2))
+        fragments = [("class:header", f"  {header_name}\n"),
+                     ("class:separator", "  " + "─" * max(
+                         1, min(50, width - 2)) + "\n")]
+        for row in visible:
             fragments.append(("", " "))
-            try:
-                fragments.extend(
-                    (style, value)
-                    for style, value, *_rest in to_formatted_text(ANSI(line)))
-            except Exception:
-                fragments.append(("", line))
+            fragments.extend((style, value) for style, value, *_rest in row)
             fragments.append(("", "\n"))
         if stream_tail:
             fragments.append((
@@ -553,8 +621,7 @@ class AgentsModeController:
         activity = self._activity_line(agent_id)
         if activity:
             lines.extend([activity, ("", "")])
-        _width, terminal_height = self._terminal_size()
-        height = max(3, terminal_height - (8 if terminal_height < 18 else 12))
+        _width, height = self._focus_body_height()
         offset = max(0, self.focus_scroll[agent_id])
         end = max(0, len(lines) - offset)
         start = max(0, end - height)

@@ -11,6 +11,7 @@ buffered and replayed to stdout when ownership returns.
 from __future__ import annotations
 
 from collections import deque
+from contextlib import contextmanager
 import re
 import sys
 import threading
@@ -21,6 +22,12 @@ import threading
 # its own activity indicator.
 _FRAME_CONTROL_RE = re.compile(
     r"\x1b\[(?:\d*[ABCDEFGJKSTLM]|\?\d+[hl]|\d*(?:;\d*)?[Hfr])")
+_ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_LIVE_STATUS_RE = re.compile(
+    r"^\s*[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s+(?:Thinking|Writing)…\s+"
+    r"\d+(?:\.\d+)?s(?:\s+·.*)?\s*$",
+    re.IGNORECASE,
+)
 
 _MAX_LINES_PER_AGENT = 4000
 _MAX_MISSED_CHUNKS = 4000
@@ -31,6 +38,12 @@ def _filter_for_mirror(text: str) -> str:
     if not text:
         return ""
     if _FRAME_CONTROL_RE.search(text):
+        return ""
+    # Rich may emit cursor controls and the visible Live frame in separate
+    # file.write() calls.  The control-code test above then cannot recognize
+    # the second chunk as transient.  Never persist a standalone status frame
+    # as conversation history (or replay it after leaving /agents).
+    if _LIVE_STATUS_RE.fullmatch(_ANSI_RE.sub("", text)):
         return ""
     if "\r" in text:
         text = text.replace("\r\n", "\n")
@@ -57,6 +70,10 @@ class MirrorHub:
         self._buffers: dict[str, _AgentBuffer] = {}
         self._owner = "cli"
         self._missed: list[str] = []
+        # Process-wide rather than thread-local: Rich Live paints from its own
+        # refresh thread.  While active, output still reaches the ordinary CLI
+        # terminal but never becomes Agent history or missed-output replay.
+        self._transient_output = 0
         # Recording gate: the mirror keeps only Agent conversation — output
         # produced while an agent loop is running (plus explicit write()
         # calls such as the dialogue echo). Terminal decoration (startup
@@ -71,6 +88,17 @@ class MirrorHub:
     def stop_recording(self) -> None:
         with self._lock:
             self._recording = max(0, self._recording - 1)
+
+    @contextmanager
+    def transient_output(self):
+        """Route repaint-in-place UI output to the CLI only, never history."""
+        with self._lock:
+            self._transient_output += 1
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._transient_output = max(0, self._transient_output - 1)
 
     # ── ownership ──────────────────────────────────────────────────────
     def is_agents(self) -> bool:
@@ -105,6 +133,13 @@ class MirrorHub:
             return
         filtered = _filter_for_mirror(text)
         with self._lock:
+            if self._transient_output:
+                if self._owner == "cli":
+                    try:
+                        sys.stdout.write(text)
+                    except Exception:
+                        pass
+                return
             if filtered and self._recording > 0:
                 self._append_locked(str(agent_id or "primary"), filtered)
             if self._owner == "cli":
@@ -171,6 +206,10 @@ class TeeFile:
 
     def fileno(self) -> int:
         return sys.stdout.fileno()
+
+    def transient_output(self):
+        """Context used by Rich Live/status displays backed by this file."""
+        return self._hub.transient_output()
 
 
 hub = MirrorHub()

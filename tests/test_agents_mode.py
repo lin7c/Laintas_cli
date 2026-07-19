@@ -542,6 +542,72 @@ class AgentsModeTests(unittest.TestCase):
 
         self.assertEqual(controller._activity_line(agent.id)[1], "◐ Writing…")
 
+    def test_primary_follow_uses_wrapped_screen_rows_after_five_turns(self):
+        agent = self._agent("primary", role="primary")
+        lines = [
+            f"TURN-{turn} " + (str(turn) * 90) + f" END-{turn}"
+            for turn in range(1, 6)
+        ]
+
+        class Mirror:
+            @staticmethod
+            def read_lines(_agent_id):
+                return lines
+
+        controller = agents_mode.AgentsModeController(
+            "term0", object(), {}, mirror=Mirror())
+        controller.selected_id = agent.id
+        with mock.patch.object(
+                controller, "_terminal_size", return_value=(40, 18)):
+            bottom = "".join(
+                text for _style, text in controller.focus_fragments())
+            controller.scroll(6)
+            scrolled = "".join(
+                text for _style, text in controller.focus_fragments())
+            controller.scroll(-6)
+            followed = "".join(
+                text for _style, text in controller.focus_fragments())
+
+        self.assertIn("END-5", bottom)
+        self.assertNotIn("TURN-1", bottom)
+        self.assertTrue(controller.follow[agent.id])
+        self.assertNotIn("END-5", scrolled)
+        self.assertIn("END-5", followed)
+
+    def test_primary_activity_remains_below_latest_wrapped_row(self):
+        agent = self._agent("primary", role="primary")
+        agent.status = "thinking"
+
+        class Mirror:
+            @staticmethod
+            def read_lines(_agent_id):
+                return ["latest " + ("界" * 80) + " END-LATEST"]
+
+        controller = agents_mode.AgentsModeController(
+            "term0", object(), {}, mirror=Mirror())
+        controller.selected_id = agent.id
+        with mock.patch.object(
+                controller, "_terminal_size", return_value=(40, 18)), \
+                mock.patch.object(agents_mode.time, "monotonic", return_value=0):
+            rendered = "".join(
+                text for _style, text in controller.focus_fragments())
+
+        self.assertIn("END-LATEST", rendered)
+        self.assertIn("●  ·  ·", rendered)
+
+    def test_focus_height_matches_full_layout_at_standard_terminal_size(self):
+        agent = self._agent("primary", role="primary")
+        controller = agents_mode.AgentsModeController(
+            "term0", object(), {})
+        controller.selected_id = agent.id
+
+        with mock.patch.object(
+                controller, "_terminal_size", return_value=(80, 25)):
+            width, body_height = controller._focus_body_height()
+
+        self.assertEqual(width, 80)
+        self.assertEqual(body_height, 12)
+
     def test_assignment_uses_employee_channels_and_reports_failed_loop(self):
         agent = self._agent("employee")
         captured = {}

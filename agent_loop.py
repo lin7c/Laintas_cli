@@ -5898,16 +5898,23 @@ def run_agent_loop(
                 if getattr(deps.console, "_laintas_event_console", False):
                     response = _do_stream_call()
                 else:
-                    with Live(_LiveWrapper(), console=deps.console,
-                              refresh_per_second=4.0, auto_refresh=True,
-                              transient=True, redirect_stdout=False,
-                              redirect_stderr=False) as live:
-                        _live_holder["live"] = live
-                        response = _do_stream_call()
-                        try:
-                            live.refresh()
-                        except Exception:
-                            pass
+                    _console_file = getattr(deps.console, "file", None)
+                    _transient_factory = getattr(
+                        _console_file, "transient_output", None)
+                    _transient_ctx = (
+                        _transient_factory()
+                        if callable(_transient_factory) else nullcontext())
+                    with _transient_ctx:
+                        with Live(_LiveWrapper(), console=deps.console,
+                                  refresh_per_second=4.0, auto_refresh=True,
+                                  transient=True, redirect_stdout=False,
+                                  redirect_stderr=False) as live:
+                            _live_holder["live"] = live
+                            response = _do_stream_call()
+                            try:
+                                live.refresh()
+                            except Exception:
+                                pass
             except ImportError:
                 with deps.console.status(f"[#3fb950]thinking… · {_spin_model} · {_spin_mode}[/#3fb950]", spinner="dots"):
                     try:
