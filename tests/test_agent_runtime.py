@@ -128,6 +128,26 @@ class AgentSchedulerTests(unittest.TestCase):
         self.assertFalse(child.slot_held)
         self.assertEqual(agent_loop._running_count, 0)
 
+    def test_abort_cascades_to_descendants(self):
+        # Build parent -> child -> grandchild tree.
+        parent = agent_loop.register_agent(name="parent", role="subagent")
+        child = agent_loop.register_agent(
+            name="child", role="subagent", parent_id=parent.id)
+        grandchild = agent_loop.register_agent(
+            name="grandchild", role="subagent", parent_id=child.id)
+        self.assertFalse(parent.abort_event.is_set())
+        self.assertFalse(child.abort_event.is_set())
+        self.assertFalse(grandchild.abort_event.is_set())
+        self.assertTrue(agent_loop.abort_agent(parent.id))
+        self.assertTrue(parent.abort_event.is_set())
+        self.assertTrue(child.abort_event.is_set(),
+                        "abort_agent must cascade to children")
+        self.assertTrue(grandchild.abort_event.is_set(),
+                        "abort_agent must cascade to grandchildren")
+        # Sibling not under parent must be untouched.
+        sibling = agent_loop.register_agent(name="sibling", role="subagent")
+        self.assertFalse(sibling.abort_event.is_set())
+
     def test_aborted_queued_agent_never_starts(self):
         agent_loop._max_concurrent = 1
         holder = agent_loop.register_agent(name="holder")
@@ -584,6 +604,44 @@ class PersistentOwnershipTests(unittest.TestCase):
         self.assertEqual(alice.home_terminal, "left")
         self.assertEqual(alice.deployment_terminal, "right")
 
+    def test_swap_station_is_atomic(self):
+        self._terminal("term0")
+        self._terminal("work", "term0")
+        alice = agent_loop.register_agent(name="alice", role="deployed")
+        bob = agent_loop.register_agent(name="bob", role="pool")
+        self.assertTrue(agent_loop.station_agent(alice.id, "work"))
+        # Snapshot occupant before swap.
+        self.assertEqual(
+            agent_loop.get_terminal("work").stationed_agent_id, alice.id)
+        # Swap.
+        self.assertTrue(agent_loop.swap_station(alice.id, bob.id, "work"))
+        term = agent_loop.get_terminal("work")
+        # After swap: bob owns work, alice is back to pool.
+        self.assertEqual(term.stationed_agent_id, bob.id)
+        self.assertEqual(term.stationed_agent_ids, [bob.id])
+        self.assertEqual(bob.deployment_terminal, "work")
+        self.assertEqual(bob.role, "deployed")
+        self.assertIsNone(alice.deployment_terminal)
+        self.assertEqual(alice.role, "pool")
+
+    def test_swap_station_rejects_invalid_inputs(self):
+        self._terminal("term0")
+        self._terminal("work", "term0")
+        alice = agent_loop.register_agent(name="alice", role="deployed")
+        bob = agent_loop.register_agent(name="bob", role="pool")
+        # No terminal deployed -> nothing to swap.
+        self.assertFalse(agent_loop.swap_station(bob.id, alice.id))
+        self.assertTrue(agent_loop.station_agent(alice.id, "work"))
+        # Self swap is a no-op.
+        self.assertFalse(agent_loop.swap_station(alice.id, alice.id, "work"))
+        # Missing target agent.
+        self.assertFalse(
+            agent_loop.swap_station(alice.id, "nonexistent", "work"))
+        # Bob already deployed elsewhere.
+        self._terminal("other", "term0")
+        self.assertTrue(agent_loop.station_agent(bob.id, "other"))
+        self.assertFalse(agent_loop.swap_station(alice.id, bob.id, "work"))
+
     def test_concurrent_station_claim_has_exactly_one_winner(self):
         self._terminal("term0")
         self._terminal("work", "term0")
@@ -610,6 +668,42 @@ class PersistentOwnershipTests(unittest.TestCase):
         terminal = agent_loop.get_terminal("work")
         self.assertEqual(len(terminal.stationed_agent_ids), 1)
         self.assertEqual(terminal.stationed_agent_ids[0], terminal.stationed_agent_id)
+
+    def test_terminal_last_cwd_inherited_by_undeployed_assignment(self):
+        """Undeployed employee inherits home_terminal.last_cwd as _task_cwd."""
+        self._terminal("term0")
+        self._terminal("work", "term0")
+        alice = agent_loop.register_agent(name="alice", role="deployed")
+        bob = agent_loop.register_agent(name="bob", role="pool")
+        bob.home_terminal = "work"
+        self.assertTrue(agent_loop.station_agent(alice.id, "work"))
+        # Simulate alice's shell.exec updating the terminal cwd.
+        agent_loop.get_terminal("work").last_cwd = "/tmp/some-project"
+        # Bob has no prior _task_cwd; start_agent_assignment should inherit.
+        ok, msg, assignment = agent_loop.start_agent_assignment(
+            bob.id, "do something", self._deps_for_assignment())
+        self.assertTrue(ok, msg)
+        self.assertEqual(bob.state.get("_task_cwd"), "/tmp/some-project")
+
+    def test_terminal_last_cwd_does_not_override_explicit_task_cwd(self):
+        """An explicit prior _task_cwd wins over home_terminal.last_cwd."""
+        self._terminal("term0")
+        self._terminal("work", "term0")
+        bob = agent_loop.register_agent(name="bob", role="pool")
+        bob.home_terminal = "work"
+        bob.state["_task_cwd"] = "/explicit/prior"
+        agent_loop.get_terminal("work").last_cwd = "/tmp/other"
+        ok, msg, assignment = agent_loop.start_agent_assignment(
+            bob.id, "do something", self._deps_for_assignment())
+        self.assertTrue(ok, msg)
+        self.assertEqual(bob.state.get("_task_cwd"), "/explicit/prior")
+
+    @staticmethod
+    def _deps_for_assignment():
+        deps = mock.Mock()
+        deps.SubTerminalSession = _FakeInteractiveSession
+        deps.InteractiveSession = _FakeInteractiveSession
+        return deps
 
     def test_communication_is_limited_to_same_or_adjacent_terminal(self):
         self._terminal("term0")

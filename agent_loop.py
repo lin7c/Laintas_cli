@@ -682,6 +682,11 @@ class TerminalInfo:
     retain_completed: bool = False
     completed_at: Optional[float] = None
     returncode: Optional[int] = None
+    # Last known cwd of the stationed agent's shell.  Undeployed agents with
+    # this terminal as ``home_terminal`` inherit it as ``_task_cwd`` when they
+    # start an assignment, so they begin in the same directory the stationed
+    # agent left behind rather than in the Python process cwd.
+    last_cwd: Optional[str] = None
 
 
 _debug_logs: list[DebugEntry] = []
@@ -2157,6 +2162,14 @@ def start_agent_assignment(agent_id: str, task: str, deps,
             # Undeployed employees use a run-owned private terminal and never
             # join a named terminal's persistent byte stream.
             terminal_name = f"temporary:{employee.id}"
+            # Inherit the home terminal's last known cwd so the temporary PTY
+            # starts where the stationed agent left off, rather than in the
+            # Python process cwd.  An explicit prior _task_cwd wins (e.g. a
+            # resumed assignment); only fall back to the terminal when absent.
+            if not employee.state.get("_task_cwd") and employee.home_terminal:
+                _home_term = _terminal_registry.get(employee.home_terminal)
+                if _home_term is not None and _home_term.last_cwd:
+                    employee.state["_task_cwd"] = _home_term.last_cwd
 
         assignment = AgentAssignment(
             id=f"job-{uuid.uuid4().hex[:10]}",
@@ -2559,6 +2572,86 @@ def unstation_agent(agent_id: str) -> None:
             _persist_warn("save_agent_state(unstation cleanup)", e)
 
 
+def swap_station(old_agent_id: str, new_agent_id: str,
+                 terminal_name: Optional[str] = None) -> bool:
+    """Atomically hand a terminal's deployment from one agent to another.
+
+    Without this, a two-step unstation+station leaves a window where the
+    terminal has no owner and pending PTY output is lost.  ``swap_station``
+    performs both halves under a single registry lock so observers
+    (Agents Mode, /agents, scheduler) never see an intermediate state.
+
+    Returns False if either agent is missing, the terminal cannot be
+    resolved, or either agent has an active assignment that forbids
+    deployment change.
+    """
+    persist_targets: list = []
+    with _registry_lock:
+        old_agent = _agent_registry.get(old_agent_id)
+        new_agent = _agent_registry.get(new_agent_id)
+        if old_agent is None or new_agent is None:
+            return False
+        if old_agent_id == new_agent_id:
+            return False
+        resolved_terminal = terminal_name or agent_deployment_terminal(old_agent)
+        if not resolved_terminal:
+            return False
+        term = _terminal_registry.get(resolved_terminal)
+        if term is None or term.session is None or not term.session.is_alive():
+            return False
+        if new_agent.role == "primary" and resolved_terminal != "term0":
+            return False
+        # New agent must not be stationed elsewhere already.
+        new_current = agent_deployment_terminal(new_agent)
+        if new_current and new_current != resolved_terminal:
+            return False
+        # Refuse if either agent is mid-assignment on a different terminal.
+        if (old_agent.active_assignment is not None
+                and agent_deployment_terminal(old_agent) != resolved_terminal):
+            return False
+        if (new_agent.active_assignment is not None
+                and agent_deployment_terminal(new_agent) is not None
+                and agent_deployment_terminal(new_agent) != resolved_terminal):
+            return False
+        # Detach old agent.
+        if old_agent_id in term.stationed_agent_ids:
+            term.stationed_agent_ids = [
+                i for i in term.stationed_agent_ids if i != old_agent_id]
+        if term.stationed_agent_id == old_agent_id:
+            term.stationed_agent_id = None
+        if term.dialog_agent_id == old_agent_id:
+            term.dialog_agent_id = None
+        old_agent.stationed_terminal = None
+        old_agent.deployment_terminal = None
+        if old_agent.role == "deployed":
+            old_agent.role = "pool"
+            old_agent.status = "idle"
+        # Attach new agent.
+        new_agent.stationed_terminal = resolved_terminal
+        new_agent.deployment_terminal = resolved_terminal
+        if not new_agent.home_terminal:
+            new_agent.home_terminal = resolved_terminal
+            new_agent.parent_terminal = term.parent_terminal
+        if new_agent.role == "primary":
+            new_agent.parent_terminal = None
+        if new_agent.role in {"pool", "deployed"}:
+            new_agent.role = "deployed"
+        term.stationed_agent_id = new_agent_id
+        term.stationed_agent_ids = [new_agent_id]
+        dialog = (_agent_registry.get(term.dialog_agent_id)
+                  if term.dialog_agent_id else None)
+        if dialog is None or agent_scope_terminal(dialog) != resolved_terminal:
+            term.dialog_agent_id = new_agent_id
+        persist_targets = [old_agent, new_agent]
+    for agent in persist_targets:
+        if agent.state.get("_persisted_employee"):
+            try:
+                agent_persistence.save_agent_state(agent)
+            except Exception as e:
+                _persist_warn("save_agent_state(swap_station)", e)
+    return True
+
+
 def close_all_agents() -> None:
     """Clean up all agent registrations. Signals abort to running children first."""
     global _current_agent_id, _running_count, _wait_queue
@@ -2676,32 +2769,50 @@ def drain_inbox(agent_id: str) -> list:
 
 
 def abort_agent(agent_id: str) -> bool:
-    """Signal an agent to stop and immediately close its private PTY, if any."""
+    """Signal an agent to stop and immediately close its private PTY, if any.
+
+    Aborts cascade to all descendants: each child's abort_event is set and its
+    ephemeral PTY is closed, so a subtree is fully stopped by aborting the root.
+    """
     global _wait_queue
     cancelled_callbacks = []
-    ephemeral_session = None
+    ephemeral_sessions = []
     with _registry_lock:
         info = _agent_registry.get(agent_id)
         if info is None:
             return False
-        info.abort_event.set()
-        ephemeral_session = info.ephemeral_session
-        info.ephemeral_session = None
-        # A running agent owns a scheduler lease until its loop observes the
-        # abort and exits. Changing status here used to leak that lease.
-        if info.status in ("idle", "queued", "waiting"):
-            info.status = "aborted"
-        if not info.slot_held:
+        # Collect this agent and all descendants in one locked pass.
+        targets: list[AgentInfo] = []
+        stack = [info]
+        while stack:
+            cur = stack.pop()
+            targets.append(cur)
+            for cid in list(cur.child_ids):
+                child = _agent_registry.get(cid)
+                if child is not None:
+                    stack.append(child)
+        target_ids = {t.id for t in targets}
+        for t in targets:
+            t.abort_event.set()
+            if t.ephemeral_session is not None:
+                ephemeral_sessions.append(t.ephemeral_session)
+                t.ephemeral_session = None
+            # A running agent owns a scheduler lease until its loop observes the
+            # abort and exits. Changing status here used to leak that lease.
+            if t.status in ("idle", "queued", "waiting"):
+                t.status = "aborted"
+        # Cancel any queued descendants along with the root.
+        if any(not t.slot_held for t in targets):
             kept = []
             for queued_id, start_fn in _wait_queue:
-                if queued_id == agent_id:
+                if queued_id in target_ids:
                     cancelled_callbacks.append(start_fn)
                 else:
                     kept.append((queued_id, start_fn))
             _wait_queue = kept
-    if ephemeral_session is not None:
+    for session in ephemeral_sessions:
         try:
-            ephemeral_session.close()
+            session.close()
         except Exception:
             pass
     for start_fn in cancelled_callbacks:
@@ -6639,6 +6750,16 @@ def run_agent_loop(
                             # mirror its terminal cwd for prompt/path compatibility.
                             if depth == 0 and os.path.isdir(state["cwd"]):
                                 os.chdir(state["cwd"])
+                            # Persist cwd on the deployment terminal so that
+                            # undeployed siblings sharing this terminal as
+                            # home_terminal can inherit it on their next
+                            # assignment instead of falling back to the Python
+                            # process cwd.
+                            _deploy_term = (agent_deployment_terminal(self_info)
+                                            if self_info is not None else None)
+                            if _deploy_term and _deploy_term in _terminal_registry:
+                                _terminal_registry[_deploy_term].last_cwd = (
+                                    state["cwd"])
 
                         # Sync back interactive_session (tools may create/close sessions)
                         if tool_ctx.interactive_session != interactive_session:
