@@ -48,6 +48,7 @@ _hooks_config: list[dict] | None = None
 _hooks_config_mtime: float = 0.0
 _python_hooks: dict | None = None
 _python_hooks_mtime: float = 0.0
+_python_hooks_lock = threading.Lock()
 _lock = threading.RLock()
 
 
@@ -131,39 +132,40 @@ def _write_default_config() -> None:
 def _load_python_hooks() -> dict:
     """Load ~/.laintas/hooks.py dynamically. mtime-cached."""
     global _python_hooks, _python_hooks_mtime
-    if not PYTHON_HOOKS_PATH.exists():
-        return {}
-    if not paths.ensure_private_file(PYTHON_HOOKS_PATH):
-        return {}
+    with _python_hooks_lock:
+        if not PYTHON_HOOKS_PATH.exists():
+            return {}
+        if not paths.ensure_private_file(PYTHON_HOOKS_PATH):
+            return {}
 
-    trust = trust_store.extension_status(
-        "hooks", "python", PYTHON_HOOKS_PATH)
-    if not trust.get("trusted"):
-        return {}
+        trust = trust_store.extension_status(
+            "hooks", "python", PYTHON_HOOKS_PATH)
+        if not trust.get("trusted"):
+            return {}
 
-    try:
-        mtime = PYTHON_HOOKS_PATH.stat().st_mtime
-        if _python_hooks is not None and mtime == _python_hooks_mtime:
-            return _python_hooks
-        _python_hooks_mtime = mtime
+        try:
+            mtime = PYTHON_HOOKS_PATH.stat().st_mtime
+            if _python_hooks is not None and mtime == _python_hooks_mtime:
+                return _python_hooks
+            _python_hooks_mtime = mtime
 
-        with open(PYTHON_HOOKS_PATH, "r", encoding="utf-8") as f:
-            src = f.read()
-        ns: dict = {}
-        exec(compile(src, str(PYTHON_HOOKS_PATH), "exec"), ns)
+            with open(PYTHON_HOOKS_PATH, "r", encoding="utf-8") as f:
+                src = f.read()
+            ns: dict = {}
+            exec(compile(src, str(PYTHON_HOOKS_PATH), "exec"), ns)
 
-        hooks = {}
-        for hook_name in ("pre_command", "post_command", "pre_tool", "post_tool",
-                          "on_session_start", "on_session_end", "on_error",
-                          "on_memory_change"):
-            fn = ns.get(hook_name)
-            if callable(fn):
-                hooks[hook_name] = fn
+            hooks = {}
+            for hook_name in ("pre_command", "post_command", "pre_tool", "post_tool",
+                              "on_session_start", "on_session_end", "on_error",
+                              "on_memory_change"):
+                fn = ns.get(hook_name)
+                if callable(fn):
+                    hooks[hook_name] = fn
 
-        _python_hooks = hooks
-        return hooks
-    except Exception:
-        return {}
+            _python_hooks = hooks
+            return hooks
+        except Exception:
+            return {}
 
 
 def _eval_condition(condition: str, ctx: dict) -> bool:

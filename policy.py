@@ -166,50 +166,52 @@ class PolicyDecision:
 _config: dict | None = None
 _config_mtime: float = 0.0
 _audit_lock = threading.Lock()
+_config_lock = threading.Lock()
 
 
 def _load_config(force: bool = False) -> dict:
     """Load policy config from disk, with mtime caching. Auto-creates defaults."""
     global _config, _config_mtime
 
-    if not force and CONFIG_PATH.exists():
+    with _config_lock:
+        if not force and CONFIG_PATH.exists():
+            try:
+                mtime = CONFIG_PATH.stat().st_mtime
+                if _config is not None and mtime == _config_mtime:
+                    return _config
+                _config_mtime = mtime
+            except OSError:
+                pass
+
+        if not CONFIG_PATH.exists():
+            _write_default_config()
+
+        if not paths.ensure_private_file(CONFIG_PATH):
+            _config = dict(_DEFAULT_CONFIG)
+            _config["mode"] = "enforce"
+            return _config
+
         try:
-            mtime = CONFIG_PATH.stat().st_mtime
-            if _config is not None and mtime == _config_mtime:
-                return _config
-            _config_mtime = mtime
-        except OSError:
-            pass
-
-    if not CONFIG_PATH.exists():
-        _write_default_config()
-
-    if not paths.ensure_private_file(CONFIG_PATH):
-        _config = dict(_DEFAULT_CONFIG)
-        _config["mode"] = "enforce"
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            if not isinstance(cfg, dict):
+                cfg = {}
+            # Fill in missing keys from defaults
+            for key, val in _DEFAULT_CONFIG.items():
+                if key not in cfg:
+                    cfg[key] = val
+            # Platform-specific allowedRoots for new configs
+            if "allowedRoots" not in cfg:
+                cfg["allowedRoots"] = ["/root/laintas_cli", "/tmp", "/home", "/root/Helpwo"]
+            # Migrate old configs: move rules that changed category
+            cfg = _migrate_config(cfg)
+            _config = cfg
+            if CONFIG_PATH.exists():
+                _config_mtime = CONFIG_PATH.stat().st_mtime
+        except (OSError, json.JSONDecodeError) as e:
+            _config = dict(_DEFAULT_CONFIG)
+            _config["allowedRoots"] = ["/root/laintas_cli", "/tmp", "/home", "/root/Helpwo"]
         return _config
-
-    try:
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
-        if not isinstance(cfg, dict):
-            cfg = {}
-        # Fill in missing keys from defaults
-        for key, val in _DEFAULT_CONFIG.items():
-            if key not in cfg:
-                cfg[key] = val
-        # Platform-specific allowedRoots for new configs
-        if "allowedRoots" not in cfg:
-            cfg["allowedRoots"] = ["/root/laintas_cli", "/tmp", "/home", "/root/Helpwo"]
-        # Migrate old configs: move rules that changed category
-        cfg = _migrate_config(cfg)
-        _config = cfg
-        if CONFIG_PATH.exists():
-            _config_mtime = CONFIG_PATH.stat().st_mtime
-    except (OSError, json.JSONDecodeError) as e:
-        _config = dict(_DEFAULT_CONFIG)
-        _config["allowedRoots"] = ["/root/laintas_cli", "/tmp", "/home", "/root/Helpwo"]
-    return _config
 
 
 def _migrate_config(cfg: dict) -> dict:

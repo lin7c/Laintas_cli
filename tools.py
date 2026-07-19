@@ -28,6 +28,7 @@ import signal
 import stat
 import subprocess
 import sys
+import threading
 import time
 import traceback
 import difflib
@@ -204,41 +205,47 @@ class ToolRegistry:
     def __init__(self):
         self._tools: dict[str, Tool] = {}
         self._builtin_names: set[str] = set()
+        self._lock = threading.RLock()
 
     def register(self, tool: Tool, overwrite: bool = True) -> bool:
         if not re.fullmatch(r"[A-Za-z0-9_.-]{1,160}", tool.name or ""):
             return False
-        existing = self._tools.get(tool.name)
-        if existing is not None and existing.source == "builtin" and tool.source != "builtin":
-            return False
-        if (existing is not None and tool.source != "builtin"
-                and existing.source != tool.source):
-            return False
-        if not overwrite and tool.name in self._tools:
-            return False
-        if not tool.capabilities:
-            tool.capabilities = infer_capabilities(tool.name)
-        if tool.source == "builtin":
-            tool.trust_level = "builtin"
-            self._builtin_names.add(tool.name)
-        self._tools[tool.name] = tool
-        return True
+        with self._lock:
+            existing = self._tools.get(tool.name)
+            if existing is not None and existing.source == "builtin" and tool.source != "builtin":
+                return False
+            if (existing is not None and tool.source != "builtin"
+                    and existing.source != tool.source):
+                return False
+            if not overwrite and tool.name in self._tools:
+                return False
+            if not tool.capabilities:
+                tool.capabilities = infer_capabilities(tool.name)
+            if tool.source == "builtin":
+                tool.trust_level = "builtin"
+                self._builtin_names.add(tool.name)
+            self._tools[tool.name] = tool
+            return True
 
     def unregister(self, name: str) -> bool:
-        return self._tools.pop(name, None) is not None
+        with self._lock:
+            return self._tools.pop(name, None) is not None
 
     def unregister_source(self, source: str) -> int:
         """Drop every tool whose source equals `source`. Returns count removed."""
-        victims = [n for n, t in self._tools.items() if t.source == source]
-        for n in victims:
-            del self._tools[n]
-        return len(victims)
+        with self._lock:
+            victims = [n for n, t in self._tools.items() if t.source == source]
+            for n in victims:
+                del self._tools[n]
+            return len(victims)
 
     def get(self, name: str) -> Optional[Tool]:
-        return self._tools.get(name)
+        with self._lock:
+            return self._tools.get(name)
 
     def list(self) -> list[Tool]:
-        return sorted(self._tools.values(), key=lambda t: t.name)
+        with self._lock:
+            return sorted(self._tools.values(), key=lambda t: t.name)
 
     def list_by_source(self) -> dict[str, list[Tool]]:
         groups: dict[str, list[Tool]] = {}
@@ -253,7 +260,8 @@ class ToolRegistry:
         tool's invoke callable. Returns shape:
         {ok: bool, result?: any, error?: str, tool: name}.
         """
-        tool = self._tools.get(name)
+        with self._lock:
+            tool = self._tools.get(name)
         if tool is None:
             return {"ok": False, "error": f"tool '{name}' not found", "tool": name}
         if tool.source != "builtin" and tool.trust_level != "trusted-extension":
@@ -372,9 +380,10 @@ class ToolRegistry:
         examples; we only need to remind it of available names. If it tries
         an unknown name, the dispatch loop re-injects the full catalog.
         """
-        names = sorted(
-            name for name in self._tools
-            if allowed_names is None or name in allowed_names)
+        with self._lock:
+            names = sorted(
+                name for name in self._tools
+                if allowed_names is None or name in allowed_names)
         n = len(names)
         # Show the most-used names verbatim; truncate the rest into a count.
         head = names[:18]
