@@ -13,6 +13,7 @@ from rich.console import Console
 from rich.markdown import Markdown
 
 import agent_loop
+import agent_ui_events
 import event_log
 import laintas_cli
 import paths
@@ -603,6 +604,57 @@ class SessionStoreTests(unittest.TestCase):
 
 
 class RemoteAgentIdentityTests(unittest.TestCase):
+    def test_foreground_wrapper_queues_into_existing_primary_run(self):
+        agent_loop.close_all_agents()
+        primary = agent_loop.register_agent(
+            name="primary", depth=0, role="primary")
+        agent_loop.set_current_agent_id(primary.id)
+        history = [{"role": "user", "content": "follow-up"}]
+        admitted, _detail = agent_loop.begin_primary_run(primary.id)
+        self.assertTrue(admitted)
+        try:
+            with mock.patch.object(laintas_cli, "run_agent_loop") as run:
+                result = laintas_cli._run_agent_loop_with_interrupt(
+                    mock.Mock(), "follow-up", {}, primary.state, history)
+
+            run.assert_not_called()
+            self.assertTrue(result["_queued_for_primary"])
+            self.assertEqual(primary.message_queue.get_nowait(), "follow-up")
+            self.assertEqual(history, [])
+        finally:
+            agent_loop.finish_primary_run(primary.id)
+            agent_loop.close_all_agents()
+
+    def test_remote_chat_joins_running_primary_instead_of_starting_second_loop(self):
+        agent_loop.close_all_agents()
+        agent_ui_events.hub.reset()
+        primary = agent_loop.register_agent(
+            name="primary", depth=0, role="primary")
+        primary.home_terminal = "term0"
+        admitted, _detail = agent_loop.begin_primary_run(primary.id)
+        self.assertTrue(admitted)
+        registry = laintas_cli.AgentRegistry()
+        try:
+            with mock.patch.object(registry, "_push_final") as final, \
+                    mock.patch.object(laintas_cli, "run_agent_loop") as run:
+                registry._handle_chat(
+                    "req-shared", {"message": "remote update"},
+                    lambda: primary.state, lambda: primary.chat_history)
+
+            run.assert_not_called()
+            self.assertEqual(primary.message_queue.get_nowait(), "remote update")
+            final.assert_called_once()
+            self.assertEqual(final.call_args.args[1], "success")
+            events = agent_ui_events.hub.agent_events(primary.id)
+            self.assertEqual(events[-1].event_type, "user_message")
+            self.assertEqual(events[-1].detail, "remote update")
+        finally:
+            agent_loop.finish_primary_run(primary.id)
+            agent_loop.close_all_agents()
+            agent_ui_events.hub.reset()
+            registry._remote_executor.shutdown(wait=False, cancel_futures=True)
+            registry._remote_control_executor.shutdown(wait=False, cancel_futures=True)
+
     def test_auto_mode_remote_approval_uses_timed_default(self):
         registry = laintas_cli.AgentRegistry()
         pushed = []

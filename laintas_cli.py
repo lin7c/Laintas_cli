@@ -257,6 +257,23 @@ console = Console(
     no_color=_no_color_requested(),
 )
 
+# ── /agents mirror: the shared console tees every chunk into the current
+# Agent's ANSI scrollback so the full-screen view can show the real REPL
+# output. Ownership of stdout switches in _enter/_exit_agents_view.
+import repl_mirror
+
+
+def _mirror_target_agent_id() -> str:
+    try:
+        from agent_loop import get_current_agent as _gca
+        _agent = _gca()
+        return _agent.id if _agent is not None else "primary"
+    except Exception:
+        return "primary"
+
+
+console.file = repl_mirror.TeeFile(_mirror_target_agent_id)
+
 _THEME_VARIANTS = {
     "dark": LAINTAS_THEME,
     "light": Theme({
@@ -794,6 +811,7 @@ from agent_loop import (
     rename_terminal,
     register_agent, unregister_agent,
     get_agent, get_all_agents, get_current_agent,
+    begin_primary_run, finish_primary_run, queue_primary_message,
     agent_deployment_terminal, agent_scope_terminal,
     set_terminal_model_selection,
     get_pool_agents, get_deployed_agents, get_or_hire_pool_agent,
@@ -833,6 +851,7 @@ import hooks as hooks_mod        # trusted Python hooks + argv hooks
 import backend_profiles          # backend trust domains + credential isolation
 import trust_store               # workspace trust for executable customization
 import usage_tracker             # local AI token/cost accounting (/usage)
+import agent_ui_events           # observable events for full-screen Agents Mode
 import mode_manager              # declarative user-selectable agent modes
 
 # MCP client: lazy import (saves ~1.8s on startup)
@@ -2316,11 +2335,16 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
             "/station <agent> <terminal> to deploy it explicitly."
         )),
     CommandSpec(
-        "/agents", "List employees or inspect capabilities and assignment history",
-        "Agents & Terminals", "/agents [tree|agent-id]", subcommands=("tree",),
+        "/agents", "Open the full-screen multi-Agent focus and activity view",
+        "Agents & Terminals", "/agents [agent-id|tree|--plain]",
+        subcommands=("tree", "--plain"),
         help_text=(
-            "Passing an employee ID shows its profile, station, current assignment, "
-            "and latest result; it does not switch the manager identity."
+            "Opens a dedicated Focus + Agent Rail + Event Feed interface. Passing "
+            "an Agent ID selects its conversation view without changing deployment "
+            "or shell ownership. Use --plain for a script-friendly snapshot. Inside "
+            "Agents Mode, Enter sends to the focused Agent, @Agent performs one-shot "
+            "routing, Tab opens the Agent rail, Alt+arrow switches "
+            "Agent/terminal, PageUp/PageDown scrolls, and Esc exits."
         )),
     CommandSpec("/term", "List, create, or rename terminals", "Agents & Terminals", "/term [name|rename <old> <new>]", aliases=("/t",), subcommands=("rename",)),
     CommandSpec("/connect", "Link this terminal to Helpwo; with a folder, share it as Helpwo's remote workspace", "Agents & Terminals", "/connect [folder]"),
@@ -6273,23 +6297,66 @@ class AgentRegistry:
             self._push_final(req_id, "success", summary[:2000])
             return
 
+        shared_primary = get_agent("primary")
+        if (shared_primary is not None
+                and shared_primary.status in {
+                    "queued", "running", "thinking", "waiting"}):
+            queued, detail = queue_primary_message(
+                shared_primary.id, content)
+            if queued:
+                agent_ui_events.hub.emit(
+                    "user_message", agent_id=shared_primary.id,
+                    terminal_name=agent_scope_terminal(shared_primary),
+                    summary=content, detail=content, status="queued")
+                self._push_final(req_id, "success", detail)
+            else:
+                self._push_final(req_id, "fail", detail)
+            return
+
         if not self._chat_run_lock.acquire(timeout=300):
             self._push_final(req_id, "fail", "another Helpwo chat is still running")
             return
+        remote_error = ""
         try:
-            abort_ev = threading.Event()
+            admitted = False
+            if shared_primary is not None:
+                admitted, detail = begin_primary_run(shared_primary.id)
+                if not admitted:
+                    queued, queue_detail = queue_primary_message(
+                        shared_primary.id, content)
+                    self._push_final(
+                        req_id, "success" if queued else "fail",
+                        queue_detail if queued else detail)
+                    return
+            abort_ev = (shared_primary.abort_event
+                        if shared_primary is not None else threading.Event())
             with self._active_req_lock:
                 self._active_requests[req_id] = abort_ev
 
             deps = self._build_loop_deps(req_id)
             session = self._session or {}
-            chat_history = chat_history_cb() if callable(chat_history_cb) else []
+            chat_history = (shared_primary.chat_history
+                            if shared_primary is not None
+                            else chat_history_cb() if callable(chat_history_cb) else [])
             if not isinstance(chat_history, list):
                 chat_history = []
+            state = shared_primary.state if shared_primary is not None else {}
+            if shared_primary is not None:
+                chat_history.append({
+                    "role": "user", "content": content,
+                    "input_kind": "prompt"})
+                agent_ui_events.hub.emit(
+                    "user_message", agent_id=shared_primary.id,
+                    terminal_name=agent_scope_terminal(shared_primary),
+                    summary=content, detail=content, status="accepted")
 
             def _chat_events(events):
                 if abort_ev.is_set():
                     raise InterruptedError("chat aborted")
+                if shared_primary is not None:
+                    agent_ui_events.hub.ingest(
+                        shared_primary.id, events,
+                        agent_scope_terminal(shared_primary))
                 for ev in events:
                     ev["reqId"] = req_id
                 self._push_events(events, req_id=req_id)
@@ -6297,17 +6364,21 @@ class AgentRegistry:
             try:
                 result = run_agent_loop(
                     deps=deps, original_input=content,
-                    session=session, state={},
+                    session=session, state=state,
                     chat_history=chat_history,
                     events_cb=_chat_events,
                     depth=0,
+                    agent_id=(shared_primary.id if shared_primary else None),
                     interrupt_event=abort_ev,
+                    message_queue=(shared_primary.message_queue
+                                   if shared_primary else None),
                     max_loops_override=int(get_runtime_config("max_loops")),
                 )
             except InterruptedError:
                 self._push_final(req_id, "aborted", "chat aborted by remote")
                 return
             except Exception as e:
+                remote_error = f"{type(e).__name__}: {e}"
                 self._push_final(req_id, "fail", str(e)[:2000])
                 return
 
@@ -6316,6 +6387,22 @@ class AgentRegistry:
             status = "success" if (isinstance(result, dict) and result.get("success")) else "fail"
             self._push_final(req_id, status, (reply or "done")[:2000])
         finally:
+            if shared_primary is not None and 'admitted' in locals() and admitted:
+                _remote_result = locals().get("result")
+                _remote_reply = str(
+                    (_remote_result or {}).get("msg")
+                    or ((_remote_result or {}).get("state") or {}).get("lastReply")
+                    or "")
+                _remote_failed = bool(
+                    isinstance(_remote_result, dict)
+                    and _remote_result.get("success", True) is False
+                    and not abort_ev.is_set())
+                finish_primary_run(
+                    shared_primary.id, reply=_remote_reply,
+                    error=(remote_error or (
+                        str(_remote_result.get("exit_reason") or "incomplete")
+                        if _remote_failed else "")),
+                    aborted=abort_ev.is_set())
             with self._active_req_lock:
                 self._active_requests.pop(req_id, None)
             self._chat_run_lock.release()
@@ -12554,7 +12641,7 @@ def _cmd_hire(parts: list, session: dict) -> bool:
     return False
 
 
-def _cmd_agents(parts: list) -> None:
+def _cmd_agents_plain(parts: list) -> None:
     if len(parts) == 1:
         agents = get_all_agents()
         ui_snapshot = (_terminal_agents.snapshot()
@@ -12622,16 +12709,308 @@ def _cmd_agents(parts: list) -> None:
     elif len(parts) == 2 and parts[1].lower() == "tree":
         console.print(build_agents_tree())
     elif len(parts) == 2:
-        agent_id = parts[1]
-        agent = get_agent(agent_id)
+        reference = parts[1]
+        agent = get_agent(reference)
         if agent is None:
-            console.print(f"[red]Agent '{agent_id}' not found. Use /hire to create one.[/red]")
+            matches = [item for item in get_all_agents()
+                       if str(item.name or "").casefold()
+                       == reference.casefold()]
+            agent = matches[0] if len(matches) == 1 else None
+        if agent is None:
+            console.print(
+                f"[red]Agent '{escape(reference)}' not found or ambiguous. "
+                "Use /agents --plain to list IDs.[/red]")
             return
         console.print(Panel(
             _employee_capability_text(agent),
             title=f"Employee: {agent.name}", border_style="cyan"))
     else:
-        console.print("[yellow]Usage: /agents [tree|agent-id][/yellow]")
+        console.print("[yellow]Usage: /agents [tree|agent-id|--plain][/yellow]")
+
+
+def _submit_primary_runtime_task(agent, text: str, deps, session: dict,
+                                 external_events_cb=None) -> tuple[bool, str]:
+    """Submit work to the CLI-owned primary runtime.
+
+    Agents Mode is deliberately absent from this lifecycle.  It supplies a
+    prompt and a renderer-safe dependency view; this outer runtime owns the
+    lease, worker, shared state/history/session, and completion events.
+    """
+    admitted, detail = begin_primary_run(agent.id)
+    if not admitted:
+        return False, detail
+    with agent.assignment_lock:
+        agent.chat_history.append({
+            "role": "user", "content": text, "input_kind": "prompt"})
+    terminal_name = agent_scope_terminal(agent)
+    run_id = f"primary-{int(time.time() * 1000)}"
+    agent_ui_events.hub.emit(
+        "user_message", agent_id=agent.id, terminal_name=terminal_name,
+        run_id=run_id, summary=text, detail=text, status="accepted")
+    agent_ui_events.hub.emit(
+        "agent_started", agent_id=agent.id, terminal_name=terminal_name,
+        run_id=run_id, summary=text, status="running")
+
+    def events_cb(events):
+        agent_ui_events.hub.ingest(agent.id, events, terminal_name)
+        if callable(external_events_cb):
+            try:
+                external_events_cb(events)
+            except Exception:
+                pass
+
+    def worker():
+        state_ref = agent.state
+        history_ref = agent.chat_history
+        try:
+            result = run_agent_loop(
+                deps, text, session, state_ref, history_ref,
+                events_cb=events_cb,
+                existing_session=agent.runtime_session,
+                depth=agent.depth, agent_id=agent.id,
+                interrupt_event=agent.abort_event,
+                message_queue=agent.message_queue)
+            returned = result.get("state") if isinstance(result, dict) else None
+            if isinstance(returned, dict):
+                state_ref.clear()
+                state_ref.update(prepare_state_for_repl(returned))
+                agent.state = state_ref
+            agent.chat_history = history_ref
+            if isinstance(result, dict) and "session" in result:
+                agent.runtime_session = result.get("session")
+            reply = str(
+                (result or {}).get("msg") or state_ref.get("lastReply") or "")
+            aborted = agent.abort_event.is_set()
+            failed = (isinstance(result, dict)
+                      and result.get("success", True) is False
+                      and not aborted)
+            error = ""
+            if failed:
+                reason = str(result.get("exit_reason") or "incomplete")
+                error = f"Agent loop ended without completion: {reason}"
+            finish_primary_run(
+                agent.id, reply=reply, error=error, aborted=aborted)
+            agent_ui_events.hub.emit(
+                "agent_aborted" if aborted else
+                "agent_error" if failed else "agent_done",
+                agent_id=agent.id, terminal_name=terminal_name, run_id=run_id,
+                summary=error if failed else reply or text,
+                detail=error if failed else reply,
+                status=("aborted" if aborted else
+                        "error" if failed else "done"))
+        except Exception as exc:
+            aborted = agent.abort_event.is_set()
+            error = f"{type(exc).__name__}: {exc}"
+            finish_primary_run(agent.id, error=error, aborted=aborted)
+            agent_ui_events.hub.emit(
+                "agent_aborted" if aborted else "agent_error",
+                agent_id=agent.id, terminal_name=terminal_name, run_id=run_id,
+                summary=error, detail=error,
+                status="aborted" if aborted else "error")
+
+    agent.thread = threading.Thread(
+        target=worker, daemon=True, name=f"primary-runtime-{agent.id}")
+    try:
+        agent.thread.start()
+    except Exception as exc:
+        error = f"Failed to start primary runtime: {exc}"
+        finish_primary_run(agent.id, error=error)
+        agent_ui_events.hub.emit(
+            "agent_error", agent_id=agent.id, terminal_name=terminal_name,
+            run_id=run_id, summary=error, detail=error, status="error")
+        return False, error
+    return True, f"Submitted to {agent.name or agent.id}"
+
+
+def _attach_primary_runtime_view(agent, *, show_result: bool = True):
+    """Mirror an already-running primary task in the outer CLI.
+
+    This only waits on and renders the existing runtime worker.  It never
+    acquires a lease or invokes the Agent loop, so leaving Agents Mode cannot
+    create a second execution.
+    """
+    worker = getattr(agent, "thread", None)
+    if worker is not None and worker.is_alive():
+        _set_run_input_state("running")
+        try:
+            with console.status(
+                    "[#3fb950]Thinking… · primary runtime[/#3fb950]",
+                    spinner="dots"):
+                while worker.is_alive():
+                    worker.join(timeout=0.1)
+        except KeyboardInterrupt:
+            agent.abort_event.set()
+            with console.status(
+                    "[yellow]Interrupting primary runtime…[/yellow]",
+                    spinner="dots"):
+                while worker.is_alive():
+                    worker.join(timeout=0.1)
+        finally:
+            _set_run_input_state("idle")
+
+    if show_result:
+        if agent.error:
+            console.print(f"[red]{escape(agent.error)}[/red]")
+        elif agent.last_reply:
+            console.print(Markdown(agent.last_reply))
+    return agent.runtime_session
+
+
+# ── Agents view: the full-screen /agents UI is only a display + input
+# router. It runs in a background thread; every submitted line is injected
+# into the main REPL loop (the single executor) via _inject_input, exactly
+# like a locally typed line or a Helpwo remote message.
+
+_agents_view_state: dict = {"controller": None}
+
+
+def _agents_view_is_active() -> bool:
+    return _agents_view_state.get("controller") is not None
+
+
+def _agents_view_controller():
+    return _agents_view_state.get("controller")
+
+
+def _enter_agents_view(controller) -> None:
+    """Hand the physical terminal to the /agents view.
+
+    The shared console keeps printing — into the mirror only — at the width
+    of the Focus pane so mirrored lines wrap correctly inside the view.
+    """
+    _agents_view_state["controller"] = controller
+    width = shutil.get_terminal_size(fallback=(100, 30)).columns
+    # Mirror output wraps to the Focus pane: on wide screens the Agent rail
+    # (28) + separator + padding sit beside it; narrow screens are full-width.
+    pane = max(40, width - 31) if width >= 100 else max(30, width - 2)
+    try:
+        console.width = pane
+    except Exception:
+        pass
+    repl_mirror.hub.set_owner("agents")
+
+
+def _exit_agents_view() -> None:
+    """Return the terminal to the plain CLI and replay missed output."""
+    _agents_view_state["controller"] = None
+    try:
+        console.width = None
+    except Exception:
+        pass
+    repl_mirror.hub.set_owner("cli")
+
+
+def _agents_repl_submit(text: str) -> tuple[bool, str]:
+    """Forward one /agents input line to the outer REPL as Agent dialogue.
+
+    Non-command input in the /agents view means "talk to this Agent", so the
+    injected line carries kind="dialogue" and the main loop routes it straight
+    to the agent loop.
+    """
+    text = str(text or "").strip()
+    if not text:
+        return False, ""
+    # Echo the accepted line into the mirror the way the prompt would.
+    repl_mirror.hub.write(
+        _mirror_target_agent_id(), f"\x1b[2m› {text}\x1b[0m\n")
+    _inject_input(text, threading.Event(), kind="dialogue")
+    return True, "Sent"
+
+
+def _cmd_agents(parts: list, session: dict, agent_registry=None,
+                existing_session=None):
+    """Open Agents Mode; retain a plain snapshot for scripts and fallback."""
+    args = list(parts[1:])
+    plain = "--plain" in args or not sys.stdin.isatty()
+    args = [item for item in args if item != "--plain"]
+    if len(args) > 1:
+        console.print("[yellow]Usage: /agents [tree|agent-id|--plain][/yellow]")
+        return
+    # `tree` is an output command, not an initial selection for Agents Mode.
+    # Keep it deterministic in both interactive and non-interactive shells.
+    if args and args[0].lower() == "tree":
+        _cmd_agents_plain(["/agents", "tree"])
+        return
+    if plain:
+        _cmd_agents_plain(["/agents", *args])
+        return
+    current = get_current_agent()
+    if current is not None and current.role == "primary":
+        repl_state = getattr(handle_meta_command, "_last_agent_state", None)
+        repl_history = getattr(handle_meta_command, "_last_chat_history", None)
+        if isinstance(repl_state, dict):
+            current.state = repl_state
+        if isinstance(repl_history, list):
+            current.chat_history = repl_history
+        if current.status not in {"queued", "running", "thinking", "waiting"}:
+            current.runtime_session = existing_session
+    terminal_name = agent_scope_terminal(current) if current else "term0"
+    requested = args[0] if args else ""
+    if requested:
+        candidate = get_agent(requested)
+        if candidate is None:
+            matches = [agent for agent in get_all_agents()
+                       if str(agent.name or "").casefold() == requested.casefold()]
+            candidate = matches[0] if len(matches) == 1 else None
+        if (candidate is None
+                or agent_scope_terminal(candidate) != terminal_name):
+            console.print(
+                f"[red]Agent '{escape(requested)}' is not available in "
+                f"{escape(terminal_name)}.[/red]")
+            return
+        from agent_loop import set_dialog_agent_for_terminal
+        set_dialog_agent_for_terminal(terminal_name, candidate.id)
+    try:
+        import agents_mode
+        if _agents_view_is_active():
+            console.print("[yellow]/agents view is already open.[/yellow]")
+            return existing_session
+        external_cb = (
+            (lambda events: agent_registry._push_events(events))
+            if agent_registry is not None and agent_registry.agent_id else None)
+        execution_block_reason = ""
+        if (get_backend_profile().sends_laintas_credentials
+                and not session.get("userId")):
+            execution_block_reason = (
+                "Not authenticated. Exit Agents Mode and run /login.")
+
+        controller = agents_mode.AgentsModeController(
+            terminal_name, get_loop_deps(), session,
+            external_events_cb=external_cb,
+            existing_session=existing_session,
+            execution_block_reason=execution_block_reason,
+            repl_submit_cb=_agents_repl_submit,
+            mirror=repl_mirror.hub)
+
+        # The view is only a display + router: it runs in its own thread
+        # while this main thread returns to the REPL loop and executes
+        # whatever the view injects — the exact same pipeline as typing at
+        # the outer prompt.
+        _enter_agents_view(controller)
+
+        def _view():
+            try:
+                controller.run()
+            except Exception as exc:
+                console.print(
+                    f"[red]Agents Mode failed: {type(exc).__name__}: "
+                    f"{escape(str(exc))}[/red]")
+                console.print("[dim]Falling back to /agents --plain.[/dim]")
+                _cmd_agents_plain(["/agents", *args])
+            finally:
+                _exit_agents_view()
+
+        threading.Thread(
+            target=_view, daemon=True, name="agents-view").start()
+        return existing_session
+    except (KeyboardInterrupt, EOFError):
+        return
+    except Exception as exc:
+        _exit_agents_view()
+        console.print(
+            f"[red]Agents Mode failed: {type(exc).__name__}: {exc}[/red]")
+        console.print("[dim]Falling back to /agents --plain.[/dim]")
+        _cmd_agents_plain(["/agents", *args])
 
 
 def _cmd_focus(parts: list) -> None:
@@ -13725,6 +14104,9 @@ def _cmd_hwo(parts: list, session: dict) -> None:
                     for item in event:
                         _hwo_progress(item)
                     return
+                agent_ui_events.hub.ingest(
+                    current.id if current else "", [event],
+                    agent_scope_terminal(current) if current else "term0")
                 kind = event.get("type")
                 if kind == "workflow_started":
                     console.print(f"[dim]HWO {event.get('runId')} started[/dim]")
@@ -13780,6 +14162,9 @@ def _cmd_hwg(parts: list, session: dict) -> None:
             for item in event:
                 _hwg_progress(item)
             return
+        agent_ui_events.hub.ingest(
+            current.id if current else "", [event],
+            agent_scope_terminal(current) if current else "term0")
         kind = event.get("type")
         if kind == "node_started":
             _workflow_event_line("▶", f"HWG node #{event.get('node', '?')} started", "warning")
@@ -13979,7 +14364,10 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
         return _cmd_hire(parts, session)
 
     elif action == "/agents":
-        _cmd_agents(parts)
+        agents_session = _cmd_agents(
+            parts, session, agent_registry, interactive_session)
+        if agents_session is not None:
+            handle_meta_command._last_existing_session = agents_session
 
     elif action == "/spawn":
         _cmd_spawn(raw_args, session, agent_registry)
@@ -14347,11 +14735,21 @@ def _simple_prompt(cwd: str) -> str:
 # user input. A wakeup pipe unblocks the main thread when a message arrives.
 
 class _InjectedInput:
-    """A message injected from the remote poll thread into the main loop."""
-    __slots__ = ("text", "done")
-    def __init__(self, text: str, done: threading.Event):
+    """A message injected from the remote poll thread into the main loop.
+
+    kind:
+      "line"     — treated exactly like a locally typed line (meta command /
+                   shell passthrough / AI, decided by the normal router).
+      "dialogue" — a conversation message for the current Agent: the REPL
+                   skips shell classification and routes it to the agent loop
+                   (used by the /agents view after slash commands have been
+                   rejected by that view).
+    """
+    __slots__ = ("text", "done", "kind")
+    def __init__(self, text: str, done: threading.Event, kind: str = "line"):
         self.text = text
         self.done = done
+        self.kind = kind
 
 
 _injected_input_queue: queue.Queue = queue.Queue()
@@ -14379,11 +14777,11 @@ def _drain_pipe(fd: int):
         pass
 
 
-def _inject_input(text: str, done: threading.Event):
+def _inject_input(text: str, done: threading.Event, kind: str = "line"):
     """Enqueue a message and wake up the main loop. Thread-safe."""
     _init_injection_pipe()
     try:
-        _injected_input_queue.put_nowait(_InjectedInput(text, done))
+        _injected_input_queue.put_nowait(_InjectedInput(text, done, kind))
     except queue.Full:
         pass
     if _wakeup_w is not None:
@@ -14406,6 +14804,14 @@ def _get_input(cwd: str):
     if (_terminal_agents.configured
             and _terminal_agents.process_pending_approval()):
         return ""
+
+    # /agents owns the screen: the REPL must not touch stdin (the view's
+    # prompt_toolkit app reads it) and consumes only injected input.
+    if _agents_view_is_active():
+        try:
+            return _injected_input_queue.get(timeout=0.25)
+        except queue.Empty:
+            return ""
 
     # Already-queued message (fast path)
     try:
@@ -14806,6 +15212,20 @@ def _blocking_approval_prompt(title: str, body: str, question: str,
     Fails closed (returns "no") when stdin isn't a real TTY — e.g. --execute
     mode with piped input, or any other headless context with no user to ask.
     """
+    # While the /agents view owns the terminal, a full-screen arrow prompt
+    # would fight its prompt_toolkit app for stdin. Route the decision to
+    # the view's y/n approval UI instead ("always" is not offered there).
+    _view_controller = _agents_view_controller()
+    if _view_controller is not None:
+        _current = get_current_agent()
+        try:
+            approved = _view_controller._request_approval(
+                _current.id if _current is not None else "primary",
+                "confirm", f"{title} — {question}", body)
+        except Exception:
+            approved = False
+        return "yes" if approved else "no"
+
     if not sys.stdin.isatty():
         console.print(
             f"[yellow]Approval required but no interactive TTY available — denying.[/yellow]")
@@ -15018,6 +15438,13 @@ def _show_plan_approval_menu() -> bool:
     import plan_mode as _pm
     if not _pm.is_plan_mode():
         return False
+    if _agents_view_is_active():
+        # The review menu is a full-screen UI; it cannot share the terminal
+        # with the /agents view. Leave the plan pending for the main CLI.
+        console.print(
+            "[yellow]A plan is ready for review — press Esc to leave the "
+            "/agents view and approve it in the main CLI.[/yellow]")
+        return False
     plan = _pm.get_current_plan()
     if not plan or plan.get("status") != "review_pending":
         return False
@@ -15042,8 +15469,33 @@ def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
 
     Returns the same dict as run_agent_loop().
     """
-    _interrupt_event = get_user_interrupt_event()
-    _msg_queue = get_user_message_queue()
+    active_agent = get_current_agent()
+    primary_admitted = False
+    if active_agent is not None and active_agent.role == "primary":
+        primary_admitted, detail = begin_primary_run(active_agent.id)
+        if not primary_admitted:
+            queued, queue_detail = queue_primary_message(
+                active_agent.id, user_input)
+            # The outer REPL records input before calling this wrapper. The
+            # running shared loop will record the queued message when it
+            # consumes it, so remove the premature duplicate history entry.
+            if (queued and chat_history
+                    and chat_history[-1].get("role") == "user"
+                    and chat_history[-1].get("content") == user_input):
+                chat_history.pop()
+            console.print(
+                f"[dim]{queue_detail if queued else detail}[/dim]")
+            return {
+                "success": queued, "msg": "", "state": agent_state,
+                "session": existing_session,
+                "_queued_for_primary": queued,
+                "exit_reason": "queued" if queued else "busy",
+            }
+        _interrupt_event = active_agent.abort_event
+        _msg_queue = active_agent.message_queue
+    else:
+        _interrupt_event = get_user_interrupt_event()
+        _msg_queue = get_user_message_queue()
 
     # Reset interrupt state from any previous call
     _interrupt_event.clear()
@@ -15073,13 +15525,14 @@ def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
 
     _set_run_input_state("running")
 
+    # Everything the loop prints is Agent conversation — record it into the
+    # /agents mirror. Output outside a run (banner, prompts, idle chatter)
+    # stays off Agent screens.
+    repl_mirror.hub.start_recording()
+    response = None
+    run_error = ""
     try:
-        active_agent = get_current_agent()
-        loop_agent_id = (
-            active_agent.id
-            if active_agent is not None and active_agent.role != "primary"
-            else None
-        )
+        loop_agent_id = active_agent.id if active_agent is not None else None
         response = run_agent_loop(
             deps, user_input, session, agent_state, chat_history,
             events_cb=events_cb,
@@ -15090,7 +15543,28 @@ def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
             message_queue=_msg_queue,
             continue_thread=continue_thread,
         )
+    except Exception as exc:
+        run_error = f"{type(exc).__name__}: {exc}"
+        raise
     finally:
+        repl_mirror.hub.stop_recording()
+        if primary_admitted and active_agent is not None:
+            if isinstance(response, dict) and "session" in response:
+                active_agent.runtime_session = response.get("session")
+            reply = str(
+                (response or {}).get("msg")
+                or ((response or {}).get("state") or {}).get("lastReply")
+                or "")
+            failed = bool(
+                isinstance(response, dict)
+                and response.get("success", True) is False
+                and not _interrupt_event.is_set())
+            finish_primary_run(
+                active_agent.id, reply=reply,
+                error=(run_error or (
+                    str(response.get("exit_reason") or "incomplete")
+                    if failed else "")),
+                aborted=_interrupt_event.is_set())
         _set_run_input_state("finalizing")
         # Restore original SIGINT handler
         signal.signal(signal.SIGINT, _old_sigint)
@@ -15473,6 +15947,12 @@ def main():
     else:
         primary = register_agent(name="primary", depth=0, role="primary",
                                  load_existing=True)
+        # The REPL and Agents Mode are two views over these exact objects.
+        # Never let the registry retain a restored copy while the REPL mutates
+        # different state/history instances.
+        primary.state = agent_state
+        primary.chat_history = chat_history
+        primary.runtime_session = interactive_session
         primary.deployment_terminal = "term0"
         primary.stationed_terminal = "term0"
         primary.home_terminal = "term0"
@@ -15537,6 +16017,16 @@ def main():
 
     # Setup graceful shutdown
     def shutdown(signum=None, frame=None):
+        if _agents_view_is_active():
+            # Reclaim stdout so shutdown messages are visible, and ask the
+            # view's app to close instead of leaving the tty in raw mode.
+            _view = _agents_view_controller()
+            _exit_agents_view()
+            try:
+                if _view is not None and _view.app is not None:
+                    _view.app.exit()
+            except Exception:
+                pass
         if (_terminal_agents.configured
                 and _terminal_agents.snapshot().get("running_count")
                 and not getattr(shutdown, "interrupting", False)):
@@ -15660,9 +16150,11 @@ def main():
         if isinstance(item, _InjectedInput):
             user_input = item.text
             injected_done = item.done
+            _is_dialogue = item.kind == "dialogue"
         else:
             user_input = item
             injected_done = None
+            _is_dialogue = False
 
         if not user_input:
             # Don't set injected_done here — the empty input might be from
@@ -15671,8 +16163,18 @@ def main():
             # before setting injected_done.
             continue
 
+        # A task submitted through /agents may have completed after that view
+        # closed.  Pull its CLI-owned PTY/session back into the foreground
+        # before routing the next outer prompt.
+        _runtime_owner = get_current_agent()
+        if (_runtime_owner is not None
+                and _runtime_owner.role == "primary"
+                and _runtime_owner.status not in {
+                    "queued", "running", "thinking", "waiting"}):
+            interactive_session = _runtime_owner.runtime_session
+
         # Ctrl+D → exit
-        if user_input == "/exit":
+        if user_input == "/exit" and not _is_dialogue:
             if args.depth == 0:
                 save_session_snapshot(agent_state, chat_history, _session_start_cwd)
                 save_resume_state(agent_state, chat_history, _session_start_cwd)
@@ -15705,7 +16207,7 @@ def main():
         # "latest" skips the picker and restores the newest directly.
         _resume_parts = user_input.strip().split(maxsplit=1)
         if (_resume_parts and _resume_parts[0].lower() == "/resume"
-                and args.depth == 0):
+                and args.depth == 0 and not _is_dialogue):
             _resume_arg = (_resume_parts[1].strip().lower()
                            if len(_resume_parts) > 1 else "")
             _echo_limit = 20
@@ -15761,7 +16263,7 @@ def main():
 
         _new_parts = user_input.strip().split(maxsplit=1)
         if (_new_parts and _new_parts[0].lower() in _NEW_SESSION_COMMANDS
-                and args.depth == 0):
+                and args.depth == 0 and not _is_dialogue):
             _active_work = workgraph.get_active_work(cwd=_session_start_cwd)
             if (_active_work and _active_work.get("status")
                     not in {"COMPLETED", "CANCELLED", "FAILED"}):
@@ -15807,6 +16309,7 @@ def main():
 
         _is_top_level_quit = (
             args.depth == 0
+            and not _is_dialogue
             and len(user_input.strip().split()) == 1
             and user_input.strip().split()[0].lower() in ("/q", "/quit")
         )
@@ -15828,10 +16331,17 @@ def main():
                     f"{_checkpoint.get('title', 'Untitled session')}[/dim]"
                 )
 
-        # Check for meta commands
-        if user_input.startswith("/"):
+        # Check for meta commands. Dialogue input from the /agents view is a
+        # conversation message, never a terminal command — even when it
+        # starts with "/" — so it skips meta dispatch entirely.
+        if user_input.startswith("/") and not _is_dialogue:
             should_exit = handle_meta_command(user_input, agent_registry, session, interactive_session)
             current_live_session = getattr(handle_meta_command, '_current_live_session', current_live_session)
+            # Full-screen commands such as /agents may reuse or replace the
+            # REPL-owned interactive PTY. Keep the local owner synchronized.
+            interactive_session = getattr(
+                handle_meta_command, '_last_existing_session',
+                interactive_session)
             if should_exit:
                 # /q already finalized this logical session as a checkpoint.
                 # Writing a generic autosave here used to create a duplicate
@@ -15850,6 +16360,28 @@ def main():
                 if injected_done is not None:
                     injected_done.set()
                 return
+            if injected_done is not None:
+                injected_done.set()
+            continue
+
+        # Primary has one authoritative execution regardless of which view
+        # started it. If Agents Mode or Helpwo already owns the run, outer
+        # REPL input becomes supplementary input for that exact task instead
+        # of starting a second loop against shared state/history.
+        _shared_primary = get_current_agent()
+        if (_shared_primary is not None
+                and _shared_primary.role == "primary"
+                and _shared_primary.status in {
+                    "queued", "running", "thinking", "waiting"}):
+            _queued, _queue_detail = queue_primary_message(
+                _shared_primary.id, user_input)
+            console.print(
+                f"[dim]{_queue_detail if _queued else 'Could not queue input.'}[/dim]")
+            if _queued:
+                agent_ui_events.hub.emit(
+                    "user_message", agent_id=_shared_primary.id,
+                    terminal_name=agent_scope_terminal(_shared_primary),
+                    summary=user_input, detail=user_input, status="queued")
             if injected_done is not None:
                 injected_done.set()
             continue
@@ -15879,6 +16411,10 @@ def main():
                 # Session exited — let the agent loop process final output
                 if session.get("userId") or not _active_backend.sends_laintas_credentials:
                     def local_events_cb(events: list):
+                        _agent = get_current_agent()
+                        agent_ui_events.hub.ingest(
+                            _agent.id if _agent else "", events,
+                            agent_scope_terminal(_agent) if _agent else "term0")
                         if agent_registry.agent_id:
                             agent_registry._push_events(events)
                     context = (f"The interactive program exited.\n"
@@ -15899,6 +16435,10 @@ def main():
                 # Session still alive — ask AI to process the new output
                 if session.get("userId") or not _active_backend.sends_laintas_credentials:
                     def local_events_cb(events: list):
+                        _agent = get_current_agent()
+                        agent_ui_events.hub.ingest(
+                            _agent.id if _agent else "", events,
+                            agent_scope_terminal(_agent) if _agent else "term0")
                         if agent_registry.agent_id:
                             agent_registry._push_events(events)
                     context = (f"User input (sent to {interactive_session.command}): {user_input}\n"
@@ -15917,7 +16457,16 @@ def main():
                     and not response.get("_history_recorded")):
                 chat_history.append({"role": "assistant", "content": response["msg"]})
             # ── Cross-interaction state preservation ──
-            agent_state = prepare_state_for_repl(response.get("state", {}))
+            _prepared_state = prepare_state_for_repl(response.get("state", {}))
+            _runtime_agent = get_current_agent()
+            if _runtime_agent is not None and _runtime_agent.role == "primary":
+                agent_state.clear()
+                agent_state.update(_prepared_state)
+                _runtime_agent.state = agent_state
+                _runtime_agent.chat_history = chat_history
+                _runtime_agent.runtime_session = interactive_session
+            else:
+                agent_state = _prepared_state
             handle_meta_command._last_agent_state = agent_state
             handle_meta_command._last_chat_history = chat_history
             handle_meta_command._last_original_input = user_input
@@ -15937,10 +16486,12 @@ def main():
                 injected_done.set()
             continue
 
-        _system_input = is_system_command(user_input)
+        _system_input = (not _is_dialogue) and is_system_command(user_input)
         # Preserve input semantics in the resume record. Shell commands are
         # terminal activity, not user-to-agent prompts, even though both are
-        # physically typed by the user.
+        # physically typed by the user. Dialogue input always goes to the
+        # Agent — typing "ls" in the /agents view asks the Agent, it does
+        # not shell out directly.
         chat_history.append({
             "role": "user",
             "content": user_input,
@@ -15968,6 +16519,11 @@ def main():
         # Push user input event to remote stream
         if agent_registry.agent_id:
             agent_registry._push_events([{"type": "user", "content": user_input}])
+        _event_agent = get_current_agent()
+        agent_ui_events.hub.ingest(
+            _event_agent.id if _event_agent else "",
+            [{"type": "user", "content": user_input}],
+            agent_scope_terminal(_event_agent) if _event_agent else "term0")
 
         # Route first word against PATH/builtins → system command or AI
         # All REPL instances (depth 0 and depth > 0) execute system commands
@@ -16058,16 +16614,27 @@ def main():
                     _sync_cwd_from_term0(_term0_info.session)
                     # marker-poll captures output but doesn't echo to the user's
                     # terminal (unlike pty_passthrough, which echoes directly) —
-                    # print so the user sees command output.
+                    # print so the user sees command output. Routed through the
+                    # mirror tee so /agents shows it and stdout ownership holds.
                     _stdout = result.get("stdout", "")
                     if _stdout:
                         try:
-                            sys.stdout.write(_stdout)
-                            if not _stdout.endswith("\n"):
-                                sys.stdout.write("\n")
+                            repl_mirror.hub.tee_write(
+                                _stdout if _stdout.endswith("\n")
+                                else _stdout + "\n",
+                                _mirror_target_agent_id())
                             sys.stdout.flush()
                         except (BrokenPipeError, OSError):
                             pass
+                elif _agents_view_is_active():
+                    # PTY passthrough hands the whole terminal to the child
+                    # program; impossible while the /agents view owns it.
+                    console.print(
+                        "[yellow]Interactive terminal programs can't run "
+                        "inside the /agents view — press Esc to return to "
+                        "the main CLI first.[/yellow]")
+                    result = {"stdout": "", "stderr": "",
+                              "returncode": -1, "success": False}
                 else:
                     # Drain any queued terminal query responses before passthrough.
                     _fl = fcntl.fcntl(sys.stdin.fileno(), fcntl.F_GETFL)
@@ -16128,6 +16695,10 @@ def main():
             console.print("[dim]Not a system command, asking AI...[/dim]")
             # Build event callback for real-time streaming
             def local_events_cb(events: list):
+                _agent = get_current_agent()
+                agent_ui_events.hub.ingest(
+                    _agent.id if _agent else "", events,
+                    agent_scope_terminal(_agent) if _agent else "term0")
                 if agent_registry.agent_id:
                     agent_registry._push_events(events)
 
@@ -16183,7 +16754,16 @@ def main():
         # ── Cross-interaction state preservation ──
         # Preserve recent context across REPL interactions so the model
         # doesn't lose track of what it was doing.
-        agent_state = prepare_state_for_repl(response.get("state", {}))
+        _prepared_state = prepare_state_for_repl(response.get("state", {}))
+        _runtime_agent = get_current_agent()
+        if _runtime_agent is not None and _runtime_agent.role == "primary":
+            agent_state.clear()
+            agent_state.update(_prepared_state)
+            _runtime_agent.state = agent_state
+            _runtime_agent.chat_history = chat_history
+            _runtime_agent.runtime_session = interactive_session
+        else:
+            agent_state = _prepared_state
         if not _system_input:
             # `/continue` mutates these exact objects; keep the references
             # aligned with the state carried by the main REPL.

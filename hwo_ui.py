@@ -53,6 +53,11 @@ _ERROR = "✗"
 class HwoTask:
     text: str
     status: str = "pending"
+    step_id: str = ""
+    agent_id: str = ""
+    last_event: str = ""
+    started_at: Optional[float] = None
+    completed_at: Optional[float] = None
 
 
 @dataclass
@@ -200,6 +205,60 @@ class HwoSession:
 
     def has_pending(self) -> bool:
         return any(t.status == "pending" for t in self.all_tasks())
+
+
+def _bind_runtime_step_ids(session: HwoSession, hwo_path: str) -> dict[str, HwoTask]:
+    """Bind runner step IDs to UI tasks in the serializer's preorder."""
+    import hwo_runner
+
+    parsed = hwo_runner.parse_hwo(Path(hwo_path).read_text(encoding="utf-8"))
+    task_steps: list[str] = []
+
+    def walk(items, path: str = "") -> None:
+        for index, item in enumerate(items):
+            step_id = f"{path}.{index}" if path else str(index)
+            kind = getattr(item, "kind", "")
+            if kind == "task":
+                task_steps.append(step_id)
+            elif kind in {"agent", "parallel"}:
+                walk(getattr(item, "body", []), step_id)
+
+    walk(parsed)
+    tasks = session.all_tasks()
+    if len(tasks) != len(task_steps):
+        # A partial zip would silently display the wrong task as running.
+        raise ValueError(
+            f"HWO UI/runner task mismatch ({len(tasks)} != {len(task_steps)})")
+    result = {}
+    for task, step_id in zip(tasks, task_steps):
+        task.step_id = step_id
+        result[step_id] = task
+    return result
+
+
+def _apply_runtime_events(tasks_by_step: dict[str, HwoTask], events) -> None:
+    """Apply only exact runner step transitions; unrelated tasks stay untouched."""
+    rows = events if isinstance(events, list) else [events]
+    now = time.time()
+    for event in rows:
+        if not isinstance(event, dict):
+            continue
+        kind = str(event.get("type") or "")
+        task = tasks_by_step.get(str(event.get("stepId") or ""))
+        if task is None:
+            continue
+        task.last_event = kind
+        task.agent_id = str(event.get("agentId") or task.agent_id or "")
+        if kind == "step_started":
+            task.status = "running"
+            task.started_at = task.started_at or now
+            task.completed_at = None
+        elif kind == "step_completed":
+            task.status = "done"
+            task.completed_at = now
+        elif kind == "step_failed":
+            task.status = "error"
+            task.completed_at = now
 
 
 # ── HWO serializer ────────────────────────────────────────────────────────
@@ -532,9 +591,18 @@ def run_hwo_ui(root_agent_name: str,
         executing[0]  = True
         run_result[0] = None
         error_msg[0]  = ""
-        for t in session.all_tasks():
-            if t.status == "pending":
-                t.status = "running"
+        tasks_by_step = {}
+        try:
+            tasks_by_step = _bind_runtime_step_ids(session, hwo_path)
+        except Exception as exc:
+            executing[0] = False
+            error_msg[0] = f"Cannot map HWO runtime steps: {exc}"
+            if cleanup:
+                try:
+                    os.unlink(hwo_path)
+                except OSError:
+                    pass
+            return
         try:
             app.invalidate()
         except Exception:
@@ -543,18 +611,33 @@ def run_hwo_ui(root_agent_name: str,
         def _exec() -> None:
             try:
                 import hwo_runner
+
+                def _on_hwo_events(events):
+                    rows = events if isinstance(events, list) else [events]
+                    _apply_runtime_events(tasks_by_step, rows)
+                    for event in rows:
+                        if not isinstance(event, dict):
+                            continue
+                        try:
+                            import agent_ui_events
+                            agent_ui_events.hub.ingest(
+                                parent_id or "", [event])
+                        except Exception:
+                            pass
+                    try:
+                        app.invalidate()
+                    except Exception:
+                        pass
+
                 r = hwo_runner.run_hwo_file(
                     path=hwo_path,
                     deps=deps,
                     session=session_data or {},
                     parent_id=parent_id,
                     abort_event=stop_evt,
+                    events_cb=_on_hwo_events,
                 )
                 run_result[0] = r
-                final = "done" if r.get("ok") else "error"
-                for t in session.all_tasks():
-                    if t.status == "running":
-                        t.status = final
             except Exception as e:
                 run_result[0] = {"ok": False, "msg": repr(e)}
                 for t in session.all_tasks():

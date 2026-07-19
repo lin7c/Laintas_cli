@@ -11,6 +11,7 @@ from rich.console import Console
 from rich.theme import Theme
 
 import agent_loop
+import agents_mode
 import backend_profiles
 import hwo_ui
 import laintas_cli
@@ -217,6 +218,106 @@ class SlashRegistryTests(unittest.TestCase):
         self.assertIn("private temporary terminal", text)
         self.assertIn("background Assignment", text)
         self.assertIn("isolated state/history", text)
+
+    def test_agents_tree_is_plain_output_even_on_interactive_tty(self):
+        with mock.patch.object(laintas_cli.sys.stdin, "isatty", return_value=True), \
+                mock.patch.object(laintas_cli, "_cmd_agents_plain") as plain:
+            laintas_cli._cmd_agents(["/agents", "tree"], {}, _Registry())
+
+        plain.assert_called_once_with(["/agents", "tree"])
+
+    def test_agents_rejects_extra_arguments_consistently(self):
+        output = io.StringIO()
+        old_console = laintas_cli.console
+        laintas_cli.console = Console(file=output, force_terminal=False)
+        try:
+            with mock.patch.object(
+                    laintas_cli.sys.stdin, "isatty", return_value=True):
+                laintas_cli._cmd_agents(
+                    ["/agents", "someone", "extra"], {}, _Registry())
+        finally:
+            laintas_cli.console = old_console
+
+        self.assertIn("Usage: /agents", output.getvalue())
+
+    def test_agents_fullscreen_fallback_preserves_requested_agent(self):
+        agent_loop.close_all_agents()
+        agent_loop.close_all_terminals()
+        terminal_session = mock.Mock()
+        terminal_session.is_alive.return_value = True
+        agent_loop.register_terminal(
+            terminal_session, "/bin/sh", 0, name="term0")
+        agent = agent_loop.register_agent(name="alice", role="pool")
+        agent.home_terminal = "term0"
+        def immediate_thread(*, target, **_kwargs):
+            thread = mock.Mock()
+            thread.start.side_effect = target
+            return thread
+        try:
+            with mock.patch.object(
+                    laintas_cli.sys.stdin, "isatty", return_value=True), \
+                    mock.patch.object(
+                        agents_mode.AgentsModeController, "run",
+                        side_effect=RuntimeError("no screen")), \
+                    mock.patch.object(
+                        laintas_cli.threading, "Thread",
+                        side_effect=immediate_thread), \
+                    mock.patch.object(laintas_cli, "_cmd_agents_plain") as plain:
+                laintas_cli._cmd_agents(
+                    ["/agents", agent.id], {}, _Registry())
+        finally:
+            agent_loop.close_all_agents()
+            agent_loop.close_all_terminals()
+
+        plain.assert_called_once_with(["/agents", agent.id])
+
+    def test_agents_binds_primary_to_current_repl_context_and_pty(self):
+        agent_loop.close_all_agents()
+        agent_loop.close_all_terminals()
+        terminal_session = mock.Mock()
+        terminal_session.is_alive.return_value = True
+        agent_loop.register_terminal(
+            terminal_session, "/bin/sh", 0, name="term0")
+        primary = agent_loop.register_agent(name="primary", role="primary")
+        agent_loop.set_current_agent_id(primary.id)
+        repl_state = {"shortTermMemory": "current"}
+        repl_history = [{"role": "user", "content": "before"}]
+        existing = object()
+        old_state = getattr(
+            laintas_cli.handle_meta_command, "_last_agent_state", None)
+        old_history = getattr(
+            laintas_cli.handle_meta_command, "_last_chat_history", None)
+        laintas_cli.handle_meta_command._last_agent_state = repl_state
+        laintas_cli.handle_meta_command._last_chat_history = repl_history
+        controller = mock.Mock()
+
+        def immediate_thread(*, target, **_kwargs):
+            thread = mock.Mock()
+            thread.start.side_effect = target
+            return thread
+        try:
+            with mock.patch.object(
+                    laintas_cli.sys.stdin, "isatty", return_value=True), \
+                    mock.patch.object(
+                        agents_mode, "AgentsModeController",
+                        return_value=controller) as controller_cls, \
+                    mock.patch.object(
+                        laintas_cli.threading, "Thread",
+                        side_effect=immediate_thread):
+                returned = laintas_cli._cmd_agents(
+                    ["/agents"], {}, _Registry(), existing)
+        finally:
+            laintas_cli.handle_meta_command._last_agent_state = old_state
+            laintas_cli.handle_meta_command._last_chat_history = old_history
+            agent_loop.close_all_agents()
+            agent_loop.close_all_terminals()
+
+        self.assertIs(returned, existing)
+        self.assertIs(primary.state, repl_state)
+        self.assertIs(primary.chat_history, repl_history)
+        self.assertIs(
+            controller_cls.call_args.kwargs["existing_session"], existing)
+        controller.run.assert_called_once_with()
 
     def test_clear_dispatches_as_new_session_command(self):
         output = io.StringIO()

@@ -914,13 +914,15 @@ def get_dialog_agent_for_terminal(name: str) -> Optional["AgentInfo"]:
         if terminal is None:
             return None
         for candidate_id in (
-                terminal.stationed_agent_id, terminal.dialog_agent_id):
+                terminal.dialog_agent_id, terminal.stationed_agent_id):
             candidate = _agent_registry.get(candidate_id) if candidate_id else None
-            if candidate is not None and agent_scope_terminal(candidate) == name:
+            if (candidate is not None and not candidate.lifecycle_terminated
+                    and agent_scope_terminal(candidate) == name):
                 return candidate
         candidates = sorted(
             (agent for agent in _agent_registry.values()
              if agent_scope_terminal(agent) == name
+             and not agent.lifecycle_terminated
              and agent_deployment_terminal(agent) is None
              and agent.status == "idle"),
             key=lambda agent: (agent.created_at, agent.id),
@@ -929,6 +931,19 @@ def get_dialog_agent_for_terminal(name: str) -> Optional["AgentInfo"]:
             terminal.dialog_agent_id = candidates[0].id
             return candidates[0]
         return None
+
+
+def set_dialog_agent_for_terminal(name: str, agent_id: str) -> bool:
+    """Change conversation focus without changing terminal shell ownership."""
+    with _registry_lock:
+        terminal = _terminal_registry.get(str(name or ""))
+        agent = _agent_registry.get(str(agent_id or ""))
+        if terminal is None or agent is None or agent.lifecycle_terminated:
+            return False
+        if agent_scope_terminal(agent) != terminal.name:
+            return False
+        terminal.dialog_agent_id = agent.id
+        return True
 
 
 def close_all_terminals() -> None:
@@ -1645,6 +1660,7 @@ class AgentInfo:
     message_queue: Any = field(default_factory=queue.Queue)
     slot_held: bool = False                    # scheduler lease; independent of status
     ephemeral_session: Any = None              # agent-private PTY; never in terminal registry
+    runtime_session: Any = None                # primary CLI-owned interactive runtime
     lifecycle_terminated: bool = False         # owning terminal ended; never persist again
     # ── Pool architecture fields ───────────────────────────────────────
     role: str = "pool"                        # pool | deployed | primary | subagent
@@ -1663,13 +1679,14 @@ class AgentInfo:
     profile: EmployeeProfile = field(default_factory=EmployeeProfile)
     active_assignment: Optional[AgentAssignment] = None
     assignment_history: list[dict] = field(default_factory=list)
+    assignment_lock: Any = field(default_factory=threading.Lock, repr=False)
 
 
 _agent_registry: dict[str, AgentInfo] = {}
 _agent_counter: int = 0
 _current_agent_id: Optional[str] = None
 # ── HWO concurrency scheduler ──────────────────────────────────────────
-_max_concurrent: int = 8                         # hard cap on running agents
+_max_concurrent: int = 8                         # background cap; foreground primary is exempt
 _running_count: int = 0                          # agents currently in 'running' state
 _wait_queue: list = []                           # FIFO: (agent_id, start_fn) pairs
 
@@ -1998,6 +2015,50 @@ def get_agent(agent_id: str) -> Optional[AgentInfo]:
         return _agent_registry.get(agent_id)
 
 
+def begin_primary_run(agent_id: str = "primary") -> tuple[bool, str]:
+    """Atomically acquire the one execution lease for a primary Agent."""
+    agent = get_agent(agent_id)
+    if agent is None or agent.lifecycle_terminated:
+        return False, f"Agent '{agent_id}' is not available."
+    if agent.role != "primary":
+        return False, f"Agent '{agent_id}' is not primary."
+    with agent.assignment_lock:
+        if agent.status in {"queued", "running", "thinking", "waiting"}:
+            return False, f"Agent '{agent_id}' is already running."
+        agent.status = "thinking"
+        agent.error = ""
+        agent.abort_event.clear()
+    return True, ""
+
+
+def finish_primary_run(agent_id: str = "primary", *, reply: str = "",
+                       error: str = "", aborted: bool = False) -> None:
+    """Release a primary execution lease without replacing shared objects."""
+    agent = get_agent(agent_id)
+    if agent is None:
+        return
+    with agent.assignment_lock:
+        agent.last_reply = str(reply or agent.last_reply or "")
+        agent.error = str(error or "")
+        agent.status = "aborted" if aborted else "error" if error else "idle"
+
+
+def queue_primary_message(agent_id: str, message: str) -> tuple[bool, str]:
+    """Append input to the currently running primary task."""
+    agent = get_agent(agent_id)
+    text = str(message or "").strip()
+    if agent is None or agent.lifecycle_terminated:
+        return False, f"Agent '{agent_id}' is not available."
+    if agent.role != "primary" or agent.status not in {
+            "queued", "running", "thinking", "waiting"}:
+        return False, f"Agent '{agent_id}' is not running."
+    try:
+        agent.message_queue.put_nowait(text)
+    except queue.Full:
+        return False, f"Agent '{agent_id}' instruction queue is full."
+    return True, f"Queued for {agent.name or agent.id}."
+
+
 def get_all_agents() -> list:
     with _registry_lock:
         return sorted(_agent_registry.values(), key=lambda a: a.created_at)
@@ -2048,76 +2109,112 @@ def start_agent_assignment(agent_id: str, task: str, deps,
     task = str(task or "").strip()
     if employee is None:
         return False, f"Agent '{agent_id}' not found.", None
+    if employee.lifecycle_terminated:
+        return False, f"Agent '{agent_id}' has been terminated.", None
+    if employee.role not in {"pool", "deployed"}:
+        return False, (
+            f"Agent '{agent_id}' has role '{employee.role}' and cannot start "
+            "a persistent employee assignment."
+        ), None
     if not task:
         return False, "Assignment task cannot be empty.", None
-    if employee.active_assignment is not None or employee.status in {
-            "queued", "running", "waiting"}:
-        active = employee.active_assignment
-        suffix = f" ({active.id})" if active else ""
-        return False, f"Agent '{agent_id}' is already working{suffix}.", active
-    terminal_name = agent_deployment_terminal(employee)
-    if terminal_name:
-        terminal = get_terminal(terminal_name)
-        if (terminal is None or terminal.session is None
-                or not terminal.session.is_alive()):
-            if terminal is not None:
-                unregister_terminal(terminal_name)
+    # Admission and fresh-state initialization must be atomic. `/station`,
+    # Agents Mode and remote control can otherwise start the same employee at
+    # the same time and make two runners share mutable state/history.
+    with employee.assignment_lock:
+        if employee.lifecycle_terminated:
+            return False, f"Agent '{agent_id}' has been terminated.", None
+        if employee.active_assignment is not None or employee.status in {
+                "queued", "running", "waiting"}:
+            active = employee.active_assignment
+            suffix = f" ({active.id})" if active else ""
             return False, (
-                f"Agent '{agent_id}' deployment terminal '{terminal_name}' "
-                "is not running."
-            ), None
-    else:
-        # Undeployed employees use a run-owned private terminal and never join
-        # a named terminal's persistent byte stream.
-        terminal_name = f"temporary:{employee.id}"
+                f"Agent '{agent_id}' is already working{suffix}."
+            ), active
+        terminal_name = agent_deployment_terminal(employee)
+        if terminal_name:
+            terminal = get_terminal(terminal_name)
+            if (terminal is None or terminal.session is None
+                    or not terminal.session.is_alive()):
+                if terminal is not None:
+                    unregister_terminal(terminal_name)
+                return False, (
+                    f"Agent '{agent_id}' deployment terminal '{terminal_name}' "
+                    "is not running."
+                ), None
+        else:
+            # Undeployed employees use a run-owned private terminal and never
+            # join a named terminal's persistent byte stream.
+            terminal_name = f"temporary:{employee.id}"
 
-    assignment = AgentAssignment(
-        id=f"job-{uuid.uuid4().hex[:10]}",
-        task=task,
-        terminal_name=terminal_name,
-        created_at=time.time(),
-    )
-    employee.active_assignment = assignment
-    employee.abort_event.clear()
-    durable_runtime_state = {
-        key: value for key, value in employee.state.items()
-        if key in {"_persisted_employee", "_session_id", "_task_cwd"}
-    }
-    employee.state = {
-        "shortTermMemory": "",
-        "lastReply": "",
-        "lastOutput": "",
-        "_assignment_id": assignment.id,
-        "_assignment_task": task,
-        **durable_runtime_state,
-    }
-    if employee.profile.specialist_role:
-        employee.state["_role_name"] = employee.profile.specialist_role
-    employee.chat_history = []
+        assignment = AgentAssignment(
+            id=f"job-{uuid.uuid4().hex[:10]}",
+            task=task,
+            terminal_name=terminal_name,
+            created_at=time.time(),
+        )
+        employee.active_assignment = assignment
+        employee.abort_event.clear()
+        durable_runtime_state = {
+            key: value for key, value in employee.state.items()
+            if key in {"_persisted_employee", "_session_id", "_task_cwd"}
+        }
+        employee.state = {
+            "shortTermMemory": "",
+            "lastReply": "",
+            "lastOutput": "",
+            "_assignment_id": assignment.id,
+            "_assignment_task": task,
+            **durable_runtime_state,
+        }
+        if employee.profile.specialist_role:
+            employee.state["_role_name"] = employee.profile.specialist_role
+        employee.chat_history = [{
+            "role": "user", "content": task, "input_kind": "prompt"}]
 
     def _finish(result: str = "", error: str = "") -> None:
-        assignment.completed_at = time.time()
-        assignment.result = result
-        assignment.error = error
-        assignment.status = (
-            "aborted" if employee.abort_event.is_set()
-            else "error" if error else "completed"
-        )
-        mark_agent_finished(employee.id, result=result, error=error)
-        employee.assignment_history.append({
-            "id": assignment.id,
-            "task": assignment.task,
-            "terminal_name": assignment.terminal_name,
-            "status": assignment.status,
-            "created_at": assignment.created_at,
-            "started_at": assignment.started_at,
-            "completed_at": assignment.completed_at,
-            "result": result,
-            "error": error,
-        })
-        employee.assignment_history = employee.assignment_history[-100:]
-        employee.active_assignment = None
-        employee.status = "idle"
+        with employee.assignment_lock:
+            assignment.completed_at = time.time()
+            assignment.result = result
+            assignment.error = error
+            assignment.status = (
+                "aborted" if employee.abort_event.is_set()
+                else "error" if error else "completed"
+            )
+            mark_agent_finished(employee.id, result=result, error=error)
+            employee.assignment_history.append({
+                "id": assignment.id,
+                "task": assignment.task,
+                "terminal_name": assignment.terminal_name,
+                "status": assignment.status,
+                "created_at": assignment.created_at,
+                "started_at": assignment.started_at,
+                "completed_at": assignment.completed_at,
+                "result": result,
+                "error": error,
+            })
+            employee.assignment_history = employee.assignment_history[-100:]
+            if employee.active_assignment is assignment:
+                employee.active_assignment = None
+            employee.status = (
+                "aborted" if assignment.status == "aborted"
+                else "error" if assignment.status == "error" else "idle")
+        event_type = (
+            "agent_aborted" if assignment.status == "aborted"
+            else "agent_error" if assignment.status == "error"
+            else "agent_done")
+        try:
+            import agent_ui_events
+            agent_ui_events.hub.emit(
+                event_type,
+                agent_id=employee.id,
+                terminal_name=agent_scope_terminal(employee),
+                run_id=assignment.id,
+                summary=error or result or assignment.task,
+                detail=error or result,
+                status=assignment.status)
+        except Exception:
+            pass
         if not employee.lifecycle_terminated:
             try:
                 agent_persistence.save_agent_state(employee)
@@ -2131,14 +2228,53 @@ def start_agent_assignment(agent_id: str, task: str, deps,
         assignment.status = "running"
         assignment.started_at = time.time()
         try:
+            import agent_ui_events
+            agent_ui_events.hub.emit(
+                "agent_started", agent_id=employee.id,
+                terminal_name=agent_scope_terminal(employee),
+                run_id=assignment.id, summary=assignment.task,
+                status="running")
+        except Exception:
+            pass
+
+        def _assignment_events(events):
+            try:
+                import agent_ui_events
+                agent_ui_events.hub.ingest(
+                    employee.id, events,
+                    agent_scope_terminal(employee))
+            except Exception:
+                pass
+            if callable(events_cb):
+                try:
+                    events_cb(events)
+                except Exception as exc:
+                    _diag("external_agent_events_failed",
+                          agent_id=employee.id, error=str(exc))
+        try:
+            # Employee assignments are background executions even if a legacy
+            # persisted profile carries depth=0. Never enable primary-only
+            # snapshot/workflow/process-cwd behavior for them.
+            runtime_depth = max(1, int(employee.depth or 0))
             result = run_agent_loop(
                 deps, task, session or {}, employee.state,
-                employee.chat_history, events_cb=events_cb,
-                depth=employee.depth, agent_id=employee.id,
+                employee.chat_history, events_cb=_assignment_events,
+                depth=runtime_depth, agent_id=employee.id,
+                interrupt_event=employee.abort_event,
+                message_queue=employee.message_queue,
             )
             reply = ((result.get("state") or {}).get("lastReply", "")
                      if isinstance(result, dict) else "")
-            _finish(result=reply)
+            if isinstance(result, dict) and result.get("success", True) is False:
+                reason = str(result.get("exit_reason") or "incomplete")
+                if employee.abort_event.is_set():
+                    _finish(result=reply)
+                else:
+                    _finish(
+                        result=reply,
+                        error=f"Agent loop ended without completion: {reason}")
+            else:
+                _finish(result=reply)
         except Exception as exc:
             _finish(error=f"{type(exc).__name__}: {exc}")
 
@@ -2152,7 +2288,21 @@ def start_agent_assignment(agent_id: str, task: str, deps,
         agent_persistence.save_agent_state(employee)
     except Exception:
         pass
-    thread.start()
+    try:
+        import agent_ui_events
+        agent_ui_events.hub.emit(
+            "user_message", agent_id=employee.id,
+            terminal_name=agent_scope_terminal(employee),
+            run_id=assignment.id, summary=task, detail=task,
+            status="accepted")
+    except Exception:
+        pass
+    try:
+        thread.start()
+    except Exception as exc:
+        error = f"Failed to start assignment thread: {exc}"
+        _finish(error=error)
+        return False, error, assignment
     return True, f"Assignment {assignment.id} started for {employee.name}.", assignment
 
 
@@ -2351,7 +2501,12 @@ def station_agent(agent_id: str, terminal_name: str) -> bool:
             agent.role = "deployed"
         term.stationed_agent_id = agent_id
         term.stationed_agent_ids = [agent_id]
-        term.dialog_agent_id = agent_id
+        # Deployment and conversation focus are independent. Initialize focus
+        # only when the previous value is absent or no longer in this scope.
+        dialog = (_agent_registry.get(term.dialog_agent_id)
+                  if term.dialog_agent_id else None)
+        if dialog is None or agent_scope_terminal(dialog) != terminal_name:
+            term.dialog_agent_id = agent_id
     # Deployment metadata is durable only for explicitly hired employees.
     # Temporary children and the primary agent have separate session state;
     # persisting them here would leak one JSON file per spawned task.
@@ -2443,10 +2598,42 @@ def send_to_agent(agent_id: str, message: dict) -> bool:
     info = get_agent(agent_id)
     if info is None:
         return False
+    body = dict(message or {})
+    sender_id = str(body.get("from") or "")
+    sender = get_agent(sender_id) if sender_id else None
+    source_terminal = agent_scope_terminal(sender) if sender is not None else ""
+    target_terminal = agent_scope_terminal(info) or ""
+    terminal_name = source_terminal or target_terminal
+    summary = body.get("summary") or body.get("text") or body.get("kind") or "message"
     try:
-        info.inbox.put_nowait(message)
+        info.inbox.put_nowait(body)
+        try:
+            import agent_ui_events
+            agent_ui_events.hub.emit(
+                "agent_message", agent_id=sender_id,
+                target_agent_id=info.id, terminal_name=terminal_name,
+                summary=summary, detail=str(body.get("text") or summary),
+                status="delivered", data={
+                    **body,
+                    "sourceTerminalName": source_terminal,
+                    "targetTerminalName": target_terminal,
+                })
+        except Exception:
+            pass
         return True
     except queue.Full:
+        try:
+            import agent_ui_events
+            agent_ui_events.hub.emit(
+                "agent_message_failed", agent_id=sender_id,
+                target_agent_id=info.id, terminal_name=terminal_name,
+                summary=summary, status="inbox_full", data={
+                    **body,
+                    "sourceTerminalName": source_terminal,
+                    "targetTerminalName": target_terminal,
+                })
+        except Exception:
+            pass
         return False
 
 
@@ -2606,6 +2793,17 @@ def spawn_subagent(parent_id: str, task: str, deps,
     child.chain_id = chain_id
     child.chain_step_index = chain_step_index
     child.group_id = group_id
+    child.chat_history.append({
+        "role": "user", "content": task, "input_kind": "prompt"})
+    try:
+        import agent_ui_events
+        agent_ui_events.hub.emit(
+            "agent_spawned", agent_id=child.id,
+            parent_agent_id=parent.id,
+            terminal_name=agent_scope_terminal(child),
+            summary=task, detail=task, status="queued")
+    except Exception:
+        pass
 
     # ── Isolate the child's file edits in their own git worktree ─────────
     # Every spawned agent used to share the parent's literal os.getcwd() —
@@ -2681,6 +2879,15 @@ def spawn_subagent(parent_id: str, task: str, deps,
     def _runner(ok: bool):
         if not ok:
             child.status = "aborted"
+            try:
+                import agent_ui_events
+                agent_ui_events.hub.emit(
+                    "agent_error", agent_id=child.id,
+                    parent_agent_id=parent.id,
+                    terminal_name=agent_scope_terminal(child),
+                    summary="Cancelled while queued.", status="aborted")
+            except Exception:
+                pass
             if _worktree_info is not None:
                 try:
                     import worktree_manager
@@ -2696,6 +2903,15 @@ def spawn_subagent(parent_id: str, task: str, deps,
                 })
             return
         try:
+            try:
+                import agent_ui_events
+                agent_ui_events.hub.emit(
+                    "agent_started", agent_id=child.id,
+                    parent_agent_id=parent.id,
+                    terminal_name=agent_scope_terminal(child),
+                    summary=task, status="running")
+            except Exception:
+                pass
             result = run_agent_loop(
                 deps, effective_task, session or {}, child.state,
                 child.chat_history,
@@ -2708,6 +2924,15 @@ def spawn_subagent(parent_id: str, task: str, deps,
             child.last_reply = reply
             status = "aborted" if child.abort_event.is_set() else "done"
             mark_agent_finished(child.id, result=reply)
+            try:
+                import agent_ui_events
+                agent_ui_events.hub.emit(
+                    "agent_done", agent_id=child.id,
+                    parent_agent_id=parent.id,
+                    terminal_name=agent_scope_terminal(child),
+                    summary=reply or task, status=status)
+            except Exception:
+                pass
             if report_to_parent:
                 send_to_agent(parent_id, {
                     "from": child.id,
@@ -2719,6 +2944,15 @@ def spawn_subagent(parent_id: str, task: str, deps,
         except Exception as e:
             error_text = repr(e) + _merge_worktree_note()
             mark_agent_finished(child.id, error=error_text)
+            try:
+                import agent_ui_events
+                agent_ui_events.hub.emit(
+                    "agent_error", agent_id=child.id,
+                    parent_agent_id=parent.id,
+                    terminal_name=agent_scope_terminal(child),
+                    summary=error_text, detail=error_text, status="error")
+            except Exception:
+                pass
             if report_to_parent:
                 send_to_agent(parent_id, {
                     "from": child.id,
@@ -6328,6 +6562,14 @@ def run_agent_loop(
                         _command_lock = getattr(
                             _command_session, "command_lock", None
                         )
+                        if events_cb is not None:
+                            events_cb([{
+                                "type": "tool_started",
+                                "toolCallId": call_id,
+                                "name": display_name,
+                                "command": salient,
+                                "content": display_name,
+                            }])
                         with (_command_lock if _command_lock is not None else nullcontext()):
                             result = tools_mod.get_registry().invoke(
                                 name, arguments, tool_ctx
@@ -6953,6 +7195,17 @@ def run_agent_loop(
         add_debug_log(debug_entry)
 
         if done:
+            # Input may arrive from the outer REPL, Agents Mode, or Helpwo
+            # while the provider is producing its final chunk. Give that
+            # shared queue one refresh tick and continue the same run instead
+            # of declaring completion with an accepted message stranded.
+            if self_info is not None and self_info.role == "primary":
+                if _msg_queue.empty():
+                    time.sleep(0.05)
+                if not _msg_queue.empty():
+                    done = False
+                    _completion_source = ""
+                    continue
             # Do not present lifecycle cleanup of the reusable shell as a
             # command result. InteractiveSession.close() intentionally ends a
             # still-running bash (sometimes with SIGKILL, hence rc=137); the

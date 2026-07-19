@@ -687,7 +687,7 @@ def _emit(ctx: HwoCtx, event_type: str, payload: Optional[dict] = None) -> None:
         pass
 
 
-def _forward_agent_events(ctx: HwoCtx, events) -> None:
+def _forward_agent_events(ctx: HwoCtx, events, agent_id: str = "") -> None:
     """Attach workflow identity to nested agent-loop events."""
     if not callable(ctx.events_cb) or not isinstance(events, list):
         return
@@ -695,6 +695,8 @@ def _forward_agent_events(ctx: HwoCtx, events) -> None:
     for event in events:
         item = dict(event) if isinstance(event, dict) else {"content": str(event)}
         item.setdefault("runId", ctx.run_id)
+        if agent_id:
+            item.setdefault("agentId", agent_id)
         enriched.append(item)
     try:
         ctx.events_cb(enriched)
@@ -803,6 +805,10 @@ def _run_task_group(texts: list[str], ctx: HwoCtx, inherited: str = "") -> dict:
         child.state['_model_override'] = ctx.model_override
 
     full_input = _format_hwo_todo_goal(texts, ctx, inherited)
+    _emit(ctx, "agent_spawned", {
+        "agentId": child.id, "parentAgentId": parent_id,
+        "summary": " / ".join(texts)[:500], "status": "queued",
+    })
 
     done_event = threading.Event()
     result_holder = {}
@@ -810,22 +816,39 @@ def _run_task_group(texts: list[str], ctx: HwoCtx, inherited: str = "") -> dict:
     def _runner(ok: bool):
         if not ok:
             result_holder.update({"ok": False, "msg": "Task cancelled while queued."})
+            _emit(ctx, "agent_error", {
+                "agentId": child.id, "parentAgentId": parent_id,
+                "summary": "Task cancelled while queued.", "status": "aborted",
+            })
             done_event.set()
             return
         try:
+            _emit(ctx, "agent_started", {
+                "agentId": child.id, "parentAgentId": parent_id,
+                "summary": " / ".join(texts)[:500], "status": "running",
+            })
             r = run_agent_loop(
                 ctx.deps, full_input, ctx.session, child.state, child.chat_history,
                 depth=child.depth, agent_id=child.id,
-                events_cb=lambda events: _forward_agent_events(ctx, events),
+                events_cb=lambda events: _forward_agent_events(
+                    ctx, events, child.id),
             )
             reply = (r.get("state") or {}).get("lastReply", "") if isinstance(r, dict) else ""
             hwo_return = child.state.pop('_hwo_return', None)
             if hwo_return is not None:
                 reply = hwo_return
             mark_agent_finished(child.id, result=reply)
+            _emit(ctx, "agent_done", {
+                "agentId": child.id, "parentAgentId": parent_id,
+                "summary": reply or "Task completed", "status": "done",
+            })
             result_holder.update({"ok": True, "msg": reply or "(done)"})
         except Exception as e:
             mark_agent_finished(child.id, error=repr(e))
+            _emit(ctx, "agent_error", {
+                "agentId": child.id, "parentAgentId": parent_id,
+                "summary": repr(e), "status": "error",
+            })
             result_holder.update({"ok": False, "msg": repr(e)})
         finally:
             done_event.set()
@@ -917,6 +940,10 @@ def _run_agent(agent_step: HwoAgent, ctx: HwoCtx, inherited: str = "") -> dict:
     io_prompt = _format_io_prompt(agent_step, resolved_inputs)
     body_parts = [p for p in (team_manifest, io_prompt, inherited) if p]
     body_context = "\n\n".join(body_parts)
+    _emit(ctx, "agent_spawned", {
+        "agentId": child.id, "parentAgentId": parent_id,
+        "summary": f"HWO agent #{full_name}#", "status": "queued",
+    })
 
     done_event = threading.Event()
     result_holder = {}
@@ -926,9 +953,18 @@ def _run_agent(agent_step: HwoAgent, ctx: HwoCtx, inherited: str = "") -> dict:
     def _runner(ok: bool):
         if not ok:
             result_holder.update({"ok": False, "msg": f"#{full_name}# cancelled while queued."})
+            _emit(ctx, "agent_error", {
+                "agentId": child.id, "parentAgentId": parent_id,
+                "summary": f"#{full_name}# cancelled while queued.",
+                "status": "aborted",
+            })
             done_event.set()
             return
         try:
+            _emit(ctx, "agent_started", {
+                "agentId": child.id, "parentAgentId": parent_id,
+                "summary": f"HWO agent #{full_name}#", "status": "running",
+            })
             if only_tasks:
                 task_ctx = HwoCtx(
                     deps=ctx.deps,
@@ -956,7 +992,8 @@ def _run_agent(agent_step: HwoAgent, ctx: HwoCtx, inherited: str = "") -> dict:
                 r = run_agent_loop(
                     ctx.deps, full_input, ctx.session, child.state, child.chat_history,
                     depth=child.depth, agent_id=child.id,
-                    events_cb=lambda events: _forward_agent_events(ctx, events),
+                    events_cb=lambda events: _forward_agent_events(
+                        ctx, events, child.id),
                 )
                 reply = (r.get("state") or {}).get("lastReply", "") if isinstance(r, dict) else ""
                 hwo_return = child.state.pop('_hwo_return', None)
@@ -1024,6 +1061,12 @@ def _run_agent(agent_step: HwoAgent, ctx: HwoCtx, inherited: str = "") -> dict:
             mark_agent_finished(child.id, error=repr(e))
             result_holder.update({"ok": False, "msg": repr(e)})
         finally:
+            failed = child.status in {"error", "aborted"}
+            _emit(ctx, "agent_error" if failed else "agent_done", {
+                "agentId": child.id, "parentAgentId": parent_id,
+                "summary": child.error or child.result or f"HWO agent #{full_name}#",
+                "status": child.status,
+            })
             done_event.set()
 
     if parent_id:

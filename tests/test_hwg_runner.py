@@ -24,6 +24,27 @@ class _Chdir:
 
 
 class HwgRunnerTests(unittest.TestCase):
+    def test_events_identify_only_the_active_node(self):
+        with tempfile.TemporaryDirectory() as tmp, _Chdir(tmp):
+            Path("flow.hwg").write_text(
+                "(a.hwo)#a#\n(b.hwo)#b#\n#a# -> #b#\n",
+                encoding="utf-8",
+            )
+            events = []
+            with mock.patch.object(hwg_runner.hwo_runner, "run_hwo_file", return_value={
+                    "ok": True, "msg": "done", "outputs": {}}):
+                result = hwg_runner.run_hwg_file(
+                    "flow.hwg", deps=object(), session={},
+                    events_cb=lambda rows: events.extend(rows))
+
+        self.assertTrue(result["ok"], result)
+        transitions = [(row["type"], row.get("node")) for row in events
+                       if row["type"] in {"node_started", "node_completed"}]
+        self.assertEqual(transitions, [
+            ("node_started", "a"), ("node_completed", "a"),
+            ("node_started", "b"), ("node_completed", "b"),
+        ])
+
     def test_parser_accepts_node_policy(self):
         ast = parse_hwg('(a.hwo)#a# { retry: 2, timeout: "10m", cache: "1h" }')
         self.assertEqual(ast[0]["policy"], {

@@ -632,7 +632,7 @@ class PersistentOwnershipTests(unittest.TestCase):
         self.assertFalse(agent_loop.can_agents_communicate(left.id, right.id))
         self.assertFalse(agent_loop.can_agents_communicate(root.id, child.id))
 
-    def test_dialog_routing_prefers_deployed_then_deterministic_local_idle(self):
+    def test_dialog_focus_is_independent_from_deployed_shell_owner(self):
         self._terminal("term0")
         self._terminal("work", "term0")
         first = agent_loop.register_agent(name="first", role="pool")
@@ -642,8 +642,16 @@ class PersistentOwnershipTests(unittest.TestCase):
         self.assertIs(
             agent_loop.get_dialog_agent_for_terminal("work"), first)
         self.assertTrue(agent_loop.station_agent(second.id, "work"))
+        self.assertEqual(
+            agent_loop.get_terminal("work").stationed_agent_id, second.id)
+        self.assertIs(
+            agent_loop.get_dialog_agent_for_terminal("work"), first)
+        self.assertTrue(agent_loop.set_dialog_agent_for_terminal(
+            "work", second.id))
         self.assertIs(
             agent_loop.get_dialog_agent_for_terminal("work"), second)
+        self.assertEqual(
+            agent_loop.get_terminal("work").stationed_agent_id, second.id)
 
     def test_agent_tell_attaches_freshness_provenance(self):
         self._terminal("term0")
