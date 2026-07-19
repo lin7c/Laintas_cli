@@ -59,11 +59,19 @@ def _connect(cwd: Optional[str] = None) -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=15000")
-    _init_schema(conn)
+    _init_schema(conn, path)
     return conn
 
+# Track which db paths have already had their schema initialized in this
+# process, so we skip the CREATE TABLE IF NOT EXISTS overhead on repeat opens.
+_schema_initialized: set[str] = set()
 
-def _init_schema(conn: sqlite3.Connection) -> None:
+
+def _init_schema(conn: sqlite3.Connection, db_path: Optional[Path] = None) -> None:
+    if db_path is not None:
+        key = str(db_path)
+        if key in _schema_initialized:
+            return
     conn.executescript("""
     CREATE TABLE IF NOT EXISTS work_items (
       id TEXT PRIMARY KEY,
@@ -148,6 +156,8 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_work_session ON work_items(session_id, updated_at)")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_steps_owner ON steps(work_id, owner_agent_id)")
+    if db_path is not None:
+        _schema_initialized.add(str(db_path))
 
 
 @contextmanager
@@ -634,6 +644,52 @@ def _step_projection(conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
     return item
 
 
+def _batch_step_projections(conn: sqlite3.Connection, rows: list) -> list[dict]:
+    """Build step projections for all rows in 3 batch queries instead of N*3.
+
+    Replaces the per-step _step_projection() calls that caused an N+1 query
+    problem in list_steps() - 50 steps = 150 queries -> 3 queries.
+    """
+    if not rows:
+        return []
+    work_id = rows[0]["work_id"]
+    step_ids = [str(r["id"]) for r in rows]
+
+    # Batch 1: dependencies (blocked_by)
+    deps_map: dict[str, list[str]] = {sid: [] for sid in step_ids}
+    for dep_step, dep_blocked_by in conn.execute(
+        "SELECT step_id, blocked_by_step_id FROM step_dependencies WHERE work_id=?",
+        (work_id,)).fetchall():
+        if str(dep_step) in deps_map:
+            deps_map[str(dep_step)].append(str(dep_blocked_by))
+
+    # Batch 2: blocks (what this step blocks)
+    blocks_map: dict[str, list[str]] = {sid: [] for sid in step_ids}
+    for blk_step, blk_blocked_by in conn.execute(
+        "SELECT step_id, blocked_by_step_id FROM step_dependencies WHERE work_id=?",
+        (work_id,)).fetchall():
+        if str(blk_blocked_by) in blocks_map:
+            blocks_map[str(blk_blocked_by)].append(str(blk_step))
+
+    # Batch 3: children
+    children_map: dict[str, list[str]] = {sid: [] for sid in step_ids}
+    for child_id, parent_id in conn.execute(
+        "SELECT id, parent_id FROM steps WHERE work_id=? AND parent_id IS NOT NULL",
+        (work_id,)).fetchall():
+        if str(parent_id) in children_map:
+            children_map[str(parent_id)].append(str(child_id))
+
+    items = []
+    for row in rows:
+        item = _row(row) or {}
+        sid = str(row["id"])
+        item["blockedBy"] = deps_map.get(sid, [])
+        item["blocks"] = blocks_map.get(sid, [])
+        item["children"] = children_map.get(sid, [])
+        items.append(item)
+    return items
+
+
 def list_steps(work_id: str, *, cwd: Optional[str] = None,
                include_deleted: bool = False,
                session_id: Optional[str] = None,
@@ -654,7 +710,7 @@ def list_steps(work_id: str, *, cwd: Optional[str] = None,
         if not include_deleted:
             query += " AND s.status<>'deleted'"
         rows = conn.execute(query, args).fetchall()
-        items = [_step_projection(conn, row) for row in rows]
+        items = _batch_step_projections(conn, rows)
     def key(item: dict):
         value = str(item.get("id", ""))
         try:

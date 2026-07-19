@@ -321,6 +321,27 @@ def _compile_rules(patterns: list) -> list[re.Pattern]:
     return compiled
 
 
+# Cache compiled rules keyed by (rule_type, config_mtime) to avoid
+# recompiling regexes on every evaluate() call.
+_compiled_cache: dict[tuple[str, float], list[re.Pattern]] = {}
+
+
+def _get_compiled_rules(key: str, cfg: dict) -> list[re.Pattern]:
+    """Return compiled rules for `key`, cached by config mtime."""
+    cache_key = (key, _config_mtime)
+    cached = _compiled_cache.get(cache_key)
+    if cached is not None:
+        return cached
+    compiled = _compile_rules(cfg.get(key, []))
+    _compiled_cache[cache_key] = compiled
+    # Prune stale entries to prevent unbounded growth across config reloads.
+    if len(_compiled_cache) > 20:
+        stale = [k for k in _compiled_cache if k[1] != _config_mtime]
+        for k in stale:
+            del _compiled_cache[k]
+    return compiled
+
+
 def _unwrap_parent(command: str) -> str:
     """Strip all ``parent(...)`` wrappers from *command*.
 
@@ -381,19 +402,6 @@ def evaluate(command: str, cwd: str = None,
 
     stripped = _unwrap_parent(command)
 
-    # ── Select platform-specific rule sets ─────────────────────────────
-    _plat = {"allow": [], "needs_approval": [], "deny": []}
-
-    # Merge user rules with platform defaults (ensures security rules survive config upgrades)
-    def _merged_rules(key):
-        seen = set()
-        merged = []
-        for r in cfg.get(key, []) + _plat.get(key, []):
-            if r not in seen:
-                seen.add(r)
-                merged.append(r)
-        return merged
-
     # ── Basic sanity checks (always enforced) ──────────────────────────
     max_len = cfg.get("maxCommandLength", 10000)
     if len(stripped) > max_len:
@@ -411,7 +419,7 @@ def evaluate(command: str, cwd: str = None,
         ))
 
     # ── Check deny list first (takes precedence) ───────────────────────
-    deny_rules = _compile_rules(_merged_rules("deny"))
+    deny_rules = _get_compiled_rules("deny", cfg)
     for rule in deny_rules:
         if rule.search(stripped):
             reason = f"Matched deny rule: {rule.pattern}"
@@ -444,7 +452,7 @@ def evaluate(command: str, cwd: str = None,
         return PolicyDecision(
             "needs_approval", "sudo", "sudo commands require approval")
 
-    approval_rules = _compile_rules(_merged_rules("needs_approval"))
+    approval_rules = _get_compiled_rules("needs_approval", cfg)
     for rule in approval_rules:
         if rule.search(stripped):
             reason = f"Matched approval rule: {rule.pattern}"
