@@ -709,6 +709,22 @@ def add_debug_log(entry: DebugEntry) -> None:
         del _debug_logs[max_entries:]
 
 
+def _persist_warn(context: str, exc: BaseException) -> None:
+    """Emit a dim warning for non-fatal persistence failures.
+
+    These were previously silently swallowed (except: pass), which meant
+    agent state could be lost without any indication. Now prints a dim
+    yellow warning to the console so the user knows something went wrong.
+    """
+    try:
+        deps.console.print(
+            f"[dim yellow](persistence warning: {context}: {type(exc).__name__}: {exc})[/dim yellow]")
+    except Exception:
+        import sys
+        print(f"(persistence warning: {context}: {type(exc).__name__}: {exc})",
+              file=sys.stderr)
+
+
 def clear_debug_logs() -> None:
     """Clear all debug entries and reset counter."""
     global _debug_logs, _debug_loop_counter
@@ -843,8 +859,8 @@ def unregister_terminal(name: str) -> bool:
             if scoped.state.get("_persisted_employee"):
                 try:
                     agent_persistence.save_agent_state(scoped)
-                except Exception:
-                    pass
+                except Exception as e:
+                    _persist_warn("save_agent_state(terminal close)", e)
 
         _terminal_registry.pop(name, None)
         _trigger_scan_cursors.pop(name, None)
@@ -2218,8 +2234,8 @@ def start_agent_assignment(agent_id: str, task: str, deps,
         if not employee.lifecycle_terminated:
             try:
                 agent_persistence.save_agent_state(employee)
-            except Exception:
-                pass
+            except Exception as e:
+                _persist_warn("save_agent_state(assignment finish)", e)
 
     def _runner(ok: bool) -> None:
         if not ok:
@@ -2286,8 +2302,8 @@ def start_agent_assignment(agent_id: str, task: str, deps,
     employee.thread = thread
     try:
         agent_persistence.save_agent_state(employee)
-    except Exception:
-        pass
+    except Exception as e:
+        _persist_warn("save_agent_state(spawn employee)", e)
     try:
         import agent_ui_events
         agent_ui_events.hub.emit(
@@ -2513,8 +2529,8 @@ def station_agent(agent_id: str, terminal_name: str) -> bool:
     if agent.state.get("_persisted_employee"):
         try:
             agent_persistence.save_agent_state(agent)
-        except Exception:
-            pass
+        except Exception as e:
+            _persist_warn("save_agent_state(unstation)", e)
     return True
 
 
@@ -2544,8 +2560,8 @@ def unstation_agent(agent_id: str) -> None:
     if agent is not None:
         try:
             agent_persistence.save_agent_state(agent)
-        except Exception:
-            pass
+        except Exception as e:
+            _persist_warn("save_agent_state(unstation cleanup)", e)
 
 
 def close_all_agents() -> None:
@@ -7379,8 +7395,8 @@ def run_agent_loop(
             self_info.chat_history = chat_history
             self_info.state = state
             agent_persistence.save_agent_state(self_info)
-        except Exception:
-            pass
+        except Exception as e:
+            _persist_warn("save_agent_state(loop exit)", e)
 
     _clean_end = _exit_reason in (TRANSITION_COMPLETED, TRANSITION_END_TURN)
     if _clean_end:
