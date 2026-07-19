@@ -15615,20 +15615,32 @@ def request_command_approval(command: str, reason: str) -> bool:
     return choice == "yes"
 
 
-def authorize_direct_command(command: str, cwd: str = None) -> tuple[bool, str]:
+def authorize_direct_command(command: str, cwd: str = None, *,
+                             remote_source: bool = False) -> tuple[bool, str]:
     """Apply the same policy gateway to commands typed into the REPL.
 
     Direct commands previously bypassed policy entirely.  Returning a reason
     lets the REPL and remote-chat caller report a deterministic denial without
     executing any part of the command.
+
+    When *remote_source* is True the command was injected from a remote
+    channel (Helpwo chat -> _inject_input) rather than typed by the local
+    user.  In that case ``needs_approval`` decisions are NOT silently
+    allowed - the local terminal is unattended and the ``/exec`` channel
+    is the proper remote path with its own approval dialog.
     """
     import policy as _policy
-    decision = _policy.evaluate(command, cwd or os.getcwd())
+    decision = _policy.evaluate(command, cwd or os.getcwd(),
+                                strict=remote_source)
     if decision.action == "deny":
         return False, f"Blocked by policy: {decision.reason}"
     if decision.action == "needs_approval":
+        if remote_source:
+            return (False,
+                    f"Remote command requires approval (use the /exec "
+                    f"channel): {decision.reason}")
         # Commands the USER types directly at the REPL run like a normal
-        # terminal — no confirmation box — since the human is the trusted
+        # terminal - no confirmation box - since the human is the trusted
         # actor here (the approval gate exists to supervise the AI agent).
         # Set /config confirm_direct_commands true to restore the prompt.
         if not get_runtime_config("confirm_direct_commands"):
@@ -16799,7 +16811,9 @@ def main():
                 agent_registry._push_events([{"type": "system", "kind": "command", "content": user_input}])
 
             _command_allowed, _command_denial = authorize_direct_command(
-                user_input, os.getcwd())
+                user_input, os.getcwd(),
+                remote_source=(injected_done is not None
+                               and agent_registry.agent_id is not None))
             if not _command_allowed:
                 console.print(f"[red]{_command_denial}[/red]")
                 agent_state["lastOutput"] = _command_denial

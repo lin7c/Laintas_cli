@@ -26,6 +26,7 @@ from typing import Optional
 
 
 import paths
+import json_store
 
 CONFIG_PATH = paths.POLICY_FILE
 AUDIT_PATH = paths.AUDIT_FILE
@@ -69,6 +70,16 @@ _DEFAULT_CONFIG = {
     "needs_approval": [
         r"(?:^|[;&|]\s*|\n\s*)(?:\S*/)?(?:rm|rmdir|unlink|shred)(?:\s|$)",
         r"\bxargs\s+(?:\S*/)?(?:rm|rmdir|unlink|shred)(?:\s|$)",
+        # Interpreter -c/-e flags execute arbitrary code and bypass every
+        # shell-level rule below; require approval so the user sees them.
+        r"^python[23]?\s+(?:.+?\s)?-c\b",
+        r"^python[23]?m\s+\S",
+        r"^node\s+(?:.+?\s)?-e\b",
+        r"^node\s+--eval\b",
+        r"^perl\s+(?:.+?\s)?-e\b",
+        r"^ruby\s+(?:.+?\s)?-e\b",
+        r"^php\s+(?:.+?\s)?-r\b",
+        r"^bash\s+-c\b", r"^sh\s+-c\b", r"^zsh\s+-c\b",
         r"^git\s+push", r"^git\s+commit", r"^git\s+reset",
         r"^git\s+rebase", r"^git\s+merge", r"^git\s+checkout",
         r"^npm\s+install\s+-g", r"^npm\s+uninstall",
@@ -230,6 +241,20 @@ def _migrate_config(cfg: dict) -> dict:
         r"(?:^|[;&|]\s*|\n\s*)(?:\S*/)?(?:rm|rmdir|unlink|shred)(?:\s|$)",
         r"\bxargs\s+(?:\S*/)?(?:rm|rmdir|unlink|shred)(?:\s|$)",
     ]
+    # v2026-07-19: interpreter -c/-e flags execute arbitrary code and bypass
+    # every shell-level rule. Existing configs must inherit the new approval
+    # rules; without this, a saved config from before today silently allows
+    # `python -c "..."` / `node -e "..."` / `bash -c "..."` without any gate.
+    _required_approval += [
+        r"^python[23]?\s+(?:.+?\s)?-c\b",
+        r"^python[23]?m\s+\S",
+        r"^node\s+(?:.+?\s)?-e\b",
+        r"^node\s+--eval\b",
+        r"^perl\s+(?:.+?\s)?-e\b",
+        r"^ruby\s+(?:.+?\s)?-e\b",
+        r"^php\s+(?:.+?\s)?-r\b",
+        r"^bash\s+-c\b", r"^sh\s+-c\b", r"^zsh\s+-c\b",
+    ]
     for rule in _required_approval:
         if rule not in approval_list:
             approval_list.append(rule)
@@ -237,10 +262,10 @@ def _migrate_config(cfg: dict) -> dict:
     if changed:
         cfg["deny"] = deny_list
         cfg["needs_approval"] = approval_list
-        # Persist the migration
+        # Persist the migration atomically (mode 0o600 - policy rules are
+        # security-sensitive; a tampered config could weaken the gate).
         try:
-            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-                json.dump(cfg, f, ensure_ascii=False, indent=2)
+            json_store.save_json_atomic(CONFIG_PATH, cfg, mode=0o600)
         except OSError:
             pass
     return cfg
@@ -250,8 +275,7 @@ def _write_default_config() -> None:
     """Write the default safe policy to disk."""
     try:
         CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump(_DEFAULT_CONFIG, f, ensure_ascii=False, indent=2)
+        json_store.save_json_atomic(CONFIG_PATH, _DEFAULT_CONFIG, mode=0o600)
     except OSError:
         pass
 
@@ -280,16 +304,32 @@ def _compile_rules(patterns: list) -> list[re.Pattern]:
     return compiled
 
 
+def _unwrap_parent(command: str) -> str:
+    """Strip all ``parent(...)`` wrappers from *command*.
+
+    ``parent(...)`` is a laintas shell override whose body executes in the
+    parent process.  Policy must inspect the body at every entry point
+    (/send, direct REPL, and agent tools), not the wrapper text.  Nested
+    wrappers like ``parent(parent(rm -rf /))`` must be fully unwrapped -
+    previously only one level was stripped, hiding the inner command from
+    every rule below.
+    """
+    stripped = (command or "").strip()
+    for _ in range(16):  # bounded loop - 16 levels is absurd, anything more is an attack
+        m = re.fullmatch(r"parent\((.*)\)", stripped, re.DOTALL)
+        if not m:
+            break
+        stripped = m.group(1).strip()
+    return stripped
+
+
 def is_delete_command(command: str) -> bool:
     """Return whether *command* invokes a common destructive delete utility.
 
     Callers use this to require a fresh Yes/No decision for deletion instead
     of honoring the session-wide "approve all commands" shortcut.
     """
-    stripped = (command or "").strip()
-    parent_match = re.fullmatch(r"parent\((.*)\)", stripped, re.DOTALL)
-    if parent_match:
-        stripped = parent_match.group(1).strip()
+    stripped = _unwrap_parent(command)
     stripped = re.sub(r"^sudo(?:\s+-\S+)*\s+", "", stripped)
     patterns = (
         r"(?:^|[;&|]\s*|\n\s*)(?:\S*/)?(?:rm|rmdir|unlink|shred)(?:\s|$)",
@@ -301,22 +341,28 @@ def is_delete_command(command: str) -> bool:
 
 
 def evaluate(command: str, cwd: str = None,
-             req_id: str = None, agent_id: str = None) -> PolicyDecision:
+             req_id: str = None, agent_id: str = None,
+             *, strict: bool = False) -> PolicyDecision:
     """Evaluate a command against the security policy.
 
     Returns a PolicyDecision with action in {"allow", "deny", "needs_approval"}.
     Side-effect: writes an audit log entry for every non-trivial decision.
+
+    When *strict* is True, ``needs_approval`` decisions are returned as-is
+    instead of being downgraded to ``allow`` in audit mode.  Used by callers
+    that supervise untrusted/remote sources (where the audit-mode advisory
+    fallthrough must NOT silently let through commands the rules flagged).
     """
     cfg = _load_config()
     mode = cfg.get("mode", "audit")
+    if strict and mode == "audit":
+        # Treat as enforce for rule matching, but preserve the user's
+        # configured mode for the audit-log text.
+        effective_mode = "enforce"
+    else:
+        effective_mode = mode
 
-    stripped = command.strip()
-    # `parent(...)` is a laintas shell override whose body executes in the
-    # parent process.  Policy must inspect the body at every entry point
-    # (/send, direct REPL, and agent tools), not the wrapper text.
-    parent_match = re.fullmatch(r"parent\((.*)\)", stripped, re.DOTALL)
-    if parent_match:
-        stripped = parent_match.group(1).strip()
+    stripped = _unwrap_parent(command)
 
     # ── Select platform-specific rule sets ─────────────────────────────
     _plat = {"allow": [], "needs_approval": [], "deny": []}
@@ -377,7 +423,7 @@ def evaluate(command: str, cwd: str = None,
     # ── Check needs_approval list ──────────────────────────────────────
     # Deny rules take precedence over sudo approval.  Otherwise approving
     # `sudo rm -rf /` would bypass the destructive-command deny list.
-    if sudo_detected and mode == "enforce":
+    if sudo_detected and effective_mode == "enforce":
         return PolicyDecision(
             "needs_approval", "sudo", "sudo commands require approval")
 
@@ -386,7 +432,7 @@ def evaluate(command: str, cwd: str = None,
         if rule.search(stripped):
             reason = f"Matched approval rule: {rule.pattern}"
             _write_audit(_audit_entry(command, "needs_approval", reason, cwd, req_id, agent_id))
-            if mode == "enforce":
+            if effective_mode == "enforce":
                 return PolicyDecision("needs_approval", rule.pattern, reason)
             # In audit mode, approval rules are advisory (allow with warning)
 
@@ -404,7 +450,7 @@ def evaluate(command: str, cwd: str = None,
                                   path_decision.reason, cwd, req_id, agent_id))
         # In enforce mode: ask user for approval (needs_approval)
         # In audit mode: allow with warning (don't block)
-        if mode == "enforce":
+        if effective_mode == "enforce":
             return path_decision
         # audit mode: log but allow
 

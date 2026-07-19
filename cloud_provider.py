@@ -18,6 +18,7 @@ except ImportError:
     _HAS_REQUESTS = False
 
 from paths import LAINTAS_HOME
+import json_store
 
 CLOUD_CONFIG_FILE = LAINTAS_HOME / "cloud.json"
 
@@ -34,10 +35,8 @@ def load_cloud_config() -> Optional[Dict[str, Any]]:
 
 def save_cloud_config(cfg: Dict[str, Any]) -> None:
     LAINTAS_HOME.mkdir(parents=True, exist_ok=True)
-    tmp = str(CLOUD_CONFIG_FILE) + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(cfg, f, indent=2)
-    os.replace(tmp, CLOUD_CONFIG_FILE)
+    # cloud.json stores API tokens (GitHub PAT, Google OAuth) - must be 0o600.
+    json_store.save_json_atomic(CLOUD_CONFIG_FILE, cfg, mode=0o600)
 
 
 def clear_cloud_config() -> None:

@@ -209,13 +209,49 @@ def evolution_lab_dir() -> Path:
 
 # ── Initialization ───────────────────────────────────────────────────────
 
+def _home_owner_ok() -> bool:
+    """Return True if LAINTAS_HOME (or its symlink target) is safe to use.
+
+    A symlinked or otherwise attacker-controlled LAINTAS_HOME would let a
+    less-privileged user redirect auth tokens (session.json), audit logs,
+    and policy rules to an arbitrary location. Refuse quietly here; the
+    fallback paths in callers already degrade to in-memory defaults when
+    writes fail.
+    """
+    try:
+        resolved = LAINTAS_HOME.resolve(strict=False)
+    except OSError:
+        return True  # let mkdir/chmod below surface the real error
+    try:
+        if hasattr(os, "getuid"):
+            rstat = resolved.stat()
+            if rstat.st_uid not in (os.getuid(), 0):
+                import sys
+                print(f"[paths] WARNING: LAINTAS_HOME resolves to {resolved} "
+                      f"(uid={rstat.st_uid}), not owned by you "
+                      f"(uid={os.getuid()}); refusing to use it.",
+                      file=sys.stderr)
+                return False
+    except OSError:
+        pass
+    return True
+
+
 def ensure_home() -> None:
     """Create ~/.laintas/ and all subdirectories with correct permissions.
 
     Safe to call multiple times (uses exist_ok=True).
     Sets 0o700 on the root directory for privacy.
     """
+    if not _home_owner_ok():
+        raise RuntimeError(
+            f"LAINTAS_HOME ({LAINTAS_HOME}) resolves to a directory not "
+            f"owned by the current user; refusing to write secrets there. "
+            f"Set LAINTAS_HOME to a safe path or fix ownership."
+        )
     LAINTAS_HOME.mkdir(parents=True, exist_ok=True)
+    # chmod the real directory (follows symlinks by default, but we already
+    # verified ownership above so this is safe).
     try:
         os.chmod(str(LAINTAS_HOME), 0o700)
     except OSError:
