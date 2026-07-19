@@ -1490,5 +1490,45 @@ class LazySnapshotTests(unittest.TestCase):
         self.assertEqual(order[:2], ["snapshot", "write"])
 
 
+class ThinkingLiveTests(unittest.TestCase):
+    def setUp(self):
+        agent_loop.reset_runtime_config()
+        agent_loop.set_runtime_config("auto_snapshot", False)
+        agent_loop.set_runtime_config("loop_delay", 0)
+
+    def tearDown(self):
+        agent_loop.reset_runtime_config()
+
+    def test_live_does_not_redirect_stdout_back_into_tee_console(self):
+        options = {}
+
+        class FakeLive:
+            def __init__(self, *_args, **kwargs):
+                options.update(kwargs)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def refresh(self):
+                pass
+
+        deps = _deps({
+            "reply": "hello", "tool_calls": [], "finish_reason": "stop",
+            "done": True, "error": False,
+        })
+        with tempfile.TemporaryDirectory() as tmp, _chdir(tmp), \
+                mock.patch("rich.live.Live", FakeLive):
+            Path(".laintas").mkdir()
+            agent_loop.run_agent_loop(
+                deps, "hello", {}, {}, [], events_cb=lambda _events: None,
+                max_loops_override=1)
+
+        self.assertIs(options["redirect_stdout"], False)
+        self.assertIs(options["redirect_stderr"], False)
+
+
 if __name__ == "__main__":
     unittest.main()

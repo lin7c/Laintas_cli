@@ -5900,7 +5900,8 @@ def run_agent_loop(
                 else:
                     with Live(_LiveWrapper(), console=deps.console,
                               refresh_per_second=4.0, auto_refresh=True,
-                              transient=True) as live:
+                              transient=True, redirect_stdout=False,
+                              redirect_stderr=False) as live:
                         _live_holder["live"] = live
                         response = _do_stream_call()
                         try:
