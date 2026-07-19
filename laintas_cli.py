@@ -1017,10 +1017,14 @@ def _marker_poll_exec_unlocked(session, command: str, timeout: int = 60,
         agent_automation=False)
     wrapped = f"echo {start_marker}; {payload} 2>&1; __laintas_rc=$?; echo {end_marker}:$__laintas_rc"
 
-    try:
-        old_len = len(session.raw_output)
-    except AttributeError:
-        old_len = len(session.full_output)
+    _output_total = getattr(session, "output_total", None)
+    if isinstance(_output_total, int):
+        old_len = _output_total
+    else:
+        try:
+            old_len = len(session.raw_output)
+        except AttributeError:
+            old_len = len(session.full_output)
 
     if getattr(session, "_laintas_shell_dirty", None) is True:
         if not tools_mod.recover_stuck_shell(session):
@@ -1037,11 +1041,18 @@ def _marker_poll_exec_unlocked(session, command: str, timeout: int = 60,
     while time.time() - poll_start < timeout:
         time.sleep(0.08)
         session.read_output(timeout=0.1)
-        try:
-            raw = session.raw_output
-        except AttributeError:
-            raw = session.full_output
-        new_content = raw[old_len:] if old_len > 0 else raw
+        output_from_fn = getattr(session, "output_from", None)
+        if (isinstance(_output_total, int)
+                and callable(output_from_fn)):
+            new_content = (
+                output_from_fn(old_len) if old_len > 0
+                else output_from_fn(0))
+        else:
+            try:
+                raw = session.raw_output
+            except AttributeError:
+                raw = session.full_output
+            new_content = raw[old_len:] if old_len > 0 else raw
 
         end_match = _re.search(rf'{_re.escape(end_marker)}:(\d+)', new_content)
         if end_match:
@@ -1510,6 +1521,35 @@ class SubTerminalSession:
             return "".join(self._output_buf)
 
     @property
+    def output_total(self) -> int:
+        """Cheap total output length. Delegates to underlying PTY when present.
+
+        For the tmux path, ``raw_output`` re-captures the pane each call so
+        its length is bounded by pane size and is itself cheap; we expose it
+        here so callers can use a uniform ``output_total``/``output_from``
+        pair regardless of backend.
+        """
+        if not self._use_tmux and self._pty is not None:
+            return self._pty.output_total
+        return len(self.raw_output)
+
+    def output_from(self, offset: int) -> str:
+        """Return accumulated output starting at character `offset`.
+
+        Delegates to the underlying ``InteractiveSession`` for the non-tmux
+        path (cheap O(delta) walk).  For tmux, ``raw_output`` is already a
+        bounded pane snapshot so we slice it directly.
+        """
+        if not self._use_tmux and self._pty is not None:
+            return self._pty.output_from(offset)
+        raw = self.raw_output
+        if offset <= 0:
+            return raw
+        if offset >= len(raw):
+            return ""
+        return raw[offset:]
+
+    @property
     def master_fd(self) -> int:
         """PTY master file descriptor for raw I/O (non-tmux only)."""
         if self._pty:
@@ -1755,6 +1795,7 @@ class InteractiveSession:
         self.pid: int = -1
         self.master_fd: int = -1
         self._output_chunks: list[str] = []
+        self._output_total: int = 0
         self._returncode: int = -1
         self._start_time: float = 0.0
         self._old_tcattr = None
@@ -1890,6 +1931,7 @@ class InteractiveSession:
             decoded = data.decode("utf-8", errors="replace")
             new_chunks.append(decoded)
             self._output_chunks.append(decoded)
+            self._output_total += len(decoded)
             if self.stream_output:
                 sys.stdout.write(decoded)
                 sys.stdout.flush()
@@ -1946,6 +1988,7 @@ class InteractiveSession:
                     break
                 decoded = data.decode("utf-8", errors="replace")
                 self._output_chunks.append(decoded)
+                self._output_total += len(decoded)
                 if self.stream_output:
                     sys.stdout.write(decoded)
                     sys.stdout.flush()
@@ -1970,6 +2013,38 @@ class InteractiveSession:
     def raw_output(self) -> str:
         """All accumulated output including ANSI escape codes."""
         return "".join(self._output_chunks)
+
+    @property
+    def output_total(self) -> int:
+        """Total length of accumulated output. Cheap (no join)."""
+        return self._output_total
+
+    def output_from(self, offset: int) -> str:
+        """Return accumulated output starting at character `offset`.
+
+        Equivalent to ``raw_output[offset:]`` but O(delta) instead of
+        O(total): walks chunks from the end and only joins the ones needed
+        to cover the requested tail.  Used by marker-poll hot loops that
+        poll a long-lived persistent shell so per-iteration cost stays
+        bounded by new output, not by session lifetime.
+        """
+        if offset <= 0:
+            return "".join(self._output_chunks)
+        if offset >= self._output_total:
+            return ""
+        needed = self._output_total - offset
+        collected: list[str] = []
+        have = 0
+        for chunk in reversed(self._output_chunks):
+            if have >= needed:
+                break
+            collected.append(chunk)
+            have += len(chunk)
+        collected.reverse()
+        joined = "".join(collected)
+        if have > needed:
+            joined = joined[have - needed:]
+        return joined
 
     @property
     def returncode(self) -> int:
@@ -2014,6 +2089,7 @@ class InteractiveSession:
                     if data:
                         decoded = data.decode("utf-8", errors="replace")
                         self._output_chunks.append(decoded)
+                        self._output_total += len(decoded)
                         if self.stream_output:
                             sys.stdout.write(decoded)
                             sys.stdout.flush()
@@ -2335,6 +2411,19 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
             "/station <agent> <terminal> to deploy it explicitly."
         )),
     CommandSpec(
+        "/agent", "Switch the REPL's current Agent focus without redeploying",
+        "Agents & Terminals", "/agent [agent-id-or-name]",
+        help_text=(
+            "Switches the main REPL's current Agent conversation/execution "
+            "identity in place: no terminal is moved, no deployment is "
+            "reissued, and the focused Agent keeps its existing state, "
+            "history, and bound terminal. With no argument, prints the "
+            "current Agent and lists every other Agent you can switch to. "
+            "Accepts either an Agent ID or an Agent name (case-insensitive "
+            "name match). Use /agents for the full-screen multi-Agent "
+            "view; /agent only changes which Agent the main REPL drives."
+        )),
+    CommandSpec(
         "/agents", "Open the full-screen multi-Agent focus and activity view",
         "Agents & Terminals", "/agents [agent-id|tree|--plain]",
         subcommands=("tree", "--plain"),
@@ -2575,7 +2664,7 @@ class MetaCompleter(Completer):
                                     yield self._completion(
                                         role.name, fragment, role.description)
                             return
-                if head_lower in ("/agents", "/station", "/st"):
+                if head_lower in ("/agent", "/agents", "/station", "/st"):
                     words = partial.split()
                     trailing_space = tail.endswith(" ")
                     if not words or (len(words) == 1 and not trailing_space):
@@ -2583,11 +2672,27 @@ class MetaCompleter(Completer):
                         candidates = []
                         if head_lower == "/agents":
                             candidates.append(("tree", "show employee tree"))
-                        candidates.extend(
-                            (agent.id, agent.profile.title)
-                            for agent in get_all_agents()
-                            if agent.role != "primary"
-                        )
+                        if head_lower == "/agent":
+                            # /agent takes a single agent-id-or-name argument.
+                            # Include every agent (primary is a valid switch
+                            # target) and surface each agent's name as a
+                            # completion alias when distinct from its id.
+                            for agent in get_all_agents():
+                                candidates.append(
+                                    (agent.id, agent.profile.title))
+                                if (agent.name
+                                        and agent.name != agent.id
+                                        and agent.name.lower()
+                                        != agent.id.lower()):
+                                    candidates.append(
+                                        (agent.name,
+                                         f"alias for {agent.id}"))
+                        else:
+                            candidates.extend(
+                                (agent.id, agent.profile.title)
+                                for agent in get_all_agents()
+                                if agent.role != "primary"
+                            )
                         for value, meta in candidates:
                             if value.lower().startswith(fragment.lower()):
                                 yield self._completion(value, fragment, meta)
@@ -8278,6 +8383,7 @@ _SLASH_ARG_RULES: dict[tuple[str, ...], SlashArgRule] = {
     ("/connect",): _arg_rule(1, "/connect [folder]"),
     ("/terminate",): _arg_rule(1, "/terminate <name>"),
     ("/abort",): _arg_rule(1, "/abort <agent-id>"),
+    ("/agent",): _arg_rule(1, "/agent [agent-id-or-name]"),
     ("/undo",): _arg_rule(1, "/undo [sha]"),
     ("/detail",): _arg_rule(1, "/detail [on|off]"),
     ("/model", "reset"): _arg_rule(1, "/model reset"),
@@ -12641,6 +12747,149 @@ def _cmd_hire(parts: list, session: dict) -> bool:
     return False
 
 
+def _resolve_agent_id_or_name(token: str):
+    """Resolve an Agent by exact ID or case-insensitive name match.
+
+    Returns the matching AgentInfo, or None.  Raises ValueError on
+    ambiguous name matches so the caller can surface a clear message.
+    """
+    if not token:
+        return None
+    agents = get_all_agents()
+    exact = next((a for a in agents if a.id == token), None)
+    if exact is not None:
+        return exact
+    token_lower = token.lower()
+    name_matches = [a for a in agents
+                    if (a.name or "").lower() == token_lower]
+    if len(name_matches) == 1:
+        return name_matches[0]
+    if len(name_matches) > 1:
+        raise ValueError(
+            f"Multiple agents match name '{token}': "
+            + ", ".join(a.id for a in name_matches))
+    return None
+
+
+def _bind_current_agent_runtime(prepared_state: dict, chat_history: list,
+                                interactive_session, agent_state: dict) -> dict:
+    """Persist one REPL turn on whichever Agent ``/agent`` selected.
+
+    Primary keeps its long-lived state dict identity because Agents Mode and
+    Helpwo share that exact object. Other Agents receive the prepared state as
+    their new authoritative state. Both paths retain history and PTY/session
+    ownership so switching away and back cannot lose conversation progress.
+    """
+    runtime_agent = get_current_agent()
+    if runtime_agent is None:
+        return prepared_state
+    if runtime_agent.role == "primary":
+        agent_state.clear()
+        agent_state.update(prepared_state)
+        bound_state = agent_state
+    else:
+        bound_state = prepared_state
+    runtime_agent.state = bound_state
+    runtime_agent.chat_history = chat_history
+    runtime_agent.runtime_session = interactive_session
+    return bound_state
+
+
+def _cmd_agent(parts: list, session: dict, interactive_session) -> bool:
+    """``/agent [agent-id-or-name]`` - switch the REPL's current Agent focus.
+
+    No argument lists the current Agent and every other switchable Agent.
+    With an argument, switches the registry's current-agent pointer and
+    rebinds the REPL's local ``agent_state`` / ``chat_history`` /
+    ``interactive_session`` to the target Agent's existing objects - no
+    deployment is reissued and no terminal ownership changes.
+    """
+    args = parts[1:] if len(parts) > 1 else []
+    current = get_current_agent()
+
+    if not args:
+        agents = get_all_agents()
+        if not agents:
+            console.print("[dim]No agents registered.[/dim]")
+            return False
+        if current is not None:
+            cur_label = (f"{current.name} ({current.id})"
+                         if current.name and current.name != current.id
+                         else current.id)
+            console.print(f"[accent]Current agent:[/accent] [bold]{cur_label}[/bold]")
+        else:
+            console.print("[dim]No current agent.[/dim]")
+        console.print("[accent]Switchable agents:[/accent]")
+        any_other = False
+        for a in agents:
+            if current is not None and a.id == current.id:
+                continue
+            any_other = True
+            label = (f"{a.name} ({a.id})"
+                     if a.name and a.name != a.id
+                     else a.id)
+            role = getattr(a, "role", "") or ""
+            term = (getattr(a, "stationed_terminal", None)
+                    or getattr(a, "deployment_terminal", None)
+                    or "")
+            suffix = f" [dim]role={role}" + (f", term={term}" if term else "") + "[/dim]"
+            console.print(f"  [cyan]/agent {a.id}[/cyan]  {label}{suffix}")
+        if not any_other:
+            console.print("  [dim](no other agents)[/dim]")
+        console.print(
+            "[dim]Use /agent <id-or-name> to switch. Use /agents for the "
+            "full-screen view.[/dim]")
+        return False
+
+    target = args[0]
+    try:
+        agent = _resolve_agent_id_or_name(target)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        return False
+    if agent is None:
+        console.print(f"[red]No agent matches '{target}'.[/red]")
+        agents = get_all_agents()
+        if agents:
+            console.print(
+                "[dim]Available: "
+                + ", ".join(a.id for a in agents) + "[/dim]")
+        return False
+    if current is not None and agent.id == current.id:
+        label = (f"{agent.name} ({agent.id})"
+                 if agent.name and agent.name != agent.id
+                 else agent.id)
+        console.print(f"[dim]Already focused on {label}.[/dim]")
+        return False
+    if not switch_to_agent(agent.id):
+        console.print(f"[red]Could not switch to agent '{agent.id}'.[/red]")
+        return False
+
+    # Rebind the REPL's runtime locals via handle_meta_command attributes.
+    # The main loop picks these up right after handle_meta_command() returns.
+    handle_meta_command._last_agent_state = agent.state
+    handle_meta_command._last_chat_history = agent.chat_history
+    handle_meta_command._last_existing_session = agent.runtime_session
+    handle_meta_command._agent_switch_performed = True
+    label = (f"{agent.name} ({agent.id})"
+             if agent.name and agent.name != agent.id
+             else agent.id)
+    console.print(f"[green]Switched to agent {label}.[/green]")
+    role = getattr(agent, "role", "") or ""
+    term = (getattr(agent, "stationed_terminal", None)
+            or getattr(agent, "deployment_terminal", None)
+            or "")
+    if term:
+        console.print(
+            f"[dim]Terminal ownership unchanged. This agent is stationed at "
+            f"'{term}' (role={role}).[/dim]")
+    else:
+        console.print(
+            f"[dim]Terminal ownership unchanged. This agent is undeployed "
+            f"(role={role}); direct commands still run in term0.[/dim]")
+    return False
+
+
 def _cmd_agents_plain(parts: list) -> None:
     if len(parts) == 1:
         agents = get_all_agents()
@@ -14362,6 +14611,9 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
 
     elif action == "/hire":
         return _cmd_hire(parts, session)
+
+    elif action == "/agent":
+        return _cmd_agent(parts, session, interactive_session)
 
     elif action == "/agents":
         agents_session = _cmd_agents(
@@ -16342,6 +16594,17 @@ def main():
             interactive_session = getattr(
                 handle_meta_command, '_last_existing_session',
                 interactive_session)
+            # /agent <id-or-name> switches the REPL's current Agent focus
+            # without redeploying. Rebind the local state/history references
+            # to the target Agent's existing objects so the next user turn
+            # drives that Agent's conversation. Terminal ownership is
+            # untouched: direct commands still route through term0.
+            if getattr(handle_meta_command, '_agent_switch_performed', False):
+                agent_state = handle_meta_command._last_agent_state
+                chat_history = handle_meta_command._last_chat_history
+                handle_meta_command._agent_switch_performed = False
+                if args.depth == 0:
+                    save_resume_state(agent_state, chat_history, _session_start_cwd)
             if should_exit:
                 # /q already finalized this logical session as a checkpoint.
                 # Writing a generic autosave here used to create a duplicate
@@ -16364,23 +16627,31 @@ def main():
                 injected_done.set()
             continue
 
-        # Primary has one authoritative execution regardless of which view
-        # started it. If Agents Mode or Helpwo already owns the run, outer
-        # REPL input becomes supplementary input for that exact task instead
-        # of starting a second loop against shared state/history.
-        _shared_primary = get_current_agent()
-        if (_shared_primary is not None
-                and _shared_primary.role == "primary"
-                and _shared_primary.status in {
+        # A selected Agent has one authoritative execution regardless of which
+        # view started it. Route input into that run instead of starting a
+        # second loop against the same state/history.
+        _shared_agent = get_current_agent()
+        if (_shared_agent is not None
+                and _shared_agent.status in {
                     "queued", "running", "thinking", "waiting"}):
-            _queued, _queue_detail = queue_primary_message(
-                _shared_primary.id, user_input)
+            if _shared_agent.role == "primary":
+                _queued, _queue_detail = queue_primary_message(
+                    _shared_agent.id, user_input)
+            else:
+                try:
+                    _shared_agent.message_queue.put_nowait(user_input)
+                    _queued = True
+                    _queue_detail = (
+                        f"Queued for {_shared_agent.name or _shared_agent.id}.")
+                except queue.Full:
+                    _queued = False
+                    _queue_detail = "Agent instruction queue is full."
             console.print(
                 f"[dim]{_queue_detail if _queued else 'Could not queue input.'}[/dim]")
             if _queued:
                 agent_ui_events.hub.emit(
-                    "user_message", agent_id=_shared_primary.id,
-                    terminal_name=agent_scope_terminal(_shared_primary),
+                    "user_message", agent_id=_shared_agent.id,
+                    terminal_name=agent_scope_terminal(_shared_agent),
                     summary=user_input, detail=user_input, status="queued")
             if injected_done is not None:
                 injected_done.set()
@@ -16458,15 +16729,9 @@ def main():
                 chat_history.append({"role": "assistant", "content": response["msg"]})
             # ── Cross-interaction state preservation ──
             _prepared_state = prepare_state_for_repl(response.get("state", {}))
-            _runtime_agent = get_current_agent()
-            if _runtime_agent is not None and _runtime_agent.role == "primary":
-                agent_state.clear()
-                agent_state.update(_prepared_state)
-                _runtime_agent.state = agent_state
-                _runtime_agent.chat_history = chat_history
-                _runtime_agent.runtime_session = interactive_session
-            else:
-                agent_state = _prepared_state
+            agent_state = _bind_current_agent_runtime(
+                _prepared_state, chat_history, interactive_session,
+                agent_state)
             handle_meta_command._last_agent_state = agent_state
             handle_meta_command._last_chat_history = chat_history
             handle_meta_command._last_original_input = user_input
@@ -16755,15 +17020,8 @@ def main():
         # Preserve recent context across REPL interactions so the model
         # doesn't lose track of what it was doing.
         _prepared_state = prepare_state_for_repl(response.get("state", {}))
-        _runtime_agent = get_current_agent()
-        if _runtime_agent is not None and _runtime_agent.role == "primary":
-            agent_state.clear()
-            agent_state.update(_prepared_state)
-            _runtime_agent.state = agent_state
-            _runtime_agent.chat_history = chat_history
-            _runtime_agent.runtime_session = interactive_session
-        else:
-            agent_state = _prepared_state
+        agent_state = _bind_current_agent_runtime(
+            _prepared_state, chat_history, interactive_session, agent_state)
         if not _system_input:
             # `/continue` mutates these exact objects; keep the references
             # aligned with the state carried by the main REPL.

@@ -75,7 +75,12 @@ class SlashRegistryTests(unittest.TestCase):
         self.assertIn("/clear", laintas_cli._NEW_SESSION_COMMANDS)
         palette_descriptions = dict(laintas_cli._COMMANDS)
         self.assertIn("/station <agent-id>", palette_descriptions["/station"])
-        self.assertNotIn("/agent", palette_descriptions)
+        # /agent (singular) is a distinct command from /agents (plural):
+        # the singular form switches the REPL's current Agent focus
+        # without redeploying, while the plural opens the full-screen view.
+        self.assertIn("/agent", palette_descriptions)
+        self.assertIn("/agents", palette_descriptions)
+        self.assertIn("agent-id-or-name", palette_descriptions["/agent"])
 
     def test_exact_slash_command_keeps_a_visible_completion(self):
         completions = self._complete("/task")
@@ -1008,6 +1013,238 @@ class SlashRegistryTests(unittest.TestCase):
             laintas_cli.handle_meta_command(
                 "/send term1 rm file.txt", _Registry(), {})
         session.send_keys.assert_not_called()
+
+
+class AgentCommandTests(unittest.TestCase):
+    """Tests for `/agent [agent-id-or-name]` (singular)."""
+
+    def setUp(self):
+        agent_loop.close_all_agents()
+        agent_loop.close_all_terminals()
+        # Always have a primary registered, mirroring the real REPL.
+        self.primary = agent_loop.register_agent(name="primary", role="primary")
+        agent_loop.set_current_agent_id("primary")
+        self._old_switch_flag = getattr(
+            laintas_cli.handle_meta_command, "_agent_switch_performed", False)
+        self._old_last_state = getattr(
+            laintas_cli.handle_meta_command, "_last_agent_state", None)
+        self._old_last_history = getattr(
+            laintas_cli.handle_meta_command, "_last_chat_history", None)
+        self._old_last_session = getattr(
+            laintas_cli.handle_meta_command, "_last_existing_session", None)
+
+    def tearDown(self):
+        if not self._old_switch_flag:
+            try:
+                del laintas_cli.handle_meta_command._agent_switch_performed
+            except AttributeError:
+                pass
+        else:
+            laintas_cli.handle_meta_command._agent_switch_performed = (
+                self._old_switch_flag)
+        laintas_cli.handle_meta_command._last_agent_state = (
+            self._old_last_state)
+        laintas_cli.handle_meta_command._last_chat_history = (
+            self._old_last_history)
+        laintas_cli.handle_meta_command._last_existing_session = (
+            self._old_last_session)
+        agent_loop.close_all_agents()
+        agent_loop.close_all_terminals()
+
+    def _capture_console(self):
+        output = io.StringIO()
+        old = laintas_cli.console
+        laintas_cli.console = Console(file=output, force_terminal=False)
+        return output, old
+
+    def test_agent_command_spec_registered(self):
+        spec = laintas_cli._find_command_spec("/agent")
+        self.assertIsNotNone(spec)
+        self.assertEqual(spec.name, "/agent")
+        self.assertIn("Agents & Terminals", spec.group)
+
+    def test_agent_arg_rule_rejects_extra_args(self):
+        with self.assertRaises(laintas_cli.SlashCommandUsageError):
+            laintas_cli._validate_slash_args("/agent", ["a", "b", "c"])
+
+    def test_agent_with_no_argument_lists_current_and_choices(self):
+        alice = agent_loop.register_agent(name="alice", role="pool")
+        bob = agent_loop.register_agent(name="bob", role="deployed")
+        output, old = self._capture_console()
+        try:
+            laintas_cli._cmd_agent(["/agent"], {}, None)
+        finally:
+            laintas_cli.console = old
+        text = output.getvalue()
+        self.assertIn("Current agent:", text)
+        self.assertIn("primary", text)
+        self.assertIn(alice.id, text)
+        self.assertIn(bob.id, text)
+        self.assertIn("Switchable agents:", text)
+
+    def test_agent_with_no_argument_notes_no_other_agents(self):
+        output, old = self._capture_console()
+        try:
+            laintas_cli._cmd_agent(["/agent"], {}, None)
+        finally:
+            laintas_cli.console = old
+        self.assertIn("no other agents", output.getvalue())
+
+    def test_agent_switches_by_id_and_stashes_repl_bindings(self):
+        alice = agent_loop.register_agent(name="alice", role="deployed")
+        alice.state = {"shortTermMemory": "alice-mem", "lastReply": "",
+                       "lastOutput": ""}
+        alice.chat_history = [{"role": "user", "content": "alice hi"}]
+        alice.runtime_session = object()
+        output, old = self._capture_console()
+        try:
+            result = laintas_cli._cmd_agent(
+                ["/agent", alice.id], {}, None)
+        finally:
+            laintas_cli.console = old
+        self.assertFalse(result)
+        self.assertEqual(agent_loop.get_current_agent().id, alice.id)
+        self.assertTrue(
+            laintas_cli.handle_meta_command._agent_switch_performed)
+        self.assertIs(
+            laintas_cli.handle_meta_command._last_agent_state,
+            alice.state)
+        self.assertIs(
+            laintas_cli.handle_meta_command._last_chat_history,
+            alice.chat_history)
+        self.assertIs(
+            laintas_cli.handle_meta_command._last_existing_session,
+            alice.runtime_session)
+        self.assertIn("Switched to agent", output.getvalue())
+
+    def test_agent_switches_by_name_case_insensitive(self):
+        alice = agent_loop.register_agent(name="Alice", role="pool")
+        output, old = self._capture_console()
+        try:
+            laintas_cli._cmd_agent(["/agent", "ALICE"], {}, None)
+        finally:
+            laintas_cli.console = old
+        self.assertEqual(agent_loop.get_current_agent().id, alice.id)
+        self.assertTrue(
+            laintas_cli.handle_meta_command._agent_switch_performed)
+
+    def test_agent_rejects_unknown_target(self):
+        output, old = self._capture_console()
+        try:
+            laintas_cli._cmd_agent(
+                ["/agent", "nonexistent"], {}, None)
+        finally:
+            laintas_cli.console = old
+        self.assertEqual(agent_loop.get_current_agent().id, "primary")
+        self.assertFalse(getattr(
+            laintas_cli.handle_meta_command, "_agent_switch_performed",
+            False))
+        self.assertIn("No agent matches", output.getvalue())
+
+    def test_agent_rejects_ambiguous_name(self):
+        # Two agents with different ids but the same display name -> ambiguous.
+        a1 = agent_loop.register_agent(role="pool")
+        a1.name = "dup"
+        a2 = agent_loop.register_agent(role="pool")
+        a2.name = "dup"
+        output, old = self._capture_console()
+        try:
+            laintas_cli._cmd_agent(["/agent", "dup"], {}, None)
+        finally:
+            laintas_cli.console = old
+        self.assertEqual(agent_loop.get_current_agent().id, "primary")
+        self.assertIn("Multiple agents match", output.getvalue())
+
+    def test_agent_same_as_current_is_noop(self):
+        output, old = self._capture_console()
+        try:
+            laintas_cli._cmd_agent(["/agent", "primary"], {}, None)
+        finally:
+            laintas_cli.console = old
+        self.assertEqual(agent_loop.get_current_agent().id, "primary")
+        self.assertFalse(getattr(
+            laintas_cli.handle_meta_command, "_agent_switch_performed",
+            False))
+        self.assertIn("Already focused", output.getvalue())
+
+    def test_agent_dispatch_invokes_cmd_agent(self):
+        alice = agent_loop.register_agent(name="alice", role="pool")
+        with mock.patch.object(
+                laintas_cli, "_cmd_agent",
+                return_value=False) as handler:
+            laintas_cli.handle_meta_command(
+                "/agent alice", _Registry(), {})
+        handler.assert_called_once()
+        self.assertEqual(handler.call_args.args[0], ["/agent", "alice"])
+
+    def test_agent_completion_includes_all_agents_and_name_aliases(self):
+        alice = agent_loop.register_agent(name="alice", role="pool")
+        bob = agent_loop.register_agent(name="bob", role="deployed")
+        from prompt_toolkit.completion import CompleteEvent
+        from prompt_toolkit.document import Document
+        completer = laintas_cli.MetaCompleter()
+        doc = Document("/agent ", len("/agent "))
+        completions = list(completer.get_completions(doc, CompleteEvent()))
+        values = {c.text for c in completions}
+        self.assertIn("primary", values)
+        self.assertIn(alice.id, values)
+        self.assertIn(bob.id, values)
+        # Name aliases appear when distinct from id.
+        self.assertIn("alice", values)
+        self.assertIn("bob", values)
+
+    def test_agent_completion_prefix_filters(self):
+        agent_loop.register_agent(name="alfred", role="pool")
+        agent_loop.register_agent(name="beatrice", role="pool")
+        from prompt_toolkit.completion import CompleteEvent
+        from prompt_toolkit.document import Document
+        completer = laintas_cli.MetaCompleter()
+        doc = Document("/agent al", len("/agent al"))
+        completions = list(completer.get_completions(doc, CompleteEvent()))
+        values = {c.text for c in completions}
+        # Should include alfred-id and "alfred" name alias; exclude beatrice.
+        self.assertTrue(any("alfred" in v for v in values))
+        self.assertFalse(any("beatrice" in v for v in values))
+
+    def test_agent_does_not_move_terminals_or_redeploy(self):
+        terminal_session = mock.Mock()
+        terminal_session.is_alive.return_value = True
+        agent_loop.register_terminal(
+            terminal_session, "/bin/sh", 0, name="term0")
+        alice = agent_loop.register_agent(name="alice", role="deployed")
+        alice.stationed_terminal = "term0"
+        alice.deployment_terminal = "term0"
+        alice.home_terminal = "term0"
+        with mock.patch.object(
+                agent_loop, "station_agent") as station:
+            output, old = self._capture_console()
+            try:
+                laintas_cli._cmd_agent(
+                    ["/agent", alice.id], {}, None)
+            finally:
+                laintas_cli.console = old
+        # station_agent must never be called by /agent.
+        station.assert_not_called()
+        # Terminal ownership fields are unchanged.
+        self.assertEqual(alice.stationed_terminal, "term0")
+        self.assertEqual(alice.deployment_terminal, "term0")
+        self.assertIn("Terminal ownership unchanged", output.getvalue())
+
+    def test_selected_non_primary_keeps_updated_runtime_when_switching(self):
+        alice = agent_loop.register_agent(name="alice", role="pool")
+        agent_loop.set_current_agent_id(alice.id)
+        previous = alice.state
+        history = [{"role": "user", "content": "keep this"}]
+        runtime_session = object()
+        prepared = {"shortTermMemory": "updated", "lastReply": "done"}
+
+        bound = laintas_cli._bind_current_agent_runtime(
+            prepared, history, runtime_session, previous)
+
+        self.assertIs(bound, prepared)
+        self.assertIs(alice.state, prepared)
+        self.assertIs(alice.chat_history, history)
+        self.assertIs(alice.runtime_session, runtime_session)
 
 
 class ConfigAndMemoryTests(unittest.TestCase):

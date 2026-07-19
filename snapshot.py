@@ -94,6 +94,17 @@ def create(cwd: str, label: str = "") -> Optional[dict]:
     root = repo_root(cwd)
     if not root:
         return None
+    # A stray ~/.git is surprisingly common on development machines. Treating
+    # the entire home directory as one repository makes `git add -A` traverse
+    # caches, credentials, package stores and every nested checkout before the
+    # first model request. Besides the severe REPL delay, that is far broader
+    # than an automatic undo checkpoint should ever be. Explicit project repos
+    # below the home directory continue to work normally.
+    try:
+        if os.path.realpath(root) == os.path.realpath(os.path.expanduser("~")):
+            return None
+    except OSError:
+        pass
     # A throwaway index path that does NOT yet exist — git creates a fresh, valid
     # index there (an empty pre-created file is rejected as a corrupt index).
     fd, idx_path = tempfile.mkstemp(prefix="laintas_snap_", suffix=".idx")

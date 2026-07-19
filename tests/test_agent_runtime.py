@@ -1430,5 +1430,65 @@ class TerminalTriggerTests(unittest.TestCase):
         self.assertEqual(event["line"], "last-line: READY")
 
 
+class LazySnapshotTests(unittest.TestCase):
+    def setUp(self):
+        agent_loop.reset_runtime_config()
+        agent_loop.set_runtime_config("auto_snapshot", True)
+        agent_loop.set_runtime_config("loop_delay", 0)
+        agent_loop.set_runtime_config("use_message_thread", False)
+
+    def tearDown(self):
+        agent_loop.reset_runtime_config()
+
+    def test_conversation_does_not_snapshot_before_thinking(self):
+        deps = _deps({
+            "reply": "hello", "tool_calls": [], "finish_reason": "stop",
+            "done": True, "error": False,
+        })
+        with tempfile.TemporaryDirectory() as tmp, _chdir(tmp), \
+                mock.patch("snapshot.create") as create:
+            Path(".laintas").mkdir()
+            result = agent_loop.run_agent_loop(
+                deps, "hello", {}, {}, [], events_cb=lambda _events: None,
+                max_loops_override=1)
+
+        create.assert_not_called()
+        self.assertEqual(result["msg"], "hello")
+
+    def test_snapshot_is_deferred_until_before_mutating_tool(self):
+        responses = iter([
+            {
+                "reply": "writing",
+                "tool_calls": [{
+                    "name": "fs.write",
+                    "arguments": {"path": "result.txt", "content": "ok"},
+                }],
+                "finish_reason": "tool_calls", "done": False, "error": False,
+            },
+            {
+                "reply": "done", "tool_calls": [], "finish_reason": "stop",
+                "done": True, "error": False,
+            },
+        ])
+        deps = _deps()
+        deps.call_backend = lambda **_kwargs: next(responses)
+        order = []
+
+        with tempfile.TemporaryDirectory() as tmp, _chdir(tmp), \
+                mock.patch("snapshot.create", side_effect=lambda *_a: (
+                    order.append("snapshot") or {"sha": "abc"})) as create, \
+                mock.patch.object(
+                    tools.get_registry(), "invoke",
+                    side_effect=lambda *_a, **_kw: (
+                        order.append("write") or {"ok": True, "result": "ok"})):
+            Path(".laintas").mkdir()
+            agent_loop.run_agent_loop(
+                deps, "write it", {}, {}, [], events_cb=lambda _events: None,
+                max_loops_override=2)
+
+        create.assert_called_once()
+        self.assertEqual(order[:2], ["snapshot", "write"])
+
+
 if __name__ == "__main__":
     unittest.main()

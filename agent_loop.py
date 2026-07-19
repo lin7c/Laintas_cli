@@ -104,7 +104,7 @@ _DEFAULT_CONFIG = {
     "use_unified_catalog": True,    # emit shared agent_tools canonical tool names (fs.read->read) to the model — unified taxonomy is the default; set False to fall back to legacy dotted names
     "model_context_window": 64000,  # model's context window (tokens) used to budget thread compaction (prune + summarize)
     "auto_format": True,            # run the best-available code formatter in place after a full-file write (no-op if none installed); surgical edits stay byte-precise
-    "auto_snapshot": True,          # at the start of each top-level task, git-checkpoint the working tree so the session can be undone with /undo (no-op outside a git repo)
+    "auto_snapshot": True,          # lazily checkpoint before the first workspace-mutating tool call in a top-level task (no-op outside a git repo)
     "browser_action_delay_min": 0.3,   # min seconds of anti-bot delay before browser actions
     "browser_action_delay_max": 1.5,   # max seconds of anti-bot delay before browser actions
     "browser_post_action_wait": 0.5,   # seconds to wait for SPA DOM updates before auto-snapshot
@@ -5134,14 +5134,6 @@ def run_agent_loop(
     # unrelated question. Follow-ups keep a short tail for continuity. depth==0
     # only — sub-agents get a purpose-built initial state, nothing to inherit.
     if depth == 0:
-        # Snapshot the working tree at task start so the session's edits can be
-        # reverted with /undo (git-backed, non-destructive; no-op outside a repo).
-        if get_runtime_config("auto_snapshot") and not state.get("_snapshot_done"):
-            try:
-                import snapshot as _snap
-                if _snap.create(os.getcwd(), f"task: {(original_input or '').strip()[:60]}"):
-                    state["_snapshot_done"] = True
-            except Exception as _e: _diag("snapshot_create_failed", error=str(_e))
         if state.get("terminalHistory"):
             state["terminalHistory"] = _trim_carried_outputs(state["terminalHistory"])
         # Completion-hook satisfaction belongs to one top-level task. A later
@@ -5208,6 +5200,11 @@ def run_agent_loop(
     _session_id = str(state.get("_session_id") or "")
     reply = ""
     interactive_session = existing_session  # InteractiveSession | SubTerminalSession | None
+    # Creating a checkpoint can require walking and hashing a large repository.
+    # Defer it until the model actually asks to mutate the workspace so ordinary
+    # conversation reaches the Thinking UI immediately and read-only tasks do
+    # not pay the checkpoint cost at all.
+    _snapshot_attempted = bool(state.get("_snapshot_done"))
 
     # In execute/non-interactive mode, suppress Rich console output.
     # Child laintas terminals capture PTY output; Rich markup pollutes it.
@@ -6161,6 +6158,34 @@ def run_agent_loop(
                 f"\n  ⚠ Emitted {_truncated_n} tool calls; only first {MAX_TC_PER_TURN} ran. "
                 f"Be more selective next turn."
             ))
+
+        if (depth == 0 and tool_calls and not _snapshot_attempted
+                and get_runtime_config("auto_snapshot")):
+            _snapshot_attempted = True
+            _needs_snapshot = False
+            for _pending_call in tool_calls:
+                _pending_tool = tools_mod.get_registry().get(
+                    str(_pending_call.get("name") or ""))
+                _pending_caps = set(
+                    getattr(_pending_tool, "capabilities", ()) or ())
+                if _pending_caps.intersection({"fs.write", "process.exec"}):
+                    _needs_snapshot = True
+                    break
+            if _needs_snapshot:
+                try:
+                    import snapshot as _snap
+                    _label = f"task: {(original_input or '').strip()[:60]}"
+                    if events_cb is not None:
+                        with deps.console.status(
+                                "[dim]Creating undo checkpoint…[/dim]",
+                                spinner="dots"):
+                            _created_snapshot = _snap.create(os.getcwd(), _label)
+                    else:
+                        _created_snapshot = _snap.create(os.getcwd(), _label)
+                    if _created_snapshot:
+                        state["_snapshot_done"] = True
+                except Exception as _e:
+                    _diag("snapshot_create_failed", error=str(_e))
 
         formatted_outputs: list[str] = []
         per_call_rows: list[dict] = []

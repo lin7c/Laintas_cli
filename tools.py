@@ -3736,10 +3736,14 @@ def recover_stuck_shell(session: Any, probe_timeout: float = 2.0) -> bool:
     """
     import uuid
     try:
-        try:
-            old_len = len(session.raw_output)
-        except AttributeError:
-            old_len = len(getattr(session, "full_output", ""))
+        _output_total = getattr(session, "output_total", None)
+        if isinstance(_output_total, int):
+            old_len = _output_total
+        else:
+            try:
+                old_len = len(session.raw_output)
+            except AttributeError:
+                old_len = len(getattr(session, "full_output", ""))
         master_fd = int(getattr(session, "master_fd", -1))
         shell_pid = int(getattr(session, "pid", -1))
         foreground_pgid = -1
@@ -3796,12 +3800,18 @@ def recover_stuck_shell(session: Any, probe_timeout: float = 2.0) -> bool:
         while time.monotonic() < deadline:
             try:
                 session.read_output(timeout=0.1)
-                raw = getattr(session, "raw_output", None)
-                if raw is None:
-                    raw = getattr(session, "full_output", "")
+                output_from_fn = getattr(session, "output_from", None)
+                if (isinstance(_output_total, int)
+                        and callable(output_from_fn)):
+                    tail = output_from_fn(old_len)
+                else:
+                    raw = getattr(session, "raw_output", None)
+                    if raw is None:
+                        raw = getattr(session, "full_output", "")
+                    tail = raw[old_len:]
             except Exception:
-                raw = ""
-            if expected in raw[old_len:]:
+                tail = ""
+            if expected in tail:
                 try:
                     session._laintas_shell_dirty = False
                 except Exception:
@@ -3921,7 +3931,11 @@ def _exec_in_deployed_shell(command: str, session: Any, timeout: int,
             lock.acquire()
             entered = True
         try:
-            old_len = len(session.raw_output)
+            _output_total = getattr(session, "output_total", None)
+            if isinstance(_output_total, int):
+                old_len = _output_total
+            else:
+                old_len = len(session.raw_output)
         except AttributeError:
             old_len = len(getattr(session, "full_output", ""))
         if getattr(session, "_laintas_shell_dirty", None) is True:
@@ -3950,10 +3964,17 @@ def _exec_in_deployed_shell(command: str, session: Any, timeout: int,
                         "returncode": -1, "via": via}
             try:
                 session.read_output(timeout=0.1)
-                raw = getattr(session, "raw_output", None)
-                if raw is None:
-                    raw = getattr(session, "full_output", "")
-                new_content = raw[old_len:] if old_len else raw
+                output_from_fn = getattr(session, "output_from", None)
+                if (isinstance(_output_total, int)
+                        and callable(output_from_fn)):
+                    new_content = (
+                        output_from_fn(old_len) if old_len
+                        else output_from_fn(0))
+                else:
+                    raw = getattr(session, "raw_output", None)
+                    if raw is None:
+                        raw = getattr(session, "full_output", "")
+                    new_content = raw[old_len:] if old_len else raw
             except Exception:
                 new_content = ""
 
