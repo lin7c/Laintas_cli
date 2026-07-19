@@ -29,6 +29,17 @@ _CHUNK = 16 * 1024            # per binary message (safe under SCTP message size
 _MAX_FILE_BYTES = 5 * 1024 * 1024
 _MAX_HTTP_BYTES = 20 * 1024 * 1024   # per tunneled HTTP response (dev bundles can be big)
 
+# Whitelist of commands allowed via the exec RPC. The browser RemoteProvider
+# uses these for directory listing + metadata; arbitrary shell is NOT allowed
+# over the P2P channel (use the agent loop's command execution instead, which
+# goes through policy.py approval).
+_EXEC_WHITELIST = frozenset({
+    "ls", "dir", "find", "mkdir", "rmdir", "mv", "cp", "rm", "stat",
+    "cat", "head", "tail", "wc", "du", "df", "file", "pwd", "echo",
+    "touch", "chmod", "chown", "ln", "readlink", "realpath", "basename",
+    "dirname", "tree", "exa", "bat",
+})
+
 try:
     from aiortc import (
         RTCPeerConnection, RTCSessionDescription, RTCConfiguration, RTCIceServer,
@@ -77,6 +88,70 @@ def _bind_ports_in_range(loop, lo: int, hi: int) -> None:
         return await orig(factory, local_addr=local_addr, **kw)
 
     loop.create_datagram_endpoint = patched
+
+
+def _is_path_allowed(path: str) -> bool:
+    """Check if `path` is within any of the policy's allowedRoots.
+
+    Prevents the WebRTC channel from reading/writing arbitrary files
+    (e.g. ~/.ssh/id_rsa, /etc/shadow) even if the connected browser is
+    compromised.
+    """
+    if not path:
+        return False
+    try:
+        import policy
+        cfg = policy._load_config()
+        roots = cfg.get("allowedRoots", [])
+    except Exception:
+        roots = []
+    if not roots:
+        # No allowedRoots configured - deny by default for safety.
+        return False
+    try:
+        resolved = os.path.realpath(path)
+    except OSError:
+        return False
+    for root in roots:
+        try:
+            root_resolved = os.path.realpath(root)
+        except OSError:
+            continue
+        if resolved == root_resolved or resolved.startswith(root_resolved + os.sep):
+            return True
+    return False
+
+
+def _validate_exec_cmd(cmd: str) -> str | None:
+    """Return an error message if `cmd` is not allowed, None if it is.
+
+    Only commands in _EXEC_WHITELIST are permitted, with simple arguments.
+    No shell metacharacters (|, ;, &, >, <, `, $(), etc.) are allowed to
+    prevent command chaining/injection.
+    """
+    if not cmd or not cmd.strip():
+        return "empty command"
+    # Reject shell metacharacters that enable chaining/injection.
+    dangerous = set("|;&`$()<>\n\r")
+    if any(c in cmd for c in dangerous):
+        return "shell metacharacters not allowed"
+    import shlex
+    try:
+        parts = shlex.split(cmd)
+    except ValueError:
+        return "malformed command"
+    if not parts:
+        return "empty command"
+    # Resolve the binary name (handle leading env assignments like FOO=bar cmd).
+    bin_idx = 0
+    while bin_idx < len(parts) and "=" in parts[bin_idx] and not os.path.isfile(parts[bin_idx]):
+        bin_idx += 1
+    if bin_idx >= len(parts):
+        return "no command found"
+    binary = os.path.basename(parts[bin_idx])
+    if binary not in _EXEC_WHITELIST:
+        return f"command '{binary}' not in whitelist"
+    return None
 
 
 class WebrtcManager:
@@ -213,6 +288,11 @@ class WebrtcManager:
     async def _serve_exec(self, channel, msg: dict):
         rid = msg.get("id")
         cmd = msg.get("cmd") or ""
+        err = _validate_exec_cmd(cmd)
+        if err:
+            channel.send(json.dumps({"t": "exec-res", "id": rid, "ok": False,
+                                     "code": -1, "out": f"rejected: {err}"}))
+            return
         try:
             proc = await asyncio.create_subprocess_shell(
                 cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
@@ -313,6 +393,10 @@ class WebrtcManager:
             if not path or not os.path.isfile(path):
                 channel.send(json.dumps({"t": "get-head", "id": rid, "ok": False, "error": "not a file"}))
                 return
+            if not _is_path_allowed(path):
+                channel.send(json.dumps({"t": "get-head", "id": rid, "ok": False,
+                                         "error": "path outside allowed roots"}))
+                return
             size = os.path.getsize(path)
             if size > _MAX_FILE_BYTES:
                 channel.send(json.dumps({"t": "get-head", "id": rid, "ok": False,
@@ -342,6 +426,10 @@ class WebrtcManager:
         size = int(msg.get("size") or 0)
         if not path or size < 0 or size > _MAX_FILE_BYTES:
             channel.send(json.dumps({"t": "put-ack", "id": rid, "ok": False, "error": "bad path/size"}))
+            return
+        if not _is_path_allowed(path):
+            channel.send(json.dumps({"t": "put-ack", "id": rid, "ok": False,
+                                     "error": "path outside allowed roots"}))
             return
         try:
             d = os.path.dirname(path)
