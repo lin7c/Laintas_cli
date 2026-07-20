@@ -4656,6 +4656,7 @@ The native function schemas are authoritative for each tool's name, purpose and 
 (General act-first / no-transitional-narration / batching / language rules are in the injected <agent_conduct> block. The rules below are laintas loop-control specifics.)
 - Your reply is OPTIONAL. Leave it empty on ordinary execution steps and just emit the tool call(s). Write user-facing text ONLY when: (a) you are giving the final answer/result, (b) you must ask the user a clarifying question, or (c) a non-obvious decision needs a one-line rationale. When you do write, cite files as path:line.
 - Completion is an explicit act: call `task_complete` with a `summary` when — and only when — the task is fully finished. Do NOT stop just to narrate progress; if more work remains, include the next tool call in the SAME turn and keep going.
+- Before calling `task_complete` on a task that modified code files, run the project's test suite (pytest, npm test, go test, etc.) to verify your changes. If tests fail, fix them before completing. If tests are not applicable, state why in the summary.
 - If you have nothing concrete to run this turn but the task is NOT finished (still reasoning or planning), call `task_continue` so the loop keeps going. Never end mid-task with no tool call.
 - Ending your turn with no tool call is only for asking the user something or handing back a final answer. It does not by itself mean the task is done.
 </output_rules>
@@ -4666,8 +4667,20 @@ The native function schemas are authoritative for each tool's name, purpose and 
 </terminal_output_style>
 
 <safety>
-Do not bypass policy.py decisions. Do not invent paths, APIs, files, or results. Claims about monitoring, tests, command success, or measured values must be grounded in returned tool output and an observed completion state; a started background command is not evidence of success. If collection fails, report the failure or rerun it instead of fabricating a plausible report. (General safety — reversibility/blast-radius, destructive-action confirmation, investigate-before-overwrite, no-vulnerabilities — is in the injected <agent_conduct> block.)
+Do not bypass policy.py decisions. Do not invent paths, APIs, files, or results. Claims about monitoring, tests, command success, or measured values must be grounded in returned tool output and an observed completion state; a started background command is not evidence of success. If collection fails, report the failure or rerun it instead of fabricating a plausible report. (General safety - reversibility/blast-radius, destructive-action confirmation, investigate-before-overwrite, no-vulnerabilities - is in the injected <agent_conduct> block.)
 </safety>
+
+<code_review>
+When the task involves reviewing, auditing, or verifying code (yours or others'), work through this checklist systematically before reporting:
+1. Read the full diff or changed files - do not review from memory or summary.
+2. Verify correctness: trace logic paths, check edge cases (empty input, off-by-one, null/None, concurrency).
+3. Check error handling: are failures caught, reported, and recoverable? Are resources released (files, connections, locks)?
+4. Check tests: do existing tests cover the change? Run them. If new behavior is untested, note it.
+5. Check naming, style, and conventions vs. surrounding code.
+6. Check for security issues: injection, path traversal, secret exposure, unsafe deserialization.
+7. Confirm no dead code, debug prints, or commented-out blocks were left behind.
+Report findings as file:line references with severity (blocker/major/minor/nit).
+</code_review>
 {{{{promptOpt}}}}
 """
 
@@ -13878,6 +13891,13 @@ def _cmd_undo(action: str, raw_args: str, parts: list) -> bool:
             console.print("[yellow]Could not snapshot (not a git repository?).[/yellow]")
     else:  # /undo
         sha = parts[1] if len(parts) > 1 else None
+        # Warn if an auto-snapshot is still being created in the background.
+        _repl_state = getattr(handle_meta_command, "_last_agent_state", None)
+        if _repl_state and _repl_state.get("_snapshot_pending") and sha is None:
+            console.print(
+                "[yellow]An auto-snapshot is still being created in the "
+                "background. Wait a moment and try again, or specify a "
+                "sha directly.[/yellow]")
         chosen_checkpoint = None
         if sha is None and sys.stdin.isatty():
             checkpoints = list(reversed(_snap.list_for(cwd)))

@@ -4439,6 +4439,41 @@ def _output_fingerprint(text: str) -> str:
     return fp
 
 
+def _parse_read_range(cmd: str) -> tuple[str, int | None, int | None]:
+    """Parse an fs.read salient arg into (path, start_line, end_line).
+
+    Returns (path, None, None) if the range can't be determined.
+    start/end are 1-indexed line numbers, inclusive. end=None means
+    "read to end of file" (no explicit limit).
+    """
+    if "@" not in cmd:
+        return cmd, 1, None
+    path, _, rest = cmd.rpartition("@")
+    if "+" in rest:
+        offset_str, _, limit_str = rest.partition("+")
+        try:
+            offset = int(offset_str)
+            limit = int(limit_str)
+            return path, offset, offset + limit - 1
+        except ValueError:
+            return path, None, None
+    else:
+        try:
+            offset = int(rest)
+            return path, offset, None
+        except ValueError:
+            return path, None, None
+
+
+def _ranges_overlap(a_start, a_end, b_start, b_end) -> bool:
+    """True if [a_start, a_end] overlaps [b_start, b_end]. None end = infinity."""
+    if a_end is None:
+        a_end = 10 ** 9
+    if b_end is None:
+        b_end = 10 ** 9
+    return a_start <= b_end and b_start <= a_end
+
+
 def _output_similarity(a: str, b: str) -> float:
     """Token-level Jaccard similarity between two fingerprints.
 
@@ -4533,7 +4568,7 @@ def _detect_loop_warnings_typed(state: dict, original_input: str) -> list[tuple[
         cmd = (last_entry.get("command") or "").strip()
         if cmd and (last_tool == "fs.read" or
                     any(cmd.startswith(p) for p in ("cat ", "head ", "tail "))):
-            # Only warn when the earlier read's CONTENT is still in context — then
+            # Only warn when the earlier read's CONTENT is still in context - then
             # "refer to it above" is actionable. If microcompact evicted it (over
             # budget), re-reading is the only option; scolding would be futile, so
             # stay silent. A wiped row has a placeholder output, not real content.
@@ -4548,6 +4583,38 @@ def _detect_loop_warnings_typed(state: dict, original_input: str) -> list[tuple[
                     f"You already have the content of `{cmd}` above (see RETAINED "
                     f"FILE CONTENT / recent steps). Refer to it instead of re-reading."
                 ))
+            elif last_tool == "fs.read":
+                # Range-aware overlap check: warn if the new read overlaps a
+                # previous read of the same file whose content is still live,
+                # even when the salient-arg strings differ (e.g. path@1+200
+                # vs path@50+100). Catches partial re-reads the exact-match
+                # check above would miss.
+                new_path, new_start, new_end = _parse_read_range(cmd)
+                if new_start is not None:
+                    for h in history[:-1][-20:]:
+                        if h.get("tool") != "fs.read":
+                            continue
+                        prev_cmd = (h.get("command") or "").strip()
+                        if not prev_cmd or prev_cmd == cmd:
+                            continue
+                        prev_path, prev_start, prev_end = _parse_read_range(prev_cmd)
+                        if prev_path != new_path or prev_start is None:
+                            continue
+                        out = h.get("output")
+                        if not isinstance(out, str) or out.startswith(
+                                ("(output cleared", "(superseded")):
+                            continue
+                        if _ranges_overlap(new_start, new_end,
+                                           prev_start, prev_end):
+                            prev_range = f"{prev_start}-{prev_end or 'end'}"
+                            new_range = f"{new_start}-{new_end or 'end'}"
+                            warnings.append(("context_amnesia",
+                                f"You already read `{new_path}` lines {prev_range} "
+                                f"above (see RETAINED FILE CONTENT). Your current "
+                                f"read ({new_range}) overlaps - refer to the existing "
+                                f"content instead of re-reading."
+                            ))
+                            break
 
     # 5. Near-repeat commands: fuzzy fingerprint matching
     # Mirrors community "grounded" tool hash window: if the last 4 commands
@@ -6513,15 +6580,27 @@ def run_agent_loop(
                 try:
                     import snapshot as _snap
                     _label = f"task: {(original_input or '').strip()[:60]}"
+                    _snap_cwd = os.getcwd()
+                    # Fire the snapshot on a daemon thread so the agent loop
+                    # isn't blocked by `git add -A` on large repos. The
+                    # checkpoint lands in the git object store and becomes
+                    # available via /undo once the thread finishes. Set
+                    # _snapshot_done optimistically so we don't retry.
+                    state["_snapshot_done"] = True
+                    state["_snapshot_pending"] = True
+                    def _async_snap():
+                        try:
+                            _created = _snap.create(_snap_cwd, _label)
+                            if _created:
+                                state["_snapshot_sha"] = _created.get("sha")
+                        except Exception as _e:
+                            _diag("snapshot_create_failed", error=str(_e))
+                        finally:
+                            state["_snapshot_pending"] = False
+                    threading.Thread(target=_async_snap, daemon=True).start()
                     if events_cb is not None:
-                        with deps.console.status(
-                                "[dim]Creating undo checkpoint…[/dim]",
-                                spinner="dots"):
-                            _created_snapshot = _snap.create(os.getcwd(), _label)
-                    else:
-                        _created_snapshot = _snap.create(os.getcwd(), _label)
-                    if _created_snapshot:
-                        state["_snapshot_done"] = True
+                        deps.console.print(
+                            "[dim]Creating undo checkpoint…[/dim]")
                 except Exception as _e:
                     _diag("snapshot_create_failed", error=str(_e))
 

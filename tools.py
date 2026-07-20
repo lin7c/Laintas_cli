@@ -3533,6 +3533,66 @@ def _bi_task_continue(params: dict, ctx: ToolCtx) -> dict:
     return {"ok": True, "result": "(continuing)"}
 
 
+_CODE_FILE_EXTS = frozenset({
+    ".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".rs", ".java",
+    ".c", ".cpp", ".h", ".hpp", ".rb", ".php", ".swift", ".kt",
+    ".scala", ".sh", ".vue", ".svelte", ".cs",
+})
+_TEST_CMD_PATTERNS = (
+    "pytest", "python -m pytest", "python -m unittest", "npm test",
+    "yarn test", "pnpm test", "cargo test", "go test", "rspec",
+    "jest", "vitest", "mocha", "phpunit", "dotnet test", "flutter test",
+    "tox", "nox", "gradle test", "mvn test", "make test",
+)
+
+
+def _check_tests_before_complete(ctx: "ToolCtx") -> str | None:
+    """Return a warning string if code was modified but no tests were run.
+
+    Returns None when: no code files were modified, tests were already run,
+    or the one-shot warning was already issued (override path).
+    """
+    if ctx.state is None:
+        return None
+    history = ctx.state.get("terminalHistory", [])
+    if not history:
+        return None
+    code_modified = False
+    for h in history:
+        tool = h.get("tool", "")
+        cmd = (h.get("command") or "").strip()
+        if tool in ("fs.write", "fs.edit", "fs.multi_edit", "fs.diff"):
+            path = cmd.split("@", 1)[0].split(" ", 1)[0]
+            ext = os.path.splitext(path)[1].lower()
+            if ext in _CODE_FILE_EXTS:
+                code_modified = True
+                break
+    if not code_modified:
+        return None
+    tests_run = False
+    for h in history:
+        if h.get("tool") != "shell.exec":
+            continue
+        cmd = (h.get("command") or "").strip().lower()
+        for pattern in _TEST_CMD_PATTERNS:
+            if pattern in cmd:
+                tests_run = True
+                break
+        if tests_run:
+            break
+    if tests_run:
+        return None
+    if ctx.state.get("_test_warning_issued"):
+        return None
+    ctx.state["_test_warning_issued"] = True
+    return (
+        "Code files were modified during this task but no test command was "
+        "run. Run the project's test suite (e.g. pytest, npm test, go test) "
+        "to verify your changes, then call task_complete again. If tests are "
+        "not applicable to this task, call task_complete again to proceed."
+    )
+
+
 def _bi_task_complete(params: dict, ctx: ToolCtx) -> dict:
     """Affirmatively signal the user's task is finished.
 
@@ -3608,6 +3668,15 @@ def _bi_task_complete(params: dict, ctx: ToolCtx) -> dict:
                 "its id before task_complete."
             ),
             "pending_rule_ids": [rule["id"] for rule in pending_hooks],
+        }
+    # Soft test gate: warn once if code was modified but no tests were run.
+    # One-shot - calling task_complete again overrides the warning.
+    test_warning = _check_tests_before_complete(ctx)
+    if test_warning:
+        return {
+            "ok": False,
+            "error": test_warning,
+            "_test_warning": True,
         }
     result = {
         "ok": True,
@@ -4054,6 +4123,22 @@ def _exec_in_deployed_shell(command: str, session: Any, timeout: int,
         if entered:
             lock.release()
 
+
+def _command_has_cd_prefix(command: str) -> bool:
+    """True if the command already begins with a `cd <dir> &&` or `cd <dir> ;`
+    prefix, so we can skip prepending our own `cd -- <cwd> &&`."""
+    stripped = command.lstrip()
+    if not stripped.startswith("cd "):
+        return False
+    # Make sure it's a real cd-then-separator, not e.g. "cd foo" as the
+    # entire command (no && or ;).
+    for sep in (" && ", " ; ", " &&", " ;"):
+        idx = stripped.find(sep.strip() + " ")
+        if idx > 3:
+            return True
+    return False
+
+
 def _bi_shell_exec(params: dict, ctx: ToolCtx) -> dict:
     """Execute a shell command.
 
@@ -4087,10 +4172,11 @@ def _bi_shell_exec(params: dict, ctx: ToolCtx) -> dict:
                     "returncode": -1, "via": "deployment_terminal"}
         # An explicit cwd is itself a request to move the persistent terminal.
         # ctx.cwd is only the fallback for isolated subprocesses; the deployed
-        # terminal's real shell state remains authoritative.
+        # terminal's real shell state remains authoritative. Skip the prefix
+        # if the model already emitted its own `cd <dir> &&` to avoid doubling.
         explicit_cwd = str(params.get("cwd") or "").strip()
         deployed_command = command
-        if explicit_cwd:
+        if explicit_cwd and not _command_has_cd_prefix(command):
             deployed_command = f"cd -- {shlex.quote(explicit_cwd)} && {command}"
         result = _exec_in_deployed_shell(
             deployed_command, deployed_session, timeout, abort_event)
@@ -4157,7 +4243,7 @@ def _bi_shell_exec(params: dict, ctx: ToolCtx) -> dict:
             ctx.interactive_session = temporary
         explicit_cwd = str(params.get("cwd") or "").strip()
         temporary_command = command
-        if explicit_cwd:
+        if explicit_cwd and not _command_has_cd_prefix(command):
             temporary_command = f"cd -- {shlex.quote(explicit_cwd)} && {command}"
         result = _exec_in_deployed_shell(
             temporary_command, temporary, timeout, abort_event,

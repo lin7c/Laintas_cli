@@ -10,6 +10,7 @@ from rich.console import Console
 
 import agent_loop
 import laintas_cli
+import tools
 
 
 def _text(fragments):
@@ -454,6 +455,85 @@ class CompactToolLineTests(unittest.TestCase):
         name, hint, meta = agent_loop._compact_tool_line(
             "shell.exec", "ls -la", "exit 0", width=80, hint_middle=False)
         self.assertEqual(hint, "ls -la")
+
+
+class CommandHasCdPrefixTests(unittest.TestCase):
+    def test_plain_command_no_prefix(self):
+        self.assertFalse(tools._command_has_cd_prefix("ls -la"))
+
+    def test_cd_with_and_ampersand(self):
+        self.assertTrue(tools._command_has_cd_prefix("cd /tmp && ls -la"))
+
+    def test_cd_with_semicolon(self):
+        self.assertTrue(tools._command_has_cd_prefix("cd /tmp ; ls -la"))
+
+    def test_cd_alone_no_separator(self):
+        self.assertFalse(tools._command_has_cd_prefix("cd /tmp"))
+
+    def test_leading_whitespace_stripped(self):
+        self.assertTrue(tools._command_has_cd_prefix("  cd /tmp && ls"))
+
+    def test_non_cd_command(self):
+        self.assertFalse(tools._command_has_cd_prefix("echo hello"))
+
+    def test_command_starting_with_cd_substring(self):
+        self.assertFalse(tools._command_has_cd_prefix("cdrecord -v file.iso"))
+
+
+class ParseReadRangeTests(unittest.TestCase):
+    def test_plain_path_no_at(self):
+        path, start, end = agent_loop._parse_read_range("src/main.py")
+        self.assertEqual(path, "src/main.py")
+        self.assertEqual(start, 1)
+        self.assertIsNone(end)
+
+    def test_offset_only(self):
+        path, start, end = agent_loop._parse_read_range("src/main.py@50")
+        self.assertEqual(path, "src/main.py")
+        self.assertEqual(start, 50)
+        self.assertIsNone(end)
+
+    def test_offset_and_limit(self):
+        path, start, end = agent_loop._parse_read_range("src/main.py@50+100")
+        self.assertEqual(path, "src/main.py")
+        self.assertEqual(start, 50)
+        self.assertEqual(end, 149)
+
+    def test_offset_one_with_limit(self):
+        path, start, end = agent_loop._parse_read_range("src/main.py@1+200")
+        self.assertEqual(path, "src/main.py")
+        self.assertEqual(start, 1)
+        self.assertEqual(end, 200)
+
+    def test_path_with_at_symbol(self):
+        # rpartition ensures we split on the LAST @
+        path, start, end = agent_loop._parse_read_range("weird@path.py@10+5")
+        self.assertEqual(path, "weird@path.py")
+        self.assertEqual(start, 10)
+        self.assertEqual(end, 14)
+
+
+class RangesOverlapTests(unittest.TestCase):
+    def test_exact_same(self):
+        self.assertTrue(agent_loop._ranges_overlap(1, 100, 1, 100))
+
+    def test_subset(self):
+        self.assertTrue(agent_loop._ranges_overlap(1, 200, 50, 100))
+
+    def test_partial_overlap(self):
+        self.assertTrue(agent_loop._ranges_overlap(1, 100, 50, 150))
+
+    def test_no_overlap(self):
+        self.assertFalse(agent_loop._ranges_overlap(1, 100, 101, 200))
+
+    def test_adjacent_no_overlap(self):
+        self.assertFalse(agent_loop._ranges_overlap(1, 100, 101, 200))
+
+    def test_open_end_overlap(self):
+        self.assertTrue(agent_loop._ranges_overlap(1, None, 50, 100))
+
+    def test_open_end_no_overlap(self):
+        self.assertFalse(agent_loop._ranges_overlap(101, 200, 1, 100))
 
 
 if __name__ == "__main__":
