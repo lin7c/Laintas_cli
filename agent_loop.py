@@ -113,6 +113,7 @@ _DEFAULT_CONFIG = {
     "trigger_scan_interval": 0.5,      # seconds between trigger scanner sweeps
     "trigger_debounce_ms": 500.0,      # idle window before flushing buffered trigger matches
     "trigger_max_per_scan": 50,        # hard cap on matches dispatched per terminal per scan
+    "auto_pilot_enabled": True,        # master switch for heuristic task classification + hint injection
 }
 
 # ── Typed Error Classes ───────────────────────────────────────────────

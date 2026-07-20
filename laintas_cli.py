@@ -853,6 +853,7 @@ import trust_store               # workspace trust for executable customization
 import usage_tracker             # local AI token/cost accounting (/usage)
 import agent_ui_events           # observable events for full-screen Agents Mode
 import mode_manager              # declarative user-selectable agent modes
+import auto_pilot                # heuristic task classification + hint injection
 
 # MCP client: lazy import (saves ~1.8s on startup)
 _mcp_mod = None
@@ -15820,10 +15821,33 @@ def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
     repl_mirror.hub.start_recording()
     response = None
     run_error = ""
+
+    # ── Auto-Pilot: heuristic task classification + hint injection ──
+    effective_input = user_input
+    try:
+        if get_runtime_config("auto_pilot_enabled"):
+            cleaned, overridden = auto_pilot.should_override(user_input)
+            if overridden:
+                effective_input = cleaned
+            else:
+                has_wf = False
+                try:
+                    import workflow_engine as _wf
+                    has_wf = _wf.get_active_workflow() is not None
+                except Exception:
+                    pass
+                strategy = auto_pilot.classify_task(user_input, has_active_workflow=has_wf)
+                hint = auto_pilot.build_hint(strategy)
+                if hint:
+                    effective_input = hint + "\n\n" + user_input
+                    console.print(f"[dim][auto-pilot] {strategy}[/dim]")
+    except Exception:
+        effective_input = user_input
+
     try:
         loop_agent_id = active_agent.id if active_agent is not None else None
         response = run_agent_loop(
-            deps, user_input, session, agent_state, chat_history,
+            deps, effective_input, session, agent_state, chat_history,
             events_cb=events_cb,
             existing_session=existing_session,
             depth=(active_agent.depth if loop_agent_id else 0),
