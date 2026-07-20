@@ -827,6 +827,7 @@ from agent_loop import (
     get_user_interrupt_event, get_user_message_queue,
     clear_loop_command_cache,
     stop_trigger_scanner,
+    set_trigger_wake_callback,
     save_session_snapshot,
     save_resume_state, load_resume_state, save_resume_checkpoint, list_resume_states,
     delete_resume_state,
@@ -16274,6 +16275,36 @@ def main():
     # dormant for compatibility with persisted Agent metadata; natural
     # language input follows the original single foreground-Agent REPL.
     _sync_status_context()
+
+    # Register the trigger-wake callback so that trigger events arriving
+    # for an idle agent auto-start a lightweight assignment to drain the
+    # inbox. Without this, triggers fired while the agent is idle sit
+    # unseen until a user manually starts a new assignment.
+    def _trigger_wake_cb(agent_id: str, msg: dict) -> None:
+        msg_type = msg.get("type") or msg.get("kind") or ""
+        term_name = msg.get("terminal") or "?"
+        if msg_type == "terminal.exit":
+            rc = msg.get("returncode")
+            task = (f"Terminal '{term_name}' exited"
+                    f" (returncode={rc}). Check its output and take any"
+                    f" needed follow-up action.")
+        else:
+            line = msg.get("line") or msg.get("text") or ""
+            task = (f"Terminal '{term_name}' triggered watch pattern"
+                    f" {msg.get('pattern', '')!r}: {line}. Inspect and"
+                    f" respond as needed.")
+        try:
+            ok, _message, _assignment = start_agent_assignment(
+                agent_id, task, get_loop_deps())
+            if not ok:
+                console.print(
+                    f"[dim]trigger-wake: could not start assignment for"
+                    f" '{agent_id}'[/dim]")
+        except Exception as _exc:
+            console.print(
+                f"[dim]trigger-wake error for '{agent_id}': {_exc}[/dim]")
+
+    set_trigger_wake_callback(_trigger_wake_cb)
 
     # Load user skills from ~/.laintas/skills. Failures are surfaced
     # but never block startup.

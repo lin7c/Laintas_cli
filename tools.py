@@ -3340,8 +3340,8 @@ def _bi_terminal_watch(params: dict, ctx: ToolCtx) -> dict:
     """Set or clear a trigger on an existing terminal.
 
     When pattern is non-empty, any new output line matching the regex pushes
-    a watch.trigger event into the agent's inbox. Pass an empty pattern to
-    remove the trigger.
+    a watch.trigger event into the inbox of every agent in ``agent_ids``
+    (defaults to the calling agent). Pass an empty pattern to remove the trigger.
     """
     name = (params.get("name") or "").strip()
     pattern = (params.get("pattern") or "")
@@ -3353,11 +3353,19 @@ def _bi_terminal_watch(params: dict, ctx: ToolCtx) -> dict:
         term = ctx.get_terminal(name)
         if term is None:
             return {"ok": False, "error": f"terminal '{name}' not found"}
-    ok = ctx.set_terminal_trigger(name, pattern.strip(), ctx.agent_id)
+    agent_ids_raw = params.get("agent_ids")
+    if isinstance(agent_ids_raw, list):
+        agent_ids = [str(a).strip() for a in agent_ids_raw if str(a).strip()]
+    elif isinstance(agent_ids_raw, str) and agent_ids_raw.strip():
+        agent_ids = [agent_ids_raw.strip()]
+    else:
+        agent_ids = [ctx.agent_id] if ctx.agent_id else []
+    ok = ctx.set_terminal_trigger(name, pattern.strip(), agent_ids=agent_ids)
     if not ok:
         return {"ok": False, "error": f"terminal '{name}' not found"}
     if pattern.strip():
-        return {"ok": True, "result": f"Trigger set on '{name}': {pattern.strip()!r}"}
+        targets = ", ".join(agent_ids) if agent_ids else "(none)"
+        return {"ok": True, "result": f"Trigger set on '{name}': {pattern.strip()!r} -> [{targets}]"}
     return {"ok": True, "result": f"Trigger cleared on '{name}'"}
 
 
@@ -6247,13 +6255,20 @@ def register_builtin_tools() -> None:
             description=(
                 "Set or clear a trigger on an existing sub-terminal. "
                 "When pattern is non-empty, matching output lines push watch.trigger "
-                "events to the agent's inbox. Empty pattern clears the trigger."
+                "events to the inbox of every agent listed in agent_ids "
+                "(defaults to the calling agent). Empty pattern clears the trigger. "
+                "When the terminal process exits, a terminal.exit event is also delivered."
             ),
             schema={
                 "type": "object",
                 "properties": {
                     "name": {"type": "string", "description": "Terminal name"},
                     "pattern": {"type": "string", "description": "Regex to match (empty = clear)"},
+                    "agent_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Agent IDs to notify (default: calling agent)",
+                    },
                 },
                 "required": ["name", "pattern"],
             },

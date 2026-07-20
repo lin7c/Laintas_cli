@@ -110,6 +110,9 @@ _DEFAULT_CONFIG = {
     "deny_exits_loop": True,           # True = terminate the agent loop the moment the user denies an approval prompt; False = old behavior (feed denial back as a tool error and keep looping)
     "enable_mouse": False,             # REPL input box: click-to-position the cursor. Off by default: terminal mouse reporting hijacks native drag-to-select of scrollback (Shift+drag is the only workaround), which costs more than click-to-position gains
     "confirm_direct_commands": False,  # False = commands the USER types directly at the REPL run like a normal terminal (no policy approval prompt, e.g. rm); True = subject direct commands to the same needs_approval prompt as AI-issued ones. Hard `deny` policy rules always apply regardless.
+    "trigger_scan_interval": 0.5,      # seconds between trigger scanner sweeps
+    "trigger_debounce_ms": 500.0,      # idle window before flushing buffered trigger matches
+    "trigger_max_per_scan": 50,        # hard cap on matches dispatched per terminal per scan
 }
 
 # ── Typed Error Classes ───────────────────────────────────────────────
@@ -678,7 +681,16 @@ class TerminalInfo:
     model_override: Optional[str] = None
     provider_override: Optional[str] = None
     trigger_pattern: Optional[str] = None    # regex; None = no trigger
-    trigger_agent_id: Optional[str] = None  # inbox target; fixed at registration time
+    # One terminal may notify multiple agents.  The legacy singular
+    # ``trigger_agent_id`` is kept as a read-only convenience property
+    # backed by this list.
+    trigger_agent_ids: list = field(default_factory=list)
+    trigger_debounce_ms: float = 500.0   # flush buffered matches after this idle window
+    trigger_max_per_scan: int = 50       # hard cap on matches dispatched per scan
+    # Debounce bookkeeping (internal, not persisted).
+    _trigger_buffer: list = field(default_factory=list)
+    _trigger_last_match_ts: float = 0.0
+    _trigger_exited: bool = False        # guard: fire terminal.exit exactly once
     retain_completed: bool = False
     completed_at: Optional[float] = None
     returncode: Optional[int] = None
@@ -748,6 +760,7 @@ def get_debug_logs() -> list:
 
 def register_terminal(session, command: str, depth: int, name: str = None,
                       trigger: str = None, trigger_agent_id: str = None,
+                      trigger_agent_ids: list = None,
                       parent_terminal: str = None,
                       retain_completed: bool = False) -> str:
     """Register a terminal under one parent; names are never replaced implicitly."""
@@ -773,6 +786,14 @@ def register_terminal(session, command: str, depth: int, name: str = None,
                     f"Parent terminal '{parent_terminal}' is not running")
             if parent_terminal == name:
                 raise ValueError("A terminal cannot be its own parent")
+        # Normalize trigger targets: accept both the legacy singular
+        # ``trigger_agent_id`` and the new ``trigger_agent_ids`` list.
+        ids: list[str] = []
+        if trigger_agent_ids:
+            ids.extend(str(t) for t in trigger_agent_ids if t)
+        if trigger_agent_id:
+            if trigger_agent_id not in ids:
+                ids.append(trigger_agent_id)
         info = TerminalInfo(
             name=name,
             command=command,
@@ -781,7 +802,7 @@ def register_terminal(session, command: str, depth: int, name: str = None,
             created_by=f"depth={depth}",
             parent_terminal=parent_terminal,
             trigger_pattern=trigger or None,
-            trigger_agent_id=trigger_agent_id or None,
+            trigger_agent_ids=ids,
             retain_completed=bool(retain_completed),
         )
         if name == "term0":
@@ -1018,10 +1039,15 @@ def rename_terminal(old_name: str, new_name: str) -> bool:
     return True
 
 
-def set_terminal_trigger(name: str, pattern: str, agent_id: str) -> bool:
+def set_terminal_trigger(name: str, pattern: str, agent_id: str = None,
+                         agent_ids: list = None) -> bool:
     """Set or clear the trigger on an existing terminal.
 
-    Pass an empty pattern to clear. Returns False if the terminal doesn't exist.
+    Pass an empty pattern to clear.  ``agent_ids`` sets the list of
+    notification targets; ``agent_id`` is accepted as a backward-compatible
+    shorthand for a single-element list.  When neither is given the
+    existing target list is left untouched (only the pattern changes).
+    Returns False if the terminal doesn't exist.
     """
     with _registry_lock:
         info = _terminal_registry.get(name)
@@ -1029,14 +1055,23 @@ def set_terminal_trigger(name: str, pattern: str, agent_id: str) -> bool:
             return False
         if pattern:
             info.trigger_pattern = pattern
-            info.trigger_agent_id = agent_id or None
+            if agent_ids is not None:
+                info.trigger_agent_ids = [str(t) for t in agent_ids if t]
+            elif agent_id is not None:
+                info.trigger_agent_ids = [agent_id] if agent_id else []
+            # else: keep existing targets, just update pattern
+            info._trigger_buffer.clear()
+            info._trigger_last_match_ts = 0.0
+            info._trigger_exited = False
             _trigger_scan_cursors.setdefault(
-                name, info.session.full_output if info.session else ""
-            )
+                name, info.session.full_output if info.session else "")
             start_trigger_scanner()
         else:
             info.trigger_pattern = None
-            info.trigger_agent_id = None
+            info.trigger_agent_ids = []
+            info._trigger_buffer.clear()
+            info._trigger_last_match_ts = 0.0
+            info._trigger_exited = False
             _trigger_scan_cursors.pop(name, None)
     return True
 
@@ -1101,30 +1136,71 @@ def _terminal_snapshot_delta(previous: str, current: str) -> str:
     return current
 
 
+def _dispatch_trigger_matches(info: TerminalInfo, matches: list) -> None:
+    """Send buffered trigger matches to all registered target agents."""
+    if not matches or not info.trigger_agent_ids:
+        return
+    payload_text = "\n".join(m["line"] for m in matches)
+    first = matches[0]
+    for target_id in info.trigger_agent_ids:
+        send_to_agent(target_id, {
+            "type": "watch.trigger",
+            "terminal": info.name,
+            "lines": [m["line"] for m in matches],
+            "line": first["line"],
+            "match": first["match"],
+            "pattern": info.trigger_pattern,
+            "count": len(matches),
+            "text": payload_text,
+        })
+
+
 def _scan_terminal_trigger_output(info: TerminalInfo) -> None:
-    """Drain and dispatch newly produced trigger lines for one terminal."""
+    """Drain and dispatch newly produced trigger lines for one terminal.
+
+    Implements debounce: matches are buffered and flushed either when
+    ``trigger_debounce_ms`` elapses with no new matches, or when
+    ``trigger_max_per_scan`` buffered matches are reached.
+    """
     if not info.trigger_pattern or not info.session:
         return
     full = info.session.full_output
     previous = _trigger_scan_cursors.get(info.name, "")
     new_text = _terminal_snapshot_delta(previous, full)
     if not new_text:
+        # No new output — check if debounce window has elapsed for buffered matches.
+        now = time.time()
+        debounce_s = get_runtime_config("trigger_debounce_ms") / 1000.0
+        if (info._trigger_buffer
+                and now - info._trigger_last_match_ts >= debounce_s):
+            _dispatch_trigger_matches(info, info._trigger_buffer)
+            info._trigger_buffer.clear()
         return
     _trigger_scan_cursors[info.name] = full
     try:
         pat = re.compile(info.trigger_pattern, re.IGNORECASE)
     except re.error:
         return
+    max_per_scan = int(get_runtime_config("trigger_max_per_scan"))
+    now = time.time()
     for line in _strip_ansi(new_text).splitlines():
         match = pat.search(line)
-        if match and info.trigger_agent_id:
-            send_to_agent(info.trigger_agent_id, {
-                "type": "watch.trigger",
-                "terminal": info.name,
-                "line": line.strip(),
-                "match": match.group(0),
-                "pattern": info.trigger_pattern,
-            })
+        if not match:
+            continue
+        info._trigger_buffer.append({
+            "line": line.strip(),
+            "match": match.group(0),
+        })
+        info._trigger_last_match_ts = now
+        if len(info._trigger_buffer) >= max_per_scan:
+            _dispatch_trigger_matches(info, info._trigger_buffer)
+            info._trigger_buffer.clear()
+    # Flush if debounce window has already elapsed since the last match.
+    debounce_s = get_runtime_config("trigger_debounce_ms") / 1000.0
+    if (info._trigger_buffer
+            and now - info._trigger_last_match_ts >= debounce_s):
+        _dispatch_trigger_matches(info, info._trigger_buffer)
+        info._trigger_buffer.clear()
 
 
 def _terminal_returncode(session) -> Optional[int]:
@@ -1136,7 +1212,8 @@ def _terminal_returncode(session) -> Optional[int]:
 
 
 def _trigger_scanner_loop() -> None:
-    while not _trigger_scanner_stop.wait(0.5):
+    while not _trigger_scanner_stop.wait(
+            get_runtime_config("trigger_scan_interval")):
         now = time.time()
         for info in get_all_terminals():
             if not info.session:
@@ -1157,6 +1234,17 @@ def _trigger_scanner_loop() -> None:
             if info.completed_at is None:
                 info.completed_at = now
                 info.returncode = _terminal_returncode(info.session)
+                # Fire terminal.exit event exactly once per terminal.
+                if (not info._trigger_exited
+                        and info.trigger_agent_ids):
+                    info._trigger_exited = True
+                    for target_id in info.trigger_agent_ids:
+                        send_to_agent(target_id, {
+                            "type": "terminal.exit",
+                            "terminal": info.name,
+                            "returncode": info.returncode,
+                            "pattern": info.trigger_pattern,
+                        })
             if (not info.retain_completed
                     or now - info.completed_at >= _COMPLETED_TERMINAL_RETENTION_SECONDS):
                 if get_terminal(info.name) is info:
@@ -2692,6 +2780,46 @@ def close_all_agents() -> None:
 
 # ── Phase 2: in-process sub-agent control plane ────────────────────────
 
+# Wake callback: set by the host process (laintas_cli.py) so that trigger
+# events arriving for an idle agent can auto-start a lightweight assignment.
+# The callback receives (agent_id, trigger_message_dict).
+_trigger_wake_cb: Optional[Callable[[str, dict], None]] = None
+
+
+def set_trigger_wake_callback(cb: Optional[Callable[[str, dict], None]]) -> None:
+    """Register or clear the global trigger-wake callback."""
+    global _trigger_wake_cb
+    _trigger_wake_cb = cb
+
+
+def _try_wake_idle_agent(agent_id: str, msg: dict) -> None:
+    """If the target agent is idle with no active assignment, invoke the wake callback.
+
+    This bridges the gap between trigger delivery (which only puts a message
+    in the inbox) and agent execution (which requires an active loop to drain
+    that inbox).  Without this, triggers fired while the agent is idle sit
+    unseen until a user manually starts a new assignment.
+    """
+    cb = _trigger_wake_cb
+    if cb is None:
+        return
+    with _registry_lock:
+        info = _agent_registry.get(agent_id)
+        if info is None:
+            return
+        # Only wake pool/deployed employees that are truly idle.
+        if info.role not in ("pool", "deployed"):
+            return
+        if info.status != "idle" or info.active_assignment is not None:
+            return
+        if info.lifecycle_terminated:
+            return
+    try:
+        cb(agent_id, msg)
+    except Exception:
+        _diag("trigger_wake_failed", agent_id=agent_id, error="callback raised")
+
+
 def send_to_agent(agent_id: str, message: dict) -> bool:
     """Drop a JSON-serializable dict into the target agent's inbox.
 
@@ -2724,6 +2852,10 @@ def send_to_agent(agent_id: str, message: dict) -> bool:
                 })
         except Exception:
             pass
+        # Auto-wake idle agents for trigger-type messages.
+        msg_type = body.get("type") or body.get("kind") or ""
+        if msg_type in ("watch.trigger", "terminal.exit", "terminal.message"):
+            _try_wake_idle_agent(agent_id, body)
         return True
     except queue.Full:
         try:

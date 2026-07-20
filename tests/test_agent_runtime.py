@@ -1502,26 +1502,146 @@ class TerminalTriggerTests(unittest.TestCase):
         job.read_output.return_value = ""
         job.full_output = "last-line: READY\n"
         job.returncode = 0
-        fired = threading.Event()
 
-        def capture(*_args, **_kwargs):
-            fired.set()
-            return True
-
-        with mock.patch.object(agent_loop, "send_to_agent", side_effect=capture) as send:
+        with mock.patch.object(agent_loop, "send_to_agent", return_value=True) as send:
             agent_loop.register_terminal(root, "bash", 0, name="term0")
             agent_loop.register_terminal(
                 job, "probe", 0, name="probe", parent_terminal="term0",
                 trigger="READY", trigger_agent_id="primary",
                 retain_completed=True)
-            self.assertTrue(fired.wait(2.0))
+            # Wait for both events: terminal.exit (immediate) and
+            # watch.trigger (flushed after debounce window).
+            deadline = time.time() + 3.0
+            while len(send.call_args_list) < 2 and time.time() < deadline:
+                time.sleep(0.1)
+            self.assertGreaterEqual(
+                len(send.call_args_list), 2,
+                f"expected >=2 events, got {len(send.call_args_list)}")
 
         info = agent_loop.get_terminal("probe")
         self.assertIsNotNone(info)
         self.assertEqual(info.returncode, 0)
         self.assertIsNotNone(info.completed_at)
-        event = send.call_args.args[1]
-        self.assertEqual(event["line"], "last-line: READY")
+        event_types = [c.args[1].get("type") for c in send.call_args_list]
+        self.assertIn("watch.trigger", event_types)
+        self.assertIn("terminal.exit", event_types)
+        trigger_evt = next(
+            c.args[1] for c in send.call_args_list
+            if c.args[1].get("type") == "watch.trigger")
+        self.assertEqual(trigger_evt["line"], "last-line: READY")
+
+    def test_multiple_trigger_targets_all_notified(self):
+        """One terminal can notify multiple agents simultaneously."""
+        root = mock.Mock()
+        root.is_alive.return_value = True
+        root.read_output.return_value = ""
+        root.full_output = ""
+        job = mock.Mock()
+        job.is_alive.return_value = True
+        job.read_output.return_value = ""
+        job.full_output = "hit: READY\n"
+        job.returncode = 0
+        delivered: list[str] = []
+
+        def capture(agent_id, msg, *a, **kw):
+            delivered.append(agent_id)
+            return True
+
+        with mock.patch.object(agent_loop, "send_to_agent", side_effect=capture):
+            agent_loop.register_terminal(root, "bash", 0, name="term0")
+            agent_loop.register_terminal(
+                job, "probe", 0, name="probe", parent_terminal="term0",
+                trigger="READY",
+                trigger_agent_ids=["agent-a", "agent-b", "agent-c"],
+                retain_completed=True)
+            # Wait for debounce to flush.
+            deadline = time.time() + 3.0
+            while len(delivered) < 3 and time.time() < deadline:
+                time.sleep(0.1)
+        agent_loop.close_all_terminals()
+        self.assertEqual(sorted(delivered), ["agent-a", "agent-b", "agent-c"])
+
+    def test_debounce_buffers_rapid_matches(self):
+        """Multiple matching lines in one scan produce a single batched event."""
+        agent_loop.set_runtime_config("trigger_debounce_ms", 100.0)
+        agent_loop.set_runtime_config("trigger_scan_interval", 0.1)
+        root = mock.Mock()
+        root.is_alive.return_value = True
+        root.read_output.return_value = ""
+        root.full_output = ""
+        job = mock.Mock()
+        job.is_alive.return_value = True
+        job.read_output.return_value = ""
+        job.full_output = "1: READY\n2: READY\n3: READY\n"
+        job.returncode = 0
+        sent: list[dict] = []
+
+        def capture(agent_id, msg, *a, **kw):
+            sent.append(msg)
+            return True
+
+        try:
+            with mock.patch.object(agent_loop, "send_to_agent", side_effect=capture):
+                agent_loop.register_terminal(root, "bash", 0, name="term0")
+                agent_loop.register_terminal(
+                    job, "probe", 0, name="probe", parent_terminal="term0",
+                    trigger="READY", trigger_agent_ids=["watcher"],
+                    retain_completed=True)
+                deadline = time.time() + 3.0
+                while not sent and time.time() < deadline:
+                    time.sleep(0.1)
+            agent_loop.close_all_terminals()
+            self.assertTrue(sent, "no trigger event delivered")
+            trigger_evts = [m for m in sent if m.get("type") == "watch.trigger"]
+            self.assertEqual(len(trigger_evts), 1,
+                             "rapid matches should be batched into one event")
+            self.assertEqual(trigger_evts[0]["count"], 3)
+        finally:
+            agent_loop.reset_runtime_config()
+
+    def test_trigger_wake_callback_fires_for_idle_agent(self):
+        """A trigger event for an idle agent invokes the wake callback."""
+        root = mock.Mock()
+        root.is_alive.return_value = True
+        root.read_output.return_value = ""
+        root.full_output = ""
+        job = mock.Mock()
+        job.is_alive.return_value = True
+        job.read_output.return_value = ""
+        job.full_output = "READY\n"
+        job.returncode = 0
+        agent_loop.register_agent(name="idle-worker", depth=1, role="pool")
+        wake_calls: list[tuple] = []
+
+        def wake_cb(agent_id, msg):
+            wake_calls.append((agent_id, msg))
+
+        agent_loop.set_trigger_wake_callback(wake_cb)
+        try:
+            with mock.patch.object(agent_loop, "send_to_agent", return_value=True):
+                agent_loop._try_wake_idle_agent("idle-worker", {
+                    "type": "watch.trigger",
+                    "terminal": "probe",
+                    "line": "READY",
+                })
+        finally:
+            agent_loop.set_trigger_wake_callback(None)
+        self.assertEqual(len(wake_calls), 1)
+        self.assertEqual(wake_calls[0][0], "idle-worker")
+
+    def test_trigger_wake_skips_busy_agent(self):
+        """The wake callback must not fire for an agent with an active assignment."""
+        agent_loop.register_agent(name="busy-worker", depth=1, role="pool")
+        agent_loop._agent_registry["busy-worker"].status = "running"
+        wake_calls: list = []
+        agent_loop.set_trigger_wake_callback(
+            lambda aid, msg: wake_calls.append((aid, msg)))
+        try:
+            agent_loop._try_wake_idle_agent("busy-worker", {
+                "type": "watch.trigger", "terminal": "t", "line": "x"})
+        finally:
+            agent_loop.set_trigger_wake_callback(None)
+        self.assertEqual(wake_calls, [])
 
 
 class LazySnapshotTests(unittest.TestCase):
