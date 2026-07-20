@@ -79,7 +79,20 @@ def repo_root(cwd: str) -> Optional[str]:
 
 
 def is_git_repo(cwd: str) -> bool:
-    return repo_root(cwd) is not None
+    """True only when cwd is inside a git repo WITH at least one commit.
+
+    A bare ``.git`` directory with no commits (e.g. ``git init`` run but
+    nothing committed yet) returns False - ``git worktree add`` requires a
+    HEAD commit to branch from, so worktree isolation is impossible there.
+    Without this check, spawn_subagent treats the empty repo as isolatable,
+    create_isolated_worktree raises WorktreeError("cannot resolve HEAD"),
+    and by design (agent_loop.py:3117) that error is fatal instead of
+    silently falling back to the shared cwd."""
+    root = repo_root(cwd)
+    if root is None:
+        return False
+    rc, _, _ = _git(root, "rev-parse", "--verify", "HEAD^{commit}")
+    return rc == 0
 
 
 def _file_hash(path: str) -> Optional[str]:

@@ -120,6 +120,7 @@ _DEFAULT_CONFIG = {
     "auto_pilot_auto_execute": False,  # Phase 3: auto-spawn sub-agents for decomposed tasks (opt-in)
     "auto_pilot_max_parallel": 4,      # Phase 3: max parallel sub-agents for auto-execution
     "auto_pilot_budget_tokens": 50000, # Phase 3: token budget for auto-execution (all sub-agents combined)
+    "tool_output_fold": 30,          # max lines of tool output shown before folding (first half + … + last half); 0 = suppress preview entirely
 }
 
 # ── Typed Error Classes ───────────────────────────────────────────────
@@ -361,19 +362,25 @@ def _adaptive_loop_delay(base: float, *, failed: bool, retry_count: int = 0,
     return min(delay, 4.0)
 
 
-def _emit_simple_diff(console, diff_text: str, depth: int = 0, cap: int = 6) -> None:
-    """Render a minimal diff: changed (+/-) lines only, capped at `cap` lines.
+def _emit_simple_diff(console, diff_text: str, depth: int = 0, cap: int = 0) -> None:
+    """Render a minimal diff: changed (+/-) lines only, folded at `cap` lines.
 
     Used in simplified progress mode. Skips file headers, hunk markers and
-    unchanged context — the reader just wants a glance at what changed. Full
+    unchanged context - the reader just wants a glance at what changed. Full
     diff remains available via /debug or /detail on.
+
+    When cap=0 (default), reads tool_output_fold from runtime config.
+    When changed lines exceed cap, shows first half + "… N more" + last half
+    so both the opening and closing edits stay visible.
     """
     if not diff_text:
         return
+    if cap <= 0:
+        cap = int(get_runtime_config("tool_output_fold") or 30)
     from rich.markup import escape as _esc
     _hunk = re.compile(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@")
     changed = []          # (kind, lineno, text)
-    total_changed = adds = dels = 0
+    adds = dels = 0
     old_no = new_no = 0
     for ln in diff_text.splitlines():
         m = _hunk.match(ln)
@@ -382,30 +389,38 @@ def _emit_simple_diff(console, diff_text: str, depth: int = 0, cap: int = 6) -> 
             continue
         if ln.startswith("+") and not ln.startswith("+++"):
             adds += 1
-            total_changed += 1
-            if len(changed) < cap:
-                changed.append(("success", "┃+", new_no, ln[1:]))
+            changed.append(("success", "┃+", new_no, ln[1:]))
             new_no += 1
         elif ln.startswith("-") and not ln.startswith("---"):
             dels += 1
-            total_changed += 1
-            if len(changed) < cap:
-                changed.append(("error", "┃-", old_no, ln[1:]))
+            changed.append(("error", "┃-", old_no, ln[1:]))
             old_no += 1
         elif ln.startswith(" "):
             old_no += 1
             new_no += 1
     if not changed:
         return
-    inner = "  " * depth + "  "
-    console.print(f"{inner}[accent]▍[/accent] [success]+{adds}[/success] [error]−{dels}[/error]", highlight=False)
-    for style, mark, no, text in changed:
+    total = len(changed)
+
+    def _print_entry(style, mark, no, text):
         if len(text) > 96:
             text = text[:95] + "…"
         console.print(f"{inner}[muted]{no:>4}[/muted] "
                       f"[{style}]{mark}{_esc(text)}[/{style}]", highlight=False)
-    if total_changed > cap:
-        console.print(f"{inner}     [muted]… {total_changed - cap} more change(s) · /detail on for full[/muted]", highlight=False)
+
+    inner = "  " * depth + "  "
+    console.print(f"{inner}[accent]▍[/accent] [success]+{adds}[/success] [error]−{dels}[/error]", highlight=False)
+    if total <= cap:
+        for style, mark, no, text in changed:
+            _print_entry(style, mark, no, text)
+    else:
+        half = cap // 2
+        hidden = total - cap
+        for style, mark, no, text in changed[:half]:
+            _print_entry(style, mark, no, text)
+        console.print(f"{inner}     [muted]… {hidden} more change(s) · /detail on for full[/muted]", highlight=False)
+        for style, mark, no, text in changed[-half:]:
+            _print_entry(style, mark, no, text)
 
 
 # ── Transition Labels ─────────────────────────────────────────────
@@ -493,6 +508,7 @@ _RUNTIME_CONFIG_DESCRIPTIONS = {
     "deny_exits_loop": "Terminate the agent loop immediately when the user denies an approval prompt",
     "confirm_direct_commands": "Ask for approval on commands YOU type directly at the REPL (False = run like a normal terminal; hard deny rules still apply)",
     "enable_mouse": "Enable mouse click-to-position in the REPL input box",
+    "tool_output_fold": "Max lines of tool output shown before folding (first half + … + last half); 0 = suppress preview",
 }
 
 _RUNTIME_NONNEGATIVE = {
@@ -500,6 +516,7 @@ _RUNTIME_NONNEGATIVE = {
     "browser_action_delay_min", "browser_action_delay_max",
     "browser_post_action_wait",
     "remote_queue_size", "remote_control_queue_size",
+    "tool_output_fold",
 }
 _RUNTIME_POSITIVE = {
     "max_loops", "max_tokens", "max_debug_entries", "output_truncate",
@@ -2506,19 +2523,26 @@ only a secondary signal; coordination and durability requirements decide.
   as its work and verification finish. TASK items belong to the current session
   and owning agent; never read, update, or complete another session's items
   implicitly.
-- HWO: use a durable .hwo workflow when two or more specialist agents need
-  explicit roles, structured input/output hand-offs, ordered stages, reusable
-  orchestration, or parallel independent branches. Load the hwo-workflows skill
-  before authoring or changing workflow files. The HWO runner owns its progress;
-  do not duplicate the same steps as manually maintained session TASK items.
+- spawn_parallel / spawn_chain: use for one-off parallel or sequential
+  delegation that does NOT need a durable, reusable workflow file. This covers
+  code review, batch analysis, multi-file edits, and any fan-out where the
+  orchestration is throwaway. Prefer this over HWO unless you specifically need
+  persistence.
+- HWO: use a durable .hwo workflow only when the orchestration is REUSABLE or
+  needs STRUCTURED input/output contracts between specialist agents — i.e.
+  explicit roles with declared file outputs, ordered stages with handoff
+  documents, or a workflow that will be run more than once. Load the
+  hwo-workflows skill before authoring or changing workflow files. The HWO
+  runner owns its progress; do not duplicate the same steps as manually
+  maintained session TASK items.
 - HWG: use a durable .hwg graph when HWO stages require conditional routing,
   retries or bounded cycles, manual intervention, resumable checkpoints, or a
   long-lived multi-phase run across sessions or process restarts. Do not choose
   HWG merely because a linear task has many steps.
 
-When uncertain, stay at the simpler level. Promote TASK -> HWO -> HWG only when
-new coordination or durability requirements appear, and retain exactly one
-authoritative source of progress after promotion.
+When uncertain, stay at the simpler level. Promote TASK -> spawn_parallel ->
+HWO -> HWG only when new coordination or durability requirements appear, and
+retain exactly one authoritative source of progress after promotion.
 </work_orchestration>"""
 
 _TERMINAL_OUTPUT_STYLE_PROMPT = """<terminal_output_style>
@@ -7207,7 +7231,9 @@ def run_agent_loop(
                     # call that actually failed, so red still *means* something.
                     ok_mark = "[success]●[/success]" if result.get("ok") else "[error]✕[/error]"
                     _hint_plain = (salient if salient else display_name) or ""
-                    if _detail:
+                    if name == "task.complete" and result.get("ok"):
+                        deps.console.rule(style="muted")
+                    elif _detail:
                         deps.console.print(
                             f"  {ok_mark} [accent.dim]{display_name}[/accent.dim] [dim]{_esc_hint(_crop_cells(_hint_plain, max(20, deps.console.width - 20), middle=True))}[/dim]")
                     else:
@@ -7244,8 +7270,6 @@ def run_agent_loop(
                                 if _cause:
                                     _meta2 += f" · {_cause[:120]}"
                                 _meta2 += " · /why"
-                        elif name == "task.complete" and result.get("ok"):
-                            _meta2 = "done"
                         elif name == "fs.grep" and result.get("ok"):
                             _matches = result.get("matches", 0)
                             _meta2 = f"{_matches} match{'es' if _matches != 1 else ''}"
@@ -7313,6 +7337,21 @@ def run_agent_loop(
                                 if _meta2:
                                     _line += f"  [muted]{_esc_hint(_meta2)}[/muted]"
                                 deps.console.print(_line, highlight=False)
+                            # Folded preview for long shell.exec output
+                            if name == "shell.exec" and formatted:
+                                _fold_lim = int(get_runtime_config("tool_output_fold") or 0)
+                                if _fold_lim > 0:
+                                    _out_lines = [l for l in _strip_ansi(formatted).split("\n") if l.strip()]
+                                    if len(_out_lines) > _fold_lim:
+                                        _half = _fold_lim // 2
+                                        _hidden = len(_out_lines) - _fold_lim
+                                        _folded = (_out_lines[:_half]
+                                                   + [f"… {_hidden} more lines"]
+                                                   + _out_lines[-_half:])
+                                        for _fl in _folded:
+                                            deps.console.print(
+                                                f"    [muted]{_esc_hint(_fl)}[/muted]",
+                                                highlight=False)
                     pending_events.append({"type": "system", "kind": "tool",
                                             "content": display_name,
                                             "meta": {"ok": result.get("ok", False),
@@ -7614,8 +7653,8 @@ def run_agent_loop(
                 _exit_reason = TRANSITION_WARNING_FORCE
                 if events_cb is not None:
                     deps.console.print(
-                        f"[red]⚠ Warning '{wk}' fired {_new_streaks[wk]} consecutive times. "
-                        f"Force-exiting to prevent infinite loop.[/red]"
+                        f"[dark_orange]⚠ Warning '{wk}' fired {_new_streaks[wk]} consecutive times. "
+                        f"Force-exiting to prevent infinite loop.[/dark_orange]"
                     )
                 _append_short_memory(state, (
                     f"\n  ⚠ Loop force-exited: warning '{wk}' persisted for "

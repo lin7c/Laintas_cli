@@ -199,9 +199,11 @@ def build_decomposed_hint(strategy: str, subtasks: list[str]) -> str:
         return (
             "[auto-pilot] This task has been decomposed into independent subtasks:\n"
             f"{subtask_list}\n\n"
-            "Consider using spawn_parallel to execute them concurrently - "
+            "Use spawn_parallel to execute them concurrently - "
             "each sub-agent gets an isolated git worktree automatically. "
             "If subtasks share files, use spawn_chain instead. "
+            "Do NOT use HWO for this - HWO is for reusable workflows with "
+            "structured I/O contracts, not one-off parallel work. "
             "You may adjust the decomposition if it doesn't fit."
         )
     if strategy == PIPELINE_HINT:
@@ -416,10 +418,11 @@ def build_hint(strategy: str) -> str:
     if strategy == PARALLEL_HINT:
         return (
             "[auto-pilot] This task has multiple independent components. "
-            "If the subtasks don't share write targets, consider using "
-            "spawn_parallel to execute them concurrently — each sub-agent "
-            "gets an isolated git worktree automatically. If they share "
-            "files, use spawn_chain instead."
+            "If the subtasks don't share write targets, use spawn_parallel "
+            "to execute them concurrently - each sub-agent gets an isolated "
+            "git worktree automatically. If they share files, use spawn_chain "
+            "instead. Do NOT use HWO for this - HWO is for reusable workflows "
+            "with structured I/O contracts, not one-off parallel work."
         )
     if strategy == PIPELINE_HINT:
         return (

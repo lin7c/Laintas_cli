@@ -9,6 +9,19 @@ version: 1.0.0
 Load this skill before creating or modifying `.hwo` or `.hwg` files. For an
 existing file, prefer `hwo({action: "compile", path: ...})` before execution.
 
+## When to use HWO (and when not to)
+
+HWO is a **durable, reusable** workflow definition with structured input/output
+contracts. Use HWO only when:
+- The orchestration will be **run more than once** with different inputs.
+- Specialist agents need **declared file I/O contracts** (`in()` / `out()`).
+- The workflow should be version-controlled and compiled before execution.
+
+Do NOT use HWO for one-off parallel work like code review, batch analysis, or
+multi-file edits. Use `spawn_parallel` or `spawn_chain` instead - they are
+throwaway delegations that don't require a `.hwo` file. If the orchestration
+proves reusable, promote to HWO later.
+
 ## HWO essentials
 
 - `@line [in(topic: string), out(report: file)]` declares the file contract.

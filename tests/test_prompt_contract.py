@@ -30,9 +30,15 @@ class PromptContractTests(unittest.TestCase):
         compact = " ".join(prompt.split())
         self.assertIn("three or more meaningful execution steps", prompt)
         self.assertIn("current session and owning agent", compact)
-        self.assertIn("structured input/output hand-offs", prompt)
+        self.assertIn("input/output contracts", prompt)
         self.assertIn("conditional routing", prompt)
         self.assertIn("Do not choose\n  HWG merely", prompt)
+        # spawn_parallel / spawn_chain must appear as a level below HWO
+        self.assertIn("spawn_parallel / spawn_chain", prompt)
+        self.assertIn("one-off parallel", prompt)
+        self.assertIn("REUSABLE", prompt)
+        # Promotion ladder must include spawn_parallel
+        self.assertIn("TASK -> spawn_parallel ->", prompt)
 
     def test_legacy_internal_tool_names_are_canonicalized(self):
         text = "Use `task.create`, fs.delete and agent_return."

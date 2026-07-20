@@ -106,7 +106,7 @@ class DirectCommandApprovalTests(unittest.TestCase):
                 mock.patch.object(laintas_cli.sys.stdin, "isatty", return_value=True), \
                 mock.patch.object(
                     laintas_cli, "_arrow_approval_prompt",
-                    return_value="Yes") as prompt:
+                    return_value="y delete") as prompt:
             approved = laintas_cli.request_file_delete_approval(
                 "/tmp/old.txt", "DELETE file", "cleanup")
 

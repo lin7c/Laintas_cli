@@ -593,8 +593,13 @@ def select_dialog(
         else:
             lines.append(("class:muted", "  " + hint))
         if _auto_deadline is not None:
-            remaining = max(0, int((_auto_deadline - time.monotonic()) + 0.999))
-            lines.append(("class:auto-confirm", f"  Auto-confirm in {remaining}s"))
+            remaining = max(0.0, _auto_deadline - time.monotonic())
+            total = _auto_seconds or 1.0
+            frac = max(0.0, min(1.0, remaining / total))
+            bar_w = 12
+            filled = int(frac * bar_w)
+            bar = "▓" * filled + "░" * (bar_w - filled)
+            lines.append(("class:auto-confirm", f"  {bar} {int(remaining + 0.999)}s"))
         return lines
 
     # ── Key bindings ──────────────────────────────────────────────
@@ -2275,8 +2280,20 @@ def display_command_output(command: str, returncode: int, output: str, depth: in
     t = _fmt_elapsed(elapsed)
     status_label = f"{status_label} · {t}" if t else status_label
 
-    preview = output.strip()[:200].split("\n")
-    preview = [p for p in preview if p.strip()][:3]
+    # Fold long output: show up to `tool_output_fold` lines. When exceeded,
+    # display first half + "… N more" + last half so both the head and tail
+    # stay visible. 0 = suppress preview entirely (meta-only).
+    fold_limit = int(get_runtime_config("tool_output_fold") or 0)
+    all_lines = [l for l in (output or "").split("\n") if l.strip()] if output else []
+    if fold_limit <= 0:
+        preview = []
+    elif len(all_lines) <= fold_limit:
+        preview = all_lines[:fold_limit]
+    else:
+        half = fold_limit // 2
+        hidden = len(all_lines) - fold_limit
+        preview = all_lines[:half] + [f"… {hidden} more lines"] + all_lines[-half:]
+
     if line_count == 0 and byte_count == 0:
         meta = "no output"
         preview = []
@@ -2318,7 +2335,10 @@ _DIFF_HUNK_RE = re.compile(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@")
 
 def display_file_diff(path: str, diff_text: str, depth: int = 0) -> None:
     """Framed unified-diff preview: a +adds/−dels ribbon, real line numbers in
-    a gutter, and a green/red left rail so changed blocks read as shapes."""
+    a gutter, and a green/red left rail so changed blocks read as shapes.
+
+    Folds at ``tool_output_fold`` lines (default 30): first half + "… N more"
+    + last half so both the opening and closing edits stay visible."""
     diff_lines = diff_text.splitlines() if diff_text else []
     adds = sum(1 for l in diff_lines
                if l.startswith("+") and not l.startswith("+++"))
@@ -2330,37 +2350,54 @@ def display_file_diff(path: str, diff_text: str, depth: int = 0) -> None:
         f"{pad}[accent]▍[/accent] [bold]{_md_escape(_truncate_with_ellipsis(path, 70))}[/bold]  "
         f"[success]+{adds}[/success] [error]−{dels}[/error]", highlight=False)
 
-    preview_limit = 60
-    shown = 0
+    fold_limit = int(get_runtime_config("tool_output_fold") or 30)
+    # Collect content lines (skip headers/hunk markers) with their line-number
+    # state so the gutter stays accurate even in the tail section.
+    content = []          # (line_text, old_no, new_no)
     old_no = new_no = 0
     for ln in diff_lines:
-        if shown >= preview_limit:
-            break
         m = _DIFF_HUNK_RE.match(ln)
         if m:
             old_no, new_no = int(m.group(1)), int(m.group(2))
             continue
         if ln.startswith(("+++", "---", "diff ", "index ", "@@")):
             continue
-        body = _md_escape(ln[:118])
+        content.append((ln, old_no, new_no))
         if ln.startswith("+"):
-            console.print(f"{pad}[accent.dim]{new_no:>4}[/accent.dim] "
-                          f"[success]┃{body}[/success]", highlight=False)
             new_no += 1
         elif ln.startswith("-"):
-            console.print(f"{pad}[error]{old_no:>4} ┃{body}[/error]", highlight=False)
             old_no += 1
         else:
-            text = _md_escape(ln[1:119] if ln.startswith(" ") else ln[:118])
-            console.print(f"{pad}[muted]{new_no:>4}[/muted] "
-                          f"[rule]│[/rule] [muted]{text}[/muted]", highlight=False)
             old_no += 1
             new_no += 1
-        shown += 1
-    remaining = len([l for l in diff_lines
-                     if not l.startswith(("+++", "---", "diff ", "index ", "@@"))]) - shown
-    if remaining > 0:
-        console.print(f"{pad}[muted]     … {remaining} more line(s)[/muted]", highlight=False)
+
+    if not content:
+        return
+
+    def _print_line(ln, o_no, n_no):
+        body = _md_escape(ln[:118])
+        if ln.startswith("+"):
+            console.print(f"{pad}[accent.dim]{n_no:>4}[/accent.dim] "
+                          f"[success]┃{body}[/success]", highlight=False)
+        elif ln.startswith("-"):
+            console.print(f"{pad}[error]{o_no:>4} ┃{body}[/error]", highlight=False)
+        else:
+            text = _md_escape(ln[1:119] if ln.startswith(" ") else ln[:118])
+            console.print(f"{pad}[muted]{n_no:>4}[/muted] "
+                          f"[rule]│[/rule] [muted]{text}[/muted]", highlight=False)
+
+    total = len(content)
+    if fold_limit <= 0 or total <= fold_limit:
+        for ln, o, n in content:
+            _print_line(ln, o, n)
+    else:
+        half = fold_limit // 2
+        hidden = total - fold_limit
+        for ln, o, n in content[:half]:
+            _print_line(ln, o, n)
+        console.print(f"{pad}[muted]     … {hidden} more line(s) · /debug for full[/muted]", highlight=False)
+        for ln, o, n in content[-half:]:
+            _print_line(ln, o, n)
 
 
 # ── prompt_toolkit Input Setup ──────────────────────────────────────────
@@ -15460,15 +15497,14 @@ def _sync_session_approval_from_mode():
 
 def _arrow_approval_prompt(title: str, body_lines: list[str],
                            options: list[str], *,
-                           auto_confirm_seconds: Optional[float] = None) -> Optional[str]:
+                           auto_confirm_seconds: Optional[float] = None,
+                           destructive: bool = False) -> Optional[str]:
     """Inline arrow-key approval selector.
 
-    Prints *body_lines* (command / diff / reason content) into the normal
-    conversation flow via ``console`` so they land in scrollback beneath the
-    AI output, then runs a *non-full-screen* prompt_toolkit selector for the
-    *options* only. This keeps the confirmation inline rather than taking over
-    the terminal on the alternate screen buffer. Returns the selected option
-    string, or None if cancelled (Esc / Ctrl+C).
+    Renders a compact header (action word + target) followed by body content
+    (reason / diff) into scrollback, then runs a non-full-screen prompt_toolkit
+    selector for the options. Returns the selected option string, or None if
+    cancelled (Esc / Ctrl+C).
     """
     from rich.markup import escape
 
@@ -15482,26 +15518,30 @@ def _arrow_approval_prompt(title: str, body_lines: list[str],
             return f"[#7aa2f7]{esc}[/#7aa2f7]"
         return f"[#c0c0c0]{esc}[/#c0c0c0]"
 
-    # Render the static context inline (title, separator, body) — this becomes
-    # part of the scrollback under the conversation.
-    console.print(f"[bold #e0af68]{escape(title)}[/bold #e0af68]")
-    console.print("[#6b7280]" + "─" * 60 + "[/#6b7280]")
-    for ln in body_lines:
-        console.print("  " + _line_markup(ln))
-    console.print("[#6b7280]" + "─" * 60 + "[/#6b7280]")
-    console.print("[#6b7280]↑↓ choose  y/n/a shortcut  ↵ confirm  Esc cancel[/#6b7280]")
+    # Split "action — question" back into the action word for the header.
+    _action = title.split(" — ")[0] if " — " in title else title
+    _target = body_lines[0] if body_lines else ""
+    _header_color = "#f85149" if destructive else "#e3b341"
 
-    # Fail-safe default: land on "No" when present, so a bare Enter denies
-    # rather than approves an approval gate. Falls back to first option.
+    console.print(
+        f"  [bold {_header_color}]{escape(_action)}[/bold {_header_color}]"
+        f"  {escape(_target)}", highlight=False)
+    for ln in body_lines[1:]:
+        if not ln.strip():
+            console.print()
+        else:
+            console.print("  " + _line_markup(ln), highlight=False)
+    console.print()
+
+    # Fail-safe default: land on the "n ..." option so a bare Enter denies.
     _default_idx = next((i for i, o in enumerate(options)
-                         if o.strip().lower().startswith("no")), 0)
+                         if o.strip().lower().startswith("n")), 0)
 
     return select_dialog(
         options,
         full_screen=False,
         selected_index=_default_idx,
         letter_shortcuts=True,
-        hint="↑↓ choose  y/n/a shortcut  ↵ confirm  Esc cancel",
         refresh_interval=0.5,
         auto_confirm_seconds=auto_confirm_seconds,
         auto_confirm_index=0,
@@ -15516,13 +15556,7 @@ def _blocking_approval_prompt(title: str, body: str, question: str,
     Returns "yes", "no", or "always". When *allow_always* is False the "always"
     option is not offered and only "yes"/"no" can come back.
 
-    Used by both request_command_approval and request_file_write_approval —
-    the agent loop's main thread owns this call, and the bg reader (which
-    also reads stdin for supplementary messages during the loop) must be
-    stopped first or the two would race for the same input line.
-
-    Fails closed (returns "no") when stdin isn't a real TTY — e.g. --execute
-    mode with piped input, or any other headless context with no user to ask.
+    Fails closed (returns "no") when stdin isn't a real TTY.
     """
     # While the /agents view owns the terminal, a full-screen arrow prompt
     # would fight its prompt_toolkit app for stdin. Route the decision to
@@ -15547,22 +15581,29 @@ def _blocking_approval_prompt(title: str, body: str, question: str,
     # markup) so diff content with literal brackets renders verbatim.
     body_lines = body.split("\n")
 
-    options = ["Yes", "Always (this session)", "No"] if allow_always else ["Yes", "No"]
+    # Use title as the short action word ("approve", "apply", "delete").
+    # Fall back to deriving from the question for legacy callers.
+    _action = title if title and " " not in title else (
+        question.split()[0].lower().rstrip("?") if question else "confirm")
+
+    if destructive:
+        options = ["y delete", "n cancel"]
+    elif allow_always:
+        options = ["y approve", "a always", "n deny"]
+    else:
+        options = ["y approve", "n deny"]
+
     auto_confirm_seconds = mode_manager.get_auto_confirm_timeout(
         destructive=destructive)
-    if auto_confirm_seconds is not None:
-        console.print(
-            f"[yellow]AUTO mode: this confirmation will be approved in "
-            f"{int(auto_confirm_seconds)} seconds unless you choose another option.[/yellow]"
-        )
 
     _reader_was_running = bool(
         _bg_reader_thread is not None and _bg_reader_thread.is_alive())
     _stop_bg_input_reader()
     try:
         choice = _arrow_approval_prompt(
-            f"{title} — {question}", body_lines, options,
+            f"{_action} — {question}", body_lines, options,
             auto_confirm_seconds=auto_confirm_seconds,
+            destructive=destructive,
         )
     except (EOFError, KeyboardInterrupt):
         choice = None
@@ -15570,9 +15611,9 @@ def _blocking_approval_prompt(title: str, body: str, question: str,
         if _reader_was_running:
             _start_bg_input_reader(get_user_message_queue())
 
-    if choice == "Always (this session)":
+    if choice is not None and choice.startswith("a "):
         return "always"
-    if choice == "Yes":
+    if choice is not None and choice.startswith("y "):
         return "yes"
     return "no"
 
@@ -15659,7 +15700,7 @@ def request_command_approval(command: str, reason: str) -> bool:
     if _session_approval_state["all_commands"] or command in _session_approval_state["approved_commands"]:
         return True
     choice = _blocking_approval_prompt(
-        "Approval required",
+        "approve",
         f"{command}\n{reason}" if reason else command,
         "Run this command?",
         allow_always=True,
@@ -15725,7 +15766,7 @@ def request_file_write_approval(path: str, diff_preview: str, reason: str) -> bo
         _body_parts.append("")
         _body_parts.append(diff_preview.rstrip("\n"))
     choice = _blocking_approval_prompt(
-        "Approval required",
+        "apply",
         "\n".join(_body_parts),
         "Apply this change?",
         allow_always=True,
@@ -15748,7 +15789,7 @@ def request_file_delete_approval(path: str, preview: str, reason: str) -> bool:
         return _request_email_approval("fs.delete", f"Delete: {path}", detail)
     body = "\n".join(part for part in (path, reason, "", preview) if part)
     choice = _blocking_approval_prompt(
-        "Deletion approval required",
+        "delete",
         body,
         "Delete this target?",
         allow_always=False,
@@ -16529,11 +16570,36 @@ def main():
 
     # Setup graceful shutdown
     def shutdown(signum=None, frame=None):
+        # Kill any live-updating parallel-agents display first. rich's Live
+        # runs a background thread that repaints ~8x/sec regardless of what
+        # the main thread does; if it's still alive while this function
+        # starts printing its own shutdown messages, the two race for the
+        # terminal and the screen ends up looking corrupted/hung until the
+        # user force-exits (reported: exiting mid parallel-agents view).
+        try:
+            tools_mod.stop_all_parallel_live_displays()
+        except Exception:
+            pass
         # Reentry guard: a second Ctrl+C while the first shutdown is cleaning
         # up can double-close terminals / agents / browser sessions and
         # corrupt in-memory state. Hard-exit on the second signal.
         if getattr(shutdown, "_in_progress", False):
             console.print("\n[red]Forced exit.[/red]")
+            # os._exit() skips every finally/atexit hook, so anything that
+            # left the tty in raw mode or the cursor hidden (a Live display,
+            # an InteractiveSession PTY takeover) never gets restored. Reset
+            # the essentials directly so the shell is usable afterward.
+            try:
+                console.show_cursor(True)
+            except Exception:
+                pass
+            try:
+                _fd = sys.stdin.fileno()
+                _attrs = termios.tcgetattr(_fd)
+                _attrs[3] |= (termios.ECHO | termios.ICANON | termios.ISIG)
+                termios.tcsetattr(_fd, termios.TCSANOW, _attrs)
+            except Exception:
+                pass
             os._exit(1)
         shutdown._in_progress = True
         if _agents_view_is_active():

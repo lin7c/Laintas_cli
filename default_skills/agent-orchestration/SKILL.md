@@ -49,3 +49,24 @@ single `agent.spawn` calls:
 
 Pick the smallest that fits: one agent for a single errand, `spawn_parallel` for
 independent fan-out, `spawn_chain` for an ordered pipeline.
+
+## HWO vs spawn_parallel / spawn_chain
+
+`spawn_parallel` and `spawn_chain` are **throwaway** orchestration - the
+delegation exists only for the current run. HWO (`.hwo` file) is a **durable,
+reusable** workflow definition with structured input/output contracts.
+
+Use `spawn_parallel` / `spawn_chain` when:
+- The work is one-off (code review, batch analysis, multi-file edit).
+- You do not need to re-run the same orchestration later.
+- Handoff between stages is simple (or absent for parallel).
+
+Use HWO only when:
+- The orchestration is **reusable** - you or someone else will run the same
+  workflow again with different inputs.
+- Specialist agents need **structured I/O contracts** (declared `in()` / `out()`
+  file bindings, not just freeform text).
+- The workflow should be version-controlled and compiled before execution.
+
+If unsure, use `spawn_parallel` / `spawn_chain`. You can always promote to HWO
+later if the orchestration proves reusable.

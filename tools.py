@@ -32,6 +32,8 @@ import threading
 import time
 import traceback
 import difflib
+import unicodedata
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -41,6 +43,21 @@ from hwo_adapter import HWO_TOOL_DESCRIPTION
 
 
 # ── Public dataclasses ─────────────────────────────────────────────────
+
+def _disp_truncate(text: str, max_width: int) -> str:
+    """Truncate text to max_width display columns, accounting for CJK chars."""
+    text = text.replace('\n', ' ').replace('\r', ' ').strip()
+    width = 0
+    out = []
+    for ch in text:
+        cw = 2 if unicodedata.east_asian_width(ch) in ('W', 'F') else 1
+        if width + cw > max_width:
+            out.append('…')
+            break
+        out.append(ch)
+        width += cw
+    return ''.join(out)
+
 
 @dataclass
 class ToolCtx:
@@ -2366,6 +2383,32 @@ def _bi_spawn(params: dict, ctx: ToolCtx) -> dict:
             "child_id": child_id}
 
 
+# Registered while a spawn_parallel Live display is on screen so the CLI's
+# shutdown handler can force it closed before printing its own messages.
+# rich Live runs a background thread that repaints ~8x/sec regardless of
+# what the main thread is doing; if shutdown() starts printing while that
+# thread is still alive, the two race for the terminal and the screen ends
+# up looking corrupted/hung until the user force-exits.
+_active_parallel_lives_lock = threading.Lock()
+_active_parallel_lives: list = []
+
+
+def stop_all_parallel_live_displays() -> None:
+    """Best-effort: stop every currently-active spawn_parallel Live display.
+
+    Call this before printing anything else during shutdown so no
+    background Live-refresh thread can keep repainting over it.
+    """
+    with _active_parallel_lives_lock:
+        lives = list(_active_parallel_lives)
+        _active_parallel_lives.clear()
+    for live in lives:
+        try:
+            live.__exit__(None, None, None)
+        except Exception:
+            pass
+
+
 def _bi_spawn_parallel(params: dict, ctx: ToolCtx) -> dict:
     """Fan out through ``spawn_subagent`` and join all canonical children."""
     import agent_loop as _al
@@ -2385,15 +2428,178 @@ def _bi_spawn_parallel(params: dict, ctx: ToolCtx) -> dict:
         if not goal:
             return {"ok": False, "error": "every parallel task requires a goal"}
         normalized.append({**task, "task": goal})
+
+    # Suppress per-tool console display for parallel children.  The parent
+    # prints a 1-line summary per child when it finishes, giving a clean
+    # parallel view instead of N threads interleaving tool output.
+    # Child context is preserved: _thread_messages (built from per_call_rows)
+    # and state["terminalHistory"] are populated regardless of events_cb.
     child_ids = _al.spawn_subagents_parallel(
         parent_id, normalized, ctx.deps,
-        session=ctx.session, events_cb=ctx.events_cb)
+        session=ctx.session, events_cb=None)
     if len(child_ids) != len(normalized):
         return {"ok": False, "error": "one or more child agents could not be spawned"}
 
+    ctx.deps.console.print(
+        f"  [muted]▾ {len(child_ids)} parallel agents launched[/muted]",
+        highlight=False)
+    _term_w = getattr(ctx.deps.console, 'width', 80) or 80
+    _goal_w = max(30, _term_w - 22)
+    for _cid, _task in zip(child_ids, normalized):
+        _goal = _disp_truncate(_task['task'], _goal_w)
+        ctx.deps.console.print(
+            f"    [agent]{_cid}[/agent]  [muted]{_goal}[/muted]",
+            highlight=False)
+
+    # Track spawn times for per-child elapsed display.
+    _start = {cid: time.time() for cid in child_ids}
+    _total_start = time.time()
+    # Track seen tool call_ids per child so we only count new ones once.
+    _seen_calls = {cid: set() for cid in child_ids}
+    # Track per-child tool count for status display.
+    _tool_counts = {cid: 0 for cid in child_ids}
+    # Current single-line activity per child: (tool, arg). Overwritten as
+    # new tool calls land -- this is the "live" line, not a scrolling log.
+    _activity: dict = {cid: ("", "starting…") for cid in child_ids}
+    # Final one-line status per child once it stops running.
+    _final: dict = {}
+    _final_elapsed: dict = {}
+    _SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+    def _spinner_glyph() -> str:
+        return _SPINNER_FRAMES[int(time.time() * 10) % len(_SPINNER_FRAMES)]
+
+    def _render_agents_block():
+        """One-line-per-agent live view: status glyph, id, current tool
+        (or final result once stopped), tool count, elapsed. Mirrors the
+        subagent panels of mainstream coding-agent CLIs -- a fixed set of
+        rows that update in place rather than an ever-growing tool log.
+        """
+        from rich.table import Table as _RichTable
+        from rich.text import Text as _RichText
+        from rich.console import Group as _RichGroup
+
+        _elapsed_total = time.time() - _total_start
+        _running = len(child_ids) - len(_final)
+        _total_tools = sum(_tool_counts.values())
+        if _running > 0:
+            _head = (f"[dim]{_spinner_glyph()} {_running}/{len(child_ids)} running · "
+                      f"{_total_tools} tool calls · {_elapsed_total:.0f}s[/dim]")
+        else:
+            _head = f"[dim]✓ {len(child_ids)}/{len(child_ids)} done · {_elapsed_total:.0f}s[/dim]"
+        _table = _RichTable(
+            box=None, show_header=False, show_edge=False, pad_edge=False,
+            padding=(0, 1), expand=True)
+        _table.add_column(width=1, no_wrap=True)
+        _table.add_column(style="agent", no_wrap=True)
+        _table.add_column(ratio=1, no_wrap=True, overflow="ellipsis")
+        _table.add_column(style="muted", justify="right", no_wrap=True)
+        for cid in child_ids:
+            if cid in _final:
+                _glyph, _text = _final[cid]
+                _meta = f"{_tool_counts[cid]} tools · {_final_elapsed.get(cid, 0):.0f}s"
+            else:
+                _glyph = f"[accent]{_spinner_glyph()}[/accent]"
+                _tool, _arg = _activity[cid]
+                _text = f"[muted]{_tool}[/muted] {_arg}" if _tool else f"[muted]{_arg}[/muted]"
+                _meta = f"{_tool_counts[cid]} tools · {time.time() - _start[cid]:.0f}s"
+            _table.add_row(_glyph, cid, _text, _meta)
+        return _RichGroup(_RichText.from_markup(_head), _table)
+
+    # Concurrent wait: poll all children at once.  Wall time = max(child
+    # times), not sum - the old list-comprehension waited sequentially,
+    # so one slow child blocked detection of the rest.
+    _timeout = 600
+    _deadline = time.time() + _timeout
     _al.enter_waiting(parent_id)
     try:
-        infos = [_al.wait_for_agent(cid, timeout=600) for cid in child_ids]
+        infos: list = [None] * len(child_ids)
+        _pending = set(child_ids)
+        _console_file = getattr(ctx.deps.console, "file", None)
+        _transient_factory = getattr(_console_file, "transient_output", None)
+        _transient_ctx = (
+            _transient_factory()
+            if callable(_transient_factory) else nullcontext())
+        _live = None
+        with _transient_ctx:
+            try:
+                from rich.live import Live
+                # transient=False: the final frame (all rows resolved) stays
+                # in the scrollback as the permanent record, instead of
+                # vanishing and being replaced by a separate summary print.
+                _live = Live(_render_agents_block(), console=ctx.deps.console,
+                             refresh_per_second=8, transient=False,
+                             redirect_stdout=False, redirect_stderr=False)
+                _live.__enter__()
+                with _active_parallel_lives_lock:
+                    _active_parallel_lives.append(_live)
+            except Exception:
+                _live = None
+            _interrupted = False
+            try:
+                while _pending and time.time() < _deadline:
+                    _parent_info = _al.get_agent(parent_id)
+                    if _parent_info is not None and _parent_info.abort_event.is_set():
+                        # User requested interrupt (Ctrl+C/Esc). Without this
+                        # check the loop only stops on the 600s timeout, so a
+                        # single Ctrl+C had no effect on an in-flight
+                        # spawn_parallel call and the CLI looked hung.
+                        _interrupted = True
+                        break
+                    for i, cid in enumerate(child_ids):
+                        if infos[i] is not None:
+                            continue
+                        info = _al.get_agent(cid)
+                        if info is not None:
+                            # Update this child's single activity line from the
+                            # most recent tool call -- no per-call scrollback.
+                            _hist = info.state.get("terminalHistory") or []
+                            for _row in _hist:
+                                if not isinstance(_row, dict):
+                                    continue
+                                _call_id = _row.get("call_id", "")
+                                if not _call_id or _call_id in _seen_calls[cid]:
+                                    continue
+                                _seen_calls[cid].add(_call_id)
+                                _tool_counts[cid] += 1
+                                _tool = _row.get("tool", "?")
+                                _cmd = _disp_truncate(
+                                    (_row.get("command") or "").strip(), _goal_w)
+                                _activity[cid] = (_tool, _cmd)
+                        if info is not None and info.status in ("done", "aborted", "error"):
+                            infos[i] = info
+                            _pending.discard(cid)
+                            _final_elapsed[cid] = time.time() - _start[cid]
+                            _has_reply = bool(
+                                (info.result or info.last_reply or "").strip())
+                            if info.status == "done" and not info.error and _has_reply:
+                                _final[cid] = ("[success]✓[/success]", "[muted]done[/muted]")
+                            elif info.status == "done" and not info.error:
+                                _final[cid] = ("[warning]◯[/warning]", "[muted]empty reply[/muted]")
+                            else:
+                                _label = _disp_truncate(info.error or info.status, 60)
+                                _final[cid] = ("[error]✕[/error]", f"[muted]{_label}[/muted]")
+                    if _live is not None:
+                        _live.update(_render_agents_block())
+                    if _pending:
+                        time.sleep(0.1)
+                for cid in _pending:
+                    _al.abort_agent(cid)
+                    infos[child_ids.index(cid)] = None
+                    _final_elapsed[cid] = time.time() - _start[cid]
+                    _label = "interrupted" if _interrupted else f"timed out · {_timeout}s"
+                    _final[cid] = ("[error]✕[/error]", f"[muted]{_label}[/muted]")
+                if _live is not None:
+                    _live.update(_render_agents_block())
+            finally:
+                if _live is not None:
+                    with _active_parallel_lives_lock:
+                        if _live in _active_parallel_lives:
+                            _active_parallel_lives.remove(_live)
+                    try:
+                        _live.__exit__(None, None, None)
+                    except Exception:
+                        pass
     finally:
         _al.exit_waiting(parent_id)
 
@@ -2401,11 +2607,18 @@ def _bi_spawn_parallel(params: dict, ctx: ToolCtx) -> dict:
     succeeded = 0
     for cid, task, info in zip(child_ids, normalized, infos):
         if info is None:
-            _al.abort_agent(cid)
-            ok, message = False, "timed out; cancellation requested"
+            ok = False
+            message = ("interrupted by user" if _interrupted
+                       else "timed out; cancellation requested")
         else:
-            ok = info.status == "done"
-            message = info.result or info.last_reply or info.error or info.status
+            ok = info.status == "done" and not info.error
+            message = (info.result or info.last_reply or "").strip()
+            if not message and info.error:
+                message = info.error
+            if ok and not message:
+                ok = False
+                message = ("(agent completed but produced no reply - "
+                           "consider retrying or rephrasing the task)")
         succeeded += int(ok)
         lines.append(
             f"\n─── [{'✓' if ok else '✗'}] {cid} ───\n"

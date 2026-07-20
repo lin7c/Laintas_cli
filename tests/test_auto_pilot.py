@@ -116,6 +116,17 @@ class TestBuildHint:
         assert hint != ""
         assert "spawn_parallel" in hint or "spawn_chain" in hint
 
+    def test_parallel_hint_discourages_hwo(self):
+        hint = auto_pilot.build_hint(auto_pilot.PARALLEL_HINT)
+        assert "HWO" in hint
+        assert "not" in hint.lower() or "do not" in hint.lower()
+
+    def test_decomposed_parallel_hint_discourages_hwo(self):
+        subtasks = ["review auth", "review API", "review tests"]
+        hint = auto_pilot.build_decomposed_hint(auto_pilot.PARALLEL_HINT, subtasks)
+        assert "HWO" in hint
+        assert "not" in hint.lower() or "do not" in hint.lower()
+
     def test_pipeline_hint_non_empty(self):
         hint = auto_pilot.build_hint(auto_pilot.PIPELINE_HINT)
         assert hint != ""
