@@ -367,5 +367,94 @@ class ParseSubtaskJsonTests(unittest.TestCase):
         self.assertEqual(result, ["run tests", "fix bugs", "commit changes"])
 
 
+class ShortestUniqueTests(unittest.TestCase):
+    def test_single_path_returns_basename(self):
+        result = agent_loop._shortest_unique(["src/router.py"])
+        self.assertEqual(result, ["router.py"])
+
+    def test_unique_basenames(self):
+        result = agent_loop._shortest_unique(["src/router.py", "lib/api.py"])
+        self.assertEqual(result, ["router.py", "api.py"])
+
+    def test_same_basename_different_dirs(self):
+        result = agent_loop._shortest_unique([
+            "agent_gateway/router.py", "gateway/router.py"])
+        self.assertEqual(result, ["agent_gateway/router.py", "gateway/router.py"])
+
+    def test_three_same_basename(self):
+        result = agent_loop._shortest_unique([
+            "a/router.py", "b/router.py", "c/router.py"])
+        self.assertEqual(result,
+                         ["a/router.py", "b/router.py", "c/router.py"])
+
+    def test_mixed_unique_and_dup(self):
+        result = agent_loop._shortest_unique([
+            "a/router.py", "b/router.py", "api.py"])
+        self.assertEqual(result, ["a/router.py", "b/router.py", "api.py"])
+
+    def test_empty_list(self):
+        self.assertEqual(agent_loop._shortest_unique([]), [])
+
+    def test_trailing_slash_stripped(self):
+        result = agent_loop._shortest_unique(["src/module/", "lib/module/"])
+        self.assertEqual(result, ["src/module", "lib/module"])
+
+    def test_backslash_normalized(self):
+        result = agent_loop._shortest_unique(["a\\router.py", "b\\router.py"])
+        self.assertEqual(result, ["a/router.py", "b/router.py"])
+
+
+class SalientArgTests(unittest.TestCase):
+    def test_task_complete_returns_summary(self):
+        result = agent_loop._salient_arg("task.complete", {
+            "summary": "Fixed the memory leak in gateway.py"
+        })
+        self.assertEqual(result, "Fixed the memory leak in gateway.py")
+
+    def test_task_complete_truncates_long_summary(self):
+        long_summary = "A" * 200
+        result = agent_loop._salient_arg("task.complete", {
+            "summary": long_summary
+        })
+        self.assertEqual(len(result), 120)
+
+    def test_task_complete_empty_summary(self):
+        result = agent_loop._salient_arg("task.complete", {})
+        self.assertEqual(result, "")
+
+    def test_shell_exec_returns_command(self):
+        result = agent_loop._salient_arg("shell.exec", {
+            "command": "python -m pytest"
+        })
+        self.assertEqual(result, "python -m pytest")
+
+
+class CompactToolLineTests(unittest.TestCase):
+    def test_shell_exec_uses_tail_truncate(self):
+        """Shell commands should not be middle-cropped (hint_middle=False)."""
+        long_cmd = "python -m pytest tests/test_gateway.py -v --tb=short -x " + "arg " * 30
+        name, hint, meta = agent_loop._compact_tool_line(
+            "shell.exec", long_cmd, "exit 0", width=60, hint_middle=False)
+        # Tail-truncated: starts with "python", ends with ellipsis
+        self.assertTrue(hint.startswith("python"))
+        self.assertTrue(hint.endswith("…"))
+        # Should NOT contain middle-crop marker in the middle of the command
+        # (middle crop would put "…" between start and end fragments)
+
+    def test_default_uses_middle_truncate(self):
+        """Default behavior middle-crops for non-shell tools."""
+        long_hint = "a" * 60 + "MIDDLE" + "b" * 60
+        name, hint, meta = agent_loop._compact_tool_line(
+            "fs.read", long_hint, "", width=40, hint_middle=True)
+        self.assertIn("…", hint)
+        # Middle crop keeps start and end
+        self.assertTrue(hint.startswith("a"))
+
+    def test_short_hint_unchanged(self):
+        name, hint, meta = agent_loop._compact_tool_line(
+            "shell.exec", "ls -la", "exit 0", width=80, hint_middle=False)
+        self.assertEqual(hint, "ls -la")
+
+
 if __name__ == "__main__":
     unittest.main()

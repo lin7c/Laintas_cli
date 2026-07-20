@@ -3254,13 +3254,20 @@ def _render_rprompt():
         "PLAN" if _is_plan else mode_manager.get_active_mode()["name"].upper()
     )
     # Auto-approve indicator: suffix the mode with * whenever writes or commands
-    # are being auto-approved this session — via a mode's auto_approve posture,
+    # are being auto-approved this session - via a mode's auto_approve posture,
     # or at least one remembered per-target "Always" approval. E.g. ACT*, OPS*.
-    if not _is_plan and (_session_approval_state.get("all_writes")
-                         or _session_approval_state.get("all_commands")
-                         or _session_approval_state.get("approved_write_paths")
-                         or _session_approval_state.get("approved_commands")):
+    _has_star = (not _is_plan and (_session_approval_state.get("all_writes")
+                     or _session_approval_state.get("all_commands")
+                     or _session_approval_state.get("approved_write_paths")
+                     or _session_approval_state.get("approved_commands")))
+    if _has_star:
         _mode_label += "*"
+        global _approval_star_announced
+        if not _approval_star_announced:
+            _approval_star_announced = True
+            console.print(
+                "[dim]⚡ Auto-approve active ([bold]*[/bold]). "
+                "Use /mode to change.[/dim]")
     _mode_cls = "rprompt-mode-plan" if _is_plan else "rprompt-mode-act"
     _model = _status_cache.get("model", "") or "default"
     width = _terminal_width()
@@ -15403,14 +15410,17 @@ _session_approval_state = {
     "approved_write_paths": set(),   # exact paths remembered via a prompt's "Always"
     "approved_commands": set(),      # exact commands remembered via a prompt's "Always"
 }
+_approval_star_announced = False
 
 
 def _reset_session_approvals():
     """Clear session-level auto-approve (called on /exit, /reload)."""
+    global _approval_star_announced
     _session_approval_state["all_commands"] = False
     _session_approval_state["all_writes"] = False
     _session_approval_state["approved_write_paths"] = set()
     _session_approval_state["approved_commands"] = set()
+    _approval_star_announced = False
 
 
 def _sync_session_approval_from_mode():
@@ -17202,7 +17212,6 @@ def main():
                 if injected_done is not None:
                     injected_done.set()
                 continue
-            console.print("[dim]Not a system command, asking AI...[/dim]")
             # Build event callback for real-time streaming
             def local_events_cb(events: list):
                 _agent = get_current_agent()

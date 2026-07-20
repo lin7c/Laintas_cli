@@ -308,7 +308,32 @@ def _crop_cells(value: str, width: int, *, middle: bool = False) -> str:
     return _take(value, left_budget) + "…" + _take(value, right_budget, reverse=True)
 
 
-def _compact_tool_line(display_name: str, hint: str, meta: str, width: int) -> tuple[str, str, str]:
+def _shortest_unique(paths: list[str]) -> list[str]:
+    """Return the shortest distinguishing suffix for each path.
+
+    When multiple paths share the same basename (e.g. ``a/router.py`` and
+    ``b/router.py``), include enough parent segments to tell them apart.
+    """
+    if not paths:
+        return []
+    parts_list = [p.rstrip("/").replace("\\", "/").split("/") for p in paths]
+    result = []
+    for i, parts_i in enumerate(parts_list):
+        chosen = parts_i[-1] if parts_i else ""
+        for depth in range(1, len(parts_i) + 1):
+            candidate = "/".join(parts_i[-depth:])
+            if all(
+                candidate != "/".join(parts_j[-depth:])
+                for j, parts_j in enumerate(parts_list) if j != i
+            ):
+                chosen = candidate
+                break
+        result.append(chosen)
+    return result
+
+
+def _compact_tool_line(display_name: str, hint: str, meta: str, width: int,
+                       hint_middle: bool = True) -> tuple[str, str, str]:
     """Fit a compact tool row, preserving status metadata before command prose."""
     name = str(display_name or "tool")
     hint = re.sub(r"\s+", " ", str(hint or "")).strip()
@@ -319,7 +344,7 @@ def _compact_tool_line(display_name: str, hint: str, meta: str, width: int) -> t
         meta_budget = min(max(12, available // 2), max(12, _cell_len(meta)))
         meta = _crop_cells(meta, meta_budget, middle=("/why" in meta or "/debug" in meta))
         available -= _cell_len(meta)
-    hint = _crop_cells(hint, max(4, available), middle=True)
+    hint = _crop_cells(hint, max(4, available), middle=hint_middle)
     return name, hint, meta
 
 
@@ -5120,6 +5145,8 @@ def _salient_arg(name: str, arguments: dict) -> str:
         return f'{arguments.get("agent_id", "?")}: {(arguments.get("message") or "")[:60]}'
     if name in ("agent.wait", "agent.abort"):
         return arguments.get("agent_id", "") or ""
+    if name == "task.complete":
+        return (arguments.get("summary") or "")[:120]
     if name in ("web.fetch",):
         return arguments.get("url", "") or ""
     if name == "web.search":
@@ -6512,10 +6539,25 @@ def run_agent_loop(
                 return
             category = _compact_read_hints[0][0]
             unique_reads = list(dict.fromkeys(item for _kind, item in _compact_read_hints))
-            shown_reads = [
-                os.path.basename(item.rstrip("/")) or item
-                for item in unique_reads[:3]
-            ]
+            # For Search category, extract the query from the first hint
+            # (fs.grep salient is "pattern in path"); show it in the label.
+            query_text = ""
+            display_reads = unique_reads
+            if category == "Search":
+                first_hint = _compact_read_hints[0][1]
+                if " in " in first_hint:
+                    query_text, _path_part = first_hint.split(" in ", 1)
+                    query_text = query_text.strip()[:40]
+                    # Strip the query prefix from each target for the tail
+                    display_reads = []
+                    for item in unique_reads:
+                        if " in " in item:
+                            _, path_part = item.split(" in ", 1)
+                            display_reads.append(path_part.strip())
+                        else:
+                            display_reads.append(item)
+            # Shortest unique suffix to disambiguate same-name files
+            shown_reads = _shortest_unique(display_reads[:3])
             read_tail = " · ".join(shown_reads).replace("[", "\\[")
             if len(unique_reads) > 3:
                 read_tail += f" · +{len(unique_reads) - 3}"
@@ -6524,6 +6566,8 @@ def run_agent_loop(
                 "List": ("List", "location", "locations"),
                 "Memory": ("Memory", "source", "sources"),
             }.get(category, ("Read", "source", "sources"))
+            if query_text:
+                label = f'{label} "{query_text}"'
             noun = singular if len(unique_reads) == 1 else plural
             deps.console.print(
                 f"  [success]●[/success] [accent.dim]{label}[/accent.dim]  "
@@ -7119,8 +7163,18 @@ def run_agent_loop(
                                 _cause = re.sub(r"\s+", " ", _cause).replace("[", "\\[")
                                 _meta2 = f"exit {_rc}"
                                 if _cause:
-                                    _meta2 += f" · {_cause[:72]}"
+                                    _meta2 += f" · {_cause[:120]}"
                                 _meta2 += " · /why"
+                        elif name == "task.complete" and result.get("ok"):
+                            _meta2 = "done"
+                        elif name == "task.continue" and result.get("ok"):
+                            _meta2 = "continue"
+                        elif name == "fs.grep" and result.get("ok"):
+                            _matches = result.get("matches", 0)
+                            _meta2 = f"{_matches} match{'es' if _matches != 1 else ''}"
+                        elif name == "web.search" and result.get("ok"):
+                            _results = result.get("results") or []
+                            _meta2 = f"{len(_results)} result{'s' if len(_results) != 1 else ''}"
                         elif not result.get("ok"):
                             _cause = str(result.get("error") or formatted or "").strip()
                             _cause = re.sub(r"\s+", " ", _cause).replace("[", "\\[")
@@ -7173,7 +7227,8 @@ def run_agent_loop(
                             else:
                                 _name2, _hint2, _meta2 = _compact_tool_line(
                                     display_name, _hint_plain, _meta2,
-                                    deps.console.width)
+                                    deps.console.width,
+                                    hint_middle=(name != "shell.exec"))
                                 _line = (
                                     f"  {_mark2} [accent.dim]{_esc_hint(_name2)}[/accent.dim]"
                                     f"  [muted]{_esc_hint(_hint2)}[/muted]"
