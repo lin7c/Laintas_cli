@@ -76,6 +76,13 @@ _AND_RE = re.compile(r"\b(?:and|also|as\s+well\s+as)\b", re.IGNORECASE)
 
 _decompose_cb: Optional[callable] = None
 
+_last_decompose_source: Optional[str] = None
+
+
+def get_last_decompose_source() -> Optional[str]:
+    """Return the source of the last successful decomposition: 'llm', 'heuristic', or None."""
+    return _last_decompose_source
+
 
 def set_decompose_callback(fn: Optional[callable]) -> None:
     """Register or clear the LLM decomposition callback.
@@ -97,7 +104,9 @@ def decompose_task(task: str, strategy: str, timeout: float = 3.0) -> Optional[l
     applicable / fails.  Falls back to heuristic decomposition when the LLM
     callback is unavailable or times out.
     """
+    global _last_decompose_source
     if strategy not in (PARALLEL_HINT, PIPELINE_HINT):
+        _last_decompose_source = None
         return None
 
     # Try LLM decomposition first.
@@ -107,12 +116,18 @@ def decompose_task(task: str, strategy: str, timeout: float = 3.0) -> Optional[l
             if result and isinstance(result, list) and len(result) >= 2:
                 cleaned = [str(s).strip() for s in result if str(s).strip()]
                 if len(cleaned) >= 2:
+                    _last_decompose_source = "llm"
                     return cleaned
         except Exception:
             pass
 
     # Heuristic fallback.
-    return _heuristic_decompose(task, strategy)
+    heuristic_result = _heuristic_decompose(task, strategy)
+    if heuristic_result:
+        _last_decompose_source = "heuristic"
+    else:
+        _last_decompose_source = None
+    return heuristic_result
 
 
 def _run_with_timeout(fn, *args, timeout: float = 3.0):

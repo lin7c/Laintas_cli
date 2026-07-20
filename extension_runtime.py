@@ -8,6 +8,7 @@ contains the raw Laintas session; model access is exposed as a gateway callback.
 from __future__ import annotations
 
 import importlib.util
+import inspect
 import json
 import re
 import sys
@@ -21,6 +22,21 @@ from tools import Tool, get_registry
 
 
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+
+
+def _positional_arity(func: Callable) -> Optional[int]:
+    """Return the number of positional parameters, or None if it can't be determined."""
+    try:
+        sig = inspect.signature(func)
+        count = 0
+        for param in sig.parameters.values():
+            if param.kind in (param.POSITIONAL_ONLY, param.POSITIONAL_OR_KEYWORD):
+                count += 1
+            elif param.kind == param.VAR_POSITIONAL:
+                return None
+        return count
+    except (ValueError, TypeError):
+        return None
 
 
 class _Registrar:
@@ -118,7 +134,7 @@ class ExtensionRuntime:
         existing = self._commands.get(normalized.lower())
         if existing and existing[0] != owner:
             raise ValueError(f"extension command already registered: {normalized}")
-        self._commands[normalized.lower()] = (owner, handler)
+        self._commands[normalized.lower()] = (owner, handler, _positional_arity(handler))
 
     def register_tool(self, owner: str, tool: Tool) -> None:
         if not isinstance(tool, Tool):
@@ -224,10 +240,16 @@ class ExtensionRuntime:
         item = self._commands.get(str(action).lower())
         if item is None:
             return False, None
+        handler = item[1]
+        arity = item[2] if len(item) > 2 else None
         try:
-            return True, item[1](parts, raw_line)
+            if arity == 1:
+                return True, handler(parts)
+            return True, handler(parts, raw_line)
         except TypeError:
-            return True, item[1](parts)
+            if arity is None:
+                return True, handler(parts)
+            raise
 
     def intercept_loop(self, command: str, ctx: dict) -> Optional[str]:
         for owner in list(self._loaded):

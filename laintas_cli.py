@@ -43,7 +43,7 @@ warnings.filterwarnings(
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 import difflib
-from contextlib import nullcontext
+from contextlib import nullcontext, contextmanager
 from pathlib import Path
 from typing import Callable, Optional
 from dataclasses import dataclass, field
@@ -374,6 +374,26 @@ def _fuzzy_match(text: str, pattern: str) -> bool:
     """Return True if all chars of pattern appear in text in order (fuzzy match)."""
     it = iter(text)
     return all(c in it for c in pattern)
+
+
+@contextmanager
+def _alt_screen():
+    """Enter the alternate screen buffer for inline content between two
+    full-screen ``select_dialog`` calls.
+
+    Without this, printing between picker invocations flashes the normal
+    screen (REPL scrollback) for a frame before the next picker re-enters
+    the alternate screen.  Wrapping the content in ``\\x1b[?1049h/l`` keeps
+    the terminal in the alternate buffer the whole time.
+    """
+    _file = getattr(console, "file", None) or sys.stdout
+    try:
+        _file.write("\x1b[?1049h")
+        _file.flush()
+        yield
+    finally:
+        _file.write("\x1b[?1049l")
+        _file.flush()
 
 
 def select_dialog(
@@ -2194,8 +2214,19 @@ def _fmt_elapsed(elapsed: float) -> str:
         return f"{elapsed * 1000:.0f}ms"
     if elapsed < 60:
         return f"{elapsed:.1f}s"
-    m, s = divmod(int(elapsed), 60)
+    total = int(elapsed)
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    if h > 0:
+        return f"{h}h{m}m{s}s"
     return f"{m}m{s}s"
+
+
+def _truncate_with_ellipsis(text: str, max_len: int) -> str:
+    """Truncate text to max_len chars, appending '...' if truncated."""
+    if len(text) <= max_len:
+        return text
+    return text[:max_len - 1] + "…"
 
 
 def _emit_block(title: str, status_label: str, status_style: str,
@@ -2204,11 +2235,11 @@ def _emit_block(title: str, status_label: str, status_style: str,
     """Render a borderless, minimal output block.
 
     A status-colored left bar marks the header; preview lines are dimmed and
-    indented. No box — keeps the transcript clean and scannable.
+    indented. No box - keeps the transcript clean and scannable.
     """
     pad = "  " * depth
     bar = "[%s]▍[/%s]" % (status_style, status_style)
-    head = f"{pad}{bar} [bold]{title[:80]}[/bold]"
+    head = f"{pad}{bar} [bold]{_truncate_with_ellipsis(title, 80)}[/bold]"
     if status_label:
         head += f"  [{status_style}]{status_label}[/{status_style}]"
     if meta:
@@ -2296,7 +2327,7 @@ def display_file_diff(path: str, diff_text: str, depth: int = 0) -> None:
 
     pad = "  " * depth
     console.print(
-        f"{pad}[accent]▍[/accent] [bold]{_md_escape(path[:70])}[/bold]  "
+        f"{pad}[accent]▍[/accent] [bold]{_md_escape(_truncate_with_ellipsis(path, 70))}[/bold]  "
         f"[success]+{adds}[/success] [error]−{dels}[/error]", highlight=False)
 
     preview_limit = 60
@@ -2412,7 +2443,8 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec("/login", "Re-authenticate with Laintas", "Account & Session"),
     CommandSpec("/usage", "Show AI usage — local token stats + Laintas backend usage", "Account & Session", "/usage [7d|30d|90d|local]", subcommands=("local",)),
     CommandSpec("/resume", "Resume a saved session (picker; echo last N events, default 20)", "Account & Session", "/resume [N|all|latest]"),
-    CommandSpec("/new", "Start a new live session", "Account & Session", "/new", aliases=("/clear",)),
+    CommandSpec("/new", "Start a new live session", "Account & Session", "/new",
+                aliases=("/clear", "/new-session", "/reset-session")),
     CommandSpec("/exit", "Log out and exit", "Account & Session"),
     CommandSpec("/quit", "Exit without logging out", "Account & Session", aliases=("/q",)),
     CommandSpec("/back", "Detach from a sub-terminal", "Account & Session"),
@@ -2519,6 +2551,8 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
                 subcommands=("all", "reply", "log")),
     # Keep /reload discoverable, but its existing handler and behavior stay untouched.
     CommandSpec("/reload", "Reload default files and restart", "History"),
+    CommandSpec("/focus", "Deprecated: use /station to run another Agent", "Agents & Terminals",
+                palette=False),
 )
 
 _NEW_SESSION_COMMANDS = ("/new", "/clear", "/new-session", "/reset-session")
@@ -4291,94 +4325,30 @@ def ensure_auth() -> Optional[dict]:
 
 # ── CLI Prompt Template (.laintas/cli.prop) ──────────────────────────────
 
-EXTRA_COMMAND_TEMPLATE = '''# .laintas/commands.py — define custom slash commands for the REPL
+EXTRA_COMMAND_TEMPLATE = '''# .laintas/commands.py - define custom slash commands for the REPL
 # context keys: session, interactive_session, agent_registry, console,
 #   get_terminal, get_all_terminals, unregister_terminal, register_terminal,
 #   rename_terminal, get_agent, get_all_agents, get_current_agent,
 #   station_agent, unstation_agent,
-#   SubTerminalSession, observe_session, _show_terminal_detail,
+#   SubTerminalSession, observe_session, enter_session,
+#   _show_terminal_detail,
 #   get_config, set_config, list_config, reset_config, reload_default_files
+#
+# Return True from handle_extra_command to indicate the command was handled.
+# Return False to fall through to "Unknown command".
+# Built-in commands like /config and /reload are intercepted before this
+# file is consulted, so overriding them here has no effect.
 
 
 def handle_extra_command(action, parts, ctx):
-    """Return True if handled, False to pass through."""
+    """Custom slash command handler. Return True if handled, False to pass through."""
     console = ctx["console"]
 
-    if action == "/config":
-        # /config                → show all
-        # /config <key>          → show one
-        # /config <key> <value>  → set value
-        # /config reset          → reset all
-        get_cfg = ctx["get_config"]
-        set_cfg = ctx["set_config"]
-        list_cfg = ctx["list_config"]
-        reset_cfg = ctx["reset_config"]
-
-        labels = {
-            "max_loops": "Max AI loops",
-            "max_tokens": "Max API tokens",
-            "max_debug_entries": "Max debug entries",
-            "loop_delay": "Loop delay (s)",
-            "output_truncate": "Output truncate (chars)",
-            "poll_timeout": "Poll timeout (s)",
-            "terminal_tail_lines": "Sub-terminal tail lines",
-            "heartbeat_interval": "Heartbeat interval (s)",
-        }
-
-        if len(parts) == 1:
-            # /config — show all
-            from rich.table import Table
-            t = Table(title="Runtime Config")
-            t.add_column("Key", style="cyan")
-            t.add_column("Value")
-            t.add_column("Description")
-            for k, v in list_cfg().items():
-                t.add_row(k, str(v), labels.get(k, ""))
-            console.print(t)
-
-        elif len(parts) == 2:
-            if parts[1] == "reset":
-                reset_cfg()
-                console.print("[green]Config reset to defaults.[/green]")
-            else:
-                key = parts[1]
-                val = get_cfg(key)
-                if val is not None:
-                    console.print(f"{labels.get(key, key)}: [bold]{val}[/bold]")
-                else:
-                    console.print(f"[red]Unknown key: {key}[/red]")
-
-        elif len(parts) >= 3:
-            key = parts[1]
-            raw = " ".join(parts[2:])
-            # coerce type
-            defaults = list_cfg()
-            if key not in defaults:
-                console.print(f"[red]Unknown key: {key}[/red]")
-                return True
-            old = get_cfg(key)
-            try:
-                if isinstance(defaults[key], bool):
-                    val = raw.lower() in ("true", "1", "yes", "on")
-                elif isinstance(defaults[key], int):
-                    val = int(raw)
-                else:
-                    val = float(raw)
-            except ValueError:
-                console.print(f"[red]Invalid value for {key}: {raw}[/red]")
-                return True
-            set_cfg(key, val)
-            console.print(f"[green]{labels.get(key, key)}: {old} → [bold]{val}[/bold][/green]")
-
-        return True
-
-    if action == "/reload":
-        reload = ctx.get("reload_default_files")
-        if reload:
-            reload()
-        else:
-            console.print("[red]reload_default_files not available[/red]")
-        return True
+    # Example: a simple greeting command.
+    # if action == "/hello":
+    #     name = parts[1] if len(parts) > 1 else "world"
+    #     console.print(f"[green]Hello, {name}![/green]")
+    #     return True
 
     return False
 '''
@@ -4831,8 +4801,12 @@ def show_resume_picker(cwd: str) -> Optional[dict]:
         return labels
 
     sel_idx = 0
+    status_msg = ""
     while choices:
         labels = _build_labels()
+        hint = "↑↓ navigate  ↵ resume  d details  x delete  q cancel"
+        if status_msg:
+            hint = f"{status_msg}\n{hint}"
         result = select_dialog(
             labels,
             title="Resume Session",
@@ -4840,7 +4814,7 @@ def show_resume_picker(cwd: str) -> Optional[dict]:
             selected_index=sel_idx,
             action_keys={"d": "details", "x": "delete"},
             enter_action="resume",
-            hint="↑↓ navigate  ↵ resume  d details  x delete  q cancel",
+            hint=hint,
         )
         if result is None:
             return None
@@ -4848,20 +4822,21 @@ def show_resume_picker(cwd: str) -> Optional[dict]:
         if action is None or idx < 0 or idx >= len(choices):
             return None
         item = choices[idx]
+        status_msg = ""
         if action == "resume":
             return item
         if action == "details":
-            _show_resume_detail(item)
-            _print_resume_transcript(item, 20)
-            input("\n[dim]Press Enter to continue...[/dim]")
+            with _alt_screen():
+                _show_resume_detail(item)
+                _print_resume_transcript(item, 20)
+                input("\n[dim]Press Enter to continue...[/dim]")
             sel_idx = idx
         elif action == "delete":
             delete_resume_state(cwd, item)
             del choices[idx]
-            console.print(f"\n[green]Deleted saved session.[/green]")
             if not choices:
-                console.print("[dim]No more saved sessions.[/dim]")
                 return None
+            status_msg = "[green]Deleted saved session.[/green]"
             sel_idx = min(idx, len(choices) - 1)
     return None
 
@@ -7661,8 +7636,9 @@ def show_debug_browser_interactive() -> None:
         if chosen is None:
             return
         idx = labels.index(chosen)
-        show_debug_detail(idx)
-        input("\n[dim]Press Enter to return to debug browser...[/dim]")
+        with _alt_screen():
+            show_debug_detail(idx)
+            input("\n[dim]Press Enter to return to debug browser...[/dim]")
 
 
 def show_debug_detail(index: int) -> None:
@@ -7825,6 +7801,7 @@ def show_terminal_manager(primary_session=None) -> None:
 
     sel_idx = 0
     first = True
+    status_msg = ""
     while True:
         items = _collect()
         if not items:
@@ -7838,6 +7815,9 @@ def show_terminal_manager(primary_session=None) -> None:
         sel_idx = min(sel_idx, len(items) - 1)
 
         labels = _build_labels(items)
+        hint = "↑↓ navigate  ↵ enter  o observe  c close  d details  q back"
+        if status_msg:
+            hint = f"{status_msg}\n{hint}"
         result = select_dialog(
             labels,
             title="Terminal Manager",
@@ -7845,7 +7825,7 @@ def show_terminal_manager(primary_session=None) -> None:
             selected_index=sel_idx,
             action_keys={"o": "observe", "c": "close", "d": "details"},
             enter_action="enter",
-            hint="↑↓ navigate  ↵ enter  o observe  c close  d details  q back",
+            hint=hint,
         )
         if result is None:
             return
@@ -7854,11 +7834,11 @@ def show_terminal_manager(primary_session=None) -> None:
             return
 
         name, cmd, sess, created, alive = items[idx]
+        status_msg = ""
 
         if action == "enter":
             if not alive:
-                console.print("\n[yellow]Session has already ended.[/yellow]")
-                input("[dim]Press Enter to continue...[/dim]")
+                status_msg = "[yellow]Session has already ended.[/yellow]"
             else:
                 enter_session(sess, display_name=name, display_cmd=cmd)
                 time.sleep(0.1)
@@ -7867,23 +7847,22 @@ def show_terminal_manager(primary_session=None) -> None:
 
         elif action == "observe":
             if not alive:
-                console.print("\n[yellow]Session has already ended.[/yellow]")
-                input("[dim]Press Enter to continue...[/dim]")
+                status_msg = "[yellow]Session has already ended.[/yellow]"
             else:
                 observe_session(sess, display_name=name, display_cmd=cmd)
 
         elif action == "close":
             if name == "term0 (primary)":
-                console.print("\n[yellow]Cannot close the primary session. "
-                              "Use /exit or close the parent terminal.[/yellow]")
-                input("[dim]Press Enter to continue...[/dim]")
+                status_msg = "[yellow]Cannot close the primary session. " \
+                             "Use /exit or close the parent terminal.[/yellow]"
             else:
                 unregister_terminal(name)
-                console.print(f"\n[green]Closed terminal [bold]{name}[/bold][/green]")
+                status_msg = f"[green]Closed terminal [bold]{name}[/bold][/green]"
 
         elif action == "details":
-            _show_terminal_detail(name, cmd, sess, created, alive)
-            input("\n[dim]Press Enter to continue...[/dim]")
+            with _alt_screen():
+                _show_terminal_detail(name, cmd, sess, created, alive)
+                input("\n[dim]Press Enter to continue...[/dim]")
 
         sel_idx = idx
 
@@ -7977,8 +7956,9 @@ def show_skill_manager() -> None:
         status_msg = ""
 
         if action == "details":
-            _show_skill_detail(name)
-            input("\n[dim]Press Enter to continue...[/dim]")
+            with _alt_screen():
+                _show_skill_detail(name)
+                input("\n[dim]Press Enter to continue...[/dim]")
         elif action == "reload":
             results = skills_mod.reload_all()
             status_msg = f"Reloaded: {len(results)} skill(s) re-scanned from disk."
@@ -8259,7 +8239,9 @@ def enter_session(session, display_name: str = "", display_cmd: str = "") -> Non
 
 
 _extra_cmd_handler_cache = None
-_extra_cmd_mtime_cache = 0
+_extra_cmd_mtime_cache: float = 0
+_extra_cmd_trust_warnings: set[str] = set()
+_EXTRA_CMD_FAILED = object()
 
 
 def _load_extra_commands():
@@ -8268,13 +8250,21 @@ def _load_extra_commands():
     path = paths.project_file(paths.CWD_COMMANDS)
     try:
         mtime = path.stat().st_mtime
-        if _extra_cmd_handler_cache is not None and mtime == _extra_cmd_mtime_cache:
-            return _extra_cmd_handler_cache
+    except OSError:
+        return None
+    if mtime == _extra_cmd_mtime_cache:
+        return _extra_cmd_handler_cache
+    try:
         allowed, reason = trust_store.is_execution_allowed(path)
         if not allowed:
-            console.print(
-                f"[yellow]Restricted Mode: not executing {path} ({reason}). "
-                "Use /trust allow after reviewing it.[/yellow]")
+            warning_key = f"{path}:{mtime}:{reason}"
+            if warning_key not in _extra_cmd_trust_warnings:
+                _extra_cmd_trust_warnings.add(warning_key)
+                console.print(
+                    f"[yellow]Restricted Mode: not executing {path} ({reason}). "
+                    "Use /trust allow after reviewing it.[/yellow]")
+            _extra_cmd_handler_cache = None
+            _extra_cmd_mtime_cache = mtime
             return None
         src = path.read_text(encoding="utf-8")
         ns = {}
@@ -8283,9 +8273,13 @@ def _load_extra_commands():
         _extra_cmd_handler_cache = handler
         _extra_cmd_mtime_cache = mtime
         return handler
-    except Exception:
+    except Exception as exc:
+        if not isinstance(exc, FileNotFoundError):
+            console.print(
+                f"[red].laintas/commands.py failed to load: "
+                f"{type(exc).__name__}: {exc}[/red]")
         _extra_cmd_handler_cache = None
-        _extra_cmd_mtime_cache = 0
+        _extra_cmd_mtime_cache = mtime
         return None
 
 
@@ -8499,6 +8493,8 @@ _SLASH_ARG_RULES: dict[tuple[str, ...], SlashArgRule] = {
     ("/version", "update"): _arg_rule(
         2, "/version update [--force]", flag_start=1,
         allowed_flags=("--force", "-f")),
+    ("/version", "--force"): _arg_rule(0, "/version [check|update [--force]]"),
+    ("/version", "-f"): _arg_rule(0, "/version [check|update [--force]]"),
     ("/update", "check"): _arg_rule(1, "/update check"),
     ("/update", "--force"): _arg_rule(1, "/update [--force]"),
     ("/update", "-f"): _arg_rule(1, "/update [-f]"),
@@ -13987,7 +13983,7 @@ def _cmd_max() -> None:
 
 def _cmd_compact(parts: list, session: dict) -> bool:
     compact_arg = parts[1].lower() if len(parts) > 1 else ""
-    if len(parts) > 2 or compact_arg not in ("", "status", "--force", "force"):
+    if len(parts) > 2 or compact_arg not in ("", "status", "--force"):
         console.print("[yellow]Usage: /compact [status|--force][/yellow]")
         return False
 
@@ -14709,8 +14705,15 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
 
     else:
         # Evolution Lab extensions register project-local slash commands here.
-        handled, extension_result = extension_runtime.get_runtime().invoke_command(
-            action, parts, cmd)
+        try:
+            handled, extension_result = extension_runtime.get_runtime().invoke_command(
+                action, parts, cmd)
+        except Exception as exc:
+            console.print(
+                f"[red]Extension command {action} error: "
+                f"{type(exc).__name__}: {exc}[/red]")
+            handled = False
+            extension_result = None
         if handled:
             if extension_result is not None:
                 console.print(extension_result)
@@ -14745,7 +14748,8 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
                     return False
             except Exception as e:
                 console.print(f"[red].laintas/commands.py error: {e}[/red]")
-        console.print(f"[red]Unknown command: {action}[/red]")
+                return False
+            console.print(f"[red]Unknown command: {action}[/red]")
         console.print("Type [bold]/help[/bold] for available commands.")
 
     return False
@@ -15829,6 +15833,7 @@ def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
             cleaned, overridden = auto_pilot.should_override(user_input)
             if overridden:
                 effective_input = cleaned
+                console.print("[dim][auto-pilot] overridden by ! prefix - single agent mode[/dim]")
             else:
                 has_wf = False
                 try:
@@ -15853,7 +15858,12 @@ def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
 
                 if hint:
                     effective_input = hint + "\n\n" + user_input
-                    console.print(f"[dim][auto-pilot] {strategy}[/dim]")
+                    if subtasks:
+                        source = auto_pilot.get_last_decompose_source()
+                        src_label = " (heuristic)" if source == "heuristic" else ""
+                        console.print(f"[dim][auto-pilot] {strategy} · {len(subtasks)} subtasks{src_label}[/dim]")
+                    else:
+                        console.print(f"[dim][auto-pilot] {strategy}[/dim]")
 
                 # Phase 3: auto-execution - set pending plan for run_agent_loop.
                 if subtasks and auto_pilot.should_auto_execute(
@@ -15862,13 +15872,14 @@ def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
                     bool(get_runtime_config("auto_pilot_auto_execute")),
                     int(get_runtime_config("auto_pilot_max_parallel") or 4),
                 ):
+                    mode = "parallel" if strategy == auto_pilot.PARALLEL_HINT else "chain"
                     plan = {
                         "strategy": strategy,
                         "subtasks": subtasks,
-                        "mode": "parallel" if strategy == auto_pilot.PARALLEL_HINT else "chain",
+                        "mode": mode,
                     }
                     auto_pilot.set_pending_plan(plan)
-                    console.print(f"[dim][auto-pilot] auto-executing {len(subtasks)} subtasks[/dim]")
+                    console.print(f"[dim][auto-pilot] auto-executing {len(subtasks)} subtasks ({mode})[/dim]")
     except Exception:
         effective_input = user_input
 
@@ -15961,6 +15972,66 @@ def run_execute_mode(task: str, session: dict, depth: int, session_id: str = Non
     print(result)
 
     return 0 if response.get("success") else 1
+
+
+def _parse_subtask_json(text: str):
+    """Extract a JSON array of strings from LLM reply text.
+
+    Handles common LLM formatting issues: code fences, single quotes,
+    trailing commas, and surrounding prose.  Tries multiple extraction
+    strategies before giving up.
+    """
+    import re as _re
+
+    candidates = []
+
+    # Strip markdown code fences if present.
+    m = _re.search(r"```(?:json)?\s*(\[.*?\])\s*```", text, _re.DOTALL)
+    if m:
+        candidates.append(m.group(1))
+
+    # Find JSON array - greedy first (handles ] inside strings),
+    # then non-greedy (handles multiple arrays in text).
+    m = _re.search(r"\[.*\]", text, _re.DOTALL)
+    if m:
+        candidates.append(m.group(0))
+    m = _re.search(r"\[.*?\]", text, _re.DOTALL)
+    if m:
+        candidates.append(m.group(0))
+
+    for candidate in candidates:
+        # Standard JSON parse.
+        try:
+            parsed = json.loads(candidate)
+            if isinstance(parsed, list) and all(isinstance(s, str) for s in parsed):
+                return parsed
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+        # Fix single quotes -> double quotes.
+        try:
+            fixed = candidate.replace("'", '"')
+            parsed = json.loads(fixed)
+            if isinstance(parsed, list) and all(isinstance(s, str) for s in parsed):
+                return parsed
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+        # Remove trailing commas before ] or }.
+        try:
+            fixed = _re.sub(r",\s*([}\]])", r"\1", candidate)
+            parsed = json.loads(fixed)
+            if isinstance(parsed, list) and all(isinstance(s, str) for s in parsed):
+                return parsed
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    # Last resort: extract individual quoted strings.
+    strings = _re.findall(r'["\']([^"\']{4,})["\']', text)
+    if strings and len(strings) >= 2:
+        return strings
+
+    return None
 
 
 def main():
@@ -16396,26 +16467,6 @@ def main():
         except Exception:
             return None
 
-    def _parse_subtask_json(text: str):
-        """Extract a JSON array of strings from LLM reply text."""
-        import re as _re
-        # Strip markdown code fences if present.
-        m = _re.search(r"```(?:json)?\s*(\[.*?\])\s*```", text, _re.DOTALL)
-        if m:
-            text = m.group(1)
-        else:
-            # Find the first JSON array in the text.
-            m = _re.search(r"\[.*\]", text, _re.DOTALL)
-            if m:
-                text = m.group(0)
-        try:
-            parsed = json.loads(text)
-            if isinstance(parsed, list) and all(isinstance(s, str) for s in parsed):
-                return parsed
-        except (json.JSONDecodeError, ValueError):
-            pass
-        return None
-
     auto_pilot.set_decompose_callback(_decompose_cb)
 
     # Load user skills from ~/.laintas/skills. Failures are surfaced
@@ -16618,7 +16669,7 @@ def main():
             interactive_session = _runtime_owner.runtime_session
 
         # Ctrl+D → exit
-        if user_input == "/exit" and not _is_dialogue:
+        if user_input.strip() == "/exit" and not _is_dialogue:
             if args.depth == 0:
                 save_session_snapshot(agent_state, chat_history, _session_start_cwd)
                 save_resume_state(agent_state, chat_history, _session_start_cwd)

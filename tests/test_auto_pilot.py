@@ -294,6 +294,48 @@ class TestDecomposeCallback:
         assert result == ["task A", "task B"]
 
 
+class TestDecomposeSourceTracking:
+    def setup_method(self):
+        auto_pilot.set_decompose_callback(None)
+
+    def teardown_method(self):
+        auto_pilot.set_decompose_callback(None)
+
+    def test_source_is_llm_when_callback_succeeds(self):
+        def cb(task, strategy, timeout):
+            return ["subtask A", "subtask B"]
+
+        auto_pilot.set_decompose_callback(cb)
+        auto_pilot.decompose_task("do stuff", auto_pilot.PARALLEL_HINT, timeout=2.0)
+        assert auto_pilot.get_last_decompose_source() == "llm"
+
+    def test_source_is_heuristic_when_no_callback(self):
+        task = ("update the authentication module in foo.py and also "
+                "fix the database connection in bar.py and also "
+                "test the new API endpoints in baz.py")
+        auto_pilot.decompose_task(task, auto_pilot.PARALLEL_HINT, timeout=1.0)
+        assert auto_pilot.get_last_decompose_source() == "heuristic"
+
+    def test_source_is_heuristic_when_callback_fails(self):
+        def cb(task, strategy, timeout):
+            raise RuntimeError("LLM unavailable")
+
+        auto_pilot.set_decompose_callback(cb)
+        task = ("update the authentication module in foo.py and also "
+                "fix the database connection in bar.py and also "
+                "test the new API endpoints in baz.py")
+        auto_pilot.decompose_task(task, auto_pilot.PARALLEL_HINT, timeout=1.0)
+        assert auto_pilot.get_last_decompose_source() == "heuristic"
+
+    def test_source_is_none_when_no_decomposition(self):
+        auto_pilot.decompose_task("fix bug", auto_pilot.SIMPLE)
+        assert auto_pilot.get_last_decompose_source() is None
+
+    def test_source_is_none_when_heuristic_finds_nothing(self):
+        auto_pilot.decompose_task("short task", auto_pilot.PARALLEL_HINT, timeout=1.0)
+        assert auto_pilot.get_last_decompose_source() is None
+
+
 class TestHeuristicDecompose:
     def test_pipeline_split_on_then(self):
         task = "first run the tests, then fix the failures, finally commit changes"

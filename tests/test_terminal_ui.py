@@ -265,5 +265,107 @@ class ResponsiveTerminalChromeTests(unittest.TestCase):
         old_session.close.assert_called_once()
 
 
+class FmtElapsedTests(unittest.TestCase):
+    def test_zero_returns_empty(self):
+        self.assertEqual(laintas_cli._fmt_elapsed(0), "")
+
+    def test_negative_returns_empty(self):
+        self.assertEqual(laintas_cli._fmt_elapsed(-1.5), "")
+
+    def test_milliseconds(self):
+        self.assertEqual(laintas_cli._fmt_elapsed(0.5), "500ms")
+
+    def test_sub_second_precision(self):
+        self.assertEqual(laintas_cli._fmt_elapsed(0.123), "123ms")
+
+    def test_seconds_with_decimal(self):
+        self.assertEqual(laintas_cli._fmt_elapsed(5.4), "5.4s")
+
+    def test_seconds_just_under_minute(self):
+        self.assertEqual(laintas_cli._fmt_elapsed(59.9), "59.9s")
+
+    def test_minutes(self):
+        self.assertEqual(laintas_cli._fmt_elapsed(125), "2m5s")
+
+    def test_hours(self):
+        self.assertEqual(laintas_cli._fmt_elapsed(3700), "1h1m40s")
+
+    def test_multiple_hours(self):
+        self.assertEqual(laintas_cli._fmt_elapsed(7384), "2h3m4s")
+
+    def test_exact_hour(self):
+        self.assertEqual(laintas_cli._fmt_elapsed(3600), "1h0m0s")
+
+
+class TruncateWithEllipsisTests(unittest.TestCase):
+    def test_short_text_unchanged(self):
+        self.assertEqual(laintas_cli._truncate_with_ellipsis("hello", 80), "hello")
+
+    def test_exact_fit_unchanged(self):
+        self.assertEqual(laintas_cli._truncate_with_ellipsis("hello", 5), "hello")
+
+    def test_truncated_adds_ellipsis(self):
+        result = laintas_cli._truncate_with_ellipsis("hello world", 8)
+        self.assertEqual(len(result), 8)
+        self.assertTrue(result.endswith("…"))
+        self.assertEqual(result, "hello w…")
+
+    def test_empty_string(self):
+        self.assertEqual(laintas_cli._truncate_with_ellipsis("", 80), "")
+
+    def test_one_char_max(self):
+        self.assertEqual(laintas_cli._truncate_with_ellipsis("ab", 1), "…")
+
+
+class ParseSubtaskJsonTests(unittest.TestCase):
+    def test_clean_json_array(self):
+        result = laintas_cli._parse_subtask_json('["task A", "task B"]')
+        self.assertEqual(result, ["task A", "task B"])
+
+    def test_json_in_code_fence(self):
+        text = '```json\n["task A", "task B"]\n```'
+        result = laintas_cli._parse_subtask_json(text)
+        self.assertEqual(result, ["task A", "task B"])
+
+    def test_json_in_plain_code_fence(self):
+        text = '```\n["task A", "task B"]\n```'
+        result = laintas_cli._parse_subtask_json(text)
+        self.assertEqual(result, ["task A", "task B"])
+
+    def test_json_with_surrounding_prose(self):
+        text = 'Here are the subtasks:\n["task A", "task B"]\nLet me know.'
+        result = laintas_cli._parse_subtask_json(text)
+        self.assertEqual(result, ["task A", "task B"])
+
+    def test_single_quotes(self):
+        result = laintas_cli._parse_subtask_json("['task A', 'task B']")
+        self.assertEqual(result, ["task A", "task B"])
+
+    def test_trailing_comma(self):
+        result = laintas_cli._parse_subtask_json('["task A", "task B",]')
+        self.assertEqual(result, ["task A", "task B"])
+
+    def test_no_array_returns_none(self):
+        self.assertIsNone(laintas_cli._parse_subtask_json("no json here"))
+
+    def test_empty_array_returns_empty_list(self):
+        """Empty array is valid JSON - caller filters it out via len() >= 2 check."""
+        result = laintas_cli._parse_subtask_json("[]")
+        self.assertEqual(result, [])
+
+    def test_non_string_elements_returns_none(self):
+        self.assertIsNone(laintas_cli._parse_subtask_json("[1, 2, 3]"))
+
+    def test_last_resort_quoted_strings(self):
+        text = 'I think "update the auth module" and "fix the API" work'
+        result = laintas_cli._parse_subtask_json(text)
+        self.assertEqual(result, ["update the auth module", "fix the API"])
+
+    def test_three_subtasks(self):
+        text = '["run tests", "fix bugs", "commit changes"]'
+        result = laintas_cli._parse_subtask_json(text)
+        self.assertEqual(result, ["run tests", "fix bugs", "commit changes"])
+
+
 if __name__ == "__main__":
     unittest.main()

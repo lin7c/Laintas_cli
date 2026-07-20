@@ -375,8 +375,10 @@ def _emit_simple_diff(console, diff_text: str, depth: int = 0, cap: int = 6) -> 
     inner = "  " * depth + "  "
     console.print(f"{inner}[accent]▍[/accent] [success]+{adds}[/success] [error]−{dels}[/error]", highlight=False)
     for style, mark, no, text in changed:
+        if len(text) > 96:
+            text = text[:95] + "…"
         console.print(f"{inner}[muted]{no:>4}[/muted] "
-                      f"[{style}]{mark}{_esc(text[:96])}[/{style}]", highlight=False)
+                      f"[{style}]{mark}{_esc(text)}[/{style}]", highlight=False)
     if total_changed > cap:
         console.print(f"{inner}     [muted]… {total_changed - cap} more change(s) · /detail on for full[/muted]", highlight=False)
 
@@ -4798,7 +4800,7 @@ def _detect_lang(text: str) -> str:
 
 
 _loop_cmd_handler_cache = None
-_loop_cmd_mtime_cache = 0
+_loop_cmd_mtime_cache: float = 0
 _loop_trust_warnings: set[str] = set()
 
 
@@ -4815,14 +4817,19 @@ def _load_loop_commands():
     try:
         path = str(paths.project_file(paths.CWD_LOOP))
         mtime = os.path.getmtime(path)
-        if _loop_cmd_handler_cache is not None and mtime == _loop_cmd_mtime_cache:
-            return _loop_cmd_handler_cache
+    except OSError:
+        return None
+    if mtime == _loop_cmd_mtime_cache:
+        return _loop_cmd_handler_cache
+    try:
         allowed, reason = trust_store.is_execution_allowed(Path(path))
         if not allowed:
             warning_key = f"{path}:{mtime}:{reason}"
             if warning_key not in _loop_trust_warnings:
                 _loop_trust_warnings.add(warning_key)
                 _diag("loop_customization_restricted", path=path, reason=reason)
+            _loop_cmd_handler_cache = None
+            _loop_cmd_mtime_cache = mtime
             return None
         with open(path, "r", encoding="utf-8") as f:
             src = f.read()
@@ -4832,9 +4839,12 @@ def _load_loop_commands():
         _loop_cmd_handler_cache = handler
         _loop_cmd_mtime_cache = mtime
         return handler
-    except Exception:
+    except Exception as exc:
+        if not isinstance(exc, FileNotFoundError):
+            _diag("loop_customization_load_error",
+                  path=path, error=f"{type(exc).__name__}: {exc}")
         _loop_cmd_handler_cache = None
-        _loop_cmd_mtime_cache = 0
+        _loop_cmd_mtime_cache = mtime
         return None
 
 
@@ -6199,7 +6209,7 @@ def run_agent_loop(
                         if callable(_transient_factory) else nullcontext())
                     with _transient_ctx:
                         with Live(_LiveWrapper(), console=deps.console,
-                                  refresh_per_second=4.0, auto_refresh=True,
+                                  refresh_per_second=10.0, auto_refresh=True,
                                   transient=True, redirect_stdout=False,
                                   redirect_stderr=False) as live:
                             _live_holder["live"] = live
