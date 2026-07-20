@@ -38,6 +38,7 @@ import paths                 # Centralized path management
 import skills as skills_mod   # Progressive skill metadata + context loading
 import event_log              # Durable prompt admission + turn event log
 import durable_rules         # Structured long-lived user obligations
+import auto_pilot            # Heuristic task classification + decomposition + auto-exec
 import trust_store            # workspace trust for executable project hooks
 import usage_tracker          # Local AI token/cost accounting
 try:
@@ -114,6 +115,11 @@ _DEFAULT_CONFIG = {
     "trigger_debounce_ms": 500.0,      # idle window before flushing buffered trigger matches
     "trigger_max_per_scan": 50,        # hard cap on matches dispatched per terminal per scan
     "auto_pilot_enabled": True,        # master switch for heuristic task classification + hint injection
+    "auto_pilot_decompose_timeout": 3.0,   # seconds to wait for LLM decomposition before falling back to heuristic
+    "auto_pilot_decompose_max_tokens": 500, # max tokens for decomposition LLM call
+    "auto_pilot_auto_execute": False,  # Phase 3: auto-spawn sub-agents for decomposed tasks (opt-in)
+    "auto_pilot_max_parallel": 4,      # Phase 3: max parallel sub-agents for auto-execution
+    "auto_pilot_budget_tokens": 50000, # Phase 3: token budget for auto-execution (all sub-agents combined)
 }
 
 # ── Typed Error Classes ───────────────────────────────────────────────
@@ -5527,6 +5533,38 @@ def run_agent_loop(
             )
             if child_id:
                 workflow_engine.mark_auto_spawned(role, child_id)
+
+    # ── Phase 3: Auto-pilot auto-execution ──
+    # If _run_agent_loop_with_interrupt set a pending plan, pre-spawn
+    # sub-agents before the main loop starts.  The main agent then runs
+    # as orchestrator with knowledge of the pre-spawned agents.
+    _auto_pilot_orchestrator = None
+    if depth == 0 and agent_id:
+        _ap_plan = auto_pilot.get_pending_plan()
+        if _ap_plan is not None:
+            _ap_strategy = _ap_plan.get("strategy", "")
+            _ap_subtasks = _ap_plan.get("subtasks", [])
+            _ap_mode = _ap_plan.get("mode", "parallel")
+            _ap_max = int(get_runtime_config("auto_pilot_max_parallel") or 4)
+            _ap_orch = auto_pilot.AutoPilotOrchestrator(
+                max_parallel=_ap_max,
+                budget_tokens=int(get_runtime_config("auto_pilot_budget_tokens") or 50000),
+            )
+            for _ap_st in _ap_subtasks[:_ap_max]:
+                _ap_child = spawn_subagent(
+                    parent_id=agent_id,
+                    task=_ap_st,
+                    deps=deps,
+                    session=None,
+                    events_cb=events_cb,
+                )
+                if _ap_child:
+                    _ap_orch.track_agent(_ap_child, _ap_st, time.time())
+            if _ap_orch.spawned_agents:
+                _auto_pilot_orchestrator = _ap_orch
+                _ap_hint = _ap_orch.build_orchestrator_hint()
+                if _ap_hint:
+                    original_input = _ap_hint + "\n\n" + original_input
     # ── Durable prompt admission (opencode pattern) ──
     # Write the prompt to the event log BEFORE execution starts, so a crash
     # never loses what the user asked. Recovery can detect an incomplete task.

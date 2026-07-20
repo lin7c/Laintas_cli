@@ -15822,7 +15822,7 @@ def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
     response = None
     run_error = ""
 
-    # ── Auto-Pilot: heuristic task classification + hint injection ──
+    # ── Auto-Pilot: heuristic classification + decomposition + auto-exec ──
     effective_input = user_input
     try:
         if get_runtime_config("auto_pilot_enabled"):
@@ -15837,10 +15837,38 @@ def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
                 except Exception:
                     pass
                 strategy = auto_pilot.classify_task(user_input, has_active_workflow=has_wf)
-                hint = auto_pilot.build_hint(strategy)
+
+                # Phase 2: LLM decomposition for parallel/pipeline strategies.
+                subtasks = None
+                if strategy in (auto_pilot.PARALLEL_HINT, auto_pilot.PIPELINE_HINT):
+                    decompose_timeout = float(get_runtime_config("auto_pilot_decompose_timeout") or 3.0)
+                    subtasks = auto_pilot.decompose_task(user_input, strategy, timeout=decompose_timeout)
+
+                # Build hint: use decomposed hint if available, else generic.
+                if subtasks and len(subtasks) >= 2:
+                    hint = auto_pilot.build_decomposed_hint(strategy, subtasks)
+                else:
+                    hint = auto_pilot.build_hint(strategy)
+                    subtasks = None  # reset so Phase 3 doesn't fire
+
                 if hint:
                     effective_input = hint + "\n\n" + user_input
                     console.print(f"[dim][auto-pilot] {strategy}[/dim]")
+
+                # Phase 3: auto-execution - set pending plan for run_agent_loop.
+                if subtasks and auto_pilot.should_auto_execute(
+                    strategy,
+                    subtasks,
+                    bool(get_runtime_config("auto_pilot_auto_execute")),
+                    int(get_runtime_config("auto_pilot_max_parallel") or 4),
+                ):
+                    plan = {
+                        "strategy": strategy,
+                        "subtasks": subtasks,
+                        "mode": "parallel" if strategy == auto_pilot.PARALLEL_HINT else "chain",
+                    }
+                    auto_pilot.set_pending_plan(plan)
+                    console.print(f"[dim][auto-pilot] auto-executing {len(subtasks)} subtasks[/dim]")
     except Exception:
         effective_input = user_input
 
@@ -16329,6 +16357,66 @@ def main():
                 f"[dim]trigger-wake error for '{agent_id}': {_exc}[/dim]")
 
     set_trigger_wake_callback(_trigger_wake_cb)
+
+    # ── Phase 2: Register LLM decomposition callback for auto-pilot ──
+    def _decompose_cb(task: str, strategy: str, timeout: float):
+        """Decompose a task into subtasks via backend LLM with timeout."""
+        try:
+            _session = load_session() or {}
+            if strategy == auto_pilot.PARALLEL_HINT:
+                mode_word = "independent"
+            else:
+                mode_word = "sequential"
+            system_prompt = (
+                "You are a task decomposition assistant. Break the given "
+                f"task into 2-4 {mode_word} subtasks. Return ONLY a JSON "
+                "array of strings, no explanation. "
+                'Example: ["subtask 1", "subtask 2", "subtask 3"]'
+            )
+            # Temporarily lower max_tokens for the decomposition call.
+            from agent_loop import get_runtime_config as _grc, set_runtime_config as _src
+            _orig_max = _grc("max_tokens")
+            _decompose_max = int(_grc("auto_pilot_decompose_max_tokens") or 500)
+            _src("max_tokens", _decompose_max)
+            try:
+                result = call_backend_stream(
+                    _session,
+                    message=task,
+                    system_prompt=system_prompt,
+                    current_path=os.getcwd(),
+                    tools_enabled=False,
+                )
+            finally:
+                _src("max_tokens", _orig_max)
+            reply = (result or {}).get("reply", "")
+            if not reply:
+                return None
+            # Robust JSON extraction: handle code blocks + surrounding text.
+            return _parse_subtask_json(reply)
+        except Exception:
+            return None
+
+    def _parse_subtask_json(text: str):
+        """Extract a JSON array of strings from LLM reply text."""
+        import re as _re
+        # Strip markdown code fences if present.
+        m = _re.search(r"```(?:json)?\s*(\[.*?\])\s*```", text, _re.DOTALL)
+        if m:
+            text = m.group(1)
+        else:
+            # Find the first JSON array in the text.
+            m = _re.search(r"\[.*\]", text, _re.DOTALL)
+            if m:
+                text = m.group(0)
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, list) and all(isinstance(s, str) for s in parsed):
+                return parsed
+        except (json.JSONDecodeError, ValueError):
+            pass
+        return None
+
+    auto_pilot.set_decompose_callback(_decompose_cb)
 
     # Load user skills from ~/.laintas/skills. Failures are surfaced
     # but never block startup.
