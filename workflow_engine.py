@@ -643,7 +643,7 @@ def is_tool_allowed_in_workflow(tool_name: str) -> bool:
 
     Returns True if no active workflow or the phase has no tool restrictions.
     """
-    if tool_name in {"task.complete", "task.continue",
+    if tool_name in {"task.complete",
                      "workflow.phase_complete", "rule.list",
                      "rule.mark_satisfied"}:
         return True

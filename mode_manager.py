@@ -60,7 +60,7 @@ _READ_ONLY_TOOLS = [
     "task.list", "task.get",
     "skill.list", "skill.reference",
     "agent.spawn", "agent.tell", "agent.list", "agent.wait", "agent.inbox",
-    "task.continue", "task.complete",
+    "task.complete",
 ]
 
 _BUILTINS = {

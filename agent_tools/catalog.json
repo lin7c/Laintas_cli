@@ -207,12 +207,6 @@
       "aliases": {"laintas_cli": "task.get"}
     },
     {
-      "name": "task_continue", "category": "task", "execContext": "either",
-      "description": "Keep the current task active when more work remains but this turn has no other concrete action.",
-      "params": {"type": "object", "properties": {}},
-      "aliases": {"laintas_cli": "task.continue"}
-    },
-    {
       "name": "task_complete", "category": "task", "execContext": "either",
       "description": "Explicitly finish the current user task after verification and all durable completion hooks are satisfied.",
       "params": {"type": "object", "properties": {"summary": {"type": "string"}}},

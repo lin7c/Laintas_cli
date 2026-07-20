@@ -7246,8 +7246,6 @@ def run_agent_loop(
                                 _meta2 += " · /why"
                         elif name == "task.complete" and result.get("ok"):
                             _meta2 = "done"
-                        elif name == "task.continue" and result.get("ok"):
-                            _meta2 = "continue"
                         elif name == "fs.grep" and result.get("ok"):
                             _matches = result.get("matches", 0)
                             _meta2 = f"{_matches} match{'es' if _matches != 1 else ''}"

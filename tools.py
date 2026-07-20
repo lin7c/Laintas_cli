@@ -3521,18 +3521,6 @@ def _bi_sleep(params: dict, ctx: ToolCtx) -> dict:
     return {"ok": True, "result": f"Slept {secs:.1f}s", "seconds": secs}
 
 
-def _bi_task_continue(params: dict, ctx: ToolCtx) -> dict:
-    """No-op continuation signal.
-
-    Its only purpose is to BE a tool call: the agent loop keeps looping whenever
-    a turn contains any tool call, so calling this lets the model keep working on
-    a turn where it has nothing concrete to run yet (still reasoning, planning a
-    next step) WITHOUT ending on an empty tool-call turn — which the loop
-    otherwise reads as "done / handing back to the user".
-    """
-    return {"ok": True, "result": "(continuing)"}
-
-
 _CODE_FILE_EXTS = frozenset({
     ".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".rs", ".java",
     ".c", ".cpp", ".h", ".hpp", ".rb", ".php", ".swift", ".kt",
@@ -6489,18 +6477,6 @@ def register_builtin_tools() -> None:
                 "summary": {"type": "string"},
             }, "required": ["summary"]},
             invoke=_bi_workflow_phase_complete,
-        ),
-        Tool(
-            name="task.continue",
-            description=(
-                "Keep working when you have nothing concrete to run THIS turn but "
-                "the task is not finished (still reasoning or planning the next "
-                "step). Call this instead of returning an empty tool_calls list — "
-                "an empty list ends the turn and hands control back to the user. "
-                "No arguments, no side effects."
-            ),
-            schema={"type": "object", "properties": {}},
-            invoke=_bi_task_continue,
         ),
         Tool(
             name="task.complete",

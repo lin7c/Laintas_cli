@@ -4657,8 +4657,8 @@ The native function schemas are authoritative for each tool's name, purpose and 
 - Your reply is OPTIONAL. Leave it empty on ordinary execution steps and just emit the tool call(s). Write user-facing text ONLY when: (a) you are giving the final answer/result, (b) you must ask the user a clarifying question, or (c) a non-obvious decision needs a one-line rationale. When you do write, cite files as path:line.
 - Completion is an explicit act: call `task_complete` with a `summary` when — and only when — the task is fully finished. Do NOT stop just to narrate progress; if more work remains, include the next tool call in the SAME turn and keep going.
 - Before calling `task_complete` on a task that modified code files, run the project's test suite (pytest, npm test, go test, etc.) to verify your changes. If tests fail, fix them before completing. If tests are not applicable, state why in the summary.
-- If you have nothing concrete to run this turn but the task is NOT finished (still reasoning or planning), call `task_continue` so the loop keeps going. Never end mid-task with no tool call.
-- Ending your turn with no tool call is only for asking the user something or handing back a final answer. It does not by itself mean the task is done.
+- If you have nothing concrete to run this turn but the task is NOT finished (still reasoning or planning), just reply with text and no tool call - the loop will continue automatically. Do NOT call task_complete unless the task is truly done.
+- Ending your turn with no tool call continues the loop. Use this for conversational replies, asking the user a question, or when you need a turn to think before your next action.
 </output_rules>
 
 <terminal_output_style>

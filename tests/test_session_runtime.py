@@ -145,7 +145,7 @@ class AgentTerminationTests(unittest.TestCase):
             {
                 "reply": "我先继续检查。",
                 "tool_calls": [{
-                    "name": "task.continue", "arguments": {},
+                    "name": "time.now", "arguments": {},
                 }],
                 "finish_reason": "tool_calls", "done": False,
                 "error": False,
@@ -172,7 +172,7 @@ class AgentTerminationTests(unittest.TestCase):
             ["user", "assistant", "tool", "assistant"],
         )
         self.assertEqual(history[1]["content"], "我先继续检查。")
-        self.assertEqual(history[2]["tool_name"], "task.continue")
+        self.assertEqual(history[2]["tool_name"], "time.now")
         self.assertEqual(history[3]["content"], "检查完成。")
 
     def test_empty_provider_turn_is_not_success(self):
@@ -253,7 +253,7 @@ class AgentTerminationTests(unittest.TestCase):
             {
                 "reply": "",
                 "tool_calls": [{
-                    "name": "task.continue",
+                    "name": "time.now",
                     "arguments": {},
                 }],
                 "finish_reason": "stop",
