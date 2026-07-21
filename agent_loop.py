@@ -6437,7 +6437,8 @@ def run_agent_loop(
                 add_debug_log(debug_entry)
                 continue
             if events_cb is not None:
-                deps.console.print(f"[red]{_err_text}[/red]")
+                from rich.markup import escape as _esc
+                deps.console.print(f"[red]{_esc(_err_text)}[/red]")
             _append_short_memory(state, f"\n  -Error: {_err_text}")
             add_debug_log(debug_entry)
             _exit_reason = TRANSITION_BACKEND_ERROR
@@ -6518,7 +6519,9 @@ def run_agent_loop(
                 # output and must not be prefixed with a decorative dot.
                 if ("\n" not in _stripped and len(_stripped) <= 100
                         and not _prose_final):
-                    deps.console.print(f"[accent]·[/accent] [dim]{_stripped}[/dim]")
+                    from rich.markup import escape as _esc
+                    deps.console.print(
+                        f"[accent]·[/accent] [dim]{_esc(_stripped)}[/dim]")
                 else:
                     _print_markdown_safely(deps, display_reply)
             step_replies.append(display_reply)
@@ -7762,7 +7765,10 @@ def run_agent_loop(
                     if not tool_calls and not reply:
                         raw = debug_entry.response_raw
                         if raw:
-                            deps.console.print(f"[dim yellow]Last backend response: {json.dumps(raw, ensure_ascii=False, default=str)[:500]}[/dim yellow]")
+                            from rich.markup import escape as _esc
+                            _raw_text = json.dumps(raw, ensure_ascii=False, default=str)[:500]
+                            deps.console.print(
+                                f"[dim yellow]Last backend response: {_esc(_raw_text)}[/dim yellow]")
                 if events_cb is not None and pending_events:
                     events_cb(pending_events)
                     pending_events.clear()

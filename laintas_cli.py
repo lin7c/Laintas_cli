@@ -229,14 +229,26 @@ class _PlainWhiteSyntaxTheme(SyntaxTheme):
         return RichStyle()
 
 
+class _PlatedWhiteSyntaxTheme(_PlainWhiteSyntaxTheme):
+    """Same white tokens, but the whole block sits on a dark plate."""
+
+    def get_background_style(self) -> RichStyle:
+        return RichStyle(bgcolor="#161b22")
+
+
 _PLAIN_WHITE_SYNTAX = _PlainWhiteSyntaxTheme()
+_PLATED_WHITE_SYNTAX = _PlatedWhiteSyntaxTheme()
 
 
 class LaintasMarkdown(RichMarkdown):
-    """Markdown renderer with no baked-in black/blue code treatment."""
+    """Markdown renderer with no baked-in black/blue code treatment.
+
+    Fenced code blocks render on a dark plate (#161b22, same as the
+    ``surface`` semantic color); inline code stays on the terminal background.
+    """
 
     def __init__(self, markup: str, **kwargs):
-        kwargs.setdefault("code_theme", _PLAIN_WHITE_SYNTAX)
+        kwargs.setdefault("code_theme", _PLATED_WHITE_SYNTAX)
         kwargs.setdefault("inline_code_theme", _PLAIN_WHITE_SYNTAX)
         kwargs.setdefault("style", "white")
         super().__init__(markup, **kwargs)
@@ -11521,7 +11533,8 @@ def _cmd_prompt(raw_args: str, parts: list, session: dict) -> None:
                 fields = None
             finally:
                 if _reader_was_running:
-                    _start_bg_input_reader(get_user_message_queue())
+                    _start_bg_input_reader(get_user_message_queue(),
+                                           get_user_interrupt_event())
         else:
             console.print(Panel(
                 _po.get_failure_template(),
@@ -15592,11 +15605,12 @@ def _parse_agent_target(text: str) -> tuple[str, str]:
 
 # ── Background stdin reader for supplementary input during agent loop ──
 # When the agent loop is running, the user can type additional instructions,
-# or press Esc to interrupt (the same soft-interrupt Ctrl+C triggers — no
-# separate cancel path to keep in sync). A background thread owns stdin in
-# cbreak mode (no line buffering, so Esc doesn't need Enter to register) and
-# hand-rolls just enough line editing — echo, backspace, Enter-submit — to
-# keep queuing supplementary text working the way it did with readline().
+# or press Esc to soft-interrupt (the same interrupt Ctrl+C triggers, but
+# wired straight to the loop's interrupt event — never a signal, so Esc can
+# never kill the process; force exit stays exclusive to double Ctrl+C).
+# A background thread owns stdin via prompt_toolkit (falling back to line
+# mode without a tty) and hand-rolls just enough line editing to keep
+# queuing supplementary text working the way it did with readline().
 _bg_reader_thread: Optional[threading.Thread] = None
 _bg_reader_stop = threading.Event()
 _bg_prompt_session: Optional[PromptSession] = None
@@ -15638,17 +15652,22 @@ def agent_loop_crop_for_ui(value: str, width: int) -> str:
         return str(value or "")[:width]
 
 
-def _bg_reader_prompt_mode(target_queue: queue.Queue):
+def _bg_reader_prompt_mode(target_queue: queue.Queue,
+                           interrupt_event: Optional[threading.Event] = None):
     """Prompt-toolkit-owned supplementary input; safe beside Rich Live output."""
     global _bg_prompt_session
     bindings = KeyBindings()
 
     @bindings.add(Keys.Escape)
     def _escape(event):
-        # Esc cancels the current supplementary draft only.  It must never
-        # raise SIGINT: doing so used to terminate the whole CLI when the
-        # prompt was empty (and could interrupt unrelated login/IO waits).
+        # Esc clears the current supplementary draft, and soft-interrupts a
+        # running agent loop by setting its interrupt event directly. It
+        # must never raise SIGINT: doing so used to terminate the whole CLI
+        # when the prompt was empty (and could interrupt unrelated login/IO
+        # waits). Force exit stays exclusive to double Ctrl+C.
         event.app.current_buffer.reset()
+        if interrupt_event is not None:
+            interrupt_event.set()
         _set_run_input_state("input_active")
 
     @bindings.add(Keys.ControlC)
@@ -15704,12 +15723,14 @@ def _bg_reader_line_mode(target_queue: queue.Queue):
             _queue_supplementary(target_queue, line)
 
 
-def _bg_reader_cbreak_mode(target_queue: queue.Queue):
-    """cbreak-mode reader: detects a bare Esc keypress immediately (no Enter
-    needed) and raises SIGINT so it goes through the exact same soft/hard
-    interrupt escalation as Ctrl+C. Also hand-rolls basic line editing for
-    supplementary text, using an incremental UTF-8 decoder so multi-byte
-    input (e.g. Chinese) is never corrupted mid-character."""
+def _bg_reader_cbreak_mode(target_queue: queue.Queue,
+                           interrupt_event: Optional[threading.Event] = None):
+    """cbreak-mode reader: a bare Esc keypress (no Enter needed) sets the
+    agent loop's interrupt event directly — the same soft interrupt Ctrl+C
+    triggers, but never a signal, so Esc can never kill the process. Force
+    exit stays exclusive to double Ctrl+C. Also hand-rolls basic line
+    editing for supplementary text, using an incremental UTF-8 decoder so
+    multi-byte input (e.g. Chinese) is never corrupted mid-character."""
     fd = sys.stdin.fileno()
     try:
         old_tcattr = termios.tcgetattr(fd)
@@ -15766,11 +15787,16 @@ def _bg_reader_cbreak_mode(target_queue: queue.Queue):
                     except OSError:
                         pass
                     continue
-                # A bare Esc is a local cancel/clear action.  Ctrl+C remains
-                # the explicit interrupt gesture and follows the normal
-                # soft/hard escalation path through the signal handler.
-                _clear_visible_line()
-                _set_run_input_state("input_active")
+                # A bare Esc soft-interrupts the running agent loop by
+                # setting its interrupt event directly (no signal, so it
+                # can never kill the whole CLI). With no event wired up it
+                # stays a pure local cancel/clear of the draft line.
+                if interrupt_event is not None:
+                    _clear_visible_line()
+                    interrupt_event.set()
+                else:
+                    _clear_visible_line()
+                    _set_run_input_state("input_active")
                 continue
 
             if chunk in (b'\r', b'\n'):
@@ -15802,7 +15828,8 @@ def _bg_reader_cbreak_mode(target_queue: queue.Queue):
             pass
 
 
-def _start_bg_input_reader(target_queue: queue.Queue):
+def _start_bg_input_reader(target_queue: queue.Queue,
+                           interrupt_event: Optional[threading.Event] = None):
     """Start a background thread that reads stdin for supplementary messages
     and Esc-to-interrupt during run_agent_loop().
 
@@ -15811,6 +15838,7 @@ def _start_bg_input_reader(target_queue: queue.Queue):
 
     target_queue: the queue to put supplementary messages into (should be
     the same queue that run_agent_loop() drains between iterations).
+    interrupt_event: when given, a bare Esc press sets it (soft interrupt).
     """
     global _bg_reader_thread, _bg_reader_stop
     if _bg_reader_thread is not None and _bg_reader_thread.is_alive():
@@ -15820,7 +15848,7 @@ def _start_bg_input_reader(target_queue: queue.Queue):
     def _reader():
         try:
             if sys.stdin.isatty():
-                _bg_reader_prompt_mode(target_queue)
+                _bg_reader_prompt_mode(target_queue, interrupt_event)
             else:
                 _bg_reader_line_mode(target_queue)
         except Exception:
@@ -16009,7 +16037,8 @@ def _blocking_approval_prompt(title: str, body: str, question: str,
         choice = None
     finally:
         if _reader_was_running:
-            _start_bg_input_reader(get_user_message_queue())
+            _start_bg_input_reader(get_user_message_queue(),
+                                   get_user_interrupt_event())
 
     if choice is not None and choice.startswith("a "):
         return "always"
@@ -16276,7 +16305,7 @@ def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
 
     def _soft_interrupt(signum, frame):
         if _interrupt_event.is_set():
-            # Double Ctrl+C/Esc → force exit (escape hatch)
+            # Double Ctrl+C → force exit (escape hatch)
             console.print("\n[red]Force exit.[/red]")
             _stop_bg_input_reader()
             # Restore and call original handler
@@ -16284,11 +16313,15 @@ def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
             _old_sigint(signum, frame)
             return
         _interrupt_event.set()
-        console.print("\n[dim]⚡ Interrupting... (press Ctrl+C or Esc again to force exit)[/dim]")
+        console.print("\n[dim]⚡ Interrupting... (press Ctrl+C again to force exit)[/dim]")
 
     signal.signal(signal.SIGINT, _soft_interrupt)
 
     _set_run_input_state("running")
+    # Background stdin reader: supplementary instructions + bare-Esc soft
+    # interrupt during the run (wired straight to the interrupt event, never
+    # a signal, so Esc can never kill the CLI).
+    _start_bg_input_reader(_msg_queue, _interrupt_event)
 
     # Everything the loop prints is Agent conversation — record it into the
     # /agents mirror. Output outside a run (banner, prompts, idle chatter)
@@ -16391,6 +16424,7 @@ def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
         _set_run_input_state("finalizing")
         # Restore original SIGINT handler
         signal.signal(signal.SIGINT, _old_sigint)
+        _stop_bg_input_reader()
         _interrupt_event.clear()
         _set_run_input_state("idle")
 
