@@ -68,8 +68,9 @@ _BUILTINS = {
         "name": "act",
         "description": "Normal execution mode",
         "instructions": (
-            "For ordinary reversible work already authorized by the user, act "
-            "without requesting redundant permission.\n"
+            "For ordinary reversible work already authorized by the user, first "
+            "understand the user's intent, then act without requesting redundant "
+            "permission.\n"
             "Before any dangerous or destructive operation, first perform a "
             "comprehensive, systematic analysis of the target, purpose, blast "
             "radius, live consumers and dependencies, reversibility or backup, "

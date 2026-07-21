@@ -181,6 +181,70 @@ class SlashRegistryTests(unittest.TestCase):
         self.assertIn("inspect src", rendered)
         self.assertIn("src contains three modules", rendered)
 
+    def test_told_browse_groups_turns_and_opens_dialog(self):
+        history = [
+            {"role": "user", "content": "first question here"},
+            {"role": "assistant", "content": "first answer"},
+            {"role": "tool", "content": "tool output"},
+            {"role": "user", "content": "second question here"},
+            {"role": "assistant", "content": "second answer"},
+            {"role": "assistant", "content": "follow-up note"},
+        ]
+        with mock.patch.object(laintas_cli, "select_dialog",
+                               return_value=None) as picker:
+            laintas_cli._told_browse_history(history)
+        picker.assert_called_once()
+        labels = picker.call_args.args[0]
+        self.assertEqual(len(labels), 2)
+        self.assertIn("first question here", labels[0])
+        self.assertIn("second question here", labels[1])
+        # second turn has two assistant replies
+        self.assertIn("2 replies", labels[1])
+
+    def test_told_browse_empty_history_prints_hint(self):
+        output = io.StringIO()
+        old_console = laintas_cli.console
+        laintas_cli.console = Console(file=output, force_terminal=False)
+        try:
+            with mock.patch.object(laintas_cli, "select_dialog") as picker:
+                laintas_cli._told_browse_history([])
+        finally:
+            laintas_cli.console = old_console
+        picker.assert_not_called()
+        self.assertIn("session history", output.getvalue())
+
+    def test_told_browse_switches_to_journal_on_tab(self):
+        import json as _json
+        import tempfile as _tmp
+        tmpdir = _tmp.mkdtemp()
+        journal = Path(tmpdir) / "events.jsonl"
+        journal.write_text(
+            _json.dumps({"type": "prompt_admitted", "ts": 1700000000,
+                         "text": "journaled prompt from disk"}) + "\n",
+            encoding="utf-8")
+        calls = []
+
+        def fake_dialog(labels, **kwargs):
+            calls.append(kwargs.get("title", ""))
+            if len(calls) == 1:
+                return ("source", -1)   # simulate Tab → switch to journal
+            return None                 # then cancel out
+
+        proj = mock.Mock()
+        proj.project_dir.return_value = Path(tmpdir)
+        history = [{"role": "user", "content": "session question"},
+                   {"role": "assistant", "content": "session answer"}]
+        with mock.patch.object(laintas_cli, "paths", proj), \
+                mock.patch.object(laintas_cli, "select_dialog",
+                                  side_effect=fake_dialog) as picker:
+            laintas_cli._told_browse_history(history)
+        self.assertEqual(picker.call_count, 2)
+        # second call renders journal entries
+        journal_labels = picker.call_args_list[1].args[0]
+        self.assertEqual(len(journal_labels), 1)
+        self.assertIn("journaled prompt from disk", journal_labels[0])
+        self.assertIn("journal", picker.call_args_list[1].kwargs["title"])
+
     def test_invalid_slash_text_has_no_completions(self):
         self.assertEqual(self._complete("/taskx"), [])
         self.assertEqual(self._complete("/task unrelated"), [])

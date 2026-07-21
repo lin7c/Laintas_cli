@@ -41,6 +41,50 @@ STATUS = {
     "idle": ("○", "class:idle"),
 }
 
+# Default md.* styles for the Agents panel, in prompt_toolkit syntax. These
+# preserve the original hard-coded look and act as the fallback for any
+# palette key the active markdown_theme leaves empty.
+_PANEL_MD_DEFAULTS: dict[str, str] = {
+    "md.h1": "bold #f0f6fc",
+    "md.h2": "bold #d2a8ff",
+    "md.bold": "bold #f0f6fc",
+    "md.italic": "italic #c9d1d9",
+    "md.code": "bg:#161b22 #ffa657",
+    "md.codeblock": "bg:#161b22 #c9d1d9",
+    "md.link": "underline #58a6ff",
+    "md.quote": "italic #8b949e",
+    "md.list": "#d2a8ff",
+}
+
+
+def _panel_md_styles() -> dict[str, str]:
+    """Derive the panel's md.* styles from the active markdown_theme.
+
+    Palette values are Rich-style strings; prompt_toolkit understands the same
+    color/attribute vocabulary (bold/italic/#rrggbb/bg:#rrggbb), so they can
+    be reused directly. Keys the palette leaves empty fall back to the
+    panel's own defaults. Any failure (e.g. early import before laintas_cli
+    is ready) keeps the historical defaults so the feed can never break.
+    """
+    styles = dict(_PANEL_MD_DEFAULTS)
+    try:
+        import laintas_cli
+        palette = laintas_cli._load_markdown_palette(
+            agent_loop.get_runtime_config("markdown_theme"))
+    except Exception:
+        return styles
+    mapping = {
+        "md.h1": palette.get("h1"), "md.h2": palette.get("h2"),
+        "md.bold": palette.get("bold"), "md.italic": palette.get("italic"),
+        "md.code": palette.get("code"), "md.codeblock": palette.get("code_block"),
+        "md.link": palette.get("link"), "md.quote": palette.get("quote"),
+    }
+    for key, value in mapping.items():
+        if value:  # only override when the theme actually sets this key
+            styles[key] = value
+    return styles
+
+
 STYLE = Style.from_dict({
     "header": "bold #58a6ff",
     "muted": "#8b949e",
@@ -62,15 +106,7 @@ STYLE = Style.from_dict({
     "feed.time": "#6e7681",
     "feed.agent": "#79c0ff",
     "feed.text": "#b1bac4",
-    "md.h1": "bold #f0f6fc",
-    "md.h2": "bold #d2a8ff",
-    "md.bold": "bold #f0f6fc",
-    "md.italic": "italic #c9d1d9",
-    "md.code": "bg:#161b22 #ffa657",
-    "md.codeblock": "bg:#161b22 #c9d1d9",
-    "md.link": "underline #58a6ff",
-    "md.quote": "italic #8b949e",
-    "md.list": "#d2a8ff",
+    **_panel_md_styles(),
 })
 
 
@@ -129,18 +165,33 @@ class AgentsModeController:
         self._closed = threading.Event()
         self._last_agents: list = []
         selected = agent_loop.get_dialog_agent_for_terminal(self.terminal_name)
+        if selected is not None and agent_loop.agent_deployment_terminal(selected) == self.terminal_name:
+            selected = None
         self.selected_id = selected.id if selected else ""
+
+    def _is_deployed_in_terminal(self, agent) -> bool:
+        """Agent owns the persistent shell of this terminal (e.g. primary)."""
+        return agent_loop.agent_deployment_terminal(agent) == self.terminal_name
 
     def agents(self) -> list:
         rows = [a for a in agent_loop.get_all_agents()
                 if agent_loop.agent_scope_terminal(a) == self.terminal_name
-                and not a.lifecycle_terminated]
+                and not a.lifecycle_terminated
+                and not self._is_deployed_in_terminal(a)]
         rows.sort(key=lambda a: (
             0 if a.role == "primary" else 1, a.created_at, a.id))
         self._last_agents = rows
-        if self.selected_id not in {a.id for a in rows}:
+        # Keep selected_id if it still points to a live agent, even one
+        # filtered from the rail (e.g. the deployed primary). Only discover
+        # a new selection when selected_id is empty or stale.
+        current = (agent_loop.get_agent(self.selected_id)
+                   if self.selected_id else None)
+        if current is None or current.lifecycle_terminated:
             candidate = agent_loop.get_dialog_agent_for_terminal(self.terminal_name)
-            self.selected_id = candidate.id if candidate else (rows[0].id if rows else "")
+            if candidate is not None and self._is_deployed_in_terminal(candidate):
+                candidate = None
+            self.selected_id = (candidate.id if candidate
+                                else (rows[0].id if rows else ""))
             if self.selected_id:
                 agent_loop.set_dialog_agent_for_terminal(
                     self.terminal_name, self.selected_id)
@@ -613,7 +664,10 @@ class AgentsModeController:
     def focus_fragments(self):
         agent_id = self.selected_id
         if not agent_id:
-            return FormattedText([("class:muted", "\n  No Agent selected")])
+            return FormattedText([
+                ("class:muted", "\n  No Agents in this terminal"),
+                ("class:muted", "\n\n  Hire an employee with /hire, or press Esc to exit.\n"),
+            ])
         mirror_lines = self._mirror_lines(agent_id)
         if mirror_lines is not None:
             return self._focus_mirror_fragments(agent_id, mirror_lines)

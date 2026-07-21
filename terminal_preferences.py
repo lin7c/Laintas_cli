@@ -28,6 +28,7 @@ PERSISTED_UI_KEYS = frozenset({
     "show_billing",
     "stream_preview",
     "theme",
+    "markdown_theme",
 })
 
 

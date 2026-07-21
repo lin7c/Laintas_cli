@@ -108,6 +108,7 @@ _DEFAULT_CONFIG = {
     "detail": False,                   # False = simplified progress rendering; True = full per-line detail (/detail on|off)
     "stream_preview": "one",          # off / one / detail (three-line bounded tail)
     "theme": "dark",                  # dark / light / mono semantic palette
+    "markdown_theme": "default",       # default / green-red / custom (custom reads the global markdown_theme.json)
     "deny_exits_loop": True,           # True = terminate the agent loop the moment the user denies an approval prompt; False = old behavior (feed denial back as a tool error and keep looping)
     "enable_mouse": False,             # REPL input box: click-to-position the cursor. Off by default: terminal mouse reporting hijacks native drag-to-select of scrollback (Shift+drag is the only workaround), which costs more than click-to-position gains
     "confirm_direct_commands": False,  # False = commands the USER types directly at the REPL run like a normal terminal (no policy approval prompt, e.g. rm); True = subject direct commands to the same needs_approval prompt as AI-issued ones. Hard `deny` policy rules always apply regardless.
@@ -505,6 +506,7 @@ _RUNTIME_CONFIG_DESCRIPTIONS = {
     "detail": "Show full per-line tool detail (True) or simplified progress (False)",
     "stream_preview": "Streaming prose preview: off, one, or detail",
     "theme": "Terminal UI theme: dark, light, or mono",
+    "markdown_theme": "Markdown output palette: default, green-red, or custom (custom reads the global markdown_theme.json)",
     "deny_exits_loop": "Terminate the agent loop immediately when the user denies an approval prompt",
     "confirm_direct_commands": "Ask for approval on commands YOU type directly at the REPL (False = run like a normal terminal; hard deny rules still apply)",
     "enable_mouse": "Enable mouse click-to-position in the REPL input box",
@@ -532,6 +534,14 @@ _RUNTIME_LIMITS = {
     "remote_queue_size": (0, 128),
     "remote_control_workers": (1, 4),
     "remote_control_queue_size": (0, 16),
+}
+
+# Fixed-vocabulary config keys — single source for validation, /config help,
+# and completion value hints. Each set also enumerates the valid choices.
+_RUNTIME_ENUM_CHOICES: dict[str, frozenset] = {
+    "stream_preview": frozenset({"off", "one", "detail"}),
+    "theme": frozenset({"dark", "light", "mono"}),
+    "markdown_theme": frozenset({"default", "green-red", "custom"}),
 }
 
 
@@ -566,14 +576,11 @@ def _coerce_runtime_config_value(key: str, value):
     else:
         parsed = str(value)
 
-    if key == "stream_preview":
+    if key in _RUNTIME_ENUM_CHOICES:
         parsed = str(parsed).strip().lower()
-        if parsed not in {"off", "one", "detail"}:
-            raise ValueError("stream_preview expects off, one, or detail")
-    if key == "theme":
-        parsed = str(parsed).strip().lower()
-        if parsed not in {"dark", "light", "mono"}:
-            raise ValueError("theme expects dark, light, or mono")
+        if parsed not in _RUNTIME_ENUM_CHOICES[key]:
+            raise ValueError(
+                f"{key} expects " + ", ".join(sorted(_RUNTIME_ENUM_CHOICES[key])))
 
     if key in _RUNTIME_POSITIVE and parsed <= 0:
         raise ValueError(f"{key} must be greater than 0")
@@ -7227,9 +7234,9 @@ def run_agent_loop(
 
                 if events_cb is not None:
                     from rich.markup import escape as _esc_hint
-                    # Green dot = quiet success; loud red ✕ is reserved for a
-                    # call that actually failed, so red still *means* something.
-                    ok_mark = "[success]●[/success]" if result.get("ok") else "[error]✕[/error]"
+                    # Green dot = quiet success; red dot = a call that
+                    # actually failed — same shape, color carries the verdict.
+                    ok_mark = "[success]●[/success]" if result.get("ok") else "[error]●[/error]"
                     _hint_plain = (salient if salient else display_name) or ""
                     if name == "task.complete" and result.get("ok"):
                         deps.console.rule(style="muted")
@@ -7241,7 +7248,7 @@ def run_agent_loop(
                         # trailing meta carries the essentials (line count / exit
                         # code); failures point to /debug. Full output stays in
                         # terminalHistory / /debug.
-                        _mark2 = "[success]●[/success]" if result.get("ok") else "[error]✕[/error]"
+                        _mark2 = "[success]●[/success]" if result.get("ok") else "[error]●[/error]"
                         _meta2 = ""
                         if name == "terminal.send" and result.get("ok"):
                             _nlines = len((formatted or "").split("\n")) if formatted else 0

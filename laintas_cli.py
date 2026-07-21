@@ -274,6 +274,50 @@ def _mirror_target_agent_id() -> str:
 
 console.file = repl_mirror.TeeFile(_mirror_target_agent_id)
 
+# Built-in Markdown palettes for model output. Keys map to Rich style names
+# (h1 -> markdown.h1, bold -> markdown.strong, italic -> markdown.em,
+# quote -> markdown.block_quote; headings h1..h6 are looked up by
+# rich.markdown.Heading). An empty string means "no style override" (keep the
+# Rich/terminal default). The `default` palette preserves the pre-existing
+# plain-white behavior.
+_MARKDOWN_THEMES: dict[str, dict[str, str]] = {
+    "default": {
+        "h1": "", "h2": "", "h3": "", "h4": "", "h5": "", "h6": "",
+        "code": "white", "code_block": "white", "link": "",
+        "bold": "", "italic": "", "quote": "",
+    },
+    "green-red": {
+        "h1": "bold #4ade80", "h2": "bold #22c55e",      # green titles
+        "h3": "bold #f85149", "h4": "bold #f85149",       # red sub-titles
+        "h5": "#f85149", "h6": "#f85149",
+        "code": "white", "code_block": "white", "link": "",
+        "bold": "", "italic": "", "quote": "",
+    },
+}
+
+# Palette key -> Rich style name. Must match the keys used above.
+_MARKDOWN_RICH_KEYS: dict[str, str] = {
+    "h1": "markdown.h1", "h2": "markdown.h2", "h3": "markdown.h3",
+    "h4": "markdown.h4", "h5": "markdown.h5", "h6": "markdown.h6",
+    "code": "markdown.code", "code_block": "markdown.code_block",
+    "link": "markdown.link", "bold": "markdown.strong",
+    "italic": "markdown.em", "quote": "markdown.block_quote",
+}
+
+_MARKDOWN_STYLE_KEYS = tuple(_MARKDOWN_RICH_KEYS)
+
+# Style keys every palette must define (fill with "" when unused). A palette
+# that misses one of these keys silently falls back to `default` instead of
+# half-rendering headings, so a broken preset can never degrade output.
+_MARKDOWN_REQUIRED_KEYS = frozenset(_MARKDOWN_STYLE_KEYS)
+
+for _preset_name, _preset in _MARKDOWN_THEMES.items():
+    if not _MARKDOWN_REQUIRED_KEYS.issubset(_preset):
+        raise RuntimeError(
+            f"markdown theme {_preset_name!r} is missing keys: "
+            f"{sorted(_MARKDOWN_REQUIRED_KEYS - set(_preset))}")
+
+# Semantic palette variants applied on top of the shared Console.
 _THEME_VARIANTS = {
     "dark": LAINTAS_THEME,
     "light": Theme({
@@ -292,6 +336,63 @@ _THEME_VARIANTS = {
         "markdown.code": "", "markdown.code_block": "",
     }),
 }
+def _load_markdown_palette(name: str) -> dict[str, str]:
+    """Resolve a markdown_theme value to a complete {key: style} palette.
+
+    `default`/built-in presets are returned as-is. `custom` merges the global
+    ~/.laintas/markdown_theme.json overrides onto the default palette. Any
+    failure (missing/invalid file, bad style value) falls back to default so
+    model output can never be degraded by a broken theme file.
+    """
+    base = dict(_MARKDOWN_THEMES["default"])
+    normalized = str(name or "default").strip().lower()
+    if normalized in _MARKDOWN_THEMES:
+        base.update(_MARKDOWN_THEMES[normalized])
+        return base
+    if normalized != "custom":
+        return base
+
+    path = paths.LAINTAS_HOME / "markdown_theme.json"
+    try:
+        import json
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("top-level JSON value must be an object")
+        from rich.style import Style as _RichStyle
+        invalid = []
+        for key, value in data.items():
+            if key not in _MARKDOWN_REQUIRED_KEYS:
+                continue  # ignore unknown keys; forward-compatible
+            text = str(value)
+            try:
+                _RichStyle.parse(text)  # raises on invalid style syntax
+            except Exception:
+                invalid.append(key)
+                continue  # skip just this key, keep the valid ones
+            base[key] = text
+        if invalid:
+            console.print(
+                f"[yellow]markdown_theme.json: ignored invalid style(s) for "
+                f"{', '.join(sorted(invalid))}.[/yellow]")
+    except FileNotFoundError:
+        pass  # custom selected but no file yet: default palette is fine
+    except Exception as exc:
+        console.print(
+            f"[yellow]markdown_theme.json ignored ({exc}); using default "
+            "Markdown palette.[/yellow]")
+    return base
+
+
+def _markdown_theme_styles(palette: dict[str, str]) -> dict[str, str]:
+    """Map palette keys to Rich style names (h1 -> markdown.h1, ...)."""
+    styles = {}
+    for key in _MARKDOWN_STYLE_KEYS:
+        value = palette.get(key, "")
+        if value:
+            styles[_MARKDOWN_RICH_KEYS[key]] = value
+    return styles
+
+
 _console_theme_pushed = False
 
 
@@ -301,12 +402,20 @@ def _apply_ui_theme(name: str) -> str:
     normalized = str(name or "dark").strip().lower()
     if normalized not in _THEME_VARIANTS:
         raise ValueError("theme expects dark, light, or mono")
+    # Merge the semantic palette with the active Markdown palette so one
+    # push_theme call covers both; markdown_theme="default" contributes no
+    # heading overrides and preserves the historical plain-white rendering.
+    palette = _load_markdown_palette(get_runtime_config("markdown_theme"))
+    merged = Theme({
+        **_THEME_VARIANTS[normalized].styles,
+        **_markdown_theme_styles(palette),
+    })
     if _console_theme_pushed:
         try:
             console.pop_theme()
         except Exception:
             pass
-    console.push_theme(_THEME_VARIANTS[normalized], inherit=False)
+    console.push_theme(merged, inherit=False)
     _console_theme_pushed = True
     return normalized
 
@@ -2558,7 +2667,7 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec("/work", "Inspect or resume unified WorkGraph state", "Planning & Tasks", "/work [status|list|resume|history]", subcommands=("status", "list", "resume", "history")),
     CommandSpec("/workflow", "Run a multi-phase workflow", "Planning & Tasks", "/workflow {start|status|advance|approve|end|list}", subcommands=("start", "status", "advance", "approve", "end", "list")),
     CommandSpec("/model", "List or select a deployed terminal model override", "Config & Tools", "/model [terminal] [id|reset]", subcommands=("reset", "clear", "default")),
-    CommandSpec("/config", "View or set runtime configuration", "Config & Tools", "/config [key [value]|reset]", subcommands=("reset",)),
+    CommandSpec("/config", "View or set runtime configuration", "Config & Tools", "/config [<key> [<value>]|reset]"),
     CommandSpec("/policy", "Show or set security policy", "Config & Tools", "/policy [audit|enforce|disabled [--yes]|reset]", subcommands=("audit", "enforce", "disabled", "reset")),
     CommandSpec("/trust", "Review or change workspace trust", "Config & Tools", "/trust [status|allow|revoke]", subcommands=("status", "allow", "revoke")),
     CommandSpec("/hooks", "Manage executable hooks", "Config & Tools", "/hooks [status|trust|revoke|reload]", subcommands=("status", "trust", "revoke", "reload")),
@@ -2726,6 +2835,61 @@ class MetaCompleter(Completer):
                 if value.startswith(fragment.casefold()):
                     yield self._completion(value, fragment, meta)
 
+    def _config_completions(self, partial: str):
+        """Complete `/config` keys and — for enumerable keys — their values.
+
+        Keys come live from ``describe_runtime_config()`` so newly registered
+        config options appear automatically. Value hints cover enum keys
+        (``_RUNTIME_ENUM_CHOICES``) and booleans; numeric/free-form keys yield
+        nothing, letting the user type the value.
+        """
+        words = partial.split()
+        trailing_space = partial.endswith(" ")
+
+        # First argument: every config key plus the `reset` subcommand.
+        if not words or (len(words) == 1 and not trailing_space):
+            fragment = words[0] if words else ""
+            try:
+                described = describe_runtime_config()
+            except Exception:
+                described = {}
+            candidates = [("reset", "Restore the default configuration")]
+            candidates.extend(
+                (key, meta.get("description", "Runtime option"))
+                for key, meta in sorted(described.items())
+            )
+            for value, meta in candidates:
+                if value.casefold().startswith(fragment.casefold()):
+                    yield self._completion(value, fragment, meta)
+            return
+
+        # Second argument: value hints for the chosen key (if enumerable).
+        if len(words) == 1 and trailing_space:
+            key, fragment = words[0], ""
+        elif len(words) == 2 and not trailing_space:
+            key, fragment = words[0], words[1]
+        else:
+            return  # already past the value — nothing more to suggest
+        if key.casefold() == "reset":
+            return
+
+        import agent_loop as _agent_loop
+        enum_choices = _agent_loop._RUNTIME_ENUM_CHOICES.get(key)
+        if enum_choices is not None:
+            candidates = sorted(enum_choices)
+        else:
+            try:
+                meta = describe_runtime_config().get(key)
+            except Exception:
+                meta = None
+            if meta and meta.get("type") == "bool":
+                candidates = ["true", "false"]
+            else:
+                return
+        for value in candidates:
+            if value.casefold().startswith(fragment.casefold()):
+                yield self._completion(value, fragment, f"{key} value")
+
     def get_completions(self, document, complete_event):
         text = document.text_before_cursor.lstrip()
         if not text:
@@ -2740,6 +2904,9 @@ class MetaCompleter(Completer):
 
                 if head_lower == "/told":
                     yield from self._told_completions(partial)
+                    return
+                if head_lower == "/config":
+                    yield from self._config_completions(partial)
                     return
 
                 # Context-aware employee command completion. These values are
@@ -4964,7 +5131,7 @@ def _print_resume_event(message: dict) -> None:
     """Render one saved event with the same visual vocabulary as the REPL."""
     tool = _resume_tool_event(message)
     if tool is not None:
-        status = "[success]●[/success]" if tool["ok"] is not False else "[error]✕[/error]"
+        status = "[success]●[/success]" if tool["ok"] is not False else "[error]●[/error]"
         summary = _md_escape(tool["summary"][:160])
         suffix = f"  [muted]{summary}[/muted]" if summary else ""
         console.print(
@@ -14022,8 +14189,8 @@ def _cmd_config(parts: list) -> None:
                 value = get_runtime_config(key)
                 if key in terminal_preferences.PERSISTED_UI_KEYS:
                     terminal_preferences.set_ui_preference(key, value)
-                if key == "theme":
-                    _apply_ui_theme(str(value))
+                if key in {"theme", "markdown_theme"}:
+                    _apply_ui_theme(str(get_runtime_config("theme") or "dark"))
                 console.print(
                     f"[green]{key} = {value!r} ({type(value).__name__})[/green]")
         except (ValueError, KeyError) as e:
@@ -14202,6 +14369,233 @@ def _cmd_continue(session: dict, agent_registry: AgentRegistry) -> bool:
     return False
 
 
+def _told_browse_history(chat: list) -> None:
+    """Interactive full-screen browser for conversation history.
+
+    Session turns are grouped by user message; Enter renders the full turn
+    (prompt + assistant replies, Markdown-rendered) in the alternate screen.
+    Tab toggles between the in-memory session history and the durable on-disk
+    prompt journal (events.jsonl).  The text subcommands (/told N|all|reply|
+    log) stay unchanged.
+    """
+    from rich.markup import escape
+
+    def _session_turns():
+        turns = []
+        i = 0
+        while i < len(chat):
+            m = chat[i]
+            if isinstance(m, dict) and m.get("role") == "user":
+                replies = []
+                j = i + 1
+                while j < len(chat):
+                    am = chat[j]
+                    if isinstance(am, dict) and am.get("role") == "user":
+                        break
+                    if isinstance(am, dict) and am.get("role") == "assistant":
+                        replies.append(am.get("content", ""))
+                    j += 1
+                turns.append({"kind": "turn",
+                              "user": m.get("content", ""),
+                              "replies": replies})
+                i = j
+            else:
+                i += 1
+        return turns
+
+    def _journal_entries():
+        path = paths.project_dir() / "events.jsonl"
+        entries = []
+        try:
+            if path.exists():
+                with open(path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            evt = json.loads(line)
+                        except (ValueError, TypeError):
+                            continue
+                        if (isinstance(evt, dict)
+                                and evt.get("type") == "prompt_admitted"):
+                            entries.append(evt)
+        except OSError:
+            pass
+        return entries
+
+    def _journal_ts(evt):
+        ts = evt.get("ts")
+        if isinstance(ts, (int, float)) and ts > 0:
+            try:
+                return datetime.fromtimestamp(ts).strftime("%m-%d %H:%M")
+            except (OSError, ValueError, OverflowError):
+                pass
+        return "????? ?????"
+
+    def _build(source):
+        if source == "session":
+            items = _session_turns()
+            labels = []
+            for idx, t in enumerate(items):
+                summary = " ".join(str(t["user"]).split())[:60] or "(empty)"
+                n = len(t["replies"])
+                labels.append(
+                    f"[dim]#{idx + 1:>3}[/dim]  {escape(summary)}"
+                    f"  [dim]({n} repl{'y' if n == 1 else 'ies'})[/dim]")
+            return items, labels, "session history"
+        items = _journal_entries()
+        labels = []
+        for idx, evt in enumerate(items):
+            summary = " ".join(str(evt.get("text", "")).split())[:56] or "(empty)"
+            labels.append(
+                f"[dim]#{idx + 1:>3}[/dim]  [dim]{_journal_ts(evt)}[/dim]  "
+                f"{escape(summary)}")
+        return items, labels, "prompt journal"
+
+    def _show_detail(item, source):
+        """Render the turn detail in a scrollable full-screen viewer.
+
+        Rich renders into an in-memory ANSI buffer; the ANSI text is converted
+        back to prompt_toolkit fragments so a Window(wrap_lines=True) can
+        scroll it with the mouse wheel, arrows and PageUp/Down.
+        """
+        from prompt_toolkit import ANSI as _ptk_ansi
+        from prompt_toolkit.application import Application as _ptk_app
+        from prompt_toolkit.key_binding import KeyBindings as _ptk_kb
+        from prompt_toolkit.layout import Layout as _ptk_layout
+        from prompt_toolkit.layout.containers import Window as _ptk_window
+        from prompt_toolkit.layout.controls import (
+            FormattedTextControl as _ptk_ftc)
+        from prompt_toolkit.mouse_events import (
+            MouseEventType as _ptk_met)
+
+        buf = io.StringIO()
+        mem = Console(file=buf, force_terminal=True,
+                      width=shutil.get_terminal_size().columns,
+                      highlight=False)
+        mem.print("[bold]── prompt ──[/bold]")
+        text = item["user"] if source == "session" else str(item.get("text", ""))
+        mem.print(f"[cyan]{escape(str(text))}[/cyan]")
+        mem.print()
+        if source == "session":
+            replies = item["replies"]
+            mem.print("[bold]── reply ──[/bold]")
+            if replies:
+                for reply in replies:
+                    mem.print(RichMarkdown(str(reply))
+                              if reply else "[dim](empty reply)[/dim]")
+                    mem.print()
+            else:
+                mem.print("[dim](no reply recorded)[/dim]")
+        else:
+            mem.print("[dim]journal records prompts only — no reply stored[/dim]")
+        mem.print("[dim]↑↓/wheel/PgUp/PgDn scroll  q/Esc/Enter back[/dim]")
+
+        # Scroll model: prompt_toolkit Windows scroll by *following the
+        # cursor* — each render recomputes vertical_scroll so the cursor
+        # stays visible.  A plain FormattedTextControl has a fixed (0,0)
+        # cursor, which snaps any manual scrolling back to the top.  So the
+        # viewer keeps a real cursor line in ``pos`` and moves that; the
+        # Window then scrolls to keep it visible.  The mouse wheel is wired
+        # by subclassing (the ``@control.mouse_handler`` decorator idiom is
+        # a no-op — the method is not a decorator factory).
+        from prompt_toolkit.data_structures import Point as _ptk_point
+        from prompt_toolkit.layout.containers import (
+            ScrollOffsets as _ptk_offsets)
+
+        line_count = buf.getvalue().count("\n") + 1
+        pos = [0]
+
+        def _move(delta):
+            pos[0] = max(0, min(line_count - 1, pos[0] + delta))
+
+        class _DetailBody(_ptk_ftc):
+            def mouse_handler(self, mouse_event):
+                etype = mouse_event.event_type
+                if etype == _ptk_met.SCROLL_UP:
+                    _move(-3)
+                    return None
+                if etype == _ptk_met.SCROLL_DOWN:
+                    _move(3)
+                    return None
+                return NotImplemented
+
+        body = _DetailBody(
+            _ptk_ansi(buf.getvalue()),
+            focusable=True,
+            show_cursor=False,
+            get_cursor_position=lambda: _ptk_point(0, pos[0]),
+        )
+        window = _ptk_window(content=body, wrap_lines=True,
+                             always_hide_cursor=True,
+                             scroll_offsets=_ptk_offsets(top=1, bottom=1))
+        kb = _ptk_kb()
+
+        @kb.add("up")
+        def _up(event):
+            _move(-1)
+
+        @kb.add("down")
+        def _down(event):
+            _move(1)
+
+        @kb.add("pageup")
+        def _pgup(event):
+            info = window.render_info
+            _move(-(info.window_height if info is not None else 10))
+
+        @kb.add("pagedown")
+        def _pgdn(event):
+            info = window.render_info
+            _move(info.window_height if info is not None else 10)
+
+        @kb.add("escape")
+        @kb.add("q")
+        @kb.add("enter")
+        def _quit(event):
+            event.app.exit()
+
+        try:
+            _ptk_app(layout=_ptk_layout(window), key_bindings=kb,
+                     full_screen=True, mouse_support=True).run()
+        except (KeyboardInterrupt, EOFError):
+            pass
+
+    source = "session"
+    sel_idx = 0
+    while True:
+        items, labels, src_label = _build(source)
+        if not items:
+            console.print(f"[yellow]Nothing in the {src_label} yet.[/yellow]")
+            return
+        sel_idx = max(0, min(sel_idx, len(items) - 1))
+        other = "journal" if source == "session" else "session"
+        result = select_dialog(
+            labels,
+            title=f"History — {src_label} ({len(items)})",
+            full_screen=True,
+            search=True,
+            selected_index=sel_idx,
+            action_keys={"tab": "source"},
+            enter_action="view",
+            hint=("↑↓ navigate  ↵ view  type to filter  "
+                  f"tab → {other}  q/Esc back"),
+        )
+        if result is None:
+            return
+        action, idx = result
+        if action is None:
+            return
+        if action == "source":
+            source = other
+            sel_idx = 0
+            continue
+        if action == "view" and 0 <= idx < len(items):
+            _show_detail(items[idx], source)
+            sel_idx = idx
+
+
 def _cmd_told(parts: list) -> bool:
     from rich.markup import escape
     args = list(parts[1:])
@@ -14230,7 +14624,9 @@ def _cmd_told(parts: list) -> bool:
         scoped_agent_name = agent.name if agent else scoped_agent_id
         args = args[1:]
 
-    sub = args[0].lower() if args else ("reply" if scoped_agent_id else "")
+    # Default subcommand: bare "/told" opens the interactive history browser;
+    # "/told <agent>" (scoped, no subcommand) keeps the last-turns text replay.
+    sub = args[0].lower() if args else ("reply" if scoped_agent_id else "browse")
     if scoped_agent_id:
         if _terminal_agents.configured:
             _chat = _terminal_agents.chat_history_for(scoped_agent_id)
@@ -14250,6 +14646,10 @@ def _cmd_told(parts: list) -> bool:
             return n if n > 0 else default
         except (TypeError, ValueError):
             return default
+
+    if sub == "browse":
+        _told_browse_history(_chat)
+        return False
 
     if sub == "":
         if _user_msgs:

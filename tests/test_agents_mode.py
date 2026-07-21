@@ -184,6 +184,26 @@ class AgentsModeTests(unittest.TestCase):
             controller.run()
         self.assertIsNone(controller.app)
 
+    def test_deployed_agents_excluded_from_rail_and_focus(self):
+        self._agent("primary", role="primary")
+        controller = agents_mode.AgentsModeController("term0", object(), {})
+        self.assertEqual(controller.agents(), [])
+        self.assertEqual(controller.selected_id, "")
+        rail_text = "".join(text for _style, text, *_ in controller.rail_fragments())
+        self.assertIn("No Agents", rail_text)
+        focus_text = "".join(text for _style, text in controller.focus_fragments())
+        self.assertIn("No Agents", focus_text)
+
+    def test_pool_agents_still_visible_alongside_deployed_primary(self):
+        primary = self._agent("primary", role="primary")
+        worker = self._agent("worker")
+        controller = agents_mode.AgentsModeController("term0", object(), {})
+        agents = controller.agents()
+        self.assertEqual(len(agents), 1)
+        self.assertEqual(agents[0].id, worker.id)
+        self.assertEqual(controller.selected_id, worker.id)
+        self.assertNotIn(primary.id, {a.id for a in agents})
+
     def test_real_application_event_loop_starts_and_quits_cleanly(self):
         self._agent("primary", role="primary")
         controller = agents_mode.AgentsModeController("term0", object(), {})
@@ -196,6 +216,7 @@ class AgentsModeTests(unittest.TestCase):
         agent = self._agent("primary", role="primary")
         controller = agents_mode.AgentsModeController(
             "term0", mock.Mock(), {})
+        controller.selected_id = agent.id
         started = threading.Event()
         calls = []
 
@@ -247,6 +268,7 @@ class AgentsModeTests(unittest.TestCase):
         controller = agents_mode.AgentsModeController(
             "term0", mock.Mock(), {}, primary_submit_cb=lambda a, t, d:
             laintas_cli._submit_primary_runtime_task(a, t, d, {}))
+        controller.selected_id = agent.id
         with create_pipe_input() as pipe_input, \
                 mock.patch.object(laintas_cli, "run_agent_loop", blocking_loop):
             def keys():
