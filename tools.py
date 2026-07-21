@@ -2291,6 +2291,25 @@ def _bi_agent_spawn(params: dict, ctx: ToolCtx) -> dict:
         if parent_id is None:
             return {"ok": False, "error": "no agent_id in context"}
 
+        if params.get("wait", False):
+            # Waiting on a parallel batch is spawn_parallel's job: live
+            # status table, Ctrl+C/abort awareness, a soft-timeout wrap-up
+            # nudge before the hard cutoff, and partial-result reporting
+            # all live there (tools.py:_bi_spawn_parallel). This used to
+            # duplicate a thinner sequential wait_for_agent loop here with
+            # none of that -- completely silent for minutes, and with a
+            # real fairness bug: each child was awaited in list order
+            # against ONE shared deadline (params["timeout"], despite the
+            # schema calling it "seconds to wait for EACH child"), so
+            # whichever child came first in the list could eat the entire
+            # budget and starve the rest. Delegate instead of maintaining
+            # two divergent implementations of the same feature.
+            remapped = [
+                {**t, "goal": (t.get("goal") or t.get("task") or "")}
+                for t in tasks_list if isinstance(t, dict)
+            ]
+            return _bi_spawn_parallel({"tasks": remapped}, ctx)
+
         # Import the parallel spawner from agent_loop
         import agent_loop as _al
         child_ids = _al.spawn_subagents_parallel(
@@ -2302,26 +2321,6 @@ def _bi_agent_spawn(params: dict, ctx: ToolCtx) -> dict:
         )
         if not child_ids:
             return {"ok": False, "error": f"parallel spawn failed (parent '{parent_id}' not found)"}
-
-        # If wait=true, block until all children complete
-        if params.get("wait", False):
-            results = []
-            deadline = time.time() + float(params.get("timeout", 120.0))
-            _al.enter_waiting(parent_id)
-            try:
-                for cid in child_ids:
-                    remaining = max(0.0, deadline - time.time())
-                    info = _al.wait_for_agent(cid, timeout=remaining)
-                    if info:
-                        results.append(f"[{cid}] {info.status}: {info.last_reply[:200] if info.last_reply else '(no reply)'}")
-                    else:
-                        _al.abort_agent(cid)
-                        results.append(f"[{cid}] timed out; cancellation requested")
-            finally:
-                _al.exit_waiting(parent_id)
-            return {"ok": True,
-                    "result": f"Spawned {len(child_ids)} agents in parallel. Results:\n" + "\n".join(results),
-                    "child_ids": child_ids}
 
         task_desc = ", ".join(t.get("role", t.get("task", "?")[:30]) for t in tasks_list)
         return {"ok": True,
@@ -2383,6 +2382,13 @@ def _bi_spawn(params: dict, ctx: ToolCtx) -> dict:
             "child_id": child_id}
 
 
+# Wall-clock budget for one spawn_parallel batch, and how long before that
+# deadline each still-running child gets a wrap-up nudge (see
+# _bi_spawn_parallel). Module-level so tests/tuning don't need to touch the
+# function body.
+SPAWN_PARALLEL_TIMEOUT_SECONDS = 600
+SPAWN_PARALLEL_WRAP_UP_LEAD_SECONDS = 100
+
 # Registered while a spawn_parallel Live display is on screen so the CLI's
 # shutdown handler can force it closed before printing its own messages.
 # rich Live runs a background thread that repaints ~8x/sec regardless of
@@ -2407,6 +2413,51 @@ def stop_all_parallel_live_displays() -> None:
             live.__exit__(None, None, None)
         except Exception:
             pass
+
+
+def pause_all_parallel_live_displays() -> list:
+    """Stop (without unregistering) every active spawn_parallel Live so a
+    command-approval prompt from one of its children can print/read a
+    keystroke without racing the table's own redraws. Pass the returned
+    list to resume_all_parallel_live_displays() afterward.
+    """
+    with _active_parallel_lives_lock:
+        lives = list(_active_parallel_lives)
+    for live in lives:
+        try:
+            live.stop()
+        except Exception:
+            pass
+    return lives
+
+
+def resume_all_parallel_live_displays(lives: list) -> None:
+    """Restart Live displays previously paused by pause_all_parallel_live_displays."""
+    for live in lives:
+        try:
+            live.start(refresh=True)
+        except Exception:
+            pass
+
+
+# agent_id -> short description of the command it's currently blocked on
+# waiting for a human approval decision. Lets the parallel status table
+# show "awaiting approval" instead of a stale/frozen activity line for an
+# agent that's stuck behind a policy gate.
+_pending_approvals_lock = threading.Lock()
+_pending_approvals: dict = {}
+
+
+def mark_awaiting_approval(agent_id: str, text: str) -> None:
+    if not agent_id:
+        return
+    with _pending_approvals_lock:
+        _pending_approvals[agent_id] = text
+
+
+def clear_awaiting_approval(agent_id: str) -> None:
+    with _pending_approvals_lock:
+        _pending_approvals.pop(agent_id, None)
 
 
 def _bi_spawn_parallel(params: dict, ctx: ToolCtx) -> dict:
@@ -2461,6 +2512,11 @@ def _bi_spawn_parallel(params: dict, ctx: ToolCtx) -> dict:
     # Current single-line activity per child: (tool, arg). Overwritten as
     # new tool calls land -- this is the "live" line, not a scrolling log.
     _activity: dict = {cid: ("", "starting…") for cid in child_ids}
+    # When _activity[cid] was last updated, so a child stuck on one tool
+    # call (e.g. blocked behind a policy approval elsewhere) can fall back
+    # to an explanatory line instead of looking frozen forever.
+    _activity_ts: dict = {cid: time.time() for cid in child_ids}
+    _IDLE_HINT_AFTER = 15.0
     # Final one-line status per child once it stops running.
     _final: dict = {}
     _final_elapsed: dict = {}
@@ -2499,9 +2555,20 @@ def _bi_spawn_parallel(params: dict, ctx: ToolCtx) -> dict:
                 _glyph, _text = _final[cid]
                 _meta = f"{_tool_counts[cid]} tools · {_final_elapsed.get(cid, 0):.0f}s"
             else:
-                _glyph = f"[accent]{_spinner_glyph()}[/accent]"
-                _tool, _arg = _activity[cid]
-                _text = f"[muted]{_tool}[/muted] {_arg}" if _tool else f"[muted]{_arg}[/muted]"
+                with _pending_approvals_lock:
+                    _awaiting = _pending_approvals.get(cid)
+                if _awaiting:
+                    _glyph = "[warning]⏳[/warning]"
+                    _text = f"[warning]awaiting approval:[/warning] {_awaiting}"
+                elif time.time() - _activity_ts[cid] >= _IDLE_HINT_AFTER:
+                    _tool, _arg = _activity[cid]
+                    _glyph = f"[accent]{_spinner_glyph()}[/accent]"
+                    _prev = f"{_tool} {_arg}".strip() or "starting…"
+                    _text = f"[muted]still on:[/muted] {_prev} [muted](may be waiting on approval)[/muted]"
+                else:
+                    _glyph = f"[accent]{_spinner_glyph()}[/accent]"
+                    _tool, _arg = _activity[cid]
+                    _text = f"[muted]{_tool}[/muted] {_arg}" if _tool else f"[muted]{_arg}[/muted]"
                 _meta = f"{_tool_counts[cid]} tools · {time.time() - _start[cid]:.0f}s"
             _table.add_row(_glyph, cid, _text, _meta)
         return _RichGroup(_RichText.from_markup(_head), _table)
@@ -2509,8 +2576,19 @@ def _bi_spawn_parallel(params: dict, ctx: ToolCtx) -> dict:
     # Concurrent wait: poll all children at once.  Wall time = max(child
     # times), not sum - the old list-comprehension waited sequentially,
     # so one slow child blocked detection of the rest.
-    _timeout = 600
+    _timeout = SPAWN_PARALLEL_TIMEOUT_SECONDS
     _deadline = time.time() + _timeout
+    # Soft-timeout wrap-up: nudge each still-running child a bit before the
+    # hard deadline so it has a chance to hand back whatever it has found
+    # instead of being cut off with nothing to show. Reuses the existing
+    # inbox mechanism -- run_agent_loop drains and prompts with inbox
+    # messages every iteration, no new plumbing needed.
+    _wrap_up_deadline = _deadline - SPAWN_PARALLEL_WRAP_UP_LEAD_SECONDS
+    _nudged: set = set()
+    # Best-effort partial conclusion captured from a child that got cut off
+    # by the timeout/interrupt, so the final report can show what it found
+    # instead of a bare "timed out" with nothing behind it.
+    _partial_replies: dict = {}
     _al.enter_waiting(parent_id)
     try:
         infos: list = [None] * len(child_ids)
@@ -2527,8 +2605,13 @@ def _bi_spawn_parallel(params: dict, ctx: ToolCtx) -> dict:
                 # transient=False: the final frame (all rows resolved) stays
                 # in the scrollback as the permanent record, instead of
                 # vanishing and being replaced by a separate summary print.
+                # auto_refresh=False: our own polling loop below already
+                # calls .update(refresh=True) every ~100ms, so Live's default
+                # background refresh thread would just be a second, redundant
+                # writer racing the same terminal -- notably against a
+                # per-child approval prompt printed from a different thread.
                 _live = Live(_render_agents_block(), console=ctx.deps.console,
-                             refresh_per_second=8, transient=False,
+                             auto_refresh=False, transient=False,
                              redirect_stdout=False, redirect_stderr=False)
                 _live.__enter__()
                 with _active_parallel_lives_lock:
@@ -2546,6 +2629,20 @@ def _bi_spawn_parallel(params: dict, ctx: ToolCtx) -> dict:
                         # spawn_parallel call and the CLI looked hung.
                         _interrupted = True
                         break
+                    if time.time() >= _wrap_up_deadline:
+                        for cid in _pending:
+                            if cid in _nudged:
+                                continue
+                            _nudged.add(cid)
+                            _al.send_to_agent(cid, {
+                                "type": "budget_warning",
+                                "text": (
+                                    f"Only ~{SPAWN_PARALLEL_WRAP_UP_LEAD_SECONDS}s left in this batch's "
+                                    "time budget. Stop opening new exploration now and reply "
+                                    "with the best conclusion you can support from what "
+                                    "you've already found — a partial, honest answer beats "
+                                    "being cut off with nothing."),
+                            })
                     for i, cid in enumerate(child_ids):
                         if infos[i] is not None:
                             continue
@@ -2566,6 +2663,7 @@ def _bi_spawn_parallel(params: dict, ctx: ToolCtx) -> dict:
                                 _cmd = _disp_truncate(
                                     (_row.get("command") or "").strip(), _goal_w)
                                 _activity[cid] = (_tool, _cmd)
+                                _activity_ts[cid] = time.time()
                         if info is not None and info.status in ("done", "aborted", "error"):
                             infos[i] = info
                             _pending.discard(cid)
@@ -2580,17 +2678,26 @@ def _bi_spawn_parallel(params: dict, ctx: ToolCtx) -> dict:
                                 _label = _disp_truncate(info.error or info.status, 60)
                                 _final[cid] = ("[error]✕[/error]", f"[muted]{_label}[/muted]")
                     if _live is not None:
-                        _live.update(_render_agents_block())
+                        _live.update(_render_agents_block(), refresh=True)
                     if _pending:
                         time.sleep(0.1)
                 for cid in _pending:
+                    # Snapshot whatever the child had already said before
+                    # abort_agent() tears it down -- the wrap-up nudge above
+                    # exists so this is a real partial conclusion, not just
+                    # whatever stale text happened to be sitting there.
+                    _last_info = _al.get_agent(cid)
+                    if _last_info is not None:
+                        _partial = (_last_info.state.get("lastReply") or "").strip()
+                        if _partial:
+                            _partial_replies[cid] = _partial
                     _al.abort_agent(cid)
                     infos[child_ids.index(cid)] = None
                     _final_elapsed[cid] = time.time() - _start[cid]
                     _label = "interrupted" if _interrupted else f"timed out · {_timeout}s"
                     _final[cid] = ("[error]✕[/error]", f"[muted]{_label}[/muted]")
                 if _live is not None:
-                    _live.update(_render_agents_block())
+                    _live.update(_render_agents_block(), refresh=True)
             finally:
                 if _live is not None:
                     with _active_parallel_lives_lock:
@@ -2603,13 +2710,36 @@ def _bi_spawn_parallel(params: dict, ctx: ToolCtx) -> dict:
     finally:
         _al.exit_waiting(parent_id)
 
+    # A reply that admits it isn't actually finished must not count as a
+    # clean success just because the loop returned status="done" — that
+    # check only looks at whether the loop exited cleanly, not whether the
+    # content is substantively complete.
+    _INCOMPLETE_SELF_REPORT = (
+        "尚未完成", "未完成", "被截断", "被迫", "需要继续", "继续读取",
+        "not yet complete", "haven't finished", "was cut off", "ran out of",
+        "incomplete", "still need to",
+    )
+
+    def _self_reports_incomplete(text: str) -> bool:
+        return any(kw in text for kw in _INCOMPLETE_SELF_REPORT)
+
     lines = [f"═══ Parallel Results ({len(child_ids)} agents) ═══"]
     succeeded = 0
+    partial = 0
     for cid, task, info in zip(child_ids, normalized, infos):
         if info is None:
             ok = False
-            message = ("interrupted by user" if _interrupted
-                       else "timed out; cancellation requested")
+            _partial_text = _partial_replies.get(cid, "")
+            if _partial_text:
+                partial += 1
+                _cause = "interrupted" if _interrupted else "ran out of its time budget"
+                message = (
+                    f"Did not finish — {_cause} before completing, but reported "
+                    f"this partial conclusion before being cut off:\n{_partial_text}"
+                )
+            else:
+                message = ("interrupted before producing any output" if _interrupted
+                           else "ran out of its time budget before producing any output")
         else:
             ok = info.status == "done" and not info.error
             message = (info.result or info.last_reply or "").strip()
@@ -2619,12 +2749,22 @@ def _bi_spawn_parallel(params: dict, ctx: ToolCtx) -> dict:
                 ok = False
                 message = ("(agent completed but produced no reply - "
                            "consider retrying or rephrasing the task)")
+            elif ok and _self_reports_incomplete(message):
+                # The agent itself says it isn't done -- e.g. "I haven't
+                # finished reading X yet" -- don't count that as succeeded
+                # just because the loop exited cleanly.
+                ok = False
+                partial += 1
         succeeded += int(ok)
         lines.append(
             f"\n─── [{'✓' if ok else '✗'}] {cid} ───\n"
             f"Goal: {task['task'][:80]}\nResult: {message[:400]}"
         )
-    lines.append(f"\n═══ Summary: {succeeded}/{len(child_ids)} succeeded ═══")
+    _summary = f"\n═══ Summary: {succeeded}/{len(child_ids)} succeeded"
+    if partial:
+        _summary += f", {partial} partial (ran out of budget or self-reported incomplete)"
+    _summary += " ═══"
+    lines.append(_summary)
     return {"ok": succeeded == len(child_ids), "result": "\n".join(lines),
             "child_ids": child_ids}
 
@@ -6101,8 +6241,11 @@ def register_builtin_tools() -> None:
                         "It has an isolated context, runs in its own thread, posts results "
                         "to your inbox, and is not a hired employee. "
                         "Supports specialized roles (explorer, architect, reviewer, "
-                        "silent-failure-hunter, simplifier, tester) and parallel spawning "
-                        "via the 'tasks' parameter.",
+                        "silent-failure-hunter, simplifier, tester) and fire-and-forget "
+                        "parallel spawning via the 'tasks' parameter (check inbox for results). "
+                        "wait=true hands the whole batch to spawn_parallel instead (live status "
+                        "table, 600s shared budget, max 6 tasks) -- prefer calling spawn_parallel "
+                        "directly when you already know you want to wait.",
             schema={
                 "type": "object",
                 "properties": {
@@ -6125,9 +6268,8 @@ def register_builtin_tools() -> None:
                         },
                     },
                     "wait": {"type": "boolean", "default": False,
-                             "description": "Block until all children complete (parallel mode)"},
-                    "timeout": {"type": "number", "default": 120,
-                                "description": "Seconds to wait for each child (with wait=true)"},
+                             "description": "Block until all children complete. Delegates to "
+                                            "spawn_parallel's fixed 600s budget (ignores 'timeout')."},
                 },
                 "required": [],
             },
@@ -6250,7 +6392,13 @@ def register_builtin_tools() -> None:
                 "Spawn multiple sub-agents in PARALLEL and wait for ALL to finish. "
                 "Returns a combined structured report. Max 6 agents per batch. "
                 "Each member must work on DIFFERENT files — decompose by file boundaries. "
-                "Agents beyond the concurrency cap queue automatically."
+                "Agents beyond the concurrency cap queue automatically. "
+                "The whole batch shares a 600s wall-clock budget: scope each task to a "
+                "reviewable slice (roughly <=300-400 lines of code, or an equivalently "
+                "bounded unit) — an oversized slice risks a forced cutoff mid-review with "
+                "nothing to show for it. Inside a child, prefer fs.read/fs.grep for reading "
+                "code over shell one-liners that slice files — each distinct ad-hoc command "
+                "re-triggers a policy approval and burns the same budget waiting on it."
             ),
             schema={
                 "type": "object",

@@ -2534,7 +2534,10 @@ only a secondary signal; coordination and durability requirements decide.
   delegation that does NOT need a durable, reusable workflow file. This covers
   code review, batch analysis, multi-file edits, and any fan-out where the
   orchestration is throwaway. Prefer this over HWO unless you specifically need
-  persistence.
+  persistence. A spawn_parallel batch shares one 600s wall-clock budget across
+  all members — scope each task to a reviewable slice (roughly <=300-400 lines
+  of code) rather than splitting a large file into a few oversized chunks, or
+  members risk a forced cutoff mid-review with nothing to show for it.
 - HWO: use a durable .hwo workflow only when the orchestration is REUSABLE or
   needs STRUCTURED input/output contracts between specialist agents — i.e.
   explicit roles with declared file outputs, ordered stages with handoff
@@ -5308,6 +5311,17 @@ def _format_tool_result_for_loop(tool_name: str, result: dict, max_chars: int) -
         # it made normal grep/pip/python failures look like shell-tool crashes.
         if rc is not None and output:
             prefix = f"[command exit {rc}]"
+            if err:
+                return f"{prefix} {err}\n{output}"[:max_chars]
+            return f"{prefix}\n{output}"[:max_chars]
+        if output:
+            # No returncode (not a shell command), but the tool still
+            # returned a substantive result payload alongside ok=False -
+            # e.g. spawn_parallel's partial-batch report, where some
+            # children succeeded and some ran out of budget. Discarding it
+            # left the AI seeing only "(no error message)" for a batch that
+            # actually produced real, useful partial findings.
+            prefix = f"[{tool_name} reported ok=false]"
             if err:
                 return f"{prefix} {err}\n{output}"[:max_chars]
             return f"{prefix}\n{output}"[:max_chars]

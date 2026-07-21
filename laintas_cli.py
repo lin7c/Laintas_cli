@@ -2653,6 +2653,7 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
         )),
     CommandSpec("/term", "List, create, or rename terminals", "Agents & Terminals", "/term [name|rename <old> <new>]", aliases=("/t",), subcommands=("rename",)),
     CommandSpec("/connect", "Link this terminal to Helpwo; with a folder, share it as Helpwo's remote workspace", "Agents & Terminals", "/connect [folder]"),
+    CommandSpec("/helpwo", "Start the local Helpwo web IDE gateway", "Agents & Terminals", "/helpwo [--port N] [--stop] [--dist <path>]", subcommands=("stop",)),
     CommandSpec("/disconnect", "Withdraw this terminal from Helpwo", "Agents & Terminals"),
     CommandSpec(
         "/station", "Bind an employee to a terminal and optionally start work",
@@ -8637,6 +8638,8 @@ _SLASH_ARG_RULES: dict[tuple[str, ...], SlashArgRule] = {
     },
     ("/help",): _arg_rule(1, "/help [command]"),
     ("/connect",): _arg_rule(1, "/connect [folder]"),
+    ("/helpwo",): _arg_rule(4, "/helpwo [--port N] [--dist <path>]"),
+    ("/helpwo", "stop"): _arg_rule(1, "/helpwo stop"),
     ("/terminate",): _arg_rule(1, "/terminate <name>"),
     ("/abort",): _arg_rule(1, "/abort <agent-id>"),
     ("/agent",): _arg_rule(1, "/agent [agent-id-or-name]"),
@@ -14002,6 +14005,107 @@ def _cmd_disconnect(agent_registry: AgentRegistry) -> None:
                       f"Run /connect to hand it over again.[/yellow]")
 
 
+def _cmd_helpwo(raw_args: str, parts: list, agent_registry: AgentRegistry,
+                session: dict) -> None:
+    """Start or stop the local Helpwo web IDE gateway.
+
+    /helpwo              - start on default port 2913
+    /helpwo --port 8080  - start on a custom port
+    /helpwo --dist <p>   - use a custom dist directory
+    /helpwo stop         - stop the running gateway
+    """
+    import helpwo_server
+
+    # Subcommand: stop
+    if len(parts) >= 2 and parts[1].lower() == "stop":
+        if helpwo_server.is_running():
+            helpwo_server.stop_server()
+            console.print("[yellow]Helpwo gateway stopped.[/yellow]")
+        else:
+            console.print("[dim]Helpwo gateway is not running.[/dim]")
+        return
+
+    if helpwo_server.is_running():
+        url = helpwo_server.get_url()
+        console.print(f"[dim]Helpwo gateway already running at {url}[/dim]")
+        console.print(f"[dim]Open {url} in your browser, or /helpwo stop to stop.[/dim]")
+        return
+
+    # Parse optional flags
+    port = helpwo_server.DEFAULT_PORT
+    dist_override = None
+    args = parts[1:]
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--port" and i + 1 < len(args):
+            try:
+                port = int(args[i + 1])
+            except ValueError:
+                console.print(f"[red]Invalid port: {args[i + 1]}[/red]")
+                return
+            if port < 1 or port > 65535:
+                console.print(f"[red]Port must be 1-65535, got {port}[/red]")
+                return
+            i += 2
+        elif arg == "--dist" and i + 1 < len(args):
+            dist_override = args[i + 1]
+            i += 2
+        elif arg.startswith("--"):
+            console.print(f"[red]Unknown option: {arg}[/red]")
+            console.print("[dim]Usage: /helpwo [--port N] [--dist <path>] | stop[/dim]")
+            return
+        else:
+            i += 1
+
+    # If the agent isn't registered yet, auto-register so the frontend
+    # has something to talk to immediately.
+    if agent_registry and not agent_registry.agent_id:
+        if not session.get("userId") and get_backend_profile().sends_laintas_credentials:
+            console.print("[yellow]Not logged in. Run /login first, then /helpwo.[/yellow]")
+            return
+        console.print("[dim]Auto-registering with local backend...[/dim]")
+        agent_registry.register(session, quiet=True)
+        agent_registry.start_heartbeat()
+        agent_registry.start_message_poll(
+            agent_registry._state_cb or (lambda: {}),
+            agent_registry._chat_cb or (lambda: []),
+        )
+
+    dist_path = None
+    if dist_override:
+        from pathlib import Path
+        p = Path(dist_override).expanduser()
+        if not p.is_dir() or not (p / "index.html").is_file():
+            console.print(f"[red]Invalid dist directory: {p}[/red]")
+            console.print("[dim]The directory must contain index.html.[/dim]")
+            return
+        dist_path = p.resolve()
+
+    ok, msg = helpwo_server.start_server(agent_registry, dist_dir=dist_path, port=port, session=session)
+    if not ok:
+        console.print(f"[red]{msg}[/red]")
+        return
+
+    url = helpwo_server.get_url()
+    console.print(f"[green bold]Helpwo gateway started[/green bold]")
+    console.print(f"  URL: [cyan]{url}[/cyan]")
+    console.print(f"  Dist: [dim]{helpwo_server._dist_dir()}[/dim]")
+
+    if agent_registry and agent_registry.agent_id:
+        console.print(f"  Agent: [dim]{agent_registry.agent_name} ({agent_registry.agent_id})[/dim]")
+    else:
+        console.print("  [yellow]No agent registered - run /connect to link this terminal.[/yellow]")
+
+    console.print("[dim]  /helpwo stop to stop the gateway.[/dim]")
+
+    # Open the browser
+    try:
+        import webbrowser
+        webbrowser.open(url)
+    except Exception:
+        pass
+
 
 def _cmd_term(parts: list, agent_registry: AgentRegistry, interactive_session) -> bool:
     if len(parts) >= 2 and parts[1].lower() == "rename":
@@ -15147,6 +15251,9 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
     elif action == "/disconnect":
         _cmd_disconnect(agent_registry)
 
+    elif action == "/helpwo":
+        _cmd_helpwo(raw_args, parts, agent_registry, session)
+
     elif action in ("/t", "/term"):
         return _cmd_term(parts, agent_registry, interactive_session)
 
@@ -15226,7 +15333,7 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
             except Exception as e:
                 console.print(f"[red].laintas/commands.py error: {e}[/red]")
                 return False
-            console.print(f"[red]Unknown command: {action}[/red]")
+        console.print(f"[red]Unknown command: {action}[/red]")
         console.print("Type [bold]/help[/bold] for available commands.")
 
     return False
@@ -15794,6 +15901,11 @@ def _bg_reader_cbreak_mode(target_queue: queue.Queue,
                 if interrupt_event is not None:
                     _clear_visible_line()
                     interrupt_event.set()
+                    console.print(
+                        "\n[dim]Esc received - will stop at the next "
+                        "checkpoint (when the model starts replying or a "
+                        "tool step begins; not during thinking). Press "
+                        "Ctrl+C twice quickly to force exit now.[/dim]")
                 else:
                     _clear_visible_line()
                     _set_run_input_state("input_active")
@@ -15976,6 +16088,112 @@ def _arrow_approval_prompt(title: str, body_lines: list[str],
     )
 
 
+_parallel_approval_lock = threading.Lock()
+
+
+def _read_single_key_choice(*, allow_always: bool,
+                            auto_confirm_seconds: Optional[float]) -> Optional[str]:
+    """Block for one y/n/a keypress (no Enter needed, no line redraw).
+
+    Returns "yes"/"no"/"always", or None on Esc/Ctrl+C/EOF. Bare Enter
+    counts as "no" — same fail-safe default as the arrow selector's
+    initial highlight. If auto_confirm_seconds elapses with no keypress,
+    returns "yes" (matches _arrow_approval_prompt's auto_confirm_index=0,
+    which is always the approve option).
+    """
+    fd = sys.stdin.fileno()
+    try:
+        old_attr = termios.tcgetattr(fd)
+    except (termios.error, OSError):
+        return None
+    try:
+        tty.setcbreak(fd)
+    except (termios.error, OSError):
+        return None
+    deadline = (time.monotonic() + auto_confirm_seconds
+               if auto_confirm_seconds is not None else None)
+    try:
+        while True:
+            wait = 0.3 if deadline is None else max(0.0, min(0.3, deadline - time.monotonic()))
+            try:
+                r, _, _ = select.select([fd], [], [], wait)
+            except (select.error, ValueError, OSError):
+                return None
+            if not r:
+                if deadline is not None and time.monotonic() >= deadline:
+                    return "yes"
+                continue
+            try:
+                ch = os.read(fd, 1).decode("utf-8", errors="ignore").lower()
+            except OSError:
+                return None
+            if ch in ("\x03", "\x1b"):  # Ctrl+C / Esc
+                return None
+            if ch == "y":
+                return "yes"
+            if ch in ("n", "\r", "\n"):
+                return "no"
+            if ch == "a" and allow_always:
+                return "always"
+            # any other key: keep waiting
+    finally:
+        try:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_attr)
+        except (termios.error, OSError):
+            pass
+
+
+def _compact_parallel_approval_prompt(title: str, body: str, question: str, *,
+                                      allow_always: bool, destructive: bool,
+                                      auto_confirm_seconds) -> str:
+    """Lean one-line approval prompt used while a spawn_parallel status
+    table is on screen.
+
+    Same decision semantics as _arrow_approval_prompt (respects /mode's
+    auto-confirm timeout, same yes/no/always outcomes) — only the render
+    differs: one line instead of a multi-line body plus a full arrow-key
+    selector, and the parallel table is paused/resumed around it instead
+    of racing it for the terminal.
+    """
+    import tools as tools_mod
+
+    _cmd = body.split("\n", 1)[0]
+    _thread_name = threading.current_thread().name or ""
+    _agent_label = (_thread_name.rsplit("-", 1)[-1]
+                   if _thread_name.startswith("laintas-sched-") else "agent")
+    _color = "#f85149" if destructive else "#e3b341"
+    # Parentheses, not brackets: a literal "[y/a/n]" would be parsed by Rich
+    # as an (unrecognized, zero-width) markup tag and silently vanish --
+    # the exact same bracket-injection failure mode fixed earlier in the
+    # AI narration line (agent_loop.py _stripped MarkupError).
+    _opts = ("y" + ("/a" if allow_always else "") + "/n")
+    _cmd_disp = _cmd if len(_cmd) <= 70 else _cmd[:67] + "…"
+
+    with _parallel_approval_lock:
+        tools_mod.mark_awaiting_approval(_agent_label, escape(_cmd_disp))
+        _paused = tools_mod.pause_all_parallel_live_displays()
+        try:
+            console.print(
+                f"  [bold {_color}]⚠[/bold {_color}] "
+                f"[agent]{escape(_agent_label)}[/agent] wants to run: "
+                f"[dim]{escape(_cmd_disp)}[/dim]  ({_opts})",
+                highlight=False)
+            try:
+                choice = _read_single_key_choice(
+                    allow_always=allow_always,
+                    auto_confirm_seconds=auto_confirm_seconds)
+            except (EOFError, KeyboardInterrupt):
+                choice = None
+            console.print(
+                f"  [dim]↳ {choice or 'no'}[/dim]" if choice != "always"
+                else "  [dim]↳ always (auto-approved for this session)[/dim]",
+                highlight=False)
+        finally:
+            tools_mod.resume_all_parallel_live_displays(_paused)
+            tools_mod.clear_awaiting_approval(_agent_label)
+    return choice or "no"
+
+
 def _blocking_approval_prompt(title: str, body: str, question: str,
                               allow_always: bool = False,
                               destructive: bool = False) -> str:
@@ -16005,6 +16223,23 @@ def _blocking_approval_prompt(title: str, body: str, question: str,
             f"[yellow]Approval required but no interactive TTY available — denying.[/yellow]")
         return "no"
 
+    auto_confirm_seconds = mode_manager.get_auto_confirm_timeout(
+        destructive=destructive)
+
+    # A spawn_parallel batch keeps its own live-updating status table on
+    # screen. The arrow-key selector below runs its own prompt_toolkit
+    # render loop with no awareness of that table's cursor bookkeeping —
+    # letting both draw at once corrupts the screen (reported: exiting mid
+    # parallel-agents view left duplicated/garbled frames). Route through a
+    # compact one-line prompt instead: identical policy decision and /mode
+    # auto-confirm timeout, just a leaner render that pauses the table
+    # around itself instead of racing it.
+    import tools as tools_mod
+    if tools_mod._active_parallel_lives:
+        return _compact_parallel_approval_prompt(
+            title, body, question, allow_always=allow_always,
+            destructive=destructive, auto_confirm_seconds=auto_confirm_seconds)
+
     # Split body into displayable lines. Callers pass plain text (no Rich
     # markup) so diff content with literal brackets renders verbatim.
     body_lines = body.split("\n")
@@ -16020,9 +16255,6 @@ def _blocking_approval_prompt(title: str, body: str, question: str,
         options = ["y approve", "a always", "n deny"]
     else:
         options = ["y approve", "n deny"]
-
-    auto_confirm_seconds = mode_manager.get_auto_confirm_timeout(
-        destructive=destructive)
 
     _reader_was_running = bool(
         _bg_reader_thread is not None and _bg_reader_thread.is_alive())
@@ -16303,8 +16535,15 @@ def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
     # Save original SIGINT handler (the shutdown function)
     _old_sigint = signal.getsignal(signal.SIGINT)
 
+    _last_ctrl_c = [0.0]  # closure-stored timestamp for double-press detection
+
     def _soft_interrupt(signum, frame):
-        if _interrupt_event.is_set():
+        # During an AI run, a single Ctrl+C is swallowed so that terminal
+        # copy / text-select operations don't accidentally interrupt the
+        # loop. ESC remains the soft-interrupt key. Only a rapid double
+        # Ctrl+C forces an exit (escape hatch).
+        now = time.time()
+        if now - _last_ctrl_c[0] <= 1.5:
             # Double Ctrl+C → force exit (escape hatch)
             console.print("\n[red]Force exit.[/red]")
             _stop_bg_input_reader()
@@ -16312,8 +16551,12 @@ def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
             signal.signal(signal.SIGINT, _old_sigint)
             _old_sigint(signum, frame)
             return
-        _interrupt_event.set()
-        console.print("\n[dim]⚡ Interrupting... (press Ctrl+C again to force exit)[/dim]")
+        _last_ctrl_c[0] = now
+        console.print(
+            "\n[dim]Ctrl+C ignored during AI run. Press Esc to interrupt "
+            "(takes effect when the model starts replying or at the next "
+            "step - not during thinking), or press Ctrl+C twice quickly "
+            "to force exit.[/dim]")
 
     signal.signal(signal.SIGINT, _soft_interrupt)
 
