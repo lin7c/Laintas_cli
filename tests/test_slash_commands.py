@@ -404,15 +404,24 @@ class SlashRegistryTests(unittest.TestCase):
             "balanceFormatted": "$1.00",
             "pricing": {
                 "defaultTier": "T3",
-                "tiers": [{
-                    "tier": "T1",
-                    "models": ["deepseek-v4-pro"],
-                }],
+                "tiers": [
+                    {"tier": "T1", "models": ["deepseek-v4-pro"]},
+                    {"tier": "T2", "models": ["kimi-k2.6"]},
+                    {"tier": "T3", "models": ["kimi-k3"]},
+                ],
             },
         }
         self.assertEqual(
             laintas_cli._usage_model_tiers(balance),
-            {"deepseek-v4-pro": "T1"},
+            {
+                "deepseek-v4-pro": "T1",
+                "kimi-k2.6": "T2",
+                "kimi-k3": "T3",
+            },
+        )
+        self.assertEqual(
+            laintas_cli._usage_pricing_note(balance),
+            "pricing · kimi-k2.6 T2 · kimi-k3 T3 · unlisted models T3",
         )
 
         totals = {
@@ -464,6 +473,8 @@ class SlashRegistryTests(unittest.TestCase):
         self.assertIn("tier", rendered)
         self.assertIn("deepseek-v4-pro", rendered)
         self.assertIn("T1", rendered)
+        self.assertIn("kimi-k2.6 T2", rendered)
+        self.assertIn("kimi-k3 T3", rendered)
         header = next(line for line in rendered.splitlines()
                       if "model" in line and "tier" in line)
         self.assertLess(header.index("cost"), header.index("tier"))

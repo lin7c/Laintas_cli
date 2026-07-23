@@ -1846,6 +1846,17 @@ def connect_terminal_to_helpwo(agent_registry: "AgentRegistry", session: dict,
     return True
 
 
+def _helpwo_web_app_url() -> Optional[str]:
+    """Return the hosted Helpwo web app URL for the current backend, or None
+    if the current backend has no known companion frontend (e.g. a custom/
+    local backend override). Used by /helpwo --remote to open a browser tab
+    without needing a local dist build."""
+    profile = get_backend_profile()
+    if profile.sends_laintas_credentials:
+        return "https://helpwo.laintas.com"
+    return None
+
+
 def _drain_fd(fd: int, chunks: list) -> None:
     """Read any remaining data from fd after child exits."""
     while True:
@@ -2653,7 +2664,7 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
         )),
     CommandSpec("/term", "List, create, or rename terminals", "Agents & Terminals", "/term [name|rename <old> <new>]", aliases=("/t",), subcommands=("rename",)),
     CommandSpec("/connect", "Link this terminal to Helpwo; with a folder, share it as Helpwo's remote workspace", "Agents & Terminals", "/connect [folder]"),
-    CommandSpec("/helpwo", "Start the local Helpwo web IDE gateway", "Agents & Terminals", "/helpwo [--port N] [--stop] [--dist <path>]", subcommands=("stop",)),
+    CommandSpec("/helpwo", "Start Helpwo and link this terminal to it (local build, or the hosted web app)", "Agents & Terminals", "/helpwo [--port N] [--dist <path>] [--remote] | stop", subcommands=("stop",)),
     CommandSpec("/disconnect", "Withdraw this terminal from Helpwo", "Agents & Terminals"),
     CommandSpec(
         "/station", "Bind an employee to a terminal and optionally start work",
@@ -9544,6 +9555,24 @@ def _usage_model_tiers(balance: dict) -> dict[str, str]:
     return result
 
 
+def _usage_pricing_note(balance: dict) -> str:
+    """Return a compact user-facing summary of notable model tiers."""
+    tiers = _usage_model_tiers(balance)
+    if not tiers:
+        return ""
+    pricing = balance.get("pricing") if isinstance(balance, dict) else None
+    default_tier = str(
+        pricing.get("defaultTier") if isinstance(pricing, dict) else ""
+    ).strip().upper()
+    parts = []
+    for model in ("kimi-k2.6", "kimi-k3"):
+        if model in tiers:
+            parts.append(f"{model} {tiers[model]}")
+    if default_tier:
+        parts.append(f"unlisted models {default_tier}")
+    return "pricing · " + " · ".join(parts) if parts else ""
+
+
 def _show_usage_command(args: list, session: dict) -> None:
     """/usage — local token accounting + Laintas backend usage (product=cli)."""
     rng, local_only = "30d", False
@@ -9699,6 +9728,10 @@ def _show_usage_command(args: list, session: dict) -> None:
                 if sub_calls:
                     footnotes.append("subscription calls carry no token counts on the "
                                      "backend — LOCAL tokens are authoritative")
+
+                pricing_note = _usage_pricing_note(bal)
+                if pricing_note:
+                    footnotes.append(pricing_note)
 
     if not get_runtime_config("show_billing"):
         footnotes.append("/config show_billing true prints cost after every reply")
@@ -14007,12 +14040,20 @@ def _cmd_disconnect(agent_registry: AgentRegistry) -> None:
 
 def _cmd_helpwo(raw_args: str, parts: list, agent_registry: AgentRegistry,
                 session: dict) -> None:
-    """Start or stop the local Helpwo web IDE gateway.
+    """Start the local Helpwo IDE, or explicitly open the hosted version.
 
-    /helpwo              - start on default port 2913
-    /helpwo --port 8080  - start on a custom port
-    /helpwo --dist <p>   - use a custom dist directory
-    /helpwo stop         - stop the running gateway
+    /helpwo              - local dist if found, else the hosted web app
+    /helpwo --port 8080  - start the local server on a custom port
+    /helpwo --dist <p>   - use a custom local dist directory
+    /helpwo --remote     - skip the local server; open the hosted web app
+    /helpwo stop         - stop the running LOCAL gateway (no-op in remote
+                           mode — there's no local server to stop; use
+                           /disconnect to take this terminal offline there)
+
+    Local mode is offline-first: its UI, filesystem bridge and command bridge
+    stay on 127.0.0.1 and do not require login or cloud registration. AI calls
+    still use the configured backend when available. ``--remote`` is the
+    explicit cloud mode and uses the normal /connect registration handshake.
     """
     import helpwo_server
 
@@ -14034,11 +14075,16 @@ def _cmd_helpwo(raw_args: str, parts: list, agent_registry: AgentRegistry,
     # Parse optional flags
     port = helpwo_server.DEFAULT_PORT
     dist_override = None
+    remote = False
     args = parts[1:]
     i = 0
     while i < len(args):
         arg = args[i]
-        if arg == "--port" and i + 1 < len(args):
+        if arg == "--port":
+            if i + 1 >= len(args):
+                console.print("[red]--port requires a value.[/red]")
+                console.print("[dim]Usage: /helpwo [--port N] [--dist <path>] [--remote] | stop[/dim]")
+                return
             try:
                 port = int(args[i + 1])
             except ValueError:
@@ -14048,39 +14094,79 @@ def _cmd_helpwo(raw_args: str, parts: list, agent_registry: AgentRegistry,
                 console.print(f"[red]Port must be 1-65535, got {port}[/red]")
                 return
             i += 2
-        elif arg == "--dist" and i + 1 < len(args):
+        elif arg == "--dist":
+            if i + 1 >= len(args):
+                console.print("[red]--dist requires a path.[/red]")
+                console.print("[dim]Usage: /helpwo [--port N] [--dist <path>] [--remote] | stop[/dim]")
+                return
             dist_override = args[i + 1]
             i += 2
+        elif arg == "--remote":
+            remote = True
+            i += 1
         elif arg.startswith("--"):
             console.print(f"[red]Unknown option: {arg}[/red]")
-            console.print("[dim]Usage: /helpwo [--port N] [--dist <path>] | stop[/dim]")
+            console.print("[dim]Usage: /helpwo [--port N] [--dist <path>] [--remote] | stop[/dim]")
             return
         else:
+            console.print(f"[yellow]Ignoring unrecognized argument: {arg}[/yellow]")
             i += 1
 
-    # If the agent isn't registered yet, auto-register so the frontend
-    # has something to talk to immediately.
-    if agent_registry and not agent_registry.agent_id:
-        if not session.get("userId") and get_backend_profile().sends_laintas_credentials:
-            console.print("[yellow]Not logged in. Run /login first, then /helpwo.[/yellow]")
-            return
-        console.print("[dim]Auto-registering with local backend...[/dim]")
-        agent_registry.register(session, quiet=True)
-        agent_registry.start_heartbeat()
-        agent_registry.start_message_poll(
-            agent_registry._state_cb or (lambda: {}),
-            agent_registry._chat_cb or (lambda: []),
-        )
-
     dist_path = None
-    if dist_override:
-        from pathlib import Path
-        p = Path(dist_override).expanduser()
-        if not p.is_dir() or not (p / "index.html").is_file():
-            console.print(f"[red]Invalid dist directory: {p}[/red]")
-            console.print("[dim]The directory must contain index.html.[/dim]")
+    if not remote:
+        if dist_override:
+            from pathlib import Path
+            p = Path(dist_override).expanduser()
+            if not p.is_dir() or not (p / "index.html").is_file():
+                console.print(f"[red]Invalid dist directory: {p}[/red]")
+                console.print("[dim]The directory must contain index.html.[/dim]")
+                return
+            dist_path = p.resolve()
+        else:
+            dist_path = helpwo_server._find_dist()
+            if dist_path is None:
+                # No local build available — fall back to the hosted web
+                # app instead of a bare error, so /helpwo always gets you
+                # to a working Helpwo one way or another.
+                remote = True
+
+    # --remote is "open the hosted web app pointed at where I am right now" —
+    # every call re-shares the CURRENT cwd (equivalent to running /connect .
+    # first), not just the first one. cd elsewhere and re-run /helpwo --remote
+    # and Helpwo follows you there. If you want a specific folder shared
+    # instead, regardless of cwd, use /connect <folder> directly.
+    #
+    # Local mode has no such standing "where am I" question — it only shares
+    # automatically the first time (nothing shared yet); once anything has
+    # been explicitly chosen (via /connect <folder> or a prior /helpwo
+    # --remote), local mode leaves it alone rather than silently overwriting
+    # a deliberate choice.
+    _auto_workspace = (
+        os.getcwd() if remote
+        else (None if agent_registry.workspace_path else os.getcwd())
+    )
+
+    if remote:
+        url = _helpwo_web_app_url()
+        if url is None:
+            console.print(
+                "[red]No hosted Helpwo web app for the current backend "
+                f"({get_backend_profile().base_url}). Set LAINTAS_HELPWO_DIST "
+                "or use --dist to point at a local build instead.[/red]")
             return
-        dist_path = p.resolve()
+        # Best-effort link: a failed handshake (not logged in, backend
+        # unreachable) shouldn't block opening the web app itself — same
+        # graceful-degradation as local mode, which starts the server either
+        # way and only warns that no agent is registered.
+        connect_terminal_to_helpwo(agent_registry, session, quiet=False,
+                                   workspace=_auto_workspace)
+        console.print(f"[dim]Opening {url}[/dim]")
+        try:
+            import webbrowser
+            webbrowser.open(url)
+        except Exception:
+            pass
+        return
 
     ok, msg = helpwo_server.start_server(agent_registry, dist_dir=dist_path, port=port, session=session)
     if not ok:
@@ -14092,10 +14178,11 @@ def _cmd_helpwo(raw_args: str, parts: list, agent_registry: AgentRegistry,
     console.print(f"  URL: [cyan]{url}[/cyan]")
     console.print(f"  Dist: [dim]{helpwo_server._dist_dir()}[/dim]")
 
+    console.print("  Runtime: [dim]local loopback (offline-capable)[/dim]")
     if agent_registry and agent_registry.agent_id:
-        console.print(f"  Agent: [dim]{agent_registry.agent_name} ({agent_registry.agent_id})[/dim]")
+        console.print(f"  Cloud link: [dim]{agent_registry.agent_name} ({agent_registry.agent_id})[/dim]")
     else:
-        console.print("  [yellow]No agent registered - run /connect to link this terminal.[/yellow]")
+        console.print("  Cloud link: [dim]off — use /connect <folder> or /helpwo --remote when needed[/dim]")
 
     console.print("[dim]  /helpwo stop to stop the gateway.[/dim]")
 

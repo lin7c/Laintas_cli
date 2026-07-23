@@ -15,9 +15,12 @@ Design:
 
 from __future__ import annotations
 
+import base64
 import json
+import mimetypes
 import os
 import re
+import shutil
 import socket
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -86,30 +89,52 @@ _event_buffer = _EventBuffer()
 
 
 def install_event_intercept(agent_registry) -> None:
-    """Monkey-patch _do_post_events so events stay in-process.
+    """Route local-bridge request events into the in-process buffer.
 
-    The original _do_post_events POSTs to the remote backend.  In local mode
-    the backend *is* us, so we short-circuit: stuff events into _event_buffer
-    instead of making an HTTP round-trip to ourselves.
+    Patch ``_push_events`` rather than ``_do_post_events`` so offline mode
+    works even when the CLI has no cloud ``agent_id`` (the normal method
+    intentionally drops events before they reach ``_do_post_events`` in that
+    state). Requests received from the local bridge are tracked explicitly;
+    unrelated cloud requests keep using the original sender. This prevents a
+    local /helpwo session from hijacking or duplicating an already-connected
+    cloud agent's event stream.
     """
-    orig = agent_registry._do_post_events
+    if hasattr(agent_registry, "_orig_push_events_for_helpwo"):
+        return
+    orig = agent_registry._push_events
 
-    def _local_post(events: list) -> None:
-        agent_id = agent_registry.agent_id
-        if agent_id:
-            _event_buffer.append(agent_id, events)
+    def _local_push(events: list, req_id: str = None) -> None:
+        if not events:
+            return
+        with _local_requests_lock:
+            is_local = bool(req_id and req_id in _local_request_ids)
+        if not is_local:
+            orig(events, req_id=req_id)
+            return
 
-    # Keep a reference to the original for uninstall.
-    agent_registry._orig_do_post_events = orig
-    agent_registry._do_post_events = _local_post
+        prepared = []
+        saw_final = False
+        for raw in events:
+            event = dict(raw)
+            event.setdefault("reqId", req_id)
+            event.setdefault("meta", {})
+            prepared.append(event)
+            saw_final = saw_final or event.get("type") == "final"
+        _event_buffer.append(_effective_agent_id(agent_registry), prepared)
+        if saw_final:
+            with _local_requests_lock:
+                _local_request_ids.discard(req_id)
+
+    agent_registry._orig_push_events_for_helpwo = orig
+    agent_registry._push_events = _local_push
 
 
 def uninstall_event_intercept(agent_registry) -> None:
-    """Restore the original _do_post_events."""
-    orig = getattr(agent_registry, "_orig_do_post_events", None)
+    """Restore the original event dispatcher."""
+    orig = getattr(agent_registry, "_orig_push_events_for_helpwo", None)
     if orig is not None:
-        agent_registry._do_post_events = orig
-        del agent_registry._orig_do_post_events
+        agent_registry._push_events = orig
+        del agent_registry._orig_push_events_for_helpwo
 
 
 # ---------------------------------------------------------------------------
@@ -190,6 +215,14 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _trusted_host(self) -> bool:
+        """Reject DNS-rebinding requests before they reach loopback APIs."""
+        host = (self.headers.get("Host") or "").split(":", 1)[0].strip().lower()
+        if host in ("127.0.0.1", "localhost"):
+            return True
+        self._json(421, {"error": "local Helpwo bridge requires a loopback host"})
+        return False
+
     def _static(self, path: str) -> None:
         dist_dir = _dist_dir()
         if dist_dir is None:
@@ -212,9 +245,34 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _content_length_ok(self) -> bool:
+        """Reject an oversized body before reading any of it into memory.
+
+        Local-fs writes are base64-encoded (~33% inflation), so the raw JSON
+        body can legitimately run larger than _MAX_LOCAL_FILE_BYTES; cap it
+        generously above that instead of trusting a client-declared
+        Content-Length unbounded. Loopback-only binding already limits who
+        can reach this at all, but a buggy or compromised same-machine
+        caller shouldn't be able to make this process buffer an arbitrary
+        multi-GB body into memory on a whim. Checked once in do_POST before
+        any handler runs, so there's exactly one response written either way
+        (no risk of a handler also writing a response after this already did).
+        """
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            return True  # malformed header — let _read_body's own parsing fail closed
+        if length > _MAX_BODY_BYTES:
+            self._json(413, {"error": "request body too large"})
+            return False
+        return True
+
     def _read_body(self) -> dict:
-        length = int(self.headers.get("Content-Length", 0))
-        if length == 0:
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            return {}
+        if length <= 0:
             return {}
         raw = self.rfile.read(length)
         try:
@@ -225,6 +283,8 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
     # -- route dispatch --
 
     def do_GET(self) -> None:
+        if not self._trusted_host():
+            return
         parsed = urlparse(self.path)
         path = parsed.path
 
@@ -246,13 +306,29 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
             return self._handle_usage()
         if path == "/api/sso/login":
             return self._handle_sso_login(parsed.query)
+        if path == "/api/local-fs/root":
+            return self._handle_local_fs_root()
+        if path == "/api/local-fs/list":
+            qs = parse_qs(parsed.query)
+            return self._handle_local_fs_list(qs.get("path", [""])[0])
+        if path == "/api/local-fs/read":
+            qs = parse_qs(parsed.query)
+            return self._handle_local_fs_read(qs.get("path", [""])[0])
+        if path == "/api/local-fs/stat":
+            qs = parse_qs(parsed.query)
+            return self._handle_local_fs_stat(qs.get("path", [""])[0])
 
         # Static files
         return self._static(path)
 
     def do_POST(self) -> None:
+        if not self._trusted_host():
+            return
         parsed = urlparse(self.path)
         path = parsed.path
+
+        if not self._content_length_ok():
+            return  # 413 already written; nothing else may write a response
 
         m = re.match(r"^/api/agents/([^/]+)/send$", path)
         if m:
@@ -269,11 +345,23 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
             return self._handle_fetch()
         if path == "/api/auth/get-session":
             return self._handle_auth_session()
+        if path == "/api/local-fs/write":
+            return self._handle_local_fs_write(self._read_body())
+        if path == "/api/local-fs/mkdir":
+            return self._handle_local_fs_mkdir(self._read_body())
+        if path == "/api/local-fs/delete":
+            return self._handle_local_fs_delete(self._read_body())
+        if path == "/api/local-fs/rename":
+            return self._handle_local_fs_rename(self._read_body())
+        if path == "/api/local-fs/move":
+            return self._handle_local_fs_move(self._read_body())
 
         self._json(404, {"error": "not found"})
 
     def do_OPTIONS(self) -> None:
         """Handle CORS preflight."""
+        if not self._trusted_host():
+            return
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "http://127.0.0.1:%d" % _server_port())
         self.send_header("Access-Control-Allow-Credentials", "true")
@@ -285,14 +373,14 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
 
     def _handle_list_agents(self) -> None:
         reg = _agent_registry()
-        if reg is None or not reg.agent_id:
+        if reg is None:
             # No agent registered yet - return empty list (frontend handles this).
             self._json(200, [])
             return
         import socket as _sock
         import platform
         entry = {
-            "id": reg.agent_id,
+            "id": _effective_agent_id(reg),
             "name": reg.agent_name or "cli",
             "hostname": _sock.gethostname(),
             "os": platform.system(),
@@ -304,19 +392,25 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
             "childIds": [],
             "terminal": reg.terminal_meta or None,
             "goal": f"CLI agent '{reg.agent_name}' on {_sock.gethostname()}",
+            "workspacePath": str(_local_root() or ""),
+            "localBridge": True,
         }
         self._json(200, [entry])
 
     def _handle_updates(self, agent_id: str, since: int) -> None:
+        reg = _agent_registry()
+        if reg is None or agent_id != _effective_agent_id(reg):
+            self._json(404, {"error": "unknown agent"})
+            return
         events, high = _event_buffer.get_since(agent_id, since)
         self._json(200, {"events": events, "seq": high})
 
     def _handle_send(self, agent_id: str, body: dict) -> None:
         reg = _agent_registry()
-        if reg is None or not reg.agent_id:
-            self._json(503, {"error": "no agent registered"})
+        if reg is None:
+            self._json(503, {"error": "local runtime unavailable"})
             return
-        if agent_id != reg.agent_id:
+        if agent_id != _effective_agent_id(reg):
             self._json(404, {"error": "unknown agent"})
             return
 
@@ -345,6 +439,12 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
             self._json(503, {"error": "executor not ready"})
             return
 
+        if not reg._reserve_remote_capacity(is_control):
+            self._json(429, {"error": "local runtime is busy"})
+            return
+
+        with _local_requests_lock:
+            _local_request_ids.add(req_id)
         try:
             executor.submit(
                 reg._run_bounded_remote, msg,
@@ -353,6 +453,12 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
                 is_control,
             )
         except RuntimeError:
+            with _local_requests_lock:
+                _local_request_ids.discard(req_id)
+            group = "control" if is_control else "task"
+            with reg._remote_capacity_lock:
+                reg._remote_accepted[group] = max(0, reg._remote_accepted[group] - 1)
+                reg._remote_capacity_lock.notify_all()
             self._json(503, {"error": "executor is shutting down"})
             return
 
@@ -472,6 +578,168 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
         body = self._read_body()
         self._proxy_json("POST", "/api/fetch", body)
 
+    # -- Local filesystem API --
+    # Scoped to _local_root() (this process's cwd when /helpwo started).
+    # Same-machine + loopback-only, so plain HTTP is enough — no P2P/WebRTC
+    # handshake needed the way a genuine remote host requires. Every handler
+    # resolves through _resolve_local_path(), which refuses anything outside
+    # the root (symlink escapes, `..`) the same way RemoteProvider.pathOf
+    # and webrtc_channel.py's _is_path_allowed do for the remote-mount path.
+
+    def _entry_meta(self, p: Path) -> dict:
+        st = p.stat()
+        is_dir = p.is_dir()
+        mime, _ = (None, None) if is_dir else mimetypes.guess_type(p.name)
+        return {
+            "name": p.name,
+            "type": "folder" if is_dir else "file",
+            "size": 0 if is_dir else st.st_size,
+            "modifiedAt": st.st_mtime,
+            "mimeType": mime,
+        }
+
+    def _handle_local_fs_root(self) -> None:
+        root = _local_root()
+        if root is None:
+            self._json(200, {"available": False})
+            return
+        self._json(200, {"available": True, "root": str(root)})
+
+    def _handle_local_fs_list(self, path: str) -> None:
+        p = _resolve_local_path(path)
+        if p is None:
+            self._json(400, {"error": "path outside local workspace root"})
+            return
+        if not p.is_dir():
+            self._json(404, {"error": "not a directory"})
+            return
+        try:
+            entries = [self._entry_meta(child) for child in p.iterdir()]
+        except OSError as e:
+            self._json(500, {"error": str(e)})
+            return
+        self._json(200, {"entries": entries})
+
+    def _handle_local_fs_stat(self, path: str) -> None:
+        p = _resolve_local_path(path)
+        if p is None or not p.exists():
+            self._json(404, {"error": "not found"})
+            return
+        self._json(200, self._entry_meta(p))
+
+    def _handle_local_fs_read(self, path: str) -> None:
+        p = _resolve_local_path(path)
+        if p is None or not p.is_file():
+            self._json(404, {"error": "not found"})
+            return
+        try:
+            size = p.stat().st_size
+            if size > _MAX_LOCAL_FILE_BYTES:
+                self._json(413, {"error": f"file too large ({size} bytes, cap {_MAX_LOCAL_FILE_BYTES})"})
+                return
+            data = p.read_bytes()
+        except OSError as e:
+            self._json(500, {"error": str(e)})
+            return
+        mime, _ = mimetypes.guess_type(p.name)
+        self._json(200, {
+            "contentBase64": base64.b64encode(data).decode("ascii"),
+            "mimeType": mime,
+            "size": len(data),
+        })
+
+    def _handle_local_fs_write(self, body: dict) -> None:
+        p = _resolve_local_path(str(body.get("path") or ""))
+        if p is None:
+            self._json(400, {"error": "path outside local workspace root"})
+            return
+        if not p.parent.is_dir():
+            self._json(400, {"error": "parent directory does not exist"})
+            return
+        try:
+            raw_b64 = body.get("contentBase64")
+            data = (base64.b64decode(raw_b64, validate=True) if raw_b64 is not None
+                   else str(body.get("content") or "").encode("utf-8"))
+            if len(data) > _MAX_LOCAL_FILE_BYTES:
+                self._json(413, {"error": f"content too large (cap {_MAX_LOCAL_FILE_BYTES})"})
+                return
+            p.write_bytes(data)
+        except (OSError, ValueError) as e:
+            self._json(500, {"error": str(e)})
+            return
+        self._json(200, {"ok": True})
+
+    def _handle_local_fs_mkdir(self, body: dict) -> None:
+        p = _resolve_local_path(str(body.get("path") or ""), follow_leaf=False)
+        if p is None:
+            self._json(400, {"error": "path outside local workspace root"})
+            return
+        try:
+            p.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            self._json(500, {"error": str(e)})
+            return
+        self._json(200, {"ok": True})
+
+    def _handle_local_fs_delete(self, body: dict) -> None:
+        p = _resolve_local_path(str(body.get("path") or ""), follow_leaf=False)
+        root = _local_root()
+        if p is None or root is None:
+            self._json(400, {"error": "path outside local workspace root"})
+            return
+        if p == root:
+            self._json(400, {"error": "cannot delete the workspace root"})
+            return
+        try:
+            if p.is_dir() and not p.is_symlink():
+                shutil.rmtree(p)
+            elif p.exists() or p.is_symlink():
+                p.unlink()
+            else:
+                self._json(404, {"error": "not found"})
+                return
+        except OSError as e:
+            self._json(500, {"error": str(e)})
+            return
+        self._json(200, {"ok": True})
+
+    def _handle_local_fs_rename(self, body: dict) -> None:
+        p = _resolve_local_path(str(body.get("path") or ""), follow_leaf=False)
+        new_name = str(body.get("newName") or "").strip()
+        if p is None or not new_name or "/" in new_name or new_name in (".", ".."):
+            self._json(400, {"error": "invalid path or name"})
+            return
+        target = _resolve_local_path(str(Path(body.get("path") or "").parent / new_name))
+        if target is None:
+            self._json(400, {"error": "target path outside local workspace root"})
+            return
+        if target.exists():
+            self._json(409, {"error": "target already exists"})
+            return
+        try:
+            p.rename(target)
+        except OSError as e:
+            self._json(500, {"error": str(e)})
+            return
+        self._json(200, {"ok": True})
+
+    def _handle_local_fs_move(self, body: dict) -> None:
+        p = _resolve_local_path(str(body.get("path") or ""), follow_leaf=False)
+        new_parent = _resolve_local_path(str(body.get("newParentPath") or ""))
+        if p is None or new_parent is None or not new_parent.is_dir():
+            self._json(400, {"error": "invalid source or destination"})
+            return
+        target = new_parent / p.name
+        if target.exists():
+            self._json(409, {"error": "target already exists"})
+            return
+        try:
+            shutil.move(str(p), str(target))
+        except OSError as e:
+            self._json(500, {"error": str(e)})
+            return
+        self._json(200, {"ok": True})
+
 
 # ---------------------------------------------------------------------------
 # Server lifecycle
@@ -484,6 +752,14 @@ _registry_ref: Optional[Any] = None  # AgentRegistry instance
 _dist_dir_ref: Optional[Path] = None
 _server_port_val: int = DEFAULT_PORT
 _session_ref: Optional[dict] = None  # CLI session dict (for backend auth)
+# Root directory the local-fs API is scoped to (this process's cwd at the
+# time /helpwo started the server). Same-origin, loopback-only, no P2P
+# handshake needed — unlike a genuine remote host, the browser and this
+# server are on the same machine, so a plain HTTP file API is sufficient.
+_local_root_ref: Optional[Path] = None
+_local_agent_id_ref: str = ""
+_local_requests_lock = threading.Lock()
+_local_request_ids: set[str] = set()
 
 
 def _agent_registry() -> Any:
@@ -500,6 +776,57 @@ def _dist_dir() -> Optional[Path]:
 
 def _server_port() -> int:
     return _server_port_val
+
+
+def _local_root() -> Optional[Path]:
+    return _local_root_ref
+
+
+def _effective_agent_id(registry: Any = None) -> str:
+    reg = registry if registry is not None else _registry_ref
+    remote_id = str(getattr(reg, "agent_id", "") or "")
+    return remote_id or _local_agent_id_ref
+
+
+_MAX_LOCAL_FILE_BYTES = 10 * 1024 * 1024  # 10MB, same order as the P2P get/put cap
+_MAX_BODY_BYTES = 2 * _MAX_LOCAL_FILE_BYTES  # raw request body cap (base64 inflates ~33%)
+
+
+def _resolve_local_path(path_str: str, *, follow_leaf: bool = True) -> Optional[Path]:
+    """Resolve `path_str` against the local-fs root, refusing any escape.
+
+    `path_str` may be an absolute path (the frontend's entry ids are full
+    host paths, mirroring RemoteProvider's convention) or empty (meaning the
+    root itself); a relative string is joined under the root as a fallback.
+    Mirrors RemoteProvider.pathOf's containment check on the frontend and
+    webrtc_channel.py's _is_path_allowed: resolve symlinks/`..` fully, then
+    require the result to BE the root or a real descendant of it. Returns
+    None (not an exception) for anything invalid so callers can respond
+    with a clean 400 instead of leaking a stack trace.
+    """
+    root = _local_root_ref
+    if root is None:
+        return None
+    path_str = (path_str or "").strip()
+    try:
+        candidate = Path(path_str) if path_str else root
+        if not candidate.is_absolute():
+            candidate = root / candidate
+        if follow_leaf:
+            resolved = candidate.resolve(strict=False)
+        else:
+            # Mutations of a directory entry (delete/rename/move) must act on
+            # the symlink itself, not on the target produced by Path.resolve().
+            # Resolve and contain the parent, then append only the leaf name.
+            resolved_parent = candidate.parent.resolve(strict=False)
+            resolved = resolved_parent / candidate.name
+    except (OSError, RuntimeError, ValueError):
+        return None
+    try:
+        resolved.relative_to(root)
+    except ValueError:
+        return None
+    return resolved
 
 
 def _find_dist() -> Optional[Path]:
@@ -537,7 +864,7 @@ def start_server(agent_registry: Any, dist_dir: Optional[Path] = None,
 
     Returns (success, message).
     """
-    global _server, _server_thread, _registry_ref, _dist_dir_ref, _server_port_val, _session_ref
+    global _server, _server_thread, _registry_ref, _dist_dir_ref, _server_port_val, _session_ref, _local_root_ref, _local_agent_id_ref
 
     if is_running():
         return True, f"already running on http://127.0.0.1:{_server_port_val}"
@@ -554,6 +881,11 @@ def start_server(agent_registry: Any, dist_dir: Optional[Path] = None,
     _registry_ref = agent_registry
     _dist_dir_ref = resolved_dist.resolve()
     _server_port_val = port
+    # Local mode never requires cloud registration. The stable-for-process
+    # alias lets the same Helpwo frontend use the existing agent request
+    # contract while all traffic remains on loopback.
+    _local_agent_id_ref = f"local-{os.getpid():x}"
+    _local_root_ref = Path(os.getcwd()).resolve()
 
     # Intercept events so they stay in-process instead of HTTP-round-tripping.
     install_event_intercept(agent_registry)
@@ -564,6 +896,10 @@ def start_server(agent_registry: Any, dist_dir: Optional[Path] = None,
         )
     except OSError as e:
         uninstall_event_intercept(agent_registry)
+        _registry_ref = None
+        _dist_dir_ref = None
+        _local_root_ref = None
+        _local_agent_id_ref = ""
         return False, f"cannot bind 127.0.0.1:{port}: {e}"
 
     srv.daemon_threads = True
@@ -581,7 +917,7 @@ def start_server(agent_registry: Any, dist_dir: Optional[Path] = None,
 
 def stop_server() -> None:
     """Stop the local Helpwo gateway server."""
-    global _server, _server_thread, _registry_ref, _dist_dir_ref, _session_ref
+    global _server, _server_thread, _registry_ref, _dist_dir_ref, _session_ref, _local_root_ref, _local_agent_id_ref
 
     if _server is not None:
         _server.shutdown()
@@ -597,6 +933,10 @@ def stop_server() -> None:
 
     _dist_dir_ref = None
     _session_ref = None
+    _local_root_ref = None
+    _local_agent_id_ref = ""
+    with _local_requests_lock:
+        _local_request_ids.clear()
     _event_buffer.clear()
 
 

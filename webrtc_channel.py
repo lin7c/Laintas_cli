@@ -18,8 +18,10 @@ so the answer SDP already carries the candidates — no separate ICE messages.
 """
 
 import asyncio
+import fnmatch
 import json
 import os
+import shutil
 import socket
 import threading
 from typing import Callable
@@ -175,6 +177,153 @@ def _validate_exec_paths(cmd: str) -> str | None:
     return None
 
 
+def _rpc_path(value, *, follow_leaf=True) -> str:
+    """Resolve and contain one structured-RPC path.
+
+    Entry mutations preserve the final symlink so deleting or moving a link
+    cannot delete its target. Reads follow it and must still land in an
+    allowed root.
+    """
+    raw = str(value or "")
+    if not raw or not os.path.isabs(raw):
+        raise ValueError("absolute path required")
+    if follow_leaf:
+        resolved = os.path.realpath(raw)
+    else:
+        resolved = os.path.join(os.path.realpath(os.path.dirname(raw)), os.path.basename(raw))
+    try:
+        import policy
+        roots = policy._load_config().get("allowedRoots", [])
+    except Exception:
+        roots = []
+    contained = False
+    for root in roots:
+        root_resolved = os.path.realpath(root)
+        if resolved == root_resolved or resolved.startswith(root_resolved + os.sep):
+            contained = True
+            break
+    if not contained:
+        raise PermissionError("path outside allowed roots")
+    return resolved
+
+
+def _validate_copied_symlinks(source: str) -> None:
+    """Reject copies that would introduce a link escaping allowed roots."""
+    candidates = [source]
+    if os.path.isdir(source) and not os.path.islink(source):
+        candidates = []
+        for current, dirs, files in os.walk(source, followlinks=False):
+            candidates.extend(os.path.join(current, name) for name in dirs + files)
+    for candidate in candidates:
+        if os.path.islink(candidate):
+            _rpc_path(candidate)
+
+
+def _fs_meta(path: str) -> dict:
+    st = os.lstat(path)
+    if os.path.islink(path):
+        kind = "symlink"
+    elif os.path.isdir(path):
+        kind = "folder"
+    else:
+        kind = "file"
+    return {
+        "name": os.path.basename(path.rstrip(os.sep)) or os.sep,
+        "type": kind,
+        "size": int(st.st_size),
+        "inode": str(st.st_ino),
+        "createdAt": float(st.st_ctime),
+        "modifiedAt": float(st.st_mtime),
+        "accessedAt": float(st.st_atime),
+        "symlinkTarget": os.readlink(path) if kind == "symlink" else None,
+    }
+
+
+def _run_fs_operation(op: str, args: dict):
+    if op == "probe":
+        return {"ready": True}
+    if op == "list":
+        path = _rpc_path(args.get("path"))
+        if not os.path.isdir(path):
+            raise NotADirectoryError(path)
+        return [_fs_meta(entry.path) for entry in os.scandir(path)]
+    if op == "stat":
+        path = _rpc_path(args.get("path"), follow_leaf=False)
+        return _fs_meta(path) if os.path.lexists(path) else None
+    if op == "mkdir":
+        path = _rpc_path(args.get("path"), follow_leaf=False)
+        os.makedirs(path, exist_ok=True)
+        return {"ok": True}
+    if op == "remove":
+        path = _rpc_path(args.get("path"), follow_leaf=False)
+        if os.path.isdir(path) and not os.path.islink(path):
+            shutil.rmtree(path)
+        elif os.path.lexists(path):
+            os.unlink(path)
+        else:
+            raise FileNotFoundError(path)
+        return {"ok": True}
+    if op == "move":
+        source = _rpc_path(args.get("source"), follow_leaf=False)
+        destination = _rpc_path(args.get("destination"), follow_leaf=False)
+        if os.path.lexists(destination):
+            raise FileExistsError(destination)
+        shutil.move(source, destination)
+        return _fs_meta(destination)
+    if op == "copy":
+        source = _rpc_path(args.get("source"), follow_leaf=False)
+        destination = _rpc_path(args.get("destination"), follow_leaf=False)
+        if os.path.lexists(destination):
+            raise FileExistsError(destination)
+        _validate_copied_symlinks(source)
+        if os.path.isdir(source) and not os.path.islink(source):
+            shutil.copytree(source, destination, symlinks=True)
+        else:
+            shutil.copy2(source, destination, follow_symlinks=False)
+        return _fs_meta(destination)
+    if op in ("search", "walk"):
+        root = _rpc_path(args.get("root"))
+        limit = min(max(int(args.get("limit") or 500), 1), 5000)
+        recursive = bool(args.get("recursive", True))
+        pattern = str(args.get("pattern") or "*")
+        rows = []
+        for current, dirs, files in os.walk(root, followlinks=False):
+            dirs[:] = [name for name in dirs if name != ".git"]
+            names = dirs + files
+            for name in names:
+                full = os.path.join(current, name)
+                rel = os.path.relpath(full, root)
+                if op == "walk" or fnmatch.fnmatch(name, pattern):
+                    meta = _fs_meta(full)
+                    meta["path"] = rel
+                    meta["absolutePath"] = full
+                    rows.append(meta)
+                    if len(rows) >= limit:
+                        return rows
+            if not recursive:
+                break
+        return rows
+    if op == "quota":
+        path = _rpc_path(args.get("path"))
+        usage = shutil.disk_usage(path)
+        return {"quota": int(usage.total), "usage": int(usage.used)}
+    if op == "symlink":
+        path = _rpc_path(args.get("path"), follow_leaf=False)
+        target = str(args.get("target") or "")
+        resolved_target = target if os.path.isabs(target) else os.path.join(os.path.dirname(path), target)
+        _rpc_path(resolved_target)
+        if os.path.lexists(path):
+            raise FileExistsError(path)
+        os.symlink(target, path)
+        return _fs_meta(path)
+    if op == "readlink":
+        path = _rpc_path(args.get("path"), follow_leaf=False)
+        if not os.path.islink(path):
+            raise OSError("not a symbolic link")
+        return {"target": os.readlink(path)}
+    raise ValueError(f"unsupported filesystem operation: {op}")
+
+
 class WebrtcManager:
     """One per agent connection. Holds a dedicated asyncio loop in a daemon
     thread and a peer connection per signaling session (keyed by reqId)."""
@@ -188,6 +337,9 @@ class WebrtcManager:
         self._pcs: dict = {}
         self._puts: dict = {}  # channel -> in-progress upload {f, path, written}
         self._vnc: dict = {}   # channel -> live VNC bridge {sock, task, name}
+        # Structured metadata calls are cheap but may recurse. Keep a hostile
+        # or buggy peer from filling the process-wide thread pool.
+        self._fs_slots = threading.BoundedSemaphore(4)
         self._loop = asyncio.new_event_loop()
         _bind_ports_in_range(self._loop, *_rtc_port_range())
         self._thread = threading.Thread(
@@ -296,6 +448,8 @@ class WebrtcManager:
             self._finish_put(channel, data)
         elif t == "exec":
             asyncio.ensure_future(self._serve_exec(channel, data))
+        elif t == "fs":
+            asyncio.ensure_future(self._serve_fs(channel, data))
         elif t == "http":
             asyncio.ensure_future(self._serve_http(channel, data))
         elif t == "vnc-open":
@@ -334,6 +488,28 @@ class WebrtcManager:
                                      "out": "command timed out"}))
         except Exception as e:
             channel.send(json.dumps({"t": "exec-res", "id": rid, "ok": False, "code": -1, "out": str(e)}))
+
+    # ── Structured filesystem metadata RPC ─────────────────────────────
+    # RemoteProvider used to send shell snippets containing pipes, redirects
+    # and `if; then`, while the security validator correctly rejected those
+    # metacharacters. Keep arbitrary commands on the approval-gated exec path;
+    # filesystem metadata uses explicit operations and native Python APIs.
+    async def _serve_fs(self, channel, msg: dict):
+        rid = msg.get("id")
+        op = str(msg.get("op") or "")
+        args = msg.get("args") if isinstance(msg.get("args"), dict) else {}
+        if not self._fs_slots.acquire(blocking=False):
+            channel.send(json.dumps({"t": "fs-res", "id": rid, "ok": False,
+                                     "error": "filesystem operation limit reached"}))
+            return
+        try:
+            result = await asyncio.to_thread(_run_fs_operation, op, args)
+            channel.send(json.dumps({"t": "fs-res", "id": rid, "ok": True, "result": result}))
+        except Exception as e:
+            channel.send(json.dumps({"t": "fs-res", "id": rid, "ok": False,
+                                     "error": str(e)}))
+        finally:
+            self._fs_slots.release()
 
     # ── HTTP tunnel RPC: proxy one request to a loopback port ───────────
     # Lets Helpwo render a dev server running on this host inside its preview
