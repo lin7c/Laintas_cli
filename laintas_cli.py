@@ -6192,6 +6192,14 @@ class AgentRegistry:
                     self._webrtc = WebrtcManager(
                         lambda sid, typ, meta: self._push(sid, typ, "", meta),
                     )
+                    # So the WebRTC path/exec checks can also allow the
+                    # folder explicitly shared via /connect or /helpwo
+                    # (self.workspace_path), not just policy.py's
+                    # allowedRoots (a separate, unrelated command-safety
+                    # list that doesn't include an arbitrary shared cwd by
+                    # default).
+                    from webrtc_channel import set_agent_registry
+                    set_agent_registry(self)
             except Exception as e:
                 console.print(f"[dim]WebRTC unavailable: {e}[/dim]")
                 self._webrtc = False

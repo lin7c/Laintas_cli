@@ -18,18 +18,49 @@ so the answer SDP already carries the candidates — no separate ICE messages.
 """
 
 import asyncio
+import base64
 import fnmatch
 import json
 import os
+import pty
 import shutil
+import signal
 import socket
+import struct
+import termios
 import threading
-from typing import Callable
+import fcntl
+from typing import Any, Callable, Optional
 
 # File RPC limits (Layer 2). Bytes flow as raw binary DataChannel messages.
 _CHUNK = 16 * 1024            # per binary message (safe under SCTP message size)
 _MAX_FILE_BYTES = 5 * 1024 * 1024
 _MAX_HTTP_BYTES = 20 * 1024 * 1024   # per tunneled HTTP response (dev bundles can be big)
+_AI_EXEC_MAX_OUTPUT = 256 * 1024    # matches the old server-relayed exec's cap
+
+# Live reference to the AgentRegistry instance that owns this WebrtcManager,
+# so path checks can also allow the folder the user explicitly shared via
+# /connect <folder> or /helpwo (agent_registry.workspace_path) — not just
+# policy.py's allowedRoots. allowedRoots gates autonomous AI shell commands;
+# workspace_path is a separate, deliberate per-connection consent the user
+# already gave when they chose what to share. Conflating the two meant a
+# mounted folder outside the (unrelated) default allowedRoots list — the
+# common case, since allowedRoots defaults to a handful of fixed dirs that
+# don't include an arbitrary shared cwd — silently listed as empty.
+_registry_ref: Optional[Any] = None
+
+
+def set_agent_registry(registry: Any) -> None:
+    """Called once from laintas_cli.py's _ensure_webrtc() so path checks stay
+    in sync with the live registry (workspace_path can change via a later
+    /connect <folder> without needing to reconstruct the WebrtcManager)."""
+    global _registry_ref
+    _registry_ref = registry
+
+
+def _extra_allowed_roots() -> list:
+    workspace_path = getattr(_registry_ref, "workspace_path", None) if _registry_ref else None
+    return [workspace_path] if workspace_path else []
 
 # Whitelist of commands allowed via the exec RPC. The browser RemoteProvider
 # uses these for directory listing + metadata; arbitrary shell is NOT allowed
@@ -92,8 +123,48 @@ def _bind_ports_in_range(loop, lo: int, hi: int) -> None:
     loop.create_datagram_endpoint = patched
 
 
+# How long a detached terminal session (browser refresh, tab switch, brief
+# network blip) keeps its shell alive waiting for the SAME sessionId to
+# reattach, before it's killed for good. Mirrors the gateway relay's own
+# detach-grace concept for the WS-based terminal, so moving a terminal to P2P
+# doesn't regress "refresh doesn't interrupt your shell".
+_TERM_DETACH_GRACE_SECONDS = 120
+# Output produced while nobody is attached (mid-grace) is buffered for replay
+# on reattach, capped so a chatty command (e.g. left running while detached)
+# can't grow this unbounded.
+_TERM_BUFFER_CAP = 65536
+
+
+def _kill_process_group(proc) -> None:
+    """Kill the whole process group `proc` leads, not just its own pid.
+
+    A plain proc.kill() only signals the immediate child (e.g. the /bin/sh
+    that create_subprocess_shell spawned). If that shell forked a real child
+    for the actual command instead of exec-replacing itself, killing just the
+    shell leaves the real command running and still holding the stdout pipe
+    open — the reader never sees EOF and abort silently does nothing.
+    Requires the process was started with start_new_session=True.
+    """
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+
+
+def _set_winsize(fd: int, rows: int, cols: int) -> None:
+    try:
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+    except OSError:
+        pass
+
+
 def _is_path_allowed(path: str) -> bool:
-    """Check if `path` is within any of the policy's allowedRoots.
+    """Check if `path` is within any of policy.py's allowedRoots, OR within
+    the folder the user explicitly shared for this connection
+    (agent_registry.workspace_path).
 
     Prevents the WebRTC channel from reading/writing arbitrary files
     (e.g. ~/.ssh/id_rsa, /etc/shadow) even if the connected browser is
@@ -104,9 +175,10 @@ def _is_path_allowed(path: str) -> bool:
     try:
         import policy
         cfg = policy._load_config()
-        roots = cfg.get("allowedRoots", [])
+        roots = list(cfg.get("allowedRoots", []))
     except Exception:
         roots = []
+    roots.extend(_extra_allowed_roots())
     if not roots:
         # No allowedRoots configured - deny by default for safety.
         return False
@@ -193,12 +265,16 @@ def _rpc_path(value, *, follow_leaf=True) -> str:
         resolved = os.path.join(os.path.realpath(os.path.dirname(raw)), os.path.basename(raw))
     try:
         import policy
-        roots = policy._load_config().get("allowedRoots", [])
+        roots = list(policy._load_config().get("allowedRoots", []))
     except Exception:
         roots = []
+    roots.extend(_extra_allowed_roots())
     contained = False
     for root in roots:
-        root_resolved = os.path.realpath(root)
+        try:
+            root_resolved = os.path.realpath(root)
+        except OSError:
+            continue
         if resolved == root_resolved or resolved.startswith(root_resolved + os.sep):
             contained = True
             break
@@ -337,6 +413,15 @@ class WebrtcManager:
         self._pcs: dict = {}
         self._puts: dict = {}  # channel -> in-progress upload {f, path, written}
         self._vnc: dict = {}   # channel -> live VNC bridge {sock, task, name}
+        # sessionId -> {channel (or None if detached), master_fd, pid, buffer,
+        # grace_handle}. Keyed by sessionId (not channel) since a session must
+        # survive its channel closing (refresh) and reattach on a new one.
+        self._terms: dict = {}
+        # reqId -> asyncio.subprocess.Process, for the AI-exec channel (below).
+        self._ai_exec_procs: dict = {}
+        # reqId -> asyncio.Future[str], resolved with "approve"/"deny" when the
+        # matching ai-exec-approval-response frame arrives.
+        self._ai_exec_approvals: dict = {}
         # Structured metadata calls are cheap but may recurse. Keep a hostile
         # or buggy peer from filling the process-wide thread pool.
         self._fs_slots = threading.BoundedSemaphore(4)
@@ -389,6 +474,7 @@ class WebrtcManager:
             @channel.on("close")
             def on_close():
                 self._close_vnc(channel)
+                self._detach_terms_for_channel(channel)
 
         @pc.on("connectionstatechange")
         async def on_state():
@@ -456,6 +542,22 @@ class WebrtcManager:
             asyncio.ensure_future(self._open_vnc(channel, data))
         elif t == "vnc-close":
             self._close_vnc(channel)
+        elif t == "term-open":
+            asyncio.ensure_future(self._open_term(channel, data))
+        elif t == "term-i":
+            self._term_input(data)
+        elif t == "term-resize":
+            self._term_resize(data)
+        elif t == "term-detach":
+            self._term_client_detach(data)
+        elif t == "term-close":
+            self._terminate_term(str(data.get("id") or ""), notify=False)
+        elif t == "ai-exec":
+            asyncio.ensure_future(self._serve_ai_exec(channel, data))
+        elif t == "ai-exec-approval-response":
+            self._handle_ai_exec_approval_response(data)
+        elif t == "ai-exec-abort":
+            self._abort_ai_exec(data)
 
     # ── Metadata RPC: exec a short shell command (ls/find/mkdir/mv/rm/stat) ──
     # Used by the browser RemoteProvider so directory listing + metadata also
@@ -510,6 +612,314 @@ class WebrtcManager:
                                      "error": str(e)}))
         finally:
             self._fs_slots.release()
+
+    # ── Interactive terminal: real PTY multiplexed over the DataChannel ──
+    # Deliberately separate from `exec` (whitelisted, one-shot, machine-driven
+    # metadata calls) — this spawns an actual shell reacting to a human
+    # typing in real time, exactly like the existing WS-relay terminal
+    # (gateway.py's `/api/agents/<id>/term`) already does with no whitelist.
+    # The trust boundary is the same one documented at the top of this file:
+    # only a session the browser opened via the authenticated agent-send API
+    # ever reaches this channel. shell_exec (the AI tool) must keep using the
+    # policy.py-gated exec path — never route AI-driven commands through here.
+    async def _open_term(self, channel, msg: dict):
+        session_id = str(msg.get("id") or "")
+        if not session_id:
+            return
+        cols = int(msg.get("cols") or 80)
+        rows = int(msg.get("rows") or 24)
+
+        existing = self._terms.get(session_id)
+        if existing is not None:
+            # Reattach: the previous channel for this session detached
+            # (refresh/tab-switch) within the grace window — rebind to the
+            # new channel and replay whatever the shell printed while nobody
+            # was listening, instead of silently starting a fresh shell.
+            handle = existing.get("grace_handle")
+            if handle is not None:
+                handle.cancel()
+                existing["grace_handle"] = None
+            existing["channel"] = channel
+            _set_winsize(existing["master_fd"], rows, cols)
+            buffered = bytes(existing["buffer"])
+            existing["buffer"].clear()
+            if buffered:
+                channel.send(json.dumps({
+                    "t": "term-o", "id": session_id,
+                    "d": base64.b64encode(buffered).decode("ascii"),
+                }))
+            channel.send(json.dumps({"t": "term-open-ack", "id": session_id, "resumed": True}))
+            return
+
+        roots = _extra_allowed_roots()
+        cwd = roots[0] if roots else None
+        try:
+            pid, master_fd = pty.fork()
+        except OSError as e:
+            channel.send(json.dumps({"t": "term-exit", "id": session_id, "error": str(e)}))
+            return
+        if pid == 0:
+            # Child: must do nothing but exec immediately — the parent's
+            # asyncio loop / aiortc state is meaningless post-fork in a
+            # multi-threaded process (same fork+exec discipline as
+            # InteractiveSession in laintas_cli.py).
+            try:
+                if cwd:
+                    os.chdir(cwd)
+            except Exception:
+                pass
+            os.environ["TERM"] = "xterm-256color"
+            shell = os.environ.get("SHELL") or "/bin/bash"
+            try:
+                os.execvp(shell, [shell])
+            except Exception:
+                pass
+            os._exit(1)
+
+        # Parent
+        _set_winsize(master_fd, rows, cols)
+        flags = fcntl.fcntl(master_fd, fcntl.F_GETFL)
+        fcntl.fcntl(master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+
+        term = {"channel": channel, "master_fd": master_fd, "pid": pid,
+                "buffer": bytearray(), "grace_handle": None}
+        self._terms[session_id] = term
+
+        def _on_readable():
+            t = self._terms.get(session_id)
+            if t is None:
+                return
+            try:
+                data = os.read(master_fd, 65536)
+            except BlockingIOError:
+                return
+            except OSError:
+                data = b""
+            if not data:
+                self._terminate_term(session_id)
+                return
+            ch = t["channel"]
+            if ch is None:
+                # Detached mid-grace — buffer for replay on reattach.
+                t["buffer"].extend(data)
+                overflow = len(t["buffer"]) - _TERM_BUFFER_CAP
+                if overflow > 0:
+                    del t["buffer"][:overflow]
+                return
+            try:
+                ch.send(json.dumps({
+                    "t": "term-o", "id": session_id,
+                    "d": base64.b64encode(data).decode("ascii"),
+                }))
+            except Exception:
+                pass
+
+        self._loop.add_reader(master_fd, _on_readable)
+        channel.send(json.dumps({"t": "term-open-ack", "id": session_id}))
+
+    def _term_input(self, msg: dict) -> None:
+        term = self._terms.get(str(msg.get("id") or ""))
+        if not term:
+            return
+        try:
+            data = base64.b64decode(msg.get("d") or "")
+            os.write(term["master_fd"], data)
+        except OSError:
+            self._terminate_term(str(msg.get("id") or ""), notify=False)
+        except Exception:
+            pass
+
+    def _term_resize(self, msg: dict) -> None:
+        term = self._terms.get(str(msg.get("id") or ""))
+        if not term:
+            return
+        cols = int(msg.get("cols") or 80)
+        rows = int(msg.get("rows") or 24)
+        _set_winsize(term["master_fd"], rows, cols)
+        try:
+            os.kill(term["pid"], signal.SIGWINCH)
+        except ProcessLookupError:
+            pass
+
+    def _term_client_detach(self, msg: dict) -> None:
+        """Quiet detach requested in-app (not a real channel close) — e.g. the
+        terminal pane was closed but the DataChannel (shared with fs ops) stays
+        open. Arms the same grace timer a real channel close would."""
+        session_id = str(msg.get("id") or "")
+        term = self._terms.get(session_id)
+        if not term or term.get("channel") is None:
+            return
+        term["channel"] = None
+        term["grace_handle"] = self._loop.call_later(
+            _TERM_DETACH_GRACE_SECONDS, self._terminate_term, session_id)
+
+    def _detach_terms_for_channel(self, channel) -> None:
+        """A DataChannel actually closed (refresh/navigate away/connection
+        drop) — detach every session still attached to it with the same
+        grace window, rather than killing shells the instant a tab reloads."""
+        for session_id, term in list(self._terms.items()):
+            if term.get("channel") is channel:
+                term["channel"] = None
+                term["grace_handle"] = self._loop.call_later(
+                    _TERM_DETACH_GRACE_SECONDS, self._terminate_term, session_id)
+
+    def _terminate_term(self, session_id: str, notify: bool = True) -> None:
+        term = self._terms.pop(session_id, None)
+        if term is None:
+            return
+        handle = term.get("grace_handle")
+        if handle is not None:
+            handle.cancel()
+        master_fd = term["master_fd"]
+        try:
+            self._loop.remove_reader(master_fd)
+        except Exception:
+            pass
+        try:
+            os.close(master_fd)
+        except OSError:
+            pass
+        try:
+            os.kill(term["pid"], signal.SIGHUP)
+        except ProcessLookupError:
+            pass
+        try:
+            os.waitpid(term["pid"], os.WNOHANG)
+        except ChildProcessError:
+            pass
+        channel = term.get("channel")
+        if notify and channel is not None:
+            try:
+                channel.send(json.dumps({"t": "term-exit", "id": session_id}))
+            except Exception:
+                pass
+
+    # ── AI-driven remote exec, fully over the P2P channel ───────────────
+    # Same policy.py evaluate()/approval gate as the server-relayed exec
+    # protocol (HELPWO_INTEGRATION_PLAN's kind:'exec') — that safety check is
+    # a local decision the CLI makes regardless of transport and stays
+    # intact. What moves is *where the bytes travel*: command text, output,
+    # the approval prompt and the user's answer now all ride this
+    # DataChannel instead of /api/agents/<id>/send + /updates, so the
+    # gateway never sees (or logs) any of it. shell_exec must always create
+    # its reqId-tagged request through this path when a P2P channel is
+    # available — the browser side no longer has a server-relay fallback
+    # for this either (see remoteHostExec.ts).
+    async def _request_p2p_approval(self, channel, req_id: str, cmd: str, cwd: str, destructive: bool) -> bool:
+        fut = self._loop.create_future()
+        self._ai_exec_approvals[req_id] = fut
+        try:
+            channel.send(json.dumps({
+                "t": "ai-exec-approval", "id": req_id, "cmd": cmd, "cwd": cwd,
+                "destructive": destructive,
+            }))
+            try:
+                decision = await asyncio.wait_for(fut, timeout=300)
+            except asyncio.TimeoutError:
+                decision = "deny"
+        finally:
+            self._ai_exec_approvals.pop(req_id, None)
+        return decision == "approve"
+
+    def _handle_ai_exec_approval_response(self, msg: dict) -> None:
+        req_id = str(msg.get("id") or "")
+        fut = self._ai_exec_approvals.get(req_id)
+        if fut is not None and not fut.done():
+            fut.set_result(str(msg.get("decision") or "deny"))
+
+    def _abort_ai_exec(self, msg: dict) -> None:
+        req_id = str(msg.get("id") or "")
+        proc = self._ai_exec_procs.get(req_id)
+        if proc is not None:
+            _kill_process_group(proc)
+        fut = self._ai_exec_approvals.get(req_id)
+        if fut is not None and not fut.done():
+            fut.set_result("deny")
+
+    async def _serve_ai_exec(self, channel, msg: dict):
+        req_id = str(msg.get("id") or "")
+        cmd = str(msg.get("cmd") or "")
+        roots = _extra_allowed_roots()
+        cwd = str(msg.get("cwd") or (roots[0] if roots else os.getcwd()))
+        try:
+            timeout = int(msg.get("timeout") or 30)
+        except (TypeError, ValueError):
+            timeout = 30
+        if not req_id or not cmd:
+            channel.send(json.dumps({"t": "ai-exec-final", "id": req_id,
+                                     "status": "fail", "error": "missing id/cmd"}))
+            return
+        try:
+            cwd = _rpc_path(cwd)
+        except (ValueError, PermissionError, OSError) as e:
+            channel.send(json.dumps({"t": "ai-exec-final", "id": req_id,
+                                     "status": "fail", "error": str(e)}))
+            return
+        if not os.path.isdir(cwd):
+            channel.send(json.dumps({"t": "ai-exec-final", "id": req_id,
+                                     "status": "fail", "error": f"invalid cwd: {cwd}"}))
+            return
+
+        import policy as _policy
+        from agent_loop import get_runtime_config
+        agent_id = getattr(_registry_ref, "agent_id", None)
+        decision = _policy.evaluate(cmd, cwd, req_id=req_id, agent_id=agent_id)
+        if decision.action == "deny":
+            channel.send(json.dumps({"t": "ai-exec-final", "id": req_id, "status": "fail",
+                                     "error": f"Blocked by policy: {decision.reason}"}))
+            return
+        if (decision.action == "needs_approval"
+                or not get_runtime_config("allow_remote_exec_without_approval")):
+            approved = await self._request_p2p_approval(
+                channel, req_id, cmd, cwd, destructive=_policy.is_delete_command(cmd))
+            if not approved:
+                channel.send(json.dumps({"t": "ai-exec-final", "id": req_id, "status": "aborted",
+                                         "error": f"User denied: {cmd[:100]}"}))
+                return
+
+        channel.send(json.dumps({"t": "ai-exec-start", "id": req_id, "cwd": cwd}))
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                cmd, cwd=cwd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+                start_new_session=True,
+            )
+        except Exception as e:
+            channel.send(json.dumps({"t": "ai-exec-final", "id": req_id, "status": "fail", "error": str(e)}))
+            return
+
+        self._ai_exec_procs[req_id] = proc
+        total = 0
+
+        async def _pump():
+            nonlocal total
+            assert proc.stdout is not None
+            while True:
+                chunk = await proc.stdout.read(4096)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total <= _AI_EXEC_MAX_OUTPUT:
+                    channel.send(json.dumps({
+                        "t": "ai-exec-out", "id": req_id,
+                        "data": chunk.decode("utf-8", "replace"),
+                    }))
+
+        try:
+            await asyncio.wait_for(_pump(), timeout=timeout)
+            code = await asyncio.wait_for(proc.wait(), timeout=5)
+            channel.send(json.dumps({
+                "t": "ai-exec-final", "id": req_id,
+                "status": "success" if code == 0 else "fail", "exitCode": code,
+            }))
+        except asyncio.TimeoutError:
+            _kill_process_group(proc)
+            channel.send(json.dumps({"t": "ai-exec-final", "id": req_id, "status": "fail",
+                                     "error": f"timeout after {timeout}s"}))
+        except asyncio.CancelledError:
+            _kill_process_group(proc)
+            raise
+        finally:
+            self._ai_exec_procs.pop(req_id, None)
 
     # ── HTTP tunnel RPC: proxy one request to a loopback port ───────────
     # Lets Helpwo render a dev server running on this host inside its preview
@@ -752,6 +1162,15 @@ class WebrtcManager:
             await self._close(sid)
         for channel in list(self._vnc):
             self._close_vnc(channel)
+        for session_id in list(self._terms):
+            self._terminate_term(session_id, notify=False)
+        for proc in list(self._ai_exec_procs.values()):
+            _kill_process_group(proc)
+        self._ai_exec_procs.clear()
+        for fut in list(self._ai_exec_approvals.values()):
+            if not fut.done():
+                fut.set_result("deny")
+        self._ai_exec_approvals.clear()
         for channel in list(self._puts):
             st = self._puts.pop(channel, None)
             if st and st.get("f"):

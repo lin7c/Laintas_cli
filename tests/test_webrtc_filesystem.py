@@ -1,5 +1,6 @@
 import os
 import tempfile
+from types import SimpleNamespace
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -8,6 +9,22 @@ import webrtc_channel
 
 
 class StructuredFilesystemRpcTests(unittest.TestCase):
+    def test_explicitly_shared_workspace_is_an_allowed_p2p_root(self):
+        with tempfile.TemporaryDirectory() as raw, tempfile.TemporaryDirectory() as outside_raw:
+            root = Path(raw).resolve()
+            outside = Path(outside_raw).resolve()
+            (root / "visible.txt").write_text("visible", encoding="utf-8")
+            registry = SimpleNamespace(workspace_path=str(root))
+
+            with (
+                patch("policy._load_config", return_value={"allowedRoots": []}),
+                patch.object(webrtc_channel, "_registry_ref", registry),
+            ):
+                rows = webrtc_channel._run_fs_operation("list", {"path": str(root)})
+                self.assertEqual([row["name"] for row in rows], ["visible.txt"])
+                with self.assertRaises(PermissionError):
+                    webrtc_channel._run_fs_operation("list", {"path": str(outside)})
+
     def test_operations_stay_inside_allowed_root(self):
         with tempfile.TemporaryDirectory() as raw, tempfile.TemporaryDirectory() as outside_raw:
             root = Path(raw).resolve()
