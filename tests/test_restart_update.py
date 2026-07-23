@@ -12,6 +12,41 @@ import laintas_cli
 import updater
 
 
+class DownloadProgressTests(unittest.TestCase):
+    def test_prompt_toolkit_stdout_uses_persistent_progress_without_changing_bytes(self):
+        payload = b"a" * 70000 + b"b" * 70000
+
+        class Response:
+            headers = {"Content-Length": str(len(payload))}
+
+            @staticmethod
+            def raise_for_status():
+                return None
+
+            @staticmethod
+            def iter_content(chunk_size=65536):
+                return (payload[i:i + chunk_size] for i in range(0, len(payload), chunk_size))
+
+        StdoutProxy = type("StdoutProxy", (), {"__module__": "prompt_toolkit.patch_stdout"})
+        messages = []
+        console = SimpleNamespace(
+            is_terminal=True,
+            file=StdoutProxy(),
+            print=messages.append,
+        )
+        with mock.patch.object(updater.requests, "get", return_value=Response()):
+            downloaded = updater._download(
+                "https://example.invalid/release.tar.gz",
+                label="release.tar.gz",
+                console=console,
+            )
+
+        self.assertEqual(downloaded, payload)
+        self.assertGreaterEqual(len(messages), 2)
+        self.assertIn("release.tar.gz", messages[0])
+        self.assertTrue(any("100%" in message for message in messages))
+
+
 class RestartResolutionTests(unittest.TestCase):
     def test_path_launch_resolves_executable_instead_of_cwd_name(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -40,6 +40,7 @@ import shutil
 import stat
 import sys
 import tempfile
+import time
 from typing import Optional
 
 import requests
@@ -231,6 +232,47 @@ def _download(url: str, label: str = "downloading", console=None) -> bytes:
             pass
         return resp.content
 
+    # prompt_toolkit's StdoutProxy is line-oriented: Rich's carriage-return
+    # animation is buffered or overwritten by the active input prompt. Use
+    # durable newline-based snapshots in that mode so a long binary update
+    # never looks frozen. The actual HTTP stream and returned bytes are shared
+    # with the normal dynamic-progress path below.
+    output = getattr(con, "file", None)
+    if (type(output).__name__ == "StdoutProxy"
+            or type(output).__module__.startswith("prompt_toolkit.")):
+        buf = bytearray()
+        started = time.monotonic()
+        last_reported_bucket = -1
+        last_reported_at = started
+
+        def report(force: bool = False) -> None:
+            nonlocal last_reported_bucket, last_reported_at
+            downloaded = len(buf)
+            now = time.monotonic()
+            if total:
+                percent = min(100, int(downloaded * 100 / total))
+                bucket = percent // 10
+                if not force and bucket <= last_reported_bucket and now - last_reported_at < 2:
+                    return
+                detail = f"{percent:3d}% · {_format_download_size(downloaded)}/{_format_download_size(total)}"
+                last_reported_bucket = bucket
+            else:
+                if not force and now - last_reported_at < 2:
+                    return
+                detail = _format_download_size(downloaded)
+            elapsed = max(now - started, 0.001)
+            speed = _format_download_size(int(downloaded / elapsed)) + "/s"
+            con.print(f"  ↓ {label}  {detail} · {speed}")
+            last_reported_at = now
+
+        report(force=True)
+        for chunk in resp.iter_content(chunk_size=65536):
+            if chunk:
+                buf.extend(chunk)
+                report()
+        report(force=True)
+        return bytes(buf)
+
     buf = bytearray()
     with Progress(
         TextColumn("  [#3fb950]↓[/#3fb950] [#6b7d6b]{task.description}[/#6b7d6b]"),
@@ -250,6 +292,16 @@ def _download(url: str, label: str = "downloading", console=None) -> bytes:
         if total is None:
             progress.update(task, total=len(buf), completed=len(buf))
     return bytes(buf)
+
+
+def _format_download_size(value: int) -> str:
+    """Small dependency-free formatter for persistent update progress."""
+    size = float(max(0, value))
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} GB"
 
 
 # ── update planning ──────────────────────────────────────────────────────
