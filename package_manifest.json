@@ -45,7 +45,16 @@
     "usage_tracker",
     "workflow_state",
     "hwg_runner",
-    "worktree_manager"
+    "worktree_manager",
+    "critic",
+    "embeddings",
+    "mem_extract",
+    "mem_recall",
+    "mem_signals",
+    "precheck",
+    "rag_signals",
+    "redactor",
+    "skill_router"
   ],
 
   "packages": [

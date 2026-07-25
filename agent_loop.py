@@ -37,6 +37,13 @@ import workgraph             # Unified objective/plan/steps/workflow authority
 import paths                 # Centralized path management
 import skills as skills_mod   # Progressive skill metadata + context loading
 import event_log              # Durable prompt admission + turn event log
+import precheck               # Tool-precheck labeled-sample capture + inference stub
+import redactor               # Outbound secret/PII redaction + weak-label capture
+import rag_signals            # Retrieval-rerank weak-label capture (search → selection)
+import mem_recall             # Semantic memory recall (embedding-ranked, lexical fallback)
+import mem_extract            # Task-end LLM memory extraction (write side of the memory network)
+import critic                 # Long-task external progress critic (drift/looping supervisor)
+import skill_router           # Dynamic skill routing: rank skills by task relevance (embedding, lexical fallback)
 import durable_rules         # Structured long-lived user obligations
 import auto_pilot            # Heuristic task classification + decomposition + auto-exec
 import trust_store            # workspace trust for executable project hooks
@@ -64,7 +71,7 @@ This block is supplied by the runtime after loading user customization.
 # Mutable defaults — these are the "factory" values; runtime overrides stored in _runtime_config
 _DEFAULT_CONFIG = {
     "max_loops": 30,
-    "max_tokens": 8192,
+    "max_tokens": 10000,          # gateway hard-caps output at 10000 (_MAX_OUTPUT_TOKENS); request the full budget so writes aren't needlessly truncated at 8192
     "max_debug_entries": 50,
     "loop_delay": 0.2,           # normal inter-iteration delay; failures back off adaptively
     "output_truncate": 3000,      # chars — lastOutput tail truncation
@@ -73,12 +80,13 @@ _DEFAULT_CONFIG = {
     "paste_summary": True,        # collapse large pastes into a [Pasted #N ~L lines] placeholder in the prompt (expanded on submit)
     "paste_summary_min_lines": 3, # paste line-count threshold that triggers the placeholder
     "paste_summary_min_chars": 150, # paste char-count threshold that triggers the placeholder
-    # `/connect` is the local opt-in that exposes this CLI to the user's Helpwo
-    # account. Remote terminal tabs therefore connect directly by default;
-    # security-conscious hosts can still opt out locally with this switch.
+    # `/helpwo` is the local opt-in that exposes this CLI as a runtime
+    # environment in the user's Helpwo account. The environment's terminal is
+    # available by default; security-conscious hosts can opt out with this.
     "disable_remote_terminal": False,
-    # Every remote command/delegation requires an explicit Helpwo approval by
-    # default. Advanced users may opt out locally, never from the remote UI.
+    # Every AI command/delegation in this environment requires an explicit
+    # Helpwo approval by default. Advanced users may opt out locally, never
+    # from the remote UI.
     "allow_remote_exec_without_approval": False,
     "remote_max_workers": 8,      # concurrently running remote tasks
     "remote_queue_size": 16,      # queued remote tasks beyond workers
@@ -110,6 +118,17 @@ _DEFAULT_CONFIG = {
     "theme": "dark",                  # dark / light / mono semantic palette
     "markdown_theme": "default",       # default / green-red / custom (custom reads the global markdown_theme.json)
     "deny_exits_loop": True,           # True = terminate the agent loop the moment the user denies an approval prompt; False = old behavior (feed denial back as a tool error and keep looping)
+    "precheck_capture": False,         # True = log each tool call's (features → outcome) to .laintas/precheck_samples.jsonl as training data for the tool-precheck model (see precheck.py). Redacted + best-effort; never affects execution. Default OFF — capture is opt-in.
+    "redact_capture": False,           # True = weak-label outbound secrets/PII to .laintas/redact_samples.jsonl (redacted text + typed spans only) as training data for the redaction model (see redactor.py). Never mutates what is sent. Default OFF — capture is opt-in.
+    "redact_enforce": False,           # True = actually scrub detected secrets/PII from context BEFORE upload. Default False: measure via capture first, flip on once confident it won't strip context the model needs.
+    "rag_capture": False,              # True = log retrieval-rerank signal (search tool → subsequent file open) to .laintas/rag_signals.jsonl as training data for the reranker (see rag_signals.py). Advisory; never affects execution. Default OFF — capture is opt-in.
+    "mem_recall_highlight": True,      # True = append a "most relevant to this task" section (semantic recall over all persistent memories, lexical fallback) to the injected memory context. Purely additive — never drops memories. See mem_recall.py.
+    "skill_route_highlight": True,      # True = prepend a "most relevant skills for this task" line to the skill catalog (semantic ranking, lexical fallback) so the model loads the right skill first. Purely additive — the full catalog is preserved. See skill_router.py.
+    "mem_extract_on_complete": True,   # True = on successful task completion, run a background LLM pass that extracts + categorizes durable memories and writes them to long-term storage (see mem_extract.py). One extra (billed) model call per completed task; runs off-thread so it never blocks. overwrite=False, so curated memories are never clobbered.
+    "critic_enabled": True,            # True = on long thread-mode tasks, an independent LLM critic periodically checks for goal drift/looping and injects a corrective nudge (see critic.py). Complements the deterministic staleness/repetition tripwires.
+    "critic_interval": 8,              # Run the critic every N loop iterations (0 disables). One extra (billed) model call each time it fires.
+    "critic_min_loop": 4,             # Don't run the critic before this loop index — no point critiquing the first few exploratory steps.
+    "critic_score_threshold": 50,      # Critic progress score (0-100) below this — or an explicit on_track=false — triggers a corrective nudge.
     "enable_mouse": False,             # REPL input box: click-to-position the cursor. Off by default: terminal mouse reporting hijacks native drag-to-select of scrollback (Shift+drag is the only workaround), which costs more than click-to-position gains
     "confirm_direct_commands": False,  # False = commands the USER types directly at the REPL run like a normal terminal (no policy approval prompt, e.g. rm); True = subject direct commands to the same needs_approval prompt as AI-issued ones. Hard `deny` policy rules always apply regardless.
     "trigger_scan_interval": 0.5,      # seconds between trigger scanner sweeps
@@ -216,7 +235,7 @@ def get_recent_tool_failures(*, agent_id: str = "", terminal: str = "",
     return list(reversed(rows))
 
 
-# ── Thinking shimmer (流光) ────────────────────────────────────────────
+# ── Thinking shimmer ───────────────────────────────────────────────────
 # A bright green highlight band sweeps left→right across the status label
 # while the agent is thinking/streaming. Recomputed every Live draw from the
 # elapsed clock, so it flows smoothly without any extra timer.
@@ -491,8 +510,8 @@ _RUNTIME_CONFIG_DESCRIPTIONS = {
     "output_truncate": "Maximum retained characters per tool-output section",
     "poll_timeout": "Seconds to wait for initial command output",
     "terminal_tail_lines": "Terminal snapshot line count",
-    "disable_remote_terminal": "Disable remote interactive terminal access",
-    "allow_remote_exec_without_approval": "Allow remote execution without local approval",
+    "disable_remote_terminal": "Opt this runtime environment out of Helpwo's interactive terminal (P2P shell)",
+    "allow_remote_exec_without_approval": "Let Helpwo's AI run commands in this environment without local approval (P2P exec)",
     "remote_max_workers": "Maximum concurrently running remote tasks",
     "remote_queue_size": "Maximum queued remote tasks beyond active workers",
     "remote_control_workers": "Maximum concurrently running remote control messages",
@@ -508,6 +527,17 @@ _RUNTIME_CONFIG_DESCRIPTIONS = {
     "theme": "Terminal UI theme: dark, light, or mono",
     "markdown_theme": "Markdown output palette: default, green-red, or custom (custom reads the global markdown_theme.json)",
     "deny_exits_loop": "Terminate the agent loop immediately when the user denies an approval prompt",
+    "precheck_capture": "Log tool-call (features → outcome) rows to .laintas/precheck_samples.jsonl as training data (redacted, advisory)",
+    "redact_capture": "Weak-label outbound secrets/PII to .laintas/redact_samples.jsonl as training data (never mutates what is sent)",
+    "redact_enforce": "Actually scrub detected secrets/PII from context before upload (default off — capture-only until confident)",
+    "rag_capture": "Log retrieval-rerank signal (search tool → subsequent file open) to .laintas/rag_signals.jsonl as training data (advisory)",
+    "mem_recall_highlight": "Append a task-relevant memory highlight (semantic recall, lexical fallback) to the injected memory context (additive; never drops memories)",
+    "skill_route_highlight": "Prepend a task-relevant 'most relevant skills' line to the skill catalog (semantic ranking, lexical fallback; additive)",
+    "mem_extract_on_complete": "On task completion, run a background LLM pass to extract + store durable long-term memories (one extra billed call per completed task; off-thread)",
+    "critic_enabled": "Periodically run an independent LLM critic on long tasks to catch goal drift/looping and inject a corrective nudge",
+    "critic_interval": "Run the long-task critic every N loop iterations (0 disables)",
+    "critic_min_loop": "Don't run the critic before this loop index",
+    "critic_score_threshold": "Critic progress score (0-100) below this triggers a corrective nudge",
     "confirm_direct_commands": "Ask for approval on commands YOU type directly at the REPL (False = run like a normal terminal; hard deny rules still apply)",
     "enable_mouse": "Enable mouse click-to-position in the REPL input box",
     "tool_output_fold": "Max lines of tool output shown before folding (first half + … + last half); 0 = suppress preview",
@@ -3429,6 +3459,37 @@ def _read_memory(deps: LoopDeps) -> list[dict]:
     return []
 
 
+def _persistent_memory_block(query: str, session) -> str:
+    """Persistent-memory context for the prompt: the full bulk context plus an
+    additive 'most relevant to this task' highlight. The highlight is best-effort
+    and never removes memories — it only surfaces the ones matching the current
+    task (semantic when the gateway embedding endpoint is available, lexical
+    otherwise). Falls back to plain bulk context on any error."""
+    base = memory_system.get_memory_context()
+    try:
+        if get_runtime_config("mem_recall_highlight") and str(query or "").strip():
+            hl = mem_recall.relevant_block(str(query), k=5, session=session)
+            if hl:
+                return f"{base}\n\n{hl}"
+    except Exception:
+        pass
+    return base
+
+
+def _skill_catalog_block(query: str, base_catalog: str, session) -> str:
+    """Skill catalog with a task-relevance highlight prepended. Additive and
+    best-effort — the full catalog is preserved; on any error the base is
+    returned unchanged. Semantic when the embedding endpoint is available,
+    lexical otherwise. See skill_router.py."""
+    try:
+        if get_runtime_config("skill_route_highlight") and str(query or "").strip():
+            return skill_router.annotate_catalog(
+                str(query), base_catalog or "", session=session)
+    except Exception:
+        pass
+    return base_catalog
+
+
 
 # ── Context Builders (3 clean sections) ──────────────────────────────────
 
@@ -4529,6 +4590,17 @@ def _output_similarity(a: str, b: str) -> float:
     return len(intersection) / len(union)
 
 
+# Warnings that stay ADVISORY: the model still sees them as a nudge (via
+# _detect_loop_warnings), but they never count toward the force-exit circuit
+# breaker. `tool_stagnation` (same tool 5x with similar args) false-positives on
+# legitimate repetitive work — reading many files, multiple edits to one file,
+# iterative web research — so a task must never be force-killed for it. Genuine
+# loops are still caught by the stronger deterministic detectors
+# (same_command_repeat, consecutive_failures, output-repetition, the repeat-
+# failure ledger).
+_ADVISORY_ONLY_WARNINGS = frozenset({"tool_stagnation"})
+
+
 def _detect_loop_warnings_typed(state: dict, original_input: str) -> list[tuple[str, str]]:
     """Detect stuck/repetitive behaviour — returns (key, message) tuples.
 
@@ -4916,7 +4988,7 @@ step {loop+1}/{max_loops} — {n_steps} command(s) executed so far
 def _detect_lang(text: str) -> str:
     """Detect the user's language from input text. Returns a language code."""
     import re
-    if re.search(r'[一-鿿㐀-䶿豈-﫿]', text):
+    if re.search('[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff]', text):
         return "ZH"
     if re.search(r'[぀-ゟ゠-ヿ]', text):
         return "JA"
@@ -5988,7 +6060,7 @@ def run_agent_loop(
 
         system_prompt = prompt_template \
             .replace("{{globalMemory}}", global_memory_str) \
-            .replace("{{persistentMemory}}", memory_system.get_memory_context()) \
+            .replace("{{persistentMemory}}", _persistent_memory_block(original_input, session)) \
             .replace("{{durableRules}}", durable_rules.format_for_prompt(os.getcwd())) \
             .replace("{{planMode}}", plan_mode.get_plan_prompt()) \
             .replace("{{promptOpt}}", _prompt_lab_section) \
@@ -6006,7 +6078,7 @@ def run_agent_loop(
             .replace("{{deploymentStatus}}", deployment_status_str) \
             .replace("{{tools}}", _render_tool_catalog_enhanced(
                 state, loop, depth, _allowed_tool_names)) \
-            .replace("{{skills}}", skill_catalog)
+            .replace("{{skills}}", _skill_catalog_block(original_input, skill_catalog, session))
         mode_section = (
             "" if plan_mode.is_plan_mode()
             else mode_manager.render_prompt_section()
@@ -6166,6 +6238,67 @@ def run_agent_loop(
                 original_input, state, memory_entries, history_context, loop, max_loops,
             )
             _thread_to_send = None
+
+        # ── Long-task critic (#2): periodic external progress supervisor ──────
+        # On a long thread-mode task, every `critic_interval` loops an independent
+        # cheap LLM call judges whether we're still on track toward the ORIGINAL
+        # goal; if it flags drift/looping, inject a focused nudge before sending.
+        # Complements (does not replace) the deterministic staleness/repetition
+        # tripwires. Foreground + gated so it only fires on genuinely long tasks.
+        # Runs before redaction so the nudge is scrubbed and sent normally.
+        try:
+            _crit_interval = int(get_runtime_config("critic_interval") or 0)
+            if (_thread_to_send is not None
+                    and get_runtime_config("critic_enabled")
+                    and _crit_interval > 0
+                    and loop >= int(get_runtime_config("critic_min_loop") or 0)
+                    and loop % _crit_interval == 0):
+                _crit_cwd = state.get("cwd") or os.getcwd()
+
+                def _crit_llm_fn(messages, _s=session, _cwd=_crit_cwd):
+                    resp = deps.call_backend(
+                        session=_s, message="",
+                        system_prompt=critic.SYSTEM_PROMPT,
+                        current_path=_cwd, messages=messages)
+                    return (resp or {}).get("reply", "") if isinstance(resp, dict) else ""
+
+                _verdict = critic.assess(original_input, _thread_to_send, _crit_llm_fn)
+                _crit_thresh = int(get_runtime_config("critic_score_threshold") or 50)
+                if critic.is_off_track(_verdict, _crit_thresh):
+                    _thread_to_send = _thread_to_send + [{
+                        "role": "user",
+                        "content": critic.nudge_text(original_input, _verdict),
+                    }]
+                    if events_cb is not None:
+                        try:
+                            deps.console.print(
+                                f"[yellow]⚠ Progress check: off track (score "
+                                f"{_verdict.get('score')}/100) — corrective guidance injected[/yellow]")
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+        # ── Outbound secret/PII redaction + weak-label capture (capability #2) ──
+        # Last stop before context leaves the machine. `_thread_to_send` carries
+        # user prose AND tool outputs (a leaked `cat .env` rides up as role:tool);
+        # `user_input` is the non-thread payload. Capture is advisory; enforce
+        # (default off) actually scrubs. redactor.* never raises. See redactor.py.
+        try:
+            _red_capture = bool(get_runtime_config("redact_capture"))
+            _red_enforce = bool(get_runtime_config("redact_enforce"))
+            if _red_capture or _red_enforce:
+                if _thread_to_send is not None:
+                    _thread_to_send, _ = redactor.scrub_messages(
+                        _thread_to_send, enforce=_red_enforce, capture=_red_capture)
+                # user_input is always sent as the `message=` param (even in
+                # thread mode); scrub it too. Dedup makes the overlap harmless.
+                if isinstance(user_input, str) and user_input:
+                    user_input, _ = redactor.scrub_text(
+                        user_input, enforce=_red_enforce, capture=_red_capture,
+                        source="user_input")
+        except Exception:
+            pass
 
         # ── Debug: create entry before API call ──
         debug_entry = DebugEntry(
@@ -7179,6 +7312,23 @@ def run_agent_loop(
                         "tool": name, "call_id": call_id,
                     })
 
+                # ── Tool-precheck training-sample capture (advisory) ──
+                # One labeled (features → outcome) row per real tool call, fed to
+                # the future tool-precheck classifier. Redacted + best-effort;
+                # precheck.record_sample never raises. See precheck.py.
+                if get_runtime_config("precheck_capture"):
+                    precheck.record_sample(
+                        name, arguments, result, _rc,
+                        elapsed=_tool_elapsed,
+                        session_id=_session_id, run_id=_run_id, loop=loop + 1)
+
+                # ── Retrieval-rerank signal capture (capability #9, advisory) ──
+                # search tool (grep/glob/ls) → later file open = weak relevance.
+                if get_runtime_config("rag_capture"):
+                    rag_signals.on_tool(
+                        name, arguments, result, formatted,
+                        session_id=_session_id, run_id=_run_id, loop=loop + 1)
+
                 # ── Per-call terminalHistory row ──
                 per_call_rows.append({
                     "command": salient,
@@ -7668,7 +7818,8 @@ def run_agent_loop(
         # ── Warning circuit breaker: escalate repeated warnings to force-exit ──
         # When the same diagnostic signal fires 3+ consecutive times,
         # escalate from advisory to enforcement.
-        _current_warning_keys = [k for k, _m in _detect_loop_warnings_typed(state, original_input)]
+        _current_warning_keys = [k for k, _m in _detect_loop_warnings_typed(state, original_input)
+                                 if k not in _ADVISORY_ONLY_WARNINGS]
         _new_streaks: dict[str, int] = {}
         for wk in _current_warning_keys:
             _prev_count = _warning_streaks.get(wk, 0)
@@ -7852,6 +8003,39 @@ def run_agent_loop(
     _last_debug_entries = get_debug_logs()
     if _last_debug_entries:
         _last_debug_entries[-1].loop_exit_reason = _exit_reason
+
+    # ── Long-term memory consolidation (write side of the memory network) ──
+    # On a genuinely completed task, mine the conversation for durable,
+    # categorized memories in the BACKGROUND so the user is never blocked. The
+    # extractor writes with overwrite=False (never clobbers curated memories),
+    # dedups, and no-ops if nothing is worth remembering. Fully best-effort:
+    # any failure is swallowed and the loop is unaffected. See mem_extract.py.
+    if (_exit_reason == TRANSITION_COMPLETED
+            and get_runtime_config("mem_extract_on_complete")):
+        try:
+            _mem_convo = (
+                f"Task: {original_input}\n\n"
+                f"Final answer / outcome:\n{(reply or '')[:6000]}"
+            )
+            _mem_session = session
+            _mem_cwd = state.get("cwd") or os.getcwd()
+
+            def _mem_llm_fn(messages, _s=_mem_session, _cwd=_mem_cwd):
+                resp = deps.call_backend(
+                    session=_s, message="",
+                    system_prompt=mem_extract.SYSTEM_PROMPT,
+                    current_path=_cwd, messages=messages)
+                return (resp or {}).get("reply", "") if isinstance(resp, dict) else ""
+
+            def _mem_worker(_text=_mem_convo, _fn=_mem_llm_fn, _s=_mem_session):
+                try:
+                    mem_extract.extract_and_store(_text, _fn, session=_s)
+                except Exception:
+                    pass
+
+            threading.Thread(target=_mem_worker, daemon=True).start()
+        except Exception:
+            pass
 
     # ── Partial response preservation on interrupt ─────────────────────
     # If the user interrupted, preserve any partial AI response so context

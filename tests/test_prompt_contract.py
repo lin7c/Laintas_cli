@@ -71,11 +71,11 @@ class PromptContractTests(unittest.TestCase):
         self.assertIn("Continue", result["result"])
         self.assertEqual(info.state["_hwo_return"], '{"x": 1}')
 
-    def test_chinese_summary_preserves_durable_rule_semantics(self):
+    def test_summary_is_english_for_all_language_modes(self):
         prompt = summary_prompt("ZH")
-        self.assertIn("长期用户规则", prompt)
-        self.assertIn("每次、仅当、除非、不得", prompt)
-        self.assertNotIn("## Goal", prompt)
+        self.assertIn("## Durable User Rules", prompt)
+        self.assertIn("cannot cancel or supersede a durable rule", prompt)
+        self.assertIn("## Goal", prompt)
 
     def test_find_delete_is_a_delete_command(self):
         self.assertTrue(policy.is_delete_command("find /tmp/x -type f -delete"))

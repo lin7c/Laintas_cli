@@ -824,7 +824,6 @@ class SlashRegistryTests(unittest.TestCase):
     def test_declared_slash_leaves_reject_ignored_arguments(self):
         cases = (
             ("/help task extra", "/help [command]"),
-            ("/connect worker extra", "/connect [folder]"),
             ("/terminate term1 extra", "/terminate <name>"),
             ("/abort agent1 extra", "/abort <agent-id>"),
             ("/task done 1 extra", "/task done <id>"),

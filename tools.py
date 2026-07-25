@@ -2715,7 +2715,9 @@ def _bi_spawn_parallel(params: dict, ctx: ToolCtx) -> dict:
     # check only looks at whether the loop exited cleanly, not whether the
     # content is substantively complete.
     _INCOMPLETE_SELF_REPORT = (
-        "尚未完成", "未完成", "被截断", "被迫", "需要继续", "继续读取",
+        "\u5c1a\u672a\u5b8c\u6210", "\u672a\u5b8c\u6210",
+        "\u88ab\u622a\u65ad", "\u88ab\u8feb",
+        "\u9700\u8981\u7ee7\u7eed", "\u7ee7\u7eed\u8bfb\u53d6",
         "not yet complete", "haven't finished", "was cut off", "ran out of",
         "incomplete", "still need to",
     )

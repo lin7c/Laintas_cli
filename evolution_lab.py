@@ -127,8 +127,12 @@ def create_branch(description: str, intent: str = "") -> dict:
         normalized = str(intent or "").upper()
         if normalized not in {"CREATE", "IMPROVE", "REPAIR"}:
             lowered = text.lower()
-            normalized = ("REPAIR" if any(k in lowered for k in ("修复", "bug", "错误"))
-                          else "IMPROVE" if any(k in lowered for k in ("改进", "改善", "优化"))
+            repair_terms = ("repair", "fix", "bug", "error",
+                            "\u4fee\u590d", "\u9519\u8bef")
+            improve_terms = ("improve", "enhance", "optimize",
+                             "\u6539\u8fdb", "\u6539\u5584", "\u4f18\u5316")
+            normalized = ("REPAIR" if any(k in lowered for k in repair_terms)
+                          else "IMPROVE" if any(k in lowered for k in improve_terms)
                           else "CREATE")
         branch = {
             "id": _new_id("branch"), "intent": normalized,

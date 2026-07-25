@@ -1771,7 +1771,7 @@ def connect_terminal_to_helpwo(agent_registry: "AgentRegistry", session: dict,
     if (get_backend_profile().sends_laintas_credentials
             and not session.get("userId")):
         if not quiet:
-            console.print("[red]/connect requires login. Run /login first.[/red]")
+            console.print("[red]/helpwo requires login. Run /login first.[/red]")
         return False
     is_sub = agent_registry.depth > 0
     meta = agent_registry.terminal_meta if is_sub else None
@@ -1785,11 +1785,10 @@ def connect_terminal_to_helpwo(agent_registry: "AgentRegistry", session: dict,
                 shared = agent_registry.workspace_path
                 console.print(Panel(
                     f"[green]Already connected to Helpwo[/green]\n"
-                    f"{'Terminal' if is_sub else 'Primary CLI'}: [bold]{current}[/bold]\n"
+                    f"{'Terminal' if is_sub else 'Runtime environment'}: [bold]{current}[/bold]\n"
                     f"Agent ID: {agent_registry.agent_id}\n"
-                    f"Shared workspace: [bold]{shared or 'none (link only)'}[/bold]\n\n"
-                    f"[dim]/connect <folder> shares that folder as Helpwo's remote "
-                    f"workspace; /name renames; /disconnect withdraws.[/dim]",
+                    f"Workspace: [bold]{shared or os.getcwd()}[/bold]\n\n"
+                    f"[dim]/name renames; /helpwo stop withdraws this environment.[/dim]",
                     title="Connected", border_style="green",
                 ))
             return True
@@ -1823,24 +1822,19 @@ def connect_terminal_to_helpwo(agent_registry: "AgentRegistry", session: dict,
                 f"Agent ID: {agent_registry.agent_id}\n"
                 f"Remote terminal: [bold green]available in Helpwo[/bold green]\n\n"
                 f"[dim]Helpwo can now read this terminal, send it input, and close it.\n"
-                f"Run /disconnect to withdraw it.[/dim]",
+                f"Run /helpwo stop to withdraw it.[/dim]",
                 title="Connected", border_style="green",
             ))
         else:
-            shared = agent_registry.workspace_path
-            ws_line = (f"Shared workspace: [bold]{shared}[/bold]\n"
-                       f"[dim]→ Helpwo's build page is now this folder (files ride P2P).[/dim]\n"
-                       if shared else
-                       "Shared workspace: [bold]none[/bold] "
-                       "[dim](run /connect <folder> to share one)[/dim]\n")
+            shared = agent_registry.workspace_path or os.getcwd()
             console.print(Panel(
-                f"[green]Primary CLI linked to Helpwo[/green]\n"
+                f"[green]Runtime environment online in Helpwo[/green]\n"
                 f"Name: [bold]{agent_registry.agent_name}[/bold]\n"
                 f"Agent ID: {agent_registry.agent_id}\n"
-                f"{ws_line}\n"
-                f"[dim]Helpwo can now create sub-terminals here from its UI.\n"
-                f"Share an existing one: /term <name>, then /connect inside it.\n"
-                f"Run /disconnect to go offline.[/dim]",
+                f"Workspace: [bold]{shared}[/bold]\n"
+                f"[dim]→ this CLI's terminal + this folder's files are the environment "
+                f"(files ride the direct P2P channel, never the server).[/dim]\n\n"
+                f"[dim]Pick it in Helpwo's terminal page. /helpwo stop to go offline.[/dim]",
                 title="Connected", border_style="green",
             ))
     return True
@@ -2663,9 +2657,7 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
             "Agent/terminal, PageUp/PageDown scrolls, and Esc exits."
         )),
     CommandSpec("/term", "List, create, or rename terminals", "Agents & Terminals", "/term [name|rename <old> <new>]", aliases=("/t",), subcommands=("rename",)),
-    CommandSpec("/connect", "Link this terminal to Helpwo; with a folder, share it as Helpwo's remote workspace", "Agents & Terminals", "/connect [folder]"),
-    CommandSpec("/helpwo", "Start Helpwo and link this terminal to it (local build, or the hosted web app)", "Agents & Terminals", "/helpwo [--port N] [--dist <path>] [--remote] | stop", subcommands=("stop",)),
-    CommandSpec("/disconnect", "Withdraw this terminal from Helpwo", "Agents & Terminals"),
+    CommandSpec("/helpwo", "Connect this CLI to Helpwo as a runtime environment (this folder = its workspace), or open the local/hosted app; /helpwo stop to go offline", "Agents & Terminals", "/helpwo [--port N] [--dist <path>] [--remote] | stop", subcommands=("stop",)),
     CommandSpec(
         "/station", "Bind an employee to a terminal and optionally start work",
         "Agents & Terminals", "/station <agent-id> [terminal] [--task <work>]",
@@ -5732,11 +5724,24 @@ def call_backend_stream(
         # ceiling. When a big single-response write (e.g. a whole-file fs.write)
         # exceeds max_tokens, the JSON never closes and parsing fails — but the
         # cause is length, not formatting, so it needs a different nudge.
-        # finish_reason == "length" is the provider's own truncation signal.
+        # finish_reason == "length" is the provider's OWN truncation signal and
+        # the authoritative one — trust it first.
+        #
+        # The completion-token heuristic below is only a *fallback* for backends
+        # that omit finish_reason. It must never override a clean stop: on
+        # reasoning models `completionTokens` includes hidden reasoning tokens,
+        # so a short, fully-finished answer can still report near-ceiling usage.
+        # Gate the fallback behind "finish_reason is not a clean end" so it can
+        # never flag a completed turn as truncated.
         _completion_tokens = int((billing_info or {}).get("completionTokens", 0) or 0)
         _max_tokens = int(get_runtime_config("max_tokens") or 0)
-        _hit_ceiling = _max_tokens > 0 and _completion_tokens >= _max_tokens * 0.95
-        _truncated_turn = _hit_ceiling or finish_reason == "length"
+        _clean_stop = finish_reason in ("stop", "end_turn", "tool_calls")
+        _hit_ceiling = (
+            not _clean_stop
+            and _max_tokens > 0
+            and _completion_tokens >= _max_tokens * 0.95
+        )
+        _truncated_turn = finish_reason == "length" or _hit_ceiling
 
         # ── Local usage accounting (/usage) — every completed call lands here
         # regardless of tool/prose outcome. Backends that send no _billing
@@ -7391,7 +7396,7 @@ class AgentRegistry:
                 pass
 
     def _handle_term_new(self, req_id: str, payload: dict):
-        """Helpwo's 添加终端 → create a named sub-terminal here (same path as
+        """Helpwo's add-terminal action creates a named sub-terminal here (same path as
         /term <name>) running a nested laintas_cli that auto-/connects, so it
         registers itself back to Helpwo as a managed terminal."""
         if self.depth > 0:
@@ -7439,7 +7444,7 @@ class AgentRegistry:
         self._push_final(req_id, "success", name)
 
     def _handle_term_close(self, req_id: str, payload: dict):
-        """Helpwo's 关闭终端 → close a sub-terminal.
+        """Helpwo's close-terminal action closes a sub-terminal.
 
         Sent to the primary CLI with a name: closes that registered
         sub-terminal (kills the nested CLI with it). Sent to a sub-terminal
@@ -7522,7 +7527,7 @@ class AgentRegistry:
         heartbeat/poll and unregister. The local terminal keeps running."""
         console.print(Panel(
             "[yellow]Helpwo disconnected this terminal.[/yellow]\n"
-            "[dim]The CLI keeps running locally. Run /connect to link again.[/dim]",
+            "[dim]The CLI keeps running locally. Run /helpwo to connect again.[/dim]",
             title="Disconnected", border_style="yellow",
         ))
         # Suppress same-id resurrection: this was an explicit user action.
@@ -8651,12 +8656,11 @@ _SLASH_ARG_RULES: dict[tuple[str, ...], SlashArgRule] = {
     **{
         (name,): _arg_rule(0, name)
         for name in (
-            "/cwd", "/scan", "/login", "/disconnect", "/max",
+            "/cwd", "/scan", "/login", "/max",
             "/tools", "/prop", "/snapshots", "/continue",
         )
     },
     ("/help",): _arg_rule(1, "/help [command]"),
-    ("/connect",): _arg_rule(1, "/connect [folder]"),
     ("/helpwo",): _arg_rule(4, "/helpwo [--port N] [--dist <path>]"),
     ("/helpwo", "stop"): _arg_rule(1, "/helpwo stop"),
     ("/terminate",): _arg_rule(1, "/terminate <name>"),
@@ -11828,57 +11832,76 @@ def _task_ui_progress(value) -> Text:
     return meter
 
 
+# Per-agent snapshot of the last-rendered task states, so the live surface can
+# print only what changed instead of re-listing the whole (growing) task set on
+# every task.create/task.update. Maps agent key -> {task_id: (status, progress)}.
+_live_task_snapshots: dict[str, dict[str, tuple]] = {}
+
+_LIVE_TASK_STATUS_UI = {
+    "in_progress": ("▶", "warning"),
+    "pending": ("○", "white"),
+    "blocked": ("!", "error"),
+    "completed": ("✓", "success"),
+}
+
+
 def display_live_task_list(tasks: list[dict], agent_id: str) -> None:
-    """Render the foreground agent's compact task list after each task change."""
+    """Print only the tasks that changed since the previous render.
+
+    Reprinting the full list after every mutation floods the scrollback with
+    near-duplicate panels (the classic ``0/1``, ``0/2`` … ``2/6`` stack). We
+    instead diff against a remembered snapshot and emit a single line per
+    changed task, reprinting the header line only on first render or when a
+    task actually completes.
+    """
     tasks = [item for item in (tasks or [])
              if item.get("status") not in {"deleted", "skipped"}]
+    key = agent_id or "current"
     if not tasks:
+        _live_task_snapshots.pop(key, None)
         return
-    rank = {"in_progress": 0, "pending": 1, "blocked": 2, "completed": 3}
-    active = sorted(
-        tasks,
-        key=lambda item: (
-            rank.get(str(item.get("status") or "pending"), 9),
-            -float(item.get("updated_at") or item.get("updated") or 0)
-            if isinstance(item.get("updated_at") or item.get("updated"), (int, float))
-            else 0,
-            str(item.get("id") or ""),
-        ),
-    )
-    completed = sum(1 for item in tasks if item.get("status") == "completed")
-    header = Text("Tasks", style="bold white")
-    header.append(f" · {agent_id or 'current'}", style="agent")
-    header.append(f"  {completed}/{len(tasks)} done", style="muted")
-    console.print(header)
-    shown = 0
-    status_ui = {
-        "in_progress": ("▶", "warning"),
-        "pending": ("○", "white"),
-        "blocked": ("!", "error"),
-        "completed": ("✓", "success"),
+
+    order = [str(item.get("id")) for item in tasks]
+    current = {
+        str(item.get("id")): (
+            str(item.get("status") or "pending"),
+            int(item.get("progress") or 0),
+            str(item.get("subject") or "(untitled task)"),
+        )
+        for item in tasks
     }
-    # Keep the live surface compact: current/next work first and at most the
-    # two most recent completed items after that.
-    completed_shown = 0
-    for item in active:
-        status = str(item.get("status") or "pending")
-        if status == "completed":
-            completed_shown += 1
-            if completed_shown > 2:
-                continue
-        if shown >= 6:
-            break
-        mark, style = status_ui.get(status, ("·", "white"))
+    previous = _live_task_snapshots.get(key, {})
+
+    # Only the tasks whose status/progress differ from the last render.
+    changed = {
+        tid for tid, value in current.items()
+        if previous.get(tid) != value
+    }
+    if not changed:
+        return  # identical re-emit — nothing new to show
+    _live_task_snapshots[key] = current
+
+    completed = sum(1 for v in current.values() if v[0] == "completed")
+    prev_completed = sum(1 for v in previous.values() if v[0] == "completed")
+    # Header carries the running "done" count; show it on the first render and
+    # whenever the completed tally moves. Pure additions/starts just append
+    # their own line beneath the existing header.
+    if not previous or completed != prev_completed:
+        header = Text("Tasks", style="bold white")
+        header.append(f" · {agent_id or 'current'}", style="agent")
+        header.append(f"  {completed}/{len(current)} done", style="muted")
+        console.print(header)
+
+    for tid in order:
+        if tid not in changed:
+            continue
+        status, progress, subject = current[tid]
+        mark, style = _LIVE_TASK_STATUS_UI.get(status, ("·", "white"))
         line = Text(f"  {mark} ", style=style)
-        line.append(str(item.get("subject") or "(untitled task)"), style="white")
-        progress = int(item.get("progress") or 0)
+        line.append(subject, style="white")
         if status == "in_progress" and progress:
             line.append(f"  {progress}%", style="muted")
         console.print(line)
-        shown += 1
-    remaining = len(tasks) - shown
-    if remaining > 0:
-        console.print(f"  [muted]… {remaining} more[/muted]")
 
 
 def _render_task_todolist(tasks: list[dict], cwd: str) -> None:
@@ -14001,77 +14024,67 @@ def _cmd_mcp(parts: list) -> bool:
     return False
 
 
-def _cmd_connect(parts: list, agent_registry: AgentRegistry, session: dict) -> None:
-    # /connect [folder] — link THIS terminal to Helpwo (primary or sub).
-    # With a folder, that folder is SHARED as Helpwo's remote workspace (build
-    # page goes remote; file bytes ride P2P). Bare /connect links only and
-    # shares nothing. The display name now lives in /name, not here.
-    if agent_registry is None:
-        console.print("[red]No agent registry available.[/red]")
-        return
-    workspace = None
-    if len(parts) >= 2:
-        raw = " ".join(parts[1:]).strip().strip('"').strip("'")
-        candidate = os.path.abspath(os.path.expanduser(raw))
-        if not os.path.isdir(candidate):
-            console.print(f"[red]Not a directory: {raw}[/red]\n"
-                          f"[dim]/connect <folder> shares an existing folder as "
-                          f"Helpwo's remote workspace; bare /connect links only.[/dim]")
-            return
-        workspace = candidate
-    connect_terminal_to_helpwo(agent_registry, session, workspace=workspace)
-
-
-
-def _cmd_disconnect(agent_registry: AgentRegistry) -> None:
+def _disconnect_from_helpwo(agent_registry: AgentRegistry) -> None:
+    """Withdraw this CLI's runtime environment from Helpwo (internal helper for
+    /helpwo stop). Symmetric with connect_terminal_to_helpwo()."""
     if agent_registry is None or not agent_registry.agent_id:
-        console.print("[dim]This terminal is not connected to Helpwo.[/dim]")
-    elif getattr(agent_registry, "depth", 0) == 0:
+        console.print("[dim]This CLI isn't connected to Helpwo.[/dim]")
+        return
+    if getattr(agent_registry, "depth", 0) == 0:
         name = agent_registry.agent_name
         agent_registry._last_agent_id = ""  # explicit — don't resurrect
-        agent_registry.workspace_path = None  # bare /connect later shares nothing
+        agent_registry.workspace_path = None
         agent_registry.unregister()
         agent_registry.agent_id = None
         agent_registry.agent_secret = ""
-        console.print(f"[yellow]Primary CLI [bold]{name}[/bold] is now offline in Helpwo "
-                      f"(sub-terminal creation from the UI is disabled). "
-                      f"Run /connect to link again.[/yellow]")
+        console.print(f"[yellow]Runtime environment [bold]{name}[/bold] withdrawn from Helpwo "
+                      f"(its terminal and files are no longer reachable there). "
+                      f"Run /helpwo to connect again.[/yellow]")
     else:
         name = (agent_registry.terminal_meta or {}).get("name", agent_registry.agent_name)
         agent_registry._last_agent_id = ""  # explicit — don't resurrect
         agent_registry.unregister()
         agent_registry.agent_id = None
         agent_registry.agent_secret = ""
-        console.print(f"[yellow]Sub-terminal [bold]{name}[/bold] withdrawn from Helpwo. "
-                      f"Run /connect to hand it over again.[/yellow]")
+        console.print(f"[yellow]Sub-terminal [bold]{name}[/bold] withdrawn from Helpwo.[/yellow]")
 
 
 def _cmd_helpwo(raw_args: str, parts: list, agent_registry: AgentRegistry,
                 session: dict) -> None:
-    """Start the local Helpwo IDE, or explicitly open the hosted version.
+    """Connect this CLI to Helpwo as a runtime environment, or open the app.
 
     /helpwo              - local dist if found, else the hosted web app
     /helpwo --port 8080  - start the local server on a custom port
     /helpwo --dist <p>   - use a custom local dist directory
     /helpwo --remote     - skip the local server; open the hosted web app
-    /helpwo stop         - stop the running LOCAL gateway (no-op in remote
-                           mode — there's no local server to stop; use
-                           /disconnect to take this terminal offline there)
+    /helpwo stop         - go offline: stop the LOCAL gateway if running, and
+                           withdraw this CLI's runtime environment from Helpwo
+
+    Connecting exposes THIS CLI as a runtime environment in Helpwo — the
+    current working directory is its workspace (files ride the direct P2P
+    channel, never the server) and its shell is the environment's terminal.
+    There is no separate "mount a folder" step: the environment IS this CLI at
+    its cwd. cd elsewhere and re-run /helpwo --remote to move the environment.
 
     Local mode is offline-first: its UI, filesystem bridge and command bridge
     stay on 127.0.0.1 and do not require login or cloud registration. AI calls
     still use the configured backend when available. ``--remote`` is the
-    explicit cloud mode and uses the normal /connect registration handshake.
+    explicit cloud mode and registers this CLI with the hosted app.
     """
     import helpwo_server
 
-    # Subcommand: stop
+    # Subcommand: stop — go fully offline (local server + cloud environment).
     if len(parts) >= 2 and parts[1].lower() == "stop":
+        stopped_any = False
         if helpwo_server.is_running():
             helpwo_server.stop_server()
             console.print("[yellow]Helpwo gateway stopped.[/yellow]")
-        else:
-            console.print("[dim]Helpwo gateway is not running.[/dim]")
+            stopped_any = True
+        if agent_registry is not None and agent_registry.agent_id:
+            _disconnect_from_helpwo(agent_registry)
+            stopped_any = True
+        if not stopped_any:
+            console.print("[dim]Helpwo is not running and this CLI isn't connected.[/dim]")
         return
 
     if helpwo_server.is_running():
@@ -14138,17 +14151,15 @@ def _cmd_helpwo(raw_args: str, parts: list, agent_registry: AgentRegistry,
                 # to a working Helpwo one way or another.
                 remote = True
 
-    # --remote is "open the hosted web app pointed at where I am right now" —
-    # every call re-shares the CURRENT cwd (equivalent to running /connect .
-    # first), not just the first one. cd elsewhere and re-run /helpwo --remote
-    # and Helpwo follows you there. If you want a specific folder shared
-    # instead, regardless of cwd, use /connect <folder> directly.
+    # --remote is "expose this environment where I am right now" — every call
+    # re-shares the CURRENT cwd as the environment's workspace, not just the
+    # first one. cd elsewhere and re-run /helpwo --remote and the environment
+    # follows you there.
     #
     # Local mode has no such standing "where am I" question — it only shares
-    # automatically the first time (nothing shared yet); once anything has
-    # been explicitly chosen (via /connect <folder> or a prior /helpwo
-    # --remote), local mode leaves it alone rather than silently overwriting
-    # a deliberate choice.
+    # automatically the first time (nothing shared yet); once a workspace has
+    # been established (a prior /helpwo --remote), local mode leaves it alone
+    # rather than silently overwriting it.
     _auto_workspace = (
         os.getcwd() if remote
         else (None if agent_registry.workspace_path else os.getcwd())
@@ -14190,9 +14201,9 @@ def _cmd_helpwo(raw_args: str, parts: list, agent_registry: AgentRegistry,
     if agent_registry and agent_registry.agent_id:
         console.print(f"  Cloud link: [dim]{agent_registry.agent_name} ({agent_registry.agent_id})[/dim]")
     else:
-        console.print("  Cloud link: [dim]off — use /connect <folder> or /helpwo --remote when needed[/dim]")
+        console.print("  Cloud link: [dim]off — use /helpwo --remote to expose this environment to the hosted app[/dim]")
 
-    console.print("[dim]  /helpwo stop to stop the gateway.[/dim]")
+    console.print("[dim]  /helpwo stop to stop the gateway and go offline.[/dim]")
 
     # Open the browser
     try:
@@ -14646,8 +14657,11 @@ def _told_browse_history(chat: list) -> None:
         return "????? ?????"
 
     def _build(source):
+        # History reads most-recent-first: the newest turn sits at the top of
+        # the list (#1) so the latest conversation is what you land on, rather
+        # than being buried under the whole session.
         if source == "session":
-            items = _session_turns()
+            items = list(reversed(_session_turns()))
             labels = []
             for idx, t in enumerate(items):
                 summary = " ".join(str(t["user"]).split())[:60] or "(empty)"
@@ -14656,7 +14670,7 @@ def _told_browse_history(chat: list) -> None:
                     f"[dim]#{idx + 1:>3}[/dim]  {escape(summary)}"
                     f"  [dim]({n} repl{'y' if n == 1 else 'ies'})[/dim]")
             return items, labels, "session history"
-        items = _journal_entries()
+        items = list(reversed(_journal_entries()))
         labels = []
         for idx, evt in enumerate(items):
             summary = " ".join(str(evt.get("text", "")).split())[:56] or "(empty)"
@@ -15339,12 +15353,6 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
 
     elif action == "/mcp":
         return _cmd_mcp(parts)
-
-    elif action == "/connect":
-        _cmd_connect(parts, agent_registry, session)
-
-    elif action == "/disconnect":
-        _cmd_disconnect(agent_registry)
 
     elif action == "/helpwo":
         _cmd_helpwo(raw_args, parts, agent_registry, session)
@@ -16921,7 +16929,7 @@ def main():
     parser.add_argument("--remote-parent-id", type=str, default=None,
                         help="Helpwo backend agent id of the primary CLI that owns this sub-terminal")
     parser.add_argument("--connect", action="store_true", default=False,
-                        help="Hand this sub-terminal over to Helpwo at startup (as if /connect was run)")
+                        help="Hand this sub-terminal over to Helpwo at startup (internal; used by term-new)")
     args = parser.parse_args()
 
     # Apply environment overrides
@@ -17164,14 +17172,11 @@ def main():
             connect_terminal_to_helpwo(agent_registry, session)
         elif args.depth == 0:
             # Two-end handshake: NO auto-link. The primary CLI goes online in
-            # Helpwo only when the user runs /connect here; sub-terminals only
-            # when /connect runs inside them.
-            console.print("[dim]Not linked to Helpwo. Run [bold]/connect[/bold] to bring this "
-                          "CLI online, or [bold]/connect <folder>[/bold] to also share that "
-                          "folder as Helpwo's remote build workspace.[/dim]")
+            # Helpwo only when the user runs /helpwo here.
+            console.print("[dim]Not connected to Helpwo. Run [bold]/helpwo[/bold] to expose this "
+                          "CLI (its shell + this folder) as a runtime environment there.[/dim]")
         else:
-            console.print("[dim]Run [bold]/connect \\[name][/bold] to hand this "
-                          "sub-terminal over to Helpwo.[/dim]")
+            console.print("[dim]This sub-terminal isn't linked to Helpwo yet.[/dim]")
 
     # PTY session managed at REPL level (must be before shutdown for nonlocal)
     interactive_session = None

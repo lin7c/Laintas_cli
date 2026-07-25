@@ -26,6 +26,11 @@ from typing import Optional
 
 import paths
 
+try:
+    import mem_signals   # Memory salience/recall weak-label capture (capability #4)
+except Exception:
+    mem_signals = None
+
 MEMORY_DIR = paths.MEMORY_DIR
 MEMORY_INDEX = paths.MEMORY_INDEX
 LOCAL_USER_SCOPE = "local-user"
@@ -292,7 +297,14 @@ def search_memories(query: str = "", mem_type: str = None,
         })
     ranked.sort(
         key=lambda item: (item["score"], item.get("mtime", 0)), reverse=True)
-    return ranked[:max(1, min(int(limit or 10), 50))]
+    _out = ranked[:max(1, min(int(limit or 10), 50))]
+    # Recall signal: only log genuine queries (empty query = bulk enumeration).
+    if mem_signals is not None and str(query or "").strip():
+        try:
+            mem_signals.on_search(query, _out)
+        except Exception:
+            pass
+    return _out
 
 
 def write_memory(name: str, mem_type: str, description: str,
@@ -312,7 +324,8 @@ def write_memory(name: str, mem_type: str, description: str,
         f = _memory_path(name, strict=True)
     except ValueError as exc:
         return False, str(exc)
-    if f.exists() and not overwrite:
+    _existed_before = f.exists()
+    if _existed_before and not overwrite:
         return False, f"Memory '{name}' already exists. Use overwrite=True."
 
     try:
@@ -337,6 +350,13 @@ def write_memory(name: str, mem_type: str, description: str,
         return False, str(e)
 
     _update_index(name, description, mem_type, resolved_scope)
+    if mem_signals is not None:
+        try:
+            mem_signals.on_write(name, mem_type, description, body,
+                                 is_update=_existed_before,
+                                 importance=resolved_importance)
+        except Exception:
+            pass
     return True, str(f)
 
 
@@ -354,6 +374,11 @@ def delete_memory(name: str) -> tuple[bool, str]:
     try:
         f.unlink()
         _remove_from_index(name)
+        if mem_signals is not None:
+            try:
+                mem_signals.on_delete(name)
+            except Exception:
+                pass
         return True, f"Deleted {name}"
     except OSError as e:
         return False, str(e)
