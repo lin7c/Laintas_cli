@@ -95,9 +95,10 @@ _DEFAULT_CONFIG = {
     "heartbeat_interval": 30,     # seconds — agent heartbeat
     "staleness_limit": 3,         # consecutive no-tool steps before auto-exit
     "repetition_threshold": 3,    # consecutive no-progress steps before force-exit (mirrors TokenBudgetTracker)
-    "warning_force_limit": 5,     # consecutive same-warning fires before force-exit (circuit breaker)
-    "deterministic_repeat_limit": 3, # identical (tool+args) call that has FAILED this many times is hard-blocked from re-running — catches non-consecutive repeat-failure loops the windowed detectors miss
+    "warning_force_limit": 5,     # consecutive warning count before force-exit when repetition_policy=interrupt
+    "deterministic_repeat_limit": 3, # identical failing-call count before warning, or hard block when repetition_policy=interrupt
     "output_similarity": 0.85,    # Jaccard threshold for "same" output (0.0-1.0)
+    "repetition_policy": "warn",  # warn / interrupt — monitoring stays active by default without terminating the task
     "microcompact_keep": 8,       # recent entries to keep full output in microcompact
     "microcompact_read_budget": 24000,  # chars of older file-read content kept verbatim (deduped, newest-first) instead of wiped — prevents re-read amnesia
     "history_max_messages": 20,    # chat messages sent to backend after local compaction
@@ -519,9 +520,10 @@ _RUNTIME_CONFIG_DESCRIPTIONS = {
     "heartbeat_interval": "Agent heartbeat interval in seconds",
     "staleness_limit": "Consecutive idle steps before exit",
     "repetition_threshold": "Consecutive repeated-output steps before exit",
-    "warning_force_limit": "Repeated warning limit before forced exit",
-    "deterministic_repeat_limit": "Identical failing tool call attempts before it is hard-blocked",
+    "warning_force_limit": "Repeated warning limit before forced exit in interrupt mode",
+    "deterministic_repeat_limit": "Identical failing tool-call attempts before warning or interrupt",
     "output_similarity": "Repeated-output similarity threshold (0-1)",
+    "repetition_policy": "How repeated behavior is handled: warn or interrupt",
     "detail": "Show full per-line tool detail (True) or simplified progress (False)",
     "stream_preview": "Streaming prose preview: off, one, or detail",
     "theme": "Terminal UI theme: dark, light, or mono",
@@ -569,6 +571,7 @@ _RUNTIME_LIMITS = {
 # Fixed-vocabulary config keys — single source for validation, /config help,
 # and completion value hints. Each set also enumerates the valid choices.
 _RUNTIME_ENUM_CHOICES: dict[str, frozenset] = {
+    "repetition_policy": frozenset({"warn", "interrupt"}),
     "stream_preview": frozenset({"off", "one", "detail"}),
     "theme": frozenset({"dark", "light", "mono"}),
     "markdown_theme": frozenset({"default", "green-red", "custom"}),
@@ -686,6 +689,7 @@ _MAX_CONFIG = {
     "warning_force_limit": 100000,  # disable warning circuit breaker
     "deterministic_repeat_limit": 100000,  # disable repeat-failure hard block
     "output_similarity": 1.0,       # only byte-identical output counts as repeat
+    "repetition_policy": "warn",    # keep monitoring advisory in MAX mode
     "microcompact_keep": 200,       # keep far more full outputs
     "microcompact_read_budget": 2000000,  # effectively keep all file-read content
     "history_max_messages": 500,
@@ -4590,9 +4594,10 @@ def _output_similarity(a: str, b: str) -> float:
     return len(intersection) / len(union)
 
 
-# Warnings that stay ADVISORY: the model still sees them as a nudge (via
-# _detect_loop_warnings), but they never count toward the force-exit circuit
-# breaker. `tool_stagnation` (same tool 5x with similar args) false-positives on
+# Warnings that stay ADVISORY even when repetition_policy=interrupt: the model
+# still sees them as a nudge (via _detect_loop_warnings), but they never count
+# toward the force-exit circuit breaker. `tool_stagnation` (same tool 5x with
+# similar args) false-positives on
 # legitimate repetitive work — reading many files, multiple edits to one file,
 # iterative web research — so a task must never be force-killed for it. Genuine
 # loops are still caught by the stronger deterministic detectors
@@ -5737,6 +5742,8 @@ def run_agent_loop(
     _fail_ledger_err: dict[str, str] = {}  # fingerprint -> last error text (for the block message)
     _repeat_block_limit = int(get_runtime_config("deterministic_repeat_limit"))
     _repeat_blocked_this_turn = False      # a doomed call was blocked this turn → force-exit after flushing
+    _warned_repeat_failures: set[str] = set()
+    _output_repetition_warned = False
     self_info = _runtime_info
     if depth == 0 and agent_id:
         wf = workflow_engine.get_active_workflow()
@@ -6333,7 +6340,7 @@ def run_agent_loop(
             # via on_chunk. Falls back to spinner if backend doesn't accept on_chunk.
             stream_state = {"reply": "", "command": "", "started": False}
             # Capture model/mode labels once for the spinner text
-            _spin_model = _live_status_model() or "default"
+            _spin_model = _live_status_model() or "auto"
             _spin_mode = _active_mode_label()
             try:
                 from rich.live import Live
@@ -6897,6 +6904,20 @@ def run_agent_loop(
                     and name not in _LEDGER_EXEMPT_TOOLS
                 )
                 if (_ledger_eligible
+                        and _fail_ledger.get(_ledger_fp, 0) >= _repeat_block_limit
+                        and get_runtime_config("repetition_policy") == "warn"):
+                    if _ledger_fp not in _warned_repeat_failures:
+                        _prev_n = _fail_ledger[_ledger_fp]
+                        _warning = (
+                            f"Repeated failing call: `{name}` on `{salient[:100]}` "
+                            f"has already failed {_prev_n} times. Monitoring remains "
+                            f"advisory; change strategy instead of repeating it."
+                        )
+                        _append_short_memory(state, f"\n  ⚠ {_warning}")
+                        if events_cb is not None:
+                            deps.console.print(f"[yellow]⚠ {_warning}[/yellow]")
+                        _warned_repeat_failures.add(_ledger_fp)
+                elif (_ledger_eligible
                         and _fail_ledger.get(_ledger_fp, 0) >= _repeat_block_limit):
                     _prev_n = _fail_ledger[_ledger_fp]
                     _last_err = _fail_ledger_err.get(_ledger_fp, "(no error text)")
@@ -7609,6 +7630,7 @@ def run_agent_loop(
             else:
                 _fail_ledger.pop(_rfp, None)
                 _fail_ledger_err.pop(_rfp, None)
+                _warned_repeat_failures.discard(_rfp)
 
         # Completion must describe the outcome of the whole emitted batch.
         # If the model called task.complete alongside a failed operation, keep
@@ -7681,8 +7703,17 @@ def run_agent_loop(
                 _no_action = state.get("_no_action_count", 0) + 1
                 state["_no_action_count"] = _no_action
                 if _no_action >= 3:
-                    done = True
-                    _completion_source = "no_action_limit"
+                    done = False
+                    _completion_source = ""
+                    if _no_action == 3:
+                        _warning = (
+                            "The model has ended 3 turns without a tool call or "
+                            "an explicit task_complete signal. Monitoring is "
+                            "advisory; the task will continue."
+                        )
+                        _append_short_memory(state, f"\n  ⚠ {_warning}")
+                        if events_cb is not None:
+                            deps.console.print(f"[yellow]⚠ {_warning}[/yellow]")
                 else:
                     done = False
                     _append_short_memory(state, (
@@ -7773,6 +7804,7 @@ def run_agent_loop(
                     _no_progress_count += 1
                 else:
                     _no_progress_count = 0
+                    _output_repetition_warned = False
             _output_fingerprints.append(_current_fp)
             if len(_output_fingerprints) > 5:
                 _output_fingerprints = _output_fingerprints[-5:]
@@ -7800,31 +7832,48 @@ def run_agent_loop(
 
         # ── Repetition circuit breaker (mirrors TokenBudgetTracker stop decision) ──
         if _no_progress_count >= _repetition_threshold:
-            _exit_reason = TRANSITION_REPETITION
-            if events_cb is not None:
-                deps.console.print(
-                    f"[yellow]⚠ Output repetition detected: last {_no_progress_count} steps "
-                    f"produced highly similar output. Exiting to prevent infinite loop.[/yellow]"
+            if get_runtime_config("repetition_policy") == "interrupt":
+                _exit_reason = TRANSITION_REPETITION
+                if events_cb is not None:
+                    deps.console.print(
+                        f"[yellow]⚠ Output repetition detected: last {_no_progress_count} steps "
+                        f"produced highly similar output. Exiting to prevent infinite loop.[/yellow]"
+                    )
+                _append_short_memory(state, (
+                    f"\n  ⚠ Loop exited: {_no_progress_count} consecutive steps with "
+                    f"near-identical output. Task may be stuck."
+                ))
+                if events_cb is not None and pending_events:
+                    events_cb(pending_events)
+                    pending_events.clear()
+                break
+            if not _output_repetition_warned:
+                _warning = (
+                    f"Output repetition detected: the last {_no_progress_count} steps "
+                    f"produced highly similar output. Monitoring is advisory; "
+                    f"consider changing strategy."
                 )
-            _append_short_memory(state, (
-                f"\n  ⚠ Loop exited: {_no_progress_count} consecutive steps with "
-                f"near-identical output. Task may be stuck."
-            ))
-            if events_cb is not None and pending_events:
-                events_cb(pending_events)
-                pending_events.clear()
-            break
+                if events_cb is not None:
+                    deps.console.print(f"[yellow]⚠ {_warning}[/yellow]")
+                _append_short_memory(state, f"\n  ⚠ {_warning}")
+                _output_repetition_warned = True
 
         # ── Warning circuit breaker: escalate repeated warnings to force-exit ──
-        # When the same diagnostic signal fires 3+ consecutive times,
-        # escalate from advisory to enforcement.
-        _current_warning_keys = [k for k, _m in _detect_loop_warnings_typed(state, original_input)
-                                 if k not in _ADVISORY_ONLY_WARNINGS]
+        # Monitoring is advisory by default. With repetition_policy=interrupt,
+        # persistent non-advisory warnings escalate to enforcement.
+        _current_warnings = _detect_loop_warnings_typed(state, original_input)
+        _current_warning_keys = [k for k, _m in _current_warnings]
         _new_streaks: dict[str, int] = {}
-        for wk in _current_warning_keys:
+        for wk, warning_message in _current_warnings:
             _prev_count = _warning_streaks.get(wk, 0)
             _new_streaks[wk] = _prev_count + 1
-            if _new_streaks[wk] >= _warning_force_limit:
+            if _prev_count == 0 and events_cb is not None:
+                deps.console.print(
+                    f"[yellow]⚠ Loop warning [{wk}]: {warning_message}[/yellow]"
+                )
+            if (get_runtime_config("repetition_policy") == "interrupt"
+                    and wk not in _ADVISORY_ONLY_WARNINGS
+                    and _new_streaks[wk] >= _warning_force_limit):
                 _exit_reason = TRANSITION_WARNING_FORCE
                 if events_cb is not None:
                     deps.console.print(
@@ -7917,16 +7966,19 @@ def run_agent_loop(
                 _exit_reason = TRANSITION_STALENESS
             break
 
-        # ── Staleness tracking: auto-exit when AI stops producing output ──
+        # ── Staleness tracking: warn when AI stops producing output ──
         # Count steps where the AI produced NO reply AND NO tool_calls as idle.
         # A conversational reply (text without tool calls) is real work and
         # resets the counter, same as a tool call would.
         if not tool_calls and not reply:
             stale_count += 1
             if stale_count >= staleness_limit:
-                if events_cb is not None and deps is not None:
-                    deps.console.print(f"[dim]Task appears complete ({stale_count} idle steps). Exiting.[/dim]")
-                    # Show raw response on idle exit so users can diagnose backend issues
+                if stale_count == staleness_limit and events_cb is not None and deps is not None:
+                    deps.console.print(
+                        f"[yellow]⚠ No reply or tool call for {stale_count} idle "
+                        f"steps. Monitoring is advisory; the task will continue.[/yellow]")
+                    # Show the raw response with the warning so users can
+                    # diagnose backend issues without terminating the task.
                     if not tool_calls and not reply:
                         raw = debug_entry.response_raw
                         if raw:
@@ -7937,8 +7989,6 @@ def run_agent_loop(
                 if events_cb is not None and pending_events:
                     events_cb(pending_events)
                     pending_events.clear()
-                _exit_reason = TRANSITION_STALENESS
-                break
         else:
             stale_count = 0  # reset on any output (tool call or conversational reply)
 

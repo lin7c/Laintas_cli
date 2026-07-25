@@ -726,10 +726,9 @@ def select_dialog(
     # ── Key bindings ──────────────────────────────────────────────
     # Second line of defense after the typeahead/tcflush purge above: bytes
     # that land between the flush and prompt_toolkit's first read (a queued
-    # Enter from fast typing, mouse-report escape sequences) would otherwise
-    # confirm or cancel the dialog before it is even rendered. Confirm/cancel
-    # keys are ignored for a short window after open; navigation keys are
-    # harmless and stay live.
+    # Enter from fast typing) would otherwise confirm the dialog before it is
+    # even rendered. Affirmative keys are ignored for a short window after
+    # open; cancellation and navigation always stay live.
     _opened_at = time.monotonic()
 
     def _in_grace() -> bool:
@@ -834,8 +833,10 @@ def select_dialog(
     @kb.add("q")
     @kb.add("c-c")
     def _(event):
-        if _in_grace():
-            return
+        # Cancellation is never subject to the startup grace period.  A user
+        # who sees a blank or half-rendered selector must always have an
+        # immediate escape hatch.  Only affirmative actions (Enter, shortcut
+        # selection) are protected from replayed typeahead above.
         if multi:
             event.app.exit(result=None)
         elif act_keys:
@@ -3428,7 +3429,7 @@ def _sync_status_context() -> None:
             agent=str(agent.name or agent.id),
             terminal=terminal_name,
             deployment="deployed" if deployment else "temporary",
-            model=model or "default",
+            model=model or "auto",
             model_source=model_source,
             detail=bool(get_runtime_config("detail")),
             running_agents=running_count,
@@ -3489,7 +3490,7 @@ def _render_rprompt():
                 "[dim]⚡ Auto-approve active ([bold]*[/bold]). "
                 "Use /mode to change.[/dim]")
     _mode_cls = "rprompt-mode-plan" if _is_plan else "rprompt-mode-act"
-    _model = _status_cache.get("model", "") or "default"
+    _model = _status_cache.get("model", "") or "auto"
     width = _terminal_width()
     _agent_name = _status_cache.get("agent", "") or "primary"
     if width >= 62:
@@ -3505,9 +3506,11 @@ def _render_rprompt():
     else:
         result = [("class:" + _mode_cls, _mode_label)]
     if width >= 78:
+        # Show "auto-routing" when auto-routing is active, plain model name otherwise
+        _model_display = "auto-routing" if _model in ("", "auto") else _model
         result.extend([
             ("class:rprompt-sep", " · "),
-            ("class:rprompt-model", _model),
+            ("class:rprompt-model", _model_display),
         ])
     if width >= 108 and not _status_cache.get("multi_agent"):
         agent = _status_cache.get("agent", "")
@@ -3840,7 +3843,11 @@ def set_model_selection(model: str, provider: str = "") -> None:
 
 
 def _normalize_model_entry(item) -> dict:
-    """Normalize common model-list response shapes into displayable rows."""
+    """Normalize common model-list response shapes into displayable rows.
+
+    Preserves ``tier`` and ``description`` fields from the gateway response
+    for richer display in the model selector table.
+    """
     if isinstance(item, str):
         return {"id": item, "name": item, "description": ""}
     if not isinstance(item, dict):
@@ -3851,7 +3858,9 @@ def _normalize_model_entry(item) -> dict:
     )
     name = item.get("name") or item.get("displayName") or item.get("label") or model_id
     desc = item.get("description") or item.get("desc") or item.get("provider") or ""
-    return {"id": str(model_id), "name": str(name), "description": str(desc)}
+    tier = item.get("tier") or ""
+    return {"id": str(model_id), "name": str(name), "description": str(desc),
+            "tier": str(tier)}
 
 
 def _extract_model_entries(data) -> list[dict]:
@@ -3884,7 +3893,128 @@ def _extract_model_entries(data) -> list[dict]:
     return [_normalize_model_entry(item) for item in raw_models]
 
 
-def fetch_available_models(session: dict) -> tuple[list[dict], str]:
+class BlockingOperationCancelled(RuntimeError):
+    """Raised when Esc or Ctrl+C cancels a foreground blocking operation."""
+
+
+def run_cancellable_blocking(
+    operation: Callable[[threading.Event], object],
+) -> object:
+    """Run blocking work off the UI thread while Esc/Ctrl+C remain responsive.
+
+    The worker is daemonized because libraries such as requests cannot abort a
+    socket read already in progress.  The cancellation event lets cooperative
+    operations stop before starting another request; the foreground returns
+    immediately even if the current socket needs its timeout to unwind.
+    """
+    cancelled = threading.Event()
+    outcome: queue.Queue = queue.Queue(maxsize=1)
+
+    def _worker() -> None:
+        try:
+            outcome.put(("result", operation(cancelled)))
+        except BaseException as exc:
+            outcome.put(("error", exc))
+
+    worker = threading.Thread(
+        target=_worker, daemon=True, name="cancellable-blocking-operation")
+
+    old_sigint = None
+    sigint_installed = False
+    input_fd = -1
+    terminal_fd = -1
+    old_tcattr = None
+
+    def _cancel_signal(_signum, _frame) -> None:
+        cancelled.set()
+
+    try:
+        if threading.current_thread() is threading.main_thread():
+            old_sigint = signal.getsignal(signal.SIGINT)
+            signal.signal(signal.SIGINT, _cancel_signal)
+            sigint_installed = True
+
+        try:
+            if sys.stdin.isatty():
+                input_fd = sys.stdin.fileno()
+                terminal_fd = input_fd
+                old_tcattr = termios.tcgetattr(input_fd)
+                tty.setcbreak(input_fd)
+        except (AttributeError, OSError, ValueError, io.UnsupportedOperation,
+                termios.error):
+            input_fd = -1
+            old_tcattr = None
+
+        # Start only after both cancellation channels are armed, so there is
+        # no startup window where the operation can block before Ctrl+C/Esc
+        # become effective.
+        worker.start()
+
+        while True:
+            try:
+                kind, value = outcome.get_nowait()
+            except queue.Empty:
+                kind = value = None
+            if kind == "result":
+                return value
+            if kind == "error":
+                raise value
+            if cancelled.is_set():
+                raise BlockingOperationCancelled(
+                    "Operation cancelled by Esc or Ctrl+C")
+
+            if input_fd < 0:
+                cancelled.wait(0.05)
+                continue
+            try:
+                ready, _, _ = select.select([input_fd], [], [], 0.05)
+            except (OSError, ValueError, select.error):
+                ready = []
+            if not ready:
+                continue
+            try:
+                key = os.read(input_fd, 1)
+            except (BlockingIOError, InterruptedError):
+                continue
+            except OSError:
+                input_fd = -1
+                continue
+            if key == b"\x03":
+                cancelled.set()
+            elif key == b"\x1b":
+                # Do not mistake an impatient arrow/navigation key for bare
+                # Esc while the next UI is still loading.
+                try:
+                    continuation, _, _ = select.select(
+                        [input_fd], [], [], 0.04)
+                except (OSError, ValueError, select.error):
+                    continuation = []
+                if continuation:
+                    try:
+                        os.read(input_fd, 32)
+                    except OSError:
+                        pass
+                else:
+                    cancelled.set()
+    except KeyboardInterrupt as exc:
+        cancelled.set()
+        raise BlockingOperationCancelled(
+            "Operation cancelled by Ctrl+C") from exc
+    finally:
+        cancelled.set()
+        if old_tcattr is not None and terminal_fd >= 0:
+            try:
+                termios.tcsetattr(terminal_fd, termios.TCSANOW, old_tcattr)
+            except (OSError, termios.error):
+                pass
+        if sigint_installed:
+            signal.signal(signal.SIGINT, old_sigint)
+
+
+def fetch_available_models(
+    session: dict,
+    cancel_event: Optional[threading.Event] = None,
+) -> tuple[list[dict], str]:
     """Fetch available models from the backend.
 
     Returns (models, endpoint). Tries the current endpoint first and keeps a
@@ -3902,6 +4032,8 @@ def fetch_available_models(session: dict) -> tuple[list[dict], str]:
 
     last_error = ""
     for endpoint in endpoints:
+        if cancel_event is not None and cancel_event.is_set():
+            raise BlockingOperationCancelled("Model fetch cancelled")
         try:
             resp = requests.get(
                 f"{backend_url}{endpoint}",
@@ -3913,6 +4045,8 @@ def fetch_available_models(session: dict) -> tuple[list[dict], str]:
         except requests.RequestException as e:
             last_error = str(e)
             continue
+        if cancel_event is not None and cancel_event.is_set():
+            raise BlockingOperationCancelled("Model fetch cancelled")
 
         if resp.status_code == 404:
             last_error = f"HTTP 404 from {endpoint}"
@@ -4066,18 +4200,29 @@ def _stop_mail_watcher():
 
 
 def show_model_selector(models: list[dict], current: str = "") -> Optional[dict]:
-    """Interactive model selector. Returns the complete model row or None."""
+    """Interactive model selector. Returns the complete model row or None.
+
+    Prepends an ``auto`` virtual entry at the start of the list. When the user
+    selects it, returns ``{"id": "auto", "provider": ""}`` so the caller
+    can set the terminal to auto-routing mode.
+    """
     if not models:
         return None
     labels = []
     sel_idx = 0
+    # Prepend the auto-routing virtual entry at the start of the list,
+    # using the same 30-char formatting as real models.
+    auto_mark = " *" if current in ("auto", "") else "  "
+    labels.append(f"{auto_mark}[cyan]{'auto-routing':30}[/cyan] Auto-routing (embedding-based)")
+    if current in ("auto", ""):
+        sel_idx = 0
     for i, model in enumerate(models):
         model_id = model.get("id", "")
         provider = model.get("description") or model.get("provider") or ""
         mark = " *" if current and model_id == current else "  "
         labels.append(f"{mark}[cyan]{model_id:30}[/cyan] {provider}")
         if current and model_id == current:
-            sel_idx = i
+            sel_idx = i + 1  # +1 because auto occupies index 0
     chosen = select_dialog(
         labels,
         title="Models — choose with ↑↓ and Enter",
@@ -4087,7 +4232,10 @@ def show_model_selector(models: list[dict], current: str = "") -> Optional[dict]
     )
     if chosen is None:
         return None
-    return models[labels.index(chosen)]
+    # If the user picked the auto virtual entry (index 0), return a synthetic record.
+    if labels.index(chosen) == 0:
+        return {"id": "auto", "provider": ""}
+    return models[labels.index(chosen) - 1]
 
 
 def choose_login_method() -> Optional[str]:
@@ -4247,13 +4395,17 @@ def login_interactive() -> Optional[dict]:
     return None
 
 
-def _login_via_device() -> Optional[dict]:
+def _login_via_device(
+    cancel_event: Optional[threading.Event] = None,
+) -> Optional[dict]:
     """Authenticate through a browser on any device using device polling."""
     try:
         started = requests.post(
             f"{ACCOUNTS_BASE}/api/auth/cli-device/start",
             json={}, timeout=10, allow_redirects=False,
         )
+        if cancel_event is not None and cancel_event.is_set():
+            return None
         if started.status_code != 200:
             console.print(f"[red]Could not start browser login (HTTP {started.status_code}).[/red]")
             return None
@@ -4267,6 +4419,8 @@ def _login_via_device() -> Optional[dict]:
         expires = max(30, min(int(payload.get("expiresIn", 600)), 900))
         interval = max(1.0, min(float(payload.get("interval", 2)), 10.0))
     except (requests.RequestException, ValueError, TypeError) as exc:
+        if cancel_event is not None and cancel_event.is_set():
+            return None
         console.print(f"[red]Cannot start browser login: {exc}[/red]")
         return None
 
@@ -4284,12 +4438,16 @@ def _login_via_device() -> Optional[dict]:
 
     deadline = time.monotonic() + expires
     while time.monotonic() < deadline:
+        if cancel_event is not None and cancel_event.is_set():
+            return None
         try:
             response = requests.post(
                 f"{ACCOUNTS_BASE}/api/auth/cli-device/poll",
                 json={"deviceId": device_id, "deviceSecret": device_secret},
                 timeout=10, allow_redirects=False,
             )
+            if cancel_event is not None and cancel_event.is_set():
+                return None
             if response.status_code == 200:
                 data = response.json()
                 if data.get("status") == "approved":
@@ -4321,17 +4479,23 @@ def _login_via_device() -> Optional[dict]:
             # A transient network failure should not invalidate a live device
             # authorization; retry until the server-side expiry.
             pass
-        time.sleep(interval)
+        if cancel_event is not None:
+            if cancel_event.wait(interval):
+                return None
+        else:
+            time.sleep(interval)
     console.print("[yellow]Browser login timed out.[/yellow]")
     return None
 
 
-def login_via_browser() -> Optional[dict]:
+def login_via_browser(
+    cancel_event: Optional[threading.Event] = None,
+) -> Optional[dict]:
     # Device authorization works when CLI and browser are on different hosts.
     # The legacy localhost implementation remains below for source-history
     # compatibility, but is intentionally not selected: it cannot provide the
     # cross-terminal guarantee this login path requires.
-    device_session = _login_via_device()
+    device_session = _login_via_device(cancel_event=cancel_event)
     if device_session is not None:
         return device_session
     return None
@@ -5494,10 +5658,13 @@ def call_backend_stream(
     # model for this one call.
     selected_model = model_override or get_selected_model()
     if selected_model:
-        payload["model"] = selected_model
+        # model_override=="auto" → send empty model so the gateway triggers
+        # embedding-based auto-routing (/api/chat/stream on the gateway side).
+        payload["model"] = "" if model_override == "auto" else selected_model
     if provider_override:
         payload["provider"] = provider_override
     # A pinned model without an explicitly paired provider is gateway-resolved.
+    # When model_override is "auto" the gateway decides both model and provider.
     elif not model_override:
         selected_provider = get_selected_provider()
         if selected_provider:
@@ -5746,9 +5913,12 @@ def call_backend_stream(
         # ── Local usage accounting (/usage) — every completed call lands here
         # regardless of tool/prose outcome. Backends that send no _billing
         # (external/unmetered) get chars/4 estimates so stats still move.
+        # When auto-routing is active, streamed_model holds the real model name
+        # selected by the gateway; use that for accurate per-model accounting.
+        _usage_model = streamed_model or selected_model
         if billing_info:
             usage_tracker.record(
-                model=selected_model,
+                model=_usage_model,
                 prompt_tokens=(billing_info or {}).get("promptTokens", 0),
                 completion_tokens=_completion_tokens,
                 cost_cents=(billing_info or {}).get("costCents", 0),
@@ -5757,7 +5927,7 @@ def call_backend_stream(
             )
         elif accumulated:
             usage_tracker.record(
-                model=selected_model,
+                model=_usage_model,
                 prompt_tokens=usage_tracker.estimate_tokens(
                     json.dumps(payload, ensure_ascii=False)),
                 completion_tokens=usage_tracker.estimate_tokens(accumulated),
@@ -5766,10 +5936,14 @@ def call_backend_stream(
                 estimated=True,
             )
 
-        # Update the REPL status bar with the actual model used this call.
+        # Update the REPL status bar with the model used this call.
+        # When auto-routing is active ("auto"), keep the virtual label so
+        # the status bar stays at "auto-routing" instead of showing the
+        # gateway's real-time pick (which changes per-request).
         # Falls back to the user's configured selection if the backend
         # didn't echo a model name in the SSE stream.
-        _effective_model = streamed_model or selected_model
+        _effective_model = (selected_model if selected_model in ("auto", "")
+                            else streamed_model or selected_model)
         if _effective_model:
             _update_status_cache(model=_effective_model)
 
@@ -8321,7 +8495,12 @@ def observe_session(session, display_name: str = "", display_cmd: str = "") -> N
         refresh_interval=0.3,
     )
 
-    app.run()
+    try:
+        app.run()
+    except (KeyboardInterrupt, EOFError):
+        # Key bindings normally handle Esc/Ctrl+C.  Keep startup, rendering,
+        # and teardown races cancellable as well.
+        return
 
 
 def enter_session(session, display_name: str = "", display_cmd: str = "") -> None:
@@ -9577,9 +9756,6 @@ def _usage_pricing_note(balance: dict) -> str:
         pricing.get("defaultTier") if isinstance(pricing, dict) else ""
     ).strip().upper()
     parts = []
-    for model in ("kimi-k2.6", "kimi-k3"):
-        if model in tiers:
-            parts.append(f"{model} {tiers[model]}")
     if default_tier:
         parts.append(f"unlisted models {default_tier}")
     return "pricing · " + " · ".join(parts) if parts else ""
@@ -9605,18 +9781,37 @@ def _show_usage_command(args: list, session: dict) -> None:
     if (not local_only and profile.sends_laintas_credentials
             and session.get("userId")):
         headers, cookies = backend_profiles.request_auth(profile, session)
+
+        def _fetch_backend_usage(cancel: threading.Event):
+            try:
+                resp = requests.get(
+                    f"{profile.base_url}/api/usage",
+                    params={"range": rng, "product": "cli"},
+                    headers=headers, cookies=cookies, timeout=10)
+                remote_usage = (
+                    resp.json() if resp.status_code == 200 else None)
+                remote_fail = (
+                    "" if remote_usage is not None
+                    else f"HTTP {resp.status_code}")
+                if cancel.is_set():
+                    raise BlockingOperationCancelled("Usage fetch cancelled")
+                bresp = requests.get(
+                    f"{profile.base_url}/api/balance",
+                    headers=headers, cookies=cookies, timeout=10)
+                remote_balance = (
+                    bresp.json() if bresp.status_code == 200 else {})
+                return remote_usage, remote_balance, remote_fail
+            except requests.RequestException as exc:
+                return None, {}, type(exc).__name__
+
         try:
-            resp = requests.get(f"{profile.base_url}/api/usage",
-                                params={"range": rng, "product": "cli"},
-                                headers=headers, cookies=cookies, timeout=10)
-            usage = resp.json() if resp.status_code == 200 else None
-            if usage is None:
-                fail = f"HTTP {resp.status_code}"
-            bresp = requests.get(f"{profile.base_url}/api/balance",
-                                 headers=headers, cookies=cookies, timeout=10)
-            bal = bresp.json() if bresp.status_code == 200 else {}
-        except requests.RequestException as e:
-            fail = type(e).__name__
+            with console.status(
+                    "[dim]Fetching usage… · Esc/Ctrl+C cancel[/dim]"):
+                usage, bal, fail = run_cancellable_blocking(
+                    _fetch_backend_usage)
+        except BlockingOperationCancelled:
+            console.print("[dim]Usage request cancelled.[/dim]")
+            return
     model_tiers = _usage_model_tiers(bal)
 
     body: list = []
@@ -9842,7 +10037,13 @@ def _cmd_new_session_notice() -> None:
 def _cmd_login(session: dict, agent_registry: AgentRegistry) -> None:
     choice = choose_login_method()
     if choice == "remote":
-        new_session = login_via_browser()
+        console.print("[dim]Starting browser login… · Esc/Ctrl+C cancel[/dim]")
+        try:
+            new_session = run_cancellable_blocking(
+                lambda cancel: login_via_browser(cancel_event=cancel))
+        except BlockingOperationCancelled:
+            new_session = None
+            console.print("[dim]Login cancelled.[/dim]")
     else:
         new_session = None
         console.print("[dim]Login cancelled.[/dim]")
@@ -9897,7 +10098,7 @@ def _cmd_model(parts: list, raw_args: str, session: dict) -> None:
         _apply("")
         console.print(
             f"[green]Model override reset for [bold]{target_terminal}[/bold]. "
-            "The deployed agent's base/default model will be used.[/green]")
+            "Gateway auto-routing will be used (model shown as 'auto-routing').[/green]")
     elif args:
         if len(args) != 1:
             console.print("[yellow]Usage: /model [terminal] <model-id>[/yellow]")
@@ -9911,8 +10112,14 @@ def _cmd_model(parts: list, raw_args: str, session: dict) -> None:
         current = str(terminal.model_override or "")
         current_provider = str(terminal.provider_override or "")
         try:
-            with console.status("[dim]Fetching available models…[/dim]"):
-                models, endpoint = fetch_available_models(session)
+            with console.status(
+                    "[dim]Fetching available models… · Esc/Ctrl+C cancel[/dim]"):
+                models, endpoint = run_cancellable_blocking(
+                    lambda cancel: fetch_available_models(
+                        session, cancel_event=cancel))
+        except BlockingOperationCancelled:
+            console.print("[dim]Model selection cancelled.[/dim]")
+            return
         except Exception as e:
             console.print(f"[red]Failed to fetch models: {e}[/red]")
             console.print(f"Current model: [bold]{current or 'backend default'}[/bold]")
@@ -9939,7 +10146,16 @@ def _cmd_model(parts: list, raw_args: str, session: dict) -> None:
                 table.add_column("Model ID", style="cyan")
                 table.add_column("Name")
                 table.add_column("Provider")
-                for idx, m in enumerate(models, start=1):
+                # Prepend the auto-routing virtual entry at the top of the table.
+                auto_marker = "*" if current in ("auto", "") else ""
+                table.add_row(
+                    "1",
+                    auto_marker,
+                    "auto-routing",
+                    "Auto-routing (embedding-based)",
+                    "",
+                )
+                for idx, m in enumerate(models, start=2):
                     marker = "*" if current and m["id"] == current else ""
                     table.add_row(
                         str(idx),
@@ -10121,8 +10337,15 @@ def _cmd_mail(parts: list, raw_args: str, session: dict) -> None:
 
     elif sub == "inbox":
         show_all = "--all" in parts[2:]
-        with console.status("[dim]Checking inbox…[/dim]"):
-            messages, error = fetch_mail_inbox(session, unread_only=not show_all)
+        try:
+            with console.status(
+                    "[dim]Checking inbox… · Esc/Ctrl+C cancel[/dim]"):
+                messages, error = run_cancellable_blocking(
+                    lambda _cancel: fetch_mail_inbox(
+                        session, unread_only=not show_all))
+        except BlockingOperationCancelled:
+            console.print("[dim]Inbox request cancelled.[/dim]")
+            return
         if error:
             console.print(f"[red]Could not reach backend: {error}[/red]")
             return
@@ -13000,8 +13223,14 @@ def _cmd_hire(parts: list, session: dict) -> bool:
     base_provider = ""
     if base_model or hire_options.get("choose_model"):
         try:
-            with console.status("[dim]Fetching available models…[/dim]"):
-                models, _endpoint = fetch_available_models(session)
+            with console.status(
+                    "[dim]Fetching available models… · Esc/Ctrl+C cancel[/dim]"):
+                models, _endpoint = run_cancellable_blocking(
+                    lambda cancel: fetch_available_models(
+                        session, cancel_event=cancel))
+        except BlockingOperationCancelled:
+            console.print("[dim]Hiring cancelled.[/dim]")
+            return False
         except Exception as exc:
             console.print(f"[red]Failed to fetch models: {exc}[/red]")
             return False
@@ -14460,10 +14689,22 @@ def _cmd_compact(parts: list, session: dict) -> bool:
             + (" · summarized" if info["summary"] else ""))
         return False
 
-    with console.status("[dim]Compacting session context…[/dim]", spinner="dots"):
-        result = compact_session_context(
-            compact_deps, compact_session, compact_state,
-            compact_chat if isinstance(compact_chat, list) else [])
+    # Compact an isolated copy so cancelling a slow summarizer cannot let its
+    # daemon worker mutate live session state after this command has returned.
+    compact_working_state = copy.deepcopy(compact_state)
+    compact_working_chat = copy.deepcopy(
+        compact_chat if isinstance(compact_chat, list) else [])
+    try:
+        with console.status(
+                "[dim]Compacting session context… · Esc/Ctrl+C cancel[/dim]",
+                spinner="dots"):
+            result = run_cancellable_blocking(
+                lambda _cancel: compact_session_context(
+                    compact_deps, compact_session, compact_working_state,
+                    compact_working_chat))
+    except BlockingOperationCancelled:
+        console.print("[dim]Context compaction cancelled.[/dim]")
+        return False
     if not result.get("ok"):
         console.print(f"[red]Context compaction failed: {result.get('error', 'unknown error')}[/red]")
         return False
@@ -14473,6 +14714,8 @@ def _cmd_compact(parts: list, session: dict) -> bool:
             f"({_fmt_tokens(result['tokens'])} tokens).[/dim]")
         return False
 
+    compact_state.clear()
+    compact_state.update(compact_working_state)
     handle_meta_command._last_agent_state = compact_state
     current_live = getattr(handle_meta_command, '_current_live_session', None)
     cwd = ((current_live or {}).get("cwd") or os.getcwd())
@@ -16210,7 +16453,9 @@ def _read_single_key_choice(*, allow_always: bool,
     except (termios.error, OSError):
         return None
     try:
-        tty.setcbreak(fd)
+        # Raw mode makes Ctrl+C available as the literal \x03 byte handled
+        # below instead of letting the terminal turn it into process SIGINT.
+        tty.setraw(fd)
     except (termios.error, OSError):
         return None
     deadline = (time.monotonic() + auto_confirm_seconds
@@ -16400,6 +16645,10 @@ def _request_email_approval(kind: str, summary: str, detail: str = "") -> bool:
     current = get_current_agent()
     terminal = (getattr(current, "home_terminal", None) or "") if current else ""
     agent_name = (getattr(current, "name", None) or "Laintas CLI") if current else "Laintas CLI"
+    interrupt_event = (
+        current.abort_event if current is not None
+        else get_user_interrupt_event()
+    )
     headers, cookies = backend_profiles.request_auth(profile, session)
 
     try:
@@ -16428,6 +16677,9 @@ def _request_email_approval(kind: str, summary: str, detail: str = "") -> bool:
     deadline = time.time() + timeout_s
     with console.status("[dim]Waiting for email approval…[/dim]"):
         while time.time() < deadline:
+            if interrupt_event.is_set():
+                console.print("[dim]Mail approval wait cancelled.[/dim]")
+                return False
             try:
                 status_resp = requests.get(
                     f"{profile.base_url}/api/agent/approval/{token}/status",
@@ -16443,7 +16695,9 @@ def _request_email_approval(kind: str, summary: str, detail: str = "") -> bool:
                         return False
             except requests.RequestException:
                 pass  # transient — keep polling until the deadline
-            time.sleep(_APPROVAL_POLL_INTERVAL)
+            if interrupt_event.wait(_APPROVAL_POLL_INTERVAL):
+                console.print("[dim]Mail approval wait cancelled.[/dim]")
+                return False
     console.print("[yellow]Mail mode: no response within the time limit — denying.[/yellow]")
     return False
 
