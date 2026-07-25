@@ -13,9 +13,9 @@ import {
 } from 'lucide-react';
 import { useLanguage } from '@/contexts/LanguageContext';
 
-const DOWNLOAD_BASE = 'https://cli.laintas.com/releases/v1.9.4';
+const DOWNLOAD_BASE = 'https://cli.laintas.com/releases/v1.9.5';
 const BASE_URL = DOWNLOAD_BASE;
-const RELEASE_VERSION = 'v1.9.4';
+const RELEASE_VERSION = 'v1.9.5';
 
 const ASSETS = [
   {

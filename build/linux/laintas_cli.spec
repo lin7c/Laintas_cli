@@ -44,7 +44,7 @@ a = Analysis(
     hiddenimports=_hidden,
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[],
+    runtime_hooks=[os.path.join(_PROJECT_DIR, 'build', 'linux', 'hook_ssl.py')],
     excludes=[
         'tkinter',
         'matplotlib',
