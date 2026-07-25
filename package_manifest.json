@@ -24,7 +24,9 @@
     "agent_persistence",
     "agent_roles",
     "workflow_engine",
+    "auto_pilot",
     "backend_profiles",
+    "durable_rules",
     "trust_store",
     "paths",
     "terminal_preferences",
@@ -32,6 +34,7 @@
     "cloud_provider",
     "hwo_runner",
     "hwo_ui",
+    "helpwo_server",
     "repl_mirror",
     "updater",
     "version",
@@ -62,6 +65,8 @@
     "context_policy",
     "diagnostics_adapter",
     "format_adapter",
+    "hwg_adapter",
+    "hwo_adapter",
     "patch_adapter"
   ],
 
