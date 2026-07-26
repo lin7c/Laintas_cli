@@ -39,6 +39,6 @@
     "usable_tokens": "window - max(max_output, buffer_tokens) — the budget the assembled prompt must fit under (opencode overflow.ts: usable()).",
     "keep_recent_tokens": "token budget of the most-recent turns kept verbatim as the tail; clamp(usable*keep_recent_ratio, keep_recent_min, keep_recent_max) when not pinned (opencode preserveRecentBudget()).",
     "tail_turns": "max recent user-turns considered for the tail; older turns become the head to summarize.",
-    "prune": "walk tool outputs backwards; protect the most-recent prune_protect_tokens and prune_protected_tools; truncate older completed tool outputs to tool_output_max_chars; only act when reclaimable > prune_minimum_tokens (opencode prune())."
+    "prune": "Opencode intent (prune()): walk tool outputs backwards; protect the most-recent prune_protect_tokens and prune_protected_tools; truncate older completed tool outputs to tool_output_max_chars; only act when reclaimable > prune_minimum_tokens. IMPLEMENTATION STATUS: prune_minimum_tokens and prune_protect_tokens are RESERVED / not-yet-wired — no current consumer (laintas_cli, gateway, Helpwo) reads either knob, so changing their values has no effect. Consumers today protect the recent tail via keep_recent_tokens + prune_protected_tools and prune tool outputs once the thread exceeds usable_tokens; the separate prune_protect_tokens boundary and the prune_minimum_tokens reclaimable-gate are not implemented."
   }
 }

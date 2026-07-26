@@ -80,7 +80,6 @@ _DEFAULT_CONFIG = {
     "max_debug_entries": 50,
     "loop_delay": 0.2,           # normal inter-iteration delay; failures back off adaptively
     "output_truncate": 3000,      # chars — lastOutput tail truncation
-    "poll_timeout": 10.0,         # seconds — wait for first command output
     "terminal_tail_lines": 20,    # lines — sub-terminal snapshot
     "paste_summary": True,        # collapse large pastes into a [Pasted #N ~L lines] placeholder in the prompt (expanded on submit)
     "paste_summary_min_lines": 3, # paste line-count threshold that triggers the placeholder
@@ -514,7 +513,6 @@ _RUNTIME_CONFIG_DESCRIPTIONS = {
     "max_debug_entries": "In-memory debug entry limit",
     "loop_delay": "Delay between loop iterations in seconds",
     "output_truncate": "Maximum retained characters per tool-output section",
-    "poll_timeout": "Seconds to wait for initial command output",
     "terminal_tail_lines": "Terminal snapshot line count",
     "disable_remote_terminal": "Opt this runtime environment out of Helpwo's interactive terminal (P2P shell)",
     "allow_remote_exec_without_approval": "Let Helpwo's AI run commands in this environment without local approval (P2P exec)",
@@ -551,7 +549,7 @@ _RUNTIME_CONFIG_DESCRIPTIONS = {
 }
 
 _RUNTIME_NONNEGATIVE = {
-    "loop_delay", "poll_timeout", "heartbeat_interval",
+    "loop_delay", "heartbeat_interval",
     "browser_action_delay_min", "browser_action_delay_max",
     "browser_post_action_wait",
     "remote_queue_size", "remote_control_queue_size",
@@ -687,7 +685,6 @@ _MAX_CONFIG = {
     "max_debug_entries": 1000,
     "loop_delay": 0.0,              # no pause between iterations
     "output_truncate": 200000,      # keep almost all tool output
-    "poll_timeout": 120.0,
     "terminal_tail_lines": 500,
     "staleness_limit": 100000,      # never auto-exit on idle
     "repetition_threshold": 100000, # disable repetition circuit breaker
@@ -4027,11 +4024,6 @@ def _compact_thread_messages(thread_messages: list, deps, session, lang: str, st
         if not force and (usable <= 0 or _thread_tokens(thread_messages) <= usable):
             return False
 
-        # Increment compaction epoch so downstream layers know a compaction
-        # occurred this turn (unifies terminalHistory + thread compression).
-        state["_compaction_epoch"] = state.get("_compaction_epoch", 0) + 1
-        state["_compacted_at"] = time.time()
-
         # Recent tail to preserve verbatim (token-budgeted, from the end).
         keep_recent = ctxpol.keep_recent_tokens(usable)
         tail_turns = max(1, int(ctxpol.load().get("tail_turns", 2) or 2))
@@ -5694,21 +5686,21 @@ def run_agent_loop(
     _stored_call_count = sum(len(m.get("tool_calls") or []) for m in thread_messages)
     _thread_call_seq = max(int(state.get("_thread_call_seq") or 0), _stored_call_count)
     if _thread_mode and original_input:
-        # P3: persist placeholder form in thread_messages to avoid bloating
-        # durable context with expanded paste content.  The expanded form
-        # still reaches the LLM via the transient live-state.
-        _input_for_thread = session.get("_input_with_placeholders", original_input) or original_input
+        # Store the expanded input verbatim in the durable thread. Large pastes
+        # are bounded by the same token-budgeted compaction that bounds tool
+        # outputs and file reads (prune + summarize) — no placeholder indirection,
+        # so continued turns never see a dangling paste reference (no amnesia).
         _thread_has_input = any(
             m.get("role") == "user"
             and _stringify_message_content(m.get("content", "")).strip()
-            == str(_input_for_thread).strip()
+            == str(original_input).strip()
             for m in thread_messages
         )
         if not continue_thread or not _thread_has_input:
             # Crash recovery can request continue_thread before the admitted
             # prompt reached `_thread_messages`.  Add it exactly once instead
             # of silently continuing an older task.
-            thread_messages.append({"role": "user", "content": _input_for_thread})
+            thread_messages.append({"role": "user", "content": original_input})
     pending_events: list[dict] = []
     done = False
     _exit_reason = TRANSITION_MAX_LOOPS  # default: assume exhaustion unless overridden by a break
@@ -5834,6 +5826,13 @@ def run_agent_loop(
                      run_id=_run_id,
                      pid=os.getpid(),
                      hostname=socket.gethostname())
+    # Each new run_agent_loop turn starts with a fresh overflow-recovery budget:
+    # _overflow_retry is persisted in `state`, so without this a prior turn that
+    # ended at the give-up cap (retry==2) would make the next turn abort on its
+    # very first overflow. Reset within the loop (on a successful response) keeps
+    # the "up to 2 escalating compactions" budget per overflow episode, not per
+    # task lifetime.
+    state["_overflow_retry"] = 0
     for loop in range(max_loops):
         # Only the iteration that actually terminates the run may supply the
         # completion source.  Workflow phase advancement can turn a nominal
@@ -6244,9 +6243,7 @@ def run_agent_loop(
             #    committed), so stale task snapshots can't accumulate. It sits
             #    last for best attention — opencode's reminders pattern.
             if not thread_messages:
-                # P3: persist placeholder form, expanded form goes in live-state
-                _input_for_thread = session.get("_input_with_placeholders", original_input) or original_input
-                thread_messages.append({"role": "user", "content": _input_for_thread})
+                thread_messages.append({"role": "user", "content": original_input})
             # opencode-style overflow handling: prune old tool outputs, then
             # summarize the head if the thread still exceeds the window. Keeps the
             # reads in context (no re-read amnesia) while bounding the thread size.
@@ -6509,28 +6506,33 @@ def run_agent_loop(
                                 lang=lang,
                             )
 
-                if getattr(deps.console, "_laintas_event_console", False):
-                    response = _do_stream_call()
-                else:
-                    _console_file = getattr(deps.console, "file", None)
-                    _transient_factory = getattr(
-                        _console_file, "transient_output", None)
-                    _transient_ctx = (
-                        _transient_factory()
-                        if callable(_transient_factory) else nullcontext())
-                    with _transient_ctx:
-                        with Live(_LiveWrapper(), console=deps.console,
-                                  refresh_per_second=10.0, auto_refresh=True,
-                                  transient=True, redirect_stdout=False,
-                                  redirect_stderr=False) as live:
-                            _live_holder["live"] = live
-                            response = _do_stream_call()
-                            try:
-                                live.refresh()
-                            except Exception:
-                                pass
+                # (Removed a dead _laintas_event_console fast-path: that flag was
+                # never set by any caller. Always render the stream via Live.)
+                _console_file = getattr(deps.console, "file", None)
+                _transient_factory = getattr(
+                    _console_file, "transient_output", None)
+                _transient_ctx = (
+                    _transient_factory()
+                    if callable(_transient_factory) else nullcontext())
+                with _transient_ctx:
+                    with Live(_LiveWrapper(), console=deps.console,
+                              refresh_per_second=10.0, auto_refresh=True,
+                              transient=True, redirect_stdout=False,
+                              redirect_stderr=False) as live:
+                        _live_holder["live"] = live
+                        response = _do_stream_call()
+                        try:
+                            live.refresh()
+                        except Exception:
+                            pass
             except ImportError:
-                with deps.console.status(f"[#3fb950]thinking… · {_spin_model} · {_spin_mode}[/#3fb950]", spinner="dots"):
+                # rich.live/spinner is unavailable here (that is why we are in this
+                # handler), so do NOT use deps.console.status() — it needs rich Live
+                # too, and on the shared TeeFile console its default
+                # redirect_stdout=True feedback-loops into a deadlock. A static
+                # print is deadlock-free and works without rich Live.
+                deps.console.print(f"[#3fb950]thinking… · {_spin_model} · {_spin_mode}[/#3fb950]")
+                with nullcontext():
                     try:
                         response = deps.call_backend(
                             session=session,
@@ -6636,6 +6638,12 @@ def run_agent_loop(
             add_debug_log(debug_entry)
             _exit_reason = TRANSITION_BACKEND_ERROR
             break
+
+        # A successful (non-error) response ends any overflow episode, so the
+        # next overflow — if one occurs later in this same task — starts its
+        # 2-retry budget fresh rather than inheriting earlier retries.
+        if state.get("_overflow_retry"):
+            state["_overflow_retry"] = 0
 
         reply = response.get("reply") or ""
         done = response.get("done", len(tool_calls) == 0)
@@ -7542,38 +7550,20 @@ def run_agent_loop(
                                 _compact_read_hints.append((_read_category, _target))
                         else:
                             _flush_compact_reads()
-                            _expand_shell = bool(
-                                name == "shell.exec"
-                                and getattr(
-                                    deps.console,
-                                    "_laintas_expand_shell_calls", False))
-                            if _expand_shell:
-                                # The concurrent prompt owns terminal layout;
-                                # preserve the complete command and let Rich
-                                # wrap naturally instead of middle-cropping it.
-                                _full_hint = re.sub(
-                                    r"\s+", " ", str(_hint_plain or "")).strip()
-                                deps.console.print(
-                                    f"  {_mark2} "
-                                    f"[accent.dim]{_esc_hint(display_name)}[/accent.dim]"
-                                    f"  [muted]{_esc_hint(_full_hint)}[/muted]",
-                                    highlight=False)
-                                if _meta2:
-                                    deps.console.print(
-                                        f"      [muted]{_esc_hint(_meta2)}[/muted]",
-                                        highlight=False)
-                            else:
-                                _name2, _hint2, _meta2 = _compact_tool_line(
-                                    display_name, _hint_plain, _meta2,
-                                    deps.console.width,
-                                    hint_middle=(name != "shell.exec"))
-                                _line = (
-                                    f"  {_mark2} [accent.dim]{_esc_hint(_name2)}[/accent.dim]"
-                                    f"  [muted]{_esc_hint(_hint2)}[/muted]"
-                                )
-                                if _meta2:
-                                    _line += f"  [muted]{_esc_hint(_meta2)}[/muted]"
-                                deps.console.print(_line, highlight=False)
+                            # (Removed a dead _laintas_expand_shell_calls branch:
+                            # that flag was never set by any caller, so shell.exec
+                            # always used the compact/cropped line below.)
+                            _name2, _hint2, _meta2 = _compact_tool_line(
+                                display_name, _hint_plain, _meta2,
+                                deps.console.width,
+                                hint_middle=(name != "shell.exec"))
+                            _line = (
+                                f"  {_mark2} [accent.dim]{_esc_hint(_name2)}[/accent.dim]"
+                                f"  [muted]{_esc_hint(_hint2)}[/muted]"
+                            )
+                            if _meta2:
+                                _line += f"  [muted]{_esc_hint(_meta2)}[/muted]"
+                            deps.console.print(_line, highlight=False)
                             # Folded preview for long shell.exec output
                             if name == "shell.exec" and formatted:
                                 _fold_lim = int(get_runtime_config("tool_output_fold") or 0)

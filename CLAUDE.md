@@ -92,9 +92,8 @@ All tunable parameters are accessible via `get_runtime_config()`/`set_runtime_co
 | `max_loops` | 30 | Max AI loop iterations per task |
 | `max_tokens` | 10000 | Max output tokens per AI response (gateway hard-caps at 10000) |
 | `max_debug_entries` | 50 | Debug ring buffer size |
-| `loop_delay` | 1.5 | Seconds between loop iterations |
+| `loop_delay` | 0.2 | Seconds between loop iterations |
 | `output_truncate` | 3000 | Char limit for `lastOutput` tail |
-| `poll_timeout` | 10.0 | Seconds to wait for first command output |
 | `terminal_tail_lines` | 20 | Lines shown in sub-terminal snapshot |
 | `heartbeat_interval` | 30 | Seconds between agent heartbeats |
 | `staleness_limit` | 3 | Consecutive no-command steps before auto-exit |

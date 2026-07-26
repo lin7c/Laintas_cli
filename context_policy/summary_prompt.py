@@ -53,9 +53,7 @@ Rules:
 - Use terse bullets, not prose paragraphs.
 - Preserve exact file paths, commands, error strings, and identifiers when known.
 - Preserve active durable-rule ids and their exact obligation. A conversation summary cannot cancel or supersede a durable rule.
-- Do not mention the summary process or that context was compacted.
-- If present, incrementally merge the previous summary; never throw away still-relevant facts.
-- Mark the beginning of each compaction boundary with a compact <compaction> tag: \"## Compaction Epoch N\" where N is the compaction round, so the LLM can reason about older vs. newer context."""
+- Do not mention the summary process or that context was compacted."""
 
 _PREAMBLE_NEW_EN = "Create a new anchored summary from the conversation history."
 _PREAMBLE_UPDATE_EN = (
