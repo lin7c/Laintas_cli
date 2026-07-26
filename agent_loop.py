@@ -53,6 +53,11 @@ try:
 except Exception:  # pragma: no cover — graceful if the vendored package is missing
     ctxpol = None
 
+try:
+    import tokenizer  # Model-aware token estimation (tiktoken + calibrated fallback)
+except Exception:  # pragma: no cover
+    tokenizer = None  # type: ignore
+
 # Path to laintas_cli.py for spawning child terminals
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _LAINTAS_CLI = os.path.join(_SCRIPT_DIR, "laintas_cli.py")
@@ -3961,7 +3966,9 @@ def _llm_summarize(deps, session, current_path: str, head_text: str,
 
 
 def _thread_tokens(messages: list) -> int:
-    """Cheap token estimate for a slice of the native message thread."""
+    """Token estimate for a slice of the native message thread."""
+    if tokenizer is not None:
+        return tokenizer.count_messages(messages)
     try:
         blob = json.dumps(messages, ensure_ascii=False)
     except (TypeError, ValueError):
@@ -4019,6 +4026,11 @@ def _compact_thread_messages(thread_messages: list, deps, session, lang: str, st
         usable = ctxpol.usable_tokens(window, max_out)
         if not force and (usable <= 0 or _thread_tokens(thread_messages) <= usable):
             return False
+
+        # Increment compaction epoch so downstream layers know a compaction
+        # occurred this turn (unifies terminalHistory + thread compression).
+        state["_compaction_epoch"] = state.get("_compaction_epoch", 0) + 1
+        state["_compacted_at"] = time.time()
 
         # Recent tail to preserve verbatim (token-budgeted, from the end).
         keep_recent = ctxpol.keep_recent_tokens(usable)
@@ -5682,17 +5694,21 @@ def run_agent_loop(
     _stored_call_count = sum(len(m.get("tool_calls") or []) for m in thread_messages)
     _thread_call_seq = max(int(state.get("_thread_call_seq") or 0), _stored_call_count)
     if _thread_mode and original_input:
+        # P3: persist placeholder form in thread_messages to avoid bloating
+        # durable context with expanded paste content.  The expanded form
+        # still reaches the LLM via the transient live-state.
+        _input_for_thread = session.get("_input_with_placeholders", original_input) or original_input
         _thread_has_input = any(
             m.get("role") == "user"
             and _stringify_message_content(m.get("content", "")).strip()
-            == str(original_input).strip()
+            == str(_input_for_thread).strip()
             for m in thread_messages
         )
         if not continue_thread or not _thread_has_input:
             # Crash recovery can request continue_thread before the admitted
             # prompt reached `_thread_messages`.  Add it exactly once instead
             # of silently continuing an older task.
-            thread_messages.append({"role": "user", "content": original_input})
+            thread_messages.append({"role": "user", "content": _input_for_thread})
     pending_events: list[dict] = []
     done = False
     _exit_reason = TRANSITION_MAX_LOOPS  # default: assume exhaustion unless overridden by a break
@@ -6228,7 +6244,9 @@ def run_agent_loop(
             #    committed), so stale task snapshots can't accumulate. It sits
             #    last for best attention — opencode's reminders pattern.
             if not thread_messages:
-                thread_messages.append({"role": "user", "content": original_input})
+                # P3: persist placeholder form, expanded form goes in live-state
+                _input_for_thread = session.get("_input_with_placeholders", original_input) or original_input
+                thread_messages.append({"role": "user", "content": _input_for_thread})
             # opencode-style overflow handling: prune old tool outputs, then
             # summarize the head if the thread still exceeds the window. Keeps the
             # reads in context (no re-read amnesia) while bounding the thread size.
@@ -6596,9 +6614,16 @@ def run_agent_loop(
             # disagree with the provider's real count, so we trust the error.
             if (_is_context_overflow(_err_text)
                     and _thread_mode
-                    and not state.get("_overflow_compacted")
                     and len(thread_messages) > 3):
-                state["_overflow_compacted"] = True
+                # Progressive overflow recovery: allow up to 2 retries with
+                # escalating compaction instead of a single shot.
+                retry = state.get("_overflow_retry", 0)
+                if retry >= 2:
+                    if events_cb is not None:
+                        deps.console.print("[red](context overflow persists after 2 compaction rounds — giving up)[/red]")
+                    _exit_reason = TRANSITION_BACKEND_ERROR
+                    break
+                state["_overflow_retry"] = retry + 1
                 if events_cb is not None:
                     deps.console.print("[dim yellow](context overflow — compacting and retrying)[/dim yellow]")
                 _compact_thread_messages(thread_messages, deps, session, lang, state, force=True)

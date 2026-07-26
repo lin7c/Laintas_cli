@@ -13,7 +13,7 @@
 
   "tool_output_max_chars": 2000,
   "prune_minimum_tokens": 20000,
-  "prune_protect_tokens": 40000,
+  "prune_protect_tokens": 12000,
   "prune_protected_tools": [
     "skill_load", "skill_unload", "skill.load", "skill.unload",
     "memory_save", "mem.save",

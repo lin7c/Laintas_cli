@@ -3639,6 +3639,11 @@ def pt_prompt(cwd: str) -> str:
             complete_while_typing=True,
         )
         expanded = _expand_pastes(user_input) if user_input else user_input
+        # Snapshot paste registry into session so agent_loop can compact
+        # the same placeholders in _thread_messages (not just display).
+        if _paste_registry:
+            session["_paste_registry"] = dict(_paste_registry)
+            session["_input_with_placeholders"] = user_input  # persist placeholder form
         _reset_paste_registry()
         return expanded.strip() if expanded else ""
     except KeyboardInterrupt:
