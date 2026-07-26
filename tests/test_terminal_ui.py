@@ -1,5 +1,7 @@
 import io
+import os
 import queue
+import sys
 import threading
 import time
 import unittest
@@ -15,6 +17,54 @@ import tools
 
 def _text(fragments):
     return "".join(value for _style, value in fragments)
+
+
+class PromptInputLifecycleTests(unittest.TestCase):
+    def test_prompt_toolkit_eof_reaches_main_loop(self):
+        prompt_session = mock.Mock()
+        prompt_session.prompt.side_effect = EOFError
+        with mock.patch.object(
+                laintas_cli, "get_prompt_session",
+                return_value=prompt_session), \
+                mock.patch.object(
+                    laintas_cli, "_terminal_width", return_value=80), \
+                mock.patch("plan_mode.is_plan_mode", return_value=False):
+            with self.assertRaises(EOFError):
+                laintas_cli.pt_prompt("/tmp")
+
+    def test_prompt_toolkit_unexpected_error_is_not_turned_into_busy_loop(self):
+        prompt_session = mock.Mock()
+        prompt_session.prompt.side_effect = RuntimeError("prompt failed")
+        with mock.patch.object(
+                laintas_cli, "get_prompt_session",
+                return_value=prompt_session), \
+                mock.patch.object(
+                    laintas_cli, "_terminal_width", return_value=80), \
+                mock.patch("plan_mode.is_plan_mode", return_value=False):
+            with self.assertRaisesRegex(RuntimeError, "prompt failed"):
+                laintas_cli.pt_prompt("/tmp")
+
+    def test_plain_input_eof_reaches_main_loop(self):
+        stdin = SimpleNamespace(buffer=io.BytesIO(b""))
+        with mock.patch.object(sys, "stdin", stdin), \
+                mock.patch("builtins.print"):
+            with self.assertRaises(EOFError):
+                laintas_cli._simple_prompt("/tmp")
+
+    @unittest.skipUnless(hasattr(os, "openpty"), "requires PTY support")
+    def test_disconnected_pty_is_detected_and_read_exits(self):
+        master_fd, slave_fd = os.openpty()
+        slave = os.fdopen(slave_fd, "rb", buffering=0)
+        stdin = SimpleNamespace(buffer=slave, fileno=slave.fileno)
+        os.close(master_fd)
+        try:
+            with mock.patch.object(sys, "stdin", stdin), \
+                    mock.patch("builtins.print"):
+                self.assertTrue(laintas_cli._stdin_terminal_disconnected())
+                with self.assertRaises(EOFError):
+                    laintas_cli._simple_prompt("/tmp")
+        finally:
+            slave.close()
 
 
 class ResponsiveTerminalChromeTests(unittest.TestCase):

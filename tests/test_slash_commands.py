@@ -421,7 +421,7 @@ class SlashRegistryTests(unittest.TestCase):
         )
         self.assertEqual(
             laintas_cli._usage_pricing_note(balance),
-            "pricing · kimi-k2.6 T2 · kimi-k3 T3 · unlisted models T3",
+            "pricing · unlisted models T3",
         )
 
         totals = {
@@ -691,6 +691,31 @@ class SlashRegistryTests(unittest.TestCase):
                 laintas_cli.get_selected_provider(), "provider-a")
             agent_loop.close_all_terminals()
             agent_loop.close_all_agents()
+
+    def test_model_fetch_can_be_cancelled_before_selector_is_rendered(self):
+        agent_loop.close_all_terminals()
+        agent_loop.close_all_agents()
+        terminal_session = mock.Mock()
+        terminal_session.is_alive.return_value = True
+        agent_loop.register_terminal(
+            terminal_session, "/bin/sh", 0, name="term0")
+        primary = agent_loop.register_agent(name="primary", role="primary")
+        agent_loop.set_current_agent_id(primary.id)
+        output = io.StringIO()
+        old_console = laintas_cli.console
+        laintas_cli.console = Console(file=output, force_terminal=False)
+        try:
+            with mock.patch.object(
+                    laintas_cli, "run_cancellable_blocking",
+                    side_effect=laintas_cli.BlockingOperationCancelled):
+                self.assertFalse(laintas_cli.handle_meta_command(
+                    "/model", _Registry(), {}))
+        finally:
+            laintas_cli.console = old_console
+            agent_loop.close_all_terminals()
+            agent_loop.close_all_agents()
+
+        self.assertIn("Model selection cancelled", output.getvalue())
 
     def test_explicit_model_clears_stale_provider(self):
         with tempfile.TemporaryDirectory() as tmp, \
@@ -1326,6 +1351,14 @@ class ConfigAndMemoryTests(unittest.TestCase):
         agent_loop.reset_runtime_config()
 
     def test_runtime_config_is_typed_and_rejects_bad_values(self):
+        self.assertEqual(
+            agent_loop.get_runtime_config("repetition_policy"), "warn")
+        self.assertTrue(agent_loop.set_runtime_config(
+            "repetition_policy", "interrupt"))
+        self.assertEqual(
+            agent_loop.get_runtime_config("repetition_policy"), "interrupt")
+        with self.assertRaises(ValueError):
+            agent_loop.set_runtime_config("repetition_policy", "stop")
         self.assertTrue(agent_loop.set_runtime_config(
             "allow_remote_exec_without_approval", "false"))
         self.assertIs(agent_loop.get_runtime_config(

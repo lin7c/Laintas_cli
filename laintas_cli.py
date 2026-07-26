@@ -3641,12 +3641,20 @@ def pt_prompt(cwd: str) -> str:
         expanded = _expand_pastes(user_input) if user_input else user_input
         _reset_paste_registry()
         return expanded.strip() if expanded else ""
-    except (KeyboardInterrupt, EOFError):
+    except KeyboardInterrupt:
         _reset_paste_registry()
         return ""
+    except EOFError:
+        _reset_paste_registry()
+        raise
+    except OSError as exc:
+        _reset_paste_registry()
+        if exc.errno in _TERMINAL_EOF_ERRNOS:
+            raise EOFError("terminal input closed") from exc
+        raise
     except Exception:
         _reset_paste_registry()
-        return ""
+        raise
 
 
 # ── Dynamic Command Discovery ──────────────────────────────────────────
@@ -4009,6 +4017,43 @@ def run_cancellable_blocking(
                 pass
         if sigint_installed:
             signal.signal(signal.SIGINT, old_sigint)
+
+
+@contextmanager
+def _safe_status(message, *, spinner="dots", **_ignored):
+    """Deadlock-free stand-in for ``console.status(...)`` that keeps the spinner.
+
+    The shared console writes through repl_mirror.TeeFile, which resolves
+    sys.stdout dynamically on every write. Rich's ``console.status`` defaults to
+    ``redirect_stdout=True``: it swaps sys.stdout for its own FileProxy, so
+    TeeFile then forwards the Live's own output back into the Live — a feedback
+    loop that deadlocks ``Live.__exit__`` (on a plain TTY and under
+    prompt_toolkit's StdoutProxy alike; that is exactly why the agent-loop
+    streaming Live at agent_loop.py sets ``redirect_stdout=False``). A hand-built
+    Live with ``redirect_stdout=False`` breaks the loop while keeping the
+    animated spinner everywhere. Extra spinner kwargs are accepted and ignored so
+    this drops in for any former ``console.status`` call verbatim.
+    """
+    try:
+        text = Text.from_markup(message) if isinstance(message, str) else message
+    except Exception:
+        text = message
+    try:
+        status_live = Live(
+            Spinner(spinner, text=text), console=console,
+            refresh_per_second=12.5, transient=True,
+            redirect_stdout=False, redirect_stderr=False)
+    except Exception:
+        # A status spinner must never take down a command: on any Live
+        # construction failure, degrade to a one-shot static line, no Live.
+        try:
+            console.print(message)
+        except Exception:
+            pass
+        yield
+        return
+    with status_live:
+        yield
 
 
 def fetch_available_models(
@@ -6305,6 +6350,7 @@ class AgentRegistry:
 
         # ── WebRTC peer-to-peer file channel (lazy) ─────────────────────
         self._webrtc = None  # WebrtcManager | False(unavailable) | None(not yet)
+        self._rtc_config: dict = {}
 
     def _new_remote_executor(self):
         return ThreadPoolExecutor(
@@ -6368,8 +6414,10 @@ class AgentRegistry:
                                   f"{WebrtcManager.import_error()})[/dim]")
                     self._webrtc = False
                 else:
+                    from webrtc_channel import configured_ice_servers
                     self._webrtc = WebrtcManager(
                         lambda sid, typ, meta: self._push(sid, typ, "", meta),
+                        ice_servers=configured_ice_servers(self._rtc_config),
                     )
                     # So the WebRTC path/exec checks can also allow the
                     # folder explicitly shared via /connect or /helpwo
@@ -6473,6 +6521,8 @@ class AgentRegistry:
                 data = resp.json()
                 self.agent_id = data.get("agentId", "")
                 self.agent_secret = data.get("agentSecret", "")
+                rtc_config = data.get("rtcConfig")
+                self._rtc_config = rtc_config if isinstance(rtc_config, dict) else {}
                 self._last_agent_id = self.agent_id
                 if not quiet:
                     console.print(Panel(
@@ -9805,7 +9855,7 @@ def _show_usage_command(args: list, session: dict) -> None:
                 return None, {}, type(exc).__name__
 
         try:
-            with console.status(
+            with _safe_status(
                     "[dim]Fetching usage… · Esc/Ctrl+C cancel[/dim]"):
                 usage, bal, fail = run_cancellable_blocking(
                     _fetch_backend_usage)
@@ -10111,8 +10161,13 @@ def _cmd_model(parts: list, raw_args: str, session: dict) -> None:
     else:
         current = str(terminal.model_override or "")
         current_provider = str(terminal.provider_override or "")
+        # _safe_status, not console.status(): the shared console writes through
+        # repl_mirror.TeeFile, and console.status's default redirect_stdout=True
+        # makes TeeFile feed the Live's own output back into itself — a loop that
+        # deadlocks Live.__exit__, so the fetch looks frozen and Esc/Ctrl+C never
+        # register. _safe_status runs the spinner with redirect_stdout=False.
         try:
-            with console.status(
+            with _safe_status(
                     "[dim]Fetching available models… · Esc/Ctrl+C cancel[/dim]"):
                 models, endpoint = run_cancellable_blocking(
                     lambda cancel: fetch_available_models(
@@ -10338,7 +10393,7 @@ def _cmd_mail(parts: list, raw_args: str, session: dict) -> None:
     elif sub == "inbox":
         show_all = "--all" in parts[2:]
         try:
-            with console.status(
+            with _safe_status(
                     "[dim]Checking inbox… · Esc/Ctrl+C cancel[/dim]"):
                 messages, error = run_cancellable_blocking(
                     lambda _cancel: fetch_mail_inbox(
@@ -10410,7 +10465,7 @@ def _cmd_mail(parts: list, raw_args: str, session: dict) -> None:
         if not body:
             console.print("[dim]Mail cancelled.[/dim]")
             return
-        with console.status("[dim]Sending…[/dim]"):
+        with _safe_status("[dim]Sending…[/dim]"):
             ok, error = send_mail(session, subject, body)
         if ok:
             console.print("[green]Sent to your verified account address.[/green]")
@@ -13223,7 +13278,7 @@ def _cmd_hire(parts: list, session: dict) -> bool:
     base_provider = ""
     if base_model or hire_options.get("choose_model"):
         try:
-            with console.status(
+            with _safe_status(
                     "[dim]Fetching available models… · Esc/Ctrl+C cancel[/dim]"):
                 models, _endpoint = run_cancellable_blocking(
                     lambda cancel: fetch_available_models(
@@ -13637,14 +13692,14 @@ def _attach_primary_runtime_view(agent, *, show_result: bool = True):
     if worker is not None and worker.is_alive():
         _set_run_input_state("running")
         try:
-            with console.status(
+            with _safe_status(
                     "[#3fb950]Thinking… · primary runtime[/#3fb950]",
                     spinner="dots"):
                 while worker.is_alive():
                     worker.join(timeout=0.1)
         except KeyboardInterrupt:
             agent.abort_event.set()
-            with console.status(
+            with _safe_status(
                     "[yellow]Interrupting primary runtime…[/yellow]",
                     spinner="dots"):
                 while worker.is_alive():
@@ -14695,7 +14750,7 @@ def _cmd_compact(parts: list, session: dict) -> bool:
     compact_working_chat = copy.deepcopy(
         compact_chat if isinstance(compact_chat, list) else [])
     try:
-        with console.status(
+        with _safe_status(
                 "[dim]Compacting session context… · Esc/Ctrl+C cancel[/dim]",
                 spinner="dots"):
             result = run_cancellable_blocking(
@@ -15926,6 +15981,45 @@ def show_banner(agent_name: str, session: dict = None):
     console.print()
 
 
+_TERMINAL_EOF_ERRNOS = frozenset({
+    errno.EBADF,
+    errno.EIO,
+    errno.ENODEV,
+    errno.ENXIO,
+})
+
+
+def _stdin_terminal_disconnected() -> bool:
+    """Return True when stdin is a PTY whose peer has disappeared."""
+    try:
+        fd = sys.stdin.fileno()
+    except (AttributeError, OSError, ValueError):
+        return False
+    if os.isatty(fd):
+        return False
+    try:
+        os.ttyname(fd)
+    except OSError as exc:
+        return exc.errno in _TERMINAL_EOF_ERRNOS
+    return False
+
+
+def _silence_disconnected_terminal_output():
+    """Keep shutdown cleanup usable after the controlling PTY is gone."""
+    try:
+        null_fd = os.open(os.devnull, os.O_WRONLY)
+    except OSError:
+        return
+    try:
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                os.dup2(null_fd, stream.fileno())
+            except (AttributeError, OSError, ValueError):
+                pass
+    finally:
+        os.close(null_fd)
+
+
 def _simple_prompt(cwd: str) -> str:
     """Plain input() prompt for non-TTY environments (piped stdin, --execute mode).
 
@@ -15936,9 +16030,17 @@ def _simple_prompt(cwd: str) -> str:
     try:
         print(f"{cwd}\n$ ", end="", flush=True)
         raw = sys.stdin.buffer.readline()
+        if not raw:
+            raise EOFError("terminal input closed")
         return raw.decode("utf-8", errors="replace").strip()
-    except (KeyboardInterrupt, EOFError):
+    except KeyboardInterrupt:
         return ""
+    except EOFError:
+        raise
+    except OSError as exc:
+        if exc.errno in _TERMINAL_EOF_ERRNOS:
+            raise EOFError("terminal input closed") from exc
+        raise
 
 
 # ── Remote Message Injection ──────────────────────────────────────────────
@@ -16675,7 +16777,7 @@ def _request_email_approval(kind: str, summary: str, detail: str = "") -> bool:
     console.print(f"[cyan]Mail mode: emailed an approval request for {kind}. "
                   f"Waiting up to {timeout_s // 60} min for your decision…[/cyan]")
     deadline = time.time() + timeout_s
-    with console.status("[dim]Waiting for email approval…[/dim]"):
+    with _safe_status("[dim]Waiting for email approval…[/dim]"):
         while time.time() < deadline:
             if interrupt_event.is_set():
                 console.print("[dim]Mail approval wait cancelled.[/dim]")
@@ -17600,7 +17702,12 @@ def main():
             console.print(f"[yellow]mcp connect error: {_e}[/yellow]")
 
     # Setup graceful shutdown
-    def shutdown(signum=None, frame=None):
+    def shutdown(signum=None, frame=None, *, input_closed=False):
+        # A disconnected SSH/PTY leaves fd 0/1/2 pointing at a dead terminal.
+        # Reads then fail immediately with EIO and writes can fail too. Silence
+        # only that dead output before cleanup; normal Ctrl+D keeps its message.
+        if input_closed and _stdin_terminal_disconnected():
+            _silence_disconnected_terminal_output()
         # Kill any live-updating parallel-agents display first. rich's Live
         # runs a background thread that repaints ~8x/sec regardless of what
         # the main thread does; if it's still alive while this function
@@ -17645,6 +17752,7 @@ def main():
                 pass
         if (_terminal_agents.configured
                 and _terminal_agents.snapshot().get("running_count")
+                and not input_closed
                 and not getattr(shutdown, "interrupting", False)):
             if _terminal_agents.abort_foreground():
                 shutdown.interrupting = True
@@ -17766,8 +17874,10 @@ def main():
         _ensure_term0_alive()
         try:
             item = _get_input(str(os.getcwd()))
-        except (KeyboardInterrupt, EOFError):
+        except KeyboardInterrupt:
             shutdown()
+        except EOFError:
+            shutdown(input_closed=True)
 
         if isinstance(item, _InjectedInput):
             user_input = item.text

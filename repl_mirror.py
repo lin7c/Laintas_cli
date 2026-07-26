@@ -156,6 +156,17 @@ class MirrorHub:
         buffer.partial = pieces.pop()
         buffer.lines.extend(pieces)
 
+    def forget_agent(self, agent_id: str) -> None:
+        """Drop a terminated Agent's scrollback buffer so it cannot leak.
+
+        Called from agent_loop.unregister_agent. Without this, _buffers keeps one
+        _AgentBuffer per distinct agent_id for the whole process lifetime — each
+        bounded (deque maxlen), but unbounded in count as sub-agents spawn and
+        are fired.
+        """
+        with self._lock:
+            self._buffers.pop(str(agent_id or ""), None)
+
     # ── reading ────────────────────────────────────────────────────────
     def read_lines(self, agent_id: str, limit: int | None = None) -> list[str]:
         with self._lock:

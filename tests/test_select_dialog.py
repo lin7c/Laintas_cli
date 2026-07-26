@@ -28,14 +28,14 @@ AFTER_GRACE = 0.35
 
 
 class SelectDialogTests(unittest.TestCase):
-    def _run(self, items, keys, *, pre_keys="", **kwargs):
+    def _run(self, items, keys, *, pre_keys="", delay=AFTER_GRACE, **kwargs):
         result = {}
         with create_pipe_input() as pipe:
             if pre_keys:
                 pipe.send_text(pre_keys)
 
             def feed():
-                time.sleep(AFTER_GRACE)
+                time.sleep(delay)
                 pipe.send_text(keys)
 
             feeder = threading.Thread(target=feed)
@@ -64,6 +64,16 @@ class SelectDialogTests(unittest.TestCase):
 
     def test_q_cancels(self):
         self.assertIsNone(self._run(["Yes", "No"], "q", full_screen=False))
+
+    def test_escape_cancels_during_startup_grace_period(self):
+        self.assertIsNone(
+            self._run(
+                ["Yes", "No"], "\x1b", delay=0.05, full_screen=False))
+
+    def test_control_c_cancels_during_startup_grace_period(self):
+        self.assertIsNone(
+            self._run(
+                ["Yes", "No"], "\x03", delay=0.05, full_screen=False))
 
     def test_grace_period_ignores_replayed_enter(self):
         # A stray Enter queued before the dialog opens must not confirm;
@@ -133,6 +143,44 @@ class SelectionEntryPointTests(unittest.TestCase):
                 [{"id": "a"}], title="Choose",
                 label=lambda item: item["id"]))
         dialog.assert_not_called()
+
+    def test_blocking_operation_can_be_cancelled_by_escape(self):
+        with mock.patch.object(
+                laintas_cli.sys.stdin, "isatty", return_value=True), \
+                mock.patch.object(
+                    laintas_cli.sys.stdin, "fileno", return_value=42), \
+                mock.patch.object(
+                    laintas_cli.termios, "tcgetattr", return_value=["saved"]), \
+                mock.patch.object(laintas_cli.termios, "tcsetattr") as restore, \
+                mock.patch.object(laintas_cli.tty, "setcbreak"), \
+                mock.patch.object(
+                    laintas_cli.select, "select",
+                    side_effect=[([42], [], []), ([], [], [])]), \
+                mock.patch.object(
+                    laintas_cli.os, "read", return_value=b"\x1b"):
+            with self.assertRaises(laintas_cli.BlockingOperationCancelled):
+                laintas_cli.run_cancellable_blocking(
+                    lambda _cancel: time.sleep(1.0))
+
+        restore.assert_called_once_with(
+            42, laintas_cli.termios.TCSANOW, ["saved"])
+
+    def test_single_key_approval_receives_control_c_as_cancel(self):
+        with mock.patch.object(
+                laintas_cli.sys.stdin, "fileno", return_value=42), \
+                mock.patch.object(
+                    laintas_cli.termios, "tcgetattr", return_value=["saved"]), \
+                mock.patch.object(laintas_cli.termios, "tcsetattr"), \
+                mock.patch.object(laintas_cli.tty, "setraw") as setraw, \
+                mock.patch.object(
+                    laintas_cli.select, "select",
+                    return_value=([42], [], [])), \
+                mock.patch.object(
+                    laintas_cli.os, "read", return_value=b"\x03"):
+            self.assertIsNone(laintas_cli._read_single_key_choice(
+                allow_always=True, auto_confirm_seconds=None))
+
+        setraw.assert_called_once_with(42)
 
     def test_login_method_is_browser_oauth_only(self):
         with mock.patch.object(laintas_cli, "select_dialog") as dialog:

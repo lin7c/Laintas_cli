@@ -83,9 +83,49 @@ except Exception as e:  # aiortc optional — CLI runs without it
     AIORTC_AVAILABLE = False
     _IMPORT_ERROR = str(e)
 
-# Public STUN for NAT traversal. Swap for a self-hosted STUN/TURN to avoid
-# leaking IPs to a third party (see the security notes in the design).
-_DEFAULT_ICE = ["stun:stun.l.google.com:19302"]
+# Self-hosted STUN for NAT traversal. TURN URLs are intentionally rejected:
+# remote workspace payloads must remain peer-to-peer.
+_DEFAULT_ICE = ["stun:192.227.215.252:3478"]
+
+
+def normalize_stun_urls(value) -> list[str]:
+    """Flatten an RTC config, URL list, or comma-separated env value.
+
+    Only STUN endpoints are accepted. In particular, a compromised or
+    misconfigured Gateway cannot silently turn this P2P channel into TURN
+    relay traffic.
+    """
+    urls: list[str] = []
+
+    def collect(item):
+        if isinstance(item, dict):
+            if "iceServers" in item:
+                collect(item.get("iceServers"))
+            elif "urls" in item:
+                collect(item.get("urls"))
+            return
+        if isinstance(item, (list, tuple, set)):
+            for child in item:
+                collect(child)
+            return
+        if isinstance(item, str):
+            candidates = item.split(",")
+            for candidate in candidates:
+                url = candidate.strip()
+                if url.startswith("stun:") and len(url) <= 512 and url not in urls:
+                    urls.append(url)
+
+    collect(value)
+    return urls
+
+
+def configured_ice_servers(gateway_config=None) -> list[str]:
+    env_value = os.environ.get("LAINTAS_ICE_SERVERS", "")
+    return (
+        normalize_stun_urls(env_value)
+        or normalize_stun_urls(gateway_config)
+        or list(_DEFAULT_ICE)
+    )
 
 # ICE candidate sockets bind inside this fixed UDP window instead of a random
 # ephemeral port, so a host firewall can allowlist exactly this range. On the
@@ -409,7 +449,7 @@ class WebrtcManager:
         # push_signal(session_id, event_type, meta) → send an event back to the
         # browser via the agent event stream (e.g. "rtc-answer").
         self._push = push_signal
-        self._ice = ice_servers or _DEFAULT_ICE
+        self._ice = configured_ice_servers(ice_servers)
         self._pcs: dict = {}
         self._puts: dict = {}  # channel -> in-progress upload {f, path, written}
         self._vnc: dict = {}   # channel -> live VNC bridge {sock, task, name}

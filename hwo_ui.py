@@ -942,5 +942,9 @@ def run_hwo_ui(root_agent_name: str,
 
     try:
         app.run()
+    except (KeyboardInterrupt, EOFError):
+        # Esc/Ctrl+C bindings handle the steady state.  Treat interrupts that
+        # race application startup or teardown as the same ordinary cancel.
+        return
     finally:
         stop_evt.set()

@@ -237,9 +237,13 @@ def _download(url: str, label: str = "downloading", console=None) -> bytes:
     # durable newline-based snapshots in that mode so a long binary update
     # never looks frozen. The actual HTTP stream and returned bytes are shared
     # with the normal dynamic-progress path below.
-    output = getattr(con, "file", None)
-    if (type(output).__name__ == "StdoutProxy"
-            or type(output).__module__.startswith("prompt_toolkit.")):
+    #
+    # The shared console writes through repl_mirror.TeeFile, which forwards to
+    # the live sys.stdout — under the REPL that is the StdoutProxy above. So the
+    # console's own .file is a TeeFile (module ``repl_mirror``) and does NOT look
+    # like a proxy by class name; probe the real sys.stdout too, otherwise Live
+    # silently comes back and the update looks frozen again.
+    if _live_hostile_stdout(getattr(con, "file", None)):
         buf = bytearray()
         started = time.monotonic()
         last_reported_bucket = -1
@@ -282,6 +286,11 @@ def _download(url: str, label: str = "downloading", console=None) -> bytes:
         TransferSpeedColumn(),
         TimeRemainingColumn(),
         console=con, transient=True,
+        # redirect_stdout defaults to True: rich would swap sys.stdout for its
+        # own FileProxy, and when the console writes through repl_mirror.TeeFile
+        # (which resolves sys.stdout dynamically) that feeds the Live's output
+        # back into itself and deadlocks Live.__exit__. Keep the real stdout.
+        redirect_stdout=False, redirect_stderr=False,
     ) as progress:
         task = progress.add_task(label, total=total)
         for chunk in resp.iter_content(chunk_size=65536):
@@ -292,6 +301,28 @@ def _download(url: str, label: str = "downloading", console=None) -> bytes:
         if total is None:
             progress.update(task, total=len(buf), completed=len(buf))
     return bytes(buf)
+
+
+def _live_hostile_stdout(console_file=None) -> bool:
+    """True when a Rich Live animation can't render cleanly on the active output.
+
+    Rich's Live (progress bars, spinners) uses carriage-return animation. When
+    stdout is prompt_toolkit's line-oriented StdoutProxy — or the shared console
+    routes through repl_mirror.TeeFile, which forwards to that proxy — the
+    animation is buffered/overwritten and the display looks frozen. Detect both
+    the console's own file and the live sys.stdout so the caller can fall back to
+    plain newline output.
+    """
+    for stream in (console_file, sys.stdout):
+        if stream is None:
+            continue
+        name = type(stream).__name__
+        module = type(stream).__module__ or ""
+        if (name == "StdoutProxy"
+                or module.startswith("prompt_toolkit.")
+                or module == "repl_mirror"):
+            return True
+    return False
 
 
 def _format_download_size(value: int) -> str:

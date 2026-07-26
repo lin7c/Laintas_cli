@@ -2055,6 +2055,20 @@ def unregister_agent(agent_id: str, delete_persisted: bool = False) -> bool:
             agent_persistence.delete_agent_state(agent_id)
         except Exception:
             pass
+    # Free this agent's per-agent-id buffers so they don't accumulate one entry
+    # per distinct agent_id for the whole process lifetime (each bounded, but
+    # unbounded in count as sub-agents spawn and are fired). Best-effort — a
+    # cleanup hiccup must never break agent removal.
+    try:
+        import repl_mirror
+        repl_mirror.hub.forget_agent(agent_id)
+    except Exception:
+        pass
+    try:
+        import agent_ui_events
+        agent_ui_events.hub.forget_agent(agent_id)
+    except Exception:
+        pass
     _pump_queue()   # a slot may have freed
     return True
 
@@ -7426,8 +7440,11 @@ def run_agent_loop(
                     # actually failed — same shape, color carries the verdict.
                     ok_mark = "[success]●[/success]" if result.get("ok") else "[error]●[/error]"
                     _hint_plain = (salient if salient else display_name) or ""
-                    if name == "task.complete" and result.get("ok"):
-                        deps.console.rule(style="muted")
+                    if name in {"task.create", "task.update", "task.list", "task.get", "task.complete"} and result.get("ok"):
+                        if name == "task.complete":
+                            deps.console.rule(style="muted")
+                        # task.create / task.update / task.list / task.get: silent —
+                        # the live task list already reflects the changes.
                     elif _detail:
                         deps.console.print(
                             f"  {ok_mark} [accent.dim]{display_name}[/accent.dim] [dim]{_esc_hint(_crop_cells(_hint_plain, max(20, deps.console.width - 20), middle=True))}[/dim]")

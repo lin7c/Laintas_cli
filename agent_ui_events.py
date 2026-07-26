@@ -133,6 +133,17 @@ class AgentUIEventHub:
             self._events.clear()
             self._agent_events.clear()
 
+    def forget_agent(self, agent_id: str) -> None:
+        """Drop a terminated Agent's per-Agent event index so it cannot leak.
+
+        The global _events deque is bounded, but _agent_events keeps one bounded
+        deque per distinct agent_id for the whole process lifetime;
+        agent_loop.unregister_agent calls this when a sub-agent is removed. The
+        global ordered log is left intact (it is already bounded by maxlen).
+        """
+        with self._lock:
+            self._agent_events.pop(str(agent_id or ""), None)
+
     def emit(self, event_type: str, **values: Any) -> AgentUIEvent:
         with self._lock:
             self._seq += 1

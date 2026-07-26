@@ -1198,6 +1198,10 @@ class AgentsModeController:
         agent_ui_events.hub.subscribe(self.on_event)
         try:
             self.app.run()
+        except (KeyboardInterrupt, EOFError):
+            # Keep startup/render/teardown races cancellable even before the
+            # regular Esc/Ctrl+C key bindings become active.
+            return
         finally:
             # Workers may outlive the full-screen application. Close the
             # approval channel first so any later request is denied instead of

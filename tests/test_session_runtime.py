@@ -271,6 +271,98 @@ class AgentTerminationTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertEqual(result["completion_source"], "provider_stop")
 
+    def test_repeated_output_warns_without_interrupting_by_default(self):
+        repeated_calls = [{
+            "reply": "",
+            "tool_calls": [{"name": "time.now", "arguments": {}}],
+            "finish_reason": "tool_calls",
+            "done": False,
+            "error": False,
+        } for _ in range(4)]
+        result, calls, _ = self._run(repeated_calls + [{
+            "reply": "finished despite repeated output",
+            "tool_calls": [],
+            "finish_reason": "stop",
+            "done": False,
+            "error": False,
+        }], max_loops=6)
+
+        self.assertEqual(len(calls), 5)
+        self.assertTrue(result["success"])
+        self.assertEqual(result["exit_reason"], agent_loop.TRANSITION_END_TURN)
+
+    def test_repeated_output_can_interrupt_when_configured(self):
+        agent_loop.set_runtime_config("repetition_policy", "interrupt")
+        repeated_calls = [{
+            "reply": "",
+            "tool_calls": [{"name": "time.now", "arguments": {}}],
+            "finish_reason": "tool_calls",
+            "done": False,
+            "error": False,
+        } for _ in range(5)]
+        result, calls, _ = self._run(repeated_calls, max_loops=6)
+
+        self.assertEqual(len(calls), 4)
+        self.assertFalse(result["success"])
+        self.assertEqual(
+            result["exit_reason"], agent_loop.TRANSITION_REPETITION)
+
+    def test_repeated_failures_warn_without_hard_blocking_by_default(self):
+        repeated_calls = [{
+            "reply": "",
+            "tool_calls": [{"name": "missing.tool", "arguments": {}}],
+            "finish_reason": "tool_calls",
+            "done": False,
+            "error": False,
+        } for _ in range(4)]
+        result, calls, _ = self._run(repeated_calls + [{
+            "reply": "reported the failed sub-goal",
+            "tool_calls": [],
+            "finish_reason": "stop",
+            "done": False,
+            "error": False,
+        }], max_loops=6)
+
+        self.assertEqual(len(calls), 5)
+        self.assertTrue(result["success"])
+        self.assertEqual(result["exit_reason"], agent_loop.TRANSITION_END_TURN)
+
+    def test_no_action_limit_warns_without_ending_the_task(self):
+        ambiguous_turns = [{
+            "reply": f"intermediate reasoning {index}",
+            "tool_calls": [],
+            "finish_reason": "unknown",
+            "done": False,
+            "error": False,
+        } for index in range(4)]
+        result, calls, _ = self._run(ambiguous_turns + [{
+            "reply": "finished after ambiguous turns",
+            "tool_calls": [],
+            "finish_reason": "stop",
+            "done": False,
+            "error": False,
+        }], max_loops=6)
+
+        self.assertEqual(len(calls), 5)
+        self.assertTrue(result["success"])
+        self.assertEqual(result["exit_reason"], agent_loop.TRANSITION_END_TURN)
+
+    def test_idle_warning_does_not_preempt_silent_failure_error(self):
+        agent_loop.set_runtime_config("staleness_limit", 1)
+        result, calls, _ = self._run([{
+            "reply": "",
+            "tool_calls": [],
+            "finish_reason": "tool_calls",
+            "done": False,
+            "error": False,
+            "_billing": {},
+        }], max_loops=5)
+
+        self.assertEqual(len(calls), 3)
+        self.assertFalse(result["success"])
+        self.assertEqual(
+            result["exit_reason"], agent_loop.TRANSITION_SILENT_FAILURE)
+
     def test_short_final_reply_has_no_decorative_dot_prefix(self):
         deps, _ = _deps([{
             "reply": "你好！有什么可以帮你的？",
