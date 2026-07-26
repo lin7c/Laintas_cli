@@ -4591,6 +4591,26 @@ def _ranges_overlap(a_start, a_end, b_start, b_end) -> bool:
     return a_start <= b_end and b_start <= a_end
 
 
+def _read_fully_contained(new_start, new_end, prev_start, prev_end) -> bool:
+    """True ONLY when [new_start,new_end] is entirely within a prior read
+    [prev_start,prev_end] — a pure re-read with zero new lines.
+
+    If any part of the new range was not previously read, the read is justified
+    (the agent needs those lines) and must not be flagged. A merely adjacent or
+    edge-overlapping read (e.g. 306-320 after 316-335, which shares only
+    316-320 while 306-315 is new) is NOT a re-read.
+    """
+    if new_start is None or prev_start is None:
+        return False
+    if new_start < prev_start:
+        return False            # starts above the prior read → has new lines
+    if prev_end is None:
+        return True             # prior ran to EOF → covers everything from prev_start on
+    if new_end is None:
+        return False            # new runs to EOF but prior was bounded → new lines below
+    return new_end <= prev_end  # end within the prior end → fully contained
+
+
 def _output_similarity(a: str, b: str) -> float:
     """Token-level Jaccard similarity between two fingerprints.
 
@@ -4733,8 +4753,8 @@ def _detect_loop_warnings_typed(state: dict, original_input: str) -> list[tuple[
                         if not isinstance(out, str) or out.startswith(
                                 ("(output cleared", "(superseded")):
                             continue
-                        if _ranges_overlap(new_start, new_end,
-                                           prev_start, prev_end):
+                        if _read_fully_contained(new_start, new_end,
+                                                 prev_start, prev_end):
                             prev_range = f"{prev_start}-{prev_end or 'end'}"
                             new_range = f"{new_start}-{new_end or 'end'}"
                             warnings.append(("context_amnesia",
@@ -4753,8 +4773,14 @@ def _detect_loop_warnings_typed(state: dict, original_input: str) -> list[tuple[
         last4_fps = [_command_fingerprint((h.get("command") or "").strip()) for h in history[-4:]]
         non_empty = [fp for fp in last4_fps if fp]
         last4_tools = [h.get("tool", "") for h in history[-4:]]
+        # Exempt tools whose repeated back-to-back use is normal bookkeeping,
+        # not a stuck loop: terminal read/wait, agent wait, and the whole task.*
+        # family (task.create/update/list/get/complete advance state each call,
+        # but their JSON args collapse to the same `task.update <JSON>`
+        # fingerprint, which otherwise trips a false near-repeat warning).
         if (len(non_empty) >= 4 and len(set(non_empty)) == 1
                 and not all(t in {"terminal.read", "terminal.wait", "agent.wait"}
+                            or t.startswith("task.")
                             for t in last4_tools)):
             warnings.append(("near_repeat_command",
                 f"Near-repeat detected: last 4 commands have the same semantic pattern "
@@ -7899,10 +7925,11 @@ def run_agent_loop(
         for wk, warning_message in _current_warnings:
             _prev_count = _warning_streaks.get(wk, 0)
             _new_streaks[wk] = _prev_count + 1
-            if _prev_count == 0 and events_cb is not None:
-                deps.console.print(
-                    f"[yellow]⚠ Loop warning [{wk}]: {warning_message}[/yellow]"
-                )
+            # Advisory loop warnings are for the AI only: they are injected into
+            # the <warnings> block of the prompt every turn so the model can
+            # self-correct. Do NOT print them to the user's console — they are
+            # internal nudges, not user-facing events. Only enforcement
+            # (force-exit below) is surfaced to the user.
             if (get_runtime_config("repetition_policy") == "interrupt"
                     and wk not in _ADVISORY_ONLY_WARNINGS
                     and _new_streaks[wk] >= _warning_force_limit):

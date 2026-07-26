@@ -837,14 +837,16 @@ def clear_session_steps(*, cwd: Optional[str] = None,
                         session_id: Optional[str] = None,
                         owner_agent_id: Optional[str] = None) -> None:
     with transaction(cwd) as conn:
-        query = "DELETE FROM steps WHERE session_only=1"
-        args: list[Any] = []
+        # Always scope by work_items.session_id so a session_id=None call only
+        # clears the unscoped (legacy/global) work items, not every session's
+        # ephemeral steps.  Without this, one /new could wipe another live
+        # session's plan.
+        query = ("DELETE FROM steps WHERE session_only=1 "
+                 "AND work_id IN (SELECT id FROM work_items WHERE session_id IS ?)")
+        args: list[Any] = [session_id]
         if owner_agent_id is not None:
             query += " AND owner_agent_id=?"
             args.append(owner_agent_id)
-        if session_id is not None:
-            query += " AND work_id IN (SELECT id FROM work_items WHERE session_id=?)"
-            args.append(session_id)
         conn.execute(query, args)
 
 
@@ -919,6 +921,16 @@ def import_session_steps(work_id: str, items: list[dict], *,
             step_id = id_map.get(str(item.get("id") or ""))
             if not step_id:
                 continue
+            # Restore parent_id hierarchy (translate old ID through id_map).
+            # The INSERT above left parent_id NULL because the parent's new ID
+            # may not have been known yet; resolve it now that id_map is full.
+            old_parent = item.get("parent_id")
+            if old_parent:
+                new_parent = id_map.get(str(old_parent))
+                if new_parent and new_parent != step_id:
+                    conn.execute(
+                        "UPDATE steps SET parent_id=? WHERE work_id=? AND id=?",
+                        (new_parent, work_id, step_id))
             for old_blocker in item.get("blockedBy", []) or []:
                 blocker = id_map.get(str(old_blocker))
                 if not blocker or blocker == step_id:

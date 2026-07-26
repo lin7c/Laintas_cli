@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import threading
 import uuid
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -37,18 +36,8 @@ import workgraph
 TASKS_PATH = paths.TASKS_FILE
 _lock = threading.RLock()
 
-# Valid status transitions
-_STATUS_FLOW = {
-    "pending": {"in_progress", "completed", "deleted"},
-    "in_progress": {"completed", "pending", "deleted"},
-    "completed": {"in_progress", "deleted"},  # can re-open
-    "deleted": set(),  # terminal state
-}
-
 # ── Session-level tasks (in-memory, not persisted) ──────────────────────
 
-_session_tasks: list[dict] = []
-_session_id_counter: int = 0
 _session_key: str = uuid.uuid4().hex[:16]
 _LEGACY_IMPORT_KEY = "legacy_tasks_imported"
 
@@ -166,48 +155,6 @@ def _load(cwd: str = None) -> list[dict]:
         task.setdefault("notes", [])
         normalized.append(task)
     return normalized
-
-
-def _save(tasks: list[dict], cwd: str = None) -> None:
-    """Atomically write tasks to disk. cwd selects project-level file."""
-    path = _project_path(cwd) if cwd else TASKS_PATH
-    try:
-        json_store.save_json_atomic(path, tasks)
-    except OSError as exc:
-        raise TaskStorageError(f"Failed to save tasks to {path}: {exc}") from exc
-
-
-def _new_task_record(task_id: str, subject: str, description: str = "",
-                     metadata: dict = None, *, session_only: bool = False,
-                     parent_task_id: str = None) -> dict:
-    now = datetime.now(timezone.utc).isoformat()
-    task = {
-        "id": task_id,
-        "subject": subject,
-        "description": description,
-        "status": "pending",
-        "created": now,
-        "updated": now,
-        "metadata": metadata or {},
-        "blocks": [],
-        "blockedBy": [str(parent_task_id)] if parent_task_id else [],
-        "progress": 0,
-        "notes": [],
-    }
-    if session_only:
-        task["session_only"] = True
-    return task
-
-
-def _next_id(tasks: list[dict]) -> str:
-    """Generate the next task ID. Short numeric string."""
-    max_id = 0
-    for t in tasks:
-        try:
-            max_id = max(max_id, int(t.get("id", "0")))
-        except (ValueError, TypeError):
-            pass
-    return str(max_id + 1)
 
 
 def create_task(subject: str, description: str = "",
@@ -363,10 +310,21 @@ def get_available_tasks(*, cwd: str = None, session_id: str = None,
     """Get tasks ready to work on: pending, not blocked by any incomplete task."""
     tasks = list_tasks(cwd=cwd, session_id=session_id,
                        owner_agent_id=owner_agent_id)
-    status = {str(item["id"]): item.get("status") for item in tasks}
+    # Build the blocker-status lookup from ALL steps in the active work, not
+    # just the owner-scoped subset returned by list_tasks: a dependency may
+    # reference another agent's task in the same session, which would be
+    # invisible (and thus permanently blocking) if we only checked the caller's
+    # own tasks.
+    work = _read_work(cwd, session_id)
+    blocker_status: dict[str, str] = {}
+    if work:
+        for step in workgraph.list_steps(
+                work["id"], cwd=cwd, include_deleted=True,
+                session_id=session_id):
+            blocker_status[str(step["id"])] = step.get("status", "pending")
     return [item for item in tasks
             if item.get("status") == "pending"
-            and all(status.get(str(blocker)) in ("completed", "skipped", "deleted")
+            and all(blocker_status.get(str(blocker)) in ("completed", "skipped", "deleted")
                     for blocker in item.get("blockedBy", []))]
 
 
@@ -406,10 +364,7 @@ def get_active_tasks_snapshot(*, cwd: str = None, session_id: str = None,
 def clear_session_tasks(*, cwd: str = None, session_id: str = None,
                         owner_agent_id: str = None) -> None:
     """Remove all session-level tasks."""
-    global _session_tasks, _session_id_counter
     with _lock:
-        _session_tasks.clear()
-        _session_id_counter = 0
         try:
             if workgraph.db_path(cwd).exists():
                 workgraph.clear_session_steps(
