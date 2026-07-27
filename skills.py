@@ -342,6 +342,27 @@ def unload_skill(name: str) -> tuple[bool, str]:
     return True, f"{name}: unloaded ({removed} tool(s) removed)"
 
 
+def loaded_skill_names() -> list[str]:
+    """Return the names of all currently-loaded skills (tools/body active)."""
+    return [name for name, st in _skill_states.items() if st and st.loaded]
+
+
+def unload_all_skills() -> list[tuple[str, bool, str]]:
+    """Unload every currently-loaded skill, freeing their tools and context.
+
+    The inverse of loading each skill; a no-op returns []. Use this to reclaim
+    context in one shot when a batch of specialized work is finished. Returns
+    ``[(name, ok, message), ...]`` for each skill that was loaded.
+    """
+    if not _scan_done:
+        scan_metadata()
+    results: list[tuple[str, bool, str]] = []
+    for name in loaded_skill_names():
+        ok, msg = unload_skill(name)
+        results.append((name, ok, msg))
+    return results
+
+
 def list_skills() -> list[dict]:
     """Return lightweight skill catalog for tools/UI."""
     if not _scan_done:
@@ -621,12 +642,16 @@ def install_template(name: str) -> tuple[bool, str]:
 def get_activated_skills_context() -> str:
     """Return a concatenated string of all activated skill bodies.
 
-    Used for {{skillContext}} template variable injection.
+    Used for {{skillContext}} template variable injection. The full SKILL.md body
+    is injected — there is no per-skill length cap, so a skill is never silently
+    truncated once loaded. Context is instead bounded by unloading skills when
+    their work is done (see ``unload_skill`` / ``unload_all_skills`` and the
+    ``skill.unload`` tool).
     """
     parts = []
     for name, state in _skill_states.items():
         if state.loaded and state.body:
-            parts.append(f"### Skill: {name}\n{state.body[:2000]}")
+            parts.append(f"### Skill: {name}\n{state.body}")
     return "\n\n".join(parts) if parts else ""
 
 

@@ -40,8 +40,28 @@ MEMORY_TYPES = {
     "user": "User profile, role, preferences, knowledge level",
     "feedback": "User corrections and confirmations about how to approach work",
     "project": "Project goals, deadlines, constraints, ongoing initiatives",
+    "structure": "Project structure / architecture facts (module map, layout, key files)",
     "reference": "Pointers to external resources (dashboards, repos, channels)",
 }
+
+# User-facing category labels for each underlying type. Single source of truth
+# shared by the /memory manager UI and the extraction prompt so the taxonomy
+# never drifts between the two.
+CATEGORY_LABELS = {
+    "user": "User Info",
+    "feedback": "Preferences",
+    "project": "Project Updates",
+    "structure": "Project Structure",
+    "reference": "External Resources",
+}
+
+# Stable display order for the manager UI (global types first, then local).
+CATEGORY_ORDER = {"user": 0, "feedback": 1, "project": 2, "structure": 3, "reference": 4}
+
+
+def scope_label(scope: str) -> str:
+    """Human label for a stored scope: user scope = global, project scope = local."""
+    return "global" if scope == "user" else "local"
 
 _MEMORY_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,79}$")
 _LEGACY_MEMORY_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_. -]{0,79}$")
@@ -414,11 +434,13 @@ def _remove_from_index(name: str) -> None:
     MEMORY_INDEX.write_text('\n'.join(lines), encoding="utf-8")
 
 
-def load_all_for_prompt(max_per_type: int = 5) -> str:
-    """Load all memories formatted for inclusion in the AI system prompt.
+def load_all_for_prompt(max_per_type: int = 8) -> str:
+    """Load persistent memories formatted for the AI system prompt.
 
-    Returns a multi-section string suitable for appending to the prompt.
-    Grouped by type. Capped at max_per_type per type.
+    Context-frugal by design: the model sees only the CATEGORY + one-line SUMMARY
+    (description) of each memory — never the full body — so this stays small even
+    as bodies grow. The agent expands any entry on demand via the ``mem.read``
+    tool. Grouped by category, capped at ``max_per_type`` per category.
     """
     ensure_memory_dir()
     memories = list_memories()
@@ -434,6 +456,7 @@ def load_all_for_prompt(max_per_type: int = 5) -> str:
         "user": "USER PROFILE",
         "feedback": "FEEDBACK & PREFERENCES",
         "project": "PROJECT CONTEXT",
+        "structure": "PROJECT STRUCTURE",
         "reference": "REFERENCES",
     }
 
@@ -445,17 +468,18 @@ def load_all_for_prompt(max_per_type: int = 5) -> str:
         )[:max_per_type]
         if not entries:
             continue
-        lines = [f"[{label}]"]
+        lines = [f"[{label}] ({CATEGORY_LABELS.get(mem_type, mem_type)})"]
         for entry in entries:
-            data = read_memory(entry["name"])
-            if data:
-                body_preview = data["body"][:300]
-                lines.append(
-                    f"  {entry['name']} [{entry.get('scope')}:{entry.get('scope_id')}]: {body_preview}"
-                )
+            scope_tag = scope_label(entry.get("scope"))
+            summary = (entry.get("description") or "").strip() or "(no summary)"
+            lines.append(f"  {entry['name']} [{scope_tag}] — {summary}")
         sections.append('\n'.join(lines))
 
-    return '\n\n'.join(sections) if sections else ""
+    if not sections:
+        return ""
+    sections.append("(Only summaries are shown. Use the mem.read tool with a "
+                    "memory's name to load its full content when needed.)")
+    return '\n\n'.join(sections)
 
 
 # ── Integration with agent_loop ─────────────────────────────────────────

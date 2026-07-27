@@ -2695,7 +2695,7 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec("/skill", "Manage skills", "Config & Tools", "/skill [manager|list|trust|revoke|load|unload|reload|new|dir]", subcommands=("manager", "list", "trust", "revoke", "load", "unload", "reload", "new", "dir")),
     CommandSpec("/mcp", "Manage MCP servers", "Config & Tools", "/mcp {list|trust|revoke|connect|disconnect|reload|tools|init|config}", subcommands=("list", "trust", "revoke", "connect", "disconnect", "reload", "tools", "init", "config")),
     CommandSpec("/bash", "Run a command through term0", "Config & Tools", "/bash <command>|list|add <command>|remove <command>", subcommands=("list", "add", "remove")),
-    CommandSpec("/memory", "Inspect project and persistent memory", "Config & Tools", "/memory [project|persistent|show <id|name>]", subcommands=("project", "persistent", "global", "show")),
+    CommandSpec("/memory", "Manage memory (interactive view/delete); split into global/local", "Config & Tools", "/memory [global|local|persistent|project|show <id|name>]", subcommands=("global", "local", "persistent", "project", "show")),
     CommandSpec("/mail", "Check or send mail to/from your Laintas account", "Config & Tools", "/mail [inbox [--all]|read <n>|send [subject]]", subcommands=("inbox", "read", "send")),
     CommandSpec("/prop", "View .laintas/cli.prop prompt template", "Config & Tools"),
     CommandSpec("/debug", "Browse or export debug entries", "Config & Tools", "/debug [clear|N|N <file> [--raw]]", subcommands=("clear",)),
@@ -8914,6 +8914,7 @@ _SLASH_ARG_RULES: dict[tuple[str, ...], SlashArgRule] = {
     ("/memory", "project"): _arg_rule(1, "/memory project"),
     ("/memory", "persistent"): _arg_rule(1, "/memory persistent"),
     ("/memory", "global"): _arg_rule(1, "/memory global"),
+    ("/memory", "local"): _arg_rule(1, "/memory local"),
     ("/memory", "show"): _arg_rule(2, "/memory show <id|name>"),
     ("/mail", "inbox"): _arg_rule(
         2, "/mail inbox [--all]", flag_start=1, allowed_flags=("--all",)),
@@ -10261,13 +10262,124 @@ def _cmd_name(raw_args: str, session: dict, agent_registry: AgentRegistry) -> No
         console.print("       /term rename <old> <new>  (rename a terminal)")
 
 
+def _memory_manager() -> None:
+    """Interactive persistent-memory manager: browse the memories visible in the
+    current scope (grouped global first then local, then by category), view a full
+    entry (Enter), and delete one in place (x). Reuses the same single-loop
+    select_dialog pattern as the resume-session picker (action_keys + enter_action,
+    inline delete with a status line); no-ops gracefully on non-interactive stdin."""
+    import memory_system
+    entries = memory_system.list_memories()
+    if not entries:
+        console.print("[dim]No persistent memories in this scope.[/dim]")
+        return
+    entries.sort(key=lambda e: (
+        0 if e.get("scope") == "user" else 1,
+        memory_system.CATEGORY_ORDER.get(e.get("type"), 9),
+        -float(e.get("importance", 0.5) or 0.5),
+    ))
+
+    def _labels():
+        rows = []
+        for e in entries:
+            scope_txt = memory_system.scope_label(e.get("scope"))
+            cat = memory_system.CATEGORY_LABELS.get(e.get("type"), e.get("type"))
+            rows.append((
+                f"[dim]{scope_txt}[/dim]  [cyan]{cat}[/cyan]  [bold]{e.get('name')}[/bold]",
+                (e.get("description") or "").strip(),
+            ))
+        return rows
+
+    sel_idx = 0
+    status_msg = ""
+    while entries:
+        hint = "↑↓ navigate  ↵ view  x delete  q cancel"
+        if status_msg:
+            hint = f"{status_msg}\n{hint}"
+        result = select_dialog(
+            _labels(),
+            title="Memory Manager",
+            full_screen=True,
+            selected_index=sel_idx,
+            search=True,
+            action_keys={"x": "delete"},
+            enter_action="view",
+            hint=hint,
+        )
+        if result is None:
+            return
+        action, idx = result
+        if action is None or idx < 0 or idx >= len(entries):
+            return
+        entry = entries[idx]
+        name = entry.get("name", "")
+        status_msg = ""
+        if action == "view":
+            data = memory_system.read_memory(name)
+            with _alt_screen():
+                if data is None:
+                    console.print(f"[red]Memory '{name}' is no longer readable.[/red]")
+                else:
+                    scope_txt = memory_system.scope_label(entry.get("scope"))
+                    cat = memory_system.CATEGORY_LABELS.get(entry.get("type"), entry.get("type"))
+                    summary = (data.get("meta", {}).get("description") or "").strip()
+                    body = data.get("body", "")
+                    panel_body = (f"[bold]Summary:[/bold] {summary}\n\n[dim]Full memory:[/dim]\n{body}"
+                                  if summary else body)
+                    _print_long_panel(panel_body, f"[{scope_txt}] {cat} · {name}")
+                input("\n[dim]Press Enter to continue...[/dim]")
+            sel_idx = idx
+        elif action == "delete":
+            ok, msg = memory_system.delete_memory(name)
+            if ok:
+                del entries[idx]
+                status_msg = f"[green]Deleted memory {name}.[/green]"
+                sel_idx = min(idx, len(entries) - 1) if entries else 0
+            else:
+                status_msg = f"[red]Delete failed: {msg}[/red]"
+                sel_idx = idx
+
+
 def _cmd_memory(parts: list) -> None:
     import memory_system
     sub = parts[1].lower() if len(parts) > 1 else ""
     project_entries, project_errors, _ = _load_project_memory_entries()
     persistent_entries = memory_system.list_memories()
 
-    if sub in ("", "project"):
+    def _persistent_table(rows: list, title: str) -> None:
+        if not rows:
+            console.print("[dim]No persistent memories in this scope.[/dim]")
+            return
+        table = Table(title=title, show_lines=False)
+        table.add_column("Name", style="cyan")
+        table.add_column("Category")
+        table.add_column("Scope", style="dim")
+        table.add_column("Description")
+        for entry in rows:
+            table.add_row(
+                entry.get("name", "?"),
+                memory_system.CATEGORY_LABELS.get(
+                    entry.get("type"), entry.get("type", "unknown")),
+                memory_system.scope_label(entry.get("scope")),
+                entry.get("description", ""),
+            )
+        console.print(table)
+        console.print("[dim]Run /memory show <name> for full text, or /memory to open the manager.[/dim]")
+
+    if sub == "":
+        # Interactive manager on a real terminal; scriptable summary otherwise.
+        if sys.stdin.isatty() and console.is_terminal:
+            _memory_manager()
+        else:
+            console.print(
+                f"[dim]Persistent memory: {len(persistent_entries)} visible. "
+                "List with /memory global|local|persistent, or /memory show <name>.[/dim]")
+            if project_entries:
+                console.print(
+                    f"[dim]Project memory.json: {len(project_entries)} entries. See /memory project.[/dim]")
+        return
+
+    if sub == "project":
         if project_errors:
             console.print(Panel(
                 "\n".join(f"[red]- {error}[/red]" for error in project_errors)
@@ -10286,30 +10398,25 @@ def _cmd_memory(parts: list) -> None:
             ))
         else:
             console.print("[dim]Project memory is empty.[/dim]")
-        if sub == "":
-            console.print(
-                f"[dim]Persistent memory: {len(persistent_entries)} visible entr"
-                f"{'y' if len(persistent_entries) == 1 else 'ies'}. "
-                "Use /memory persistent to list them.[/dim]")
+        return
 
-    elif sub in ("persistent", "global"):
-        if not persistent_entries:
-            console.print("[dim]No persistent memories are visible in this scope.[/dim]")
-        else:
-            table = Table(title="Persistent Memory", show_lines=False)
-            table.add_column("Name", style="cyan")
-            table.add_column("Type")
-            table.add_column("Scope", style="dim")
-            table.add_column("Description")
-            for entry in persistent_entries:
-                table.add_row(
-                    entry.get("name", "?"), entry.get("type", "unknown"),
-                    entry.get("scope", "?"), entry.get("description", ""),
-                )
-            console.print(table)
-            console.print("[dim]Run /memory show to choose an entry, or pass its name directly.[/dim]")
+    if sub == "global":
+        _persistent_table(
+            [e for e in persistent_entries if e.get("scope") == "user"],
+            "Global Memory")
+        return
 
-    elif sub == "show":
+    if sub == "local":
+        _persistent_table(
+            [e for e in persistent_entries if e.get("scope") == "project"],
+            "Local Memory (current project)")
+        return
+
+    if sub == "persistent":
+        _persistent_table(persistent_entries, "Persistent Memory (All)")
+        return
+
+    if sub == "show":
         selector = parts[2] if len(parts) >= 3 else ""
         selected_kind = ""
         if not selector and sys.stdin.isatty():
@@ -10359,7 +10466,7 @@ def _cmd_memory(parts: list) -> None:
                     f"Persistent memory: {selector}",
                 )
     else:
-        console.print("[yellow]Usage: /memory [project|persistent|show <id|name>][/yellow]")
+        console.print("[yellow]Usage: /memory [global|local|persistent|project|show <id|name>][/yellow]")
 
 
 # Last `/mail inbox` listing, so `/mail read <n>` can resolve a position to
@@ -14122,6 +14229,13 @@ def _cmd_skill(parts: list) -> bool:
                         console.print("[yellow]Skill not trusted.[/yellow]")
     elif sub in ("load", "unload"):
         skill_name = parts[2] if len(parts) >= 3 else ""
+        if sub == "unload" and skill_name.lower() == "all":
+            results = skills_mod.unload_all_skills()
+            if not results:
+                console.print("[dim]No skills are loaded.[/dim]")
+            for name, ok, msg in results:
+                console.print(f"[{'green' if ok else 'red'}]{msg}[/{'green' if ok else 'red'}]")
+            return False
         if not skill_name and sys.stdin.isatty():
             skills = skills_mod.list_skills()
             eligible = [
@@ -14161,7 +14275,7 @@ def _cmd_skill(parts: list) -> bool:
     elif sub == "dir":
         console.print(str(skills_mod.SKILLS_DIR))
     else:
-        console.print("[yellow]Usage: /skill [manager|list|trust <name>|revoke <name>|load <name>|unload <name>|reload|new <name>|dir][/yellow]")
+        console.print("[yellow]Usage: /skill [manager|list|trust <name>|revoke <name>|load <name>|unload <name>|unload all|reload|new <name>|dir][/yellow]")
 
     return False
 

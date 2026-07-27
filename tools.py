@@ -653,11 +653,20 @@ def _bi_skill_load(params: dict, ctx: ToolCtx) -> dict:
 
 
 def _bi_skill_unload(params: dict, ctx: ToolCtx) -> dict:
-    """Unload a previously loaded skill, freeing its tools and context."""
+    """Unload a loaded skill (or ALL loaded skills when no name is given),
+    freeing their tools and reclaiming the context their bodies occupied."""
     import skills as _skills
     name = (params.get("name") or "").strip()
     if not name:
-        return {"ok": False, "error": "missing 'name'"}
+        results = _skills.unload_all_skills()
+        if not results:
+            return {"ok": True, "result": "no skills were loaded"}
+        freed = [n for n, ok, _ in results if ok]
+        return {
+            "ok": True,
+            "result": f"unloaded {len(freed)} skill(s): {', '.join(freed)}",
+            "instruction": "All loaded skills are now unloaded; their instructions and tools are gone from the next turn.",
+        }
     ok, msg = _skills.unload_skill(name)
     if not ok:
         return {"ok": False, "error": msg}
@@ -2370,11 +2379,15 @@ def _bi_spawn(params: dict, ctx: ToolCtx) -> dict:
         return {"ok": False, "error": "Cannot spawn child agent."}
     _al.enter_waiting(parent_id)
     try:
-        info = _al.wait_for_agent(child_id, timeout=300)
+        _parent = _al.get_agent(parent_id)
+        _abort_ev = _parent.abort_event if _parent is not None else None
+        info = _al.wait_for_agent(child_id, timeout=300, abort_event=_abort_ev)
     finally:
         _al.exit_waiting(parent_id)
     if info is None:
         _al.abort_agent(child_id)
+        if _abort_ev is not None and _abort_ev.is_set():
+            return {"ok": False, "error": f"spawn interrupted: {goal[:80]}"}
         return {"ok": False, "error": f"spawn timed out: {goal[:80]}"}
     if info.status != "done":
         return {"ok": False, "result": f"[{child_id}] {info.error or info.status}"}
@@ -2788,6 +2801,8 @@ def _bi_spawn_chain(params: dict, ctx: ToolCtx) -> dict:
     summaries = []
     child_ids = []
     handoff = ""
+    _parent = _al.get_agent(parent_id)
+    _abort_ev = _parent.abort_event if _parent is not None else None
     for index, step in enumerate(steps):
         goal = str(step.get("goal") or "").strip()
         if not goal:
@@ -2814,12 +2829,16 @@ def _bi_spawn_chain(params: dict, ctx: ToolCtx) -> dict:
         child_ids.append(cid)
         _al.enter_waiting(parent_id)
         try:
-            info = _al.wait_for_agent(cid, timeout=300)
+            info = _al.wait_for_agent(cid, timeout=300, abort_event=_abort_ev)
         finally:
             _al.exit_waiting(parent_id)
         if info is None:
             _al.abort_agent(cid)
-            return {"ok": False, "result": f"Chain {chain_id} timed out at step {index + 1}"}
+            if _abort_ev is not None and _abort_ev.is_set():
+                return {"ok": False, "result": f"Chain {chain_id} interrupted at step {index + 1}",
+                        "child_ids": child_ids}
+            return {"ok": False, "result": f"Chain {chain_id} timed out at step {index + 1}",
+                    "child_ids": child_ids}
         if info.status != "done":
             return {
                 "ok": False,
@@ -2861,10 +2880,13 @@ def _bi_await_spawns(params: dict, ctx: ToolCtx) -> dict:
     if not target_ids:
         return {"ok": True, "result": "No agents to wait for."}
 
-    STALL_S = 120
     HARD_CAP_S = 20 * 60
     start = time.time()
     hard_cap_reached = False
+    interrupted = False
+
+    _parent = _al.get_agent(parent_id) if parent_id else None
+    _abort_ev = _parent.abort_event if _parent is not None else None
 
     if parent_id:
         _al.enter_waiting(parent_id)
@@ -2873,6 +2895,9 @@ def _bi_await_spawns(params: dict, ctx: ToolCtx) -> dict:
             agents = [_al.get_agent(aid) for aid in target_ids]
             agents = [a for a in agents if a is not None]
             if all(a.status in ("done", "error", "aborted") for a in agents):
+                break
+            if _abort_ev is not None and _abort_ev.is_set():
+                interrupted = True
                 break
             elapsed = time.time() - start
             if elapsed > HARD_CAP_S:
@@ -2883,7 +2908,7 @@ def _bi_await_spawns(params: dict, ctx: ToolCtx) -> dict:
         if parent_id:
             _al.exit_waiting(parent_id)
 
-    if hard_cap_reached:
+    if hard_cap_reached or interrupted:
         for aid in target_ids:
             info = _al.get_agent(aid)
             if info and info.status not in ("done", "error", "aborted"):
@@ -2901,7 +2926,12 @@ def _bi_await_spawns(params: dict, ctx: ToolCtx) -> dict:
             lines.append(f"Error: {a.error[:200]}")
     ok = all(a.status == "done" for a in agents)
     succeeded = sum(1 for a in agents if a.status == "done")
-    lines.append(f"\n═══ Summary: {succeeded}/{len(agents)} succeeded ═══")
+    summary_tail = f"{succeeded}/{len(agents)} succeeded"
+    if interrupted:
+        summary_tail += " (interrupted)"
+    elif hard_cap_reached:
+        summary_tail += " (timed out)"
+    lines.append(f"\n═══ Summary: {summary_tail} ═══")
     return {"ok": ok, "result": "\n".join(lines)}
 
 
@@ -3194,14 +3224,21 @@ def _bi_agent_wait(params: dict, ctx: ToolCtx) -> dict:
     if ctx.wait_for_agent is None:
         return {"ok": False, "error": "wait not available"}
     import agent_loop as _al
+    _abort_ev = None
+    if ctx.agent_id:
+        _parent = _al.get_agent(ctx.agent_id)
+        if _parent is not None:
+            _abort_ev = _parent.abort_event
     if ctx.agent_id:
         _al.enter_waiting(ctx.agent_id)
     try:
-        info = ctx.wait_for_agent(target_id, timeout)
+        info = ctx.wait_for_agent(target_id, timeout, abort_event=_abort_ev)
     finally:
         if ctx.agent_id:
             _al.exit_waiting(ctx.agent_id)
     if info is None:
+        if _abort_ev is not None and _abort_ev.is_set():
+            return {"ok": False, "error": f"wait interrupted: agent '{target_id}'"}
         return {"ok": False, "error": f"agent '{target_id}' not found or timed out"}
     return {"ok": True, "result": f"Agent {target_id}: {info.status}", "status": info.status}
 
@@ -5598,14 +5635,15 @@ def register_builtin_tools() -> None:
             name="mem.save",
             description="Save a persistent memory that survives across sessions. "
                         "Types: user (profile/preferences), feedback (corrections/confirmations), "
-                        "project (goals/deadlines), reference (external resources). "
+                        "project (goals/deadlines), structure (project architecture/layout facts), "
+                        "reference (external resources). "
                         "Use this to remember important facts for future conversations.",
             schema={
                 "type": "object",
                 "properties": {
                     "name": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_-]{0,79}$",
                              "description": "lowercase slug (e.g., 'user-role')"},
-                    "type": {"type": "string", "enum": ["user", "feedback", "project", "reference"],
+                    "type": {"type": "string", "enum": ["user", "feedback", "project", "structure", "reference"],
                             "description": "memory category"},
                     "description": {"type": "string", "description": "one-line summary for the index"},
                     "body": {"type": "string", "description": "full memory content (markdown)"},
@@ -5638,7 +5676,7 @@ def register_builtin_tools() -> None:
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "optional lexical search query"},
-                    "type": {"type": "string", "enum": ["user", "feedback", "project", "reference"],
+                    "type": {"type": "string", "enum": ["user", "feedback", "project", "structure", "reference"],
                             "description": "filter by type (omit for all)"},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10},
                 },
@@ -5667,15 +5705,16 @@ def register_builtin_tools() -> None:
         ),
         Tool(
             name="skill.unload",
-            description="Unload a previously loaded skill: drop its tools and stop injecting its "
+            description="Unload a loaded skill: drop its tools and stop injecting its "
                         "instructions. Call when you are done with that specialized work to free "
-                        "context. The skill stays available and can be re-loaded later.",
+                        "context. Omit 'name' to unload ALL loaded skills at once. Skills stay "
+                        "available and can be re-loaded later.",
             schema={
                 "type": "object",
                 "properties": {
-                    "name": {"type": "string", "description": "Skill name to unload"},
+                    "name": {"type": "string",
+                             "description": "Skill name to unload; omit to unload every loaded skill"},
                 },
-                "required": ["name"],
             },
             invoke=_bi_skill_unload,
         ),

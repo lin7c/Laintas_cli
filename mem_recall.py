@@ -155,18 +155,15 @@ def relevant_block(query: str, *, k: int = 5, session: Optional[dict] = None) ->
         return ""
     if not hits:
         return ""
-    lines = ["★ Most relevant memories for the current task:"]
+    # Summary-only, like the bulk context: name + category + one-line summary, no
+    # body. The agent expands a specific entry via mem.read when it needs detail.
+    lines = ["★ Most relevant memories for the current task (summaries; use mem.read for full text):"]
     for h in hits:
         name = h.get("name", "")
         typ = h.get("type", "")
-        desc = h.get("description", "")
-        preview = (h.get("body_preview", "") or "").strip().replace("\n", " ")
-        if len(preview) > 240:
-            preview = preview[:240] + "…"
+        desc = (h.get("description", "") or "").strip()
         head = f"- [{name}]" + (f" ({typ})" if typ else "")
         lines.append(f"{head} {desc}".rstrip())
-        if preview:
-            lines.append(f"    {preview}")
     return "\n".join(lines)
 
 

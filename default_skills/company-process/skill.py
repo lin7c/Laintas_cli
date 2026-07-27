@@ -409,16 +409,23 @@ def _t_status(params: dict, ctx) -> dict:
 
 
 def get_tools():
+    # Capabilities must be declared explicitly: these tools are named `company.*`,
+    # which infer_capabilities() cannot map to a known capability (it would fall
+    # back to core.other and fail the manifest subset check). deploy/run register
+    # employees (agent.control), spawn role sub-terminals (process.exec), and
+    # write run state/workspaces (fs.write); list/status only read state.
+    _RW = frozenset({"agent.control", "process.exec", "fs.read", "fs.write"})
+    _RO = frozenset({"fs.read"})
     return [
         Tool(name="company.deploy", description="Register a Helpwo company process on the CLI and pre-hire its employees (set runNow to also run one cycle).",
              schema={"type": "object", "properties": {"process": {"type": "object"}, "runNow": {"type": "boolean"}}, "required": ["process"]},
-             invoke=_t_deploy, source="skill:company-process"),
+             invoke=_t_deploy, source="skill:company-process", capabilities=_RW),
         Tool(name="company.run", description="Run one cycle of a registered company process now.",
              schema={"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]},
-             invoke=_t_run, source="skill:company-process"),
+             invoke=_t_run, source="skill:company-process", capabilities=_RW),
         Tool(name="company.list", description="List registered company processes and their last run status.",
-             schema={"type": "object", "properties": {}}, invoke=_t_list, source="skill:company-process"),
+             schema={"type": "object", "properties": {}}, invoke=_t_list, source="skill:company-process", capabilities=_RO),
         Tool(name="company.status", description="Show the last-run status and workspace of a company process.",
              schema={"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]},
-             invoke=_t_status, source="skill:company-process"),
+             invoke=_t_status, source="skill:company-process", capabilities=_RO),
     ]

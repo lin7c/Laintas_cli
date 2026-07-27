@@ -99,6 +99,9 @@ class AgentTerminationTests(unittest.TestCase):
         agent_loop.set_runtime_config("auto_snapshot", False)
         agent_loop.set_runtime_config("loop_delay", 0)
         agent_loop.set_runtime_config("use_message_thread", False)
+        # Isolate compaction-mechanics tests from the background memory
+        # consolidation side-effect (exercised separately below).
+        agent_loop.set_runtime_config("mem_extract_on_compact", False)
 
     def tearDown(self):
         agent_loop.reset_runtime_config()
@@ -453,6 +456,47 @@ class AgentTerminationTests(unittest.TestCase):
         self.assertFalse(result["changed"])
         self.assertEqual(len(calls), 1)
         self.assertEqual(state, original)
+
+    def test_compaction_triggers_memory_consolidation(self):
+        # When mem_extract_on_compact is on, a successful compaction fires a
+        # background pass that mines the just-compacted context for durable
+        # memories. Run the worker inline (patch Thread) for determinism.
+        agent_loop.set_runtime_config("mem_extract_on_compact", True)
+        deps, calls = _deps([{
+            "reply": "anchored compact summary",
+            "tool_calls": [], "finish_reason": "stop", "done": True, "error": False,
+        }])
+        messages = [{"role": "user", "content": "initial task"}]
+        for index in range(1, 5):
+            messages.extend([
+                {"role": "assistant", "content": f"answer {index}"},
+                {"role": "user", "content": f"follow-up {index}"},
+            ])
+        state = {"_thread_messages": messages, "terminalHistory": []}
+
+        seen = {}
+
+        def _inline_thread(target=None, daemon=None, **kw):
+            class _T:
+                def start(self_inner):
+                    target()
+            return _T()
+
+        def _fake_extract(text, llm_fn, *, session=None):
+            seen["text"] = text
+            llm_fn([{"role": "user", "content": "x"}])  # exercise the injected llm_fn
+            return ["consolidated"]
+
+        with mock.patch.object(agent_loop.threading, "Thread", _inline_thread), \
+                mock.patch.object(agent_loop.mem_extract, "extract_and_store", _fake_extract):
+            result = agent_loop.compact_session_context(
+                deps, {"token": "t"}, state,
+                [{"role": "user", "content": "follow-up 4"}])
+
+        self.assertTrue(result["changed"])
+        self.assertIn("text", seen)                 # consolidation ran
+        self.assertIn("summary", seen["text"].lower())
+        self.assertEqual(len(calls), 2)             # summarizer + consolidation llm_fn
 
     def test_missing_tool_calls_and_content_filter_are_not_success(self):
         missing, calls, _ = self._run([{

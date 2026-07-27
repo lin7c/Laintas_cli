@@ -129,7 +129,8 @@ _DEFAULT_CONFIG = {
     "rag_capture": False,              # True = log retrieval-rerank signal (search tool → subsequent file open) to .laintas/rag_signals.jsonl as training data for the reranker (see rag_signals.py). Advisory; never affects execution. Default OFF — capture is opt-in.
     "mem_recall_highlight": True,      # True = append a "most relevant to this task" section (semantic recall over all persistent memories, lexical fallback) to the injected memory context. Purely additive — never drops memories. See mem_recall.py.
     "skill_route_highlight": True,      # True = prepend a "most relevant skills for this task" line to the skill catalog (semantic ranking, lexical fallback) so the model loads the right skill first. Purely additive — the full catalog is preserved. See skill_router.py.
-    "mem_extract_on_complete": True,   # True = on successful task completion, run a background LLM pass that extracts + categorizes durable memories and writes them to long-term storage (see mem_extract.py). One extra (billed) model call per completed task; runs off-thread so it never blocks. overwrite=False, so curated memories are never clobbered.
+    "mem_extract_on_complete": False,  # True = ALSO extract durable memories on every successful task completion. Default OFF: consolidation now happens at compaction time only (mem_extract_on_compact) to keep it rare and cheap. See mem_extract.py.
+    "mem_extract_on_compact": True,    # True = when the session context is compacted, run one background LLM pass that extracts + aggressively consolidates durable memories into long-term storage (see mem_extract.py). Off-thread; near-duplicates are merged (summarised) rather than duplicated.
     "critic_enabled": True,            # True = on long thread-mode tasks, an independent LLM critic periodically checks for goal drift/looping and injects a corrective nudge (see critic.py). Complements the deterministic staleness/repetition tripwires.
     "critic_interval": 8,              # Run the critic every N loop iterations (0 disables). One extra (billed) model call each time it fires.
     "critic_min_loop": 4,             # Don't run the critic before this loop index — no point critiquing the first few exploratory steps.
@@ -538,7 +539,8 @@ _RUNTIME_CONFIG_DESCRIPTIONS = {
     "rag_capture": "Log retrieval-rerank signal (search tool → subsequent file open) to .laintas/rag_signals.jsonl as training data (advisory)",
     "mem_recall_highlight": "Append a task-relevant memory highlight (semantic recall, lexical fallback) to the injected memory context (additive; never drops memories)",
     "skill_route_highlight": "Prepend a task-relevant 'most relevant skills' line to the skill catalog (semantic ranking, lexical fallback; additive)",
-    "mem_extract_on_complete": "On task completion, run a background LLM pass to extract + store durable long-term memories (one extra billed call per completed task; off-thread)",
+    "mem_extract_on_complete": "ALSO extract durable memories on task completion (default off; consolidation runs at compaction time instead)",
+    "mem_extract_on_compact": "On context compaction, run a background LLM pass to extract + aggressively consolidate durable long-term memories (off-thread; merges near-duplicates)",
     "critic_enabled": "Periodically run an independent LLM critic on long tasks to catch goal drift/looping and inject a corrective nudge",
     "critic_interval": "Run the long-task critic every N loop iterations (0 disables)",
     "critic_min_loop": "Don't run the critic before this loop index",
@@ -3071,10 +3073,13 @@ def abort_agent(agent_id: str) -> bool:
     return True
 
 
-def wait_for_agent(agent_id: str, timeout: float = 30.0) -> Optional[AgentInfo]:
+def wait_for_agent(agent_id: str, timeout: float = 30.0,
+                   abort_event=None) -> Optional[AgentInfo]:
     """Block until the target agent finishes (status in {done, aborted, error}).
 
     Returns the final AgentInfo, or None if timed out / agent missing.
+    If *abort_event* is provided and becomes set, returns None immediately
+    so the caller can clean up and yield to its own interrupt handling.
     """
     info = get_agent(agent_id)
     if info is None:
@@ -3082,6 +3087,8 @@ def wait_for_agent(agent_id: str, timeout: float = 30.0) -> Optional[AgentInfo]:
     waiting_for_assignment = info.active_assignment is not None
     deadline = time.time() + timeout
     while time.time() < deadline:
+        if abort_event is not None and abort_event.is_set():
+            return None
         if info.status in ("done", "aborted", "error"):
             return info
         if (waiting_for_assignment and info.active_assignment is None
@@ -4102,6 +4109,50 @@ def session_context_status(state: dict) -> dict:
     }
 
 
+def _consolidate_memories_on_compact(deps, session: dict, working: dict) -> None:
+    """Mine the just-compacted context for durable, categorized memories in the
+    BACKGROUND. This is the ONLY automatic write path (task-completion extraction
+    is off by default): consolidation happens once per compaction, aggressively
+    merging near-duplicates so the store stays small. Fully best-effort — any
+    failure is swallowed and never disturbs compaction. See mem_extract.py."""
+    if not get_runtime_config("mem_extract_on_compact"):
+        return
+    try:
+        summary = str(working.get("_thread_summary") or "")
+        tail = []
+        for item in (working.get("_thread_messages") or [])[-8:]:
+            if not isinstance(item, dict):
+                continue
+            role = item.get("role", "")
+            if role not in ("user", "assistant"):
+                continue
+            text = _stringify_message_content(item.get("content", ""))
+            if text.strip():
+                tail.append(f"{role}: {text}")
+        convo = (f"Conversation summary:\n{summary}\n\n"
+                 f"Recent turns:\n" + "\n".join(tail))[:8000]
+        if not convo.strip():
+            return
+        _cwd = working.get("cwd") or os.getcwd()
+
+        def _mem_llm_fn(messages, *, system_prompt=mem_extract.SYSTEM_PROMPT,
+                        _s=session, _cwd=_cwd):
+            resp = deps.call_backend(
+                session=_s, message="", system_prompt=system_prompt,
+                current_path=_cwd, messages=messages)
+            return (resp or {}).get("reply", "") if isinstance(resp, dict) else ""
+
+        def _worker(_text=convo, _fn=_mem_llm_fn, _s=session):
+            try:
+                mem_extract.extract_and_store(_text, _fn, session=_s)
+            except Exception:
+                pass
+
+        threading.Thread(target=_worker, daemon=True).start()
+    except Exception:
+        pass
+
+
 def compact_session_context(deps, session: dict, state: dict,
                             chat_history: Optional[list] = None) -> dict:
     """Safely force-compact the current session without touching work state.
@@ -4153,6 +4204,7 @@ def compact_session_context(deps, session: dict, state: dict,
     if changed:
         state.clear()
         state.update(working)
+        _consolidate_memories_on_compact(deps, session, working)
     after = session_context_status(working if changed else state)
     return {
         **before,
@@ -8129,10 +8181,11 @@ def run_agent_loop(
             _mem_session = session
             _mem_cwd = state.get("cwd") or os.getcwd()
 
-            def _mem_llm_fn(messages, _s=_mem_session, _cwd=_mem_cwd):
+            def _mem_llm_fn(messages, *, system_prompt=mem_extract.SYSTEM_PROMPT,
+                            _s=_mem_session, _cwd=_mem_cwd):
                 resp = deps.call_backend(
                     session=_s, message="",
-                    system_prompt=mem_extract.SYSTEM_PROMPT,
+                    system_prompt=system_prompt,
                     current_path=_cwd, messages=messages)
                 return (resp or {}).get("reply", "") if isinstance(resp, dict) else ""
 
