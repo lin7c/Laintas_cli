@@ -1,5 +1,7 @@
 # Laintas CLI
 
+**[Download](https://cli.laintas.com)** · [Docs](https://laintas.com/docs) · [Laintas](https://laintas.com)
+
 Laintas CLI is a Linux-native autonomous AI agent for terminal work. It combines a normal interactive shell with an agent loop that can understand natural-language tasks, inspect the current workspace, execute commands through a real PTY, and continue from command output.
 
 It is designed for developers, server operators, and remote workspaces that need an AI assistant close to the filesystem and terminal rather than inside a separate chat window.
