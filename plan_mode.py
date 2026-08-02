@@ -493,11 +493,14 @@ def list_plans() -> list[dict]:
     for work in workgraph.list_work():
         if not work.get("current_revision"):
             continue
+        plan_path = PLANS_DIR / f"{work['id']}.md"
+        if not plan_path.exists():
+            continue
         revision = workgraph.get_revision(work["id"], work["current_revision"])
         graph_plans.append({
             "name": work["id"],
             "title": work["objective"],
-            "file": str(PLANS_DIR / f"{work['id']}.md"),
+            "file": str(plan_path),
             "mtime": work["updated_at"],
             "size": len((revision or {}).get("content", "")),
             "status": work["status"],

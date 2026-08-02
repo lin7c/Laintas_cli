@@ -193,7 +193,7 @@ cycle detection, normalized progress/status, and an append-only event history.
 | `/memory` | View `.helpwo` contents |
 | `/prop` | View `.cli.prop` template |
 | `/prompt [issue]` | Capture a behavior incident and open Prompt Lab |
-| `/mode [act|plan|review|list]` | View or switch agent behavior mode |
+| `/mode [act|plan|review|study|list]` | View or switch agent behavior mode (`study` = read-only mentor: the user writes the code, the agent teaches and checks it) |
 | `/mode create <name> [--read-only] <instructions>` | Create a declarative project mode |
 | `/mode delete <name>` | Delete a custom project mode |
 | `/work [status|list|resume|history]` | Inspect unified work state |

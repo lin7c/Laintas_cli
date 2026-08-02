@@ -517,6 +517,29 @@ def _alt_screen():
         _file.flush()
 
 
+def _clear_stale_running_loop() -> None:
+    """Clear a stale asyncio running-loop flag left on this thread.
+
+    prompt_toolkit's ``Application.run()`` calls ``asyncio.run()`` which
+    internally calls ``loop.run_forever()``.  ``run_forever()`` sets the
+    running-loop flag in a ``try`` and clears it in a ``finally`` block.
+    If a SIGINT (Ctrl+C) lands inside that ``finally`` block - between the
+    Python-level ``except`` handling and the ``events._set_running_loop(None)``
+    call - the flag is never cleared.  The next ``asyncio.run()`` on the same
+    thread then fails with::
+
+        RuntimeError: asyncio.run() cannot be called from a running event loop
+
+    This is a no-op when no stale flag is present; it only clears the flag
+    when a previous ``app.run()`` was interrupted by SIGINT.
+    """
+    try:
+        if asyncio.events._get_running_loop() is not None:
+            asyncio.events._set_running_loop(None)
+    except Exception:
+        pass
+
+
 def select_dialog(
     items,
     *,
@@ -909,8 +932,11 @@ def select_dialog(
     # application is starting/stopping; convert that into the same ordinary
     # cancel result as Esc/q instead of leaking a traceback to the user.
     try:
-        return app.run(pre_run=_pre_run)
+        result = app.run(pre_run=_pre_run)
+        _clear_stale_running_loop()
+        return result
     except (KeyboardInterrupt, EOFError):
+        _clear_stale_running_loop()
         return (None, -1) if act_keys else None
 
 
@@ -2676,7 +2702,7 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec("/abort", "Abort an agent", "Agents & Terminals", "/abort <agent-id>"),
     CommandSpec("/hwo", "Open or run an orchestration workflow", "Planning & Tasks", "/hwo [file|run <file>|compile <file>]", subcommands=("run", "compile")),
     CommandSpec("/hwg", "Compile, run, or resume an HWO graph workflow", "Planning & Tasks", "/hwg {run|compile|resume|status|cancel} ...", subcommands=("run", "compile", "resume", "status", "cancel")),
-    CommandSpec("/mode", "Show, switch, or create agent modes", "Planning & Tasks", "/mode [act [always]|plan [task]|review|list|create|delete]", subcommands=("act", "always", "plan", "review", "list", "create", "delete")),
+    CommandSpec("/mode", "Show, switch, or create agent modes", "Planning & Tasks", "/mode [act [always]|plan [task]|review|study|list|create|delete]", subcommands=("act", "always", "plan", "review", "study", "list", "create", "delete")),
     CommandSpec("/plan", "Create, revise, review, or approve versioned plans", "Planning & Tasks", "/plan {enter|submit|revise|approve|exit|status|list}", subcommands=("enter", "submit", "revise", "approve", "exit", "status", "list")),
     CommandSpec("/prompt", "Open Prompt Lab or manage tested prompt overlays", "Planning & Tasks", "/prompt [issue|subcommand]", subcommands=("status", "branches", "open", "chat", "review", "test", "activate", "disable", "patches", "profiles", "profile", "use", "rollback", "feedback", "fail", "optimize", "apply", "discard", "list", "skill", "export", "install", "publish")),
     CommandSpec("/evolve", "Create, improve, test, and hot-load project extensions", "Planning & Tasks", "/evolve [idea|subcommand]", subcommands=("status", "branches", "open", "chat", "review", "test", "activate", "disable", "candidates", "profiles", "profile", "use", "rollback", "list", "help")),
@@ -3300,6 +3326,13 @@ def _build_keybindings() -> KeyBindings:
         _update_status_cache(detail=enabled)
         event.app.invalidate()
 
+    @kb.add("escape")
+    def _(event):
+        """Esc: clear the current input buffer. Works like Ctrl+C cancel."""
+        buf = event.current_buffer
+        buf.reset()
+        _set_run_input_state("input_active")
+
     return kb
 
 
@@ -3471,13 +3504,16 @@ def _render_rprompt():
         _is_plan = _pm.is_plan_mode()
     except Exception:
         _is_plan = False
-    _mode_label = (
-        "PLAN" if _is_plan else mode_manager.get_active_mode()["name"].upper()
-    )
+    _active_mode = mode_manager.get_active_mode()
+    _mode_label = "PLAN" if _is_plan else _active_mode["name"].upper()
     # Auto-approve indicator: suffix the mode with * whenever writes or commands
     # are being auto-approved this session - via a mode's auto_approve posture,
     # or at least one remembered per-target "Always" approval. E.g. ACT*, OPS*.
-    _has_star = (not _is_plan and (_session_approval_state.get("all_writes")
+    # A read-only mode (STUDY, REVIEW, ...) can't write or run anything, so a
+    # leftover session approval must not advertise itself there.
+    _read_only = mode_manager.is_read_only_mode(_active_mode)
+    _has_star = (not _is_plan and not _read_only
+                 and (_session_approval_state.get("all_writes")
                      or _session_approval_state.get("all_commands")
                      or _session_approval_state.get("approved_write_paths")
                      or _session_approval_state.get("approved_commands")))
@@ -3489,7 +3525,9 @@ def _render_rprompt():
             console.print(
                 "[dim]⚡ Auto-approve active ([bold]*[/bold]). "
                 "Use /mode to change.[/dim]")
-    _mode_cls = "rprompt-mode-plan" if _is_plan else "rprompt-mode-act"
+    # Read-only modes share PLAN's styling — same "I won't touch anything" signal.
+    _mode_cls = ("rprompt-mode-plan" if (_is_plan or _read_only)
+                 else "rprompt-mode-act")
     _model = _status_cache.get("model", "") or "auto"
     width = _terminal_width()
     _agent_name = _status_cache.get("agent", "") or "primary"
@@ -3630,6 +3668,7 @@ def pt_prompt(cwd: str) -> str:
         (gutter_cls, "│ "),
         ("class:prompt-caret", "› "),
     ]
+    _clear_stale_running_loop()
     try:
         user_input = session.prompt(
             message,
@@ -5090,11 +5129,6 @@ The native function schemas are authoritative for each tool's name, purpose and 
 - Ending your turn with no tool call continues the loop. Use this for conversational replies, asking the user a question, or when you need a turn to think before your next action.
 </output_rules>
 
-<terminal_output_style>
-- Ordinary user-facing output must be plain text/Markdown with no forced background; laintas-cli renders it on the user's terminal background.
-- Use special color only when it carries real semantic value. In that exceptional case, choose the foreground and background yourself with explicit ANSI 24-bit SGR, keep the span short, and reset immediately. Never assume a fixed black background or use the former blue-on-black treatment.
-</terminal_output_style>
-
 <safety>
 Do not bypass policy.py decisions. Do not invent paths, APIs, files, or results. Claims about monitoring, tests, command success, or measured values must be grounded in returned tool output and an observed completion state; a started background command is not evidence of success. If collection fails, report the failure or rerun it instead of fabricating a plausible report. (General safety - reversibility/blast-radius, destructive-action confirmation, investigate-before-overwrite, no-vulnerabilities - is in the injected <agent_conduct> block.)
 </safety>
@@ -5960,7 +5994,8 @@ def call_backend_stream(
         # (external/unmetered) get chars/4 estimates so stats still move.
         # When auto-routing is active, streamed_model holds the real model name
         # selected by the gateway; use that for accurate per-model accounting.
-        _usage_model = streamed_model or selected_model
+        # A backend-echoed "auto" is not a real model name, so skip it.
+        _usage_model = (streamed_model if streamed_model not in ("", "auto") else "") or selected_model
         if billing_info:
             usage_tracker.record(
                 model=_usage_model,
@@ -5987,8 +6022,12 @@ def call_backend_stream(
         # gateway's real-time pick (which changes per-request).
         # Falls back to the user's configured selection if the backend
         # didn't echo a model name in the SSE stream.
+        # A backend-echoed "auto" carries no real model name (the gateway
+        # auto-routed), so treat it as empty and fall back to the user's
+        # explicit selection instead of clobbering it with "auto".
         _effective_model = (selected_model if selected_model in ("auto", "")
-                            else streamed_model or selected_model)
+                            else streamed_model if streamed_model not in ("", "auto")
+                            else selected_model)
         if _effective_model:
             _update_status_cache(model=_effective_model)
 
@@ -8547,9 +8586,11 @@ def observe_session(session, display_name: str = "", display_cmd: str = "") -> N
 
     try:
         app.run()
+        _clear_stale_running_loop()
     except (KeyboardInterrupt, EOFError):
         # Key bindings normally handle Esc/Ctrl+C.  Keep startup, rendering,
         # and teardown races cancellable as well.
+        _clear_stale_running_loop()
         return
 
 
@@ -8903,6 +8944,7 @@ _SLASH_ARG_RULES: dict[tuple[str, ...], SlashArgRule] = {
     ("/mode", "act"): _arg_rule(2, "/mode act [always]"),
     ("/mode", "always"): _arg_rule(1, "/mode always"),
     ("/mode", "review"): _arg_rule(1, "/mode review"),
+    ("/mode", "study"): _arg_rule(1, "/mode study"),
     ("/mode", "approve"): _arg_rule(1, "/mode approve"),
     ("/mode", "list"): _arg_rule(1, "/mode list"),
     ("/mode", "status"): _arg_rule(1, "/mode status"),
@@ -10663,6 +10705,35 @@ def _cmd_bash(parts: list, raw_args: str) -> bool:
     return False
 
 
+def _print_mode_activation_note(name: str) -> None:
+    """Print the posture note for a mode that was just activated.
+
+    Shared by the `/mode <name>` and the interactive selector paths so the two
+    never drift. Only one note is shown — timed confirmation, auto-approve, and
+    read-only are mutually exclusive postures.
+    """
+    timeout = mode_manager.get_auto_confirm_timeout()
+    if timeout is not None:
+        console.print(
+            f"[yellow]↳ AUTO confirmation windows: {int(timeout)}s ordinary, "
+            f"{int(mode_manager.get_auto_confirm_timeout(destructive=True) or 0)}s "
+            f"deletion. Choose No before the timer expires to stop an action."
+            f"[/yellow]")
+        return
+    auto_approve = mode_manager.get_auto_approve()
+    if auto_approve != "none":
+        console.print(
+            f"[dim]↳ {name.upper()}* — auto-approving {auto_approve} "
+            f"this session.[/dim]")
+        return
+    if mode_manager.is_read_only_mode():
+        detail = ("You write the code and run the commands; the agent teaches "
+                  "and checks your work. "
+                  if name == "study" else
+                  "No file writes or commands. ")
+        console.print(f"[dim]↳ {detail}Use /mode act to switch back.[/dim]")
+
+
 def _cmd_mode(raw_args: str, parts: list) -> bool:
     import plan_mode as _pm_mode
     from rich.markup import escape as _escape
@@ -10874,17 +10945,8 @@ def _cmd_mode(raw_args: str, parts: list) -> bool:
         console.print(
             f"[{'green' if ok else 'red'}]{_escape(msg)}"
             f"[/{'green' if ok else 'red'}]")
-        if ok and mode_manager.get_auto_confirm_timeout() is not None:
-            console.print(
-                f"[yellow]↳ AUTO confirmation windows: "
-                f"{int(mode_manager.get_auto_confirm_timeout())}s ordinary, "
-                f"{int(mode_manager.get_auto_confirm_timeout(destructive=True) or 0)}s deletion."
-                f" Choose No before the timer expires to stop an action.[/yellow]"
-            )
-        elif ok and mode_manager.get_auto_approve() != "none":
-            console.print(
-                f"[dim]↳ {sub.upper()}* — auto-approving "
-                f"{mode_manager.get_auto_approve()} this session.[/dim]")
+        if ok:
+            _print_mode_activation_note(sub)
 
     else:
         active = mode_manager.get_active_mode()
@@ -10947,13 +11009,8 @@ def _cmd_mode(raw_args: str, parts: list) -> bool:
                 console.print(
                     f"[{'green' if ok else 'red'}]{_escape(msg)}"
                     f"[/{'green' if ok else 'red'}]")
-                if ok and mode_manager.get_auto_confirm_timeout() is not None:
-                    console.print(
-                        f"[yellow]↳ AUTO confirmation windows: "
-                        f"{int(mode_manager.get_auto_confirm_timeout())}s ordinary, "
-                        f"{int(mode_manager.get_auto_confirm_timeout(destructive=True) or 0)}s deletion."
-                        f" Choose No before the timer expires to stop an action.[/yellow]"
-                    )
+                if ok:
+                    _print_mode_activation_note(target)
         elif not sys.stdin.isatty():
             console.print(
                 f"[dim]Current mode: {'plan' if _in_plan else active['name']}[/dim]")
@@ -14095,6 +14152,110 @@ def _cmd_tools() -> None:
 
 
 
+def _safe_input_line(prompt: str = "") -> Optional[str]:
+    """Read one line in cbreak mode with Esc-to-cancel support.
+
+    Returns the line as a string, or None on Esc/Ctrl+C/EOF.
+    This is a drop-in replacement for input() in cooked-mode contexts
+    where the user should be able to press Esc to cancel.
+    """
+    if not sys.stdin.isatty():
+        # Non-TTY: fall back to plain input() — Esc is not meaningful here.
+        try:
+            return input(prompt)
+        except (EOFError, KeyboardInterrupt):
+            return None
+    fd = sys.stdin.fileno()
+    try:
+        old_attr = termios.tcgetattr(fd)
+    except (termios.error, OSError):
+        try:
+            return input(prompt)
+        except (EOFError, KeyboardInterrupt):
+            return None
+    try:
+        tty.setcbreak(fd)
+    except (termios.error, OSError):
+        try:
+            return input(prompt)
+        except (EOFError, KeyboardInterrupt):
+            return None
+
+    decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
+    buf: list[str] = []
+
+    def _write(s: str) -> None:
+        sys.stdout.write(s)
+        sys.stdout.flush()
+
+    def _backspace(n: int = 1) -> None:
+        for _ in range(n):
+            if buf:
+                c = buf.pop()
+                width = 2 if unicodedata.east_asian_width(c) in ('W', 'F') else 1
+                sys.stdout.write('\b \b' * width)
+        sys.stdout.flush()
+
+    try:
+        _write(prompt)
+        while True:
+            try:
+                r, _, _ = select.select([fd], [], [], 0.5)
+            except (select.error, ValueError, OSError):
+                return None
+            if not r:
+                continue
+            try:
+                chunk = os.read(fd, 1)
+            except (BlockingIOError, InterruptedError):
+                continue
+            except OSError:
+                return None
+            if not chunk:
+                return None  # EOF
+
+            if chunk == b'\x1b':
+                # Disambiguate bare Esc vs escape sequence
+                try:
+                    r2, _, _ = select.select([fd], [], [], 0.05)
+                except (select.error, ValueError, OSError):
+                    r2 = []
+                if r2:
+                    try:
+                        os.read(fd, 32)  # drain the sequence
+                    except OSError:
+                        pass
+                    continue
+                # Bare Esc — cancel
+                _write('\r\n')
+                return None
+            if chunk == b'\x03':  # Ctrl+C
+                _write('^C\r\n')
+                return None
+            if chunk in (b'\r', b'\n'):
+                _write('\r\n')
+                return ''.join(buf)
+            if chunk in (b'\x7f', b'\x08'):  # Backspace / Ctrl+H
+                _backspace()
+                continue
+            if chunk == b'\x17':  # Ctrl+W — delete word
+                while buf and buf[-1] == ' ':
+                    buf.pop()
+                while buf and buf[-1] != ' ':
+                    _backspace()
+                continue
+
+            text = decoder.decode(chunk)
+            if text:
+                _write(text)
+                buf.append(text)
+    finally:
+        try:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_attr)
+        except (termios.error, OSError):
+            pass
+
+
 def _cmd_tool(raw_args: str, session: dict, agent_registry: AgentRegistry) -> None:
     tool_name, tool_params_raw = _raw_tail_after_word(raw_args)
     if not tool_name and sys.stdin.isatty():
@@ -14108,11 +14269,11 @@ def _cmd_tool(raw_args: str, session: dict, agent_registry: AgentRegistry) -> No
         )
         tool_name = chosen.name if chosen else ""
         if tool_name:
-            try:
-                tool_params_raw = input(
-                    "JSON parameters (Enter for {}): ").strip()
-            except (EOFError, KeyboardInterrupt):
+            result = _safe_input_line("JSON parameters (Enter for {}): ")
+            if result is None:
                 tool_name = ""
+            else:
+                tool_params_raw = result.strip()
     if not tool_name:
         console.print("[dim]Tool selection cancelled.[/dim]")
     else:
@@ -16118,6 +16279,70 @@ def _stdin_terminal_disconnected() -> bool:
     return False
 
 
+def _install_terminal_watchdog(shutdown_fn, *, interval: float = 30.0, grace: float = 8.0):
+    """Exit when the controlling terminal disappears.
+
+    The REPL already turns a dead terminal into EOF and shuts down — but only
+    while it is actually reading from it. A session parked anywhere else (a
+    lock, a queue, a remote poll, an agent view) never reaches that code, and
+    signal handlers cannot rescue it: Python runs them on the main thread at a
+    bytecode boundary, so a main thread blocked in a futex never executes them.
+    SIGHUP and SIGTERM are both registered below and both were ignored by three
+    sessions found alive ten days after their SSH connection died, holding
+    440MB of swap between them; only SIGKILL removed them.
+
+    A watchdog thread is the piece that was missing. It observes from outside
+    the main thread, so it still runs when the main thread cannot, and it can
+    end the process itself.
+    """
+    try:
+        fd = sys.stdin.fileno()
+        if not os.isatty(fd):
+            return          # piped input or a headless run: no terminal to lose
+        tty_path = os.ttyname(fd)
+    except (AttributeError, OSError, ValueError):
+        return
+
+    def terminal_gone() -> bool:
+        # The slave device is unlinked from /dev/pts the moment the master
+        # closes, so its absence is the earliest reliable signal. tcgetpgrp
+        # covers the rarer case where the path lingers but the line hung up.
+        if not os.path.exists(tty_path):
+            return True
+        try:
+            os.tcgetpgrp(fd)
+        except OSError as exc:
+            return exc.errno in _TERMINAL_EOF_ERRNOS
+        except ValueError:
+            return True
+        return False
+
+    def attempt_clean_shutdown():
+        try:
+            shutdown_fn(input_closed=True)
+        except SystemExit:
+            pass
+        except Exception:
+            pass
+
+    def watch():
+        while True:
+            time.sleep(interval)
+            try:
+                if not terminal_gone():
+                    continue
+            except Exception:
+                continue
+            # Give the ordinary shutdown its chance — it unregisters the agent
+            # and saves the session — but never wait on it indefinitely, since
+            # a stuck main thread is the reason this thread exists at all.
+            threading.Thread(target=attempt_clean_shutdown, daemon=True).start()
+            time.sleep(grace)
+            os._exit(0)
+
+    threading.Thread(target=watch, name="terminal-watchdog", daemon=True).start()
+
+
 def _silence_disconnected_terminal_output():
     """Keep shutdown cleanup usable after the controlling PTY is gone."""
     try:
@@ -16522,7 +16747,14 @@ def _start_bg_input_reader(target_queue: queue.Queue,
     def _reader():
         try:
             if sys.stdin.isatty():
-                _bg_reader_prompt_mode(target_queue, interrupt_event)
+                # Prefer cbreak mode when an interrupt_event is wired —
+                # it avoids prompt_toolkit's stdin ownership and its
+                # potential race with Rich Live output (patch_stdout).
+                # Fall back to prompt_toolkit only when cbreak fails.
+                if interrupt_event is not None:
+                    _bg_reader_cbreak_mode(target_queue, interrupt_event)
+                else:
+                    _bg_reader_prompt_mode(target_queue, interrupt_event)
             else:
                 _bg_reader_line_mode(target_queue)
         except Exception:
@@ -17927,6 +18159,12 @@ def main():
     # delivers SIGHUP — unregister from Helpwo before dying instead of
     # leaving a stale agent until the 60s heartbeat timeout.
     signal.signal(signal.SIGHUP, shutdown)
+
+    # Signals only help when the main thread can run them. Monitor-only is the
+    # one mode meant to outlive its terminal, so it opts out; every other mode
+    # gets a watchdog that exits if the terminal it was started from is gone.
+    if not args.monitor_only:
+        _install_terminal_watchdog(shutdown)
 
     # ── Create term0: a real persistent bash session ──
     # Direct user terminal commands route through this via marker-poll.

@@ -63,6 +63,21 @@ _READ_ONLY_TOOLS = [
     "task.complete",
 ]
 
+# STUDY deliberately does not reuse _READ_ONLY_TOOLS: sub-agents are excluded
+# (an employee profile carries its own tool policy, so delegating would be a
+# way around the teaching restriction), while task.* and mem.* are added so a
+# lesson plan and the student's progress survive context compression and
+# restarts. Neither touches the student's code — they write to
+# .laintas/tasks.json and ~/.laintas/memory/ only.
+_STUDY_TOOLS = [
+    "fs.read", "fs.ls", "fs.grep", "fs.glob", "fs.diff",
+    "web.search", "web.fetch", "time.now",
+    "skill.list", "skill.reference",
+    "task.create", "task.update", "task.list", "task.get",
+    "mem.read", "mem.list", "mem.save",
+    "task.complete",
+]
+
 _BUILTINS = {
     "act": {
         "name": "act",
@@ -98,6 +113,79 @@ _BUILTINS = {
             "prioritize findings. Do not modify files or the system."
         ),
         "allowed_tools": list(_READ_ONLY_TOOLS),
+        "denied_tools": None,
+        "auto_approve": "none",
+        "builtin": True,
+    },
+    "study": {
+        "name": "study",
+        "description": "Read-only mentor: the user writes the code, you teach",
+        "instructions": (
+            "You are a hands-on programming mentor. The user is the only one who "
+            "writes code, runs commands, and creates files in this session. You "
+            "have read-only access: you can inspect their work and look things "
+            "up, but you cannot edit files or run commands, and you must not ask "
+            "to. This instruction overrides any earlier guidance telling you to "
+            "complete tasks yourself — in this mode, finishing the task for the "
+            "user is a failure, not a success.\n"
+            "\n"
+            "TEACHING LOOP — repeat until the project is done:\n"
+            "1. Calibrate first. Before the first lesson, find out what the user "
+            "already knows and what they are building. Read the existing files "
+            "instead of asking questions the repository already answers.\n"
+            "2. Break the goal into milestones, then into steps a beginner can "
+            "finish in 5-15 minutes. Record the milestones in the task list so "
+            "progress stays visible and survives a restart.\n"
+            "3. Teach exactly ONE step at a time. For each step state: what to "
+            "build, why it matters here, where it goes (file and location), and "
+            "how they will know it worked — a command to run, an output to "
+            "expect, or a behaviour to see.\n"
+            "4. Stop and hand control back. End every message with one concrete "
+            "instruction and an invitation to report back, then end the turn "
+            "with task_complete summarising the step you just assigned. Never "
+            "stack the next three steps 'for convenience', and never keep "
+            "working after handing one over — the turn belongs to the user "
+            "now.\n"
+            "5. When they report back, verify by reading their actual files — "
+            "never take 'I did it' at face value. Then give specific feedback: "
+            "name what is right before what is wrong, quote the line you mean, "
+            "and explain the underlying rule, not just the fix.\n"
+            "\n"
+            "HOW MUCH TO GIVE AWAY — escalate only when the user is actually "
+            "stuck, one level per attempt:\n"
+            "  1st: a guiding question, or the concept they are missing.\n"
+            "  2nd: where to look — the doc, the file, the analogous code that "
+            "already exists in their project.\n"
+            "  3rd: a skeleton — signatures, structure, TODO comments; no bodies.\n"
+            "  4th: the two or three key lines, with an explanation of each.\n"
+            "  last: the full snippet, only after they have tried, and always "
+            "followed by asking them to explain back why it works.\n"
+            "Boilerplate that is not the point of the lesson (config, imports, "
+            "scaffolding) may be given in full immediately — do not make people "
+            "practise typing noise.\n"
+            "\n"
+            "ERRORS ARE THE CURRICULUM. When the user hits an error, do not jump "
+            "to the fix. Show them how to read it: which line of the trace "
+            "matters, what the message actually claims, how to form a hypothesis "
+            "and test it. Ask what they think is happening before you say what is "
+            "happening.\n"
+            "\n"
+            "COMMANDS. Give commands for the user to type themselves, one at a "
+            "time, with what the output should look like and the most likely way "
+            "it goes wrong. If a command is destructive or irreversible, say so "
+            "plainly before they run it. Commands the user runs in this terminal "
+            "appear to you as observed output — read that output and correct what "
+            "they actually did, not what you assumed they did.\n"
+            "\n"
+            "IF THEY ASK YOU TO JUST DO IT: say once, briefly, that STUDY mode is "
+            "read-only by design and that `/mode act` switches to normal "
+            "execution — then respect their choice without repeating the offer.\n"
+            "\n"
+            "Keep each message short enough to act on — roughly one screen. Match "
+            "the user's language. Never claim to have created, edited, or run "
+            "anything."
+        ),
+        "allowed_tools": list(_STUDY_TOOLS),
         "denied_tools": None,
         "auto_approve": "none",
         "builtin": True,
@@ -408,6 +496,30 @@ def is_tool_allowed(tool_name: str) -> bool:
     if allowed is None:
         return True
     return _matches_tool(tool_name, allowed)
+
+
+# Representative mutating tools. A mode that cannot reach any of them cannot
+# change the workspace, so approval-related UI (the auto-approve star) is
+# meaningless while it is active.
+_MUTATING_TOOLS = ("fs.write", "fs.edit", "fs.multi_edit", "fs.delete",
+                   "shell.exec")
+
+
+def is_read_only_mode(mode: Optional[dict] = None) -> bool:
+    """True when the active (or given) mode blocks every mutating tool.
+
+    Mirrors :func:`is_tool_allowed` (deny-first, allowlist narrows) so custom
+    ``--read-only`` modes are recognised too, not just the built-ins.
+    """
+    m = mode if mode is not None else get_active_mode()
+    denied = (m or {}).get("denied_tools")
+    allowed = (m or {}).get("allowed_tools")
+    for name in _MUTATING_TOOLS:
+        if _matches_tool(name, denied):
+            continue
+        if allowed is None or _matches_tool(name, allowed):
+            return False
+    return True
 
 
 def get_auto_approve(mode: Optional[dict] = None) -> str:

@@ -206,6 +206,9 @@ class AgentTerminationTests(unittest.TestCase):
         self.assertEqual(result["exit_reason"], agent_loop.TRANSITION_MAX_LOOPS)
         self.assertEqual(result["task_status"], "incomplete")
         self.assertTrue(session_store.is_continuable_reason(result["exit_reason"]))
+        self.assertIn(
+            "Run /max, then /continue",
+            result["state"]["shortTermMemory"])
 
     def test_task_complete_is_explicit_task_completion(self):
         result, calls, _ = self._run([{

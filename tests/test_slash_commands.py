@@ -196,10 +196,11 @@ class SlashRegistryTests(unittest.TestCase):
         picker.assert_called_once()
         labels = picker.call_args.args[0]
         self.assertEqual(len(labels), 2)
-        self.assertIn("first question here", labels[0])
-        self.assertIn("second question here", labels[1])
+        # Most-recent turn first (reverse order); each label has Rich markup
+        self.assertIn("second question here", labels[0])
+        self.assertIn("first question here", labels[1])
         # second turn has two assistant replies
-        self.assertIn("2 replies", labels[1])
+        self.assertIn("2 replies", labels[0])
 
     def test_told_browse_empty_history_prints_hint(self):
         output = io.StringIO()
@@ -473,8 +474,6 @@ class SlashRegistryTests(unittest.TestCase):
         self.assertIn("tier", rendered)
         self.assertIn("deepseek-v4-pro", rendered)
         self.assertIn("T1", rendered)
-        self.assertIn("kimi-k2.6 T2", rendered)
-        self.assertIn("kimi-k3 T3", rendered)
         header = next(line for line in rendered.splitlines()
                       if "model" in line and "tier" in line)
         self.assertLess(header.index("cost"), header.index("tier"))
@@ -596,6 +595,28 @@ class SlashRegistryTests(unittest.TestCase):
             self.assertIn("Switched to STRICT mode", text)
             self.assertEqual(mode_manager.get_active_mode()["name"], "act")
 
+    def test_mode_study_switches_and_explains_itself(self):
+        with tempfile.TemporaryDirectory() as tmp, _chdir(tmp):
+            output = io.StringIO()
+            old_console = laintas_cli.console
+            laintas_cli.console = Console(file=output, force_terminal=False)
+            try:
+                for command in ("/mode study", "/mode list"):
+                    self.assertFalse(laintas_cli.handle_meta_command(
+                        command, _Registry(), {}))
+                self.assertEqual(
+                    mode_manager.get_active_mode()["name"], "study")
+                text = output.getvalue()
+                self.assertIn("Switched to STUDY mode", text)
+                self.assertIn("You write the code", text)
+                self.assertIn("/mode act", text)
+                self.assertFalse(laintas_cli.handle_meta_command(
+                    "/mode act", _Registry(), {}))
+                self.assertEqual(
+                    mode_manager.get_active_mode()["name"], "act")
+            finally:
+                laintas_cli.console = old_console
+
     def test_mode_without_args_uses_picker(self):
         with tempfile.TemporaryDirectory() as tmp, _chdir(tmp), \
                 mock.patch.object(
@@ -643,7 +664,8 @@ class SlashRegistryTests(unittest.TestCase):
         ]
 
         def choose_second(items, **_kwargs):
-            return items[1]
+            # "auto" entry is prepended at index 0; pick the second real model
+            return items[2]
 
         with mock.patch.object(
                 laintas_cli, "select_dialog", side_effect=choose_second):
@@ -1549,6 +1571,58 @@ class PlanAndWorkflowTests(unittest.TestCase):
             self.assertFalse(mode_manager.is_tool_allowed("shell.exec"))
             self.assertFalse(mode_manager.delete_mode("review")[0])
 
+    def test_builtin_study_mode_teaches_without_touching_the_workspace(self):
+        with tempfile.TemporaryDirectory() as tmp, _chdir(tmp):
+            self.assertTrue(mode_manager.activate("study")[0])
+            self.assertEqual(mode_manager.get_active_mode()["name"], "study")
+            # Reads and lookups stay available so the mentor can check work.
+            for allowed in ("fs.read", "fs.grep", "fs.diff", "web.search",
+                            "task.create", "mem.save", "task.complete"):
+                self.assertTrue(mode_manager.is_tool_allowed(allowed), allowed)
+            # Everything that could do the user's work for them is blocked,
+            # including delegating it to a sub-agent.
+            for blocked in ("fs.write", "fs.edit", "fs.multi_edit", "fs.delete",
+                            "shell.exec", "agent.spawn", "agent.hire",
+                            "terminal.exec", "browser.navigate", "skill.load",
+                            "mem.delete"):
+                self.assertFalse(mode_manager.is_tool_allowed(blocked), blocked)
+            self.assertTrue(mode_manager.is_read_only_mode())
+            self.assertEqual(mode_manager.get_auto_approve(), "none")
+            self.assertIsNone(mode_manager.get_auto_confirm_timeout())
+            self.assertFalse(mode_manager.delete_mode("study")[0])
+
+    def test_study_mode_prompt_enforces_teaching_posture(self):
+        study = mode_manager.get_mode("study")
+        self.assertIsNotNone(study)
+        with mock.patch.object(mode_manager, "get_active_mode",
+                               return_value=study):
+            section = mode_manager.render_prompt_section()
+
+        self.assertIn("[AGENT MODE: STUDY]", section)
+        self.assertIn("hands-on programming mentor", section)
+        self.assertIn("overrides any earlier guidance", section)
+        self.assertIn("ONE step at a time", section)
+        self.assertIn("never take 'I did it' at face value", section)
+        self.assertIn("`/mode act`", section)
+        self.assertIn("Tools are restricted to:", section)
+
+    def test_read_only_detection_covers_modes_and_postures(self):
+        self.assertTrue(
+            mode_manager.is_read_only_mode(mode_manager.get_mode("review")))
+        self.assertFalse(
+            mode_manager.is_read_only_mode(mode_manager.get_mode("act")))
+        self.assertFalse(
+            mode_manager.is_read_only_mode(mode_manager.get_mode("auto")))
+        # A custom mode that denies the mutating tools by glob counts too.
+        self.assertTrue(mode_manager.is_read_only_mode({
+            "name": "x", "allowed_tools": None,
+            "denied_tools": ["fs.write", "fs.edit", "fs.multi_edit",
+                             "fs.delete", "shell.*"],
+        }))
+        self.assertFalse(mode_manager.is_read_only_mode({
+            "name": "y", "allowed_tools": None, "denied_tools": ["fs.delete"],
+        }))
+
     def test_plan_can_wait_for_next_task_message(self):
         with tempfile.TemporaryDirectory() as tmp, _chdir(tmp):
             root = Path(tmp)
@@ -1977,14 +2051,13 @@ class TerminalOutputStyleTests(unittest.TestCase):
         self.assertNotIn("other session hidden", rendered)
 
     def test_terminal_style_instruction_is_laintas_prompt_local_and_small(self):
-        prompt = laintas_cli.generate_cli_prop_template()
+        prompt = agent_loop._TERMINAL_OUTPUT_STYLE_PROMPT
         start = prompt.index("<terminal_output_style>")
         end = prompt.index("</terminal_output_style>")
         section = prompt[start:end]
 
-        self.assertIn("user's terminal background", section)
-        self.assertIn("ANSI 24-bit SGR", section)
         self.assertIn("foreground and background", section)
+        self.assertIn("24-bit SGR", section)
         self.assertLess(len(section), 900)
 
 

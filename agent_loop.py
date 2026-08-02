@@ -7172,12 +7172,25 @@ def run_agent_loop(
                 if (not _prompt_lab_worker and not _evolution_lab_worker
                         and not plan_mode.is_plan_mode()
                         and not mode_manager.is_tool_allowed(name)):
-                    _active_mode_name = mode_manager.get_active_mode()["name"]
+                    _active_mode = mode_manager.get_active_mode()
+                    _active_mode_name = _active_mode["name"]
+                    _blocked_hint = ""
+                    if _active_mode_name == "study":
+                        _blocked_hint = (
+                            " STUDY mode is read-only on purpose: the user makes "
+                            "every change. Do not retry through another tool — "
+                            "teach the step instead and wait for them to do it."
+                        )
+                    elif mode_manager.is_read_only_mode(_active_mode):
+                        _blocked_hint = (
+                            " This mode is read-only. Do not retry through "
+                            "another tool; report what you found instead."
+                        )
                     result = {
                         "ok": False,
                         "error": (
                             f"BLOCKED: tool '{name}' is not allowed in "
-                            f"{_active_mode_name.upper()} mode."
+                            f"{_active_mode_name.upper()} mode.{_blocked_hint}"
                         ),
                         "tool": name, "returncode": -1,
                     }
@@ -8147,7 +8160,9 @@ def run_agent_loop(
         _exit_reason = TRANSITION_MAX_LOOPS
         _exhaustion_msg = (
             f"Turn limit reached ({max_loops}/{max_loops}). "
-            f"Use /continue to resume."
+            f"Use /continue to resume. "
+            f"Run /max, then /continue, to lift this limit for the current "
+            f"process and resume."
         )
         if events_cb is not None:
             deps.console.print(f"[yellow]⚠️ {_exhaustion_msg}[/yellow]")

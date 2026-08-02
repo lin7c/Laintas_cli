@@ -1,25 +1,20 @@
 """Headless-browser session for laintas_cli — live-view stack.
 
 Spawns Xvfb + Chrome (headed-in-virtual-display, --remote-debugging-port) +
-x11vnc, and bridges the local RFB socket to the Helpwo backend's /vnc
-WebSocket relay so the browser UI can render the page via noVNC. The AI side
-drives Chrome over CDP (http://127.0.0.1:<debug-port>) — see the browser.*
-tools in tools.py.
+x11vnc. The AI side drives Chrome over CDP (http://127.0.0.1:<debug-port>) —
+see the browser.* tools in tools.py.
 
-Topology mirrors TerminalSession (laintas_cli.py): the host runs a WebSocket
-*client* to the backend, and the backend relays bytes to the browser's noVNC
-client. Frames are JSON text with base64 payloads — same wire format as the
-PTY relay — so the backend can reuse one relay implementation:
-  host → browser : {"t":"o","d":<b64>}   RFB bytes from x11vnc
-  browser → host : {"t":"i","d":<b64>}   RFB bytes from noVNC
-  host → browser : {"t":"exit"}          x11vnc ended
+The user-facing live view is peer-to-peer: x11vnc serves RFB on
+127.0.0.1:<rfb_port>, and webrtc_channel.py's VNC bridge carries those bytes to
+the browser's noVNC over a WebRTC DataChannel, so the framebuffer never touches
+the backend. See Helpwo/docs/vnc-p2p-design.md. (An earlier revision relayed RFB
+through a backend /vnc WebSocket; that endpoint was never deployed and the code
+for it has been removed — don't reintroduce it.)
 
 Unix-only: requires Xvfb for the live view.
 
-Optional system packages (probed at start; missing → clear error, no crash):
+Required system packages (probed at start; missing → clear error, no crash):
   Xvfb, x11vnc, google-chrome | chromium | chromium-browser
-The websockify package is NOT needed on the host — this module is itself the
-WS↔RFB bridge. (Backend may use websockify on its side; that's its concern.)
 """
 
 from __future__ import annotations
@@ -205,6 +200,31 @@ def _wait_for_port(host: str, port: int, timeout: float = 10.0) -> bool:
     return False
 
 
+def _wait_for_rfb(host: str, port: int, timeout: float = 15.0) -> bool:
+    """Wait until x11vnc will actually greet a viewer, not just accept TCP.
+
+    Its listening socket opens before it can serve the RFB handshake, and a
+    viewer that lands in that window gets a socket that never sends the banner
+    — the session reports itself connected and stays blank forever. Probing for
+    the banner is the only check that distinguishes the two states.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        remaining = deadline - time.time()
+        try:
+            with socket.create_connection((host, port), timeout=min(2.0, remaining)) as probe:
+                # Hold this connection and wait out the rest of the budget: the
+                # greeting can lag the accept, and hanging up to reconnect every
+                # second only restarts that wait.
+                probe.settimeout(max(0.5, deadline - time.time()))
+                if probe.recv(4).startswith(b"RFB"):
+                    return True
+        except OSError:
+            pass
+        time.sleep(0.2)
+    return False
+
+
 def _xserver_ready(display_n: int) -> bool:
     """Xvfb doesn't listen on TCP (we pass -nolisten tcp); the X server is up
     once its lock file + unix socket exist."""
@@ -228,6 +248,190 @@ def _xserver_port(display_n: int) -> int:
     return 6000 + display_n
 
 
+# ── upstream proxy with credentials ─────────────────────────────────────
+
+class ProxyAuthRelay:
+    """Loopback proxy that adds Proxy-Authorization on the way upstream.
+
+    Chrome has no command-line flag for proxy credentials, and argv would be
+    the wrong place for them anyway — every local user can read it out of
+    ``ps``. Chrome is pointed at this relay over loopback instead, so the
+    credentials only ever exist in this process's memory.
+
+    Handles both forms a browser sends to a proxy: ``CONNECT host:port`` for
+    HTTPS (the tunnel is opaque once established) and an absolute-URI request
+    line for plain HTTP.
+    """
+
+    _HEAD_LIMIT = 64 * 1024      # a request head larger than this is not a browser
+    _CONNECT_TIMEOUT = 20.0
+
+    def __init__(self, upstream: str, credentials: Optional[str] = None):
+        host, _, port = upstream.rpartition(":")
+        if not host or not port.isdigit():
+            raise ValueError(f"upstream proxy must be host:port (got {upstream!r})")
+        self.upstream_host = host
+        self.upstream_port = int(port)
+        self._auth = b""
+        if credentials:
+            token = base64.b64encode(credentials.encode()).decode()
+            self._auth = f"Proxy-Authorization: Basic {token}\r\n".encode()
+        self._sock: Optional[socket.socket] = None
+        self._thread: Optional[threading.Thread] = None
+        self._closed = threading.Event()
+        self.port = 0
+
+    # ── lifecycle ───────────────────────────────────────────────────────
+    def start(self) -> int:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # Loopback only. This host is on the public internet; an open proxy on
+        # it would be found by scanners and abused within hours.
+        sock.bind(("127.0.0.1", 0))
+        sock.listen(16)
+        self._sock = sock
+        self.port = sock.getsockname()[1]
+        self._thread = threading.Thread(target=self._accept_loop, args=(sock,),
+                                        daemon=True, name="proxy-auth-relay")
+        self._thread.start()
+        return self.port
+
+    def close(self) -> None:
+        if self._closed.is_set():
+            return
+        self._closed.set()
+        self._sock = None
+        # The listening socket is closed by the accept loop itself: closing an
+        # fd out from under a blocked accept() leaves the port bound until that
+        # call returns, so the owning thread has to be the one to do it. Wake it
+        # with a throwaway connection and wait for it to finish.
+        try:
+            socket.create_connection(("127.0.0.1", self.port), timeout=1).close()
+        except OSError:
+            pass
+        if self._thread is not None:
+            self._thread.join(timeout=3)
+            self._thread = None
+
+    # ── plumbing ────────────────────────────────────────────────────────
+    def _accept_loop(self, sock: socket.socket) -> None:
+        try:
+            while not self._closed.is_set():
+                try:
+                    client, _ = sock.accept()
+                except OSError:
+                    return
+                if self._closed.is_set():
+                    try:
+                        client.close()      # the wake-up connection from close()
+                    except OSError:
+                        pass
+                    return
+                threading.Thread(target=self._serve, args=(client,), daemon=True).start()
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    @staticmethod
+    def _read_head(sock: socket.socket, limit: int) -> bytes:
+        """Read up to and including the blank line ending the request head."""
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            if len(buf) > limit:
+                raise ValueError("request head too large")
+            chunk = sock.recv(8192)
+            if not chunk:
+                raise ConnectionError("client closed before sending a full request")
+            buf += chunk
+        return buf
+
+    def _serve(self, client: socket.socket) -> None:
+        upstream: Optional[socket.socket] = None
+        try:
+            client.settimeout(self._CONNECT_TIMEOUT)
+            head = self._read_head(client, self._HEAD_LIMIT)
+            line, _, rest = head.partition(b"\r\n")
+
+            upstream = socket.create_connection(
+                (self.upstream_host, self.upstream_port), timeout=self._CONNECT_TIMEOUT)
+            # Drop any Proxy-Authorization the client supplied; ours is the one
+            # that counts, and duplicating the header confuses some proxies.
+            headers = b"".join(
+                h + b"\r\n" for h in rest.split(b"\r\n")
+                if h and not h.lower().startswith(b"proxy-authorization:")
+            )
+            upstream.sendall(line + b"\r\n" + self._auth + headers + b"\r\n")
+
+            if line.upper().startswith(b"CONNECT "):
+                # Relay the upstream's answer verbatim: a 407 or a refusal is
+                # something the browser should see, not something to mask.
+                answer = self._read_head(upstream, self._HEAD_LIMIT)
+                client.sendall(answer)
+                if b" 200" not in answer.split(b"\r\n", 1)[0]:
+                    return
+
+            # From here the connection is opaque in both directions.
+            client.settimeout(None)
+            upstream.settimeout(None)
+            done = threading.Event()
+            forward = threading.Thread(target=self._pipe, args=(client, upstream, done), daemon=True)
+            forward.start()
+            self._pipe(upstream, client, done)
+            forward.join(timeout=5)
+        except (OSError, ValueError, ConnectionError):
+            pass                            # a dead tab is not an error worth raising
+        finally:
+            for sock in (client, upstream):
+                if sock is not None:
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+
+    @staticmethod
+    def _pipe(src: socket.socket, dst: socket.socket, done: threading.Event) -> None:
+        try:
+            while not done.is_set():
+                data = src.recv(65536)
+                if not data:
+                    break
+                dst.sendall(data)
+        except OSError:
+            pass
+        finally:
+            done.set()
+            try:
+                dst.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+
+
+def egress_from_env() -> dict:
+    """Browser egress settings for this host, taken from the environment.
+
+    Deliberately not a tool parameter: pointing the browser at an arbitrary
+    proxy is a capability the agent must not be able to grant itself on the
+    say-so of a page it is reading. Only whoever starts the process can set it.
+
+      LAINTAS_BROWSER_PROXY              host:port of an upstream HTTP proxy
+      LAINTAS_BROWSER_PROXY_CREDENTIALS  user:pass for it, when it needs auth
+      LAINTAS_BROWSER_USER_AGENT         User-Agent to pin for every page
+    """
+    out: dict = {}
+    proxy = (os.environ.get("LAINTAS_BROWSER_PROXY") or "").strip()
+    if proxy:
+        out["proxy"] = proxy
+        creds = (os.environ.get("LAINTAS_BROWSER_PROXY_CREDENTIALS") or "").strip()
+        if creds:
+            out["proxy_credentials"] = creds
+    user_agent = (os.environ.get("LAINTAS_BROWSER_USER_AGENT") or "").strip()
+    if user_agent:
+        out["user_agent"] = user_agent
+    return out
+
+
 # ── BrowserSession ──────────────────────────────────────────────────────
 
 @dataclass
@@ -242,24 +446,24 @@ class BrowserSessionInfo:
 
 
 class BrowserSession:
-    """One headless Chrome + live-view relay, bridged to Helpwo over WS.
+    """One headless Chrome with a screen that can be viewed and driven remotely.
 
     Lifecycle:
-      start()  → spawn Xvfb, Chrome, x11vnc; connect WS to backend (retried);
-                 start the two bridge threads.
-      close()  → kill subprocesses, close WS, remove user-data-dir.
+      start()  → spawn Xvfb, Chrome, x11vnc.
+      close()  → kill subprocesses, drop the proxy relay, remove user-data-dir.
 
-    The WS connection is retried in the background so the host stack comes up
-    immediately even if the backend /vnc endpoint isn't deployed yet — useful
-    for debugging and for surviving transient backend outages.
+    Nothing here reaches out to the backend: the live view is attached
+    separately by webrtc_channel.py, which connects to rfb_port on demand.
     """
 
-    def __init__(self, backend_url: str, agent_id: str, agent_secret: str,
+    def __init__(self, backend_url: str, agent_id: str,
                  session_id: str, url: str = "about:blank",
-                 width: int = 1280, height: int = 800):
+                 width: int = 1280, height: int = 800,
+                 proxy: Optional[str] = None,
+                 proxy_credentials: Optional[str] = None,
+                 user_agent: Optional[str] = None):
         self.backend_url = backend_url.rstrip("/")
         self.agent_id = agent_id
-        self.agent_secret = agent_secret
         self.session_id = session_id
         # Security-check the opening URL (SSRF / scheme guard). about:blank and
         # other non-navigational defaults pass through untouched.
@@ -269,6 +473,13 @@ class BrowserSession:
             self.url = url
         self.width = width
         self.height = height
+        # Egress via an upstream proxy, so the page sees that exit IP rather
+        # than this host's. Credentials go to a loopback relay instead of
+        # Chrome's argv — see ProxyAuthRelay.
+        self.proxy = proxy
+        self.proxy_credentials = proxy_credentials
+        self.user_agent = user_agent
+        self._relay: Optional[ProxyAuthRelay] = None
 
         self.display_n: int = 0
         self.cdp_port: int = 0
@@ -279,12 +490,7 @@ class BrowserSession:
         self._chrome: Optional[subprocess.Popen] = None
         self._x11vnc: Optional[subprocess.Popen] = None
 
-        self._rfb_sock: Optional[socket.socket] = None
-        self._ws = None
-        self._ws_thread: Optional[threading.Thread] = None
-        self._rfb_reader: Optional[threading.Thread] = None
         self._closed = threading.Event()
-        self._ws_connected = threading.Event()
         self._log_dir: Optional[str] = None
 
         # Playwright CDP connection (lazily connected by get_page()).
@@ -394,8 +600,6 @@ class BrowserSession:
             return False
         return bool(self._chrome and self._chrome.poll() is None)
 
-    def ws_connected(self) -> bool:
-        return self._ws_connected.is_set()
 
     def get_page(self):
         """Lazily connect to Chrome via Playwright CDP and return the active
@@ -574,6 +778,17 @@ class BrowserSession:
         self.rfb_port = _free_tcp_port(5900, 6000)
         self.user_data_dir = tempfile.mkdtemp(prefix=f"hwo-chrome-{self.display_n}-")
 
+        # The relay exists only to keep credentials out of Chrome's argv, so an
+        # upstream that needs no credentials is pointed at directly. Callers
+        # running their own relay (one that must outlive this process) pass its
+        # address with no credentials and get the same effect.
+        #
+        # Must be listening before Chrome starts — Chrome resolves its proxy at
+        # launch and a refused connection surfaces as an unhelpful page error.
+        if self.proxy and self.proxy_credentials:
+            self._relay = ProxyAuthRelay(self.proxy, self.proxy_credentials)
+            self._relay.start()
+
         self._start_xvfb()
         # Chrome needs the display up to attach; Xvfb is -nolisten tcp so we
         # poll the lock file + unix socket, not a TCP port.
@@ -596,14 +811,13 @@ class BrowserSession:
                 raise RuntimeError(f"Chrome CDP port {self.cdp_port} did not open "
                                    f"(see {self._log('chrome')})")
         self._start_x11vnc()
-        if not _wait_for_port("127.0.0.1", self.rfb_port, timeout=5):
-            raise RuntimeError(f"x11vnc RFB port {self.rfb_port} did not open")
+        if not _wait_for_rfb("127.0.0.1", self.rfb_port, timeout=15):
+            raise RuntimeError(f"x11vnc on RFB port {self.rfb_port} never sent its "
+                               f"banner (see {self._log('x11vnc')})")
 
-        # The screen is now served by x11vnc on 127.0.0.1:rfb_port. The browser
-        # attaches to it peer-to-peer over WebRTC (webrtc_channel.py's VNC
-        # bridge) — RFB bytes never touch the backend. No relay WS is started;
-        # the legacy _ws_bridge_loop is retained only for optional fallback and
-        # is intentionally not spawned here.
+        # The screen is now served by x11vnc on 127.0.0.1:rfb_port; the live
+        # view attaches to it peer-to-peer when a viewer asks (webrtc_channel.py's
+        # VNC bridge). Nothing is pushed to the backend from here.
 
     def close(self) -> None:
         if self._closed.is_set():
@@ -613,17 +827,9 @@ class BrowserSession:
         # Disconnect Playwright before killing Chrome so it doesn't hang.
         self._close_playwright()
 
-        # Close the RFB socket first so the reader thread exits.
-        if self._rfb_sock is not None:
-            try:
-                self._rfb_sock.close()
-            except OSError:
-                pass
-        if self._ws is not None:
-            try:
-                self._ws.close()
-            except Exception:
-                pass
+        if self._relay is not None:
+            self._relay.close()
+            self._relay = None
 
         for proc in (self._x11vnc, self._chrome, self._xvfb):
             if proc is not None and proc.poll() is None:
@@ -692,6 +898,18 @@ class BrowserSession:
             # Prefer pages to start at a real size even without a WM.
             f"--window-position=0,0",
         ]
+
+        if self._relay is not None or self.proxy:
+            # Point at the loopback relay when there is one: credentials in argv
+            # are readable by every local user through ps. Without credentials
+            # there is nothing to hide and the upstream is used directly.
+            upstream = f"127.0.0.1:{self._relay.port}" if self._relay else self.proxy
+            args.append(f"--proxy-server=http://{upstream}")
+            # Chrome otherwise bypasses the proxy for loopback, which would let
+            # a page reach services bound to this host.
+            args.append("--proxy-bypass-list=<-loopback>")
+        if self.user_agent:
+            args.append(f"--user-agent={self.user_agent}")
 
         # Privilege handling: a page we browse is untrusted, so we want Chrome's
         # setuid sandbox ON. The sandbox refuses to run as root, so when we are
@@ -765,145 +983,6 @@ class BrowserSession:
             start_new_session=True,
         )
 
-    # ── WS ↔ RFB bridge ────────────────────────────────────────────────
-
-    def _ws_url(self) -> str:
-        base = self.backend_url
-        base = base.replace("https://", "wss://").replace("http://", "ws://")
-        return (f"{base}/api/agents/{self.agent_id}/vnc"
-                f"?sessionId={self.session_id}&role=host")
-
-    def _ws_bridge_loop(self) -> None:
-        """Connect to backend /vnc, then shuttle RFB bytes both ways.
-
-        Retries the WS connect every 3s until close() — so a missing or
-        temporarily-down backend /vnc endpoint never takes down the host
-        stack. Once connected, runs until either side closes.
-        """
-        try:
-            from websockets.sync.client import connect as _ws_connect
-        except ImportError:
-            return  # websockets not installed → no relay; host stack still up
-
-        # Same certifi-vs-OS-trust-store gap as TerminalSession._run: requests
-        # (used elsewhere for backend HTTP calls) bundles its own certifi CA
-        # store and works even when the OS trust store is broken/missing;
-        # websockets has no such fallback and fails CERTIFICATE_VERIFY_FAILED
-        # in that situation unless given an explicit ssl context.
-        ssl_context = None
-        if self._ws_url().startswith("wss://"):
-            try:
-                import ssl as _ssl_module
-                import certifi
-                ssl_context = _ssl_module.create_default_context(cafile=certifi.where())
-            except Exception:
-                ssl_context = None
-
-        while not self._closed.is_set():
-            try:
-                # Browser-shaped UA — see TerminalSession._run for why: the
-                # library default reads as a bot to CF/WAF layers and can get
-                # the WS upgrade blocked before it reaches the backend.
-                self._ws = _ws_connect(
-                    self._ws_url(), open_timeout=10, max_size=None, ssl=ssl_context,
-                    additional_headers={"Authorization": f"Agent {self.agent_secret}"},
-                    user_agent_header="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                                      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                )
-            except Exception:
-                # Backend may not have deployed /vnc yet. Retry.
-                if self._closed.wait(timeout=3):
-                    return
-                continue
-
-            self._ws_connected.set()
-            # Connect to x11vnc's RFB port on the host side.
-            try:
-                self._rfb_sock = socket.create_connection(
-                    ("127.0.0.1", self.rfb_port), timeout=5)
-            except OSError:
-                try:
-                    self._ws.close()
-                except Exception:
-                    pass
-                self._ws = None
-                self._ws_connected.clear()
-                if self._closed.wait(timeout=3):
-                    return
-                continue
-
-            # Reader: RFB → WS (sole WS writer per the one-writer pattern).
-            self._rfb_reader = threading.Thread(
-                target=self._pump_rfb_to_ws, daemon=True,
-                name=f"hwo-vnc-rfb-{self.session_id}")
-            self._rfb_reader.start()
-
-            # Main: WS → RFB (sole RFB writer).
-            try:
-                self._pump_ws_to_rfb()
-            finally:
-                self._ws_connected.clear()
-                if self._rfb_sock is not None:
-                    try:
-                        self._rfb_sock.close()
-                    except OSError:
-                        pass
-                self._rfb_sock = None
-                if self._ws is not None:
-                    try:
-                        self._ws.close()
-                    except Exception:
-                        pass
-                self._ws = None
-
-            if self._closed.wait(timeout=3):
-                return
-
-    def _pump_rfb_to_ws(self) -> None:
-        """RFB socket → WS. Sole writer of the WS so frames stay ordered."""
-        while not self._closed.is_set() and self._ws is not None:
-            try:
-                data = self._rfb_sock.recv(65536)
-            except OSError:
-                break
-            if not data:
-                break
-            try:
-                self._ws.send(json.dumps({
-                    "t": "o",
-                    "d": base64.b64encode(data).decode("ascii"),
-                }))
-            except Exception:
-                break
-        # Tell the browser the VNC server ended.
-        try:
-            if self._ws is not None:
-                self._ws.send(json.dumps({"t": "exit"}))
-        except Exception:
-            pass
-
-    def _pump_ws_to_rfb(self) -> None:
-        """WS → RFB socket."""
-        import base64 as _b64
-        if self._ws is None:
-            return
-        try:
-            for message in self._ws:
-                try:
-                    msg = json.loads(message)
-                except (ValueError, TypeError):
-                    continue
-                t = msg.get("t")
-                if t == "i":
-                    try:
-                        self._rfb_sock.sendall(
-                            _b64.b64decode(msg.get("d", "")))
-                    except OSError:
-                        break
-                # no resize/exit handling — VNC has no resize semantic.
-        except Exception:
-            pass
-
     def info(self, name: str) -> BrowserSessionInfo:
         return BrowserSessionInfo(
             name=name,
@@ -962,6 +1041,20 @@ def get_all_browser_sessions() -> List[BrowserSession]:
         return list(_browser_sessions.values())
 
 
+def get_latest_browser_session() -> Optional[BrowserSession]:
+    """The most recently registered session, or None.
+
+    For viewers that have no way to name one: Helpwo's live-view button is a
+    single icon per agent, so "this agent's browser" is the only thing it can
+    mean, and it should not depend on how the session happened to be named.
+    """
+    with _browser_lock:
+        for session in reversed(list(_browser_sessions.values())):
+            if session.is_alive():
+                return session
+        return None
+
+
 def close_all_browser_sessions() -> None:
     """Cascading cleanup — wired into the same shutdown hooks as
     close_all_terminals / close_all_agents."""
@@ -986,7 +1079,7 @@ def _self_test(url: str = "https://www.google.com") -> int:
     print(f"[*] starting headless-browser stack for {url}")
     sess = BrowserSession(
         backend_url=os.environ.get("LAINTAS_BACKEND", "http://localhost:8000"),
-        agent_id="selftest", agent_secret="selftest",
+        agent_id="selftest",
         session_id=f"selftest-{int(time.time())}",
         url=url,
     )
@@ -1003,7 +1096,6 @@ def _self_test(url: str = "https://www.google.com") -> int:
     print(f"    display     :{sess.display_n}")
     print(f"    cdp         : {sess.cdp_endpoint()}")
     print(f"    rfb (VNC)   : 127.0.0.1:{sess.rfb_port}")
-    print(f"    ws relay    : {sess.ws_connected()} (retries until backend /vnc is up)")
     print(f"    chrome pid  : {sess._chrome.pid if sess._chrome else '-'}")
     print("[*] Ctrl-C to tear down")
 

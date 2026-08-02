@@ -3448,11 +3448,7 @@ def _bi_terminal_send(params: dict, ctx: ToolCtx) -> dict:
         cursors = {}
         setattr(term.session, "_laintas_terminal_read_cursors", cursors)
     cursors[ctx.agent_id or "_default"] = len(full)
-    try:
-        output = ctx.deps.strip_ansi(delta) if ctx.deps else delta
-    except Exception:
-        output = delta
-    new_output = output.strip()
+    new_output = delta.strip()
     return {
         "ok": True,
         "status": "sent",
@@ -3499,14 +3495,10 @@ def _bi_terminal_read(params: dict, ctx: ToolCtx) -> dict:
     cursor = max(0, min(cursor, len(full)))
     delta = full[cursor:]
     cursors[key] = len(full)
-    try:
-        output = ctx.deps.strip_ansi(delta) if ctx.deps else delta
-    except Exception:
-        output = delta
-    truncated = len(output) > max_chars
+    truncated = len(delta) > max_chars
     if truncated:
-        output = output[-max_chars:]
-    new_output = output.strip()
+        delta = delta[-max_chars:]
+    new_output = delta.strip()
     completed = not alive
     returncode = None
     if completed:
@@ -3762,10 +3754,13 @@ def _bi_terminal_watch(params: dict, ctx: ToolCtx) -> dict:
 
 
 def _session_output(session, ctx: ToolCtx) -> str:
-    """Return normalized output without assuming a concrete PTY class."""
+    """Return normalized output without assuming a concrete PTY class.
+    
+    ANSI escape sequences are preserved so the AI can see colors when
+    terminal_output_style rules call for semantic color use.
+    """
     try:
-        output = session.full_output
-        return ctx.deps.strip_ansi(output) if ctx.deps else output
+        return session.full_output or ""
     except Exception:
         return getattr(session, "full_output", "") or ""
 
@@ -4718,11 +4713,11 @@ def _bi_browser_debug_open(params: dict, ctx: ToolCtx) -> dict:
     sess = _bs.BrowserSession(
         backend_url=backend,
         agent_id=agent_id,
-        agent_secret="debug",
         session_id=session_id,
         url=url,
         width=width,
         height=height,
+        **_bs.egress_from_env(),
     )
     try:
         sess.start()
@@ -4752,7 +4747,6 @@ def _bi_browser_debug_open(params: dict, ctx: ToolCtx) -> dict:
             f"  cdp      : {sess.cdp_endpoint()}\n"
             f"  cdp ver  : {cdp_ver}\n"
             f"  vnc      : 127.0.0.1:{sess.rfb_port}\n"
-            f"  ws relay : {'connected' if sess.ws_connected() else 'retrying (backend /vnc not deployed)'}\n"
             f"  chrome   : pid {sess._chrome.pid if sess._chrome else '-'}"
         ),
         "name": registered,
@@ -4793,7 +4787,7 @@ def _bi_browser_debug_list(params: dict, ctx: ToolCtx) -> dict:
             lines.append(
                 f"  {nm}: url={sess.url} display=:{sess.display_n} "
                 f"cdp={sess.cdp_endpoint()} vnc=:{sess.rfb_port} "
-                f"alive={sess.is_alive()} ws={sess.ws_connected()}"
+                f"alive={sess.is_alive()}"
             )
     return {"ok": True, "result": f"{len(sessions)} session(s):\n" + "\n".join(lines)}
 
@@ -4830,8 +4824,9 @@ def _browser_resolve_session(params: dict):
     width = int(params.get("width", 1280) or 1280)
     height = int(params.get("height", 800) or 800)
     sess = _bs.BrowserSession(
-        backend_url=backend, agent_id="debug", agent_secret="debug",
+        backend_url=backend, agent_id="debug",
         session_id=session_id, url="about:blank", width=width, height=height,
+        **_bs.egress_from_env(),
     )
     try:
         sess.start()
@@ -4994,8 +4989,9 @@ def _bi_browser_open(params: dict, ctx: ToolCtx) -> dict:
     session_id = f"browser-{int(__import__('time').time() * 1000)}"
 
     sess = _bs.BrowserSession(
-        backend_url=backend, agent_id=agent_id, agent_secret="debug",
+        backend_url=backend, agent_id=agent_id,
         session_id=session_id, url=url, width=width, height=height,
+        **_bs.egress_from_env(),
     )
     try:
         sess.start()
@@ -5012,7 +5008,6 @@ def _bi_browser_open(params: dict, ctx: ToolCtx) -> dict:
             f"  display  :{sess.display_n}\n"
             f"  cdp      : {sess.cdp_endpoint()}\n"
             f"  vnc      : 127.0.0.1:{sess.rfb_port}\n"
-            f"  ws relay : {'connected' if sess.ws_connected() else 'retrying (backend /vnc not deployed)'}"
         ),
         "name": registered,
         "cdp_endpoint": sess.cdp_endpoint(),

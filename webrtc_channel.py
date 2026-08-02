@@ -1115,6 +1115,12 @@ class WebrtcManager:
         try:
             import browser_session as _bs
             sess = _bs.get_browser_session(name)
+            if sess is None:
+                # The live-view button has no session picker — it always asks
+                # for "default" — while browser.open auto-names sessions
+                # browser1, browser2, ... Rather than make the button depend on
+                # how a session happened to be named, show the newest one.
+                sess = _bs.get_latest_browser_session()
         except Exception as e:
             channel.send(json.dumps({"t": "vnc-error", "error": f"registry: {e}"}))
             return
