@@ -27,6 +27,7 @@ from typing import Optional
 import json_store
 import paths
 import workgraph
+import symbols                # Centralized UI symbol constants
 
 PLANS_DIR = paths.PLANS_DIR
 _STATE_PATH = paths.PLANS_STATE
@@ -268,7 +269,7 @@ def exit_plan_mode(approve: bool = False) -> Optional[dict]:
             try:
                 p = Path(plan["file"])
                 content = p.read_text(encoding="utf-8")
-                content = content.replace("Status:** drafting", "Status:** approved ✅")
+                content = content.replace("Status:** drafting", f"Status:** approved {symbols.OK}")
                 content = content.replace("Approved:** no", "Approved:** yes")
                 p.write_text(content, encoding="utf-8")
             except OSError:
@@ -412,8 +413,8 @@ def _write_projection_status(plan: dict, approved: bool) -> None:
         p = Path(plan["file"])
         content = p.read_text(encoding="utf-8")
         if approved:
-            content = content.replace("**Status:** drafting", "**Status:** approved ✅")
-            content = content.replace("**Status:** review_pending", "**Status:** approved ✅")
+            content = content.replace("**Status:** drafting", f"**Status:** approved {symbols.OK}")
+            content = content.replace("**Status:** review_pending", f"**Status:** approved {symbols.OK}")
             content = content.replace("**Approved:** no", "**Approved:** yes")
         tmp = p.with_suffix(".tmp")
         tmp.write_text(content, encoding="utf-8")

@@ -33,6 +33,7 @@ import time
 import traceback
 import difflib
 import unicodedata
+import symbols                # Centralized UI symbol constants
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
@@ -2552,10 +2553,10 @@ def _bi_spawn_parallel(params: dict, ctx: ToolCtx) -> dict:
         _running = len(child_ids) - len(_final)
         _total_tools = sum(_tool_counts.values())
         if _running > 0:
-            _head = (f"[dim]{_spinner_glyph()} {_running}/{len(child_ids)} running · "
-                      f"{_total_tools} tool calls · {_elapsed_total:.0f}s[/dim]")
+            _head = (f"[dim]{_spinner_glyph()} {_running}/{len(child_ids)} running {symbols.BULLET} "
+                      f"{_total_tools} tool calls {symbols.BULLET} {_elapsed_total:.0f}s[/dim]")
         else:
-            _head = f"[dim]✓ {len(child_ids)}/{len(child_ids)} done · {_elapsed_total:.0f}s[/dim]"
+            _head = f"[dim]{symbols.OK} {len(child_ids)}/{len(child_ids)} done {symbols.BULLET} {_elapsed_total:.0f}s[/dim]"
         _table = _RichTable(
             box=None, show_header=False, show_edge=False, pad_edge=False,
             padding=(0, 1), expand=True)
@@ -2566,12 +2567,12 @@ def _bi_spawn_parallel(params: dict, ctx: ToolCtx) -> dict:
         for cid in child_ids:
             if cid in _final:
                 _glyph, _text = _final[cid]
-                _meta = f"{_tool_counts[cid]} tools · {_final_elapsed.get(cid, 0):.0f}s"
+                _meta = f"{_tool_counts[cid]} tools {symbols.BULLET} {_final_elapsed.get(cid, 0):.0f}s"
             else:
                 with _pending_approvals_lock:
                     _awaiting = _pending_approvals.get(cid)
                 if _awaiting:
-                    _glyph = "[warning]⏳[/warning]"
+                    _glyph = f"[warning]{symbols.WAIT}[/warning]"
                     _text = f"[warning]awaiting approval:[/warning] {_awaiting}"
                 elif time.time() - _activity_ts[cid] >= _IDLE_HINT_AFTER:
                     _tool, _arg = _activity[cid]
@@ -2582,7 +2583,7 @@ def _bi_spawn_parallel(params: dict, ctx: ToolCtx) -> dict:
                     _glyph = f"[accent]{_spinner_glyph()}[/accent]"
                     _tool, _arg = _activity[cid]
                     _text = f"[muted]{_tool}[/muted] {_arg}" if _tool else f"[muted]{_arg}[/muted]"
-                _meta = f"{_tool_counts[cid]} tools · {time.time() - _start[cid]:.0f}s"
+                _meta = f"{_tool_counts[cid]} tools {symbols.BULLET} {time.time() - _start[cid]:.0f}s"
             _table.add_row(_glyph, cid, _text, _meta)
         return _RichGroup(_RichText.from_markup(_head), _table)
 
@@ -2684,12 +2685,12 @@ def _bi_spawn_parallel(params: dict, ctx: ToolCtx) -> dict:
                             _has_reply = bool(
                                 (info.result or info.last_reply or "").strip())
                             if info.status == "done" and not info.error and _has_reply:
-                                _final[cid] = ("[success]✓[/success]", "[muted]done[/muted]")
+                                _final[cid] = (f"[success]{symbols.OK}[/success]", "[muted]done[/muted]")
                             elif info.status == "done" and not info.error:
                                 _final[cid] = ("[warning]◯[/warning]", "[muted]empty reply[/muted]")
                             else:
                                 _label = _disp_truncate(info.error or info.status, 60)
-                                _final[cid] = ("[error]✕[/error]", f"[muted]{_label}[/muted]")
+                                _final[cid] = (f"[error]{symbols.FAIL}[/error]", f"[muted]{_label}[/muted]")
                     if _live is not None:
                         _live.update(_render_agents_block(), refresh=True)
                     if _pending:
@@ -2707,8 +2708,8 @@ def _bi_spawn_parallel(params: dict, ctx: ToolCtx) -> dict:
                     _al.abort_agent(cid)
                     infos[child_ids.index(cid)] = None
                     _final_elapsed[cid] = time.time() - _start[cid]
-                    _label = "interrupted" if _interrupted else f"timed out · {_timeout}s"
-                    _final[cid] = ("[error]✕[/error]", f"[muted]{_label}[/muted]")
+                    _label = "interrupted" if _interrupted else f"timed out {symbols.BULLET} {_timeout}s"
+                    _final[cid] = (f"[error]{symbols.FAIL}[/error]", f"[muted]{_label}[/muted]")
                 if _live is not None:
                     _live.update(_render_agents_block(), refresh=True)
             finally:
@@ -2772,7 +2773,7 @@ def _bi_spawn_parallel(params: dict, ctx: ToolCtx) -> dict:
                 partial += 1
         succeeded += int(ok)
         lines.append(
-            f"\n─── [{'✓' if ok else '✗'}] {cid} ───\n"
+            f"\n─── [{'{symbols.OK}' if ok else f'{symbols.FAIL}'}] {cid} ───\n"
             f"Goal: {task['task'][:80]}\nResult: {message[:400]}"
         )
     _summary = f"\n═══ Summary: {succeeded}/{len(child_ids)} succeeded"
@@ -2849,7 +2850,7 @@ def _bi_spawn_chain(params: dict, ctx: ToolCtx) -> dict:
                 "child_ids": child_ids,
             }
         handoff = info.result or info.last_reply or "(done)"
-        summaries.append(f"  ✓ Step {index + 1}: {goal[:80]}")
+        summaries.append(f"  {symbols.OK} Step {index + 1}: {goal[:80]}")
 
     return {
         "ok": True,
@@ -2917,7 +2918,7 @@ def _bi_await_spawns(params: dict, ctx: ToolCtx) -> dict:
     agents = [_al.get_agent(aid) for aid in target_ids if _al.get_agent(aid)]
     lines = [f"═══ Sub-agent Results ({len(agents)} agents) ═══"]
     for a in agents:
-        icon = "✓" if a.status == "done" else "✗"
+        icon = f"{symbols.OK}" if a.status == "done" else f"{symbols.FAIL}"
         lines.append(f"\n─── [{icon}] {a.id} ───")
         lines.append(f"Goal: {a.name} [status={a.status}]")
         if a.result:
@@ -5601,7 +5602,7 @@ def _bi_browser_test_flow(params: dict, ctx: ToolCtx) -> dict:
     summary = ("PASS" if passed_all else "FAIL") + f": {n_pass}/{ran} step(s) passed"
     lines = [summary]
     for r in results:
-        mark = "✓" if r["pass"] else "✗"
+        mark = f"{symbols.OK}" if r["pass"] else f"{symbols.FAIL}"
         lines.append(f"  {mark} [{r['step']}] {r['action']}: {str(r['detail'])[:300]}")
     if shot_path:
         lines.append(f"  failure screenshot: {shot_path}")

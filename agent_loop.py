@@ -36,6 +36,7 @@ import task_manager          # Structured task tracking (session + persisted)
 import workgraph             # Unified objective/plan/steps/workflow authority
 import paths                 # Centralized path management
 import skills as skills_mod   # Progressive skill metadata + context loading
+import symbols                # Centralized UI symbol constants
 import event_log              # Durable prompt admission + turn event log
 import precheck               # Tool-precheck labeled-sample capture + inference stub
 import redactor               # Outbound secret/PII redaction + weak-label capture
@@ -251,7 +252,7 @@ _SHIMMER_GRAD = (
     "#b7f7c0", "#7ee787", "#4ade80", "#3fb950",
 )
 
-_THINKING_SPINNER_FRAMES = tuple("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
+_THINKING_SPINNER_FRAMES = symbols.SPINNER_BRAILLE
 
 
 def _shimmer_segments(label: str, elapsed: float) -> list[tuple[str, str]]:
@@ -444,7 +445,7 @@ def _emit_simple_diff(console, diff_text: str, depth: int = 0, cap: int = 0) -> 
         hidden = total - cap
         for style, mark, no, text in changed[:half]:
             _print_entry(style, mark, no, text)
-        console.print(f"{inner}     [muted]… {hidden} more change(s) · /detail on for full[/muted]", highlight=False)
+        console.print(f"{inner}     [muted]… {hidden} more change(s) {symbols.BULLET} /detail on for full[/muted]", highlight=False)
         for style, mark, no, text in changed[-half:]:
             _print_entry(style, mark, no, text)
 
@@ -1547,7 +1548,7 @@ def _build_resume_payload(state: dict, chat_history: list, cwd: str, kind: str) 
         title_source = str(prompt_turns[-1].get("content") or "").strip()
     if not title_source:
         project_name = Path(cwd).name or cwd
-        title_source = f"Terminal session · {project_name}"
+        title_source = f"Terminal session {symbols.BULLET} {project_name}"
     title = re.sub(r"\s+", " ", title_source)[:80] or "Untitled session"
     session_id = _ensure_session_id(state)
     return {
@@ -3639,7 +3640,7 @@ def _maybe_retry_suggestion(state: dict) -> str:
             failures += 1
 
     if failures >= _CONSECUTIVE_FAILURE_LIMIT:
-        return (f"\n⚠️  The last {failures} commands all failed. "
+        return (f"\n{symbols.WARN}  The last {failures} commands all failed. "
                 f"Consider a different approach or checking the error messages above.")
 
     return ""
@@ -3704,8 +3705,8 @@ def _summarize_old_entries(old_entries: list) -> dict:
 
         if is_error:
             # Show errors verbatim (truncated to 240 chars) — signal-rich
-            err_snip = err.get("output_snippet", "")[:240].replace("\n", " ⏎ ")
-            lines.append(f"  {step_label} ✗ {cmd_short}{rc_tag}{run_tag} → {err_snip}")
+            err_snip = err.get("output_snippet", "")[:240].replace("\n", f" {symbols.RETURN} ")
+            lines.append(f"  {step_label} {symbols.FAIL} {cmd_short}{rc_tag}{run_tag} → {err_snip}")
         else:
             # Preserve first 150 chars of successful output — prevents amnesia
             # that causes the model to re-read files it already examined.
@@ -3719,9 +3720,9 @@ def _summarize_old_entries(old_entries: list) -> dict:
                     if len(_out_lines[0]) > 150:
                         out_snip += "…"
             if out_snip:
-                lines.append(f"  {step_label} ✓ {cmd_short}{rc_tag}{run_tag} → {out_snip}")
+                lines.append(f"  {step_label} {symbols.OK} {cmd_short}{rc_tag}{run_tag} → {out_snip}")
             else:
-                lines.append(f"  {step_label} ✓ {cmd_short}{rc_tag}{run_tag}")
+                lines.append(f"  {step_label} {symbols.OK} {cmd_short}{rc_tag}{run_tag}")
 
         i = j
 
@@ -5598,12 +5599,12 @@ def _format_parallel_results(inbox_msgs: list) -> str:
         if kind == "child-done":
             summary = msg.get("summary", "(no summary)")
             results.append(
-                f"[{from_agent}] ✅ {status}\n{summary[:500]}"
+                f"[{from_agent}] {symbols.OK} {status}\n{summary[:500]}"
             )
         else:
             error = msg.get("error", "(no error)")
             results.append(
-                f"[{from_agent}] ❌ error: {error[:300]}"
+                f"[{from_agent}] {symbols.FAIL} error: {error[:300]}"
             )
 
     if not results:
@@ -5936,7 +5937,7 @@ def run_agent_loop(
         # ── Soft-interrupt check (Ctrl+C from user) ──────────────────
         if _interrupt.is_set():
             state["lastReply"] = "(interrupted by user)"
-            deps.console.print("\n[yellow]⚡ Interrupted by user (Ctrl+C).[/yellow]")
+            deps.console.print(f"\n[yellow]{symbols.ZAP} Interrupted by user (Ctrl+C).[/yellow]")
             _exit_reason = TRANSITION_INTERRUPTED
             break
 
@@ -6386,7 +6387,7 @@ def run_agent_loop(
                     if events_cb is not None:
                         try:
                             deps.console.print(
-                                f"[yellow]⚠ Progress check: off track (score "
+                                f"[yellow]{symbols.WARN} Progress check: off track (score "
                                 f"{_verdict.get('score')}/100) — corrective guidance injected[/yellow]")
                         except Exception:
                             pass
@@ -6486,11 +6487,11 @@ def run_agent_loop(
                     _txt.append(f" {_elapsed:.1f}s", style="#8b949e")
                     if _detail:
                         _txt.append(
-                            f" · ↑{_fmt_tokens(_cur_in_est)} ↓{_fmt_tokens(_cur_out_est)}",
+                            f" {symbols.BULLET} {symbols.ARROW_U}{_fmt_tokens(_cur_in_est)} {symbols.ARROW_D}{_fmt_tokens(_cur_out_est)}",
                             style="#8b949e",
                         )
                     if _cw >= 72:
-                        _txt.append(f" · {_spin_model} · {_spin_mode}", style="#8b949e")
+                        _txt.append(f" {symbols.BULLET} {_spin_model} {symbols.BULLET} {_spin_mode}", style="#8b949e")
                     _spinner.text = _txt
                     parts.append(_spinner)
                     # Reserve a constant number of preview rows for the whole
@@ -6609,7 +6610,7 @@ def run_agent_loop(
                 # too, and on the shared TeeFile console its default
                 # redirect_stdout=True feedback-loops into a deadlock. A static
                 # print is deadlock-free and works without rich Live.
-                deps.console.print(f"[#3fb950]thinking… · {_spin_model} · {_spin_mode}[/#3fb950]")
+                deps.console.print(f"[#3fb950]thinking… {symbols.BULLET} {_spin_model} {symbols.BULLET} {_spin_mode}[/#3fb950]")
                 with nullcontext():
                     try:
                         response = deps.call_backend(
@@ -6800,7 +6801,7 @@ def run_agent_loop(
                         and not _prose_final):
                     from rich.markup import escape as _esc
                     deps.console.print(
-                        f"[accent]·[/accent] [dim]{_esc(_stripped)}[/dim]")
+                        f"[accent]{symbols.BULLET}[/accent] [dim]{_esc(_stripped)}[/dim]")
                 else:
                     _print_markdown_safely(deps, display_reply)
             step_replies.append(display_reply)
@@ -6838,14 +6839,14 @@ def run_agent_loop(
         # retrying the same too-long write. The note carries into the next turn. ──
         if response.get("_truncated"):
             _append_short_memory(state, (
-                "\n  ⚠ Your last response was cut off at the output token "
+                f"\n  {symbols.WARN} Your last response was cut off at the output token "
                 "limit — it was too long to finish. Do NOT rewrite the whole "
                 "file in one call. Write it in chunks: write the first "
                 "part, then append the rest with edit."
             ))
             if events_cb is not None:
                 deps.console.print(
-                    "[yellow]⚠ Response truncated at token limit — asking AI to write in smaller chunks.[/yellow]")
+                    f"[yellow]{symbols.WARN} Response truncated at token limit — asking AI to write in smaller chunks.[/yellow]")
 
         # A retry is needed only on a genuine empty response (silent failure
         # above set _parse_failed); it already printed its own hint.
@@ -6857,7 +6858,7 @@ def run_agent_loop(
             balance = billing.get("balanceCents") or 0
             if cost > 0:
                 prefix = "official" if billing.get("official") else "external"
-                billing_text = f"{prefix} · ${cost / 100:.2f} · balance ${balance / 100:.2f}"
+                billing_text = f"{prefix} {symbols.BULLET} ${cost / 100:.2f} {symbols.BULLET} balance ${balance / 100:.2f}"
                 if events_cb is not None:
                     deps.console.print(f"[dim]({billing_text})[/dim]")
                     pending_events.append({"type": "system", "kind": "billing", "content": billing_text})
@@ -6873,7 +6874,7 @@ def run_agent_loop(
             _truncated_n = len(tool_calls)
             tool_calls = tool_calls[:MAX_TC_PER_TURN]
             _append_short_memory(state, (
-                f"\n  ⚠ Emitted {_truncated_n} tool calls; only first {MAX_TC_PER_TURN} ran. "
+                f"\n  {symbols.WARN} Emitted {_truncated_n} tool calls; only first {MAX_TC_PER_TURN} ran. "
                 f"Be more selective next turn."
             ))
 
@@ -6950,9 +6951,9 @@ def run_agent_loop(
                             display_reads.append(item)
             # Shortest unique suffix to disambiguate same-name files
             shown_reads = _shortest_unique(display_reads[:3])
-            read_tail = " · ".join(shown_reads).replace("[", "\\[")
+            read_tail = f" {symbols.BULLET} ".join(shown_reads).replace("[", "\\[")
             if len(unique_reads) > 3:
-                read_tail += f" · +{len(unique_reads) - 3}"
+                read_tail += f" {symbols.BULLET} +{len(unique_reads) - 3}"
             label, singular, plural = {
                 "Search": ("Search", "result", "results"),
                 "List": ("List", "location", "locations"),
@@ -6962,8 +6963,8 @@ def run_agent_loop(
                 label = f'{label} "{query_text}"'
             noun = singular if len(unique_reads) == 1 else plural
             deps.console.print(
-                f"  [success]●[/success] [accent.dim]{label}[/accent.dim]  "
-                f"[muted]{len(unique_reads)} {noun} · {read_tail}[/muted]",
+                f"  [success]{symbols.DOT}[/success] [accent.dim]{label}[/accent.dim]  "
+                f"[muted]{len(unique_reads)} {noun} {symbols.BULLET} {read_tail}[/muted]",
                 highlight=False,
             )
             _compact_read_hints.clear()
@@ -6972,7 +6973,7 @@ def run_agent_loop(
             for idx, tc in enumerate(tool_calls):
                 # ── Soft-interrupt check before each tool call ──
                 if _interrupt.is_set():
-                    deps.console.print(f"\n[yellow]⚡ Interrupted — skipping remaining {len(tool_calls) - idx} tool call(s).[/yellow]")
+                    deps.console.print(f"\n[yellow]{symbols.ZAP} Interrupted — skipping remaining {len(tool_calls) - idx} tool call(s).[/yellow]")
                     break
 
                 name = tc.get("name", "")
@@ -7038,9 +7039,9 @@ def run_agent_loop(
                             f"has already failed {_prev_n} times. Monitoring remains "
                             f"advisory; change strategy instead of repeating it."
                         )
-                        _append_short_memory(state, f"\n  ⚠ {_warning}")
+                        _append_short_memory(state, f"\n  {symbols.WARN} {_warning}")
                         if events_cb is not None:
-                            deps.console.print(f"[yellow]⚠ {_warning}[/yellow]")
+                            deps.console.print(f"[yellow]{symbols.WARN} {_warning}[/yellow]")
                         _warned_repeat_failures.add(_ledger_fp)
                 elif (_ledger_eligible
                         and _fail_ledger.get(_ledger_fp, 0) >= _repeat_block_limit):
@@ -7071,7 +7072,7 @@ def run_agent_loop(
                     _repeat_blocked_this_turn = True
                     if events_cb is not None:
                         deps.console.print(
-                            f"[red]⚠ Blocked repeated failing call `{name} {salient[:60]}` "
+                            f"[red]{symbols.WARN} Blocked repeated failing call `{name} {salient[:60]}` "
                             f"(failed {_prev_n}× already).[/red]")
                     continue
 
@@ -7250,7 +7251,7 @@ def run_agent_loop(
                                 result["_user_denied"] = True
                             skip_invoke = True
                         elif policy_approval:
-                            _append_short_memory(state, f"\n  ⚠ Policy: {policy_reason}")
+                            _append_short_memory(state, f"\n  {symbols.WARN} Policy: {policy_reason}")
 
                         if not skip_invoke:
                             cmd_allowed, _ = hooks_mod.trigger("pre_command", {
@@ -7562,7 +7563,7 @@ def run_agent_loop(
                     from rich.markup import escape as _esc_hint
                     # Green dot = quiet success; red dot = a call that
                     # actually failed — same shape, color carries the verdict.
-                    ok_mark = "[success]●[/success]" if result.get("ok") else "[error]●[/error]"
+                    ok_mark = f"[success]{symbols.DOT}[/success]" if result.get("ok") else f"[error]{symbols.DOT}[/error]"
                     _hint_plain = (salient if salient else display_name) or ""
                     if name in {"task.create", "task.update", "task.list", "task.get", "task.complete"} and result.get("ok"):
                         if name == "task.complete":
@@ -7577,35 +7578,35 @@ def run_agent_loop(
                         # trailing meta carries the essentials (line count / exit
                         # code); failures point to /debug. Full output stays in
                         # terminalHistory / /debug.
-                        _mark2 = "[success]●[/success]" if result.get("ok") else "[error]●[/error]"
+                        _mark2 = f"[success]{symbols.DOT}[/success]" if result.get("ok") else f"[error]{symbols.DOT}[/error]"
                         _meta2 = ""
                         if name == "terminal.send" and result.get("ok"):
                             _nlines = len((formatted or "").split("\n")) if formatted else 0
-                            _meta2 = f"sent · {_nlines}L" if _nlines else "sent"
+                            _meta2 = f"sent {symbols.BULLET} {_nlines}L" if _nlines else "sent"
                         elif name == "terminal.exec" and result.get("ok"):
                             if result.get("completed"):
-                                _meta2 = (f"completed · exit {_rc}" if _rc is not None
-                                          else "completed · exit unknown")
+                                _meta2 = (f"completed {symbols.BULLET} exit {_rc}" if _rc is not None
+                                          else f"completed {symbols.BULLET} exit unknown")
                             else:
-                                _meta2 = "started · running"
+                                _meta2 = f"started {symbols.BULLET} running"
                         elif name in ("terminal.read", "terminal.wait") and result.get("ok"):
                             _status = result.get("status", "running")
                             if result.get("completed"):
-                                _meta2 = (f"completed · exit {_rc}" if _rc is not None
-                                          else "completed · exit unknown")
+                                _meta2 = (f"completed {symbols.BULLET} exit {_rc}" if _rc is not None
+                                          else f"completed {symbols.BULLET} exit unknown")
                             else:
                                 _meta2 = _status.replace("_", " ")
                         elif name == "shell.exec":
                             _nlines = len((formatted or "").split("\n")) if formatted else 0
                             if result.get("ok"):
-                                _meta2 = f"{_nlines}L · exit {_rc}" if _nlines else f"exit {_rc}"
+                                _meta2 = f"{_nlines}L {symbols.BULLET} exit {_rc}" if _nlines else f"exit {_rc}"
                             else:
                                 _cause = str(result.get("error") or formatted or "").strip()
                                 _cause = re.sub(r"\s+", " ", _cause).replace("[", "\\[")
                                 _meta2 = f"exit {_rc}"
                                 if _cause:
-                                    _meta2 += f" · {_cause[:120]}"
-                                _meta2 += " · /why"
+                                    _meta2 += f" {symbols.BULLET} {_cause[:120]}"
+                                _meta2 += f" {symbols.BULLET} /why"
                         elif name == "fs.grep" and result.get("ok"):
                             _matches = result.get("matches", 0)
                             _meta2 = f"{_matches} match{'es' if _matches != 1 else ''}"
@@ -7615,9 +7616,9 @@ def run_agent_loop(
                         elif not result.get("ok"):
                             _cause = str(result.get("error") or formatted or "").strip()
                             _cause = re.sub(r"\s+", " ", _cause).replace("[", "\\[")
-                            _meta2 = f"{_cause} · /why" if _cause else "/why"
+                            _meta2 = f"{_cause} {symbols.BULLET} /why" if _cause else "/why"
                         if _tool_elapsed >= 2.0:
-                            _meta2 = f"{_meta2} · {_tool_elapsed:.1f}s" if _meta2 else f"{_tool_elapsed:.1f}s"
+                            _meta2 = f"{_meta2} {symbols.BULLET} {_tool_elapsed:.1f}s" if _meta2 else f"{_tool_elapsed:.1f}s"
                         _quiet_read = (
                             not _detail
                             and bool(result.get("ok"))
@@ -7715,7 +7716,7 @@ def run_agent_loop(
             _exit_reason = TRANSITION_USER_DENIED
             if events_cb is not None:
                 deps.console.print(
-                    "\n[yellow]⚡ User denied approval — terminating task.[/yellow]")
+                    f"\n[yellow]{symbols.ZAP} User denied approval — terminating task.[/yellow]")
                 if pending_events:
                     events_cb(pending_events)
                     pending_events.clear()
@@ -7766,7 +7767,7 @@ def run_agent_loop(
         if _explicit_complete and _failed_calls:
             _explicit_complete = False
             _append_short_memory(state, (
-                "\n  ⚠ task_complete was ignored because another tool in "
+                f"\n  {symbols.WARN} task_complete was ignored because another tool in "
                 "the same turn failed. Inspect the failed result before "
                 "completing the task."
             ))
@@ -7834,13 +7835,13 @@ def run_agent_loop(
                             "an explicit task_complete signal. Monitoring is "
                             "advisory; the task will continue."
                         )
-                        _append_short_memory(state, f"\n  ⚠ {_warning}")
+                        _append_short_memory(state, f"\n  {symbols.WARN} {_warning}")
                         if events_cb is not None:
-                            deps.console.print(f"[yellow]⚠ {_warning}[/yellow]")
+                            deps.console.print(f"[yellow]{symbols.WARN} {_warning}[/yellow]")
                 else:
                     done = False
                     _append_short_memory(state, (
-                        "\n  ⚠ Turn ended with no tool call and no task_complete. "
+                        f"\n  {symbols.WARN} Turn ended with no tool call and no task_complete. "
                         "If the task is finished, call task_complete with a summary; "
                         "otherwise keep working."
                     ))
@@ -7941,11 +7942,11 @@ def run_agent_loop(
             _exit_reason = TRANSITION_WARNING_FORCE
             if events_cb is not None:
                 deps.console.print(
-                    "[red]⚠ Exiting: a tool call kept failing identically and was "
+                    f"[red]{symbols.WARN} Exiting: a tool call kept failing identically and was "
                     "blocked. The task appears stuck.[/red]"
                 )
             _append_short_memory(state, (
-                "\n  ⚠ Loop force-exited: a tool call failed identically "
+                f"\n  {symbols.WARN} Loop force-exited: a tool call failed identically "
                 f"{_repeat_block_limit}+ times and was hard-blocked."
             ))
             if events_cb is not None and pending_events:
@@ -7959,11 +7960,11 @@ def run_agent_loop(
                 _exit_reason = TRANSITION_REPETITION
                 if events_cb is not None:
                     deps.console.print(
-                        f"[yellow]⚠ Output repetition detected: last {_no_progress_count} steps "
+                        f"[yellow]{symbols.WARN} Output repetition detected: last {_no_progress_count} steps "
                         f"produced highly similar output. Exiting to prevent infinite loop.[/yellow]"
                     )
                 _append_short_memory(state, (
-                    f"\n  ⚠ Loop exited: {_no_progress_count} consecutive steps with "
+                    f"\n  {symbols.WARN} Loop exited: {_no_progress_count} consecutive steps with "
                     f"near-identical output. Task may be stuck."
                 ))
                 if events_cb is not None and pending_events:
@@ -7977,8 +7978,8 @@ def run_agent_loop(
                     f"consider changing strategy."
                 )
                 if events_cb is not None:
-                    deps.console.print(f"[yellow]⚠ {_warning}[/yellow]")
-                _append_short_memory(state, f"\n  ⚠ {_warning}")
+                    deps.console.print(f"[yellow]{symbols.WARN} {_warning}[/yellow]")
+                _append_short_memory(state, f"\n  {symbols.WARN} {_warning}")
                 _output_repetition_warned = True
 
         # ── Warning circuit breaker: escalate repeated warnings to force-exit ──
@@ -8001,11 +8002,11 @@ def run_agent_loop(
                 _exit_reason = TRANSITION_WARNING_FORCE
                 if events_cb is not None:
                     deps.console.print(
-                        f"[dark_orange]⚠ Warning '{wk}' fired {_new_streaks[wk]} consecutive times. "
+                        f"[dark_orange]{symbols.WARN} Warning '{wk}' fired {_new_streaks[wk]} consecutive times. "
                         f"Force-exiting to prevent infinite loop.[/dark_orange]"
                     )
                 _append_short_memory(state, (
-                    f"\n  ⚠ Loop force-exited: warning '{wk}' persisted for "
+                    f"\n  {symbols.WARN} Loop force-exited: warning '{wk}' persisted for "
                     f"{_new_streaks[wk]} consecutive iterations."
                 ))
                 if events_cb is not None and pending_events:
@@ -8030,7 +8031,7 @@ def run_agent_loop(
         if error_info["category"] != "none":
             _append_short_memory(
                 state,
-                f"\n  🔍 Error detected [{error_info['category']}]: {error_info['suggestion']}"
+                f"\n  {symbols.INFO} Error detected [{error_info['category']}]: {error_info['suggestion']}"
             )
             # ── Hooks: on_error ──
             hooks_mod.trigger("on_error", {
@@ -8099,7 +8100,7 @@ def run_agent_loop(
             if stale_count >= staleness_limit:
                 if stale_count == staleness_limit and events_cb is not None and deps is not None:
                     deps.console.print(
-                        f"[yellow]⚠ No reply or tool call for {stale_count} idle "
+                        f"[yellow]{symbols.WARN} No reply or tool call for {stale_count} idle "
                         f"steps. Monitoring is advisory; the task will continue.[/yellow]")
                     # Show the raw response with the warning so users can
                     # diagnose backend issues without terminating the task.
@@ -8131,7 +8132,7 @@ def run_agent_loop(
                 repeated=bool(_no_progress_count),
             )
             if _interrupt.wait(timeout=_delay):
-                deps.console.print("\n[yellow]⚡ Agent loop interrupted during delay.[/yellow]")
+                deps.console.print(f"\n[yellow]{symbols.ZAP} Agent loop interrupted during delay.[/yellow]")
                 _exit_reason = TRANSITION_INTERRUPTED
                 break
 
@@ -8165,8 +8166,8 @@ def run_agent_loop(
             f"process and resume."
         )
         if events_cb is not None:
-            deps.console.print(f"[yellow]⚠️ {_exhaustion_msg}[/yellow]")
-        _append_short_memory(state, f"\n  ⚠️ {_exhaustion_msg}")
+            deps.console.print(f"[yellow]{symbols.WARN} {_exhaustion_msg}[/yellow]")
+        _append_short_memory(state, f"\n  {symbols.WARN} {_exhaustion_msg}")
         state["_max_loops_exhausted"] = True
         state["_exhaustion_loop_count"] = max_loops
         if not reply:
@@ -8220,7 +8221,7 @@ def run_agent_loop(
     if _interrupt.is_set() and reply:
         if (reply.strip()
                 and reply.strip() not in {"(interrupted)", "(interrupted by user)"}):
-            deps.console.print(f"\n[dim]💬 Partial response preserved ({len(reply)} chars)[/dim]")
+            deps.console.print(f"\n[dim]{symbols.INFO} Partial response preserved ({len(reply)} chars)[/dim]")
 
     # Clean up session only when NOT managed by REPL (existing_session=None)
     # When REPL manages the session, it handles lifecycle externally.

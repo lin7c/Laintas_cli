@@ -11,6 +11,7 @@ import threading
 import time
 from typing import Callable, Optional
 
+import symbols
 from rich.console import Console
 from prompt_toolkit.application import Application
 from prompt_toolkit.buffer import Buffer
@@ -30,15 +31,15 @@ import agent_ui_events
 
 
 STATUS = {
-    "running": ("●", "class:running"),
-    "thinking": ("◐", "class:thinking"),
-    "queued": ("◌", "class:queued"),
-    "waiting": ("○", "class:waiting"),
-    "done": ("✓", "class:done"),
-    "ready": ("✓", "class:done"),
-    "error": ("✗", "class:error"),
-    "aborted": ("✗", "class:error"),
-    "idle": ("○", "class:idle"),
+    "running": (symbols.DOT, "class:running"),
+    "thinking": (symbols.DOT_HALF, "class:thinking"),
+    "queued": (symbols.DOT_DASH, "class:queued"),
+    "waiting": (symbols.DOT_OPEN, "class:waiting"),
+    "done": (symbols.OK, "class:done"),
+    "ready": (symbols.OK, "class:done"),
+    "error": (symbols.FAIL, "class:error"),
+    "aborted": (symbols.FAIL, "class:error"),
+    "idle": (symbols.DOT_OPEN, "class:idle"),
 }
 
 # Default md.* styles for the Agents panel, in prompt_toolkit syntax. These
@@ -159,7 +160,7 @@ class AgentsModeController:
         self.focus_scroll: dict[str, int] = defaultdict(int)
         self.follow: dict[str, bool] = defaultdict(lambda: True)
         self.read_seq: dict[str, int] = defaultdict(int)
-        self.notice = "Enter: send · @Agent one-shot · Tab: Agents · Esc: exit"
+        self.notice = f"Enter: send {symbols.BULLET} @Agent one-shot {symbols.BULLET} Tab: Agents {symbols.BULLET} Esc: exit"
         self._approval_lock = threading.Lock()
         self._approvals: list[dict] = []
         self._closed = threading.Event()
@@ -308,11 +309,11 @@ class AgentsModeController:
         self.rail_offset = min(max(0, self.rail_offset), max_offset)
         visible = agents[self.rail_offset:self.rail_offset + page]
         if self.rail_offset:
-            fragments.append(("class:muted", "  ↑ more Agents\n"))
+            fragments.append((f"class:muted", f"  {symbols.ARROW_U} more Agents\n"))
         for agent in visible:
             selected = agent.id == self.selected_id
             status = self._display_status(agent)
-            icon, status_style = STATUS.get(status, ("○", "class:idle"))
+            icon, status_style = STATUS.get(status, (f"{symbols.DOT_OPEN}", "class:idle"))
             unread = self.unread(agent.id)
             row_style = "class:rail.selected" if selected else "class:rail"
 
@@ -333,7 +334,7 @@ class AgentsModeController:
                     self._current_task(agent), 24) + "\n\n", handler),
             ])
         if self.rail_offset + page < len(agents):
-            fragments.append(("class:muted", "  ↓ more Agents\n"))
+            fragments.append((f"class:muted", f"  {symbols.ARROW_D} more Agents\n"))
         if not fragments:
             fragments.append(("class:muted", " No Agents in this terminal\n"))
         return FormattedText(fragments)
@@ -417,22 +418,22 @@ class AgentsModeController:
                 # Focus. Startup is status metadata, not a second chat line.
                 continue
             elif kind == "input_rejected":
-                lines.append(("class:error", f"✗ {event.summary}"))
+                lines.append(("class:error", f"{symbols.FAIL} {event.summary}"))
             elif kind == "approval_requested":
-                lines.append(("class:thinking", "◐ Approval required"))
+                lines.append((f"class:thinking", f"{symbols.DOT_HALF} Approval required"))
                 lines.append(("", event.summary))
                 lines.extend(("class:muted", line)
                              for line in event.detail.splitlines()[-12:])
             elif kind == "approval_resolved":
                 approved = event.status == "approved"
                 lines.append(("class:done" if approved else "class:error",
-                              "✓ Approved" if approved else "✗ Denied"))
+                              f"{symbols.OK} Approved" if approved else f"{symbols.FAIL} Denied"))
             elif kind == "agent_done":
                 # The answer immediately above is the completion state. A
                 # quiet divider separates turns without adding a fake result.
                 lines.append(("class:separator", "─" * 24))
             elif kind == "agent_aborted":
-                lines.append(("class:error", "✗ Task aborted"))
+                lines.append((f"class:error", f"{symbols.FAIL} Task aborted"))
                 if event.detail:
                     lines.extend(("class:muted", line)
                                  for line in event.detail.splitlines()[-12:])
@@ -444,23 +445,23 @@ class AgentsModeController:
                 lines.extend(("class:muted", "  " + line)
                              for line in event.detail.splitlines()[-12:])
             elif kind == "tool_started":
-                lines.append(("class:tool", f"◐ {event.summary}"))
+                lines.append(("class:tool", f"{symbols.DOT_HALF} {event.summary}"))
                 if event.tool_call_id:
                     active_tools[event.tool_call_id] = len(lines) - 1
             elif kind == "tool_finished" and event.tool_call_id in active_tools:
                 lines[active_tools.pop(event.tool_call_id)] = (
-                    "class:tool", f"● {event.summary}")
+                    "class:tool", f"{symbols.DOT} {event.summary}")
                 # The start event already owns spacing and chronology.
                 continue
             elif kind in {"system", "tool", "tool_finished"}:
-                symbol = "◐" if kind == "tool_started" else "●"
+                symbol = f"{symbols.DOT_HALF}" if kind == "tool_started" else f"{symbols.DOT}"
                 lines.append(("class:tool", f"{symbol} {event.summary}"))
                 if event.detail and event.detail != event.summary:
                     lines.extend(("class:muted", "  " + line)
                                  for line in event.detail.splitlines()[-12:])
             elif kind not in {"stream.reset", "stream.end"}:
-                symbol = "✗" if "fail" in kind or "error" in kind else "·"
-                style = "class:error" if symbol == "✗" else "class:muted"
+                symbol = f"{symbols.FAIL}" if "fail" in kind or "error" in kind else f"{symbols.BULLET}"
+                style = f"class:error" if symbol == f"{symbols.FAIL}" else "class:muted"
                 lines.append((style, f"{symbol} {event.summary or kind}"))
             if lines and lines[-1][1] != "":
                 lines.append(("", ""))
@@ -515,25 +516,25 @@ class AgentsModeController:
                 "running", "thinking", "queued", "waiting"}:
             return None
         if agent.status == "queued":
-            return "class:queued", "◌ Queued…"
+            return f"class:queued", f"{symbols.DOT_DASH} Queued…"
         if agent.status == "waiting":
-            return "class:waiting", "○ Waiting…"
+            return f"class:waiting", f"{symbols.DOT_OPEN} Waiting…"
         events = agent_ui_events.hub.agent_events(agent_id, limit=30)
         for event in reversed(events):
             if event.event_type == "ai_stream":
-                return "class:thinking", "◐ Writing…"
+                return f"class:thinking", f"{symbols.DOT_HALF} Writing…"
             if event.event_type == "ai_end":
                 return None
             if event.event_type == "tool_started":
-                return "class:thinking", f"◐ {event.summary or 'Running tool…'}"
+                return "class:thinking", f"{symbols.DOT_HALF} {event.summary or 'Running tool…'}"
             if event.event_type in {"tool_finished", "agent_started"}:
                 break
         # Three dots animate with the application's refresh tick. The larger
         # dot advances one position per frame, giving feedback without a
         # literal "Thinking" placeholder.
         phase = int(time.monotonic() * 5) % 3
-        dots = ["·", "·", "·"]
-        dots[phase] = "●"
+        dots = [f"{symbols.BULLET}", f"{symbols.BULLET}", f"{symbols.BULLET}"]
+        dots[phase] = f"{symbols.DOT}"
         return "class:thinking", "  ".join(dots)
 
     def _mirror_lines(self, agent_id: str) -> Optional[list[str]]:
@@ -730,14 +731,14 @@ class AgentsModeController:
         if width < 100:
             pieces = [f"[{self._agent_name(self.selected_id)}] "]
             pieces.extend(
-                f"{STATUS.get(self._display_status(a), ('○', ''))[0]}{a.name}"
+                f"{STATUS.get(self._display_status(a), (f'{symbols.DOT_OPEN}', ''))[0]}{a.name}"
                 + (f"({self.unread(a.id)})" if self.unread(a.id) else "")
                 for a in agents[:4])
             return FormattedText([("class:header", " ".join(pieces)),
                                   ("class:muted", "  Tab:switch")])
         return FormattedText([
-            ("class:header", f" Laintas · {self.terminal_name}"),
-            ("class:muted", f" · {running} running · Focus: "),
+            ("class:header", f" Laintas {symbols.BULLET} {self.terminal_name}"),
+            ("class:muted", f" {symbols.BULLET} {running} running {symbols.BULLET} Focus: "),
             ("class:agent", self._agent_name(self.selected_id)),
             ("class:muted", "   Alt+←/→ terminals"),
         ])
@@ -924,7 +925,7 @@ class AgentsModeController:
         agent_name = self._agent_name(str(request.get("agent_id") or ""))
         with self._approval_lock:
             count = len(self._approvals)
-        queued = f" · {count} pending" if count > 1 else ""
+        queued = f" {symbols.BULLET} {count} pending" if count > 1 else ""
         return (
             f"Approval for {agent_name} ({request['kind']}): "
             f"{self._crop(request['summary'], 62)}{queued}  "
@@ -937,7 +938,7 @@ class AgentsModeController:
             return FormattedText([])
         agent_name = self._agent_name(str(request.get("agent_id") or ""))
         fragments = [
-            ("class:thinking", "\n  ◐ Approval required\n\n"),
+            (f"class:thinking", f"\n  {symbols.DOT_HALF} Approval required\n\n"),
             ("class:agent", f"  Agent: {agent_name}\n"),
             ("class:muted", f"  Terminal: {request.get('terminal_name')}\n"),
             ("class:tool", f"  Type: {request.get('kind')}\n\n"),
@@ -1031,7 +1032,7 @@ class AgentsModeController:
                     "agent_done", "agent_error", "agent_aborted"}):
             name = self._agent_name(event.agent_id)
             if event.event_type == "agent_done":
-                self.notice = "Ready · Enter a message or Esc to return"
+                self.notice = f"Ready {symbols.BULLET} Enter a message or Esc to return"
             elif event.event_type == "agent_aborted":
                 self.notice = f"Aborted {name}"
             else:
@@ -1185,8 +1186,8 @@ class AgentsModeController:
             ConditionalContainer(
                 Window(FormattedTextControl(lambda: FormattedText([
                     ("class:muted",
-                     " Esc/Ctrl-C: exit · Enter: send · Tab: Agents · "
-                     "Alt+↑/↓: focus · PgUp/PgDn: scroll")
+                     f" Esc/Ctrl-C: exit {symbols.BULLET} Enter: send {symbols.BULLET} Tab: Agents {symbols.BULLET} "
+                     f"Alt+{symbols.ARROW_U}/{symbols.ARROW_D}: focus {symbols.BULLET} PgUp/PgDn: scroll")
                 ])), height=1),
                 filter=verbose_footer_filter),
         ])

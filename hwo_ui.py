@@ -18,8 +18,8 @@ Input syntax:
   #A#[N]-x>           delete task at position N
   #A#[N]-x>text       replace task at position N
 
-Task icons:  □ pending   ◰◳◲◱ running   ✓ done   ✗ error
-Scroll:      ↑ ↓ PgUp PgDn Home End
+Task icons:  {symbols.SQUARE_OPEN} pending   ◰◳◲◱ running   {symbols.OK} done   {symbols.FAIL} error
+Scroll:      {symbols.ARROW_U} {symbols.ARROW_D} PgUp PgDn Home End
 Exit:        /q  or  Ctrl-C
 """
 
@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import symbols
 import tempfile
 import threading
 import time
@@ -41,10 +42,10 @@ from prompt_toolkit.layout import Layout, HSplit, VSplit, Window, FormattedTextC
 from prompt_toolkit.layout.controls import BufferControl
 from prompt_toolkit.styles import Style
 
-_SPIN  = ["◰", "◳", "◲", "◱"]
-_IDLE  = "□"
-_DONE  = "✓"
-_ERROR = "✗"
+_SPIN  = list(symbols.SPINNER_GEO)
+_IDLE  = symbols.SQUARE_OPEN
+_DONE  = symbols.OK
+_ERROR = symbols.FAIL
 
 
 # ── Data model ────────────────────────────────────────────────────────────
@@ -404,7 +405,7 @@ _HELP_LINES = [
     ("class:dim",       "  #A#[N]->text       insert at N\n"),
     ("class:dim",       "  #A#[N]-x>          delete N\n"),
     ("class:dim",       "  #A#[N]-x>text      replace N\n\n"),
-    ("class:dim",       "  ↑↓ PgUp PgDn Home End — scroll\n"),
+    (f"class:dim",       f"  {symbols.ARROW_U}{symbols.ARROW_D} PgUp PgDn Home End — scroll\n"),
 ]
 
 
@@ -414,7 +415,7 @@ def _render_all(session: HwoSession, tick: int, executing: bool,
         return list(_HELP_LINES)
 
     out: list = []
-    out.append(("class:header",      "  HWO  ·  Agent: "))
+    out.append((f"class:header",      f"  HWO  {symbols.BULLET}  Agent: "))
     out.append(("class:header.name", session.root_name))
     if executing:
         out.append(("class:running", "  [running]"))
@@ -479,10 +480,10 @@ def _render_status(error_msg: str, executing: bool, mode: str,
     scroll_info = ""
     if total_lines > visible_lines:
         pct = int(scroll_top / max(1, total_lines - visible_lines) * 100)
-        scroll_info = f"  ↑↓/{total_lines}L {pct}%"
+        scroll_info = f"  {symbols.ARROW_U}{symbols.ARROW_D}/{total_lines}L {pct}%"
 
     if error_msg:
-        return [("class:task.err", f"  ✗ {error_msg}{scroll_info}")]
+        return [("class:task.err", f"  {symbols.FAIL} {error_msg}{scroll_info}")]
 
     if mode == "save":
         return [("class:help", f"  save as: (Enter to confirm  Esc to cancel){scroll_info}")]

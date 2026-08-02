@@ -13,6 +13,7 @@ Usage:
 import asyncio
 import copy
 import io
+import symbols
 import os
 import re
 import sys
@@ -700,7 +701,7 @@ def select_dialog(
                 end = min(start + list_h, len(vis))
 
         if start > 0:
-            lines.append(("class:muted", f"  ↑ {start} more\n"))
+            lines.append(("class:muted", f"  {symbols.ARROW_U} {start} more\n"))
 
         if not vis:
             lines.append(("class:muted", "  No matches\n"))
@@ -720,7 +721,7 @@ def select_dialog(
             lines.append((style, row_text + "\n"))
 
         if end < len(vis):
-            lines.append(("class:muted", f"  ↓ {len(vis) - end} more\n"))
+            lines.append(("class:muted", f"  {symbols.ARROW_D} {len(vis) - end} more\n"))
 
         # ── Footer hint ──
         lines.append(("", "\n"))
@@ -733,7 +734,7 @@ def select_dialog(
                 parts.insert(0, "Type to filter")
             if act_keys:
                 parts.insert(0, "  ".join(f"{k}={a}" for k, a in act_keys.items()))
-            lines.append(("class:muted", "  " + "  ·  ".join(parts)))
+            lines.append((f"class:muted", "  " + f"  {symbols.BULLET}  ".join(parts)))
         else:
             lines.append(("class:muted", "  " + hint))
         if _auto_deadline is not None:
@@ -959,8 +960,8 @@ def choose_record(records, *, title: str, label: Callable,
         selected_index=max(0, min(selected_index, len(rows) - 1)),
         search=search,
         full_screen=full_screen,
-        hint=("Type to filter  ↑↓ navigate  ↵ select  Esc/q cancel"
-              if search else "↑↓ navigate  ↵ select  Esc/q cancel"),
+        hint=(f"Type to filter  {symbols.ARROW_U}{symbols.ARROW_D} navigate  ↵ select  Esc/q cancel"
+              if search else f"{symbols.ARROW_U}{symbols.ARROW_D} navigate  ↵ select  Esc/q cancel"),
     )
     if chosen is None:
         return None
@@ -2431,7 +2432,7 @@ def display_command_output(command: str, returncode: int, output: str, depth: in
         status_label, status_style = f"EXIT {returncode}", "error"
 
     t = _fmt_elapsed(elapsed)
-    status_label = f"{status_label} · {t}" if t else status_label
+    status_label = f"{status_label} {symbols.BULLET} {t}" if t else status_label
 
     # Fold long output: show up to `tool_output_fold` lines. When exceeded,
     # display first half + "… N more" + last half so both the head and tail
@@ -2451,7 +2452,7 @@ def display_command_output(command: str, returncode: int, output: str, depth: in
         meta = "no output"
         preview = []
     else:
-        meta = f"{line_count}L {byte_count}B · /debug"
+        meta = f"{line_count}L {byte_count}B {symbols.BULLET} /debug"
 
     _emit_block(command, status_label, status_style, meta, preview, depth)
 
@@ -2464,13 +2465,13 @@ def display_sub_terminal_preview(command: str, output: str, depth: int = 0, aliv
 
     if total_lines > 6:
         preview = all_lines[-6:]
-        meta = f"running · {total_lines}L" if alive else f"exited · {total_lines}L"
+        meta = f"running {symbols.BULLET} {total_lines}L" if alive else f"exited {symbols.BULLET} {total_lines}L"
     elif all_lines:
         preview = all_lines
         meta = "running" if alive else "exited"
     else:
         preview = []
-        meta = "running · no output" if alive else "exited"
+        meta = f"running {symbols.BULLET} no output" if alive else "exited"
 
     status_label = "RUNNING" if alive else "EXITED"
     status_style = "warning" if alive else "muted"
@@ -2548,7 +2549,7 @@ def display_file_diff(path: str, diff_text: str, depth: int = 0) -> None:
         hidden = total - fold_limit
         for ln, o, n in content[:half]:
             _print_line(ln, o, n)
-        console.print(f"{pad}[muted]     … {hidden} more line(s) · /debug for full[/muted]", highlight=False)
+        console.print(f"{pad}[muted]     … {hidden} more line(s) {symbols.BULLET} /debug for full[/muted]", highlight=False)
         for ln, o, n in content[-half:]:
             _print_line(ln, o, n)
 
@@ -2620,7 +2621,7 @@ class CommandSpec:
                 item,
                 descriptions.get(item)
                 or _SUBCOMMAND_HINTS.get(item)
-                or f"{self.name} option · {self.usage or self.description}",
+                or f"{self.name} option {symbols.BULLET} {self.usage or self.description}",
             )
             for item in self.subcommands
         )
@@ -2835,9 +2836,9 @@ class MetaCompleter(Completer):
                 continue
             name = str(row.get("name") or agent_id)
             phase = str(row.get("phase") or "idle")
-            identity = f"{name} · " if name != agent_id else ""
+            identity = f"{name} {symbols.BULLET} " if name != agent_id else ""
             result.append((
-                agent_id, name, f"{identity}{phase} · history available"))
+                agent_id, name, f"{identity}{phase} {symbols.BULLET} history available"))
         return result
 
     def _told_completions(self, partial: str):
@@ -2859,7 +2860,7 @@ class MetaCompleter(Completer):
                         or name.casefold().startswith(fragment.casefold())):
                     yield self._completion(
                         agent_id, fragment,
-                        meta.rsplit(" · ", 1)[0] + " · conversation history")
+                        meta.rsplit(f" {symbols.BULLET} ", 1)[0] + f" {symbols.BULLET} conversation history")
             return
 
         first = words[0].casefold()
@@ -3523,7 +3524,7 @@ def _render_rprompt():
         if not _approval_star_announced:
             _approval_star_announced = True
             console.print(
-                "[dim]⚡ Auto-approve active ([bold]*[/bold]). "
+                f"[dim]{symbols.ZAP} Auto-approve active ([bold]*[/bold]). "
                 "Use /mode to change.[/dim]")
     # Read-only modes share PLAN's styling — same "I won't touch anything" signal.
     _mode_cls = ("rprompt-mode-plan" if (_is_plan or _read_only)
@@ -3539,7 +3540,7 @@ def _render_rprompt():
             label = (f"to {_agent_name}"
                      if _status_cache.get("multi_agent") else _agent_name)
         result = [("class:rprompt-context", label),
-                  ("class:rprompt-sep", " · "),
+                  (f"class:rprompt-sep", f" {symbols.BULLET} "),
                   ("class:" + _mode_cls, _mode_label)]
     else:
         result = [("class:" + _mode_cls, _mode_label)]
@@ -3547,7 +3548,7 @@ def _render_rprompt():
         # Show "auto-routing" when auto-routing is active, plain model name otherwise
         _model_display = "auto-routing" if _model in ("", "auto") else _model
         result.extend([
-            ("class:rprompt-sep", " · "),
+            (f"class:rprompt-sep", f" {symbols.BULLET} "),
             ("class:rprompt-model", _model_display),
         ])
     if width >= 108 and not _status_cache.get("multi_agent"):
@@ -3555,7 +3556,7 @@ def _render_rprompt():
         terminal = _status_cache.get("terminal", "")
         if agent and terminal:
             result.extend([
-                ("class:rprompt-sep", " · "),
+                (f"class:rprompt-sep", f" {symbols.BULLET} "),
                 ("class:rprompt-context", f"{agent}@{terminal}"),
             ])
     return result
@@ -3573,23 +3574,23 @@ def _render_bottom_toolbar():
     _think_str = _fmt_elapsed(_think) if _think > 0 else "—"
 
     width = _terminal_width()
-    tokens = ("class:stbar-tokens", f"↑{_fmt_tokens(_tin)} ↓{_fmt_tokens(_tout)}")
+    tokens = ("class:stbar-tokens", f"{symbols.ARROW_U}{_fmt_tokens(_tin)} {symbols.ARROW_D}{_fmt_tokens(_tout)}")
     if width < 54:
         return [tokens]
     result = [
         ("class:stbar-time", f"last {_think_str}"),
-        ("class:stbar-sep", "  ·  "),
+        (f"class:stbar-sep", f"  {symbols.BULLET}  "),
         tokens,
     ]
     if width >= 86:
         terminal = _status_cache.get("terminal", "term0")
         deployment = _status_cache.get("deployment", "temporary")
-        context = f"{terminal} · {deployment}"
+        context = f"{terminal} {symbols.BULLET} {deployment}"
         running_count = int(_status_cache.get("running_agents", 0) or 0)
         if running_count:
-            context += f" · {running_count} running"
+            context += f" {symbols.BULLET} {running_count} running"
         if _status_cache.get("detail"):
-            context += " · detail"
+            context += f" {symbols.BULLET} detail"
         result[:0] = [
             ("class:stbar-context", context),
             ("class:stbar-sep", "  │  "),
@@ -3597,7 +3598,7 @@ def _render_bottom_toolbar():
     input_state = _status_cache.get("run_input_state")
     if input_state in {"queued", "input_active"} and width >= 72:
         result.extend([
-            ("class:stbar-sep", "  ·  "),
+            (f"class:stbar-sep", f"  {symbols.BULLET}  "),
             ("class:stbar-context", "input " + ("queued" if input_state == "queued" else "ready")),
         ])
     return result
@@ -4309,10 +4310,10 @@ def show_model_selector(models: list[dict], current: str = "") -> Optional[dict]
             sel_idx = i + 1  # +1 because auto occupies index 0
     chosen = select_dialog(
         labels,
-        title="Models — choose with ↑↓ and Enter",
+        title=f"Models — choose with {symbols.ARROW_U}{symbols.ARROW_D} and Enter",
         full_screen=True,
         selected_index=sel_idx,
-        hint="↑↓ navigate  ↵ select  Esc/q cancel",
+        hint=f"{symbols.ARROW_U}{symbols.ARROW_D} navigate  ↵ select  Esc/q cancel",
     )
     if chosen is None:
         return None
@@ -5276,7 +5277,7 @@ def show_resume_picker(cwd: str) -> Optional[dict]:
         labels = []
         for item in choices:
             kind = item.get("kind", "session")
-            badge = "[magenta]◆ checkpoint[/magenta]" if kind == "checkpoint" else "[blue]○ autosave[/blue]"
+            badge = "[magenta]◆ checkpoint[/magenta]" if kind == "checkpoint" else f"[blue]{symbols.DOT_OPEN} autosave[/blue]"
             turns = item.get("turn_count") or _resume_turn_count(item)
             ago = _format_time_ago(item.get("timestamp", 0))
             title = str(item.get("title") or "Untitled session")[:60].replace("\n", " ")
@@ -5287,7 +5288,7 @@ def show_resume_picker(cwd: str) -> Optional[dict]:
     status_msg = ""
     while choices:
         labels = _build_labels()
-        hint = "↑↓ navigate  ↵ resume  d details  x delete  q cancel"
+        hint = f"{symbols.ARROW_U}{symbols.ARROW_D} navigate  ↵ resume  d details  x delete  q cancel"
         if status_msg:
             hint = f"{status_msg}\n{hint}"
         result = select_dialog(
@@ -5390,7 +5391,7 @@ def _print_resume_event(message: dict) -> None:
     """Render one saved event with the same visual vocabulary as the REPL."""
     tool = _resume_tool_event(message)
     if tool is not None:
-        status = "[success]●[/success]" if tool["ok"] is not False else "[error]●[/error]"
+        status = f"[success]{symbols.DOT}[/success]" if tool["ok"] is not False else f"[error]{symbols.DOT}[/error]"
         summary = _md_escape(tool["summary"][:160])
         suffix = f"  [muted]{summary}[/muted]" if summary else ""
         console.print(
@@ -5428,7 +5429,7 @@ def _print_resume_event(message: dict) -> None:
         style = "error" if isinstance(rc, int) and rc != 0 else "muted"
         console.print(Padding(Text(content or "(no output)", style=style), (0, 0, 0, 2)))
     else:
-        console.print(f"[muted]{_md_escape(role)} · {_md_escape(content)}[/muted]",
+        console.print(f"[muted]{_md_escape(role)} {symbols.BULLET} {_md_escape(content)}[/muted]",
                       highlight=False)
 
 
@@ -7627,7 +7628,7 @@ class AgentRegistry:
             scheme = "http" if raw_host.split(":", 1)[0] in ("localhost", "127.0.0.1") else "https"
             backend_url = f"{scheme}://{raw_host}"
         console.print(Panel(
-            f"[bold cyan]Browser opened a terminal[/bold cyan]\n[dim]session {session_id} · {cols}×{rows}[/dim]\n[dim]relay: {backend_url}[/dim]",
+            f"[bold cyan]Browser opened a terminal[/bold cyan]\n[dim]session {session_id} {symbols.BULLET} {cols}×{rows}[/dim]\n[dim]relay: {backend_url}[/dim]",
             title="Remote Terminal", border_style="cyan",
         ))
         try:
@@ -8155,7 +8156,7 @@ def show_debug_browser_interactive() -> None:
             labels,
             title="Debug Log — Last 20 Entries",
             full_screen=True,
-            hint="↑↓ navigate  ↵ view detail  q/Esc back",
+            hint=f"{symbols.ARROW_U}{symbols.ARROW_D} navigate  ↵ view detail  q/Esc back",
         )
         if chosen is None:
             return
@@ -8301,7 +8302,7 @@ def show_terminal_manager(primary_session=None) -> None:
     def _build_labels(items):
         labels = []
         for name, cmd, _sess, created, alive in items:
-            status = "[green]● alive[/green]" if alive else "[red]■ dead[/red]"
+            status = f"[green]{symbols.DOT} alive[/green]" if alive else "[red]■ dead[/red]"
             uptime_str = ""
             if created > 0:
                 uptime = time.time() - created
@@ -8339,7 +8340,7 @@ def show_terminal_manager(primary_session=None) -> None:
         sel_idx = min(sel_idx, len(items) - 1)
 
         labels = _build_labels(items)
-        hint = "↑↓ navigate  ↵ enter  o observe  c close  d details  q back"
+        hint = f"{symbols.ARROW_U}{symbols.ARROW_D} navigate  ↵ enter  o observe  c close  d details  q back"
         if status_msg:
             hint = f"{status_msg}\n{hint}"
         result = select_dialog(
@@ -8419,7 +8420,7 @@ def show_skill_manager() -> None:
 
     Lists every scanned skill with its loaded status; navigate with the arrow
     keys and load/unload/reload/inspect without leaving the page.
-    ↑↓ navigate, ↵/space toggle load, l load, u unload, r reload all,
+    {symbols.ARROW_U}{symbols.ARROW_D} navigate, ↵/space toggle load, l load, u unload, r reload all,
     d details, n hint for new, q back.
     """
     def _collect():
@@ -8434,7 +8435,7 @@ def show_skill_manager() -> None:
     def _build_labels(items):
         labels = []
         for name, desc, loaded, ntools in items:
-            badge = "[green]● loaded[/green]" if loaded else "[dim]○ available[/dim]"
+            badge = f"[green]{symbols.DOT} loaded[/green]" if loaded else f"[dim]{symbols.DOT_OPEN} available[/dim]"
             tool_str = f" [dim]({ntools} tool{'s' if ntools != 1 else ''})[/dim]" if ntools else ""
             desc_preview = (desc or "").replace("\n", " ")[:56]
             labels.append(f"[bold]{name}[/bold]  {badge}{tool_str}  "
@@ -8455,7 +8456,7 @@ def show_skill_manager() -> None:
         sel_idx = min(sel_idx, len(items) - 1)
 
         labels = _build_labels(items)
-        hint = ("↑↓ navigate  ↵/space toggle  l load  u unload  "
+        hint = (f"{symbols.ARROW_U}{symbols.ARROW_D} navigate  ↵/space toggle  l load  u unload  "
                 "r reload  d details  q back")
         if status_msg:
             hint = f"{status_msg}\n{hint}"
@@ -8546,11 +8547,11 @@ def observe_session(session, display_name: str = "", display_cmd: str = "") -> N
         alive = session.is_alive()
 
         if alive:
-            lines.append(("bold cyan", f"● Observing: {cmd_display}\n"))
+            lines.append(("bold cyan", f"{symbols.DOT} Observing: {cmd_display}\n"))
         else:
             _ended[0] = True
             lines.append(("bold red", f"■ Session ended: {cmd_display}\n"))
-        lines.append(("dim", "Read-only  ·  q/Esc to return to terminal 0\n"))
+        lines.append((f"dim", f"Read-only  {symbols.BULLET}  q/Esc to return to terminal 0\n"))
         lines.append(("dim", "─" * 60 + "\n\n"))
 
         output = session.full_output
@@ -8655,7 +8656,7 @@ def enter_session(session, display_name: str = "", display_cmd: str = "") -> Non
     # Clear screen and show a minimal header (no pending-output replay —
     # stale ANSI absolute-position sequences cause cursor misalignment).
     sys.stdout.write("\033[2J\033[H")
-    sys.stdout.write(f"\033[2m● {cmd_display}  │  /back or /q detach  │  Ctrl+\\ force-detach\033[0m\n")
+    sys.stdout.write(f"\033[2m{symbols.DOT} {cmd_display}  │  /back or /q detach  │  Ctrl+\\ force-detach\033[0m\n")
     sys.stdout.write("─" * 60 + "\n")
     sys.stdout.flush()
 
@@ -8764,9 +8765,9 @@ def enter_session(session, display_name: str = "", display_cmd: str = "") -> Non
         signal.signal(signal.SIGWINCH, old_sigwinch)
 
     if session_died:
-        console.print(f"\n[dim]● Sub-terminal exited. Returned to term0[/dim]")
+        console.print(f"\n[dim]{symbols.DOT} Sub-terminal exited. Returned to term0[/dim]")
     else:
-        console.print(f"\n[green]● Detached. Returned to term0[/green]")
+        console.print(f"\n[green]{symbols.DOT} Detached. Returned to term0[/green]")
 
 
 _extra_cmd_handler_cache = None
@@ -9851,7 +9852,7 @@ def _usage_pricing_note(balance: dict) -> str:
     parts = []
     if default_tier:
         parts.append(f"unlisted models {default_tier}")
-    return "pricing · " + " · ".join(parts) if parts else ""
+    return f"pricing {symbols.BULLET} " + f" {symbols.BULLET} ".join(parts) if parts else ""
 
 
 def _show_usage_command(args: list, session: dict) -> None:
@@ -9899,7 +9900,7 @@ def _show_usage_command(args: list, session: dict) -> None:
 
         try:
             with _safe_status(
-                    "[dim]Fetching usage… · Esc/Ctrl+C cancel[/dim]"):
+                    f"[dim]Fetching usage… {symbols.BULLET} Esc/Ctrl+C cancel[/dim]"):
                 usage, bal, fail = run_cancellable_blocking(
                     _fetch_backend_usage)
         except BlockingOperationCancelled:
@@ -9912,7 +9913,7 @@ def _show_usage_command(args: list, session: dict) -> None:
     # ── LOCAL — token accounting, works for every backend ────────────
     summary = usage_tracker.summarize(days=days)
     range_totals = summary["range"]["totals"]
-    body.append(_usage_section("accent", "LOCAL", "this machine · all projects"))
+    body.append(_usage_section(f"accent", "LOCAL", f"this machine {symbols.BULLET} all projects"))
     body.append(Text())
 
     if range_totals["calls"] == 0 and summary["session"]["totals"]["calls"] == 0:
@@ -9996,7 +9997,7 @@ def _show_usage_command(args: list, session: dict) -> None:
                 plan = ((bal.get("subscription") or {}).get("plan") or "").upper()
 
                 body.append(_usage_section("agent", "LAINTAS",
-                                           f"{profile.origin} · product=cli · {rng}"))
+                                           f"{profile.origin} {symbols.BULLET} product=cli {symbols.BULLET} {rng}"))
                 body.append(Text())
                 grid = Table(box=None, show_edge=False, show_header=False,
                              pad_edge=False, padding=(0, 1))
@@ -10015,7 +10016,7 @@ def _show_usage_command(args: list, session: dict) -> None:
                 calls_val = Text()
                 calls_val.append(str(bal_calls), style="bold")
                 calls_val.append(" balance", style="muted")
-                calls_val.append("  ·  ", style="rule")
+                calls_val.append(f"  {symbols.BULLET}  ", style="rule")
                 calls_val.append(str(sub_calls), style="bold")
                 calls_val.append(" subscription", style="muted")
                 grid.add_row("calls", calls_val)
@@ -10038,7 +10039,7 @@ def _show_usage_command(args: list, session: dict) -> None:
     if footnotes:
         body.append(Text())
         for note in footnotes:
-            body.append(Text(f"· {note}", style="muted"))
+            body.append(Text(f"{symbols.BULLET} {note}", style="muted"))
 
     console.print()
     console.print(Panel(
@@ -10047,7 +10048,7 @@ def _show_usage_command(args: list, session: dict) -> None:
         border_style="rule",
         title="[bold accent]AI usage[/bold accent]",
         title_align="left",
-        subtitle=f"[muted]/usage · {rng}[/muted]",
+        subtitle=f"[muted]/usage {symbols.BULLET} {rng}[/muted]",
         subtitle_align="right",
         padding=(1, 2),
     ))
@@ -10130,7 +10131,7 @@ def _cmd_new_session_notice() -> None:
 def _cmd_login(session: dict, agent_registry: AgentRegistry) -> None:
     choice = choose_login_method()
     if choice == "remote":
-        console.print("[dim]Starting browser login… · Esc/Ctrl+C cancel[/dim]")
+        console.print(f"[dim]Starting browser login… {symbols.BULLET} Esc/Ctrl+C cancel[/dim]")
         try:
             new_session = run_cancellable_blocking(
                 lambda cancel: login_via_browser(cancel_event=cancel))
@@ -10211,7 +10212,7 @@ def _cmd_model(parts: list, raw_args: str, session: dict) -> None:
         # register. _safe_status runs the spinner with redirect_stdout=False.
         try:
             with _safe_status(
-                    "[dim]Fetching available models… · Esc/Ctrl+C cancel[/dim]"):
+                    f"[dim]Fetching available models… {symbols.BULLET} Esc/Ctrl+C cancel[/dim]"):
                 models, endpoint = run_cancellable_blocking(
                     lambda cancel: fetch_available_models(
                         session, cancel_event=cancel))
@@ -10335,7 +10336,7 @@ def _memory_manager() -> None:
     sel_idx = 0
     status_msg = ""
     while entries:
-        hint = "↑↓ navigate  ↵ view  x delete  q cancel"
+        hint = f"{symbols.ARROW_U}{symbols.ARROW_D} navigate  ↵ view  x delete  q cancel"
         if status_msg:
             hint = f"{status_msg}\n{hint}"
         result = select_dialog(
@@ -10368,7 +10369,7 @@ def _memory_manager() -> None:
                     body = data.get("body", "")
                     panel_body = (f"[bold]Summary:[/bold] {summary}\n\n[dim]Full memory:[/dim]\n{body}"
                                   if summary else body)
-                    _print_long_panel(panel_body, f"[{scope_txt}] {cat} · {name}")
+                    _print_long_panel(panel_body, f"[{scope_txt}] {cat} {symbols.BULLET} {name}")
                 input("\n[dim]Press Enter to continue...[/dim]")
             sel_idx = idx
         elif action == "delete":
@@ -10474,7 +10475,7 @@ def _cmd_memory(parts: list) -> None:
                 title="View Memory",
                 label=lambda item: (
                     f"project #{item.get('id')}" if item["kind"] == "project"
-                    else f"persistent · {item.get('name', '?')}"),
+                    else f"persistent {symbols.BULLET} {item.get('name', '?')}"),
                 description=lambda item: (
                     str(item.get("content") or "")[:100]
                     if item["kind"] == "project"
@@ -10543,7 +10544,7 @@ def _cmd_mail(parts: list, raw_args: str, session: dict) -> None:
         show_all = "--all" in parts[2:]
         try:
             with _safe_status(
-                    "[dim]Checking inbox… · Esc/Ctrl+C cancel[/dim]"):
+                    f"[dim]Checking inbox… {symbols.BULLET} Esc/Ctrl+C cancel[/dim]"):
                 messages, error = run_cancellable_blocking(
                     lambda _cancel: fetch_mail_inbox(
                         session, unread_only=not show_all))
@@ -10589,7 +10590,7 @@ def _cmd_mail(parts: list, raw_args: str, session: dict) -> None:
         message = _last_mail_inbox[n - 1]
         _print_long_panel(
             message.get("body", ""),
-            f"From {message.get('from', '?')} · {message.get('subject', '(no subject)')}",
+            f"From {message.get('from', f'?')} {symbols.BULLET} {message.get('subject', '(no subject)')}",
         )
         email_id = message.get("email_id")
         if email_id and not message.get("read"):
@@ -10700,7 +10701,7 @@ def _cmd_bash(parts: list, raw_args: str) -> bool:
             if stdout:
                 console.print(stdout)
             returncode = result.get("returncode")
-            rc_text = f" · exit {returncode}" if returncode is not None else ""
+            rc_text = f" {symbols.BULLET} exit {returncode}" if returncode is not None else ""
             console.print(f"[dim]cwd → {os.getcwd()}{rc_text}[/dim]")
     return False
 
@@ -10855,7 +10856,7 @@ def _cmd_mode(raw_args: str, parts: list) -> bool:
                 )
             console.print(
                 f"{marker} [cyan]{item['name']}[/cyan] "
-                f"[dim]{_escape(' · '.join(_bits))}[/dim]")
+                f"[dim]{_escape(f' {symbols.BULLET} '.join(_bits))}[/dim]")
 
     elif sub == "create":
         if len(parts) < 4:
@@ -10973,7 +10974,7 @@ def _cmd_mode(raw_args: str, parts: list) -> bool:
             options,
             title="Select Agent Mode",
             label=lambda item: (
-                f"{'●' if item['name'] == active_name else '○'} "
+                f"{'{symbols.DOT}' if item['name'] == active_name else f'{symbols.DOT_OPEN}'} "
                 f"{item['name']}"),
             description=lambda item: item.get("description", ""),
             selected_index=selected_index,
@@ -11103,9 +11104,9 @@ def _cmd_backend(parts: list) -> None:
                 profiles,
                 title="Select Backend",
                 label=lambda item: (
-                    f"{'●' if item.name == active_name else '○'} {item.name}"),
+                    f"{'{symbols.DOT}' if item.name == active_name else f'{symbols.DOT_OPEN}'} {item.name}"),
                 description=lambda item: (
-                    f"{item.kind} · {item.base_url} · {item.billing_label}"),
+                    f"{item.kind} {symbols.BULLET} {item.base_url} {symbols.BULLET} {item.billing_label}"),
                 selected_index=selected_index,
                 search=True,
             )
@@ -11215,7 +11216,7 @@ def _cmd_policy(parts: list) -> bool:
             choices,
             title="Select Security Policy",
             label=lambda item: (
-                f"{'●' if item['name'] == current_mode else '○'} "
+                f"{'{symbols.DOT}' if item['name'] == current_mode else f'{symbols.DOT_OPEN}'} "
                 f"{item['name']}"),
             description=lambda item: item["description"],
             selected_index=selected_index,
@@ -11425,7 +11426,7 @@ def _cmd_evolve(raw_args: str, parts: list, session: dict) -> None:
                 title="Open Evolution Branch",
                 label=lambda item: item.get("id", ""),
                 description=lambda item: (
-                    f"{item.get('status')} · "
+                    f"{item.get('status')} {symbols.BULLET} "
                     f"{str(item.get('description') or '')[:100]}"),
                 search=True,
             )
@@ -11514,7 +11515,7 @@ def _cmd_evolve(raw_args: str, parts: list, session: dict) -> None:
                 title="Disable Extension",
                 label=lambda item: item.get("name", ""),
                 description=lambda item: (
-                    f"v{item.get('version') or '?'} · {item.get('path', '')}"),
+                    f"v{item.get('version') or f'?'} {symbols.BULLET} {item.get('path', '')}"),
                 search=True,
             )
             extension_name = chosen.get("name", "") if chosen else ""
@@ -11628,7 +11629,7 @@ def _cmd_prompt(raw_args: str, parts: list, session: dict) -> None:
                 title="Open Prompt Lab Branch",
                 label=lambda item: item.get("id", ""),
                 description=lambda item: (
-                    f"{item.get('status')} · "
+                    f"{item.get('status')} {symbols.BULLET} "
                     f"{str(item.get('description') or '')[:100]}"),
                 search=True,
             )
@@ -12007,7 +12008,7 @@ def _cmd_prompt(raw_args: str, parts: list, session: dict) -> None:
                     title="Failure category",
                     full_screen=False,
                     selected_index=0,
-                    hint="↑↓ navigate  ↵ select  Esc/q keep unspecified",
+                    hint=f"{symbols.ARROW_U}{symbols.ARROW_D} navigate  ↵ select  Esc/q keep unspecified",
                 )
                 category = ("" if category_choice in (None, "Unspecified")
                             else category_choice)
@@ -12076,7 +12077,7 @@ def _cmd_prompt(raw_args: str, parts: list, session: dict) -> None:
                     title="Review Skill Patch",
                     label=lambda item: item.get("id", ""),
                     description=lambda item: (
-                        f"{item.get('status')} · {item.get('skill_name', '?')}/"
+                        f"{item.get(f'status')} {symbols.BULLET} {item.get('skill_name', '?')}/"
                         f"{item.get('skill_file', '?')}"),
                     search=True,
                 )
@@ -12110,7 +12111,7 @@ def _cmd_prompt(raw_args: str, parts: list, session: dict) -> None:
                     title="Apply Skill Patch",
                     label=lambda item: item.get("id", ""),
                     description=lambda item: (
-                        f"{item.get('status')} · {item.get('skill_name', '?')}/"
+                        f"{item.get(f'status')} {symbols.BULLET} {item.get('skill_name', '?')}/"
                         f"{item.get('skill_file', '?')}"),
                     search=True,
                 )
@@ -12143,7 +12144,7 @@ def _cmd_prompt(raw_args: str, parts: list, session: dict) -> None:
                     title="Discard Skill Patch",
                     label=lambda item: item.get("id", ""),
                     description=lambda item: (
-                        f"{item.get('status')} · {item.get('skill_name', '?')}/"
+                        f"{item.get(f'status')} {symbols.BULLET} {item.get('skill_name', '?')}/"
                         f"{item.get('skill_file', '?')}"),
                     search=True,
                 )
@@ -12218,7 +12219,7 @@ def _cmd_work(parts: list) -> None:
                 title="Resume WorkGraph",
                 label=lambda item: item["id"],
                 description=lambda item: (
-                    f"{item['status']} · {item['objective'][:100]}"),
+                    f"{item[f'status']} {symbols.BULLET} {item['objective'][:100]}"),
                 search=True,
             )
             work_id = chosen["id"] if chosen else ""
@@ -12281,9 +12282,9 @@ _live_task_snapshots: dict[str, dict[str, tuple]] = {}
 
 _LIVE_TASK_STATUS_UI = {
     "in_progress": ("▶", "warning"),
-    "pending": ("○", "white"),
+    "pending": (f"{symbols.DOT_OPEN}", "white"),
     "blocked": ("!", "error"),
-    "completed": ("✓", "success"),
+    "completed": (f"{symbols.OK}", "success"),
 }
 
 
@@ -12330,7 +12331,7 @@ def display_live_task_list(tasks: list[dict], agent_id: str) -> None:
     # their own line beneath the existing header.
     if not previous or completed != prev_completed:
         header = Text("Tasks", style="bold white")
-        header.append(f" · {agent_id or 'current'}", style="agent")
+        header.append(f" {symbols.BULLET} {agent_id or 'current'}", style="agent")
         header.append(f"  {completed}/{len(current)} done", style="muted")
         console.print(header)
 
@@ -12338,7 +12339,7 @@ def display_live_task_list(tasks: list[dict], agent_id: str) -> None:
         if tid not in changed:
             continue
         status, progress, subject = current[tid]
-        mark, style = _LIVE_TASK_STATUS_UI.get(status, ("·", "white"))
+        mark, style = _LIVE_TASK_STATUS_UI.get(status, (f"{symbols.BULLET}", "white"))
         line = Text(f"  {mark} ", style=style)
         line.append(subject, style="white")
         if status == "in_progress" and progress:
@@ -12364,12 +12365,12 @@ def _render_task_todolist(tasks: list[dict], cwd: str) -> None:
     console.print(heading)
     summary = Text()
     summary.append(f"{counts['in_progress']} active", style="warning")
-    summary.append("  ·  ", style="muted")
+    summary.append(f"  {symbols.BULLET}  ", style="muted")
     summary.append(f"{counts['pending']} pending", style="white")
     if counts["blocked"]:
-        summary.append("  ·  ", style="muted")
+        summary.append(f"  {symbols.BULLET}  ", style="muted")
         summary.append(f"{counts['blocked']} blocked", style="error")
-    summary.append("  ·  ", style="muted")
+    summary.append(f"  {symbols.BULLET}  ", style="muted")
     summary.append(f"{counts['completed']} done", style="success")
     console.print(summary)
 
@@ -12387,14 +12388,14 @@ def _render_task_todolist(tasks: list[dict], cwd: str) -> None:
     }
     status_ui = {
         "in_progress": ("▶", "warning"),
-        "completed": ("✓", "success"),
+        "completed": (f"{symbols.OK}", "success"),
         "blocked": ("!", "error"),
         "skipped": ("–", "muted"),
-        "pending": ("○", "white"),
+        "pending": (f"{symbols.DOT_OPEN}", "white"),
     }
     for task in ordered:
         status = task.get("status", "pending")
-        mark, mark_style = status_ui.get(status, ("·", "white"))
+        mark, mark_style = status_ui.get(status, (f"{symbols.BULLET}", "white"))
         source, source_style = _task_ui_source(task)
         blocked = [
             str(blocker) for blocker in task.get("blockedBy", [])
@@ -12467,15 +12468,15 @@ def _render_task_agent_tree(tasks: list[dict], cwd: str,
     }
     heading = Text("Tasks", style="bold white")
     if session_id:
-        heading.append(f" · session {session_id[:12]}", style="muted")
+        heading.append(f" {symbols.BULLET} session {session_id[:12]}", style="muted")
     if current_id:
-        heading.append(f" · current {current_id}", style="agent")
+        heading.append(f" {symbols.BULLET} current {current_id}", style="agent")
     heading.append(f"  {cwd}", style="muted")
     console.print(heading)
     console.print(
-        f"[warning]{counts['in_progress']} active[/warning]  [muted]·[/muted]  "
-        f"{counts['pending']} pending  [muted]·[/muted]  "
-        f"[error]{counts['blocked']} blocked[/error]  [muted]·[/muted]  "
+        f"[warning]{counts['in_progress']} active[/warning]  [muted]{symbols.BULLET}[/muted]  "
+        f"{counts['pending']} pending  [muted]{symbols.BULLET}[/muted]  "
+        f"[error]{counts['blocked']} blocked[/error]  [muted]{symbols.BULLET}[/muted]  "
         f"[success]{counts['completed']} done[/success]"
     )
 
@@ -12495,9 +12496,9 @@ def _render_task_agent_tree(tasks: list[dict], cwd: str,
     rank = {"in_progress": 0, "pending": 1, "blocked": 2,
             "completed": 3, "skipped": 4}
     status_ui = {
-        "in_progress": ("▶", "warning"), "completed": ("✓", "success"),
+        "in_progress": ("▶", "warning"), "completed": (f"{symbols.OK}", "success"),
         "blocked": ("!", "error"), "skipped": ("–", "muted"),
-        "pending": ("○", "white"),
+        "pending": (f"{symbols.DOT_OPEN}", "white"),
     }
     parent_by_agent = {
         str(item.get("owner_agent_id") or ""):
@@ -12537,7 +12538,7 @@ def _render_task_agent_tree(tasks: list[dict], cwd: str,
             agent_label += f" [{info.status}]"
         for task_index, task in enumerate(owned):
             status = task.get("status", "pending")
-            mark, mark_style = status_ui.get(status, ("·", "white"))
+            mark, mark_style = status_ui.get(status, (f"{symbols.BULLET}", "white"))
             source, source_style = _task_ui_source(task)
             table.add_row(
                 Text(agent_label if task_index == 0 else "", style="agent"),
@@ -12586,9 +12587,9 @@ def _cmd_task(raw_args: str, parts: list) -> None:
         return choose_record(
             candidates,
             title=title,
-            label=lambda item: f"{item['id']} · {item.get('subject', '(untitled)')}",
+            label=lambda item: f"{item[f'id']} {symbols.BULLET} {item.get('subject', '(untitled)')}",
             description=lambda item: (
-                f"{item.get('status', 'pending')} · "
+                f"{item.get('status', 'pending')} {symbols.BULLET} "
                 f"{item.get('progress', 0)}%"),
             search=True,
         )
@@ -13025,7 +13026,7 @@ def _cmd_detail(parts: list) -> None:
                 title="Tool Output Detail",
                 full_screen=False,
                 selected_index=1 if _cur else 0,
-                hint="↑↓ navigate  ↵ select  Esc/q cancel",
+                hint=f"{symbols.ARROW_U}{symbols.ARROW_D} navigate  ↵ select  Esc/q cancel",
                 letter_shortcuts=True,
             )
             if chosen is not None:
@@ -13321,7 +13322,7 @@ def _cmd_terminate(parts: list) -> None:
             label=lambda item: item.name,
             description=lambda item: (
                 f"{'alive' if item.session and item.session.is_alive() else 'stopped'}"
-                f" · {item.command[:80]}"),
+                f" {symbols.BULLET} {item.command[:80]}"),
             search=True,
         )
         name = chosen.name if chosen else ""
@@ -13443,7 +13444,7 @@ def _cmd_hire(parts: list, session: dict) -> bool:
     if base_model or hire_options.get("choose_model"):
         try:
             with _safe_status(
-                    "[dim]Fetching available models… · Esc/Ctrl+C cancel[/dim]"):
+                    f"[dim]Fetching available models… {symbols.BULLET} Esc/Ctrl+C cancel[/dim]"):
                 models, _endpoint = run_cancellable_blocking(
                     lambda cancel: fetch_available_models(
                         session, cancel_event=cancel))
@@ -13857,7 +13858,7 @@ def _attach_primary_runtime_view(agent, *, show_result: bool = True):
         _set_run_input_state("running")
         try:
             with _safe_status(
-                    "[#3fb950]Thinking… · primary runtime[/#3fb950]",
+                    f"[#3fb950]Thinking… {symbols.BULLET} primary runtime[/#3fb950]",
                     spinner="dots"):
                 while worker.is_alive():
                     worker.join(timeout=0.1)
@@ -14078,7 +14079,7 @@ def _cmd_tell(raw_args: str) -> None:
             title="Send Message to Agent",
             label=lambda item: item.id,
             description=lambda item: (
-                f"{item.status} · {item.name} · role={item.role}"),
+                f"{item.status} {symbols.BULLET} {item.name} {symbols.BULLET} role={item.role}"),
             search=True,
         )
         target_id = chosen.id if chosen else ""
@@ -14125,7 +14126,7 @@ def _cmd_abort(parts: list) -> None:
             title="Abort Agent",
             label=lambda item: item.id,
             description=lambda item: (
-                f"{item.status} · {item.name} · role={item.role}"),
+                f"{item.status} {symbols.BULLET} {item.name} {symbols.BULLET} role={item.role}"),
             search=True,
         )
         target_id = chosen.id if chosen else ""
@@ -14264,7 +14265,7 @@ def _cmd_tool(raw_args: str, session: dict, agent_registry: AgentRegistry) -> No
             title="Run Tool",
             label=lambda item: item.name,
             description=lambda item: (
-                f"{item.source} · {item.description[:100]}"),
+                f"{item.source} {symbols.BULLET} {item.description[:100]}"),
             search=True,
         )
         tool_name = chosen.name if chosen else ""
@@ -14459,7 +14460,7 @@ def _cmd_mcp(parts: list) -> bool:
             label=lambda item: item[0],
             description=lambda item: (
                 f"{(mgr.servers.get(item[0]).status if mgr.servers.get(item[0]) else 'offline')}"
-                f" · {item[1].get('command', '?')}"),
+                f" {symbols.BULLET} {item[1].get('command', '?')}"),
             search=True,
         )
         return chosen[0] if chosen else ""
@@ -14892,7 +14893,7 @@ def _cmd_undo(action: str, raw_args: str, parts: list) -> bool:
                 title="Restore Checkpoint",
                 label=lambda item: item["sha"][:10],
                 description=lambda item: (
-                    f"{item.get('label') or '(no label)'} · "
+                    f"{item.get('label') or '(no label)'} {symbols.BULLET} "
                     f"{_format_time_ago(item.get('ts', 0))}"),
                 search=True,
             )
@@ -14987,7 +14988,7 @@ def _cmd_max() -> None:
     # Crank every capacity knob to its ceiling and lift every auto-exit
     # circuit breaker. Process-global → applies to all agents. /config reset reverts.
     applied = apply_max_config()
-    console.print("[green]⚡ MAX mode — all limits lifted (applies to every agent):[/green]")
+    console.print(f"[green]{symbols.ZAP} MAX mode — all limits lifted (applies to every agent):[/green]")
     for k, v in applied.items():
         console.print(f"  [cyan]{k}[/cyan] = {v}")
     console.print("[dim]Note: max_tokens may be capped lower by the provider. Revert with /config reset.[/dim]")
@@ -15013,10 +15014,10 @@ def _cmd_compact(parts: list, session: dict) -> bool:
         ratio = (info["tokens"] / info["usable"] * 100
                  if info["usable"] else 0)
         console.print(
-            f"[bold]Context[/bold]  {_fmt_tokens(info['tokens'])} tokens · "
-            f"{info['messages']} messages · {ratio:.0f}% of "
+            f"[bold]Context[/bold]  {_fmt_tokens(info['tokens'])} tokens {symbols.BULLET} "
+            f"{info['messages']} messages {symbols.BULLET} {ratio:.0f}% of "
             f"{_fmt_tokens(info['usable'])} usable"
-            + (" · summarized" if info["summary"] else ""))
+            + (f" {symbols.BULLET} summarized" if info["summary"] else ""))
         return False
 
     # Compact an isolated copy so cancelling a slow summarizer cannot let its
@@ -15026,7 +15027,7 @@ def _cmd_compact(parts: list, session: dict) -> bool:
         compact_chat if isinstance(compact_chat, list) else [])
     try:
         with _safe_status(
-                "[dim]Compacting session context… · Esc/Ctrl+C cancel[/dim]",
+                f"[dim]Compacting session context… {symbols.BULLET} Esc/Ctrl+C cancel[/dim]",
                 spinner="dots"):
             result = run_cancellable_blocking(
                 lambda _cancel: compact_session_context(
@@ -15071,7 +15072,7 @@ def _cmd_compact(parts: list, session: dict) -> bool:
     console.print(
         f"[green]Context compacted: {_fmt_tokens(result['tokens'])} → "
         f"{_fmt_tokens(result['after_tokens'])} tokens"
-        f" · {result['messages']} → {result['after_messages']} messages[/green]")
+        f" {symbols.BULLET} {result['messages']} → {result['after_messages']} messages[/green]")
     return False
 
 
@@ -15289,7 +15290,7 @@ def _told_browse_history(chat: list) -> None:
                 mem.print("[dim](no reply recorded)[/dim]")
         else:
             mem.print("[dim]journal records prompts only — no reply stored[/dim]")
-        mem.print("[dim]↑↓/wheel/PgUp/PgDn scroll  q/Esc/Enter back[/dim]")
+        mem.print(f"[dim]{symbols.ARROW_U}{symbols.ARROW_D}/wheel/PgUp/PgDn scroll  q/Esc/Enter back[/dim]")
 
         # Scroll model: prompt_toolkit Windows scroll by *following the
         # cursor* — each render recomputes vertical_scroll so the cursor
@@ -15378,7 +15379,7 @@ def _told_browse_history(chat: list) -> None:
             selected_index=sel_idx,
             action_keys={"tab": "source"},
             enter_action="view",
-            hint=("↑↓ navigate  ↵ view  type to filter  "
+            hint=(f"{symbols.ARROW_U}{symbols.ARROW_D} navigate  ↵ view  type to filter  "
                   f"tab → {other}  q/Esc back"),
         )
         if result is None:
@@ -15476,7 +15477,7 @@ def _cmd_told(parts: list) -> bool:
                     f"{escape(scoped_agent_name)}.[/yellow]")
             else:
                 console.print(
-                    f"[bold]── {escape(scoped_agent_name)} · complete "
+                    f"[bold]── {escape(scoped_agent_name)} {symbols.BULLET} complete "
                     f"conversation ({len(replayable)} events) ──[/bold]")
                 for message in replayable:
                     _print_resume_event(message)
@@ -15516,7 +15517,7 @@ def _cmd_told(parts: list) -> bool:
             console.print("[dim]Tip: /told log reads the durable per-cwd journal.[/dim]")
         else:
             recent = _turns[-n:] if n < len(_turns) else _turns
-            owner = f"{scoped_agent_name} · " if scoped_agent_id else ""
+            owner = f"{scoped_agent_name} {symbols.BULLET} " if scoped_agent_id else ""
             label = (f"{owner}last turn" if len(recent) == 1
                      else f"{owner}last {len(recent)} turns")
             console.print(f"[bold]── {label} ──[/bold]")
@@ -15606,9 +15607,9 @@ def _workflow_result(kind: str, result: dict) -> None:
     ok = bool(result.get("ok"))
     paused = bool(result.get("paused"))
     symbol, status, style = (
-        ("✓", "complete", "success") if ok
+        (f"{symbols.OK}", "complete", "success") if ok
         else (("Ⅱ", "paused", "warning") if paused
-              else ("✗", "failed", "error"))
+              else (f"{symbols.FAIL}", "failed", "error"))
     )
     heading = Text()
     heading.append(f"{symbol} ", style=style)
@@ -15647,11 +15648,11 @@ def _cmd_hwo(parts: list, session: dict) -> None:
                 elif kind == "step_started":
                     _workflow_event_line("▶", f"{event.get('stepId', '?')} started", "warning")
                 elif kind == "step_completed":
-                    _workflow_event_line("✓", f"{event.get('stepId', '?')} completed", "success")
+                    _workflow_event_line(f"{symbols.OK}", f"{event.get('stepId', '?')} completed", "success")
                 elif kind == "step_failed":
-                    _workflow_event_line("✗", f"{event.get('stepId', '?')} failed", "error")
+                    _workflow_event_line(f"{symbols.FAIL}", f"{event.get('stepId', '?')} failed", "error")
                 elif kind == "workflow_completed":
-                    _workflow_event_line("✓", f"HWO {event.get('runId')} completed", "success")
+                    _workflow_event_line(f"{symbols.OK}", f"HWO {event.get('runId')} completed", "success")
             r = hwo_runner.run_hwo_file(
                 path=path,
                 deps=get_loop_deps(),
@@ -15703,9 +15704,9 @@ def _cmd_hwg(parts: list, session: dict) -> None:
         if kind == "node_started":
             _workflow_event_line("▶", f"HWG node #{event.get('node', '?')} started", "warning")
         elif kind == "node_completed":
-            _workflow_event_line("✓", f"HWG node #{event.get('node', '?')} completed", "success")
+            _workflow_event_line(f"{symbols.OK}", f"HWG node #{event.get('node', '?')} completed", "success")
         elif kind == "node_failed":
-            _workflow_event_line("✗", f"HWG node #{event.get('node', '?')} failed", "error")
+            _workflow_event_line(f"{symbols.FAIL}", f"HWG node #{event.get('node', '?')} failed", "error")
         elif kind == "workflow_paused":
             _workflow_event_line("Ⅱ", f"HWG paused at node #{event.get('node', '?')}", "warning")
     if sub in ("run", "compile") and len(parts) >= 3:
@@ -16054,7 +16055,7 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict,
 
 _COMMANDS = [
     (spec.name, (
-        f"{spec.description} · {spec.usage}" if spec.usage else spec.description))
+        f"{spec.description} {symbols.BULLET} {spec.usage}" if spec.usage else spec.description))
     for spec in COMMAND_SPECS
     if spec.palette
 ]
@@ -16071,7 +16072,7 @@ def show_command_palette():
         title="Commands — type to filter",
         full_screen=True,
         search=True,
-        hint="↑↓ navigate  ↵ select  Esc cancel",
+        hint=f"{symbols.ARROW_U}{symbols.ARROW_D} navigate  ↵ select  Esc cancel",
     )
     if chosen is None:
         return None
@@ -16180,7 +16181,7 @@ def show_banner(agent_name: str, session: dict = None):
         console.print(f"[accent]{line}[/accent]")
     console.print(
         f"  [muted]cli[/muted] [accent.dim]v{__version__}[/accent.dim]"
-        f"  [muted]·[/muted]  [agent]{agent_name}[/agent]"
+        f"  [muted]{symbols.BULLET}[/muted]  [agent]{agent_name}[/agent]"
     )
     console.print()
 
@@ -16190,7 +16191,7 @@ def show_banner(agent_name: str, session: dict = None):
                    or session.get("userId") or "")
         if account:
             rows.append(("account", account))
-    rows.append(("system", f"{SYSTEM} · {shell_info}"))
+    rows.append(("system", f"{SYSTEM} {symbols.BULLET} {shell_info}"))
     rows.append(("cwd", _shorten_path(os.getcwd())))
     backend_profile = get_backend_profile()
     rows.append((
@@ -16248,9 +16249,9 @@ def show_banner(agent_name: str, session: dict = None):
 
     console.print()
     console.print(
-        "  [muted]PATH commands run directly · plain text → AI · "
-        "[/muted][accent]/help[/accent][muted] for commands · "
-        "[/muted][accent]/mode[/accent][muted] plan · "
+        f"  [muted]PATH commands run directly {symbols.BULLET} plain text → AI {symbols.BULLET} "
+        f"[/muted][accent]/help[/accent][muted] for commands {symbols.BULLET} "
+        f"[/muted][accent]/mode[/accent][muted] plan {symbols.BULLET} "
         "[/muted][accent]/policy[/accent][muted] approvals[/muted]"
     )
     console.print()
@@ -17282,7 +17283,7 @@ def _show_plan_approval_menu() -> bool:
     approved = _review_and_approve_current_plan()
     if approved:
         console.print(
-            f"[green]✓ Revision {approved['revision']} approved. Executing exact SHA "
+            f"[green]{symbols.OK} Revision {approved['revision']} approved. Executing exact SHA "
             f"{approved['content_sha'][:12]}…[/green]")
         return True
     return False
@@ -17413,7 +17414,7 @@ def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
                     if subtasks:
                         source = auto_pilot.get_last_decompose_source()
                         src_label = " (heuristic)" if source == "heuristic" else ""
-                        console.print(f"[dim][auto-pilot] {strategy} · {len(subtasks)} subtasks{src_label}[/dim]")
+                        console.print(f"[dim][auto-pilot] {strategy} {symbols.BULLET} {len(subtasks)} subtasks{src_label}[/dim]")
                     else:
                         console.print(f"[dim][auto-pilot] {strategy}[/dim]")
 
@@ -18411,7 +18412,7 @@ def main():
             if _checkpoint:
                 console.print(
                     f"[dim]Saved resume checkpoint: "
-                    f"{_format_time_ago(_checkpoint.get('timestamp', 0))} · "
+                    f"{_format_time_ago(_checkpoint.get('timestamp', 0))} {symbols.BULLET} "
                     f"{_checkpoint.get('title', 'Untitled session')}[/dim]"
                 )
 
