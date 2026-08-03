@@ -12,21 +12,26 @@ import laintas_cli
 import updater
 
 
+def _make_response(payload):
+    class Response:
+        headers = {"Content-Length": str(len(payload))}
+
+        @staticmethod
+        def raise_for_status():
+            return None
+
+        @staticmethod
+        def iter_content(chunk_size=65536):
+            return (payload[i:i + chunk_size] for i in range(0, len(payload), chunk_size))
+
+    return Response()
+
+
 class DownloadProgressTests(unittest.TestCase):
-    def test_prompt_toolkit_stdout_uses_persistent_progress_without_changing_bytes(self):
+    def test_tty_path_writes_single_line_progress_to_fd(self):
+        """When /dev/tty is available, progress goes to the tty fd via \r,
+        not to con.print. Verify output content and byte integrity."""
         payload = b"a" * 70000 + b"b" * 70000
-
-        class Response:
-            headers = {"Content-Length": str(len(payload))}
-
-            @staticmethod
-            def raise_for_status():
-                return None
-
-            @staticmethod
-            def iter_content(chunk_size=65536):
-                return (payload[i:i + chunk_size] for i in range(0, len(payload), chunk_size))
-
         StdoutProxy = type("StdoutProxy", (), {"__module__": "prompt_toolkit.patch_stdout"})
         messages = []
         console = SimpleNamespace(
@@ -34,7 +39,40 @@ class DownloadProgressTests(unittest.TestCase):
             file=StdoutProxy(),
             print=messages.append,
         )
-        with mock.patch.object(updater.requests, "get", return_value=Response()):
+        r_fd, w_fd = os.pipe()
+        try:
+            with mock.patch.object(updater.requests, "get", return_value=_make_response(payload)), \
+                    mock.patch.object(updater, "_open_tty", return_value=(w_fd, 120)):
+                downloaded = updater._download(
+                    "https://example.invalid/release.tar.gz",
+                    label="release.tar.gz",
+                    console=console,
+                )
+            # _download closes w_fd via os.close(tty_fd), so it's already closed.
+            # Read what was written to the pipe.
+            output = os.read(r_fd, 65536).decode("utf-8", errors="replace")
+        finally:
+            try:
+                os.close(r_fd)
+            except OSError:
+                pass
+        # Should contain the label, 100%, and a final newline
+        self.assertIn("release.tar.gz", output)
+        self.assertIn("100%", output)
+        self.assertTrue(output.endswith("\n"))
+
+    def test_no_tty_fallback_uses_throttled_console_print(self):
+        """When /dev/tty is unavailable, fall back to throttled con.print."""
+        payload = b"a" * 70000 + b"b" * 70000
+        StdoutProxy = type("StdoutProxy", (), {"__module__": "prompt_toolkit.patch_stdout"})
+        messages = []
+        console = SimpleNamespace(
+            is_terminal=True,
+            file=StdoutProxy(),
+            print=messages.append,
+        )
+        with mock.patch.object(updater.requests, "get", return_value=_make_response(payload)), \
+                mock.patch.object(updater, "_open_tty", return_value=(None, 0)):
             downloaded = updater._download(
                 "https://example.invalid/release.tar.gz",
                 label="release.tar.gz",
@@ -44,7 +82,7 @@ class DownloadProgressTests(unittest.TestCase):
         self.assertEqual(downloaded, payload)
         self.assertGreaterEqual(len(messages), 2)
         self.assertIn("release.tar.gz", messages[0])
-        self.assertTrue(any("100%" in message for message in messages))
+        self.assertTrue(any("100%" in m for m in messages))
 
 
 class RestartResolutionTests(unittest.TestCase):

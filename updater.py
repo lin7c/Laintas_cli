@@ -201,6 +201,39 @@ def fetch_manifest() -> dict:
     return data
 
 
+def _open_tty():
+    """Open /dev/tty for direct writes, bypassing prompt_toolkit's StdoutProxy.
+
+    Returns (fd, width) or (None, 0). The fd is a raw OS file descriptor;
+    callers must os.close() it. width is the terminal column count for
+    line truncation, queried from the tty itself via TIOCGWINSZ.
+    """
+    try:
+        fd = os.open("/dev/tty", os.O_WRONLY | os.O_NOCTTY)
+    except OSError:
+        return None, 0
+    width = 80
+    try:
+        import struct
+        import fcntl
+        import termios
+        packed = fcntl.ioctl(fd, termios.TIOCGWINSZ, b"\0" * 8)
+        _rows, cols = struct.unpack("hhhh", packed)[:2]
+        if cols > 0:
+            width = cols
+    except Exception:
+        pass
+    return fd, width
+
+
+def _write_tty(fd: int, text: str) -> None:
+    """Write text to a raw tty fd, ignoring errors."""
+    try:
+        os.write(fd, text.encode("utf-8", errors="replace"))
+    except OSError:
+        pass
+
+
 def _download(url: str, label: str = "downloading", console=None) -> bytes:
     """Download ``url`` into memory, showing a curl-style progress bar.
 
@@ -233,35 +266,68 @@ def _download(url: str, label: str = "downloading", console=None) -> bytes:
         return resp.content
 
     # prompt_toolkit's StdoutProxy is line-oriented: Rich's carriage-return
-    # animation is buffered or overwritten by the active input prompt. Use
-    # durable newline-based snapshots in that mode so a long binary update
-    # never looks frozen. The actual HTTP stream and returned bytes are shared
-    # with the normal dynamic-progress path below.
-    #
-    # The shared console writes through repl_mirror.TeeFile, which forwards to
-    # the live sys.stdout — under the REPL that is the StdoutProxy above. So the
-    # console's own .file is a TeeFile (module ``repl_mirror``) and does NOT look
-    # like a proxy by class name; probe the real sys.stdout too, otherwise Live
-    # silently comes back and the update looks frozen again.
+    # animation is buffered or overwritten by the active input prompt. Bypass
+    # it by writing directly to /dev/tty with \r-based single-line refresh.
+    # If /dev/tty is unavailable (non-PTY SSH, container without tty),
+    # fall back to throttled multi-line output via the console.
     if _live_hostile_stdout(getattr(con, "file", None)):
         buf = bytearray()
         started = time.monotonic()
-        last_reported_bucket = -1
+
+        tty_fd, tty_width = _open_tty()
+        if tty_fd is not None:
+            # Direct TTY path: single-line \r refresh.
+            def _render(final: bool = False) -> None:
+                downloaded = len(buf)
+                now = time.monotonic()
+                elapsed = max(now - started, 0.001)
+                speed = _format_download_size(int(downloaded / elapsed)) + "/s"
+                if total:
+                    pct = min(100, int(downloaded * 100 / total))
+                    if final and downloaded >= total:
+                        pct = 100
+                    detail = f"{pct:3d}% · {_format_download_size(downloaded)}/{_format_download_size(total)}"
+                else:
+                    detail = _format_download_size(downloaded)
+                mark = "✓" if final else "↓"
+                line = f"  {mark} {label}  {detail} · {speed}"
+                # Truncate to terminal width, leave room for \r.
+                if tty_width > 4 and len(line) > tty_width - 1:
+                    line = line[: tty_width - 2] + "…"
+                _write_tty(tty_fd, "\r" + line)
+                if final:
+                    _write_tty(tty_fd, "\n")
+
+            last_render = 0.0
+            _render()
+            for chunk in resp.iter_content(chunk_size=65536):
+                if chunk:
+                    buf.extend(chunk)
+                    now = time.monotonic()
+                    if now - last_render >= 0.15:
+                        last_render = now
+                        _render()
+            _render(final=True)
+            try:
+                os.close(tty_fd)
+            except OSError:
+                pass
+            return bytes(buf)
+
+        # Fallback: no /dev/tty - throttled multi-line via console.
         last_reported_at = started
 
         def report(force: bool = False) -> None:
-            nonlocal last_reported_bucket, last_reported_at
+            nonlocal last_reported_at
             downloaded = len(buf)
             now = time.monotonic()
             if total:
                 percent = min(100, int(downloaded * 100 / total))
-                bucket = percent // 10
-                if not force and bucket <= last_reported_bucket and now - last_reported_at < 2:
+                if not force and now - last_reported_at < 5:
                     return
                 detail = f"{percent:3d}% · {_format_download_size(downloaded)}/{_format_download_size(total)}"
-                last_reported_bucket = bucket
             else:
-                if not force and now - last_reported_at < 2:
+                if not force and now - last_reported_at < 5:
                     return
                 detail = _format_download_size(downloaded)
             elapsed = max(now - started, 0.001)
