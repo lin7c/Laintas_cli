@@ -4,11 +4,12 @@ requests>=2.28.0
 certifi>=2024.0.0
 rich>=13.0.0
 prompt_toolkit>=3.0.0
+pysocks>=1.7
 
-# Optional extras — install via pip install .[<extra>]  (e.g. .[browser,webrtc])
-#   [browser]  websockets, playwright  — headless-browser live-view + CDP tools
-#   [webrtc]   aiortc                  — P2P file channel (bypasses relay)
-#   [mcp]      mcp                     — MCP server tools (/mcp)
+# Optional extras - install via pip install .[<extra>]  (e.g. .[browser,webrtc])
+#   [browser]  websockets, playwright  - headless-browser live-view + CDP tools
+#   [webrtc]   aiortc                  - P2P file channel (bypasses relay)
+#   [mcp]      mcp                     - MCP server tools (/mcp)
 #   [all]      all of the above
 #
 # The lines below are for `pip install -r requirements.txt` (dev convenience).
@@ -22,12 +23,6 @@ aiortc>=1.14
 # laintas-cli starts and runs without this; the /mcp command will tell
 # you it's missing and how to install. Comment out if you don't need MCP.
 mcp>=1.0
-
-# Optional - enables SOCKS5 proxy support for web.search and web.fetch
-# (e.g. socks5://127.0.0.1:1080 for VPN users in restricted networks).
-# HTTP/HTTPS proxies work without this; only SOCKS5 needs PySocks.
-#   pip install .[search]
-pysocks>=1.7
 
 # Optional — enables the headless-browser live-view stack (browser.* tools).
 # The CLI runs without this; browser._debug_open will report the missing dep.

@@ -5,7 +5,7 @@ Engine chain (auto): Google -> DuckDuckGo -> laintas_search
   - laintas_search: paid API fallback, always reliable
 
 Proxy: LAINTAS_HTTP_PROXY env or /config search_proxy
-  - http://, https://, socks5://, socks5h:// (socks5 requires PySocks)
+  - http://, https://, socks5://, socks5h://
   - Only affects web.search (Google/DDG) and web.fetch, NOT laintas_search API
 
 Cookie: shared process-level CookieJar, opt-in via /config search_cookie_enabled
