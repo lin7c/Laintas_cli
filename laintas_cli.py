@@ -1235,8 +1235,11 @@ def _marker_poll_exec_unlocked(session, command: str, timeout: int = 60,
             starts = list(_re.finditer(
                 rf'{_re.escape(start_marker)}(?=[\r\n]|$)', new_content))
             if starts:
+                # Take the FIRST start marker before end, not the last -
+                # command output begins right after the first marker; taking
+                # the last one truncates any output between first and last.
                 valid = [m for m in starts if m.end() < end_match.start()]
-                chosen = valid[-1] if valid else starts[-1]
+                chosen = valid[0] if valid else starts[0]
                 body_start = chosen.end()
                 while body_start < len(new_content) and new_content[body_start] in '\r\n':
                     body_start += 1
@@ -1433,6 +1436,55 @@ def _modify_interactive_commands(command: str, add: bool) -> None:
         pass
 
 
+def _pane_snapshot_delta(previous: str, current: str) -> str:
+    """Return output added between two bounded tmux pane snapshots.
+
+    tmux ``capture-pane`` returns a rolling window: once output exceeds the
+    pane height the oldest lines are trimmed. A naive ``current[old_len:]``
+    slice breaks because ``old_len`` (the previous snapshot length) can exceed
+    the current snapshot length after scrolling, yielding empty deltas forever.
+
+    We find the longest suffix of ``previous`` that is a prefix of ``current``
+    (KMP failure-function overlap). Everything after that overlap in
+    ``current`` is the true incremental delta.
+
+    If no overlap exists (clear/redraw), return ``current`` wholesale — this
+    is correct for a one-shot refresh but callers that must avoid duplicates
+    should deduplicate on their own (see trigger scanner).
+    """
+    if not current:
+        return ""
+    if not previous:
+        return current
+    if current == previous:
+        return ""
+    if current.startswith(previous):
+        return current[len(previous):]
+
+    n, m = len(previous), len(current)
+    # KMP prefix function on `current`
+    lps = [0] * m
+    k = 0
+    for i in range(1, m):
+        while k > 0 and current[i] != current[k]:
+            k = lps[k - 1]
+        if current[i] == current[k]:
+            k += 1
+        lps[i] = k
+    # Walk `previous` through `current`'s LPS to find the longest suffix of
+    # `previous` matching a prefix of `current`.
+    j = 0
+    for i in range(n):
+        while j > 0 and previous[i] != current[j]:
+            j = lps[j - 1]
+        if previous[i] == current[j]:
+            j += 1
+            if j == m:
+                # `current` is fully matched inside `previous`; no new content.
+                return ""
+    return current[j:]
+
+
 class SubTerminalSession:
     """A sub-terminal session that runs a command in a separate terminal context.
 
@@ -1458,6 +1510,13 @@ class SubTerminalSession:
         self._start_time: float = 0.0
         self._returncode: int = -1
         self._tmux_exit_marker = f"__LAINTAS_EXIT_{uuid.uuid4().hex}__"
+        # tmux pane snapshots are bounded (rolling). A naive length-diff delta
+        # breaks once output scrolls past the pane height. We track the last
+        # raw snapshot and compute true increments via suffix/prefix overlap,
+        # accumulating into _accumulated_output so full_output/output_total/
+        # output_from stay correct regardless of pane scrolling.
+        self._last_pane_snapshot: str = ""
+        self._accumulated_output: str = ""
         # Commands routed through one shell must be atomic. Without this,
         # marker-poll executions from multiple agents can interleave.
         self.command_lock = threading.RLock()
@@ -1529,28 +1588,55 @@ class SubTerminalSession:
 
     # ── output ─────────────────────────────────────────────────~~~~~~
 
+    def _tmux_sync_snapshot(self) -> str:
+        """Capture the tmux pane, compute the true delta since the last
+        snapshot, append it to the accumulated buffer, and return the delta.
+
+        tmux capture-pane returns a *bounded rolling* snapshot. Once output
+        exceeds the pane height the oldest lines are trimmed, so a naive
+        length-diff (old_len vs len(snapshot)) permanently returns empty.
+        We instead find the longest suffix of the previous snapshot that is
+        a prefix of the new snapshot (KMP), and treat everything after that
+        overlap as the incremental delta.
+        """
+        if not self._tmux_window:
+            return ""
+        import subprocess as _sp
+        try:
+            result = _sp.run(
+                ["tmux", "capture-pane", "-p", "-t", self._tmux_window, "-S", "-500"],
+                capture_output=True, text=True, timeout=5,
+            )
+            new_output = result.stdout or ""
+            self._capture_tmux_returncode(new_output)
+        except Exception:
+            return ""
+
+        previous = self._last_pane_snapshot
+        self._last_pane_snapshot = new_output
+
+        if not new_output:
+            return ""
+        if not previous:
+            delta = new_output
+        elif new_output == previous:
+            return ""
+        elif new_output.startswith(previous):
+            delta = new_output[len(previous):]
+        else:
+            # Rolling snapshot: find longest suffix of `previous` that is a
+            # prefix of `new_output` (KMP overlap).
+            delta = _pane_snapshot_delta(previous, new_output)
+
+        if delta:
+            self._output_buf.append(delta)
+            self._accumulated_output += delta
+        return self._clean_tmux_markers(delta)
+
     def read_output(self, timeout: float = 0.3) -> str:
         """Read current output. For tmux: captures pane content."""
         if self._use_tmux:
-            if not self._tmux_window:
-                return ""
-            import subprocess as _sp
-            try:
-                result = _sp.run(
-                    ["tmux", "capture-pane", "-p", "-t", self._tmux_window, "-S", "-500"],
-                    capture_output=True, text=True, timeout=5,
-                )
-                new_output = result.stdout or ""
-                self._capture_tmux_returncode(new_output)
-            except Exception:
-                new_output = ""
-            # Return only what's new since last read
-            old_len = sum(len(c) for c in self._output_buf)
-            if len(new_output) > old_len:
-                delta = new_output[old_len:]
-                self._output_buf.append(delta)
-                return self._clean_tmux_markers(delta)
-            return ""
+            return self._tmux_sync_snapshot()
         else:
             if self._pty:
                 return self._pty.read_output(timeout=timeout)
@@ -1565,21 +1651,28 @@ class SubTerminalSession:
         decoded = _decode_send_keys(text)
         if self._use_tmux:
             try:
-                lines = decoded.replace('\r', '\n').split('\n')
-                if lines and lines[-1] == "":
-                    lines.pop()
-                for line in lines:
+                # Normalise CRLF -> LF first, then standalone CR -> LF, so
+                # that "\r\n" does not become two newlines.  Both CR and LF
+                # represent the Enter key in terminal context.
+                normalized = decoded.replace('\r\n', '\n').replace('\r', '\n')
+                # Split on newlines.  Enter is sent *before* each line
+                # (except the first), so a trailing "\n" produces exactly
+                # one Enter and a string with no trailing "\n" sends none.
+                # Empty lines still get Enter, preserving heredoc semantics.
+                lines = normalized.split('\n')
+                for i, line in enumerate(lines):
+                    if i > 0:
+                        subprocess.run(
+                            ["tmux", "send-keys", "-t", self._tmux_window,
+                             "Enter"],
+                            capture_output=True, timeout=5,
+                        )
                     if line:
-                        # Send literal text
                         subprocess.run(
                             ["tmux", "send-keys", "-t", self._tmux_window,
                              "-l", line],
                             capture_output=True, timeout=5,
                         )
-                    subprocess.run(
-                        ["tmux", "send-keys", "-t", self._tmux_window, "Enter"],
-                        capture_output=True, timeout=5,
-                    )
             except (OSError, subprocess.SubprocessError):
                 self._alive = False
         else:
@@ -1658,18 +1751,11 @@ class SubTerminalSession:
     def full_output(self) -> str:
         """Full accumulated output."""
         if self._use_tmux:
-            # Re-read full pane to get complete output
-            import subprocess as _sp
-            try:
-                result = _sp.run(
-                    ["tmux", "capture-pane", "-p", "-t", self._tmux_window, "-S", "-2000"],
-                    capture_output=True, text=True, timeout=5,
-                )
-                output = result.stdout or ""
-                self._capture_tmux_returncode(output)
-                return self._clean_tmux_markers(output)
-            except Exception:
-                return self._clean_tmux_markers("".join(self._output_buf))
+            # Sync any pane changes since the last read, then return the
+            # accumulated buffer. This is scroll-safe: the accumulated buffer
+            # only grows and never loses content to pane trimming.
+            self._tmux_sync_snapshot()
+            return self._clean_tmux_markers(self._accumulated_output)
         else:
             if self._pty:
                 return self._pty.full_output
@@ -1679,17 +1765,8 @@ class SubTerminalSession:
     def raw_output(self) -> str:
         """Full accumulated output including ANSI escape codes."""
         if self._use_tmux:
-            import subprocess as _sp
-            try:
-                result = _sp.run(
-                    ["tmux", "capture-pane", "-p", "-t", self._tmux_window, "-S", "-2000"],
-                    capture_output=True, text=True, timeout=5,
-                )
-                output = result.stdout or ""
-                self._capture_tmux_returncode(output)
-                return self._clean_tmux_markers(output)
-            except Exception:
-                return self._clean_tmux_markers("".join(self._output_buf))
+            self._tmux_sync_snapshot()
+            return self._accumulated_output
         else:
             if self._pty:
                 return self._pty.raw_output
@@ -1699,25 +1776,25 @@ class SubTerminalSession:
     def output_total(self) -> int:
         """Cheap total output length. Delegates to underlying PTY when present.
 
-        For the tmux path, ``raw_output`` re-captures the pane each call so
-        its length is bounded by pane size and is itself cheap; we expose it
-        here so callers can use a uniform ``output_total``/``output_from``
-        pair regardless of backend.
+        For the tmux path, the accumulated buffer grows monotonically so its
+        length is a stable cursor reference (unlike the old rolling-snapshot
+        length which shrank when content scrolled out of the pane).
         """
         if not self._use_tmux and self._pty is not None:
             return self._pty.output_total
-        return len(self.raw_output)
+        return len(self._accumulated_output)
 
     def output_from(self, offset: int) -> str:
         """Return accumulated output starting at character `offset`.
 
         Delegates to the underlying ``InteractiveSession`` for the non-tmux
-        path (cheap O(delta) walk).  For tmux, ``raw_output`` is already a
-        bounded pane snapshot so we slice it directly.
+        path (cheap O(delta) walk).  For tmux, the accumulated buffer is
+        scroll-safe and monotonic so the offset never goes stale.
         """
         if not self._use_tmux and self._pty is not None:
             return self._pty.output_from(offset)
-        raw = self.raw_output
+        self._tmux_sync_snapshot()
+        raw = self._accumulated_output
         if offset <= 0:
             return raw
         if offset >= len(raw):

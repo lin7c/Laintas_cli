@@ -3593,9 +3593,16 @@ def _bi_terminal_create(params: dict, ctx: ToolCtx) -> dict:
         return {"ok": False, "error": "terminal creation not available"}
     if ctx.get_terminal is not None:
         existing = ctx.get_terminal(name)
-        if existing and existing.session and not existing.session.is_alive() and ctx.unregister_terminal:
-            ctx.unregister_terminal(name)
-            existing = None
+        if existing:
+            # Reclaim the name if the terminal is dead OR in a half-dismantled
+            # state (session is None). Previously a None session left the name
+            # permanently stuck because only the alive-session branch cleaned
+            # up - terminate would also fail to find a session to close.
+            is_dead = (existing.session is None
+                       or not existing.session.is_alive())
+            if is_dead and ctx.unregister_terminal:
+                ctx.unregister_terminal(name)
+                existing = None
         if existing is not None:
             return {"ok": False, "error": f"terminal '{name}' already exists"}
 

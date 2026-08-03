@@ -1228,8 +1228,27 @@ def _terminal_snapshot_delta(previous: str, current: str) -> str:
     if overlap:
         return current[overlap:]
 
-    # Screen redraw or cleared terminal: treat the current visible snapshot as
-    # new. Duplicate trigger delivery is preferable to silently missing it.
+    # No character-level overlap (screen redraw, buffer trim, or cleared
+    # terminal).  Returning the entire current snapshot would re-deliver
+    # triggers for every already-visible matching line.  Fall back to
+    # line-level suffix-prefix matching: find the longest run of trailing
+    # lines from *previous* that matches leading lines of *current* and
+    # return only the genuinely new lines after that point.
+    prev_lines = previous.splitlines()
+    curr_lines = current.splitlines()
+    if prev_lines and curr_lines:
+        max_k = min(len(prev_lines), len(curr_lines))
+        best = 0
+        for k in range(max_k, 0, -1):
+            if prev_lines[-k:] == curr_lines[:k]:
+                best = k
+                break
+        if best == 0:
+            # No line-level overlap either – genuinely new content.
+            return current
+        if best < len(curr_lines):
+            return "\n".join(curr_lines[best:])
+        return ""  # current is entirely a repeat of previous
     return current
 
 
@@ -5226,8 +5245,13 @@ def _marker_poll_simple(session, command: str, timeout: float = 30) -> str:
             starts = list(_re.finditer(
                 rf'{_re.escape(start_marker)}(?=[\r\n]|$)', new_content))
             if starts:
-                valid = [m for m in starts if m.end() < end_match.start()]
-                chosen = valid[-1] if valid else starts[-1]
+                # Take the FIRST start marker before end, not the last.
+                # Command output begins right after the first start marker;
+                # taking the last one would truncate any output between the
+                # first and last marker (e.g. when the command itself echoes
+                # a matching line). The (?=[\r\n]|$) lookahead already
+                # excludes shell-echoed command lines (marker followed by ';').
+                chosen = valid[0] if valid else starts[0]
                 body_start = chosen.end()
                 while body_start < len(new_content) and new_content[body_start] in '\r\n':
                     body_start += 1
@@ -5277,8 +5301,11 @@ def _sync_cwd_from_session(session) -> None:
             starts = list(_re.finditer(
                 rf'{_re.escape(start_marker)}(?=[\r\n]|$)', new_content))
             if starts:
+                # Take the FIRST start marker before end, not the last -
+                # output begins after the first marker; the last one would
+                # truncate content between markers.
                 valid = [m for m in starts if m.end() < end_match.start()]
-                chosen = valid[-1] if valid else starts[-1]
+                chosen = valid[0] if valid else starts[0]
                 body_start = chosen.end()
                 while body_start < len(new_content) and new_content[body_start] in '\r\n':
                     body_start += 1
@@ -5337,21 +5364,32 @@ def _check_policy(command: str, agent_id: str = None,
 def _process_parent_cmd_marker(cmd_output: str, *, deps=None,
                                agent_id: str = None) -> tuple:
     """Scan sub-terminal output for __PARENT_CMD__:<cmd> markers.
-    Execute any found commands in the parent context and return
-    (cleaned_output, parent_result | None)."""
+    Execute *all* found commands in the parent context and return
+    (cleaned_output, combined_parent_result | None).
+
+    Previously this only executed the first marker while the cleanup regex
+    silently deleted every marker - so additional commands were lost without
+    trace. Now each marker is executed in order and results are joined.
+    """
     import re as _re
-    m = _re.search(r'__PARENT_CMD__:(.*?)(?:\n|$)', cmd_output)
-    if not m:
+    matches = list(_re.finditer(r'__PARENT_CMD__:(.*?)(?:\n|$)', cmd_output))
+    if not matches:
         return cmd_output, None
-    cmd = m.group(1).strip()
     cleaned = _re.sub(r'__PARENT_CMD__:[^\n]*\n?', '', cmd_output).strip()
-    allowed, reason, _, _ = _check_policy(
-        cmd, agent_id=agent_id, deps=deps,
-    )
-    if not allowed:
-        return cleaned, f"BLOCKED: {reason}"
-    result = _execute_parent_command(cmd)
-    return cleaned, result
+    results = []
+    for m in matches:
+        cmd = m.group(1).strip()
+        if not cmd:
+            continue
+        allowed, reason, _, _ = _check_policy(
+            cmd, agent_id=agent_id, deps=deps,
+        )
+        if not allowed:
+            results.append(f"BLOCKED: {reason}")
+            continue
+        results.append(_execute_parent_command(cmd))
+    combined = "\n".join(r for r in results if r) if results else None
+    return cleaned, combined
 
 
 def _salient_arg(name: str, arguments: dict) -> str:
