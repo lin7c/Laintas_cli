@@ -29,6 +29,11 @@ PERSISTED_UI_KEYS = frozenset({
     "stream_preview",
     "theme",
     "markdown_theme",
+    "search_engine",
+    "search_laintas_api_key",
+    "search_laintas_api_url",
+    "search_proxy",
+    "search_cookie_enabled",
 })
 
 

@@ -57,7 +57,8 @@
     "precheck",
     "rag_signals",
     "redactor",
-    "skill_router"
+    "skill_router",
+    "web_search"
   ],
 
   "packages": [
@@ -90,7 +91,8 @@
     "browser": ["websockets>=12.0", "playwright>=1.40"],
     "webrtc":  ["aiortc>=1.14"],
     "mcp":     ["mcp>=1.0"],
-    "all":     ["websockets>=12.0", "playwright>=1.40", "aiortc>=1.14", "mcp>=1.0"]
+    "search":  ["pysocks>=1.7"],
+    "all":     ["websockets>=12.0", "playwright>=1.40", "aiortc>=1.14", "mcp>=1.0", "pysocks>=1.7"]
   },
 
   "core_requires": [

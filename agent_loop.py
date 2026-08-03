@@ -148,6 +148,12 @@ _DEFAULT_CONFIG = {
     "auto_pilot_max_parallel": 4,      # Phase 3: max parallel sub-agents for auto-execution
     "auto_pilot_budget_tokens": 50000, # Phase 3: token budget for auto-execution (all sub-agents combined)
     "tool_output_fold": 30,          # max lines of tool output shown before folding (first half + … + last half); 0 = suppress preview entirely
+    # ── Web search / fetch ──
+    "search_engine": "auto",            # auto = engine chain (Google -> DDG -> laintas_search); or google / duckduckgo / laintas_search
+    "search_laintas_api_key": "",        # laintas_search API key (X-API-KEY header); register at search.laintas.com
+    "search_laintas_api_url": "https://search.laintas.com",  # laintas_search API base URL
+    "search_proxy": "",                 # proxy for web.search and web.fetch; e.g. socks5://127.0.0.1:1080 or http://host:port (empty = direct)
+    "search_cookie_enabled": False,     # share a process-level cookie jar across search/fetch; enables Google consent-cookie auto-injection
 }
 
 # ── Typed Error Classes ───────────────────────────────────────────────
@@ -549,6 +555,11 @@ _RUNTIME_CONFIG_DESCRIPTIONS = {
     "confirm_direct_commands": "Ask for approval on commands YOU type directly at the REPL (False = run like a normal terminal; hard deny rules still apply)",
     "enable_mouse": "Enable mouse click-to-position in the REPL input box",
     "tool_output_fold": "Max lines of tool output shown before folding (first half + … + last half); 0 = suppress preview",
+    "search_engine": "Search engine: auto (Google -> DDG -> laintas_search chain), google, duckduckgo, or laintas_search",
+    "search_laintas_api_key": "API key for laintas_search (sent as X-API-KEY header; leave empty to skip laintas_search engine)",
+    "search_laintas_api_url": "Base URL for laintas_search API (default: https://search.laintas.com)",
+    "search_proxy": "Proxy for web.search and web.fetch (e.g. socks5://127.0.0.1:1080 or http://host:port; empty = direct connection)",
+    "search_cookie_enabled": "Share a process-level cookie jar across web.search and web.fetch (enables Google consent-cookie auto-injection; default off)",
 }
 
 _RUNTIME_NONNEGATIVE = {
@@ -581,6 +592,7 @@ _RUNTIME_ENUM_CHOICES: dict[str, frozenset] = {
     "stream_preview": frozenset({"off", "one", "detail"}),
     "theme": frozenset({"dark", "light", "mono"}),
     "markdown_theme": frozenset({"default", "green-red", "custom"}),
+    "search_engine": frozenset({"auto", "google", "duckduckgo", "laintas_search"}),
 }
 
 

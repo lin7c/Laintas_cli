@@ -1989,8 +1989,6 @@ def _bi_fs_glob(params: dict, ctx: ToolCtx) -> dict:
     }
 
 
-_WEB_FETCH_TIMEOUT = 15
-
 # ── Import memory system for mem.save ──────────────────────────────────
 try:
     import memory_system as _mem_sys
@@ -2027,160 +2025,38 @@ try:
 except ImportError:
     _policy_mod = None
 
-# Try to import html2text for better content extraction (optional)
-try:
-    import html2text as _html2text_mod
-    _HTML2TEXT = _html2text_mod.HTML2Text()
-    _HTML2TEXT.ignore_links = False
-    _HTML2TEXT.ignore_images = True
-    _HTML2TEXT.body_width = 0
-except ImportError:
-    _HTML2TEXT = None
-
 
 def _bi_web_search(params: dict, ctx: ToolCtx) -> dict:
-    """Search the web using HTML search pages (no API key needed).
+    """Search the web using the engine chain (Google -> DDG -> laintas_search).
 
-    Returns list of {title, url, snippet} results.
+    Delegates to web_search.search() which handles proxy, cookie, error
+    classification, and fast-fail caching.
     """
-    import urllib.request
-    import urllib.parse
-    import urllib.error
-    import html as _html
-    import re as _re_html
+    try:
+        import web_search as _ws
+    except ImportError:
+        return {"ok": False, "error": "web_search module not available"}
 
     query = params.get("query", "").strip()
     if not query:
         return {"ok": False, "error": "missing 'query'"}
 
     max_results = min(max(int(params.get("max_results", 10)), 1), 20)
+    engine = params.get("engine")  # optional per-call override
 
-    def _fetch_html(url: str, referer: str = "") -> str:
-        req = urllib.request.Request(url, headers={
-            "User-Agent": "Mozilla/5.0",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-        })
-        if referer:
-            req.add_header("Referer", referer)
-        with urllib.request.urlopen(req, timeout=_WEB_FETCH_TIMEOUT) as resp:
-            content_type = resp.headers.get("Content-Type", "")
-            raw = resp.read(2_000_000)
-        charset = "utf-8"
-        if "charset=" in content_type:
-            charset = content_type.split("charset=")[-1].split(";")[0].strip() or "utf-8"
-        return raw.decode(charset, errors="replace")
-
-    def _clean(text: str) -> str:
-        text = _re_html.sub(r'<script[^>]*>.*?</script>', '', text,
-                            flags=_re_html.DOTALL | _re_html.IGNORECASE)
-        text = _re_html.sub(r'<style[^>]*>.*?</style>', '', text,
-                            flags=_re_html.DOTALL | _re_html.IGNORECASE)
-        text = _re_html.sub(r'<[^>]+>', '', text)
-        text = _html.unescape(text)
-        return _re_html.sub(r'\s+', ' ', text).strip()
-
-    def _dedupe(results: list[dict]) -> list[dict]:
-        seen = set()
-        out = []
-        for item in results:
-            url = item.get("url", "").strip()
-            title = item.get("title", "").strip()
-            if not url or not title or url in seen:
-                continue
-            seen.add(url)
-            out.append(item)
-            if len(out) >= max_results:
-                break
-        return out
-
-    def _parse_duckduckgo(html: str) -> list[dict]:
-        results = []
-        blocks = _re_html.split(r'<div[^>]*class="[^"]*result[^"]*"[^>]*>', html)
-        for block in blocks:
-            title_m = _re_html.search(
-                r'<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]*)"[^>]*>(.*?)</a>',
-                block, _re_html.DOTALL)
-            if not title_m:
-                continue
-            href = _html.unescape(title_m.group(1))
-            parsed = urllib.parse.urlparse(href)
-            qs = urllib.parse.parse_qs(parsed.query)
-            if "uddg" in qs and qs["uddg"]:
-                href = qs["uddg"][0]
-            snippet_m = _re_html.search(
-                r'<[^>]*class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</(?:a|div)>',
-                block, _re_html.DOTALL)
-            results.append({
-                "title": _clean(title_m.group(2)),
-                "url": href,
-                "snippet": _clean(snippet_m.group(1))[:500] if snippet_m else "",
-            })
-        return _dedupe(results)
-
-    def _parse_bing(html: str) -> list[dict]:
-        results = []
-        blocks = _re_html.split(r'<li[^>]*class="[^"]*b_algo[^"]*"[^>]*>', html)
-        for block in blocks:
-            title_m = _re_html.search(
-                r'<h2[^>]*>\s*<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>\s*</h2>',
-                block, _re_html.DOTALL)
-            if not title_m:
-                continue
-            snippet_m = _re_html.search(
-                r'<p[^>]*>(.*?)</p>',
-                block, _re_html.DOTALL)
-            results.append({
-                "title": _clean(title_m.group(2)),
-                "url": _html.unescape(title_m.group(1)),
-                "snippet": _clean(snippet_m.group(1))[:500] if snippet_m else "",
-            })
-        return _dedupe(results)
-
-    engine = str(params.get("engine") or os.environ.get("LAINTAS_SEARCH_ENGINE") or "auto").lower()
-    engines = {
-        "duckduckgo": [("duckduckgo", _parse_duckduckgo,
-                       "https://html.duckduckgo.com/html/?" + urllib.parse.urlencode({"q": query}), "")],
-        "ddg": [("duckduckgo", _parse_duckduckgo,
-                 "https://html.duckduckgo.com/html/?" + urllib.parse.urlencode({"q": query}), "")],
-        "bing": [("bing", _parse_bing,
-                  "https://cn.bing.com/search?" + urllib.parse.urlencode({"q": query, "mkt": "zh-CN"}), "https://cn.bing.com/")],
-        "bing-cn": [("bing", _parse_bing,
-                     "https://cn.bing.com/search?" + urllib.parse.urlencode({"q": query, "mkt": "zh-CN"}), "https://cn.bing.com/")],
-    }
-    search_plan = engines.get(engine)
-    if search_plan is None:
-        search_plan = engines["duckduckgo"] + engines["bing"]
-
-    errors = []
-    for engine_name, parser, url, referer in search_plan:
-        try:
-            html = _fetch_html(url, referer=referer)
-            results = parser(html)
-            if results:
-                return {
-                    "ok": True,
-                    "result": results,
-                    "query": query,
-                    "count": len(results),
-                    "engine": engine_name,
-                }
-            errors.append(f"{engine_name}: no results parsed")
-        except urllib.error.URLError as e:
-            errors.append(f"{engine_name}: {e}")
-        except Exception as e:
-            errors.append(f"{engine_name}: {type(e).__name__}: {e}")
-
-    return {"ok": False, "error": "Search request failed; " + " | ".join(errors), "query": query}
+    return _ws.search(query=query, max_results=max_results, engine=engine)
 
 
 def _bi_web_fetch(params: dict, ctx: ToolCtx) -> dict:
     """Fetch a URL and extract its text content.
 
-    Strips HTML tags and returns clean text. Uses html2text if available.
+    Delegates to web_search.fetch() which uses the same proxy and cookie
+    jar as web.search, and returns structured error information.
     """
-    import urllib.request
-    import urllib.error
+    try:
+        import web_search as _ws
+    except ImportError:
+        return {"ok": False, "error": "web_search module not available"}
 
     url = params.get("url", "").strip()
     if not url:
@@ -2189,80 +2065,7 @@ def _bi_web_fetch(params: dict, ctx: ToolCtx) -> dict:
     max_bytes = int(params.get("max_bytes", 65536))
     timeout = int(params.get("timeout", 15))
 
-    if not url.startswith(("http://", "https://")):
-        return {"ok": False, "error": "URL must start with http:// or https://"}
-
-    try:
-        req = urllib.request.Request(url, headers={
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                          "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        })
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            content_type = resp.headers.get("Content-Type", "")
-            raw = resp.read(max_bytes + 1)
-        truncated = len(raw) > max_bytes
-        raw = raw[:max_bytes]
-    except urllib.error.HTTPError as e:
-        return {"ok": False, "error": f"HTTP {e.code}: {e.reason}", "url": url}
-    except urllib.error.URLError as e:
-        return {"ok": False, "error": f"Request failed: {e.reason}", "url": url}
-    except Exception as e:
-        return {"ok": False, "error": f"{type(e).__name__}: {e}", "url": url}
-
-    # Decode body
-    charset = "utf-8"
-    if "charset=" in content_type:
-        try:
-            charset = content_type.split("charset=")[-1].split(";")[0].strip()
-        except (IndexError, ValueError):
-            pass
-
-    try:
-        body = raw.decode(charset, errors="replace")
-    except (LookupError, UnicodeDecodeError):
-        body = raw.decode("utf-8", errors="replace")
-
-    # Extract text
-    is_html = "text/html" in content_type or "<html" in body[:1000].lower() or "<!doctype html" in body[:1000].lower()
-
-    if is_html and _HTML2TEXT is not None:
-        text = _HTML2TEXT.handle(body)
-    elif is_html:
-        # Fallback: strip HTML tags
-        import re as _re_html
-        # Remove scripts and styles
-        body = _re_html.sub(r'<script[^>]*>.*?</script>', '', body,
-                            flags=_re_html.DOTALL | _re_html.IGNORECASE)
-        body = _re_html.sub(r'<style[^>]*>.*?</style>', '', body,
-                            flags=_re_html.DOTALL | _re_html.IGNORECASE)
-        # Convert block elements to newlines
-        body = _re_html.sub(r'<(?:br|p|div|li|tr|h[1-6])[^>]*>', '\n', body,
-                            flags=_re_html.IGNORECASE)
-        # Strip remaining tags
-        text = _re_html.sub(r'<[^>]+>', '', body)
-        # Collapse whitespace
-        text = _re_html.sub(r'\n{3,}', '\n\n', text)
-        # Decode common entities
-        for ent, ch in [('&amp;', '&'), ('&lt;', '<'), ('&gt;', '>'),
-                         ('&quot;', '"'), ('&#x27;', "'"), ('&nbsp;', ' ')]:
-            text = text.replace(ent, ch)
-    else:
-        text = body
-
-    # Trim
-    text = text.strip()
-    if len(text) > max_bytes:
-        text = text[:max_bytes]
-        truncated = True
-
-    return {
-        "ok": True,
-        "result": text,
-        "url": url,
-        "content_type": content_type,
-        "size": len(text),
-        "truncated": truncated,
-    }
+    return _ws.fetch(url=url, max_bytes=max_bytes, timeout=timeout)
 
 
 # ── Agent / Terminal / Session tools (replace meta-commands) ──────────
@@ -5961,6 +5764,7 @@ def register_builtin_tools() -> None:
                 "properties": {
                     "query": {"type": "string", "description": "search query"},
                     "max_results": {"type": "integer", "default": 10, "description": "max results (1-20)"},
+                    "engine": {"type": "string", "description": "override engine: google, duckduckgo, or laintas_search (default: engine chain)"},
                 },
                 "required": ["query"],
             },

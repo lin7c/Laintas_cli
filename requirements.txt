@@ -23,6 +23,12 @@ aiortc>=1.14
 # you it's missing and how to install. Comment out if you don't need MCP.
 mcp>=1.0
 
+# Optional - enables SOCKS5 proxy support for web.search and web.fetch
+# (e.g. socks5://127.0.0.1:1080 for VPN users in restricted networks).
+# HTTP/HTTPS proxies work without this; only SOCKS5 needs PySocks.
+#   pip install .[search]
+pysocks>=1.7
+
 # Optional — enables the headless-browser live-view stack (browser.* tools).
 # The CLI runs without this; browser._debug_open will report the missing dep.
 # Requires system packages: Xvfb, x11vnc, google-chrome (or chromium).
