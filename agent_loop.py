@@ -1633,11 +1633,13 @@ def save_resume_state(state: dict, chat_history: list, cwd: str) -> None:
         if payload is None:
             return
         paths.SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
-        # The per-session file is authoritative. The legacy per-cwd file remains
-        # a latest-session index for backward-compatible /resume behavior.
+        # The per-session file is authoritative for autosave. We deliberately
+        # do NOT write _resume_latest_path here: that file is the /q checkpoint
+        # pointer and an autosave (which may carry stale/partial state from a
+        # later trivial turn) must never overwrite it. The per-session file is
+        # still discoverable via list_resume_states' glob pattern.
         _atomic_write_json_if_changed(
             _resume_session_path(cwd, payload["session_id"]), payload)
-        _atomic_write_json_if_changed(_resume_latest_path(cwd), payload)
     except Exception:
         pass
 

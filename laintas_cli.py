@@ -17854,12 +17854,15 @@ def main():
         if _session_warning:
             console.print(f"[yellow]{_session_warning}[/yellow]")
         if _previous_live_session:
-            save_resume_checkpoint(
-                _previous_live_session.get("state")
-                or _previous_live_session.get("agent_state") or {},
-                _previous_live_session.get("chat_history") or [],
-                _session_start_cwd,
-            )
+            _prev_ch = _previous_live_session.get("chat_history") or []
+            _prev_user_turns = [m for m in _prev_ch if isinstance(m, dict) and m.get("role") == "user"]
+            if _prev_user_turns:
+                save_resume_checkpoint(
+                    _previous_live_session.get("state")
+                    or _previous_live_session.get("agent_state") or {},
+                    _prev_ch,
+                    _session_start_cwd,
+                )
             session_store.close_session(_previous_live_session)
 
         if not _explicit_startup_resume:
@@ -18125,6 +18128,8 @@ def main():
         except Exception as _e:
             console.print(f"[yellow]mcp connect error: {_e}[/yellow]")
 
+    _quit_checkpoint_saved = False
+
     # Setup graceful shutdown
     def shutdown(signum=None, frame=None, *, input_closed=False):
         # A disconnected SSH/PTY leaves fd 0/1/2 pointing at a dead terminal.
@@ -18201,7 +18206,7 @@ def main():
                 pass
             os._exit(0)
         console.print("\n[yellow]Shutting down...[/yellow]")
-        if args.depth == 0:
+        if args.depth == 0 and not _quit_checkpoint_saved:
             save_session_snapshot(agent_state, chat_history, _session_start_cwd)
             save_resume_state(agent_state, chat_history, _session_start_cwd)
             if current_live_session:
@@ -18340,6 +18345,7 @@ def main():
             if args.depth == 0:
                 save_session_snapshot(agent_state, chat_history, _session_start_cwd)
                 save_resume_state(agent_state, chat_history, _session_start_cwd)
+                _quit_checkpoint_saved = True
                 if current_live_session:
                     session_store.sync_runtime(
                         current_live_session, agent_state, chat_history,
@@ -18478,6 +18484,7 @@ def main():
         if _is_top_level_quit:
             save_session_snapshot(agent_state, chat_history, _session_start_cwd)
             _checkpoint = save_resume_checkpoint(agent_state, chat_history, _session_start_cwd)
+            _quit_checkpoint_saved = True
             if current_live_session:
                 session_store.sync_runtime(
                     current_live_session, agent_state, chat_history,
