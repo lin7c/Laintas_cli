@@ -42,6 +42,7 @@ The project has grown from two core modules to ten, organized in layers:
 - **`tools.py`** (~1400 lines) — `ToolRegistry` singleton: structured `Tool` dataclass (name, JSONSchema params, invoke callable) + `ToolCtx`. Built-in tools registered at import time. All modules share one registry.
 - **`skills.py`** (~200 lines) — Loads user-installed skill directories from `~/.laintas/skills/`. Each skill is a `skill.py` that exposes `get_tools() -> list[Tool]`. Tags tools with `source="skill:<name>"`.
 - **`mcp_client.py`** (~370 lines) — Bridges async `mcp` SDK to the sync Tool registry. Runs a dedicated asyncio thread, one child subprocess per configured MCP server, registers tools as `source="mcp:<server>"`. Config lives in `~/.laintas/mcp.json`.
+- **`web_search.py`** (~770 lines) - Search engine chain (Google -> DuckDuckGo -> laintas_search) with proxy support (HTTP/SOCKS5 via PySocks), shared cookie jar, fast-fail cooldown, and structured error types. Backs the `web.search` and `web.fetch` tools. Config: `search_engine`, `search_proxy`, `search_laintas_api_key`, `search_cookie_enabled`.
 
 **Cross-cutting subsystems:**
 - **`policy.py`** (~370 lines) — Security policy engine: evaluates every command as allow/needs_approval/deny via regex rules. Config in `~/.laintas/policy.json` (mtime-cached, zero-restart updates). Audit log in `~/.laintas/audit.log`. Three modes: audit, enforce, disabled.
@@ -97,6 +98,11 @@ All tunable parameters are accessible via `get_runtime_config()`/`set_runtime_co
 | `terminal_tail_lines` | 20 | Lines shown in sub-terminal snapshot |
 | `heartbeat_interval` | 30 | Seconds between agent heartbeats |
 | `staleness_limit` | 3 | Consecutive no-command steps before auto-exit |
+| `search_engine` | `auto` | Search engine: `auto` (Google->DDG->laintas_search), `google`, `duckduckgo`, `laintas_search` |
+| `search_laintas_api_key` | _(none)_ | API key for `search.laintas.com` (required for laintas_search engine) |
+| `search_laintas_api_url` | `https://search.laintas.com` | Base URL for laintas_search API |
+| `search_proxy` | _(none)_ | Proxy URL for web.search/web.fetch (`socks5://`, `http://`); env `LAINTAS_HTTP_PROXY` |
+| `search_cookie_enabled` | `false` | Enable shared cookie jar for web.search/web.fetch |
 
 ### Backend API
 

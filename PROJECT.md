@@ -121,6 +121,11 @@ All tunable parameters are accessible via `get_runtime_config()`/`set_runtime_co
 | `poll_timeout` | 10.0 | Seconds to wait for first command output |
 | `terminal_tail_lines` | 20 | Lines shown in sub-terminal snapshot |
 | `heartbeat_interval` | 30 | Seconds between agent heartbeats |
+| `search_engine` | `auto` | Search engine: `auto` (Google→DDG→laintas_search chain), `google`, `duckduckgo`, `laintas_search` |
+| `search_laintas_api_key` | _(none)_ | API key for `search.laintas.com` (required for laintas_search engine) |
+| `search_laintas_api_url` | `https://search.laintas.com` | Base URL for laintas_search API |
+| `search_proxy` | _(none)_ | Proxy URL for web.search/web.fetch (e.g. `socks5://127.0.0.1:1080`, `http://proxy:8080`); env `LAINTAS_HTTP_PROXY` |
+| `search_cookie_enabled` | `false` | Enable shared cookie jar for web.search/web.fetch (Google consent cookie auto-injected) |
 
 ### 6. Backend API Client (`call_backend_stream`)
 
@@ -211,6 +216,38 @@ cycle detection, normalized progress/status, and an append-only event history.
 | `/clear` | Clear screen |
 | `/exit, /quit` | Exit (cascading cleanup of all terminals) |
 
+### 13. Web Search & Fetch (`web_search.py`)
+
+The `web.search` and `web.fetch` tools are backed by `web_search.py`, a standalone
+module that implements a multi-engine search chain with proxy support, cookie
+sharing, and structured error reporting.
+
+**Engine chain** (default order, tried sequentially on failure):
+
+1. **Google** — HTML scrape of `www.google.com/search`. When cookies are enabled,
+   a `CONSENT=YES+` cookie is auto-injected to bypass the EU consent wall.
+2. **DuckDuckGo** — HTML scrape of `html.duckduckgo.com/html/` (lite endpoint).
+3. **laintas_search** — Native HTTP API (`POST /search` with `X-API-KEY` header).
+   Does **not** go through the user's proxy (HTTPS to `search.laintas.com`;
+   GFW typically does not block it). Requires `search_laintas_api_key`.
+
+When `search_engine` is `auto`, engines are tried in order. A failed engine
+(captcha, rate limit, network error) enters a 5-minute fast-fail cooldown and
+is skipped on subsequent calls. laintas_search is exempt from fast-fail.
+
+**Proxy support:** `search_proxy` (or `LAINTAS_HTTP_PROXY` env) accepts
+`http://`, `https://`, `socks5://`, and `socks5h://` URLs. SOCKS5 support uses
+PySocks (a core dependency). `web.fetch` always uses the user's network/proxy.
+
+**Cookie jar:** When `search_cookie_enabled` is true, `web.search` and
+`web.fetch` share a process-level `RequestsCookieJar`. This helps maintain
+search sessions and bypass consent walls. Cookies can be cleared via
+`web_search.clear_cookie_jar()`.
+
+**Structured errors:** Failures are classified into `SearchErrorType` enums so
+the AI agent can reason about cause: `captcha`, `rate_limited`, `network`,
+`proxy_error`, `consent_page`, `empty`, `degraded`, `api_error`.
+
 ---
 
 ## File System Artifacts
@@ -265,9 +302,11 @@ AI: /term close srv
 ## Dependencies
 
 ```
-requests>=2.28.0      # HTTP client for backend API
+requests>=2.28.0      # HTTP client for backend API, web.search, web.fetch
 rich>=13.0.0          # Terminal UI (Panel, Markdown, Table, Live, Spinner)
 prompt_toolkit>=3.0.0 # Interactive prompt with completion, history, keybindings
+pysocks>=1.7          # SOCKS5 proxy support for web.search / web.fetch
+certifi>=2024.0.0     # TLS certificate bundle
 ```
 
 Unix-specific stdlib: `pty`, `select`, `fcntl`, `termios`, `http.server`
