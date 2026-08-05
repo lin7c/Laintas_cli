@@ -49,28 +49,6 @@ DEFAULT_PORT = 2913
 _COOKIE_NAME = "laintas_helpwo_token"
 _auth_token_value: Optional[str] = None
 _bind_host: str = "127.0.0.1"
-_scheme: str = "http"
-_cert_hostnames: set = set()
-
-
-def _hostnames_in_cert(cert_path: str) -> set:
-    """Subject Alternative Names (and CN) from a PEM certificate."""
-    names: set = set()
-    try:
-        import ssl as _ssl
-        decoded = _ssl._ssl._test_decode_cert(cert_path)  # type: ignore[attr-defined]
-        for key, value in decoded.get("subjectAltName", ()):
-            if key.lower() == "dns" and value:
-                names.add(value.lower().lstrip("*."))
-        for rdn in decoded.get("subject", ()):
-            for key, value in rdn:
-                if key == "commonName" and value:
-                    names.add(value.lower().lstrip("*."))
-    except Exception:
-        pass
-    return names
-
-
 def _auth_token() -> str:
     """The token this server requires, or "" when explicitly disabled."""
     return _auth_token_value or ""
@@ -84,7 +62,7 @@ def _self_origin() -> str:
     advertised an origin that was not the one the browser had loaded.
     """
     host = _bind_host if _bind_host not in ("0.0.0.0", "::") else "127.0.0.1"
-    return f"{_scheme}://{host}:{_server_port()}"
+    return f"http://{host}:{_server_port()}"
 
 
 def _allowed_hosts() -> set:
@@ -97,12 +75,6 @@ def _allowed_hosts() -> set:
     hosts = {"127.0.0.1", "localhost", "[::1]", "::1"}
     if _bind_host and _bind_host not in ("0.0.0.0", "::"):
         hosts.add(_bind_host.lower())
-    # Names the TLS certificate was issued for. Supplying a certificate for
-    # cli.laintas.com is a statement that the server answers to that name, so
-    # requiring the operator to repeat it in LAINTAS_HELPWO_HOSTS would just be
-    # a second chance to get it wrong — and the failure (421) says nothing
-    # about what is missing.
-    hosts.update(_cert_hostnames)
     extra = os.environ.get("LAINTAS_HELPWO_HOSTS", "")
     for item in extra.replace(",", " ").split():
         if item.strip():
@@ -1455,31 +1427,26 @@ def start_server(agent_registry: Any, dist_dir: Optional[Path] = None,
                  port: int = DEFAULT_PORT,
                  session: Optional[dict] = None,
                  host: str = "127.0.0.1",
-                 token: Optional[str] = None,
-                 tls_cert: Optional[str] = None,
-                 tls_key: Optional[str] = None) -> tuple[bool, str]:
+                 token: Optional[str] = None) -> tuple[bool, str]:
     """Start the local Helpwo gateway server.
 
-    host defaults to loopback. Binding anywhere else is the operator's call —
-    this server does not decide whether a machine should be reachable — but it
-    always requires the token, and it says what a non-loopback address costs.
+    LOOPBACK ONLY, by design. A browser grants Web Crypto, Service Workers,
+    File System Access and the clipboard only in a secure context — HTTPS or
+    localhost — so served as plain HTTP on a routable address the terminal, the
+    agent loop and the browser runtime all fail on startup, each on the id it
+    mints there. Loopback is a secure context, so local mode simply stays local:
+    reach it from another machine with an SSH tunnel, or share the environment
+    peer-to-peer with `/helpwo --remote`. Serving TLS here was the other way to
+    satisfy the rule and it worked, but it made this process hold a private key
+    while answering the network — not a trade local mode needs to make.
 
     token defaults to a fresh random one. Pass "" to disable authentication;
     only sensible for a throwaway sandbox.
 
-    tls_cert/tls_key serve HTTPS instead of HTTP. This is not decoration: a
-    browser grants Web Crypto, Service Workers, File System Access and the
-    clipboard only in a SECURE CONTEXT, which means HTTPS or localhost. Reached
-    over plain HTTP at a routable address, crypto.randomUUID and crypto.subtle
-    are simply absent, and the terminal, the agent loop and the browser runtime
-    all fail on startup because each generates an id. Serving a real
-    certificate is what makes this usable as a network service at all — the
-    alternative is not "slightly degraded", it is broken.
-
     Returns (success, message).
     """
     global _server, _server_thread, _registry_ref, _dist_dir_ref, _server_port_val, _session_ref, _local_root_ref, _local_agent_id_ref
-    global _auth_token_value, _bind_host, _scheme, _cert_hostnames
+    global _auth_token_value, _bind_host
 
     if is_running():
         return True, f"already running on {get_url()}"
@@ -1507,31 +1474,10 @@ def start_server(agent_registry: Any, dist_dir: Optional[Path] = None,
     # Intercept events so they stay in-process instead of HTTP-round-tripping.
     install_event_intercept(agent_registry)
 
-    # Prepare TLS before binding, so a bad certificate fails loudly here
-    # rather than as an unexplained handshake error in the browser later.
-    ssl_context = None
-    if tls_cert or tls_key:
-        if not (tls_cert and tls_key):
-            uninstall_event_intercept(agent_registry)
-            _registry_ref = None
-            return False, "TLS needs both a certificate and a key"
-        try:
-            import ssl as _ssl
-            ssl_context = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
-            ssl_context.minimum_version = _ssl.TLSVersion.TLSv1_2
-            ssl_context.load_cert_chain(certfile=tls_cert, keyfile=tls_key)
-            _cert_hostnames = _hostnames_in_cert(tls_cert)
-        except Exception as e:
-            uninstall_event_intercept(agent_registry)
-            _registry_ref = None
-            return False, f"cannot load TLS certificate: {e}"
-
     try:
         srv = ThreadingHTTPServer(
             (_bind_host, port), _HelpwoHandler,
         )
-        if ssl_context is not None:
-            srv.socket = ssl_context.wrap_socket(srv.socket, server_side=True)
     except OSError as e:
         uninstall_event_intercept(agent_registry)
         _registry_ref = None
@@ -1541,7 +1487,6 @@ def start_server(agent_registry: Any, dist_dir: Optional[Path] = None,
         return False, f"cannot bind {_bind_host}:{port}: {e}"
 
     srv.daemon_threads = True
-    _scheme = "https" if ssl_context is not None else "http"
     _server = srv
 
     t = threading.Thread(
@@ -1594,7 +1539,7 @@ def get_url(with_token: bool = False) -> str:
     if not is_running():
         return ""
     host = _bind_host if _bind_host not in ("0.0.0.0", "::") else "127.0.0.1"
-    url = f"{_scheme}://{host}:{_server_port_val}"
+    url = f"http://{host}:{_server_port_val}"
     if with_token and _auth_token():
         url += f"/?token={_auth_token()}"
     return url
@@ -1609,15 +1554,13 @@ def bind_host() -> str:
     return _bind_host
 
 
-def scheme() -> str:
-    """"http" or "https" — what the running server actually speaks."""
-    return _scheme
+LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
 
 
 def is_secure_context() -> bool:
     """Whether a browser will treat this origin as a secure context.
 
-    HTTPS anywhere, or plain HTTP on loopback. Everything the frontend needs
-    from Web Crypto and Service Workers hangs on this being true.
+    Always true now that the bind is loopback-only, but kept as the single
+    place that states the rule the whole design turns on.
     """
-    return _scheme == "https" or _bind_host in ("127.0.0.1", "localhost", "::1")
+    return _bind_host in LOOPBACK_HOSTS

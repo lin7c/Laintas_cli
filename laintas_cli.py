@@ -9155,9 +9155,9 @@ _SLASH_ARG_RULES: dict[tuple[str, ...], SlashArgRule] = {
         )
     },
     ("/help",): _arg_rule(1, "/help [command]"),
-    # --port/--host/--dist/--tls-cert/--tls-key are all key+value pairs, so the
-    # ceiling has to cover them together, not just the two it was written for.
-    ("/helpwo",): _arg_rule(10, "/helpwo [--port N] [--host ADDR] [--tls-cert F --tls-key F] [--dist <path>]"),
+    # --port/--host/--dist are key+value pairs, so the ceiling has to cover
+    # them together, not just the two it was written for.
+    ("/helpwo",): _arg_rule(6, "/helpwo [--port N] [--dist <path>] [--remote]"),
     ("/helpwo", "stop"): _arg_rule(1, "/helpwo stop"),
     ("/terminate",): _arg_rule(1, "/terminate <name>"),
     ("/abort",): _arg_rule(1, "/abort <agent-id>"),
@@ -14906,8 +14906,6 @@ def _cmd_helpwo(raw_args: str, parts: list, agent_registry: AgentRegistry,
     dist_override = None
     remote = False
     bind_host = "127.0.0.1"
-    tls_cert = None
-    tls_key = None
     args = parts[1:]
     i = 0
     while i < len(args):
@@ -14915,7 +14913,7 @@ def _cmd_helpwo(raw_args: str, parts: list, agent_registry: AgentRegistry,
         if arg == "--port":
             if i + 1 >= len(args):
                 console.print("[red]--port requires a value.[/red]")
-                console.print(r"[dim]Usage: /helpwo \[--port N] \[--host ADDR] \[--tls-cert F --tls-key F] \[--dist <path>] \[--remote] | stop[/dim]")
+                console.print(r"[dim]Usage: /helpwo \[--port N] \[--dist <path>] \[--remote] | stop[/dim]")
                 return
             try:
                 port = int(args[i + 1])
@@ -14929,7 +14927,7 @@ def _cmd_helpwo(raw_args: str, parts: list, agent_registry: AgentRegistry,
         elif arg == "--dist":
             if i + 1 >= len(args):
                 console.print("[red]--dist requires a path.[/red]")
-                console.print(r"[dim]Usage: /helpwo \[--port N] \[--host ADDR] \[--tls-cert F --tls-key F] \[--dist <path>] \[--remote] | stop[/dim]")
+                console.print(r"[dim]Usage: /helpwo \[--port N] \[--dist <path>] \[--remote] | stop[/dim]")
                 return
             dist_override = args[i + 1]
             i += 2
@@ -14937,26 +14935,37 @@ def _cmd_helpwo(raw_args: str, parts: list, agent_registry: AgentRegistry,
             if i + 1 >= len(args):
                 console.print("[red]--host requires an address.[/red]")
                 return
+            # Loopback only, and not as caution — as correctness. A browser
+            # withholds Web Crypto, Service Workers, File System Access and the
+            # clipboard outside a secure context, and plain HTTP on a routable
+            # address is not one, so the terminal, the AI and the browser
+            # runtime fail there rather than merely losing features. Loopback
+            # IS a secure context. The two ways to reach this from elsewhere
+            # keep that property instead of fighting it.
+            if args[i + 1] not in helpwo_server.LOOPBACK_HOSTS:
+                console.print(
+                    f"[red]--host must be loopback "
+                    f"({', '.join(helpwo_server.LOOPBACK_HOSTS)}).[/red]")
+                console.print(
+                    "[dim]Serving this on a routable address over plain HTTP is not a "
+                    "secure context, so the browser hides Web Crypto and the terminal, "
+                    "the AI and the browser runtime stop working.[/dim]")
+                console.print("[dim]From another machine, either:[/dim]")
+                console.print(
+                    f"[dim]  ssh -N -L {port}:127.0.0.1:{port} <user>@<this-host>   "
+                    f"# then open http://127.0.0.1:{port}/[/dim]")
+                console.print(
+                    "[dim]  /helpwo --remote                                  "
+                    "# share this environment peer-to-peer instead[/dim]")
+                return
             bind_host = args[i + 1]
-            i += 2
-        elif arg == "--tls-cert":
-            if i + 1 >= len(args):
-                console.print("[red]--tls-cert requires a path.[/red]")
-                return
-            tls_cert = args[i + 1]
-            i += 2
-        elif arg == "--tls-key":
-            if i + 1 >= len(args):
-                console.print("[red]--tls-key requires a path.[/red]")
-                return
-            tls_key = args[i + 1]
             i += 2
         elif arg == "--remote":
             remote = True
             i += 1
         elif arg.startswith("--"):
             console.print(f"[red]Unknown option: {arg}[/red]")
-            console.print(r"[dim]Usage: /helpwo \[--port N] \[--host ADDR] \[--tls-cert F --tls-key F] \[--dist <path>] \[--remote] | stop[/dim]")
+            console.print(r"[dim]Usage: /helpwo \[--port N] \[--dist <path>] \[--remote] | stop[/dim]")
             return
         else:
             console.print(f"[yellow]Ignoring unrecognized argument: {arg}[/yellow]")
@@ -15017,8 +15026,7 @@ def _cmd_helpwo(raw_args: str, parts: list, agent_registry: AgentRegistry,
         return
 
     ok, msg = helpwo_server.start_server(agent_registry, dist_dir=dist_path, port=port,
-                                         session=session, host=bind_host,
-                                         tls_cert=tls_cert, tls_key=tls_key)
+                                         session=session, host=bind_host)
     if not ok:
         console.print(f"[red]{msg}[/red]")
         return
@@ -15030,39 +15038,14 @@ def _cmd_helpwo(raw_args: str, parts: list, agent_registry: AgentRegistry,
     console.print(f"  URL: [cyan]{url}[/cyan]")
     console.print(f"  Dist: [dim]{helpwo_server._dist_dir()}[/dim]")
 
-    # The warning belongs to insecure ORIGINS, not to non-loopback binds: with
-    # --tls-cert this is a proper HTTPS origin and nothing is withheld.
-    if not helpwo_server.is_secure_context():
-        # Not a refusal — whether this machine should be reachable is the
-        # operator's call. But browsers only grant File System Access,
-        # clipboard, microphone and Service Workers on a secure context, and
-        # a plain-HTTP non-loopback address is not one.
-        console.print(
-            f"  [yellow]Bound to {helpwo_server.bind_host()} — reachable beyond this "
-            f"machine.[/yellow]")
-        # Naming only the optional-feeling APIs understated this. The secure
-        # context rule also hides crypto.randomUUID and crypto.subtle, and the
-        # terminal, the agent loop and the browser runtime each mint an id on
-        # their startup path — so they do not lose features, they fail with
-        # "crypto.randomUUID is not a function".
-        console.print(
-            "  [yellow]Plain HTTP to a non-loopback address is not a secure context, so the "
-            "browser hides Web Crypto, File System Access, clipboard and Service "
-            "Workers — the terminal, the AI and the browser runtime will FAIL, not "
-            "merely degrade.[/yellow]")
-        console.print(
-            f"  [bold]Serve HTTPS instead — that is what makes this a real network "
-            f"service:[/bold]")
-        console.print(
-            f"  [bold]  /helpwo --port {port} --host <addr> --tls-cert <fullchain.pem> "
-            f"--tls-key <privkey.pem>[/bold]")
-    else:
-        console.print(
-            f"  [dim]Remote machine? From your own computer:[/dim]")
-        console.print(
-            f"  [dim]  ssh -N -L {port}:127.0.0.1:{port} <user>@<this-host>[/dim]")
-        console.print(
-            f"  [dim]then open the URL above — loopback keeps every browser feature.[/dim]")
+    # Loopback-only by construction, so there is no insecure-origin case left
+    # to warn about — only the question of how to reach it from elsewhere.
+    console.print(f"  [dim]Remote machine? Forward the port from your own computer:[/dim]")
+    console.print(f"  [dim]  ssh -N -L {port}:127.0.0.1:{port} <user>@<this-host>[/dim]")
+    console.print(
+        f"  [dim]then open the URL above — loopback is a secure context, so every "
+        f"browser feature keeps working. To share the environment itself instead, "
+        f"use /helpwo --remote.[/dim]")
 
     console.print("  Runtime: [dim]local loopback (offline-capable)[/dim]")
     if agent_registry and agent_registry.agent_id:
