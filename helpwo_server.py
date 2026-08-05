@@ -560,6 +560,8 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
             return self._handle_send(agent_id, body)
         if path == "/api/chat/stream":
             return self._handle_chat_stream()
+        if path == "/api/chat":
+            return self._handle_chat()
         if path == "/api/generate-image":
             return self._handle_generate_image()
         # The frontend calls /api/helpwo/search; /api/search is the older name
@@ -717,6 +719,27 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(resp.content)
 
+    def _proxy_json(self, path: str, body: dict) -> None:
+        """Forward a request to the remote backend and return its JSON reply."""
+        import backend_profiles
+        import requests as _requests
+        profile = backend_profiles.resolve(
+            os.environ.get("LAINTAS_BACKEND") or "https://laintas.com")
+        url = f"{profile.base_url}{path}"
+        headers, cookies = backend_profiles.request_auth(profile, _session())
+        headers["Content-Type"] = "application/json"
+        try:
+            resp = _requests.post(url, json=body, headers=headers, cookies=cookies,
+                                  timeout=120, allow_redirects=False)
+        except Exception as e:
+            self._json(502, {"error": f"backend unreachable: {e}"})
+            return
+        try:
+            payload = resp.json()
+        except ValueError:
+            payload = {"error": resp.text[:500] or "backend returned no JSON"}
+        self._json(resp.status_code, payload)
+
     def _proxy_stream(self, path: str, body: dict) -> None:
         """Forward a request to the remote backend and stream SSE response back."""
         import backend_profiles
@@ -787,6 +810,21 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
         """Proxy /api/chat/stream to the remote backend."""
         body = self._read_body()
         self._proxy_stream("/api/chat/stream", body)
+
+    def _handle_chat(self) -> None:
+        """Proxy the NON-streaming /api/chat to the remote backend.
+
+        The cloud backend serves both /api/chat and /api/chat/stream and the
+        frontend uses both — streaming for conversation, the plain endpoint for
+        one-shot answers it just wants a value from. Only the streaming one was
+        proxied here, so against a locally served Helpwo every non-streaming
+        call 404'd: language detection fell back with "AI analysis failed", and
+        HelpwoBridge.query (which previewed pages use to ask the model
+        something) failed outright. Observed as `POST /api/chat -> 404` while
+        driving the local UI in a browser.
+        """
+        body = self._read_body()
+        self._proxy_json("/api/chat", body)
 
     def _handle_generate_image(self) -> None:
         """Proxy /api/generate-image to the remote backend."""
