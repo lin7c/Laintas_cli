@@ -719,6 +719,31 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(resp.content)
 
+    def _proxy_json_get(self, path: str):
+        """GET `path` from the backend with the CLI's credentials.
+
+        Returns the decoded JSON, or None when the backend cannot answer — the
+        caller decides what a local-mode fallback should look like rather than
+        surfacing a 502 for something the UI only needs advisory data from.
+        """
+        import backend_profiles
+        import requests as _requests
+        try:
+            profile = backend_profiles.resolve(
+                os.environ.get("LAINTAS_BACKEND") or "https://laintas.com")
+            headers, cookies = backend_profiles.request_auth(profile, _session())
+            # Follow redirects here, unlike the streaming proxy: these are
+            # read-only metadata endpoints and /api/balance answers behind a
+            # 301, which a no-redirect fetch reports as failure and silently
+            # degrades to the zero-balance fallback.
+            resp = _requests.get(f"{profile.base_url}{path}", headers=headers,
+                                 cookies=cookies, timeout=20, allow_redirects=True)
+            if resp.status_code != 200:
+                return None
+            return resp.json()
+        except Exception:
+            return None
+
     def _proxy_json(self, path: str, body: dict) -> None:
         """Forward a request to the remote backend and return its JSON reply."""
         import backend_profiles
@@ -773,29 +798,60 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
 
     # -- Stub handlers --
 
+    # These four used to be stubs, which made local mode lie about itself.
+    # Chat has always been proxied with the CLI's own credentials, so calls
+    # were really billed to the signed-in account — while the UI was told
+    # there was no session, no balance, no usage, and offered a made-up model
+    # list. Serving the truth means proxying them like everything else.
+
     def _handle_auth_session(self) -> None:
-        """Stub better-auth /api/auth/get-session - returns null session (local mode)."""
-        self._json(200, None)
+        """Who the CLI is signed in as.
+
+        Returned null before, so the UI showed a signed-out state even though
+        every AI call it made was billed to this account.
+        """
+        session = _session() or {}
+        payload = self._proxy_json_get("/api/auth/get-session")
+        if payload is None:
+            # Backend unreachable or unauthenticated: fall back to what the CLI
+            # already knows, so the UI still names the account paying for the
+            # calls rather than claiming nobody is signed in.
+            if not session.get("token"):
+                self._json(200, None)
+                return
+            payload = {"user": {
+                "id": session.get("userId"),
+                "email": session.get("userEmail"),
+                "name": session.get("userName"),
+            }}
+        self._json(200, payload)
 
     def _handle_balance(self) -> None:
-        """Stub /api/balance - returns zero balance (no billing in local mode)."""
-        self._json(200, {"balance": 0, "subscription": None})
+        """The signed-in account's real balance (was hardcoded to zero)."""
+        payload = self._proxy_json_get("/api/balance")
+        self._json(200, payload if payload is not None
+                   else {"balance": 0, "subscription": None})
 
     def _handle_models(self) -> None:
-        """Stub /api/models - returns a minimal model list."""
-        self._json(200, {
-            "models": ["deepseek-v4-flash", "deepseek-v4", "gpt-4o", "claude-sonnet-4"],
-            "providers": [
-                {"id": "deepseek", "name": "DeepSeek", "models": ["deepseek-v4-flash", "deepseek-v4"]},
-                {"id": "openai", "name": "OpenAI", "models": ["gpt-4o"]},
-                {"id": "anthropic", "name": "Anthropic", "models": ["claude-sonnet-4"]},
-            ],
-            "contextWindows": {},
+        """The models the backend actually serves.
+
+        This was a hardcoded list naming gpt-4o and claude-sonnet-4 under
+        "OpenAI" and "Anthropic" providers. None of them exist on this gateway:
+        picking one sent an unknown model upstream, which resolves to the
+        default provider with the wrong key and bills at the unlisted-model
+        tier. The real catalog comes from the backend.
+        """
+        payload = self._proxy_json_get("/api/models")
+        self._json(200, payload if payload is not None else {
+            "models": [], "providers": [], "contextWindows": {},
+            "error": "model catalog unavailable — backend unreachable",
         })
 
     def _handle_usage(self) -> None:
-        """Stub /api/usage - returns empty usage (no billing in local mode)."""
-        self._json(200, {"usage": [], "total": 0})
+        """Real usage for the signed-in account (was always empty)."""
+        payload = self._proxy_json_get("/api/usage")
+        self._json(200, payload if payload is not None
+                   else {"usage": [], "total": 0})
 
     def _handle_sso_login(self, query: str) -> None:
         """Stub /api/sso/login - redirect to the main page (no SSO in local mode)."""
