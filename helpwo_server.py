@@ -3,7 +3,14 @@ in-process API that bridges the frontend to the running laintas_cli.
 
 Design:
 - stdlib http.server (no Flask dependency).
-- Binds 127.0.0.1 ONLY - never reachable from the network.
+- Binds 127.0.0.1 by default. Whether a machine should be reachable from the
+  network is the operator's decision, not this server's, so `host` is settable
+  — but the token is always required, and a non-loopback bind is reported for
+  what it costs (browsers only grant File System Access, clipboard, microphone
+  and Service Workers on a secure context: HTTPS, or localhost).
+- Authentication follows Jupyter: the token arrives once in the URL, is
+  exchanged for a cookie, and is not needed again. The frontend needs no
+  change — its calls are same-origin with credentials already.
 - Three API endpoints mirror Helpwo's gateway contract:
     GET  /api/agents                       - list registered agents
     POST /api/agents/<id>/send             - dispatch a message to the CLI
@@ -16,10 +23,13 @@ Design:
 from __future__ import annotations
 
 import base64
+import hashlib
+import hmac
 import json
 import mimetypes
 import os
 import re
+import secrets
 import shutil
 import socket
 import threading
@@ -35,6 +45,106 @@ DEFAULT_PORT = 2913
 # ---------------------------------------------------------------------------
 # Per-agent event buffer
 # ---------------------------------------------------------------------------
+
+_COOKIE_NAME = "laintas_helpwo_token"
+_auth_token_value: Optional[str] = None
+_bind_host: str = "127.0.0.1"
+
+
+def _auth_token() -> str:
+    """The token this server requires, or "" when explicitly disabled."""
+    return _auth_token_value or ""
+
+
+def _allowed_hosts() -> set:
+    """Host names a request's Host/Origin header may carry.
+
+    Loopback always, plus whatever the server was actually bound to. Binding
+    to a routable address is the user's decision; refusing their own Host
+    header afterwards would just look like a broken server.
+    """
+    hosts = {"127.0.0.1", "localhost", "[::1]", "::1"}
+    if _bind_host and _bind_host not in ("0.0.0.0", "::"):
+        hosts.add(_bind_host.lower())
+    extra = os.environ.get("LAINTAS_HELPWO_HOSTS", "")
+    for item in extra.replace(",", " ").split():
+        if item.strip():
+            hosts.add(item.strip().lower())
+    return hosts
+
+
+# RFC 6455's fixed handshake GUID. Verified against the worked example in the
+# spec: key "dGhlIHNhbXBsZSBub25jZQ==" must accept as "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=".
+_WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+_WS_MAX_FRAME = 8 * 1024 * 1024
+
+
+def _ws_accept_key(client_key: str) -> str:
+    digest = hashlib.sha1((client_key + _WS_GUID).encode("ascii")).digest()
+    return base64.b64encode(digest).decode("ascii")
+
+
+def _ws_frame(payload: bytes, opcode: int = 0x2) -> bytes:
+    """Encode one unfragmented server frame (server frames are never masked)."""
+    header = bytearray([0x80 | opcode])
+    length = len(payload)
+    if length < 126:
+        header.append(length)
+    elif length < 65536:
+        header.append(126)
+        header += length.to_bytes(2, "big")
+    else:
+        header.append(127)
+        header += length.to_bytes(8, "big")
+    return bytes(header) + payload
+
+
+def _ws_read_exact(sock, count: int) -> bytes:
+    """Read exactly count bytes, or return b"" if the peer went away."""
+    chunks = bytearray()
+    while len(chunks) < count:
+        chunk = sock.recv(count - len(chunks))
+        if not chunk:
+            return b""
+        chunks += chunk
+    return bytes(chunks)
+
+
+def _ws_read_frame(sock) -> tuple[int, bytes] | None:
+    """Read one client frame. Returns (opcode, payload) or None when closed.
+
+    Client frames are always masked; an unmasked one is a protocol violation
+    and closes the connection rather than being interpreted.
+    """
+    head = _ws_read_exact(sock, 2)
+    if len(head) < 2:
+        return None
+    opcode = head[0] & 0x0F
+    masked = bool(head[1] & 0x80)
+    length = head[1] & 0x7F
+    if length == 126:
+        raw = _ws_read_exact(sock, 2)
+        if len(raw) < 2:
+            return None
+        length = int.from_bytes(raw, "big")
+    elif length == 127:
+        raw = _ws_read_exact(sock, 8)
+        if len(raw) < 8:
+            return None
+        length = int.from_bytes(raw, "big")
+    if length > _WS_MAX_FRAME or not masked:
+        return None
+    mask = _ws_read_exact(sock, 4)
+    if len(mask) < 4:
+        return None
+    payload = _ws_read_exact(sock, length) if length else b""
+    if length and not payload:
+        return None
+    unmasked = bytearray(payload)
+    for i in range(len(unmasked)):
+        unmasked[i] ^= mask[i & 3]
+    return opcode, bytes(unmasked)
+
 
 class _EventBuffer:
     """Thread-safe per-agent event store with monotonic sequence numbers."""
@@ -212,16 +322,115 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
         # (all requests are localhost, but be explicit).
         self.send_header("Access-Control-Allow-Origin", "http://127.0.0.1:%d" % _server_port())
         self.send_header("Access-Control-Allow-Credentials", "true")
+        self._emit_auth_cookie()
         self.end_headers()
         self.wfile.write(data)
+
+    def _emit_auth_cookie(self) -> None:
+        """Emit the Set-Cookie queued by a successful ?token= exchange."""
+        pending = getattr(self, "_pending_cookie", "")
+        if pending:
+            self.send_header("Set-Cookie", pending)
+            self._pending_cookie = ""
 
     def _trusted_host(self) -> bool:
         """Reject DNS-rebinding requests before they reach loopback APIs."""
         host = (self.headers.get("Host") or "").split(":", 1)[0].strip().lower()
-        if host in ("127.0.0.1", "localhost"):
+        if host in _allowed_hosts():
             return True
-        self._json(421, {"error": "local Helpwo bridge requires a loopback host"})
+        self._json(421, {"error": "local Helpwo bridge: host not allowed"})
         return False
+
+    # -- authentication (Jupyter's model) --
+    #
+    # The token arrives once in the URL, is exchanged for a cookie, and is not
+    # needed again. The browser carries the cookie on its own, so the Helpwo
+    # frontend needs no change: every one of its /api calls is already
+    # same-origin with credentials: 'include'.
+    #
+    # Before this there was no authentication at all — any process on the
+    # machine could drive the bridge, and any web page could POST to it.
+
+    def _cookie(self, name: str) -> str:
+        raw = self.headers.get("Cookie") or ""
+        for part in raw.split(";"):
+            key, _, value = part.strip().partition("=")
+            if key == name:
+                return value
+        return ""
+
+    def _authenticated(self, query: dict) -> bool:
+        token = _auth_token()
+        if not token:
+            return True  # token disabled explicitly
+        if hmac.compare_digest(self._cookie(_COOKIE_NAME), token):
+            return True
+        supplied = (query.get("token") or [""])[0]
+        if supplied and hmac.compare_digest(supplied, token):
+            self._set_auth_cookie(token)
+            return True
+        header = (self.headers.get("Authorization") or "")
+        if header.startswith("token ") and hmac.compare_digest(header[6:].strip(), token):
+            return True
+        return False
+
+    def _set_auth_cookie(self, token: str) -> None:
+        # Marked for the rest of this response cycle; _json/_static emit it.
+        self._pending_cookie = (
+            f"{_COOKIE_NAME}={token}; Path=/; SameSite=Strict; HttpOnly; Max-Age=31536000"
+        )
+
+    def _require_auth(self, parsed) -> bool:
+        if self._authenticated(parse_qs(parsed.query)):
+            return True
+        self._json(403, {
+            "error": "authentication required",
+            "detail": "open the URL printed by /helpwo, which carries ?token=",
+        })
+        return False
+
+    def _same_origin(self) -> bool:
+        """Reject cross-site state changes without needing frontend cooperation.
+
+        Two independent checks, either of which is enough:
+          - Sec-Fetch-Site, which the browser sets and a page cannot forge;
+          - Origin, matched against this server's own origins.
+
+        This replaces Jupyter's _xsrf header, which would require the frontend
+        to send something it does not send today.
+        """
+        site = (self.headers.get("Sec-Fetch-Site") or "").strip().lower()
+        if site in ("same-origin", "none"):
+            return True
+        if site in ("cross-site", "same-site"):
+            return False
+        origin = (self.headers.get("Origin") or "").strip()
+        if not origin:
+            return True  # non-browser client (curl, the CLI itself)
+        try:
+            host = urlparse(origin).hostname or ""
+        except ValueError:
+            return False
+        return host.lower() in _allowed_hosts()
+
+    def _guard_write(self, parsed) -> bool:
+        """Everything a state-changing request must satisfy.
+
+        The Content-Type check is load-bearing, not cosmetic: without it a
+        cross-site form post of text/plain is a "simple request", skips the
+        CORS preflight entirely, and reaches /api/local-fs/write. Requiring
+        JSON forces a preflight, which the origin check then refuses.
+        """
+        if not self._require_auth(parsed):
+            return False
+        if not self._same_origin():
+            self._json(403, {"error": "cross-site request refused"})
+            return False
+        ctype = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+        if ctype and ctype != "application/json":
+            self._json(415, {"error": "Content-Type must be application/json"})
+            return False
+        return True
 
     def _static(self, path: str) -> None:
         dist_dir = _dist_dir()
@@ -242,6 +451,9 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", mime)
         self.send_header("Content-Length", str(len(data)))
+        # The very first page load is what carries ?token=, so the static
+        # response is where the cookie has to be set.
+        self._emit_auth_cookie()
         self.end_headers()
         self.wfile.write(data)
 
@@ -288,7 +500,15 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
 
+        # A GET is not a state change, so it needs the token but not the
+        # cross-site checks — and it is the request that exchanges ?token=
+        # for the cookie every later request rides on.
+        if not self._require_auth(parsed):
+            return
+
         # API routes
+        if path == "/api/vnc":
+            return self._handle_vnc(parsed)
         if path == "/api/agents":
             return self._handle_list_agents()
         m = re.match(r"^/api/agents/([^/]+)/updates$", path)
@@ -327,6 +547,9 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
 
+        if not self._guard_write(parsed):
+            return  # response already written
+
         if not self._content_length_ok():
             return  # 413 already written; nothing else may write a response
 
@@ -339,7 +562,9 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
             return self._handle_chat_stream()
         if path == "/api/generate-image":
             return self._handle_generate_image()
-        if path == "/api/search":
+        # The frontend calls /api/helpwo/search; /api/search is the older name
+        # the cloud backend also answers. Both land here.
+        if path in ("/api/helpwo/search", "/api/search"):
             return self._handle_search()
         if path == "/api/fetch":
             return self._handle_fetch()
@@ -568,15 +793,247 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
         body = self._read_body()
         self._proxy_json("POST", "/api/generate-image", body)
 
+    # -- Live view: RFB over a WebSocket on this same port --
+    #
+    # The screen of the browser this machine drives, so a human can clear a
+    # CAPTCHA or sign in by hand. It shares the port (and therefore the auth
+    # cookie and the origin) with everything else here, and the bytes go
+    # straight from x11vnc to the viewer — no relay, no signalling server.
+
+    def _resolve_vnc_session(self, name: str):
+        """Pick which browser session the viewer should see.
+
+        A session waiting on the user wins over everything else. The viewer
+        asks for "default" because its button has no session picker, so
+        without this preference a fetch stuck on a challenge is invisible
+        whenever any other session happens to exist.
+        """
+        try:
+            import browser_session as _bs
+        except ImportError:
+            return None, "browser_session module unavailable"
+
+        with _bs._browser_lock:
+            sessions = list(_bs._browser_sessions.items())
+        for _key, session in sessions:
+            if getattr(session, "_needs_attention", False) and session.is_alive():
+                return session, ""
+        if name:
+            session = _bs.get_browser_session(name)
+            if session is not None and session.is_alive():
+                return session, ""
+        session = _bs.get_latest_browser_session()
+        if session is None:
+            return None, "no browser session is open"
+        return session, ""
+
+    def _handle_vnc(self, parsed) -> None:
+        key = (self.headers.get("Sec-WebSocket-Key") or "").strip()
+        upgrade = (self.headers.get("Upgrade") or "").strip().lower()
+        if upgrade != "websocket" or not key:
+            self._json(400, {"error": "expected a WebSocket upgrade"})
+            return
+
+        name = (parse_qs(parsed.query).get("session") or [""])[0].strip()
+        session, err = self._resolve_vnc_session(name)
+        rfb_port = getattr(session, "rfb_port", 0) if session is not None else 0
+        if not rfb_port:
+            self._json(503, {"error": err or "that session has no live view"})
+            return
+
+        try:
+            rfb = socket.create_connection(("127.0.0.1", rfb_port), timeout=5)
+        except OSError as e:
+            self._json(502, {"error": f"cannot reach the live view: {e}"})
+            return
+
+        # Written straight to the socket rather than through send_response():
+        # this handler speaks HTTP/1.0, where the base class marks the
+        # connection for closing and the upgrade never survives the response.
+        handshake = (
+            "HTTP/1.1 101 Switching Protocols\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Accept: {_ws_accept_key(key)}\r\n"
+            "\r\n"
+        ).encode("ascii")
+        try:
+            self.wfile.write(handshake)
+            self.wfile.flush()
+        except OSError:
+            rfb.close()
+            return
+
+        self._pump_vnc(rfb)
+
+    def _pump_vnc(self, rfb) -> None:
+        """Shuttle RFB bytes between the viewer and x11vnc until either ends."""
+        import select
+        client = self.connection
+        client.settimeout(None)
+        rfb.settimeout(None)
+        try:
+            while True:
+                ready, _w, _x = select.select([client, rfb], [], [], 60)
+                if not ready:
+                    # Keep middleboxes from dropping an idle viewer.
+                    try:
+                        client.sendall(_ws_frame(b"", opcode=0x9))  # ping
+                    except OSError:
+                        return
+                    continue
+                if rfb in ready:
+                    data = rfb.recv(65536)
+                    if not data:
+                        return
+                    try:
+                        client.sendall(_ws_frame(data))
+                    except OSError:
+                        return
+                if client in ready:
+                    frame = _ws_read_frame(client)
+                    if frame is None:
+                        return
+                    opcode, payload = frame
+                    if opcode == 0x8:          # close
+                        return
+                    if opcode == 0x9:          # ping → pong
+                        try:
+                            client.sendall(_ws_frame(payload, opcode=0xA))
+                        except OSError:
+                            return
+                        continue
+                    if opcode == 0xA:          # pong
+                        continue
+                    if payload:
+                        try:
+                            rfb.sendall(payload)
+                        except OSError:
+                            return
+        finally:
+            try:
+                rfb.close()
+            except OSError:
+                pass
+            self.close_connection = True
+
+    # -- Web search / fetch: served here, not proxied --
+    #
+    # These used to forward to the cloud backend. Running them in-process means
+    # the browser inherits *this machine's* view of the web: its engine list
+    # (including cn.bing, which is what works from inside China), its per-host
+    # proxy routing, the challenge clearance it has already earned, and its
+    # saved logins. A page the CLI can read is now a page Helpwo can read.
+    #
+    # It also fixes a plain break: the frontend calls /api/helpwo/search, which
+    # this server had no route for at all, so search 404'd in local mode.
+
+    def _web_search_module(self):
+        try:
+            import web_search
+            return web_search
+        except ImportError:
+            return None
+
     def _handle_search(self) -> None:
-        """Proxy /api/search to the remote backend."""
         body = self._read_body()
-        self._proxy_json("POST", "/api/search", body)
+        ws = self._web_search_module()
+        if ws is None:
+            self._json(503, {"error": "web_search module unavailable"})
+            return
+        query = str(body.get("query") or "").strip()
+        if not query:
+            self._json(400, {"error": "a query is required"})
+            return
+        try:
+            max_results = min(max(int(body.get("maxResults", 8)), 1), 20)
+        except (TypeError, ValueError):
+            max_results = 8
+        timelimit = body.get("timelimit")
+        if timelimit not in ("d", "w", "m", "y"):
+            timelimit = None
+        engines = body.get("engines")
+        if isinstance(engines, str):
+            engines = [engines]
+        elif not isinstance(engines, list):
+            engines = None
+
+        try:
+            out = ws.search(query, max_results=max_results,
+                            region=body.get("region"), timelimit=timelimit,
+                            engines=engines)
+        except Exception as e:
+            self._json(502, {"error": f"search failed: {type(e).__name__}"})
+            return
+
+        if not out.get("ok"):
+            self._json(502, {
+                "error": out.get("error", "search failed"),
+                "engines": out.get("engines_available"),
+            })
+            return
+        # Shape matches what the frontend already expects from the cloud route,
+        # including the "domain" field it renders as a tag next to each result.
+        from urllib.parse import urlparse
+        results = []
+        for item in out.get("result") or []:
+            entry = dict(item)
+            if not entry.get("domain"):
+                try:
+                    entry["domain"] = urlparse(entry.get("url", "")).netloc
+                except ValueError:
+                    entry["domain"] = ""
+            results.append(entry)
+        self._json(200, {
+            "query": query,
+            "results": results,
+            "engine": out.get("engine"),
+        })
 
     def _handle_fetch(self) -> None:
-        """Proxy /api/fetch to the remote backend."""
         body = self._read_body()
-        self._proxy_json("POST", "/api/fetch", body)
+        ws = self._web_search_module()
+        if ws is None:
+            self._json(503, {"error": "web_search module unavailable"})
+            return
+        url = str(body.get("url") or "").strip()
+        if not url:
+            self._json(400, {"error": "a URL is required"})
+            return
+        try:
+            max_chars = min(max(int(body.get("maxChars", 16000)), 500), 200_000)
+        except (TypeError, ValueError):
+            max_chars = 16000
+        try:
+            timeout = min(max(int(body.get("timeout", 15)), 3), 60)
+        except (TypeError, ValueError):
+            timeout = 15
+        # A saved login is only ever used when named, and identity_store still
+        # checks the URL against that identity's own domains.
+        identity = str(body.get("identity") or "").strip() or None
+
+        try:
+            out = ws.fetch(url, max_bytes=max_chars, timeout=timeout,
+                           identity=identity)
+        except Exception as e:
+            self._json(502, {"error": f"fetch failed: {type(e).__name__}"})
+            return
+
+        if not out.get("ok"):
+            self._json(502, {
+                "error": out.get("error", "fetch failed"),
+                "blocked": out.get("blocked"),
+                "attempts": out.get("attempts"),
+            })
+            return
+        self._json(200, {
+            "url": out.get("final_url", url),
+            "title": out.get("title", ""),
+            "text": out.get("result", ""),
+            "truncated": bool(out.get("truncated")),
+            "transport": out.get("transport"),
+            "note": out.get("note", ""),
+        })
 
     # -- Local filesystem API --
     # Scoped to _local_root() (this process's cwd when /helpwo started).
@@ -834,8 +1291,9 @@ def _find_dist() -> Optional[Path]:
 
     Search order:
     1. LAINTAS_HELPWO_DIST env var
-    2. Sibling /root/Helpwo/dist (development layout)
-    3. Package-bundled dist (future: shipped inside laintas_cli)
+    2. A sibling checkout (development layout) — a developer's own build wins
+       over the downloaded one, so editing Helpwo shows up immediately
+    3. The dist downloaded by the updater into ~/.laintas/helpwo/dist
     """
     env = os.environ.get("LAINTAS_HELPWO_DIST")
     if env:
@@ -847,6 +1305,11 @@ def _find_dist() -> Optional[Path]:
         Path("/root/Helpwo/dist"),
         Path(__file__).resolve().parent.parent / "Helpwo" / "dist",
     ]
+    try:
+        import updater
+        candidates.append(Path(updater.helpwo_dist_dir()))
+    except Exception:
+        pass
     for c in candidates:
         if c.is_dir() and (c / "index.html").is_file():
             return c.resolve()
@@ -859,15 +1322,25 @@ def is_running() -> bool:
 
 def start_server(agent_registry: Any, dist_dir: Optional[Path] = None,
                  port: int = DEFAULT_PORT,
-                 session: Optional[dict] = None) -> tuple[bool, str]:
+                 session: Optional[dict] = None,
+                 host: str = "127.0.0.1",
+                 token: Optional[str] = None) -> tuple[bool, str]:
     """Start the local Helpwo gateway server.
+
+    host defaults to loopback. Binding anywhere else is the operator's call —
+    this server does not decide whether a machine should be reachable — but it
+    always requires the token, and it says what a non-loopback address costs.
+
+    token defaults to a fresh random one. Pass "" to disable authentication;
+    only sensible for a throwaway sandbox.
 
     Returns (success, message).
     """
     global _server, _server_thread, _registry_ref, _dist_dir_ref, _server_port_val, _session_ref, _local_root_ref, _local_agent_id_ref
+    global _auth_token_value, _bind_host
 
     if is_running():
-        return True, f"already running on http://127.0.0.1:{_server_port_val}"
+        return True, f"already running on {get_url()}"
 
     if session is not None:
         _session_ref = session
@@ -886,13 +1359,15 @@ def start_server(agent_registry: Any, dist_dir: Optional[Path] = None,
     # contract while all traffic remains on loopback.
     _local_agent_id_ref = f"local-{os.getpid():x}"
     _local_root_ref = Path(os.getcwd()).resolve()
+    _bind_host = host or "127.0.0.1"
+    _auth_token_value = secrets.token_urlsafe(32) if token is None else token
 
     # Intercept events so they stay in-process instead of HTTP-round-tripping.
     install_event_intercept(agent_registry)
 
     try:
         srv = ThreadingHTTPServer(
-            ("127.0.0.1", port), _HelpwoHandler,
+            (_bind_host, port), _HelpwoHandler,
         )
     except OSError as e:
         uninstall_event_intercept(agent_registry)
@@ -900,7 +1375,7 @@ def start_server(agent_registry: Any, dist_dir: Optional[Path] = None,
         _dist_dir_ref = None
         _local_root_ref = None
         _local_agent_id_ref = ""
-        return False, f"cannot bind 127.0.0.1:{port}: {e}"
+        return False, f"cannot bind {_bind_host}:{port}: {e}"
 
     srv.daemon_threads = True
     _server = srv
@@ -912,7 +1387,13 @@ def start_server(agent_registry: Any, dist_dir: Optional[Path] = None,
     t.start()
     _server_thread = t
 
-    return True, f"Helpwo gateway running at http://127.0.0.1:{port}"
+    # The actual bound port, so port=0 (ephemeral) reports something usable.
+    try:
+        _server_port_val = srv.server_address[1]
+    except Exception:
+        pass
+
+    return True, f"Helpwo gateway running at {get_url()}"
 
 
 def stop_server() -> None:
@@ -940,8 +1421,25 @@ def stop_server() -> None:
     _event_buffer.clear()
 
 
-def get_url() -> str:
-    """Return the base URL of the running server (or empty string)."""
-    if is_running():
-        return f"http://127.0.0.1:{_server_port_val}"
-    return ""
+def get_url(with_token: bool = False) -> str:
+    """Base URL of the running server (or empty string).
+
+    with_token appends the one the browser needs on its first visit; after
+    that the cookie carries it.
+    """
+    if not is_running():
+        return ""
+    host = _bind_host if _bind_host not in ("0.0.0.0", "::") else "127.0.0.1"
+    url = f"http://{host}:{_server_port_val}"
+    if with_token and _auth_token():
+        url += f"/?token={_auth_token()}"
+    return url
+
+
+def auth_token() -> str:
+    """The token this server requires ("" when authentication is disabled)."""
+    return _auth_token()
+
+
+def bind_host() -> str:
+    return _bind_host

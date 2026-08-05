@@ -77,7 +77,7 @@ This block is supplied by the runtime after loading user customization.
 # Mutable defaults — these are the "factory" values; runtime overrides stored in _runtime_config
 _DEFAULT_CONFIG = {
     "max_loops": 30,
-    "max_tokens": 10000,          # gateway hard-caps output at 10000 (_MAX_OUTPUT_TOKENS); request the full budget so writes aren't needlessly truncated at 8192
+    "max_tokens": 0,              # 0 = ask the gateway for everything that fits (provider ceiling ∩ remaining window). A positive value is a deliberate cap, never a floor — the gateway clamps but never raises it.
     "max_debug_entries": 50,
     "loop_delay": 0.2,           # normal inter-iteration delay; failures back off adaptively
     "output_truncate": 3000,      # chars — lastOutput tail truncation
@@ -149,11 +149,18 @@ _DEFAULT_CONFIG = {
     "auto_pilot_budget_tokens": 50000, # Phase 3: token budget for auto-execution (all sub-agents combined)
     "tool_output_fold": 30,          # max lines of tool output shown before folding (first half + … + last half); 0 = suppress preview entirely
     # ── Web search / fetch ──
-    "search_engine": "auto",            # auto = engine chain (Google -> DDG -> laintas_search); or google / duckduckgo / laintas_search
+    "search_engine": "auto",            # auto = default chain (google, duckduckgo, cn-bing, laintas_search, laintas_gateway); or a space/comma separated list of engine names
     "search_laintas_api_key": "",        # laintas_search API key (X-API-KEY header); register at search.laintas.com
     "search_laintas_api_url": "https://search.laintas.com",  # laintas_search API base URL
     "search_proxy": "",                 # proxy for web.search and web.fetch; e.g. socks5://127.0.0.1:1080 or http://host:port (empty = direct)
-    "search_cookie_enabled": False,     # share a process-level cookie jar across search/fetch; enables Google consent-cookie auto-injection
+    "search_cookie_enabled": False,     # share a persistent cookie jar across search/fetch/browser; lets a challenge solved once keep working
+    "search_cookie_domains": "",         # optional allowlist for the cookie store, e.g. "example.com news.ycombinator.com" (empty = all domains)
+    "search_cookie_names": "",           # extra cookie names to treat as challenge clearance (auto-kept); anything else needs /identity capture
+    "identity_enabled": False,          # allow web.fetch to browse as a saved login (see /identity); separate switch because these are account credentials, not challenge cookies
+    "search_proxy_mode": "auto",        # off = never proxy; auto = direct first, proxy only for hosts that need it; always = proxy everything
+    "fetch_render": "auto",             # off = HTTP only; auto = render blocked/client-rendered pages in the browser; always = always render
+    "fetch_unlock": True,               # when a challenge survives rendering, keep the browser open so the user can solve it in the live view
+    "fetch_wayback": True,              # fall back to a Wayback Machine snapshot when the live page cannot be read
 }
 
 # ── Typed Error Classes ───────────────────────────────────────────────
@@ -517,7 +524,7 @@ _runtime_config: dict[str, object] = {}
 
 _RUNTIME_CONFIG_DESCRIPTIONS = {
     "max_loops": "Maximum agent-loop iterations per task",
-    "max_tokens": "Requested model output-token budget",
+    "max_tokens": "Output-token cap to request (0 = whatever the model and window allow)",
     "max_debug_entries": "In-memory debug entry limit",
     "loop_delay": "Delay between loop iterations in seconds",
     "output_truncate": "Maximum retained characters per tool-output section",
@@ -555,11 +562,18 @@ _RUNTIME_CONFIG_DESCRIPTIONS = {
     "confirm_direct_commands": "Ask for approval on commands YOU type directly at the REPL (False = run like a normal terminal; hard deny rules still apply)",
     "enable_mouse": "Enable mouse click-to-position in the REPL input box",
     "tool_output_fold": "Max lines of tool output shown before folding (first half + … + last half); 0 = suppress preview",
-    "search_engine": "Search engine: auto (Google -> DDG -> laintas_search chain), google, duckduckgo, or laintas_search",
+    "search_engine": "Search engine chain: 'auto', or an ordered list like 'cn-bing duckduckgo'. Built-ins: google, duckduckgo, cn-bing, laintas_search, laintas_gateway. Add your own JSON APIs in ~/.laintas/search_engines.json",
     "search_laintas_api_key": "API key for laintas_search (sent as X-API-KEY header; leave empty to skip laintas_search engine)",
     "search_laintas_api_url": "Base URL for laintas_search API (default: https://search.laintas.com)",
     "search_proxy": "Proxy for web.search and web.fetch (e.g. socks5://127.0.0.1:1080 or http://host:port; empty = direct connection)",
-    "search_cookie_enabled": "Share a process-level cookie jar across web.search and web.fetch (enables Google consent-cookie auto-injection; default off)",
+    "search_cookie_enabled": "Keep cookies across web.search, web.fetch and the browser, persisted in ~/.laintas/cookies.json (default off). Required for a manually solved CAPTCHA or login to keep working",
+    "search_cookie_domains": "Only store cookies for these domains, space or comma separated (empty = all). Subdomains of a listed domain are included",
+    "search_cookie_names": "Extra cookie names to treat as anti-bot clearance and keep automatically (space or comma separated). Everything else a browser picks up is a credential and needs /identity capture",
+    "identity_enabled": "Allow saved logins (/identity) to be used by web.fetch. Separate from search_cookie_enabled on purpose: that one keeps challenge cookies, this one unlocks your account sessions",
+    "search_proxy_mode": "When to use search_proxy: off, auto (direct first, proxy only for hosts that proved unreachable), or always",
+    "fetch_render": "When web.fetch may render a page in the headless browser: off, auto (only when blocked or client-rendered), or always. Needs Playwright plus Xvfb/x11vnc/Chrome",
+    "fetch_unlock": "When a challenge survives rendering, leave the browser open on it so the user can solve it in the live view (default on)",
+    "fetch_wayback": "Fall back to a Wayback Machine snapshot when the live page cannot be read (default on)",
 }
 
 _RUNTIME_NONNEGATIVE = {
@@ -592,7 +606,12 @@ _RUNTIME_ENUM_CHOICES: dict[str, frozenset] = {
     "stream_preview": frozenset({"off", "one", "detail"}),
     "theme": frozenset({"dark", "light", "mono"}),
     "markdown_theme": frozenset({"default", "green-red", "custom"}),
-    "search_engine": frozenset({"auto", "google", "duckduckgo", "laintas_search"}),
+    # search_engine is deliberately not enumerated here: the set of valid names
+    # now depends on the user's own engine registry, and a fixed vocabulary
+    # would reject the very entries they added. web_search.resolve_chain
+    # validates it against the live registry and reports unknown names.
+    "search_proxy_mode": frozenset({"off", "auto", "always"}),
+    "fetch_render": frozenset({"off", "auto", "always"}),
 }
 
 
@@ -696,7 +715,7 @@ def reset_runtime_config():
 # show_billing, heartbeat_interval) are intentionally left alone.
 _MAX_CONFIG = {
     "max_loops": 100000,            # effectively unbounded iterations
-    "max_tokens": 32000,            # max response budget (provider may cap lower)
+    "max_tokens": 0,                # unlimited: take the full provider/window budget
     "max_debug_entries": 1000,
     "loop_delay": 0.0,              # no pause between iterations
     "output_truncate": 200000,      # keep almost all tool output
@@ -4059,7 +4078,7 @@ def _compact_thread_messages(thread_messages: list, deps, session, lang: str, st
     if ctxpol is None or len(thread_messages) < 4:
         return False
     try:
-        window = int(get_runtime_config("model_context_window") or 64000)
+        window = _effective_context_window()
         max_out = int(get_runtime_config("max_tokens") or 8192)
         usable = ctxpol.usable_tokens(window, max_out)
         if not force and (usable <= 0 or _thread_tokens(thread_messages) <= usable):
@@ -4125,12 +4144,43 @@ def _compact_thread_messages(thread_messages: list, deps, session, lang: str, st
         return False
 
 
+# The gateway reports the running model's REAL context window with every
+# response. The config default (64000) predates knowing them and is far below
+# reality — the served models run 256K-1M — so budgeting compaction from it
+# summarises long sessions that had plenty of room left. Adopt what the
+# provider reports, but never override a window the user set deliberately:
+# a smaller value is a legitimate way to force earlier compaction.
+_provider_context_window: int = 0
+
+
+def _note_provider_context_window(tokens: int) -> None:
+    global _provider_context_window
+    if tokens and tokens > 0:
+        _provider_context_window = int(tokens)
+
+
+# A bigger window is not a licence to fill it. Compaction bounds cost and
+# latency as well as overflow: every uncompacted turn re-sends the whole thread,
+# so budgeting against a 1M window would grow prompts until a single request
+# costs dollars and takes minutes. Take the headroom the real window gives us
+# over the old 64000 default, but stop well short of the model's maximum.
+_CONTEXT_WINDOW_ADOPT_CAP = 200_000
+
+
+def _effective_context_window() -> int:
+    configured = int(get_runtime_config("model_context_window") or 64000)
+    if (configured == _DEFAULT_CONFIG["model_context_window"]
+            and _provider_context_window > configured):
+        return min(_provider_context_window, _CONTEXT_WINDOW_ADOPT_CAP)
+    return configured
+
+
 def session_context_status(state: dict) -> dict:
     """Return read-only token/budget information for `/compact status`."""
     messages = (state or {}).get("_thread_messages") or []
     if not isinstance(messages, list):
         messages = []
-    window = int(get_runtime_config("model_context_window") or 64000)
+    window = _effective_context_window()
     max_out = int(get_runtime_config("max_tokens") or 8192)
     usable = ctxpol.usable_tokens(window, max_out) if ctxpol is not None else 0
     return {
@@ -4331,6 +4381,58 @@ def _append_short_memory(state: dict, text: str) -> None:
         f"{state.get('shortTermMemory', '')}{text}"
     )
 
+
+
+# Below this remaining output ceiling, a single ordinary tool-writing turn is
+# at risk of being cut off, so compaction is worth spending a turn on. Well
+# above a typical turn's output; well below any provider ceiling.
+_ROOM_PRESSURE_TOKENS = 6000
+
+
+def _record_truncation(state: dict, kind: str) -> None:
+    """Tally truncations by kind for the session.
+
+    Individual truncations are recovered silently, so without a tally they
+    would leave no trace at all. A model that truncates on a large share of
+    its turns is a configuration-level signal (wrong model for the workload,
+    or an output ceiling that needs raising) — it deserves to be visible in
+    /usage once, not shouted on every occurrence.
+    """
+    counts = state.setdefault("_truncation_counts", {})
+    counts[kind] = counts.get(kind, 0) + 1
+    counts["_total"] = counts.get("_total", 0) + 1
+
+
+def _write_cap_violation(state: dict, name: str, arguments: dict):
+    """Reject an oversized single write while the truncation ladder is active.
+
+    Telling the model "write in chunks" after the fact does not stop it from
+    re-emitting the same oversized write — it has already committed to the
+    approach. Rejecting the call converts the advice into a constraint it
+    cannot ignore, and the rejection is far cheaper than another truncated
+    generation. The cap only exists after a truncation (_max_write_lines is
+    cleared on any clean turn), so normal large writes are untouched.
+
+    Returns a tool-result dict to use instead of invoking, or None to proceed.
+    """
+    cap = state.get("_max_write_lines")
+    if not cap or name != "fs.write":
+        return None
+    content = arguments.get("content")
+    if not isinstance(content, str):
+        return None
+    lines = content.count("\n") + 1
+    if lines <= cap:
+        return None
+    return {
+        "ok": False,
+        "error": (
+            f"Rejected: {lines} lines in one fs.write, over the current "
+            f"{cap}-line cap. Your previous response was cut off at the output "
+            f"token limit, so this write would be cut off too. Write the first "
+            f"{cap} lines with fs.write, then append the rest with fs.edit."
+        ),
+    }
 
 
 def _summarize_reply_for_memory(reply: str, limit: int = 120) -> str:
@@ -6139,6 +6241,12 @@ def run_agent_loop(
         # ── Microcompact: strip old tool outputs to save context window ──
         # Microcompact: zero-cost context recovery.
         _micro_keep = int(get_runtime_config("microcompact_keep"))
+        # A truncated turn sets _force_micro_keep: the output ceiling is
+        # (context window - prompt), so compacting harder is the one lever that
+        # actually gives the next attempt more room to finish in.
+        _forced_keep = state.get("_force_micro_keep")
+        if _forced_keep:
+            _micro_keep = min(_micro_keep, int(_forced_keep))
         state["terminalHistory"] = _microcompact_history(
             state["terminalHistory"], keep_recent=_micro_keep
         )
@@ -6794,7 +6902,10 @@ def run_agent_loop(
         # Empty provider turns are invalid regardless of whether the gateway
         # supplied billing metadata.  In particular, finish_reason=tool_calls
         # with no parsed calls must be retried rather than marked completed.
-        if not tool_calls and (not reply or _provider_finish == "tool_calls"):
+        # Truncated responses (including reasoning-model turns that spent their
+        # entire budget on chain-of-thought) are NOT silent failures - they
+        # are handled by the truncation block below.
+        if not tool_calls and not response.get("_truncated") and (not reply or _provider_finish == "tool_calls"):
             completion_tokens = (billing or {}).get("completionTokens", 0)
             reason = _provider_finish or "missing"
             msg = (
@@ -6886,20 +6997,92 @@ def run_agent_loop(
         # ── Handle JSON parse failure: nudge the model ──
         # When model outputs pure prose instead of JSON, show a subtle hint
         # and inject a reminder into the next turn.
-        # ── Truncation: the response hit the output-token ceiling mid-generation
-        # (typically one oversized write). Tell the model to chunk instead of
-        # retrying the same too-long write. The note carries into the next turn. ──
-        if response.get("_truncated"):
-            _append_short_memory(state, (
-                f"\n  {symbols.WARN} Your last response was cut off at the output token "
-                "limit — it was too long to finish. Do NOT rewrite the whole "
-                "file in one call. Write it in chunks: write the first "
-                "part, then append the rest with edit."
-            ))
-            if events_cb is not None:
-                deps.console.print(
-                    f"[yellow]{symbols.WARN} Response truncated at token limit — asking AI to write in smaller chunks.[/yellow]")
+        # ── Room pressure: compact BEFORE the window becomes the limit ──
+        # The output ceiling is (context window - prompt), so in a long task the
+        # prompt eventually squeezes the answer rather than the provider doing
+        # it. That is a compaction problem wearing a truncation costume: the fix
+        # is to free window, and there is no reason to wait for a cut-off
+        # response to learn that. The gateway reports the room it computed, so
+        # act on it while the current turn still succeeded.
+        _budget = response.get("_budget") or {}
+        _note_provider_context_window(int(_budget.get("contextWindow") or 0))
+        _room_ceiling = int(_budget.get("ceiling") or 0)
+        _provider_max = int(_budget.get("providerMax") or 0)
+        if (_room_ceiling and _provider_max
+                and _room_ceiling < _provider_max
+                and _room_ceiling < _ROOM_PRESSURE_TOKENS):
+            state["_force_micro_keep"] = min(
+                int(state.get("_force_micro_keep") or 99), 4)
 
+        if response.get("_truncated"):
+            _reasoning = response.get("_reasoning") or ""
+            _kind = response.get("_truncation_kind") or ""
+            if not _kind:
+                # Backend predates _truncation_kind — fall back to the old
+                # (imprecise) inference rather than guessing "output".
+                _kind = "reasoning" if (not reply and _reasoning) else "output"
+            _trunc_count = state.get("_truncation_retry_count", 0) + 1
+            state["_truncation_retry_count"] = _trunc_count
+
+            # Truncation is recoverable, so on its own it is not worth
+            # interrupting the user over. What matters is whether recovery
+            # WORKS. The old code retried three times with an identical request
+            # and an identical hint, which made exhausting the counter
+            # arithmetically certain — the warning fired on ordinary long
+            # writes and told the user nothing.
+            #
+            # Each rung below must change something real about the next
+            # attempt: free window room (raising the output ceiling), and cap
+            # the size of a single write (removing the thing that overran).
+            # Only when the whole ladder has been walked does the warning fire
+            # — and then it means the model failed to progress even with
+            # maximum room and forced chunking, which is a real anomaly.
+            _record_truncation(state, _kind)
+
+            if _trunc_count >= 3:
+                if events_cb is not None:
+                    deps.console.print(
+                        f"[yellow]{symbols.WARN} Response truncated {_trunc_count} consecutive times "
+                        f"({_kind}) even with maximum output budget and forced chunking - "
+                        f"stopping.[/yellow]")
+                _append_short_memory(state,
+                    f"\n  -Error: Response truncated {_trunc_count} consecutive times ({_kind}); "
+                    "unable to make progress.")
+                _exit_reason = TRANSITION_SILENT_FAILURE
+                break
+
+            # Rung 1 and 2 both recover; only rung 2 says anything on screen.
+            # Free window room so the next turn's output ceiling is larger:
+            # the ceiling is (context window - prompt), so dropping old tool
+            # output directly buys back output budget.
+            state["_force_micro_keep"] = 4 if _trunc_count == 1 else 2
+
+            if _kind == "reasoning":
+                _append_short_memory(state, (
+                    f"\n  {symbols.WARN} Your reasoning consumed the entire token "
+                    "budget, leaving no room for output. Be more concise in "
+                    "your reasoning, or skip it for straightforward tasks."
+                ))
+                _msg = "reasoning used the whole budget - asking for less of it"
+            else:
+                # "tool_args" (cut off mid tool-call) and "output" (prose ran
+                # long) get the same remedy: produce less per call.
+                _cap = 400 if _trunc_count == 1 else 150
+                state["_max_write_lines"] = _cap
+                _append_short_memory(state, (
+                    f"\n  {symbols.WARN} Your last response was cut off at the output token "
+                    "limit - it was too long to finish. Do NOT rewrite the whole "
+                    f"file in one call. Write at most {_cap} lines per call: write the "
+                    "first part with fs.write, then append the rest with fs.edit."
+                ))
+                _msg = f"output hit the token limit - capping writes at {_cap} lines"
+
+            if _trunc_count >= 2 and events_cb is not None:
+                deps.console.print(f"[dim]{symbols.WARN} {_msg}[/dim]")
+        else:
+            state["_truncation_retry_count"] = 0
+            state.pop("_force_micro_keep", None)
+            state.pop("_max_write_lines", None)
         # A retry is needed only on a genuine empty response (silent failure
         # above set _parse_failed); it already printed its own hint.
         _nudge_needed = bool(response.get("_parse_failed"))
@@ -7423,9 +7606,13 @@ def run_agent_loop(
                                 "content": display_name,
                             }])
                         with (_command_lock if _command_lock is not None else nullcontext()):
-                            result = tools_mod.get_registry().invoke(
-                                name, arguments, tool_ctx
-                            )
+                            _cap_err = _write_cap_violation(state, name, arguments)
+                            if _cap_err is not None:
+                                result = _cap_err
+                            else:
+                                result = tools_mod.get_registry().invoke(
+                                    name, arguments, tool_ctx
+                                )
 
                         if (name in {"task.create", "task.update"}
                                 and result.get("ok")

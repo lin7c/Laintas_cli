@@ -35,6 +35,7 @@ asset.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import shutil
 import stat
@@ -647,5 +648,185 @@ def apply_frozen_update(manifest: dict, channel_dir: str, log) -> Optional[str]:
             raise FileNotFoundError(
                 f"updated executable is missing after atomic replace: {target}")
         return target
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# ── Helpwo dist ──────────────────────────────────────────────────────────
+#
+# The browser UI /helpwo serves is a build artifact of a separate project, so
+# it needs a way to reach a user who does not have that project checked out.
+# It rides the exact mechanism /v already uses — same /releases/<channel>/ URL
+# layout, same manifest shape, same sha256-per-file verification, same
+# download-once-and-verify-before-writing order — rather than inventing a
+# second updater with its own failure modes.
+#
+# Like /v, the payload is a single zip: there is one download or none. The
+# saving is skipping it entirely when the manifest matches what is installed,
+# which for a UI whose largest assets (a 13 MB esbuild wasm, three tree-sitter
+# grammars) never change is nearly every check.
+
+HELPWO_MANIFEST_ASSET = "helpwo_manifest.json"
+HELPWO_ZIP_ASSET = "helpwo_dist.zip"
+
+
+def helpwo_home() -> str:
+    """Where the downloaded dist lives."""
+    try:
+        from paths import LAINTAS_HOME
+        return str(LAINTAS_HOME / "helpwo")
+    except Exception:
+        return os.path.join(os.path.expanduser("~"), ".laintas", "helpwo")
+
+
+def helpwo_dist_dir() -> str:
+    return os.path.join(helpwo_home(), "dist")
+
+
+def _helpwo_local_manifest_path() -> str:
+    return os.path.join(helpwo_home(), "installed.json")
+
+
+def helpwo_installed() -> dict:
+    """The manifest of the dist currently installed, or {}."""
+    try:
+        with open(_helpwo_local_manifest_path(), "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def fetch_helpwo_manifest(timeout: float = _TIMEOUT) -> dict:
+    """Fetch and validate the remote dist manifest.
+
+    Same contract as fetch_manifest(): every entry must carry a sha256, so a
+    tampered or truncated manifest cannot cause an unverified file to be
+    installed.
+    """
+    url = _asset_url(update_channel(), HELPWO_MANIFEST_ASSET)
+    resp = requests.get(url, timeout=timeout, verify=_CA_BUNDLE)
+    resp.raise_for_status()
+    data = resp.json()
+    if "version" not in data or "files" not in data:
+        raise ValueError(f"{HELPWO_MANIFEST_ASSET} is missing required keys (version, files)")
+    files = data.get("files", {})
+    if not isinstance(files, dict) or not files:
+        raise ValueError(f"{HELPWO_MANIFEST_ASSET} has no files")
+    if "index.html" not in files:
+        raise ValueError(f"{HELPWO_MANIFEST_ASSET} has no index.html")
+    for name, meta in files.items():
+        if not _safe_name(name):
+            raise ValueError(f"unsafe path in {HELPWO_MANIFEST_ASSET}: {name!r}")
+        sha = (meta or {}).get("sha256", "")
+        if not sha or not isinstance(sha, str) or len(sha) != 64:
+            raise ValueError(f"manifest entry '{name}' is missing a valid sha256")
+    return data
+
+
+def helpwo_dist_changed(manifest: dict) -> list:
+    """[(name, sha)] for dist files missing or differing on disk."""
+    base = helpwo_dist_dir()
+    changed = []
+    for name, meta in manifest.get("files", {}).items():
+        if not _safe_name(name):
+            continue
+        remote_sha = (meta or {}).get("sha256", "")
+        if not remote_sha or len(remote_sha) != 64:
+            continue
+        local_path = os.path.join(base, name)
+        if not os.path.exists(local_path):
+            changed.append((name, remote_sha))
+            continue
+        try:
+            if _sha256_file(local_path) != remote_sha:
+                changed.append((name, remote_sha))
+        except OSError:
+            changed.append((name, remote_sha))
+    return changed
+
+
+def install_helpwo_dist(log=None, console=None) -> tuple[bool, str]:
+    """Download and install the Helpwo dist if it differs from what is on disk.
+
+    Returns (ok, message). Verifies every file against the manifest before a
+    single byte is written, then swaps the directory into place, so a failed
+    download can never leave a half-updated UI behind.
+    """
+    def emit(text: str) -> None:
+        if log:
+            log(text)
+
+    try:
+        manifest = fetch_helpwo_manifest()
+    except Exception as e:
+        return False, f"could not fetch the Helpwo manifest: {e}"
+
+    version = str(manifest.get("version", "?"))
+    installed = helpwo_installed()
+    changed = helpwo_dist_changed(manifest)
+    if not changed and installed.get("version") == version:
+        return True, f"Helpwo UI {version} is already current"
+
+    emit(f"Downloading Helpwo UI {version} ({len(changed)} file(s) differ)…")
+    try:
+        data = _download(_asset_url(update_channel(), HELPWO_ZIP_ASSET),
+                         label=HELPWO_ZIP_ASSET, console=console)
+    except Exception as e:
+        return False, f"could not download the Helpwo bundle: {e}"
+
+    import io
+    import zipfile
+    tmpdir = tempfile.mkdtemp(prefix="laintas-helpwo-")
+    try:
+        try:
+            with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                for entry in zf.namelist():
+                    if not _safe_name(entry.rstrip("/")) and not entry.endswith("/"):
+                        return False, f"bundle contains an unsafe path: {entry!r}"
+                zf.extractall(tmpdir)
+        except zipfile.BadZipFile:
+            return False, "the Helpwo bundle is not a valid zip"
+
+        # Verify EVERY file, not just the changed ones: the directory is
+        # swapped wholesale, so anything unverified would go live too.
+        for name, meta in manifest.get("files", {}).items():
+            src = os.path.join(tmpdir, name)
+            if not os.path.exists(src):
+                return False, f"{name} is missing from the Helpwo bundle"
+            if _sha256_file(src) != meta.get("sha256"):
+                return False, f"checksum mismatch for {name}"
+
+        target = helpwo_dist_dir()
+        staging = target + ".new"
+        previous = target + ".old"
+        try:
+            os.makedirs(helpwo_home(), exist_ok=True)
+            if os.path.exists(staging):
+                shutil.rmtree(staging, ignore_errors=True)
+            shutil.copytree(tmpdir, staging)
+            if os.path.exists(previous):
+                shutil.rmtree(previous, ignore_errors=True)
+            if os.path.exists(target):
+                os.rename(target, previous)
+            os.rename(staging, target)
+        except OSError as e:
+            # Put back whatever was there before failing.
+            if not os.path.exists(target) and os.path.exists(previous):
+                try:
+                    os.rename(previous, target)
+                except OSError:
+                    pass
+            return False, f"could not install the Helpwo UI: {e}"
+        finally:
+            shutil.rmtree(previous, ignore_errors=True)
+            shutil.rmtree(staging, ignore_errors=True)
+
+        try:
+            with open(_helpwo_local_manifest_path(), "w", encoding="utf-8") as fh:
+                json.dump(manifest, fh)
+        except OSError:
+            pass
+        return True, f"Helpwo UI {version} installed to {target}"
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)

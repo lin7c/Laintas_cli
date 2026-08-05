@@ -114,7 +114,7 @@ All tunable parameters are accessible via `get_runtime_config()`/`set_runtime_co
 | Key | Default | Description |
 |---|---|---|
 | `max_loops` | 10 | Max AI loop iterations per task |
-| `max_tokens` | 2000 | Max tokens for AI API response |
+| `max_tokens` | 0 | Output-token cap to request; 0 = the model's full budget (gateway-resolved per request) |
 | `max_debug_entries` | 50 | Debug ring buffer size |
 | `loop_delay` | 1.5 | Seconds between loop iterations |
 | `output_truncate` | 3000 | Char limit for `lastOutput` tail |

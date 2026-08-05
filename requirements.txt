@@ -34,5 +34,17 @@ websockets>=12.0
 # Optional (P2+) — enables full browser automation (click, type, screenshot,
 # DOM query) via Playwright. browser._debug_open works without this (uses raw
 # CDP), but the browser.* tool family requires it.
+# Also what lets web.fetch render a page when a plain request is blocked or the
+# page turns out to be client-rendered.
 #   pip install playwright && playwright install chromium
 playwright>=1.40
+
+# Optional — article extraction for web.fetch. Without it the fallback keeps
+# nav bars, cookie banners and footers in the text handed to the model, so this
+# is the single biggest quality difference in what the AI reads off a page.
+trafilatura>=1.8
+
+# Optional — a real browser's TLS/HTTP2 fingerprint, used only to retry a page
+# that came back blocked. Bot walls fingerprint the handshake, which no header
+# can disguise. Ships binary wheels, hence optional rather than core.
+curl_cffi>=0.7

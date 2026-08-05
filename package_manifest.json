@@ -58,7 +58,9 @@
     "rag_signals",
     "redactor",
     "skill_router",
-    "web_search"
+    "web_search",
+    "cookie_store",
+    "identity_store"
   ],
 
   "packages": [
@@ -89,9 +91,10 @@
 
   "extras_require": {
     "browser": ["websockets>=12.0", "playwright>=1.40"],
+    "web":     ["trafilatura>=1.8", "curl_cffi>=0.7"],
     "webrtc":  ["aiortc>=1.14"],
     "mcp":     ["mcp>=1.0"],
-    "all":     ["websockets>=12.0", "playwright>=1.40", "aiortc>=1.14", "mcp>=1.0"]
+    "all":     ["websockets>=12.0", "playwright>=1.40", "aiortc>=1.14", "mcp>=1.0", "trafilatura>=1.8", "curl_cffi>=0.7"]
   },
 
   "core_requires": [

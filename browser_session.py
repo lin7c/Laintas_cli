@@ -421,6 +421,16 @@ def egress_from_env() -> dict:
     """
     out: dict = {}
     proxy = (os.environ.get("LAINTAS_BROWSER_PROXY") or "").strip()
+    if not proxy:
+        # Fall back to the one proxy setting shared with web.search/web.fetch.
+        # Without this a page that escalates from an HTTP fetch to a browser
+        # render goes direct, and fails for exactly the users who configured a
+        # proxy because they cannot reach the site any other way.
+        try:
+            import web_search as _ws
+            proxy = str(_ws.browser_egress_overrides().get("proxy") or "").strip()
+        except Exception:
+            proxy = ""
     if proxy:
         out["proxy"] = proxy
         creds = (os.environ.get("LAINTAS_BROWSER_PROXY_CREDENTIALS") or "").strip()
@@ -903,8 +913,18 @@ class BrowserSession:
             # Point at the loopback relay when there is one: credentials in argv
             # are readable by every local user through ps. Without credentials
             # there is nothing to hide and the upstream is used directly.
-            upstream = f"127.0.0.1:{self._relay.port}" if self._relay else self.proxy
-            args.append(f"--proxy-server=http://{upstream}")
+            # The relay always speaks HTTP. A directly-used upstream keeps its
+            # own scheme: prefixing "http://" onto a "socks5://host:port" value
+            # yields a proxy URL Chrome cannot parse, and it silently falls back
+            # to a direct connection — the failure mode is a page that loads
+            # from the wrong exit IP rather than an error.
+            if self._relay is not None:
+                args.append(f"--proxy-server=http://127.0.0.1:{self._relay.port}")
+            else:
+                upstream = self.proxy
+                if "://" not in upstream:
+                    upstream = f"http://{upstream}"
+                args.append(f"--proxy-server={upstream}")
             # Chrome otherwise bypasses the proxy for loopback, which would let
             # a page reach services bound to this host.
             args.append("--proxy-bypass-list=<-loopback>")

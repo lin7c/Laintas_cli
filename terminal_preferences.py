@@ -33,7 +33,14 @@ PERSISTED_UI_KEYS = frozenset({
     "search_laintas_api_key",
     "search_laintas_api_url",
     "search_proxy",
+    "search_proxy_mode",
     "search_cookie_enabled",
+    "search_cookie_domains",
+    "search_cookie_names",
+    "identity_enabled",
+    "fetch_render",
+    "fetch_unlock",
+    "fetch_wayback",
 })
 
 

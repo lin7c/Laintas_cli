@@ -52,8 +52,13 @@ class TerminalPreferenceTests(unittest.TestCase):
         terminal_preferences.reset_cache()
 
     def test_model_provider_and_mode_survive_restart_per_terminal(self):
+        # load_config() must be stubbed too: get_selected_model() falls back to
+        # the global config.json when a terminal has no preference of its own,
+        # so without this the assertions read whatever model the developer
+        # happens to have selected on their real machine.
         with tempfile.TemporaryDirectory() as tmp, \
-                mock.patch.object(paths, "SESSIONS_DIR", Path(tmp)):
+                mock.patch.object(paths, "SESSIONS_DIR", Path(tmp)), \
+                mock.patch.object(laintas_cli, "load_config", return_value={}):
             with mock.patch.object(paths, "TERMINAL_ID", "term-a"):
                 laintas_cli.set_model_selection("model-a", "provider-a")
                 self.assertTrue(mode_manager.activate("auto")[0])

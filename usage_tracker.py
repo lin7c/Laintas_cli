@@ -42,7 +42,7 @@ def estimate_tokens(text: str) -> int:
 
 def record(*, model: str, prompt_tokens: int, completion_tokens: int,
            cost_cents: int = 0, official: bool = False, backend_kind: str = "",
-           estimated: bool = False) -> None:
+           estimated: bool = False, truncated: bool = False) -> None:
     """Append one AI-call record. Never raises."""
     try:
         rec = {
@@ -54,6 +54,12 @@ def record(*, model: str, prompt_tokens: int, completion_tokens: int,
             "official": bool(official),
             "backend": (backend_kind or "")[:24],
             "estimated": bool(estimated),
+            # Individual truncations are recovered silently now, so this tally
+            # is the only lasting trace of them. A model truncating on a large
+            # share of its calls is a configuration signal (wrong model for the
+            # workload, or a ceiling worth raising) that belongs in /usage
+            # rather than in a warning on every occurrence.
+            "truncated": bool(truncated),
             "pid": os.getpid(),
         }
         line = json.dumps(rec, ensure_ascii=False) + "\n"
@@ -100,10 +106,12 @@ def _iter_records(since_ts: float) -> Iterator[dict]:
 def _aggregate(records) -> dict:
     """Fold records into totals + a per-model breakdown."""
     models: dict[str, dict] = {}
-    totals = {"calls": 0, "in": 0, "out": 0, "costCents": 0, "estimated": False}
+    totals = {"calls": 0, "in": 0, "out": 0, "costCents": 0, "estimated": False,
+              "truncated": 0}
     for r in records:
         m = models.setdefault(r.get("model", "?"), {
             "calls": 0, "in": 0, "out": 0, "costCents": 0, "estimated": False,
+            "truncated": 0,
         })
         for bucket in (m, totals):
             bucket["calls"] += 1
@@ -111,6 +119,7 @@ def _aggregate(records) -> dict:
             bucket["out"] += int(r.get("out", 0) or 0)
             bucket["costCents"] += int(r.get("costCents", 0) or 0)
             bucket["estimated"] = bucket["estimated"] or bool(r.get("estimated"))
+            bucket["truncated"] += 1 if r.get("truncated") else 0
     return {"totals": totals, "models": models}
 
 

@@ -2762,7 +2762,7 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
             "Agent/terminal, PageUp/PageDown scrolls, and Esc exits."
         )),
     CommandSpec("/term", "List, create, or rename terminals", "Agents & Terminals", "/term [name|rename <old> <new>]", aliases=("/t",), subcommands=("rename",)),
-    CommandSpec("/helpwo", "Connect this CLI to Helpwo as a runtime environment (this folder = its workspace), or open the local/hosted app; /helpwo stop to go offline", "Agents & Terminals", "/helpwo [--port N] [--dist <path>] [--remote] | stop", subcommands=("stop",)),
+    CommandSpec("/helpwo", "Connect this CLI to Helpwo as a runtime environment (this folder = its workspace), or open the local/hosted app; /helpwo stop to go offline", "Agents & Terminals", "/helpwo [--port N] [--host ADDR] [--dist <path>] [--remote] | stop", subcommands=("stop",)),
     CommandSpec(
         "/station", "Bind an employee to a terminal and optionally start work",
         "Agents & Terminals", "/station <agent-id> [terminal] [--task <work>]",
@@ -2788,7 +2788,16 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec("/work", "Inspect or resume unified WorkGraph state", "Planning & Tasks", "/work [status|list|resume|history]", subcommands=("status", "list", "resume", "history")),
     CommandSpec("/workflow", "Run a multi-phase workflow", "Planning & Tasks", "/workflow {start|status|advance|approve|end|list}", subcommands=("start", "status", "advance", "approve", "end", "list")),
     CommandSpec("/model", "List or select a deployed terminal model override", "Config & Tools", "/model [terminal] [id|reset]", subcommands=("reset", "clear", "default")),
-    CommandSpec("/config", "View or set runtime configuration", "Config & Tools", "/config [<key> [<value>]|reset]"),
+    CommandSpec("/config", "View or set runtime configuration", "Config & Tools", "/config [<key>|<prefix> [<value>]|reset]"),
+    CommandSpec("/web", "Inspect web search and fetch: engines, proxy, cookies, diagnostics",
+                "Config & Tools",
+                "/web [status|engines [init]|test [engine]|try <query>|cookies [clear [domain]]]",
+                aliases=("/search",),
+                subcommands=("status", "engines", "test", "try", "cookies")),
+    CommandSpec("/identity", "Manage saved logins the agent may browse as",
+                "Config & Tools",
+                "/identity [list|check <name>|capture <name> [domains]|delete <name>]",
+                subcommands=("list", "check", "capture", "delete")),
     CommandSpec("/policy", "Show or set security policy", "Config & Tools", "/policy [audit|enforce|disabled [--yes]|reset]", subcommands=("audit", "enforce", "disabled", "reset")),
     CommandSpec("/trust", "Review or change workspace trust", "Config & Tools", "/trust [status|allow|revoke]", subcommands=("status", "allow", "revoke")),
     CommandSpec("/hooks", "Manage executable hooks", "Config & Tools", "/hooks [status|trust|revoke|reload]", subcommands=("status", "trust", "revoke", "reload")),
@@ -3923,8 +3932,15 @@ def _save_instance_preferences() -> None:
 
 
 def get_selected_model() -> str:
-    """Return this terminal's selected model, if any."""
+    """Return this terminal's selected model, falling back to config.json.
+
+    Per-terminal preferences take priority; ``config.json`` (the legacy global
+    store) is consulted as a fallback so a model set there before the
+    per-terminal migration — or set as a global default — is still honoured.
+    """
     val = terminal_preferences.get("model", "")
+    if not val:
+        val = load_config().get("model", "")
     return str(val).strip() if val else ""
 
 
@@ -3938,8 +3954,10 @@ def set_selected_model(model: str) -> None:
 
 
 def get_selected_provider() -> str:
-    """Return this terminal's selected provider, if any."""
+    """Return this terminal's selected provider, falling back to config.json."""
     val = terminal_preferences.get("provider", "")
+    if not val:
+        val = load_config().get("provider", "")
     return str(val).strip() if val else ""
 
 
@@ -5936,7 +5954,9 @@ def call_backend_stream(
         # chunks: each event is `{"choices":[{"delta":{"content":"..."}}]}`.
         # Accumulate deltas into one string, then parse JSON {reply,command,...}.
         accumulated = ""
+        reasoning_accumulated = ""  # reasoning models emit delta.reasoning_content
         billing_info: dict = {}
+        budget_info: dict = {}
         streamed_model: str = ""
         got_any_event = False
         finish_reason: Optional[str] = None  # last non-null choices[0].finish_reason
@@ -5970,6 +5990,12 @@ def call_backend_stream(
                     # Backend post-processing failed but content was already streamed — use it.
                     break
                 return {"reply": f"Server Error: {evt['error']}", "tool_calls": [], "done": True, "error": True}
+            if "_budget" in evt:
+                # The gateway's answer to "how many output tokens do I actually
+                # have?" — the clamped ceiling, plus the window room left after
+                # this prompt. Arrives before any content.
+                budget_info = dict(evt["_budget"] or {})
+                continue
             if "_billing" in evt:
                 billing_info = dict(evt["_billing"] or {})
                 billing_info["billingDomain"] = backend_profile.kind
@@ -5995,6 +6021,18 @@ def call_backend_stream(
                     finish_reason = _fr
             delta_content = (
                 _choices[0].get("delta", {}).get("content")
+                if isinstance(_choices, list) and _choices
+                else None
+            )
+            # Reasoning models (e.g. deepseek-v4-pro via Ark) emit their
+            # chain-of-thought through delta.reasoning_content, a SEPARATE
+            # field from delta.content.  Without consuming it, a turn whose
+            # entire token budget is spent on reasoning produces an empty
+            # accumulated string, which is then misdiagnosed as a silent
+            # failure.  Accumulate it separately so callers can distinguish
+            # "model is still thinking" from "model produced nothing".
+            delta_reasoning = (
+                _choices[0].get("delta", {}).get("reasoning_content")
                 if isinstance(_choices, list) and _choices
                 else None
             )
@@ -6031,12 +6069,17 @@ def call_backend_stream(
             if delta_content:
                 accumulated += delta_content
                 if on_chunk is not None:
-                    # Content is plain prose — stream it straight through as the
+                    # Content is plain prose - stream it straight through as the
                     # reply. Tool calls arrive natively via delta.tool_calls
                     # (handled above), never by parsing content.
                     try: on_chunk("reply", delta_content)
                     except Exception: pass
                     prev_reply_for_chunks = accumulated.strip()
+            if delta_reasoning:
+                reasoning_accumulated += delta_reasoning
+                if on_chunk is not None:
+                    try: on_chunk("thinking", delta_reasoning)
+                    except Exception: pass
 
         if not got_any_event:
             return {"reply": "No response from AI", "tool_calls": [], "done": True, "error": True}
@@ -6058,14 +6101,50 @@ def call_backend_stream(
         # Gate the fallback behind "finish_reason is not a clean end" so it can
         # never flag a completed turn as truncated.
         _completion_tokens = int((billing_info or {}).get("completionTokens", 0) or 0)
-        _max_tokens = int(get_runtime_config("max_tokens") or 0)
+        # Compare against what the gateway GRANTED, not what we asked for. The
+        # request is clamped against the provider ceiling and the remaining
+        # window, so the local config value is not the limit in force — using
+        # it made the heuristic both miss real truncations (granted < asked)
+        # and invent false ones (granted > asked). Fall back to the local
+        # value only for gateways too old to report a budget.
+        _max_tokens = int((budget_info or {}).get("granted")
+                          or get_runtime_config("max_tokens") or 0)
         _clean_stop = finish_reason in ("stop", "end_turn", "tool_calls")
+        # On some models reasoning tokens are counted OUTSIDE max_tokens (a
+        # 40,000-token request measured 106,108 completion tokens on
+        # doubao-seed-2.0-pro), so completion_tokens routinely exceeds the
+        # grant with nothing wrong. Comparing the two would then flag every
+        # reasoning-heavy turn as truncated whenever finish_reason is missing.
+        # Where the gateway says the budget does not bound the count, trust
+        # finish_reason alone.
+        _reasoning_in_budget = (budget_info or {}).get("reasoningInBudget", True)
         _hit_ceiling = (
             not _clean_stop
+            and _reasoning_in_budget
             and _max_tokens > 0
             and _completion_tokens >= _max_tokens * 0.95
         )
         _truncated_turn = finish_reason == "length" or _hit_ceiling
+
+        # Why the turn was cut off. agent_loop used to infer this from "reply is
+        # empty and reasoning is not", which mis-fires on the single most common
+        # case: a truncated tool call puts its bytes in delta.tool_calls[].
+        # arguments, never in delta.content, so `reply` is empty on a plain
+        # output overrun too — and a reasoning model always has reasoning text.
+        # The overrun was therefore reported as reasoning exhaustion and the
+        # model got told to think less instead of to write in chunks.
+        # Decide it here, where the two channels are still distinguishable.
+        #   "tool_args"  — cut off mid tool-call; the write was too big
+        #   "reasoning"  — reasoning ate the budget, nothing came out
+        #   "output"     — prose ran past the ceiling
+        _truncation_kind = ""
+        if _truncated_turn:
+            if native_tc_frags:
+                _truncation_kind = "tool_args"
+            elif not accumulated.strip() and reasoning_accumulated:
+                _truncation_kind = "reasoning"
+            else:
+                _truncation_kind = "output"
 
         # ── Local usage accounting (/usage) — every completed call lands here
         # regardless of tool/prose outcome. Backends that send no _billing
@@ -6082,6 +6161,7 @@ def call_backend_stream(
                 cost_cents=(billing_info or {}).get("costCents", 0),
                 official=bool(billing_info.get("official")),
                 backend_kind=backend_profile.kind,
+                truncated=_truncated_turn,
             )
         elif accumulated:
             usage_tracker.record(
@@ -6092,6 +6172,7 @@ def call_backend_stream(
                 official=False,
                 backend_kind=backend_profile.kind,
                 estimated=True,
+                truncated=_truncated_turn,
             )
 
         # Update the REPL status bar with the model used this call.
@@ -6118,13 +6199,35 @@ def call_backend_stream(
         # (delta.tool_calls). This is the normal end-to-end mode: the backend
         # passes the provider's native tool_calls straight through.
         if native_calls:
+            # L4: If the turn was truncated mid-tool-call, the JSON arguments
+            # are incomplete and _native_to_tool_calls falls back to args={}
+            # (or partial args).  Drop the calls so they are not silently
+            # executed with empty/invalid arguments; the truncation handler
+            # in agent_loop will nudge the model to retry.
+            if _truncated_turn:
+                return {
+                    "reply": prose_reply,
+                    "tool_calls": [],
+                    "finish_reason": finish_reason or "tool_calls",
+                    "done": False,
+                    "error": False,
+                    "_truncated": True,
+                    "_truncation_kind": _truncation_kind or "tool_args",
+                    "_reasoning": reasoning_accumulated,
+                    "_billing": billing_info,
+                    "_budget": budget_info,
+                    "_diag_events": _diag_events + ["truncated_native_tool_calls_dropped"],
+                }
             return {
                 "reply": prose_reply,
                 "tool_calls": native_calls,
                 "finish_reason": finish_reason or "tool_calls",
                 "done": False,
                 "error": False,
+                "_truncated": False,
+                "_reasoning": reasoning_accumulated,
                 "_billing": billing_info,
+                "_budget": budget_info,
                 "_diag_events": _diag_events + ["parsed_native_tool_calls"],
             }
 
@@ -6133,13 +6236,32 @@ def call_backend_stream(
         # instead of using the native channel. Convert so the loop continues.
         tagged_tool_calls = _extract_tagged_tool_calls(accumulated)
         if tagged_tool_calls:
+            # L4: Same truncation guard as Path 1 - a truncated tagged block
+            # yields incomplete tool calls.  Drop and let the loop retry.
+            if _truncated_turn:
+                return {
+                    "reply": "",
+                    "tool_calls": [],
+                    "finish_reason": finish_reason or "tool_calls",
+                    "done": False,
+                    "error": False,
+                    "_truncated": True,
+                    "_truncation_kind": _truncation_kind or "tool_args",
+                    "_reasoning": reasoning_accumulated,
+                    "_billing": billing_info,
+                    "_budget": budget_info,
+                    "_diag_events": _diag_events + ["truncated_tagged_tool_calls_dropped"],
+                }
             return {
                 "reply": "",
                 "tool_calls": tagged_tool_calls,
                 "finish_reason": finish_reason or "tool_calls",
                 "done": False,
                 "error": False,
+                "_truncated": False,
+                "_reasoning": reasoning_accumulated,
                 "_billing": billing_info,
+                "_budget": budget_info,
                 "_diag_events": _diag_events + ["parsed_tagged_tool_calls"],
             }
 
@@ -6154,7 +6276,10 @@ def call_backend_stream(
             "done": False,
             "error": False,
             "_truncated": _truncated_turn,
+            "_truncation_kind": _truncation_kind,
+            "_reasoning": reasoning_accumulated,
             "_billing": billing_info,
+            "_budget": budget_info,
             "_diag_events": _diag_events,
         }
 
@@ -10046,6 +10171,28 @@ def _show_usage_command(args: list, session: dict) -> None:
         if range_totals["estimated"]:
             body.append(Text("  ~ estimated — backend sent no token counts (chars/4)",
                              style="muted"))
+        # Truncations are recovered silently during a task, so this is where a
+        # persistent pattern becomes visible. Shown only when it is actually
+        # happening, and phrased as a rate — one truncated call in a hundred is
+        # noise, one in five means the model or the ceiling is wrong.
+        _trunc = range_totals.get("truncated", 0)
+        if _trunc:
+            _rate = _trunc * 100.0 / max(1, range_totals["calls"])
+            _worst = max(
+                ((n, m) for n, m in summary["range"]["models"].items()
+                 if m.get("truncated")),
+                key=lambda kv: kv[1]["truncated"] / max(1, kv[1]["calls"]),
+                default=None,
+            )
+            _detail = ""
+            if _worst is not None:
+                _wn, _wm = _worst
+                _detail = (f" {symbols.BULLET} worst {_wn} "
+                           f"{_wm['truncated']}/{_wm['calls']}")
+            body.append(Text(
+                f"  {_trunc} of {range_totals['calls']} calls hit the output "
+                f"limit ({_rate:.0f}%){_detail}",
+                style="warning" if _rate >= 10 else "muted"))
 
     # ── LAINTAS — backend usage, same gateway endpoints Helpwo uses ──
     footnotes: list[str] = []
@@ -14726,7 +14873,8 @@ def _cmd_helpwo(raw_args: str, parts: list, agent_registry: AgentRegistry,
 
     if helpwo_server.is_running():
         url = helpwo_server.get_url()
-        console.print(f"[dim]Helpwo gateway already running at {url}[/dim]")
+        console.print(f"[dim]Helpwo gateway already running at "
+                      f"{helpwo_server.get_url(with_token=True)}[/dim]")
         console.print(f"[dim]Open {url} in your browser, or /helpwo stop to stop.[/dim]")
         return
 
@@ -14734,6 +14882,7 @@ def _cmd_helpwo(raw_args: str, parts: list, agent_registry: AgentRegistry,
     port = helpwo_server.DEFAULT_PORT
     dist_override = None
     remote = False
+    bind_host = "127.0.0.1"
     args = parts[1:]
     i = 0
     while i < len(args):
@@ -14741,7 +14890,7 @@ def _cmd_helpwo(raw_args: str, parts: list, agent_registry: AgentRegistry,
         if arg == "--port":
             if i + 1 >= len(args):
                 console.print("[red]--port requires a value.[/red]")
-                console.print("[dim]Usage: /helpwo [--port N] [--dist <path>] [--remote] | stop[/dim]")
+                console.print(r"[dim]Usage: /helpwo \[--port N] \[--host ADDR] \[--dist <path>] \[--remote] | stop[/dim]")
                 return
             try:
                 port = int(args[i + 1])
@@ -14755,16 +14904,22 @@ def _cmd_helpwo(raw_args: str, parts: list, agent_registry: AgentRegistry,
         elif arg == "--dist":
             if i + 1 >= len(args):
                 console.print("[red]--dist requires a path.[/red]")
-                console.print("[dim]Usage: /helpwo [--port N] [--dist <path>] [--remote] | stop[/dim]")
+                console.print(r"[dim]Usage: /helpwo \[--port N] \[--host ADDR] \[--dist <path>] \[--remote] | stop[/dim]")
                 return
             dist_override = args[i + 1]
+            i += 2
+        elif arg == "--host":
+            if i + 1 >= len(args):
+                console.print("[red]--host requires an address.[/red]")
+                return
+            bind_host = args[i + 1]
             i += 2
         elif arg == "--remote":
             remote = True
             i += 1
         elif arg.startswith("--"):
             console.print(f"[red]Unknown option: {arg}[/red]")
-            console.print("[dim]Usage: /helpwo [--port N] [--dist <path>] [--remote] | stop[/dim]")
+            console.print(r"[dim]Usage: /helpwo \[--port N] \[--host ADDR] \[--dist <path>] \[--remote] | stop[/dim]")
             return
         else:
             console.print(f"[yellow]Ignoring unrecognized argument: {arg}[/yellow]")
@@ -14824,15 +14979,42 @@ def _cmd_helpwo(raw_args: str, parts: list, agent_registry: AgentRegistry,
             pass
         return
 
-    ok, msg = helpwo_server.start_server(agent_registry, dist_dir=dist_path, port=port, session=session)
+    ok, msg = helpwo_server.start_server(agent_registry, dist_dir=dist_path, port=port,
+                                         session=session, host=bind_host)
     if not ok:
         console.print(f"[red]{msg}[/red]")
         return
 
-    url = helpwo_server.get_url()
+    # The token rides in the URL on the first visit only; after that the
+    # browser's cookie carries it. Same shape as Jupyter.
+    url = helpwo_server.get_url(with_token=True)
     console.print(f"[green bold]Helpwo gateway started[/green bold]")
     console.print(f"  URL: [cyan]{url}[/cyan]")
     console.print(f"  Dist: [dim]{helpwo_server._dist_dir()}[/dim]")
+
+    if helpwo_server.bind_host() not in ("127.0.0.1", "localhost", "::1"):
+        # Not a refusal — whether this machine should be reachable is the
+        # operator's call. But browsers only grant File System Access,
+        # clipboard, microphone and Service Workers on a secure context, and
+        # a plain-HTTP non-loopback address is not one.
+        console.print(
+            f"  [yellow]Bound to {helpwo_server.bind_host()} — reachable beyond this "
+            f"machine.[/yellow]")
+        console.print(
+            "  [yellow]Over plain HTTP the browser will withhold File System Access, "
+            "clipboard, microphone and Service Workers.[/yellow]")
+        console.print(
+            f"  [dim]To keep every feature without exposing a port, leave the default "
+            f"bind and forward instead:[/dim]")
+        console.print(
+            f"  [dim]  ssh -N -L {port}:127.0.0.1:{port} <user>@<this-host>[/dim]")
+    else:
+        console.print(
+            f"  [dim]Remote machine? From your own computer:[/dim]")
+        console.print(
+            f"  [dim]  ssh -N -L {port}:127.0.0.1:{port} <user>@<this-host>[/dim]")
+        console.print(
+            f"  [dim]then open the URL above — loopback keeps every browser feature.[/dim]")
 
     console.print("  Runtime: [dim]local loopback (offline-capable)[/dim]")
     if agent_registry and agent_registry.agent_id:
@@ -15000,35 +15182,54 @@ def _cmd_undo(action: str, raw_args: str, parts: list) -> bool:
     return False
 
 
+def _config_table(described: dict, title: str) -> Table:
+    table = Table(title=title, show_lines=False)
+    table.add_column("Key", style="cyan")
+    table.add_column("Value")
+    table.add_column("Type", style="dim")
+    table.add_column("Source", style="dim")
+    table.add_column("Description", style="dim")
+    for key, meta in sorted(described.items()):
+        table.add_row(
+            key, repr(meta["value"]), meta["type"],
+            "override" if meta["overridden"] else "default",
+            meta["description"],
+        )
+    return table
+
+
 def _cmd_config(parts: list) -> None:
     # Built-in config command (doesn't require .laintas/commands.py)
     if len(parts) == 1:
-        table = Table(title="Runtime Configuration", show_lines=False)
-        table.add_column("Key", style="cyan")
-        table.add_column("Value")
-        table.add_column("Type", style="dim")
-        table.add_column("Source", style="dim")
-        table.add_column("Description", style="dim")
-        for key, meta in sorted(describe_runtime_config().items()):
-            table.add_row(
-                key, repr(meta["value"]), meta["type"],
-                "override" if meta["overridden"] else "default",
-                meta["description"],
-            )
-        console.print(table)
+        console.print(_config_table(describe_runtime_config(), "Runtime Configuration"))
         console.print("[dim]Set with /config <key> <value>; restore with /config reset.[/dim]")
+        console.print("[dim]Narrow the list with a prefix, e.g. /config search[/dim]")
     elif len(parts) == 2 and parts[1].lower() == "reset":
         reset_runtime_config()
         terminal_preferences.clear_ui_preferences()
         _apply_ui_theme("dark")
         console.print("[green]Runtime config reset to defaults.[/green]")
     elif len(parts) == 2:
-        # /config <key> — show one
+        # /config <key> — show one; /config <prefix> — show the group.
+        # 76 keys in one alphabetical table buries any subsystem's handful of
+        # them in three separate places, so an unmatched word is treated as a
+        # prefix before it is treated as a mistake.
         key = parts[1]
-        meta = describe_runtime_config().get(key)
+        described = describe_runtime_config()
+        meta = described.get(key)
         if meta is None:
-            console.print(f"[red]Unknown config key: {key}[/red]")
-            console.print("[dim]Run /config to list valid keys.[/dim]")
+            fragment = key.casefold()
+            matches = {k: v for k, v in described.items()
+                       if k.casefold().startswith(fragment)}
+            if matches:
+                console.print(_config_table(
+                    matches, f"Runtime Configuration {symbols.BULLET} {key}*"))
+                console.print(
+                    f"[dim]{len(matches)} of {len(described)} keys. "
+                    f"Set with /config <key> <value>.[/dim]")
+            else:
+                console.print(f"[red]Unknown config key: {key}[/red]")
+                console.print("[dim]Run /config to list valid keys.[/dim]")
         else:
             console.print(Panel(
                 f"Value: [bold]{meta['value']!r}[/bold]\n"
@@ -15059,6 +15260,377 @@ def _cmd_config(parts: list) -> None:
     else:
         console.print("[yellow]Usage: /config [key [value]] | /config reset[/yellow]")
 
+
+
+def _web_modules():
+    """(web_search, error). Both /web and /identity need it and it is optional."""
+    try:
+        import web_search
+        return web_search, ""
+    except ImportError as e:
+        return None, f"web_search module unavailable: {e}"
+
+
+def _web_status() -> None:
+    """One screen answering 'why did that search or fetch behave like that'."""
+    ws, err = _web_modules()
+    if ws is None:
+        console.print(f"[red]{err}[/red]")
+        return
+
+    chain, warnings = ws.resolve_chain(None)
+    health = {h["engine"]: h for h in ws.engine_health()}
+
+    table = Table(title="Search engines", show_lines=False)
+    table.add_column("#", style="dim", width=3)
+    table.add_column("Engine", style="cyan")
+    table.add_column("Cost", style="dim")
+    table.add_column("Usable")
+    table.add_column("Notes", style="dim")
+    for index, name in enumerate(chain, 1):
+        meta = health.get(name, {})
+        usable = meta.get("usable")
+        table.add_row(
+            str(index), name, meta.get("cost", ""),
+            f"[green]yes[/green]" if usable else "[yellow]no[/yellow]",
+            meta.get("reason") or meta.get("describe", ""))
+    # Registered but not in the active chain — otherwise a user who set
+    # search_engine by hand cannot see what they excluded.
+    for name in sorted(set(health) - set(chain)):
+        meta = health[name]
+        table.add_row("-", f"[dim]{name}[/dim]", meta.get("cost", ""),
+                      "[dim]not in chain[/dim]", meta.get("describe", ""))
+    console.print(table)
+    for warning in warnings:
+        console.print(f"[yellow]{warning}[/yellow]")
+
+    proxy = ws._get_proxy() or ""
+    mode = ws._proxy_mode()
+    learned = sorted(ws._PROXY_HOSTS)
+    render_reason = ws._render_unavailable_reason()
+
+    lines = [
+        f"Proxy        : {proxy or '(none)'}  mode={mode}",
+    ]
+    if mode == "auto" and proxy:
+        lines.append(
+            f"  routed via proxy: {', '.join(learned) if learned else '(no host has needed it yet)'}")
+    # The browser deliberately takes its proxy only from the environment, so a
+    # mismatch here is invisible everywhere else and shows up as a render that
+    # silently goes direct.
+    browser_proxy = (os.environ.get("LAINTAS_BROWSER_PROXY") or "").strip()
+    if browser_proxy:
+        lines.append(f"  browser override (env): {browser_proxy}")
+    elif proxy and mode != "off":
+        lines.append("  browser: shares the setting above")
+    if (os.environ.get("LAINTAS_BROWSER_USER_AGENT") or "").strip():
+        lines.append("  browser UA pinned by env")
+
+    lines.append(
+        f"Render tier  : {'[green]available[/green]' if not render_reason else '[yellow]' + render_reason + '[/yellow]'}"
+        f"  (fetch_render={ws._render_mode()})")
+    lines.append(
+        f"Fallbacks    : unlock={'on' if ws._unlock_enabled() else 'off'}  "
+        f"wayback={'on' if ws._wayback_enabled() else 'off'}")
+
+    try:
+        import cookie_store
+        if cookie_store.enabled():
+            stats = cookie_store.stats()
+            note = ""
+            if stats["total"] != stats["usable"]:
+                # Clearance is bound to the exit that earned it, so a changed
+                # proxy makes cookies unusable without deleting them.
+                note = (f"  [yellow]{stats['total'] - stats['usable']} not valid "
+                        f"for this exit[/yellow]")
+            lines.append(
+                f"Cookie jar   : {stats['usable']}/{stats['total']} usable across "
+                f"{stats['domains']} domain(s){note}  [dim](/web cookies)[/dim]")
+        else:
+            lines.append("Cookie jar   : off  [dim](/config search_cookie_enabled true)[/dim]")
+    except ImportError:
+        pass
+
+    try:
+        import identity_store
+        count = len(identity_store.names())
+        state = "on" if identity_store.enabled() else "off"
+        lines.append(f"Saved logins : {count} stored, use is {state}"
+                     f"  [dim](/identity)[/dim]")
+    except ImportError:
+        pass
+
+    console.print(Panel("\n".join(lines), title="Web", border_style="cyan"))
+
+
+def _web_engines(parts: list) -> None:
+    ws, err = _web_modules()
+    if ws is None:
+        console.print(f"[red]{err}[/red]")
+        return
+    if len(parts) >= 3 and parts[2].lower() == "init":
+        written, path = ws.write_engine_template()
+        if written:
+            console.print(f"[green]Wrote a starter engine file to {path}[/green]")
+            console.print("[dim]Edit it, then /web engines to see the result.[/dim]")
+        else:
+            console.print(f"[yellow]{path} already exists — edit it in place.[/yellow]")
+        return
+
+    entries, errors = ws.load_engine_registry()
+    health = {h["engine"]: h for h in ws.engine_health()}
+    table = Table(title="Engine registry", show_lines=False)
+    table.add_column("Engine", style="cyan")
+    table.add_column("Kind", style="dim")
+    table.add_column("Cost", style="dim")
+    table.add_column("Usable")
+    table.add_column("Description", style="dim")
+    for name in sorted(entries):
+        meta = health.get(name, {})
+        table.add_row(
+            name, entries[name].get("kind", ""), entries[name].get("cost", ""),
+            "[green]yes[/green]" if meta.get("usable") else "[yellow]no[/yellow]",
+            meta.get("reason") or entries[name].get("describe", ""))
+    console.print(table)
+    for message in errors:
+        console.print(f"[red]{message}[/red]")
+    console.print("[dim]Add your own JSON engines with /web engines init.[/dim]")
+
+
+def _web_test(parts: list) -> None:
+    """Run a known query through engines and report what came back.
+
+    Scraped engines fail in a way that is not an error: a result list that is
+    the right length with every snippet empty, or a 200 carrying an empty
+    result frame. Only actually running one and counting shows that.
+    """
+    ws, err = _web_modules()
+    if ws is None:
+        console.print(f"[red]{err}[/red]")
+        return
+    entries, _errors = ws.load_engine_registry()
+    requested = parts[2].lower() if len(parts) >= 3 else ""
+    if requested:
+        name = ws.canonical_engine(requested)
+        if name not in entries:
+            console.print(f"[red]Unknown engine: {requested}[/red]")
+            console.print(f"[dim]Known: {', '.join(sorted(entries))}[/dim]")
+            return
+        names = [name]
+    else:
+        names, _warnings = ws.resolve_chain(None)
+
+    # Plain words, no operators. A probe using site: or a bang reports a
+    # healthy engine as broken whenever that engine simply does not support
+    # the operator — cn.bing returns nothing at all for site: queries — and
+    # the point here is to test the engine, not its query syntax.
+    probe = "python urllib parse documentation"
+    console.print(f"[dim]Query: {probe!r}  "
+                  f"(use /web try <query> to test your own)[/dim]")
+    table = Table(show_lines=False)
+    table.add_column("Engine", style="cyan")
+    table.add_column("Result", width=10)
+    table.add_column("Hits", justify="right", width=5)
+    table.add_column("Snippets", justify="right", width=9)
+    table.add_column("Time", justify="right", width=7)
+    table.add_column("Detail", style="dim")
+
+    for name in names:
+        started = time.time()
+        out = ws.search(probe, max_results=5, engines=[name])
+        elapsed = f"{time.time() - started:.1f}s"
+        if out.get("ok"):
+            results = out.get("result") or []
+            with_snippet = sum(1 for r in results if r.get("snippet"))
+            # Full count with no snippets is the half-broken parser case.
+            if results and with_snippet == 0:
+                verdict = "[yellow]degraded[/yellow]"
+                detail = "results have no snippets — the parser is likely stale"
+            else:
+                verdict = "[green]ok[/green]"
+                detail = ""
+            table.add_row(name, verdict, str(len(results)),
+                          f"{with_snippet}/{len(results)}", elapsed, detail)
+        else:
+            reasons = "; ".join(
+                e.get("message", e.get("error", "")) for e in (out.get("errors") or []))
+            table.add_row(name, "[red]fail[/red]", "0", "-", elapsed, reasons[:70])
+    console.print(table)
+
+
+def _web_try(parts: list) -> None:
+    ws, err = _web_modules()
+    if ws is None:
+        console.print(f"[red]{err}[/red]")
+        return
+    query = " ".join(parts[2:]).strip()
+    if not query:
+        console.print("[yellow]Usage: /web try <query>[/yellow]")
+        return
+    started = time.time()
+    out = ws.search(query, max_results=5)
+    elapsed = time.time() - started
+    if not out.get("ok"):
+        console.print(f"[red]{out.get('error')}[/red]")
+        return
+    console.print(
+        f"[green]{out.get('engine')}[/green] answered in {elapsed:.1f}s "
+        f"[dim](cost: {out.get('cost', 'free')})[/dim]")
+    for skipped in (out.get("errors") or []):
+        console.print(f"  [dim]{skipped.get('engine')}: {skipped.get('message', '')[:80]}[/dim]")
+    for item in out.get("result") or []:
+        console.print(f"\n[cyan]{item.get('title', '')[:90]}[/cyan]")
+        console.print(f"  [dim]{item.get('url', '')[:100]}[/dim]")
+        if item.get("snippet"):
+            console.print(f"  {item['snippet'][:160]}")
+
+
+def _web_cookies(parts: list) -> None:
+    try:
+        import cookie_store
+    except ImportError:
+        console.print("[red]cookie_store module unavailable[/red]")
+        return
+    action = parts[2].lower() if len(parts) >= 3 else "list"
+    if action == "clear":
+        domain = parts[3] if len(parts) >= 4 else ""
+        removed = cookie_store.clear(domain)
+        target = domain or "all domains"
+        console.print(f"[green]Cleared {removed} cookie(s) for {target}.[/green]")
+        ws, _err = _web_modules()
+        if ws is not None and not domain:
+            ws.clear_cookie_jar(persistent=False)
+        return
+    if action not in ("list", ""):
+        console.print(r"[yellow]Usage: /web cookies \[clear \[domain]][/yellow]")
+        return
+    if not cookie_store.enabled():
+        console.print("[yellow]The cookie jar is off "
+                      "(/config search_cookie_enabled true).[/yellow]")
+        return
+    summary = cookie_store.summary()
+    if not summary:
+        console.print("[dim]No cookies stored.[/dim]")
+        console.print("[dim]Only anti-bot clearance is kept automatically; a "
+                      "sign-in must be saved with /identity capture.[/dim]")
+        return
+    stats = cookie_store.stats()
+    table = Table(title="Stored clearance cookies", show_lines=False)
+    table.add_column("Domain", style="cyan")
+    table.add_column("Cookies", justify="right")
+    for domain, count in summary:
+        table.add_row(domain, str(count))
+    console.print(table)
+    console.print(f"[dim]Current exit: {stats['egress']} "
+                  f"{symbols.BULLET} {stats['usable']} of {stats['total']} usable "
+                  f"here.[/dim]")
+    console.print(r"[dim]Values are never displayed. Clear with "
+                  r"/web cookies clear \[domain].[/dim]")
+
+
+def _cmd_web(parts: list) -> None:
+    sub = parts[1].lower() if len(parts) > 1 else ""
+    if sub in ("", "status"):
+        _web_status()
+    elif sub == "engines":
+        _web_engines(parts)
+    elif sub == "test":
+        _web_test(parts)
+    elif sub == "try":
+        _web_try(parts)
+    elif sub == "cookies":
+        _web_cookies(parts)
+    else:
+        console.print(r"[yellow]Usage: /web \[status|engines \[init]|test \[engine]"
+                      r"|try <query>|cookies \[clear \[domain]]][/yellow]")
+
+
+def _cmd_identity(parts: list) -> None:
+    """Manage saved logins. Never prints a cookie or token value."""
+    try:
+        import identity_store
+    except ImportError:
+        console.print("[red]identity_store module unavailable[/red]")
+        return
+    ws, _err = _web_modules()
+    sub = parts[1].lower() if len(parts) > 1 else ""
+
+    if sub in ("", "list"):
+        records = identity_store.describe_all()
+        if not records:
+            console.print("[dim]No saved logins.[/dim]")
+            console.print("[dim]Sign in through the live-view browser, then "
+                          "/identity capture <name>.[/dim]")
+            return
+        table = Table(title="Saved logins", show_lines=False)
+        table.add_column("Name", style="cyan")
+        table.add_column("Domains", style="dim")
+        table.add_column("Cookies", justify="right")
+        table.add_column("Storage", justify="right")
+        table.add_column("Exit")
+        table.add_column("Last check", style="dim")
+        for record in records:
+            probe = record.get("last_probe") or {}
+            if probe:
+                checked = ("[green]signed in[/green]" if probe.get("ok")
+                           else "[red]signed out[/red]")
+            else:
+                checked = "never checked"
+            table.add_row(
+                record["name"], ", ".join(record["domains"])[:40],
+                str(record["cookies"]), str(record["origins"]),
+                "[green]ok[/green]" if record["egress_matches_now"]
+                else "[yellow]changed[/yellow]",
+                checked)
+        console.print(table)
+        if not identity_store.enabled():
+            console.print("[yellow]Use is disabled — /config identity_enabled true[/yellow]")
+        console.print("[dim]Values are never displayed.[/dim]")
+
+    elif sub == "check":
+        name = parts[2] if len(parts) >= 3 else ""
+        if not name or ws is None:
+            console.print("[yellow]Usage: /identity check <name>[/yellow]")
+            return
+        out = ws.probe_identity(name)
+        if not out.get("ok"):
+            console.print(f"[red]{out.get('error')}[/red]")
+        elif out.get("signed_in"):
+            console.print(f"[green]{name}: still signed in[/green]")
+        else:
+            console.print(f"[yellow]{name}: signed out — {out.get('detail', '')}[/yellow]")
+            console.print("[dim]Sign in again in the live view, then "
+                          f"/identity capture {name}[/dim]")
+
+    elif sub == "capture":
+        name = parts[2] if len(parts) >= 3 else ""
+        if not name or ws is None:
+            console.print(r"[yellow]Usage: /identity capture <name> \[domain,domain][/yellow]")
+            return
+        domains = [d.strip() for d in (parts[3] if len(parts) >= 4 else "").split(",")
+                   if d.strip()] or None
+        out = ws.capture_identity(name, domains=domains)
+        if not out.get("ok"):
+            console.print(f"[red]{out.get('error')}[/red]")
+            return
+        record = out["identity"]
+        console.print(f"[green]Saved '{record['name']}'[/green]")
+        console.print(f"  domains : {', '.join(record['domains']) or '(none)'}")
+        console.print(f"  cookies : {record['cookies']}, storage origins {record['origins']}")
+        console.print(f"  exit    : {record['egress'] or '(not recorded)'}")
+
+    elif sub == "delete":
+        name = parts[2] if len(parts) >= 3 else ""
+        if not name:
+            console.print("[yellow]Usage: /identity delete <name>[/yellow]")
+        elif identity_store.delete(name):
+            console.print(f"[green]Deleted saved login '{name}'.[/green]")
+        else:
+            console.print(f"[red]No saved login named '{name}'.[/red]")
+
+    else:
+        console.print(r"[yellow]Usage: /identity \[list|check <name>"
+                      r"|capture <name> \[domains]|delete <name>][/yellow]")
 
 
 def _cmd_max() -> None:
@@ -16019,6 +16591,12 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
 
     elif action == "/config":
         _cmd_config(parts)
+
+    elif action in ("/web", "/search"):
+        _cmd_web(parts)
+
+    elif action == "/identity":
+        _cmd_identity(parts)
 
     elif action == "/max":
         _cmd_max()

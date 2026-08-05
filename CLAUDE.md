@@ -42,7 +42,24 @@ The project has grown from two core modules to ten, organized in layers:
 - **`tools.py`** (~1400 lines) — `ToolRegistry` singleton: structured `Tool` dataclass (name, JSONSchema params, invoke callable) + `ToolCtx`. Built-in tools registered at import time. All modules share one registry.
 - **`skills.py`** (~200 lines) — Loads user-installed skill directories from `~/.laintas/skills/`. Each skill is a `skill.py` that exposes `get_tools() -> list[Tool]`. Tags tools with `source="skill:<name>"`.
 - **`mcp_client.py`** (~370 lines) — Bridges async `mcp` SDK to the sync Tool registry. Runs a dedicated asyncio thread, one child subprocess per configured MCP server, registers tools as `source="mcp:<server>"`. Config lives in `~/.laintas/mcp.json`.
-- **`web_search.py`** (~770 lines) - Search engine chain (Google -> DuckDuckGo -> laintas_search) with proxy support (HTTP/SOCKS5 via PySocks), shared cookie jar, fast-fail cooldown, and structured error types. Backs the `web.search` and `web.fetch` tools. Config: `search_engine`, `search_proxy`, `search_laintas_api_key`, `search_cookie_enabled`.
+- **`web_search.py`** (~1900 lines) - Backs `web.search` and `web.fetch`.
+  - **Search**: engine chain (Google -> DuckDuckGo -> laintas_search), fast-fail cooldown, structured error types, `region`/`timelimit` filters.
+  - **Fetch**: escalates instead of failing — plain HTTP → curl_cffi TLS fingerprint → rendered browser → hand the challenge to the user in the live view → Wayback snapshot. Each result names its rung in `transport`; failures list every rung tried. Every URL and **every redirect hop** is SSRF-checked (`_guard_url`) — this runs on the user's machine, so an unguarded fetch reaches their LAN and cloud metadata.
+  - The render tier owns its browser on one dedicated thread (`_RenderWorker`) because Playwright's sync API is thread-affine; `browser.*` tools skip sessions marked `_owned_by_web_fetch`.
+  - Proxy config is shared with the headless browser via `browser_egress_overrides()` (`egress_from_env` falls back to it), with per-host "auto" routing.
+  - **Engines are a registry, not a chain of branches.** Built-ins: `google`, `duckduckgo`, `cn-bing` (works from inside China), `laintas_search` (user's key), `laintas_gateway` (signed-in account via `/api/agent/search`, no key needed, bills balance). Default order is by **cost, not quality** — the metered tiers are last and are usually the best results. Users add JSON APIs (serper, extra keys) in `~/.laintas/search_engines.json`; `web.search(engines=[...])` lets the model pick, and failures report per-engine health. Scraped-HTML engines are deliberately **not** user-definable.
+- **`cookie_store.py`** (~330 lines) - Anti-bot **clearance** store in `~/.laintas/cookies.json` (chmod 600), shared by search, fetch and the browser; what makes a manually solved CAPTCHA keep working. Three rules:
+  1. **Clearance only.** `cf_clearance`, `__cf_bm`, `GOOGLE_ABUSE_EXEMPTION`, DataDome, Imperva… (extend with `search_cookie_names`). A session cookie the browser picked up while the user was signing in is a *credential*, not clearance — it is reported and dropped, never made ambient. Promote it deliberately with `/identity capture`.
+  2. **Bound to its exit.** Clearance names the address it was issued to (Google's exemption literally contains `IP=<addr>`), so every record is stamped with `web_search.current_egress()` and filtered on load. `load(all_egress=True)` for listing/clearing — and `merge()` uses it, since `save()` rewrites the whole file and a filtered merge would silently delete another exit's cookies.
+  3. **Flows both ways.** `_seed_browser_cookies()` injects the store into each new render session via `context.add_cookies`; without it the browser closes after 5 idle minutes and the next one faces a wall this machine had already cleared.
+- **`identity_store.py`** (~300 lines) - Named signed-in sessions in `~/.laintas/identities/<name>.json` (0700 dir, 0600 files), the basis for automation that runs *as the user*. Four rules it exists to enforce:
+  1. Stores Playwright `storage_state` (cookies **and** localStorage) — cookie-only export logs you out of sites that keep the session in localStorage.
+  2. Pins the **egress**: a session replayed from a different exit is refused (Google's abuse exemption literally embeds the IP it was issued for).
+  3. Credentials are **never ambient** — `web.fetch` attaches an identity only when the caller names one *and* the URL is inside that identity's own domains. This is the prompt-injection boundary.
+  4. Values are **never returned to the model**; `identity.list` / `describe()` expose names, domains and freshness only.
+
+  Created by `remote_browser/rb.py save <name>` after a human signs in through the temporary live-view route; `identity.check` / `web_search.probe_identity()` verify a session is still alive before a task depends on it. Manual sign-in pays off for **login walls** (sessions last weeks); it does not for anti-bot walls (exemptions are short-lived and IP-bound — measured dead within 3 days).
+  - Optional deps (`pip install .[web]`): `trafilatura` for article extraction — without it the fallback keeps nav bars and footers in what the model reads — and `curl_cffi` for the fingerprint rung.
 
 **Cross-cutting subsystems:**
 - **`policy.py`** (~370 lines) — Security policy engine: evaluates every command as allow/needs_approval/deny via regex rules. Config in `~/.laintas/policy.json` (mtime-cached, zero-restart updates). Audit log in `~/.laintas/audit.log`. Three modes: audit, enforce, disabled.
@@ -50,6 +67,25 @@ The project has grown from two core modules to ten, organized in layers:
 - **`hooks.py`** (~270 lines) — Event-driven hook system: pre_command, post_command, pre_tool, post_tool, on_session_start/end, on_error, on_memory_change. Config in `~/.laintas/hooks.json`; Python hooks in `~/.laintas/hooks.py` (mtime-cached).
 - **`plan_mode.py`** (~260 lines) — Structured planning: `/plan enter` → AI explores & designs → writes plan to `~/.laintas/plans/<name>.md` → `/plan approve` → execution.
 - **`task_manager.py`** (~180 lines) — Persistent task tracking in `~/.laintas/tasks.json` with status workflow (pending→in_progress→completed) and dependency links.
+
+### Config vs. subsystem commands
+
+`/config` holds **scalars** (76 keys, flat). Anything with *state* — a file, a
+registry, credentials — gets its own slash command, as `/policy`, `/trust`,
+`/hooks`, `/backend` and `/skill` already do. The web stack follows that split:
+
+| Surface | Command |
+|---|---|
+| 14 scalar knobs (`search_*`, `fetch_*`, `browser_*`) | `/config search`, `/config fetch`, … — an unmatched word is treated as a **prefix filter** before it is treated as a mistake |
+| Engine registry, proxy routing, cookie jar, diagnostics | `/web` (alias `/search`) — `status`, `engines [init]`, `test [engine]`, `try <query>`, `cookies [clear [domain]]` |
+| Saved logins | `/identity` — `list`, `check`, `capture`, `delete`. Never prints a cookie or token value |
+
+`/web test` is not a nicety: scraped engines fail *without erroring* — a full
+result list with every snippet empty (the DDG bug), or a 200 carrying an empty
+result frame (cn.bing without fetch-metadata headers). Only running one and
+counting snippet coverage reveals it, so the command reports `degraded`
+separately from `ok` and `fail`. Its probe query is deliberately operator-free:
+`site:` makes cn.bing look broken when it is merely unsupported.
 
 ### Input Routing (REPL classifies every line)
 
@@ -91,18 +127,24 @@ All tunable parameters are accessible via `get_runtime_config()`/`set_runtime_co
 | Key | Default | Description |
 |---|---|---|
 | `max_loops` | 30 | Max AI loop iterations per task |
-| `max_tokens` | 10000 | Max output tokens per AI response (gateway hard-caps at 10000) |
+| `max_tokens` | 0 | Output-token cap to REQUEST. 0 = take the model's full budget (the gateway grants `min(provider ceiling, context window - prompt)`). A positive value only lowers that, never raises it |
 | `max_debug_entries` | 50 | Debug ring buffer size |
 | `loop_delay` | 0.2 | Seconds between loop iterations |
 | `output_truncate` | 3000 | Char limit for `lastOutput` tail |
 | `terminal_tail_lines` | 20 | Lines shown in sub-terminal snapshot |
 | `heartbeat_interval` | 30 | Seconds between agent heartbeats |
 | `staleness_limit` | 3 | Consecutive no-command steps before auto-exit |
-| `search_engine` | `auto` | Search engine: `auto` (Google->DDG->laintas_search), `google`, `duckduckgo`, `laintas_search` |
+| `search_engine` | `auto` | Engine chain: `auto`, or an ordered list (`"cn-bing duckduckgo"`). Validated against the live registry, not a fixed enum |
 | `search_laintas_api_key` | _(none)_ | API key for `search.laintas.com` (required for laintas_search engine) |
 | `search_laintas_api_url` | `https://search.laintas.com` | Base URL for laintas_search API |
-| `search_proxy` | _(none)_ | Proxy URL for web.search/web.fetch (`socks5://`, `http://`); env `LAINTAS_HTTP_PROXY` |
-| `search_cookie_enabled` | `false` | Enable shared cookie jar for web.search/web.fetch |
+| `search_proxy` | _(none)_ | Proxy URL shared by web.search, web.fetch **and the headless browser** (`socks5://`, `http://`); env `LAINTAS_HTTP_PROXY` |
+| `search_proxy_mode` | `auto` | `off` / `auto` (direct first, proxy only for hosts that proved unreachable) / `always` |
+| `search_cookie_enabled` | `false` | Persist challenge cookies across search, fetch and the browser (`~/.laintas/cookies.json`) |
+| `identity_enabled` | `false` | Allow `web.fetch` to browse as a saved login. **Separate switch on purpose** — remembering a CAPTCHA is not the same decision as letting fetches act as your signed-in account |
+| `search_cookie_domains` | _(all)_ | Allowlist of domains whose cookies may be stored |
+| `fetch_render` | `auto` | When web.fetch may render in the browser: `off` / `auto` (blocked or client-rendered) / `always` |
+| `fetch_unlock` | `true` | Leave the browser open on a surviving challenge so the user can solve it in the live view |
+| `fetch_wayback` | `true` | Fall back to a Wayback Machine snapshot when the live page can't be read |
 
 ### Backend API
 

@@ -740,11 +740,15 @@ class SlashRegistryTests(unittest.TestCase):
         self.assertIn("Model selection cancelled", output.getvalue())
 
     def test_explicit_model_clears_stale_provider(self):
+        # get_selected_provider() falls back to the global config.json, so it
+        # has to be stubbed as well — otherwise "no provider" is asserted
+        # against whatever the developer's own config happens to hold.
         with tempfile.TemporaryDirectory() as tmp, \
                 mock.patch.object(
                     laintas_cli.paths, "SESSIONS_DIR", Path(tmp)), \
                 mock.patch.object(
-                    laintas_cli.paths, "TERMINAL_ID", "model-direct"):
+                    laintas_cli.paths, "TERMINAL_ID", "model-direct"), \
+                mock.patch.object(laintas_cli, "load_config", return_value={}):
             agent_loop.close_all_terminals()
             agent_loop.close_all_agents()
             terminal_session = mock.Mock()
@@ -2076,3 +2080,77 @@ class _chdir:
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WebAndIdentityCommandTests(unittest.TestCase):
+    """The /web and /identity surface. These commands exist to make the search
+    stack's state visible, so the assertions are about what they reveal — and,
+    for saved logins, about what they must never reveal."""
+
+    def _render(self, fn, *args):
+        """Run a command and return what it printed."""
+        from rich.console import Console
+        buffer = io.StringIO()
+        original = laintas_cli.console
+        self.addCleanup(setattr, laintas_cli, "console", original)
+        laintas_cli.console = Console(file=buffer, force_terminal=False, width=200)
+        fn(*args)
+        laintas_cli.console = original
+        return buffer.getvalue()
+
+    def test_commands_are_registered_with_their_alias(self):
+        names = [name for spec in laintas_cli.COMMAND_SPECS for name in spec.all_names]
+        self.assertIn("/web", names)
+        self.assertIn("/search", names)      # alias people reach for first
+        self.assertIn("/identity", names)
+
+    def test_config_prefix_lists_the_group_instead_of_erroring(self):
+        output = self._render(laintas_cli._cmd_config, ["/config", "search"])
+        self.assertIn("search_engine", output)
+        self.assertIn("search_proxy", output)
+        self.assertNotIn("Unknown config key", output)
+
+    def test_config_still_reports_a_genuinely_unknown_key(self):
+        output = self._render(laintas_cli._cmd_config, ["/config", "zzz_not_a_key"])
+        self.assertIn("Unknown config key", output)
+
+    def test_config_exact_key_wins_over_prefix_match(self):
+        # search_engine is also a prefix of nothing else, but the exact key
+        # must render the single-key panel, not a filtered table.
+        output = self._render(laintas_cli._cmd_config, ["/config", "search_engine"])
+        self.assertIn("Default:", output)
+
+    def test_identity_listing_never_prints_secrets(self):
+        import identity_store
+        directory = Path(tempfile.mkdtemp()) / "identities"
+        self.addCleanup(setattr, identity_store, "IDENTITY_DIR",
+                        identity_store.IDENTITY_DIR)
+        identity_store.IDENTITY_DIR = directory
+        self.addCleanup(setattr, identity_store, "_get_config",
+                        identity_store._get_config)
+        identity_store._get_config = lambda key, default=None: (
+            True if key == "identity_enabled" else default)
+        identity_store.save("acct", {
+            "cookies": [{"name": "sid", "value": "SUPER-SECRET-VALUE",
+                         "domain": "example.com", "path": "/"}],
+            "origins": [{"origin": "https://example.com",
+                         "localStorage": [{"name": "t", "value": "LS-SECRET"}]}],
+        }, domains=["example.com"])
+
+        output = self._render(laintas_cli._cmd_identity, ["/identity"])
+        self.assertIn("acct", output)
+        self.assertIn("example.com", output)
+        self.assertNotIn("SUPER-SECRET-VALUE", output)
+        self.assertNotIn("LS-SECRET", output)
+
+    def test_usage_strings_survive_rich_markup(self):
+        # Square brackets are Rich markup; unescaped, "[clear [domain]]" is
+        # silently eaten and the user is shown a usage line missing its
+        # optional arguments.
+        for command, args in ((laintas_cli._cmd_web, ["/web", "nope"]),
+                              (laintas_cli._cmd_web, ["/web", "cookies", "bogus"]),
+                              (laintas_cli._cmd_identity, ["/identity", "nope"])):
+            with self.subTest(args=args):
+                output = self._render(command, args)
+                self.assertIn("[", output)
+                self.assertIn("]", output)
