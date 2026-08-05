@@ -5375,6 +5375,23 @@ def _bi_browser_expect(params: dict, ctx: ToolCtx) -> dict:
     sess, err = _browser_resolve_session(params)
     if sess is None:
         return {"ok": False, "error": err}
+
+    # An assertion that cannot fail is worse than no assertion. Every condition
+    # here is optional and a bare selector legitimately means "this exists", so
+    # a misspelled condition key used to be dropped and the call silently
+    # degraded to the existence check — expect(selector="h1", contains="nope")
+    # returned PASS on a page with no such text. This tool backs test_flow and
+    # the *.test.json suites, so that turns a typo into a permanently green
+    # test. Unknown keys are now refused rather than ignored.
+    _known = {"session", "selector", "ref", "text", "state", "count",
+              "url_contains", "title_contains"}
+    _unknown = sorted(k for k in params if k not in _known)
+    if _unknown:
+        return {"ok": False,
+                "error": (f"unknown expect parameter(s): {', '.join(_unknown)}. "
+                          f"Valid conditions: text, state, count, url_contains, "
+                          f"title_contains (with selector or ref).")}
+
     try:
         page = sess.get_page()
         url_c = params.get("url_contains")
