@@ -9046,7 +9046,7 @@ def handle_version_command(parts: list) -> None:
     force = any(p in ("--force", "-f") for p in parts[2:])
 
     if sub not in ("", "update", "check"):
-        console.print("[yellow]Usage: /v  |  /v check  |  /v update [--force][/yellow]")
+        console.print("[yellow]Usage: /v  |  /v check  |  /v update \\[--force][/yellow]")
         return
 
     console.print(f"[bold]laintas-cli[/bold] [cyan]v{updater.LOCAL_VERSION}[/cyan] "
@@ -10434,7 +10434,7 @@ def _cmd_model(parts: list, raw_args: str, session: dict) -> None:
 
     if args and args[0].lower() in ("reset", "clear", "default"):
         if len(args) != 1:
-            console.print("[yellow]Usage: /model [terminal] reset[/yellow]")
+            console.print("[yellow]Usage: /model \\[terminal] reset[/yellow]")
             return
         _apply("")
         console.print(
@@ -10442,7 +10442,7 @@ def _cmd_model(parts: list, raw_args: str, session: dict) -> None:
             "Gateway auto-routing will be used (model shown as 'auto-routing').[/green]")
     elif args:
         if len(args) != 1:
-            console.print("[yellow]Usage: /model [terminal] <model-id>[/yellow]")
+            console.print("[yellow]Usage: /model \\[terminal] <model-id>[/yellow]")
             return
         model = args[0]
         _apply(model)
@@ -10520,8 +10520,8 @@ def _cmd_model(parts: list, raw_args: str, session: dict) -> None:
                         "[dim]Non-interactive terminal: select explicitly with "
                         "/model <model-id>.[/dim]")
             console.print(
-                "Set with [bold]/model [terminal] <model-id>[/bold], reset with "
-                "[bold]/model [terminal] reset[/bold]. This never changes the "
+                "Set with [bold]/model \\[terminal] <model-id>[/bold], reset with "
+                "[bold]/model \\[terminal] reset[/bold]. This never changes the "
                 "employee base model.")
 
 
@@ -10756,7 +10756,7 @@ def _cmd_memory(parts: list) -> None:
                     f"Persistent memory: {selector}",
                 )
     else:
-        console.print("[yellow]Usage: /memory [global|local|persistent|project|show <id|name>][/yellow]")
+        console.print("[yellow]Usage: /memory \\[global|local|persistent|project|show <id|name>][/yellow]")
 
 
 # Last `/mail inbox` listing, so `/mail read <n>` can resolve a position to
@@ -10783,7 +10783,7 @@ def _cmd_mail(parts: list, raw_args: str, session: dict) -> None:
     sub = parts[1].lower() if len(parts) > 1 else ""
 
     if sub in ("", "help"):
-        console.print("Usage: [bold]/mail[/bold] [inbox [--all]|read <n>|send [subject]]")
+        console.print("Usage: [bold]/mail[/bold] [inbox \\[--all]|read <n>|send \\[subject]]")
         console.print("[dim]inbox: list mail sent to your account's AI agent address. "
                       "send: email yourself (needs your approval to actually send).[/dim]")
 
@@ -10870,7 +10870,7 @@ def _cmd_mail(parts: list, raw_args: str, session: dict) -> None:
             console.print(f"[red]Send failed: {error}[/red]")
 
     else:
-        console.print("[yellow]Usage: /mail [inbox [--all]|read <n>|send [subject]][/yellow]")
+        console.print("[yellow]Usage: /mail [inbox \\[--all]|read <n>|send \\[subject]][/yellow]")
 
 
 def _cmd_prop() -> None:
@@ -11108,9 +11108,9 @@ def _cmd_mode(raw_args: str, parts: list) -> bool:
     elif sub == "create":
         if len(parts) < 4:
             console.print(
-                "[yellow]Usage: /mode create <name> [--tools \"fs.*,web.search\"] "
-                "[--deny \"shell.*\"] [--read-only] "
-                "[--auto-approve none|writes|commands|all] <instructions>[/yellow]")
+                "[yellow]Usage: /mode create <name> \\[--tools \"fs.*,web.search\"] "
+                "\\[--deny \"shell.*\"] \\[--read-only] "
+                "\\[--auto-approve none|writes|commands|all] <instructions>[/yellow]")
         else:
             name = parts[2]
             _cargs = parts[3:]
@@ -11221,7 +11221,7 @@ def _cmd_mode(raw_args: str, parts: list) -> bool:
             options,
             title="Select Agent Mode",
             label=lambda item: (
-                f"{'{symbols.DOT}' if item['name'] == active_name else f'{symbols.DOT_OPEN}'} "
+                f"{f'{symbols.DOT}' if item['name'] == active_name else f'{symbols.DOT_OPEN}'} "
                 f"{item['name']}"),
             description=lambda item: item.get("description", ""),
             selected_index=selected_index,
@@ -11318,7 +11318,7 @@ def _cmd_trust(parts: list) -> None:
             "[green]Workspace trust revoked.[/green]" if removed
             else "[dim]Workspace was not explicitly trusted.[/dim]")
     else:
-        console.print("[yellow]Usage: /trust [status|allow|revoke][/yellow]")
+        console.print("[yellow]Usage: /trust \\[status|allow|revoke][/yellow]")
 
 
 def _cmd_backend(parts: list) -> None:
@@ -11351,7 +11351,7 @@ def _cmd_backend(parts: list) -> None:
                 profiles,
                 title="Select Backend",
                 label=lambda item: (
-                    f"{'{symbols.DOT}' if item.name == active_name else f'{symbols.DOT_OPEN}'} {item.name}"),
+                    f"{f'{symbols.DOT}' if item.name == active_name else f'{symbols.DOT_OPEN}'} {item.name}"),
                 description=lambda item: (
                     f"{item.kind} {symbols.BULLET} {item.base_url} {symbols.BULLET} {item.billing_label}"),
                 selected_index=selected_index,
@@ -11369,7 +11369,7 @@ def _cmd_backend(parts: list) -> None:
     elif sub == "config":
         console.print(str(backend_profiles.ensure_template()))
     else:
-        console.print("[yellow]Usage: /backend [status|list|use <name>|config][/yellow]")
+        console.print("[yellow]Usage: /backend \\[status|list|use <name>|config][/yellow]")
 
 
 def _cmd_hooks(parts: list) -> None:
@@ -11442,7 +11442,7 @@ def _cmd_hooks(parts: list) -> None:
         info = hooks_mod.reload()
         console.print(json.dumps(info, ensure_ascii=False, indent=2))
     else:
-        console.print("[yellow]Usage: /hooks [status|trust|revoke|reload][/yellow]")
+        console.print("[yellow]Usage: /hooks \\[status|trust|revoke|reload][/yellow]")
 
 
 def _cmd_policy(parts: list) -> bool:
@@ -11463,7 +11463,7 @@ def _cmd_policy(parts: list) -> bool:
             choices,
             title="Select Security Policy",
             label=lambda item: (
-                f"{'{symbols.DOT}' if item['name'] == current_mode else f'{symbols.DOT_OPEN}'} "
+                f"{f'{symbols.DOT}' if item['name'] == current_mode else f'{symbols.DOT_OPEN}'} "
                 f"{item['name']}"),
             description=lambda item: item["description"],
             selected_index=selected_index,
@@ -11783,7 +11783,7 @@ def _cmd_evolve(raw_args: str, parts: list, session: dict) -> None:
                 f"[dim]{len(profile.get('extensions') or {})} extension(s)[/dim]")
     elif sub == "profile":
         if len(parts) < 4 or parts[2].lower() != "create":
-            console.print("[yellow]Usage: /evolve profile create <name> [candidate-id ...][/yellow]")
+            console.print("[yellow]Usage: /evolve profile create <name> \\[candidate-id ...][/yellow]")
         else:
             ok, message = evolution_lab.create_profile(parts[3], parts[4:])
             console.print(f"[{'green' if ok else 'red'}]{message}[/{'green' if ok else 'red'}]")
@@ -11819,7 +11819,7 @@ def _cmd_evolve(raw_args: str, parts: list, session: dict) -> None:
         console.print(
             "[bold]Evolution Lab[/bold]\n"
             "  /evolve <idea>\n  /evolve status|branches|candidates\n"
-            "  /evolve chat <refinement>\n  /evolve review|test|activate [id]\n"
+            "  /evolve chat <refinement>\n  /evolve review|test|activate \\[id]\n"
             "  /evolve disable <extension>\n"
             "  /evolve profiles|profile create|use|rollback")
 
@@ -12029,7 +12029,7 @@ def _cmd_prompt(raw_args: str, parts: list, session: dict) -> None:
                 f"[dim]{len(profile.get('patches') or [])} patch(es)[/dim]")
     elif sub == "profile":
         if len(parts) < 4 or parts[2].lower() != "create":
-            console.print("[yellow]Usage: /prompt profile create <name> [patch-id ...][/yellow]")
+            console.print("[yellow]Usage: /prompt profile create <name> \\[patch-id ...][/yellow]")
         else:
             ok, msg = prompt_lab.create_profile(parts[3], parts[4:])
             console.print(f"[{'green' if ok else 'red'}]{_escape(msg)}[/{'green' if ok else 'red'}]")
@@ -12078,12 +12078,12 @@ def _cmd_prompt(raw_args: str, parts: list, session: dict) -> None:
     elif sub == "help":
         console.print(
             "[bold]Prompt Lab[/bold]\n"
-            "  /prompt [issue]                  Capture an incident and start diagnosis\n"
+            "  /prompt \\[issue]                  Capture an incident and start diagnosis\n"
             "  /prompt chat <message>           Refine with AI in the active branch\n"
             "  /prompt status|branches|patches  Inspect project state\n"
-            "  /prompt review [patch-id]        Review diagnosis, overlay, and tests\n"
-            "  /prompt test [patch-id]          Run an isolated AI regression evaluation\n"
-            "  /prompt activate [id] [--force]  Confirm, activate, and hot-reload\n"
+            "  /prompt review \\[patch-id]        Review diagnosis, overlay, and tests\n"
+            "  /prompt test \\[patch-id]          Run an isolated AI regression evaluation\n"
+            "  /prompt activate \\[id] \\[--force]  Confirm, activate, and hot-reload\n"
             "  /prompt disable <id>             Confirm and disable an overlay\n"
             "  /prompt profiles|use <name>      Manage switchable prompt profiles\n"
             "  /prompt rollback                 Confirm and undo latest prompt change")
@@ -12492,7 +12492,7 @@ def _cmd_work(parts: list) -> None:
                     f"  [dim]{event['id']}[/dim] {event['event_type']} "
                     f"[dim]{json.dumps(event['payload'], ensure_ascii=False)[:120]}[/dim]")
     else:
-        console.print("[yellow]Usage: /work [status|list|resume <id>|history][/yellow]")
+        console.print("[yellow]Usage: /work \\[status|list|resume <id>|history][/yellow]")
 
 
 
@@ -13060,7 +13060,7 @@ def _cmd_workflow(raw_args: str, parts: list) -> None:
                 wf_desc = ""
         if not wf_name or not wf_desc:
             console.print("[dim]Workflow creation cancelled. You can also use "
-                          "/workflow start [--replace] <name> \"<description>\".[/dim]")
+                          "/workflow start \\[--replace] <name> \"<description>\".[/dim]")
         else:
             existing = _we.get_active_workflow()
             wf = _we.start_workflow(wf_name, wf_desc, replace=replace)
@@ -13297,7 +13297,7 @@ def _cmd_detail(parts: list) -> None:
                 f"[green]Detail mode {_sub}. "
                 f"{'Compact mode folds read/search/list output.' if not enabled else 'Command output and file diffs are expanded.'}[/green]")
         else:
-            console.print("[red]Usage: /detail [on|off][/red]")
+            console.print("[red]Usage: /detail \\[on|off][/red]")
 
 
 def _cmd_stream(parts: list) -> None:
@@ -13310,7 +13310,7 @@ def _cmd_stream(parts: list) -> None:
         return
     mode = parts[1].strip().lower()
     if len(parts) != 2 or mode not in {"off", "one", "detail"}:
-        console.print("[error]Usage: /stream [off|one|detail][/error]")
+        console.print("[error]Usage: /stream \\[off|one|detail][/error]")
         return
     set_runtime_config("stream_preview", mode)
     terminal_preferences.set_ui_preference("stream_preview", mode)
@@ -13330,7 +13330,7 @@ def _cmd_theme(parts: list) -> None:
         return
     name = parts[1].strip().lower()
     if len(parts) != 2 or name not in {"dark", "light", "mono"}:
-        console.print("[error]Usage: /theme [dark|light|mono][/error]")
+        console.print("[error]Usage: /theme \\[dark|light|mono][/error]")
         return
     set_runtime_config("theme", name)
     terminal_preferences.set_ui_preference("theme", name)
@@ -13392,13 +13392,13 @@ def _cmd_station(parts: list, agent_registry: AgentRegistry, session: dict) -> b
         station_args = station_args[:task_marker]
         if not task:
             console.print(
-                "[yellow]Usage: /station <agent-id> [terminal] "
+                "[yellow]Usage: /station <agent-id> \\[terminal] "
                 "--task <work>[/yellow]")
             return False
     if not station_args or len(station_args) > 2:
         console.print(
-            "[yellow]Usage: /station <agent-id> [terminal] "
-            "[--task <work>][/yellow]")
+            "[yellow]Usage: /station <agent-id> \\[terminal] "
+            "\\[--task <work>][/yellow]")
         return False
 
     agent_id_arg = station_args[0]
@@ -13617,7 +13617,7 @@ def _cmd_send(raw_args: str) -> bool:
     if send_raw.startswith("--wait"):
         match = re.match(r"--wait(?:\s+([^\s]+))?\s+(.*)$", send_raw, re.DOTALL)
         if match is None:
-            console.print("[yellow]Usage: /send <name> [--wait <seconds>] <command>[/yellow]")
+            console.print("[yellow]Usage: /send <name> \\[--wait <seconds>] <command>[/yellow]")
             return False
         try:
             wait_seconds = max(0.0, min(float(match.group(1) or "0.8"), 30.0))
@@ -13996,7 +13996,7 @@ def _cmd_agents_plain(parts: list) -> None:
             _employee_capability_text(agent),
             title=f"Employee: {agent.name}", border_style="cyan"))
     else:
-        console.print("[yellow]Usage: /agents [tree|agent-id|--plain][/yellow]")
+        console.print("[yellow]Usage: /agents \\[tree|agent-id|--plain][/yellow]")
 
 
 def _submit_primary_runtime_task(agent, text: str, deps, session: dict,
@@ -14195,7 +14195,7 @@ def _cmd_agents(parts: list, session: dict, agent_registry=None,
     plain = "--plain" in args or not sys.stdin.isatty()
     args = [item for item in args if item != "--plain"]
     if len(args) > 1:
-        console.print("[yellow]Usage: /agents [tree|agent-id|--plain][/yellow]")
+        console.print("[yellow]Usage: /agents \\[tree|agent-id|--plain][/yellow]")
         return
     # `tree` is an output command, not an initial selection for Agents Mode.
     # Keep it deterministic in both interactive and non-interactive shells.
@@ -14293,7 +14293,7 @@ def _cmd_focus(parts: list) -> None:
 
 def _cmd_spawn(raw_args: str, session: dict, agent_registry: AgentRegistry) -> None:
     if not raw_args:
-        console.print("[yellow]Usage: /spawn [name:] <task...>[/yellow]")
+        console.print("[yellow]Usage: /spawn \\[name:] <task...>[/yellow]")
     else:
         # Parse optional "name:" prefix
         rest = raw_args
@@ -14684,7 +14684,7 @@ def _cmd_skill(parts: list) -> bool:
     elif sub == "dir":
         console.print(str(skills_mod.SKILLS_DIR))
     else:
-        console.print("[yellow]Usage: /skill [manager|list|trust <name>|revoke <name>|load <name>|unload <name>|unload all|reload|new <name>|dir][/yellow]")
+        console.print("[yellow]Usage: /skill \\[manager|list|trust <name>|revoke <name>|load <name>|unload <name>|unload all|reload|new <name>|dir][/yellow]")
 
     return False
 
@@ -15120,7 +15120,7 @@ def _cmd_term(parts: list, agent_registry: AgentRegistry, interactive_session) -
                 return False
             console.print(f"[green]Created sub-terminal [bold]{name}[/bold] (no agent stationed)[/green]")
     elif len(parts) > 2:
-        console.print("[yellow]Usage: /term [name|rename <old> <new>][/yellow]")
+        console.print("[yellow]Usage: /term \\[name|rename <old> <new>][/yellow]")
     else:
         # /t or /term (no args) — list terminals browser
         terminals = get_all_terminals()
@@ -15289,7 +15289,7 @@ def _cmd_config(parts: list) -> None:
             console.print(f"[red]{e}[/red]")
             console.print(f"[dim]Run /config {key} to inspect the expected type.[/dim]")
     else:
-        console.print("[yellow]Usage: /config [key [value]] | /config reset[/yellow]")
+        console.print("[yellow]Usage: /config [key \\[value]] | /config reset[/yellow]")
 
 
 
@@ -15678,7 +15678,7 @@ def _cmd_max() -> None:
 def _cmd_compact(parts: list, session: dict) -> bool:
     compact_arg = parts[1].lower() if len(parts) > 1 else ""
     if len(parts) > 2 or compact_arg not in ("", "status", "--force"):
-        console.print("[yellow]Usage: /compact [status|--force][/yellow]")
+        console.print("[yellow]Usage: /compact \\[status|--force][/yellow]")
         return False
 
     compact_state = getattr(handle_meta_command, '_last_agent_state', None)
@@ -16211,7 +16211,7 @@ def _cmd_told(parts: list) -> bool:
         if scoped_agent_id:
             console.print(
                 "[yellow]The durable prompt journal is project-wide; use "
-                "/told log [N] without an Agent.[/yellow]")
+                "/told log \\[N] without an Agent.[/yellow]")
             return False
         n = _parse_n(args[1] if len(args) > 1 else "", 10)
         _log_path = paths.project_dir() / "events.jsonl"
@@ -16257,8 +16257,8 @@ def _cmd_told(parts: list) -> bool:
         except ValueError:
             console.print(f"[red]Unknown subcommand: {escape(sub)}[/red]")
             console.print(
-                "[yellow]Usage: /told [agent-id [reply [N]|all]|N|all|"
-                "reply [N]|log [N]][/yellow]")
+                "[yellow]Usage: /told [agent-id [reply \\[N]|all]|N|all|"
+                "reply \\[N]|log \\[N]][/yellow]")
             return False
         if n <= 0:
             console.print("[yellow]N must be a positive integer.[/yellow]")
@@ -16454,7 +16454,7 @@ def _cmd_version(action: str, parts: list) -> None:
         elif len(parts) == 2 and parts[1].lower() == "check":
             handle_version_command(["/v", "check"])
         else:
-            console.print("[yellow]Usage: /update [--force]  |  /update check[/yellow]")
+            console.print("[yellow]Usage: /update \\[--force]  |  /update check[/yellow]")
     else:
         handle_version_command(parts)
 
@@ -18072,7 +18072,7 @@ def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
             cleaned, overridden = auto_pilot.should_override(user_input)
             if overridden:
                 effective_input = cleaned
-                console.print("[dim][auto-pilot] overridden by ! prefix - single agent mode[/dim]")
+                console.print("[dim]\\[auto-pilot] overridden by ! prefix - single agent mode[/dim]")
             else:
                 has_wf = False
                 try:
@@ -18997,7 +18997,7 @@ def main():
                 _echo_limit = int(_resume_arg)
             elif _resume_arg and _resume_arg not in ("-s", "--show"):
                 console.print(f"[red]Invalid /resume argument: {_resume_arg}[/red]")
-                console.print("[dim]Usage: /resume [N|all|latest]  "
+                console.print("[dim]Usage: /resume \\[N|all|latest]  "
                               "(N = messages to echo, default 20, 0 = silent)[/dim]")
                 if injected_done is not None:
                     injected_done.set()

@@ -2650,7 +2650,7 @@ def _bi_spawn_parallel(params: dict, ctx: ToolCtx) -> dict:
                 partial += 1
         succeeded += int(ok)
         lines.append(
-            f"\n─── [{'{symbols.OK}' if ok else f'{symbols.FAIL}'}] {cid} ───\n"
+            f"\n─── [{f'{symbols.OK}' if ok else f'{symbols.FAIL}'}] {cid} ───\n"
             f"Goal: {task['task'][:80]}\nResult: {message[:400]}"
         )
     _summary = f"\n═══ Summary: {succeeded}/{len(child_ids)} succeeded"

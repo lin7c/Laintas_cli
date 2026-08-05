@@ -509,6 +509,13 @@ def _live_status_model() -> str:
     """Best-effort read of the current model name for the thinking spinner."""
     try:
         import laintas_cli
+        # Same order the status bar uses. Reading only the cache made the two
+        # disagree: the bar showed the real model while the spinner, finding
+        # the cache empty, fell back to a placeholder. The cache is filled from
+        # a completed response, so it is empty for the whole first turn.
+        selected = laintas_cli.get_selected_model()
+        if selected:
+            return selected
         return laintas_cli._status_cache.get("model", "") or ""
     except Exception:
         return ""
@@ -6608,7 +6615,11 @@ def run_agent_loop(
             # via on_chunk. Falls back to spinner if backend doesn't accept on_chunk.
             stream_state = {"reply": "", "command": "", "started": False}
             # Capture model/mode labels once for the spinner text
-            _spin_model = _live_status_model() or "auto"
+            # Not "auto": that is a real routing mode, so an unknown model
+            # shown as "auto" reads as "the router is on" rather than "we could
+            # not tell" — which is how a missing value got mistaken for a
+            # misconfiguration and chased through the routing code instead.
+            _spin_model = _live_status_model() or "\u2014"
             _spin_mode = _active_mode_label()
             try:
                 from rich.live import Live
