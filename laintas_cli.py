@@ -5705,7 +5705,8 @@ def _repair_json_candidate(candidate: str) -> str:
     return repaired
 
 
-def _native_to_tool_calls(frags: dict, name_map: Optional[dict] = None) -> list:
+def _native_to_tool_calls(frags: dict, name_map: Optional[dict] = None,
+                          damaged: Optional[list] = None) -> list:
     """Reassemble OpenAI-native streamed tool_calls into laintas tool_calls.
 
     Some providers emit tool calls through the function-calling channel
@@ -5717,6 +5718,13 @@ def _native_to_tool_calls(frags: dict, name_map: Optional[dict] = None) -> list:
 
     `name_map` un-mangles provider-safe names (e.g. `fs_write` → `fs.write`)
     back to canonical tool names — see ToolRegistry.to_openai_tools.
+
+    `damaged`, when given a list, collects the names of calls whose arguments
+    would not parse. That is direct evidence the turn was cut off mid-call —
+    far better evidence than finish_reason, which providers set to "tool_calls"
+    even when the arguments stop mid-string. Without it the caller cannot tell
+    a truncated call from a genuine one and runs it with args={}, which is how
+    fs.write ends up executing with no `path` over and over.
     """
     name_map = name_map or {}
     out = []
@@ -5743,6 +5751,8 @@ def _native_to_tool_calls(frags: dict, name_map: Optional[dict] = None) -> list:
                     args = json.loads(_repair_json_candidate(args_raw))
                 except json.JSONDecodeError:
                     args = {}
+                    if damaged is not None:
+                        damaged.append(name)
         if not isinstance(args, dict):
             args = {"value": args}
         out.append({"name": name, "arguments": args})
@@ -6085,7 +6095,9 @@ def call_backend_stream(
             return {"reply": "No response from AI", "tool_calls": [], "done": True, "error": True}
 
         # Native function-calls emitted out-of-band (delta.tool_calls), if any.
-        native_calls = _native_to_tool_calls(native_tc_frags, tool_name_map)
+        _damaged_calls: list = []
+        native_calls = _native_to_tool_calls(native_tc_frags, tool_name_map,
+                                             damaged=_damaged_calls)
 
         # Output-truncation signal: the model ran right up against the token
         # ceiling. When a big single-response write (e.g. a whole-file fs.write)
@@ -6124,7 +6136,16 @@ def call_backend_stream(
             and _max_tokens > 0
             and _completion_tokens >= _max_tokens * 0.95
         )
-        _truncated_turn = finish_reason == "length" or _hit_ceiling
+        # Unparseable tool-call arguments settle it regardless of what the
+        # provider said. Measured against the live gateway: a turn cut off in
+        # the middle of an fs.write reported finish_reason "tool_calls", not
+        # "length", with 1790 bytes of arguments ending in an unterminated
+        # string — so both the provider signal and the completion-token
+        # heuristic (which only applies when the finish is NOT clean) missed it,
+        # and the call ran with args={}. Of 56 calls in one session that all
+        # stopped exactly at the 512-token ceiling, only 2 were being flagged.
+        _truncated_turn = (finish_reason == "length" or _hit_ceiling
+                           or bool(_damaged_calls))
 
         # Why the turn was cut off. agent_loop used to infer this from "reply is
         # empty and reasoning is not", which mis-fires on the single most common
