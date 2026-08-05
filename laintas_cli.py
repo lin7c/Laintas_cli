@@ -9155,7 +9155,9 @@ _SLASH_ARG_RULES: dict[tuple[str, ...], SlashArgRule] = {
         )
     },
     ("/help",): _arg_rule(1, "/help [command]"),
-    ("/helpwo",): _arg_rule(4, "/helpwo [--port N] [--dist <path>]"),
+    # --port/--host/--dist/--tls-cert/--tls-key are all key+value pairs, so the
+    # ceiling has to cover them together, not just the two it was written for.
+    ("/helpwo",): _arg_rule(10, "/helpwo [--port N] [--host ADDR] [--tls-cert F --tls-key F] [--dist <path>]"),
     ("/helpwo", "stop"): _arg_rule(1, "/helpwo stop"),
     ("/terminate",): _arg_rule(1, "/terminate <name>"),
     ("/abort",): _arg_rule(1, "/abort <agent-id>"),
@@ -14904,6 +14906,8 @@ def _cmd_helpwo(raw_args: str, parts: list, agent_registry: AgentRegistry,
     dist_override = None
     remote = False
     bind_host = "127.0.0.1"
+    tls_cert = None
+    tls_key = None
     args = parts[1:]
     i = 0
     while i < len(args):
@@ -14911,7 +14915,7 @@ def _cmd_helpwo(raw_args: str, parts: list, agent_registry: AgentRegistry,
         if arg == "--port":
             if i + 1 >= len(args):
                 console.print("[red]--port requires a value.[/red]")
-                console.print(r"[dim]Usage: /helpwo \[--port N] \[--host ADDR] \[--dist <path>] \[--remote] | stop[/dim]")
+                console.print(r"[dim]Usage: /helpwo \[--port N] \[--host ADDR] \[--tls-cert F --tls-key F] \[--dist <path>] \[--remote] | stop[/dim]")
                 return
             try:
                 port = int(args[i + 1])
@@ -14925,7 +14929,7 @@ def _cmd_helpwo(raw_args: str, parts: list, agent_registry: AgentRegistry,
         elif arg == "--dist":
             if i + 1 >= len(args):
                 console.print("[red]--dist requires a path.[/red]")
-                console.print(r"[dim]Usage: /helpwo \[--port N] \[--host ADDR] \[--dist <path>] \[--remote] | stop[/dim]")
+                console.print(r"[dim]Usage: /helpwo \[--port N] \[--host ADDR] \[--tls-cert F --tls-key F] \[--dist <path>] \[--remote] | stop[/dim]")
                 return
             dist_override = args[i + 1]
             i += 2
@@ -14935,12 +14939,24 @@ def _cmd_helpwo(raw_args: str, parts: list, agent_registry: AgentRegistry,
                 return
             bind_host = args[i + 1]
             i += 2
+        elif arg == "--tls-cert":
+            if i + 1 >= len(args):
+                console.print("[red]--tls-cert requires a path.[/red]")
+                return
+            tls_cert = args[i + 1]
+            i += 2
+        elif arg == "--tls-key":
+            if i + 1 >= len(args):
+                console.print("[red]--tls-key requires a path.[/red]")
+                return
+            tls_key = args[i + 1]
+            i += 2
         elif arg == "--remote":
             remote = True
             i += 1
         elif arg.startswith("--"):
             console.print(f"[red]Unknown option: {arg}[/red]")
-            console.print(r"[dim]Usage: /helpwo \[--port N] \[--host ADDR] \[--dist <path>] \[--remote] | stop[/dim]")
+            console.print(r"[dim]Usage: /helpwo \[--port N] \[--host ADDR] \[--tls-cert F --tls-key F] \[--dist <path>] \[--remote] | stop[/dim]")
             return
         else:
             console.print(f"[yellow]Ignoring unrecognized argument: {arg}[/yellow]")
@@ -15001,7 +15017,8 @@ def _cmd_helpwo(raw_args: str, parts: list, agent_registry: AgentRegistry,
         return
 
     ok, msg = helpwo_server.start_server(agent_registry, dist_dir=dist_path, port=port,
-                                         session=session, host=bind_host)
+                                         session=session, host=bind_host,
+                                         tls_cert=tls_cert, tls_key=tls_key)
     if not ok:
         console.print(f"[red]{msg}[/red]")
         return
@@ -15013,7 +15030,9 @@ def _cmd_helpwo(raw_args: str, parts: list, agent_registry: AgentRegistry,
     console.print(f"  URL: [cyan]{url}[/cyan]")
     console.print(f"  Dist: [dim]{helpwo_server._dist_dir()}[/dim]")
 
-    if helpwo_server.bind_host() not in ("127.0.0.1", "localhost", "::1"):
+    # The warning belongs to insecure ORIGINS, not to non-loopback binds: with
+    # --tls-cert this is a proper HTTPS origin and nothing is withheld.
+    if not helpwo_server.is_secure_context():
         # Not a refusal — whether this machine should be reachable is the
         # operator's call. But browsers only grant File System Access,
         # clipboard, microphone and Service Workers on a secure context, and
@@ -15021,14 +15040,22 @@ def _cmd_helpwo(raw_args: str, parts: list, agent_registry: AgentRegistry,
         console.print(
             f"  [yellow]Bound to {helpwo_server.bind_host()} — reachable beyond this "
             f"machine.[/yellow]")
+        # Naming only the optional-feeling APIs understated this. The secure
+        # context rule also hides crypto.randomUUID and crypto.subtle, and the
+        # terminal, the agent loop and the browser runtime each mint an id on
+        # their startup path — so they do not lose features, they fail with
+        # "crypto.randomUUID is not a function".
         console.print(
-            "  [yellow]Over plain HTTP the browser will withhold File System Access, "
-            "clipboard, microphone and Service Workers.[/yellow]")
+            "  [yellow]Plain HTTP to a non-loopback address is not a secure context, so the "
+            "browser hides Web Crypto, File System Access, clipboard and Service "
+            "Workers — the terminal, the AI and the browser runtime will FAIL, not "
+            "merely degrade.[/yellow]")
         console.print(
-            f"  [dim]To keep every feature without exposing a port, leave the default "
-            f"bind and forward instead:[/dim]")
+            f"  [bold]Serve HTTPS instead — that is what makes this a real network "
+            f"service:[/bold]")
         console.print(
-            f"  [dim]  ssh -N -L {port}:127.0.0.1:{port} <user>@<this-host>[/dim]")
+            f"  [bold]  /helpwo --port {port} --host <addr> --tls-cert <fullchain.pem> "
+            f"--tls-key <privkey.pem>[/bold]")
     else:
         console.print(
             f"  [dim]Remote machine? From your own computer:[/dim]")
