@@ -4,9 +4,9 @@
 
 Laintas CLI is an autonomous AI agent for the terminal. Users type natural-language tasks at a prompt; the AI agent loop calls a backend API (Laintas/Helpwo), receives a reply with a shell command, executes that command in a pseudo-terminal, feeds the output back to the AI, and iterates until the task is done. System commands typed directly are executed via PTY passthrough with no AI involvement.
 
-**Version:** 0.1.1
+**Version:** 1.10.1
 **Python:** >= 3.10
-**Files:** 12 Python modules (~11,500 lines total) — see CLAUDE.md for the full module table
+**Files:** 62 Python modules (~40,000+ lines total) — see CLAUDE.md for the full module table
 
 ---
 

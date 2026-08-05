@@ -608,7 +608,7 @@ class SlashRegistryTests(unittest.TestCase):
                     mode_manager.get_active_mode()["name"], "study")
                 text = output.getvalue()
                 self.assertIn("Switched to STUDY mode", text)
-                self.assertIn("You write the code", text)
+                self.assertIn("The agent listens and saves", text)
                 self.assertIn("/mode act", text)
                 self.assertFalse(laintas_cli.handle_meta_command(
                     "/mode act", _Registry(), {}))
@@ -1579,16 +1579,17 @@ class PlanAndWorkflowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, _chdir(tmp):
             self.assertTrue(mode_manager.activate("study")[0])
             self.assertEqual(mode_manager.get_active_mode()["name"], "study")
-            # Reads and lookups stay available so the mentor can check work.
+            # Reads, lookups, and memory tools stay available so the agent
+            # can capture and manage persistent memories.
             for allowed in ("fs.read", "fs.grep", "fs.diff", "web.search",
-                            "task.create", "mem.save", "task.complete"):
+                            "task.create", "mem.save", "mem.delete",
+                            "task.complete"):
                 self.assertTrue(mode_manager.is_tool_allowed(allowed), allowed)
-            # Everything that could do the user's work for them is blocked,
+            # Everything that could modify the user's code is blocked,
             # including delegating it to a sub-agent.
             for blocked in ("fs.write", "fs.edit", "fs.multi_edit", "fs.delete",
                             "shell.exec", "agent.spawn", "agent.hire",
-                            "terminal.exec", "browser.navigate", "skill.load",
-                            "mem.delete"):
+                            "terminal.exec", "browser.navigate", "skill.load"):
                 self.assertFalse(mode_manager.is_tool_allowed(blocked), blocked)
             self.assertTrue(mode_manager.is_read_only_mode())
             self.assertEqual(mode_manager.get_auto_approve(), "none")
@@ -1603,10 +1604,10 @@ class PlanAndWorkflowTests(unittest.TestCase):
             section = mode_manager.render_prompt_section()
 
         self.assertIn("[AGENT MODE: STUDY]", section)
-        self.assertIn("hands-on programming mentor", section)
+        self.assertIn("memory-capture assistant", section)
         self.assertIn("overrides any earlier guidance", section)
-        self.assertIn("ONE step at a time", section)
-        self.assertIn("never take 'I did it' at face value", section)
+        self.assertIn("MEMORY-CAPTURE LOOP", section)
+        self.assertIn("mem.save and mem.delete are your only write paths", section)
         self.assertIn("`/mode act`", section)
         self.assertIn("Tools are restricted to:", section)
 
