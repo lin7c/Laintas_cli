@@ -11,6 +11,8 @@
     "skills",
     "mcp_client",
     "policy",
+    "command_parse",
+    "enterprise_installer",
     "memory_system",
     "hooks",
     "plan_mode",

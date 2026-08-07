@@ -2718,11 +2718,12 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec("/back", "Detach from a sub-terminal", "Account & Session"),
     CommandSpec(
         "/version", "Show version or update", "Account & Session",
-        "/version [check|update [--force]]", aliases=("/v", "/update"),
-        subcommands=("check", "update"),
+        "/version [check|update [--force]|enterprise [cli|gateway]]", aliases=("/v", "/update"),
+        subcommands=("check", "update", "enterprise"),
         completion_descriptions=(
             ("check", "Check whether a newer version is available"),
             ("update", "Download, install, and restart on the latest version"),
+            ("enterprise", "Install the private Enterprise CLI or gateway bundle"),
         )),
     CommandSpec("/name", "Show or set the current agent name", "Agents & Terminals", "/name [new-name]"),
     CommandSpec(
@@ -9045,8 +9046,12 @@ def handle_version_command(parts: list) -> None:
     sub = parts[1].lower() if len(parts) > 1 else ""
     force = any(p in ("--force", "-f") for p in parts[2:])
 
+    if sub == "enterprise":
+        _handle_enterprise(parts[2:])
+        return
+
     if sub not in ("", "update", "check"):
-        console.print("[yellow]Usage: /v  |  /v check  |  /v update \\[--force][/yellow]")
+        console.print("[yellow]Usage: /v  |  /v check  |  /v update \\[--force]  |  /v enterprise [cli|gateway][/yellow]")
         return
 
     console.print(f"[bold]laintas-cli[/bold] [cyan]v{updater.LOCAL_VERSION}[/cyan] "
@@ -9131,6 +9136,40 @@ class SlashArgRule:
     usage: str
     flag_start: Optional[int] = None
     allowed_flags: frozenset[str] = frozenset()
+
+
+def _handle_enterprise(parts: list) -> None:
+    """Handle ``/v enterprise [cli|gateway]`` — download enterprise assets."""
+    import enterprise_installer
+
+    target = parts[0].lower() if parts else "cli"
+    if target not in ("cli", "gateway"):
+        console.print(
+            "[yellow]Usage: /v enterprise [cli|gateway][/yellow]\n"
+            "  [dim]cli     — Download and install the Enterprise CLI binary[/dim]\n"
+            "  [dim]gateway — Download the Enterprise gateway bundle[/dim]"
+        )
+        return
+
+    # No token is asked for. The server resolves the caller's organisation and
+    # role from their signed-in session, so an installation right follows
+    # membership: gained on joining, lost the moment an admin removes you.
+    log = lambda message: console.print(
+        f"[green]{escape(message)}[/green]")
+
+    try:
+        if target == "cli":
+            enterprise_installer.install_and_launch(log=log)
+        else:
+            enterprise_installer.install_gateway(log=log)
+            console.print(
+                "\n[bold]Gateway bundle downloaded.[/bold]\n"
+                "  [dim]Run the following inside the extracted directory:[/dim]\n"
+                "    [bold]./install.sh[/bold]"
+            )
+    except Exception as exc:
+        console.print(
+            f"[red]Enterprise installation failed: {escape(str(exc))}[/red]")
 
 
 def _arg_rule(max_args: int, usage: str, *, flag_start: Optional[int] = None,

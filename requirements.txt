@@ -48,3 +48,4 @@ trafilatura>=1.8
 # that came back blocked. Bot walls fingerprint the handshake, which no header
 # can disguise. Ships binary wheels, hence optional rather than core.
 curl_cffi>=0.7
+cryptography>=41.0
