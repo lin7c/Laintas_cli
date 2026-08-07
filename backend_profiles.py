@@ -123,9 +123,24 @@ def resolve(default_url: str, selected: Optional[str] = None) -> BackendProfile:
     return BackendProfile("default", _kind_for_url(url), url)
 
 
+def _policy_headers() -> dict:
+    """The organisation policy fingerprint, when one has been applied.
+
+    Set by the Enterprise edition after it verifies and applies a signed policy.
+    Sent on every request so the server can check that the client it is serving
+    is holding the policy it published — the client is what blocks a command,
+    but the client is also what a member can edit, so its word needs something
+    behind it.
+
+    Absent on a personal install, where there is no organisation to attest to.
+    """
+    digest = os.environ.get("LAINTAS_POLICY_DIGEST", "").strip().lower()
+    return {"X-Laintas-Policy": digest} if re.fullmatch(r"[a-f0-9]{64}", digest) else {}
+
+
 def request_auth(profile: BackendProfile, session: Optional[dict]) -> tuple[dict, dict]:
     """Return (headers, cookies) appropriate for this backend trust domain."""
-    headers = {"Content-Type": "application/json"}
+    headers = {"Content-Type": "application/json", **_policy_headers()}
     session = session or {}
     if profile.sends_laintas_credentials:
         authorization = (session.get("headers") or {}).get("Authorization")
