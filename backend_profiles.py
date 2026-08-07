@@ -10,12 +10,14 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Optional
 from urllib.parse import urlsplit, urlunsplit
 
 import paths
+import json_store
 import terminal_preferences
 
 
@@ -180,6 +182,43 @@ def ensure_template() -> Path:
     except OSError:
         pass
     return path
+
+
+def upsert_profile(name: str, base_url: str, auth_ref: str = "env:LAINTAS_CUSTOM_BACKEND_TOKEN",
+                   *, activate: bool = True) -> tuple:
+    """Add or update a profile and optionally switch to it.
+
+    Exists so adding a custom gateway is a command rather than an instruction
+    to hand-edit JSON.
+
+    Returns ``(ok, message)``; never raises for ordinary input problems.
+    """
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", name or ""):
+        return False, "profile name must be 1-64 chars of letters, digits, . _ -"
+    try:
+        url = _normalize_url(base_url)
+    except ValueError as exc:
+        return False, str(exc)
+
+    kind = _kind_for_url(url)
+    if kind == "official":
+        return False, ("that URL is an official Laintas endpoint; it is reached "
+                       "through the built-in profile, not a custom one")
+
+    data = _load_profiles()
+    if not data:
+        ensure_template()
+        data = _load_profiles()
+    profiles = data.setdefault("profiles", {})
+    profiles[name] = {"kind": kind, "baseUrl": url, "auth": auth_ref}
+    if activate:
+        data["active"] = name
+
+    try:
+        json_store.save_json_atomic(paths.BACKENDS_FILE, data, mode=0o600)
+    except OSError as exc:
+        return False, f"could not write {paths.BACKENDS_FILE}: {exc}"
+    return True, f"backend {name!r} -> {url}"
 
 
 def list_profiles() -> list[BackendProfile]:
