@@ -165,30 +165,45 @@ class PolicyDecision:
 # ── Module-level cache ────────────────────────────────────────────────────
 _config: dict | None = None
 _config_mtime: float = 0.0
+# Version of the organisation policy baked into the cached config. -1 means
+# "not yet resolved", which is distinct from 0 ("resolved: no org policy").
+_config_org_version: int = -1
+
+
+def _current_org_version() -> int:
+    """Public edition has no organization policy overlay."""
+    return 0
+
 _audit_lock = threading.Lock()
 _config_lock = threading.Lock()
-
-
 def _load_config(force: bool = False) -> dict:
     """Load policy config from disk, with mtime caching. Auto-creates defaults."""
-    global _config, _config_mtime
+    global _config, _config_mtime, _config_org_version
+
+    org_version = _current_org_version()
 
     with _config_lock:
         if not force and CONFIG_PATH.exists():
             try:
                 mtime = CONFIG_PATH.stat().st_mtime
-                if _config is not None and mtime == _config_mtime:
+                # An org policy change must invalidate the cache even when the
+                # local file is untouched — otherwise a tightened company policy
+                # would not take effect until the member edited their own config.
+                if (_config is not None and mtime == _config_mtime
+                        and org_version == _config_org_version):
                     return _config
                 _config_mtime = mtime
             except OSError:
                 pass
+        _config_org_version = org_version
 
         if not CONFIG_PATH.exists():
             _write_default_config()
 
         if not paths.ensure_private_file(CONFIG_PATH):
-            _config = dict(_DEFAULT_CONFIG)
-            _config["mode"] = "enforce"
+            fallback = dict(_DEFAULT_CONFIG)
+            fallback["mode"] = "enforce"
+            _config = _apply_org_policy(fallback)
             return _config
 
         try:
@@ -205,7 +220,7 @@ def _load_config(force: bool = False) -> dict:
                 cfg["allowedRoots"] = ["/root/laintas_cli", "/tmp", "/home", "/root/Helpwo"]
             # Migrate old configs: move rules that changed category
             cfg = _migrate_config(cfg)
-            _config = cfg
+            _config = _apply_org_policy(cfg)
             if CONFIG_PATH.exists():
                 _config_mtime = CONFIG_PATH.stat().st_mtime
         except (OSError, json.JSONDecodeError) as e:
@@ -214,14 +229,42 @@ def _load_config(force: bool = False) -> dict:
         return _config
 
 
+def command_parse_unresolved(risks) -> bool:
+    """True when the analyser could not determine what a segment will execute."""
+    try:
+        import command_parse
+        return command_parse.RISK_UNRESOLVED in (risks or set())
+    except Exception:
+        return False
+
+
+def _command_variants(command: str) -> tuple:
+    """Every command this line will actually run, plus how it was obfuscated.
+
+    Returns ``(variants, risks)``. The original string is always first, so a bug
+    in decomposition can only ever *add* matches — it can never silently remove a
+    match that the old string-only rules already caught.
+    """
+    try:
+        import command_parse
+        return command_parse.effective_commands(command), command_parse.obfuscation_risks(command)
+    except Exception:
+        # A parser failure must not open a hole: fall back to the raw string,
+        # which is exactly the pre-existing behaviour.
+        return [command], set()
+
+
+def _apply_org_policy(cfg: dict) -> dict:
+    """Hook point used only by the separately distributed Enterprise binary."""
+    return cfg
+
+
 def _migrate_config(cfg: dict) -> dict:
     """Migrate old config rules to new positions.
 
-    When rules are reclassified (e.g. deny → needs_approval), old saved configs
-    still carry them in the wrong list. This function strips deprecated patterns
-    and re-adds them to the correct list.
+    When rules are reclassified, old saved configs still carry them in the
+    wrong list. Strip deprecated patterns and re-add them correctly.
     """
-    # v2026-05-27: download pipe-to-shell moved from deny to needs_approval
     _deny_to_approval = [
         r"^wget\s+.*\|\s*(?:ba)?sh",
         r"^curl\s+.*\|\s*(?:ba)?sh",
@@ -323,12 +366,14 @@ def _compile_rules(patterns: list) -> list[re.Pattern]:
 
 # Cache compiled rules keyed by (rule_type, config_mtime) to avoid
 # recompiling regexes on every evaluate() call.
-_compiled_cache: dict[tuple[str, float], list[re.Pattern]] = {}
+_compiled_cache: dict[tuple[str, float, int], list[re.Pattern]] = {}
 
 
 def _get_compiled_rules(key: str, cfg: dict) -> list[re.Pattern]:
     """Return compiled rules for `key`, cached by config mtime."""
-    cache_key = (key, _config_mtime)
+    # Org policy contributes rules, so its version belongs in the cache key —
+    # otherwise a tightened company policy would keep hitting stale compiles.
+    cache_key = (key, _config_mtime, _config_org_version)
     cached = _compiled_cache.get(cache_key)
     if cached is not None:
         return cached
@@ -336,7 +381,8 @@ def _get_compiled_rules(key: str, cfg: dict) -> list[re.Pattern]:
     _compiled_cache[cache_key] = compiled
     # Prune stale entries to prevent unbounded growth across config reloads.
     if len(_compiled_cache) > 20:
-        stale = [k for k in _compiled_cache if k[1] != _config_mtime]
+        stale = [k for k in _compiled_cache
+                 if k[1] != _config_mtime or k[2] != _config_org_version]
         for k in stale:
             del _compiled_cache[k]
     return compiled
@@ -418,17 +464,37 @@ def evaluate(command: str, cwd: str = None,
             command, "needs_approval", "sudo detected", cwd, req_id, agent_id,
         ))
 
+    # ── Decompose before matching ──────────────────────────────────────
+    # Rules are matched against every command this line will actually run, not
+    # just the string as typed. `\rm`, `"rm"`, `$X`, `eval "…"` and `… | sh` all
+    # reach the same binary; matching the raw text alone is the bug class that
+    # walked past ten of eleven agents in Adversa's 2026 survey.
+    variants, obf_risks = _command_variants(stripped)
+
     # ── Check deny list first (takes precedence) ───────────────────────
     deny_rules = _get_compiled_rules("deny", cfg)
     for rule in deny_rules:
-        if rule.search(stripped):
-            reason = f"Matched deny rule: {rule.pattern}"
-            _write_audit(_audit_entry(command, "deny", reason, cwd, req_id, agent_id))
-            if mode == "enforce":
-                return PolicyDecision("deny", rule.pattern, reason)
-            elif mode == "audit":
-                # In audit mode, deny rules still block
-                return PolicyDecision("deny", rule.pattern, reason)
+        for variant in variants:
+            if rule.search(variant):
+                disguised = variant != stripped
+                reason = f"Matched deny rule: {rule.pattern}"
+                if disguised:
+                    reason += f" (resolved from obfuscated form as: {variant})"
+                _write_audit(_audit_entry(command, "deny", reason, cwd, req_id, agent_id))
+                if mode in ("enforce", "audit"):
+                    # Deny blocks in audit mode too — unchanged behaviour.
+                    return PolicyDecision("deny", rule.pattern, reason)
+
+    # ── Unresolvable command words ─────────────────────────────────────
+    # `$(…)` or an unknown variable in command position means we cannot say what
+    # will run. Guessing "probably fine" is how these guards fail; the honest
+    # answer is to put a human in the loop. Approval rather than denial, because
+    # command substitution is also ordinary shell usage in legitimate work.
+    if mode != "disabled" and command_parse_unresolved(obf_risks):
+        reason = ("Command name is produced at runtime (substitution or variable); "
+                  "what will execute cannot be determined before it runs")
+        _write_audit(_audit_entry(command, "needs_approval", reason, cwd, req_id, agent_id))
+        return PolicyDecision("needs_approval", "", reason)
 
     # ── Destructive delete utilities: always-ask tier ───────────────────
     # rm/rmdir/unlink/shred (direct or via xargs) are treated like
