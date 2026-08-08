@@ -34,6 +34,7 @@
     "terminal_preferences",
     "migrate",
     "cloud_provider",
+    "shared_storage",
     "hwo_runner",
     "hwo_ui",
     "helpwo_server",

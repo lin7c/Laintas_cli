@@ -87,6 +87,51 @@ def is_installed() -> bool:
     return (extension_path() / "extension.json").is_file()
 
 
+def installed_version() -> str:
+    """The version currently on disk, or "" if nothing is installed."""
+    try:
+        data = json.loads(
+            (extension_path() / "extension.json").read_text(encoding="utf-8"))
+        return str(data.get("version") or "")
+    except (OSError, ValueError):
+        return ""
+
+
+def _version_tuple(value: str) -> tuple:
+    """Compare versions numerically where possible, textually where not."""
+    parts = []
+    for chunk in str(value or "").split("."):
+        digits = "".join(ch for ch in chunk if ch.isdigit())
+        parts.append((0, int(digits)) if digits == chunk and digits
+                     else (1, chunk))
+    return tuple(parts)
+
+
+def _refuse_downgrade(offered: str, force: bool) -> None:
+    """Refuse to replace an installed package with an older one.
+
+    The signature proves Laintas published this package. It does not prove it is
+    the *current* one — a signature stays valid forever, so a release store that
+    was rolled back, or served stale, hands out a genuinely signed package with
+    whatever weaknesses the newer one fixed. The signed policy already defends
+    against exactly this with `min_version`; the package that applies the policy
+    had no equivalent.
+    """
+    if force:
+        return
+    held = installed_version()
+    if not held or not offered:
+        return
+    if _version_tuple(offered) >= _version_tuple(held):
+        return
+    raise RuntimeError(
+        f"Refusing to replace Laintas Enterprise v{held} with the older "
+        f"v{offered}.\n"
+        "  A signature proves who published a package, not that it is the "
+        "current one.\n"
+        "  If this downgrade is intended, run:  /v enterprise --force")
+
+
 def gateway_path() -> Path:
     return paths.LAINTAS_HOME / "enterprise" / "gateway"
 
@@ -208,7 +253,7 @@ def _format_size(value: int) -> str:
 
 # ── public API ─────────────────────────────────────────────────────────────
 
-def install_extension(log=print, runtime=None) -> tuple[Path, dict]:
+def install_extension(log=print, runtime=None, force=False) -> tuple[Path, dict]:
     """Download, verify, unpack and load the organisation extension.
 
     Returns ``(installed_path, manifest)``.
@@ -219,6 +264,7 @@ def install_extension(log=print, runtime=None) -> tuple[Path, dict]:
     """
     release = _fetch_release("/api/org/download/cli",
                              platform=EXTENSION_PLATFORM, log=log)
+    _refuse_downgrade(str(release.get("version") or ""), force)
     payload = _download_payload(release, _authenticated_session(), log)
     _verify_enterprise(payload, release)
 

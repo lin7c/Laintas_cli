@@ -2774,6 +2774,29 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
             "employee, omitting the terminal with --task uses a private temporary "
             "terminal; deployment always requires an explicit target."
         )),
+    CommandSpec(
+        "/shared", "Share files with Helpwo through Laintas storage",
+        "Agents & Terminals",
+        "/shared [list [path]|push <local> [remote]|pull <remote> [local]|rm <path>|mkdir <path>|mv <from> <to>|cp <from> <to>|usage]",
+        subcommands=("list", "push", "pull", "rm", "mkdir", "mv", "cp", "usage"),
+        completion_descriptions=(
+            ("list", "List what is in shared storage"),
+            ("push", "Upload a local file or folder"),
+            ("pull", "Download a stored file"),
+            ("rm", "Delete a stored file or folder"),
+            ("mkdir", "Create a folder"),
+            ("mv", "Move or rename a stored entry"),
+            ("cp", "Copy a stored entry"),
+            ("usage", "Show storage used, free allowance and cost"),
+        ),
+        help_text=(
+            "Reads and writes the same per-account storage Helpwo mounts as its "
+            "\"Laintas Storage\" cloud folder: push a file here and it is in the "
+            "Helpwo file tree, pull one that Helpwo wrote. Unlike /connect, it "
+            "does not need a live link and it outlives this process — the files "
+            "sit on the server. Storage above the plan's free allowance is "
+            "billed monthly; /shared usage shows where you stand."
+        )),
     CommandSpec("/terminate", "Close a terminal and all child resources", "Agents & Terminals", "/terminate <name>"),
     CommandSpec("/send", "Send input to a terminal", "Agents & Terminals", "/send <name> [--wait <seconds>] <command>"),
     CommandSpec("/spawn", "Spawn a sub-agent", "Agents & Terminals", "/spawn [name:] <task>"),
@@ -9172,15 +9195,18 @@ def _handle_enterprise(parts: list) -> None:
     """
     import enterprise_installer
 
-    target = parts[0].lower() if parts else "on"
+    force = any(str(p).lower() in ("--force", "-f") for p in parts)
+    words = [str(p) for p in parts if not str(p).startswith("-")]
+    target = words[0].lower() if words else "on"
     if target in ("cli", "install", "update"):
         target = "on"          # the names the frozen-binary era used
     if target not in ("on", "off", "gateway"):
         console.print(
-            "[yellow]Usage: /v enterprise [on|off|gateway][/yellow]\n"
+            "[yellow]Usage: /v enterprise [on|off|gateway] \\[--force][/yellow]\n"
             "  [dim]on      — Install or update the organisation layer (default)[/dim]\n"
             "  [dim]off     — Remove it and go back to a personal CLI[/dim]\n"
-            "  [dim]gateway — Download the self-hosted gateway bundle[/dim]"
+            "  [dim]gateway — Download the self-hosted gateway bundle[/dim]\n"
+            "  [dim]--force — Allow replacing the installed version with an older one[/dim]"
         )
         return
 
@@ -9202,7 +9228,7 @@ def _handle_enterprise(parts: list) -> None:
     try:
         if target == "on":
             enterprise_installer.install_extension(
-                log=log, runtime=extension_runtime.get_runtime())
+                log=log, runtime=extension_runtime.get_runtime(), force=force)
         else:
             enterprise_installer.install_gateway(log=log)
             console.print(
@@ -9242,6 +9268,15 @@ _SLASH_ARG_RULES: dict[tuple[str, ...], SlashArgRule] = {
     ("/helpwo",): _arg_rule(6, "/helpwo [--port N] [--dist <path>] [--remote]"),
     ("/helpwo", "stop"): _arg_rule(1, "/helpwo stop"),
     ("/terminate",): _arg_rule(1, "/terminate <name>"),
+    ("/shared", "usage"): _arg_rule(1, "/shared usage"),
+    ("/shared", "list"): _arg_rule(2, "/shared list [path]"),
+    ("/shared", "pull"): _arg_rule(3, "/shared pull <remote> [local]"),
+    ("/shared", "push"): _arg_rule(3, "/shared push <local> [remote]"),
+    ("/shared", "mkdir"): _arg_rule(2, "/shared mkdir <path>"),
+    ("/shared", "mv"): _arg_rule(3, "/shared mv <from> <to>"),
+    ("/shared", "cp"): _arg_rule(3, "/shared cp <from> <to>"),
+    ("/shared", "rm"): _arg_rule(
+        3, "/shared rm <path> [--yes]", flag_start=2, allowed_flags=("--yes",)),
     ("/abort",): _arg_rule(1, "/abort <agent-id>"),
     ("/agent",): _arg_rule(1, "/agent [agent-id-or-name]"),
     ("/undo",): _arg_rule(1, "/undo [sha]"),
@@ -10097,6 +10132,38 @@ def _usage_daily_values(daily: list, days: int) -> list[int]:
             for i in range(days - 1, -1, -1)]
 
 
+def _fmt_mb(byte_count: int) -> str:
+    """Packs are sold in whole megabytes, so this never needs to be cleverer."""
+    if byte_count >= 1024 ** 3:
+        return f"{byte_count / 1024 ** 3:.1f} GB"
+    return f"{round(byte_count / 1048576)} MB"
+
+
+def _usage_allowance_bar(used: int, limit: int, figures: str, note: str | int = ""):
+    """One allowance as a proportional bar, the two numbers, and what it is made
+    of. Amber before it bites and red once it does — a bar that only changes
+    colour after the allowance is gone gives no warning at all."""
+    ratio = min(1.0, used / limit) if limit > 0 else 0.0
+    filled = round(ratio * 16)
+    style = "error" if ratio >= 1 else "warning" if ratio >= 0.9 else "agent"
+    bar = Text()
+    bar.append("━" * filled, style=style)
+    bar.append("╌" * (16 - filled), style="rule")
+    bar.append(f"  {figures}", style="bold")
+    if note:
+        bar.append(f"  {note}", style="muted")
+    return bar
+
+
+def _usage_allowance_tight(state, used_key: str, limit_key: str) -> bool:
+    """True once an allowance is 90% gone — the point where saying so is help
+    rather than advertising."""
+    if not isinstance(state, dict):
+        return False
+    limit = state.get(limit_key) or 0
+    return bool(limit) and (state.get(used_key) or 0) / limit >= 0.9
+
+
 def _usage_sparkline(values: list[int]) -> str:
     blocks = "▁▂▃▄▅▆▇█"
     peak = max(values) or 1
@@ -10178,7 +10245,7 @@ def _show_usage_command(args: list, session: dict) -> None:
     # Fetch backend data before rendering so its pricing tier map can annotate
     # the local per-model table. /usage local remains network-free.
     profile = get_backend_profile()
-    usage, bal, fail = None, {}, ""
+    usage, bal, fail, sub = None, {}, "", {}
     if (not local_only and profile.sends_laintas_credentials
             and session.get("userId")):
         headers, cookies = backend_profiles.request_auth(profile, session)
@@ -10201,14 +10268,26 @@ def _show_usage_command(args: list, session: dict) -> None:
                     headers=headers, cookies=cookies, timeout=10)
                 remote_balance = (
                     bresp.json() if bresp.status_code == 200 else {})
-                return remote_usage, remote_balance, remote_fail
+                if cancel.is_set():
+                    raise BlockingOperationCancelled("Usage fetch cancelled")
+                # Call allowances live with the subscription, not the balance.
+                # Optional: without it the allowance lines are simply omitted
+                # rather than the whole panel failing.
+                try:
+                    sresp = requests.get(
+                        f"{profile.base_url}/api/subscription",
+                        headers=headers, cookies=cookies, timeout=10)
+                    remote_sub = sresp.json() if sresp.status_code == 200 else {}
+                except requests.RequestException:
+                    remote_sub = {}
+                return remote_usage, remote_balance, remote_fail, remote_sub
             except requests.RequestException as exc:
-                return None, {}, type(exc).__name__
+                return None, {}, type(exc).__name__, {}
 
         try:
             with _safe_status(
                     f"[dim]Fetching usage… {symbols.BULLET} Esc/Ctrl+C cancel[/dim]"):
-                usage, bal, fail = run_cancellable_blocking(
+                usage, bal, fail, sub = run_cancellable_blocking(
                     _fetch_backend_usage)
         except BlockingOperationCancelled:
             console.print("[dim]Usage request cancelled.[/dim]")
@@ -10349,12 +10428,42 @@ def _show_usage_command(args: list, session: dict) -> None:
                 calls_val.append(str(sub_calls), style="bold")
                 calls_val.append(" subscription", style="muted")
                 grid.add_row("calls", calls_val)
+                # Two allowances, two different things to run out of. Storage is
+                # shared with Helpwo because it is one store; calls are not.
+                call_quota = next(
+                    (p.get("monthly") for p in (sub.get("byProduct") or [])
+                     if p.get("productId") == "cli"), None)
+                if isinstance(call_quota, dict) and call_quota.get("limit"):
+                    grid.add_row("quota", _usage_allowance_bar(
+                        int(call_quota.get("used") or 0), int(call_quota["limit"]),
+                        f"{int(call_quota.get('used') or 0):,} / {int(call_quota['limit']):,} calls",
+                        int(call_quota.get("purchased") or 0) and
+                        f"incl {int(call_quota.get('included') or 0):,} + {int(call_quota['purchased']):,} bought"))
+                store = bal.get("storage")
+                if isinstance(store, dict) and store.get("limit_bytes"):
+                    used_b, lim_b = int(store.get("used_bytes") or 0), int(store["limit_bytes"])
+                    grid.add_row("storage", _usage_allowance_bar(
+                        used_b, lim_b,
+                        f"{_fmt_mb(used_b)} / {_fmt_mb(lim_b)}",
+                        int(store.get("extra_bytes") or 0) and
+                        f"incl {_fmt_mb(int(store.get('base_bytes') or 0))}"
+                        f" + {_fmt_mb(int(store['extra_bytes']))} bought"))
+
                 values = _usage_daily_values(usage.get("daily") or [], days)
                 if any(values):
                     spark = Text.from_markup(_usage_sparkline(values))
                     spark.append(f"  peak {max(values)}/day", style="muted")
                     grid.add_row("activity", spark)
                 body.append(Padding(grid, (0, 0, 0, 1)))
+
+                # Said only when it is nearly true. A standing advert on a panel
+                # somebody opened to check their usage is noise.
+                if _usage_allowance_tight(call_quota, "used", "limit"):
+                    footnotes.append("CLI calls nearly used up — add 5,000/month for $10 "
+                                     "at cli.laintas.com/settings")
+                if _usage_allowance_tight(store, "used_bytes", "limit_bytes"):
+                    footnotes.append("storage nearly full — add 100 MB for $1/month in "
+                                     "Helpwo settings (the CLI shares that store)")
                 if sub_calls:
                     footnotes.append("subscription calls carry no token counts on the "
                                      "backend — LOCAL tokens are authoritative")
@@ -10953,6 +11062,200 @@ def _cmd_mail(parts: list, raw_args: str, session: dict) -> None:
 
     else:
         console.print("[yellow]Usage: /mail [inbox \\[--all]|read <n>|send \\[subject]][/yellow]")
+
+
+def _shared_storage_client(session: dict):
+    """Build a shared-storage client, or explain why we can't."""
+    import shared_storage
+
+    if not session.get("userId"):
+        raise shared_storage.SharedStorageError(
+            "Not signed in. Run /login — shared storage is per Laintas account.")
+    return shared_storage.SharedStorage(get_backend_profile(), session)
+
+
+def _shared_print_usage(usage) -> None:
+    import shared_storage as ss
+
+    tier = {"pro": "Pro", "gen": "Gen"}.get(usage.tier, "Free")
+    line = (f"[bold]{tier}[/bold] {symbols.BULLET} "
+            f"{ss.human_bytes(usage.used_bytes)} used {symbols.BULLET} "
+            f"{ss.human_bytes(usage.free_bytes)} free {symbols.BULLET} "
+            f"{ss.human_bytes(usage.max_bytes)} limit")
+    console.print(line)
+    if usage.est_cost_cents > 0:
+        console.print(
+            f"[yellow]{ss.human_bytes(usage.overage_bytes)} over the free allowance "
+            f"{symbols.BULLET} about ${usage.est_cost_cents / 100:.2f}/month, "
+            f"billed at month end.[/yellow]")
+
+
+def _shared_print_listing(entries, prefix: str) -> None:
+    import shared_storage as ss
+
+    if not entries:
+        console.print(f"[dim]Nothing stored{f' under {prefix}' if prefix else ''} yet. "
+                      f"Use /shared push <file> to put something here.[/dim]")
+        return
+    table = Table(title=f"Laintas Storage{f' {symbols.BULLET} {prefix}' if prefix else ''}"
+                        f" ({len(entries)})")
+    table.add_column("", width=1)
+    table.add_column("Path", style="cyan")
+    table.add_column("Size", justify="right", style="dim")
+    table.add_column("Modified", style="dim")
+    for entry in entries:
+        table.add_row(
+            "[blue]/[/blue]" if entry.is_dir else "",
+            entry.path,
+            "" if entry.is_dir else ss.human_bytes(entry.size),
+            (entry.modified or "")[:19].replace("T", " "),
+        )
+    console.print(table)
+
+
+def _cmd_shared(parts: list, session: dict) -> None:
+    """Share files with Helpwo through Laintas shared storage.
+
+    The same storage Helpwo mounts as its "Laintas Storage" cloud folder, so
+    this is how a terminal hands work to a Helpwo session and takes it back.
+    Unlike /connect, it outlives the process and needs no live link.
+    """
+    import shared_storage as ss
+
+    sub = (parts[1].lower() if len(parts) > 1 else "").strip()
+    args = [str(a) for a in parts[2:]]
+
+    if sub in ("help", "-h", "--help"):
+        console.print(
+            "Usage: [bold]/shared[/bold] [list \\[path]|push <local> \\[remote]|"
+            "pull <remote> \\[local]|rm <path>|mkdir <path>|mv <from> <to>|"
+            "cp <from> <to>|usage]\n"
+            "[dim]Files land in the same storage Helpwo mounts as "
+            "\"Laintas Storage\" — push here, open it there.[/dim]")
+        return
+
+    try:
+        client = _shared_storage_client(session)
+
+        if sub in ("", "usage"):
+            with _safe_status("[dim]Reading storage…[/dim]"):
+                usage = client.usage()
+            _shared_print_usage(usage)
+            if sub == "":
+                _shared_print_listing(client.list(), "")
+            return
+
+        if sub in ("list", "ls"):
+            prefix = ss.clean_remote_path(args[0]) if args else ""
+            with _safe_status("[dim]Listing…[/dim]"):
+                entries = client.list(prefix)
+            _shared_print_listing(entries, prefix)
+            return
+
+        if sub == "push":
+            if not args:
+                console.print("[yellow]Usage: /shared push <local-path> \\[remote-path][/yellow]")
+                return
+            local = os.path.expanduser(args[0])
+            if not os.path.exists(local):
+                console.print(f"[red]No such file or directory: {escape(local)}[/red]")
+                return
+
+            if os.path.isdir(local):
+                base = ss.clean_remote_path(args[1]) if len(args) > 1 \
+                    else os.path.basename(os.path.abspath(local))
+                files = ss.walk_local(local)
+                if not files:
+                    console.print("[dim]Nothing to push — the folder has no files.[/dim]")
+                    return
+                total = 0
+                for index, (full, relative) in enumerate(files, start=1):
+                    with _safe_status(
+                            f"[dim]Pushing {index}/{len(files)} {symbols.BULLET} "
+                            f"{escape(relative)}[/dim]"):
+                        total += client.push_file(full, f"{base}/{relative}")
+                console.print(
+                    f"[green]Pushed {len(files)} files ({ss.human_bytes(total)}) "
+                    f"to {escape(base)}/[/green]")
+            else:
+                remote = ss.clean_remote_path(args[1]) if len(args) > 1 \
+                    else os.path.basename(local)
+                with _safe_status(f"[dim]Pushing {escape(os.path.basename(local))}…[/dim]"):
+                    size = client.push_file(local, remote)
+                console.print(
+                    f"[green]Pushed {escape(remote)} ({ss.human_bytes(size)}).[/green]")
+            console.print("[dim]Open it in Helpwo under Laintas Storage.[/dim]")
+            return
+
+        if sub == "pull":
+            if not args:
+                console.print("[yellow]Usage: /shared pull <remote-path> \\[local-path][/yellow]")
+                return
+            remote = ss.clean_remote_path(args[0])
+            local = os.path.expanduser(args[1]) if len(args) > 1 else os.path.basename(remote)
+            if os.path.isdir(local):
+                local = os.path.join(local, os.path.basename(remote))
+            with _safe_status(f"[dim]Pulling {escape(remote)}…[/dim]"):
+                size = client.pull_file(remote, local)
+            console.print(
+                f"[green]Pulled {escape(remote)} → {escape(local)} "
+                f"({ss.human_bytes(size)}).[/green]")
+            return
+
+        if sub in ("rm", "delete"):
+            if not args:
+                console.print("[yellow]Usage: /shared rm <remote-path>[/yellow]")
+                return
+            target = ss.clean_remote_path(args[0])
+            # A folder delete is recursive and there is no undo, so say what is
+            # about to go before doing it.
+            victims = client.list(target)
+            if len(victims) > 1 and "--yes" not in args:
+                console.print(
+                    f"[yellow]{escape(target)} contains {len(victims)} entries; "
+                    f"deleting it removes all of them.[/yellow]")
+                try:
+                    answer = input(f"Delete {target} and everything under it? [y/N] ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    answer = ""
+                if answer.lower() not in ("y", "yes"):
+                    console.print("[dim]Cancelled.[/dim]")
+                    return
+            with _safe_status("[dim]Deleting…[/dim]"):
+                removed = client.remove(target)
+            console.print(f"[green]Deleted {escape(target)} ({removed} objects).[/green]")
+            return
+
+        if sub == "mkdir":
+            if not args:
+                console.print("[yellow]Usage: /shared mkdir <remote-path>[/yellow]")
+                return
+            client.mkdir(args[0])
+            console.print(f"[green]Created {escape(ss.clean_remote_path(args[0]))}/[/green]")
+            return
+
+        if sub in ("mv", "move", "rename"):
+            if len(args) < 2:
+                console.print("[yellow]Usage: /shared mv <from> <to>[/yellow]")
+                return
+            client.move(args[0], args[1])
+            console.print(f"[green]Moved {escape(args[0])} → {escape(args[1])}[/green]")
+            return
+
+        if sub in ("cp", "copy"):
+            if len(args) < 2:
+                console.print("[yellow]Usage: /shared cp <from> <to>[/yellow]")
+                return
+            client.copy(args[0], args[1])
+            console.print(f"[green]Copied {escape(args[0])} → {escape(args[1])}[/green]")
+            return
+
+        console.print(f"[yellow]Unknown subcommand: {escape(sub)}[/yellow] — run /shared help")
+
+    except ss.SharedStorageError as exc:
+        console.print(f"[red]{escape(str(exc))}[/red]")
+    except BlockingOperationCancelled:
+        console.print("[dim]Cancelled.[/dim]")
 
 
 def _cmd_prop() -> None:
@@ -16584,6 +16887,9 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
 
     elif action == "/mail":
         _cmd_mail(parts, raw_args, session)
+
+    elif action == "/shared":
+        _cmd_shared(parts, session)
 
     elif action == "/prop":
         _cmd_prop()

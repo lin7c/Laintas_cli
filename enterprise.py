@@ -330,14 +330,47 @@ def verify_policy(token: str, *, policy_key: str = "", min_version: int = 0,
     }
 
 
+#: JS cannot represent an integer beyond this exactly, so neither may a policy.
+MAX_SAFE_INTEGER = 2 ** 53 - 1
+
+
+def _canonical_json(value) -> str:
+    """The canonical form, specified in `laintas/server/enterprise-license.js`.
+
+    Keys sorted by UTF-8 byte sequence, integers only, no incidental whitespace.
+    Spelled out rather than left to `json.dumps(sort_keys=True)` because the
+    server computing the other half of this comparison is JavaScript, and the
+    two languages' defaults disagree on exactly the values a policy might
+    plausibly contain — `2.0` serialises as "2" there and "2.0" here, and key
+    order diverges above U+FFFF. The mismatch would not raise anywhere; it would
+    simply stop matching, and this member would fall out of governance without
+    anyone being told.
+    """
+    if isinstance(value, bool):
+        return "true" if value else "false"        # before the int check
+    if isinstance(value, (int, float)):
+        if isinstance(value, float) or abs(value) > MAX_SAFE_INTEGER:
+            raise ValueError(
+                f"policy documents may only contain integers within "
+                f"±{MAX_SAFE_INTEGER}; got {value!r}")
+        return json.dumps(value)
+    if value is None or isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, (list, tuple)):
+        return "[" + ",".join(_canonical_json(item) for item in value) + "]"
+    if isinstance(value, dict):
+        keys = sorted(value, key=lambda k: str(k).encode("utf-8"))
+        return "{" + ",".join(
+            f"{json.dumps(str(k), ensure_ascii=False)}:{_canonical_json(value[k])}"
+            for k in keys) + "}"
+    raise ValueError(f"policy documents may not contain {type(value).__name__}")
+
+
 def policy_digest(document: dict) -> str:
     """The fingerprint a client reports to prove which policy it applied.
 
-    Canonical JSON — sorted keys, no incidental whitespace — so the same
-    document always produces the same digest no matter who serialised it. The
-    server compares this against what it published; a member who edited their
-    local copy produces a different one and is refused.
+    The server compares this against what it published; a member who edited
+    their local copy produces a different one and is refused.
     """
-    canonical = json.dumps(document, sort_keys=True, separators=(",", ":"),
-                           ensure_ascii=False)
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return hashlib.sha256(
+        _canonical_json(document).encode("utf-8")).hexdigest()

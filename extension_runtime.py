@@ -1,8 +1,20 @@
-"""Project extension runtime used by Evolution Lab.
+"""Runtime for loaded extensions — Evolution Lab's, and the Enterprise
+organisation layer installed by ``/v enterprise``.
 
-Extensions are intentionally expressive local Python.  They register commands,
-tools and shell interceptors through a small stable context.  The context never
-contains the raw Laintas session; model access is exposed as a gateway callback.
+Extensions are intentionally expressive local Python. They register commands,
+tools and shell interceptors through a small stable context.
+
+**The context is a convenience, not a boundary.** It hands over a console and a
+narrowed inference gateway rather than the raw Laintas session, which keeps the
+*common* path honest — but an extension executes in this process, with this
+user's permissions, and can read `~/.laintas/session.json` for itself. The
+Enterprise extension does exactly that, because it must authenticate to its own
+organisation. Nothing here prevents any other extension from doing the same.
+
+So the trust in a loaded extension comes from where it came from — code the user
+wrote, or a package whose Ed25519 signature `enterprise_installer` verified —
+and never from the shape of this API. Read `load()` with that in mind before
+widening what may be loaded.
 """
 
 from __future__ import annotations

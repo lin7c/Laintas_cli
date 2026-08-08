@@ -170,9 +170,66 @@ _config_mtime: float = 0.0
 _config_org_version: int = -1
 
 
+# ── Organisation policy contributors ─────────────────────────────────────
+#
+# Something outside this module — today the Enterprise organisation extension —
+# may tighten the local policy. It registers here rather than assigning to a
+# module global, for two reasons learned the hard way:
+#
+#   1. A single assignable slot silently loses whichever contributor loaded
+#      first. Extensions are plural by design; the tool registry already solved
+#      this with source tags and `unregister_source`, and this is the same shape.
+#   2. A contributor must also report its *version*, because that version is
+#      part of the config cache key. When only the merge function was wired, a
+#      newly published organisation policy did not invalidate anything and took
+#      effect on the next unrelated edit of the member's own config — which is
+#      exactly what the cache key was introduced to prevent.
+#
+# Contract: `apply_fn(cfg) -> cfg` may only make the policy stricter, and
+# `version_fn() -> int` must increase whenever `apply_fn` would produce a
+# different result.
+_org_contributors: "dict[str, tuple]" = {}
+
+
+def register_policy_contributor(source: str, apply_fn, version_fn=None) -> None:
+    """Register (or replace) an organisation policy contributor."""
+    if not callable(apply_fn):
+        raise TypeError("apply_fn must be callable")
+    _org_contributors[str(source)] = (apply_fn, version_fn)
+    reload_config()
+
+
+def unregister_policy_contributor(source: str) -> bool:
+    """Remove a contributor and drop its rules from the active config."""
+    removed = _org_contributors.pop(str(source), None) is not None
+    if removed:
+        reload_config()
+    return removed
+
+
+def policy_contributors() -> list[str]:
+    return sorted(_org_contributors)
+
+
 def _current_org_version() -> int:
-    """Public edition has no organization policy overlay."""
-    return 0
+    """Combined version of every contributor; 0 when there are none.
+
+    Summed rather than maxed so that two contributors moving in opposite
+    directions still change the total — the number only has to differ, and a max
+    would hide one contributor rolling back while another moved forward.
+    """
+    total = 0
+    for _apply, version_fn in _org_contributors.values():
+        if version_fn is None:
+            continue
+        try:
+            total += int(version_fn() or 0)
+        except Exception:
+            # A contributor that cannot report its version must not take the
+            # policy engine down with it; treat it as "unknown, assume changed".
+            total += 1
+    return total
+
 
 _audit_lock = threading.Lock()
 _config_lock = threading.Lock()
@@ -255,7 +312,20 @@ def _command_variants(command: str) -> tuple:
 
 
 def _apply_org_policy(cfg: dict) -> dict:
-    """Hook point used only by the separately distributed Enterprise binary."""
+    """Run every registered contributor over the local config.
+
+    Order is by source name so the result does not depend on load order. A
+    contributor that raises is skipped rather than allowed to blank the policy:
+    losing one organisation's rules is bad, losing all of them is worse.
+    """
+    for source in sorted(_org_contributors):
+        apply_fn, _version_fn = _org_contributors[source]
+        try:
+            result = apply_fn(cfg)
+        except Exception:
+            continue
+        if isinstance(result, dict):
+            cfg = result
     return cfg
 
 

@@ -13,6 +13,12 @@ export default function SettingsPage() {
   const navigate = useNavigate();
   const [signingOut, setSigningOut] = useState(false);
   const [balance, setBalance] = useState(null);
+  // The CLI's own monthly allowance. Sold here rather than on a central price
+  // list, because this is the page somebody lands on when it runs out.
+  const [calls, setCalls] = useState(null);
+  const [buying, setBuying] = useState(false);
+  const [buyError, setBuyError] = useState(null);
+  const [reload, setReload] = useState(0);
 
   useEffect(() => {
     if (!session) return;
@@ -20,7 +26,37 @@ export default function SettingsPage() {
       .then(r => r.json())
       .then(d => { if (d.balance != null) setBalance(d.balance); })
       .catch(() => {});
-  }, [session]);
+  }, [session, reload]);
+
+  useEffect(() => {
+    if (!session) return;
+    fetch('/api/subscription', { credentials: 'include' })
+      .then(r => r.json())
+      .then(d => setCalls((d?.byProduct || []).find(p => p.productId === 'cli')?.monthly ?? null))
+      .catch(() => {});
+  }, [session, reload]);
+
+  async function buyCallPack() {
+    setBuying(true);
+    setBuyError(null);
+    try {
+      const res = await fetch('/api/subscription/upgrades', {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ kind: 'extra_calls_cli' }),
+      });
+      const body = await res.json().catch(() => ({}));
+      // The server's own words: it knows whether the problem was a missing
+      // membership or an empty balance, and those need different answers.
+      if (!res.ok) setBuyError(body.detail || body.error || '加购失败，请重试。');
+      else setReload(v => v + 1);
+    } catch {
+      setBuyError('加购失败，请重试。');
+    } finally {
+      setBuying(false);
+    }
+  }
 
   async function handleSignOut() {
     setSigningOut(true);
@@ -97,6 +133,47 @@ export default function SettingsPage() {
               </div>
             </div>
           </div>
+
+          {/* CLI call allowance — the bar, what it is made of, and the one
+              thing that makes it bigger. Storage is not here: the CLI shares
+              Helpwo's store, so it is bought once, in Helpwo. */}
+          {calls && calls.limit != null && (
+            <div className="rounded-2xl p-6 mb-5" style={{ background: 'var(--card-bg)', border: '1px solid var(--card-border)' }}>
+              <h2 className="font-display text-lg italic font-semibold mb-4" style={{ color: 'var(--text-primary)' }}>调用额度</h2>
+              <div className="p-4 rounded-xl" style={{ background: 'var(--input-bg)' }}>
+                <div className="flex items-baseline justify-between mb-2">
+                  <span className="text-sm" style={{ color: 'var(--text-tertiary)' }}>本月 CLI 调用</span>
+                  <span className="font-mono text-sm" style={{ color: 'var(--text-primary)' }}>
+                    {calls.used.toLocaleString()} / {calls.limit.toLocaleString()}
+                  </span>
+                </div>
+                <div className="h-1.5 rounded-full overflow-hidden mb-2" style={{ background: 'var(--bg-hover)' }}>
+                  <div className="h-full rounded-full transition-all" style={{
+                    width: `${Math.min(100, (calls.used / calls.limit) * 100)}%`,
+                    background: calls.used >= calls.limit ? 'var(--error, #ef4444)'
+                      : calls.used / calls.limit >= 0.9 ? 'var(--warning, #d97706)'
+                        : 'var(--accent-soft)',
+                  }} />
+                </div>
+                <div className="flex items-center justify-between gap-3">
+                  <span className="text-xs" style={{ color: 'var(--text-muted)' }}>
+                    {calls.purchased > 0
+                      ? `含 ${(calls.included ?? 0).toLocaleString()} + 已加购 ${calls.purchased.toLocaleString()}`
+                      : '额度用尽后按 Token 计费扣余额'}
+                  </span>
+                  <button onClick={buyCallPack} disabled={buying}
+                    className="flex-none text-xs px-3 py-1.5 rounded-lg transition-colors disabled:opacity-50"
+                    style={{ background: 'var(--bg-hover)', color: 'var(--text-secondary)' }}>
+                    {buying ? '处理中…' : '加购 5,000 次 · $10/月'}
+                  </button>
+                </div>
+              </div>
+              {buyError && <p className="text-xs mt-3" style={{ color: 'var(--error, #ef4444)' }}>{buyError}</p>}
+              <p className="text-xs mt-3 leading-relaxed" style={{ color: 'var(--text-muted)' }}>
+                增值项加在会员上，与会员同日扣费，不会多出第二个账期。可随时取消，已付的当月照常供应。
+              </p>
+            </div>
+          )}
 
           {/* Preferences */}
           <div className="rounded-2xl p-6 mb-5" style={{ background: 'var(--card-bg)', border: '1px solid var(--card-border)' }}>
