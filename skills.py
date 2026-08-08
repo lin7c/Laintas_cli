@@ -114,6 +114,47 @@ def ensure_skills_dir() -> Path:
     return SKILLS_DIR
 
 
+# ── Managed (externally synchronised) skills ────────────────────────────
+#
+# A skill directory carrying this marker was placed here by something other than
+# the user — today, an Enterprise organisation pushing shared skills to its
+# members. The marker is what makes re-syncing safe: it is the only evidence
+# that overwriting the directory destroys nothing the user wrote.
+
+MANAGED_MARKER = ".laintas-asset.json"
+
+
+def managed_owner(directory: Path) -> str:
+    """Who manages this skill directory, or "" if the user owns it."""
+    try:
+        data = json.loads((directory / MANAGED_MARKER).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    owner = data.get("managed_by") if isinstance(data, dict) else None
+    return str(owner or "")
+
+
+def claim_managed_dir(name: str, owner: str) -> tuple[Optional[Path], str]:
+    """Resolve where a managed skill may be written, refusing to take over.
+
+    Returns ``(path, "")`` when the slot is free or already belongs to *owner*,
+    and ``(None, reason)`` when it does not. A user who happens to have written
+    a skill of the same name keeps it — silently replacing it would be the
+    behaviour that made pushed defaults so destructive the last time round.
+    """
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name or ""):
+        return None, f"invalid skill name: {name!r}"
+    target = SKILLS_DIR / name
+    if not target.exists():
+        return target, ""
+    existing = managed_owner(target)
+    if existing == owner:
+        return target, ""
+    if existing:
+        return None, f"'{name}' is already managed by {existing}"
+    return None, f"'{name}' already exists as your own skill and was left alone"
+
+
 def ensure_bundled_skills_installed() -> list[str]:
     """Copy bundled documentation skills into the user skills dir if missing.
 
@@ -148,6 +189,7 @@ class SkillMetadata:
     trigger_patterns: list[str] = field(default_factory=list)
     version: str = ""
     dir_path: str = ""
+    managed_by: str = ""              # e.g. "org" — see MANAGED_MARKER
 
 
 @dataclass
@@ -281,6 +323,7 @@ def scan_metadata() -> dict[str, SkillMetadata]:
         meta, _ = _parse_skill_md(child)
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", meta.name):
             continue
+        meta.managed_by = managed_owner(child)
         _skill_metadata[meta.name] = meta
 
     # Bundled defaults are also usable in-place. User-installed skills with the
@@ -376,6 +419,7 @@ def list_skills() -> list[dict]:
             "version": meta.version,
             "loaded": bool(state and state.loaded),
             "path": meta.dir_path,
+            "managed_by": meta.managed_by,
         })
     return out
 

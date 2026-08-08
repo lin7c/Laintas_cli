@@ -2718,12 +2718,12 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec("/back", "Detach from a sub-terminal", "Account & Session"),
     CommandSpec(
         "/version", "Show version or update", "Account & Session",
-        "/version [check|update [--force]|enterprise [cli|gateway]]", aliases=("/v", "/update"),
+        "/version [check|update [--force]|enterprise [on|off|gateway]]", aliases=("/v", "/update"),
         subcommands=("check", "update", "enterprise"),
         completion_descriptions=(
             ("check", "Check whether a newer version is available"),
             ("update", "Download, install, and restart on the latest version"),
-            ("enterprise", "Install the private Enterprise CLI or gateway bundle"),
+            ("enterprise", "Turn your organisation layer on or off in this CLI"),
         )),
     CommandSpec("/name", "Show or set the current agent name", "Agents & Terminals", "/name [new-name]"),
     CommandSpec(
@@ -2844,6 +2844,23 @@ def _slash_command_names() -> list[str]:
     return sorted(names)
 
 
+#: Completion has to see commands that did not exist at import time — an
+#: extension registers its own during startup, and `/v enterprise` can add an
+#: organisation layer mid-session. Recomputed at most once a second so a
+#: keystroke never re-walks the registry.
+_completion_names_cache: tuple[float, list[str]] = (0.0, [])
+
+
+def completion_command_names() -> list[str]:
+    global _completion_names_cache
+    stamp, names = _completion_names_cache
+    now = time.time()
+    if not names or now - stamp > 1.0:
+        names = _slash_command_names()
+        _completion_names_cache = (now, names)
+    return names
+
+
 def _find_command_spec(name: str) -> Optional[CommandSpec]:
     normalized = name if name.startswith("/") else f"/{name}"
     normalized = normalized.lower()
@@ -2857,6 +2874,9 @@ def _find_command_spec(name: str) -> Optional[CommandSpec]:
 class MetaCompleter(Completer):
     """Context-aware completer: /-commands, shell commands from PATH, and paths."""
 
+    #: Built-in commands, fixed at import. Live lookups go through
+    #: `completion_command_names()`, which also sees extension commands
+    #: registered after this class was defined.
     META_COMMANDS = _slash_command_names()
 
     def __init__(self):
@@ -3112,7 +3132,7 @@ class MetaCompleter(Completer):
                             yield self._completion(
                                 entry.value, partial, entry.description)
                 return
-            for cmd in self.META_COMMANDS:
+            for cmd in completion_command_names():
                 if cmd.casefold().startswith(text.casefold()):
                     _spec = _find_command_spec(cmd)
                     yield self._completion(
@@ -8653,16 +8673,20 @@ def show_skill_manager() -> None:
         for s in skills_mod.list_skills():
             n = s["name"]
             out.append((n, s.get("description", ""), bool(s.get("loaded")),
-                        len(groups.get(f"skill:{n}", []))))
+                        len(groups.get(f"skill:{n}", [])),
+                        str(s.get("managed_by") or "")))
         return out
 
     def _build_labels(items):
         labels = []
-        for name, desc, loaded, ntools in items:
+        for name, desc, loaded, ntools, managed in items:
             badge = f"[green]{symbols.DOT} loaded[/green]" if loaded else f"[dim]{symbols.DOT_OPEN} available[/dim]"
             tool_str = f" [dim]({ntools} tool{'s' if ntools != 1 else ''})[/dim]" if ntools else ""
+            # A managed skill is replaced on the next sync, so local edits to it
+            # do not survive. Saying who owns it is cheaper than the surprise.
+            owner_str = f" [cyan]{symbols.DOT} {managed}[/cyan]" if managed else ""
             desc_preview = (desc or "").replace("\n", " ")[:56]
-            labels.append(f"[bold]{name}[/bold]  {badge}{tool_str}  "
+            labels.append(f"[bold]{name}[/bold]  {badge}{tool_str}{owner_str}  "
                           f"[dim]{desc_preview}[/dim]")
         return labels
 
@@ -8701,7 +8725,7 @@ def show_skill_manager() -> None:
         if action is None or idx < 0 or idx >= len(items):
             return
 
-        name, desc, loaded, ntools = items[idx]
+        name, desc, loaded, ntools, managed = items[idx]
         status_msg = ""
 
         if action == "details":
@@ -9051,7 +9075,7 @@ def handle_version_command(parts: list) -> None:
         return
 
     if sub not in ("", "update", "check"):
-        console.print("[yellow]Usage: /v  |  /v check  |  /v update \\[--force]  |  /v enterprise [cli|gateway][/yellow]")
+        console.print("[yellow]Usage: /v  |  /v check  |  /v update \\[--force]  |  /v enterprise [on|off|gateway][/yellow]")
         return
 
     console.print(f"[bold]laintas-cli[/bold] [cyan]v{updater.LOCAL_VERSION}[/cyan] "
@@ -9139,16 +9163,34 @@ class SlashArgRule:
 
 
 def _handle_enterprise(parts: list) -> None:
-    """Handle ``/v enterprise [cli|gateway]`` — download enterprise assets."""
+    """Handle ``/v enterprise [on|off|gateway]`` — the organisation layer.
+
+    Enterprise is not a separate program. Turning it on installs a signed
+    package that this process loads straight away, after which `/org`, the
+    organisation's shared skills and its rules are simply part of the CLI the
+    member was already using.
+    """
     import enterprise_installer
 
-    target = parts[0].lower() if parts else "cli"
-    if target not in ("cli", "gateway"):
+    target = parts[0].lower() if parts else "on"
+    if target in ("cli", "install", "update"):
+        target = "on"          # the names the frozen-binary era used
+    if target not in ("on", "off", "gateway"):
         console.print(
-            "[yellow]Usage: /v enterprise [cli|gateway][/yellow]\n"
-            "  [dim]cli     — Download and install the Enterprise CLI binary[/dim]\n"
-            "  [dim]gateway — Download the Enterprise gateway bundle[/dim]"
+            "[yellow]Usage: /v enterprise [on|off|gateway][/yellow]\n"
+            "  [dim]on      — Install or update the organisation layer (default)[/dim]\n"
+            "  [dim]off     — Remove it and go back to a personal CLI[/dim]\n"
+            "  [dim]gateway — Download the self-hosted gateway bundle[/dim]"
         )
+        return
+
+    if target == "off":
+        removed = enterprise_installer.uninstall_extension(
+            runtime=extension_runtime.get_runtime())
+        console.print(
+            "[green]Organisation layer removed — /org and organisation rules "
+            "are gone.[/green]" if removed else
+            "[dim]No organisation layer was installed.[/dim]")
         return
 
     # No token is asked for. The server resolves the caller's organisation and
@@ -9158,8 +9200,9 @@ def _handle_enterprise(parts: list) -> None:
         f"[green]{escape(message)}[/green]")
 
     try:
-        if target == "cli":
-            enterprise_installer.install_and_launch(log=log)
+        if target == "on":
+            enterprise_installer.install_extension(
+                log=log, runtime=extension_runtime.get_runtime())
         else:
             enterprise_installer.install_gateway(log=log)
             console.print(
@@ -18440,6 +18483,23 @@ def main():
             _extension_runtime):
         if not _ext_ok and args.depth == 0:
             console.print(f"[yellow]Extension {_ext_name}: {_ext_message}[/yellow]")
+
+    # The organisation layer, when this machine has one. Installed means enabled
+    # — there is no second switch to get out of sync with what is on disk.
+    # A failure here is reported and survived: a member who cannot load their
+    # organisation's package still gets their CLI, and the server still decides
+    # what they are allowed to do without a verified policy digest.
+    try:
+        import enterprise_installer as _enterprise_installer
+        if _enterprise_installer.is_installed():
+            _org_ok, _org_message = _extension_runtime.load(
+                _enterprise_installer.EXTENSION_NAME)
+            if not _org_ok and args.depth == 0:
+                console.print(
+                    f"[yellow]Organisation layer: {_org_message}[/yellow]")
+    except Exception as _org_exc:
+        if args.depth == 0:
+            console.print(f"[yellow]Organisation layer: {_org_exc}[/yellow]")
 
     # ── Non-interactive execution mode ──
     if args.execute:

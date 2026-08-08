@@ -22,6 +22,10 @@ from tools import Tool, get_registry
 
 
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+#: An extension may claim its own tool namespace instead of the default
+#: `extension.<owner>.` — kept short and lower-case because these names end up
+#: in front of the model on every request.
+_SAFE_TOOL_PREFIX = re.compile(r"^[a-z][a-z0-9_]{0,15}\.$")
 
 
 def _positional_arity(func: Callable) -> Optional[int]:
@@ -37,6 +41,15 @@ def _positional_arity(func: Callable) -> Optional[int]:
         return count
     except (ValueError, TypeError):
         return None
+
+
+def _extension_roots() -> list[Path]:
+    """Where `load` looks for an extension, most specific first.
+
+    A project-local extension shadows a machine-wide one of the same name, the
+    same precedence `skills.py` gives user skills over bundled ones.
+    """
+    return [paths.extensions_dir(), paths.global_extensions_dir()]
 
 
 class _Registrar:
@@ -110,6 +123,7 @@ class ExtensionRuntime:
         self._loaded: dict[str, LoadedExtension] = {}
         self._commands: dict[str, tuple[str, Callable]] = {}
         self._loops: dict[str, list[Callable]] = {}
+        self._tool_prefixes: dict[str, str] = {}
         self._console: Any = None
         self._backend = BackendGateway()
         self._reserved_commands: set[str] = set()
@@ -139,7 +153,7 @@ class ExtensionRuntime:
     def register_tool(self, owner: str, tool: Tool) -> None:
         if not isinstance(tool, Tool):
             raise TypeError("extension tool must be a Tool")
-        prefix = f"extension.{owner}."
+        prefix = self._tool_prefixes.get(owner) or f"extension.{owner}."
         if not tool.name.startswith(prefix):
             tool.name = prefix + tool.name.lstrip(".")
         tool.source = f"extension:{owner}"
@@ -165,6 +179,11 @@ class ExtensionRuntime:
             raise ValueError("extension manifest fields are invalid")
         if name != directory.name:
             raise ValueError("manifest name must match extension directory")
+        prefix = value.get("toolPrefix")
+        if prefix is not None and (not isinstance(prefix, str)
+                                   or not _SAFE_TOOL_PREFIX.fullmatch(prefix)):
+            raise ValueError(
+                "toolPrefix must look like 'org.' — lower-case, dot-terminated")
         return value
 
     def load(self, name: str) -> tuple[bool, str]:
@@ -173,9 +192,13 @@ class ExtensionRuntime:
         with self._lock:
             if name in self._loaded:
                 self.unload(name)
-            directory = paths.extensions_dir() / name
+            candidates = [root / name for root in _extension_roots()]
+            directory = next(
+                (item for item in candidates if (item / "extension.json").is_file()),
+                candidates[0])
             try:
                 manifest = self._manifest(directory)
+                self._tool_prefixes[name] = str(manifest.get("toolPrefix") or "")
                 entrypoint = directory / "main.py"
                 if not entrypoint.is_file() or entrypoint.is_symlink():
                     raise ValueError("missing main.py entrypoint")
@@ -213,6 +236,7 @@ class ExtensionRuntime:
             if item[0] != name
         }
         self._loops.pop(name, None)
+        self._tool_prefixes.pop(name, None)
         get_registry().unregister_source(f"extension:{name}")
 
     def unload(self, name: str) -> tuple[bool, str]:

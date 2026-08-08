@@ -1,13 +1,24 @@
 """Authenticated installer for the separately distributed Enterprise edition.
 
 This module intentionally contains no organization, seat, asset or policy
-implementation. It only obtains a platform-specific signed executable from the
-logged-in user's organization and installs it atomically.
+implementation. It only obtains a signed package from the logged-in user's
+organization and installs it.
 
 It therefore ships with the public CLI, and must stay that way: it holds a
 *public* verification key and no secrets, and the entry point is useless without
 a session and a membership the server checks on its side. What stays private is
 the Enterprise edition it downloads, not the code that fetches it.
+
+What it downloads is an **extension**, not a program. Enterprise used to be a
+frozen executable that re-launched the public CLI as a library; it is now a
+package that `extension_runtime` loads into the running process, where it
+registers `/org`, its tools, the organisation's shared skills and — through
+`policy._apply_org_policy` — the organisation's rules. The member keeps using
+laintas-cli; the organisation layer appears inside it.
+
+That change also removed a failure mode worth remembering: a frozen binary
+carries its own interpreter, so it inherited the build machine's glibc and died
+on startup for every customer on an older distribution. An extension is source.
 
 Releases are served from enterprise.laintas.com only. Nothing here follows a
 download URL to another origin — see `_download_payload`.
@@ -16,15 +27,24 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
+import shutil
 from pathlib import Path
 from typing import Optional
 
 import requests
 
 import paths
-from release import (atomic_write, download, platform_id, verify_ed25519,
-                     verify_sha256)
+from release import (download, extract_archive, verify_ed25519, verify_sha256)
+
+#: Directory name of the organisation extension, and the identity it is known by
+#: to `extension_runtime` and to managed skills. The manifest inside the package
+#: must declare the same name.
+EXTENSION_NAME = "laintas-org"
+
+#: The `platform` a member asks for. The Enterprise CLI used to be built per
+#: architecture; the extension is pure source and there is exactly one build, so
+#: this constant stands where `release.platform_id()` used to.
+EXTENSION_PLATFORM = "extension"
 
 API_BASE = os.environ.get(
     "LAINTAS_ENTERPRISE_API", "https://enterprise.laintas.com").rstrip("/")
@@ -54,13 +74,27 @@ def _authenticated_session() -> requests.Session:
 
 # ── install paths ──────────────────────────────────────────────────────────
 
-def executable_path() -> Path:
-    suffix = ".exe" if os.name == "nt" else ""
-    return paths.LAINTAS_HOME / "enterprise" / "bin" / f"laintas-enterprise{suffix}"
+def extension_path() -> Path:
+    """Where the organisation extension lives.
+
+    Machine-wide rather than project-local: an organisation's rules do not stop
+    applying because the member changed directory.
+    """
+    return paths.global_extensions_dir() / EXTENSION_NAME
+
+
+def is_installed() -> bool:
+    return (extension_path() / "extension.json").is_file()
 
 
 def gateway_path() -> Path:
     return paths.LAINTAS_HOME / "enterprise" / "gateway"
+
+
+def _legacy_executable() -> Path:
+    """The pre-extension frozen binary, kept only so it can be removed."""
+    suffix = ".exe" if os.name == "nt" else ""
+    return paths.LAINTAS_HOME / "enterprise" / "bin" / f"laintas-enterprise{suffix}"
 
 
 # ── download + verify + install ────────────────────────────────────────────
@@ -107,6 +141,10 @@ _REFUSALS = {
     "wrong_host": (
         "Enterprise releases are served only from enterprise.laintas.com.\n"
         "  Unset LAINTAS_ENTERPRISE_API to use the default."),
+    "client_too_old": (
+        "This Laintas CLI is too old for Laintas Enterprise.\n"
+        "  Enterprise now loads into the CLI instead of installing a separate\n"
+        "  executable. Run:  /v update   then  /v enterprise"),
 }
 
 
@@ -170,18 +208,80 @@ def _format_size(value: int) -> str:
 
 # ── public API ─────────────────────────────────────────────────────────────
 
-def install_cli(log=print) -> tuple[Path, dict]:
-    """Download and install the Enterprise CLI binary.
+def install_extension(log=print, runtime=None) -> tuple[Path, dict]:
+    """Download, verify, unpack and load the organisation extension.
 
     Returns ``(installed_path, manifest)``.
+
+    The previous install is replaced only once the new one is on disk and
+    verified, and the running process picks it up immediately — an organisation
+    that publishes a rule should not have to ask its members to restart.
     """
-    manifest = _fetch_release("/api/org/download/cli", platform=platform_id(), log=log)
-    payload = _download_payload(manifest, _authenticated_session(), log)
-    _verify_enterprise(payload, manifest)
-    target = executable_path()
-    atomic_write(payload, target)
-    log(f"Enterprise CLI v{manifest['version']} installed at {target}")
-    return target, manifest
+    release = _fetch_release("/api/org/download/cli",
+                             platform=EXTENSION_PLATFORM, log=log)
+    payload = _download_payload(release, _authenticated_session(), log)
+    _verify_enterprise(payload, release)
+
+    target = extension_path()
+    staging = target.with_name(f".{target.name}.incoming")
+    previous = target.with_name(f".{target.name}.previous")
+    shutil.rmtree(staging, ignore_errors=True)
+    try:
+        extract_archive(payload, staging)
+        if not (staging / "extension.json").is_file():
+            raise RuntimeError(
+                "Enterprise package is missing extension.json — refusing it.")
+        shutil.rmtree(previous, ignore_errors=True)
+        if target.exists():
+            os.replace(target, previous)
+        os.replace(staging, target)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+    # The frozen binary this replaced would otherwise sit around looking
+    # installed; nothing launches it any more.
+    _remove_legacy_executable()
+
+    if runtime is not None:
+        ok, message = runtime.load(EXTENSION_NAME)
+        if not ok:
+            # Loading is the only real proof the package works. Put the previous
+            # one back rather than leaving the member with a broken org layer.
+            shutil.rmtree(target, ignore_errors=True)
+            if previous.exists():
+                os.replace(previous, target)
+                runtime.load(EXTENSION_NAME)
+            raise RuntimeError(f"Enterprise package failed to load: {message}")
+
+    shutil.rmtree(previous, ignore_errors=True)
+    log(f"Laintas Enterprise v{release['version']} enabled — try /org status")
+    return target, release
+
+
+def uninstall_extension(runtime=None) -> bool:
+    """Remove the organisation extension. Returns True if something was removed.
+
+    Organisation *rules* go with it, which is the point: this is how a member
+    who has left, or who is troubleshooting, gets back to a plain CLI. The
+    server still knows who they are — it decides what they may install next.
+    """
+    if runtime is not None:
+        runtime.unload(EXTENSION_NAME)
+    os.environ.pop("LAINTAS_POLICY_DIGEST", None)
+    target = extension_path()
+    existed = target.exists()
+    shutil.rmtree(target, ignore_errors=True)
+    _remove_legacy_executable()
+    return existed
+
+
+def _remove_legacy_executable() -> None:
+    legacy = _legacy_executable()
+    try:
+        legacy.unlink(missing_ok=True)
+        legacy.parent.rmdir()
+    except OSError:
+        pass
 
 
 def install_gateway(log=print) -> tuple[Path, dict]:
@@ -194,13 +294,6 @@ def install_gateway(log=print) -> tuple[Path, dict]:
     _verify_enterprise(payload, manifest)
 
     target = gateway_path()
-    from release import extract_archive
     extract_archive(payload, target)
     log(f"Enterprise gateway v{manifest['version']} extracted to {target}")
     return target, manifest
-
-
-def install_and_launch(log=print) -> None:
-    """Download, install, and launch the Enterprise CLI."""
-    target, _ = install_cli(log=log)
-    subprocess.run([str(target)], check=False)

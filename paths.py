@@ -202,6 +202,16 @@ def extensions_dir() -> Path:
     return project_dir() / "extensions"
 
 
+def global_extensions_dir() -> Path:
+    """Machine-wide extensions, loaded from every working directory.
+
+    Project-local extensions belong to one tree; an extension that governs the
+    account — the Enterprise organisation package is the reason this exists —
+    must not stop applying because the user cd'd somewhere else.
+    """
+    return LAINTAS_HOME / "extensions"
+
+
 def evolution_lab_dir() -> Path:
     """Project-local Evolution Lab branches, candidates, tests and history."""
     return project_dir() / "evolution-lab"
