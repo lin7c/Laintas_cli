@@ -3282,6 +3282,121 @@ def _bi_agent_rename(params: dict, ctx: ToolCtx) -> dict:
     return {"ok": False, "error": "no current agent to rename"}
 
 
+def _bi_file_push(params: dict, ctx: ToolCtx) -> dict:
+    """Push files from the local filesystem to Laintas shared storage (R2).
+
+    Uploads files to the Helpwo shared storage via agent_gateway's presigned
+    PUT URLs, then sends a 'file_push' message to a target Helpwo agent so it
+    can receive the files into its workspace.
+
+    Requires LAINTAS_BACKEND to be configured and the user to be authenticated.
+    """
+    import backend_profiles
+    import os as _os
+
+    backend_url = _os.environ.get("LAINTAS_BACKEND", "https://laintas.com")
+    try:
+        profile = backend_profiles.resolve(backend_url)
+    except Exception:
+        return {"ok": False, "error": f"cannot resolve backend: {backend_url}"}
+
+    paths = params.get("paths")
+    if not paths:
+        return {"ok": False, "error": "missing 'paths' — list of local file paths"}
+    if isinstance(paths, str):
+        paths = [paths]
+    if not isinstance(paths, list):
+        return {"ok": False, "error": "'paths' must be a list of file paths"}
+
+    target_agent_id = (params.get("target_agent_id") or "").strip()
+    if not target_agent_id:
+        return {"ok": False, "error": "missing 'target_agent_id' — the Helpwo agent to notify"}
+
+    headers, cookies = backend_profiles.request_auth(profile, ctx.session)
+    gateway_base = profile.base_url
+
+    uploaded = []
+    errors = []
+
+    for path in paths:
+        path = str(path).strip()
+        if not path:
+            continue
+        try:
+            import os as _osp
+            fname = _osp.path.basename(path)
+            fsize = _osp.path.getsize(path)
+            import mimetypes
+            mime, _ = mimetypes.guess_type(path)
+            if not mime:
+                mime = "application/octet-stream"
+
+            # 1. Request presigned upload URL
+            presign_resp = requests.post(
+                f"{gateway_base}/api/storage/presign-upload",
+                json={"name": fname, "size": fsize, "content_type": mime},
+                headers=headers, cookies=cookies, timeout=15,
+            )
+            if presign_resp.status_code == 413:
+                errors.append(f"{fname}: storage full — delete some files or upgrade")
+                continue
+            if presign_resp.status_code != 200:
+                try:
+                    detail = presign_resp.json()
+                    err_msg = detail.get("detail", presign_resp.text[:200])
+                except Exception:
+                    err_msg = presign_resp.text[:200]
+                errors.append(f"{fname}: presign failed ({presign_resp.status_code}): {err_msg}")
+                continue
+            presign = presign_resp.json()
+
+            # 2. Upload directly to R2
+            with open(path, "rb") as fh:
+                put_resp = requests.put(
+                    presign["upload_url"],
+                    data=fh,
+                    headers={"Content-Type": mime},
+                    timeout=120,
+                )
+            if put_resp.status_code not in (200, 201):
+                errors.append(f"{fname}: R2 upload failed ({put_resp.status_code})")
+                continue
+
+            uploaded.append({
+                "name": fname,
+                "size": fsize,
+                "key": presign["key"],
+                "mime_type": mime,
+            })
+        except FileNotFoundError:
+            errors.append(f"{path}: file not found")
+        except Exception as exc:
+            errors.append(f"{path}: {exc}")
+
+    if not uploaded:
+        return {"ok": False, "error": "; ".join(errors) if errors else "no files uploaded"}
+
+    # 3. Send file_push message to target agent
+    try:
+        send_resp = requests.post(
+            f"{gateway_base}/api/agents/{target_agent_id}/send",
+            json={
+                "kind": "file_push",
+                "payload": {"files": uploaded},
+            },
+            headers=headers, cookies=cookies, timeout=10,
+        )
+        if send_resp.status_code != 200:
+            errors.append(f"agent notification failed ({send_resp.status_code})")
+    except Exception as exc:
+        errors.append(f"agent notification failed: {exc}")
+
+    result = f"Uploaded {len(uploaded)} file(s) to shared storage"
+    if errors:
+        result += f"; {len(errors)} error(s): " + "; ".join(errors[:3])
+    return {"ok": True, "result": result, "files": uploaded}
+
+
 def _bi_terminal_send(params: dict, ctx: ToolCtx) -> dict:
     """Send interactive input to a terminal and return only newly read output.
 
@@ -6369,6 +6484,31 @@ def register_builtin_tools() -> None:
                 "required": ["name"],
             },
             invoke=_bi_agent_rename,
+        ),
+        Tool(
+            name="file_push",
+            description=(
+                "Push local files to Laintas shared cloud storage (R2) and notify a "
+                "Helpwo agent. Files are uploaded via presigned URLs — the gateway "
+                "never touches the bytes. After upload, a 'file_push' message is sent "
+                "to the target agent so it can download the files into its workspace."
+            ),
+            schema={
+                "type": "object",
+                "properties": {
+                    "paths": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of local file paths to upload.",
+                    },
+                    "target_agent_id": {
+                        "type": "string",
+                        "description": "The Helpwo agent ID to notify after upload.",
+                    },
+                },
+                "required": ["paths", "target_agent_id"],
+            },
+            invoke=_bi_file_push,
         ),
         # ── HWO spawn primitives ────────────────────────────────────
         Tool(
