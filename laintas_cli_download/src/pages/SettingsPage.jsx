@@ -16,7 +16,10 @@ export default function SettingsPage() {
   // The CLI's own monthly allowance. Sold here rather than on a central price
   // list, because this is the page somebody lands on when it runs out.
   const [calls, setCalls] = useState(null);
-  const [buying, setBuying] = useState(false);
+  // One store, shared with Helpwo — but bought from whichever product the user
+  // happens to be looking at, because "go to the other site" is not an answer.
+  const [storage, setStorage] = useState(null);
+  const [buying, setBuying] = useState('');
   const [buyError, setBuyError] = useState(null);
   const [reload, setReload] = useState(0);
 
@@ -24,7 +27,10 @@ export default function SettingsPage() {
     if (!session) return;
     fetch('/api/balance', { credentials: 'include' })
       .then(r => r.json())
-      .then(d => { if (d.balance != null) setBalance(d.balance); })
+      .then(d => {
+        if (d.balance != null) setBalance(d.balance);
+        setStorage(d.storage ?? null);
+      })
       .catch(() => {});
   }, [session, reload]);
 
@@ -36,26 +42,37 @@ export default function SettingsPage() {
       .catch(() => {});
   }, [session, reload]);
 
-  async function buyCallPack() {
-    setBuying(true);
+  async function buyPack(kind) {
+    setBuying(kind);
     setBuyError(null);
     try {
       const res = await fetch('/api/subscription/upgrades', {
         method: 'POST',
         credentials: 'include',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ kind: 'extra_calls_cli' }),
+        body: JSON.stringify({ kind }),
       });
       const body = await res.json().catch(() => ({}));
       // The server's own words: it knows whether the problem was a missing
       // membership or an empty balance, and those need different answers.
-      if (!res.ok) setBuyError(body.detail || body.error || '加购失败，请重试。');
+      if (!res.ok) setBuyError({ kind, message: body.detail || body.error || '加购失败，请重试。' });
       else setReload(v => v + 1);
     } catch {
-      setBuyError('加购失败，请重试。');
+      setBuyError({ kind, message: '加购失败，请重试。' });
     } finally {
-      setBuying(false);
+      setBuying('');
     }
+  }
+
+  // Whole megabytes turn a real 84 KB of files into "0 MB", which reads as a
+  // broken counter rather than as a nearly-empty store.
+  function fmtBytes(n) {
+    if (!Number.isFinite(n)) return '—';
+    if (n >= 1024 ** 3) return `${(n / 1024 ** 3).toFixed(1)} GB`;
+    if (n >= 10 * 1048576) return `${Math.round(n / 1048576)} MB`;
+    if (n >= 1048576) return `${(n / 1048576).toFixed(1).replace(/\.0$/, '')} MB`;
+    if (n >= 1024) return `${Math.round(n / 1024)} KB`;
+    return `${n} B`;
   }
 
   async function handleSignOut() {
@@ -135,8 +152,7 @@ export default function SettingsPage() {
           </div>
 
           {/* CLI call allowance — the bar, what it is made of, and the one
-              thing that makes it bigger. Storage is not here: the CLI shares
-              Helpwo's store, so it is bought once, in Helpwo. */}
+              thing that makes it bigger. */}
           {calls && calls.limit != null && (
             <div className="rounded-2xl p-6 mb-5" style={{ background: 'var(--card-bg)', border: '1px solid var(--card-border)' }}>
               <h2 className="font-display text-lg italic font-semibold mb-4" style={{ color: 'var(--text-primary)' }}>调用额度</h2>
@@ -161,16 +177,69 @@ export default function SettingsPage() {
                       ? `含 ${(calls.included ?? 0).toLocaleString()} + 已加购 ${calls.purchased.toLocaleString()}`
                       : '额度用尽后按 Token 计费扣余额'}
                   </span>
-                  <button onClick={buyCallPack} disabled={buying}
-                    className="flex-none text-xs px-3 py-1.5 rounded-lg transition-colors disabled:opacity-50"
-                    style={{ background: 'var(--bg-hover)', color: 'var(--text-secondary)' }}>
-                    {buying ? '处理中…' : '加购 5,000 次 · $10/月'}
-                  </button>
+                  {calls.top_up && (
+                    <button onClick={() => buyPack(calls.top_up.kind)} disabled={!!buying}
+                      className="flex-none text-xs px-3 py-1.5 rounded-lg transition-colors disabled:opacity-50"
+                      style={{ background: 'var(--bg-hover)', color: 'var(--text-secondary)' }}>
+                      {buying === calls.top_up.kind ? '处理中…'
+                        : `加购 ${calls.top_up.quantity.toLocaleString()} 次 · $${(calls.top_up.monthly_cents / 100).toFixed(0)}/月`}
+                    </button>
+                  )}
                 </div>
               </div>
-              {buyError && <p className="text-xs mt-3" style={{ color: 'var(--error, #ef4444)' }}>{buyError}</p>}
+              {buyError?.kind === calls.top_up?.kind && (
+                <p className="text-xs mt-3" style={{ color: 'var(--error, #ef4444)' }}>{buyError.message}</p>
+              )}
               <p className="text-xs mt-3 leading-relaxed" style={{ color: 'var(--text-muted)' }}>
                 增值项加在会员上，与会员同日扣费，不会多出第二个账期。可随时取消，已付的当月照常供应。
+              </p>
+            </div>
+          )}
+
+          {/* Shared storage — what `/shared` and Helpwo's "Laintas 存储" both
+              write into. Sold here as well as in Helpwo: it is one allowance,
+              and the person who filled it from the CLI is standing here. */}
+          {storage && storage.limit_bytes != null && (
+            <div className="rounded-2xl p-6 mb-5" style={{ background: 'var(--card-bg)', border: '1px solid var(--card-border)' }}>
+              <h2 className="font-display text-lg italic font-semibold mb-4" style={{ color: 'var(--text-primary)' }}>存储空间</h2>
+              <div className="p-4 rounded-xl" style={{ background: 'var(--input-bg)' }}>
+                <div className="flex items-baseline justify-between mb-2">
+                  <span className="text-sm" style={{ color: 'var(--text-tertiary)' }}>已用空间</span>
+                  <span className="font-mono text-sm" style={{ color: 'var(--text-primary)' }}>
+                    {fmtBytes(storage.used_bytes)} / {fmtBytes(storage.limit_bytes)}
+                  </span>
+                </div>
+                <div className="h-1.5 rounded-full overflow-hidden mb-2" style={{ background: 'var(--bg-hover)' }}>
+                  <div className="h-full rounded-full transition-all" style={{
+                    width: `${Math.min(100, (storage.used_bytes / storage.limit_bytes) * 100)}%`,
+                    background: storage.read_only ? 'var(--error, #ef4444)'
+                      : storage.used_bytes / storage.limit_bytes >= 0.9 ? 'var(--warning, #d97706)'
+                        : 'var(--accent-soft)',
+                  }} />
+                </div>
+                <div className="flex items-center justify-between gap-3">
+                  <span className="text-xs" style={{ color: 'var(--text-muted)' }}>
+                    {storage.extra_bytes > 0
+                      ? `含 ${fmtBytes(storage.base_bytes)} + 已加购 ${fmtBytes(storage.extra_bytes)}`
+                      : '与 Helpwo 共用同一份存储'}
+                  </span>
+                  {storage.top_up && (
+                    <button onClick={() => buyPack(storage.top_up.kind)} disabled={!!buying}
+                      className="flex-none text-xs px-3 py-1.5 rounded-lg transition-colors disabled:opacity-50"
+                      style={{ background: 'var(--bg-hover)', color: 'var(--text-secondary)' }}>
+                      {buying === storage.top_up.kind ? '处理中…'
+                        : `加购 ${fmtBytes(storage.top_up.quantity)} · $${(storage.top_up.monthly_cents / 100).toFixed(0)}/月`}
+                    </button>
+                  )}
+                </div>
+              </div>
+              {buyError?.kind === storage.top_up?.kind && (
+                <p className="text-xs mt-3" style={{ color: 'var(--error, #ef4444)' }}>{buyError.message}</p>
+              )}
+              <p className="text-xs mt-3 leading-relaxed" style={{ color: 'var(--text-muted)' }}>
+                {storage.read_only
+                  ? '空间已满：现有文件不会被删除，但暂时无法写入新文件，加购后立即恢复。'
+                  : '空间满了只会停止写入，不会删除已有文件，也不会额外扣费。'}
               </p>
             </div>
           )}

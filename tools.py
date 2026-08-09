@@ -4867,7 +4867,14 @@ def _browser_check_action(action: str, params: dict, ctx: ToolCtx):
     if decision.action == "needs_approval":
         # Build a human-readable command string for the approval prompt.
         url = params.get("url", "")
-        selector = params.get("selector", "")
+        # The model normally targets elements by `ref` (from browser.snapshot),
+        # not `selector` — reading only `selector` rendered the prompt as a bare
+        # "Click element: " and asked the user to approve an unnamed target.
+        selector = (params.get("selector") or "").strip()
+        if not selector and params.get("ref") is not None:
+            selector = f"ref={params['ref']}"
+        if not selector:
+            selector = "(no target given)"
         if action == "navigate":
             cmd = f"browser.navigate {url}"
         elif action == "click":

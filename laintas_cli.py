@@ -518,7 +518,7 @@ def _alt_screen():
         _file.flush()
 
 
-def _clear_stale_running_loop() -> None:
+def _clear_stale_running_loop() -> bool:
     """Clear a stale asyncio running-loop flag left on this thread.
 
     prompt_toolkit's ``Application.run()`` calls ``asyncio.run()`` which
@@ -533,12 +533,28 @@ def _clear_stale_running_loop() -> None:
 
     This is a no-op when no stale flag is present; it only clears the flag
     when a previous ``app.run()`` was interrupted by SIGINT.
+
+    A *live* loop is never cleared: if the flag points at a loop that is
+    genuinely running, this thread really is inside asyncio and stealing its
+    flag would corrupt that loop instead of the caller's dialog.  Returns True
+    only when a stale flag was actually cleared.
     """
     try:
-        if asyncio.events._get_running_loop() is not None:
-            asyncio.events._set_running_loop(None)
+        loop = asyncio.events._get_running_loop()
+    except Exception:
+        return False
+    if loop is None:
+        return False
+    try:
+        if loop.is_running() and not loop.is_closed():
+            return False  # a real running loop — not ours to clear
     except Exception:
         pass
+    try:
+        asyncio.events._set_running_loop(None)
+        return True
+    except Exception:
+        return False
 
 
 def select_dialog(
@@ -932,13 +948,31 @@ def select_dialog(
     # surface KeyboardInterrupt when the terminal is interrupted while the
     # application is starting/stopping; convert that into the same ordinary
     # cancel result as Esc/q instead of leaking a traceback to the user.
-    try:
-        result = app.run(pre_run=_pre_run)
-        _clear_stale_running_loop()
-        return result
-    except (KeyboardInterrupt, EOFError):
-        _clear_stale_running_loop()
-        return (None, -1) if act_keys else None
+    #
+    # The flag is cleared BEFORE the run as well as after: an interrupted
+    # app.run() elsewhere (or one whose `finally` never got to run) leaves the
+    # flag set on this thread, and every later dialog on that thread then dies
+    # in asyncio.run() with "cannot be called from a running event loop" —
+    # permanently, since the post-run cleanup below is never reached. That is
+    # what made browser.* approvals fail for the rest of a session.
+    _clear_stale_running_loop()
+    for _attempt in (0, 1):
+        try:
+            result = app.run(pre_run=_pre_run)
+            return result
+        except (KeyboardInterrupt, EOFError):
+            return (None, -1) if act_keys else None
+        except RuntimeError as e:
+            # Retry once, but only if we actually found a stale flag to clear;
+            # if the loop is live this thread cannot host a dialog at all and
+            # the caller needs to hear about it (see _blocking_approval_prompt,
+            # which falls back to a raw-termios prompt).
+            if (_attempt == 0 and "event loop" in str(e).lower()
+                    and _clear_stale_running_loop()):
+                continue
+            raise
+        finally:
+            _clear_stale_running_loop()
 
 
 def choose_record(records, *, title: str, label: Callable,
@@ -2709,7 +2743,7 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec("/cwd", "Show the working directory", "Basics"),
     CommandSpec("/scan", "List user-facing PATH commands", "Basics"),
     CommandSpec("/login", "Re-authenticate with Laintas", "Account & Session"),
-    CommandSpec("/usage", "Show AI usage — local token stats + Laintas backend usage", "Account & Session", "/usage [7d|30d|90d|local]", subcommands=("local",)),
+    CommandSpec("/usage", "Show AI usage — local token stats + Laintas backend usage", "Account & Session", "/usage [7d|30d|90d|local|buy <calls|storage>]", subcommands=("local", "buy")),
     CommandSpec("/resume", "Resume a saved session (picker; echo last N events, default 20)", "Account & Session", "/resume [N|all|latest]"),
     CommandSpec("/new", "Start a new live session", "Account & Session", "/new",
                 aliases=("/clear", "/new-session", "/reset-session")),
@@ -9219,11 +9253,7 @@ def _handle_enterprise(parts: list) -> None:
             "[dim]No organisation layer was installed.[/dim]")
         return
 
-    # No token is asked for. The server resolves the caller's organisation and
-    # role from their signed-in session, so an installation right follows
-    # membership: gained on joining, lost the moment an admin removes you.
-    log = lambda message: console.print(
-        f"[green]{escape(message)}[/green]")
+    log = console.print
 
     try:
         if target == "on":
@@ -10133,10 +10163,19 @@ def _usage_daily_values(daily: list, days: int) -> list[int]:
 
 
 def _fmt_mb(byte_count: int) -> str:
-    """Packs are sold in whole megabytes, so this never needs to be cleverer."""
+    """Allowance sizes, in the unit that keeps the number meaningful. Rounding
+    everything to whole megabytes reported 84 KB of real files as "0 MB", which
+    reads as a broken counter rather than as a nearly-empty store."""
     if byte_count >= 1024 ** 3:
         return f"{byte_count / 1024 ** 3:.1f} GB"
-    return f"{round(byte_count / 1048576)} MB"
+    if byte_count >= 10 * 1048576:
+        return f"{round(byte_count / 1048576)} MB"
+    if byte_count >= 1048576:
+        # "5.0 MB" for an exactly-5 MB allowance reads as spurious precision.
+        return f"{byte_count / 1048576:.1f}".rstrip("0").rstrip(".") + " MB"
+    if byte_count >= 1024:
+        return f"{round(byte_count / 1024)} KB"
+    return f"{byte_count} B"
 
 
 def _usage_allowance_bar(used: int, limit: int, figures: str, note: str | int = ""):
@@ -10162,6 +10201,99 @@ def _usage_allowance_tight(state, used_key: str, limit_key: str) -> bool:
         return False
     limit = state.get(limit_key) or 0
     return bool(limit) and (state.get(used_key) or 0) / limit >= 0.9
+
+
+def _usage_top_ups(session: dict) -> tuple[dict, str]:
+    """The two add-ons the CLI can buy, as the server describes them.
+
+    Pricing is read back rather than hardcoded: a pack whose price lives in two
+    places eventually quotes one and charges the other.
+    """
+    profile = get_backend_profile()
+    if not (profile.sends_laintas_credentials and session.get("userId")):
+        return {}, "Not signed in to Laintas. Run /login."
+    headers, cookies = backend_profiles.request_auth(profile, session)
+    packs = {}
+    try:
+        bal = requests.get(f"{profile.base_url}/api/balance",
+                           headers=headers, cookies=cookies, timeout=10)
+        store = (bal.json() or {}).get("storage") if bal.status_code == 200 else None
+        if isinstance(store, dict) and isinstance(store.get("top_up"), dict):
+            packs["storage"] = dict(store["top_up"], state=store)
+        sub = requests.get(f"{profile.base_url}/api/subscription",
+                           headers=headers, cookies=cookies, timeout=10)
+        quota = next((p.get("monthly") for p in ((sub.json() or {}).get("byProduct") or [])
+                      if p.get("productId") == "cli"), None) if sub.status_code == 200 else None
+        if isinstance(quota, dict) and isinstance(quota.get("top_up"), dict):
+            packs["calls"] = dict(quota["top_up"], state=quota)
+    except requests.RequestException as exc:
+        return {}, f"Could not reach Laintas ({type(exc).__name__})"
+    return packs, "" if packs else "No add-ons are available on this account."
+
+
+def _usage_pack_label(what: str, pack: dict) -> str:
+    """`+100 MB storage for $1.00 a month` — quantity in the pack's own unit."""
+    qty = int(pack.get("quantity") or 0)
+    size = _fmt_mb(qty) if what == "storage" else f"{qty:,} calls"
+    return f"+{size} for {_fmt_cents(int(pack.get('monthly_cents') or 0))} a month"
+
+
+def _usage_buy_pack(what: str, session: dict) -> None:
+    """/usage buy <calls|storage> — add a recurring pack to the membership.
+
+    This spends real money, so it states the whole commitment (recurring, billed
+    with the membership) and takes an explicit yes before posting.
+    """
+    packs, why = _usage_top_ups(session)
+    pack = packs.get(what)
+    if not pack:
+        console.print(f"[yellow]{why or f'No {what} pack is available.'}[/yellow]")
+        return
+
+    console.print()
+    console.print(f"  [bold]{what} pack[/bold]  {_usage_pack_label(what, pack)}")
+    console.print("  [muted]Recurring: charged now, then on your membership's "
+                  "billing day. Cancel any time in Laintas settings.[/muted]")
+    try:
+        answer = input(f"\nBuy this {what} pack? [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        console.print("\n[dim]Cancelled.[/dim]")
+        return
+    if answer not in ("y", "yes"):
+        console.print("[dim]Cancelled — nothing was charged.[/dim]")
+        return
+
+    profile = get_backend_profile()
+    headers, cookies = backend_profiles.request_auth(profile, session)
+    try:
+        resp = requests.post(f"{profile.base_url}/api/subscription/upgrades",
+                             json={"kind": pack.get("kind")},
+                             headers=headers, cookies=cookies, timeout=20)
+        data = resp.json() if resp.content else {}
+    except requests.RequestException as exc:
+        console.print(f"[red]Purchase failed to send ({type(exc).__name__}). "
+                      "Nothing was charged.[/red]")
+        return
+    except ValueError:
+        console.print(f"[red]Purchase failed (HTTP {resp.status_code}).[/red]")
+        return
+
+    if resp.status_code == 200 and data.get("success"):
+        console.print(f"[green]Added.[/green] {_fmt_cents(int(data.get('chargedCents') or 0))} "
+                      "charged; renews with your membership.")
+        console.print("[dim]Run /usage to see the new allowance.[/dim]")
+        return
+    if data.get("code") == "no_membership":
+        console.print("[yellow]Add-ons are billed with a membership, so there has to "
+                      "be one to bill them with.[/yellow]")
+        console.print("[dim]Subscribe at laintas.com/settings, then try again.[/dim]")
+        return
+    if data.get("code") in ("insufficient_balance", "insufficient_funds"):
+        console.print(f"[yellow]Not enough balance — this pack needs "
+                      f"{_fmt_cents(int(data.get('required_cents') or 0))}.[/yellow]")
+        console.print("[dim]Top up at laintas.com/settings.[/dim]")
+        return
+    console.print(f"[red]{data.get('error') or f'Purchase failed (HTTP {resp.status_code}).'}[/red]")
 
 
 def _usage_sparkline(values: list[int]) -> str:
@@ -10231,15 +10363,22 @@ def _usage_pricing_note(balance: dict) -> str:
 
 def _show_usage_command(args: list, session: dict) -> None:
     """/usage — local token accounting + Laintas backend usage (product=cli)."""
+    words = [a.strip().lower() for a in args if a.strip()]
+    if words and words[0] == "buy":
+        what = words[1] if len(words) > 1 else ""
+        if what not in ("calls", "storage"):
+            raise SlashCommandUsageError("Usage: /usage buy <calls|storage>")
+        _usage_buy_pack(what, session)
+        return
+
     rng, local_only = "30d", False
-    for a in args:
-        a = a.strip().lower()
+    for a in words:
         if a == "local":
             local_only = True
         elif a in ("7d", "30d", "90d"):
             rng = a
-        elif a:
-            raise SlashCommandUsageError("Usage: /usage [7d|30d|90d|local]")
+        else:
+            raise SlashCommandUsageError("Usage: /usage [7d|30d|90d|local|buy <calls|storage>]")
     days = {"7d": 7, "30d": 30, "90d": 90}[rng]
 
     # Fetch backend data before rendering so its pricing tier map can annotate
@@ -10449,6 +10588,19 @@ def _show_usage_command(args: list, session: dict) -> None:
                         f"incl {_fmt_mb(int(store.get('base_bytes') or 0))}"
                         f" + {_fmt_mb(int(store['extra_bytes']))} bought"))
 
+                # Where to buy more, stated once, next to the bars it grows —
+                # the two commands are the whole answer to "I ran out".
+                label = "add-ons"
+                for what, state in (("calls", call_quota), ("storage", store)):
+                    top_up = state.get("top_up") if isinstance(state, dict) else None
+                    if not isinstance(top_up, dict):
+                        continue
+                    line = Text()
+                    line.append(f"/usage buy {what}".ljust(19), style="bold")
+                    line.append(_usage_pack_label(what, top_up), style="muted")
+                    grid.add_row(label, line)
+                    label = ""  # one heading, one row per pack
+
                 values = _usage_daily_values(usage.get("daily") or [], days)
                 if any(values):
                     spark = Text.from_markup(_usage_sparkline(values))
@@ -10459,11 +10611,10 @@ def _show_usage_command(args: list, session: dict) -> None:
                 # Said only when it is nearly true. A standing advert on a panel
                 # somebody opened to check their usage is noise.
                 if _usage_allowance_tight(call_quota, "used", "limit"):
-                    footnotes.append("CLI calls nearly used up — add 5,000/month for $10 "
-                                     "at cli.laintas.com/settings")
+                    footnotes.append("CLI calls nearly used up — /usage buy calls")
                 if _usage_allowance_tight(store, "used_bytes", "limit_bytes"):
-                    footnotes.append("storage nearly full — add 100 MB for $1/month in "
-                                     "Helpwo settings (the CLI shares that store)")
+                    footnotes.append("storage nearly full — /usage buy storage "
+                                     "(one store, shared with Helpwo)")
                 if sub_calls:
                     footnotes.append("subscription calls carry no token counts on the "
                                      "backend — LOCAL tokens are authoritative")
@@ -18138,6 +18289,25 @@ def _blocking_approval_prompt(title: str, body: str, question: str,
         )
     except (EOFError, KeyboardInterrupt):
         choice = None
+    except RuntimeError as e:
+        if "event loop" not in str(e).lower():
+            raise
+        # prompt_toolkit cannot start on this thread (it already owns a live
+        # asyncio loop). Ask with the raw-termios single-key prompt instead —
+        # letting the RuntimeError escape would surface to the model as a tool
+        # error and silently drop the user's decision.
+        from rich.markup import escape as _esc
+        console.print(
+            f"  [bold #e3b341]{_esc(_action)}[/bold #e3b341]  "
+            f"{_esc(body_lines[0]) if body_lines else ''}", highlight=False)
+        for _ln in body_lines[1:]:
+            console.print(f"  [#c0c0c0]{_esc(_ln)}[/#c0c0c0]", highlight=False)
+        console.print(f"  [dim]{question}[/dim] "
+                      + ("(y/a/n)" if allow_always else "(y/n)"))
+        _key_choice = _read_single_key_choice(
+            allow_always=allow_always,
+            auto_confirm_seconds=auto_confirm_seconds)
+        choice = {"yes": "y ", "always": "a ", "no": "n "}.get(_key_choice or "no")
     finally:
         if _reader_was_running:
             _start_bg_input_reader(get_user_message_queue(),

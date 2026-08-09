@@ -230,8 +230,8 @@ def _download_payload(manifest: dict, session, log) -> bytes:
         raise RuntimeError(
             f"Refusing a release download that points outside {API_BASE}.")
 
-    log(f"Downloading enterprise release v{manifest.get('version')} "
-        f"({_format_size(size)})…")
+    log(f"[bold]Downloading enterprise release v{manifest.get('version')} "
+        f"({_format_size(size)})…[/bold]")
     payload = download(download_url, label="enterprise release",
                        timeout=180, session=session)
 
@@ -300,7 +300,7 @@ def install_extension(log=print, runtime=None, force=False) -> tuple[Path, dict]
             raise RuntimeError(f"Enterprise package failed to load: {message}")
 
     shutil.rmtree(previous, ignore_errors=True)
-    log(f"Laintas Enterprise v{release['version']} enabled — try /org status")
+    log(f"[green]Laintas Enterprise v{release['version']} enabled — try /org status[/green]")
     return target, release
 
 
@@ -341,5 +341,5 @@ def install_gateway(log=print) -> tuple[Path, dict]:
 
     target = gateway_path()
     extract_archive(payload, target)
-    log(f"Enterprise gateway v{manifest['version']} extracted to {target}")
+    log(f"[green]Enterprise gateway v{manifest['version']} extracted to {target}[/green]")
     return target, manifest

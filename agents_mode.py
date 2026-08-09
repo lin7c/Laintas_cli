@@ -1204,6 +1204,15 @@ class AgentsModeController:
             # regular Esc/Ctrl+C key bindings become active.
             return
         finally:
+            # An interrupt landing inside asyncio's own teardown can leave the
+            # running-loop flag set on this thread; every later prompt_toolkit
+            # dialog (approval gates especially) would then die in asyncio.run()
+            # with "cannot be called from a running event loop".
+            try:
+                import laintas_cli
+                laintas_cli._clear_stale_running_loop()
+            except Exception:
+                pass
             # Workers may outlive the full-screen application. Close the
             # approval channel first so any later request is denied instead of
             # waiting forever for a UI that no longer exists.

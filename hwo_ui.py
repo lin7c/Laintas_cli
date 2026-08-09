@@ -949,3 +949,11 @@ def run_hwo_ui(root_agent_name: str,
         return
     finally:
         stop_evt.set()
+        # An interrupt inside asyncio's teardown can leave this thread's
+        # running-loop flag set, which breaks every later prompt_toolkit
+        # dialog (approval gates included) with a RuntimeError.
+        try:
+            import laintas_cli
+            laintas_cli._clear_stale_running_loop()
+        except Exception:
+            pass

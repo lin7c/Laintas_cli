@@ -12,6 +12,7 @@
     "mcp_client",
     "policy",
     "command_parse",
+    "enterprise",
     "enterprise_installer",
     "memory_system",
     "hooks",
