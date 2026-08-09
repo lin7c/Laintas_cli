@@ -288,6 +288,10 @@ def install_extension(log=print, runtime=None, force=False) -> tuple[Path, dict]
     # installed; nothing launches it any more.
     _remove_legacy_executable()
 
+    # Mark as Ed25519-verified so the trust gate in load() lets it through
+    # without a separate /extensions trust step.
+    _stamp_install_metadata(target, "ed25519", str(release.get("version") or ""))
+
     if runtime is not None:
         ok, message = runtime.load(EXTENSION_NAME)
         if not ok:
@@ -319,6 +323,32 @@ def uninstall_extension(runtime=None) -> bool:
     shutil.rmtree(target, ignore_errors=True)
     _remove_legacy_executable()
     return existed
+
+
+def _stamp_install_metadata(directory: Path, trusted_by: str,
+                            version: str = "") -> None:
+    """Write install.trustedBy into the extension's manifest.
+
+    Called after the signed package is extracted to its final location, so
+    the trust gate in extension_runtime.load() recognises it as Ed25519-
+    verified and lets it through without a /extensions trust step.
+    """
+    manifest_path = directory / "extension.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    manifest.setdefault("install", {})["trustedBy"] = trusted_by
+    manifest["install"]["source"] = "official"
+    if version:
+        manifest["install"].setdefault("installedAt", _now_iso())
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def _now_iso() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _remove_legacy_executable() -> None:

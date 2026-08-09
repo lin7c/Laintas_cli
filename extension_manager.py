@@ -462,7 +462,7 @@ class ExtensionManager:
         except ValueError as exc:
             return InstallResult(ok=False, message=f"Invalid manifest: {exc}")
 
-        errors = validate_manifest(manifest, staging.name)
+        errors = validate_manifest(manifest, "")
         if errors:
             return InstallResult(
                 ok=False,

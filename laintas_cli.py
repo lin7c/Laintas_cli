@@ -2759,6 +2759,21 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
             ("update", "Download, install, and restart on the latest version"),
             ("enterprise", "Turn your organisation layer on or off in this CLI"),
         )),
+    CommandSpec(
+        "/extensions", "Install, manage, and publish community extensions",
+        "Account & Session",
+        "/extensions [list|install <src>|remove <name>|trust <name>|info <name>|create <name>|pack <name>]",
+        subcommands=("list", "install", "remove", "trust", "untrust", "info", "create", "pack"),
+        completion_descriptions=(
+            ("list", "List installed extensions"),
+            ("install", "Install from a local path, .lext archive, or URL"),
+            ("remove", "Uninstall an extension"),
+            ("trust", "Approve an extension's hash"),
+            ("untrust", "Revoke trust for an extension"),
+            ("info", "Show details about an installed extension"),
+            ("create", "Scaffold a new extension"),
+            ("pack", "Pack an extension into a .lext archive"),
+        )),
     CommandSpec("/name", "Show or set the current agent name", "Agents & Terminals", "/name [new-name]"),
     CommandSpec(
         "/hire", "Hire an undeployed employee; does not start an assignment",
@@ -9438,6 +9453,16 @@ _SLASH_ARG_RULES: dict[tuple[str, ...], SlashArgRule] = {
     ("/update", "check"): _arg_rule(1, "/update check"),
     ("/update", "--force"): _arg_rule(1, "/update [--force]"),
     ("/update", "-f"): _arg_rule(1, "/update [-f]"),
+    ("/extensions", "list"): _arg_rule(0, "/extensions list"),
+    ("/extensions", "install"): _arg_rule(
+        3, "/extensions install <src> [--global] [--force]",
+        flag_start=1, allowed_flags=("--global", "--force", "-f")),
+    ("/extensions", "remove"): _arg_rule(1, "/extensions remove <name>"),
+    ("/extensions", "trust"): _arg_rule(1, "/extensions trust <name>"),
+    ("/extensions", "untrust"): _arg_rule(1, "/extensions untrust <name>"),
+    ("/extensions", "info"): _arg_rule(1, "/extensions info <name>"),
+    ("/extensions", "create"): _arg_rule(1, "/extensions create <name>"),
+    ("/extensions", "pack"): _arg_rule(1, "/extensions pack <name>"),
 }
 
 
@@ -17028,6 +17053,134 @@ def _cmd_version(action: str, parts: list) -> None:
         handle_version_command(parts)
 
 
+def _cmd_extensions(parts: list) -> None:
+    """Handle ``/extensions [list|install|remove|trust|untrust|info|create|pack]``."""
+    import extension_manager
+
+    args = [str(p) for p in parts[1:]]
+    sub = args[0].lower() if args else "list"
+    rest = args[1:]
+
+    mgr = extension_manager.ExtensionManager(
+        runtime=extension_runtime.get_runtime(), console=console)
+
+    if sub == "list":
+        entries = mgr.list_installed()
+        if not entries:
+            console.print("[dim]No extensions installed.[/dim]")
+            return
+        for entry in entries:
+            trust_marker = "[green]✓[/green]" if entry["trusted"] else "[yellow]![/yellow]"
+            console.print(
+                f"  {trust_marker} [cyan]{entry['name']}[/cyan] "
+                f"v{entry['version']}  [dim]{entry['scope']}[/dim]  "
+                f"[dim]{entry.get('source', '')}[/dim]  "
+                f"{entry['description']}")
+        console.print("\n[dim]✓ = trusted  ! = untrusted[/dim]")
+        return
+
+    if sub == "install":
+        if not rest:
+            console.print("[yellow]Usage: /extensions install <path|url|.lext> [--global] [--force][/yellow]")
+            return
+        global_install = "--global" in rest
+        force = "--force" in rest or "-f" in rest
+        source = next((a for a in rest if not a.startswith("-")), "")
+        if not source:
+            console.print("[yellow]Usage: /extensions install <path|url|.lext> [--global] [--force][/yellow]")
+            return
+        result = mgr.install(source, global_install=global_install, force=force)
+        if result.ok:
+            console.print(f"[green]{result.message}[/green]")
+        else:
+            console.print(f"[red]{result.message}[/red]")
+        return
+
+    if sub == "remove":
+        if not rest:
+            console.print("[yellow]Usage: /extensions remove <name>[/yellow]")
+            return
+        removed = mgr.uninstall(rest[0])
+        if removed:
+            console.print(f"[green]Removed {rest[0]}.[/green]")
+        else:
+            console.print(f"[dim]No extension named {rest[0]!r} was found.[/dim]")
+        return
+
+    if sub == "trust":
+        if not rest:
+            console.print("[yellow]Usage: /extensions trust <name>[/yellow]")
+            return
+        ok, msg = mgr.trust(rest[0])
+        console.print(f"[green]{msg}[/green]" if ok else f"[red]{msg}[/red]")
+        return
+
+    if sub == "untrust":
+        if not rest:
+            console.print("[yellow]Usage: /extensions untrust <name>[/yellow]")
+            return
+        ok, msg = mgr.untrust(rest[0])
+        console.print(f"[green]{msg}[/green]" if ok else f"[red]{msg}[/red]")
+        return
+
+    if sub == "info":
+        if not rest:
+            console.print("[yellow]Usage: /extensions info <name>[/yellow]")
+            return
+        info = mgr.info(rest[0])
+        if info is None:
+            console.print(f"[red]Extension {rest[0]!r} is not installed.[/red]")
+            return
+        manifest = info["manifest"]
+        trust = info["trust"]
+        console.print(
+            f"[bold]{manifest.get('name')}[/bold] v{manifest.get('version')}\n"
+            f"  [dim]description : {manifest.get('description', '')}[/dim]\n"
+            f"  [dim]directory   : {info['directory']}[/dim]\n"
+            f"  [dim]integrity   : {info['integrity'][:16]}[/dim]\n"
+            f"  [dim]trusted     : {'yes' if trust.get('trusted') else 'no'} "
+            f"({trust.get('reason', '')})[/dim]\n"
+            f"  [dim]files       : {', '.join(info['files'])}[/dim]")
+        return
+
+    if sub == "create":
+        if not rest:
+            console.print("[yellow]Usage: /extensions create <name> [--desc \"description\"][/yellow]")
+            return
+        name = rest[0]
+        desc = ""
+        if "--desc" in rest:
+            idx = rest.index("--desc")
+            if idx + 1 < len(rest):
+                desc = rest[idx + 1]
+        try:
+            target = mgr.create(name, description=desc)
+            console.print(f"[green]Created extension scaffold at {target}[/green]")
+            console.print(f"[dim]Edit main.py, then: /extensions install {target}[/dim]")
+        except Exception as exc:
+            console.print(f"[red]{exc}[/red]")
+        return
+
+    if sub == "pack":
+        if not rest:
+            console.print("[yellow]Usage: /extensions pack <name> [--output <path>][/yellow]")
+            return
+        name = rest[0]
+        output = None
+        if "--output" in rest:
+            idx = rest.index("--output")
+            if idx + 1 < len(rest):
+                output = Path(rest[idx + 1])
+        try:
+            result_path = mgr.pack(name, output)
+            console.print(f"[green]Packed {name} -> {result_path}[/green]")
+        except Exception as exc:
+            console.print(f"[red]{exc}[/red]")
+        return
+
+    console.print("[yellow]Usage: /extensions [list|install|remove|trust|untrust|info|create|pack][/yellow]")
+
+
 def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: dict, interactive_session=None) -> bool:
     """Handle meta commands. Returns True if should exit."""
     action, raw_args, parts = _parse_slash_command(cmd)
@@ -17221,6 +17374,9 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
 
     elif action in ("/v", "/version", "/update"):
         _cmd_version(action, parts)
+
+    elif action == "/extensions":
+        _cmd_extensions(parts)
 
     else:
         # Evolution Lab extensions register project-local slash commands here.
@@ -18808,6 +18964,14 @@ def run_execute_mode(task: str, session: dict, depth: int, session_id: str = Non
     prints the result to stdout, and returns the exit code. Local subagents run
     in-process; this entry point remains for scripts, CI, and external callers.
     """
+    # Apply the active mode's auto-approve posture before the loop starts.
+    # Interactive sessions reach this through /mode and /auto; --execute never
+    # did, so a mode declaring auto_approve="writes" still stopped at the first
+    # write and — with no TTY to ask — failed closed. That made every
+    # unattended caller (cron, CI, this file's own reason for existing)
+    # unusable with any tool that writes.
+    _sync_session_approval_from_mode()
+
     agent_state = {
         "shortTermMemory": "",
         "lastReply": "",

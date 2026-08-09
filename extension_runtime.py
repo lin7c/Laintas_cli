@@ -196,7 +196,8 @@ class ExtensionRuntime:
         except (OSError, ValueError) as exc:
             raise ValueError(f"invalid extension manifest: {exc}") from exc
         name = value.get("name") if isinstance(value, dict) else None
-        if (not isinstance(value, dict) or value.get("schemaVersion") != 1
+        if (not isinstance(value, dict)
+                or value.get("schemaVersion") not in (1, 2)
                 or not isinstance(name, str) or not _SAFE_NAME.fullmatch(name)
                 or value.get("entrypoint", "main.py") != "main.py"):
             raise ValueError("extension manifest fields are invalid")
@@ -225,6 +226,29 @@ class ExtensionRuntime:
                 entrypoint = directory / "main.py"
                 if not entrypoint.is_file() or entrypoint.is_symlink():
                     raise ValueError("missing main.py entrypoint")
+
+                # ── Trust gate ────────────────────────────────────────
+                # Extensions with a signed or lab-verified provenance skip
+                # the hash check.  Legacy extensions (no "install" block)
+                # are allowed through for backward compatibility.
+                install_meta = manifest.get("install") or {}
+                trusted_by = str(install_meta.get("trustedBy") or "")
+                if install_meta and trusted_by not in ("ed25519", "evolution-lab"):
+                    import trust_store as _ts
+                    related = tuple(
+                        p for p in sorted(directory.rglob("*.py"))
+                        if p.is_file() and not p.is_symlink()
+                        and p.name != "main.py"
+                    )
+                    status = _ts.extension_status(
+                        "runtime", name, entrypoint,
+                        related_paths=related)
+                    if not status.get("trusted"):
+                        raise ValueError(
+                            f"extension {name} is not trusted "
+                            f"({status.get('reason', 'unknown')}). "
+                            f"Run /extensions trust {name} to approve it.")
+
                 safe_module_name = name.replace("-", "_")
                 module_name = f"laintas_extension_{safe_module_name}_{id(self)}"
                 spec = importlib.util.spec_from_file_location(

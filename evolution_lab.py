@@ -383,6 +383,24 @@ def _append_history(value: dict) -> None:
         handle.write(json.dumps(value, ensure_ascii=False) + "\n")
 
 
+def _stamp_trust(directory: Path, trusted_by: str) -> None:
+    """Write install.trustedBy into the extension's manifest.
+
+    Called after activate_candidate swaps the directory into place, so the
+    trust gate in extension_runtime.load() lets it through without requiring
+    a separate /extensions trust step.
+    """
+    import json as _json
+    manifest_path = directory / "extension.json"
+    try:
+        manifest = _json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    manifest.setdefault("install", {})["trustedBy"] = trusted_by
+    manifest_path.write_text(
+        _json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
 def _write_candidate_files(candidate: dict, destination: Path) -> None:
     destination.mkdir(parents=True, exist_ok=True)
     for item in candidate.get("files") or []:
@@ -422,6 +440,9 @@ def activate_candidate(candidate_id: str, runtime=None,
                 if target.exists():
                     shutil.rmtree(target)
                 staging.replace(target)
+                # Mark as lab-trusted so the trust gate in load() lets it
+                # through without a separate /extensions trust step.
+                _stamp_trust(target, "evolution-lab")
                 if runtime is not None:
                     loaded, message = runtime.load(name)
                     if not loaded:
