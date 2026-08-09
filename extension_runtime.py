@@ -327,7 +327,36 @@ class ExtensionRuntime:
 
     def command_subcommands(self, name: str) -> list[tuple[str, str]]:
         meta = self._command_meta.get(str(name).lower())
-        return meta.get("subcommands", []) if meta else []
+        if not meta:
+            return []
+        # Strip any third element (nested children) so callers always get
+        # (name, description) pairs regardless of whether the entry has
+        # sub-subcommands.
+        return [(entry[0], entry[1]) for entry in meta.get("subcommands", [])]
+
+    def command_subcommands_at(self, name: str, *path: str) -> list[tuple[str, str]]:
+        """Resolve a subcommand *path* and return the subcommands at that level.
+
+        With no *path*, returns the top-level subcommands (same as
+        :meth:`command_subcommands`).  Each subcommand entry may optionally
+        carry a third element -- a list of nested subcommands -- which is what
+        this method descends into so that ``/org policy <TAB>`` can complete
+        ``publish``.
+        """
+        meta = self._command_meta.get(str(name).lower())
+        if not meta:
+            return []
+        subs = meta.get("subcommands", [])
+        for segment in path:
+            found = None
+            for entry in subs:
+                if entry[0].casefold() == segment.casefold():
+                    found = entry
+                    break
+            if found is None:
+                return []
+            subs = found[2] if len(found) > 2 else []
+        return [(entry[0], entry[1]) for entry in subs]
 
 
 _runtime = ExtensionRuntime()

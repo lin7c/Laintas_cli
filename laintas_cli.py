@@ -3190,15 +3190,28 @@ class MetaCompleter(Completer):
                                 entry.value, partial, entry.description)
                 elif not spec:
                     # Extension-registered commands (e.g. /org): query
-                    # subcommand metadata from extension_runtime.
+                    # subcommand metadata from extension_runtime, supporting
+                    # multi-level paths like /org policy pub<TAB>.
                     try:
-                        for sub_name, sub_desc in (
-                                extension_runtime.get_runtime()
-                                .command_subcommands(head)):
-                            if sub_name.casefold().startswith(
-                                    partial.casefold()):
-                                yield self._completion(
-                                    sub_name, partial, sub_desc)
+                        rt = extension_runtime.get_runtime()
+                        words = partial.split()
+                        trailing_space = partial.endswith(" ")
+                        if not words:
+                            for sub_name, sub_desc in rt.command_subcommands(head):
+                                yield self._completion(sub_name, "", sub_desc)
+                        elif trailing_space:
+                            for sub_name, sub_desc in rt.command_subcommands_at(head, *words):
+                                yield self._completion(sub_name, "", sub_desc)
+                        elif len(words) == 1:
+                            fragment = words[0]
+                            for sub_name, sub_desc in rt.command_subcommands(head):
+                                if sub_name.casefold().startswith(fragment.casefold()):
+                                    yield self._completion(sub_name, fragment, sub_desc)
+                        else:
+                            path, fragment = words[:-1], words[-1]
+                            for sub_name, sub_desc in rt.command_subcommands_at(head, *path):
+                                if sub_name.casefold().startswith(fragment.casefold()):
+                                    yield self._completion(sub_name, fragment, sub_desc)
                     except Exception:
                         pass
                 return
@@ -17330,6 +17343,28 @@ def show_help(command: str = ""):
     if command:
         spec = _find_command_spec(command)
         if spec is None:
+            # Extension-registered commands (e.g. /org) are not in
+            # COMMAND_SPECS; look them up via extension_runtime.
+            try:
+                ext_desc = extension_runtime.get_runtime()\
+                    .command_description(command)
+            except Exception:
+                ext_desc = ""
+            if ext_desc:
+                subcommands = extension_runtime.get_runtime()\
+                    .command_subcommands(command)
+                lines = [f"[bold]{escape(command)}[/bold]\n\n"
+                         f"{escape(ext_desc)}"]
+                if subcommands:
+                    lines.append("")
+                    for sub_name, sub_desc in subcommands:
+                        lines.append(f"  [cyan]{escape(sub_name)}[/cyan]"
+                                     f"  [dim]{escape(sub_desc)}[/dim]")
+                console.print(Panel(
+                    "\n".join(lines),
+                    title=escape(command), border_style="cyan",
+                ))
+                return
             console.print(f"[red]Unknown command: {escape(command)}[/red]")
             console.print("[dim]Run /help to list available commands.[/dim]")
             return
@@ -17364,6 +17399,28 @@ def show_help(command: str = ""):
         console.print(f"  [accent]{title}[/accent]")
         cmd_w = max(len(c) for c, _ in rows)
         for cmd, desc in rows:
+            padded = escape(cmd.ljust(cmd_w))
+            console.print(f"    [accent.dim]{padded}[/accent.dim]  [muted]{escape(desc)}[/muted]")
+        console.print()
+
+    # Extension-registered commands (e.g. /org) are not in COMMAND_SPECS.
+    # Show them in their own group so /help reflects everything the user can
+    # actually run.
+    try:
+        ext_names = extension_runtime.get_runtime().command_names()
+    except Exception:
+        ext_names = []
+    if ext_names:
+        console.print("  [accent]Extensions[/accent]")
+        ext_rows = []
+        for name in ext_names:
+            try:
+                desc = extension_runtime.get_runtime().command_description(name)
+            except Exception:
+                desc = ""
+            ext_rows.append((name, desc))
+        cmd_w = max(len(c) for c, _ in ext_rows) if ext_rows else 1
+        for cmd, desc in ext_rows:
             padded = escape(cmd.ljust(cmd_w))
             console.print(f"    [accent.dim]{padded}[/accent.dim]  [muted]{escape(desc)}[/muted]")
         console.print()
