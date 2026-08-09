@@ -3188,12 +3188,32 @@ class MetaCompleter(Completer):
                         if entry.value.casefold().startswith(partial.casefold()):
                             yield self._completion(
                                 entry.value, partial, entry.description)
+                elif not spec:
+                    # Extension-registered commands (e.g. /org): query
+                    # subcommand metadata from extension_runtime.
+                    try:
+                        for sub_name, sub_desc in (
+                                extension_runtime.get_runtime()
+                                .command_subcommands(head)):
+                            if sub_name.casefold().startswith(
+                                    partial.casefold()):
+                                yield self._completion(
+                                    sub_name, partial, sub_desc)
+                    except Exception:
+                        pass
                 return
             for cmd in completion_command_names():
                 if cmd.casefold().startswith(text.casefold()):
                     _spec = _find_command_spec(cmd)
-                    yield self._completion(
-                        cmd, text, _spec.description if _spec else "")
+                    if _spec:
+                        _desc = _spec.description
+                    else:
+                        try:
+                            _desc = extension_runtime.get_runtime()\
+                                .command_description(cmd)
+                        except Exception:
+                            _desc = ""
+                    yield self._completion(cmd, text, _desc)
             return
 
         # For non-/-prefixed input, only show completions on explicit Tab —

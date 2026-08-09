@@ -98,8 +98,12 @@ class ExtensionContext:
     cwd: str
     _runtime: "ExtensionRuntime"
 
-    def register_command(self, name: str, handler: Callable) -> None:
-        self._runtime.register_command(self.name, name, handler)
+    def register_command(self, name: str, handler: Callable, *,
+                         description: str = "",
+                         subcommands: Optional[list[tuple[str, str]]] = None) -> None:
+        self._runtime.register_command(self.name, name, handler,
+                                       description=description,
+                                       subcommands=subcommands)
 
     def register_tool(self, tool: Tool) -> None:
         self._runtime.register_tool(self.name, tool)
@@ -134,6 +138,7 @@ class ExtensionRuntime:
         self._lock = threading.RLock()
         self._loaded: dict[str, LoadedExtension] = {}
         self._commands: dict[str, tuple[str, Callable]] = {}
+        self._command_meta: dict[str, dict] = {}  # {"/org": {"description": str, "subcommands": [(name, desc), ...]}}
         self._loops: dict[str, list[Callable]] = {}
         self._tool_prefixes: dict[str, str] = {}
         self._console: Any = None
@@ -149,7 +154,9 @@ class ExtensionRuntime:
             str(name).lower() for name in (reserved_commands or [])
         }
 
-    def register_command(self, owner: str, name: str, handler: Callable) -> None:
+    def register_command(self, owner: str, name: str, handler: Callable,
+                         *, description: str = "",
+                         subcommands: Optional[list[tuple[str, str]]] = None) -> None:
         normalized = name if str(name).startswith("/") else f"/{name}"
         if not re.fullmatch(r"/[A-Za-z0-9][A-Za-z0-9_-]{0,63}", normalized):
             raise ValueError(f"invalid extension command: {name}")
@@ -161,6 +168,10 @@ class ExtensionRuntime:
         if existing and existing[0] != owner:
             raise ValueError(f"extension command already registered: {normalized}")
         self._commands[normalized.lower()] = (owner, handler, _positional_arity(handler))
+        self._command_meta[normalized.lower()] = {
+            "description": description,
+            "subcommands": list(subcommands) if subcommands else [],
+        }
 
     def register_tool(self, owner: str, tool: Tool) -> None:
         if not isinstance(tool, Tool):
@@ -247,6 +258,10 @@ class ExtensionRuntime:
             command: item for command, item in self._commands.items()
             if item[0] != name
         }
+        self._command_meta = {
+            command: meta for command, meta in self._command_meta.items()
+            if self._commands.get(command)  # keep only still-registered
+        }
         self._loops.pop(name, None)
         self._tool_prefixes.pop(name, None)
         get_registry().unregister_source(f"extension:{name}")
@@ -305,6 +320,14 @@ class ExtensionRuntime:
 
     def command_names(self) -> list[str]:
         return sorted(self._commands)
+
+    def command_description(self, name: str) -> str:
+        meta = self._command_meta.get(str(name).lower())
+        return meta.get("description", "") if meta else ""
+
+    def command_subcommands(self, name: str) -> list[tuple[str, str]]:
+        meta = self._command_meta.get(str(name).lower())
+        return meta.get("subcommands", []) if meta else []
 
 
 _runtime = ExtensionRuntime()
