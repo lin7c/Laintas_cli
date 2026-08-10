@@ -48,7 +48,7 @@ from contextlib import nullcontext, contextmanager
 from pathlib import Path
 from typing import Callable, Optional
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, urlencode
 
@@ -486,45 +486,6 @@ def _ptk_fragments(pairs):
     return out
 
 
-def _apply_marquee(row_text: str, sel_idx: int,
-                   last_sel: list, start_time: list) -> str:
-    """Scroll a long selected row horizontally (marquee / focus-follow effect).
-
-    When the focused row's plain-text length exceeds the terminal width, the
-    text scrolls left over time so the user can read the full content.  Non-
-    selected rows are returned unchanged (they are simply truncated by the
-    terminal).  When the selection moves to a different row the scroll resets.
-
-    The marquee cycle: pause 1 s at start → scroll 1 char / 0.2 s → pause 2 s
-    at end → wrap back to start.
-    """
-    import shutil
-    term_w = shutil.get_terminal_size().columns
-    plain = re.sub(r"\[/?[^\]]+\]", "", row_text)
-    avail = term_w - 1  # leave 1-char right margin
-    if len(plain) <= avail:
-        return row_text
-    now = time.monotonic()
-    if last_sel[0] != sel_idx:
-        last_sel[0] = sel_idx
-        start_time[0] = now
-    elapsed = now - start_time[0]
-    pause_start = 1.0
-    scroll_speed = 0.2          # seconds per character
-    max_offset = len(plain) - avail + 2
-    raw = max(0.0, elapsed - pause_start) / scroll_speed
-    # Wrap: after scrolling to the end, pause 2 s, then reset.
-    wrap_at = max_offset + 2.0 / scroll_speed
-    if raw > wrap_at:
-        start_time[0] = now
-        raw = 0.0
-    offset = int(min(raw, max_offset))
-    visible = plain[offset:offset + avail - 1]
-    if offset < max_offset:
-        visible += "…"
-    return visible
-
-
 # ── Reusable selection dialog ──────────────────────────────────────────
 # A single component covering single-select, multi-select, inline (non-full-
 # screen), full-screen, fuzzy-search, and action-key variants.  Supersedes
@@ -535,6 +496,26 @@ def _fuzzy_match(text: str, pattern: str) -> bool:
     """Return True if all chars of pattern appear in text in order (fuzzy match)."""
     it = iter(text)
     return all(c in it for c in pattern)
+
+
+@contextmanager
+def _alt_screen():
+    """Enter the alternate screen buffer for inline content between two
+    full-screen ``select_dialog`` calls.
+
+    Without this, printing between picker invocations flashes the normal
+    screen (REPL scrollback) for a frame before the next picker re-enters
+    the alternate screen.  Wrapping the content in ``\\x1b[?1049h/l`` keeps
+    the terminal in the alternate buffer the whole time.
+    """
+    _file = getattr(console, "file", None) or sys.stdout
+    try:
+        _file.write("\x1b[?1049h")
+        _file.flush()
+        yield
+    finally:
+        _file.write("\x1b[?1049l")
+        _file.flush()
 
 
 def _clear_stale_running_loop() -> bool:
@@ -686,9 +667,6 @@ def select_dialog(
     chk: set[int] = set(checked) if (multi and checked) else set()
     filter_buf = Buffer() if search else None
     act_keys: dict[str, str] = action_keys or {}
-    # Marquee state for focus-follow horizontal scroll on long selected rows.
-    _marquee_last_sel = [-1]
-    _marquee_start = [0.0]
 
     def _visible():
         """Return (list_of_(orig_idx, label, desc)) after filtering."""
@@ -755,9 +733,6 @@ def select_dialog(
                 row_text = f" {prefix} {lab}"
             if desc:
                 row_text += f"  [dim]{desc}[/dim]"
-            if is_sel:
-                row_text = _apply_marquee(
-                    row_text, oi, _marquee_last_sel, _marquee_start)
             style = "class:selected" if is_sel else ""
             lines.append((style, row_text + "\n"))
 
@@ -1063,7 +1038,7 @@ from agent_loop import (
     set_trigger_wake_callback,
     save_session_snapshot,
     save_resume_state, load_resume_state, save_resume_checkpoint, list_resume_states,
-    delete_resume_state, save_fork_state,
+    delete_resume_state,
 )
 
 import tools as tools_mod    # noqa: E402 — load after agent_loop so registry inits once
@@ -2770,7 +2745,6 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec("/login", "Re-authenticate with Laintas", "Account & Session"),
     CommandSpec("/usage", "Show AI usage — local token stats + Laintas backend usage", "Account & Session", "/usage [7d|30d|90d|local|buy <calls|storage>]", subcommands=("local", "buy")),
     CommandSpec("/resume", "Resume a saved session (picker; echo last N events, default 20)", "Account & Session", "/resume [N|all|latest]"),
-    CommandSpec("/fork", "Fork current context into a named branch, or start a new session from current context", "Account & Session", "/fork [name]"),
     CommandSpec("/new", "Start a new live session", "Account & Session", "/new",
                 aliases=("/clear", "/new-session", "/reset-session")),
     CommandSpec("/exit", "Log out and exit", "Account & Session"),
@@ -2880,7 +2854,7 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec("/hwo", "Open or run an orchestration workflow", "Planning & Tasks", "/hwo [file|run <file>|compile <file>]", subcommands=("run", "compile")),
     CommandSpec("/hwg", "Compile, run, or resume an HWO graph workflow", "Planning & Tasks", "/hwg {run|compile|resume|status|cancel} ...", subcommands=("run", "compile", "resume", "status", "cancel")),
     CommandSpec("/mode", "Show, switch, or create agent modes", "Planning & Tasks", "/mode [act [always]|plan [task]|review|study|list|create|delete]", subcommands=("act", "always", "plan", "review", "study", "list", "create", "delete")),
-    CommandSpec("/plan", "Create, revise, review, or approve versioned plans", "Planning & Tasks", "/plan [enter <task>|submit|revise <feedback>|approve|exit|status|list]", subcommands=("enter", "submit", "revise", "approve", "exit", "status", "list")),
+    CommandSpec("/plan", "Create, revise, review, or approve versioned plans", "Planning & Tasks", "/plan {enter|submit|revise|approve|exit|status|list}", subcommands=("enter", "submit", "revise", "approve", "exit", "status", "list")),
     CommandSpec("/prompt", "Open Prompt Lab or manage tested prompt overlays", "Planning & Tasks", "/prompt [issue|subcommand]", subcommands=("status", "branches", "open", "chat", "review", "test", "activate", "disable", "patches", "profiles", "profile", "use", "rollback", "feedback", "fail", "optimize", "apply", "discard", "list", "skill", "export", "install", "publish")),
     CommandSpec("/evolve", "Create, improve, test, and hot-load project extensions", "Planning & Tasks", "/evolve [idea|subcommand]", subcommands=("status", "branches", "open", "chat", "review", "test", "activate", "disable", "candidates", "profiles", "profile", "use", "rollback", "list", "help")),
     CommandSpec("/task", "Track project tasks", "Planning & Tasks", "/task [list|add|show|start|done|del|progress|note|subtask]", subcommands=("list", "add", "show", "start", "done", "del", "progress", "note", "subtask")),
@@ -5426,28 +5400,6 @@ def _resume_turn_count(blob: Optional[dict]) -> int:
     ])
 
 
-def _resume_last_assistant_excerpt(blob: Optional[dict], max_len: int = 80) -> str:
-    """Opening snippet of the AI's last reply, for the resume picker label.
-
-    The picker previously showed the user's last prompt as the title, which is
-    often a terse command like ``.clear`` or ``/usage`` - not a useful hint for
-    *what the session was about*. The assistant's last output is a far better
-    summary of where the conversation left off. Falls back to the stored title
-    when no assistant message exists (e.g. session ended on a user turn).
-    """
-    if not blob:
-        return ""
-    for msg in reversed(blob.get("chat_history") or []):
-        if msg.get("role") == "assistant":
-            content = str(msg.get("content") or "").strip()
-            if content:
-                # Collapse whitespace/newlines so the snippet fits one label line
-                snippet = re.sub(r"\s+", " ", content)[:max_len]
-                return snippet
-    # No assistant reply in history - fall back to the stored title
-    return str(blob.get("title") or "")[:max_len]
-
-
 def _restore_resume_blob(blob: dict, chat_history: list) -> dict:
     """Restore full-fidelity conversation state from a per-cwd resume blob.
 
@@ -5480,15 +5432,7 @@ def _restore_resume_blob(blob: dict, chat_history: list) -> dict:
                                           session_id=restored_session_id or None)
     except Exception:
         pass
-    restored_state = prepare_state_for_repl(blob.get("state") or {})
-    # Inject fork lineage so subsequent /fork calls chain correctly.
-    if blob.get("fork_lineage"):
-        restored_state["_fork_lineage"] = blob["fork_lineage"]
-        restored_state["_fork_name"] = blob.get("fork_name", "")
-    else:
-        restored_state.pop("_fork_lineage", None)
-        restored_state.pop("_fork_name", None)
-    return restored_state
+    return prepare_state_for_repl(blob.get("state") or {})
 
 
 def _reset_fresh_session_context(cwd: str) -> None:
@@ -5538,73 +5482,6 @@ def _choose_resume_blob(cwd: str, selector: str = "") -> Optional[dict]:
     return _resolve_resume_selector(_resume_choices(cwd), selector)
 
 
-def _build_fork_tree_rows(choices: list) -> list[tuple[dict, str]]:
-    """Build tree-structured display rows from resume choices.
-
-    Forks (blobs with ``fork_name``) are organized into a trie by their
-    ``fork_lineage`` path and rendered with ``├─``/``└─``/``│`` tree
-    prefixes via DFS. Non-fork blobs (autosave/checkpoint) are listed as
-    root-level entries with no prefix, sorted newest-first as before.
-
-    Returns a list of ``(blob, tree_prefix)`` tuples in display order.
-    """
-    forks = [c for c in choices if c.get("fork_name")]
-    non_forks = [c for c in choices if not c.get("fork_name")]
-
-    # Build a trie from fork lineage paths.
-    # Each node: {"blob": dict|None, "children": {name: node}}
-    root = {"blob": None, "children": {}, "name": ""}
-    for fork in forks:
-        lineage = fork.get("fork_lineage") or [fork["fork_name"]]
-        node = root
-        for i, name in enumerate(lineage):
-            if name not in node["children"]:
-                node["children"][name] = {
-                    "blob": None, "children": {}, "name": name,
-                }
-            node = node["children"][name]
-            if i == len(lineage) - 1:
-                node["blob"] = fork
-
-    rows: list[tuple[dict, str]] = []
-
-    # Non-forks first (root level, no prefix), newest first.
-    non_forks.sort(key=lambda item: item.get("timestamp", 0), reverse=True)
-    for item in non_forks:
-        rows.append((item, ""))
-
-    # Then DFS the fork trie. Root-level forks (depth 1) get no prefix -
-    # they are peers of non-fork entries. Only their children get tree
-    # connectors (├─ / └─ / │).
-    def _dfs(node, prefix: str, depth: int):
-        children = list(node["children"].values())
-        # Sort children by their blob timestamp (newest first), or by name
-        # for nodes without a direct blob.
-        def _child_sort_key(child):
-            blob = child["blob"]
-            if blob:
-                return -(blob.get("timestamp", 0))
-            return 0
-
-        children.sort(key=_child_sort_key)
-        for i, child in enumerate(children):
-            is_last = i == len(children) - 1
-            if depth == 0:
-                # Root-level fork: no tree prefix, just like non-forks.
-                tree_prefix = ""
-                child_prefix = ""
-            else:
-                connector = symbols.TREE_LAST if is_last else symbols.TREE_BRANCH
-                tree_prefix = prefix + connector + " "
-                child_prefix = prefix + (symbols.TREE_VERT + " " if not is_last else "  ")
-            if child["blob"]:
-                rows.append((child["blob"], tree_prefix))
-            _dfs(child, child_prefix, depth + 1)
-
-    _dfs(root, "", 0)
-    return rows
-
-
 def show_resume_picker(cwd: str) -> Optional[dict]:
     """Full-screen `/t`-style picker for saved resume sessions.
 
@@ -5617,39 +5494,20 @@ def show_resume_picker(cwd: str) -> Optional[dict]:
         console.print("[yellow]No saved session to resume in this directory.[/yellow]")
         return None
 
-    # Build tree-structured rows: [(blob, tree_prefix), ...]
-    # Forks are arranged hierarchically; non-forks are root-level entries.
-    tree_rows = _build_fork_tree_rows(choices)
-
     def _build_labels():
         labels = []
-        for item, tree_prefix in tree_rows:
+        for item in choices:
             kind = item.get("kind", "session")
-            if kind == "fork":
-                badge = f"[magenta]{symbols.DOT}[/magenta]"
-                name = item.get("fork_name", "fork")
-                name_part = f"[magenta]{name}[/magenta]"
-            elif kind == "checkpoint":
-                badge = f"[magenta]{symbols.DOT}[/magenta]"
-                name_part = ""
-            else:
-                badge = f"[blue]{symbols.DOT_OPEN}[/blue]"
-                name_part = ""
+            badge = "[magenta]◆ checkpoint[/magenta]" if kind == "checkpoint" else f"[blue]{symbols.DOT_OPEN} autosave[/blue]"
             turns = item.get("turn_count") or _resume_turn_count(item)
             ago = _format_time_ago(item.get("timestamp", 0))
-            title = _resume_last_assistant_excerpt(item, max_len=50) or "Untitled session"
-            title = title.replace("\n", " ")
-            # Build label with tree prefix
-            prefix_str = f"[dim]{tree_prefix}[/dim]" if tree_prefix else ""
-            kind_label = f"[dim]{kind}[/dim]" if not name_part else name_part
-            meta = f"[dim]{ago} {symbols.BULLET} {turns} turn(s)[/dim]"
-            labels.append(
-                f"{prefix_str}{badge} {kind_label}  {meta}  [bold]{title}[/bold]")
+            title = str(item.get("title") or "Untitled session")[:60].replace("\n", " ")
+            labels.append(f"{badge}  [dim]{ago}[/dim]  {turns} turn(s)  [bold]{title}[/bold]")
         return labels
 
     sel_idx = 0
     status_msg = ""
-    while tree_rows:
+    while choices:
         labels = _build_labels()
         hint = f"{symbols.ARROW_U}{symbols.ARROW_D} navigate  ↵ resume  d details  x delete  q cancel"
         if status_msg:
@@ -5666,44 +5524,35 @@ def show_resume_picker(cwd: str) -> Optional[dict]:
         if result is None:
             return None
         action, idx = result
-        if action is None or idx < 0 or idx >= len(tree_rows):
+        if action is None or idx < 0 or idx >= len(choices):
             return None
-        item = tree_rows[idx][0]
+        item = choices[idx]
         status_msg = ""
         if action == "resume":
             return item
         if action == "details":
-            _show_resume_detail(item)
-            _print_resume_transcript(item, 20)
-            console.print("\n[dim]Press Enter to continue...[/dim]", end="")
-            input()
+            with _alt_screen():
+                _show_resume_detail(item)
+                _print_resume_transcript(item, 20)
+                input("\n[dim]Press Enter to continue...[/dim]")
             sel_idx = idx
         elif action == "delete":
             delete_resume_state(cwd, item)
-            # Rebuild tree after deletion
-            choices = _resume_choices(cwd)
+            del choices[idx]
             if not choices:
                 return None
-            tree_rows = _build_fork_tree_rows(choices)
             status_msg = "[green]Deleted saved session.[/green]"
-            sel_idx = min(idx, len(tree_rows) - 1)
+            sel_idx = min(idx, len(choices) - 1)
     return None
 
 
 def _show_resume_detail(item: dict) -> None:
     """Print a rich summary of one resume blob for the picker's details view."""
     console.print()
-    excerpt = _resume_last_assistant_excerpt(item, max_len=120) or "Untitled session"
-    console.print(f"[bold cyan]{excerpt}[/bold cyan]")
+    console.print(f"[bold cyan]{item.get('title') or 'Untitled session'}[/bold cyan]")
     console.print(f"[dim]Type:[/dim] {item.get('kind', 'session')}   "
                   f"[dim]When:[/dim] {_format_time_ago(item.get('timestamp', 0))}   "
                   f"[dim]Turns:[/dim] {item.get('turn_count') or _resume_turn_count(item)}")
-    # Show fork lineage if this blob is part of a fork tree.
-    if item.get("fork_lineage"):
-        lineage_str = " › ".join(item["fork_lineage"])
-        console.print(f"[dim]Lineage:[/dim] [magenta]{lineage_str}[/magenta]")
-        if len(item["fork_lineage"]) > 1:
-            console.print(f"[dim]Parent:[/dim] [magenta]{item['fork_lineage'][-2]}[/magenta]")
     history = item.get("chat_history") or []
     console.print(f"[dim]Events:[/dim] {len(history)}\n")
     for msg in history[-6:]:
@@ -8661,9 +8510,9 @@ def show_debug_browser_interactive() -> None:
         if chosen is None:
             return
         idx = labels.index(chosen)
-        show_debug_detail(idx)
-        console.print("\n[dim]Press Enter to return to debug browser...[/dim]", end="")
-        input()
+        with _alt_screen():
+            show_debug_detail(idx)
+            input("\n[dim]Press Enter to return to debug browser...[/dim]")
 
 
 def show_debug_detail(index: int) -> None:
@@ -8885,9 +8734,9 @@ def show_terminal_manager(primary_session=None) -> None:
                 status_msg = f"[green]Closed terminal [bold]{name}[/bold][/green]"
 
         elif action == "details":
-            _show_terminal_detail(name, cmd, sess, created, alive)
-            console.print("\n[dim]Press Enter to continue...[/dim]", end="")
-            input()
+            with _alt_screen():
+                _show_terminal_detail(name, cmd, sess, created, alive)
+                input("\n[dim]Press Enter to continue...[/dim]")
 
         sel_idx = idx
 
@@ -8985,9 +8834,9 @@ def show_skill_manager() -> None:
         status_msg = ""
 
         if action == "details":
-            _show_skill_detail(name)
-            console.print("\n[dim]Press Enter to continue...[/dim]", end="")
-            input()
+            with _alt_screen():
+                _show_skill_detail(name)
+                input("\n[dim]Press Enter to continue...[/dim]")
         elif action == "reload":
             results = skills_mod.reload_all()
             status_msg = f"Reloaded: {len(results)} skill(s) re-scanned from disk."
@@ -9492,7 +9341,6 @@ _SLASH_ARG_RULES: dict[tuple[str, ...], SlashArgRule] = {
         )
     },
     ("/help",): _arg_rule(1, "/help [command]"),
-    ("/fork",): _arg_rule(1, "/fork [name]"),
     # --port/--host/--dist are key+value pairs, so the ceiling has to cover
     # them together, not just the two it was written for.
     ("/helpwo",): _arg_rule(6, "/helpwo [--port N] [--dist <path>] [--remote]"),
@@ -10413,43 +10261,6 @@ def _usage_allowance_tight(state, used_key: str, limit_key: str) -> bool:
     return bool(limit) and (state.get(used_key) or 0) / limit >= 0.9
 
 
-def _usage_countdown(resets_at: str | None) -> str:
-    """Human-readable countdown to an allowance reset.
-
-    The backend stamps resetsAt as an ISO-8601 UTC string (e.g.
-    ``2026-08-09T11:16:18.425Z``). We turn that into a compact relative
-    duration - ``in 12m``, ``in 3h 20m``, ``in 27d`` - so a glance at /usage
-    tells you not just *that* a quota is nearly gone but *when* it comes back.
-    Returns ``""`` when the timestamp is missing or already in the past.
-    """
-    if not resets_at or not isinstance(resets_at, str):
-        return ""
-    ts = resets_at.strip()
-    # Python <3.11 datetime.fromisoformat doesn't accept a trailing 'Z';
-    # normalise to an explicit +00:00 offset.
-    if ts.endswith("Z"):
-        ts = ts[:-1] + "+00:00"
-    try:
-        target = datetime.fromisoformat(ts)
-    except (ValueError, TypeError):
-        return ""
-    if target.tzinfo is None:
-        target = target.replace(tzinfo=timezone.utc)
-    now = datetime.now(timezone.utc)
-    delta = target - now
-    if delta.total_seconds() <= 0:
-        return ""  # already reset; the next /usage refresh picks up fresh numbers
-    secs = int(delta.total_seconds())
-    days, secs = divmod(secs, 86400)
-    hours, secs = divmod(secs, 3600)
-    mins = secs // 60
-    if days:
-        return f"in {days}d{' ' + str(hours) + 'h' if hours else ''}"
-    if hours:
-        return f"in {hours}h{' ' + str(mins) + 'm' if mins else ''}"
-    return f"in {mins}m" if mins else "in <1m"
-
-
 def _usage_top_ups(session: dict) -> tuple[dict, str]:
     """The two add-ons the CLI can buy, as the server describes them.
 
@@ -10816,40 +10627,15 @@ def _show_usage_command(args: list, session: dict) -> None:
                 grid.add_row("calls", calls_val)
                 # Two allowances, two different things to run out of. Storage is
                 # shared with Helpwo because it is one store; calls are not.
-                cli_product = next(
-                    (p for p in (sub.get("byProduct") or [])
+                call_quota = next(
+                    (p.get("monthly") for p in (sub.get("byProduct") or [])
                      if p.get("productId") == "cli"), None)
-                call_quota = (cli_product.get("monthly")
-                              if isinstance(cli_product, dict) else None)
-                five_hour = (cli_product.get("fiveHour")
-                             if isinstance(cli_product, dict) else None)
                 if isinstance(call_quota, dict) and call_quota.get("limit"):
-                    quota_notes = []
-                    if int(call_quota.get("purchased") or 0):
-                        quota_notes.append(
-                            f"incl {int(call_quota.get('included') or 0):,}"
-                            f" + {int(call_quota['purchased']):,} bought")
-                    cd = _usage_countdown(call_quota.get("resetsAt"))
-                    if cd:
-                        quota_notes.append(f"resets {cd}")
                     grid.add_row("quota", _usage_allowance_bar(
                         int(call_quota.get("used") or 0), int(call_quota["limit"]),
                         f"{int(call_quota.get('used') or 0):,} / {int(call_quota['limit']):,} calls",
-                        "  ".join(quota_notes)))
-                # 5-hour rolling window - a short-lived throttle separate from
-                # the monthly quota. When it bites the only remedy is to wait,
-                # so the countdown is the single most useful thing to show.
-                if isinstance(five_hour, dict) and five_hour.get("limit"):
-                    fh_used = int(five_hour.get("used") or 0)
-                    fh_lim = int(five_hour["limit"])
-                    fh_notes = []
-                    cd = _usage_countdown(five_hour.get("resetsAt"))
-                    if cd:
-                        fh_notes.append(f"recovers {cd}")
-                    grid.add_row("5h window", _usage_allowance_bar(
-                        fh_used, fh_lim,
-                        f"{fh_used:,} / {fh_lim:,} calls",
-                        "  ".join(fh_notes)))
+                        int(call_quota.get("purchased") or 0) and
+                        f"incl {int(call_quota.get('included') or 0):,} + {int(call_quota['purchased']):,} bought"))
                 store = bal.get("storage")
                 if isinstance(store, dict) and store.get("limit_bytes"):
                     used_b, lim_b = int(store.get("used_bytes") or 0), int(store["limit_bytes"])
@@ -10883,13 +10669,7 @@ def _show_usage_command(args: list, session: dict) -> None:
                 # Said only when it is nearly true. A standing advert on a panel
                 # somebody opened to check their usage is noise.
                 if _usage_allowance_tight(call_quota, "used", "limit"):
-                    footnotes.append("CLI calls nearly used up - /usage buy calls")
-                if isinstance(five_hour, dict) and five_hour.get("limit") and \
-                        _usage_allowance_tight(five_hour, "used", "limit"):
-                    cd = _usage_countdown(five_hour.get("resetsAt"))
-                    footnotes.append(
-                        f"5h rolling window nearly used up - recovers {cd}"
-                        if cd else "5h rolling window nearly used up")
+                    footnotes.append("CLI calls nearly used up — /usage buy calls")
                 if _usage_allowance_tight(store, "used_bytes", "limit_bytes"):
                     footnotes.append("storage nearly full — /usage buy storage "
                                      "(one store, shared with Helpwo)")
@@ -11226,18 +11006,18 @@ def _memory_manager() -> None:
         status_msg = ""
         if action == "view":
             data = memory_system.read_memory(name)
-            if data is None:
-                console.print(f"[red]Memory '{name}' is no longer readable.[/red]")
-            else:
-                scope_txt = memory_system.scope_label(entry.get("scope"))
-                cat = memory_system.CATEGORY_LABELS.get(entry.get("type"), entry.get("type"))
-                summary = (data.get("meta", {}).get("description") or "").strip()
-                body = data.get("body", "")
-                panel_body = (f"[bold]Summary:[/bold] {summary}\n\n[dim]Full memory:[/dim]\n{body}"
-                              if summary else body)
-                _print_long_panel(panel_body, f"[{scope_txt}] {cat} {symbols.BULLET} {name}")
-            console.print("\n[dim]Press Enter to continue...[/dim]", end="")
-            input()
+            with _alt_screen():
+                if data is None:
+                    console.print(f"[red]Memory '{name}' is no longer readable.[/red]")
+                else:
+                    scope_txt = memory_system.scope_label(entry.get("scope"))
+                    cat = memory_system.CATEGORY_LABELS.get(entry.get("type"), entry.get("type"))
+                    summary = (data.get("meta", {}).get("description") or "").strip()
+                    body = data.get("body", "")
+                    panel_body = (f"[bold]Summary:[/bold] {summary}\n\n[dim]Full memory:[/dim]\n{body}"
+                                  if summary else body)
+                    _print_long_panel(panel_body, f"[{scope_txt}] {cat} {symbols.BULLET} {name}")
+                input("\n[dim]Press Enter to continue...[/dim]")
             sel_idx = idx
         elif action == "delete":
             ok, msg = memory_system.delete_memory(name)
@@ -12336,172 +12116,10 @@ def _cmd_policy(parts: list) -> bool:
     return False
 
 
-def show_plan_picker() -> None:
-    """Interactive plan manager UI reusing the mature select_dialog pattern.
-
-    Arrow keys navigate the plan list; action keys provide create / view /
-    approve / exit / status / delete operations.  Mirrors the resume picker's
-    loop-and-reinvoke style (action_keys + enter_action).
-    """
-    import plan_mode as _pm
-
-    sel_idx = 0
-    status_msg = ""
-    while True:
-        plans = _pm.list_plans()
-        current = _pm.get_current_plan()
-        in_plan = _pm.is_plan_mode()
-
-        # --- build labels ---
-        labels: list[str] = []
-        for p in plans:
-            name = p.get("name", "?")
-            title = (p.get("title") or "")[:60]
-            status = p.get("status", "")
-            is_current = bool(current and current.get("name") == name)
-            marker = (f"[green]{symbols.DOT}[/green]"
-                      if is_current else f"[dim]{symbols.DOT_OPEN}[/dim]")
-            badge = f" [yellow]({status})[/yellow]" if status else ""
-            labels.append(
-                f"{marker} [cyan]{name}[/cyan]{badge}  [bold]{title}[/bold]")
-        if not labels:
-            labels = ["[dim](No saved plans - press n to create one)[/dim]"]
-
-        # --- context-sensitive action keys ---
-        action_keys: dict[str, str] = {
-            "n": "new", "v": "view", "d": "delete"}
-        hint_parts = [
-            f"{symbols.ARROW_U}{symbols.ARROW_D} navigate",
-            "v view", "n new", "d delete"]
-        if in_plan and current:
-            action_keys["a"] = "approve"
-            action_keys["e"] = "exit"
-            action_keys["s"] = "status"
-            hint_parts += ["a approve", "e exit", "s status"]
-        hint_parts.append("q cancel")
-        hint = "  ".join(hint_parts)
-        if status_msg:
-            hint = f"{status_msg}\n{hint}"
-
-        result = select_dialog(
-            labels,
-            title="Plan Manager",
-            full_screen=True,
-            selected_index=min(sel_idx, max(0, len(labels) - 1)),
-            action_keys=action_keys,
-            enter_action="view",
-            hint=hint,
-        )
-        if result is None:
-            return
-        action, idx = result
-        if action is None:
-            return
-        status_msg = ""
-
-        # --- actions ---
-        if action == "view" and plans and idx < len(plans):
-            plan = plans[idx]
-            content = _pm.read_plan(plan["name"])
-            _print_long_panel(
-                content or "(empty)",
-                f"Plan: {plan.get('title', plan['name'])[:60]}")
-            console.print("\n[dim]Press Enter to continue...[/dim]", end="")
-            input()
-
-        elif action == "new":
-            try:
-                task = input("\nTask description: ").strip()
-            except (EOFError, KeyboardInterrupt):
-                continue
-            if not task:
-                status_msg = "[yellow]No task provided.[/yellow]"
-                continue
-            if _pm.is_plan_mode():
-                status_msg = ("[yellow]A plan is already active. "
-                              "Approve or exit first.[/yellow]")
-                continue
-            mode_manager.activate("act")
-            plan = _pm.enter_plan_mode(task)
-            _enqueue_user_input(task)
-            console.print(Panel(
-                f"[bold]Plan Mode: [green]ENTERED[/green][/bold]\n\n"
-                f"Task: {task}\n"
-                f"Plan file: {plan['file']}\n\n"
-                f"[dim]The AI will now explore and design "
-                f"- no code will be executed.[/dim]\n"
-                f"[dim]When the plan is ready, run "
-                f"[bold]/plan approve[/bold].[/dim]",
-                title="Plan Mode",
-                border_style="green",
-            ))
-            return  # exit picker after entering plan mode
-
-        elif action == "approve":
-            plan = _review_and_approve_current_plan()
-            if plan:
-                followup = (
-                    f"Execute approved WorkGraph {plan['work_id']} revision "
-                    f"{plan['revision']} SHA {plan['content_sha']} for task: "
-                    f"{plan['task']}. Follow the injected "
-                    f"approved_work_plan exactly.")
-                _enqueue_user_input(followup)
-                console.print(Panel(
-                    f"[bold]Plan [green]APPROVED[/green][/bold]\n\n"
-                    f"File: {plan['file']}\n\n"
-                    "[dim]Execution request queued.[/dim]",
-                    title="Plan Approved",
-                    border_style="green",
-                ))
-                return  # exit after approval
-            else:
-                status_msg = "[yellow]Plan was not approved.[/yellow]"
-
-        elif action == "exit":
-            plan = _pm.exit_plan_mode(approve=False)
-            if plan:
-                status_msg = ("[dim]Exited plan mode; draft remains in the "
-                              "plans directory.[/dim]")
-            else:
-                status_msg = "[yellow]No active plan to exit.[/yellow]"
-
-        elif action == "status":
-            plan = _pm.get_current_plan()
-            if plan:
-                content = _pm.read_plan() or "(empty)"
-                _print_long_panel(content, f"Plan: {plan['task'][:60]}")
-                console.print("\n[dim]Press Enter to continue...[/dim]", end="")
-                input()
-            else:
-                status_msg = "[dim]Not in plan mode.[/dim]"
-
-        elif action == "delete" and plans and idx < len(plans):
-            plan = plans[idx]
-            answer = input(
-                f"\nDelete plan '{plan['name']}'? [y/N] ").strip().lower()
-            if answer == "y":
-                try:
-                    if _pm.delete_plan(plan["name"]):
-                        status_msg = (
-                            f"[green]Deleted plan '{plan['name']}'.[/green]")
-                        sel_idx = max(0, sel_idx - 1)
-                    else:
-                        status_msg = (
-                            f"[yellow]Plan '{plan['name']}' not found.[/yellow]")
-                except Exception as exc:
-                    status_msg = f"[red]Could not delete: {exc}[/red]"
-
-
 def _cmd_plan(raw_args: str, parts: list) -> None:
     import plan_mode as _pm
     sub = parts[1].lower() if len(parts) > 1 else ""
     _, plan_args_raw = _raw_tail_after_word(raw_args)
-
-    if not sub:
-        # Bare /plan -> open interactive plan manager UI
-        show_plan_picker()
-        return
-
     if sub == "enter" and plan_args_raw:
         task = _decode_text_arg(plan_args_raw)
         if _pm.is_plan_mode():
@@ -20235,84 +19853,6 @@ def main():
             if injected_done is not None:
                 injected_done.set()
             continue
-
-        # /fork [name] - fork the current context into a named branch snapshot
-        # (like git branch: save a named point, current session continues).
-        # Without a name: start a new session that inherits the current
-        # chat_history + state (a branching continuation, NOT a /clear).
-        _fork_parts = user_input.strip().split(maxsplit=1)
-        if (_fork_parts and _fork_parts[0].lower() == "/fork"
-                and args.depth == 0 and not _is_dialogue):
-            _fork_name = (_fork_parts[1].strip()
-                          if len(_fork_parts) > 1 else "")
-            if _fork_name:
-                # /fork <name> - save current context as named fork snapshot.
-                # Reject if an identical lineage path already exists.
-                _current_lineage = list(agent_state.get("_fork_lineage") or [])
-                _new_lineage = _current_lineage + [_fork_name]
-                _existing = list_resume_states(_session_start_cwd)
-                _lineage_exists = any(
-                    item.get("fork_lineage") == _new_lineage
-                    for item in _existing
-                )
-                if _lineage_exists:
-                    console.print(
-                        f"[red]Fork already exists at path: "
-                        f"{' › '.join(_new_lineage)}[/red]")
-                    console.print("[dim]Choose a different name or delete the existing fork first.[/dim]")
-                    if injected_done is not None:
-                        injected_done.set()
-                    continue
-                _parent_session_id = str(agent_state.get("_session_id") or "")
-                _fork_blob = save_fork_state(
-                    agent_state, chat_history, _session_start_cwd,
-                    _fork_name, _new_lineage, _parent_session_id)
-                if _fork_blob:
-                    _n = _resume_turn_count(_fork_blob)
-                    _ago = _format_time_ago(_fork_blob.get("timestamp", 0))
-                    console.print(
-                        f"[green]Forked \"{_fork_name}\"[/green] "
-                        f"[dim]{symbols.BULLET} {_n} turn(s) {_ago} "
-                        f"{symbols.BULLET} Resume with /resume[/dim]")
-                else:
-                    console.print("[red]Could not save fork (no conversation to snapshot).[/red]")
-                if injected_done is not None:
-                    injected_done.set()
-                continue
-            else:
-                # /fork (no name) - start a new session inheriting current
-                # context, like a branching continuation. The current context
-                # is saved as an anonymous fork checkpoint first so it can be
-                # resumed later.
-                save_resume_state(agent_state, chat_history, _session_start_cwd)
-                if current_live_session:
-                    session_store.close_session(current_live_session)
-                # Inherit chat_history (copy) + state; new session_id.
-                _inherited_history = list(chat_history)
-                _inherited_state = dict(agent_state)
-                # Clear fork lineage for the new branch root - it starts fresh.
-                _inherited_state.pop("_fork_lineage", None)
-                _inherited_state.pop("_fork_name", None)
-                _inherited_state.pop("_session_id", None)
-                chat_history.clear()
-                chat_history.extend(_inherited_history)
-                agent_state.clear()
-                agent_state.update(prepare_state_for_repl(_inherited_state))
-                _ensure_session_id(agent_state)
-                current_live_session = session_store.create_session(
-                    _session_start_cwd, agent_state, chat_history)
-                handle_meta_command._current_live_session = current_live_session
-                handle_meta_command._last_agent_state = agent_state
-                handle_meta_command._last_chat_history = chat_history
-                handle_meta_command._last_original_input = None
-                _n = _resume_turn_count({"chat_history": chat_history})
-                console.print(
-                    f"[green]Started a new branched session[/green] "
-                    f"[dim]{symbols.BULLET} {_n} turn(s) inherited "
-                    f"{symbols.BULLET} Previous context saved for /resume[/dim]")
-                if injected_done is not None:
-                    injected_done.set()
-                continue
 
         _new_parts = user_input.strip().split(maxsplit=1)
         if (_new_parts and _new_parts[0].lower() in _NEW_SESSION_COMMANDS
