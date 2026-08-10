@@ -48,7 +48,7 @@ from contextlib import nullcontext, contextmanager
 from pathlib import Path
 from typing import Callable, Optional
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, urlencode
 
@@ -5428,6 +5428,28 @@ def _resume_turn_count(blob: Optional[dict]) -> int:
     ])
 
 
+def _resume_last_assistant_excerpt(blob: Optional[dict], max_len: int = 80) -> str:
+    """Opening snippet of the AI's last reply, for the resume picker label.
+
+    The picker previously showed the user's last prompt as the title, which is
+    often a terse command like ``.clear`` or ``/usage`` - not a useful hint for
+    *what the session was about*. The assistant's last output is a far better
+    summary of where the conversation left off. Falls back to the stored title
+    when no assistant message exists (e.g. session ended on a user turn).
+    """
+    if not blob:
+        return ""
+    for msg in reversed(blob.get("chat_history") or []):
+        if msg.get("role") == "assistant":
+            content = str(msg.get("content") or "").strip()
+            if content:
+                # Collapse whitespace/newlines so the snippet fits one label line
+                snippet = re.sub(r"\s+", " ", content)[:max_len]
+                return snippet
+    # No assistant reply in history - fall back to the stored title
+    return str(blob.get("title") or "")[:max_len]
+
+
 def _restore_resume_blob(blob: dict, chat_history: list) -> dict:
     """Restore full-fidelity conversation state from a per-cwd resume blob.
 
@@ -5529,7 +5551,8 @@ def show_resume_picker(cwd: str) -> Optional[dict]:
             badge = "[magenta]◆ checkpoint[/magenta]" if kind == "checkpoint" else f"[blue]{symbols.DOT_OPEN} autosave[/blue]"
             turns = item.get("turn_count") or _resume_turn_count(item)
             ago = _format_time_ago(item.get("timestamp", 0))
-            title = str(item.get("title") or "Untitled session")[:60].replace("\n", " ")
+            title = _resume_last_assistant_excerpt(item, max_len=60) or "Untitled session"
+            title = title.replace("\n", " ")
             labels.append(f"{badge}  [dim]{ago}[/dim]  {turns} turn(s)  [bold]{title}[/bold]")
         return labels
 
@@ -5577,7 +5600,8 @@ def show_resume_picker(cwd: str) -> Optional[dict]:
 def _show_resume_detail(item: dict) -> None:
     """Print a rich summary of one resume blob for the picker's details view."""
     console.print()
-    console.print(f"[bold cyan]{item.get('title') or 'Untitled session'}[/bold cyan]")
+    excerpt = _resume_last_assistant_excerpt(item, max_len=120) or "Untitled session"
+    console.print(f"[bold cyan]{excerpt}[/bold cyan]")
     console.print(f"[dim]Type:[/dim] {item.get('kind', 'session')}   "
                   f"[dim]When:[/dim] {_format_time_ago(item.get('timestamp', 0))}   "
                   f"[dim]Turns:[/dim] {item.get('turn_count') or _resume_turn_count(item)}")
@@ -10289,6 +10313,43 @@ def _usage_allowance_tight(state, used_key: str, limit_key: str) -> bool:
     return bool(limit) and (state.get(used_key) or 0) / limit >= 0.9
 
 
+def _usage_countdown(resets_at: str | None) -> str:
+    """Human-readable countdown to an allowance reset.
+
+    The backend stamps resetsAt as an ISO-8601 UTC string (e.g.
+    ``2026-08-09T11:16:18.425Z``). We turn that into a compact relative
+    duration - ``in 12m``, ``in 3h 20m``, ``in 27d`` - so a glance at /usage
+    tells you not just *that* a quota is nearly gone but *when* it comes back.
+    Returns ``""`` when the timestamp is missing or already in the past.
+    """
+    if not resets_at or not isinstance(resets_at, str):
+        return ""
+    ts = resets_at.strip()
+    # Python <3.11 datetime.fromisoformat doesn't accept a trailing 'Z';
+    # normalise to an explicit +00:00 offset.
+    if ts.endswith("Z"):
+        ts = ts[:-1] + "+00:00"
+    try:
+        target = datetime.fromisoformat(ts)
+    except (ValueError, TypeError):
+        return ""
+    if target.tzinfo is None:
+        target = target.replace(tzinfo=timezone.utc)
+    now = datetime.now(timezone.utc)
+    delta = target - now
+    if delta.total_seconds() <= 0:
+        return ""  # already reset; the next /usage refresh picks up fresh numbers
+    secs = int(delta.total_seconds())
+    days, secs = divmod(secs, 86400)
+    hours, secs = divmod(secs, 3600)
+    mins = secs // 60
+    if days:
+        return f"in {days}d{' ' + str(hours) + 'h' if hours else ''}"
+    if hours:
+        return f"in {hours}h{' ' + str(mins) + 'm' if mins else ''}"
+    return f"in {mins}m" if mins else "in <1m"
+
+
 def _usage_top_ups(session: dict) -> tuple[dict, str]:
     """The two add-ons the CLI can buy, as the server describes them.
 
@@ -10655,15 +10716,40 @@ def _show_usage_command(args: list, session: dict) -> None:
                 grid.add_row("calls", calls_val)
                 # Two allowances, two different things to run out of. Storage is
                 # shared with Helpwo because it is one store; calls are not.
-                call_quota = next(
-                    (p.get("monthly") for p in (sub.get("byProduct") or [])
+                cli_product = next(
+                    (p for p in (sub.get("byProduct") or [])
                      if p.get("productId") == "cli"), None)
+                call_quota = (cli_product.get("monthly")
+                              if isinstance(cli_product, dict) else None)
+                five_hour = (cli_product.get("fiveHour")
+                             if isinstance(cli_product, dict) else None)
                 if isinstance(call_quota, dict) and call_quota.get("limit"):
+                    quota_notes = []
+                    if int(call_quota.get("purchased") or 0):
+                        quota_notes.append(
+                            f"incl {int(call_quota.get('included') or 0):,}"
+                            f" + {int(call_quota['purchased']):,} bought")
+                    cd = _usage_countdown(call_quota.get("resetsAt"))
+                    if cd:
+                        quota_notes.append(f"resets {cd}")
                     grid.add_row("quota", _usage_allowance_bar(
                         int(call_quota.get("used") or 0), int(call_quota["limit"]),
                         f"{int(call_quota.get('used') or 0):,} / {int(call_quota['limit']):,} calls",
-                        int(call_quota.get("purchased") or 0) and
-                        f"incl {int(call_quota.get('included') or 0):,} + {int(call_quota['purchased']):,} bought"))
+                        "  ".join(quota_notes)))
+                # 5-hour rolling window - a short-lived throttle separate from
+                # the monthly quota. When it bites the only remedy is to wait,
+                # so the countdown is the single most useful thing to show.
+                if isinstance(five_hour, dict) and five_hour.get("limit"):
+                    fh_used = int(five_hour.get("used") or 0)
+                    fh_lim = int(five_hour["limit"])
+                    fh_notes = []
+                    cd = _usage_countdown(five_hour.get("resetsAt"))
+                    if cd:
+                        fh_notes.append(f"recovers {cd}")
+                    grid.add_row("5h window", _usage_allowance_bar(
+                        fh_used, fh_lim,
+                        f"{fh_used:,} / {fh_lim:,} calls",
+                        "  ".join(fh_notes)))
                 store = bal.get("storage")
                 if isinstance(store, dict) and store.get("limit_bytes"):
                     used_b, lim_b = int(store.get("used_bytes") or 0), int(store["limit_bytes"])
@@ -10697,7 +10783,13 @@ def _show_usage_command(args: list, session: dict) -> None:
                 # Said only when it is nearly true. A standing advert on a panel
                 # somebody opened to check their usage is noise.
                 if _usage_allowance_tight(call_quota, "used", "limit"):
-                    footnotes.append("CLI calls nearly used up — /usage buy calls")
+                    footnotes.append("CLI calls nearly used up - /usage buy calls")
+                if isinstance(five_hour, dict) and five_hour.get("limit") and \
+                        _usage_allowance_tight(five_hour, "used", "limit"):
+                    cd = _usage_countdown(five_hour.get("resetsAt"))
+                    footnotes.append(
+                        f"5h rolling window nearly used up - recovers {cd}"
+                        if cd else "5h rolling window nearly used up")
                 if _usage_allowance_tight(store, "used_bytes", "limit_bytes"):
                     footnotes.append("storage nearly full — /usage buy storage "
                                      "(one store, shared with Helpwo)")
