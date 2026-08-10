@@ -1057,6 +1057,7 @@ import extension_runtime         # hot-loaded project extension runtime
 import workgraph                 # unified objective/plan/steps/workflow state
 import hooks as hooks_mod        # trusted Python hooks + argv hooks
 import backend_profiles          # backend trust domains + credential isolation
+import ppos_client               # secure PPOS Agent API + autonomous policy
 import trust_store               # workspace trust for executable customization
 import usage_tracker             # local AI token/cost accounting (/usage)
 import agent_ui_events           # observable events for full-screen Agents Mode
@@ -2875,6 +2876,16 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec("/trust", "Review or change workspace trust", "Config & Tools", "/trust [status|allow|revoke]", subcommands=("status", "allow", "revoke")),
     CommandSpec("/hooks", "Manage executable hooks", "Config & Tools", "/hooks [status|trust|revoke|reload]", subcommands=("status", "trust", "revoke", "reload")),
     CommandSpec("/backend", "Manage backend trust profiles", "Config & Tools", "/backend [status|list|use <name>|config]", subcommands=("status", "list", "use", "config")),
+    CommandSpec(
+        "/ppos", "Use the PPOS publishing and review agent client", "Config & Tools",
+        "/ppos [account|storage|communities|works|status|publish|comment|community-review|platform-review|agent] ...",
+        subcommands=("account", "storage", "communities", "works", "status", "publish",
+                     "comment", "community-review", "platform-review", "agent"),
+        help_text=(
+            "Reads use the active official Laintas gateway and are briefly cached. "
+            "AI-initiated writes are disabled until /ppos agent enable <scope>. "
+            "Use /ppos agent policy to inspect community allowlists, daily caps, "
+            "fee cap, and minimum review confidence.")),
     CommandSpec("/max", "Lift runtime limits for this process", "Config & Tools"),
     CommandSpec("/tools", "List registered tools", "Config & Tools"),
     CommandSpec("/tool", "Invoke a tool directly", "Config & Tools", "/tool <name> [json-params]"),
@@ -11966,6 +11977,111 @@ def _cmd_backend(parts: list) -> None:
         console.print("[yellow]Usage: /backend \\[status|list|use <name>|config][/yellow]")
 
 
+def _ppos_print(value) -> None:
+    console.print(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True,
+                             default=str))
+
+
+def _cmd_ppos_agent(parts: list, session: dict) -> None:
+    action = parts[2].lower() if len(parts) > 2 else "status"
+    if action in ("status", "policy") and len(parts) <= 3:
+        _ppos_print(ppos_client.load_policy())
+        return
+    if action in ("enable", "disable"):
+        enabled = action == "enable"
+        scope = parts[3].lower().replace("-", "_") if len(parts) > 3 else ""
+        if not scope or scope == "all":
+            policy = ppos_client.update_policy(enabled=enabled)
+            if not enabled and scope == "all":
+                for item in ("publish", "comment", "community_review", "platform_review"):
+                    policy = ppos_client.update_policy(scope=item, scope_enabled=False)
+        else:
+            policy = ppos_client.update_policy(
+                enabled=True if enabled else None, scope=scope, scope_enabled=enabled)
+        server = ppos_client.PPOSClient(session).sync_server_policy()
+        _ppos_print({"local": policy, "server": server})
+        return
+    if action == "policy" and len(parts) >= 5 and parts[3].lower() == "set":
+        key = parts[4].lower().replace("-", "_")
+        value = parts[5] if len(parts) > 5 else ""
+        if key in ("communities", "community_allowlist"):
+            policy = ppos_client.update_policy(
+                community_allowlist=[v for v in value.split(",") if v])
+        elif key.startswith("daily_"):
+            scope = key[len("daily_"):]
+            policy = ppos_client.update_policy(daily_cap=(scope, int(value)))
+        elif key == "fee_cap_cents":
+            policy = ppos_client.update_policy(fee_cap_cents=int(value))
+        elif key in ("minimum_confidence", "minimum_review_confidence"):
+            policy = ppos_client.update_policy(minimum_review_confidence=float(value))
+        else:
+            raise ValueError("policy key must be communities, daily-<scope>, "
+                             "fee-cap-cents, or minimum-confidence")
+        server = ppos_client.PPOSClient(session).sync_server_policy()
+        _ppos_print({"local": policy, "server": server})
+        return
+    console.print("[yellow]Usage: /ppos agent [status|enable [scope]|disable [scope|all]|"
+                  "policy [set <key> <value>]][/yellow]")
+
+
+def _cmd_ppos(parts: list, session: dict) -> None:
+    """Explicit-user PPOS commands; autonomous policy gates live in AI tools."""
+    sub = parts[1].lower() if len(parts) > 1 else "status"
+    try:
+        if sub == "agent":
+            _cmd_ppos_agent(parts, session)
+            return
+        client = ppos_client.PPOSClient(session)
+        if sub in ("account", "storage", "status"):
+            _ppos_print(client.read(sub))
+        elif sub in ("communities", "works"):
+            page = int(parts[2]) if len(parts) > 2 else 1
+            page_size = int(parts[3]) if len(parts) > 3 else 20
+            _ppos_print(client.read(sub, page=page, page_size=page_size))
+        elif sub == "publish":
+            if len(parts) < 5:
+                raise ValueError("Usage: /ppos publish <community> <self-score-0..100> <markdown-path> [title]")
+            _ppos_print(client.publish_markdown(
+                parts[4], community=parts[2], self_score=float(parts[3]),
+                title=" ".join(parts[5:]), autonomous=False))
+        elif sub == "comment":
+            if len(parts) < 4:
+                raise ValueError("Usage: /ppos comment <work-id> <comment> [rating]")
+            rating = None
+            comment_parts = parts[3:]
+            if len(comment_parts) > 1 and comment_parts[-1].isdigit():
+                rating = int(comment_parts.pop())
+            _ppos_print(client.comment(
+                parts[2], " ".join(comment_parts), rating=rating, autonomous=False))
+        elif sub in ("community-review", "platform-review"):
+            level = sub.split("-", 1)[0]
+            operation = parts[2].lower() if len(parts) > 2 else "queue"
+            if operation == "queue":
+                page = int(parts[3]) if len(parts) > 3 else 1
+                _ppos_print(client.read(f"{level}_review_queue", page=page))
+            elif operation == "decide":
+                if len(parts) < 7:
+                    raise ValueError(
+                        f"Usage: /ppos {sub} decide <id> <approve|reject|escalate> "
+                        "<confidence> <json-comment-reason-evidence>")
+                detail = json.loads(" ".join(parts[6:]))
+                if not isinstance(detail, dict):
+                    raise ValueError("review detail must be a JSON object")
+                _ppos_print(client.review_decision(
+                    level, parts[3], parts[4], confidence=float(parts[5]),
+                    comment=str(detail.get("comment") or ""),
+                    reason=str(detail.get("reason") or ""),
+                    evidence=detail.get("evidence") or [], score=detail.get("score"),
+                    community=str(detail.get("community") or ""), autonomous=False))
+            else:
+                raise ValueError(f"Usage: /ppos {sub} [queue [page]|decide ...]")
+        else:
+            console.print("[yellow]Usage: /ppos [account|storage|communities|works|status|"
+                          "publish|comment|community-review|platform-review|agent] ...[/yellow]")
+    except (OSError, ValueError, ppos_client.PPOSClientError) as exc:
+        console.print(f"[red]PPOS: {exc}[/red]")
+
+
 def _cmd_hooks(parts: list) -> None:
     sub = parts[1].lower() if len(parts) > 1 else "status"
     hook_path = paths.PYTHON_HOOKS_FILE
@@ -17251,6 +17367,9 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
 
     elif action == "/backend":
         _cmd_backend(parts)
+
+    elif action == "/ppos":
+        _cmd_ppos(parts, session)
 
     elif action == "/hooks":
         _cmd_hooks(parts)

@@ -273,6 +273,61 @@
     },
 
     {
+      "name": "ppos_account", "category": "ppos", "execContext": "either",
+      "description": "Read the signed-in PPOS account.", "params": {"type": "object", "properties": {}},
+      "aliases": {"laintas_cli": "ppos.account.get", "helpwo": "ppos_account"}
+    },
+    {
+      "name": "ppos_storage", "category": "ppos", "execContext": "either",
+      "description": "Read PPOS storage usage.", "params": {"type": "object", "properties": {}},
+      "aliases": {"laintas_cli": "ppos.storage.get", "helpwo": "ppos_storage"}
+    },
+    {
+      "name": "ppos_communities", "category": "ppos", "execContext": "either",
+      "description": "List PPOS communities and roles.", "params": {"type": "object", "properties": {}},
+      "aliases": {"laintas_cli": "ppos.communities.list", "helpwo": "ppos_communities"}
+    },
+    {
+      "name": "ppos_works", "category": "ppos", "execContext": "either",
+      "description": "List the caller's PPOS works.", "params": {"type": "object", "properties": {}},
+      "aliases": {"laintas_cli": "ppos.works.list"}
+    },
+    {
+      "name": "ppos_publish", "category": "ppos", "execContext": "host",
+      "description": "Publish Markdown and safe relative images to PPOS.",
+      "params": {"type": "object", "properties": {"path": {"type": "string"}, "community_id": {"type": "string"}, "self_score": {"type": "number", "minimum": 0, "maximum": 100}}, "required": ["path", "community_id", "self_score"]},
+      "aliases": {"laintas_cli": "ppos.publish_markdown", "helpwo": "ppos_publish"}
+    },
+    {
+      "name": "ppos_comment", "category": "ppos", "execContext": "either",
+      "description": "Post a comment with an optional 0-100 rating.",
+      "params": {"type": "object", "properties": {"work_id": {"type": "string"}, "body": {"type": "string"}, "rating": {"type": "number", "minimum": 0, "maximum": 100}}, "required": ["work_id", "body"]},
+      "aliases": {"laintas_cli": "ppos.comment", "helpwo": "ppos_comment"}
+    },
+    {
+      "name": "ppos_community_review_queue", "category": "ppos", "execContext": "either",
+      "description": "Read a community moderation queue.", "params": {"type": "object", "properties": {"community_id": {"type": "string"}}, "required": ["community_id"]},
+      "aliases": {"laintas_cli": "ppos.community_review.queue", "helpwo": "ppos_community_review_queue"}
+    },
+    {
+      "name": "ppos_community_review_decide", "category": "ppos", "execContext": "either",
+      "description": "Approve, reject, or escalate a community review with evidence.",
+      "params": {"type": "object", "properties": {"community_id": {"type": "string"}, "work_id": {"type": "string"}, "decision": {"type": "string", "enum": ["approve", "reject", "escalate"]}, "confidence": {"type": "number", "minimum": 0, "maximum": 1}, "evidence": {"type": "array", "items": {"type": "object"}}}, "required": ["community_id", "work_id", "decision", "confidence", "evidence"]},
+      "aliases": {"laintas_cli": "ppos.community_review.decide", "helpwo": "ppos_community_decide"}
+    },
+    {
+      "name": "ppos_platform_review_queue", "category": "ppos", "execContext": "either",
+      "description": "Read the admin-only platform review queue.", "params": {"type": "object", "properties": {}},
+      "aliases": {"laintas_cli": "ppos.platform_review.queue", "helpwo": "ppos_platform_review_queue"}
+    },
+    {
+      "name": "ppos_platform_review_decide", "category": "ppos", "execContext": "either",
+      "description": "Approve, reject, or escalate an admin-only platform review.",
+      "params": {"type": "object", "properties": {"work_id": {"type": "string"}, "decision": {"type": "string", "enum": ["approve", "reject", "escalate"]}, "confidence": {"type": "number", "minimum": 0, "maximum": 1}, "evidence": {"type": "array", "items": {"type": "object"}}}, "required": ["work_id", "decision", "confidence", "evidence"]},
+      "aliases": {"laintas_cli": "ppos.platform_review.decide", "helpwo": "ppos_platform_decide"}
+    },
+
+    {
       "name": "hwo", "category": "hwo", "execContext": "backend",
       "description": "Run / manage an HWO multi-agent workflow.",
       "params": {"type": "object", "properties": {

@@ -40,6 +40,7 @@ from typing import Any, Callable, Optional
 
 import paths
 import durable_rules
+import ppos_client
 from hwo_adapter import HWO_TOOL_DESCRIPTION
 
 
@@ -1176,6 +1177,57 @@ def _bi_mail_check_inbox(params: dict, ctx: ToolCtx) -> dict:
                 pass  # best-effort; next check will just see them again
 
     return {"ok": True, "result": f"{len(messages)} message(s)", "messages": messages}
+
+
+# ── PPOS Agent client ─────────────────────────────────────────────────
+
+def _ppos_client(ctx: ToolCtx) -> ppos_client.PPOSClient:
+    return ppos_client.PPOSClient(ctx.session, agent_id=ctx.agent_id or "")
+
+
+def _bi_ppos_read(kind: str, params: dict, ctx: ToolCtx) -> dict:
+    try:
+        result = _ppos_client(ctx).read(
+            kind, page=params.get("page", 1), page_size=params.get("page_size", 20),
+            filters={k: v for k, v in params.items() if k not in ("page", "page_size")})
+        return {"ok": True, "result": result}
+    except ppos_client.PPOSClientError as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def _bi_ppos_publish(params: dict, ctx: ToolCtx) -> dict:
+    try:
+        community = params.get("community_id") or params.get("community")
+        result = _ppos_client(ctx).publish_markdown(
+            params["path"], community=community,
+            self_score=params["self_score"], title=params.get("title", ""), autonomous=True)
+        return {"ok": True, "result": result}
+    except (OSError, ppos_client.PPOSClientError) as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def _bi_ppos_comment(params: dict, ctx: ToolCtx) -> dict:
+    try:
+        result = _ppos_client(ctx).comment(
+            params["work_id"], params.get("body") or params.get("comment", ""), rating=params.get("rating"),
+            community=params.get("community", ""), autonomous=True)
+        return {"ok": True, "result": result}
+    except ppos_client.PPOSClientError as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def _bi_ppos_review(level: str, params: dict, ctx: ToolCtx) -> dict:
+    try:
+        review_id = params.get("work_id") or params.get("review_id")
+        result = _ppos_client(ctx).review_decision(
+            level, review_id, params["decision"],
+            comment=params.get("comment", ""), reason=params.get("reason", ""),
+            evidence=params.get("evidence") or [], confidence=params["confidence"],
+            score=params.get("score"),
+            community=params.get("community_id") or params.get("community", ""), autonomous=True)
+        return {"ok": True, "result": result}
+    except ppos_client.PPOSClientError as exc:
+        return {"ok": False, "error": str(exc)}
 
 
 def _bi_fs_write(params: dict, ctx: ToolCtx) -> dict:
@@ -5649,6 +5701,126 @@ def _bi_browser_test_flow(params: dict, ctx: ToolCtx) -> dict:
 def register_builtin_tools() -> None:
     """Idempotent — safe to call multiple times."""
     builtins = [
+        Tool(
+            name="ppos.account.get",
+            description="Read the signed-in user's PPOS account profile. Read-only and briefly cached.",
+            schema={"type": "object", "properties": {}, "additionalProperties": False},
+            invoke=lambda p, c: _bi_ppos_read("account", p, c),
+            capabilities=frozenset({"network"}),
+        ),
+        Tool(
+            name="ppos.storage.get",
+            description="Read PPOS storage usage and limits. Read-only and briefly cached.",
+            schema={"type": "object", "properties": {}, "additionalProperties": False},
+            invoke=lambda p, c: _bi_ppos_read("storage", p, c),
+            capabilities=frozenset({"network"}),
+        ),
+        Tool(
+            name="ppos.communities.list",
+            description="List PPOS communities one bounded page at a time.",
+            schema={"type": "object", "properties": {
+                "page": {"type": "integer", "minimum": 1, "default": 1},
+                "page_size": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20},
+                "query": {"type": "string"},
+            }, "additionalProperties": False},
+            invoke=lambda p, c: _bi_ppos_read("communities", p, c),
+            capabilities=frozenset({"network"}),
+        ),
+        Tool(
+            name="ppos.works.list",
+            description="List PPOS works one bounded page at a time.",
+            schema={"type": "object", "properties": {
+                "page": {"type": "integer", "minimum": 1, "default": 1},
+                "page_size": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20},
+                "community": {"type": "string"}, "status": {"type": "string"},
+            }, "additionalProperties": False},
+            invoke=lambda p, c: _bi_ppos_read("works", p, c),
+            capabilities=frozenset({"network"}),
+        ),
+        Tool(
+            name="ppos.status.get",
+            description="Read PPOS service and agent-account status. Read-only and briefly cached.",
+            schema={"type": "object", "properties": {}, "additionalProperties": False},
+            invoke=lambda p, c: _bi_ppos_read("status", p, c),
+            capabilities=frozenset({"network"}),
+        ),
+        Tool(
+            name="ppos.publish_markdown",
+            description="Publish a UTF-8 Markdown file and its safe relative local images to PPOS. "
+                        "Requires explicit local autonomous-publish opt-in.",
+            schema={"type": "object", "properties": {
+                "path": {"type": "string", "minLength": 1},
+                "community": {"type": "string", "minLength": 1},
+                "self_score": {"type": "number", "minimum": 0, "maximum": 100},
+                "title": {"type": "string"},
+            }, "required": ["path", "community", "self_score"], "additionalProperties": False},
+            invoke=_bi_ppos_publish,
+            capabilities=frozenset({"fs.read", "network", "external.write"}),
+        ),
+        Tool(
+            name="ppos.comment",
+            description="Post a PPOS comment, optionally with an ordinary 0-100 rating attached. "
+                        "Requires explicit local autonomous-comment opt-in.",
+            schema={"type": "object", "properties": {
+                "work_id": {"type": "string", "minLength": 1},
+                "comment": {"type": "string", "minLength": 1},
+                "rating": {"type": "number", "minimum": 0, "maximum": 100},
+                "community": {"type": "string"},
+            }, "required": ["work_id", "comment"], "additionalProperties": False},
+            invoke=_bi_ppos_comment,
+            capabilities=frozenset({"network", "external.write"}),
+        ),
+        Tool(
+            name="ppos.community_review.queue",
+            description="Read a bounded page from the PPOS community review queue.",
+            schema={"type": "object", "properties": {
+                "page": {"type": "integer", "minimum": 1, "default": 1},
+                "page_size": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20},
+                "community": {"type": "string"},
+            }, "additionalProperties": False},
+            invoke=lambda p, c: _bi_ppos_read("community_review_queue", p, c),
+            capabilities=frozenset({"network"}),
+        ),
+        Tool(
+            name="ppos.community_review.decide",
+            description="Approve, reject, or escalate a community review with structured rationale. "
+                        "Requires community-review opt-in and minimum confidence.",
+            schema={"type": "object", "properties": {
+                "review_id": {"type": "string", "minLength": 1},
+                "decision": {"type": "string", "enum": ["approve", "reject", "escalate"]},
+                "comment": {"type": "string"}, "reason": {"type": "string"},
+                "evidence": {"type": "array", "items": {"type": "object"}, "minItems": 1, "maxItems": 20},
+                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                "score": {"type": "number", "minimum": 0, "maximum": 100},
+                "community": {"type": "string"},
+            }, "required": ["review_id", "decision", "confidence", "evidence", "community"], "additionalProperties": False},
+            invoke=lambda p, c: _bi_ppos_review("community", p, c),
+            capabilities=frozenset({"network", "external.write", "review.decide"}),
+        ),
+        Tool(
+            name="ppos.platform_review.queue",
+            description="Read a bounded page from the PPOS platform review queue.",
+            schema={"type": "object", "properties": {
+                "page": {"type": "integer", "minimum": 1, "default": 1},
+                "page_size": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20},
+            }, "additionalProperties": False},
+            invoke=lambda p, c: _bi_ppos_read("platform_review_queue", p, c),
+            capabilities=frozenset({"network"}),
+        ),
+        Tool(
+            name="ppos.platform_review.decide",
+            description="Approve, reject, or escalate a platform review with structured rationale. "
+                        "Disabled by default and requires explicit platform-review opt-in.",
+            schema={"type": "object", "properties": {
+                "review_id": {"type": "string", "minLength": 1},
+                "decision": {"type": "string", "enum": ["approve", "reject", "escalate"]},
+                "comment": {"type": "string"}, "reason": {"type": "string"},
+                "evidence": {"type": "array", "items": {"type": "object"}, "minItems": 1, "maxItems": 20},
+                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+            }, "required": ["review_id", "decision", "confidence", "evidence"], "additionalProperties": False},
+            invoke=lambda p, c: _bi_ppos_review("platform", p, c),
+            capabilities=frozenset({"network", "external.write", "review.decide"}),
+        ),
         Tool(
             name="mem.read",
             description="Read one persistent memory by name from the current user/project scope.",
