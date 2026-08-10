@@ -5534,7 +5534,7 @@ def show_resume_picker(cwd: str) -> Optional[dict]:
             with _alt_screen():
                 _show_resume_detail(item)
                 _print_resume_transcript(item, 20)
-                input("\n[dim]Press Enter to continue...[/dim]")
+                console.input("\n[dim]Press Enter to continue...[/dim]")
             sel_idx = idx
         elif action == "delete":
             delete_resume_state(cwd, item)
@@ -8512,7 +8512,7 @@ def show_debug_browser_interactive() -> None:
         idx = labels.index(chosen)
         with _alt_screen():
             show_debug_detail(idx)
-            input("\n[dim]Press Enter to return to debug browser...[/dim]")
+            console.input("\n[dim]Press Enter to return to debug browser...[/dim]")
 
 
 def show_debug_detail(index: int) -> None:
@@ -8736,7 +8736,7 @@ def show_terminal_manager(primary_session=None) -> None:
         elif action == "details":
             with _alt_screen():
                 _show_terminal_detail(name, cmd, sess, created, alive)
-                input("\n[dim]Press Enter to continue...[/dim]")
+                console.input("\n[dim]Press Enter to continue...[/dim]")
 
         sel_idx = idx
 
@@ -8836,7 +8836,7 @@ def show_skill_manager() -> None:
         if action == "details":
             with _alt_screen():
                 _show_skill_detail(name)
-                input("\n[dim]Press Enter to continue...[/dim]")
+                console.input("\n[dim]Press Enter to continue...[/dim]")
         elif action == "reload":
             results = skills_mod.reload_all()
             status_msg = f"Reloaded: {len(results)} skill(s) re-scanned from disk."
@@ -11017,7 +11017,7 @@ def _memory_manager() -> None:
                     panel_body = (f"[bold]Summary:[/bold] {summary}\n\n[dim]Full memory:[/dim]\n{body}"
                                   if summary else body)
                     _print_long_panel(panel_body, f"[{scope_txt}] {cat} {symbols.BULLET} {name}")
-                input("\n[dim]Press Enter to continue...[/dim]")
+                console.input("\n[dim]Press Enter to continue...[/dim]")
             sel_idx = idx
         elif action == "delete":
             ok, msg = memory_system.delete_memory(name)
