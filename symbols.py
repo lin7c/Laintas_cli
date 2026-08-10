@@ -29,6 +29,11 @@ ARROW_U = "↑"     # up (input tokens)
 ARROW_D = "↓"     # down (output tokens)
 ARROW_RR = "↳"    # sub-item / continuation
 
+# ── Tree ───────────────────────────────────────────────────────────────────
+TREE_BRANCH = "├─"   # branch node (has sibling below)
+TREE_LAST = "└─"     # last child node (no sibling below)
+TREE_VERT = "│"      # vertical continuation line
+
 # ── Special ────────────────────────────────────────────────────────────────
 ZAP = "⚡"        # interrupt / fast action
 RETURN = "⏎"     # line return / enter

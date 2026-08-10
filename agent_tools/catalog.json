@@ -279,7 +279,7 @@
     },
     {
       "name": "ppos_storage", "category": "ppos", "execContext": "either",
-      "description": "Read PPOS storage usage.", "params": {"type": "object", "properties": {}},
+      "description": "Read PPOS storage usage, limits, and the per-work breakdown.", "params": {"type": "object", "properties": {}},
       "aliases": {"laintas_cli": "ppos.storage.get", "helpwo": "ppos_storage"}
     },
     {
@@ -289,13 +289,44 @@
     },
     {
       "name": "ppos_works", "category": "ppos", "execContext": "either",
-      "description": "List the caller's PPOS works.", "params": {"type": "object", "properties": {}},
-      "aliases": {"laintas_cli": "ppos.works.list"}
+      "description": "List the caller's PPOS works with the storage each one occupies.",
+      "params": {"type": "object", "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 50}, "offset": {"type": "integer", "minimum": 0}}},
+      "aliases": {"laintas_cli": "ppos.works.list", "helpwo": "ppos_works"}
     },
     {
-      "name": "ppos_publish", "category": "ppos", "execContext": "host",
-      "description": "Publish Markdown and safe relative images to PPOS.",
-      "params": {"type": "object", "properties": {"path": {"type": "string"}, "community_id": {"type": "string"}, "self_score": {"type": "number", "minimum": 0, "maximum": 100}}, "required": ["path", "community_id", "self_score"]},
+      "name": "ppos_work", "category": "ppos", "execContext": "either",
+      "description": "Read one PPOS work in full, including its Markdown source.",
+      "params": {"type": "object", "properties": {"work_id": {"type": "string"}}, "required": ["work_id"]},
+      "aliases": {"laintas_cli": "ppos.work.get", "helpwo": "ppos_work"}
+    },
+    {
+      "name": "ppos_work_update", "category": "ppos", "execContext": "either",
+      "description": "Edit one of your PPOS works: title, tags, self score, community, or replacement Markdown (its media is uploaded). Editing text re-enters review and re-charges the $1 review fee.",
+      "params": {"type": "object", "properties": {"work_id": {"type": "string"}, "title": {"type": "string"}, "path": {"type": "string"}, "tags": {"type": "array", "items": {"type": "string"}}, "self_score": {"type": "number", "minimum": 0, "maximum": 100}, "community_id": {"type": "string"}}, "required": ["work_id"]},
+      "aliases": {"laintas_cli": "ppos.work.update", "helpwo": "ppos_work_update"}
+    },
+    {
+      "name": "ppos_work_delete", "category": "ppos", "execContext": "either",
+      "description": "Delete one of your PPOS works and free the storage quota it occupied.",
+      "params": {"type": "object", "properties": {"work_id": {"type": "string"}}, "required": ["work_id"]},
+      "aliases": {"laintas_cli": "ppos.work.delete", "helpwo": "ppos_work_delete"}
+    },
+    {
+      "name": "ppos_storage_cleanup", "category": "ppos", "execContext": "either",
+      "description": "Find, and optionally delete, PPOS media that no live work references any more (leftovers from failed publishes or deleted works). Dry run by default.",
+      "params": {"type": "object", "properties": {"dry_run": {"type": "boolean"}, "min_age_hours": {"type": "integer", "minimum": 1, "maximum": 720}}},
+      "aliases": {"laintas_cli": "ppos.storage.cleanup", "helpwo": "ppos_storage_cleanup"}
+    },
+    {
+      "name": "ppos_draft_save", "category": "ppos", "execContext": "either",
+      "description": "Save Markdown as a private PPOS draft, or replace an existing draft. Media is uploaded, but no review is requested and no review fee is charged.",
+      "params": {"type": "object", "properties": {"path": {"type": "string"}, "draft_id": {"type": "string"}}, "required": ["path"]},
+      "aliases": {"laintas_cli": "ppos.draft.save", "helpwo": "ppos_draft_save"}
+    },
+    {
+      "name": "ppos_publish", "category": "ppos", "execContext": "either",
+      "description": "Publish Markdown to PPOS, optionally replacing and submitting an existing private draft. Relative local images and videos are uploaded into PPOS storage and their links rewritten.",
+      "params": {"type": "object", "properties": {"path": {"type": "string"}, "community_id": {"type": "string"}, "self_score": {"type": "number", "minimum": 0, "maximum": 100}, "draft_id": {"type": "string"}}, "required": ["path", "community_id", "self_score"]},
       "aliases": {"laintas_cli": "ppos.publish_markdown", "helpwo": "ppos_publish"}
     },
     {

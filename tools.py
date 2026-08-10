@@ -1200,7 +1200,18 @@ def _bi_ppos_publish(params: dict, ctx: ToolCtx) -> dict:
         community = params.get("community_id") or params.get("community")
         result = _ppos_client(ctx).publish_markdown(
             params["path"], community=community,
-            self_score=params["self_score"], title=params.get("title", ""), autonomous=True)
+            self_score=params["self_score"], title=params.get("title", ""),
+            draft_id=params.get("draft_id", ""), autonomous=True)
+        return {"ok": True, "result": result}
+    except (OSError, ppos_client.PPOSClientError) as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def _bi_ppos_draft_save(params: dict, ctx: ToolCtx) -> dict:
+    try:
+        result = _ppos_client(ctx).save_draft(
+            params["path"], draft_id=params.get("draft_id", ""),
+            title=params.get("title", ""), autonomous=True)
         return {"ok": True, "result": result}
     except (OSError, ppos_client.PPOSClientError) as exc:
         return {"ok": False, "error": str(exc)}
@@ -1212,6 +1223,35 @@ def _bi_ppos_comment(params: dict, ctx: ToolCtx) -> dict:
             params["work_id"], params.get("body") or params.get("comment", ""), rating=params.get("rating"),
             community=params.get("community", ""), autonomous=True)
         return {"ok": True, "result": result}
+    except ppos_client.PPOSClientError as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def _bi_ppos_work_update(params: dict, ctx: ToolCtx) -> dict:
+    try:
+        result = _ppos_client(ctx).update_work(
+            params["work_id"], title=params.get("title", ""),
+            markdown_path=params.get("path", ""), tags=params.get("tags"),
+            self_score=params.get("self_score"),
+            community=params.get("community_id", ""), autonomous=True)
+        return {"ok": True, "result": result}
+    except (OSError, ppos_client.PPOSClientError) as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def _bi_ppos_work_delete(params: dict, ctx: ToolCtx) -> dict:
+    try:
+        return {"ok": True, "result": _ppos_client(ctx).delete_work(
+            params["work_id"], autonomous=True)}
+    except ppos_client.PPOSClientError as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def _bi_ppos_storage_cleanup(params: dict, ctx: ToolCtx) -> dict:
+    try:
+        return {"ok": True, "result": _ppos_client(ctx).cleanup_storage(
+            dry_run=params.get("dry_run", True),
+            min_age_hours=int(params.get("min_age_hours", 24)), autonomous=True)}
     except ppos_client.PPOSClientError as exc:
         return {"ok": False, "error": str(exc)}
 
@@ -5721,21 +5761,72 @@ def register_builtin_tools() -> None:
             schema={"type": "object", "properties": {
                 "page": {"type": "integer", "minimum": 1, "default": 1},
                 "page_size": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20},
-                "query": {"type": "string"},
+                "mine": {"type": "boolean", "default": True,
+                         "description": "Only communities you have joined"},
             }, "additionalProperties": False},
             invoke=lambda p, c: _bi_ppos_read("communities", p, c),
             capabilities=frozenset({"network"}),
         ),
         Tool(
             name="ppos.works.list",
-            description="List PPOS works one bounded page at a time.",
+            description="List your PPOS works one bounded page at a time, "
+                        "including how much storage each one occupies.",
             schema={"type": "object", "properties": {
                 "page": {"type": "integer", "minimum": 1, "default": 1},
                 "page_size": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20},
-                "community": {"type": "string"}, "status": {"type": "string"},
+                "community_id": {"type": "string"},
+                "status": {"type": "string", "enum": ["pending", "active", "hidden", "rejected"]},
             }, "additionalProperties": False},
             invoke=lambda p, c: _bi_ppos_read("works", p, c),
             capabilities=frozenset({"network"}),
+        ),
+        Tool(
+            name="ppos.work.get",
+            description="Read one PPOS work in full, including its Markdown source.",
+            schema={"type": "object", "properties": {
+                "work_id": {"type": "string", "minLength": 1},
+            }, "required": ["work_id"], "additionalProperties": False},
+            invoke=lambda p, c: _bi_ppos_read("work", p, c),
+            capabilities=frozenset({"network"}),
+        ),
+        Tool(
+            name="ppos.work.update",
+            description="Edit one of your PPOS works: title, tags, self score, community, or "
+                        "replace its Markdown from a local file (media is re-uploaded). "
+                        "Editing text re-enters review and re-charges the $1 review fee. "
+                        "Requires the manage opt-in.",
+            schema={"type": "object", "properties": {
+                "work_id": {"type": "string", "minLength": 1},
+                "title": {"type": "string"},
+                "path": {"type": "string", "description": "Markdown file replacing the body"},
+                "tags": {"type": "array", "items": {"type": "string"}},
+                "self_score": {"type": "number", "minimum": 0, "maximum": 100},
+                "community_id": {"type": "string"},
+            }, "required": ["work_id"], "additionalProperties": False},
+            invoke=_bi_ppos_work_update,
+            capabilities=frozenset({"network", "external.write"}),
+        ),
+        Tool(
+            name="ppos.work.delete",
+            description="Delete one of your PPOS works and free the storage it occupied. "
+                        "Requires the manage opt-in.",
+            schema={"type": "object", "properties": {
+                "work_id": {"type": "string", "minLength": 1},
+            }, "required": ["work_id"], "additionalProperties": False},
+            invoke=_bi_ppos_work_delete,
+            capabilities=frozenset({"network", "external.write"}),
+        ),
+        Tool(
+            name="ppos.storage.cleanup",
+            description="Find (and optionally delete) PPOS media in R2 that no live work "
+                        "references any more — leftovers from failed publishes or deleted "
+                        "works. Defaults to a dry run; deleting requires the manage opt-in.",
+            schema={"type": "object", "properties": {
+                "dry_run": {"type": "boolean", "default": True},
+                "min_age_hours": {"type": "integer", "minimum": 1, "maximum": 720, "default": 24},
+            }, "additionalProperties": False},
+            invoke=_bi_ppos_storage_cleanup,
+            capabilities=frozenset({"network", "external.write"}),
         ),
         Tool(
             name="ppos.status.get",
@@ -5745,14 +5836,33 @@ def register_builtin_tools() -> None:
             capabilities=frozenset({"network"}),
         ),
         Tool(
+            name="ppos.draft.save",
+            description="Save a UTF-8 Markdown file as an author-private PPOS draft, or replace "
+                        "an existing draft. Local media is uploaded and rewritten, but the draft "
+                        "is not reviewed, charged, indexed, or published. Requires the publish opt-in.",
+            schema={"type": "object", "properties": {
+                "path": {"type": "string", "minLength": 1,
+                         "description": "Local UTF-8 Markdown file to store"},
+                "draft_id": {"type": "string",
+                             "description": "Existing draft ID to replace; omit to create one"},
+                "title": {"type": "string", "description": "Optional title override"},
+            }, "required": ["path"], "additionalProperties": False},
+            invoke=_bi_ppos_draft_save,
+            capabilities=frozenset({"fs.read", "network", "external.write"}),
+        ),
+        Tool(
             name="ppos.publish_markdown",
-            description="Publish a UTF-8 Markdown file and its safe relative local images to PPOS. "
+            description="Publish a UTF-8 Markdown file to PPOS. Relative local images and "
+                        "videos (jpg/png/webp/gif/avif/bmp, mp4/webm/mov) are uploaded into "
+                        "PPOS storage and their links rewritten. "
                         "Requires explicit local autonomous-publish opt-in.",
             schema={"type": "object", "properties": {
                 "path": {"type": "string", "minLength": 1},
                 "community": {"type": "string", "minLength": 1},
                 "self_score": {"type": "number", "minimum": 0, "maximum": 100},
                 "title": {"type": "string"},
+                "draft_id": {"type": "string",
+                             "description": "Existing private draft to replace and submit"},
             }, "required": ["path", "community", "self_score"], "additionalProperties": False},
             invoke=_bi_ppos_publish,
             capabilities=frozenset({"fs.read", "network", "external.write"}),

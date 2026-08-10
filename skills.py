@@ -79,6 +79,8 @@ from tools import Tool, get_registry, infer_capabilities
 
 
 import paths
+import backend_profiles
+import json_store
 import trust_store
 
 SKILLS_DIR = paths.SKILLS_DIR
@@ -122,6 +124,9 @@ def ensure_skills_dir() -> Path:
 # that overwriting the directory destroys nothing the user wrote.
 
 MANAGED_MARKER = ".laintas-asset.json"
+GATEWAY_SKILL_OWNER = "gateway"
+GATEWAY_SKILL_MAX_RESPONSE_BYTES = 512 * 1024
+GATEWAY_SKILL_MAX_MANUAL_BYTES = 200 * 1024
 
 
 def managed_owner(directory: Path) -> str:
@@ -153,6 +158,112 @@ def claim_managed_dir(name: str, owner: str) -> tuple[Optional[Path], str]:
     if existing:
         return None, f"'{name}' is already managed by {existing}"
     return None, f"'{name}' already exists as your own skill and was left alone"
+
+
+def sync_gateway_skills(session: Optional[dict], *, requests_module=None,
+                        timeout: float = 4.0) -> list[tuple[str, bool, str]]:
+    """Best-effort sync of documentation-only skills from the active gateway.
+
+    A local user-owned directory always wins. Gateway entries create only a
+    SKILL.md plus the managed marker: no Python or executable manifest received
+    over the network is accepted. Official credentials remain audience-bound
+    through backend_profiles.request_auth().
+    """
+    if not session:
+        return []
+    try:
+        requests_module = requests_module or __import__("requests")
+        profile = backend_profiles.resolve("https://laintas.com")
+        headers, cookies = backend_profiles.request_auth(profile, session)
+        response = requests_module.get(
+            f"{profile.base_url}/api/skills",
+            headers=headers, cookies=cookies, timeout=timeout,
+            allow_redirects=False,
+        )
+    except Exception as exc:
+        return [("gateway", False, f"skill catalog unavailable: {exc}")]
+    if response.status_code != 200:
+        return [("gateway", False, f"skill catalog HTTP {response.status_code}")]
+    raw = response.content
+    if len(raw) > GATEWAY_SKILL_MAX_RESPONSE_BYTES:
+        return [("gateway", False, "skill catalog exceeds the size limit")]
+    try:
+        payload = response.json()
+    except (TypeError, ValueError):
+        return [("gateway", False, "skill catalog is not valid JSON")]
+    entries = payload.get("skills") if isinstance(payload, dict) else None
+    if (not isinstance(payload, dict) or payload.get("schema_version") != 1
+            or not isinstance(entries, list) or len(entries) > 32):
+        return [("gateway", False, "skill catalog schema is invalid")]
+
+    ensure_skills_dir()
+    results: list[tuple[str, bool, str]] = []
+    for item in entries:
+        if not isinstance(item, dict):
+            results.append(("gateway", False, "ignored malformed skill entry"))
+            continue
+        name = str(item.get("name") or "")
+        description = str(item.get("description") or "").strip()
+        revision = str(item.get("revision") or "").strip()
+        digest = str(item.get("sha256") or "").strip().lower()
+        manual = str(item.get("manual") or "").strip()
+        client = (item.get("clients") or {}).get("laintas_cli") or {}
+        triggers = client.get("trigger_patterns") or []
+        valid = (
+            re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", name)
+            and 1 <= len(description) <= 2000
+            and re.fullmatch(r"gateway-[a-f0-9]{12}", revision)
+            and re.fullmatch(r"[a-f0-9]{64}", digest)
+            and 0 < len(manual.encode("utf-8")) <= GATEWAY_SKILL_MAX_MANUAL_BYTES
+            and "[TODO" not in manual
+            and isinstance(triggers, list) and len(triggers) <= 32
+            and all(isinstance(value, str) and 0 < len(value) <= 120 for value in triggers)
+        )
+        if not valid:
+            results.append((name or "gateway", False, "ignored invalid skill entry"))
+            continue
+        target, reason = claim_managed_dir(name, GATEWAY_SKILL_OWNER)
+        if target is None:
+            results.append((name, True, reason))
+            continue
+        try:
+            if target.is_symlink():
+                raise OSError("managed skill target is a symlink")
+            target.mkdir(mode=0o700, parents=True, exist_ok=True)
+            marker_path = target / MANAGED_MARKER
+            skill_path = target / "SKILL.md"
+            if marker_path.is_symlink() or skill_path.is_symlink():
+                raise OSError("managed skill file is a symlink")
+            marker = {
+                "managed_by": GATEWAY_SKILL_OWNER,
+                "revision": revision,
+                "sha256": digest,
+                "source": f"{profile.base_url}/api/skills",
+            }
+            json_store.save_json_atomic(marker_path, marker, mode=0o600)
+            trigger_block = "".join(
+                f"  - {json.dumps(value, ensure_ascii=False)}\n" for value in triggers
+            )
+            rendered = (
+                "---\n"
+                f"name: {name}\n"
+                f"description: {json.dumps(description, ensure_ascii=False)}\n"
+                f"version: {revision}\n"
+                "triggers:\n"
+                f"{trigger_block}"
+                "---\n\n"
+                f"{manual}\n"
+            )
+            temporary = target / ".SKILL.md.tmp"
+            if temporary.is_symlink():
+                raise OSError("managed skill temporary file is a symlink")
+            temporary.write_text(rendered, encoding="utf-8")
+            temporary.chmod(0o600)
+            os.replace(temporary, skill_path)
+            results.append((name, True, f"synced {revision}"))
+        except OSError as exc:
+            results.append((name, False, f"could not install managed skill: {exc}"))
+    return results
 
 
 def ensure_bundled_skills_installed() -> list[str]:

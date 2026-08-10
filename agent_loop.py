@@ -1644,6 +1644,15 @@ def _resume_checkpoint_pattern(cwd: str) -> str:
     return f"{_session_key(cwd)}_resume_*.json"
 
 
+def _resume_fork_pattern(cwd: str) -> str:
+    return f"{_session_key(cwd)}_fork_*.json"
+
+
+def _resume_fork_path(cwd: str, fork_name: str):
+    safe = re.sub(r"[^A-Za-z0-9_-]", "-", fork_name.strip())[:64]
+    return paths.SESSIONS_DIR / f"{_session_key(cwd)}_fork_{safe}.json"
+
+
 def _prune_resume_checkpoints(cwd: str) -> None:
     try:
         files = sorted(
@@ -1699,6 +1708,33 @@ def save_resume_checkpoint(state: dict, chat_history: list, cwd: str) -> Optiona
         return None
 
 
+def save_fork_state(state: dict, chat_history: list, cwd: str,
+                    fork_name: str, fork_lineage: list = None,
+                    fork_parent_session_id: str = "") -> Optional[dict]:
+    """Save a named fork snapshot of the current session context.
+
+    Like ``save_resume_checkpoint`` but tagged with fork metadata so the
+    resume picker can render it as a tree node. The fork file uses a
+    human-readable name in its filename (sanitized) so duplicate detection
+    by lineage path is straightforward. Also writes the per-session file so
+    ``list_resume_states`` discovers it via its glob pattern.
+    """
+    try:
+        payload = _build_resume_payload(state, chat_history, cwd, "fork")
+        if payload is None:
+            return None
+        payload["fork_name"] = fork_name
+        payload["fork_lineage"] = fork_lineage or [fork_name]
+        payload["fork_parent_session_id"] = fork_parent_session_id
+        payload["fork_created_at"] = payload["timestamp"]
+        paths.SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+        _atomic_write_json(_resume_fork_path(cwd, fork_name), payload)
+        _atomic_write_json(_resume_session_path(cwd, payload["session_id"]), payload)
+        return payload
+    except Exception:
+        return None
+
+
 def list_resume_states(cwd: str) -> list:
     """Return selectable resume states for this cwd, newest first."""
     states = []
@@ -1706,6 +1742,7 @@ def list_resume_states(cwd: str) -> list:
     try:
         files = list(paths.SESSIONS_DIR.glob(_resume_checkpoint_pattern(cwd)))
         files.extend(paths.SESSIONS_DIR.glob(_resume_session_pattern(cwd)))
+        files.extend(paths.SESSIONS_DIR.glob(_resume_fork_pattern(cwd)))
         latest = _resume_latest_path(cwd)
         if latest.exists():
             files.append(latest)
@@ -1741,6 +1778,7 @@ def list_resume_states(cwd: str) -> list:
             "chat_history": item.get("chat_history") or [],
             "tasks": item.get("tasks") or [],
             "state": item.get("state") or {},
+            "fork_lineage": item.get("fork_lineage") or [],
         }
         snapshot_key = _fingerprint_payload(stable)
         previous_index = by_snapshot.get(snapshot_key)
@@ -1799,6 +1837,9 @@ def delete_resume_state(cwd: str, blob: dict) -> None:
 
         if blob.get("kind") == "checkpoint" and blob_id:
             (paths.SESSIONS_DIR / f"{key}_resume_{blob_id}.json").unlink(missing_ok=True)
+
+        if blob.get("kind") == "fork" and blob.get("fork_name"):
+            _resume_fork_path(cwd, blob["fork_name"]).unlink(missing_ok=True)
 
         if session_id:
             sess_path = paths.SESSIONS_DIR / f"{key}_session_{_normalize_session_id(session_id)}.json"

@@ -488,6 +488,49 @@ def begin_amendment() -> Optional[dict]:
     return attach_work(work["id"])
 
 
+def delete_plan(name: str) -> bool:
+    """Delete a plan by work-id or legacy file name.
+
+    Removes the WorkGraph record (cascade-deletes revisions/steps/events),
+    the Markdown projection file, and exits plan mode if the deleted plan is
+    the current one.  Returns True if anything was actually removed.
+    """
+    _ensure_project_state()
+    removed = False
+
+    # Try WorkGraph-backed plan first.
+    work = workgraph.get_work(name)
+    if work:
+        work_id = work["id"]
+        try:
+            removed = workgraph.delete_work(work_id) or removed
+        except workgraph.WorkGraphError:
+            pass
+        # Remove the Markdown projection.
+        plan_path = PLANS_DIR / f"{work_id}.md"
+        try:
+            plan_path.unlink()
+            removed = True
+        except OSError:
+            pass
+    else:
+        # Legacy file-only plan (pre-WorkGraph).
+        p = PLANS_DIR / f"{name}.md"
+        try:
+            p.unlink()
+            removed = True
+        except OSError:
+            pass
+
+    # If we just deleted the current plan, exit plan mode cleanly.
+    if _current_plan and _current_plan.get("work_id") == name:
+        exit_plan_mode(approve=False)
+    elif _current_plan and _current_plan.get("name") == name:
+        exit_plan_mode(approve=False)
+
+    return removed
+
+
 def list_plans() -> list[dict]:
     """List all saved plans."""
     graph_plans = []

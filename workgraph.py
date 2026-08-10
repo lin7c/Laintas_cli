@@ -559,6 +559,28 @@ def update_work(work_id: str, *, cwd: Optional[str] = None, **fields: Any) -> di
     return get_work(work_id, cwd=cwd) or {}
 
 
+def delete_work(work_id: str, *, cwd: Optional[str] = None,
+                session_id: Optional[str] = None) -> bool:
+    """Delete a work item and all cascade children (revisions, steps, events).
+
+    Clears the active-work pointer if it points at the deleted item.
+    Returns True if a row was deleted, False if the work item did not exist.
+    """
+    if not db_path(cwd).exists():
+        return False
+    with transaction(cwd) as conn:
+        # Clear active pointer if it references this work item.
+        active_id = _active_id(conn, session_id)
+        if active_id == work_id:
+            conn.execute(
+                "UPDATE project_state SET value='' WHERE key=?",
+                (_active_key(session_id),))
+        cursor = conn.execute(
+            "DELETE FROM work_items WHERE id=?", (work_id,))
+        deleted = cursor.rowcount > 0
+    return deleted
+
+
 def _next_step_id(conn: sqlite3.Connection, work_id: str, session_only: bool) -> str:
     rows = conn.execute("SELECT id FROM steps WHERE work_id=?", (work_id,)).fetchall()
     prefix = "s" if session_only else ""
