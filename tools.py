@@ -133,6 +133,106 @@ def infer_capabilities(name: str) -> frozenset[str]:
 
 # ── Input validation ───────────────────────────────────────────────────
 
+_TRUE_STRINGS = {"true", "yes", "on", "1"}
+_FALSE_STRINGS = {"false", "no", "off", "0"}
+
+
+def _coerce_params(params: dict, schema: dict) -> dict:
+    """Return *params* with JSON-ish scalars converted to the schema's types.
+
+    Models routinely emit ``{"limit": "100"}`` where the schema says integer —
+    it was by far the largest single source of tool failures in the event log
+    (``fs.read`` limit/offset, ``shell`` timeout, ``fs.grep`` max_results), and
+    rejecting them taught the model nothing: the call was unambiguous and the
+    retry usually repeated the same mistake.
+
+    Only LOSSLESS, unambiguous conversions are performed:
+      * "100" / " 100 " -> 100 for an integer param (never "1e3", never "abc",
+        and never a float string like "1.5" for an integer)
+      * "1.5" -> 1.5 for a number param
+      * "true"/"false"/"yes"/"no"/"on"/"off"/"1"/"0" -> bool for a boolean param
+      * a bare scalar -> [scalar] for an array-of-scalar param
+
+    A value that cannot be converted is left exactly as it was, so validation
+    still reports the real problem. Never raises; the original dict is not
+    mutated.
+    """
+    if not isinstance(params, dict) or not isinstance(schema, dict):
+        return params
+    properties = schema.get("properties")
+    if not isinstance(properties, dict):
+        return params
+
+    def _types(rule: dict) -> list:
+        declared = rule.get("type")
+        if isinstance(declared, list):
+            return [t for t in declared if t]
+        return [declared] if declared else []
+
+    def _coerce(value, rule: dict):
+        if not isinstance(rule, dict):
+            return value
+        types = _types(rule)
+        if not types:
+            return value
+        # Already acceptable — a bool is NOT an acceptable integer here, but
+        # leaving it alone keeps the validator's message truthful.
+        if "boolean" in types and type(value) is bool:
+            return value
+        if type(value) is not bool and any(
+                (t == "integer" and type(value) is int)
+                or (t == "number" and type(value) in (int, float))
+                or (t == "string" and isinstance(value, str))
+                or (t == "array" and isinstance(value, list))
+                or (t == "object" and isinstance(value, dict))
+                or (t == "null" and value is None)
+                for t in types):
+            # Recurse into structures so nested params get the same treatment.
+            if isinstance(value, dict) and isinstance(rule.get("properties"), dict):
+                return _coerce_params(value, rule)
+            if isinstance(value, list) and isinstance(rule.get("items"), dict):
+                return [_coerce(item, rule["items"]) for item in value]
+            return value
+
+        if isinstance(value, str):
+            text = value.strip()
+            if "integer" in types:
+                try:
+                    return int(text, 10)
+                except ValueError:
+                    pass
+            if "number" in types:
+                try:
+                    return float(text)
+                except ValueError:
+                    pass
+            if "boolean" in types:
+                lowered = text.lower()
+                if lowered in _TRUE_STRINGS:
+                    return True
+                if lowered in _FALSE_STRINGS:
+                    return False
+        # An integer param handed a whole-valued float ("2.0" already parsed).
+        if "integer" in types and type(value) is float and value.is_integer():
+            return int(value)
+        # A single value where a list was expected.
+        if "array" in types and not isinstance(value, (list, dict)) and value is not None:
+            item_rule = rule.get("items")
+            item = _coerce(value, item_rule) if isinstance(item_rule, dict) else value
+            return [item]
+        return value
+
+    coerced = dict(params)
+    for key, value in params.items():
+        rule = properties.get(key)
+        if isinstance(rule, dict):
+            try:
+                coerced[key] = _coerce(value, rule)
+            except Exception:
+                coerced[key] = value
+    return coerced
+
+
 def _validate_params(params: dict, schema: dict) -> Optional[str]:
     """Validate ``params`` against a JSONSchema. Returns an error string or None.
 
@@ -291,7 +391,10 @@ class ToolRegistry:
         # ── Input validation (opencode Schema.Struct gate) ──
         schema = tool.schema
         if schema and isinstance(schema, dict) and schema.get("properties") is not None:
-            _vErr = _validate_params(params or {}, schema)
+            # Coerce BEFORE validating: a model that sends "100" for an integer
+            # made an unambiguous call, not a mistake worth a round trip.
+            params = _coerce_params(params or {}, schema)
+            _vErr = _validate_params(params, schema)
             if _vErr:
                 return {"ok": False, "tool": name, "error": _vErr, "_validation_error": True}
         try:
@@ -1372,12 +1475,46 @@ def _bi_task_create(params: dict, ctx: ToolCtx) -> dict:
     return {"ok": True, "result": task}
 
 
+def _task_scope_hint(ctx: ToolCtx, limit: int = 12) -> str:
+    """Describe the tasks actually addressable from *ctx*, for error messages.
+
+    A bare "Task 's3' not found" is a dead end: the model cannot tell whether
+    it mistyped, whether the task belongs to another agent, or whether the
+    session rolled over (session-scoped ids like s1/s2 do NOT survive a new
+    session, but the transcript that mentions them does — which is exactly how
+    the log's stale-id failures arose). Naming the live ids turns a retry loop
+    into a one-step correction.
+    """
+    if _task_mgr is None:
+        return ""
+    try:
+        tasks = _task_mgr.list_tasks(
+            cwd=ctx.task_cwd or ctx.cwd or None,
+            session_id=ctx.session_id or None,
+            owner_agent_id=ctx.agent_id)
+    except Exception:
+        return ""
+    live = [t for t in tasks if t.get("status") != "deleted"]
+    if not live:
+        return ("No tasks exist in this session yet — task ids are "
+                "session-scoped, so ids from an earlier session are gone. "
+                "Call task_create to start one.")
+    shown = live[:limit]
+    rows = "; ".join(
+        f"{t.get('id')} ({str(t.get('subject') or '')[:40]}, {t.get('status')})"
+        for t in shown)
+    more = f" …and {len(live) - len(shown)} more" if len(live) > len(shown) else ""
+    return f"Tasks you can address here: {rows}{more}."
+
+
 def _bi_task_update(params: dict, ctx: ToolCtx) -> dict:
     if _task_mgr is None:
         return {"ok": False, "error": "task_manager module not available"}
     task_id = params.get("id", "")
     if not task_id:
-        return {"ok": False, "error": "missing 'id'"}
+        hint = _task_scope_hint(ctx)
+        return {"ok": False,
+                "error": f"missing 'id'{'. ' + hint if hint else ''}"}
     kwargs = {}
     for k in ("status", "subject", "description", "metadata",
               "addBlocks", "addBlockedBy", "removeBlocks", "removeBlockedBy",
@@ -1393,6 +1530,10 @@ def _bi_task_update(params: dict, ctx: ToolCtx) -> dict:
             **kwargs)
     except _task_mgr.TaskStorageError as exc:
         return {"ok": False, "result": None, "error": str(exc)}
+    if not ok and "not found" in (msg or ""):
+        hint = _task_scope_hint(ctx)
+        if hint:
+            msg = f"{msg}. {hint}"
     return {"ok": ok, "result": task if ok else None, "error": "" if ok else msg}
 
 
@@ -1419,13 +1560,17 @@ def _bi_task_get(params: dict, ctx: ToolCtx) -> dict:
         return {"ok": False, "error": "task_manager module not available"}
     task_id = params.get("id", "")
     if not task_id:
-        return {"ok": False, "error": "missing 'id'"}
+        hint = _task_scope_hint(ctx)
+        return {"ok": False,
+                "error": f"missing 'id'{'. ' + hint if hint else ''}"}
     task = _task_mgr.get_task(
         str(task_id), cwd=ctx.task_cwd or ctx.cwd or None,
         session_id=ctx.session_id or None,
         owner_agent_id=ctx.agent_id)
     if task is None:
-        return {"ok": False, "error": f"Task '{task_id}' not found"}
+        hint = _task_scope_hint(ctx)
+        return {"ok": False,
+                "error": f"Task '{task_id}' not found{'. ' + hint if hint else ''}"}
     return {"ok": True, "result": task}
 
 
@@ -1448,6 +1593,86 @@ def _bi_plan_update(params: dict, ctx: ToolCtx) -> dict:
     ok = _plan_mod.update_plan(content)
     return {"ok": ok, "result": "Plan updated" if ok else "",
             "error": "" if ok else "No active plan to update"}
+
+
+# ── Session checkpoints (snapshot.py) ──────────────────────────────────
+# The undo net behind `/snapshot` / `/undo` was previously reachable only by
+# the human at the REPL. Exposing create/list lets the agent put a marker down
+# *before* it starts something hard to unpick, which is when the marker is
+# actually worth having — the automatic one only fires once per top-level task.
+
+def _bi_snapshot_create(params: dict, ctx: ToolCtx) -> dict:
+    """Capture the working tree as a restorable checkpoint."""
+    import snapshot as _snap
+    label = str(params.get("label") or "").strip()[:120]
+    cwd = ctx.cwd or os.getcwd()
+    try:
+        cp = _snap.create(cwd, label)
+    except Exception as exc:
+        return {"ok": False, "error": f"checkpoint failed: {exc}"}
+    if not cp:
+        return {"ok": False,
+                "error": "no checkpoint taken (not a git repository, or git failed)"}
+    return {"ok": True,
+            "result": f"checkpoint {cp['sha'][:10]} created ({cp['label'] or 'no label'})",
+            "sha": cp["sha"], "label": cp["label"]}
+
+
+def _bi_snapshot_list(params: dict, ctx: ToolCtx) -> dict:
+    """List checkpoints recorded for the repo containing the current cwd."""
+    import snapshot as _snap
+    cwd = ctx.cwd or os.getcwd()
+    try:
+        entries = _snap.list_for(cwd)
+    except Exception as exc:
+        return {"ok": False, "error": f"could not read checkpoints: {exc}"}
+    if not entries:
+        return {"ok": True, "result": "no checkpoints for this repository",
+                "checkpoints": []}
+    rows = [{"sha": e.get("sha", "")[:10], "label": e.get("label", ""),
+             "ts": e.get("ts", 0)} for e in entries]
+    listing = "\n".join(
+        f"{r['sha']}  {r['label'] or '(no label)'}" for r in rows)
+    return {"ok": True,
+            "result": f"{len(rows)} checkpoint(s), newest last:\n{listing}",
+            "checkpoints": rows}
+
+
+def _bi_snapshot_restore(params: dict, ctx: ToolCtx) -> dict:
+    """Roll the working tree back to a checkpoint, with the user's approval.
+
+    Gated on a fresh approval rather than left to the model's judgement: a
+    restore rewrites the WHOLE tree, so it silently reverts anything the user
+    changed in another terminal since the checkpoint — the one thing an agent
+    must never do on its own initiative.
+    """
+    import snapshot as _snap
+    cwd = ctx.cwd or os.getcwd()
+    sha = str(params.get("sha") or "").strip() or None
+
+    target = sha or "the most recent checkpoint"
+    approve_fn = getattr(ctx.deps, "request_command_approval", None) if ctx.deps else None
+    if not callable(approve_fn):
+        return {"ok": False,
+                "error": "restoring a checkpoint requires approval but no approval channel is available"}
+    try:
+        approved = approve_fn(
+            f"snapshot.restore {target}",
+            "Restores every tracked file in the working tree to that checkpoint, "
+            "including changes made outside this session. Files created since "
+            "the checkpoint are kept, and the current state is checkpointed first.")
+    except Exception:
+        approved = False
+    if not approved:
+        return {"ok": False, "error": "user denied the checkpoint restore",
+                "_user_denied": True}
+
+    try:
+        ok, message = _snap.restore(cwd, sha)
+    except Exception as exc:
+        return {"ok": False, "error": f"restore failed: {exc}"}
+    return {"ok": bool(ok), "result": message if ok else "",
+            "error": "" if ok else message}
 
 
 def _bi_plan_list(params: dict, ctx: ToolCtx) -> dict:
@@ -2195,6 +2420,114 @@ def _bi_identity_check(params: dict, ctx: ToolCtx) -> dict:
         "detail": out.get("detail", ""),
         "identity": out.get("identity"),
     }}
+
+
+# ── Media generation ─────────────────────────────────────────────────
+# Both go through the gateway rather than talking to a provider directly: the
+# key lives there, and so does the metering. Image generation is one call;
+# video is a task the gateway renders asynchronously, so it is created and then
+# polled.
+
+_VIDEO_POLL_INTERVAL_S = 6
+_VIDEO_POLL_TIMEOUT_S = 8 * 60
+
+
+def _bi_media_generate_image(params: dict, ctx: ToolCtx) -> dict:
+    """Generate an image from a text prompt via the gateway."""
+    prompt = (params.get("prompt") or "").strip()
+    if not prompt:
+        return {"ok": False, "error": "missing 'prompt'"}
+    try:
+        import requests
+        backend_profiles, profile = _resolve_backend_profile()
+    except ImportError as exc:
+        return {"ok": False, "error": f"missing dependency: {exc}"}
+
+    body = {"prompt": prompt}
+    if params.get("size"):
+        body["size"] = str(params["size"])
+    headers, cookies = backend_profiles.request_auth(profile, ctx.session)
+    try:
+        resp = requests.post(f"{profile.base_url}/api/generate-image", json=body,
+                             headers=headers, cookies=cookies, timeout=180)
+    except requests.RequestException as exc:
+        return {"ok": False, "error": f"could not reach backend: {exc}"}
+    try:
+        data = resp.json()
+    except ValueError:
+        return {"ok": False, "error": f"backend returned no JSON (HTTP {resp.status_code})"}
+    if resp.status_code >= 300:
+        return {"ok": False, "error": data.get("detail") or data.get("title")
+                or f"HTTP {resp.status_code}"}
+    # `images` is a list of URL strings.
+    images = [u for u in (data.get("images") or []) if u]
+    if not images:
+        return {"ok": False, "error": "no image in response"}
+    return {"ok": True, "result": {
+        "url": images[0],
+        "model": data.get("model", ""),
+        "cost": (data.get("billing") or {}).get("costFormatted", ""),
+    }}
+
+
+def _bi_media_generate_video(params: dict, ctx: ToolCtx) -> dict:
+    """Generate a short video clip. Creates the task, then waits for it.
+
+    The wait is the point: an agent handed a task id has no good way to come
+    back for the result later, so the tool blocks until the clip exists. On
+    timeout the task id is returned rather than swallowed — the render is still
+    running server-side and will finish.
+    """
+    prompt = (params.get("prompt") or "").strip()
+    if not prompt:
+        return {"ok": False, "error": "missing 'prompt'"}
+    try:
+        import requests
+        backend_profiles, profile = _resolve_backend_profile()
+    except ImportError as exc:
+        return {"ok": False, "error": f"missing dependency: {exc}"}
+
+    body = {"prompt": prompt}
+    for key in ("duration", "resolution", "ratio", "image"):
+        if params.get(key) is not None:
+            body[key] = params[key]
+    headers, cookies = backend_profiles.request_auth(profile, ctx.session)
+    try:
+        resp = requests.post(f"{profile.base_url}/api/generate-video", json=body,
+                             headers=headers, cookies=cookies, timeout=120)
+    except requests.RequestException as exc:
+        return {"ok": False, "error": f"could not reach backend: {exc}"}
+    try:
+        data = resp.json()
+    except ValueError:
+        return {"ok": False, "error": f"backend returned no JSON (HTTP {resp.status_code})"}
+    if resp.status_code >= 300:
+        return {"ok": False, "error": data.get("detail") or data.get("title")
+                or f"HTTP {resp.status_code}"}
+    task_id = data.get("taskId") or ""
+    if not task_id:
+        return {"ok": False, "error": "backend returned no task id"}
+
+    deadline = time.time() + _VIDEO_POLL_TIMEOUT_S
+    while time.time() < deadline:
+        time.sleep(_VIDEO_POLL_INTERVAL_S)
+        try:
+            poll = requests.get(f"{profile.base_url}/api/generate-video/{task_id}",
+                                headers=headers, cookies=cookies, timeout=60)
+            status = poll.json()
+        except (requests.RequestException, ValueError):
+            continue  # a dropped poll is not a failed render
+        if status.get("status") == "succeeded" and status.get("videoUrl"):
+            return {"ok": True, "result": {
+                "url": status["videoUrl"],
+                "model": status.get("model", ""),
+                "task_id": task_id,
+                "cost": (status.get("billing") or {}).get("costFormatted", ""),
+            }}
+        if status.get("status") == "failed":
+            return {"ok": False, "error": f"generation failed upstream: {status.get('error')}"}
+    return {"ok": False, "error": f"still rendering after {_VIDEO_POLL_TIMEOUT_S}s; "
+                                  f"task {task_id} is still running server-side"}
 
 
 def _bi_web_fetch(params: dict, ctx: ToolCtx) -> dict:
@@ -4005,19 +4338,82 @@ _CODE_FILE_EXTS = frozenset({
     ".c", ".cpp", ".h", ".hpp", ".rb", ".php", ".swift", ".kt",
     ".scala", ".sh", ".vue", ".svelte", ".cs",
 })
-_TEST_CMD_PATTERNS = (
-    "pytest", "python -m pytest", "python -m unittest", "npm test",
-    "yarn test", "pnpm test", "cargo test", "go test", "rspec",
-    "jest", "vitest", "mocha", "phpunit", "dotnet test", "flutter test",
-    "tox", "nox", "gradle test", "mvn test", "make test",
+# Substring matching missed most real invocations: "python -m unittest" does
+# not match `python3 -m unittest` (the "3"), and "npm test" does not match
+# `npm run test`. Those false negatives are why task_complete kept reporting
+# "no test command was run" at agents that had just run the suite. Match on
+# word boundaries with the optional pieces spelled out instead.
+_TEST_CMD_REGEXES = tuple(re.compile(p) for p in (
+    r"\bpytest\b",
+    r"\bpython[0-9.]*\s+-m\s+(?:pytest|unittest|nose2|green)\b",
+    r"\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?test\b",          # npm run test:unit too
+    r"\b(?:bun|deno)\s+test\b",
+    r"\bcargo\s+test\b",
+    r"\bgo\s+test\b",
+    r"\b(?:rspec|jest|vitest|mocha|ava|karma|phpunit|pest|tox|nox|behave)\b",
+    r"\bdotnet\s+test\b",
+    r"\bflutter\s+test\b",
+    r"\b(?:gradle|gradlew|mvn|make|just|task|rake|bazel)\s+\S*test\b",
+    r"\bctest\b",
+    r"\bswift\s+test\b",
+    r"\bmix\s+test\b",
+    r"\.\/(?:run_)?tests?(?:\.sh|\.py)?\b",                  # ./run_tests.sh
+    r"\bpytest-\S+\b",
+))
+
+
+def _looks_like_test_command(command: str) -> bool:
+    """Whether *command* runs a test suite (any common runner or wrapper)."""
+    text = (command or "").strip().lower()
+    if not text:
+        return False
+    return any(rx.search(text) for rx in _TEST_CMD_REGEXES)
+
+
+# Failure signatures for a test run whose exit code we cannot see — a suite
+# started via terminal.exec reports returncode=None because the terminal is
+# still open. The runner's own summary line is then the only evidence.
+_TEST_FAILURE_MARKERS = (
+    re.compile(r"\bFAILED\b"),
+    re.compile(r"\bfailures=[1-9]"),
+    re.compile(r"\berrors=[1-9]"),
+    re.compile(r"^FAILED\b", re.MULTILINE),
+    re.compile(r"\b\d+ failed\b"),
+    re.compile(r"\bFAIL\b.*\n?.*\bok\b", re.MULTILINE),
+    re.compile(r"\btest result: FAILED\b"),
+    # No \b before "---": \b needs a word character on one side, and "-" is not
+    # one, so \b--- never matches at the start of a Go test failure line.
+    re.compile(r"---\s+FAIL:"),
 )
 
 
-def _check_tests_before_complete(ctx: "ToolCtx") -> str | None:
-    """Return a warning string if code was modified but no tests were run.
+def _test_run_outcome(row: dict) -> str:
+    """Classify one terminalHistory row that ran tests: 'pass' | 'fail'.
 
-    Returns None when: no code files were modified, tests were already run,
-    or the one-shot warning was already issued (override path).
+    The exit code is the primary signal (`returncode` is set from the tool
+    result — 0 on success, the process's code for shell.exec). It is None for a
+    still-open sub-terminal, and there we fall back to the runner's own summary
+    text, which is all the evidence that exists.
+    """
+    rc = row.get("returncode")
+    if isinstance(rc, int):
+        return "pass" if rc == 0 else "fail"
+    output = str(row.get("output") or "")
+    if any(rx.search(output) for rx in _TEST_FAILURE_MARKERS):
+        return "fail"
+    return "pass"
+
+
+def _check_tests_before_complete(ctx: "ToolCtx") -> str | None:
+    """Advise once when code changed and the tests did not run, or did not pass.
+
+    Checking that a test command was *issued* was never verification — an agent
+    could run the suite, watch it fail, and complete the task anyway. What
+    matters is the outcome, so the most recent test run is classified and a
+    failing one is reported as such.
+
+    Returns None when no code files were modified, when the last test run
+    passed, or when the one-shot advisory was already issued (override path).
     """
     if ctx.state is None:
         return None
@@ -4036,27 +4432,41 @@ def _check_tests_before_complete(ctx: "ToolCtx") -> str | None:
                 break
     if not code_modified:
         return None
-    tests_run = False
+
+    # The LAST test run is the verdict — an early red that the agent then fixed
+    # must not keep condemning the task.
+    last_run = None
     for h in history:
-        if h.get("tool") != "shell.exec":
+        # Tests get run through the shell, but also inside a named sub-terminal
+        # (terminal.exec) — a suite started there used to count for nothing.
+        if h.get("tool") not in ("shell.exec", "terminal.exec", "session.start"):
             continue
-        cmd = (h.get("command") or "").strip().lower()
-        for pattern in _TEST_CMD_PATTERNS:
-            if pattern in cmd:
-                tests_run = True
-                break
-        if tests_run:
-            break
-    if tests_run:
+        if _looks_like_test_command(h.get("command") or ""):
+            last_run = h
+    if last_run is not None and _test_run_outcome(last_run) == "pass":
         return None
+
     if ctx.state.get("_test_warning_issued"):
         return None
     ctx.state["_test_warning_issued"] = True
+
+    if last_run is not None:
+        command = str(last_run.get("command") or "").strip()[:120]
+        return (
+            "Not an error — a reminder, shown once. The test run in this task "
+            f"reported failures: `{command}`. Read its output, fix the cause, "
+            "and re-run until it passes, then call task_complete again. If "
+            "those failures are pre-existing and unrelated to your change, "
+            "call task_complete again and say so explicitly in the summary; "
+            "the second call always proceeds."
+        )
     return (
-        "Code files were modified during this task but no test command was "
-        "run. Run the project's test suite (e.g. pytest, npm test, go test) "
-        "to verify your changes, then call task_complete again. If tests are "
-        "not applicable to this task, call task_complete again to proceed."
+        "Not an error — a reminder, shown once. This task modified code files "
+        "and no test run was detected. Run the project's existing suite "
+        "(pytest, npm test, go test, cargo test…) and check the result, then "
+        "call task_complete again. If this project has no tests or they do not "
+        "apply here, just call task_complete again and say so in the summary; "
+        "the second call always proceeds."
     )
 
 
@@ -4144,6 +4554,8 @@ def _bi_task_complete(params: dict, ctx: ToolCtx) -> dict:
             "ok": False,
             "error": test_warning,
             "_test_warning": True,
+            # Declining on purpose, not failing — see _format_tool_result_for_loop.
+            "_advisory": True,
         }
     result = {
         "ok": True,
@@ -6324,6 +6736,53 @@ def register_builtin_tools() -> None:
             invoke=_bi_web_fetch,
         ),
         Tool(
+            name="media.generate_image",
+            description="Generate an image from a text prompt. Returns a URL. "
+                        "Costs more than an ordinary call, so write a specific "
+                        "prompt (subject, style, composition) rather than "
+                        "regenerating repeatedly. Only when the user actually "
+                        "wants a generated picture.",
+            schema={
+                "type": "object",
+                "properties": {
+                    "prompt": {"type": "string",
+                               "description": "what to draw; English works best"},
+                    "size": {"type": "string",
+                             "description": "\"WIDTHxHEIGHT\", e.g. \"1024x1024\". Default 2048x2048."},
+                },
+                "required": ["prompt"],
+            },
+            invoke=_bi_media_generate_image,
+        ),
+        Tool(
+            name="media.generate_video",
+            description="Generate a short video clip from a text prompt, or "
+                        "animate a first-frame image. Describe MOTION, not just "
+                        "the scene. BILLED PER SECOND and far more expensive "
+                        "than an image; one call blocks for 40s to several "
+                        "minutes. Only on an explicit request for a video, "
+                        "never speculatively, and at the shortest duration and "
+                        "lowest resolution that answers the ask.",
+            schema={
+                "type": "object",
+                "properties": {
+                    "prompt": {"type": "string",
+                               "description": "what happens in the clip; describe motion"},
+                    "duration": {"type": "integer", "default": 5,
+                                 "description": "seconds, 1-12"},
+                    "resolution": {"type": "string", "default": "480p",
+                                   "enum": ["480p", "720p", "1080p"],
+                                   "description": "higher costs proportionally more"},
+                    "ratio": {"type": "string",
+                              "description": "aspect ratio, e.g. \"16:9\""},
+                    "image": {"type": "string",
+                              "description": "first-frame image URL, for image-to-video"},
+                },
+                "required": ["prompt"],
+            },
+            invoke=_bi_media_generate_video,
+        ),
+        Tool(
             name="identity.list",
             description="List the saved logins this machine can browse as. "
                         "Returns names, which domains each covers, and whether it is "
@@ -6372,7 +6831,9 @@ def register_builtin_tools() -> None:
             name="task.update",
             description="Update a WorkGraph Step's status, description, dependencies, progress, "
                         "notes, or metadata. Use addSubtask to create a child task "
-                        "with automatic dependency linking.",
+                        "with automatic dependency linking. `id` is REQUIRED — pass an id "
+                        "from task_list or from the task_create that returned it in THIS "
+                        "session; ids are session-scoped and do not survive into a new one.",
             schema={
                 "type": "object",
                 "properties": {
@@ -6395,7 +6856,11 @@ def register_builtin_tools() -> None:
                     "addBlockedBy": {"type": "array", "items": {"type": "string"},
                                     "description": "Task IDs that block this task"},
                 },
-                "required": ["id"],
+                # `id` is required, but deliberately NOT declared here: the
+                # schema gate would answer with a bare "missing required param
+                # 'id'", while _bi_task_update answers with the ids that
+                # actually exist in this session — which is what lets the model
+                # correct itself in one step. The tool enforces it.
             },
             invoke=_bi_task_update,
         ),
@@ -6416,13 +6881,16 @@ def register_builtin_tools() -> None:
         ),
         Tool(
             name="task.get",
-            description="Get full details of a single task by ID.",
+            description="Get full details of a single task by ID. `id` is REQUIRED and "
+                        "must come from task_list or task_create in this session.",
             schema={
                 "type": "object",
                 "properties": {
-                    "id": {"type": "string", "description": "Task ID"},
+                    "id": {"type": "string",
+                           "description": "Task ID (required; from task_list/task_create)"},
                 },
-                "required": ["id"],
+                # See task.update: enforced in _bi_task_get so the error can
+                # name the ids that exist.
             },
             invoke=_bi_task_get,
         ),
@@ -6465,6 +6933,51 @@ def register_builtin_tools() -> None:
                         "not approve or execute the plan.",
             schema={"type": "object", "properties": {}},
             invoke=_bi_plan_submit,
+        ),
+        # ── Session checkpoints (git-backed working-tree undo) ─────
+        Tool(
+            name="snapshot.create",
+            description="Record the current working tree as a restorable checkpoint "
+                        "before starting something hard to unpick — a wide refactor, a "
+                        "codemod, a risky migration. Backed by a dangling git commit: it "
+                        "does not touch the index, the stash, or any branch, and it is not "
+                        "a commit (it never enters project history). Covers tracked and "
+                        "untracked files but NOT gitignored ones. No-op outside a git repo. "
+                        "Cheap and non-destructive — prefer taking one over asking whether to.",
+            schema={
+                "type": "object",
+                "properties": {
+                    "label": {"type": "string",
+                              "description": "short note on what is about to happen, e.g. "
+                                             "'before auth refactor'"},
+                },
+            },
+            invoke=_bi_snapshot_create,
+        ),
+        Tool(
+            name="snapshot.list",
+            description="List the checkpoints recorded for the current repository "
+                        "(newest last), with their short sha and label. Use before "
+                        "proposing a restore so you can name the right one.",
+            schema={"type": "object", "properties": {}},
+            invoke=_bi_snapshot_list,
+        ),
+        Tool(
+            name="snapshot.restore",
+            description="Roll the working tree back to a checkpoint. Always asks the user "
+                        "first and cannot be pre-approved in bulk. Restores EVERY tracked "
+                        "file, so it also reverts edits made outside this session — propose "
+                        "it only when your own changes are the problem and the user agrees. "
+                        "Files created since the checkpoint are kept, and the current state "
+                        "is checkpointed first, so the restore is itself reversible.",
+            schema={
+                "type": "object",
+                "properties": {
+                    "sha": {"type": "string",
+                            "description": "checkpoint sha from snapshot.list; omit for the latest"},
+                },
+            },
+            invoke=_bi_snapshot_restore,
         ),
         # ── Prompt optimization tools ──────────────────────────────
         Tool(

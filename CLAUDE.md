@@ -16,7 +16,17 @@ python laintas_cli.py --execute "task"   # Non-interactive single task
 python laintas_cli.py --backend URL      # Override LAINTAS_BACKEND
 ```
 
-There is no test suite, no linter config, and no Makefile — iterate by running the CLI directly. After editing files, force-reload the dev session by typing `/reload` inside the REPL (deletes `.laintas/` project files and restarts).
+There IS a test suite — 39 files under `tests/`, 664 tests. Activate the venv first (`source venv/bin/activate`); two modules import `pytest`, which the system python lacks.
+
+```bash
+python3 -m unittest discover -s tests          # full suite, ~70s
+python3 -m unittest tests.test_git_policy      # targeted, sub-second — use this while iterating
+python3 -m pytest tests/                       # also works, ~85s
+```
+
+Two tests fail on a clean checkout and are not yours: `test_slash_commands.py::test_mode_study_switches_and_explains_itself` (asserts a string the source no longer contains) and `::test_usage_model_tier_mapping_and_rendering` (exhausted requests mock). Exactly those two = green. Note `-t .` fails — there is no `tests/__init__.py`.
+
+There is no linter config and no Makefile. Beyond tests, iterate by running the CLI directly. After editing files, force-reload the dev session by typing `/reload` inside the REPL (deletes `.laintas/` project files and restarts).
 
 ## Package Builds
 

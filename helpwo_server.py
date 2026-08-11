@@ -36,7 +36,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Optional
-from urllib.parse import urlparse, parse_qs, unquote
+from urllib.parse import urlparse, parse_qs, unquote, quote
 
 # Default port: 2913 is the same port _detect_backend() probes, so when the
 # local server is up the CLI auto-detects it as the backend.
@@ -531,6 +531,9 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
             return self._handle_balance()
         if path == "/api/models":
             return self._handle_models()
+        m = re.match(r"^/api/generate-video/([A-Za-z0-9_-]{1,128})$", path)
+        if m:
+            return self._handle_generate_video_status(m.group(1))
         if path == "/api/usage":
             return self._handle_usage()
         if path == "/api/sso/login":
@@ -573,6 +576,8 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
             return self._handle_chat()
         if path == "/api/generate-image":
             return self._handle_generate_image()
+        if path == "/api/generate-video":
+            return self._handle_generate_video()
         # The frontend calls /api/helpwo/search; /api/search is the older name
         # the cloud backend also answers. Both land here.
         if path in ("/api/helpwo/search", "/api/search"):
@@ -703,31 +708,6 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
 
     # -- Proxy helpers --
 
-    def _proxy_json(self, method: str, path: str, body: dict | None = None) -> None:
-        """Forward a JSON request to the remote backend and relay the response."""
-        import backend_profiles
-        import requests as _requests
-        profile = backend_profiles.resolve(
-            os.environ.get("LAINTAS_BACKEND") or "https://laintas.com")
-        url = f"{profile.base_url}{path}"
-        headers, cookies = backend_profiles.request_auth(profile, _session())
-        headers["Content-Type"] = "application/json"
-        try:
-            resp = _requests.request(method, url, json=body, headers=headers,
-                                     cookies=cookies, timeout=60, stream=False,
-                                     allow_redirects=False)
-        except Exception as e:
-            self._json(502, {"error": f"backend unreachable: {e}"})
-            return
-        self.send_response(resp.status_code)
-        ct = resp.headers.get("Content-Type", "application/json")
-        self.send_header("Content-Type", ct)
-        self.send_header("Content-Length", str(len(resp.content)))
-        self.send_header("Access-Control-Allow-Origin", _self_origin())
-        self.send_header("Access-Control-Allow-Credentials", "true")
-        self.end_headers()
-        self.wfile.write(resp.content)
-
     def _proxy_json_get(self, path: str):
         """GET `path` from the backend with the CLI's credentials.
 
@@ -753,8 +733,15 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
         except Exception:
             return None
 
-    def _proxy_json(self, path: str, body: dict) -> None:
-        """Forward a request to the remote backend and return its JSON reply."""
+    def _proxy_json(self, path: str, body: dict | None = None,
+                    method: str = "POST") -> None:
+        """Forward a request to the remote backend and return its JSON reply.
+
+        There used to be a second `_proxy_json` above this one taking
+        (method, path, body). Python kept only the later definition, so the one
+        caller written against the other signature was silently posting to
+        `{base}/POST` with the path as its body. One method, one signature.
+        """
         import backend_profiles
         import requests as _requests
         profile = backend_profiles.resolve(
@@ -763,8 +750,9 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
         headers, cookies = backend_profiles.request_auth(profile, _session())
         headers["Content-Type"] = "application/json"
         try:
-            resp = _requests.post(url, json=body, headers=headers, cookies=cookies,
-                                  timeout=120, allow_redirects=False)
+            resp = _requests.request(method, url, json=body, headers=headers,
+                                     cookies=cookies, timeout=120,
+                                     allow_redirects=False)
         except Exception as e:
             self._json(502, {"error": f"backend unreachable: {e}"})
             return
@@ -894,7 +882,17 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
     def _handle_generate_image(self) -> None:
         """Proxy /api/generate-image to the remote backend."""
         body = self._read_body()
-        self._proxy_json("POST", "/api/generate-image", body)
+        self._proxy_json("/api/generate-image", body)
+
+    def _handle_generate_video(self) -> None:
+        """Proxy /api/generate-video (task creation) to the remote backend."""
+        body = self._read_body()
+        self._proxy_json("/api/generate-video", body)
+
+    def _handle_generate_video_status(self, task_id: str) -> None:
+        """Proxy the video task poll. Generation is asynchronous upstream, so
+        the clip is collected here rather than on the creating request."""
+        self._proxy_json(f"/api/generate-video/{quote(task_id)}", method="GET")
 
     # -- Live view: RFB over a WebSocket on this same port --
     #

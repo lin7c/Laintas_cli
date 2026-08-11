@@ -486,6 +486,45 @@ def _ptk_fragments(pairs):
     return out
 
 
+def _apply_marquee(row_text: str, sel_idx: int,
+                   last_sel: list, start_time: list) -> str:
+    """Scroll a long selected row horizontally (marquee / focus-follow effect).
+
+    When the focused row's plain-text length exceeds the terminal width, the
+    text scrolls left over time so the user can read the full content.  Non-
+    selected rows are returned unchanged (they are simply truncated by the
+    terminal).  When the selection moves to a different row the scroll resets.
+
+    The marquee cycle: pause 1 s at start -> scroll 1 char / 0.2 s -> pause 2 s
+    at end -> wrap back to start.
+    """
+    import shutil
+    term_w = shutil.get_terminal_size().columns
+    plain = re.sub(r"\[/?[^\]]+\]", "", row_text)
+    avail = term_w - 1  # leave 1-char right margin
+    if len(plain) <= avail:
+        return row_text
+    now = time.monotonic()
+    if last_sel[0] != sel_idx:
+        last_sel[0] = sel_idx
+        start_time[0] = now
+    elapsed = now - start_time[0]
+    pause_start = 1.0
+    scroll_speed = 0.2          # seconds per character
+    max_offset = len(plain) - avail + 2
+    raw = max(0.0, elapsed - pause_start) / scroll_speed
+    # Wrap: after scrolling to the end, pause 2 s, then reset.
+    wrap_at = max_offset + 2.0 / scroll_speed
+    if raw > wrap_at:
+        start_time[0] = now
+        raw = 0.0
+    offset = int(min(raw, max_offset))
+    visible = plain[offset:offset + avail - 1]
+    if offset < max_offset:
+        visible += "…"
+    return visible
+
+
 # ── Reusable selection dialog ──────────────────────────────────────────
 # A single component covering single-select, multi-select, inline (non-full-
 # screen), full-screen, fuzzy-search, and action-key variants.  Supersedes
@@ -516,6 +555,72 @@ def _alt_screen():
     finally:
         _file.write("\x1b[?1049l")
         _file.flush()
+
+
+def _press_enter_to_continue(
+        message: str = "Press Enter to continue") -> None:
+    """Pause a full-screen detail page until the user presses a key.
+
+    Reads ONE keypress with the terminal in cbreak + noecho, so the keystroke
+    never appears on the page. ``console.input`` cannot do this: it leaves the
+    tty in canonical mode, so the terminal itself echoes whatever is typed
+    (and a stray paste or held key scrolls the page it was meant to hold).
+    Any key continues, not just Enter — a user who hits Esc or q to leave a
+    read-only page should not be stuck.
+
+    Silently returns on EOF, Ctrl+C, or a non-TTY stdin (piped contexts), and
+    restores the original terminal attributes on every path.
+    """
+    hint = f"\n[dim]{message}...[/dim]"
+    if not sys.stdin.isatty():
+        console.print(hint)
+        return
+    console.print(hint, end="")
+    try:
+        sys.stdout.flush()
+    except (OSError, ValueError):
+        pass
+
+    fd = sys.stdin.fileno()
+    try:
+        old_attr = termios.tcgetattr(fd)
+    except (termios.error, OSError, ValueError):
+        old_attr = None
+    try:
+        if old_attr is not None:
+            # cbreak gives us one key without waiting for Enter; clearing ECHO
+            # on top of it is what keeps the keystroke off the screen.
+            tty.setcbreak(fd)
+            quiet = termios.tcgetattr(fd)
+            quiet[3] &= ~termios.ECHO          # lflag
+            termios.tcsetattr(fd, termios.TCSADRAIN, quiet)
+        try:
+            ch = sys.stdin.read(1)
+        except (EOFError, KeyboardInterrupt, OSError, ValueError):
+            ch = ""
+        # An escape sequence (arrow key, function key) arrives as several
+        # bytes. Drain them so the leftovers are not read as input by the
+        # next prompt once we are back at the REPL.
+        if ch == "\x1b":
+            _drain_stdin(fd)
+    finally:
+        if old_attr is not None:
+            try:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_attr)
+            except (termios.error, OSError, ValueError):
+                pass
+    # Close the hint line ourselves, since nothing was echoed onto it.
+    console.print()
+
+
+def _drain_stdin(fd: int) -> None:
+    """Discard whatever is already buffered on *fd* without blocking."""
+    try:
+        while select.select([fd], [], [], 0)[0]:
+            if not os.read(fd, 1024):
+                break
+    except (OSError, ValueError):
+        pass
 
 
 def _clear_stale_running_loop() -> bool:
@@ -667,6 +772,9 @@ def select_dialog(
     chk: set[int] = set(checked) if (multi and checked) else set()
     filter_buf = Buffer() if search else None
     act_keys: dict[str, str] = action_keys or {}
+    # Marquee state for focus-follow horizontal scroll on long selected rows.
+    _marquee_last_sel = [-1]
+    _marquee_start = [0.0]
 
     def _visible():
         """Return (list_of_(orig_idx, label, desc)) after filtering."""
@@ -733,6 +841,9 @@ def select_dialog(
                 row_text = f" {prefix} {lab}"
             if desc:
                 row_text += f"  [dim]{desc}[/dim]"
+            if is_sel:
+                row_text = _apply_marquee(
+                    row_text, oi, _marquee_last_sel, _marquee_start)
             style = "class:selected" if is_sel else ""
             lines.append((style, row_text + "\n"))
 
@@ -1038,7 +1149,7 @@ from agent_loop import (
     set_trigger_wake_callback,
     save_session_snapshot,
     save_resume_state, load_resume_state, save_resume_checkpoint, list_resume_states,
-    delete_resume_state,
+    delete_resume_state, save_fork_state, _ensure_session_id,
 )
 
 import tools as tools_mod    # noqa: E402 — load after agent_loop so registry inits once
@@ -2746,6 +2857,7 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec("/login", "Re-authenticate with Laintas", "Account & Session"),
     CommandSpec("/usage", "Show AI usage — local token stats + Laintas backend usage", "Account & Session", "/usage [7d|30d|90d|local|buy <calls|storage>]", subcommands=("local", "buy")),
     CommandSpec("/resume", "Resume a saved session (picker; echo last N events, default 20)", "Account & Session", "/resume [N|all|latest]"),
+    CommandSpec("/fork", "Fork current context into a named branch, or start a new session from current context", "Account & Session", "/fork [name]"),
     CommandSpec("/new", "Start a new live session", "Account & Session", "/new",
                 aliases=("/clear", "/new-session", "/reset-session")),
     CommandSpec("/exit", "Log out and exit", "Account & Session"),
@@ -2855,7 +2967,7 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec("/hwo", "Open or run an orchestration workflow", "Planning & Tasks", "/hwo [file|run <file>|compile <file>]", subcommands=("run", "compile")),
     CommandSpec("/hwg", "Compile, run, or resume an HWO graph workflow", "Planning & Tasks", "/hwg {run|compile|resume|status|cancel} ...", subcommands=("run", "compile", "resume", "status", "cancel")),
     CommandSpec("/mode", "Show, switch, or create agent modes", "Planning & Tasks", "/mode [act [always]|plan [task]|review|study|list|create|delete]", subcommands=("act", "always", "plan", "review", "study", "list", "create", "delete")),
-    CommandSpec("/plan", "Create, revise, review, or approve versioned plans", "Planning & Tasks", "/plan {enter|submit|revise|approve|exit|status|list}", subcommands=("enter", "submit", "revise", "approve", "exit", "status", "list")),
+    CommandSpec("/plan", "Create, revise, review, or approve versioned plans", "Planning & Tasks", "/plan [enter <task>|submit|revise <feedback>|approve|exit|status|list]", subcommands=("enter", "submit", "revise", "approve", "exit", "status", "list")),
     CommandSpec("/prompt", "Open Prompt Lab or manage tested prompt overlays", "Planning & Tasks", "/prompt [issue|subcommand]", subcommands=("status", "branches", "open", "chat", "review", "test", "activate", "disable", "patches", "profiles", "profile", "use", "rollback", "feedback", "fail", "optimize", "apply", "discard", "list", "skill", "export", "install", "publish")),
     CommandSpec("/evolve", "Create, improve, test, and hot-load project extensions", "Planning & Tasks", "/evolve [idea|subcommand]", subcommands=("status", "branches", "open", "chat", "review", "test", "activate", "disable", "candidates", "profiles", "profile", "use", "rollback", "list", "help")),
     CommandSpec("/task", "Track project tasks", "Planning & Tasks", "/task [list|add|show|start|done|del|progress|note|subtask]", subcommands=("list", "add", "show", "start", "done", "del", "progress", "note", "subtask")),
@@ -3636,6 +3748,8 @@ _terminal_agents = _SingleForegroundAgentUI()
 _status_cache: dict = {
     "model": "",
     "model_source": "default",
+    "prompt_path": "",   # shortened cwd on the prompt's first row; the rprompt
+                         # shares that row and needs its width to fit itself
     "agent": "",
     "terminal": "term0",
     "deployment": "temporary",
@@ -3660,6 +3774,46 @@ def _terminal_width() -> int:
         return max(20, int(shutil.get_terminal_size(fallback=(80, 24)).columns))
     except Exception:
         return 80
+
+
+def _pessimistic_width(text: str) -> int:
+    """Display width of *text*, counting East-Asian AMBIGUOUS chars as 2.
+
+    prompt_toolkit (via wcwidth) counts ambiguous-width characters — U+00B7
+    MIDDLE DOT, the arrows, ● — as ONE column. A terminal configured for a CJK
+    locale draws them as TWO. Our own chrome is full of them (``symbols.BULLET``
+    separates every rprompt segment), so on such a terminal the rprompt is
+    physically wider than prompt_toolkit believes, runs past the right edge,
+    wraps, and desyncs the renderer's cursor model — after which every repaint
+    lands on a fresh line and the prompt stacks down the screen.
+
+    Measuring the worst case and fitting to THAT is what keeps the line inside
+    the terminal on both kinds of terminal. Never underestimates.
+    """
+    total = 0
+    for ch in text:
+        if unicodedata.combining(ch):
+            continue
+        eaw = unicodedata.east_asian_width(ch)
+        total += 2 if eaw in ("W", "F", "A") else 1
+    return total
+
+
+def _fit_rprompt(segments: list, budget: int) -> list:
+    """Drop trailing rprompt segments until the worst-case width fits *budget*.
+
+    Segments are dropped in pairs where possible (separator + value), so the
+    result never ends on a dangling " · ".
+    """
+    if budget <= 0:
+        return []
+    while segments and _pessimistic_width(
+            "".join(text for _style, text in segments)) > budget:
+        segments = segments[:-1]
+        # Never leave a trailing separator behind.
+        while segments and not segments[-1][1].strip(f" {symbols.BULLET}"):
+            segments = segments[:-1]
+    return segments
 
 
 def _sync_status_context() -> None:
@@ -3760,12 +3914,15 @@ def _render_rprompt():
                      or _session_approval_state.get("approved_commands")))
     if _has_star:
         _mode_label += "*"
-        global _approval_star_announced
+        global _approval_star_pending
         if not _approval_star_announced:
-            _approval_star_announced = True
-            console.print(
-                f"[dim]{symbols.ZAP} Auto-approve active ([bold]*[/bold]). "
-                "Use /mode to change.[/dim]")
+            # NEVER print from here. prompt_toolkit calls this callable in the
+            # middle of a render pass; writing to the console mid-render pushes
+            # bytes into the screen diff, and the renderer then redraws the
+            # prompt on a fresh line instead of over the old one — which is how
+            # the prompt used to end up stacked in scrollback. Queue it and let
+            # pt_prompt() print it before the next prompt starts.
+            _approval_star_pending = True
     # Read-only modes share PLAN's styling — same "I won't touch anything" signal.
     _mode_cls = ("rprompt-mode-plan" if (_is_plan or _read_only)
                  else "rprompt-mode-act")
@@ -3799,7 +3956,21 @@ def _render_rprompt():
                 (f"class:rprompt-sep", f" {symbols.BULLET} "),
                 ("class:rprompt-context", f"{agent}@{terminal}"),
             ])
-    return result
+    # The width breakpoints above decide what we WANT to show; this decides
+    # what actually fits. The rprompt shares its row with the path line, and
+    # must still fit if every ambiguous-width glyph in it is drawn double.
+    # One trailing column stays free so the cursor never sits past the edge.
+    used = _pessimistic_width("  " + (_status_cache.get("prompt_path") or ""))
+    result = _fit_rprompt(result, width - used - 2)
+    if not result:
+        return result
+    # prompt_toolkit right-aligns the rprompt FLUSH to the terminal edge, so
+    # its last glyph lands in the final column. Writing that cell arms the
+    # terminal's deferred-wrap flag; the next write spills onto a new row and
+    # the renderer's cursor model is wrong from then on — every repaint stacks
+    # another copy of the prompt down the screen. A trailing space is the
+    # cheapest way to keep a real glyph out of the last column.
+    return result + [("", " ")]
 
 
 def _render_bottom_toolbar():
@@ -3902,6 +4073,9 @@ def pt_prompt(cwd: str) -> str:
             if _pm.is_plan_mode() else "class:prompt-gutter")
     except Exception:
         gutter_cls = "class:prompt-gutter"
+    # _render_rprompt shares this row and needs the path's real width to know
+    # how much room is left.
+    _update_status_cache(prompt_path=disp)
     message = [
         ("class:stbar-sep", "  "),
         ("class:prompt-path", disp),
@@ -3910,14 +4084,24 @@ def pt_prompt(cwd: str) -> str:
         ("class:prompt-caret", "› "),
     ]
     _clear_stale_running_loop()
+    _flush_deferred_notices()
     try:
-        user_input = session.prompt(
-            message,
-            style=_build_prompt_style(),
-            multiline=False,
-            rprompt=_render_rprompt,
-            complete_while_typing=True,
-        )
+        # patch_stdout is what keeps this prompt from being duplicated down the
+        # screen. Poll threads, sub-agents and terminal watchers all write to
+        # the console while the prompt is live; an unguarded write lands inside
+        # prompt_toolkit's render region, the renderer loses track of the cursor
+        # and repaints the prompt on a NEW line instead of over the old one —
+        # leaving a stack of prompt/rprompt lines in scrollback. Under
+        # patch_stdout those writes are held and flushed above the prompt, which
+        # is redrawn intact underneath.
+        with patch_stdout(raw=True):
+            user_input = session.prompt(
+                message,
+                style=_build_prompt_style(),
+                multiline=False,
+                rprompt=_render_rprompt,
+                complete_while_typing=True,
+            )
         expanded = _expand_pastes(user_input) if user_input else user_input
         _reset_paste_registry()
         return expanded.strip() if expanded else ""
@@ -5482,7 +5666,15 @@ def _restore_resume_blob(blob: dict, chat_history: list) -> dict:
                                           session_id=restored_session_id or None)
     except Exception:
         pass
-    return prepare_state_for_repl(blob.get("state") or {})
+    restored_state = prepare_state_for_repl(blob.get("state") or {})
+    # Inject fork lineage so subsequent /fork calls chain correctly.
+    if blob.get("fork_lineage"):
+        restored_state["_fork_lineage"] = blob["fork_lineage"]
+        restored_state["_fork_name"] = blob.get("fork_name", "")
+    else:
+        restored_state.pop("_fork_lineage", None)
+        restored_state.pop("_fork_name", None)
+    return restored_state
 
 
 def _reset_fresh_session_context(cwd: str) -> None:
@@ -5532,6 +5724,73 @@ def _choose_resume_blob(cwd: str, selector: str = "") -> Optional[dict]:
     return _resolve_resume_selector(_resume_choices(cwd), selector)
 
 
+def _build_fork_tree_rows(choices: list) -> list[tuple[dict, str]]:
+    """Build tree-structured display rows from resume choices.
+
+    Forks (blobs with ``fork_name``) are organized into a trie by their
+    ``fork_lineage`` path and rendered with ``├─``/``└─``/``│`` tree
+    prefixes via DFS. Non-fork blobs (autosave/checkpoint) are listed as
+    root-level entries with no prefix, sorted newest-first as before.
+
+    Returns a list of ``(blob, tree_prefix)`` tuples in display order.
+    """
+    forks = [c for c in choices if c.get("fork_name")]
+    non_forks = [c for c in choices if not c.get("fork_name")]
+
+    # Build a trie from fork lineage paths.
+    # Each node: {"blob": dict|None, "children": {name: node}}
+    root = {"blob": None, "children": {}, "name": ""}
+    for fork in forks:
+        lineage = fork.get("fork_lineage") or [fork["fork_name"]]
+        node = root
+        for i, name in enumerate(lineage):
+            if name not in node["children"]:
+                node["children"][name] = {
+                    "blob": None, "children": {}, "name": name,
+                }
+            node = node["children"][name]
+            if i == len(lineage) - 1:
+                node["blob"] = fork
+
+    rows: list[tuple[dict, str]] = []
+
+    # Non-forks first (root level, no prefix), newest first.
+    non_forks.sort(key=lambda item: item.get("timestamp", 0), reverse=True)
+    for item in non_forks:
+        rows.append((item, ""))
+
+    # Then DFS the fork trie. Root-level forks (depth 1) get no prefix -
+    # they are peers of non-fork entries. Only their children get tree
+    # connectors (├─ / └─ / │).
+    def _dfs(node, prefix: str, depth: int):
+        children = list(node["children"].values())
+        # Sort children by their blob timestamp (newest first), or by name
+        # for nodes without a direct blob.
+        def _child_sort_key(child):
+            blob = child["blob"]
+            if blob:
+                return -(blob.get("timestamp", 0))
+            return 0
+
+        children.sort(key=_child_sort_key)
+        for i, child in enumerate(children):
+            is_last = i == len(children) - 1
+            if depth == 0:
+                # Root-level fork: no tree prefix, just like non-forks.
+                tree_prefix = ""
+                child_prefix = ""
+            else:
+                connector = symbols.TREE_LAST if is_last else symbols.TREE_BRANCH
+                tree_prefix = prefix + connector + " "
+                child_prefix = prefix + (symbols.TREE_VERT + " " if not is_last else "  ")
+            if child["blob"]:
+                rows.append((child["blob"], tree_prefix))
+            _dfs(child, child_prefix, depth + 1)
+
+    _dfs(root, "", 0)
+    return rows
+
+
 def show_resume_picker(cwd: str) -> Optional[dict]:
     """Full-screen `/t`-style picker for saved resume sessions.
 
@@ -5544,21 +5803,39 @@ def show_resume_picker(cwd: str) -> Optional[dict]:
         console.print("[yellow]No saved session to resume in this directory.[/yellow]")
         return None
 
+    # Build tree-structured rows: [(blob, tree_prefix), ...]
+    # Forks are arranged hierarchically; non-forks are root-level entries.
+    tree_rows = _build_fork_tree_rows(choices)
+
     def _build_labels():
         labels = []
-        for item in choices:
+        for item, tree_prefix in tree_rows:
             kind = item.get("kind", "session")
-            badge = "[magenta]◆ checkpoint[/magenta]" if kind == "checkpoint" else f"[blue]{symbols.DOT_OPEN} autosave[/blue]"
+            if kind == "fork":
+                badge = f"[magenta]{symbols.DOT}[/magenta]"
+                name = item.get("fork_name", "fork")
+                name_part = f"[magenta]{name}[/magenta]"
+            elif kind == "checkpoint":
+                badge = f"[magenta]{symbols.DOT}[/magenta]"
+                name_part = ""
+            else:
+                badge = f"[blue]{symbols.DOT_OPEN}[/blue]"
+                name_part = ""
             turns = item.get("turn_count") or _resume_turn_count(item)
             ago = _format_time_ago(item.get("timestamp", 0))
-            title = _resume_last_assistant_excerpt(item, max_len=60) or "Untitled session"
+            title = _resume_last_assistant_excerpt(item, max_len=50) or "Untitled session"
             title = title.replace("\n", " ")
-            labels.append(f"{badge}  [dim]{ago}[/dim]  {turns} turn(s)  [bold]{title}[/bold]")
+            # Build label with tree prefix
+            prefix_str = f"[dim]{tree_prefix}[/dim]" if tree_prefix else ""
+            kind_label = f"[dim]{kind}[/dim]" if not name_part else name_part
+            meta = f"[dim]{ago} {symbols.BULLET} {turns} turn(s)[/dim]"
+            labels.append(
+                f"{prefix_str}{badge} {kind_label}  {meta}  [bold]{title}[/bold]")
         return labels
 
     sel_idx = 0
     status_msg = ""
-    while choices:
+    while tree_rows:
         labels = _build_labels()
         hint = f"{symbols.ARROW_U}{symbols.ARROW_D} navigate  ↵ resume  d details  x delete  q cancel"
         if status_msg:
@@ -5575,9 +5852,9 @@ def show_resume_picker(cwd: str) -> Optional[dict]:
         if result is None:
             return None
         action, idx = result
-        if action is None or idx < 0 or idx >= len(choices):
+        if action is None or idx < 0 or idx >= len(tree_rows):
             return None
-        item = choices[idx]
+        item = tree_rows[idx][0]
         status_msg = ""
         if action == "resume":
             return item
@@ -5585,15 +5862,17 @@ def show_resume_picker(cwd: str) -> Optional[dict]:
             with _alt_screen():
                 _show_resume_detail(item)
                 _print_resume_transcript(item, 20)
-                console.input("\n[dim]Press Enter to continue...[/dim]")
+                _press_enter_to_continue()
             sel_idx = idx
         elif action == "delete":
             delete_resume_state(cwd, item)
-            del choices[idx]
+            # Rebuild tree after deletion
+            choices = _resume_choices(cwd)
             if not choices:
                 return None
+            tree_rows = _build_fork_tree_rows(choices)
             status_msg = "[green]Deleted saved session.[/green]"
-            sel_idx = min(idx, len(choices) - 1)
+            sel_idx = min(idx, len(tree_rows) - 1)
     return None
 
 
@@ -5605,6 +5884,12 @@ def _show_resume_detail(item: dict) -> None:
     console.print(f"[dim]Type:[/dim] {item.get('kind', 'session')}   "
                   f"[dim]When:[/dim] {_format_time_ago(item.get('timestamp', 0))}   "
                   f"[dim]Turns:[/dim] {item.get('turn_count') or _resume_turn_count(item)}")
+    # Show fork lineage if this blob is part of a fork tree.
+    if item.get("fork_lineage"):
+        lineage_str = " › ".join(item["fork_lineage"])
+        console.print(f"[dim]Lineage:[/dim] [magenta]{lineage_str}[/magenta]")
+        if len(item["fork_lineage"]) > 1:
+            console.print(f"[dim]Parent:[/dim] [magenta]{item['fork_lineage'][-2]}[/magenta]")
     history = item.get("chat_history") or []
     console.print(f"[dim]Events:[/dim] {len(history)}\n")
     for msg in history[-6:]:
@@ -7467,7 +7752,8 @@ class AgentRegistry:
                 or not get_runtime_config("allow_remote_exec_without_approval")):
             approval = self._request_approval(
                 req_id, cmd, cwd, timeout=300,
-                destructive=_policy.is_delete_command(cmd),
+                destructive=(_policy.is_delete_command(cmd)
+                             or _policy.is_destructive_git_command(cmd)),
             )
             if approval != "approve":
                 self._push_final(req_id, "aborted",
@@ -8564,7 +8850,7 @@ def show_debug_browser_interactive() -> None:
         idx = labels.index(chosen)
         with _alt_screen():
             show_debug_detail(idx)
-            console.input("\n[dim]Press Enter to return to debug browser...[/dim]")
+            _press_enter_to_continue("Press Enter to return to debug browser")
 
 
 def show_debug_detail(index: int) -> None:
@@ -8788,7 +9074,7 @@ def show_terminal_manager(primary_session=None) -> None:
         elif action == "details":
             with _alt_screen():
                 _show_terminal_detail(name, cmd, sess, created, alive)
-                console.input("\n[dim]Press Enter to continue...[/dim]")
+                _press_enter_to_continue()
 
         sel_idx = idx
 
@@ -8888,7 +9174,7 @@ def show_skill_manager() -> None:
         if action == "details":
             with _alt_screen():
                 _show_skill_detail(name)
-                console.input("\n[dim]Press Enter to continue...[/dim]")
+                _press_enter_to_continue()
         elif action == "reload":
             results = skills_mod.reload_all()
             status_msg = f"Reloaded: {len(results)} skill(s) re-scanned from disk."
@@ -9393,6 +9679,7 @@ _SLASH_ARG_RULES: dict[tuple[str, ...], SlashArgRule] = {
         )
     },
     ("/help",): _arg_rule(1, "/help [command]"),
+    ("/fork",): _arg_rule(1, "/fork [name]"),
     # --port/--host/--dist are key+value pairs, so the ceiling has to cover
     # them together, not just the two it was written for.
     ("/helpwo",): _arg_rule(6, "/helpwo [--port N] [--dist <path>] [--remote]"),
@@ -11137,7 +11424,7 @@ def _memory_manager() -> None:
                     panel_body = (f"[bold]Summary:[/bold] {summary}\n\n[dim]Full memory:[/dim]\n{body}"
                                   if summary else body)
                     _print_long_panel(panel_body, f"[{scope_txt}] {cat} {symbols.BULLET} {name}")
-                console.input("\n[dim]Press Enter to continue...[/dim]")
+                _press_enter_to_continue()
             sel_idx = idx
         elif action == "delete":
             ok, msg = memory_system.delete_memory(name)
@@ -12458,10 +12745,167 @@ def _cmd_policy(parts: list) -> bool:
     return False
 
 
+def show_plan_picker() -> None:
+    """Interactive plan manager UI reusing the mature select_dialog pattern.
+
+    Arrow keys navigate the plan list; action keys provide create / view /
+    approve / exit / status / delete operations.  Mirrors the resume picker's
+    loop-and-reinvoke style (action_keys + enter_action).
+    """
+    import plan_mode as _pm
+
+    sel_idx = 0
+    status_msg = ""
+    while True:
+        plans = _pm.list_plans()
+        current = _pm.get_current_plan()
+        in_plan = _pm.is_plan_mode()
+
+        # --- build labels ---
+        labels: list[str] = []
+        for p in plans:
+            name = p.get("name", "?")
+            title = (p.get("title") or "")[:60]
+            status = p.get("status", "")
+            is_current = bool(current and current.get("name") == name)
+            marker = (f"[green]{symbols.DOT}[/green]"
+                      if is_current else f"[dim]{symbols.DOT_OPEN}[/dim]")
+            badge = f" [yellow]({status})[/yellow]" if status else ""
+            labels.append(
+                f"{marker} [cyan]{name}[/cyan]{badge}  [bold]{title}[/bold]")
+        if not labels:
+            labels = ["[dim](No saved plans - press n to create one)[/dim]"]
+
+        # --- context-sensitive action keys ---
+        action_keys: dict[str, str] = {
+            "n": "new", "v": "view", "d": "delete"}
+        hint_parts = [
+            f"{symbols.ARROW_U}{symbols.ARROW_D} navigate",
+            "v view", "n new", "d delete"]
+        if in_plan and current:
+            action_keys["a"] = "approve"
+            action_keys["e"] = "exit"
+            action_keys["s"] = "status"
+            hint_parts += ["a approve", "e exit", "s status"]
+        hint_parts.append("q cancel")
+        hint = "  ".join(hint_parts)
+        if status_msg:
+            hint = f"{status_msg}\n{hint}"
+
+        result = select_dialog(
+            labels,
+            title="Plan Manager",
+            full_screen=True,
+            selected_index=min(sel_idx, max(0, len(labels) - 1)),
+            action_keys=action_keys,
+            enter_action="view",
+            hint=hint,
+        )
+        if result is None:
+            return
+        action, idx = result
+        if action is None:
+            return
+        status_msg = ""
+
+        # --- actions ---
+        if action == "view" and plans and idx < len(plans):
+            plan = plans[idx]
+            content = _pm.read_plan(plan["name"])
+            _print_long_panel(
+                content or "(empty)",
+                f"Plan: {plan.get('title', plan['name'])[:60]}")
+            _press_enter_to_continue()
+
+        elif action == "new":
+            try:
+                task = input("\nTask description: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                continue
+            if not task:
+                status_msg = "[yellow]No task provided.[/yellow]"
+                continue
+            if _pm.is_plan_mode():
+                status_msg = ("[yellow]A plan is already active. "
+                              "Approve or exit first.[/yellow]")
+                continue
+            mode_manager.activate("act")
+            plan = _pm.enter_plan_mode(task)
+            _enqueue_user_input(task)
+            console.print(Panel(
+                f"[bold]Plan Mode: [green]ENTERED[/green][/bold]\n\n"
+                f"Task: {task}\n"
+                f"Plan file: {plan['file']}\n\n"
+                f"[dim]The AI will now explore and design "
+                f"- no code will be executed.[/dim]\n"
+                f"[dim]When the plan is ready, run "
+                f"[bold]/plan approve[/bold].[/dim]",
+                title="Plan Mode",
+                border_style="green",
+            ))
+            return  # exit picker after entering plan mode
+
+        elif action == "approve":
+            plan = _review_and_approve_current_plan()
+            if plan:
+                followup = (
+                    f"Execute approved WorkGraph {plan['work_id']} revision "
+                    f"{plan['revision']} SHA {plan['content_sha']} for task: "
+                    f"{plan['task']}. Follow the injected "
+                    f"approved_work_plan exactly.")
+                _enqueue_user_input(followup)
+                console.print(Panel(
+                    f"[bold]Plan [green]APPROVED[/green][/bold]\n\n"
+                    f"File: {plan['file']}\n\n"
+                    "[dim]Execution request queued.[/dim]",
+                    title="Plan Approved",
+                    border_style="green",
+                ))
+                return  # exit after approval
+            else:
+                status_msg = "[yellow]Plan was not approved.[/yellow]"
+
+        elif action == "exit":
+            plan = _pm.exit_plan_mode(approve=False)
+            if plan:
+                status_msg = ("[dim]Exited plan mode; draft remains in the "
+                              "plans directory.[/dim]")
+            else:
+                status_msg = "[yellow]No active plan to exit.[/yellow]"
+
+        elif action == "status":
+            plan = _pm.get_current_plan()
+            if plan:
+                content = _pm.read_plan() or "(empty)"
+                _print_long_panel(content, f"Plan: {plan['task'][:60]}")
+                _press_enter_to_continue()
+            else:
+                status_msg = "[dim]Not in plan mode.[/dim]"
+
+        elif action == "delete" and plans and idx < len(plans):
+            plan = plans[idx]
+            answer = input(
+                f"\nDelete plan '{plan['name']}'? [y/N] ").strip().lower()
+            if answer == "y":
+                try:
+                    Path(plan["file"]).unlink()
+                    status_msg = (
+                        f"[green]Deleted plan '{plan['name']}'.[/green]")
+                    sel_idx = max(0, sel_idx - 1)
+                except OSError as exc:
+                    status_msg = f"[red]Could not delete: {exc}[/red]"
+
+
 def _cmd_plan(raw_args: str, parts: list) -> None:
     import plan_mode as _pm
     sub = parts[1].lower() if len(parts) > 1 else ""
     _, plan_args_raw = _raw_tail_after_word(raw_args)
+
+    if not sub:
+        # Bare /plan -> open interactive plan manager UI
+        show_plan_picker()
+        return
+
     if sub == "enter" and plan_args_raw:
         task = _decode_text_arg(plan_args_raw)
         if _pm.is_plan_mode():
@@ -18606,16 +19050,35 @@ _session_approval_state = {
     "approved_commands": set(),      # exact commands remembered via a prompt's "Always"
 }
 _approval_star_announced = False
+# Set by _render_rprompt (a render callback, which must never print) and
+# drained by _flush_deferred_notices() between prompts.
+_approval_star_pending = False
+
+
+def _flush_deferred_notices() -> None:
+    """Print notices queued by render callbacks, from a safe place.
+
+    Anything a prompt_toolkit callable wants to tell the user has to be
+    queued and emitted here — between prompts, with no application running.
+    """
+    global _approval_star_announced, _approval_star_pending
+    if _approval_star_pending and not _approval_star_announced:
+        _approval_star_announced = True
+        console.print(
+            f"[dim]{symbols.ZAP} Auto-approve active ([bold]*[/bold]). "
+            "Use /mode to change.[/dim]")
+    _approval_star_pending = False
 
 
 def _reset_session_approvals():
     """Clear session-level auto-approve (called on /exit, /reload)."""
-    global _approval_star_announced
+    global _approval_star_announced, _approval_star_pending
     _session_approval_state["all_commands"] = False
     _session_approval_state["all_writes"] = False
     _session_approval_state["approved_write_paths"] = set()
     _session_approval_state["approved_commands"] = set()
     _approval_star_announced = False
+    _approval_star_pending = False
 
 
 def _sync_session_approval_from_mode():
@@ -18986,13 +19449,22 @@ def request_command_approval(command: str, reason: str) -> bool:
 
     if command.startswith("browser.evaluate ") and mode_manager.is_mail_mode():
         return _request_email_approval("browser.evaluate", command, reason)
-    if _session_approval_state["all_commands"] or command in _session_approval_state["approved_commands"]:
+
+    # Destructive git (clean/reset --hard/push --force/branch -D/stash drop…)
+    # gets a fresh Yes/No for the same reason deletion does: a blanket
+    # "approve all" the user granted for ordinary commands must not silently
+    # cover a command that throws away their uncommitted work or rewrites a
+    # ref other people already fetched.
+    destructive_git = _policy.is_destructive_git_command(command)
+    if not destructive_git and (
+            _session_approval_state["all_commands"]
+            or command in _session_approval_state["approved_commands"]):
         return True
     choice = _blocking_approval_prompt(
         "approve",
         f"{command}\n{reason}" if reason else command,
-        "Run this command?",
-        allow_always=True,
+        "Destructive git command — run it?" if destructive_git else "Run this command?",
+        allow_always=not destructive_git,
     )
     if choice == "always":
         # Remember this EXACT command, not a blanket "approve everything" —
@@ -20207,6 +20679,84 @@ def main():
             if injected_done is not None:
                 injected_done.set()
             continue
+
+        # /fork [name] - fork the current context into a named branch snapshot
+        # (like git branch: save a named point, current session continues).
+        # Without a name: start a new session that inherits the current
+        # chat_history + state (a branching continuation, NOT a /clear).
+        _fork_parts = user_input.strip().split(maxsplit=1)
+        if (_fork_parts and _fork_parts[0].lower() == "/fork"
+                and args.depth == 0 and not _is_dialogue):
+            _fork_name = (_fork_parts[1].strip()
+                          if len(_fork_parts) > 1 else "")
+            if _fork_name:
+                # /fork <name> - save current context as named fork snapshot.
+                # Reject if an identical lineage path already exists.
+                _current_lineage = list(agent_state.get("_fork_lineage") or [])
+                _new_lineage = _current_lineage + [_fork_name]
+                _existing = list_resume_states(_session_start_cwd)
+                _lineage_exists = any(
+                    item.get("fork_lineage") == _new_lineage
+                    for item in _existing
+                )
+                if _lineage_exists:
+                    console.print(
+                        f"[red]Fork already exists at path: "
+                        f"{' › '.join(_new_lineage)}[/red]")
+                    console.print("[dim]Choose a different name or delete the existing fork first.[/dim]")
+                    if injected_done is not None:
+                        injected_done.set()
+                    continue
+                _parent_session_id = str(agent_state.get("_session_id") or "")
+                _fork_blob = save_fork_state(
+                    agent_state, chat_history, _session_start_cwd,
+                    _fork_name, _new_lineage, _parent_session_id)
+                if _fork_blob:
+                    _n = _resume_turn_count(_fork_blob)
+                    _ago = _format_time_ago(_fork_blob.get("timestamp", 0))
+                    console.print(
+                        f"[green]Forked \"{_fork_name}\"[/green] "
+                        f"[dim]{symbols.BULLET} {_n} turn(s) {_ago} "
+                        f"{symbols.BULLET} Resume with /resume[/dim]")
+                else:
+                    console.print("[red]Could not save fork (no conversation to snapshot).[/red]")
+                if injected_done is not None:
+                    injected_done.set()
+                continue
+            else:
+                # /fork (no name) - start a new session inheriting current
+                # context, like a branching continuation. The current context
+                # is saved as an anonymous fork checkpoint first so it can be
+                # resumed later.
+                save_resume_state(agent_state, chat_history, _session_start_cwd)
+                if current_live_session:
+                    session_store.close_session(current_live_session)
+                # Inherit chat_history (copy) + state; new session_id.
+                _inherited_history = list(chat_history)
+                _inherited_state = dict(agent_state)
+                # Clear fork lineage for the new branch root - it starts fresh.
+                _inherited_state.pop("_fork_lineage", None)
+                _inherited_state.pop("_fork_name", None)
+                _inherited_state.pop("_session_id", None)
+                chat_history.clear()
+                chat_history.extend(_inherited_history)
+                agent_state.clear()
+                agent_state.update(prepare_state_for_repl(_inherited_state))
+                _ensure_session_id(agent_state)
+                current_live_session = session_store.create_session(
+                    _session_start_cwd, agent_state, chat_history)
+                handle_meta_command._current_live_session = current_live_session
+                handle_meta_command._last_agent_state = agent_state
+                handle_meta_command._last_chat_history = chat_history
+                handle_meta_command._last_original_input = None
+                _n = _resume_turn_count({"chat_history": chat_history})
+                console.print(
+                    f"[green]Started a new branched session[/green] "
+                    f"[dim]{symbols.BULLET} {_n} turn(s) inherited "
+                    f"{symbols.BULLET} Previous context saved for /resume[/dim]")
+                if injected_done is not None:
+                    injected_done.set()
+                continue
 
         _new_parts = user_input.strip().split(maxsplit=1)
         if (_new_parts and _new_parts[0].lower() in _NEW_SESSION_COMMANDS

@@ -103,7 +103,14 @@ class ResponsiveTerminalChromeTests(unittest.TestCase):
                 mock.patch.object(laintas_cli, "_terminal_width", return_value=120):
             wide = _text(laintas_cli._render_rprompt())
 
-        self.assertEqual(narrow, "ACT")
+        # Every rprompt ends with one reserved space: prompt_toolkit aligns it
+        # flush to the terminal edge, and a glyph in the final column arms the
+        # terminal's deferred wrap, which desyncs the renderer and stacks the
+        # prompt down the screen. Assert the padding, then compare content.
+        for rendered in (narrow, medium, wide):
+            self.assertTrue(rendered.endswith(" "),
+                            f"rprompt must reserve the last column: {rendered!r}")
+        self.assertEqual(narrow.rstrip(), "ACT")
         self.assertIn("model-long", medium)
         self.assertNotIn("primary@term0", medium)
         self.assertIn("primary@term0", wide)

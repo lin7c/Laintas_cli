@@ -5702,6 +5702,13 @@ def _format_tool_result_for_loop(tool_name: str, result: dict, max_chars: int) -
                 return f"{prefix} {err}\n{output}"[:max_chars]
             return f"{prefix}\n{output}"[:max_chars]
         if err:
+            # An advisory is a tool declining ON PURPOSE and telling the caller
+            # what to do next — the soft test gate, for one. It has to return
+            # ok=false to stop the turn, but labelling it "[tool error]" made a
+            # working guard rail read as a malfunction, to the model and to the
+            # user watching the transcript.
+            if result.get("_advisory"):
+                return f"[action needed] {tool_name}: {err}"[:max_chars]
             return f"[tool error] {tool_name}: {err}"[:max_chars]
         return f"[tool error] {tool_name}: (no error message)"[:max_chars]
 

@@ -50,7 +50,12 @@ _DEFAULT_CONFIG = {
         r"^python", r"^node\s", r"^npm\s", r"^npx\s",
         r"^pip\s", r"^pip3\s", r"^cargo\s", r"^go\s",
         r"^git\s+status", r"^git\s+log", r"^git\s+diff",
-        r"^git\s+branch", r"^git\s+stash", r"^git\s+remote",
+        r"^git\s+show", r"^git\s+blame", r"^git\s+remote(?:\s+-v)?$",
+        # Only the READ-ONLY forms of stash/branch belong here. Bare
+        # `git stash` moves the whole working tree away and `git branch -D`
+        # deletes a branch; listing them as blanket-safe was wrong.
+        r"^git\s+stash\s+(?:list|show)\b",
+        r"^git\s+branch\s*$", r"^git\s+branch\s+(?:-a|-r|-l|-v|-vv|--list)\b",
         r"^curl\s", r"^wget\s", r"^tar\s", r"^zip\s",
         r"^unzip\s", r"^gzip\s", r"^gunzip\s",
         r"^docker\s+ps", r"^docker\s+images", r"^docker\s+logs",
@@ -82,6 +87,17 @@ _DEFAULT_CONFIG = {
         r"^bash\s+-c\b", r"^sh\s+-c\b", r"^zsh\s+-c\b",
         r"^git\s+push", r"^git\s+commit", r"^git\s+reset",
         r"^git\s+rebase", r"^git\s+merge", r"^git\s+checkout",
+        # Working-tree / history mutations that were missing entirely.
+        # The subset that cannot be undone is ALSO caught by
+        # is_destructive_git_command() below, which asks in audit mode too.
+        r"^git\s+clean\b", r"^git\s+stash\b", r"^git\s+restore\b",
+        r"^git\s+switch\b", r"^git\s+cherry-pick\b", r"^git\s+revert\b",
+        r"^git\s+am\b", r"^git\s+apply\b", r"^git\s+filter-branch\b",
+        r"^git\s+tag\s+-d\b", r"^git\s+update-ref\b", r"^git\s+reflog\b",
+        r"^git\s+worktree\s+(?:add|remove|prune)\b",
+        r"^git\s+submodule\s+(?:deinit|update)\b",
+        r"^git\s+remote\s+(?:add|remove|rm|set-url|rename)\b",
+        r"^git\s+config\s+(?!--get|--list|-l\b)",
         r"^npm\s+install\s+-g", r"^npm\s+uninstall",
         r"^pip\s+install\s", r"^pip\s+uninstall",
         r"^apt\s+install", r"^apt\s+remove", r"^apt\s+purge",
@@ -477,6 +493,91 @@ def _unwrap_parent(command: str) -> str:
     return stripped
 
 
+# Matches the `git` binary plus any global options that may sit between it and
+# the subcommand. Without this, `git -C /repo clean -fd` and
+# `git --git-dir=x reset --hard` walk straight past a naive `^git\s+clean`.
+# The leading alternation lets a command hide behind `;`, `&&` or a newline.
+_GIT_PREFIX = (
+    r"(?:^|[;&|]\s*|\n\s*)(?:\S*/)?git"
+    r"(?:\s+(?:-[cC]\s+\S+|--(?:git-dir|work-tree|exec-path|namespace)=\S+"
+    r"|--no-pager|--paginate|--bare|--literal-pathspecs))*\s+"
+)
+
+
+def is_destructive_git_command(command: str) -> bool:
+    """Return whether *command* is a git operation that destroys work.
+
+    The companion of :func:`is_delete_command` for git. These lose uncommitted
+    changes, unreachable commits, or state other people already fetched — and
+    unlike the ordinary ``needs_approval`` git rules (which are advisory in
+    "audit" mode, the default), a match here asks in BOTH modes and does not
+    honour the session-wide "approve all commands" shortcut.
+
+    Deliberately NOT listed: ``commit``, ``merge``, ``rebase`` of local-only
+    work, and ``revert`` — they add to history rather than destroying it and
+    are recoverable through the reflog. Read-only forms (``clean --dry-run``,
+    ``restore --staged``) are excluded so ordinary inspection stays friction-free.
+    """
+    stripped = _unwrap_parent(command)
+    stripped = re.sub(r"^sudo(?:\s+-\S+)*\s+", "", stripped)
+
+    def _git(subcommand: str) -> bool:
+        return re.search(_GIT_PREFIX + subcommand, stripped) is not None
+
+    # `git clean` deletes untracked files outright; with -x/-X it takes
+    # gitignored ones too (.env, local config), which the session checkpoint
+    # in snapshot.py deliberately does not capture. Nothing recovers those.
+    # -n/--dry-run only reports, so it stays out of the way.
+    if _git(r"clean\b") and not re.search(
+            r"\bclean\b[^\n;&|]*(?:\s-\w*n\b|\s--dry-run\b)", stripped):
+        return True
+
+    # Discards every uncommitted change in the working tree.
+    if _git(r"reset\b[^\n;&|]*\s--hard\b"):
+        return True
+
+    # `git checkout -- <path>` / `git checkout .` / `-f` overwrite the working
+    # tree from the index. Plain `git checkout <branch>` is only needs_approval.
+    if _git(r"checkout\b[^\n;&|]*\s(?:--(?:\s|$)|-f\b|--force\b)") or _git(r"checkout\s+\.(?:\s|$)"):
+        return True
+
+    # `git restore <path>` throws away working-tree edits. `--staged` alone
+    # only unstages, which is recoverable.
+    if _git(r"restore\b") and not re.search(
+            r"\brestore\b[^\n;&|]*\s--staged\b[^\n;&|]*", stripped):
+        return True
+    if _git(r"restore\b[^\n;&|]*\s--worktree\b"):
+        return True
+
+    # Rewrites or deletes a ref other people may already have fetched.
+    if _git(r"push\b[^\n;&|]*\s(?:-f\b|--force\b|--force-with-lease\b|--delete\b|--mirror\b)"):
+        return True
+    if _git(r"push\b[^\n;&|]*\s:\S+"):  # refspec form of a remote branch delete
+        return True
+
+    # Branch/tag/ref deletion and history surgery.
+    if _git(r"branch\b[^\n;&|]*\s-(?:D\b|d\b[^\n;&|]*\s--force\b)"):
+        return True
+    if _git(r"tag\b[^\n;&|]*\s-d\b"):
+        return True
+    if _git(r"update-ref\b[^\n;&|]*\s-d\b"):
+        return True
+    if _git(r"filter-branch\b") or _git(r"filter-repo\b"):
+        return True
+    if _git(r"reflog\s+(?:delete|expire)\b"):
+        return True
+
+    # Drops stashed work permanently (`git stash list` cannot bring it back).
+    if _git(r"stash\s+(?:drop|clear)\b"):
+        return True
+
+    # Removes a sibling agent's isolated worktree along with its edits.
+    if _git(r"worktree\s+remove\b[^\n;&|]*\s(?:-f\b|--force\b)"):
+        return True
+
+    return False
+
+
 def is_delete_command(command: str) -> bool:
     """Return whether *command* invokes a common destructive delete utility.
 
@@ -578,6 +679,18 @@ def evaluate(command: str, cwd: str = None,
     # branch, so it silently falls through to allow).
     if mode != "disabled" and is_delete_command(stripped):
         reason = "delete command always requires approval (audit and enforce modes alike)"
+        _write_audit(_audit_entry(command, "needs_approval", reason, cwd, req_id, agent_id))
+        return PolicyDecision("needs_approval", "", reason)
+
+    # ── Destructive git: same always-ask tier ───────────────────────────
+    # `git clean -fdx`, `reset --hard`, `checkout -- .`, `push --force`,
+    # `branch -D`, `stash drop`… destroy work exactly like `rm` does, but the
+    # ordinary git rules in "needs_approval" are ADVISORY in audit mode (the
+    # default), so before this check they ran with no prompt at all. Checked
+    # across command_parse variants so an obfuscated form cannot slip past.
+    if mode != "disabled" and any(is_destructive_git_command(v) for v in variants):
+        reason = ("destructive git command always requires approval "
+                  "(audit and enforce modes alike)")
         _write_audit(_audit_entry(command, "needs_approval", reason, cwd, req_id, agent_id))
         return PolicyDecision("needs_approval", "", reason)
 

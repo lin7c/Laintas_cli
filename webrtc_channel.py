@@ -911,7 +911,9 @@ class WebrtcManager:
         if (decision.action == "needs_approval"
                 or not get_runtime_config("allow_remote_exec_without_approval")):
             approved = await self._request_p2p_approval(
-                channel, req_id, cmd, cwd, destructive=_policy.is_delete_command(cmd))
+                channel, req_id, cmd, cwd,
+                destructive=(_policy.is_delete_command(cmd)
+                             or _policy.is_destructive_git_command(cmd)))
             if not approved:
                 channel.send(json.dumps({"t": "ai-exec-final", "id": req_id, "status": "aborted",
                                          "error": f"User denied: {cmd[:100]}"}))
