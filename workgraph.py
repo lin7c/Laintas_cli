@@ -986,9 +986,16 @@ def active_plan_context(*, cwd: Optional[str] = None) -> str:
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
-def approved_plan_context(*, cwd: Optional[str] = None) -> str:
-    """Return the exact approved revision used as the Act-stage authority."""
-    work = get_active_work(cwd=cwd)
+def approved_plan_context(*, cwd: Optional[str] = None,
+                         session_id: Optional[str] = None) -> str:
+    """Return the exact approved revision used as the Act-stage authority.
+
+    Prefers the session-scoped active work; falls back to the global pointer
+    for plans created before session-scoping was introduced.
+    """
+    work = get_active_work(cwd=cwd, session_id=session_id)
+    if not work:
+        work = get_active_work(cwd=cwd)
     if not work or work.get("status") not in {"APPROVED", "EXECUTING", "VERIFYING"}:
         return ""
     revision_no = work.get("approved_revision")

@@ -9876,6 +9876,13 @@ def _raw_tail_after_word(text: str) -> tuple[str, str]:
     return match.group(1), match.group(2) or ""
 
 
+def _current_session_id() -> Optional[str]:
+    """Return the session_id from the current agent state, or None."""
+    _agent = get_current_agent()
+    _sid = str(((_agent.state or {}).get("_session_id") if _agent else "") or "")
+    return _sid or None
+
+
 def _decode_text_arg(text: str) -> str:
     """Decode a single quoted argument; otherwise preserve the original text."""
     raw = (text or "").strip()
@@ -12028,7 +12035,7 @@ def _cmd_mode(raw_args: str, parts: list) -> bool:
                 "/plan approve, or /plan exit before starting another.[/yellow]")
             return False
         mode_manager.activate("act")
-        plan = _pm_mode.enter_plan_mode(task)
+        plan = _pm_mode.enter_plan_mode(task, session_id=_current_session_id())
         _enqueue_user_input(task)
         console.print(Panel(
             f"[bold]Plan Mode: [green]ENTERED[/green][/bold]\n\n"
@@ -12844,7 +12851,7 @@ def show_plan_picker() -> None:
                               "Approve or exit first.[/yellow]")
                 continue
             mode_manager.activate("act")
-            plan = _pm.enter_plan_mode(task)
+            plan = _pm.enter_plan_mode(task, session_id=_current_session_id())
             _enqueue_user_input(task)
             console.print(Panel(
                 f"[bold]Plan Mode: [green]ENTERED[/green][/bold]\n\n"
@@ -12928,7 +12935,7 @@ def _cmd_plan(raw_args: str, parts: list) -> None:
                 "starting another.[/yellow]")
             return
         mode_manager.activate("act")
-        plan = _pm.enter_plan_mode(task)
+        plan = _pm.enter_plan_mode(task, session_id=_current_session_id())
         _enqueue_user_input(task)
         console.print(Panel(
             f"[bold]Plan Mode: [green]ENTERED[/green][/bold]\n\n"
@@ -12968,7 +12975,7 @@ def _cmd_plan(raw_args: str, parts: list) -> None:
         feedback = _decode_text_arg(plan_args_raw)
         plan = _pm.get_current_plan()
         if plan is None and feedback:
-            plan = _pm.begin_amendment()
+            plan = _pm.begin_amendment(session_id=_current_session_id())
         if not plan or not feedback:
             console.print("[yellow]Usage: /plan revise <feedback>[/yellow]")
         else:
@@ -13828,7 +13835,9 @@ def _cmd_prompt(raw_args: str, parts: list, session: dict) -> None:
 def _cmd_work(parts: list) -> None:
     sub = parts[1].lower() if len(parts) > 1 else "status"
     if sub == "status":
-        work = workgraph.get_active_work()
+        work = workgraph.get_active_work(session_id=_current_session_id())
+        if not work:
+            work = workgraph.get_active_work()
         if not work:
             console.print("[dim]No active WorkGraph in this project.[/dim]")
         else:
@@ -13871,13 +13880,15 @@ def _cmd_work(parts: list) -> None:
             if not work:
                 console.print(f"[red]WorkGraph {work_id} not found.[/red]")
             else:
-                workgraph.set_active_work(work["id"])
+                workgraph.set_active_work(work["id"], session_id=_current_session_id())
                 if work["status"] in {"DRAFT", "REVIEW_PENDING", "NEEDS_USER", "BLOCKED"}:
                     import plan_mode as _work_pm
-                    _work_pm.attach_work(work["id"])
+                    _work_pm.attach_work(work["id"], session_id=_current_session_id())
                 console.print(f"[green]Resumed WorkGraph {work['id']}.[/green]")
     elif sub == "history":
-        work = workgraph.get_active_work()
+        work = workgraph.get_active_work(session_id=_current_session_id())
+        if not work:
+            work = workgraph.get_active_work()
         if not work:
             console.print("[dim]No active WorkGraph.[/dim]")
         else:
@@ -21025,7 +21036,7 @@ def main():
         if not _system_input:
             import plan_mode as _pending_pm
             if _pending_pm.is_pending_task():
-                _pending_pm.enter_plan_mode(user_input)
+                _pending_pm.enter_plan_mode(user_input, session_id=_current_session_id())
                 console.print(
                     "[green]PLAN task set from this message.[/green]")
 

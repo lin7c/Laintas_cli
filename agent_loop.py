@@ -5227,7 +5227,9 @@ def _build_user_message(original_input: str, state: dict, memory_entries: list,
     if tasks_snapshot:
         tasks_block = f"\n<active_tasks>\n{tasks_snapshot}\n</active_tasks>\n"
 
-    approved_plan = workgraph.approved_plan_context(cwd=os.getcwd())
+    approved_plan = workgraph.approved_plan_context(
+        cwd=os.getcwd(),
+        session_id=str(state.get("_session_id") or "") or None)
     approved_plan_block = (
         f"\n{approved_plan}\n" if approved_plan else "")
 

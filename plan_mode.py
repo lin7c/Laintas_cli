@@ -126,7 +126,9 @@ def _restore_state() -> None:
     _plan_mode = True
     try:
         if plan.get("work_id"):
-            workgraph.set_active_work(plan["work_id"])
+            workgraph.set_active_work(
+                plan["work_id"],
+                session_id=plan.get("session_id"))
     except workgraph.WorkGraphError:
         _current_plan = None
         _plan_mode = False
@@ -184,7 +186,7 @@ def is_tool_allowed(tool_name: str) -> bool:
     return tool_name in _PLAN_ALLOWED_TOOLS
 
 
-def enter_plan_mode(task: str) -> dict:
+def enter_plan_mode(task: str, session_id: Optional[str] = None) -> dict:
     """Enter plan mode for a given task.
 
     Creates a new plan file and sets plan mode active.
@@ -217,13 +219,15 @@ def enter_plan_mode(task: str) -> dict:
             "status": "drafting",
             "approved": False,
             "cwd": str(Path.cwd().resolve()),
+            "session_id": session_id,
         }
 
         # Write template
         content = _plan_template(task, now)
         plan_file.write_text(content, encoding="utf-8")
 
-        work = workgraph.create_work(task, cwd=str(Path.cwd().resolve()))
+        work = workgraph.create_work(
+            task, cwd=str(Path.cwd().resolve()), session_id=session_id)
         revision = workgraph.add_revision(
             work["id"], content, cwd=str(Path.cwd().resolve()), author="system")
         plan.update({
@@ -434,7 +438,7 @@ def get_review_snapshot() -> Optional[dict]:
         return None
 
 
-def attach_work(work_id: str) -> Optional[dict]:
+def attach_work(work_id: str, session_id: Optional[str] = None) -> Optional[dict]:
     """Attach an existing draft/review WorkGraph to Plan Mode."""
     global _plan_mode, _current_plan, _pending_task, _loaded_cwd
     with _lock:
@@ -462,18 +466,33 @@ def attach_work(work_id: str) -> Optional[dict]:
             "work_id": work_id,
             "revision": revision["revision"],
             "content_sha": revision["content_sha"],
+            "session_id": session_id or work.get("session_id"),
         }
         _plan_mode = work["status"] in {"DRAFT", "REVIEW_PENDING", "NEEDS_USER", "BLOCKED"}
         _pending_task = False
         _loaded_cwd = str(Path.cwd().resolve())
-        workgraph.set_active_work(work_id)
+        workgraph.set_active_work(work_id, session_id=session_id)
         _save_state({"plan_mode": _plan_mode, "current_plan": _current_plan if _plan_mode else None})
         return dict(_current_plan)
 
 
-def begin_amendment() -> Optional[dict]:
+def begin_amendment(session_id: Optional[str] = None) -> Optional[dict]:
     """Fork the active approved revision into a new DRAFT revision."""
-    work = workgraph.get_active_work()
+    work = workgraph.get_active_work(session_id=session_id)
+    if not work:
+        work = workgraph.get_active_work()
+    if not work or work.get("status") not in {"APPROVED", "EXECUTING", "VERIFYING"}:
+        return None
+    revision_no = work.get("approved_revision") or work.get("current_revision")
+    revision = workgraph.get_revision(work["id"], revision_no)
+    if not revision:
+        return None
+    try:
+        workgraph.add_revision(
+            work["id"], revision["content"], author="amendment")
+    except workgraph.WorkGraphError:
+        return None
+    return attach_work(work["id"], session_id=session_id or work.get("session_id"))
     if not work or work.get("status") not in {"APPROVED", "EXECUTING", "VERIFYING"}:
         return None
     revision_no = work.get("approved_revision") or work.get("current_revision")
