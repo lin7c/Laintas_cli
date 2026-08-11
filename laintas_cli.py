@@ -2611,6 +2611,20 @@ def _truncate_with_ellipsis(text: str, max_len: int) -> str:
     return text[:max_len - 1] + "…"
 
 
+def _bg_print(console, markup_text: str, width: int = 0) -> None:
+    """Print Rich markup text with 'surface' background, padded to terminal width."""
+    from rich.text import Text
+    if not width:
+        width = console.width or 80
+    try:
+        t = Text.from_markup(markup_text)
+    except Exception:
+        t = Text(markup_text)
+    t.set_length(width)
+    t.stylize("surface")
+    console.print(t, highlight=False)
+
+
 def _emit_block(title: str, status_label: str, status_style: str,
                 meta: str, preview_lines: list, depth: int,
                 line_style: str = "muted") -> None:
@@ -2620,16 +2634,16 @@ def _emit_block(title: str, status_label: str, status_style: str,
     indented. No box - keeps the transcript clean and scannable.
     """
     pad = "  " * depth
-    bar = "[%s]▍[/%s]" % (status_style, status_style)
+    bar = "[%s]▌[/%s]" % (status_style, status_style)
     head = f"{pad}{bar} [bold]{_truncate_with_ellipsis(title, 80)}[/bold]"
     if status_label:
         head += f"  [{status_style}]{status_label}[/{status_style}]"
     if meta:
         head += f"  [muted]{meta}[/muted]"
-    console.print(head)
+    _bg_print(console, head)
     inner = pad + "  "
     for ln in preview_lines:
-        console.print(f"{inner}[{line_style}]{ln}[/{line_style}]")
+        _bg_print(console, f"{inner}[{line_style}]{ln}[/{line_style}]")
 
 
 def display_command_output(command: str, returncode: int, output: str, depth: int = 0, elapsed: float = 0.0) -> None:
@@ -2723,9 +2737,9 @@ def display_file_diff(path: str, diff_text: str, depth: int = 0) -> None:
                if l.startswith("-") and not l.startswith("---"))
 
     pad = "  " * depth
-    console.print(
+    _bg_print(console,
         f"{pad}[accent]▍[/accent] [bold]{_md_escape(_truncate_with_ellipsis(path, 70))}[/bold]  "
-        f"[success]+{adds}[/success] [error]−{dels}[/error]", highlight=False)
+        f"[success]+{adds}[/success] [error]−{dels}[/error]")
 
     fold_limit = int(get_runtime_config("tool_output_fold") or 30)
     # Collect content lines (skip headers/hunk markers) with their line-number
@@ -2754,14 +2768,14 @@ def display_file_diff(path: str, diff_text: str, depth: int = 0) -> None:
     def _print_line(ln, o_no, n_no):
         body = _md_escape(ln[:118])
         if ln.startswith("+"):
-            console.print(f"{pad}[accent.dim]{n_no:>4}[/accent.dim] "
-                          f"[success]┃{body}[/success]", highlight=False)
+            _bg_print(console, f"{pad}[accent.dim]{n_no:>4}[/accent.dim] "
+                      f"[success]┃{body}[/success]")
         elif ln.startswith("-"):
-            console.print(f"{pad}[error]{o_no:>4} ┃{body}[/error]", highlight=False)
+            _bg_print(console, f"{pad}[error]{o_no:>4} ┃{body}[/error]")
         else:
             text = _md_escape(ln[1:119] if ln.startswith(" ") else ln[:118])
-            console.print(f"{pad}[muted]{n_no:>4}[/muted] "
-                          f"[rule]│[/rule] [muted]{text}[/muted]", highlight=False)
+            _bg_print(console, f"{pad}[muted]{n_no:>4}[/muted] "
+                      f"[rule]│[/rule] [muted]{text}[/muted]")
 
     total = len(content)
     if fold_limit <= 0 or total <= fold_limit:
@@ -2772,7 +2786,7 @@ def display_file_diff(path: str, diff_text: str, depth: int = 0) -> None:
         hidden = total - fold_limit
         for ln, o, n in content[:half]:
             _print_line(ln, o, n)
-        console.print(f"{pad}[muted]     … {hidden} more line(s) {symbols.BULLET} /debug for full[/muted]", highlight=False)
+        _bg_print(console, f"{pad}[muted]     … {hidden} more line(s) {symbols.BULLET} /debug for full[/muted]")
         for ln, o, n in content[-half:]:
             _print_line(ln, o, n)
 

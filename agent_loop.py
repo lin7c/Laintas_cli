@@ -402,6 +402,20 @@ def _adaptive_loop_delay(base: float, *, failed: bool, retry_count: int = 0,
     return min(delay, 4.0)
 
 
+def _bg_print(console, markup_text: str, width: int = 0) -> None:
+    """Print Rich markup text with 'surface' background, padded to terminal width."""
+    from rich.text import Text
+    if not width:
+        width = console.width or 80
+    try:
+        t = Text.from_markup(markup_text)
+    except Exception:
+        t = Text(markup_text)
+    t.set_length(width)
+    t.stylize("surface")
+    console.print(t, highlight=False)
+
+
 def _emit_simple_diff(console, diff_text: str, depth: int = 0, cap: int = 0) -> None:
     """Render a minimal diff: changed (+/-) lines only, folded at `cap` lines.
 
@@ -445,11 +459,11 @@ def _emit_simple_diff(console, diff_text: str, depth: int = 0, cap: int = 0) -> 
     def _print_entry(style, mark, no, text):
         if len(text) > 96:
             text = text[:95] + "…"
-        console.print(f"{inner}[muted]{no:>4}[/muted] "
-                      f"[{style}]{mark}{_esc(text)}[/{style}]", highlight=False)
+        _bg_print(console, f"{inner}[muted]{no:>4}[/muted] "
+                  f"[{style}]{mark}{_esc(text)}[/{style}]")
 
     inner = "  " * depth + "  "
-    console.print(f"{inner}[accent]▍[/accent] [success]+{adds}[/success] [error]−{dels}[/error]", highlight=False)
+    _bg_print(console, f"{inner}[accent]▍[/accent] [success]+{adds}[/success] [error]−{dels}[/error]")
     if total <= cap:
         for style, mark, no, text in changed:
             _print_entry(style, mark, no, text)
@@ -458,7 +472,7 @@ def _emit_simple_diff(console, diff_text: str, depth: int = 0, cap: int = 0) -> 
         hidden = total - cap
         for style, mark, no, text in changed[:half]:
             _print_entry(style, mark, no, text)
-        console.print(f"{inner}     [muted]… {hidden} more change(s) {symbols.BULLET} /detail on for full[/muted]", highlight=False)
+        _bg_print(console, f"{inner}     [muted]… {hidden} more change(s) {symbols.BULLET} /detail on for full[/muted]")
         for style, mark, no, text in changed[-half:]:
             _print_entry(style, mark, no, text)
 
@@ -7256,11 +7270,9 @@ def run_agent_loop(
             if query_text:
                 label = f'{label} "{query_text}"'
             noun = singular if len(unique_reads) == 1 else plural
-            deps.console.print(
+            _bg_print(deps.console,
                 f"  [success]{symbols.DOT}[/success] [accent.dim]{label}[/accent.dim]  "
-                f"[muted]{len(unique_reads)} {noun} {symbols.BULLET} {read_tail}[/muted]",
-                highlight=False,
-            )
+                f"[muted]{len(unique_reads)} {noun} {symbols.BULLET} {read_tail}[/muted]")
             _compact_read_hints.clear()
 
         if tool_calls:
@@ -7869,7 +7881,7 @@ def run_agent_loop(
                         # task.create / task.update / task.list / task.get: silent —
                         # the live task list already reflects the changes.
                     elif _detail:
-                        deps.console.print(
+                        _bg_print(deps.console,
                             f"  {ok_mark} [accent.dim]{display_name}[/accent.dim] [dim]{_esc_hint(_crop_cells(_hint_plain, max(20, deps.console.width - 20), middle=True))}[/dim]")
                     else:
                         # Simplified: one clean, aligned line per tool. A short
@@ -7953,7 +7965,7 @@ def run_agent_loop(
                             )
                             if _meta2:
                                 _line += f"  [muted]{_esc_hint(_meta2)}[/muted]"
-                            deps.console.print(_line, highlight=False)
+                            _bg_print(deps.console, _line)
                             # Folded preview for long shell.exec output
                             if name == "shell.exec" and formatted:
                                 _fold_lim = int(get_runtime_config("tool_output_fold") or 0)
@@ -7966,9 +7978,8 @@ def run_agent_loop(
                                                    + [f"… {_hidden} more lines"]
                                                    + _out_lines[-_half:])
                                         for _fl in _folded:
-                                            deps.console.print(
-                                                f"    [muted]{_esc_hint(_fl)}[/muted]",
-                                                highlight=False)
+                                            _bg_print(deps.console,
+                                                f"    [muted]{_esc_hint(_fl)}[/muted]")
                     pending_events.append({"type": "system", "kind": "tool",
                                             "content": display_name,
                                             "meta": {"ok": result.get("ok", False),
