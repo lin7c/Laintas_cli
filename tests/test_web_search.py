@@ -461,7 +461,9 @@ class EngineRegistryTests(unittest.TestCase):
 
     def test_builtins_include_cn_bing_after_duckduckgo(self):
         chain, _warnings = ws.resolve_chain(None)
-        self.assertEqual(chain[:3], ["google", "duckduckgo", "cn-bing"])
+        # tavily keyless comes first (best free results, no key needed),
+        # followed by the HTML scraping engines.
+        self.assertEqual(chain[:4], ["tavily", "google", "duckduckgo", "cn-bing"])
         # Metered tiers come last: this is a cost ordering, not a quality one.
         self.assertEqual(chain[-1], "laintas_gateway")
 

@@ -492,6 +492,8 @@ def unload_skill(name: str) -> tuple[bool, str]:
     # Drop the imported skill.py module so re-loading picks up edits/fresh state.
     sys.modules.pop(f"laintas_skill_{name}", None)
     state.module = None
+    state.body = ""
+    state.references.clear()
     state.loaded = False
     return True, f"{name}: unloaded ({removed} tool(s) removed)"
 

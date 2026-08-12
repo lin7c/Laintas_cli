@@ -123,6 +123,44 @@ class SlashRegistryTests(unittest.TestCase):
         self.assertEqual(buffer.text, "/task")
         buffer.start_completion.assert_called_once_with()
 
+    def test_enter_always_submits_nonempty_input(self):
+        """Enter must submit, not insert a newline, even with text present.
+
+        Regression for the multiline-mode Enter handler that submitted only
+        on an empty buffer and inserted a newline otherwise, making it
+        impossible to send any non-empty message.
+        """
+        buffer = laintas_cli.Buffer()
+        buffer.text = "hello world"
+        buffer.cursor_position = len(buffer.text)
+        buffer.validate_and_handle = mock.Mock()
+        enter = next(
+            binding for binding in laintas_cli._build_keybindings().bindings
+            if binding.keys == (laintas_cli.Keys.Enter,)
+        )
+
+        enter.handler(mock.Mock(current_buffer=buffer))
+
+        buffer.validate_and_handle.assert_called_once_with()
+        self.assertEqual(buffer.text, "hello world")
+
+    def test_escape_enter_inserts_newline_without_submitting(self):
+        """Alt+Enter (escape then enter) inserts a newline; it must not submit."""
+        buffer = laintas_cli.Buffer()
+        buffer.text = "line1"
+        buffer.cursor_position = len(buffer.text)
+        buffer.validate_and_handle = mock.Mock()
+        esc_enter = next(
+            binding for binding in laintas_cli._build_keybindings().bindings
+            if binding.keys
+            == (laintas_cli.Keys.Escape, laintas_cli.Keys.Enter)
+        )
+
+        esc_enter.handler(mock.Mock(current_buffer=buffer))
+
+        self.assertEqual(buffer.text, "line1\n")
+        buffer.validate_and_handle.assert_not_called()
+
     def test_all_static_subcommands_have_contextual_descriptions(self):
         for spec in laintas_cli.COMMAND_SPECS:
             for entry in spec.contextual_completions:

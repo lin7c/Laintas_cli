@@ -3699,19 +3699,20 @@ def _build_keybindings() -> KeyBindings:
 
     @kb.add("enter")
     def _(event):
-        """Enter: submit on empty/whitespace buffer; otherwise insert a newline.
-        
+        """Enter: always submit.
+
         In multiline mode prompt_toolkit disables the default Enter=submit
-        and instead requires Escape+Enter.  This handler restores the
-        submit-on-empty behaviour so the user can type multi-line input
-        (arrow keys move between lines) and submit by clearing or hitting
-        Enter on a blank line — matching the Claude Code input experience.
+        and turns Enter into a newline; this handler restores submit so the
+        user can keep the arrow-key cursor movement of multiline mode while
+        Enter still sends the message.  A newline is inserted via Alt+Enter
+        (see the escape-enter binding below).
         """
-        buf = event.current_buffer
-        if buf.text.strip() == "":
-            buf.validate_and_handle()
-        else:
-            buf.insert_text("\n")
+        event.current_buffer.validate_and_handle()
+
+    @kb.add("escape", "enter")
+    def _(event):
+        """Alt+Enter (escape then enter): insert a newline without submitting."""
+        event.current_buffer.insert_text("\n")
 
     @kb.add("escape")
     def _(event):

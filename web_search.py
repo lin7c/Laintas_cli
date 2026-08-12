@@ -982,6 +982,71 @@ def _search_laintas(query: str, max_results: int,
     return results, None, ""
 
 
+# ── Tavily Keyless (no API key, zero-config) ─────────────────────────
+
+
+def _search_tavily_keyless(query: str, max_results: int,
+                           region: str | None = None,
+                           timelimit: str | None = None,
+                           ) -> tuple[list[dict], SearchErrorType | None, str]:
+    """Search via Tavily's keyless API endpoint.
+
+    No account or API key required — the ``X-Tavily-Access-Mode: keyless``
+    header enables free, rate-limited access.  Results are structured for
+    LLM consumption (ranked, scored snippets) rather than raw HTML, so
+    this engine gives the best signal-per-token of all the free tiers.
+    """
+    payload: dict = {"query": query, "max_results": min(max_results, 10)}
+    headers = {
+        "Content-Type": "application/json",
+        "X-Tavily-Access-Mode": "keyless",
+    }
+
+    try:
+        resp = requests.post(
+            "https://api.tavily.com/search",
+            json=payload, headers=headers,
+            timeout=_WEB_FETCH_TIMEOUT, allow_redirects=True,
+        )
+    except requests.RequestException as e:
+        return [], _classify_request_error(e), f"tavily keyless request failed: {e}"
+
+    if resp.status_code == 429:
+        return [], SearchErrorType.RATE_LIMITED, "tavily keyless rate limited (429)"
+    if resp.status_code >= 400:
+        msg = ""
+        try:
+            msg = resp.json().get("detail", resp.text[:200])
+        except Exception:
+            msg = resp.text[:200]
+        return [], SearchErrorType.API_ERROR, f"tavily keyless error ({resp.status_code}): {msg}"
+
+    try:
+        data = resp.json()
+    except ValueError:
+        return [], SearchErrorType.API_ERROR, "tavily keyless returned non-JSON"
+
+    raw = data.get("results") or []
+    results = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        title = item.get("title", "")
+        url_val = item.get("url", "")
+        snippet = item.get("content", item.get("snippet", ""))
+        if title and url_val:
+            results.append({
+                "title": str(title).strip(),
+                "url": str(url_val).strip(),
+                "snippet": str(snippet).strip()[:500] if snippet else "",
+            })
+
+    results = _dedupe(results, max_results)
+    if not results:
+        return [], SearchErrorType.EMPTY, "tavily keyless returned no usable results"
+    return results, None, ""
+
+
 # ── Engine chain ─────────────────────────────────────────────────────
 
 
@@ -1290,13 +1355,19 @@ _ENGINE_ALIASES = {
 # Order matters: free scrapers first, then the user's own metered credits,
 # then the account balance. This is a cost ordering, not a quality ordering —
 # the last entry is usually the *best* results, just the only one that bills.
-_DEFAULT_CHAIN = ["google", "duckduckgo", "cn-bing",
+_DEFAULT_CHAIN = ["tavily", "google", "duckduckgo", "cn-bing",
                   "laintas_search", "laintas_gateway"]
 
 
 def _builtin_engines() -> dict:
     """The engines that ship with the CLI, each with a Python driver."""
     return {
+        "tavily": {
+            "name": "tavily", "kind": "builtin", "cost": "free",
+            "driver": _search_tavily_keyless,
+            "describe": "Tavily Keyless — AI-optimized search with no API key; "
+                        "returns clean, scored results built for LLM consumption",
+        },
         "google": {
             "name": "google", "kind": "builtin", "cost": "free",
             "driver": lambda q, n, r, t: _search_google(q, n, r, t) + ("",),
