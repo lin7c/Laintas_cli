@@ -6704,6 +6704,13 @@ def run_agent_loop(
                     return (resp or {}).get("reply", "") if isinstance(resp, dict) else ""
 
                 _verdict = critic.assess(original_input, _thread_to_send, _crit_llm_fn)
+                # Persist critic score for training-data quality filtering.
+                # laintas_model collector reads this to compute Gold/Silver/Bronze tiers.
+                if isinstance(_verdict, dict) and _verdict.get("score") is not None:
+                    event_log.append("critic_assessment",
+                                     score=_verdict.get("score"),
+                                     on_track=_verdict.get("on_track", True),
+                                     issue=_verdict.get("issue", ""))
                 _crit_thresh = int(get_runtime_config("critic_score_threshold") or 50)
                 if critic.is_off_track(_verdict, _crit_thresh):
                     _thread_to_send = _thread_to_send + [{
