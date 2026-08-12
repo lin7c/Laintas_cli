@@ -11,6 +11,7 @@ Event types:
   - tool_call         — tool name + arguments, before dispatch
   - tool_result       — tool name + ok/error, after tool execution
   - turn_ended        — exit reason, written when the loop exits
+  - critic_assessment — periodic quality score + on_track flag
 
 The log lives in `.laintas/events.jsonl` (per-cwd). It is append-only and
 synchronously flushed. ``event_id`` is the durable identity; ``seq`` is an
@@ -18,10 +19,19 @@ advisory ordering aid for one local writer and survives normal restarts.
 
 Recovery: `last_incomplete_task()` returns the most recent prompt_admitted
 without a matching turn_ended, or None if the last task completed cleanly.
+
+Integrity (laintas_model): when ``_EVENT_HMAC_KEY`` is set (by
+``attestation.fetch_and_arm()``), every entry written to the log carries an
+``_sig`` field — an HMAC-SHA256 over the canonical JSON of the entry.  The
+key lives ONLY in memory and is never written to disk.  An aggregator can
+re-derive the same key from the gateway-issued ``jti`` and verify that
+neither the event contents nor the ``seq`` order have been tampered with.
 """
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
 import socket
@@ -35,6 +45,12 @@ import paths
 
 _SEQ_BY_PATH: dict[str, int] = {}
 _LOCK = threading.RLock()
+
+# ── Integrity ─────────────────────────────────────────────────────────────
+# Set by attestation.fetch_and_arm() — a 32-byte HMAC-SHA256 key derived from
+# the gateway-issued jti.  ``None`` means signatures are disabled (e.g. the
+# user is running a custom backend that cannot issue attestation tokens).
+_EVENT_HMAC_KEY: Optional[bytes] = None
 
 
 def _log_path() -> Path:
@@ -61,6 +77,19 @@ def _next_seq(path: Path) -> int:
     return _SEQ_BY_PATH[key]
 
 
+def set_hmac_key(key: bytes) -> None:
+    """Install the HMAC key used to sign every subsequent ``append()`` call.
+
+    The key is held in memory (NEVER on disk) and survives for the lifetime
+    of the process.  Called by ``attestation.fetch_and_arm()`` at startup.
+
+    Pass an empty ``bytes()`` to explicitly disable signing (e.g. after a
+    session logout).
+    """
+    global _EVENT_HMAC_KEY
+    _EVENT_HMAC_KEY = key if key else None
+
+
 def append(event_type: str, **fields) -> int:
     """Append an event to the durable log. Returns the sequence number.
 
@@ -77,6 +106,16 @@ def append(event_type: str, **fields) -> int:
                 "ts": time.time(),
                 **fields,
             }
+            # ── Integrity signature (laintas_model) ──
+            # When an HMAC key is active, sign the entry BEFORE writing.
+            # The signature covers every field so any post-hoc edit or
+            # reordering changes the canonical JSON and invalidates _sig.
+            if _EVENT_HMAC_KEY:
+                canonical = json.dumps(
+                    entry, sort_keys=True, ensure_ascii=False, default=str)
+                entry["_sig"] = hmac.new(
+                    _EVENT_HMAC_KEY, canonical.encode("utf-8"),
+                    hashlib.sha256).hexdigest()
             p.parent.mkdir(parents=True, exist_ok=True)
             with open(p, "a", encoding="utf-8") as f:
                 f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
