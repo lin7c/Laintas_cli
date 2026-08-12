@@ -3697,6 +3697,22 @@ def _build_keybindings() -> KeyBindings:
         _update_status_cache(detail=enabled)
         event.app.invalidate()
 
+    @kb.add("enter")
+    def _(event):
+        """Enter: submit on empty/whitespace buffer; otherwise insert a newline.
+        
+        In multiline mode prompt_toolkit disables the default Enter=submit
+        and instead requires Escape+Enter.  This handler restores the
+        submit-on-empty behaviour so the user can type multi-line input
+        (arrow keys move between lines) and submit by clearing or hitting
+        Enter on a blank line — matching the Claude Code input experience.
+        """
+        buf = event.current_buffer
+        if buf.text.strip() == "":
+            buf.validate_and_handle()
+        else:
+            buf.insert_text("\n")
+
     @kb.add("escape")
     def _(event):
         """Esc: clear the current input buffer. Works like Ctrl+C cancel."""
@@ -4116,7 +4132,7 @@ def pt_prompt(cwd: str) -> str:
             user_input = session.prompt(
                 message,
                 style=_build_prompt_style(),
-                multiline=False,
+                multiline=True,
                 rprompt=_render_rprompt,
                 complete_while_typing=True,
             )
