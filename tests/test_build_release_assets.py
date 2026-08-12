@@ -1,8 +1,40 @@
 import json
 import hashlib
+import subprocess
 from pathlib import Path
 
 from scripts import build_release_assets
+
+
+def test_manifest_covers_all_tracked_top_level_modules():
+    """Every git-tracked top-level .py module must be registered in
+    package_manifest.json — that file drives setup.py, the PyInstaller
+    spec, the CI source bundle, and the /v self-update manifest.  A module
+    missing from ``modules`` silently ships in NO release artifact, so an
+    installed CLI would ImportError at runtime (e.g. attestation.py and
+    stuck_signals.py were once missed).
+
+    Untracked work-in-progress files are intentionally excluded: they are
+    not part of any release until they are committed and registered.
+    """
+    repo = Path(build_release_assets.REPO)
+    pm = json.loads((repo / "package_manifest.json").read_text(encoding="utf-8"))
+    modules = set(pm["modules"])
+
+    out = subprocess.run(
+        ["git", "ls-files", "*.py"], cwd=repo,
+        capture_output=True, text=True, check=True)
+    tracked_top = {
+        line[:-3] for line in out.stdout.splitlines()
+        if "/" not in line and line.endswith(".py")
+    }
+    # setup.py is the packaging entry point, not a shipped module.
+    missing = sorted(m for m in tracked_top - modules if m != "setup")
+    assert not missing, f"顶层模块未登记到 package_manifest.json: {missing}"
+    # Sanity: attestation (training-data integrity) must never regress.
+    assert "attestation" in modules
+    assert "stuck_signals" in modules
+
 
 
 def test_source_update_bundle_includes_declared_data_files(tmp_path, monkeypatch):

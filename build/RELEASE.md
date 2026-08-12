@@ -11,6 +11,27 @@ git status
 python3 -m py_compile version.py
 ```
 
+**顶层模块登记校验**：`package_manifest.json` 是所有打包（setup.py、PyInstaller spec、
+CI source 包、`/v` 自更新 manifest）的单一事实来源。新增任何顶层 `.py` 模块后必须登记到
+`modules`，否则该模块不会进入任何发布产物（正式安装的 CLI 上会 `ImportError`）。发布前运行：
+
+```bash
+python3 - <<'PY'
+import json, os
+pm = json.load(open("package_manifest.json"))
+modules = set(pm["modules"])
+top_py = sorted(f[:-3] for f in os.listdir(".") if f.endswith(".py") and os.path.isfile(f))
+missing = [m for m in top_py if m not in modules and m != "setup"]
+assert not missing, f"顶层模块未登记到 package_manifest.json: {missing}"
+print("package_manifest.json 完整: 所有顶层模块均已登记")
+PY
+```
+
+当前登记在案的采集链路模块（`event_log` / `attestation` / `critic` / `precheck` /
+`rag_signals` / `mem_signals` / `stuck_signals` / `redactor`）由
+[laintas_model](https://github.com/lin7c/laintas_model) 训练数据采集使用，
+删除或改名任何模块都必须同步更新该项目的 `collector/`。
+
 修改 [version.py](../version.py) 中的唯一版本号，例如：
 
 ```python
