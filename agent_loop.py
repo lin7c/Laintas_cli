@@ -2722,6 +2722,13 @@ HWO -> HWG only when new coordination or durability requirements appear, and
 retain exactly one authoritative source of progress after promotion.
 </work_orchestration>"""
 
+# What {{inbox}} resolves to in the system prompt. The messages themselves are
+# delivered in the live-state message at the tail of the request (see
+# _build_user_message): they arrive mid-task, and any per-iteration text inside
+# the system prompt would invalidate the provider's cached prefix — the system
+# prompt plus tool schemas are ~24k identical tokens on every call.
+_INBOX_POINTER = "delivered in the <inbox> block of the latest live-state message"
+
 _TERMINAL_OUTPUT_STYLE_PROMPT = """<terminal_output_style>
 Ordinary user-facing output is plain text or Markdown with no forced background.
 Use ANSI color only for real semantic value. For such a short span, choose both
@@ -3601,35 +3608,48 @@ def _read_memory(deps: LoopDeps) -> list[dict]:
     return []
 
 
-def _persistent_memory_block(query: str, session) -> str:
-    """Persistent-memory context for the prompt: the full bulk context plus an
-    additive 'most relevant to this task' highlight. The highlight is best-effort
-    and never removes memories — it only surfaces the ones matching the current
-    task (semantic when the gateway embedding endpoint is available, lexical
-    otherwise). Falls back to plain bulk context on any error."""
+def _persistent_memory_parts(query: str, session) -> tuple[str, str]:
+    """Persistent-memory context, split into ``(bulk, highlight)``.
+
+    ``bulk`` is the full memory context — identical for every task, so it
+    belongs in the system prompt where the provider's prefix cache can keep it.
+    ``highlight`` is the additive 'most relevant to THIS task' block, which
+    changes with the user's input and therefore rides in the transient
+    live-state message at the tail instead; putting it in the system prompt
+    would invalidate the cached prefix on every new task.
+
+    The highlight is best-effort and never removes memories — semantic when the
+    gateway embedding endpoint is available, lexical otherwise. On any error
+    the highlight is empty and the bulk context is unaffected.
+    """
     base = memory_system.get_memory_context()
     try:
         if get_runtime_config("mem_recall_highlight") and str(query or "").strip():
-            hl = mem_recall.relevant_block(str(query), k=5, session=session)
-            if hl:
-                return f"{base}\n\n{hl}"
+            return base, (mem_recall.relevant_block(
+                str(query), k=5, session=session) or "")
     except Exception:
         pass
-    return base
+    return base, ""
 
 
-def _skill_catalog_block(query: str, base_catalog: str, session) -> str:
-    """Skill catalog with a task-relevance highlight prepended. Additive and
-    best-effort — the full catalog is preserved; on any error the base is
-    returned unchanged. Semantic when the embedding endpoint is available,
-    lexical otherwise. See skill_router.py."""
+def _skill_catalog_parts(query: str, base_catalog: str, session) -> tuple[str, str]:
+    """Skill catalog, split into ``(catalog, highlight)`` — same reasoning as
+    ``_persistent_memory_parts``: the catalog is task-independent and stays in
+    the cached system prompt, while the task-relevance line is per-task and
+    moves to the live-state tail. Never raises; on any error the highlight is
+    empty and the catalog is returned unchanged. See skill_router.py."""
     try:
         if get_runtime_config("skill_route_highlight") and str(query or "").strip():
-            return skill_router.annotate_catalog(
+            annotated = skill_router.annotate_catalog(
                 str(query), base_catalog or "", session=session)
+            base = base_catalog or ""
+            # annotate_catalog prepends the highlight line to the catalog;
+            # recover it alone so the catalog half stays byte-identical.
+            if annotated != base and annotated.endswith(base):
+                return base_catalog, annotated[:len(annotated) - len(base)].strip()
     except Exception:
         pass
-    return base_catalog
+    return base_catalog, ""
 
 
 
@@ -5180,8 +5200,16 @@ def _thread_messages_for_turn(reply: str, executed: list) -> list:
 
 def _build_user_message(original_input: str, state: dict, memory_entries: list,
                         chat_history: list, loop: int, max_loops: int,
-                        thread_mode: bool = False, first_turn: bool = True) -> str:
+                        thread_mode: bool = False, first_turn: bool = True,
+                        volatile: Optional[dict] = None) -> str:
     """Compose the user-message body for one agent iteration.
+
+    ``volatile`` carries the context blocks that used to live in the system
+    prompt but change per iteration or per task (inbox, sub-agent results,
+    memory/skill relevance highlights). They belong here, at the tail: the
+    system prompt is the cached prefix every provider matches literally, so
+    anything that changes inside it re-bills the entire request at the
+    cache-miss rate. See the ``_persistent_memory_parts`` docstring.
 
     Section order matters for LLM attention. Recent recommendations and our
     own observations: task first, then the freshest signal (last command +
@@ -5246,6 +5274,28 @@ def _build_user_message(original_input: str, state: dict, memory_entries: list,
     # the first turn (afterwards the original task already lives in the thread as
     # the first user message). This message becomes a per-turn, transient
     # "live state" injection (objective/tasks/warnings/memory) — see Stage C.
+    # Blocks relocated out of the system prompt (see the `volatile` docstring
+    # note). Each is rendered only when it has content, so a plain single-agent
+    # task carries none of them.
+    vol = volatile or {}
+    volatile_block = ""
+    for tag, value in (("inbox", vol.get("inbox")),
+                       ("sub_agent_results", vol.get("parallel_results")),
+                       ("relevant_memory", vol.get("memory_highlight")),
+                       ("relevant_skills", vol.get("skill_highlight"))):
+        text = str(value or "").strip()
+        if text:
+            volatile_block += f"\n<{tag}>\n{text}\n</{tag}>\n"
+
+    # The wall clock belongs here, in the transient tail, NOT in the system
+    # prompt. Every provider we talk to caches prompt prefixes automatically
+    # and matches them literally, so a per-second timestamp anywhere in the
+    # system prompt moves the first differing byte to the front of the request
+    # and turns the whole conversation behind it into a cache miss — on every
+    # one of the ~5 calls a single task makes. This block changes just as often
+    # but sits after everything else, where it costs only itself.
+    now_block = f"\n<now>\n{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} (local)\n</now>\n"
+
     if thread_mode:
         task_block = f"<task>\n{original_input}\n</task>\n" if first_turn else ""
         return f"""{task_block}{objective_block}{approved_plan_block}
@@ -5259,7 +5309,8 @@ step {loop+1}/{max_loops} — {n_steps} command(s) executed so far
 
 <sub_terminals>
 {terminals_snapshot or "(none)"}
-</sub_terminals>"""
+</sub_terminals>
+{volatile_block}{now_block}"""
 
     return f"""<task>
 {original_input}
@@ -5283,7 +5334,8 @@ step {loop+1}/{max_loops} — {n_steps} command(s) executed so far
 
 <sub_terminals>
 {terminals_snapshot or "(none)"}
-</sub_terminals>"""
+</sub_terminals>
+{volatile_block}{now_block}"""
 
 
 def _detect_lang(text: str) -> str:
@@ -6354,13 +6406,16 @@ def run_agent_loop(
         agent_id_str = current_agent.id if current_agent else "unknown"
 
         # Inbox messages this iteration, rendered as a compact JSON block.
+        # This goes into the live-state tail, not the system prompt: it changes
+        # on every iteration that receives a message, and the system prompt has
+        # to stay byte-identical to keep the provider's prefix cache warm.
         if inbox_msgs:
             try:
                 inbox_str = json.dumps(inbox_msgs, ensure_ascii=False, indent=2)
             except (TypeError, ValueError):
                 inbox_str = str(inbox_msgs)
         else:
-            inbox_str = "(empty)"
+            inbox_str = ""
 
         # Children + parent metadata
         if current_agent:
@@ -6404,9 +6459,23 @@ def run_agent_loop(
         # standalone prompt section. Empty/no-op for logged-out sessions.
         tools_mod.refresh_mail_tool_hint(session)
 
+        # Task-dependent halves of these two blocks are relocated to the
+        # live-state tail so the system prompt stays identical across tasks;
+        # only the task-independent bulk stays in the cached prefix.
+        _memory_bulk, _memory_highlight = _persistent_memory_parts(
+            original_input, session)
+        _skill_catalog, _skill_highlight = _skill_catalog_parts(
+            original_input, skill_catalog, session)
+        _volatile_context = {
+            "inbox": inbox_str,
+            "parallel_results": _format_parallel_results(inbox_msgs),
+            "memory_highlight": _memory_highlight,
+            "skill_highlight": _skill_highlight,
+        }
+
         system_prompt = prompt_template \
             .replace("{{globalMemory}}", global_memory_str) \
-            .replace("{{persistentMemory}}", _persistent_memory_block(original_input, session)) \
+            .replace("{{persistentMemory}}", _memory_bulk) \
             .replace("{{durableRules}}", durable_rules.format_for_prompt(os.getcwd())) \
             .replace("{{planMode}}", plan_mode.get_plan_prompt()) \
             .replace("{{promptOpt}}", _prompt_lab_section) \
@@ -6416,7 +6485,7 @@ def run_agent_loop(
             .replace("{{activeFile}}", "None") \
             .replace("{{depth}}", str(depth)) \
             .replace("{{nextDepth}}", str(depth + 1)) \
-            .replace("{{inbox}}", inbox_str) \
+            .replace("{{inbox}}", _INBOX_POINTER) \
             .replace("{{children}}", children_str) \
             .replace("{{parent}}", parent_str) \
             .replace("{{terminalName}}", terminal_name_str) \
@@ -6424,7 +6493,7 @@ def run_agent_loop(
             .replace("{{deploymentStatus}}", deployment_status_str) \
             .replace("{{tools}}", _render_tool_catalog_enhanced(
                 state, loop, depth, _allowed_tool_names)) \
-            .replace("{{skills}}", _skill_catalog_block(original_input, skill_catalog, session))
+            .replace("{{skills}}", _skill_catalog)
         mode_section = (
             "" if plan_mode.is_plan_mode()
             else mode_manager.render_prompt_section()
@@ -6504,9 +6573,11 @@ def run_agent_loop(
         # {{skillContext}} — activated skill bodies (placeholder; skills.py handles)
         system_prompt = system_prompt.replace("{{skillContext}}", skill_context)
 
-        # {{parallelResults}} — aggregated sub-agent results from inbox
-        parallel_results_str = _format_parallel_results(inbox_msgs)
-        system_prompt = system_prompt.replace("{{parallelResults}}", parallel_results_str)
+        # {{parallelResults}} — aggregated sub-agent results, now delivered in
+        # the live-state tail (_volatile_context) because they arrive mid-task.
+        # The placeholder resolves to nothing so an existing cli.prop that
+        # still carries it neither leaks the raw token nor breaks the cache.
+        system_prompt = system_prompt.replace("{{parallelResults}}", "")
 
         # {{behaviorDiagnostics}} — empty placeholder (filled in user message)
         system_prompt = system_prompt.replace("{{behaviorDiagnostics}}", "")
@@ -6535,8 +6606,31 @@ def run_agent_loop(
             + "\n</user_customization>"
         )
 
-        # Inject current date/time so the AI always knows when it is.
-        system_prompt += f"\n\n[CURRENT DATE & TIME]\n{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} (local)"
+        # The current date/time is deliberately NOT appended here — it now
+        # rides in the transient live-state message at the tail of the request
+        # (see _build_user_message). Anything volatile in the system prompt
+        # invalidates the provider's prefix cache for the entire request.
+
+        # Prefix-stability tripwire. The system prompt is rebuilt every
+        # iteration (it must be: skill_load, a mode switch or a workflow phase
+        # change during the task all legitimately alter it), but the REBUILT
+        # STRING should be byte-identical unless one of those really happened.
+        # When it changes for any other reason we have silently gone back to
+        # paying the cache-miss rate on ~24k tokens per call, and the only
+        # symptom is a bigger invoice — so record the transition where /debug
+        # and the event log can show it.
+        _sys_prompt_digest = hashlib.sha256(
+            system_prompt.encode("utf-8", "replace")).hexdigest()[:12]
+        _sys_prompt_prev = state.get("_sys_prompt_digest")
+        _sys_prompt_changed = bool(_sys_prompt_prev
+                                   and _sys_prompt_prev != _sys_prompt_digest)
+        state["_sys_prompt_digest"] = _sys_prompt_digest
+        if _sys_prompt_changed:
+            state["_sys_prompt_churn"] = int(state.get("_sys_prompt_churn", 0)) + 1
+            event_log.append("system_prompt_changed", loop=_loop_id,
+                             digest=_sys_prompt_digest,
+                             previous=_sys_prompt_prev,
+                             churn=state["_sys_prompt_churn"])
 
         # 5. Build user message via the structured-section helper.
         terminal_section = _build_terminal_section(state)
@@ -6562,7 +6656,7 @@ def run_agent_loop(
                                      _detect_lang(original_input), state)
             _live_state = _build_user_message(
                 original_input, state, memory_entries, history_context, loop, max_loops,
-                thread_mode=True, first_turn=False,
+                thread_mode=True, first_turn=False, volatile=_volatile_context,
             )
             user_input = _live_state  # for debug display
             _thread_to_send = thread_messages + (
@@ -6582,6 +6676,7 @@ def run_agent_loop(
             _live_state = None
             user_input = _build_user_message(
                 original_input, state, memory_entries, history_context, loop, max_loops,
+                volatile=_volatile_context,
             )
             _thread_to_send = None
 
@@ -6665,6 +6760,11 @@ def run_agent_loop(
                 "history": history_for_backend,
                 "loadedSkills": [s["name"] for s in skills_mod.list_skills() if s.get("loaded")],
                 "promptLen": len(system_prompt),
+                # Identity of the cached prefix this call presented, and how
+                # many times it has changed within this task. Anything above 0
+                # without a skill/mode/workflow change behind it is lost cache.
+                "promptDigest": _sys_prompt_digest,
+                "promptChurn": int(state.get("_sys_prompt_churn", 0)),
                 "promptPreview": system_prompt[:500],
                 "memorySection": memory_section[:500],
             },
@@ -8452,6 +8552,7 @@ def run_agent_loop(
         history_context = _history_without_current_turn(chat_history, original_input)
         user_input = _build_user_message(
             original_input, state, memory_entries, history_context, loop, max_loops,
+            volatile=_volatile_context,
         )
 
         # ── Inject nudge if the model produced an empty turn ──

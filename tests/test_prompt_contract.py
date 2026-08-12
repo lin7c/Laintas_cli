@@ -90,6 +90,103 @@ class PromptContractTests(unittest.TestCase):
             "Prefer concise evidence-backed reports."), [])
 
 
+class PrefixCacheStabilityTests(unittest.TestCase):
+    """The system prompt is the cached prefix.
+
+    Every provider we run against (DeepSeek, Moonshot, Zhipu, Ark) caches
+    prompt prefixes automatically and matches them by literal comparison, and
+    the system prompt plus the tool schemas are ~24k identical tokens on every
+    call. Anything that changes inside that prefix moves the first differing
+    byte to the front of the request, so the entire conversation behind it is
+    re-billed at the cache-miss rate — on each of the ~5 calls one task makes.
+    These tests pin the invariant: volatile context belongs in the live-state
+    message at the tail, never in the template.
+    """
+
+    def test_template_carries_no_per_turn_values(self):
+        prompt = laintas_cli.generate_cli_prop_template()
+        for volatile in ("{{inbox}}", "{{parallelResults}}"):
+            self.assertNotIn(volatile, prompt)
+        # A clock in the template is the specific regression that cost the
+        # cache on every single call; the runtime must not append one either.
+        self.assertNotIn("CURRENT DATE", prompt)
+
+    def test_relocated_placeholders_still_resolve_for_existing_projects(self):
+        # A project's cli.prop is user-owned and never rewritten, so templates
+        # created before the move still contain these. They must resolve to
+        # something stable rather than leaking the raw token.
+        self.assertNotIn("{{", agent_loop._INBOX_POINTER)
+        self.assertTrue(agent_loop._INBOX_POINTER.strip())
+
+    def test_live_state_carries_the_clock_and_volatile_blocks(self):
+        state = {"terminalHistory": [], "cwd": os.getcwd()}
+        volatile = {
+            "inbox": '[{"kind": "child-done"}]',
+            "parallel_results": "worker-1 finished",
+            "memory_highlight": "★ relevant memory",
+            "skill_highlight": "★ relevant skills",
+        }
+        with mock.patch("agent_loop.get_terminals_snapshot", return_value=""), \
+                mock.patch("agent_loop.task_manager.get_active_tasks_snapshot",
+                           return_value=""), \
+                mock.patch("agent_loop.workgraph.approved_plan_context",
+                           return_value=""):
+            msg = agent_loop._build_user_message(
+                "task", state, [], [], 0, 30,
+                thread_mode=True, first_turn=True, volatile=volatile)
+        self.assertIn("<now>", msg)
+        for tag in ("<inbox>", "<sub_agent_results>",
+                    "<relevant_memory>", "<relevant_skills>"):
+            self.assertIn(tag, msg)
+        # Empty volatile context must not emit empty scaffolding: a plain
+        # single-agent task should carry none of these blocks.
+        with mock.patch("agent_loop.get_terminals_snapshot", return_value=""), \
+                mock.patch("agent_loop.task_manager.get_active_tasks_snapshot",
+                           return_value=""), \
+                mock.patch("agent_loop.workgraph.approved_plan_context",
+                           return_value=""):
+            bare = agent_loop._build_user_message(
+                "task", state, [], [], 0, 30, thread_mode=True, first_turn=True)
+        for tag in ("<inbox>", "<sub_agent_results>",
+                    "<relevant_memory>", "<relevant_skills>"):
+            self.assertNotIn(tag, bare)
+        self.assertIn("<now>", bare)
+
+    def test_memory_and_skill_highlights_are_split_from_their_bulk(self):
+        # The bulk half must be identical regardless of the task, so it can sit
+        # in the cached prefix while only the highlight moves to the tail.
+        with mock.patch("agent_loop.memory_system.get_memory_context",
+                        return_value="BULK"), \
+                mock.patch("agent_loop.get_runtime_config", return_value=True), \
+                mock.patch("agent_loop.mem_recall.relevant_block",
+                           return_value="HL"):
+            bulk_a, hl_a = agent_loop._persistent_memory_parts("task a", None)
+            bulk_b, hl_b = agent_loop._persistent_memory_parts("task b", None)
+        self.assertEqual(bulk_a, bulk_b)
+        self.assertEqual(bulk_a, "BULK")
+        self.assertEqual(hl_a, "HL")
+        self.assertNotIn("HL", bulk_a)
+
+        with mock.patch("agent_loop.get_runtime_config", return_value=True), \
+                mock.patch("agent_loop.skill_router.annotate_catalog",
+                           side_effect=lambda t, base, **k: f"★ {t}\n{base}"):
+            cat_a, s_hl = agent_loop._skill_catalog_parts("task a", "CATALOG", None)
+            cat_b, _ = agent_loop._skill_catalog_parts("task b", "CATALOG", None)
+        self.assertEqual(cat_a, cat_b)
+        self.assertEqual(cat_a, "CATALOG")
+        self.assertEqual(s_hl, "★ task a")
+
+    def test_highlight_failure_leaves_the_cached_half_intact(self):
+        with mock.patch("agent_loop.memory_system.get_memory_context",
+                        return_value="BULK"), \
+                mock.patch("agent_loop.get_runtime_config", return_value=True), \
+                mock.patch("agent_loop.mem_recall.relevant_block",
+                           side_effect=RuntimeError("recall down")):
+            bulk, hl = agent_loop._persistent_memory_parts("task", None)
+        self.assertEqual(bulk, "BULK")
+        self.assertEqual(hl, "")
+
+
 class DurableRuleTests(unittest.TestCase):
     def test_completion_hook_is_idempotent_and_blocks_until_satisfied(self):
         with tempfile.TemporaryDirectory() as tmp:

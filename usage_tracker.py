@@ -42,13 +42,25 @@ def estimate_tokens(text: str) -> int:
 
 def record(*, model: str, prompt_tokens: int, completion_tokens: int,
            cost_cents: int = 0, official: bool = False, backend_kind: str = "",
-           estimated: bool = False, truncated: bool = False) -> None:
-    """Append one AI-call record. Never raises."""
+           estimated: bool = False, truncated: bool = False,
+           cached_prompt_tokens: int = 0) -> None:
+    """Append one AI-call record. Never raises.
+
+    ``cached_prompt_tokens`` is the subset of ``prompt_tokens`` the provider
+    served from its context cache (gateway `_billing.cachedPromptTokens`). It
+    is the diagnostic for prompt-prefix stability: a healthy agent loop reuses
+    the same system prompt + tool schemas every call and should show a high
+    hit rate, while a prefix that changes each turn (a clock in the system
+    prompt, a per-turn block near the top) drives it toward zero and pays the
+    full input rate every time.
+    """
     try:
         rec = {
             "ts": round(time.time(), 3),
             "model": (model or "(default)")[:80],
             "in": max(0, int(prompt_tokens or 0)),
+            "cachedIn": max(0, min(int(cached_prompt_tokens or 0),
+                                   max(0, int(prompt_tokens or 0)))),
             "out": max(0, int(completion_tokens or 0)),
             "costCents": max(0, int(cost_cents or 0)),
             "official": bool(official),
@@ -106,16 +118,20 @@ def _iter_records(since_ts: float) -> Iterator[dict]:
 def _aggregate(records) -> dict:
     """Fold records into totals + a per-model breakdown."""
     models: dict[str, dict] = {}
-    totals = {"calls": 0, "in": 0, "out": 0, "costCents": 0, "estimated": False,
-              "truncated": 0}
+    totals = {"calls": 0, "in": 0, "cachedIn": 0, "out": 0, "costCents": 0,
+              "estimated": False, "truncated": 0}
     for r in records:
         m = models.setdefault(r.get("model", "?"), {
-            "calls": 0, "in": 0, "out": 0, "costCents": 0, "estimated": False,
-            "truncated": 0,
+            "calls": 0, "in": 0, "cachedIn": 0, "out": 0, "costCents": 0,
+            "estimated": False, "truncated": 0,
         })
         for bucket in (m, totals):
             bucket["calls"] += 1
             bucket["in"] += int(r.get("in", 0) or 0)
+            # Absent on records written before cache accounting existed; those
+            # simply contribute 0 hits, so an old file reads as "unknown/low"
+            # rather than breaking the aggregate.
+            bucket["cachedIn"] += int(r.get("cachedIn", 0) or 0)
             bucket["out"] += int(r.get("out", 0) or 0)
             bucket["costCents"] += int(r.get("costCents", 0) or 0)
             bucket["estimated"] = bucket["estimated"] or bool(r.get("estimated"))

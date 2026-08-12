@@ -2227,9 +2227,13 @@ class InteractiveSession:
 
         master_fd, slave_fd = pty.openpty()
 
-        # Get slave terminal attrs
+        # Get slave terminal attrs and disable ECHO so programmatic
+        # input written through the master fd is not echoed back into
+        # the output stream.  Interactive input is handled by the UI
+        # line editor and does not rely on PTY echo.
         try:
             slave_attr = termios.tcgetattr(slave_fd)
+            slave_attr[3] &= ~termios.ECHO  # lflag
         except termios.error:
             slave_attr = None
 
@@ -5495,7 +5499,7 @@ def generate_cli_prop_template() -> str:
     Variables substituted at run time (see agent_loop.run_agent_loop):
       {{agentName}} {{agentId}} {{currentPath}} {{depth}}
       {{globalMemory}} {{persistentMemory}} {{durableRules}} {{lastSession}}
-      {{planMode}} {{tools}} {{inbox}} {{parallelResults}} {{children}} {{parent}}
+      {{planMode}} {{tools}} {{children}} {{parent}}
       {{terminalName}} {{parentTerminal}} {{deploymentStatus}}
       {{workflowPhase}} {{rolePrompt}} {{confidenceGuidance}}
       {{skillContext}} {{promptOpt}}
@@ -5505,6 +5509,16 @@ def generate_cli_prop_template() -> str:
     referenced by this template — {{activeFile}} only ever resolves to the literal
     string "None" and {{behaviorDiagnostics}} is always "", so neither carries
     real signal yet. Add them back here if/when they're wired to real values.
+
+    Everything in this template must be STABLE across the calls of a session.
+    Providers cache prompt prefixes by literal match, and this template plus the
+    tool schemas are ~24k identical tokens on every request; a value that changes
+    per turn (a clock, the inbox, a per-task memory highlight) moves the first
+    differing byte to the front and re-bills the whole conversation behind it at
+    the cache-miss rate. Volatile context goes in the live-state message at the
+    tail instead — see agent_loop._build_user_message. {{inbox}} and
+    {{parallelResults}} are still substituted (to a pointer and to nothing) so
+    existing project templates carrying them keep working.
     """
     shell_info = SHELL_NAME
 
@@ -5518,10 +5532,9 @@ Solve real engineering tasks by reading the repo, using tools, editing files, ru
 - OS: {SYSTEM} | Shell: {shell_info} | CWD: {{{{currentPath}}}}
 - Terminal: {{{{terminalName}}}} | Parent terminal: {{{{parentTerminal}}}}
 - Depth: {{{{depth}}}} | Parent agent: {{{{parent}}}} | Children: {{{{children}}}}
-- Inbox: {{{{inbox}}}}
-{{{{parallelResults}}}}
 - Plan mode: {{{{planMode}}}}
-- Current date/time is appended by the runtime.
+- Live state (current date/time, inbox messages, sub-agent results, task-relevant
+  memory and skills) arrives in the last user message of each turn, not here.
 </environment>
 
 <memory>
@@ -6655,6 +6668,7 @@ def call_backend_stream(
             usage_tracker.record(
                 model=_usage_model,
                 prompt_tokens=(billing_info or {}).get("promptTokens", 0),
+                cached_prompt_tokens=(billing_info or {}).get("cachedPromptTokens", 0),
                 completion_tokens=_completion_tokens,
                 cost_cents=(billing_info or {}).get("costCents", 0),
                 official=bool(billing_info.get("official")),
@@ -10772,6 +10786,31 @@ def _usage_bar(value: int, peak: int, style: str = "accent") -> str:
             f"[rule]{'╌' * (_USAGE_BAR_W - filled)}[/rule]")
 
 
+def _usage_cache_cell(totals: dict, dimmed: bool, row_style: str) -> Text:
+    """Render the share of input tokens the provider served from its cache.
+
+    This is the health check on prompt-prefix stability, not a vanity metric:
+    the system prompt and tool schemas are ~24k identical tokens on every call,
+    so a low rate means something volatile is sitting in front of them and each
+    call is paying the full input rate for text the provider already has.
+
+    Shown as a percentage because the absolute number means nothing without the
+    input total next to it. `—` means the backend reported no cache figures at
+    all (an unmetered backend, or records written before cache accounting), and
+    is deliberately distinct from a real 0%.
+    """
+    total_in = int(totals.get("in", 0) or 0)
+    cached = int(totals.get("cachedIn", 0) or 0)
+    if dimmed or total_in <= 0 or cached <= 0:
+        return Text("—", style=row_style or "muted")
+    pct = cached * 100.0 / total_in
+    # Two thirds is roughly where a stable prefix lands once the conversation
+    # tail is the only uncached part; below a third, the prefix itself is
+    # missing and that is worth making visible.
+    style = "success" if pct >= 66 else ("warning" if pct < 33 else "")
+    return Text(f"{pct:.0f}%", style=row_style or style)
+
+
 def _usage_section(marker_style: str, title: str, note: str = "") -> Text:
     head = Text()
     head.append("▍", style=marker_style)
@@ -10902,7 +10941,7 @@ def _show_usage_command(args: list, session: dict) -> None:
     else:
         scope = Table(box=None, show_edge=False, pad_edge=False, padding=(0, 1))
         scope.add_column("", style="muted", min_width=10)
-        for col in ("calls", "input", "output", "cost"):
+        for col in ("calls", "input", "cached", "output", "cost"):
             scope.add_column(col, justify="right", header_style="muted", min_width=7)
         for label, key in (("session", "session"), ("today", "today"),
                            (f"{days}d", "range")):
@@ -10914,6 +10953,7 @@ def _show_usage_command(args: list, session: dict) -> None:
                 label,
                 Text(str(t["calls"]), style=row_style or "bold"),
                 Text(approx + _fmt_tokens(t["in"]), style=row_style),
+                _usage_cache_cell(t, dimmed, row_style),
                 Text(approx + _fmt_tokens(t["out"]), style=row_style),
                 Text("—" if dimmed else _fmt_cents(t["costCents"]),
                      style=row_style or ("success" if t["costCents"] == 0 else "")),
