@@ -4,6 +4,14 @@ import { motion } from 'framer-motion';
 import { useAuth } from '../contexts/AuthContext';
 import { useLanguage } from '../contexts/LanguageContext';
 
+const USE_ACCOUNTS_SSO = typeof window !== 'undefined' && window.location.hostname === 'cli.laintas.com';
+
+function ssoUrl(mode) {
+  const params = new URLSearchParams({ return_to: window.location.href });
+  if (mode === 'register') params.set('mode', 'register');
+  return `/api/sso/login?${params}`;
+}
+
 export default function LoginPage() {
   const { t } = useLanguage();
   const auth = useAuth();
@@ -20,6 +28,10 @@ export default function LoginPage() {
   const usernameRef = useRef(null);
 
   useEffect(() => { usernameRef.current?.focus(); }, []);
+
+  useEffect(() => {
+    if (USE_ACCOUNTS_SSO) window.location.replace(ssoUrl('login'));
+  }, []);
 
   useEffect(() => {
     if (!sessionLoading && session) {
@@ -67,7 +79,7 @@ export default function LoginPage() {
     if (serverError) setServerError('');
   }
 
-  if (sessionLoading) {
+  if (USE_ACCOUNTS_SSO || sessionLoading) {
     return (
       <div className="min-h-screen flex items-center justify-center">
         <div className="w-5 h-5 border-2 border-current border-t-transparent rounded-full animate-spin" style={{ color: 'var(--text-muted)' }} />

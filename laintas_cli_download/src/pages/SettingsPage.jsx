@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
+import { Link } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import { useAuth } from '../contexts/AuthContext';
 import { useLanguage } from '../contexts/LanguageContext';
@@ -10,7 +10,6 @@ export default function SettingsPage() {
   const { theme, toggleTheme } = useTheme();
   const auth = useAuth();
   const { data: session, isPending } = auth.useSession();
-  const navigate = useNavigate();
   const [signingOut, setSigningOut] = useState(false);
   const [balance, setBalance] = useState(null);
   // The CLI's own monthly allowance. Sold here rather than on a central price
@@ -79,8 +78,9 @@ export default function SettingsPage() {
     setSigningOut(true);
     try {
       await auth.signOut();
-      navigate('/', { replace: true });
-    } catch { setSigningOut(false); }
+    } finally {
+      window.location.replace('https://accounts.laintas.com/login');
+    }
   }
 
   const inputClass = "w-full px-4 py-2.5 rounded-xl text-sm outline-none transition-all duration-200";
@@ -99,8 +99,8 @@ export default function SettingsPage() {
         <div className="text-center rounded-2xl p-8 max-w-md" style={{ background: 'var(--card-bg)', border: '1px solid var(--card-border)' }}>
           <h2 className="font-display text-xl font-semibold italic mb-3" style={{ color: 'var(--text-primary)' }}>未登录</h2>
           <p className="text-sm mb-6" style={{ color: 'var(--text-tertiary)' }}>请先登录后访问设置页面</p>
-          <Link to="/login" className="inline-block px-6 py-2.5 rounded-xl font-semibold text-sm transition-all"
-            style={{ background: 'var(--accent-soft)', color: 'var(--text-primary)' }}>登录</Link>
+          <a href="/api/sso/login?return_to=%2Fsettings" className="inline-block px-6 py-2.5 rounded-xl font-semibold text-sm transition-all"
+            style={{ background: 'var(--accent-soft)', color: 'var(--text-primary)' }}>登录</a>
         </div>
       </div>
     );

@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
+import { Link } from 'react-router-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useLanguage } from '../contexts/LanguageContext';
 import { useTheme } from '../contexts/ThemeContext';
@@ -11,7 +11,6 @@ export default function Header() {
   const { theme, toggleTheme } = useTheme();
   const auth = useAuth();
   const { data: session, isPending } = auth.useSession();
-  const navigate = useNavigate();
 
   const [userOpen, setUserOpen] = useState(false);
   const [modalContent, setModalContent] = useState(null);
@@ -38,8 +37,9 @@ export default function Header() {
     setUserOpen(false);
     try {
       await auth.signOut();
-      navigate('/', { replace: true });
-    } catch {}
+    } finally {
+      window.location.replace('https://accounts.laintas.com/login');
+    }
   }
 
   const navItems = [
@@ -186,8 +186,8 @@ export default function Header() {
                           guest@laintas.com
                         </p>
                       </div>
-                      <Link
-                        to="/login"
+                      <a
+                        href="/api/sso/login?return_to=%2F"
                         onClick={() => setUserOpen(false)}
                         className="block w-full text-left px-3.5 py-2.5 rounded-lg text-sm transition-colors"
                         style={{ color: 'var(--text-secondary)' }}
@@ -195,9 +195,9 @@ export default function Header() {
                         onMouseLeave={e => { e.target.style.background = ''; e.target.style.color = 'var(--text-secondary)'; }}
                       >
                         {t.user.login}
-                      </Link>
-                      <Link
-                        to="/register"
+                      </a>
+                      <a
+                        href="/api/sso/login?mode=register&return_to=%2F"
                         onClick={() => setUserOpen(false)}
                         className="block w-full text-left px-3.5 py-2.5 rounded-lg text-sm transition-colors"
                         style={{ color: 'var(--text-secondary)' }}
@@ -205,7 +205,7 @@ export default function Header() {
                         onMouseLeave={e => { e.target.style.background = ''; e.target.style.color = 'var(--text-secondary)'; }}
                       >
                         {t.user.register}
-                      </Link>
+                      </a>
                     </>
                   )}
                 </motion.div>
