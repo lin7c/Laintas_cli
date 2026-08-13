@@ -5678,6 +5678,36 @@ def _resume_last_assistant_excerpt(blob: Optional[dict], max_len: int = 80) -> s
     return str(blob.get("title") or "")[:max_len]
 
 
+def _acquire_resume_lease(blob: dict) -> Optional[dict]:
+    """Try to take ownership of a resumed session before restoring it.
+
+    A session must not be held by two live instances at once — both would
+    write the same resume file and last-writer-wins would drop one side's
+    progress.  Returns the blob to resume on success, or None (with a
+    warning printed) when another live instance currently owns it.
+    """
+    session_id = str(
+        blob.get("session_id")
+        or (blob.get("state") or {}).get("_session_id") or "")
+    if not session_id:
+        return blob   # no session id → nothing to lock
+    try:
+        import peer_coordination
+        result = peer_coordination.acquire_session_lease(blob.get("cwd") or os.getcwd(),
+                                                         session_id)
+    except Exception:
+        return blob   # best-effort: never block resume on a failure
+    if not result.get("ok"):
+        owner = result.get("owner") or {}
+        console.print(
+            f"[yellow]This session is already open in another running instance "
+            f"(pid {owner.get('pid', '?')}). Resuming it here would make two "
+            f"instances write the same session and overwrite each other's "
+            f"progress. Not resuming.[/yellow]")
+        return None
+    return blob
+
+
 def _restore_resume_blob(blob: dict, chat_history: list) -> dict:
     """Restore full-fidelity conversation state from a per-cwd resume blob.
 
@@ -7389,6 +7419,15 @@ class AgentRegistry:
             return
         backend_url = get_backend_url()
         headers = self._agent_auth_headers()
+        # Attach attestation JWT so the gateway can verify the client passed
+        # version gating and is authorized to push training-data events.
+        try:
+            import attestation
+            _jwt = attestation.get_jwt()
+            if _jwt:
+                headers["X-Laintas-Attestation"] = _jwt
+        except Exception:
+            pass
         try:
             requests.post(
                 f"{backend_url}/api/agents/{self.agent_id}/events",
@@ -19880,6 +19919,8 @@ def run_execute_mode(task: str, session: dict, depth: int, session_id: str = Non
     if session_id:
         saved = load_resume_state(os.getcwd(), session_id=session_id)
         if saved:
+            saved = _acquire_resume_lease(saved)
+        if saved:
             agent_state = _restore_resume_blob(saved, chat_history)
         else:
             agent_state["_session_id"] = session_id
@@ -20019,6 +20060,19 @@ def main():
                         help="Hand this sub-terminal over to Helpwo at startup (internal; used by term-new)")
     args = parser.parse_args()
 
+    # ── Cross-instance coordination: register this process in the peer
+    # registry so other laintas_cli instances sharing this cwd can see it.
+    # atexit deregisters on every exit path (sys.exit, REPL end, exception).
+    # Single instance: one atomic write at startup + mtime refresh per turn.
+    try:
+        import atexit
+        import peer_coordination
+        peer_coordination.get_coord().register(os.getcwd())
+        atexit.register(peer_coordination.get_coord().unregister)
+        atexit.register(peer_coordination.release_all_leases)
+    except Exception:
+        pass
+
     # Apply environment overrides
     if args.backend:
         os.environ["LAINTAS_BACKEND"] = args.backend
@@ -20146,6 +20200,15 @@ def main():
         except Exception:
             pass
 
+        # Arm event-log HMAC integrity for training-data verification
+        # (best-effort; official backends only, never blocks startup).
+        if _active_backend.sends_laintas_credentials and session:
+            try:
+                import attestation
+                attestation.fetch_and_arm(timeout=2.0)
+            except Exception:
+                pass
+
         # Mail mode's watcher runs for the whole process lifetime and
         # self-gates on the active mode each poll — started once here rather
         # than wired into every /mode switch branch. No-ops until /mode mail
@@ -20215,6 +20278,8 @@ def main():
             _ago = _format_time_ago(_resume_blob.get("timestamp", 0))
             if args.resume or args.continue_session:
                 _selected_resume = _choose_resume_blob(_session_start_cwd, "latest")
+                if _selected_resume:
+                    _selected_resume = _acquire_resume_lease(_selected_resume)
                 if _selected_resume:
                     if current_live_session:
                         session_store.close_session(current_live_session)
@@ -20736,6 +20801,10 @@ def main():
             else:
                 # Multiple saved sessions — open the full-screen picker.
                 _blob = show_resume_picker(_session_start_cwd)
+            if _blob and not _blob.get("chat_history"):
+                console.print("[yellow]Saved session has no conversation to resume.[/yellow]")
+            elif _blob:
+                _blob = _acquire_resume_lease(_blob)
             if _blob and not _blob.get("chat_history"):
                 console.print("[yellow]Saved session has no conversation to resume.[/yellow]")
             elif _blob:

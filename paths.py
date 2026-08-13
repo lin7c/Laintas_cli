@@ -148,6 +148,9 @@ PLANS_STATE   = PLANS_DIR / "_state.json"
 AGENTS_DIR    = LAINTAS_HOME / "agents"
 SKILLS_DIR    = LAINTAS_HOME / "skills"
 SESSIONS_DIR  = LAINTAS_HOME / "sessions"
+INSTANCES_DIR = LAINTAS_HOME / "instances"   # cross-instance peer registry (0700)
+WRITES_DIR    = LAINTAS_HOME / "writes"      # cross-instance write log (0700)
+SESSION_LOCKS_DIR = LAINTAS_HOME / "session_locks"  # per-session ownership leases (0700)
 
 # Prompt self-optimization: feedback log + candidate drafts + applied-patch state.
 # Lives under ~/.laintas/ (NOT per-cwd) so it survives /reload (which only wipes

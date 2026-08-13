@@ -831,7 +831,10 @@ def _bi_fs_read(params: dict, ctx: ToolCtx) -> dict:
     else:
         body = "\n".join(selected)
 
-    return {
+    # Cross-instance coordination: record the file's etag and report whether
+    # it changed since this instance last read it (stale-context detection).
+    # Inert for a single instance (no fingerprint tracking while inactive).
+    result = {
         "ok": True,
         "result": body,
         "path": abs_path,
@@ -841,6 +844,16 @@ def _bi_fs_read(params: dict, ctx: ToolCtx) -> dict:
         "truncated": byte_truncated or line_truncated,
         "byte_truncated": byte_truncated,
     }
+    try:
+        import peer_coordination
+        note = peer_coordination.get_coord().note_read(abs_path)
+        if note.get("changed"):
+            result["external_change"] = (
+                "file changed since this instance last read it — content may "
+                "differ from what is in context; re-read fully before editing")
+    except Exception:
+        pass
+    return result
 
 
 def _check_file_write_policy(abs_path: str, ctx: ToolCtx, diff_preview: str) -> Optional[dict]:
@@ -1402,11 +1415,30 @@ def _bi_fs_write(params: dict, ctx: ToolCtx) -> dict:
     if blocked is not None:
         return blocked
 
+    # Cross-instance coordination: CAS — refuse to overwrite a file that
+    # changed since this instance last read it (silent lost-update guard).
+    try:
+        import peer_coordination
+        _stale = peer_coordination.get_coord().assert_unchanged(abs_path)
+        if _stale is not None:
+            return {"ok": False,
+                    "error": f"Blocked by cross-instance coordination: {_stale}",
+                    "path": abs_path}
+    except Exception:
+        pass
+
     try:
         with open(abs_path, "w", encoding="utf-8") as f:
             f.write(content)
     except OSError as e:
         return {"ok": False, "error": str(e)}
+
+    try:
+        import peer_coordination
+        peer_coordination.get_coord().note_write(abs_path)
+        peer_coordination.get_coord().log_write(abs_path, "write")
+    except Exception:
+        pass
 
     action = "updated" if existed else "created"
     if _run_formatter(abs_path):
@@ -1955,10 +1987,25 @@ def _bi_fs_edit(params: dict, ctx: ToolCtx) -> dict:
         if blocked is not None:
             return blocked
         try:
+            import peer_coordination
+            _stale = peer_coordination.get_coord().assert_unchanged(abs_path)
+            if _stale is not None:
+                return {"ok": False,
+                        "error": f"Blocked by cross-instance coordination: {_stale}",
+                        "path": abs_path}
+        except Exception:
+            pass
+        try:
             with open(abs_path, "w", encoding="utf-8") as f:
                 f.write(new_content)
         except OSError as e:
             return {"ok": False, "error": str(e)}
+        try:
+            import peer_coordination
+            peer_coordination.get_coord().note_write(abs_path)
+            peer_coordination.get_coord().log_write(abs_path, "edit")
+        except Exception:
+            pass
         return _attach_diagnostics({"ok": True, "result": f"Edited {path} (fuzzy match: {_fuzzy_strategy})",
                 "diff": diff, "tool": "fs.edit", "fuzzy": _fuzzy_strategy}, abs_path)
 
@@ -1987,10 +2034,27 @@ def _bi_fs_edit(params: dict, ctx: ToolCtx) -> dict:
         return blocked
 
     try:
+        import peer_coordination
+        _stale = peer_coordination.get_coord().assert_unchanged(abs_path)
+        if _stale is not None:
+            return {"ok": False,
+                    "error": f"Blocked by cross-instance coordination: {_stale}",
+                    "path": abs_path}
+    except Exception:
+        pass
+
+    try:
         with open(abs_path, "w", encoding="utf-8") as f:
             f.write(new_content)
     except OSError as e:
         return {"ok": False, "error": str(e)}
+
+    try:
+        import peer_coordination
+        peer_coordination.get_coord().note_write(abs_path)
+        peer_coordination.get_coord().log_write(abs_path, "edit")
+    except Exception:
+        pass
 
     return _attach_diagnostics({
         "ok": True,
@@ -2056,10 +2120,27 @@ def _bi_fs_multi_edit(params: dict, ctx: ToolCtx) -> dict:
         return blocked
 
     try:
+        import peer_coordination
+        _stale = peer_coordination.get_coord().assert_unchanged(abs_path)
+        if _stale is not None:
+            return {"ok": False,
+                    "error": f"Blocked by cross-instance coordination: {_stale}",
+                    "path": abs_path}
+    except Exception:
+        pass
+
+    try:
         with open(abs_path, "w", encoding="utf-8") as f:
             f.write(working)
     except OSError as e:
         return {"ok": False, "error": str(e)}
+
+    try:
+        import peer_coordination
+        peer_coordination.get_coord().note_write(abs_path)
+        peer_coordination.get_coord().log_write(abs_path, "multi_edit")
+    except Exception:
+        pass
 
     return _attach_diagnostics({"ok": True, "result": f"Applied {len(applied)} edits to {abs_path}",
             "path": abs_path, "edits_applied": applied,

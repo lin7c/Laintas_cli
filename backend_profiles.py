@@ -141,6 +141,13 @@ def _policy_headers() -> dict:
 def request_auth(profile: BackendProfile, session: Optional[dict]) -> tuple[dict, dict]:
     """Return (headers, cookies) appropriate for this backend trust domain."""
     headers = {"Content-Type": "application/json", **_policy_headers()}
+    # Report the CLI version on every gateway request so the gateway can
+    # enforce "latest version only" server-side (the single authority).
+    try:
+        from version import __version__ as _cli_ver
+    except Exception:
+        _cli_ver = "0.0.0"
+    headers["X-Laintas-Version"] = str(_cli_ver)
     session = session or {}
     if profile.sends_laintas_credentials:
         authorization = (session.get("headers") or {}).get("Authorization")

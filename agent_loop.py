@@ -35,6 +35,7 @@ import workflow_engine        # Structured multi-phase workflow engine
 import task_manager          # Structured task tracking (session + persisted)
 import workgraph             # Unified objective/plan/steps/workflow authority
 import paths                 # Centralized path management
+import peer_coordination     # Cross-instance file-conflict coordination
 import skills as skills_mod   # Progressive skill metadata + context loading
 import symbols                # Centralized UI symbol constants
 import event_log              # Durable prompt admission + turn event log
@@ -98,6 +99,7 @@ _DEFAULT_CONFIG = {
     "remote_control_workers": 2,  # concurrently running abort/approval controls
     "remote_control_queue_size": 8,  # queued remote control messages
     "heartbeat_interval": 30,     # seconds — agent heartbeat
+    "peer_coordination": "auto",  # cross-instance conflict detection: auto (lazy, on with 2+ peers) / off
     "staleness_limit": 3,         # consecutive no-tool steps before auto-exit
     "repetition_threshold": 3,    # consecutive no-progress steps before force-exit (mirrors TokenBudgetTracker)
     "warning_force_limit": 5,     # consecutive warning count before force-exit when repetition_policy=interrupt
@@ -557,6 +559,7 @@ _RUNTIME_CONFIG_DESCRIPTIONS = {
     "remote_control_workers": "Maximum concurrently running remote control messages",
     "remote_control_queue_size": "Maximum queued remote control messages",
     "heartbeat_interval": "Agent heartbeat interval in seconds",
+    "peer_coordination": "Cross-instance file-conflict detection: auto (lazy — activates only with 2+ live peers in the same cwd) or off",
     "staleness_limit": "Consecutive idle steps before exit",
     "repetition_threshold": "Consecutive repeated-output steps before exit",
     "warning_force_limit": "Repeated warning limit before forced exit in interrupt mode",
@@ -6190,6 +6193,13 @@ def run_agent_loop(
     # task lifetime.
     state["_overflow_retry"] = 0
     for loop in range(max_loops):
+        # Cross-instance coordination: refresh heartbeat + (re)detect whether
+        # another laintas_cli instance shares this cwd.  Lazy — while alone,
+        # this only refreshes the registration mtime and costs one listdir.
+        try:
+            peer_coordination.get_coord().maybe_update()
+        except Exception:
+            pass
         # Only the iteration that actually terminates the run may supply the
         # completion source.  Workflow phase advancement can turn a nominal
         # completion back into continuation.
