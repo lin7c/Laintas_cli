@@ -90,6 +90,27 @@ def set_hmac_key(key: bytes) -> None:
     _EVENT_HMAC_KEY = key if key else None
 
 
+def sign_json_row(row: dict) -> dict:
+    """Sign a JSON-serializable row dict with the active HMAC key, in-place.
+
+    Returns the same dict (mutated).  When no key is active this is a no-op.
+    Idempotent: removes any existing ``_sig`` before signing so repeated calls
+    produce the same output.  Never raises.
+    """
+    try:
+        if not _EVENT_HMAC_KEY:
+            return row
+        row.pop("_sig", None)
+        canonical = json.dumps(
+            row, sort_keys=True, ensure_ascii=False, default=str)
+        row["_sig"] = hmac.new(
+            _EVENT_HMAC_KEY, canonical.encode("utf-8"),
+            hashlib.sha256).hexdigest()
+    except Exception:
+        pass
+    return row
+
+
 def append(event_type: str, **fields) -> int:
     """Append an event to the durable log. Returns the sequence number.
 
@@ -107,15 +128,7 @@ def append(event_type: str, **fields) -> int:
                 **fields,
             }
             # ── Integrity signature (laintas_model) ──
-            # When an HMAC key is active, sign the entry BEFORE writing.
-            # The signature covers every field so any post-hoc edit or
-            # reordering changes the canonical JSON and invalidates _sig.
-            if _EVENT_HMAC_KEY:
-                canonical = json.dumps(
-                    entry, sort_keys=True, ensure_ascii=False, default=str)
-                entry["_sig"] = hmac.new(
-                    _EVENT_HMAC_KEY, canonical.encode("utf-8"),
-                    hashlib.sha256).hexdigest()
+            sign_json_row(entry)
             p.parent.mkdir(parents=True, exist_ok=True)
             with open(p, "a", encoding="utf-8") as f:
                 f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
