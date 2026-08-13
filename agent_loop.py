@@ -8288,7 +8288,7 @@ def run_agent_loop(
             _step_note = action_desc_short or "(no tool call)"
             _append_short_memory(
                 state,
-                f"\n  Step {loop+1}: {_step_note} | result: {state.get('lastOutput','')[:200]}"
+                f"\n  Step {loop+1}: {_step_note}"
             )
         state["terminalHistory"].extend(per_call_rows)
 
