@@ -118,6 +118,39 @@ class AgentTerminationTests(unittest.TestCase):
             )
         return result, calls, history
 
+    def test_detail_recording_enriches_history_without_expanding_renderer(self):
+        agent_loop.set_runtime_config("detail", True)
+        responses = [
+            {
+                "reply": "checking",
+                "tool_calls": [{"name": "time.now", "arguments": {}}],
+                "finish_reason": "tool_calls", "done": False, "error": False,
+            },
+            {
+                "reply": "finished",
+                "tool_calls": [],
+                "finish_reason": "stop", "done": False, "error": False,
+            },
+        ]
+        deps, _ = _deps(responses)
+        history = [{"role": "user", "content": "check time"}]
+        with tempfile.TemporaryDirectory() as tmp, _chdir(tmp):
+            Path(".laintas").mkdir()
+            agent_loop.run_agent_loop(
+                deps, "check time", {}, {}, history,
+                events_cb=lambda events: None, max_loops_override=3)
+
+        self.assertTrue(history[0]["detail_trace"])
+        roles = [message.get("role") for message in history]
+        self.assertEqual(roles, ["user", "assistant", "tool", "assistant"])
+        tool_message = next(
+            message for message in history if message.get("role") == "tool")
+        self.assertEqual(tool_message["trace"]["tool"], "time.now")
+        self.assertIn("content", tool_message["trace"])
+        # Detail recording must not call the old expanded-output render hooks.
+        self.assertFalse(deps.display_command_output.called
+                         if hasattr(deps.display_command_output, "called") else False)
+
     def test_truncated_prose_continues_instead_of_completing(self):
         result, calls, _ = self._run([
             {

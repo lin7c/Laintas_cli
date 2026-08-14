@@ -245,11 +245,34 @@ class AgentUIEventHub:
                     }]
         return rows[-max(1, int(limit)):]
 
+    def events_snapshot(self, terminal_name: str = "", limit: int = 500
+                        ) -> tuple[int, list[AgentUIEvent]]:
+        """Return one consistent revision + event view for render caches."""
+        with self._lock:
+            revision = self._seq
+            rows = list(self._events)
+        if terminal_name:
+            rows = [row for row in rows
+                    if row.terminal_name == terminal_name
+                    or terminal_name in {
+                        str(row.data.get("sourceTerminalName") or ""),
+                        str(row.data.get("targetTerminalName") or ""),
+                    }]
+        return revision, rows[-max(1, int(limit)):]
+
     def agent_events(self, agent_id: str, limit: int = 1000
                      ) -> list[AgentUIEvent]:
         with self._lock:
             rows = list(self._agent_events.get(agent_id, ()))
         return rows[-max(1, int(limit)):]
+
+    def agent_events_snapshot(self, agent_id: str, limit: int = 1000
+                              ) -> tuple[int, list[AgentUIEvent]]:
+        """Return a cache key and detached list under a single lock hold."""
+        with self._lock:
+            revision = self._seq
+            rows = list(self._agent_events.get(agent_id, ()))
+        return revision, rows[-max(1, int(limit)):]
 
     @staticmethod
     def needs_attention(event: AgentUIEvent) -> bool:

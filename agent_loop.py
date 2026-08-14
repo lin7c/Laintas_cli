@@ -50,6 +50,7 @@ import durable_rules         # Structured long-lived user obligations
 import auto_pilot            # Heuristic task classification + decomposition + auto-exec
 import trust_store            # workspace trust for executable project hooks
 import usage_tracker          # Local AI token/cost accounting
+import detail_trace           # Optional per-conversation tool/output recording
 try:
     import context_policy as ctxpol  # Vendored shared compaction policy (opencode-derived)
 except Exception:  # pragma: no cover — graceful if the vendored package is missing
@@ -121,15 +122,15 @@ _DEFAULT_CONFIG = {
     "browser_action_delay_max": 1.5,   # max seconds of anti-bot delay before browser actions
     "browser_post_action_wait": 0.5,   # seconds to wait for SPA DOM updates before auto-snapshot
     "browser_auto_snapshot": True,     # return page snapshot after state-changing browser actions
-    "detail": False,                   # False = simplified progress rendering; True = full per-line detail (/detail on|off)
+    "detail": False,                   # Record per-conversation tool/AI details for /detail trace; live rendering is unchanged
     "stream_preview": "one",          # off / one / detail (three-line bounded tail)
     "theme": "dark",                  # dark / light / mono semantic palette
     "markdown_theme": "default",       # default / green-red / custom (custom reads the global markdown_theme.json)
     "deny_exits_loop": True,           # True = terminate the agent loop the moment the user denies an approval prompt; False = old behavior (feed denial back as a tool error and keep looping)
-    "precheck_capture": True,          # True = log each tool call's (features → outcome) to .laintas/precheck_samples.jsonl as training data for the tool-precheck model (see precheck.py). Redacted + best-effort; never affects execution. Default ON.
-    "redact_capture": True,            # True = weak-label outbound secrets/PII to .laintas/redact_samples.jsonl (redacted text + typed spans only) as training data for the redaction model (see redactor.py). Never mutates what is sent. Default ON.
+    "precheck_capture": False,         # Training-content capture is explicit opt-in. Operational execution never depends on it.
+    "redact_capture": False,           # Training-content capture is explicit opt-in. Secret enforcement remains a separate control.
     "redact_enforce": False,           # True = actually scrub detected secrets/PII from context BEFORE upload. Default False: measure via capture first, flip on once confident it won't strip context the model needs.
-    "rag_capture": True,               # True = log retrieval-rerank signal (search tool → subsequent file open) to .laintas/rag_signals.jsonl as training data for the reranker (see rag_signals.py). Advisory; never affects execution. Default ON.
+    "rag_capture": False,              # Training-content capture is explicit opt-in; no passive coding-session collection.
     "mem_recall_highlight": True,      # True = append a "most relevant to this task" section (semantic recall over all persistent memories, lexical fallback) to the injected memory context. Purely additive — never drops memories. See mem_recall.py.
     "skill_route_highlight": True,      # True = prepend a "most relevant skills for this task" line to the skill catalog (semantic ranking, lexical fallback) so the model loads the right skill first. Purely additive — the full catalog is preserved. See skill_router.py.
     "mem_extract_on_complete": False,  # True = ALSO extract durable memories on every successful task completion. Default OFF: consolidation now happens at compaction time only (mem_extract_on_compact) to keep it rare and cheap. See mem_extract.py.
@@ -566,15 +567,15 @@ _RUNTIME_CONFIG_DESCRIPTIONS = {
     "deterministic_repeat_limit": "Identical failing tool-call attempts before warning or interrupt",
     "output_similarity": "Repeated-output similarity threshold (0-1)",
     "repetition_policy": "How repeated behavior is handled: warn or interrupt",
-    "detail": "Show full per-line tool detail (True) or simplified progress (False)",
+    "detail": "Record tool calls, outputs, and whole-file changes for /detail trace (live display unchanged)",
     "stream_preview": "Streaming prose preview: off, one, or detail",
     "theme": "Terminal UI theme: dark, light, or mono",
     "markdown_theme": "Markdown output palette: default, green-red, or custom (custom reads the global markdown_theme.json)",
     "deny_exits_loop": "Terminate the agent loop immediately when the user denies an approval prompt",
-    "precheck_capture": "Log tool-call (features → outcome) rows to .laintas/precheck_samples.jsonl as training data (redacted, advisory)",
-    "redact_capture": "Weak-label outbound secrets/PII to .laintas/redact_samples.jsonl as training data (never mutates what is sent)",
+    "precheck_capture": "Log local tool-call diagnostics to .laintas/precheck_samples.jsonl (never uploaded by laintas_cli)",
+    "redact_capture": "Log local redacted secret/PII diagnostics to .laintas/redact_samples.jsonl (never uploaded by laintas_cli)",
     "redact_enforce": "Actually scrub detected secrets/PII from context before upload (default off — capture-only until confident)",
-    "rag_capture": "Log retrieval-rerank signal (search tool → subsequent file open) to .laintas/rag_signals.jsonl as training data (advisory)",
+    "rag_capture": "Log local retrieval diagnostics to .laintas/rag_signals.jsonl (never uploaded by laintas_cli)",
     "mem_recall_highlight": "Append a task-relevant memory highlight (semantic recall, lexical fallback) to the injected memory context (additive; never drops memories)",
     "skill_route_highlight": "Prepend a task-relevant 'most relevant skills' line to the skill catalog (semantic ranking, lexical fallback; additive)",
     "mem_extract_on_complete": "ALSO extract durable memories on task completion (default off; consolidation runs at compaction time instead)",
@@ -5679,7 +5680,7 @@ def _salient_arg(name: str, arguments: dict) -> str:
         if limit:
             return f"{path}@1+{limit}"
         return path
-    if name in ("fs.write", "fs.edit", "fs.multi_edit", "fs.diff"):
+    if name in ("fs.write", "fs.edit", "fs.multi_edit", "fs.delete", "fs.diff"):
         return arguments.get("path", "") or ""
     if name == "fs.grep":
         return f'{arguments.get("pattern", "")} in {arguments.get("path", "")}'
@@ -6011,6 +6012,16 @@ def run_agent_loop(
     )
     if chat_history is None:
         chat_history = []
+
+    # /detail on records this prompt's execution without changing the compact
+    # live renderer.  The marker rides with chat history into resume/session
+    # persistence and is the boundary used by /detail trace [n].
+    _trace_recording = bool(get_runtime_config("detail"))
+    if _trace_recording:
+        for _message in reversed(chat_history):
+            if isinstance(_message, dict) and _message.get("role") == "user":
+                _message["detail_trace"] = True
+                break
 
     # ── Pin the objective (durable goal anchor) ────────────────────────────
     # A session can contain multiple tasks.  This objective identifies the
@@ -6714,8 +6725,9 @@ def run_agent_loop(
                     return (resp or {}).get("reply", "") if isinstance(resp, dict) else ""
 
                 _verdict = critic.assess(original_input, _thread_to_send, _crit_llm_fn)
-                # Persist critic score for training-data quality filtering.
-                # laintas_model collector reads this to compute Gold/Silver/Bronze tiers.
+                # Persist critic score for local diagnostics only. The server
+                # training pipeline does not read client critic scores.
+                # Local diagnostics only; server-side training ignores it.
                 if isinstance(_verdict, dict) and _verdict.get("score") is not None:
                     event_log.append("critic_assessment",
                                      score=_verdict.get("score"),
@@ -6789,7 +6801,9 @@ def run_agent_loop(
 
         # 5. Call backend (skip spinner in non-interactive/execute mode)
         lang = _detect_lang(original_input)
-        _detail = bool(get_runtime_config("detail"))
+        # Detail mode now controls background trace capture only.  Live tool
+        # progress deliberately stays in the existing compact presentation.
+        _detail = False
         _thinking_t0 = time.monotonic()
         if events_cb is not None:
             # Streaming render: use rich.live.Live to render the reply as it arrives
@@ -7422,6 +7436,11 @@ def run_agent_loop(
                 call_id = f"call_{loop+1:02d}_{idx+1:02d}"
                 _tool_t0 = time.monotonic()
                 salient = _salient_arg(name, arguments)
+                _trace_before = (
+                    detail_trace.capture_before(
+                        name, arguments, state.get("cwd") or os.getcwd())
+                    if _trace_recording else {}
+                )
                 is_shell_flavored = name in ("shell.exec", "terminal.send", "terminal.exec")
                 _tool_definition = tools_mod.get_registry().get(name)
                 event_log.append(
@@ -7962,7 +7981,7 @@ def run_agent_loop(
                 # material; treating tool output as knowledge made resume
                 # transcripts both noisy and semantically wrong.
                 if events_cb is not None:
-                    chat_history.append({
+                    _history_tool = {
                         "role": "tool",
                         "content": formatted[:2000],
                         "tool_name": name,
@@ -7971,7 +7990,14 @@ def run_agent_loop(
                         "call_id": call_id,
                         "ok": bool(result.get("ok", False)),
                         "returncode": _rc,
-                    })
+                    }
+                    if _trace_recording:
+                        _history_tool["trace"] = detail_trace.build_tool_trace(
+                            name, display_name, arguments, result, formatted,
+                            _tool_elapsed, state.get("cwd") or os.getcwd(),
+                            _trace_before,
+                        )
+                    chat_history.append(_history_tool)
                     history_events_recorded = True
 
                 # ── Debug + events ──

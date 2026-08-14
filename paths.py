@@ -304,4 +304,10 @@ def ensure_project_dir() -> Path:
     """Create <cwd>/.laintas/ if it doesn't exist. Returns the directory path."""
     d = project_dir()
     d.mkdir(parents=True, exist_ok=True)
+    try:
+        if not d.is_symlink() and (
+                not hasattr(os, "getuid") or d.stat().st_uid == os.getuid()):
+            d.chmod(stat.S_IRWXU)
+    except OSError:
+        pass
     return d

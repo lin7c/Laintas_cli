@@ -73,6 +73,7 @@ Useful commands:
 |---|---|
 | `/help` | Show available commands (including extension commands) |
 | `/login` | Re-authenticate with Laintas |
+| `/training [status\|on\|off]` | Manage optional, account-level training-data sharing |
 | `/mode` | Switch between plan, review, act, study, and auto modes |
 | `/plan` | Create, revise, submit, or approve a versioned plan |
 | `/task` | Track project tasks and dependencies |

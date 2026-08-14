@@ -71,6 +71,15 @@ class SlashRegistryTests(unittest.TestCase):
         self.assertEqual(set(names), set(laintas_cli.MetaCompleter.META_COMMANDS))
         self.assertIn("/resume", names)
         self.assertIn("/compact", names)
+        self.assertIn("/training", names)
+        training = next(
+            spec for spec in laintas_cli.COMMAND_SPECS
+            if spec.name == "/training")
+        self.assertEqual(training.subcommands, ("status", "on", "off"))
+        detail = next(
+            spec for spec in laintas_cli.COMMAND_SPECS
+            if spec.name == "/detail")
+        self.assertEqual(detail.subcommands, ("on", "off", "trace"))
         self.assertIn("/clear", names)
         self.assertIn("/clear", laintas_cli._NEW_SESSION_COMMANDS)
         palette_descriptions = dict(laintas_cli._COMMANDS)
@@ -81,6 +90,53 @@ class SlashRegistryTests(unittest.TestCase):
         self.assertIn("/agent", palette_descriptions)
         self.assertIn("/agents", palette_descriptions)
         self.assertIn("agent-id-or-name", palette_descriptions["/agent"])
+
+    def test_detail_on_records_without_changing_live_display(self):
+        with mock.patch.object(laintas_cli, "set_runtime_config") as set_config, \
+                mock.patch.object(
+                    laintas_cli.terminal_preferences,
+                    "set_ui_preference") as set_preference:
+            laintas_cli._cmd_detail(["/detail", "on"])
+        set_config.assert_called_once_with("detail", True)
+        set_preference.assert_called_once_with("detail", True)
+
+    def test_detail_trace_uses_newest_conversation_by_default(self):
+        chat = [{"role": "user", "content": "hello", "detail_trace": True}]
+        old = getattr(
+            laintas_cli.handle_meta_command, "_last_chat_history", None)
+        laintas_cli.handle_meta_command._last_chat_history = chat
+        try:
+            with mock.patch.object(
+                    laintas_cli, "_browse_detail_trace") as browse:
+                laintas_cli._cmd_detail(["/detail", "trace"])
+            browse.assert_called_once_with(chat, 1)
+        finally:
+            laintas_cli.handle_meta_command._last_chat_history = old
+
+    def test_detail_trace_accepts_conversation_number(self):
+        with mock.patch.object(
+                laintas_cli, "_browse_detail_trace") as browse:
+            laintas_cli._cmd_detail(["/detail", "trace", "3"])
+        self.assertEqual(browse.call_args.args[1], 3)
+
+    def test_detail_file_view_builds_full_screen_viewer(self):
+        item = {
+            "kind": "tool",
+            "message": {
+                "summary": "mode_manager.py",
+                "trace": {
+                    "tool": "fs.edit",
+                    "display_name": "Edit",
+                    "before": "one\ntwo\nthree",
+                    "after": "one\nTWO\nthree",
+                    "diff": "-two\n+TWO",
+                },
+            },
+        }
+        with mock.patch(
+                "prompt_toolkit.application.Application.run") as run:
+            laintas_cli._show_detail_trace_item(item)
+        run.assert_called_once_with()
 
     def test_exact_slash_command_keeps_a_visible_completion(self):
         completions = self._complete("/task")
@@ -228,61 +284,115 @@ class SlashRegistryTests(unittest.TestCase):
             {"role": "assistant", "content": "second answer"},
             {"role": "assistant", "content": "follow-up note"},
         ]
-        with mock.patch.object(laintas_cli, "select_dialog",
-                               return_value=None) as picker:
+        with tempfile.TemporaryDirectory() as tmpdir, \
+                mock.patch.object(laintas_cli.paths, "project_dir",
+                                  return_value=Path(tmpdir)), \
+                mock.patch.object(
+                    laintas_cli.resource_ui, "ResourceBrowser") as picker:
             laintas_cli._told_browse_history(history)
         picker.assert_called_once()
-        labels = picker.call_args.args[0]
+        labels = picker.call_args.kwargs["load_items"]()
         self.assertEqual(len(labels), 2)
-        # Most-recent turn first (reverse order); each label has Rich markup
-        self.assertIn("second question here", labels[0])
-        self.assertIn("first question here", labels[1])
+        # Most-recent turn first; details are loaded without another dialog.
+        self.assertIn("second question here", labels[0].title)
+        self.assertIn("first question here", labels[1].title)
         # second turn has two assistant replies
-        self.assertIn("2 replies", labels[0])
+        self.assertIn("2 AI replies", labels[0].subtitle)
+        self.assertIn("0 tool events", labels[0].subtitle)
+        detail = picker.call_args.kwargs["load_detail"](labels[0])
+        self.assertIn("second answer", [line.text for line in detail.lines])
+        self.assertIn("follow-up note", [line.text for line in detail.lines])
+        self.assertEqual(picker.call_args.kwargs["presentation"], "timeline")
+        self.assertEqual(
+            picker.call_args.kwargs["pane_labels"],
+            ("CONVERSATIONS", "TRANSCRIPT"))
+
+    def test_told_browse_extracts_real_final_reply_after_tool_call(self):
+        history = [
+            {"role": "user", "content": "inspect the project"},
+            {"role": "assistant", "content": "I will inspect it.",
+             "message_kind": "intermediate"},
+            {"role": "tool", "content": "three files", "tool_name": "fs.ls",
+             "display_name": "List", "ok": True},
+            {"role": "assistant", "content": "Inspection complete.",
+             "message_kind": "final"},
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir, \
+                mock.patch.object(laintas_cli.paths, "project_dir",
+                                  return_value=Path(tmpdir)), \
+                mock.patch.object(
+                    laintas_cli.resource_ui, "ResourceBrowser") as picker:
+            laintas_cli._told_browse_history(history)
+        kwargs = picker.call_args.kwargs
+        row = kwargs["load_items"]()[0]
+        self.assertIn("2 AI replies", row.subtitle)
+        self.assertIn("1 tool event", row.subtitle)
+        detail = kwargs["load_detail"](row)
+        rendered = [(line.text, line.style) for line in detail.lines]
+        self.assertIn(("AI REPLY 2  •  FINAL", "class:detail.heading"), rendered)
+        self.assertIn(("Inspection complete.", "class:detail"), rendered)
+        self.assertIn(("TOOL  •  List", "class:detail.heading"), rendered)
+        self.assertIn("three files", [line.text for line in detail.lines])
+
+    def test_told_browse_extracts_provider_text_blocks(self):
+        history = [
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": [
+                {"type": "text", "text": "answer from a content block"},
+            ], "message_kind": "final"},
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir, \
+                mock.patch.object(laintas_cli.paths, "project_dir",
+                                  return_value=Path(tmpdir)), \
+                mock.patch.object(
+                    laintas_cli.resource_ui, "ResourceBrowser") as picker:
+            laintas_cli._told_browse_history(history)
+        kwargs = picker.call_args.kwargs
+        detail = kwargs["load_detail"](kwargs["load_items"]()[0])
+        self.assertIn("answer from a content block",
+                      [line.text for line in detail.lines])
 
     def test_told_browse_empty_history_prints_hint(self):
         output = io.StringIO()
         old_console = laintas_cli.console
         laintas_cli.console = Console(file=output, force_terminal=False)
         try:
-            with mock.patch.object(laintas_cli, "select_dialog") as picker:
+            with tempfile.TemporaryDirectory() as tmpdir, \
+                    mock.patch.object(laintas_cli.paths, "project_dir",
+                                      return_value=Path(tmpdir)), \
+                    mock.patch.object(
+                        laintas_cli.resource_ui, "ResourceBrowser") as picker:
                 laintas_cli._told_browse_history([])
         finally:
             laintas_cli.console = old_console
         picker.assert_not_called()
-        self.assertIn("session history", output.getvalue())
+        self.assertIn("current session", output.getvalue())
+        self.assertIn("/told log", output.getvalue())
 
-    def test_told_browse_switches_to_journal_on_tab(self):
+    def test_told_browse_does_not_fall_back_to_old_journal(self):
         import json as _json
-        import tempfile as _tmp
-        tmpdir = _tmp.mkdtemp()
-        journal = Path(tmpdir) / "events.jsonl"
-        journal.write_text(
-            _json.dumps({"type": "prompt_admitted", "ts": 1700000000,
-                         "text": "journaled prompt from disk"}) + "\n",
-            encoding="utf-8")
-        calls = []
-
-        def fake_dialog(labels, **kwargs):
-            calls.append(kwargs.get("title", ""))
-            if len(calls) == 1:
-                return ("source", -1)   # simulate Tab → switch to journal
-            return None                 # then cancel out
-
-        proj = mock.Mock()
-        proj.project_dir.return_value = Path(tmpdir)
-        history = [{"role": "user", "content": "session question"},
-                   {"role": "assistant", "content": "session answer"}]
-        with mock.patch.object(laintas_cli, "paths", proj), \
-                mock.patch.object(laintas_cli, "select_dialog",
-                                  side_effect=fake_dialog) as picker:
-            laintas_cli._told_browse_history(history)
-        self.assertEqual(picker.call_count, 2)
-        # second call renders journal entries
-        journal_labels = picker.call_args_list[1].args[0]
-        self.assertEqual(len(journal_labels), 1)
-        self.assertIn("journaled prompt from disk", journal_labels[0])
-        self.assertIn("journal", picker.call_args_list[1].kwargs["title"])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            journal = Path(tmpdir) / "events.jsonl"
+            journal.write_text(
+                _json.dumps({"type": "prompt_admitted", "ts": 1700000000,
+                             "text": "journaled prompt from disk"}) + "\n",
+                encoding="utf-8")
+            proj = mock.Mock()
+            proj.project_dir.return_value = Path(tmpdir)
+            history = []
+            output = io.StringIO()
+            old_console = laintas_cli.console
+            laintas_cli.console = Console(file=output, force_terminal=False)
+            with mock.patch.object(laintas_cli, "paths", proj), \
+                    mock.patch.object(
+                        laintas_cli.resource_ui, "ResourceBrowser") as picker:
+                try:
+                    laintas_cli._told_browse_history(history)
+                finally:
+                    laintas_cli.console = old_console
+        picker.assert_not_called()
+        self.assertIn("No conversations in the current session", output.getvalue())
+        self.assertNotIn("journaled prompt from disk", output.getvalue())
 
     def test_invalid_slash_text_has_no_completions(self):
         self.assertEqual(self._complete("/taskx"), [])
@@ -482,6 +592,8 @@ class SlashRegistryTests(unittest.TestCase):
         }
         balance_response = mock.Mock(status_code=200)
         balance_response.json.return_value = balance
+        subscription_response = mock.Mock(status_code=200)
+        subscription_response.json.return_value = {}
         profile = backend_profiles.BackendProfile(
             "official", "official", "https://laintas.com")
         output = io.StringIO()
@@ -504,7 +616,8 @@ class SlashRegistryTests(unittest.TestCase):
                         return_value=({}, {})), \
                     mock.patch.object(
                         laintas_cli.requests, "get",
-                        side_effect=[usage_response, balance_response]):
+                        side_effect=[usage_response, balance_response,
+                                     subscription_response]):
                 laintas_cli._show_usage_command([], {"userId": "u1"})
         finally:
             laintas_cli.console = old_console
@@ -515,6 +628,60 @@ class SlashRegistryTests(unittest.TestCase):
         header = next(line for line in rendered.splitlines()
                       if "model" in line and "tier" in line)
         self.assertLess(header.index("cost"), header.index("tier"))
+
+    def test_training_on_uses_server_notice_and_exact_scope(self):
+        profile = backend_profiles.BackendProfile(
+            "official", "official", "https://laintas.com")
+        scope = "gateway-observed CLI model inputs and outputs"
+        current = mock.Mock(status_code=200)
+        current.json.return_value = {
+            "enabled": False,
+            "collection_available": True,
+            "notice_version": "server-notice-v2",
+            "scope": scope,
+        }
+        accepted = mock.Mock(status_code=200)
+        accepted.json.return_value = {"enabled": True}
+
+        with mock.patch.object(
+                laintas_cli, "get_backend_profile", return_value=profile), \
+                mock.patch.object(
+                    laintas_cli.backend_profiles, "request_auth",
+                    return_value=({"Authorization": "Bearer x"}, {})), \
+                mock.patch.object(
+                    laintas_cli.requests, "get", return_value=current), \
+                mock.patch.object(
+                    laintas_cli.requests, "put", return_value=accepted) as put:
+            laintas_cli._cmd_training(
+                ["/training", "on"], {"userId": "u1"})
+
+        self.assertEqual(put.call_args.kwargs["json"], {
+            "enabled": True,
+            "notice_version": "server-notice-v2",
+            "confirm_scope": scope,
+        })
+
+    def test_training_on_fails_closed_when_gateway_is_unavailable(self):
+        profile = backend_profiles.BackendProfile(
+            "official", "official", "https://laintas.com")
+        current = mock.Mock(status_code=200)
+        current.json.return_value = {
+            "enabled": False,
+            "collection_available": False,
+            "notice_version": "v1",
+            "scope": "scope",
+        }
+        with mock.patch.object(
+                laintas_cli, "get_backend_profile", return_value=profile), \
+                mock.patch.object(
+                    laintas_cli.backend_profiles, "request_auth",
+                    return_value=({}, {})), \
+                mock.patch.object(
+                    laintas_cli.requests, "get", return_value=current), \
+                mock.patch.object(laintas_cli.requests, "put") as put:
+            laintas_cli._cmd_training(
+                ["/training", "on"], {"userId": "u1"})
+        put.assert_not_called()
 
     def test_compact_command_syncs_live_and_resume_state(self):
         state = {"_session_id": "s1", "_thread_messages": [{}] * 8}
@@ -646,7 +813,8 @@ class SlashRegistryTests(unittest.TestCase):
                     mode_manager.get_active_mode()["name"], "study")
                 text = output.getvalue()
                 self.assertIn("Switched to STUDY mode", text)
-                self.assertIn("The agent listens and saves", text)
+                self.assertIn("the agent teaches and checks your", text)
+                self.assertIn("work. Use /mode act", text)
                 self.assertIn("/mode act", text)
                 self.assertFalse(laintas_cli.handle_meta_command(
                     "/mode act", _Registry(), {}))

@@ -11,8 +11,7 @@ def test_manifest_covers_all_tracked_top_level_modules():
     package_manifest.json — that file drives setup.py, the PyInstaller
     spec, the CI source bundle, and the /v self-update manifest.  A module
     missing from ``modules`` silently ships in NO release artifact, so an
-    installed CLI would ImportError at runtime (e.g. attestation.py and
-    stuck_signals.py were once missed).
+    installed CLI would ImportError at runtime.
 
     Untracked work-in-progress files are intentionally excluded: they are
     not part of any release until they are committed and registered.
@@ -31,8 +30,6 @@ def test_manifest_covers_all_tracked_top_level_modules():
     # setup.py is the packaging entry point, not a shipped module.
     missing = sorted(m for m in tracked_top - modules if m != "setup")
     assert not missing, f"顶层模块未登记到 package_manifest.json: {missing}"
-    # Sanity: attestation (training-data integrity) must never regress.
-    assert "attestation" in modules
     assert "stuck_signals" in modules
 
 

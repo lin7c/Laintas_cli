@@ -27,10 +27,9 @@ print("package_manifest.json 完整: 所有顶层模块均已登记")
 PY
 ```
 
-当前登记在案的采集链路模块（`event_log` / `attestation` / `critic` / `precheck` /
-`rag_signals` / `mem_signals` / `stuck_signals` / `redactor`）由
-[laintas_model](https://github.com/lin7c/laintas_model) 训练数据采集使用，
-删除或改名任何模块都必须同步更新该项目的 `collector/`。
+当前登记在案的本地诊断模块（`event_log` / `critic` / `precheck` /
+`rag_signals` / `mem_signals` / `stuck_signals` / `redactor`）只服务于
+CLI 恢复和本地诊断，不上传到训练管线。
 
 修改 [version.py](../version.py) 中的唯一版本号，例如：
 

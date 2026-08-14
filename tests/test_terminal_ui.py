@@ -223,6 +223,7 @@ class ResponsiveTerminalChromeTests(unittest.TestCase):
         self.assertIn("policy", rendered)
         self.assertIn("/mode", rendered)
         self.assertIn("/policy", rendered)
+        self.assertIn("/training on", rendered)
 
     def test_prompt_uses_thin_unbold_chevron(self):
         captured = {}

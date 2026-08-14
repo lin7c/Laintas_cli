@@ -107,14 +107,12 @@ def _record(**fields) -> None:
         row = {"v": _SCHEMA_VERSION, "ts": round(time.time(), 3)}
         row.update(fields)
         path = _signals_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            import event_log
-            event_log.sign_json_row(row)
-        except Exception:
-            pass
+        paths.ensure_project_dir()
+        if not paths.ensure_private_file(path):
+            return
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+        paths.ensure_private_file(path)
     except Exception:
         pass
 

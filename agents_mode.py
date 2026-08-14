@@ -87,7 +87,11 @@ def _panel_md_styles() -> dict[str, str]:
 
 
 STYLE = Style.from_dict({
-    "header": "bold #58a6ff",
+    "root": "bg:#0d1117 #e6edf3",
+    "header": "bold #4ade80",
+    "header.brand": "bold #4ade80",
+    "pane.title": "bold #8b949e",
+    "pane.title.focus": "bold #4ade80",
     "muted": "#8b949e",
     "rail.selected": "bg:#1f2937 bold #f0f6fc",
     "rail": "#c9d1d9",
@@ -99,14 +103,17 @@ STYLE = Style.from_dict({
     "error": "bold #f85149",
     "idle": "#8b949e",
     "separator": "#30363d",
-    "agent": "bold #79c0ff",
+    "agent": "bold #a78bfa",
     "user": "bold #f0f6fc",
-    "tool": "#a5d6ff",
+    "tool": "#d2a8ff",
     "message": "#d2a8ff",
     "input": "bold #3fb950",
     "feed.time": "#6e7681",
-    "feed.agent": "#79c0ff",
+    "feed.agent": "#a78bfa",
     "feed.text": "#b1bac4",
+    "inspector.label": "#8b949e",
+    "inspector.value": "#e6edf3",
+    "approval": "bold #e3b341",
     **_panel_md_styles(),
 })
 
@@ -165,6 +172,10 @@ class AgentsModeController:
         self._approvals: list[dict] = []
         self._closed = threading.Event()
         self._last_agents: list = []
+        self._event_lines_cache: dict[str, tuple[tuple[int, int, int], tuple]] = {}
+        self._feed_cache: tuple[tuple[int, int], FormattedText] | None = None
+        self._drafts: dict[str, str] = defaultdict(str)
+        self._input_buffer: Optional[Buffer] = None
         selected = agent_loop.get_dialog_agent_for_terminal(self.terminal_name)
         if selected is not None and agent_loop.agent_deployment_terminal(selected) == self.terminal_name:
             selected = None
@@ -199,10 +210,16 @@ class AgentsModeController:
         return rows
 
     def select(self, agent_id: str) -> bool:
+        previous_id = self.selected_id
         if not agent_loop.set_dialog_agent_for_terminal(
                 self.terminal_name, agent_id):
             return False
+        if self._input_buffer is not None and previous_id:
+            self._drafts[previous_id] = self._input_buffer.text
         self.selected_id = agent_id
+        if self._input_buffer is not None:
+            self._input_buffer.text = self._drafts.get(agent_id, "")
+            self._input_buffer.cursor_position = len(self._input_buffer.text)
         self.overlay = False
         events = agent_ui_events.hub.agent_events(agent_id)
         if events and self.follow[agent_id]:
@@ -264,17 +281,24 @@ class AgentsModeController:
         if not terminals:
             return
         index = terminals.index(self.terminal_name) if self.terminal_name in terminals else 0
+        if self._input_buffer is not None and self.selected_id:
+            self._drafts[self.selected_id] = self._input_buffer.text
         self.terminal_name = terminals[(index + delta) % len(terminals)]
         candidate = agent_loop.get_dialog_agent_for_terminal(self.terminal_name)
         self.selected_id = candidate.id if candidate else ""
+        if self._input_buffer is not None:
+            self._input_buffer.text = self._drafts.get(self.selected_id, "")
+            self._input_buffer.cursor_position = len(self._input_buffer.text)
         self.overlay = False
         self.invalidate()
 
-    def unread(self, agent_id: str) -> int:
+    def unread(self, agent_id: str, events=None) -> int:
+        events = (agent_ui_events.hub.agent_events(agent_id)
+                  if events is None else events)
         return sum(
             event.seq > self.read_seq[agent_id]
             and agent_ui_events.hub.needs_attention(event)
-            for event in agent_ui_events.hub.agent_events(agent_id))
+            for event in events)
 
     def _current_task(self, agent) -> str:
         active = getattr(agent, "active_assignment", None)
@@ -286,12 +310,13 @@ class AgentsModeController:
         return str(state.get("_assignment_task") or state.get("objective")
                    or previous_task or "idle")
 
-    def _display_status(self, agent) -> str:
+    def _display_status(self, agent, events=None) -> str:
         """Combine authoritative runtime state with the last durable UI event."""
         status = str(getattr(agent, "status", "idle") or "idle")
         if status in {"running", "thinking", "queued", "waiting"}:
             return status
-        events = agent_ui_events.hub.agent_events(agent.id, limit=20)
+        events = (agent_ui_events.hub.agent_events(agent.id, limit=20)
+                  if events is None else events[-20:])
         for event in reversed(events):
             if event.event_type in {"agent_error", "step_failed", "node_failed"}:
                 return "error"
@@ -304,6 +329,10 @@ class AgentsModeController:
     def rail_fragments(self):
         fragments = []
         agents = self.agents()
+        event_rows = {
+            agent.id: agent_ui_events.hub.agent_events(agent.id)
+            for agent in agents
+        }
         page = self._rail_page_size()
         max_offset = max(0, len(agents) - page)
         self.rail_offset = min(max(0, self.rail_offset), max_offset)
@@ -312,9 +341,9 @@ class AgentsModeController:
             fragments.append((f"class:muted", f"  {symbols.ARROW_U} more Agents\n"))
         for agent in visible:
             selected = agent.id == self.selected_id
-            status = self._display_status(agent)
+            status = self._display_status(agent, event_rows[agent.id])
             icon, status_style = STATUS.get(status, (f"{symbols.DOT_OPEN}", "class:idle"))
-            unread = self.unread(agent.id)
+            unread = self.unread(agent.id, event_rows[agent.id])
             row_style = "class:rail.selected" if selected else "class:rail"
 
             def handler(mouse_event, agent_id=agent.id):
@@ -351,7 +380,14 @@ class AgentsModeController:
         return text if len(text) <= width else text[:max(1, width - 1)] + "…"
 
     def _event_lines(self, agent_id: str) -> list[tuple[str, str]]:
-        events = agent_ui_events.hub.agent_events(agent_id, limit=1500)
+        _revision, events = agent_ui_events.hub.agent_events_snapshot(
+            agent_id, limit=1500)
+        agent = agent_loop.get_agent(agent_id)
+        history_size = len(getattr(agent, "chat_history", []) or []) if agent else 0
+        cache_key = (events[-1].seq if events else 0, len(events), history_size)
+        cached = self._event_lines_cache.get(agent_id)
+        if cached is not None and cached[0] == cache_key:
+            return list(cached[1])
         lines: list[tuple[str, str]] = []
         stream = ""
         active_tools: dict[str, int] = {}
@@ -467,7 +503,6 @@ class AgentsModeController:
                 lines.append(("", ""))
         flush_stream()
         if not lines:
-            agent = agent_loop.get_agent(agent_id)
             for message in (getattr(agent, "chat_history", []) or [])[-30:]:
                 role = str(message.get("role") or "")
                 label = "You" if role == "user" else self._agent_name(agent_id)
@@ -478,7 +513,8 @@ class AgentsModeController:
                 else:
                     append_markdown(str(message.get("content") or ""))
                 lines.append(("", ""))
-        return lines
+        self._event_lines_cache[agent_id] = (cache_key, tuple(lines))
+        return list(lines)
 
     def _agent_name(self, agent_id: str) -> str:
         agent = agent_loop.get_agent(agent_id)
@@ -694,13 +730,18 @@ class AgentsModeController:
         return FormattedText(fragments)
 
     def feed_fragments(self):
+        _revision, events = agent_ui_events.hub.events_snapshot(
+            self.terminal_name, limit=100)
+        cache_key = (events[-1].seq if events else 0, len(events))
+        if self._feed_cache is not None and self._feed_cache[0] == cache_key:
+            return self._feed_cache[1]
         rows = []
         ignored = {
             "ai_stream", "ai_end", "stream.reset", "stream.end", "user", "ai",
             "user_message", "user_broadcast", "tool_output", "tool_started",
             "agent_done",
         }
-        for event in agent_ui_events.hub.events(self.terminal_name, limit=100):
+        for event in events:
             if event.event_type in ignored:
                 continue
             when = time.strftime("%H:%M", time.localtime(event.timestamp))
@@ -721,24 +762,72 @@ class AgentsModeController:
             ])
         while sum(1 for _s, text, *_rest in fragments if text.endswith("\n")) < 4:
             fragments.append(("", "\n"))
-        return FormattedText(fragments)
+        rendered = FormattedText(fragments)
+        self._feed_cache = (cache_key, rendered)
+        return rendered
+
+    def inspector_fragments(self):
+        """Compact operational context for wide terminals."""
+        agent = agent_loop.get_agent(self.selected_id) if self.selected_id else None
+        if agent is None:
+            return FormattedText([("class:muted", "\n  No Agent selected\n")])
+        _revision, events = agent_ui_events.hub.agent_events_snapshot(
+            agent.id, limit=300)
+        status = self._display_status(agent, events)
+        tool_ids = {event.tool_call_id for event in events
+                    if event.tool_call_id and event.event_type in {
+                        "tool", "tool_started", "tool_finished"}}
+        anonymous_tools = sum(
+            not event.tool_call_id and event.event_type in {
+                "tool", "tool_finished"} for event in events)
+        tools = len(tool_ids) + anonymous_tools
+        messages = sum(event.event_type in {
+            "user", "user_message", "ai", "ai_end"} for event in events)
+        approvals = sum(event.event_type == "approval_requested" for event in events)
+        latest = next((event for event in reversed(events)
+                       if event.summary), None)
+        rows = [
+            ("class:pane.title", "  CONTEXT\n"),
+            ("class:separator", "  ───────────────────────\n"),
+            ("class:inspector.label", "  STATUS\n"),
+            (STATUS.get(status, (symbols.DOT_OPEN, "class:idle"))[1],
+             f"  {STATUS.get(status, (symbols.DOT_OPEN, ''))[0]} {status.upper()}\n\n"),
+            ("class:inspector.label", "  TASK\n"),
+            ("class:inspector.value", "  " + self._crop(
+                self._current_task(agent), 25) + "\n\n"),
+            ("class:inspector.label", "  RUNTIME\n"),
+            ("class:inspector.value", f"  role       {agent.role}\n"),
+            ("class:inspector.value", f"  terminal   {self.terminal_name}\n"),
+            ("class:inspector.value", f"  messages   {messages}\n"),
+            ("class:inspector.value", f"  tools      {tools}\n"),
+            ("class:inspector.value", f"  approvals  {approvals}\n"),
+        ]
+        if latest is not None:
+            rows.extend([
+                ("class:inspector.label", "\n  LATEST\n"),
+                ("class:muted", "  " + self._crop(
+                    latest.summary, 25) + "\n"),
+            ])
+        return FormattedText(rows)
 
     def header_fragments(self):
         agents = self.agents()
-        running = sum(self._display_status(a) in {
+        statuses = {a.id: self._display_status(a) for a in agents}
+        running = sum(statuses[a.id] in {
             "running", "thinking", "queued"} for a in agents)
+        attention = sum(self.unread(a.id) > 0 for a in agents)
         width, _height = self._terminal_size()
         if width < 100:
             pieces = [f"[{self._agent_name(self.selected_id)}] "]
             pieces.extend(
-                f"{STATUS.get(self._display_status(a), (f'{symbols.DOT_OPEN}', ''))[0]}{a.name}"
+                f"{STATUS.get(statuses[a.id], (f'{symbols.DOT_OPEN}', ''))[0]}{a.name}"
                 + (f"({self.unread(a.id)})" if self.unread(a.id) else "")
                 for a in agents[:4])
             return FormattedText([("class:header", " ".join(pieces)),
                                   ("class:muted", "  Tab:switch")])
         return FormattedText([
-            ("class:header", f" Laintas {symbols.BULLET} {self.terminal_name}"),
-            ("class:muted", f" {symbols.BULLET} {running} running {symbols.BULLET} Focus: "),
+            ("class:header.brand", f" LAINTAS  /  AGENTS  {symbols.BULLET} {self.terminal_name}"),
+            ("class:muted", f"   {running} running  {symbols.BULLET}  {attention} attention  {symbols.BULLET}  Focus: "),
             ("class:agent", self._agent_name(self.selected_id)),
             ("class:muted", "   Alt+←/→ terminals"),
         ])
@@ -937,11 +1026,17 @@ class AgentsModeController:
         if not request:
             return FormattedText([])
         agent_name = self._agent_name(str(request.get("agent_id") or ""))
+        with self._approval_lock:
+            queue_size = len(self._approvals)
+        risk = "DESTRUCTIVE" if request.get("kind") == "delete" else "CHANGES SYSTEM"
         fragments = [
-            (f"class:thinking", f"\n  {symbols.DOT_HALF} Approval required\n\n"),
+            ("class:approval", f"\n  APPROVAL  1/{queue_size}\n"),
+            ("class:separator", "  ──────────────────────────────\n\n"),
             ("class:agent", f"  Agent: {agent_name}\n"),
             ("class:muted", f"  Terminal: {request.get('terminal_name')}\n"),
             ("class:tool", f"  Type: {request.get('kind')}\n\n"),
+            ("class:error" if request.get("kind") == "delete" else "class:thinking",
+             f"  Risk: {risk}\n\n"),
             ("class:user", f"  {request.get('summary')}\n"),
         ]
         detail = str(request.get("detail") or "").splitlines()[-20:]
@@ -1044,6 +1139,12 @@ class AgentsModeController:
             self._closed.clear()
         kb = KeyBindings()
         input_buffer = Buffer(multiline=False)
+        self._input_buffer = input_buffer
+
+        def _remember_draft(buffer):
+            if self.selected_id:
+                self._drafts[self.selected_id] = buffer.text
+        input_buffer.on_text_changed += _remember_draft
 
         def accept(buffer):
             value = buffer.text
@@ -1129,28 +1230,50 @@ class AgentsModeController:
         def _terminal_next(_event):
             self.cycle_terminal(1)
 
-        rail = Window(FormattedTextControl(self.rail_fragments), width=28,
+        rail = Window(FormattedTextControl(self.rail_fragments), width=30,
                       wrap_lines=False, style="class:rail")
         focus = Window(FormattedTextControl(
             lambda: FormattedText([
                 (style, text, self.focus_mouse)
                 for style, text in self.focus_fragments()
             ])), wrap_lines=True)
-        wide_filter = Condition(lambda: self._terminal_size()[0] >= 100)
+        wide_filter = Condition(lambda: self._terminal_size()[0] >= 96)
+        inspector_filter = Condition(lambda: self._terminal_size()[0] >= 140)
+        approval_wide_filter = Condition(
+            lambda: self.pending_approval() is not None
+            and self._terminal_size()[0] >= 120)
         wide_rail = ConditionalContainer(rail, filter=wide_filter)
         wide_separator = ConditionalContainer(
             Window(width=1, char="│", style="class:separator"),
             filter=wide_filter)
+        inspector = ConditionalContainer(
+            Window(FormattedTextControl(self.inspector_fragments),
+                   width=29, wrap_lines=False, style="class:root"),
+            filter=inspector_filter & ~approval_filter)
+        inspector_separator = ConditionalContainer(
+            Window(width=1, char="│", style="class:separator"),
+            filter=inspector_filter & ~approval_filter)
+        approval_separator = ConditionalContainer(
+            Window(width=1, char="│", style="class:separator"),
+            filter=approval_wide_filter)
+        approval_side = ConditionalContainer(
+            Window(FormattedTextControl(self.approval_fragments),
+                   width=42, wrap_lines=True, style="class:root"),
+            filter=approval_wide_filter)
         main = VSplit([
             wide_rail,
             wide_separator,
             focus,
+            inspector_separator,
+            inspector,
+            approval_separator,
+            approval_side,
         ])
         overlay_filter = Condition(lambda: self.overlay)
         approval_view = ConditionalContainer(
             Window(FormattedTextControl(self.approval_fragments),
                    wrap_lines=True),
-            filter=approval_filter)
+            filter=approval_filter & ~approval_wide_filter)
         overlay_rail = ConditionalContainer(
             Window(FormattedTextControl(self.rail_fragments), wrap_lines=False),
             filter=overlay_filter & ~approval_filter)
@@ -1169,7 +1292,8 @@ class AgentsModeController:
             approval_view,
             overlay_rail,
             ConditionalContainer(
-                main, filter=~overlay_filter & ~approval_filter),
+                main, filter=~overlay_filter & (
+                    ~approval_filter | approval_wide_filter)),
             ConditionalContainer(
                 Window(height=1, char="─", style="class:separator"),
                 filter=feed_filter),
@@ -1194,11 +1318,25 @@ class AgentsModeController:
         self.app = Application(
             layout=Layout(root, focused_element=input_control),
             key_bindings=kb, style=STYLE, full_screen=True,
-            mouse_support=True, refresh_interval=0.1,
+            mouse_support=True, refresh_interval=None,
+            min_redraw_interval=0.05,
             input=input, output=output)
         agent_ui_events.hub.subscribe(self.on_event)
+
+        def _pre_run():
+            async def _animate_live_work():
+                import asyncio
+                while self.app is not None and not self.app.is_done:
+                    active = self.pending_approval() is not None or any(
+                        str(getattr(agent, "status", "")) in {
+                            "running", "thinking", "queued", "waiting"}
+                        for agent in self.agents())
+                    await asyncio.sleep(0.2 if active else 0.8)
+                    if active and self.app is not None and not self.app.is_done:
+                        self.app.invalidate()
+            self.app.create_background_task(_animate_live_work())
         try:
-            self.app.run()
+            self.app.run(pre_run=_pre_run)
         except (KeyboardInterrupt, EOFError):
             # Keep startup/render/teardown races cancellable even before the
             # regular Esc/Ctrl+C key bindings become active.
@@ -1219,6 +1357,7 @@ class AgentsModeController:
             self.deny_pending_approvals(
                 close=True, reason="agents_mode_closed")
             agent_ui_events.hub.unsubscribe(self.on_event)
+            self._input_buffer = None
             self.app = None
 
 

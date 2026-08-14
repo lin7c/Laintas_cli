@@ -200,14 +200,12 @@ def record_sample(name: str, arguments: dict, result: dict, returncode,
             "loop": int(loop or 0),
         }
         path = _samples_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            import event_log
-            event_log.sign_json_row(row)
-        except Exception:
-            pass
+        paths.ensure_project_dir()
+        if not paths.ensure_private_file(path):
+            return
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+        paths.ensure_private_file(path)
     except Exception:
         # Capture is strictly advisory; never propagate.
         pass

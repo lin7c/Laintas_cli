@@ -46,7 +46,7 @@ from concurrent.futures import ThreadPoolExecutor
 import difflib
 from contextlib import nullcontext, contextmanager
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -1174,6 +1174,8 @@ import usage_tracker             # local AI token/cost accounting (/usage)
 import agent_ui_events           # observable events for full-screen Agents Mode
 import mode_manager              # declarative user-selectable agent modes
 import auto_pilot                # heuristic task classification + hint injection
+import detail_trace              # /detail trace conversation/tool browser
+import resource_ui               # unified responsive resource browsers/managers
 
 # MCP client: lazy import (saves ~1.8s on startup)
 _mcp_mod = None
@@ -2873,6 +2875,14 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec("/cwd", "Show the working directory", "Basics"),
     CommandSpec("/scan", "List user-facing PATH commands", "Basics"),
     CommandSpec("/login", "Re-authenticate with Laintas", "Account & Session"),
+    CommandSpec(
+        "/training", "Manage optional training-data sharing", "Account & Session",
+        "/training [status|on|off]",
+        subcommands=("status", "on", "off"),
+        help_text=(
+            "Sharing is off by default. 'on' explicitly allows Laintas to retain "
+            "gateway-observed CLI model inputs and outputs. 'off' stops future "
+            "collection; previously collected training data is retained.")),
     CommandSpec("/usage", "Show AI usage — local token stats + Laintas backend usage", "Account & Session", "/usage [7d|30d|90d|local|buy <calls|storage>]", subcommands=("local", "buy")),
     CommandSpec("/resume", "Resume a saved session (picker; echo last N events, default 20)", "Account & Session", "/resume [N|all|latest]"),
     CommandSpec("/fork", "Fork current context into a named branch, or start a new session from current context", "Account & Session", "/fork [name]"),
@@ -3046,7 +3056,7 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec("/why", "Explain a recent tool failure", "Config & Tools", "/why [N|tool|terminal|agent]"),
     CommandSpec("/stream", "Set bounded streaming preview", "Config & Tools", "/stream [off|one|detail]", subcommands=("off", "one", "detail")),
     CommandSpec("/theme", "Set terminal color theme", "Config & Tools", "/theme [dark|light|mono]", subcommands=("dark", "light", "mono")),
-    CommandSpec("/detail", "Toggle full vs simplified progress rendering", "Config & Tools", "/detail [on|off]", subcommands=("on", "off")),
+    CommandSpec("/detail", "Record and browse conversation execution details", "Config & Tools", "/detail [on|off|trace [N]]", subcommands=("on", "off", "trace")),
     CommandSpec("/undo", "Restore a git checkpoint", "History", "/undo [sha]"),
     CommandSpec("/snapshot", "Create a git checkpoint", "History", "/snapshot [label]"),
     CommandSpec("/snapshots", "List git checkpoints", "History"),
@@ -7419,15 +7429,6 @@ class AgentRegistry:
             return
         backend_url = get_backend_url()
         headers = self._agent_auth_headers()
-        # Attach attestation JWT so the gateway can verify the client passed
-        # version gating and is authorized to push training-data events.
-        try:
-            import attestation
-            _jwt = attestation.get_jwt()
-            if _jwt:
-                headers["X-Laintas-Attestation"] = _jwt
-        except Exception:
-            pass
         try:
             requests.post(
                 f"{backend_url}/api/agents/{self.agent_id}/events",
@@ -8904,37 +8905,63 @@ class AgentRegistry:
 # ── Debug Display ───────────────────────────────────────────────────────
 
 def show_debug_browser_interactive() -> None:
-    """Interactive debug browser — arrow keys to select, Enter to view detail, q/Esc to exit."""
-    while True:
-        entries = get_debug_logs()[:20]
-        if not entries:
-            console.print("[dim]No debug entries yet. Run an AI command to see data.[/dim]")
-            return
+    """Browse debug entries without leaving or rebuilding the full-screen UI."""
+    def _entries():
+        return get_debug_logs()[:50]
 
-        labels = []
-        for i, e in enumerate(entries):
-            ts = e.timestamp[-19:] if len(e.timestamp) > 19 else e.timestamp
-            if e.request_body:
-                tag = "AI "
-                summary = e.reply[:60] or e.command[:60] or "(no response)"
-            else:
-                tag = "CMD"
-                summary = e.exec_command[:60] or "(no output)"
-            summary = summary.replace("\n", " ")[:60]
-            labels.append(f"#{i+1:2d}  {ts}  [{tag}]  {summary}")
+    def _load_items():
+        rows = []
+        for index, entry in enumerate(_entries()):
+            is_ai = bool(entry.request_body)
+            summary = (entry.reply or entry.command if is_ai
+                       else entry.exec_command or "(no output)")
+            rows.append(resource_ui.UIItem(
+                key=f"{entry.timestamp}-{entry.loop}-{index}",
+                badge="AI" if is_ai else "CMD",
+                title=" ".join(str(summary).split())[:110] or "(no response)",
+                subtitle=f"{entry.timestamp[-19:]} · {entry.current_path}",
+                status="error" if entry.error or entry.exec_returncode not in (0, None) else "",
+                status_style="class:error", payload=entry,
+                search_text=" ".join((entry.user_input, entry.exec_stdout,
+                                      entry.exec_stderr)),
+            ))
+        return rows
 
-        chosen = select_dialog(
-            labels,
-            title="Debug Log — Last 20 Entries",
-            full_screen=True,
-            hint=f"{symbols.ARROW_U}{symbols.ARROW_D} navigate  ↵ view detail  q/Esc back",
-        )
-        if chosen is None:
-            return
-        idx = labels.index(chosen)
-        with _alt_screen():
-            show_debug_detail(idx)
-            _press_enter_to_continue("Press Enter to return to debug browser")
+    def _load_detail(row):
+        entry = row.payload
+        sections = []
+        if entry.user_input:
+            sections.append(("USER INPUT", entry.user_input))
+        if entry.request_body:
+            sections.extend([
+                ("REQUEST", entry.request_body.get("message", "")),
+                ("CONTEXT", json.dumps(entry.context_sizes,
+                                       ensure_ascii=False, indent=2)),
+                ("PROMPT PREVIEW", entry.request_body.get("promptPreview", "")),
+            ])
+        if entry.reply:
+            sections.append(("AI RESPONSE", entry.reply))
+        if entry.command:
+            sections.append(("TOOL CALLS", entry.command))
+        if entry.exec_command:
+            sections.append(("COMMAND", entry.exec_command))
+        if entry.exec_stdout:
+            sections.append(("OUTPUT", entry.exec_stdout))
+        if entry.exec_stderr:
+            sections.append(("STDERR", entry.exec_stderr))
+        if entry.response_raw:
+            sections.append(("RAW RESPONSE", json.dumps(
+                entry.response_raw, ensure_ascii=False, indent=2, default=str)))
+        return _ui_multisection_detail(
+            f"Debug #{entry.loop}", sections,
+            f"{entry.timestamp} · {entry.current_path}")
+
+    resource_ui.ResourceBrowser(
+        title="Debug Activity", load_items=_load_items,
+        load_detail=_load_detail, searchable=True,
+        presentation="timeline",
+        pane_labels=("ACTIVITY", "EVENT DETAIL"),
+        empty_message="No debug entries yet. Run an AI command first.").run()
 
 
 def show_debug_detail(index: int) -> None:
@@ -9050,117 +9077,112 @@ def _show_terminal_detail(name: str, cmd: str, sess, created: float, alive: bool
 
 
 def show_terminal_manager(primary_session=None) -> None:
-    """Interactive terminal manager — list, enter, observe, close, view details.
+    """Live terminal manager with output preview and in-place lifecycle actions."""
 
-    Shows the primary session (if alive) plus all registered terminals.
-    Arrow keys to navigate, Enter to fully enter (interactive takeover),
-    o to observe read-only, c to close, d for details, q to exit.
-    """
-
-    def _collect():
-        out = []
+    def collect_rows():
+        rows = []
         if primary_session is not None and primary_session.is_alive():
-            out.append(("term0 (primary)", primary_session.command,
-                        primary_session, 0.0, True))
+            rows.append(("term0", primary_session.command,
+                         primary_session, 0.0, True, True))
         for term in get_all_terminals():
             if term.name == "term0":
                 continue
-            out.append((term.name, term.command, term.session,
-                        term.created_at,
-                        term.session is not None and term.session.is_alive()))
-        return out
+            rows.append((term.name, term.command, term.session, term.created_at,
+                         term.session is not None and term.session.is_alive(), False))
+        return rows
 
-    def _build_labels(items):
-        labels = []
-        for name, cmd, _sess, created, alive in items:
-            status = f"[green]{symbols.DOT} alive[/green]" if alive else "[red]■ dead[/red]"
-            uptime_str = ""
-            if created > 0:
-                uptime = time.time() - created
-                if uptime < 60:
-                    uptime_str = f" {uptime:.0f}s"
-                elif uptime < 3600:
-                    uptime_str = f" {uptime / 60:.1f}m"
-                else:
-                    uptime_str = f" {uptime / 3600:.1f}h"
-            cmd_preview = cmd[:60].replace("\n", " ")
-            registry_name = "term0" if name == "term0 (primary)" else name
-            info = get_terminal(registry_name)
-            owner = (
-                f" parent={info.parent_terminal or 'root'}"
-                f" agents={len(info.stationed_agent_ids)}"
-                if info else ""
-            )
-            labels.append(f"[bold]{name}[/bold]  {status}{uptime_str}  "
-                          f"[dim]{cmd_preview}{owner}[/dim]")
-        return labels
+    def load_items():
+        items = []
+        for name, command, session, created, alive, primary in collect_rows():
+            uptime = max(0.0, time.time() - created) if created else 0.0
+            age = (f"{uptime:.0f}s" if uptime < 60 else
+                   f"{uptime / 60:.1f}m" if uptime < 3600 else
+                   f"{uptime / 3600:.1f}h")
+            info = get_terminal(name)
+            agents = len(info.stationed_agent_ids) if info else 0
+            items.append(resource_ui.UIItem(
+                key=name,
+                title=name + (" (primary)" if primary else ""),
+                subtitle=str(command or "No command").replace("\n", " "),
+                badge="PRIMARY" if primary else "TERM",
+                status=("alive" if alive else "ended") + (f"  {age}" if created else ""),
+                status_style="class:success" if alive else "class:error",
+                payload=(name, command, session, created, alive, primary),
+                search_text=f"{info.parent_terminal if info else ''} {agents}",
+            ))
+        return items
 
-    sel_idx = 0
-    first = True
-    status_msg = ""
-    while True:
-        items = _collect()
-        if not items:
-            if first:
-                console.print("[dim]No sub-terminals. Use /t <name> to create one, "
-                              "or let the AI spawn a command.[/dim]")
-            else:
-                console.print("\n[dim]No more terminals.[/dim]")
-            return
-        first = False
-        sel_idx = min(sel_idx, len(items) - 1)
+    def load_detail(item):
+        name, command, session, created, alive, primary = item.payload
+        info = get_terminal(name)
+        read_output = getattr(session, "read_output", None)
+        if alive and callable(read_output):
+            read_output(timeout=0)
+        output = session.full_output if session else ""
+        metadata = [
+            f"Status       {'alive' if alive else 'ended'}",
+            f"Parent       {(info.parent_terminal if info else None) or '(root)'}",
+            f"Agents       {(', '.join(info.stationed_agent_ids) if info else '') or '(none)'}",
+            f"Return code  {session.returncode if session else 'N/A'}",
+            "",
+            "Command",
+            str(command or "(none)"),
+            "",
+            f"Output · {len(output)} bytes",
+            output or "(no output yet)",
+        ]
+        detail = resource_ui.UIDetail.text(
+            item.title, "\n".join(metadata),
+            "Live output · refreshes automatically")
+        for index, line in enumerate(detail.lines):
+            if line.text in {"Command", f"Output · {len(output)} bytes"}:
+                detail.lines[index] = resource_ui.UILine(line.text, "class:detail.heading")
+        return detail
 
-        labels = _build_labels(items)
-        hint = f"{symbols.ARROW_U}{symbols.ARROW_D} navigate  ↵ enter  o observe  c close  d details  q back"
-        if status_msg:
-            hint = f"{status_msg}\n{hint}"
-        result = select_dialog(
-            labels,
-            title="Terminal Manager",
-            full_screen=True,
-            selected_index=sel_idx,
-            action_keys={"o": "observe", "c": "close", "d": "details"},
-            enter_action="enter",
-            hint=hint,
-        )
-        if result is None:
-            return
-        action, idx = result
-        if action is None or idx < 0 or idx >= len(items):
-            return
+    armed = {"key": "", "at": 0.0}
 
-        name, cmd, sess, created, alive = items[idx]
-        status_msg = ""
+    def close(item):
+        name, _command, _session, _created, _alive, primary = item.payload
+        if primary:
+            return resource_ui.UIActionResult(
+                message="The primary terminal cannot be closed here.",
+                message_style="class:warning")
+        now = time.monotonic()
+        if armed["key"] != name or now - armed["at"] > 4:
+            armed.update(key=name, at=now)
+            return resource_ui.UIActionResult(
+                message=f"Press x again to close {name}", message_style="class:warning")
+        unregister_terminal(name)
+        armed.update(key="", at=0.0)
+        return resource_ui.UIActionResult(
+            message=f"Closed {name}", message_style="class:success", refresh=True)
 
-        if action == "enter":
-            if not alive:
-                status_msg = "[yellow]Session has already ended.[/yellow]"
-            else:
-                enter_session(sess, display_name=name, display_cmd=cmd)
-                time.sleep(0.1)
-                if name != "term0 (primary)" and not sess.is_alive():
-                    unregister_terminal(name)
-
-        elif action == "observe":
-            if not alive:
-                status_msg = "[yellow]Session has already ended.[/yellow]"
-            else:
-                observe_session(sess, display_name=name, display_cmd=cmd)
-
-        elif action == "close":
-            if name == "term0 (primary)":
-                status_msg = "[yellow]Cannot close the primary session. " \
-                             "Use /exit or close the parent terminal.[/yellow]"
-            else:
-                unregister_terminal(name)
-                status_msg = f"[green]Closed terminal [bold]{name}[/bold][/green]"
-
-        elif action == "details":
-            with _alt_screen():
-                _show_terminal_detail(name, cmd, sess, created, alive)
-                _press_enter_to_continue()
-
-        sel_idx = idx
+    outcome = resource_ui.ResourceBrowser(
+        title="Terminals",
+        load_items=load_items,
+        load_detail=load_detail,
+        actions=[
+            resource_ui.UIAction("e", "enter", "Enter"),
+            resource_ui.UIAction("o", "observe", "Observe"),
+            resource_ui.UIAction("x", "close", "Close", close, "class:error"),
+        ],
+        refresh_interval=0.5,
+        presentation="operations",
+        pane_labels=("TERMINALS", "LIVE OUTPUT"),
+        empty_message="No terminals. Create one with /term <name>.",
+    ).run()
+    if outcome.item is None or outcome.action not in {"enter", "observe"}:
+        return
+    name, command, session, _created, alive, primary = outcome.item.payload
+    if not alive:
+        console.print("[yellow]Session has already ended.[/yellow]")
+    elif outcome.action == "observe":
+        observe_session(session, display_name=name, display_cmd=command)
+    else:
+        enter_session(session, display_name=name, display_cmd=command)
+        time.sleep(0.1)
+        if not primary and not session.is_alive():
+            unregister_terminal(name)
 
 
 def _show_skill_detail(name: str) -> None:
@@ -9187,93 +9209,130 @@ def _show_skill_detail(name: str) -> None:
 
 
 def show_skill_manager() -> None:
-    """Interactive skill manager — same style as the terminal manager.
+    """Manage skills and inspect their complete metadata/tool surface."""
 
-    Lists every scanned skill with its loaded status; navigate with the arrow
-    keys and load/unload/reload/inspect without leaving the page.
-    {symbols.ARROW_U}{symbols.ARROW_D} navigate, ↵/space toggle load, l load, u unload, r reload all,
-    d details, n hint for new, q back.
-    """
-    def _collect():
+    def load_items():
         groups = tools_mod.get_registry().list_by_source()
-        out = []
-        for s in skills_mod.list_skills():
-            n = s["name"]
-            out.append((n, s.get("description", ""), bool(s.get("loaded")),
-                        len(groups.get(f"skill:{n}", [])),
-                        str(s.get("managed_by") or "")))
-        return out
+        return [resource_ui.UIItem(
+            key=str(skill["name"]),
+            title=str(skill["name"]),
+            subtitle=str(skill.get("description") or "No description"),
+            badge="SKILL",
+            status="loaded" if skill.get("loaded") else "available",
+            status_style="class:success" if skill.get("loaded") else "class:muted",
+            payload=skill,
+            search_text=f"{skill.get('managed_by', '')} {len(groups.get('skill:' + skill['name'], []))}",
+        ) for skill in skills_mod.list_skills()]
 
-    def _build_labels(items):
-        labels = []
-        for name, desc, loaded, ntools, managed in items:
-            badge = f"[green]{symbols.DOT} loaded[/green]" if loaded else f"[dim]{symbols.DOT_OPEN} available[/dim]"
-            tool_str = f" [dim]({ntools} tool{'s' if ntools != 1 else ''})[/dim]" if ntools else ""
-            # A managed skill is replaced on the next sync, so local edits to it
-            # do not survive. Saying who owns it is cheaper than the surprise.
-            owner_str = f" [cyan]{symbols.DOT} {managed}[/cyan]" if managed else ""
-            desc_preview = (desc or "").replace("\n", " ")[:56]
-            labels.append(f"[bold]{name}[/bold]  {badge}{tool_str}{owner_str}  "
-                          f"[dim]{desc_preview}[/dim]")
-        return labels
+    def load_detail(item):
+        name = item.title
+        meta = skills_mod.get_all_metadata().get(name)
+        tools = tools_mod.get_registry().list_by_source().get(f"skill:{name}", [])
+        skill_dir_text = str(
+            getattr(meta, "dir_path", "") or item.payload.get("path") or "")
+        skill_dir = Path(skill_dir_text) if skill_dir_text else None
+        lines = []
 
-    sel_idx = 0
-    status_msg = ""
-    first = True
-    while True:
-        items = _collect()
-        if not items:
-            if first:
-                console.print(f"[dim]No skills in {skills_mod.SKILLS_DIR}[/dim]")
-                console.print("[dim]Create one with: /skill new <name>[/dim]")
-            return
-        first = False
-        sel_idx = min(sel_idx, len(items) - 1)
+        def section(title, content, kind="text"):
+            if lines:
+                lines.append(resource_ui.UILine(""))
+            lines.append(resource_ui.UILine(title, "class:detail.heading"))
+            styled = _ui_text_detail("", content or "(empty)", kind=kind)
+            lines.extend(styled.lines)
 
-        labels = _build_labels(items)
-        hint = (f"{symbols.ARROW_U}{symbols.ARROW_D} navigate  ↵/space toggle  l load  u unload  "
-                "r reload  d details  q back")
-        if status_msg:
-            hint = f"{status_msg}\n{hint}"
+        skill_md = skill_dir / "SKILL.md" if skill_dir else None
+        if skill_md is None:
+            manual = "(skill directory is unavailable)"
+        else:
+            try:
+                manual = skill_md.read_text(encoding="utf-8")
+            except OSError as exc:
+                manual = f"(SKILL.md unavailable: {exc})"
+        section("SKILL.md", manual, "markdown")
 
-        result = select_dialog(
-            labels,
-            title="Skill Manager",
-            full_screen=True,
-            selected_index=sel_idx,
-            action_keys={"l": "load", "u": "unload", "r": "reload",
-                         "d": "details", "space": "toggle"},
-            enter_action="toggle",
-            hint=hint,
-        )
-        if result is None:
-            return
-        action, idx = result
-        if action is None or idx < 0 or idx >= len(items):
-            return
+        manifest_path = (skill_dir / skills_mod.SKILL_MANIFEST
+                         if skill_dir else None)
+        if manifest_path is not None and manifest_path.is_file():
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                manifest_text = json.dumps(
+                    manifest, ensure_ascii=False, indent=2, default=str)
+            except (OSError, ValueError) as exc:
+                manifest_text = f"(manifest unreadable: {exc})"
+            section(skills_mod.SKILL_MANIFEST, manifest_text, "json")
 
-        name, desc, loaded, ntools, managed = items[idx]
-        status_msg = ""
+        files = []
+        if skill_dir is not None and skill_dir.is_dir():
+            try:
+                for path in sorted(skill_dir.rglob("*")):
+                    if (path.is_file() and "__pycache__" not in path.parts
+                            and not path.is_symlink()):
+                        try:
+                            size = path.stat().st_size
+                        except OSError:
+                            size = 0
+                        files.append(f"{path.relative_to(skill_dir)}  ({size} bytes)")
+            except OSError:
+                pass
+        section(f"FILES · {len(files)}", "\n".join(files) or "(none)")
 
-        if action == "details":
-            with _alt_screen():
-                _show_skill_detail(name)
-                _press_enter_to_continue()
-        elif action == "reload":
-            results = skills_mod.reload_all()
-            status_msg = f"Reloaded: {len(results)} skill(s) re-scanned from disk."
-        elif action in ("toggle", "load", "unload"):
-            want_load = action == "load" or (action == "toggle" and not loaded)
-            if action == "unload" or (action == "toggle" and loaded):
-                want_load = False
-            if want_load:
-                ok, msg = skills_mod.load_skill(name)
-            else:
-                ok, msg = skills_mod.unload_skill(name)
-            status_msg = ("[green]" if ok else "[red]") + msg + (
-                "[/green]" if ok else "[/red]")
+        tool_lines = []
+        for tool in tools:
+            if tool_lines:
+                tool_lines.append("")
+            tool_lines.extend([
+                str(tool.name),
+                str(tool.description or "(no description)"),
+                f"source: {tool.source}",
+                f"trust: {tool.trust_level}",
+                "capabilities: " + (", ".join(sorted(tool.capabilities)) or "(none)"),
+                "schema:",
+                json.dumps(tool.schema, ensure_ascii=False, indent=2, default=str),
+            ])
+        section(f"REGISTERED TOOLS · {len(tools)}",
+                "\n".join(tool_lines) or "(none — documentation-only or not loaded)",
+                "json")
 
-        sel_idx = idx
+        subtitle = "  •  ".join(filter(None, (
+            item.status, str(getattr(meta, "version", "") or "unversioned"),
+            skill_dir_text or "unknown path")))
+        return resource_ui.UIDetail(
+            title=name, subtitle=subtitle,
+            lines=lines or [resource_ui.UILine("(empty skill)")],
+            kind="document")
+
+    def set_loaded(item, want_load=None):
+        loaded = bool(item.payload.get("loaded"))
+        target = not loaded if want_load is None else want_load
+        ok, message = (skills_mod.load_skill(item.title) if target
+                       else skills_mod.unload_skill(item.title))
+        return resource_ui.UIActionResult(
+            message=message,
+            message_style="class:success" if ok else "class:error",
+            refresh=True)
+
+    def reload_all(_item):
+        results = skills_mod.reload_all()
+        return resource_ui.UIActionResult(
+            message=f"Re-scanned {len(results)} skills", refresh=True)
+
+    resource_ui.ResourceBrowser(
+        title="Skills",
+        load_items=load_items,
+        load_detail=load_detail,
+        actions=[
+            resource_ui.UIAction("t", "toggle", "Toggle", set_loaded),
+            resource_ui.UIAction("l", "load", "Load",
+                                 lambda item: set_loaded(item, True)),
+            resource_ui.UIAction("u", "unload", "Unload",
+                                 lambda item: set_loaded(item, False)),
+            resource_ui.UIAction("r", "reload", "Reload", reload_all,
+                                 allow_empty=True),
+        ],
+        presentation="document",
+        pane_labels=("SKILLS", "SOURCE & TOOLS"),
+        empty_message="No skills. Create one with /skill new <name>.",
+    ).run()
 
 
 # ── Meta Commands ──────────────────────────────────────────────────────
@@ -9764,6 +9823,10 @@ _SLASH_ARG_RULES: dict[tuple[str, ...], SlashArgRule] = {
     },
     ("/help",): _arg_rule(1, "/help [command]"),
     ("/fork",): _arg_rule(1, "/fork [name]"),
+    ("/training",): _arg_rule(1, "/training [status|on|off]"),
+    ("/training", "status"): _arg_rule(1, "/training status"),
+    ("/training", "on"): _arg_rule(1, "/training on"),
+    ("/training", "off"): _arg_rule(1, "/training off"),
     # --port/--host/--dist are key+value pairs, so the ceiling has to cover
     # them together, not just the two it was written for.
     ("/helpwo",): _arg_rule(6, "/helpwo [--port N] [--dist <path>] [--remote]"),
@@ -9781,7 +9844,8 @@ _SLASH_ARG_RULES: dict[tuple[str, ...], SlashArgRule] = {
     ("/abort",): _arg_rule(1, "/abort <agent-id>"),
     ("/agent",): _arg_rule(1, "/agent [agent-id-or-name]"),
     ("/undo",): _arg_rule(1, "/undo [sha]"),
-    ("/detail",): _arg_rule(1, "/detail [on|off]"),
+    ("/detail",): _arg_rule(2, "/detail [on|off|trace [N]]"),
+    ("/detail", "trace"): _arg_rule(2, "/detail trace [N]"),
     ("/model", "reset"): _arg_rule(1, "/model reset"),
     ("/model", "clear"): _arg_rule(1, "/model clear"),
     ("/model", "default"): _arg_rule(1, "/model default"),
@@ -10200,6 +10264,77 @@ def _redact_sensitive_text(text: str) -> str:
     for pattern, replacement in patterns:
         redacted = re.sub(pattern, replacement, redacted)
     return redacted
+
+
+def _ui_text_detail(title: str, content: Any, subtitle: str = "",
+                    *, kind: str = "text") -> resource_ui.UIDetail:
+    """Build consistently styled content for the unified resource UI."""
+    raw = str(content if content is not None else "(empty)")
+    lines = []
+    fenced = False
+    for value in raw.splitlines() or ["(empty)"]:
+        stripped = value.lstrip()
+        style = "class:detail"
+        if kind == "diff":
+            if value.startswith("+") and not value.startswith("+++"):
+                style = "class:detail.add"
+            elif value.startswith("-") and not value.startswith("---"):
+                style = "class:detail.delete"
+            elif value.startswith("@@"):
+                style = "class:detail.heading"
+        elif kind == "markdown":
+            if stripped.startswith("```"):
+                fenced = not fenced
+                style = "class:detail.code"
+            elif fenced or stripped.startswith(("    ", "> ")):
+                style = "class:detail.code"
+            elif stripped.startswith("#"):
+                style = "class:detail.heading"
+            elif stripped.startswith(("- ", "* ", "+ ")):
+                style = "class:accent"
+        elif kind == "json":
+            style = "class:detail.code"
+        lines.append(resource_ui.UILine(value, style))
+    return resource_ui.UIDetail(
+        title=title, subtitle=subtitle, lines=lines,
+        kind={"diff": "diff", "markdown": "document",
+              "json": "code"}.get(kind, ""))
+
+
+def _ui_multisection_detail(title: str, sections: list[tuple[str, Any]],
+                            subtitle: str = "") -> resource_ui.UIDetail:
+    lines = []
+    for index, (heading, content) in enumerate(sections):
+        if index:
+            lines.append(resource_ui.UILine(""))
+        lines.append(resource_ui.UILine(heading, "class:detail.heading"))
+        values = str(content if content is not None else "(empty)").splitlines()
+        lines.extend(resource_ui.UILine(value) for value in (values or ["(empty)"]))
+    return resource_ui.UIDetail(
+        title=title, subtitle=subtitle, lines=lines, kind="sections")
+
+
+def _ui_pick(records, *, title: str, label: Callable,
+             description: Optional[Callable] = None,
+             status: Optional[Callable] = None,
+             search: bool = True, empty_message: str = "Nothing available."):
+    """Modern one-shot picker used while managers are migrated incrementally."""
+    rows = list(records or ())
+    if not rows or not sys.stdin.isatty():
+        return None
+    items = [
+        resource_ui.UIItem(
+            key=str(index), title=resource_ui.plain(label(record)),
+            subtitle=resource_ui.plain(description(record)) if description else "",
+            status=resource_ui.plain(status(record)) if status else "",
+            payload=record)
+        for index, record in enumerate(rows)
+    ]
+    outcome = resource_ui.ResourceBrowser(
+        title=title, load_items=lambda: items, searchable=search,
+        primary_action="select", primary_label="Select",
+        empty_message=empty_message).run()
+    return outcome.value if outcome.action == "select" else None
 
 
 def _validate_prop_template(prop: str) -> tuple[list[str], list[str], list[str]]:
@@ -10911,6 +11046,107 @@ def _usage_pricing_note(balance: dict) -> str:
     return f"pricing {symbols.BULLET} " + f" {symbols.BULLET} ".join(parts) if parts else ""
 
 
+def _training_control_request(session: dict, method: str,
+                              payload: Optional[dict] = None) -> Optional[dict]:
+    """Call the authenticated account training-data control endpoint."""
+    profile = get_backend_profile()
+    is_official = bool(getattr(
+        profile, "sends_laintas_credentials", profile.kind == "official"))
+    if not is_official:
+        console.print(
+            "[yellow]Training-data controls are available only with the "
+            "official Laintas backend.[/yellow]")
+        return None
+    if not session.get("userId"):
+        console.print(
+            "[yellow]Log in with /login before changing training-data "
+            "sharing.[/yellow]")
+        return None
+
+    headers, cookies = backend_profiles.request_auth(profile, session)
+    url = f"{profile.base_url}/api/data-controls/training"
+    try:
+        if method == "GET":
+            response = requests.get(
+                url, headers=headers, cookies=cookies, timeout=10)
+        elif method == "PUT":
+            response = requests.put(
+                url, json=payload or {}, headers=headers, cookies=cookies,
+                timeout=10)
+        else:
+            raise ValueError(f"unsupported training control method: {method}")
+    except requests.RequestException as exc:
+        console.print(
+            f"[red]Could not reach training-data controls: {escape(str(exc))}[/red]")
+        return None
+
+    try:
+        body = response.json()
+    except (ValueError, TypeError):
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    if response.status_code < 200 or response.status_code >= 300:
+        reason = (body.get("title") or body.get("detail")
+                  or f"HTTP {response.status_code}")
+        console.print(
+            f"[red]Training-data control failed: {escape(str(reason))}[/red]")
+        return None
+    return body
+
+
+def _cmd_training(parts: list, session: dict) -> None:
+    """Manage explicit, account-scoped training-data consent."""
+    action = parts[1].strip().lower() if len(parts) > 1 else "status"
+    if action not in ("status", "on", "off"):
+        raise SlashCommandUsageError(
+            "Usage: /training [status|on|off]")
+
+    state = _training_control_request(session, "GET")
+    if state is None:
+        return
+    available = bool(state.get("collection_available", True))
+    scope = str(state.get("scope") or "")
+
+    if action == "status":
+        status = "on" if state.get("enabled") else "off"
+        style = "green" if status == "on" else "yellow"
+        console.print(f"[{style}]Training-data sharing: {status}[/{style}]")
+        console.print(
+            "[dim]Collection service: "
+            f"{'available' if available else 'unavailable'}[/dim]")
+        if scope:
+            console.print(f"[dim]Scope: {escape(scope)}[/dim]")
+        return
+
+    if action == "on" and not available:
+        console.print(
+            "[red]Training-data collection is not configured on the Gateway; "
+            "sharing was not enabled.[/red]")
+        return
+
+    payload = {
+        "enabled": action == "on",
+        "notice_version": str(state.get("notice_version") or ""),
+    }
+    if action == "on":
+        payload["confirm_scope"] = scope
+    updated = _training_control_request(session, "PUT", payload)
+    if updated is None:
+        return
+    if action == "on":
+        console.print(
+            "[green]Training-data sharing is on.[/green]\n"
+            "[dim]Laintas may retain model inputs and outputs actually observed "
+            "by the Gateway for review and training. Use /training off to stop "
+            "future collection.[/dim]")
+    else:
+        console.print(
+            "[green]Training-data sharing is off. No new interactions will be "
+            "retained. Previously collected training data remains in the "
+            "versioned dataset.[/green]")
+
+
 def _show_usage_command(args: list, session: dict) -> None:
     """/usage — local token accounting + Laintas backend usage (product=cli)."""
     words = [a.strip().lower() for a in args if a.strip()]
@@ -11477,81 +11713,73 @@ def _cmd_name(raw_args: str, session: dict, agent_registry: AgentRegistry) -> No
 
 
 def _memory_manager() -> None:
-    """Interactive persistent-memory manager: browse the memories visible in the
-    current scope (grouped global first then local, then by category), view a full
-    entry (Enter), and delete one in place (x). Reuses the same single-loop
-    select_dialog pattern as the resume-session picker (action_keys + enter_action,
-    inline delete with a status line); no-ops gracefully on non-interactive stdin."""
+    """Browse and manage persistent memories in the unified resource UI."""
     import memory_system
-    entries = memory_system.list_memories()
-    if not entries:
-        console.print("[dim]No persistent memories in this scope.[/dim]")
-        return
-    entries.sort(key=lambda e: (
-        0 if e.get("scope") == "user" else 1,
-        memory_system.CATEGORY_ORDER.get(e.get("type"), 9),
-        -float(e.get("importance", 0.5) or 0.5),
-    ))
 
-    def _labels():
-        rows = []
-        for e in entries:
-            scope_txt = memory_system.scope_label(e.get("scope"))
-            cat = memory_system.CATEGORY_LABELS.get(e.get("type"), e.get("type"))
-            rows.append((
-                f"[dim]{scope_txt}[/dim]  [cyan]{cat}[/cyan]  [bold]{e.get('name')}[/bold]",
-                (e.get("description") or "").strip(),
-            ))
-        return rows
+    def load_items():
+        entries = memory_system.list_memories()
+        entries.sort(key=lambda entry: (
+            0 if entry.get("scope") == "user" else 1,
+            memory_system.CATEGORY_ORDER.get(entry.get("type"), 9),
+            -float(entry.get("importance", 0.5) or 0.5),
+            str(entry.get("name", "")).casefold(),
+        ))
+        return [resource_ui.UIItem(
+            key=f"{entry.get('scope', '')}:{entry.get('name', '')}",
+            title=str(entry.get("name") or "(unnamed)"),
+            subtitle=str(entry.get("description") or "No description"),
+            badge=str(memory_system.CATEGORY_LABELS.get(
+                entry.get("type"), entry.get("type") or "memory")),
+            status=str(memory_system.scope_label(entry.get("scope"))),
+            status_style="class:accent" if entry.get("scope") == "user" else "class:muted",
+            payload=entry,
+            search_text=f"{entry.get('type', '')} {entry.get('scope', '')}",
+        ) for entry in entries]
 
-    sel_idx = 0
-    status_msg = ""
-    while entries:
-        hint = f"{symbols.ARROW_U}{symbols.ARROW_D} navigate  ↵ view  x delete  q cancel"
-        if status_msg:
-            hint = f"{status_msg}\n{hint}"
-        result = select_dialog(
-            _labels(),
-            title="Memory Manager",
-            full_screen=True,
-            selected_index=sel_idx,
-            search=True,
-            action_keys={"x": "delete"},
-            enter_action="view",
-            hint=hint,
-        )
-        if result is None:
-            return
-        action, idx = result
-        if action is None or idx < 0 or idx >= len(entries):
-            return
-        entry = entries[idx]
-        name = entry.get("name", "")
-        status_msg = ""
-        if action == "view":
-            data = memory_system.read_memory(name)
-            with _alt_screen():
-                if data is None:
-                    console.print(f"[red]Memory '{name}' is no longer readable.[/red]")
-                else:
-                    scope_txt = memory_system.scope_label(entry.get("scope"))
-                    cat = memory_system.CATEGORY_LABELS.get(entry.get("type"), entry.get("type"))
-                    summary = (data.get("meta", {}).get("description") or "").strip()
-                    body = data.get("body", "")
-                    panel_body = (f"[bold]Summary:[/bold] {summary}\n\n[dim]Full memory:[/dim]\n{body}"
-                                  if summary else body)
-                    _print_long_panel(panel_body, f"[{scope_txt}] {cat} {symbols.BULLET} {name}")
-                _press_enter_to_continue()
-            sel_idx = idx
-        elif action == "delete":
-            ok, msg = memory_system.delete_memory(name)
-            if ok:
-                del entries[idx]
-                status_msg = f"[green]Deleted memory {name}.[/green]"
-                sel_idx = min(idx, len(entries) - 1) if entries else 0
-            else:
-                status_msg = f"[red]Delete failed: {msg}[/red]"
-                sel_idx = idx
+    def load_detail(item):
+        entry = item.payload
+        data = memory_system.read_memory(entry.get("name", ""))
+        if data is None:
+            return resource_ui.UIDetail.text(
+                item.title, "This memory is no longer readable.", style="class:error")
+        meta = data.get("meta", {})
+        category = memory_system.CATEGORY_LABELS.get(
+            entry.get("type"), entry.get("type") or "memory")
+        subtitle = (f"{memory_system.scope_label(entry.get('scope'))}  •  {category}"
+                    f"  •  importance {float(entry.get('importance', .5) or .5):.1f}")
+        description = str(meta.get("description") or "").strip()
+        body = str(data.get("body") or "(empty)")
+        content = f"{description}\n\n{body}" if description else body
+        return _ui_text_detail(item.title, content, subtitle, kind="markdown")
+
+    armed = {"key": "", "at": 0.0}
+
+    def delete(item):
+        now = time.monotonic()
+        if armed["key"] != item.key or now - armed["at"] > 4:
+            armed.update(key=item.key, at=now)
+            return resource_ui.UIActionResult(
+                message=f"Press x again to delete {item.title}",
+                message_style="class:warning")
+        ok, message = memory_system.delete_memory(item.payload.get("name", ""))
+        armed.update(key="", at=0.0)
+        return resource_ui.UIActionResult(
+            message=(f"Deleted {item.title}" if ok else f"Delete failed: {message}"),
+            message_style="class:success" if ok else "class:error",
+            refresh=ok)
+
+    browser = resource_ui.ResourceBrowser(
+        title="Memory",
+        load_items=load_items,
+        load_detail=load_detail,
+        actions=[resource_ui.UIAction("x", "delete", "Delete", delete,
+                                      "class:error")],
+        searchable=True,
+        presentation="document",
+        pane_labels=("MEMORIES", "CONTENT"),
+        empty_message="No persistent memories in this scope.",
+    )
+    browser.run()
 
 
 def _cmd_memory(parts: list) -> None:
@@ -11641,7 +11869,7 @@ def _cmd_memory(parts: list) -> None:
                 {"kind": "persistent", **entry}
                 for entry in persistent_entries
             ]
-            chosen = choose_record(
+            chosen = _ui_pick(
                 choices,
                 title="View Memory",
                 label=lambda item: (
@@ -12863,154 +13091,97 @@ def _cmd_policy(parts: list) -> bool:
 
 
 def show_plan_picker() -> None:
-    """Interactive plan manager UI reusing the mature select_dialog pattern.
-
-    Arrow keys navigate the plan list; action keys provide create / view /
-    approve / exit / status / delete operations.  Mirrors the resume picker's
-    loop-and-reinvoke style (action_keys + enter_action).
-    """
+    """Browse drafts, inspect full plans, and manage plan-mode state."""
     import plan_mode as _pm
 
-    sel_idx = 0
-    status_msg = ""
-    while True:
-        plans = _pm.list_plans()
+    def load_items():
         current = _pm.get_current_plan()
-        in_plan = _pm.is_plan_mode()
+        current_name = str(current.get("name", "")) if current else ""
+        return [resource_ui.UIItem(
+            key=str(plan.get("name") or plan.get("file") or "?"),
+            title=str(plan.get("title") or plan.get("name") or "Untitled plan"),
+            subtitle=str(plan.get("name") or ""),
+            badge="ACTIVE" if plan.get("name") == current_name else "PLAN",
+            status=str(plan.get("status") or "draft"),
+            status_style=("class:success" if plan.get("name") == current_name
+                          else "class:warning"),
+            payload=plan,
+            search_text=f"{plan.get('task', '')} {plan.get('file', '')}",
+        ) for plan in _pm.list_plans()]
 
-        # --- build labels ---
-        labels: list[str] = []
-        for p in plans:
-            name = p.get("name", "?")
-            title = (p.get("title") or "")[:60]
-            status = p.get("status", "")
-            is_current = bool(current and current.get("name") == name)
-            marker = (f"[green]{symbols.DOT}[/green]"
-                      if is_current else f"[dim]{symbols.DOT_OPEN}[/dim]")
-            badge = f" [yellow]({status})[/yellow]" if status else ""
-            labels.append(
-                f"{marker} [cyan]{name}[/cyan]{badge}  [bold]{title}[/bold]")
-        if not labels:
-            labels = ["[dim](No saved plans - press n to create one)[/dim]"]
+    def load_detail(item):
+        plan = item.payload
+        content = _pm.read_plan(plan.get("name")) or "(empty)"
+        subtitle = "  •  ".join(filter(None, (
+            str(plan.get("name") or ""), str(plan.get("status") or "draft"),
+            str(plan.get("file") or ""))))
+        return _ui_text_detail(item.title, content, subtitle, kind="markdown")
 
-        # --- context-sensitive action keys ---
-        action_keys: dict[str, str] = {
-            "n": "new", "v": "view", "d": "delete"}
-        hint_parts = [
-            f"{symbols.ARROW_U}{symbols.ARROW_D} navigate",
-            "v view", "n new", "d delete"]
-        if in_plan and current:
-            action_keys["a"] = "approve"
-            action_keys["e"] = "exit"
-            action_keys["s"] = "status"
-            hint_parts += ["a approve", "e exit", "s status"]
-        hint_parts.append("q cancel")
-        hint = "  ".join(hint_parts)
-        if status_msg:
-            hint = f"{status_msg}\n{hint}"
+    armed = {"key": "", "at": 0.0}
 
-        result = select_dialog(
-            labels,
-            title="Plan Manager",
-            full_screen=True,
-            selected_index=min(sel_idx, max(0, len(labels) - 1)),
-            action_keys=action_keys,
-            enter_action="view",
-            hint=hint,
-        )
-        if result is None:
+    def delete(item):
+        current = _pm.get_current_plan()
+        if current and current.get("name") == item.payload.get("name"):
+            return resource_ui.UIActionResult(
+                message="Exit or approve the active plan before deleting it.",
+                message_style="class:warning")
+        now = time.monotonic()
+        if armed["key"] != item.key or now - armed["at"] > 4:
+            armed.update(key=item.key, at=now)
+            return resource_ui.UIActionResult(
+                message=f"Press d again to delete {item.payload.get('name', item.title)}",
+                message_style="class:warning")
+        try:
+            Path(item.payload["file"]).unlink()
+        except OSError as exc:
+            return resource_ui.UIActionResult(
+                message=f"Could not delete: {exc}", message_style="class:error")
+        armed.update(key="", at=0.0)
+        return resource_ui.UIActionResult(
+            message=f"Deleted {item.payload.get('name', item.title)}",
+            message_style="class:success", refresh=True)
+
+    def leave(_item):
+        plan = _pm.exit_plan_mode(approve=False)
+        return resource_ui.UIActionResult(
+            message=("Exited plan mode; the draft remains saved."
+                     if plan else "No active plan to exit."),
+            message_style="class:success" if plan else "class:warning",
+            refresh=True)
+
+    actions = [
+        resource_ui.UIAction("n", "new", "New", allow_empty=True),
+        resource_ui.UIAction("d", "delete", "Delete", delete, "class:error"),
+    ]
+    if _pm.is_plan_mode() and _pm.get_current_plan():
+        actions.extend([
+            resource_ui.UIAction("a", "approve", "Approve", allow_empty=True),
+            resource_ui.UIAction("e", "exit", "Exit plan", leave,
+                                 "class:warning", True),
+        ])
+    outcome = resource_ui.ResourceBrowser(
+        title="Plans",
+        load_items=load_items,
+        load_detail=load_detail,
+        actions=actions,
+        searchable=True,
+        presentation="document",
+        pane_labels=("PLANS", "PLAN DOCUMENT"),
+        empty_message="No saved plans. Press n to create one.",
+    ).run()
+
+    if outcome.action == "new":
+        if _pm.is_plan_mode():
+            console.print("[yellow]Approve or exit the active plan first.[/yellow]")
             return
-        action, idx = result
-        if action is None:
+        try:
+            task = input("Task description: ").strip()
+        except (EOFError, KeyboardInterrupt):
             return
-        status_msg = ""
-
-        # --- actions ---
-        if action == "view" and plans and idx < len(plans):
-            plan = plans[idx]
-            content = _pm.read_plan(plan["name"])
-            _print_long_panel(
-                content or "(empty)",
-                f"Plan: {plan.get('title', plan['name'])[:60]}")
-            _press_enter_to_continue()
-
-        elif action == "new":
-            try:
-                task = input("\nTask description: ").strip()
-            except (EOFError, KeyboardInterrupt):
-                continue
-            if not task:
-                status_msg = "[yellow]No task provided.[/yellow]"
-                continue
-            if _pm.is_plan_mode():
-                status_msg = ("[yellow]A plan is already active. "
-                              "Approve or exit first.[/yellow]")
-                continue
-            mode_manager.activate("act")
-            plan = _pm.enter_plan_mode(task, session_id=_current_session_id())
-            _enqueue_user_input(task)
-            console.print(Panel(
-                f"[bold]Plan Mode: [green]ENTERED[/green][/bold]\n\n"
-                f"Task: {task}\n"
-                f"Plan file: {plan['file']}\n\n"
-                f"[dim]The AI will now explore and design "
-                f"- no code will be executed.[/dim]\n"
-                f"[dim]When the plan is ready, run "
-                f"[bold]/plan approve[/bold].[/dim]",
-                title="Plan Mode",
-                border_style="green",
-            ))
-            return  # exit picker after entering plan mode
-
-        elif action == "approve":
-            plan = _review_and_approve_current_plan()
-            if plan:
-                followup = (
-                    f"Execute approved WorkGraph {plan['work_id']} revision "
-                    f"{plan['revision']} SHA {plan['content_sha']} for task: "
-                    f"{plan['task']}. Follow the injected "
-                    f"approved_work_plan exactly.")
-                _enqueue_user_input(followup)
-                console.print(Panel(
-                    f"[bold]Plan [green]APPROVED[/green][/bold]\n\n"
-                    f"File: {plan['file']}\n\n"
-                    "[dim]Execution request queued.[/dim]",
-                    title="Plan Approved",
-                    border_style="green",
-                ))
-                return  # exit after approval
-            else:
-                status_msg = "[yellow]Plan was not approved.[/yellow]"
-
-        elif action == "exit":
-            plan = _pm.exit_plan_mode(approve=False)
-            if plan:
-                status_msg = ("[dim]Exited plan mode; draft remains in the "
-                              "plans directory.[/dim]")
-            else:
-                status_msg = "[yellow]No active plan to exit.[/yellow]"
-
-        elif action == "status":
-            plan = _pm.get_current_plan()
-            if plan:
-                content = _pm.read_plan() or "(empty)"
-                _print_long_panel(content, f"Plan: {plan['task'][:60]}")
-                _press_enter_to_continue()
-            else:
-                status_msg = "[dim]Not in plan mode.[/dim]"
-
-        elif action == "delete" and plans and idx < len(plans):
-            plan = plans[idx]
-            answer = input(
-                f"\nDelete plan '{plan['name']}'? [y/N] ").strip().lower()
-            if answer == "y":
-                try:
-                    Path(plan["file"]).unlink()
-                    status_msg = (
-                        f"[green]Deleted plan '{plan['name']}'.[/green]")
-                    sel_idx = max(0, sel_idx - 1)
-                except OSError as exc:
-                    status_msg = f"[red]Could not delete: {exc}[/red]"
+        if task:
+            _cmd_plan(f"enter {task}", ["/plan", "enter", task])
+    elif outcome.action == "approve":
+        _cmd_plan("approve", ["/plan", "approve"])
 
 
 def _cmd_plan(raw_args: str, parts: list) -> None:
@@ -13960,15 +14131,49 @@ def _cmd_work(parts: list) -> None:
     elif sub == "resume":
         work_id = parts[2] if len(parts) >= 3 else ""
         if not work_id and sys.stdin.isatty():
-            chosen = choose_record(
-                workgraph.list_work(),
-                title="Resume WorkGraph",
-                label=lambda item: item["id"],
-                description=lambda item: (
-                    f"{item[f'status']} {symbols.BULLET} {item['objective'][:100]}"),
-                search=True,
-            )
-            work_id = chosen["id"] if chosen else ""
+            records = workgraph.list_work()
+
+            def work_items():
+                return [resource_ui.UIItem(
+                    key=str(item["id"]),
+                    title=str(item.get("objective") or "Untitled work"),
+                    subtitle=str(item["id"]),
+                    badge="WORK",
+                    status=str(item.get("status") or "unknown"),
+                    status_style=("class:success" if item.get("status") == "COMPLETED"
+                                  else "class:warning"),
+                    payload=item,
+                ) for item in records]
+
+            def work_detail(row):
+                item = row.payload
+                steps = workgraph.list_steps(item["id"])
+                lines = [
+                    f"Status       {item.get('status', 'unknown')}",
+                    f"Revision     {item.get('current_revision') or 0}",
+                    f"Approved     {item.get('approved_revision') or '(none)'}",
+                    "",
+                    "Objective",
+                    str(item.get("objective") or "(none)"),
+                    "",
+                    f"Steps · {len(steps)}",
+                ]
+                lines.extend(
+                    f"{step.get('status', 'pending'):12} {step.get('title') or step.get('objective') or step.get('id')}"
+                    for step in steps)
+                return _ui_text_detail(row.title, "\n".join(lines), item["id"])
+
+            outcome = resource_ui.ResourceBrowser(
+                title="Resume Work",
+                load_items=work_items,
+                load_detail=work_detail,
+                actions=[resource_ui.UIAction("r", "resume", "Resume")],
+                presentation="operations",
+                pane_labels=("WORKGRAPHS", "OBJECTIVE & STEPS"),
+                empty_message="No WorkGraph history in this project.",
+            ).run()
+            work_id = (outcome.item.payload["id"]
+                       if outcome.action == "resume" and outcome.item else "")
         if not work_id:
             console.print("[dim]WorkGraph selection cancelled.[/dim]")
         else:
@@ -14332,17 +14537,104 @@ def _cmd_task(raw_args: str, parts: list) -> None:
             if item.get("status") != "deleted"
             and (statuses is None or item.get("status") in statuses)
         ]
-        return choose_record(
+        return _ui_pick(
             candidates,
             title=title,
             label=lambda item: f"{item[f'id']} {symbols.BULLET} {item.get('subject', '(untitled)')}",
             description=lambda item: (
                 f"{item.get('status', 'pending')} {symbols.BULLET} "
                 f"{item.get('progress', 0)}%"),
+            status=lambda item: str(item.get("owner_agent_id") or ""),
             search=True,
         )
 
-    if sub in ("", "list"):
+    def _task_manager():
+        rank = {"in_progress": 0, "pending": 1, "blocked": 2,
+                "completed": 3, "skipped": 4}
+
+        def load_items():
+            records = [task for task in _session_tasks()
+                       if task.get("status") != "deleted"]
+            records.sort(key=lambda task: (
+                rank.get(task.get("status", "pending"), 9),
+                str(task.get("id", ""))))
+            items = []
+            for task in records:
+                source, _style = _task_ui_source(task)
+                status = str(task.get("status") or "pending")
+                status_style = {
+                    "completed": "class:success", "blocked": "class:error",
+                    "in_progress": "class:warning",
+                }.get(status, "class:muted")
+                items.append(resource_ui.UIItem(
+                    key=str(task.get("id") or ""),
+                    title=str(task.get("subject") or "Untitled task"),
+                    subtitle=(f"{task.get('owner_agent_id') or 'unowned'}  •  "
+                              f"{task.get('progress', 0)}%"),
+                    badge=source,
+                    status=status.replace("_", " "),
+                    status_style=status_style,
+                    payload=task,
+                    search_text=(f"{task.get('description', '')} "
+                                 f"{' '.join(task.get('notes', []))}"),
+                ))
+            return items
+
+        def load_detail(item):
+            task = item.payload
+            sections = [
+                ("Overview", (
+                    f"ID           {task.get('id')}\n"
+                    f"Status       {task.get('status', 'pending')}\n"
+                    f"Progress     {task.get('progress', 0)}%\n"
+                    f"Owner        {task.get('owner_agent_id') or '(none)'}\n"
+                    f"Parent agent {task.get('parent_agent_id') or '(none)'}\n"
+                    f"Blocked by   {', '.join(map(str, task.get('blockedBy', []))) or '(none)'}\n"
+                    f"Blocks       {', '.join(map(str, task.get('blocks', []))) or '(none)'}")),
+                ("Description", task.get("description") or "(none)"),
+                ("Notes", "\n".join(map(str, task.get("notes", []))) or "(none)"),
+            ]
+            return _ui_multisection_detail(item.title, sections, f"Task {task.get('id')}")
+
+        def update(item, **changes):
+            ok, message, task = _update_scoped(item.key, **changes)
+            return resource_ui.UIActionResult(
+                message=(message if not ok else f"Updated {task.get('id')}: {task.get('subject')}"),
+                message_style="class:success" if ok else "class:error",
+                refresh=ok)
+
+        armed = {"key": "", "at": 0.0}
+
+        def delete(item):
+            now = time.monotonic()
+            if armed["key"] != item.key or now - armed["at"] > 4:
+                armed.update(key=item.key, at=now)
+                return resource_ui.UIActionResult(
+                    message=f"Press x again to delete task {item.key}",
+                    message_style="class:warning")
+            armed.update(key="", at=0.0)
+            return update(item, status="deleted")
+
+        resource_ui.ResourceBrowser(
+            title="Tasks",
+            load_items=load_items,
+            load_detail=load_detail,
+            actions=[
+                resource_ui.UIAction("s", "start", "Start",
+                                     lambda item: update(item, status="in_progress")),
+                resource_ui.UIAction("c", "complete", "Complete",
+                                     lambda item: update(item, status="completed", progress=100)),
+                resource_ui.UIAction("x", "delete", "Delete", delete, "class:error"),
+            ],
+            presentation="operations",
+            pane_labels=("TASKS", "TASK DETAIL"),
+            empty_message="No tasks. Create one with /task add <subject>.",
+        ).run()
+
+    if sub == "" and sys.stdin.isatty() and console.is_terminal:
+        _task_manager()
+
+    elif sub in ("", "list"):
         _tasks = [t for t in _session_tasks()
                   if t.get("status") != "deleted"]
         if not _tasks:
@@ -14757,48 +15049,271 @@ def _cmd_debug(parts: list) -> None:
 
 
 
-def _cmd_detail(parts: list) -> None:
-    # Toggle full vs simplified progress rendering. Off (default) folds
-    # successful read/search/list output into grouped one-line summaries;
-    # errors, writes and command status remain visible. On expands command
-    # output and file diffs for the current run.
-    if len(parts) == 1:
-        _cur = bool(get_runtime_config("detail"))
-        if sys.stdin.isatty():
-            options = [
-                ("Off", "Compact one-line tool progress"),
-                ("On", "Full command output and detailed panels"),
-            ]
-            chosen = select_dialog(
-                options,
-                title="Tool Output Detail",
-                full_screen=False,
-                selected_index=1 if _cur else 0,
-                hint=f"{symbols.ARROW_U}{symbols.ARROW_D} navigate  ↵ select  Esc/q cancel",
-                letter_shortcuts=True,
-            )
-            if chosen is not None:
-                enabled = chosen == options[1]
-                set_runtime_config("detail", enabled)
-                terminal_preferences.set_ui_preference("detail", enabled)
-                console.print(
-                    f"[green]Detail mode {'on' if enabled else 'off'}.[/green]")
-        else:
-            console.print(
-                f"[dim]Detail mode is [bold]{'on' if _cur else 'off'}[/bold]. "
-                "Compact mode folds read/search/list output; use /detail on "
-                "to expand tool output.[/dim]")
+def _show_detail_trace_item(item: dict) -> None:
+    """Show one tool result or AI message as a pure, scrollable content view."""
+    from prompt_toolkit import ANSI as _ptk_ansi
+    from prompt_toolkit.application import Application as _ptk_app
+    from prompt_toolkit.data_structures import Point as _ptk_point
+    from prompt_toolkit.key_binding import KeyBindings as _ptk_kb
+    from prompt_toolkit.layout import Layout as _ptk_layout
+    from prompt_toolkit.layout.containers import (
+        ScrollOffsets as _ptk_offsets, Window as _ptk_window)
+    from prompt_toolkit.layout.controls import (
+        FormattedTextControl as _ptk_ftc)
+    from prompt_toolkit.mouse_events import MouseEventType as _ptk_met
+    from rich.text import Text as _RichText
+
+    message = item.get("message") or {}
+    buf = io.StringIO()
+    mem = Console(file=buf, force_terminal=True,
+                  width=shutil.get_terminal_size().columns, highlight=False)
+    change_rows = []
+
+    if item.get("kind") == "ai":
+        mem.print("[bold]AI[/bold]")
+        mem.print(RichMarkdown(str(message.get("content") or "")))
     else:
-        _sub = parts[1].lower()
-        if _sub in ("on", "off"):
-            enabled = _sub == "on"
-            set_runtime_config("detail", enabled)
-            terminal_preferences.set_ui_preference("detail", enabled)
-            console.print(
-                f"[green]Detail mode {_sub}. "
-                f"{'Compact mode folds read/search/list output.' if not enabled else 'Command output and file diffs are expanded.'}[/green]")
+        trace = message.get("trace") or {}
+        title = detail_trace.trace_item_label(item)
+        mem.print(f"[bold]{escape(title)}[/bold]")
+        tool = str(trace.get("tool") or "")
+        if tool in {"fs.write", "fs.edit", "fs.multi_edit", "fs.delete"}:
+            rows = detail_trace.full_file_diff(
+                trace.get("before"), trace.get("after"))
+            for row_index, row in enumerate(rows, 1):
+                style = {
+                    "add": "green",
+                    "delete": "red",
+                    "same": "dim",
+                }.get(row.get("style"), "")
+                if row.get("style") in {"add", "delete"}:
+                    # One title line precedes the full-file rows.
+                    change_rows.append(row_index)
+                mem.print(_RichText(str(row.get("text") or ""), style=style),
+                          soft_wrap=True)
+            if not rows:
+                mem.print(_RichText(str(trace.get("content") or "(no content)")))
         else:
-            console.print("[red]Usage: /detail \\[on|off][/red]")
+            if tool == "shell.exec":
+                command = str((trace.get("arguments") or {}).get("command") or "")
+                if command:
+                    mem.print(_RichText(f"$ {command}", style="dim"))
+            mem.print(_RichText(str(trace.get("content") or "(no output)")))
+
+    mem.print()
+    mem.print(
+        f"[dim]{symbols.ARROW_U}{symbols.ARROW_D}/wheel/PgUp/PgDn scroll"
+        f"{'  n/N changes' if change_rows else ''}  q/Esc/Enter back[/dim]")
+
+    line_count = buf.getvalue().count("\n") + 1
+    pos = [0]
+
+    def _move(delta):
+        pos[0] = max(0, min(line_count - 1, pos[0] + delta))
+
+    def _jump_change(forward=True):
+        if not change_rows:
+            return
+        if forward:
+            target = next((line for line in change_rows if line > pos[0]),
+                          change_rows[0])
+        else:
+            target = next((line for line in reversed(change_rows)
+                           if line < pos[0]), change_rows[-1])
+        pos[0] = target
+
+    class _TraceBody(_ptk_ftc):
+        def mouse_handler(self, mouse_event):
+            if mouse_event.event_type == _ptk_met.SCROLL_UP:
+                _move(-3)
+                return None
+            if mouse_event.event_type == _ptk_met.SCROLL_DOWN:
+                _move(3)
+                return None
+            return NotImplemented
+
+    body = _TraceBody(
+        _ptk_ansi(buf.getvalue()), focusable=True, show_cursor=False,
+        get_cursor_position=lambda: _ptk_point(0, pos[0]))
+    window = _ptk_window(
+        content=body, wrap_lines=True, always_hide_cursor=True,
+        scroll_offsets=_ptk_offsets(top=1, bottom=1))
+    kb = _ptk_kb()
+
+    @kb.add("up")
+    def _up(event):
+        _move(-1)
+
+    @kb.add("down")
+    def _down(event):
+        _move(1)
+
+    @kb.add("pageup")
+    def _page_up(event):
+        info = window.render_info
+        _move(-(info.window_height if info is not None else 10))
+
+    @kb.add("pagedown")
+    def _page_down(event):
+        info = window.render_info
+        _move(info.window_height if info is not None else 10)
+
+    @kb.add("n")
+    def _next_change(event):
+        _jump_change(True)
+
+    @kb.add("N")
+    def _previous_change(event):
+        _jump_change(False)
+
+    @kb.add("g")
+    def _top(event):
+        pos[0] = 0
+
+    @kb.add("G")
+    def _bottom(event):
+        pos[0] = line_count - 1
+
+    @kb.add("escape")
+    @kb.add("q")
+    @kb.add("enter")
+    def _quit(event):
+        event.app.exit()
+
+    try:
+        _ptk_app(layout=_ptk_layout(window), key_bindings=kb,
+                 full_screen=True, mouse_support=True).run()
+    except (KeyboardInterrupt, EOFError):
+        pass
+
+
+def _browse_detail_trace(chat_history: list, conversation_number: int = 1) -> None:
+    """Browse one recorded conversation in the unified resource UI."""
+    turns = list(reversed(detail_trace.conversation_traces(chat_history)))
+    if not turns:
+        console.print("[yellow]No conversations are available.[/yellow]")
+        return
+    if conversation_number < 1 or conversation_number > len(turns):
+        console.print(
+            f"[red]Conversation #{conversation_number} does not exist "
+            f"(available: 1-{len(turns)}).[/red]")
+        return
+    turn = turns[conversation_number - 1]
+    if not turn.get("enabled"):
+        console.print(
+            f"[yellow]Conversation #{conversation_number} has no detail trace. "
+            "Use /detail on before starting a conversation.[/yellow]")
+        return
+    items = turn.get("items") or []
+    if not items:
+        console.print(
+            f"[yellow]Conversation #{conversation_number} contains no recorded "
+            "tool calls or AI output.[/yellow]")
+        return
+
+    prompt = " ".join(str(turn.get("prompt") or "").split())[:70]
+
+    def _load_items():
+        rows = []
+        for index, trace_item in enumerate(items):
+            message = trace_item.get("message") or {}
+            trace = message.get("trace") or {}
+            is_ai = trace_item.get("kind") == "ai"
+            rows.append(resource_ui.UIItem(
+                key=str(index),
+                badge="AI" if is_ai else str(trace.get("display_name")
+                                                or trace.get("tool") or "Tool"),
+                title=(" ".join(str(message.get("content") or "").split())[:100]
+                       if is_ai else str(message.get("summary")
+                                         or trace.get("path") or "(no target)")),
+                subtitle=("Assistant output" if is_ai else
+                          f"{trace.get('elapsed_seconds', 0):g}s"
+                          + (f" · exit {trace.get('returncode')}"
+                             if trace.get("returncode") is not None else "")),
+                status=("" if is_ai or trace.get("ok") else "failed"),
+                status_style="class:error",
+                payload=trace_item,
+                search_text=str(trace.get("content") or ""),
+            ))
+        return rows
+
+    def _load_detail(row):
+        trace_item = row.payload
+        message = trace_item.get("message") or {}
+        if trace_item.get("kind") == "ai":
+            return _ui_text_detail(
+                "AI", message.get("content") or "", "Assistant output",
+                kind="markdown")
+        trace = message.get("trace") or {}
+        tool = str(trace.get("tool") or "")
+        title = str(trace.get("path") or message.get("summary")
+                    or trace.get("display_name") or tool)
+        if tool in {"fs.write", "fs.edit", "fs.multi_edit", "fs.delete"}:
+            changed_at = 0
+            lines = []
+            for index, diff_row in enumerate(detail_trace.full_file_diff(
+                    trace.get("before"), trace.get("after"))):
+                style = {
+                    "add": "class:detail.add",
+                    "delete": "class:detail.delete",
+                }.get(diff_row.get("style"), "class:detail")
+                if style != "class:detail" and changed_at == 0:
+                    changed_at = index
+                lines.append(resource_ui.UILine(diff_row.get("text", ""), style))
+            return resource_ui.UIDetail(
+                title=title,
+                subtitle=str(trace.get("display_name") or tool),
+                lines=lines or [resource_ui.UILine(
+                    str(trace.get("content") or "(no content)"))],
+                start_line=changed_at,
+                kind="diff",
+            )
+        content = str(trace.get("content") or "(no output)")
+        if tool == "shell.exec":
+            command = str((trace.get("arguments") or {}).get("command") or "")
+            if command:
+                content = f"$ {command}\n\n{content}"
+        return _ui_text_detail(
+            title, content, str(trace.get("display_name") or tool),
+            kind="json" if content.lstrip().startswith(("{", "[")) else "text")
+
+    resource_ui.ResourceBrowser(
+        title=f"Detail Trace #{conversation_number} · {prompt}",
+        load_items=_load_items, load_detail=_load_detail,
+        presentation="timeline",
+        pane_labels=("EVENTS", "RAW EVIDENCE"),
+        empty_message="No recorded tool calls or AI output.").run()
+
+
+def _cmd_detail(parts: list) -> None:
+    """Control trace recording or browse a recorded conversation."""
+    if len(parts) == 1:
+        current = bool(get_runtime_config("detail"))
+        console.print(
+            f"[dim]Detail recording is [bold]{'on' if current else 'off'}[/bold]. "
+            "Use /detail on|off or /detail trace [N].[/dim]")
+        return
+
+    sub = parts[1].strip().lower()
+    if sub in {"on", "off"} and len(parts) == 2:
+        enabled = sub == "on"
+        set_runtime_config("detail", enabled)
+        terminal_preferences.set_ui_preference("detail", enabled)
+        console.print(
+            f"[green]Detail recording {sub}. Live tool display is unchanged.[/green]")
+        return
+    if sub == "trace" and len(parts) <= 3:
+        number = 1
+        if len(parts) == 3:
+            try:
+                number = int(parts[2])
+            except ValueError:
+                console.print("[red]Usage: /detail trace [N][/red]")
+                return
+        chat = getattr(handle_meta_command, "_last_chat_history", None) or []
+        _browse_detail_trace(chat, number)
+        return
+    console.print("[red]Usage: /detail [on|off|trace [N]][/red]")
 
 
 def _cmd_stream(parts: list) -> None:
@@ -16086,7 +16601,7 @@ def _cmd_skill(parts: list) -> bool:
         skill_name = parts[2] if len(parts) >= 3 else ""
         if not skill_name and sys.stdin.isatty():
             skill_rows = list(skills_mod.get_all_metadata().items())
-            chosen = choose_record(
+            chosen = _ui_pick(
                 skill_rows,
                 title=f"{sub.title()} Skill",
                 label=lambda item: item[0],
@@ -16152,7 +16667,7 @@ def _cmd_skill(parts: list) -> bool:
                 item for item in skills
                 if bool(item.get("loaded")) == (sub == "unload")
             ]
-            chosen = choose_record(
+            chosen = _ui_pick(
                 eligible,
                 title=f"{sub.title()} Skill",
                 label=lambda item: item["name"],
@@ -17347,7 +17862,7 @@ def _cmd_continue(session: dict, agent_registry: AgentRegistry) -> bool:
     return False
 
 
-def _told_browse_history(chat: list) -> None:
+def _told_browse_history_legacy(chat: list) -> None:
     """Interactive full-screen browser for conversation history.
 
     Session turns are grouped by user message; Enter renders the full turn
@@ -17575,6 +18090,132 @@ def _told_browse_history(chat: list) -> None:
         if action == "view" and 0 <= idx < len(items):
             _show_detail(items[idx], source)
             sel_idx = idx
+
+
+def _told_browse_history(chat: list) -> None:
+    """Browse conversations from the current in-memory session only."""
+
+    def message_text(message: dict) -> str:
+        """Extract visible text from native and provider-style messages."""
+        value = message.get("content")
+        if value is None:
+            value = (message.get("reply") or message.get("msg")
+                     or message.get("text") or "")
+        if isinstance(value, str):
+            return value
+        if isinstance(value, list):
+            parts = []
+            for block in value:
+                if isinstance(block, str):
+                    parts.append(block)
+                elif isinstance(block, dict):
+                    text = block.get("text") or block.get("content")
+                    if isinstance(text, str):
+                        parts.append(text)
+            if parts:
+                return "\n".join(parts)
+        try:
+            return json.dumps(value, ensure_ascii=False, indent=2, default=str)
+        except (TypeError, ValueError):
+            return str(value or "")
+
+    session_records = []
+    index = 0
+    while index < len(chat):
+        message = chat[index]
+        if not isinstance(message, dict) or message.get("role") != "user":
+            index += 1
+            continue
+        events = []
+        cursor = index + 1
+        while cursor < len(chat):
+            event = chat[cursor]
+            if isinstance(event, dict) and event.get("role") == "user":
+                break
+            if isinstance(event, dict):
+                events.append(event)
+            cursor += 1
+        session_records.append({
+            "key": f"session-{index}", "source": "Session",
+            "prompt": message_text(message), "events": events,
+        })
+        index = cursor
+    session_records.reverse()
+    if not session_records:
+        console.print(
+            "[dim]No conversations in the current session yet. "
+            "Use /told log to inspect the project prompt journal.[/dim]")
+        return
+
+    def _load_items():
+        rows = []
+        for record in session_records:
+            prompt = " ".join(record["prompt"].split()) or "(empty prompt)"
+            replies = [event for event in record["events"]
+                       if event.get("role") == "assistant"
+                       and message_text(event).strip()]
+            tools = [event for event in record["events"]
+                     if event.get("role") in {"tool", "shell", "knowledge"}]
+            subtitle = (f"{len(replies)} AI repl{'y' if len(replies) == 1 else 'ies'}"
+                        f"  •  {len(tools)} tool event{'s' if len(tools) != 1 else ''}")
+            rows.append(resource_ui.UIItem(
+                key=record["key"], badge=record["source"],
+                title=prompt[:110],
+                subtitle=subtitle, payload=record,
+                search_text=" ".join(
+                    [record["prompt"]]
+                    + [message_text(event) for event in record["events"]]),
+            ))
+        return rows
+
+    def _load_detail(row):
+        record = row.payload
+        lines = [
+            resource_ui.UILine("PROMPT", "class:detail.heading"),
+            *[resource_ui.UILine(value, "class:accent")
+              for value in record["prompt"].splitlines()],
+        ]
+        reply_number = 0
+        for event in record["events"]:
+            role = str(event.get("role") or "event").upper()
+            content = message_text(event)
+            if not content:
+                continue
+            if role == "ASSISTANT":
+                reply_number += 1
+                kind = str(event.get("message_kind") or "").upper()
+                heading = f"AI REPLY {reply_number}"
+                if kind:
+                    heading += f"  •  {kind}"
+            elif role in {"TOOL", "SHELL", "KNOWLEDGE"}:
+                heading = role
+                trace = event.get("trace") or {}
+                tool_name = (event.get("display_name")
+                             or event.get("tool_name")
+                             or trace.get("display_name")
+                             or trace.get("tool"))
+                if tool_name:
+                    heading += f"  •  {tool_name}"
+            else:
+                heading = role
+            lines.extend([
+                resource_ui.UILine(""),
+                resource_ui.UILine(heading, "class:detail.heading"),
+            ])
+            style = ("class:detail.code" if role in {"TOOL", "SHELL"}
+                     else "class:detail")
+            lines.extend(resource_ui.UILine(value, style)
+                         for value in content.splitlines())
+        return resource_ui.UIDetail(
+            title=record["prompt"].splitlines()[0][:100] if record["prompt"] else "Conversation",
+            subtitle=record["source"], lines=lines, kind="timeline")
+
+    resource_ui.ResourceBrowser(
+        title="Conversation History", load_items=_load_items,
+        load_detail=_load_detail,
+        presentation="timeline",
+        pane_labels=("CONVERSATIONS", "TRANSCRIPT"),
+        empty_message="No conversations in the current session.").run()
 
 
 def _cmd_told(parts: list) -> bool:
@@ -18117,6 +18758,9 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
     elif action == "/login":
         _cmd_login(session, agent_registry)
 
+    elif action == "/training":
+        _cmd_training(parts, session)
+
     elif action == "/model":
         _cmd_model(parts, raw_args, session)
 
@@ -18622,6 +19266,16 @@ def show_banner(agent_name: str, session: dict = None):
         f"[/muted][accent]/mode[/accent][muted] plan {symbols.BULLET} "
         "[/muted][accent]/policy[/accent][muted] approvals[/muted]"
     )
+    if bool(getattr(
+            backend_profile, "sends_laintas_credentials",
+            backend_profile.kind == "official")):
+        console.print(
+            "  [muted]Training-data sharing is off by default "
+            f"{symbols.BULLET} [/muted][accent]/training on[/accent]"
+            "[muted] to opt in "
+            f"{symbols.BULLET} [/muted][accent]/training status[/accent]"
+            "[muted] to check[/muted]"
+        )
     console.print()
 
 
@@ -20199,15 +20853,6 @@ def main():
                     f"[dim](run /v update)[/dim]")
         except Exception:
             pass
-
-        # Arm event-log HMAC integrity for training-data verification
-        # (best-effort; official backends only, never blocks startup).
-        if _active_backend.sends_laintas_credentials and session:
-            try:
-                import attestation
-                attestation.fetch_and_arm(timeout=2.0)
-            except Exception:
-                pass
 
         # Mail mode's watcher runs for the whole process lifetime and
         # self-gates on the active mode each poll — started once here rather

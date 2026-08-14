@@ -1,5 +1,7 @@
 import queue
 import io
+import os
+import re
 import tempfile
 import threading
 import time
@@ -8,13 +10,17 @@ from pathlib import Path
 from unittest import mock
 
 from prompt_toolkit.input.defaults import create_pipe_input
+from prompt_toolkit.data_structures import Size
 from prompt_toolkit.output import DummyOutput
+from prompt_toolkit.output.vt100 import Vt100_Output
+from prompt_toolkit.buffer import Buffer
 from rich.console import Console
 
 import agent_loop
 import agent_ui_events
 import agents_mode
 import hwo_ui
+import hwo_runner
 import laintas_cli
 
 
@@ -70,6 +76,20 @@ class AgentsModeTests(unittest.TestCase):
         self.assertEqual(controller.selected_id, first.id)
         start.assert_called_once()
         self.assertEqual(start.call_args.args[0:2], (second.id, "inspect auth"))
+
+    def test_unsent_drafts_are_isolated_per_selected_agent(self):
+        first = self._agent("first")
+        second = self._agent("second")
+        controller = agents_mode.AgentsModeController("term0", object(), {})
+        controller.selected_id = first.id
+        controller._input_buffer = Buffer(multiline=False)
+        controller._input_buffer.text = "message for first"
+
+        self.assertTrue(controller.select(second.id))
+        self.assertEqual(controller._input_buffer.text, "")
+        controller._input_buffer.text = "message for second"
+        self.assertTrue(controller.select(first.id))
+        self.assertEqual(controller._input_buffer.text, "message for first")
 
     def test_stream_chunks_render_as_one_assistant_message(self):
         agent = self._agent("writer")
@@ -858,6 +878,57 @@ class AgentUIEventHubTests(unittest.TestCase):
         self.assertEqual(sanitized.summary, "red")
         self.assertEqual(sanitized.detail, "ab")
 
+    def test_snapshot_revision_and_rows_are_consistent(self):
+        hub = agent_ui_events.AgentUIEventHub()
+        first = hub.emit("ai", agent_id="a", detail="one")
+        revision, rows = hub.agent_events_snapshot("a")
+        self.assertEqual(revision, first.seq)
+        self.assertEqual([row.detail for row in rows], ["one"])
+
+
+class AgentsModeRenderingTests(unittest.TestCase):
+    def setUp(self):
+        agent_loop.close_all_agents()
+        agent_loop.close_all_terminals()
+        agent_ui_events.hub.reset()
+        terminal = mock.Mock()
+        terminal.is_alive.return_value = True
+        agent_loop.register_terminal(terminal, "/bin/sh", 0, name="term0")
+
+    def tearDown(self):
+        agent_loop.close_all_agents()
+        agent_loop.close_all_terminals()
+        agent_ui_events.hub.reset()
+
+    def test_event_lines_reuse_parsed_cache_until_agent_changes(self):
+        agent = agent_loop.register_agent(name="cached", role="pool")
+        agent.home_terminal = "term0"
+        controller = agents_mode.AgentsModeController("term0", object(), {})
+        agent_ui_events.hub.emit(
+            "ai", agent_id=agent.id, terminal_name="term0", detail="answer")
+        with mock.patch.object(
+                controller, "_agent_name", wraps=controller._agent_name) as names:
+            first = controller._event_lines(agent.id)
+            first_calls = names.call_count
+            second = controller._event_lines(agent.id)
+        self.assertEqual(first, second)
+        self.assertGreater(first_calls, 0)
+        self.assertEqual(names.call_count, first_calls)
+
+    def test_wide_inspector_contains_runtime_context(self):
+        agent = agent_loop.register_agent(name="worker", role="pool")
+        agent.home_terminal = "term0"
+        agent.state["objective"] = "verify release"
+        controller = agents_mode.AgentsModeController("term0", object(), {})
+        controller.selected_id = agent.id
+        agent_ui_events.hub.emit(
+            "tool_finished", agent_id=agent.id, terminal_name="term0",
+            summary="pytest", status="done")
+        text = "".join(value for _style, value in controller.inspector_fragments())
+        self.assertIn("CONTEXT", text)
+        self.assertIn("verify release", text)
+        self.assertIn("tools", text)
+
 
 class HwoUIRuntimeEventTests(unittest.TestCase):
     def test_step_binding_and_updates_are_exact(self):
@@ -883,6 +954,244 @@ class HwoUIRuntimeEventTests(unittest.TestCase):
         ])
         self.assertEqual(nested.status, "done")
         self.assertIsNotNone(nested.completed_at)
+
+    def test_metadata_round_trip_preserves_model_prompt_and_io(self):
+        source = """@line [in(topic: string)]
+
+(review.md)#reviewer@model-x# [in(topic: string), out(report: file)] {
+  -> inspect $self.topic
+}
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp, "flow.hwo")
+            path.write_text(source, encoding="utf-8")
+            session, error = hwo_ui.load_hwo_file(str(path))
+        self.assertIsNone(error)
+        agent = session.nodes[0]
+        self.assertEqual(agent.prompt_file, "review.md")
+        self.assertEqual(agent.model, "model-x")
+        reparsed = hwo_runner.parse_hwo(hwo_ui._session_to_hwo(session))
+        self.assertEqual(reparsed[0].prompt_file, "review.md")
+        self.assertEqual(reparsed[0].model, "model-x")
+        self.assertEqual(reparsed[0].io["out"][0]["name"], "report")
+        ast = hwo_ui._session_to_hwo(session)
+        self.assertIn("@line [in(topic: string)]", ast)
+
+    def test_top_level_tasks_keep_parent_runtime_semantics(self):
+        source = "-> inspect\n-> verify\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp, "parent.hwo")
+            path.write_text(source, encoding="utf-8")
+            session, error = hwo_ui.load_hwo_file(str(path))
+        self.assertIsNone(error)
+        self.assertTrue(all(isinstance(node, hwo_ui.HwoTask)
+                            for node in session.nodes))
+        self.assertEqual(hwo_ui._session_to_hwo(session), source)
+
+    def test_real_studio_keyboard_adds_task_without_dsl(self):
+        root = hwo_ui.HwoAgent("root")
+        session = hwo_ui.HwoSession("primary", nodes=[root])
+        session._last_agent = root
+        with create_pipe_input() as pipe:
+            # Studio starts in Outline navigation; the form exists only while
+            # the add action is active.
+            pipe.send_text("aWrite verification\r\x1b")
+            hwo_ui.run_hwo_ui(
+                "primary", initial_session=session,
+                input=pipe, output=DummyOutput())
+        self.assertEqual([task.text for task in root.tasks], ["Write verification"])
+
+    def test_command_palette_accepts_hwo_dsl_then_returns_to_navigation(self):
+        session = hwo_ui.HwoSession("primary")
+        with create_pipe_input() as pipe:
+            pipe.send_text(":#builder#\r:#builder#->ship release\r\x1b")
+            hwo_ui.run_hwo_ui(
+                "primary", initial_session=session,
+                input=pipe, output=DummyOutput())
+        agent = session.find_agent("builder")
+        self.assertIsNotNone(agent)
+        self.assertEqual([task.text for task in agent.tasks], ["ship release"])
+
+    def test_hash_and_arrow_prefixes_quick_open_command_palette(self):
+        session = hwo_ui.HwoSession("primary")
+        with create_pipe_input() as pipe:
+            pipe.send_text("#builder#\r->compile assets\r\x1b")
+            hwo_ui.run_hwo_ui(
+                "primary", initial_session=session,
+                input=pipe, output=DummyOutput())
+        agent = session.find_agent("builder")
+        self.assertIsNotNone(agent)
+        self.assertEqual([task.text for task in agent.tasks], ["compile assets"])
+
+    def test_slash_help_moves_focus_off_hidden_command_field(self):
+        session = hwo_ui.HwoSession(
+            "primary", nodes=[hwo_ui.HwoAgent("root")])
+        with create_pipe_input() as pipe:
+            # Slash opens the palette, /h replaces it with Help, then the two
+            # Esc presses close Help and Studio without focusing a hidden Window.
+            pipe.send_text("/h\r\x1b\x1b")
+            hwo_ui.run_hwo_ui(
+                "primary", initial_session=session,
+                input=pipe, output=DummyOutput())
+
+    def test_delete_confirmation_defaults_to_cancel(self):
+        root = hwo_ui.HwoAgent("root")
+        session = hwo_ui.HwoSession("primary", nodes=[root])
+        with create_pipe_input() as pipe:
+            pipe.send_text("d\r\x1b")
+            hwo_ui.run_hwo_ui(
+                "primary", initial_session=session,
+                input=pipe, output=DummyOutput())
+        self.assertEqual(session.nodes, [root])
+
+    def test_delete_confirmation_and_single_undo_restore_content(self):
+        root = hwo_ui.HwoAgent("root", tasks=[hwo_ui.HwoTask("verify")])
+        session = hwo_ui.HwoSession("primary", nodes=[root])
+        with create_pipe_input() as pipe:
+            pipe.send_text("dyu\x1b")
+            hwo_ui.run_hwo_ui(
+                "primary", initial_session=session,
+                input=pipe, output=DummyOutput())
+        self.assertEqual(len(session.nodes), 1)
+        restored = session.nodes[0]
+        self.assertEqual(restored.name, "root")
+        self.assertEqual([task.text for task in restored.tasks], ["verify"])
+
+    def test_slash_save_without_argument_opens_labeled_file_form(self):
+        root = hwo_ui.HwoAgent("root", tasks=[hwo_ui.HwoTask("verify")])
+        session = hwo_ui.HwoSession("primary", nodes=[root])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp, "saved-workflow"))
+            with create_pipe_input() as pipe:
+                pipe.send_text(f"/w\r{path}\r\x1b")
+                hwo_ui.run_hwo_ui(
+                    "primary", initial_session=session,
+                    input=pipe, output=DummyOutput())
+            saved = Path(path + ".hwo")
+            self.assertTrue(saved.exists())
+            self.assertIn("#root#", saved.read_text(encoding="utf-8"))
+
+    def test_studio_renders_distinct_navigation_form_command_and_confirm_surfaces(self):
+        cases = [
+            ("", ("NAVIGATION",)),
+            ("a", ("ADD TASK", "Task          ┃")),
+            (":", ("COMMAND PALETTE",)),
+            ("d", ("DELETE", "[ Cancel ]")),
+            ("?", ("HELP",)),
+            ("i", ("INSPECTOR",)),
+        ]
+        all_frames = []
+        for trigger, labels in cases:
+            session = hwo_ui.HwoSession(
+                "primary", nodes=[hwo_ui.HwoAgent("root")])
+            screen = io.StringIO()
+            output = Vt100_Output(
+                screen, lambda: Size(rows=24, columns=100),
+                term="xterm", enable_cpr=False)
+            with create_pipe_input() as pipe:
+                def drive(keys=trigger):
+                    time.sleep(0.08)
+                    if keys:
+                        pipe.send_text(keys)
+                    time.sleep(0.12)
+                    pipe.send_text("\x03")
+
+                driver = threading.Thread(target=drive)
+                driver.start()
+                hwo_ui.run_hwo_ui(
+                    "primary", initial_session=session,
+                    input=pipe, output=output)
+                driver.join(timeout=1)
+            plain = re.sub(
+                r"\x1b\[[0-?]*[ -/]*[@-~]", "", screen.getvalue())
+            all_frames.append(plain)
+            for label in labels:
+                self.assertIn(label, plain)
+        self.assertNotIn("command ›", "".join(all_frames))
+
+    def test_slash_run_focus_and_cancel_confirmation_have_safe_transitions(self):
+        root = hwo_ui.HwoAgent("root", tasks=[hwo_ui.HwoTask("verify")])
+        session = hwo_ui.HwoSession("primary", nodes=[root])
+        screen = io.StringIO()
+        output = Vt100_Output(
+            screen, lambda: Size(rows=24, columns=100),
+            term="xterm", enable_cpr=False)
+        started = threading.Event()
+        release = threading.Event()
+
+        def fake_run(**_kwargs):
+            started.set()
+            release.wait(2)
+            return {"ok": True, "msg": "done"}
+
+        with create_pipe_input() as pipe, mock.patch.object(
+                hwo_runner, "run_hwo_file", side_effect=fake_run):
+            def drive():
+                time.sleep(0.08)
+                pipe.send_text("/r\r")
+                if not started.wait(1):
+                    pipe.send_text("\x03")
+                    return
+                time.sleep(0.1)
+                pipe.send_text("\x1b")       # running -> cancel confirmation
+                time.sleep(0.3)
+                pipe.send_text("\x1b")       # dismiss confirmation
+                time.sleep(0.3)
+                release.set()
+                time.sleep(0.2)
+                pipe.send_text("\x1b\x1b")  # result -> navigation -> exit
+
+            driver = threading.Thread(target=drive)
+            driver.start()
+            hwo_ui.run_hwo_ui(
+                "primary", initial_session=session,
+                input=pipe, output=output)
+            driver.join(timeout=3)
+        self.assertTrue(started.is_set())
+        self.assertFalse(driver.is_alive())
+        plain = re.sub(
+            r"\x1b\[[0-?]*[ -/]*[@-~]", "", screen.getvalue())
+        self.assertIn("RUNNING", plain)
+        self.assertIn("CANCEL RUN", plain)
+        self.assertIn("RESULT", plain)
+
+    def test_narrow_studio_inspector_has_predictable_escape_path(self):
+        root = hwo_ui.HwoAgent("root", tasks=[hwo_ui.HwoTask("verify")])
+        session = hwo_ui.HwoSession("primary", nodes=[root])
+        with create_pipe_input() as pipe, mock.patch.object(
+                hwo_ui.shutil, "get_terminal_size",
+                return_value=os.terminal_size((70, 20))):
+            # Outline -> inspector -> Outline -> exit.
+            pipe.send_text("i\x1b\x1b")
+            hwo_ui.run_hwo_ui(
+                "primary", initial_session=session,
+                input=pipe, output=DummyOutput())
+
+    def test_wide_studio_inspector_has_predictable_escape_path(self):
+        session = hwo_ui.HwoSession(
+            "primary", nodes=[hwo_ui.HwoAgent("root")])
+        with create_pipe_input() as pipe, mock.patch.object(
+                hwo_ui.shutil, "get_terminal_size",
+                return_value=os.terminal_size((140, 35))):
+            pipe.send_text("\t\t\x1b")
+            hwo_ui.run_hwo_ui(
+                "primary", initial_session=session,
+                input=pipe, output=DummyOutput())
+
+    def test_nested_parallel_loader_refuses_lossy_edit(self):
+        source = """#root# {
+  //
+    #a# { -> one }
+    #b# { -> two }
+  //
+}
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp, "nested.hwo")
+            path.write_text(source, encoding="utf-8")
+            session, error = hwo_ui.load_hwo_file(str(path))
+        self.assertIsNone(session)
+        self.assertIn("not editable", error)
 
 
 if __name__ == "__main__":

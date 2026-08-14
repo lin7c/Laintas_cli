@@ -20,6 +20,22 @@ import agent_roles
 import tools
 
 
+class TrainingPrivacyDefaultsTests(unittest.TestCase):
+    def test_training_content_capture_is_opt_in(self):
+        self.assertIs(agent_loop._DEFAULT_CONFIG["precheck_capture"], False)
+        self.assertIs(agent_loop._DEFAULT_CONFIG["redact_capture"], False)
+        self.assertIs(agent_loop._DEFAULT_CONFIG["rag_capture"], False)
+
+    def test_local_event_content_is_private(self):
+        import event_log
+        with tempfile.TemporaryDirectory() as tmp, _chdir(tmp):
+            self.assertGreater(event_log.append("prompt_admitted", prompt="secret"), 0)
+            directory = Path(tmp) / ".laintas"
+            event_file = directory / "events.jsonl"
+            self.assertEqual(directory.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(event_file.stat().st_mode & 0o777, 0o600)
+
+
 @contextmanager
 def _chdir(path):
     old = os.getcwd()
