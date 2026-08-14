@@ -118,6 +118,18 @@ import fcntl
 import termios
 import tty
 
+# Imported before anything can touch the terminal: constructing the arbiter is
+# what captures PRISTINE, the single baseline every terminal mode is computed
+# from. Nothing else in this process may call tcsetattr on stdin — see the
+# module docstring for why that rule exists.
+import terminal_arbiter
+from terminal_arbiter import Mode as TermMode, TerminalBusy
+
+# Capture PRISTINE now, while the terminal is still in the state the user's
+# shell handed us. Deferring this to first use would let an early prompt set
+# cbreak and have *that* become the baseline everything restores to.
+terminal_arbiter.get_arbiter()
+
 import requests
 from rich.console import Console, Group
 from rich.panel import Panel
@@ -581,34 +593,17 @@ def _press_enter_to_continue(
     except (OSError, ValueError):
         pass
 
-    fd = sys.stdin.fileno()
     try:
-        old_attr = termios.tcgetattr(fd)
-    except (termios.error, OSError, ValueError):
-        old_attr = None
-    try:
-        if old_attr is not None:
-            # cbreak gives us one key without waiting for Enter; clearing ECHO
-            # on top of it is what keeps the keystroke off the screen.
-            tty.setcbreak(fd)
-            quiet = termios.tcgetattr(fd)
-            quiet[3] &= ~termios.ECHO          # lflag
-            termios.tcsetattr(fd, termios.TCSADRAIN, quiet)
-        try:
-            ch = sys.stdin.read(1)
-        except (EOFError, KeyboardInterrupt, OSError, ValueError):
-            ch = ""
-        # An escape sequence (arrow key, function key) arrives as several
-        # bytes. Drain them so the leftovers are not read as input by the
-        # next prompt once we are back at the REPL.
-        if ch == "\x1b":
-            _drain_stdin(fd)
-    finally:
-        if old_attr is not None:
-            try:
-                termios.tcsetattr(fd, termios.TCSADRAIN, old_attr)
-            except (termios.error, OSError, ValueError):
-                pass
+        # CBREAK already clears ECHO, so the keystroke stays off the page.
+        # An arrow key arrives as one parsed Key rather than as three bytes,
+        # so there are no leftovers for the next prompt to mistake for input
+        # — the old code had to hand-drain the tail of every escape sequence.
+        with terminal_arbiter.hold("any-key", TermMode.CBREAK,
+                                   timeout=2.0) as term:
+            if term.interactive:
+                term.read_key(timeout=None)
+    except (TerminalBusy, KeyboardInterrupt):
+        pass
     # Close the hint line ourselves, since nothing was echoed onto it.
     console.print()
 
@@ -1255,44 +1250,54 @@ def pty_passthrough(command: str, timeout: int = 120) -> dict:
 
     Returns {stdout, stderr, returncode, success}.
     """
-    fd = sys.stdin.fileno()
-    old_tcattr = termios.tcgetattr(fd)
     old_sigint = signal.getsignal(signal.SIGINT)
     old_sigquit = signal.getsignal(signal.SIGQUIT)
-
-    pid = os.fork()
-    if pid == 0:
-        # Child: restore default signal handlers and exec directly into the
-        # current terminal (no new PTY — stdin/stdout/stderr are inherited).
-        try:
-            signal.signal(signal.SIGINT, signal.SIG_DFL)
-            signal.signal(signal.SIGQUIT, signal.SIG_DFL)
-            os.execve(DEFAULT_SHELL, [DEFAULT_SHELL, "-c", command], _child_env())
-        except Exception:
-            pass
-        os._exit(127)
-
-    # Parent: let SIGINT reach the child's process group, just wait.
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
-    signal.signal(signal.SIGQUIT, signal.SIG_IGN)
-
     returncode = -1
+
+    # EXTERNAL: the child owns the inherited terminal for its whole lifetime.
+    # The arbiter reads nothing while it runs — otherwise vim and friends
+    # would lose keystrokes to us — but still keeps every other component out,
+    # and restores from PRISTINE afterwards, which is what cleans up after a
+    # child that died leaving the terminal in raw mode.
     try:
-        _, status = os.waitpid(pid, 0)
-        if os.WIFEXITED(status):
-            returncode = os.WEXITSTATUS(status)
-        elif os.WIFSIGNALED(status):
-            returncode = -os.WTERMSIG(status)
-    except ChildProcessError:
-        pass
-    finally:
-        signal.signal(signal.SIGINT, old_sigint)
-        signal.signal(signal.SIGQUIT, old_sigquit)
-        # Restore terminal settings the child may have left in a dirty state.
+        term_ctx = terminal_arbiter.hold("passthrough", TermMode.EXTERNAL,
+                                         timeout=10.0)
+        term_ctx.__enter__()
+    except TerminalBusy as exc:
+        return {"stdout": "", "stderr": str(exc), "returncode": -1,
+                "success": False}
+
+    try:
+        pid = os.fork()
+        if pid == 0:
+            # Child: restore default signal handlers and exec directly into
+            # the current terminal (no new PTY — stdio is inherited).
+            try:
+                signal.signal(signal.SIGINT, signal.SIG_DFL)
+                signal.signal(signal.SIGQUIT, signal.SIG_DFL)
+                os.execve(DEFAULT_SHELL, [DEFAULT_SHELL, "-c", command],
+                          _child_env())
+            except Exception:
+                pass
+            os._exit(127)
+
+        # Parent: let SIGINT reach the child's process group, just wait.
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        signal.signal(signal.SIGQUIT, signal.SIG_IGN)
+
         try:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old_tcattr)
-        except (termios.error, OSError):
+            _, status = os.waitpid(pid, 0)
+            if os.WIFEXITED(status):
+                returncode = os.WEXITSTATUS(status)
+            elif os.WIFSIGNALED(status):
+                returncode = -os.WTERMSIG(status)
+        except ChildProcessError:
             pass
+        finally:
+            signal.signal(signal.SIGINT, old_sigint)
+            signal.signal(signal.SIGQUIT, old_sigquit)
+    finally:
+        term_ctx.__exit__(None, None, None)
 
     return {
         "stdout": "",
@@ -2207,7 +2212,6 @@ class InteractiveSession:
         self._output_dropped: int = 0  # bytes dropped from beginning (cap eviction)
         self._returncode: int = -1
         self._start_time: float = 0.0
-        self._old_tcattr = None
         self._started: bool = False
         self._closed: bool = False
         self._eof_reached: bool = False
@@ -2221,12 +2225,13 @@ class InteractiveSession:
             return
         self._started = True
 
-        # Save terminal attrs for restoration
-        try:
-            self._old_tcattr = termios.tcgetattr(sys.stdin.fileno())
-        except (termios.error, OSError):
-            self._old_tcattr = None
-
+        # NOTE: this class deliberately does not touch the *outer* terminal's
+        # termios state. The child runs on its own pty (opened below); the only
+        # attrs it needs are the slave's, set in the child after the fork.
+        # Snapshotting sys.stdin here and restoring it in close()/__del__ used
+        # to corrupt whoever owned the real terminal — the restore could land
+        # from the garbage collector, on any thread, with a snapshot taken
+        # minutes earlier, silently undoing prompt_toolkit's raw mode.
         master_fd, slave_fd = pty.openpty()
 
         # Get slave terminal attrs and disable ECHO so programmatic
@@ -2541,15 +2546,10 @@ class InteractiveSession:
         self._reap_child()
         self._drain_remaining()
 
-        # Clean up fd and terminal
+        # Clean up fd (the outer terminal is not ours to restore — see start())
         if self.master_fd >= 0:
             os.close(self.master_fd)
             self.master_fd = -1
-        try:
-            if self._old_tcattr:
-                termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, self._old_tcattr)
-        except (termios.error, OSError):
-            pass
 
         stdout = _strip_ansi("".join(self._output_chunks)).strip()
         return {
@@ -2562,7 +2562,11 @@ class InteractiveSession:
     # ── cleanup ─────────────────────────────────────────────────~~~~~~~
 
     def close(self) -> None:
-        """Kill the process, reap it, close fd, restore terminal."""
+        """Kill the process, reap it, close the pty master.
+
+        Safe to call from ``__del__`` (i.e. from the GC, on any thread)
+        precisely because it never touches the outer terminal — see start().
+        """
         if self._closed:
             return
 
@@ -2582,12 +2586,6 @@ class InteractiveSession:
             self._drain_remaining()
             os.close(self.master_fd)
             self.master_fd = -1
-
-        try:
-            if self._old_tcattr:
-                termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, self._old_tcattr)
-        except (termios.error, OSError):
-            pass
 
     def __del__(self):
         self.close()
@@ -4139,17 +4137,33 @@ def pt_prompt(cwd: str) -> str:
         # leaving a stack of prompt/rprompt lines in scrollback. Under
         # patch_stdout those writes are held and flushed above the prompt, which
         # is redrawn intact underneath.
-        with patch_stdout(raw=True):
-            user_input = session.prompt(
-                message,
-                style=_build_prompt_style(),
-                multiline=True,
-                rprompt=_render_rprompt,
-                complete_while_typing=True,
-            )
+        # EXTERNAL: prompt_toolkit drives its own raw mode and its own reader.
+        # Holding it here is what guarantees no background reader is on fd 0
+        # at the same time — two readers used to split escape sequences
+        # between them, which is how a Ctrl+C ended up rendered as the literal
+        # text "^C" inside the input buffer instead of interrupting. On exit
+        # the arbiter restores from PRISTINE, which also clears the
+        # O_NONBLOCK that prompt_toolkit can leave behind.
+        with terminal_arbiter.hold("repl-prompt", TermMode.EXTERNAL,
+                                   timeout=10.0):
+            with patch_stdout(raw=True):
+                user_input = session.prompt(
+                    message,
+                    style=_build_prompt_style(),
+                    multiline=True,
+                    rprompt=_render_rprompt,
+                    complete_while_typing=True,
+                )
         expanded = _expand_pastes(user_input) if user_input else user_input
         _reset_paste_registry()
         return expanded.strip() if expanded else ""
+    except TerminalBusy as exc:
+        # Never spin: a REPL that cannot get the terminal must say so rather
+        # than silently returning empty input in a tight loop.
+        _reset_paste_registry()
+        console.print(f"[yellow]{exc}[/yellow]")
+        time.sleep(0.5)
+        return ""
     except KeyboardInterrupt:
         _reset_paste_registry()
         return ""
@@ -4447,35 +4461,12 @@ def run_cancellable_blocking(
 
     old_sigint = None
     sigint_installed = False
-    input_fd = -1
-    terminal_fd = -1
-    old_tcattr = None
 
     def _cancel_signal(_signum, _frame) -> None:
         cancelled.set()
 
-    try:
-        if threading.current_thread() is threading.main_thread():
-            old_sigint = signal.getsignal(signal.SIGINT)
-            signal.signal(signal.SIGINT, _cancel_signal)
-            sigint_installed = True
-
-        try:
-            if sys.stdin.isatty():
-                input_fd = sys.stdin.fileno()
-                terminal_fd = input_fd
-                old_tcattr = termios.tcgetattr(input_fd)
-                tty.setcbreak(input_fd)
-        except (AttributeError, OSError, ValueError, io.UnsupportedOperation,
-                termios.error):
-            input_fd = -1
-            old_tcattr = None
-
-        # Start only after both cancellation channels are armed, so there is
-        # no startup window where the operation can block before Ctrl+C/Esc
-        # become effective.
-        worker.start()
-
+    def _pump(term) -> object:
+        """Wait for the worker while keeping Esc responsive."""
         while True:
             try:
                 kind, value = outcome.get_nowait()
@@ -4489,50 +4480,46 @@ def run_cancellable_blocking(
                 raise BlockingOperationCancelled(
                     "Operation cancelled by Esc or Ctrl+C")
 
-            if input_fd < 0:
+            if term is None or not term.interactive:
                 cancelled.wait(0.05)
                 continue
-            try:
-                ready, _, _ = select.select([input_fd], [], [], 0.05)
-            except (OSError, ValueError, select.error):
-                ready = []
-            if not ready:
-                continue
-            try:
-                key = os.read(input_fd, 1)
-            except (BlockingIOError, InterruptedError):
-                continue
-            except OSError:
-                input_fd = -1
-                continue
-            if key == b"\x03":
+            key = term.read_key(timeout=0.05)
+            # Ctrl+C is not read here: CBREAK leaves ISIG on, so the terminal
+            # raises SIGINT and _cancel_signal picks it up. Arrow keys arrive
+            # as their own named keys, so an impatient navigation press can no
+            # longer be mistaken for a bare Esc.
+            if key is not None and key.name == "escape":
                 cancelled.set()
-            elif key == b"\x1b":
-                # Do not mistake an impatient arrow/navigation key for bare
-                # Esc while the next UI is still loading.
-                try:
-                    continuation, _, _ = select.select(
-                        [input_fd], [], [], 0.04)
-                except (OSError, ValueError, select.error):
-                    continuation = []
-                if continuation:
-                    try:
-                        os.read(input_fd, 32)
-                    except OSError:
-                        pass
-                else:
-                    cancelled.set()
+
+    try:
+        if threading.current_thread() is threading.main_thread():
+            old_sigint = signal.getsignal(signal.SIGINT)
+            signal.signal(signal.SIGINT, _cancel_signal)
+            sigint_installed = True
+
+        started = False
+        try:
+            with terminal_arbiter.hold("blocking-op", TermMode.CBREAK,
+                                       timeout=2.0) as term:
+                # Start only after both cancellation channels are armed, so
+                # there is no startup window where the operation can block
+                # before Ctrl+C/Esc become effective.
+                worker.start()
+                started = True
+                return _pump(term)
+        except TerminalBusy:
+            # Run anyway, without Esc — SIGINT still cancels. Refusing to do
+            # the work because the terminal is busy would be worse than doing
+            # it with one fewer cancellation channel.
+            if not started:
+                worker.start()
+            return _pump(None)
     except KeyboardInterrupt as exc:
         cancelled.set()
         raise BlockingOperationCancelled(
             "Operation cancelled by Ctrl+C") from exc
     finally:
         cancelled.set()
-        if old_tcattr is not None and terminal_fd >= 0:
-            try:
-                termios.tcsetattr(terminal_fd, termios.TCSANOW, old_tcattr)
-            except (OSError, termios.error):
-                pass
         if sigint_installed:
             signal.signal(signal.SIGINT, old_sigint)
 
@@ -6338,6 +6325,102 @@ def _extract_tagged_tool_calls(text: str) -> Optional[list]:
     return out or None
 
 
+# ── Interruptible backend I/O ───────────────────────────────────────────
+# Both helpers below exist for one reason: `requests` blocks inside a socket
+# read, and while it does, nothing checks the interrupt event. Esc during a
+# model's thinking phase set the event and then did nothing at all, because
+# the next checkpoint was "between two SSE lines" and a provider that buffers
+# its reasoning sends no lines for the whole thinking period — up to the
+# 120s read timeout. Moving the blocking read onto a worker thread gives the
+# consumer a checkpoint on a fixed interval no matter what the wire is doing.
+
+_BACKEND_POLL = 0.1
+
+
+def _post_with_interrupt(interrupt_event: Optional[threading.Event], **kwargs):
+    """requests.post() that Esc can abandon while it waits for headers."""
+    if interrupt_event is None:
+        return requests.post(**kwargs)
+
+    box: queue.Queue = queue.Queue(maxsize=1)
+
+    def _do():
+        try:
+            box.put(("ok", requests.post(**kwargs)))
+        except BaseException as exc:
+            box.put(("err", exc))
+
+    threading.Thread(target=_do, daemon=True, name="backend-post").start()
+
+    while True:
+        if interrupt_event.is_set():
+            # The worker keeps its socket until the request completes; the
+            # response is dropped on the floor and closed when collected.
+            # We cannot abort a socket read already in flight, but we can
+            # stop making the user wait for it.
+            raise InterruptedError("interrupted while waiting for the backend")
+        try:
+            kind, value = box.get(timeout=_BACKEND_POLL)
+        except queue.Empty:
+            continue
+        if kind == "err":
+            raise value
+        return value
+
+
+def _iter_lines_interruptible(response,
+                              interrupt_event: Optional[threading.Event]):
+    """Yield SSE lines with an interrupt checkpoint every _BACKEND_POLL.
+
+    The queue is deliberately unbounded: a bounded one would let the reader
+    thread block in put() after the consumer has stopped, and then it would
+    never see the close that was supposed to release it.
+    """
+    if interrupt_event is None:
+        yield from response.iter_lines(decode_unicode=True)
+        return
+
+    out: queue.Queue = queue.Queue()
+    done = object()
+
+    def _pump():
+        try:
+            for line in response.iter_lines(decode_unicode=True):
+                out.put(line)
+                if interrupt_event.is_set():
+                    break
+        except BaseException as exc:
+            out.put(exc)
+        finally:
+            out.put(done)
+
+    threading.Thread(target=_pump, daemon=True, name="backend-sse").start()
+
+    interrupted = False
+    try:
+        while True:
+            if interrupt_event.is_set():
+                interrupted = True
+                return
+            try:
+                item = out.get(timeout=_BACKEND_POLL)
+            except queue.Empty:
+                continue
+            if item is done:
+                return
+            if isinstance(item, BaseException):
+                raise item
+            yield item
+    finally:
+        if interrupted:
+            # Closing the response is what unblocks the reader thread if it
+            # is parked in a socket read.
+            try:
+                response.close()
+            except Exception:
+                pass
+
+
 def call_backend_stream(
     session: dict,
     message: str,
@@ -6442,8 +6525,9 @@ def call_backend_stream(
             if interrupt_event is not None and interrupt_event.is_set():
                 raise InterruptedError("interrupted before request")
             try:
-                response = requests.post(
-                    f"{backend_url}/api/chat/stream",
+                response = _post_with_interrupt(
+                    interrupt_event,
+                    url=f"{backend_url}/api/chat/stream",
                     json=payload,
                     headers=headers,
                     cookies=cookies,
@@ -6521,7 +6605,7 @@ def call_backend_stream(
         prev_reply_for_chunks = ""
         prev_command_for_chunks = ""
         native_tc_frags: dict = {}  # index -> {id,name,arguments} for native tool_calls
-        for line in response.iter_lines(decode_unicode=True):
+        for line in _iter_lines_interruptible(response, interrupt_event):
             # Check for soft-interrupt between SSE chunks
             if interrupt_event is not None and interrupt_event.is_set():
                 response.close()
@@ -6637,6 +6721,20 @@ def call_backend_stream(
                 if on_chunk is not None:
                     try: on_chunk("thinking", delta_reasoning)
                     except Exception: pass
+
+        # An interrupt that lands while the stream is idle ends the generator
+        # without yielding, so the in-loop check above never runs. Report it
+        # here or a cancelled turn would be mistaken for a finished one — and
+        # for a *truncated* one, since `got_any_event` is false when the
+        # interrupt arrived during thinking.
+        if interrupt_event is not None and interrupt_event.is_set():
+            return {
+                "reply": accumulated or "(interrupted)",
+                "tool_calls": [],
+                "done": True,
+                "error": False,
+                "_interrupted": True,
+            }
 
         if not got_any_event:
             return {"reply": "No response from AI", "tool_calls": [], "done": True, "error": True}
@@ -9451,17 +9549,14 @@ def enter_session(session, display_name: str = "", display_cmd: str = "") -> Non
         console.print("[yellow]Session does not support raw PTY I/O (tmux mode).[/yellow]")
         return
 
-    fd = sys.stdin.fileno()
-
     # Display info
     if display_name:
         cmd_display = f"{display_name}: {display_cmd[:60]}" if display_cmd else display_name
     else:
         cmd_display = getattr(session, 'command', 'sub-terminal')[:80]
 
-    # Save terminal state
-    old_tcattr = termios.tcgetattr(fd)
-    old_flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+    # Terminal mode is the arbiter's job (RAW for the duration, restored from
+    # PRISTINE on the way out); only the signal handlers are ours to save.
     old_sigquit = signal.getsignal(signal.SIGQUIT)
     old_sigwinch = signal.getsignal(signal.SIGWINCH)
 
@@ -9520,40 +9615,36 @@ def enter_session(session, display_name: str = "", display_cmd: str = "") -> Non
     partial_buf = b''
 
     try:
-        # Ensure stdin is in blocking mode — prompt_toolkit may leave O_NONBLOCK
-        # set after app.run() exits, which makes select() report fd as always
-        # readable and os.read() raise EAGAIN, causing the I/O loop to exit
-        # immediately (resulting in read-only "observe" behavior).
-        fcntl.fcntl(fd, fcntl.F_SETFL, old_flags & ~os.O_NONBLOCK)
-        tty.setraw(fd)
+        # raw_bytes: keystrokes are forwarded to the sub-terminal verbatim, so
+        # they must not be parsed into keys and re-serialised on the way. The
+        # arbiter still owns the fd, which is what stops the agent loop's
+        # background reader from eating half of what the user types in here.
+        # It also clears O_NONBLOCK, which prompt_toolkit can leave set — a
+        # non-blocking fd makes select() report readable forever while read()
+        # raises EAGAIN, and this loop degraded to read-only "observe" mode.
+        with terminal_arbiter.hold("subterm", TermMode.RAW,
+                                   timeout=2.0, raw_bytes=True) as term:
+            while session.is_alive() and not detached:
+                data = term.read_bytes(timeout=0.1)
+                if data is not None:
+                    if not data:
+                        break                     # EOF on stdin
+                    # Ctrl+\ (byte 0x1c) → force detach
+                    if data == b'\x1c':
+                        detached = True
+                        break
+                    try:
+                        os.write(mfd, data)
+                    except OSError:
+                        break
 
-        while session.is_alive() and not detached:
-            try:
-                r, _, _ = select.select([fd, mfd], [], [], 0.1)
-            except (select.error, ValueError):
-                break
-
-            if fd in r:
                 try:
-                    data = os.read(fd, 4096)
-                except BlockingIOError:
-                    # Transient EAGAIN — shouldn't happen after clearing
-                    # O_NONBLOCK, but guard anyway.
+                    r, _, _ = select.select([mfd], [], [], 0.02)
+                except (select.error, ValueError):
+                    break
+                if mfd not in r:
                     continue
-                except OSError:
-                    break
-                if not data:
-                    break
-                # Ctrl+\ (byte 0x1c) → force detach
-                if data == b'\x1c':
-                    detached = True
-                    break
-                try:
-                    os.write(mfd, data)
-                except OSError:
-                    break
 
-            if mfd in r:
                 try:
                     data = os.read(mfd, 4096)
                 except OSError:
@@ -9585,16 +9676,10 @@ def enter_session(session, display_name: str = "", display_cmd: str = "") -> Non
                     # EOF — sub-terminal exited
                     session_died = True
                     break
-
+    except TerminalBusy as exc:
+        console.print(f"\n[yellow]Cannot take over: {exc}[/yellow]")
+        return
     finally:
-        try:
-            termios.tcsetattr(fd, termios.TCSANOW, old_tcattr)
-        except termios.error:
-            pass
-        try:
-            fcntl.fcntl(fd, fcntl.F_SETFL, old_flags)
-        except OSError:
-            pass
         signal.signal(signal.SIGQUIT, old_sigquit)
         signal.signal(signal.SIGWINCH, old_sigwinch)
 
@@ -13909,7 +13994,8 @@ def _cmd_prompt(raw_args: str, parts: list, session: dict) -> None:
         elif sys.stdin.isatty():
             _reader_was_running = bool(
                 _bg_reader_thread is not None and _bg_reader_thread.is_alive())
-            _stop_bg_input_reader()
+            _reader_was_running = (_stop_bg_input_reader()
+                                   and _reader_was_running)
             try:
                 console.print(Panel(
                     "Enter a concise failure report. Task and actual behavior are required.",
@@ -16423,101 +16509,65 @@ def _safe_input_line(prompt: str = "") -> Optional[str]:
     This is a drop-in replacement for input() in cooked-mode contexts
     where the user should be able to press Esc to cancel.
     """
-    if not sys.stdin.isatty():
-        # Non-TTY: fall back to plain input() — Esc is not meaningful here.
-        try:
-            return input(prompt)
-        except (EOFError, KeyboardInterrupt):
-            return None
-    fd = sys.stdin.fileno()
-    try:
-        old_attr = termios.tcgetattr(fd)
-    except (termios.error, OSError):
-        try:
-            return input(prompt)
-        except (EOFError, KeyboardInterrupt):
-            return None
-    try:
-        tty.setcbreak(fd)
-    except (termios.error, OSError):
+    def _fallback() -> Optional[str]:
         try:
             return input(prompt)
         except (EOFError, KeyboardInterrupt):
             return None
 
-    decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
+    if not sys.stdin.isatty():
+        # Non-TTY: fall back to plain input() — Esc is not meaningful here.
+        return _fallback()
+
     buf: list[str] = []
 
     def _write(s: str) -> None:
         sys.stdout.write(s)
         sys.stdout.flush()
 
-    def _backspace(n: int = 1) -> None:
-        for _ in range(n):
-            if buf:
-                c = buf.pop()
-                width = 2 if unicodedata.east_asian_width(c) in ('W', 'F') else 1
-                sys.stdout.write('\b \b' * width)
-        sys.stdout.flush()
+    def _backspace() -> None:
+        if buf:
+            c = buf.pop()
+            width = 2 if unicodedata.east_asian_width(c) in ('W', 'F') else 1
+            sys.stdout.write('\b \b' * width)
+            sys.stdout.flush()
 
     try:
-        _write(prompt)
-        while True:
-            try:
-                r, _, _ = select.select([fd], [], [], 0.5)
-            except (select.error, ValueError, OSError):
-                return None
-            if not r:
-                continue
-            try:
-                chunk = os.read(fd, 1)
-            except (BlockingIOError, InterruptedError):
-                continue
-            except OSError:
-                return None
-            if not chunk:
-                return None  # EOF
-
-            if chunk == b'\x1b':
-                # Disambiguate bare Esc vs escape sequence
-                try:
-                    r2, _, _ = select.select([fd], [], [], 0.05)
-                except (select.error, ValueError, OSError):
-                    r2 = []
-                if r2:
-                    try:
-                        os.read(fd, 32)  # drain the sequence
-                    except OSError:
-                        pass
+        with terminal_arbiter.hold("input-line", TermMode.CBREAK,
+                                   timeout=2.0) as term:
+            if not term.interactive:
+                return _fallback()
+            _write(prompt)
+            while True:
+                key = term.read_key(timeout=0.5)
+                if key is None:
                     continue
-                # Bare Esc — cancel
-                _write('\r\n')
-                return None
-            if chunk == b'\x03':  # Ctrl+C
-                _write('^C\r\n')
-                return None
-            if chunk in (b'\r', b'\n'):
-                _write('\r\n')
-                return ''.join(buf)
-            if chunk in (b'\x7f', b'\x08'):  # Backspace / Ctrl+H
-                _backspace()
-                continue
-            if chunk == b'\x17':  # Ctrl+W — delete word
-                while buf and buf[-1] == ' ':
-                    buf.pop()
-                while buf and buf[-1] != ' ':
+                if key.name in ("eof", "ctrl-d"):
+                    return None
+                if key.name == "escape":
+                    _write('\r\n')
+                    return None
+                if key.name == "enter":
+                    _write('\r\n')
+                    return ''.join(buf)
+                if key.name == "backspace":
                     _backspace()
-                continue
-
-            text = decoder.decode(chunk)
-            if text:
-                _write(text)
-                buf.append(text)
-    finally:
-        try:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old_attr)
-        except (termios.error, OSError):
-            pass
+                    continue
+                if key.name == "ctrl-u":
+                    while buf:
+                        _backspace()
+                    continue
+                if key.name == "ctrl-w":  # delete word
+                    while buf and buf[-1] == ' ':
+                        _backspace()
+                    while buf and buf[-1] != ' ':
+                        _backspace()
+                    continue
+                if key.is_text:
+                    _write(key.text)
+                    buf.extend(key.text)
+    except TerminalBusy:
+        return _fallback()
 
 
 def _cmd_tool(raw_args: str, session: dict, agent_registry: AgentRegistry) -> None:
@@ -19570,9 +19620,16 @@ def agent_loop_crop_for_ui(value: str, width: int) -> str:
 
 
 def _bg_reader_prompt_mode(target_queue: queue.Queue,
-                           interrupt_event: Optional[threading.Event] = None):
-    """Prompt-toolkit-owned supplementary input; safe beside Rich Live output."""
+                           interrupt_event: Optional[threading.Event] = None,
+                           stop_event: Optional[threading.Event] = None):
+    """Prompt-toolkit-owned supplementary input; safe beside Rich Live output.
+
+    prompt_toolkit drives its own raw mode, so the terminal is held as
+    EXTERNAL: the arbiter keeps everyone else out and restores from PRISTINE
+    afterwards, but does not read a single byte while pt owns the stream.
+    """
     global _bg_prompt_session
+    stop = stop_event if stop_event is not None else _bg_reader_stop
     bindings = KeyBindings()
 
     @bindings.add(Keys.Escape)
@@ -19596,32 +19653,38 @@ def _bg_reader_prompt_mode(target_queue: queue.Queue,
 
     _bg_prompt_session = PromptSession(key_bindings=bindings, multiline=False)
     try:
-        with patch_stdout(raw=True):
-            while not _bg_reader_stop.is_set():
-                _set_run_input_state("input_active")
-                try:
-                    line = _bg_prompt_session.prompt(
-                        [("class:prompt-gutter", "  │ "),
-                         ("class:prompt-caret", "› ")],
-                        style=_build_prompt_style(),
-                        erase_when_done=True,
-                        complete_while_typing=False,
-                    )
-                except (EOFError, KeyboardInterrupt):
-                    if _bg_reader_stop.is_set():
+        with terminal_arbiter.hold("bg-input-pt", TermMode.EXTERNAL,
+                                   timeout=2.0):
+            with patch_stdout(raw=True):
+                while not stop.is_set():
+                    _set_run_input_state("input_active")
+                    try:
+                        line = _bg_prompt_session.prompt(
+                            [("class:prompt-gutter", "  │ "),
+                             ("class:prompt-caret", "› ")],
+                            style=_build_prompt_style(),
+                            erase_when_done=True,
+                            complete_while_typing=False,
+                        )
+                    except (EOFError, KeyboardInterrupt):
+                        if stop.is_set():
+                            break
+                        continue
+                    if stop.is_set():
                         break
-                    continue
-                if _bg_reader_stop.is_set():
-                    break
-                _queue_supplementary(target_queue, line)
+                    _queue_supplementary(target_queue, line)
+    except TerminalBusy:
+        return
     finally:
         _bg_prompt_session = None
 
 
-def _bg_reader_line_mode(target_queue: queue.Queue):
+def _bg_reader_line_mode(target_queue: queue.Queue,
+                         stop_event: Optional[threading.Event] = None):
     """Fallback for non-tty stdin (pipes, tests): no Esc detection possible
     without a real terminal, so just queue whole lines like before."""
-    while not _bg_reader_stop.is_set():
+    stop = stop_event if stop_event is not None else _bg_reader_stop
+    while not stop.is_set():
         try:
             r, _, _ = select.select([sys.stdin], [], [], 0.5)
             if not r:
@@ -19635,32 +19698,29 @@ def _bg_reader_line_mode(target_queue: queue.Queue):
             break
         if not line:
             break  # EOF
+        if stop.is_set():
+            break
         line = line.strip()
         if line:
             _queue_supplementary(target_queue, line)
 
 
 def _bg_reader_cbreak_mode(target_queue: queue.Queue,
-                           interrupt_event: Optional[threading.Event] = None):
-    """cbreak-mode reader: a bare Esc keypress (no Enter needed) sets the
-    agent loop's interrupt event directly — the same soft interrupt Ctrl+C
-    triggers, but never a signal, so Esc can never kill the process. Force
-    exit stays exclusive to double Ctrl+C. Also hand-rolls basic line
-    editing for supplementary text, using an incremental UTF-8 decoder so
-    multi-byte input (e.g. Chinese) is never corrupted mid-character."""
-    fd = sys.stdin.fileno()
-    try:
-        old_tcattr = termios.tcgetattr(fd)
-    except (termios.error, OSError):
-        _bg_reader_line_mode(target_queue)
-        return
-    try:
-        tty.setcbreak(fd)
-    except (termios.error, OSError):
-        _bg_reader_line_mode(target_queue)
-        return
+                           interrupt_event: Optional[threading.Event] = None,
+                           stop_event: Optional[threading.Event] = None):
+    """Supplementary input + Esc-to-interrupt while the agent loop runs.
 
-    decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
+    Holds the terminal through the arbiter, so this reader cannot coexist
+    with the approval prompt or the REPL — the previous version read fd 0
+    directly and raced them for bytes, which is how keystrokes vanished and
+    how half-parsed escape sequences ended up rendered as literal text.
+
+    Esc sets the loop's interrupt event directly rather than raising a
+    signal, so it can never kill the CLI; force exit stays exclusive to
+    double Ctrl+C. In CBREAK the terminal turns Ctrl+C into SIGINT before it
+    reaches us, so the run's own SIGINT handler still owns that key.
+    """
+    stop = stop_event if stop_event is not None else _bg_reader_stop
     buf: list[str] = []
 
     def _clear_visible_line():
@@ -19670,84 +19730,67 @@ def _bg_reader_cbreak_mode(target_queue: queue.Queue,
             sys.stdout.write('\r' + ' ' * width + '\r')
             sys.stdout.flush()
         buf.clear()
-        decoder.reset()
 
     try:
-        while not _bg_reader_stop.is_set():
-            try:
-                r, _, _ = select.select([fd], [], [], 0.3)
-            except (select.error, ValueError, OSError):
-                break
-            if not r:
-                continue
-            try:
-                chunk = os.read(fd, 1)
-            except (BlockingIOError, InterruptedError):
-                continue
-            except OSError:
-                break
-            if not chunk:
-                break  # EOF
-
-            if chunk == b'\x1b':
-                # Disambiguate a bare Esc from an escape sequence (arrow
-                # keys, Home/End, ...) which also starts with 0x1b — a real
-                # sequence's remaining bytes arrive within a few ms; a lone
-                # Esc press has nothing following it.
-                try:
-                    r2, _, _ = select.select([fd], [], [], 0.05)
-                except (select.error, ValueError, OSError):
-                    r2 = []
-                if r2:
-                    try:
-                        os.read(fd, 32)  # drain and discard the sequence
-                    except OSError:
-                        pass
+        with terminal_arbiter.hold("bg-input", TermMode.CBREAK,
+                                   timeout=2.0) as term:
+            if not term.interactive:
+                _bg_reader_line_mode(target_queue, stop)
+                return
+            while not stop.is_set():
+                key = term.read_key(timeout=0.3)
+                if key is None:
                     continue
-                # A bare Esc soft-interrupts the running agent loop by
-                # setting its interrupt event directly (no signal, so it
-                # can never kill the whole CLI). With no event wired up it
-                # stays a pure local cancel/clear of the draft line.
-                if interrupt_event is not None:
-                    _clear_visible_line()
-                    interrupt_event.set()
-                    console.print(
-                        "\n[dim]Esc received - will stop at the next "
-                        "checkpoint (when the model starts replying or a "
-                        "tool step begins; not during thinking). Press "
-                        "Ctrl+C twice quickly to force exit now.[/dim]")
-                else:
-                    _clear_visible_line()
-                    _set_run_input_state("input_active")
-                continue
 
-            if chunk in (b'\r', b'\n'):
-                if buf:
-                    line = ''.join(buf)
-                    sys.stdout.write('\n')
+                if key.name == "eof":
+                    break
+
+                if key.name == "escape":
+                    _clear_visible_line()
+                    if interrupt_event is not None:
+                        # Printed once per press, not once per press *plus*
+                        # once per key that followed it: a held Esc used to
+                        # repaint this whole paragraph down the screen.
+                        already_set = interrupt_event.is_set()
+                        interrupt_event.set()
+                        if not already_set:
+                            console.print(
+                                "\n[dim]Esc received - stopping. A tool "
+                                "already running finishes first; press "
+                                "Ctrl+C twice quickly to force exit "
+                                "now.[/dim]")
+                    else:
+                        _set_run_input_state("input_active")
+                    continue
+
+                if key.name == "enter":
+                    if buf:
+                        line = ''.join(buf)
+                        sys.stdout.write('\n')
+                        sys.stdout.flush()
+                        _clear_visible_line()
+                        _queue_supplementary(target_queue, line)
+                    continue
+
+                if key.name == "backspace":
+                    if buf:
+                        removed = buf.pop()
+                        cells = 2 if unicodedata.east_asian_width(removed) in ('W', 'F') else 1
+                        sys.stdout.write('\b \b' * cells)
+                        sys.stdout.flush()
+                    continue
+
+                if key.is_text:
+                    sys.stdout.write(key.text)
                     sys.stdout.flush()
-                    _clear_visible_line()
-                    _queue_supplementary(target_queue, line)
-                continue
-
-            if chunk in (b'\x7f', b'\x08'):  # Backspace/Delete
-                if buf:
-                    removed = buf.pop()
-                    cells = 2 if unicodedata.east_asian_width(removed) in ('W', 'F') else 1
-                    sys.stdout.write('\b \b' * cells)
-                    sys.stdout.flush()
-                continue
-
-            text = decoder.decode(chunk)
-            if text:  # complete character(s) — echo + accumulate
-                sys.stdout.write(text)
-                sys.stdout.flush()
-                buf.extend(text)
-    finally:
-        try:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old_tcattr)
-        except (termios.error, OSError):
-            pass
+                    buf.extend(key.text)
+    except TerminalBusy:
+        # Someone else legitimately owns the terminal (an approval prompt
+        # that outlived its stop signal, say). Degrading to line mode would
+        # put a second reader back on fd 0 — the exact bug this replaces —
+        # so stay silent instead; the run continues, only supplementary
+        # typing is unavailable until the next step.
+        return
 
 
 def _start_bg_input_reader(target_queue: queue.Queue,
@@ -19765,7 +19808,13 @@ def _start_bg_input_reader(target_queue: queue.Queue,
     global _bg_reader_thread, _bg_reader_stop
     if _bg_reader_thread is not None and _bg_reader_thread.is_alive():
         return  # already running
-    _bg_reader_stop.clear()
+
+    # A stop event per thread, captured in the closure. The single global
+    # event this replaces was cleared on every start, which un-stopped any
+    # reader that had not yet noticed it should quit — resurrecting an
+    # orphan that then competed with its own replacement for stdin.
+    stop_event = threading.Event()
+    _bg_reader_stop = stop_event
 
     def _reader():
         try:
@@ -19775,11 +19824,13 @@ def _start_bg_input_reader(target_queue: queue.Queue,
                 # potential race with Rich Live output (patch_stdout).
                 # Fall back to prompt_toolkit only when cbreak fails.
                 if interrupt_event is not None:
-                    _bg_reader_cbreak_mode(target_queue, interrupt_event)
+                    _bg_reader_cbreak_mode(target_queue, interrupt_event,
+                                           stop_event)
                 else:
-                    _bg_reader_prompt_mode(target_queue, interrupt_event)
+                    _bg_reader_prompt_mode(target_queue, interrupt_event,
+                                           stop_event)
             else:
-                _bg_reader_line_mode(target_queue)
+                _bg_reader_line_mode(target_queue, stop_event)
         except Exception:
             pass
 
@@ -19788,8 +19839,14 @@ def _start_bg_input_reader(target_queue: queue.Queue,
     _bg_reader_thread.start()
 
 
-def _stop_bg_input_reader():
-    """Stop the background input reader thread."""
+def _stop_bg_input_reader() -> bool:
+    """Stop the background input reader thread. True if it actually stopped.
+
+    The handle is cleared only on a confirmed exit. Clearing it after a
+    failed join used to defeat the "already running" guard in
+    ``_start_bg_input_reader``, so the next start added a *second* reader
+    while the first was still reading stdin.
+    """
     global _bg_reader_thread, _bg_prompt_session
     _bg_reader_stop.set()
     if _bg_prompt_session is not None:
@@ -19799,10 +19856,19 @@ def _stop_bg_input_reader():
                 app.exit(result="")
         except Exception:
             pass
+    stopped = True
     if _bg_reader_thread is not None:
         _bg_reader_thread.join(timeout=1.5)
-        _bg_reader_thread = None
+        if _bg_reader_thread.is_alive():
+            # Keep the handle so nothing starts a rival reader. The thread is
+            # a daemon holding the terminal; the arbiter will refuse the next
+            # holder with TerminalBusy naming "bg-input" rather than letting
+            # two readers interleave.
+            stopped = False
+        else:
+            _bg_reader_thread = None
     _set_run_input_state("idle")
+    return stopped
 
 
 # ── Session-level approval state ─────────────────────────────────────────
@@ -19936,49 +20002,44 @@ def _read_single_key_choice(*, allow_always: bool,
     initial highlight. If auto_confirm_seconds elapses with no keypress,
     returns "yes" (matches _arrow_approval_prompt's auto_confirm_index=0,
     which is always the approve option).
+
+    CBREAK, not raw: this prompt used to disable ISIG so it could read
+    Ctrl+C as a byte, which meant a prompt the user could not signal their
+    way out of if it ever stopped consuming input. Letting the terminal
+    raise SIGINT keeps the escape hatch in the kernel where it belongs;
+    Esc still returns None here, which denies.
     """
-    fd = sys.stdin.fileno()
-    try:
-        old_attr = termios.tcgetattr(fd)
-    except (termios.error, OSError):
-        return None
-    try:
-        # Raw mode makes Ctrl+C available as the literal \x03 byte handled
-        # below instead of letting the terminal turn it into process SIGINT.
-        tty.setraw(fd)
-    except (termios.error, OSError):
-        return None
     deadline = (time.monotonic() + auto_confirm_seconds
-               if auto_confirm_seconds is not None else None)
+                if auto_confirm_seconds is not None else None)
     try:
-        while True:
-            wait = 0.3 if deadline is None else max(0.0, min(0.3, deadline - time.monotonic()))
-            try:
-                r, _, _ = select.select([fd], [], [], wait)
-            except (select.error, ValueError, OSError):
+        with terminal_arbiter.hold("approval", TermMode.CBREAK,
+                                   timeout=2.0) as term:
+            if not term.interactive:
                 return None
-            if not r:
-                if deadline is not None and time.monotonic() >= deadline:
-                    return "yes"
-                continue
-            try:
-                ch = os.read(fd, 1).decode("utf-8", errors="ignore").lower()
-            except OSError:
-                return None
-            if ch in ("\x03", "\x1b"):  # Ctrl+C / Esc
-                return None
-            if ch == "y":
-                return "yes"
-            if ch in ("n", "\r", "\n"):
-                return "no"
-            if ch == "a" and allow_always:
-                return "always"
-            # any other key: keep waiting
-    finally:
-        try:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old_attr)
-        except (termios.error, OSError):
-            pass
+            while True:
+                wait = (0.3 if deadline is None
+                        else max(0.0, min(0.3, deadline - time.monotonic())))
+                key = term.read_key(timeout=wait)
+                if key is None:
+                    if deadline is not None and time.monotonic() >= deadline:
+                        return "yes"
+                    continue
+                if key.name in ("escape", "ctrl-c", "ctrl-d", "eof"):
+                    return None
+                if key.name == "enter":
+                    return "no"
+                if key.is_text:
+                    ch = key.text.strip().lower()[:1]
+                    if ch == "y":
+                        return "yes"
+                    if ch == "n":
+                        return "no"
+                    if ch == "a" and allow_always:
+                        return "always"
+                # any other key: keep waiting
+    except TerminalBusy:
+        # Fail closed: an approval we cannot ask about is not an approval.
+        return None
 
 
 def _compact_parallel_approval_prompt(title: str, body: str, question: str, *,
@@ -20094,9 +20155,11 @@ def _blocking_approval_prompt(title: str, body: str, question: str,
     else:
         options = ["y approve", "n deny"]
 
+    # Only restart the reader if it actually stopped. Restarting on top of a
+    # reader that ignored its stop signal put two of them on stdin at once.
     _reader_was_running = bool(
         _bg_reader_thread is not None and _bg_reader_thread.is_alive())
-    _stop_bg_input_reader()
+    _reader_was_running = _stop_bg_input_reader() and _reader_was_running
     try:
         choice = _arrow_approval_prompt(
             f"{_action} — {question}", body_lines, options,
@@ -20429,9 +20492,9 @@ def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
         _last_ctrl_c[0] = now
         console.print(
             "\n[dim]Ctrl+C ignored during AI run. Press Esc to interrupt "
-            "(takes effect when the model starts replying or at the next "
-            "step - not during thinking), or press Ctrl+C twice quickly "
-            "to force exit.[/dim]")
+            "(takes effect within a moment, including while the model is "
+            "thinking; a tool already running finishes first), or press "
+            "Ctrl+C twice quickly to force exit.[/dim]")
 
     signal.signal(signal.SIGINT, _soft_interrupt)
 
@@ -21204,10 +21267,11 @@ def main():
             except Exception:
                 pass
             try:
-                _fd = sys.stdin.fileno()
-                _attrs = termios.tcgetattr(_fd)
-                _attrs[3] |= (termios.ECHO | termios.ICANON | termios.ISIG)
-                termios.tcsetattr(_fd, termios.TCSANOW, _attrs)
+                # Exact restore, not a best-effort patch: PRISTINE is the
+                # state the user's shell handed us at startup, so this puts
+                # the terminal back byte for byte rather than just forcing
+                # ECHO/ICANON/ISIG back on over whatever else is wrong.
+                terminal_arbiter.reset_to_pristine()
             except Exception:
                 pass
             os._exit(1)
@@ -21277,6 +21341,12 @@ def main():
         if interactive_session:
             interactive_session.close()
         agent_registry.unregister()
+        # SIGTERM/SIGHUP land while prompt_toolkit holds the terminal in raw
+        # mode, and sys.exit() unwinds through daemon threads that never get
+        # to run their restore. Without this the user's shell is left with
+        # ICANON and ECHO off — typing invisible, Enter doing nothing — which
+        # is what a dropped SSH connection used to leave behind.
+        terminal_arbiter.reset_to_pristine()
         sys.exit(0)
 
     signal.signal(signal.SIGINT, shutdown)

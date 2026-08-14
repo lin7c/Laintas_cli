@@ -70,6 +70,7 @@
     "stuck_signals",
     "release",
     "skill_router",
+    "terminal_arbiter",
     "tokenizer",
     "web_search",
     "cookie_store",

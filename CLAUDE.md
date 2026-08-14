@@ -120,9 +120,33 @@ Both `.laintas/commands.py` and `.laintas/loop.py` are **mtime-cached** — edit
 
 ### PTY Model
 
-`InteractiveSession` is the workhorse: `os.fork()` + `pty.openpty()` + non-blocking `fcntl` reads + `termios` restore. Unix stdlib imports (`pty`, `fcntl`, `termios`, `tty`, `select`) are unconditional top-level imports in `laintas_cli.py`.
+`InteractiveSession` is the workhorse: `os.fork()` + `pty.openpty()` + non-blocking `fcntl` reads. Unix stdlib imports (`pty`, `fcntl`, `termios`, `tty`, `select`) are unconditional top-level imports in `laintas_cli.py`.
 
 `SubTerminalSession` inside tmux spawns a new tmux window (`tmux new-window -d`) so interactive programs (`vim`, `claude`, REPLs) get native passthrough while the AI loop keeps running in the main pane. Outside tmux it degrades to a backgrounded `InteractiveSession`.
+
+### Terminal ownership — one hard rule
+
+**Nothing outside `terminal_arbiter.py` may call `termios.tcsetattr` on stdin, or read fd 0 directly.** Take the terminal with `terminal_arbiter.hold(owner, Mode.X)` and read parsed keys off the returned session. Read `terminal_arbiter.py`'s module docstring before touching any input code — it explains the two bug classes the rule exists to prevent (stale mode snapshots, and two readers tearing one escape sequence in half), both of which shipped and both of which presented as intermittent freezes that no amount of local locking fixed.
+
+| Mode | Use for | ISIG |
+|---|---|---|
+| `COOKED` | canonical line input | on |
+| `CBREAK` | per-key prompts, approvals, the run's background reader | **on** |
+| `RAW` | full byte passthrough only (sub-terminal takeover) | off |
+| `EXTERNAL` | prompt_toolkit, or a forked child on the inherited terminal — arbiter stops reading, still restores afterwards | n/a |
+
+Two consequences worth knowing before you "fix" something:
+
+- **A prompt must never run in `RAW`.** Raw disables ISIG, so a prompt that stops consuming input becomes a prompt the user cannot Ctrl+C out of. In `CBREAK` the kernel turns Ctrl+C into SIGINT before any Python code is involved, which is why `_read_single_key_choice` reads Esc but never `\x03`.
+- **Modes are computed from `PRISTINE`, never from `tcgetattr` at the call site.** `PRISTINE` is captured at import in `laintas_cli.py`, before anything can dirty it. Restoring from a local snapshot is what let a mode taken during someone else's cbreak get written back minutes later.
+
+The exception, and it is the only one: `InteractiveSession` configures its *own pty slave's* attrs in the forked child. That is the child's terminal, not ours.
+
+### Interrupting a run
+
+Esc soft-interrupts; only a double Ctrl+C force-exits. Esc sets the loop's interrupt event directly and never raises a signal, so it cannot kill the CLI.
+
+For Esc to be honoured promptly the blocking work must have a checkpoint. Backend I/O gets one from `_post_with_interrupt` and `_iter_lines_interruptible`, which move the socket read onto a worker thread — without them a provider that buffers its reasoning gave Esc nothing to land on for the entire thinking phase. **Any new blocking call on the run's critical path needs the same treatment**, or it silently reintroduces a window where Esc does nothing.
 
 ### Terminal & Agent Registries
 
