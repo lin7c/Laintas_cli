@@ -7,6 +7,7 @@
     "agent_loop",
     "agent_ui_events",
     "detail_trace",
+    "grounding",
     "resource_ui",
     "agents_mode",
     "tools",
