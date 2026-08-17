@@ -116,6 +116,28 @@ _DEFAULT_CONFIG = {
     "use_message_thread": True,     # native OpenAI message thread (assistant tool_calls + role:tool results) — reads stay in context like opencode/Helpwo, no re-read amnesia. Compacted by _compact_thread_messages.
     "use_unified_catalog": True,    # emit shared agent_tools canonical tool names (fs.read->read) to the model — unified taxonomy is the default; set False to fall back to legacy dotted names
     "model_context_window": 64000,  # model's context window (tokens) used to budget thread compaction (prune + summarize)
+    # Ceiling on the window compaction budgets against, even when the provider
+    # offers far more. Exposed as a knob rather than hardcoded, but the DEFAULT
+    # stays at the historical 200000: the budget is supposed to track what the
+    # running model can actually hold, and lowering it globally would make a
+    # 1M-window model compact as though it had a quarter of that — paying for
+    # summarisation to solve a problem that model does not have. If compaction
+    # is not firing when you expect it to, that is a fact about the window, not
+    # a reason to shrink the budget.
+    "context_window_adopt_cap": 200000,
+    # Largest slice of thread the summarizer is handed in one call. Without a
+    # bound the head goes up in a single request — the 312k-token outlier in
+    # that same sample was exactly this. Chunking also keeps the job inside a
+    # small auxiliary model's comfortable window instead of requiring the main
+    # model's.
+    "compact_chunk_tokens": 24000,
+    # Model for the auxiliary calls (compaction, critic, memory extraction).
+    # Empty = use whatever the terminal has selected, i.e. the main model, which
+    # is the historical behaviour. These calls are tool-less, structured and
+    # high-volume; pointing them at a cheaper long-context model separates the
+    # "reasoning" bill from the "context plumbing" bill.
+    "aux_model": "google/gemma-4-26b-a4b-it",
+    "aux_provider": "openrouter",
     "auto_format": True,            # run the best-available code formatter in place after a full-file write (no-op if none installed); surgical edits stay byte-precise
     "auto_snapshot": True,          # lazily checkpoint before the first workspace-mutating tool call in a top-level task (no-op outside a git repo)
     "browser_action_delay_min": 0.3,   # min seconds of anti-bot delay before browser actions
@@ -547,6 +569,10 @@ def _active_mode_label() -> str:
 _runtime_config: dict[str, object] = {}
 
 _RUNTIME_CONFIG_DESCRIPTIONS = {
+    "context_window_adopt_cap": "Ceiling on the auto-adopted provider window — lower it to compact earlier. Every turn re-sends the thread, so this is a cost knob, not just an overflow guard",
+    "compact_chunk_tokens": "Largest slice of thread handed to the summarizer in one call",
+    "aux_model": "Model for compaction / critic / memory-extraction (empty = use the main model)",
+    "aux_provider": "Provider paired with aux_model",
     "max_loops": "Maximum agent-loop iterations per task",
     "max_tokens": "Output-token cap to request (0 = whatever the model and window allow)",
     "max_debug_entries": "In-memory debug entry limit",
@@ -615,6 +641,7 @@ _RUNTIME_POSITIVE = {
     "microcompact_keep", "microcompact_read_budget",
     "history_max_messages", "message_truncate", "short_memory_max_chars",
     "model_context_window", "remote_max_workers", "remote_control_workers",
+    "context_window_adopt_cap", "compact_chunk_tokens",
 }
 
 _RUNTIME_LIMITS = {
@@ -3286,9 +3313,18 @@ def spawn_subagent(parent_id: str, task: str, deps,
     # in a child worktree. Runtime-owned identity cannot be overridden by a
     # model-supplied child state.
     child.state["_session_id"] = _ensure_session_id(parent.state)
-    child.state["_task_cwd"] = (
-        parent.state.get("_task_cwd")
-        or parent.state.get("cwd") or os.getcwd())
+    # _task_cwd is parent-owned EXCEPT when the caller pinned one in
+    # state_overrides. state_overrides is a trusted-code-only parameter
+    # (extensions / CLI internals, never model tool input), and a caller
+    # that points a child at an isolated checkout must have the child's
+    # prompt env agree about WHERE it works: the env block renders CWD from
+    # _task_cwd, so inheriting the parent's value there tells the child it
+    # works in the parent tree and it builds absolute paths against the
+    # real checkout - silently defeating the requested isolation.
+    if not child.state.get("_task_cwd"):
+        child.state["_task_cwd"] = (
+            parent.state.get("_task_cwd")
+            or parent.state.get("cwd") or os.getcwd())
     # Children share topology with their parent, never the parent's persistent
     # terminal lease. Their shell commands run in a private temporary PTY.
     child.home_terminal = agent_scope_terminal(parent) or "term0"
@@ -3327,6 +3363,12 @@ def spawn_subagent(parent_id: str, task: str, deps,
                 _worktree_info = worktree_manager.create_isolated_worktree(
                     _base_cwd, label=name or role or "agent")
                 child.state["cwd"] = _worktree_info.path
+                # Published so a caller that asked to keep the branch can find
+                # it afterwards. Without this the branch exists but only the
+                # spawn frame knows its name, which makes "compare two agents'
+                # finished work" impossible to build on top.
+                child.state["_worktree_branch"] = _worktree_info.branch
+                child.state["_worktree_path"] = _worktree_info.path
         except Exception as _wt_err:
             # Isolation was promised for a git-backed task. Never disguise a
             # failed worktree as a safe spawn in the parent's shared checkout.
@@ -3360,6 +3402,14 @@ def spawn_subagent(parent_id: str, task: str, deps,
         or "" if no worktree was involved. Never raises."""
         if _worktree_info is None:
             return ""
+        # Opt-out for callers that spawn several agents on one task and decide
+        # afterwards which result to keep: merging every child back on
+        # completion would interleave their edits in the parent tree and
+        # destroy exactly the thing being compared. The branch is left intact
+        # and the caller owns merging or discarding it.
+        if child.state.get("_keep_worktree"):
+            return (f"\n\n[worktree] kept on branch {_worktree_info.branch} "
+                    f"at {_worktree_info.path} (not merged: caller holds it)")
         try:
             import worktree_manager
             merge_result = worktree_manager.merge_worktree_back(_worktree_info)
@@ -4080,7 +4130,8 @@ def _is_context_overflow(error_text: str) -> bool:
 
 
 def _llm_summarize(deps, session, current_path: str, head_text: str,
-                   prev_summary: Optional[str], lang: str) -> Optional[str]:
+                   prev_summary: Optional[str], lang: str,
+                   trajectory_id: str = "") -> Optional[str]:
     """Summarize the conversation HEAD into opencode's structured running summary.
 
     Makes one tool-less backend completion using the shared summary prompt
@@ -4092,6 +4143,7 @@ def _llm_summarize(deps, session, current_path: str, head_text: str,
         return None
     try:
         sys_prompt = ctxpol.summary_prompt(lang, previous_summary=prev_summary)
+        _aux_m, _aux_p = aux_model_override()
         resp = deps.call_backend(
             session=session,
             message=head_text,
@@ -4100,12 +4152,39 @@ def _llm_summarize(deps, session, current_path: str, head_text: str,
             history=[],
             lang=lang,
             tools_enabled=False,
+            model_override=_aux_m or None, provider_override=_aux_p or None,
+            task_kind="compaction", trajectory_id=trajectory_id,
         )
         text = (resp or {}).get("reply", "") if isinstance(resp, dict) else ""
         text = (text or "").strip()
-        return text or None
+        if not text:
+            return None
+        return _ground_summary(session, head_text, text)
     except Exception:
         return None
+
+
+def _ground_summary(session, head_text: str, summary: str) -> str:
+    """Repair summary sentences the head does not support.
+
+    This summary is about to REPLACE the turns it summarizes. Anything the
+    model invented here stops being checkable the moment that happens, and
+    then steers every later decision. It is the one output worth verifying
+    against its own input.
+
+    A distorted sentence is swapped for the head sentence it came from, which
+    restores the fact; only a fabrication with no counterpart is dropped.
+    Degrades to the summary as written on any failure — a grounding outage
+    must not be the reason a compaction fails.
+    """
+    try:
+        import grounding
+    except Exception:
+        return summary
+    try:
+        return grounding.repair_summary(head_text, summary, session=session)
+    except Exception:
+        return summary
 
 
 def _thread_tokens(messages: list) -> int:
@@ -4143,6 +4222,91 @@ def _serialize_thread_msg(m: dict) -> str:
     return ""
 
 
+def _per_request_overhead_tokens(state: dict) -> int:
+    """Tokens every request carries on top of the thread.
+
+    Compaction budgets the THREAD, but the assembled request is thread + system
+    prompt + the full tool catalogue, and the last of those is not small: 122
+    tools serialise to ~67KB, about 16.9k tokens, re-sent on every single turn.
+    Ignoring it meant compaction could shrink the thread to exactly the budget
+    and still overflow the window by ~2.1k once the request was assembled —
+    invisible on a 256K model, fatal on one served at 65536, which is how it
+    was found.
+
+    Estimated, not measured, and deliberately so: the real tool set varies with
+    `allowed_tool_names` per turn. Over-reserving costs a slightly earlier
+    compaction; under-reserving costs a failed request.
+    """
+    total = 0
+    try:
+        import tools as _tools_mod
+        _catalog, _ = _tools_mod.get_registry().to_openai_tools(
+            unified=bool(get_runtime_config("use_unified_catalog")))
+        total += len(json.dumps(_catalog, ensure_ascii=False)) // 4
+    except Exception:
+        # Never let the estimate break compaction; fall back to a figure that
+        # is wrong but the right order of magnitude.
+        total += 16000
+    prompt = (state or {}).get("_system_prompt_chars")
+    total += (int(prompt) // 4) if prompt else 5000
+    return total
+
+
+def _summarize_head_in_chunks(deps, session, head: list,
+                              prev_summary: Optional[str], lang: str,
+                              trajectory_id: str) -> Optional[str]:
+    """Summarize the head a slice at a time, folding each into a running summary.
+
+    The head used to go up in ONE call. On a long session that is a single
+    enormous request — the largest prompt in the 2026-08-14 sample was 312k
+    tokens and this was it. Three things go wrong at that size: the call is slow
+    and expensive, it can exceed the summarizer's own window (so the compaction
+    meant to fix an overflow overflows itself), and it forces the summarizer to
+    be a model with a huge context even though the job is not hard.
+
+    Chunking removes all three. Each slice is bounded by `compact_chunk_tokens`
+    and folded into the running summary through the same incremental path
+    `_llm_summarize` already supported for cross-compaction merges — so this
+    reuses the existing prompt contract rather than inventing a second one.
+
+    Slices are cut on message boundaries, never mid-message: half a tool result
+    is worse than none, and an assistant tool_call separated from its result
+    reads as an action that never returned.
+    """
+    chunk_budget = max(4000, int(get_runtime_config("compact_chunk_tokens") or 24000))
+    cwd = os.getcwd()
+
+    slices: list[list] = []
+    current: list = []
+    acc = 0
+    for message in head:
+        cost = _thread_tokens([message])
+        # Oversized single message: give it a slice of its own rather than
+        # letting it silently blow the budget it was supposed to respect.
+        if current and acc + cost > chunk_budget:
+            slices.append(current)
+            current, acc = [], 0
+        current.append(message)
+        acc += cost
+    if current:
+        slices.append(current)
+
+    summary = prev_summary
+    for index, part in enumerate(slices):
+        text = "\n".join(s for s in (_serialize_thread_msg(m) for m in part) if s)
+        if not text.strip():
+            continue
+        merged = _llm_summarize(deps, session, cwd, text, summary, lang,
+                                trajectory_id)
+        if not merged:
+            # Keep whatever was folded in so far. A partial summary of the older
+            # turns beats discarding the compaction entirely and re-sending the
+            # whole head on the next turn.
+            break
+        summary = merged
+    return summary
+
+
 def _compact_thread_messages(thread_messages: list, deps, session, lang: str, state: dict,
                              *, force: bool = False) -> bool:
     """opencode-style compaction of the native message thread, IN PLACE.
@@ -4167,6 +4331,9 @@ def _compact_thread_messages(thread_messages: list, deps, session, lang: str, st
         window = _effective_context_window()
         max_out = int(get_runtime_config("max_tokens") or 8192)
         usable = ctxpol.usable_tokens(window, max_out)
+        # Reserve what the request will add on top of the thread, or compaction
+        # hits its target and the assembled request still overflows.
+        usable = max(4000, usable - _per_request_overhead_tokens(state))
         if not force and (usable <= 0 or _thread_tokens(thread_messages) <= usable):
             return False
 
@@ -4214,11 +4381,11 @@ def _compact_thread_messages(thread_messages: list, deps, session, lang: str, st
         if tail_start <= 1 or tail_start >= len(thread_messages):
             return changed
         head = thread_messages[:tail_start]
-        head_text = "\n".join(s for s in (_serialize_thread_msg(m) for m in head) if s)
-        if not head_text.strip():
+        if not any((_serialize_thread_msg(m) or "").strip() for m in head):
             return changed
-        summary = _llm_summarize(deps, session, os.getcwd(), head_text,
-                                 state.get("_thread_summary"), lang)
+        summary = _summarize_head_in_chunks(
+            deps, session, head, state.get("_thread_summary"), lang,
+            str(state.get("_run_id") or ""))
         if not summary:
             return changed
         state["_thread_summary"] = summary
@@ -4257,8 +4424,25 @@ def _effective_context_window() -> int:
     configured = int(get_runtime_config("model_context_window") or 64000)
     if (configured == _DEFAULT_CONFIG["model_context_window"]
             and _provider_context_window > configured):
-        return min(_provider_context_window, _CONTEXT_WINDOW_ADOPT_CAP)
+        cap = int(get_runtime_config("context_window_adopt_cap")
+                  or _CONTEXT_WINDOW_ADOPT_CAP)
+        return min(_provider_context_window, cap)
     return configured
+
+
+def aux_model_override() -> tuple[str, str]:
+    """(model, provider) for auxiliary calls, or ("", "") to use the main model.
+
+    Compaction, the critic and memory extraction are tool-less structured jobs
+    that ride on whatever the terminal happens to have selected — so they have
+    always been billed at the main model's rate for work that does not need it.
+    Naming a separate model here splits the two bills without touching the
+    agent's own model choice.
+    """
+    model = str(get_runtime_config("aux_model") or "").strip()
+    if not model:
+        return "", ""
+    return model, str(get_runtime_config("aux_provider") or "").strip()
 
 
 def session_context_status(state: dict) -> dict:
@@ -4305,11 +4489,22 @@ def _consolidate_memories_on_compact(deps, session: dict, working: dict) -> None
             return
         _cwd = working.get("cwd") or os.getcwd()
 
+        _mem_traj = str(working.get("_run_id") or "")
+
+        _am, _ap = aux_model_override()
+
         def _mem_llm_fn(messages, *, system_prompt=mem_extract.SYSTEM_PROMPT,
-                        _s=session, _cwd=_cwd):
+                        _s=session, _cwd=_cwd, _traj=_mem_traj,
+                        _am=_am, _ap=_ap):
+            # Same fix as the critic: extraction emits a JSON array and never
+            # calls a tool, so shipping the tool registry and the core-tool
+            # guide on every call is pure waste.
             resp = deps.call_backend(
                 session=_s, message="", system_prompt=system_prompt,
-                current_path=_cwd, messages=messages)
+                current_path=_cwd, messages=messages,
+                tools_enabled=False,
+                model_override=_am or None, provider_override=_ap or None,
+                task_kind="mem_extract", trajectory_id=_traj)
             return (resp or {}).get("reply", "") if isinstance(resp, dict) else ""
 
         def _worker(_text=convo, _fn=_mem_llm_fn, _s=session):
@@ -6076,6 +6271,18 @@ def run_agent_loop(
     _exit_reason = TRANSITION_MAX_LOOPS  # default: assume exhaustion unless overridden by a break
     _completion_source = ""
     _run_id = uuid.uuid4().hex
+    # Published on `state` so the auxiliary calls that run outside this frame
+    # (compaction, memory consolidation) can stamp the same trajectory on their
+    # training-capture labels instead of arriving unattributed.
+    state["_run_id"] = _run_id
+    # Training-capture label for this run's turns. Overridable so a caller that
+    # spawns agents for something other than doing the user's work — a
+    # side-by-side comparison, where one whole side is the approach that gets
+    # rejected — can keep those turns out of the corpus that teaches the model
+    # what good work looks like. Sub-agents run this same function with the
+    # same session, so without an override their turns are indistinguishable
+    # from real ones.
+    _task_kind = str(state.get("_task_kind") or "main_loop")[:40]
     _session_id = str(state.get("_session_id") or "")
     reply = ""
     interactive_session = existing_session  # InteractiveSession | SubTerminalSession | None
@@ -6502,7 +6709,7 @@ def run_agent_loop(
             .replace("{{promptOpt}}", _prompt_lab_section) \
             .replace("{{agentName}}", agent_name) \
             .replace("{{agentId}}", agent_id_str) \
-            .replace("{{currentPath}}", os.getcwd()) \
+            .replace("{{currentPath}}", state.get("cwd") or os.getcwd()) \
             .replace("{{activeFile}}", "None") \
             .replace("{{depth}}", str(depth)) \
             .replace("{{nextDepth}}", str(depth + 1)) \
@@ -6717,11 +6924,27 @@ def run_agent_loop(
                     and loop % _crit_interval == 0):
                 _crit_cwd = state.get("cwd") or os.getcwd()
 
-                def _crit_llm_fn(messages, _s=session, _cwd=_crit_cwd):
+                _aux_m, _aux_p = aux_model_override()
+
+                def _crit_llm_fn(messages, _s=session, _cwd=_crit_cwd,
+                                 _traj=_run_id, _aux_m=_aux_m, _aux_p=_aux_p):
+                    # tools_enabled=False is load-bearing, not tidiness. The
+                    # critic returns a JSON verdict and can never call a tool,
+                    # but the default (True) attaches the whole tool registry
+                    # AND leaves injectToolGuide on, so the gateway appends the
+                    # core-tool guide too. Measured before this was fixed: the
+                    # critic averaged 23.4k prompt tokens a call — larger than
+                    # the main loop's 17.4k — for 10.1% of all input spend, and
+                    # every captured critic sample carried a tool catalogue the
+                    # judging task has no use for.
                     resp = deps.call_backend(
                         session=_s, message="",
                         system_prompt=critic.SYSTEM_PROMPT,
-                        current_path=_cwd, messages=messages)
+                        current_path=_cwd, messages=messages,
+                        tools_enabled=False,
+                        model_override=_aux_m or None,
+                        provider_override=_aux_p or None,
+                        task_kind="critic", trajectory_id=_traj)
                     return (resp or {}).get("reply", "") if isinstance(resp, dict) else ""
 
                 _verdict = critic.assess(original_input, _thread_to_send, _crit_llm_fn)
@@ -6805,6 +7028,21 @@ def run_agent_loop(
         # progress deliberately stays in the existing compact presentation.
         _detail = False
         _thinking_t0 = time.monotonic()
+        # Resolved once, outside the presentation branches. Which of the three
+        # call shapes below runs is decided by whether there is an events
+        # callback and whether rich is importable — presentation concerns that
+        # have nothing to do with which model should answer. Resolving inside
+        # only the streaming branch meant `--execute` (events_cb=None) silently
+        # dropped the HWO `#name@model#` pin, the terminal-scoped override and
+        # the employee's own base_model, falling back to the global selection;
+        # it also dropped task_kind/trajectory_id, so roughly half of captured
+        # trajectories landed untagged and could not be split by task at
+        # training time.
+        _request_model, _request_provider = resolve_agent_model(
+            current_agent,
+            state.get('_model_override', ''),
+            state.get('_provider_override', ''),
+        )
         if events_cb is not None:
             # Streaming render: use rich.live.Live to render the reply as it arrives
             # via on_chunk. Falls back to spinner if backend doesn't accept on_chunk.
@@ -6904,11 +7142,6 @@ def run_agent_loop(
                     # re-computes _render() on every auto-refresh tick.
 
                 def _do_stream_call():
-                    _request_model, _request_provider = resolve_agent_model(
-                        current_agent,
-                        state.get('_model_override', ''),
-                        state.get('_provider_override', ''),
-                    )
                     try:
                         return deps.call_backend(
                             session=session,
@@ -6923,6 +7156,7 @@ def run_agent_loop(
                             allowed_tool_names=_allowed_tool_names,
                             model_override=_request_model or None,
                             provider_override=_request_provider or None,
+                            task_kind=_task_kind, trajectory_id=_run_id,
                         )
                     except TypeError:
                         # Compatibility with injected backends that support the
@@ -6989,6 +7223,9 @@ def run_agent_loop(
                             interrupt_event=_interrupt,
                             messages=_thread_to_send,
                             allowed_tool_names=_allowed_tool_names,
+                            model_override=_request_model or None,
+                            provider_override=_request_provider or None,
+                            task_kind=_task_kind, trajectory_id=_run_id,
                         )
                     except TypeError:
                         response = deps.call_backend(
@@ -7020,6 +7257,9 @@ def run_agent_loop(
                     interrupt_event=_interrupt,
                     messages=_thread_to_send,
                     allowed_tool_names=_allowed_tool_names,
+                    model_override=_request_model or None,
+                    provider_override=_request_provider or None,
+                    task_kind=_task_kind, trajectory_id=_run_id,
                 )
             except TypeError:
                 response = deps.call_backend(
@@ -7160,6 +7400,7 @@ def run_agent_loop(
         # structural parsing, do not surface the malformed text as a normal
         # answer; the next turn gets a format nudge instead.
         display_reply = "" if response.get("_parse_failed") else reply
+        _reply_rendered_normally = False
         if display_reply:
             if events_cb is not None and not _reply_already_rendered:
                 _stripped = display_reply.strip()
@@ -7173,6 +7414,10 @@ def run_agent_loop(
                         f"[accent]{symbols.BULLET}[/accent] [dim]{_esc(_stripped)}[/dim]")
                 else:
                     _print_markdown_safely(deps, display_reply)
+                    _reply_rendered_normally = True
+            elif events_cb is not None:
+                # Streaming already rendered this reply as ordinary Markdown.
+                _reply_rendered_normally = True
             step_replies.append(display_reply)
             state["lastReply"] = display_reply
             # Preserve the real sequence. Historically intermediate assistant
@@ -8022,7 +8267,11 @@ def run_agent_loop(
                     _hint_plain = (salient if salient else display_name) or ""
                     if name in {"task.create", "task.update", "task.list", "task.get", "task.complete"} and result.get("ok"):
                         if name == "task.complete":
-                            deps.console.rule(style="muted")
+                            # A non-empty completion summary is rendered below
+                            # as the final answer. The old rule made that hidden
+                            # tool result look like collapsed content.
+                            if not str(result.get("summary") or "").strip():
+                                deps.console.rule(style="muted")
                         # task.create / task.update / task.list / task.get: silent —
                         # the live task list already reflects the changes.
                     elif _detail:
@@ -8242,8 +8491,37 @@ def run_agent_loop(
         if _explicit_complete:
             done = True
             _completion_source = "plan_submitted" if _plan_submitted else "task_complete"
-            if _complete_summary and not reply:
-                reply = _complete_summary
+            if _complete_summary:
+                _summary = str(_complete_summary).strip()
+                _summary_already_in_reply = any(
+                    item.strip() == _summary for item in step_replies)
+                _summary_already_rendered = (
+                    _reply_rendered_normally
+                    and str(display_reply).strip() == _summary)
+                if (_completion_source == "task_complete"
+                        and events_cb is not None
+                        and not _summary_already_rendered):
+                    # task.complete's tool result is otherwise hidden. Surface
+                    # its summary as ordinary final Markdown instead of the old
+                    # horizontal-rule placeholder. A dim narration does not
+                    # count as an already-rendered final answer.
+                    _print_markdown_safely(deps, _summary)
+                    chat_history.append({
+                        "role": "assistant",
+                        "content": _summary,
+                        "message_kind": "final",
+                    })
+                    history_events_recorded = True
+                    pending_events.append({"type": "ai", "content": _summary})
+                if (_completion_source == "task_complete"
+                        and not _summary_already_in_reply):
+                    # Also expose the summary through the returned transcript;
+                    # this is what non-interactive execute mode prints.
+                    step_replies.append(_summary)
+                if _completion_source == "task_complete":
+                    state["lastReply"] = _summary
+                if not reply:
+                    reply = _summary
             state["_no_action_count"] = 0
         elif tool_calls:
             # Tool calls require their results to be returned to the model even
@@ -8652,12 +8930,25 @@ def run_agent_loop(
             _mem_session = session
             _mem_cwd = state.get("cwd") or os.getcwd()
 
+            _mem_am, _mem_ap = aux_model_override()
+
             def _mem_llm_fn(messages, *, system_prompt=mem_extract.SYSTEM_PROMPT,
-                            _s=_mem_session, _cwd=_mem_cwd):
+                            _s=_mem_session, _cwd=_mem_cwd, _traj=_run_id,
+                            _am=_mem_am, _ap=_mem_ap):
+                # The second extraction site. It was missed when the first one
+                # was fixed and had drifted into being the expensive one: no
+                # tools_enabled=False, so every memory extraction shipped the
+                # whole tool registry for a call that emits a JSON array and
+                # never invokes a tool; no aux model, so it billed the main
+                # model; and no task_kind, so its records were
+                # indistinguishable from main-loop turns in the training set.
                 resp = deps.call_backend(
                     session=_s, message="",
                     system_prompt=system_prompt,
-                    current_path=_cwd, messages=messages)
+                    current_path=_cwd, messages=messages,
+                    tools_enabled=False,
+                    model_override=_am or None, provider_override=_ap or None,
+                    task_kind="mem_extract", trajectory_id=_traj)
                 return (resp or {}).get("reply", "") if isinstance(resp, dict) else ""
 
             def _mem_worker(_text=_mem_convo, _fn=_mem_llm_fn, _s=_mem_session):

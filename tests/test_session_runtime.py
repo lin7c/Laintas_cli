@@ -260,6 +260,110 @@ class AgentTerminationTests(unittest.TestCase):
         self.assertEqual(result["completion_source"], "task_complete")
         self.assertEqual(result["msg"], "verified complete")
 
+    def test_dimmed_narration_surfaces_task_complete_summary_as_final(self):
+        deps, calls = _deps([{
+            "reply": "Wrapping up.",
+            "tool_calls": [{
+                "name": "task.complete",
+                "arguments": {"summary": "Implemented and verified the fix."},
+            }],
+            "finish_reason": "tool_calls",
+            "done": False,
+            "error": False,
+        }])
+        history = [{"role": "user", "content": "fix it"}]
+        emitted = []
+        with tempfile.TemporaryDirectory() as tmp, _chdir(tmp):
+            Path(".laintas").mkdir()
+            result = agent_loop.run_agent_loop(
+                deps, "fix it", {}, {}, history,
+                events_cb=lambda events: emitted.extend(copy.deepcopy(events)),
+                max_loops_override=2,
+            )
+
+        output = deps.console.file.getvalue()
+        self.assertEqual(len(calls), 1)
+        self.assertIn("· Wrapping up.", output)
+        self.assertIn("Implemented and verified the fix.", output)
+        self.assertLess(
+            output.index("· Wrapping up."),
+            output.index("Implemented and verified the fix."),
+        )
+        self.assertEqual(
+            output.count("Implemented and verified the fix."), 1)
+        self.assertNotIn("────────────────", output)
+        self.assertEqual(result["msg"], (
+            "Wrapping up.\n\nImplemented and verified the fix."))
+        self.assertEqual(history[-1], {
+            "role": "assistant",
+            "content": "Implemented and verified the fix.",
+            "message_kind": "final",
+        })
+        self.assertEqual(
+            [event for event in emitted
+             if event.get("type") == "ai"
+             and event.get("content") == "Implemented and verified the fix."],
+            [{"type": "ai", "content": "Implemented and verified the fix."}],
+        )
+
+    def test_task_complete_summary_renders_without_prior_narration(self):
+        deps, calls = _deps([{
+            "reply": "",
+            "tool_calls": [{
+                "name": "task.complete",
+                "arguments": {"summary": "Implemented and verified the fix."},
+            }],
+            "finish_reason": "tool_calls",
+            "done": False,
+            "error": False,
+        }])
+        history = [{"role": "user", "content": "fix it"}]
+        with tempfile.TemporaryDirectory() as tmp, _chdir(tmp):
+            Path(".laintas").mkdir()
+            result = agent_loop.run_agent_loop(
+                deps, "fix it", {}, {}, history,
+                events_cb=lambda _events: None,
+                max_loops_override=2,
+            )
+
+        output = deps.console.file.getvalue()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(output.count("Implemented and verified the fix."), 1)
+        self.assertNotIn("────────────────", output)
+        self.assertEqual(result["msg"], "Implemented and verified the fix.")
+
+    def test_normally_rendered_identical_completion_summary_is_not_duplicated(self):
+        summary = (
+            "Implemented and verified the completion-summary rendering fix.\n\n"
+            "The existing task lifecycle and tool semantics remain unchanged.")
+        deps, calls = _deps([{
+            "reply": summary,
+            "tool_calls": [{
+                "name": "task.complete",
+                "arguments": {"summary": summary},
+            }],
+            "finish_reason": "tool_calls",
+            "done": False,
+            "error": False,
+        }])
+        history = [{"role": "user", "content": "fix it"}]
+        with tempfile.TemporaryDirectory() as tmp, _chdir(tmp):
+            Path(".laintas").mkdir()
+            result = agent_loop.run_agent_loop(
+                deps, "fix it", {}, {}, history,
+                events_cb=lambda _events: None,
+                max_loops_override=2,
+            )
+
+        output = deps.console.file.getvalue()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            output.count("Implemented and verified the completion-summary rendering fix."),
+            1,
+        )
+        self.assertNotIn("────────────────", output)
+        self.assertEqual(result["msg"], summary)
+
     def test_task_complete_is_ignored_when_same_batch_contains_failure(self):
         result, calls, _ = self._run([
             {

@@ -5,9 +5,11 @@ test-shaped command appeared in terminalHistory. An agent could run the suite,
 watch twelve tests fail, and call task_complete unchallenged — the gate checked
 that a ritual was performed, not that the code worked.
 """
+import tempfile
 import unittest
 from types import SimpleNamespace
 
+import task_manager
 import tools
 
 
@@ -112,15 +114,44 @@ class GateTests(unittest.TestCase):
 
 
 class GateResultShapeTests(unittest.TestCase):
+    """The gate runs only inside a real TASK — see the module note below.
+
+    `terminalHistory` is session-scoped and survives across turns, so without a
+    TASK to scope it there is nothing to grade: an earlier turn's edits condemn
+    a later turn that changed nothing, and a throwaway script written to /tmp
+    reads as "modified code files".
+    """
+
+    def _ctx_with_task(self, tmp, rows):
+        task_manager.create_task(
+            "real task", cwd=tmp, session_id="s1", owner_agent_id="a1")
+        task_manager.update_task(
+            task_manager.list_tasks(cwd=tmp, session_id="s1")[0]["id"],
+            cwd=tmp, session_id="s1", owner_agent_id="a1", status="completed")
+        ctx = tools.ToolCtx(cwd=tmp, session_id="s1", agent_id="a1")
+        ctx.state = {"terminalHistory": rows}
+        return ctx
+
     def test_task_complete_marks_the_failure_advisory(self):
         rows = [EDIT, {"tool": "shell.exec", "command": "pytest",
                        "output": "1 failed", "returncode": 1}]
-        ctx = tools.ToolCtx(cwd=".")
-        ctx.state = {"terminalHistory": rows}
-        result = tools._bi_task_complete({"summary": "done"}, ctx)
+        with tempfile.TemporaryDirectory() as tmp:
+            result = tools._bi_task_complete(
+                {"summary": "done"}, self._ctx_with_task(tmp, rows))
         self.assertFalse(result["ok"])
         self.assertTrue(result.get("_advisory"))
         self.assertIn("reported failures", result["error"])
+
+    def test_gate_is_silent_when_no_task_was_ever_created(self):
+        """Every recorded false positive came from a session with zero TASKs."""
+        rows = [EDIT, {"tool": "shell.exec", "command": "pytest",
+                       "output": "1 failed", "returncode": 1}]
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = tools.ToolCtx(cwd=tmp, session_id="s-empty", agent_id="a1")
+            ctx.state = {"terminalHistory": rows}
+            result = tools._bi_task_complete({"summary": "done"}, ctx)
+        self.assertTrue(result["ok"])
+        self.assertNotIn("_test_warning", result)
 
 
 if __name__ == "__main__":

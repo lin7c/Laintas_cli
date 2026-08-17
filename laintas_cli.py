@@ -2999,7 +2999,7 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec("/task", "Track project tasks", "Planning & Tasks", "/task [list|add|show|start|done|del|progress|note|subtask]", subcommands=("list", "add", "show", "start", "done", "del", "progress", "note", "subtask")),
     CommandSpec("/work", "Inspect or resume unified WorkGraph state", "Planning & Tasks", "/work [status|list|resume|history]", subcommands=("status", "list", "resume", "history")),
     CommandSpec("/workflow", "Run a multi-phase workflow", "Planning & Tasks", "/workflow {start|status|advance|approve|end|list}", subcommands=("start", "status", "advance", "approve", "end", "list")),
-    CommandSpec("/model", "List or select a deployed terminal model override", "Config & Tools", "/model [terminal] [id|reset]", subcommands=("reset", "clear", "default")),
+    CommandSpec("/model", "List or select a deployed terminal model override", "Config & Tools", "/model [terminal|aux] [id|reset]", subcommands=("aux", "reset", "clear", "default")),
     CommandSpec("/config", "View or set runtime configuration", "Config & Tools", "/config [<key>|<prefix> [<value>]|reset]"),
     CommandSpec("/web", "Inspect web search and fetch: engines, proxy, cookies, diagnostics",
                 "Config & Tools",
@@ -5599,9 +5599,10 @@ The native function schemas are authoritative for each tool's name, purpose and 
 (General act-first / no-transitional-narration / batching / language rules are in the injected <agent_conduct> block. The rules below are laintas loop-control specifics.)
 - Your reply is OPTIONAL. Leave it empty on ordinary execution steps and just emit the tool call(s). Write user-facing text ONLY when: (a) you are giving the final answer/result, (b) you must ask the user a clarifying question, or (c) a non-obvious decision needs a one-line rationale. When you do write, cite files as path:line.
 - Completion is an explicit act: call `task_complete` with a `summary` when — and only when — the task is fully finished. Do NOT stop just to narrate progress; if more work remains, include the next tool call in the SAME turn and keep going.
+- `task_complete` finishes a TASK, not a turn. A turn that only answered a question, explained or reviewed code, or read/searched without changing anything is not a task: give the final answer as plain text with no tool call and stop there. That returns control to the user normally. Do NOT append `task_complete` as punctuation on an answer.
 - Before calling `task_complete` on a task that modified code files, run the project's test suite (pytest, npm test, go test, etc.) to verify your changes. If tests fail, fix them before completing. If tests are not applicable, state why in the summary.
 - If you have nothing concrete to run this turn but the task is NOT finished (still reasoning or planning), just reply with text and no tool call - the loop will continue automatically. Do NOT call task_complete unless the task is truly done.
-- Ending your turn with no tool call continues the loop. Use this for conversational replies, asking the user a question, or when you need a turn to think before your next action.
+- Ending your turn with text and no tool call is always a valid ending: use it for your final answer, for conversational replies, for asking the user a question, or when you need a turn to think before your next action.
 </output_rules>
 
 <safety>
@@ -6435,6 +6436,8 @@ def call_backend_stream(
     allowed_tool_names: Optional[set[str]] = None,
     model_override: Optional[str] = None,
     provider_override: Optional[str] = None,
+    task_kind: str = "",
+    trajectory_id: str = "",
 ) -> dict:
     """Call Helpwo backend /api/chat/stream, same as Helpwo frontend.
     Returns parsed {reply, command, memory, done, _billing} dict.
@@ -6467,6 +6470,15 @@ def call_backend_stream(
         # the system message. The base prompt below intentionally omits it.
         "injectToolGuide": True,
     }
+    # Training-capture labels. Bucketing metadata only: the gateway records them
+    # verbatim but derives no fact from them, so a tampered value can misfile a
+    # sample and nothing more (see training_data.py's trust model). Deliberately
+    # omitted when empty so an unlabelled call stays visibly unlabelled instead
+    # of being silently filed under whatever the default happens to be.
+    if task_kind:
+        payload["taskKind"] = str(task_kind)[:40]
+    if trajectory_id:
+        payload["trajectoryId"] = str(trajectory_id)[:64]
     if messages:
         payload["messages"] = messages
     # An HWO `#name@model#` pin (model_override) overrides the globally-selected
@@ -6532,7 +6544,15 @@ def call_backend_stream(
                     headers=headers,
                     cookies=cookies,
                     stream=True,
-                    timeout=120,
+                    # Outermost hop, so it must be the longest. The chain is
+                    # CLI -> nginx -> gateway -> model upstream, and a
+                    # scale-to-zero upstream boots in ~250s while the gateway
+                    # retries through it. At 120s this end gave up first and
+                    # reported "Response ended prematurely" — a timeout dressed
+                    # up as a broken response. nginx sits at 360s; this stays
+                    # above it so whichever layer is genuinely stuck is the one
+                    # that reports it.
+                    timeout=420,
                     allow_redirects=False,
                 )
             except requests.Timeout:
@@ -9931,6 +9951,7 @@ _SLASH_ARG_RULES: dict[tuple[str, ...], SlashArgRule] = {
     ("/undo",): _arg_rule(1, "/undo [sha]"),
     ("/detail",): _arg_rule(2, "/detail [on|off|trace [N]]"),
     ("/detail", "trace"): _arg_rule(2, "/detail trace [N]"),
+    ("/model", "aux"): _arg_rule(2, "/model aux [id|reset]"),
     ("/model", "reset"): _arg_rule(1, "/model reset"),
     ("/model", "clear"): _arg_rule(1, "/model clear"),
     ("/model", "default"): _arg_rule(1, "/model default"),
@@ -10025,16 +10046,21 @@ _SLASH_ARG_RULES: dict[tuple[str, ...], SlashArgRule] = {
     ("/update", "check"): _arg_rule(1, "/update check"),
     ("/update", "--force"): _arg_rule(1, "/update [--force]"),
     ("/update", "-f"): _arg_rule(1, "/update [-f]"),
-    ("/extensions", "list"): _arg_rule(0, "/extensions list"),
+    # max_args counts the subcommand itself: _validate_slash_args receives
+    # parts[1:], which starts with the sub. These /extensions rules were
+    # originally authored with "arguments after the subcommand" semantics,
+    # so even the bare valid forms ("/extensions list",
+    # "/extensions trust <name>") raised Usage before the handler ran.
+    ("/extensions", "list"): _arg_rule(1, "/extensions list"),
     ("/extensions", "install"): _arg_rule(
-        3, "/extensions install <src> [--global] [--force]",
-        flag_start=1, allowed_flags=("--global", "--force", "-f")),
-    ("/extensions", "remove"): _arg_rule(1, "/extensions remove <name>"),
-    ("/extensions", "trust"): _arg_rule(1, "/extensions trust <name>"),
-    ("/extensions", "untrust"): _arg_rule(1, "/extensions untrust <name>"),
-    ("/extensions", "info"): _arg_rule(1, "/extensions info <name>"),
-    ("/extensions", "create"): _arg_rule(1, "/extensions create <name>"),
-    ("/extensions", "pack"): _arg_rule(1, "/extensions pack <name>"),
+        4, "/extensions install <src> [--global] [--force]",
+        flag_start=2, allowed_flags=("--global", "--force", "-f")),
+    ("/extensions", "remove"): _arg_rule(2, "/extensions remove <name>"),
+    ("/extensions", "trust"): _arg_rule(2, "/extensions trust <name>"),
+    ("/extensions", "untrust"): _arg_rule(2, "/extensions untrust <name>"),
+    ("/extensions", "info"): _arg_rule(2, "/extensions info <name>"),
+    ("/extensions", "create"): _arg_rule(2, "/extensions create <name>"),
+    ("/extensions", "pack"): _arg_rule(2, "/extensions pack <name>"),
 }
 
 
@@ -11643,9 +11669,73 @@ def _cmd_login(session: dict, agent_registry: AgentRegistry) -> None:
         console.print(f"[green]Logged in as {new_session.get('userEmail') or new_session.get('userName') or new_session['userId']}[/green]")
 
 
+def _cmd_model_aux(args: list, session: dict) -> None:
+    """`/model aux [id|reset]` — pick the model for compaction/critic/memory.
+
+    Shares the terminal picker deliberately: the auxiliary model is chosen from
+    the same catalogue as any other, so anything the gateway serves is a valid
+    choice here — Gemma for long-context compaction by default, but
+    deepseek-v4-flash or whatever else is equally selectable.
+    """
+    current = str(get_runtime_config("aux_model") or "")
+    current_provider = str(get_runtime_config("aux_provider") or "")
+
+    def _apply(model: str, provider: str = "") -> None:
+        set_runtime_config("aux_model", model)
+        set_runtime_config("aux_provider", provider)
+
+    if args and args[0].lower() in ("reset", "clear", "default"):
+        _apply("", "")
+        console.print(
+            "[green]Auxiliary model cleared — compaction, the critic and memory "
+            "extraction will use the terminal's own model again.[/green]")
+        return
+    if args:
+        _apply(args[0])
+        console.print(f"[green]Auxiliary model set to: [bold]{args[0]}[/bold][/green]")
+        return
+
+    try:
+        with _safe_status(
+                f"[dim]Fetching available models… {symbols.BULLET} Esc/Ctrl+C cancel[/dim]"):
+            models, _endpoint = run_cancellable_blocking(
+                lambda cancel: fetch_available_models(session, cancel_event=cancel))
+    except BlockingOperationCancelled:
+        console.print("[dim]Selection cancelled.[/dim]")
+        return
+    except Exception as exc:
+        console.print(f"[red]Failed to fetch models: {exc}[/red]")
+        console.print(f"Current auxiliary model: [bold]{current or 'same as terminal'}[/bold]")
+        console.print("Usage: /model aux <model-id>  or  /model aux reset")
+        return
+
+    if not (models and sys.stdin.isatty()):
+        console.print(f"Current auxiliary model: [bold]{current or 'same as terminal'}[/bold]")
+        return
+    selected = show_model_selector(models, current)
+    if not selected:
+        console.print("[dim]Unchanged.[/dim]")
+        return
+    model_id = selected.get("id", "") if isinstance(selected, dict) else selected
+    provider_id = selected.get("provider", "") if isinstance(selected, dict) else ""
+    _apply(model_id, provider_id)
+    info = f"[bold]{model_id}[/bold]" + (f" ([dim]{provider_id}[/dim])" if provider_id else "")
+    console.print(f"[green]Auxiliary model set to {info}[/green]")
+    if model_id != current:
+        console.print("[dim]Applies to compaction, the critic and memory "
+                      "extraction. The terminal's own model is unchanged.[/dim]")
+
+
 def _cmd_model(parts: list, raw_args: str, session: dict) -> None:
     """Manage deployment-model overrides without changing agent base models."""
     args = [_normalize_slash_arg(item) for item in parts[1:]]
+    # `/model aux` targets the auxiliary model instead of a terminal's. It is a
+    # different axis entirely — compaction, the critic and memory extraction do
+    # not belong to any one terminal — so it short-circuits before the terminal
+    # resolution below rather than pretending "aux" is a terminal name.
+    if args and args[0].lower() == "aux":
+        _cmd_model_aux(args[1:], session)
+        return
     current_agent = get_current_agent()
     current_terminal = agent_deployment_terminal(current_agent) or "term0"
     target_terminal = current_terminal
@@ -20160,21 +20250,13 @@ def _blocking_approval_prompt(title: str, body: str, question: str,
     _reader_was_running = bool(
         _bg_reader_thread is not None and _bg_reader_thread.is_alive())
     _reader_was_running = _stop_bg_input_reader() and _reader_was_running
-    try:
-        choice = _arrow_approval_prompt(
-            f"{_action} — {question}", body_lines, options,
-            auto_confirm_seconds=auto_confirm_seconds,
-            destructive=destructive,
-        )
-    except (EOFError, KeyboardInterrupt):
-        choice = None
-    except RuntimeError as e:
-        if "event loop" not in str(e).lower():
-            raise
-        # prompt_toolkit cannot start on this thread (it already owns a live
-        # asyncio loop). Ask with the raw-termios single-key prompt instead —
-        # letting the RuntimeError escape would surface to the model as a tool
-        # error and silently drop the user's decision.
+
+    def _single_key_approval() -> Optional[str]:
+        # prompt_toolkit cannot run here - either its renderer already owns a
+        # live asyncio loop, or this thread is not the one that owns it. Ask
+        # with the raw-termios single-key prompt instead of letting the
+        # exception escape (which would surface to the model as a tool error
+        # and silently drop the user's decision).
         from rich.markup import escape as _esc
         console.print(
             f"  [bold #e3b341]{_esc(_action)}[/bold #e3b341]  "
@@ -20186,7 +20268,31 @@ def _blocking_approval_prompt(title: str, body: str, question: str,
         _key_choice = _read_single_key_choice(
             allow_always=allow_always,
             auto_confirm_seconds=auto_confirm_seconds)
-        choice = {"yes": "y ", "always": "a ", "no": "n "}.get(_key_choice or "no")
+        return {"yes": "y ", "always": "a ", "no": "n "}.get(_key_choice or "no")
+
+    try:
+        # prompt_toolkit's renderer owns an asyncio loop tied to the thread
+        # that first ran it. A background sub-agent (e.g. blindpick's two
+        # model children running under enforce mode) hitting a write approval
+        # used to call select_dialog on its own thread, which corrupts the
+        # shared renderer ("Future attached to a different loop") and wedges
+        # the whole UI. Detect that case up front - the fallback except-path
+        # alone is not enough, because the renderer failure can surface as an
+        # "Unhandled exception in event loop" log rather than a raise.
+        if threading.current_thread() is not threading.main_thread():
+            choice = _single_key_approval()
+        else:
+            choice = _arrow_approval_prompt(
+                f"{_action} - {question}", body_lines, options,
+                auto_confirm_seconds=auto_confirm_seconds,
+                destructive=destructive,
+            )
+    except (EOFError, KeyboardInterrupt):
+        choice = None
+    except RuntimeError as e:
+        if "event loop" not in str(e).lower():
+            raise
+        choice = _single_key_approval()
     finally:
         if _reader_was_running:
             _start_bg_input_reader(get_user_message_queue(),
@@ -20887,6 +20993,20 @@ def main():
     except Exception as _org_exc:
         if args.depth == 0:
             console.print(f"[yellow]Organisation layer: {_org_exc}[/yellow]")
+
+    # Installed means enabled for user-installed extensions as well: the
+    # `/extensions install` confirmation is the opt-in, so a later session
+    # must not leave the extension dormant.  Lab-owned extensions stay with
+    # their profile, names already loaded keep their registration, and each
+    # load still passes the full trust gate.
+    try:
+        for _ext_name, _ext_ok, _ext_message in _extension_runtime.load_installed():
+            if not _ext_ok and args.depth == 0:
+                console.print(
+                    f"[yellow]Extension {_ext_name}: {_ext_message}[/yellow]")
+    except Exception as _ext_exc:
+        if args.depth == 0:
+            console.print(f"[yellow]Extensions: {_ext_exc}[/yellow]")
 
     # ── Non-interactive execution mode ──
     if args.execute:

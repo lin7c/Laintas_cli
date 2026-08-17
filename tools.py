@@ -4560,6 +4560,7 @@ def _bi_task_complete(params: dict, ctx: ToolCtx) -> dict:
     longer infers "done" from a turn that simply lacks a tool call.
     """
     summary = (params.get("summary") or "").strip()
+    tree_items = []
     if _task_mgr is not None and ctx.session_id:
         scoped = _task_mgr.list_tasks(
             cwd=ctx.task_cwd or ctx.cwd or None,
@@ -4574,10 +4575,13 @@ def _bi_task_complete(params: dict, ctx: ToolCtx) -> dict:
                         and item.get("parent_agent_id") in descendants):
                     descendants.add(owner)
                     changed = True
-        open_items = [
+        tree_items = [
             item for item in scoped
             if item.get("owner_agent_id") in descendants
-            and item.get("status") not in {
+        ]
+        open_items = [
+            item for item in tree_items
+            if item.get("status") not in {
                 "completed", "skipped", "deleted"
             }
         ]
@@ -4629,7 +4633,15 @@ def _bi_task_complete(params: dict, ctx: ToolCtx) -> dict:
         }
     # Soft test gate: warn once if code was modified but no tests were run.
     # One-shot - calling task_complete again overrides the warning.
-    test_warning = _check_tests_before_complete(ctx)
+    #
+    # Only when a real TASK exists. Without one there is no task scope to grade
+    # against: the gate's only evidence is `terminalHistory`, which is
+    # session-scoped and carries the last 12 rows across turns. On a task-less
+    # session that means an earlier turn's edits condemn a later turn that
+    # changed nothing, and a throwaway probe script written to /tmp counts as
+    # "modified code files". Every recorded firing of this gate happened in a
+    # session with zero TASK items, and every one of them was wrong.
+    test_warning = _check_tests_before_complete(ctx) if tree_items else None
     if test_warning:
         return {
             "ok": False,
