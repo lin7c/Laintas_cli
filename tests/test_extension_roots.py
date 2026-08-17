@@ -19,7 +19,7 @@ from tools import Tool
 
 
 def setup(ctx):
-    ctx.register_command("/probe", lambda parts, raw="": {reply!r})
+    ctx.register_command("/{cmd}", lambda parts, raw="": {reply!r})
     ctx.register_tool(Tool(name={tool!r}, description="ping",
                            schema={{"type": "object", "properties": {{}}}},
                            invoke=lambda args, ctx=None: {{"ok": True}}))
@@ -27,7 +27,8 @@ def setup(ctx):
 
 
 def _write_extension(root: Path, name: str, *, reply: str = "local",
-                     tool_prefix=None, tool: str = "ping") -> Path:
+                     tool_prefix=None, tool: str = "ping",
+                     cmd: str = "probe") -> Path:
     directory = root / name
     directory.mkdir(parents=True, exist_ok=True)
     manifest = {"schemaVersion": 1, "name": name, "version": "1.0.0"}
@@ -35,7 +36,7 @@ def _write_extension(root: Path, name: str, *, reply: str = "local",
         manifest["toolPrefix"] = tool_prefix
     (directory / "extension.json").write_text(json.dumps(manifest), encoding="utf-8")
     (directory / "main.py").write_text(
-        _MAIN.format(reply=reply, tool=tool), encoding="utf-8")
+        _MAIN.format(reply=reply, tool=tool, cmd=cmd), encoding="utf-8")
     return directory
 
 
@@ -105,6 +106,90 @@ class ExtensionRootTests(unittest.TestCase):
         ok, message = self.runtime.load("thing")
         self.assertFalse(ok, message)
         self.assertEqual(get_registry().get("fs.read").source, "builtin")
+
+
+class LoadInstalledTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.project = self.root / "project"
+        self.machine = self.root / "machine"
+        self.project.mkdir()
+        self.machine.mkdir()
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.root, ignore_errors=True))
+        patches = [
+            mock.patch.object(paths, "extensions_dir", lambda: self.project),
+            mock.patch.object(paths, "global_extensions_dir", lambda: self.machine),
+            mock.patch.object(paths, "TRUST_FILE", self.root / "trust.json"),
+        ]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.runtime = extension_runtime.ExtensionRuntime()
+        self.runtime.configure(reserved_commands=["/help"])
+        # The tool registry is process-global: unload everything this test
+        # loaded or the next test's same-named extension collides on register.
+        self.addCleanup(lambda: [
+            self.runtime.unload(item["name"]) for item in self.runtime.list()])
+
+    def _loaded_names(self):
+        return sorted(item["name"] for item in self.runtime.list())
+
+    def test_installs_in_both_roots_load(self):
+        # Distinct command names: two extensions claiming the same command
+        # would collide in register_command, which is a different rule.
+        _write_extension(self.machine, "mthing", cmd="mprobe")
+        _write_extension(self.project, "pthing", cmd="pprobe")
+        results = self.runtime.load_installed()
+        self.assertEqual(sorted((name, ok) for name, ok, _ in results),
+                         [("mthing", True), ("pthing", True)])
+        self.assertEqual(self._loaded_names(), ["mthing", "pthing"])
+
+    def test_a_loaded_name_is_not_loaded_twice(self):
+        _write_extension(self.machine, "thing")
+        self.assertTrue(self.runtime.load("thing")[0])
+        results = self.runtime.load_installed()
+        self.assertEqual(results, [])
+        self.assertEqual(self._loaded_names(), ["thing"])
+
+    def test_the_project_copy_wins_when_both_roots_have_the_name(self):
+        _write_extension(self.machine, "thing", reply="machine")
+        _write_extension(self.project, "thing", reply="project")
+        results = self.runtime.load_installed()
+        self.assertEqual([(name, ok) for name, ok, _ in results], [("thing", True)])
+        self.assertIn("thing", self._loaded_names())
+        _, result = self.runtime.invoke_command("/probe", ["/probe"], "/probe")
+        self.assertEqual(result, "project")
+
+    def test_a_broken_extension_is_reported_without_stopping_the_rest(self):
+        _write_extension(self.machine, "broken", reply="x")
+        (self.machine / "broken" / "main.py").write_text("no setup here\n", encoding="utf-8")
+        _write_extension(self.machine, "healthy", reply="y")
+        results = dict((name, ok) for name, ok, _ in self.runtime.load_installed())
+        self.assertFalse(results["broken"])
+        self.assertTrue(results["healthy"])
+        self.assertEqual(self._loaded_names(), ["healthy"])
+
+    def test_lab_owned_installs_are_left_to_the_profile(self):
+        directory = _write_extension(self.machine, "labthing")
+        manifest = json.loads(
+            (directory / "extension.json").read_text(encoding="utf-8"))
+        manifest["install"] = {"trustedBy": "evolution-lab"}
+        (directory / "extension.json").write_text(
+            json.dumps(manifest), encoding="utf-8")
+        self.assertEqual(self.runtime.load_installed(), [])
+        self.assertEqual(self._loaded_names(), [])
+
+    def test_an_install_block_without_trust_fails_closed_with_a_hint(self):
+        directory = _write_extension(self.machine, "sealed")
+        manifest = json.loads(
+            (directory / "extension.json").read_text(encoding="utf-8"))
+        manifest["install"] = {"trustedBy": "user-confirm"}
+        (directory / "extension.json").write_text(
+            json.dumps(manifest), encoding="utf-8")
+        results = self.runtime.load_installed()
+        self.assertEqual([name for name, _, _ in results], ["sealed"])
+        self.assertFalse(results[0][1])
+        self.assertIn("/extensions trust sealed", results[0][2])
 
 
 if __name__ == "__main__":

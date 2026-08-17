@@ -367,7 +367,13 @@ def switch_profile(name: str, runtime) -> tuple[bool, str]:
                 activate_candidate(
                     str(previous_id), runtime=runtime, force=True,
                     record_history=False)
+            # The blanket unload above took user-installed extensions with
+            # it; bring them back so a failed switch leaves no dormancy.
+            runtime.load_installed()
             return False, f"Profile switch failed: {message}"
+    # Switching profiles must not silently unload extensions the user
+    # installed outside the Lab.
+    runtime.load_installed()
     _append_history({
         "id": uuid.uuid4().hex, "action": "switch",
         "before_profile": previous, "after_profile": name,
@@ -627,6 +633,7 @@ def rollback(runtime) -> tuple[bool, str]:
                 record_history=False)
             if not ok:
                 return False, f"Profile rollback failed: {message}"
+        runtime.load_installed()
     elif last.get("action") == "disable":
         profile = get_active_profile()
         profile["extensions"] = dict(last.get("before") or {})

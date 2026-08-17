@@ -832,6 +832,59 @@ def _extract_paths(command: str) -> list:
     return paths
 
 
+# ── Runtime sandbox write grants ──────────────────────────────────────────
+# Process-local directory prefixes that trusted caller code (an extension,
+# after showing the user the exact paths) has pre-approved for agent file
+# writes - e.g. blindpick's disposable git-worktree sandboxes. Enforce mode
+# prompts on every write, and a background sub-agent's write cannot render
+# an interactive prompt on the main UI thread without breaking it. Grants
+# are evaluated AFTER denyFileWrite and never reopen a protected target;
+# they vanish with the CLI process.
+
+_sandbox_write_prefixes: list[str] = []
+_sandbox_write_lock = threading.Lock()
+
+
+def grant_file_write_prefix(prefix: str) -> str:
+    """Pre-approve file writes under *prefix* for this process.
+
+    Returns the normalized granted prefix ("" when the path is unusable).
+    """
+    try:
+        normalized = str(Path(prefix).resolve(strict=False))
+    except OSError:
+        return ""
+    if not normalized or normalized == "/":
+        return ""
+    with _sandbox_write_lock:
+        if normalized not in _sandbox_write_prefixes:
+            _sandbox_write_prefixes.append(normalized)
+    return normalized
+
+
+def revoke_file_write_prefix(prefix: str) -> None:
+    """Drop one prefix from the runtime sandbox grant set."""
+    try:
+        normalized = str(Path(prefix).resolve(strict=False))
+    except OSError:
+        normalized = str(prefix)
+    with _sandbox_write_lock:
+        _sandbox_write_prefixes[:] = [
+            p for p in _sandbox_write_prefixes if p != normalized]
+
+
+def _sandbox_write_allowed(abs_path: str) -> bool:
+    with _sandbox_write_lock:
+        prefixes = tuple(_sandbox_write_prefixes)
+    for prefix in prefixes:
+        try:
+            Path(abs_path).relative_to(prefix)
+            return True
+        except (ValueError, OSError):
+            continue
+    return False
+
+
 def evaluate_file_write(path: str, cwd: str | None = None,
                         req_id: str | None = None, agent_id: str | None = None) -> PolicyDecision:
     """Evaluate a file-write target (fs.write / fs.edit / fs.multi_edit) against policy.
@@ -865,6 +918,14 @@ def evaluate_file_write(path: str, cwd: str | None = None,
                 reason = f"Matched denyFileWrite rule: {pattern}"
                 _write_audit(_audit_entry(label, "deny", reason, cwd, req_id, agent_id))
                 return PolicyDecision("deny", pattern, reason)
+
+    # ── Runtime sandbox grant: trusted caller pre-approved this prefix ──
+    # Placed after the deny loop on purpose: a grant must never reopen a
+    # protected target (.ssh, keys, .git/config ...).
+    if _sandbox_write_allowed(abs_path):
+        _write_audit(_audit_entry(
+            label, "allow", "runtime sandbox write grant", cwd, req_id, agent_id))
+        return PolicyDecision("allow")
 
     # ── Path boundary: writes outside allowedRoots ──────────────────────
     allowed_roots = list(cfg.get("allowedRoots", []))
