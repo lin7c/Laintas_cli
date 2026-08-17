@@ -64,6 +64,22 @@ def _extension_roots() -> list[Path]:
     return [paths.extensions_dir(), paths.global_extensions_dir()]
 
 
+def _lab_owned(manifest_path: Path) -> bool:
+    """True when the Evolution Lab stamped this install as its own.
+
+    Lab-owned extensions load through their profile (`load_active_extensions`)
+    so a version pinned there is not silently replaced by whatever is on disk,
+    and `/evolve disable` keeps meaning "off" across sessions.
+    """
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    install = manifest.get("install") if isinstance(manifest, dict) else None
+    return (isinstance(install, dict)
+            and install.get("trustedBy") == "evolution-lab")
+
+
 class _Registrar:
     def __init__(self, callback: Callable):
         self._callback = callback
@@ -310,6 +326,32 @@ class ExtensionRuntime:
     def reload(self, name: str) -> tuple[bool, str]:
         self.unload(name)
         return self.load(name)
+
+    def load_installed(self) -> list[tuple[str, bool, str]]:
+        """Load every installed-but-not-loaded extension in both roots.
+
+        "Installed means enabled": `/extensions install` is the opt-in, so a
+        later session must not leave the extension dormant - the rule the
+        organisation layer already follows.  Lab-owned extensions stay with
+        their profile, and names the Lab or the organisation layer already
+        loaded keep their registration and priority.  Every name still passes
+        the full trust gate in `load`.
+        """
+        names: list[str] = []
+        with self._lock:
+            for root in _extension_roots():
+                if not root.is_dir():
+                    continue
+                for directory in sorted(root.iterdir()):
+                    name = directory.name
+                    if (name in names or name in self._loaded
+                            or not _SAFE_NAME.fullmatch(name)
+                            or not (directory / "extension.json").is_file()):
+                        continue
+                    if _lab_owned(directory / "extension.json"):
+                        continue
+                    names.append(name)
+        return [(name, *self.load(name)) for name in names]
 
     def invoke_command(self, action: str, parts: list[str], raw_line: str = "") -> tuple[bool, Any]:
         item = self._commands.get(str(action).lower())

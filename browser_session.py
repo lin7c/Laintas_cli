@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import os
 import sys
+import glob
+import signal
 import socket
 import subprocess
 import threading
@@ -176,11 +178,154 @@ def _free_tcp_port(start: int = 9222, end: int = 9322) -> int:
 def _free_display(start: int = 99, end: int = 200) -> int:
     """Find a free X display number by checking the lock file."""
     for n in range(start, end):
-        lock = f"/tmp/.X{n}-lock"
+        lock = os.path.join(_X_LOCK_DIR, f".X{n}-lock")
         if not os.path.exists(lock):
             # Also confirm no process is listening on the abstract socket.
             return n
     raise RuntimeError(f"no free X display in :{start}..:{end}")
+
+
+_STALE_TEMP_PREFIXES = ("hwo-chrome-", "hwo-vnc-")
+_STALE_TEMP_AGE = 24 * 3600
+# An orphan has to be old enough that it cannot be a session still starting up.
+_ORPHAN_MIN_AGE = 3600
+# Patched in tests; X itself always uses /tmp.
+_X_LOCK_DIR = "/tmp"
+
+
+def _proc_stat(pid: int):
+    """Return (ppid, comm) for a live pid, or None. Linux /proc only."""
+    try:
+        with open(f"/proc/{pid}/stat", "r") as fh:
+            data = fh.read()
+        # comm can contain spaces and parens, so split on the LAST ')'.
+        close = data.rindex(")")
+        comm = data[data.index("(") + 1:close]
+        return int(data[close + 2:].split()[1]), comm
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _reap_stale_displays(start: int = 99, end: int = 200) -> int:
+    """Release X displays whose session died without cleaning up.
+
+    Two kinds of debris, and only the first is inert:
+
+      * a `/tmp/.X<n>-lock` naming a pid that no longer exists — harmless in
+        itself, but `_free_display` treats any lock as occupied, so every leaked
+        lock permanently removes a display number from the pool;
+      * an `Xvfb`/`x11vnc` pair that outlived its BrowserSession. Those hold a
+        real lock and a real RFB port for as long as the box stays up (measured:
+        7.8 days, five displays, on a machine with 200 to give away).
+
+    Killing processes unattended needs a high bar, so an orphan must satisfy
+    all of: reparented to init (its creator is gone), older than an hour, and no
+    surviving Chrome profile directory for that display. A session whose CLI is
+    still alive keeps its real ppid and is never touched.
+    """
+    if not os.path.isdir("/proc"):
+        return 0
+    freed = 0
+    for n in range(start, end):
+        lock = os.path.join(_X_LOCK_DIR, f".X{n}-lock")
+        try:
+            if not os.path.exists(lock):
+                continue
+            with open(lock, "r") as fh:
+                holder = int(fh.read().strip() or 0)
+        except (OSError, ValueError):
+            continue
+
+        stat = _proc_stat(holder) if holder else None
+        if stat is None:
+            # Nothing owns it. Drop the lock and the socket so the number
+            # returns to the pool.
+            _remove_display_files(n)
+            freed += 1
+            continue
+
+        ppid, comm = stat
+        if comm != "Xvfb" or ppid != 1:
+            continue                      # live session, or not ours
+        try:
+            # The lock is written when Xvfb starts, so its mtime is the
+            # session's age — more direct than deriving it from /proc.
+            if time.time() - os.path.getmtime(lock) < _ORPHAN_MIN_AGE:
+                continue
+        except OSError:
+            continue
+        if glob.glob(os.path.join(tempfile.gettempdir(), f"hwo-chrome-{n}-*")):
+            continue                      # profile still there — leave it alone
+
+        _kill_display_stack(n, holder)
+        _remove_display_files(n)
+        freed += 1
+    return freed
+
+
+def _kill_display_stack(display_n: int, xvfb_pid: int) -> None:
+    """SIGTERM the orphaned Xvfb and the x11vnc attached to it."""
+    victims = [xvfb_pid]
+    try:
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            pid = int(entry)
+            stat = _proc_stat(pid)
+            if not stat or stat[1] != "x11vnc":
+                continue
+            with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                argv = fh.read().split(b"\0")
+            if b"-display" in argv and f":{display_n}".encode() in argv:
+                victims.append(pid)
+    except OSError:
+        pass
+    for pid in victims:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+
+
+def _remove_display_files(display_n: int) -> None:
+    for path in (os.path.join(_X_LOCK_DIR, f".X{display_n}-lock"),
+                 os.path.join(_X_LOCK_DIR, ".X11-unix", f"X{display_n}")):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def _reap_stale_temp_dirs(max_age: float = _STALE_TEMP_AGE) -> int:
+    """Delete profile/log dirs left behind by sessions that never shut down.
+
+    `stop()` removes these, but it only runs on a graceful exit — a SIGKILL, an
+    OOM kill or a dropped SSH session leaves the whole Chrome profile on disk.
+    They accumulate at a few hundred MB each and nothing else ever collects
+    them, so a session sweeps for orphans before creating its own.
+
+    Age is the liveness test: a running Chrome writes into its profile
+    constantly, so anything untouched for a day owns no process. Best-effort by
+    design — this must never be the reason a browser fails to start.
+    """
+    removed = 0
+    try:
+        root = tempfile.gettempdir()
+        now = time.time()
+        for name in os.listdir(root):
+            if not name.startswith(_STALE_TEMP_PREFIXES):
+                continue
+            path = os.path.join(root, name)
+            try:
+                if not os.path.isdir(path) or now - os.path.getmtime(path) < max_age:
+                    continue
+                shutil.rmtree(path, ignore_errors=True)
+                removed += 1
+            except OSError:
+                continue
+    except Exception:
+        pass
+    return removed
 
 
 def _port_open(host: str, port: int, timeout: float = 0.5) -> bool:
@@ -782,6 +927,11 @@ class BrowserSession:
         err = _check_host_deps()
         if err:
             raise RuntimeError(err)
+
+        # Collect orphans from earlier sessions before adding one of our own —
+        # displays first, so _free_display sees the numbers they release.
+        _reap_stale_temp_dirs()
+        _reap_stale_displays()
 
         self.display_n = _free_display()
         self.cdp_port = _free_tcp_port(9222, 9322)
