@@ -20792,9 +20792,17 @@ def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
                     if failed else "")),
                 aborted=_interrupt_event.is_set())
         _set_run_input_state("finalizing")
-        # Restore original SIGINT handler
-        signal.signal(signal.SIGINT, _old_sigint)
+        # Stop the reader BEFORE restoring the SIGINT handler. While the
+        # reader lives, its Ctrl+C binding re-raises SIGINT in-process (it
+        # simulates the kernel's ISIG that raw mode disabled). Restoring the
+        # handler first opened a window where that synthetic signal hit the
+        # shutdown handler - an instant exit the "double Ctrl+C only"
+        # escape-hatch rule never allowed - or landed mid-teardown of an
+        # asyncio run and left a stale running-loop flag behind. The
+        # double-Ctrl+C force-exit path above already stops the reader
+        # first; align the normal unwind with it.
         _stop_bg_input_reader()
+        signal.signal(signal.SIGINT, _old_sigint)
         _interrupt_event.clear()
         _set_run_input_state("idle")
 
