@@ -36,6 +36,28 @@ class StaleRunningLoopTests(unittest.TestCase):
         self.assertTrue(laintas_cli._clear_stale_running_loop())
         self.assertIsNone(asyncio.events._get_running_loop())
 
+    def test_stale_flag_with_thread_id_set_is_cleared(self):
+        """Window B: teardown interrupted BEFORE run_forever reset _thread_id.
+
+        The flag is set AND the abandoned loop still claims to be running
+        (is_running() stays True forever). The old is_running()-based guard
+        mistook this for a live loop and refused to clean up, wedging every
+        later prompt on the thread - the "double Ctrl+C kills the REPL" bug.
+        The frame-walk guard clears it because no loop-run frame is on the
+        stack of a caller executing plain synchronous code.
+        """
+        import threading
+
+        loop = asyncio.new_event_loop()
+        loop._thread_id = threading.get_ident()  # run_forever never unwound
+        asyncio.events._set_running_loop(loop)
+        self.assertTrue(loop.is_running())  # the lie the old guard trusted
+
+        self.assertTrue(laintas_cli._clear_stale_running_loop())
+        self.assertIsNone(asyncio.events._get_running_loop())
+        self.assertFalse(loop.is_running())
+        loop.close()
+
     def test_live_loop_is_never_stolen(self):
         async def probe():
             cleared = laintas_cli._clear_stale_running_loop()

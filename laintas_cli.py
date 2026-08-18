@@ -634,10 +634,30 @@ def _clear_stale_running_loop() -> bool:
     This is a no-op when no stale flag is present; it only clears the flag
     when a previous ``app.run()`` was interrupted by SIGINT.
 
-    A *live* loop is never cleared: if the flag points at a loop that is
-    genuinely running, this thread really is inside asyncio and stealing its
-    flag would corrupt that loop instead of the caller's dialog.  Returns True
-    only when a stale flag was actually cleared.
+    Why an apparently "running" loop is still cleared
+    --------------------------------------------------
+    ``BaseEventLoop.is_running()`` merely reports ``self._thread_id is not
+    None``.  ``run_forever``'s ``finally`` resets ``_thread_id`` *before*
+    clearing the thread-local flag, so an interrupt can also land in the
+    other order - flag still set, ``_thread_id`` still holding the dead
+    loop's owner - leaving ``is_running() == True`` forever.  The earlier
+    version of this helper trusted that answer and refused to clean up,
+    which wedged every later prompt on this thread for good (the "browser.*
+    approvals fail for the rest of a session" class of bug).
+
+    That answer cannot be trusted from *this* code: the running-loop flag
+    is thread-local and is only ever set by the thread that is inside
+    ``run_forever`` itself.  This helper runs as plain synchronous Python,
+    so if this thread is executing it, this thread cannot simultaneously be
+    parked inside ``run_forever`` - any non-None flag is stale by
+    construction, no matter what the dead loop claims via ``is_running()``.
+
+    So: clear the thread-local flag whenever this thread's call stack holds
+    no event-loop frame (see the frame walk below), and also reset the dead
+    loop's own ``_thread_id`` so it stops claiming to run (a forever-True
+    ``is_running()`` would otherwise wedge a later ``loop.close()`` or
+    ``Runner`` teardown of that loop in turn).
+    Returns True only when a stale flag was actually cleared.
     """
     try:
         loop = asyncio.events._get_running_loop()
@@ -645,9 +665,24 @@ def _clear_stale_running_loop() -> bool:
         return False
     if loop is None:
         return False
+    # Structural fact, not the loop's own claim: while a loop is genuinely
+    # running on this thread, a run_forever/run_until_complete frame is
+    # physically on the stack (e.g. when called from inside a coroutine -
+    # the test suite does exactly that). An interrupted teardown leaves the
+    # flag behind but never leaves a loop frame behind, so this check can
+    # not be fooled by the stale states described above.
+    frame = sys._getframe()
+    while frame is not None:
+        if frame.f_code.co_name in ("run_forever", "run_until_complete"):
+            return False  # genuinely inside a running loop on this thread
+        frame = frame.f_back
+    # No loop-run frame on this stack: this thread is executing plain
+    # synchronous code, so a non-None flag can only be a leftover from an
+    # interrupted teardown. Clear it, whatever the dead loop claims.
+    loop_thread_id = getattr(loop, "_thread_id", None)
     try:
-        if loop.is_running() and not loop.is_closed():
-            return False  # a real running loop — not ours to clear
+        if loop_thread_id is not None:
+            loop._thread_id = None  # stop the dead loop's is_running() lies
     except Exception:
         pass
     try:
@@ -4140,56 +4175,70 @@ def pt_prompt(cwd: str) -> str:
     ]
     _clear_stale_running_loop()
     _flush_deferred_notices()
-    try:
-        # patch_stdout is what keeps this prompt from being duplicated down the
-        # screen. Poll threads, sub-agents and terminal watchers all write to
-        # the console while the prompt is live; an unguarded write lands inside
-        # prompt_toolkit's render region, the renderer loses track of the cursor
-        # and repaints the prompt on a NEW line instead of over the old one —
-        # leaving a stack of prompt/rprompt lines in scrollback. Under
-        # patch_stdout those writes are held and flushed above the prompt, which
-        # is redrawn intact underneath.
-        # EXTERNAL: prompt_toolkit drives its own raw mode and its own reader.
-        # Holding it here is what guarantees no background reader is on fd 0
-        # at the same time — two readers used to split escape sequences
-        # between them, which is how a Ctrl+C ended up rendered as the literal
-        # text "^C" inside the input buffer instead of interrupting. On exit
-        # the arbiter restores from PRISTINE, which also clears the
-        # O_NONBLOCK that prompt_toolkit can leave behind.
-        with terminal_arbiter.hold("repl-prompt", TermMode.EXTERNAL,
-                                   timeout=10.0):
-            with patch_stdout(raw=True):
-                user_input = session.prompt(
-                    message,
-                    style=_build_prompt_style(),
-                    multiline=True,
-                    rprompt=_render_rprompt,
-                    complete_while_typing=True,
-                )
-        expanded = _expand_pastes(user_input) if user_input else user_input
-        _reset_paste_registry()
-        return expanded.strip() if expanded else ""
-    except TerminalBusy as exc:
-        # Never spin: a REPL that cannot get the terminal must say so rather
-        # than silently returning empty input in a tight loop.
-        _reset_paste_registry()
-        console.print(f"[yellow]{exc}[/yellow]")
-        time.sleep(0.5)
-        return ""
-    except KeyboardInterrupt:
-        _reset_paste_registry()
-        return ""
-    except EOFError:
-        _reset_paste_registry()
-        raise
-    except OSError as exc:
-        _reset_paste_registry()
-        if exc.errno in _TERMINAL_EOF_ERRNOS:
-            raise EOFError("terminal input closed") from exc
-        raise
-    except Exception:
-        _reset_paste_registry()
-        raise
+    for _attempt in (0, 1):
+        try:
+            # patch_stdout is what keeps this prompt from being duplicated down the
+            # screen. Poll threads, sub-agents and terminal watchers all write to
+            # the console while the prompt is live; an unguarded write lands inside
+            # prompt_toolkit's render region, the renderer loses track of the cursor
+            # and repaints the prompt on a NEW line instead of over the old one -
+            # leaving a stack of prompt/rprompt lines in scrollback. Under
+            # patch_stdout those writes are held and flushed above the prompt, which
+            # is redrawn intact underneath.
+            # EXTERNAL: prompt_toolkit drives its own raw mode and its own reader.
+            # Holding it here is what guarantees no background reader is on fd 0
+            # at the same time - two readers used to split escape sequences
+            # between them, which is how a Ctrl+C ended up rendered as the literal
+            # text "^C" inside the input buffer instead of interrupting. On exit
+            # the arbiter restores from PRISTINE, which also clears the
+            # O_NONBLOCK that prompt_toolkit can leave behind.
+            with terminal_arbiter.hold("repl-prompt", TermMode.EXTERNAL,
+                                       timeout=10.0):
+                with patch_stdout(raw=True):
+                    user_input = session.prompt(
+                        message,
+                        style=_build_prompt_style(),
+                        multiline=True,
+                        rprompt=_render_rprompt,
+                        complete_while_typing=True,
+                    )
+            expanded = _expand_pastes(user_input) if user_input else user_input
+            _reset_paste_registry()
+            return expanded.strip() if expanded else ""
+        except RuntimeError as exc:
+            # select_dialog already had this pattern; the main REPL prompt was the
+            # one ptk entry point without it. An event-loop RuntimeError here means
+            # a previous asyncio.run teardown on this thread was interrupted
+            # mid-finally (double Ctrl+C) and left the running-loop flag set.
+            # Retry once, but only when we actually found a stale flag to clear;
+            # otherwise the caller needs to hear about it (main() then reports it
+            # once and continues).
+            _reset_paste_registry()
+            if (_attempt == 0 and "event loop" in str(exc).lower()
+                    and _clear_stale_running_loop()):
+                continue
+            raise
+        except TerminalBusy as exc:
+            # Never spin: a REPL that cannot get the terminal must say so rather
+            # than silently returning empty input in a tight loop.
+            _reset_paste_registry()
+            console.print(f"[yellow]{exc}[/yellow]")
+            time.sleep(0.5)
+            return ""
+        except KeyboardInterrupt:
+            _reset_paste_registry()
+            return ""
+        except EOFError:
+            _reset_paste_registry()
+            raise
+        except OSError as exc:
+            _reset_paste_registry()
+            if exc.errno in _TERMINAL_EOF_ERRNOS:
+                raise EOFError("terminal input closed") from exc
+            raise
+        except Exception:
+            _reset_paste_registry()
+            raise
 
 
 # ── Dynamic Command Discovery ──────────────────────────────────────────
@@ -9549,14 +9598,25 @@ def observe_session(session, display_name: str = "", display_cmd: str = "") -> N
         refresh_interval=0.3,
     )
 
-    try:
-        app.run()
-        _clear_stale_running_loop()
-    except (KeyboardInterrupt, EOFError):
-        # Key bindings normally handle Esc/Ctrl+C.  Keep startup, rendering,
-        # and teardown races cancellable as well.
-        _clear_stale_running_loop()
-        return
+    _clear_stale_running_loop()
+    for _attempt in (0, 1):
+        try:
+            app.run()
+            _clear_stale_running_loop()
+            break
+        except (KeyboardInterrupt, EOFError):
+            # Key bindings normally handle Esc/Ctrl+C.  Keep startup, rendering,
+            # and teardown races cancellable as well.
+            _clear_stale_running_loop()
+            return
+        except RuntimeError as exc:
+            # Same stale running-loop repair as the other ptk entry points:
+            # a double Ctrl+C landing mid-teardown of an earlier asyncio.run
+            # used to wedge this view (and every later prompt) for good.
+            if (_attempt == 0 and "event loop" in str(exc).lower()
+                    and _clear_stale_running_loop()):
+                continue
+            raise
 
 
 def enter_session(session, display_name: str = "", display_cmd: str = "") -> None:
@@ -19760,21 +19820,32 @@ def _bg_reader_prompt_mode(target_queue: queue.Queue,
             with patch_stdout(raw=True):
                 while not stop.is_set():
                     _set_run_input_state("input_active")
-                    try:
-                        line = _bg_prompt_session.prompt(
-                            [("class:prompt-gutter", "  │ "),
-                             ("class:prompt-caret", "› ")],
-                            style=_build_prompt_style(),
-                            erase_when_done=True,
-                            complete_while_typing=False,
-                        )
-                    except (EOFError, KeyboardInterrupt):
-                        if stop.is_set():
+                    line = None
+                    for _attempt in (0, 1):
+                        try:
+                            line = _bg_prompt_session.prompt(
+                                [("class:prompt-gutter", "  │ "),
+                                 ("class:prompt-caret", "› ")],
+                                style=_build_prompt_style(),
+                                erase_when_done=True,
+                                complete_while_typing=False,
+                            )
                             break
+                        except (EOFError, KeyboardInterrupt):
+                            line = None
+                            break
+                        except RuntimeError as exc:
+                            # Same stale running-loop repair as pt_prompt: the
+                            # bg reader thread also ends a prompt_toolkit run
+                            # per line, and a SIGINT landing mid-teardown here
+                            # would otherwise kill the reader thread for good.
+                            if (_attempt == 0
+                                    and "event loop" in str(exc).lower()
+                                    and _clear_stale_running_loop()):
+                                continue
+                            raise
+                    if line is None or stop.is_set():
                         continue
-                    if stop.is_set():
-                        break
-                    _queue_supplementary(target_queue, line)
     except TerminalBusy:
         return
     finally:
@@ -21558,6 +21629,17 @@ def main():
             shutdown()
         except EOFError:
             shutdown(input_closed=True)
+        except RuntimeError as exc:
+            # A wedge here used to be fatal: the traceback escaped to top
+            # level and killed the whole CLI. With pt_prompt/select_dialog
+            # now self-healing, reaching this branch means they could not
+            # clear the flag themselves - report once and keep the REPL
+            # alive rather than dying on an interactive-UI glitch.
+            if "event loop" in str(exc).lower() and _clear_stale_running_loop():
+                console.print("[yellow]Recovered from a stale event-loop "
+                              "flag; continuing.[/yellow]")
+                continue
+            raise
 
         if isinstance(item, _InjectedInput):
             user_input = item.text
