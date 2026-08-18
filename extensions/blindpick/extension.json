@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 2,
+  "name": "blindpick",
+  "version": "3.1.0",
+  "entrypoint": "main.py",
+  "description": "双模型同台：同一任务两边同时执行，全屏看着跑完，盲选胜者后才揭晓模型名，只应用胜者的改动",
+  "toolPrefix": "blindpick.",
+  "capabilities": [
+    "fs.read",
+    "fs.write"
+  ],
+  "minCliVersion": "1.0.0"
+}

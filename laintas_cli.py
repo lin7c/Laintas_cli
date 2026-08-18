@@ -2735,27 +2735,33 @@ def display_file_diff(path: str, diff_text: str, depth: int = 0) -> None:
     Folds at ``tool_output_fold`` lines (default 30): first half + "… N more"
     + last half so both the opening and closing edits stay visible."""
     diff_lines = diff_text.splitlines() if diff_text else []
-    adds = sum(1 for l in diff_lines
-               if l.startswith("+") and not l.startswith("+++"))
-    dels = sum(1 for l in diff_lines
-               if l.startswith("-") and not l.startswith("---"))
-
     pad = "  " * depth
-    _bg_print(console,
-        f"{pad}[accent]▍[/accent] [bold]{_md_escape(_truncate_with_ellipsis(path, 70))}[/bold]  "
-        f"[success]+{adds}[/success] [error]−{dels}[/error]")
-
     fold_limit = int(get_runtime_config("tool_output_fold") or 30)
-    # Collect content lines (skip headers/hunk markers) with their line-number
-    # state so the gutter stays accurate even in the tail section.
+
+    # Collect content lines with their line-number state so the gutter stays
+    # accurate even in the tail section. Everything outside a hunk is a
+    # header: prefix-matching instead ("+++"/"---"/index/diff) both leaked
+    # extended headers ("new file mode", "rename to", "Binary files") into
+    # the body as context lines and mistook a source line that itself starts
+    # with "++ " for a header, so the ribbon disagreed with the diff below it.
     content = []          # (line_text, old_no, new_no)
     old_no = new_no = 0
+    in_hunk = False
     for ln in diff_lines:
         m = _DIFF_HUNK_RE.match(ln)
         if m:
             old_no, new_no = int(m.group(1)), int(m.group(2))
+            in_hunk = True
             continue
-        if ln.startswith(("+++", "---", "diff ", "index ", "@@")):
+        if ln.startswith("diff "):
+            in_hunk = False   # next file: back to header territory
+            continue
+        if ln.startswith("@@"):
+            # Unparsable header (a combined "@@@" diff): still a hunk, so the
+            # body renders — only the gutter numbers go stale.
+            in_hunk = True
+            continue
+        if not in_hunk:
             continue
         content.append((ln, old_no, new_no))
         if ln.startswith("+"):
@@ -2765,6 +2771,12 @@ def display_file_diff(path: str, diff_text: str, depth: int = 0) -> None:
         else:
             old_no += 1
             new_no += 1
+
+    adds = sum(1 for ln, _o, _n in content if ln.startswith("+"))
+    dels = sum(1 for ln, _o, _n in content if ln.startswith("-"))
+    _bg_print(console,
+        f"{pad}[accent]▍[/accent] [bold]{_md_escape(_truncate_with_ellipsis(path, 70))}[/bold]  "
+        f"[success]+{adds}[/success] [error]−{dels}[/error]")
 
     if not content:
         return

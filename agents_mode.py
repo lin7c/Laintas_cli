@@ -161,6 +161,8 @@ class AgentsModeController:
         width = max(40, shutil.get_terminal_size(fallback=(100, 30)).columns)
         self._silent_console = Console(
             file=_NullWriter(), force_terminal=False, width=width)
+        self._agent_consoles: dict[str, Console] = {}
+        self._console_width = width
         self.app: Optional[Application] = None
         self.overlay = False
         self.rail_offset = 0
@@ -924,7 +926,12 @@ class AgentsModeController:
         # prompt_toolkit is the sole terminal renderer while Agents Mode owns
         # the screen. Rich Live/status/print output from worker threads causes
         # duplicated input, lost redraws and apparently unresponsive Enter.
-        deps.console = self._silent_console
+        #
+        # One console PER AGENT, not one shared silent console: rich refuses a
+        # second live display on the same Console, so two agents streaming at
+        # the same time meant the later one died with
+        # LiveError("Only one live display may be active at once").
+        deps.console = self._console_for(agent_id)
         for renderer in (
                 "display_command_output", "display_sub_terminal_preview",
                 "display_file_diff", "display_task_list"):
@@ -942,6 +949,15 @@ class AgentsModeController:
                 agent_id, "delete", path, "\n".join(
                     part for part in (reason, preview) if part)))
         return deps
+
+    def _console_for(self, agent_id: str) -> Console:
+        """A private silent console per Agent (rich allows one live each)."""
+        console = self._agent_consoles.get(agent_id)
+        if console is None:
+            console = Console(file=_NullWriter(), force_terminal=False,
+                              width=self._console_width)
+            self._agent_consoles[agent_id] = console
+        return console
 
     def _request_approval(self, agent_id: str, kind: str,
                           summary: str, detail: str) -> bool:

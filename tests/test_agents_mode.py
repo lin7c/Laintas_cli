@@ -384,11 +384,22 @@ class AgentsModeTests(unittest.TestCase):
 
         wired = controller._deps_for(agent.id)
 
-        self.assertIs(wired.console, controller._silent_console)
         self.assertIsNot(wired.console, deps.console)
+        self.assertIs(wired.console, controller._console_for(agent.id))
         # These calls must be harmless and write nothing to the terminal.
         wired.console.print("hidden worker output")
         wired.display_command_output("cmd", 0, "output")
+
+    def test_each_agent_gets_its_own_console(self):
+        # rich allows one live display per Console: two agents streaming at
+        # once on a shared console kill the second one with LiveError.
+        first, second = self._agent("one"), self._agent("two")
+        controller = agents_mode.AgentsModeController("term0", mock.Mock(), {})
+
+        self.assertIsNot(controller._deps_for(first.id).console,
+                         controller._deps_for(second.id).console)
+        self.assertIs(controller._deps_for(first.id).console,
+                      controller._deps_for(first.id).console)
 
     def test_worker_approval_is_resolved_by_ui_and_attributed_to_agent(self):
         agent = self._agent("reviewer")
