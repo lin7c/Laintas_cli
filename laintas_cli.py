@@ -3095,7 +3095,6 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec("/mcp", "Manage MCP servers", "Config & Tools", "/mcp {list|trust|revoke|connect|disconnect|reload|tools|init|config}", subcommands=("list", "trust", "revoke", "connect", "disconnect", "reload", "tools", "init", "config")),
     CommandSpec("/bash", "Run a command through term0", "Config & Tools", "/bash <command>|list|add <command>|remove <command>", subcommands=("list", "add", "remove")),
     CommandSpec("/memory", "Manage memory (interactive view/delete); split into global/local", "Config & Tools", "/memory [global|local|persistent|project|show <id|name>]", subcommands=("global", "local", "persistent", "project", "show")),
-    CommandSpec("/mail", "Check or send mail to/from your Laintas account", "Config & Tools", "/mail [inbox [--all]|read <n>|send [subject]]", subcommands=("inbox", "read", "send")),
     CommandSpec("/prop", "View .laintas/cli.prop prompt template", "Config & Tools"),
     CommandSpec("/debug", "Browse or export debug entries", "Config & Tools", "/debug [clear|N|N <file> [--raw]]", subcommands=("clear",)),
     CommandSpec("/why", "Explain a recent tool failure", "Config & Tools", "/why [N|tool|terminal|agent]"),
@@ -4687,127 +4686,6 @@ def fetch_available_models(
     raise RuntimeError(last_error or "No model endpoint responded")
 
 
-# ── Mail: /mail command support (thin client over the gateway's mailbox) ──
-
-def fetch_mail_inbox(session: dict, unread_only: bool = False) -> tuple[list[dict], str]:
-    """Returns (messages, error). error is "" on success."""
-    profile = get_backend_profile()
-    headers, cookies = backend_profiles.request_auth(profile, session)
-    try:
-        resp = requests.get(
-            f"{profile.base_url}/api/agent/inbox",
-            params={"unread_only": "true" if unread_only else "false"},
-            headers=headers, cookies=cookies, timeout=10,
-        )
-    except requests.RequestException as e:
-        return [], str(e)
-    if resp.status_code != 200:
-        return [], f"HTTP {resp.status_code}: {resp.text[:200]}"
-    try:
-        return resp.json().get("messages", []), ""
-    except ValueError:
-        return [], "Non-JSON response from /api/agent/inbox"
-
-
-def ack_mail_read(session: dict, email_ids: list[str]) -> None:
-    """Best-effort — a failed ack just means the message shows up again."""
-    profile = get_backend_profile()
-    headers, cookies = backend_profiles.request_auth(profile, session)
-    try:
-        requests.post(
-            f"{profile.base_url}/api/agent/inbox/ack",
-            json={"email_ids": email_ids},
-            headers=headers, cookies=cookies, timeout=10,
-        )
-    except requests.RequestException:
-        pass
-
-
-def send_mail(session: dict, subject: str, body: str) -> tuple[bool, str]:
-    """Returns (ok, error). error is "" on success."""
-    profile = get_backend_profile()
-    current = get_current_agent()
-    terminal = (getattr(current, "home_terminal", None) or "") if current else ""
-    agent_name = (getattr(current, "name", None) or "Laintas CLI") if current else "Laintas CLI"
-    headers, cookies = backend_profiles.request_auth(profile, session)
-    try:
-        resp = requests.post(
-            f"{profile.base_url}/api/agent/send-email",
-            json={"subject": subject[:200], "body": body[:5000],
-                  "system": "laintas_cli", "terminal": terminal, "agent": agent_name},
-            headers=headers, cookies=cookies, timeout=10,
-        )
-    except requests.RequestException as e:
-        return False, str(e)
-    if resp.status_code >= 300:
-        try:
-            detail = resp.json().get("detail") or resp.text[:200]
-        except ValueError:
-            detail = resp.text[:200]
-        return False, detail
-    return True, ""
-
-
-# ── Mail-mode watcher: wake the idle loop on new mail, don't wait for the ──
-# ── user to start an unrelated task and happen to check the inbox then.  ──
-_MAIL_WATCHER_POLL_INTERVAL = 25  # seconds
-_mail_watcher_thread: Optional[threading.Thread] = None
-_mail_watcher_stop = threading.Event()
-
-
-def _start_mail_watcher(session: dict):
-    """Background poller: while /mode mail is active, new mail should start
-    a turn on its own — not sit until the user separately begins some other
-    task and the AI happens to check mail.check_inbox then. Runs for the
-    whole process lifetime (self-gates on the active mode each cycle) so it
-    doesn't need wiring into every /mode switch branch; only does anything
-    while mode=mail and logged in."""
-    global _mail_watcher_thread
-    if _mail_watcher_thread is not None and _mail_watcher_thread.is_alive():
-        return
-    _mail_watcher_stop.clear()
-    seen_ids: set[str] = set()
-
-    def _watch():
-        while not _mail_watcher_stop.wait(_MAIL_WATCHER_POLL_INTERVAL):
-            try:
-                if not mode_manager.is_mail_mode():
-                    continue
-                current_session = load_session() or session
-                if not current_session.get("userId"):
-                    continue
-                messages, error = fetch_mail_inbox(current_session, unread_only=True)
-                if error:
-                    continue
-                new_messages = [m for m in messages
-                                if m.get("email_id") and m["email_id"] not in seen_ids]
-                if not new_messages:
-                    continue
-                for m in new_messages:
-                    seen_ids.add(m["email_id"])
-                block = "\n\n".join(
-                    f"From: {m.get('from', '?')}\n"
-                    f"Subject: {m.get('subject', '(no subject)')}\n"
-                    f"{m.get('body', '')}"
-                    for m in new_messages
-                )
-                plural = "s" if len(new_messages) != 1 else ""
-                task_text = (
-                    f"[Mail mode] {len(new_messages)} new email{plural} arrived while idle "
-                    f"— read it below and respond appropriately (reply via mail.send_to_user "
-                    f"if needed, or act on the request):\n\n{block}"
-                )
-                _enqueue_user_input(task_text)
-            except Exception:
-                continue  # a watcher hiccup must never take down the process
-
-    _mail_watcher_thread = threading.Thread(
-        target=_watch, daemon=True, name="mail-watcher")
-    _mail_watcher_thread.start()
-
-
-def _stop_mail_watcher():
-    _mail_watcher_stop.set()
 
 
 def show_model_selector(models: list[dict], current: str = "") -> Optional[dict]:
@@ -10044,9 +9922,6 @@ _SLASH_ARG_RULES: dict[tuple[str, ...], SlashArgRule] = {
     ("/memory", "global"): _arg_rule(1, "/memory global"),
     ("/memory", "local"): _arg_rule(1, "/memory local"),
     ("/memory", "show"): _arg_rule(2, "/memory show <id|name>"),
-    ("/mail", "inbox"): _arg_rule(
-        2, "/mail inbox [--all]", flag_start=1, allowed_flags=("--all",)),
-    ("/mail", "read"): _arg_rule(2, "/mail read <n>"),
     ("/backend", "status"): _arg_rule(1, "/backend status"),
     ("/backend", "list"): _arg_rule(1, "/backend list"),
     ("/backend", "use"): _arg_rule(2, "/backend use <name>"),
@@ -12158,118 +12033,6 @@ def _cmd_memory(parts: list) -> None:
         console.print("[yellow]Usage: /memory \\[global|local|persistent|project|show <id|name>][/yellow]")
 
 
-# Last `/mail inbox` listing, so `/mail read <n>` can resolve a position to
-# an email_id without a second round trip. Session-lifetime only — reset by
-# the next `/mail inbox` call, not persisted.
-_last_mail_inbox: list[dict] = []
-
-
-def _fmt_mail_time(ts) -> str:
-    try:
-        return datetime.fromtimestamp(float(ts)).strftime("%Y-%m-%d %H:%M")
-    except (TypeError, ValueError, OSError):
-        return "?"
-
-
-def _cmd_mail(parts: list, raw_args: str, session: dict) -> None:
-    global _last_mail_inbox
-
-    if not session.get("userId"):
-        console.print("[yellow]Not logged in.[/yellow] Run [bold]/login[/bold] to use mail — "
-                      "it only works for a verified Laintas account.")
-        return
-
-    sub = parts[1].lower() if len(parts) > 1 else ""
-
-    if sub in ("", "help"):
-        console.print("Usage: [bold]/mail[/bold] [inbox \\[--all]|read <n>|send \\[subject]]")
-        console.print("[dim]inbox: list mail sent to your account's AI agent address. "
-                      "send: email yourself (needs your approval to actually send).[/dim]")
-
-    elif sub == "inbox":
-        show_all = "--all" in parts[2:]
-        try:
-            with _safe_status(
-                    f"[dim]Checking inbox… {symbols.BULLET} Esc/Ctrl+C cancel[/dim]"):
-                messages, error = run_cancellable_blocking(
-                    lambda _cancel: fetch_mail_inbox(
-                        session, unread_only=not show_all))
-        except BlockingOperationCancelled:
-            console.print("[dim]Inbox request cancelled.[/dim]")
-            return
-        if error:
-            console.print(f"[red]Could not reach backend: {error}[/red]")
-            return
-        _last_mail_inbox = messages
-        if not messages:
-            console.print("[dim]No mail." + (
-                "" if show_all else " (use /mail inbox --all to include read messages)") + "[/dim]")
-            return
-        table = Table(title=f"Mail Inbox ({len(messages)})")
-        table.add_column("#", style="dim")
-        table.add_column("", width=1)  # unread marker
-        table.add_column("From", style="cyan")
-        table.add_column("Subject")
-        table.add_column("Received", style="dim")
-        for idx, m in enumerate(messages, start=1):
-            table.add_row(
-                str(idx),
-                "" if m.get("read") else "[green]*[/green]",
-                m.get("from", "?"),
-                m.get("subject", "(no subject)"),
-                _fmt_mail_time(m.get("received_at")),
-            )
-        console.print(table)
-        console.print("[dim]Use /mail read <n> to view one in full (marks it read).[/dim]")
-
-    elif sub == "read":
-        if len(parts) < 3 or not parts[2].isdigit():
-            console.print("[yellow]Usage: /mail read <n>[/yellow] (n from the last /mail inbox)")
-            return
-        n = int(parts[2])
-        if not _last_mail_inbox:
-            console.print("[dim]Run /mail inbox first.[/dim]")
-            return
-        if n < 1 or n > len(_last_mail_inbox):
-            console.print(f"[red]No message #{n} in the last /mail inbox listing.[/red]")
-            return
-        message = _last_mail_inbox[n - 1]
-        _print_long_panel(
-            message.get("body", ""),
-            f"From {message.get('from', f'?')} {symbols.BULLET} {message.get('subject', '(no subject)')}",
-        )
-        email_id = message.get("email_id")
-        if email_id and not message.get("read"):
-            ack_mail_read(session, [email_id])
-            message["read"] = True
-
-    elif sub == "send":
-        _, subject_arg = _raw_tail_after_word(raw_args)
-        subject = _decode_text_arg(subject_arg) if subject_arg else ""
-        if not subject:
-            try:
-                subject = input("Subject: ").strip()
-            except (EOFError, KeyboardInterrupt):
-                subject = ""
-        if not subject:
-            console.print("[dim]Mail cancelled.[/dim]")
-            return
-        try:
-            body = input("Body: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            body = ""
-        if not body:
-            console.print("[dim]Mail cancelled.[/dim]")
-            return
-        with _safe_status("[dim]Sending…[/dim]"):
-            ok, error = send_mail(session, subject, body)
-        if ok:
-            console.print("[green]Sent to your verified account address.[/green]")
-        else:
-            console.print(f"[red]Send failed: {error}[/red]")
-
-    else:
-        console.print("[yellow]Usage: /mail [inbox \\[--all]|read <n>|send \\[subject]][/yellow]")
 
 
 def _shared_storage_client(session: dict):
@@ -18985,8 +18748,6 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
     elif action == "/memory":
         _cmd_memory(parts)
 
-    elif action == "/mail":
-        _cmd_mail(parts, raw_args, session)
 
     elif action == "/shared":
         _cmd_shared(parts, session)
@@ -20391,76 +20152,6 @@ def _blocking_approval_prompt(title: str, body: str, question: str,
 _APPROVAL_POLL_INTERVAL = 5  # seconds between status checks
 
 
-def _request_email_approval(kind: str, summary: str, detail: str = "") -> bool:
-    """Mail mode's substitute for _blocking_approval_prompt: email a
-    confirm-page link and poll for the human's decision instead of blocking
-    on local terminal input. Denies (fails closed) on any error, and on
-    timeout — an unattended agent must never treat "no response yet" as
-    permission."""
-    session = load_session() or {}
-    if not session.get("userId"):
-        console.print("[yellow]Mail mode approval needed but not logged in — denying.[/yellow]")
-        return False
-
-    profile = get_backend_profile()
-    current = get_current_agent()
-    terminal = (getattr(current, "home_terminal", None) or "") if current else ""
-    agent_name = (getattr(current, "name", None) or "Laintas CLI") if current else "Laintas CLI"
-    interrupt_event = (
-        current.abort_event if current is not None
-        else get_user_interrupt_event()
-    )
-    headers, cookies = backend_profiles.request_auth(profile, session)
-
-    try:
-        resp = requests.post(
-            f"{profile.base_url}/api/agent/request-approval",
-            json={"kind": kind, "summary": summary, "detail": detail,
-                  "system": "laintas_cli", "terminal": terminal, "agent": agent_name},
-            headers=headers, cookies=cookies, timeout=10,
-        )
-    except requests.RequestException as e:
-        console.print(f"[red]Mail mode: could not request email approval ({e}) — denying.[/red]")
-        return False
-    if resp.status_code != 200:
-        console.print(f"[red]Mail mode: approval request failed (HTTP {resp.status_code}) — denying.[/red]")
-        return False
-
-    data = resp.json()
-    token = data.get("token")
-    timeout_s = int(data.get("expires_in") or 900)
-    if not token:
-        console.print("[red]Mail mode: no approval token returned — denying.[/red]")
-        return False
-
-    console.print(f"[cyan]Mail mode: emailed an approval request for {kind}. "
-                  f"Waiting up to {timeout_s // 60} min for your decision…[/cyan]")
-    deadline = time.time() + timeout_s
-    with _safe_status("[dim]Waiting for email approval…[/dim]"):
-        while time.time() < deadline:
-            if interrupt_event.is_set():
-                console.print("[dim]Mail approval wait cancelled.[/dim]")
-                return False
-            try:
-                status_resp = requests.get(
-                    f"{profile.base_url}/api/agent/approval/{token}/status",
-                    headers=headers, cookies=cookies, timeout=10,
-                )
-                if status_resp.status_code == 200:
-                    status = status_resp.json().get("status")
-                    if status == "approved":
-                        console.print("[green]Mail mode: approved by email.[/green]")
-                        return True
-                    if status in ("denied", "expired"):
-                        console.print(f"[yellow]Mail mode: {status} by email.[/yellow]")
-                        return False
-            except requests.RequestException:
-                pass  # transient — keep polling until the deadline
-            if interrupt_event.wait(_APPROVAL_POLL_INTERVAL):
-                console.print("[dim]Mail approval wait cancelled.[/dim]")
-                return False
-    console.print("[yellow]Mail mode: no response within the time limit — denying.[/yellow]")
-    return False
 
 
 def request_command_approval(command: str, reason: str) -> bool:
@@ -20474,8 +20165,6 @@ def request_command_approval(command: str, reason: str) -> bool:
             reason,
         )
 
-    if command.startswith("browser.evaluate ") and mode_manager.is_mail_mode():
-        return _request_email_approval("browser.evaluate", command, reason)
 
     # Destructive git (clean/reset --hard/push --force/branch -D/stash drop…)
     # gets a fresh Yes/No for the same reason deletion does: a blanket
@@ -20572,9 +20261,6 @@ def request_file_write_approval(path: str, diff_preview: str, reason: str) -> bo
 
 def request_file_delete_approval(path: str, preview: str, reason: str) -> bool:
     """Require a fresh confirmation for every destructive delete operation."""
-    if mode_manager.is_mail_mode():
-        detail = "\n".join(part for part in (reason, "", preview) if part)
-        return _request_email_approval("fs.delete", f"Delete: {path}", detail)
     body = "\n".join(part for part in (path, reason, "", preview) if part)
     choice = _blocking_approval_prompt(
         "delete",
@@ -21127,14 +20813,6 @@ def main():
                     f"[dim](run /v update)[/dim]")
         except Exception:
             pass
-
-        # Mail mode's watcher runs for the whole process lifetime and
-        # self-gates on the active mode each poll — started once here rather
-        # than wired into every /mode switch branch. No-ops until /mode mail
-        # is actually active.
-        if session:
-            _start_mail_watcher(session)
-
     # Register as remote agent (only if authenticated)
     agent_registry = AgentRegistry()
     _session_start_cwd = os.getcwd()

@@ -377,6 +377,18 @@ Release assets use architecture-specific names because native ELF binaries are C
 
 The history below is curated from the repository tags and changes, following an Added/Changed/Fixed-style release-note structure rather than reproducing raw commit messages. The tagged public history currently represented in this repository begins at v1.3.0.
 
+### Unreleased
+
+**Removed**
+
+- Removed Mail mode entirely: the `mail` mode, the `/mail` command, the
+  `mail.send_to_user` and `mail.check_inbox` tools, the new-mail watcher, the
+  send-a-report-on-task-complete hook, and the email approval channel that stood
+  in for a terminal prompt when nobody was watching. The gateway side went with
+  it — the mailbox, the inbound-mail webhook, the approval links, and the whole
+  `notifications` module. Outbound mail was the only consumer of the Resend
+  integration, so those credentials are now unused.
+
 ### [v1.16.0](https://github.com/lin7c/Laintas_cli/releases/tag/v1.16.0) — 2026-08-14
 
 **Added**

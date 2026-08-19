@@ -6681,12 +6681,6 @@ def run_agent_loop(
         _durable_rules_has_slot = "{{durableRules}}" in prompt_template
         _terminal_style_has_block = "<terminal_output_style>" in prompt_template
 
-        # The mail tools' own catalog descriptions carry the gateway-served
-        # usage nudge (see tools.refresh_mail_tool_hint) — no separate
-        # template variable, since the guidance belongs to the tool, not a
-        # standalone prompt section. Empty/no-op for logged-out sessions.
-        tools_mod.refresh_mail_tool_hint(session)
-
         # Task-dependent halves of these two blocks are relocated to the
         # live-state tail so the system prompt stays identical across tasks;
         # only the task-independent bulk stays in the cached prefix.
