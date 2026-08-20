@@ -355,6 +355,55 @@ def _fs_meta(path: str) -> dict:
     }
 
 
+# ── Cross-writer coordination ──────────────────────────────────────────
+# Helpwo writes this machine's disk through this process, so peer_coordination
+# (which activates on a second *process* sharing the cwd) could not see it: a
+# frontend agent in the browser and a backend agent in the CLI editing one
+# repository were invisible to each other, and the later write silently won.
+# Registering Helpwo as a named actor puts both writers under the same
+# compare-and-swap and the same write log. All of it is best-effort — losing
+# the bookkeeping must never turn into a failed file operation.
+
+def _peer_note_read(path: str) -> None:
+    try:
+        import peer_coordination
+        peer_coordination.note_external_read(path, peer_coordination.HELPWO_P2P_ACTOR)
+    except Exception:
+        pass
+
+
+def _peer_guard_write(path: str):
+    try:
+        import peer_coordination
+        return peer_coordination.guard_external_write(path, peer_coordination.HELPWO_P2P_ACTOR)
+    except Exception:
+        return None
+
+
+def _peer_note_write(path: str, op: str) -> None:
+    try:
+        import peer_coordination
+        peer_coordination.note_external_write(path, op, peer_coordination.HELPWO_P2P_ACTOR)
+    except Exception:
+        pass
+
+
+def _peer_attach_actor() -> None:
+    try:
+        import peer_coordination
+        peer_coordination.attach_external_actor(peer_coordination.HELPWO_P2P_ACTOR)
+    except Exception:
+        pass
+
+
+def _peer_detach_actor() -> None:
+    try:
+        import peer_coordination
+        peer_coordination.detach_external_actor(peer_coordination.HELPWO_P2P_ACTOR)
+    except Exception:
+        pass
+
+
 def _run_fs_operation(op: str, args: dict):
     if op == "probe":
         return {"ready": True}
@@ -372,19 +421,28 @@ def _run_fs_operation(op: str, args: dict):
         return {"ok": True}
     if op == "remove":
         path = _rpc_path(args.get("path"), follow_leaf=False)
+        stale = _peer_guard_write(path)
+        if stale is not None:
+            raise PermissionError(f"Blocked by cross-writer coordination: {stale}")
         if os.path.isdir(path) and not os.path.islink(path):
             shutil.rmtree(path)
         elif os.path.lexists(path):
             os.unlink(path)
         else:
             raise FileNotFoundError(path)
+        _peer_note_write(path, "remove")
         return {"ok": True}
     if op == "move":
         source = _rpc_path(args.get("source"), follow_leaf=False)
         destination = _rpc_path(args.get("destination"), follow_leaf=False)
         if os.path.lexists(destination):
             raise FileExistsError(destination)
+        stale = _peer_guard_write(source)
+        if stale is not None:
+            raise PermissionError(f"Blocked by cross-writer coordination: {stale}")
         shutil.move(source, destination)
+        _peer_note_write(source, "move")
+        _peer_note_write(destination, "move")
         return _fs_meta(destination)
     if op == "copy":
         source = _rpc_path(args.get("source"), follow_leaf=False)
@@ -501,6 +559,10 @@ class WebrtcManager:
     async def _handle_offer(self, session_id: str, sdp: str):
         pc = RTCPeerConnection(self._config())
         self._pcs[session_id] = pc
+        # A connected browser is a second writer in this working directory.
+        # Declaring it activates the compare-and-swap in peer_coordination for
+        # as long as any peer session is open; see _peer_guard_write above.
+        _peer_attach_actor()
 
         @pc.on("datachannel")
         def on_datachannel(channel):
@@ -1057,6 +1119,10 @@ class WebrtcManager:
                                          "error": f"file too large ({size} bytes)"}))
                 return
             channel.send(json.dumps({"t": "get-head", "id": rid, "ok": True, "size": size}))
+            # Record the version Helpwo is about to hold, so a later put can
+            # tell "I am overwriting what I read" from "someone changed this
+            # underneath me". See peer_coordination.attach_external_actor.
+            _peer_note_read(path)
             with open(path, "rb") as f:
                 while True:
                     chunk = f.read(_CHUNK)
@@ -1085,6 +1151,15 @@ class WebrtcManager:
             channel.send(json.dumps({"t": "put-ack", "id": rid, "ok": False,
                                      "error": "path outside allowed roots"}))
             return
+        # Compare-and-swap BEFORE truncating: `open(path, "wb")` destroys the
+        # previous contents, so a check afterwards would be a check on the
+        # corpse. A file this client never read is unprotected by design —
+        # there is no prior version it could be clobbering unknowingly.
+        stale = _peer_guard_write(path)
+        if stale is not None:
+            channel.send(json.dumps({"t": "put-ack", "id": rid, "ok": False,
+                                     "error": f"Blocked by cross-writer coordination: {stale}"}))
+            return
         try:
             d = os.path.dirname(path)
             if d:
@@ -1107,6 +1182,7 @@ class WebrtcManager:
         if st.get("error"):
             channel.send(json.dumps({"t": "put-ack", "id": rid, "ok": False, "error": st["error"]}))
         else:
+            _peer_note_write(st["path"], "put")
             channel.send(json.dumps({"t": "put-ack", "id": rid, "ok": True, "written": st["written"]}))
 
     # ── VNC bridge: x11vnc RFB socket ⇄ DataChannel ─────────────────────
@@ -1183,6 +1259,12 @@ class WebrtcManager:
                 await pc.close()
             except Exception:
                 pass
+        # The last peer leaving ends the second-writer condition — unless the
+        # local bridge is also up, which holds its own attachment for as long
+        # as it serves. detach is idempotent and re-attaching is one call, so
+        # dropping it here costs nothing if a new peer arrives a moment later.
+        if not self._pcs:
+            _peer_detach_actor()
 
     def close(self):
         """Shut down all peer connections, VNC bridges, and the event loop.

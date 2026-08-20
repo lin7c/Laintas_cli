@@ -106,6 +106,10 @@ def _file_hash(path: str) -> Optional[str]:
         return None
 
 
+# The one path inside `.laintas/` that is project content, not runtime state.
+_CONTRACT_PREFIX = ".laintas/contract/"
+
+
 def _relevant_files(root: str) -> set:
     """Tracked + untracked-but-not-gitignored relative paths. Using git to
     enumerate (instead of os.walk) keeps node_modules/venv/.git out for free
@@ -115,7 +119,13 @@ def _relevant_files(root: str) -> set:
     hasn't been set up to cover it yet (it's documented convention, not
     enforced) — it holds laintas_cli's own runtime state, including nested
     worktrees created for grandchild sub-agents, which must never be picked
-    up as "content" to seed into or merge back from a worktree."""
+    up as "content" to seed into or merge back from a worktree.
+
+    `.laintas/contract/` is the exception, and has to be: it is the API
+    agreement with the frontend, not runtime state. An agent sent into a
+    worktree to build an endpoint needs to read what it agreed to and needs
+    its `implement`/`verify` result to come back out — excluding it would
+    leave the contract permanently stale on one side of every worktree."""
     files = set()
     rc, out, _ = _git(root, "ls-files")
     if rc == 0:
@@ -123,14 +133,18 @@ def _relevant_files(root: str) -> set:
     rc, out, _ = _git(root, "ls-files", "--others", "--exclude-standard")
     if rc == 0:
         files.update(l for l in out.splitlines() if l.strip())
-    return {f for f in files if f != ".laintas" and not f.startswith(".laintas/")}
+    return {f for f in files
+            if f.startswith(_CONTRACT_PREFIX)
+            or (f != ".laintas" and not f.startswith(".laintas/"))}
 
 
 def _changed_vs_head(root: str) -> List[str]:
     """Relative paths of every file that differs from HEAD or is untracked
     (what `git add -A` would stage right now). Excludes `.laintas/` for the
     same reason as _relevant_files — it's laintas_cli's own runtime state
-    (including nested worktrees), never project content to replicate."""
+    (including nested worktrees), never project content to replicate — with
+    the same `.laintas/contract/` exception, so an endpoint built in a
+    worktree brings its contract update back with it."""
     rc, out, err = _git(root, "status", "--porcelain=v1", "--untracked-files=all")
     if rc != 0:
         raise WorktreeError(f"git status failed: {err}")
@@ -142,7 +156,8 @@ def _changed_vs_head(root: str) -> List[str]:
         if " -> " in rest:  # renames
             rest = rest.split(" -> ", 1)[1]
         rel = rest.strip().strip('"')
-        if rel == ".laintas" or rel.startswith(".laintas/"):
+        if not rel.startswith(_CONTRACT_PREFIX) and (
+                rel == ".laintas" or rel.startswith(".laintas/")):
             continue
         paths.append(rel)
     return paths

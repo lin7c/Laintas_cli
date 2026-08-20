@@ -40,6 +40,7 @@ from typing import Any, Callable, Optional
 
 import paths
 import durable_rules
+import git_attribution
 import ppos_client
 from hwo_adapter import HWO_TOOL_DESCRIPTION
 
@@ -3927,6 +3928,7 @@ def _bi_terminal_exec(params: dict, ctx: ToolCtx) -> dict:
         return {"ok": False, "error": "missing 'name'"}
     if not command:
         return {"ok": False, "error": "missing 'command'"}
+    command = git_attribution.apply(command)
     if ctx.register_terminal is None or ctx.deps is None:
         return {"ok": False, "error": "terminal creation not available"}
     if ctx.get_terminal is not None:
@@ -4872,6 +4874,10 @@ def _bi_shell_exec(params: dict, ctx: ToolCtx) -> dict:
         command = command[len("shell.exec "):].strip()
     elif command == "shell.exec":
         return {"ok": False, "error": "missing shell command after 'shell.exec'"}
+
+    # Commits the agent makes carry it as co-author. No-op for everything that
+    # is not a git commit, and for users who switched attribution off.
+    command = git_attribution.apply(command)
 
     timeout = int(params.get("timeout", 60))
     owner = (ctx.get_agent(ctx.agent_id)
@@ -5984,9 +5990,212 @@ def _bi_browser_test_flow(params: dict, ctx: ToolCtx) -> dict:
             "screenshot": shot_path, "errors": error_digest}
 
 
+# ── Contract tools ──────────────────────────────────────────────────────
+# The shared API contract between this backend and a Helpwo frontend.
+# See contract_store.py for why it is a file in the repository and not a
+# message on a channel.
+
+def _contract_actor(ctx) -> str:
+    return f"cli:{ctx.agent_id}" if getattr(ctx, "agent_id", None) else "cli"
+
+
+def _contract_call(fn, *args, **kwargs) -> dict:
+    import contract_store
+    try:
+        return fn(*args, **kwargs)
+    except contract_store.ContractError as e:
+        return {"ok": False, "error": str(e)}
+    except OSError as e:
+        return {"ok": False, "error": f"contract file error: {e}"}
+
+
+def _bi_contract_read(params: dict, ctx) -> dict:
+    import contract_store
+    return _contract_call(contract_store.read,
+                          str(params.get("operation") or ""),
+                          str(params.get("state") or ""),
+                          ctx.cwd or None)
+
+
+def _bi_contract_status(params: dict, ctx) -> dict:
+    import contract_store
+    return _contract_call(contract_store.status, ctx.cwd or None)
+
+
+def _bi_contract_propose(params: dict, ctx) -> dict:
+    import contract_store
+    result = _contract_call(contract_store.propose,
+                            str(params.get("operation") or ""),
+                            params.get("definition") or {},
+                            _contract_actor(ctx),
+                            str(params.get("note") or ""),
+                            ctx.cwd or None)
+    _contract_notify(ctx, result, "proposed")
+    return result
+
+
+def _bi_contract_agree(params: dict, ctx) -> dict:
+    import contract_store
+    result = _contract_call(contract_store.agree,
+                            str(params.get("operation") or ""),
+                            _contract_actor(ctx),
+                            str(params.get("note") or ""),
+                            ctx.cwd or None)
+    _contract_notify(ctx, result, "agreed")
+    return result
+
+
+def _bi_contract_implement(params: dict, ctx) -> dict:
+    import contract_store
+    result = _contract_call(contract_store.implement,
+                            str(params.get("operation") or ""),
+                            _contract_actor(ctx),
+                            list(params.get("files") or []),
+                            str(params.get("baseUrl") or ""),
+                            str(params.get("note") or ""),
+                            ctx.cwd or None)
+    _contract_notify(ctx, result, "implemented")
+    return result
+
+
+def _bi_contract_verify(params: dict, ctx) -> dict:
+    import contract_store
+    result = _contract_call(contract_store.verify,
+                            str(params.get("operation") or ""),
+                            str(params.get("baseUrl") or ""),
+                            ctx.cwd or None)
+    _contract_notify(ctx, result, "verified")
+    return result
+
+
+def _bi_contract_drift(params: dict, ctx) -> dict:
+    import contract_store
+    return _contract_call(contract_store.drift, ctx.cwd or None,
+                          bool(params.get("mark")))
+
+
+def _bi_contract_mock(params: dict, ctx) -> dict:
+    import contract_store
+    return _contract_call(contract_store.mock_response,
+                          str(params.get("operation") or ""), ctx.cwd or None)
+
+
+def _contract_notify(ctx, result: dict, what: str) -> None:
+    """Tell an attached Helpwo the contract moved.
+
+    The file is the truth; this is only the nudge that saves the other agent
+    from polling. Losing it costs a round of staleness, never correctness,
+    which is why nothing here is allowed to fail the tool call.
+    """
+    if not isinstance(result, dict) or not result.get("ok"):
+        return
+    try:
+        import contract_notify
+        contract_notify.push(what, result)
+    except Exception:
+        pass
+
+
 def register_builtin_tools() -> None:
     """Idempotent — safe to call multiple times."""
     builtins = [
+        Tool(
+            name="contract.status",
+            description="Summarise the shared API contract with the frontend: how many "
+                        "operations sit in each state (proposed/agreed/implemented/verified/drift).",
+            schema={"type": "object", "properties": {}, "additionalProperties": False},
+            invoke=_bi_contract_status,
+        ),
+        Tool(
+            name="contract.read",
+            description="Read the shared API contract. Omit both arguments for the whole "
+                        "surface; pass `operation` for one endpoint, or `state` to list only "
+                        "the endpoints in that state. Prefer a filter — reading the entire "
+                        "contract when you need four endpoints wastes the context you will "
+                        "need for the code.",
+            schema={"type": "object", "properties": {
+                "operation": {"type": "string", "description": "e.g. 'GET /api/orders'"},
+                "state": {"type": "string",
+                          "enum": ["proposed", "agreed", "implemented", "verified", "drift"]},
+            }, "additionalProperties": False},
+            invoke=_bi_contract_read,
+        ),
+        Tool(
+            name="contract.propose",
+            description="Declare what an endpoint should look like, as an OpenAPI 3.1 operation "
+                        "object. Use this when you need an interface the other side has not "
+                        "agreed to yet, and re-use it to counter-offer a change: re-proposing an "
+                        "agreed operation moves it back to `proposed` so the other side has to "
+                        "see the change instead of inheriting it.",
+            schema={"type": "object", "properties": {
+                "operation": {"type": "string", "description": "'<METHOD> <path>', e.g. 'POST /api/orders'"},
+                "definition": {"type": "object",
+                               "description": "OpenAPI operation object: summary, parameters, "
+                                              "requestBody, responses (declare at least one)"},
+                "note": {"type": "string", "description": "why — the other agent reads this"},
+            }, "required": ["operation", "definition"], "additionalProperties": False},
+            invoke=_bi_contract_propose,
+        ),
+        Tool(
+            name="contract.agree",
+            description="Accept a proposed endpoint shape. After this it is a commitment the "
+                        "other side is entitled to build against, so read the definition before "
+                        "agreeing rather than after.",
+            schema={"type": "object", "properties": {
+                "operation": {"type": "string"},
+                "note": {"type": "string"},
+            }, "required": ["operation"], "additionalProperties": False},
+            invoke=_bi_contract_agree,
+        ),
+        Tool(
+            name="contract.implement",
+            description="Record that an agreed endpoint is now built, naming the files that "
+                        "build it. Those files' hash is what later drift checks compare against, "
+                        "so name the ones that actually implement the behaviour — not the whole "
+                        "directory, and not a file you merely touched.",
+            schema={"type": "object", "properties": {
+                "operation": {"type": "string"},
+                "files": {"type": "array", "items": {"type": "string"},
+                          "description": "repo-relative paths implementing this operation"},
+                "baseUrl": {"type": "string",
+                            "description": "where it answers, for verification (e.g. http://127.0.0.1:8000)"},
+                "note": {"type": "string"},
+            }, "required": ["operation", "files"], "additionalProperties": False},
+            invoke=_bi_contract_implement,
+        ),
+        Tool(
+            name="contract.verify",
+            description="Make the real request and check the real response against the declared "
+                        "schema. This is the only step that is evidence rather than a claim — "
+                        "`implemented` is you saying you built it, `verified` is it answering "
+                        "correctly. Omit `operation` to verify everything implemented.",
+            schema={"type": "object", "properties": {
+                "operation": {"type": "string"},
+                "baseUrl": {"type": "string", "description": "overrides the recorded base URL"},
+            }, "additionalProperties": False},
+            invoke=_bi_contract_verify,
+            capabilities=frozenset({"network"}),
+        ),
+        Tool(
+            name="contract.drift",
+            description="Find endpoints whose contract and code have parted ways — the declared "
+                        "shape changed after it was agreed, or an implementing file changed after "
+                        "it was declared done. Read-only unless `mark` is true.",
+            schema={"type": "object", "properties": {
+                "mark": {"type": "boolean", "default": False,
+                         "description": "write the finding back as state 'drift'"},
+            }, "additionalProperties": False},
+            invoke=_bi_contract_drift,
+        ),
+        Tool(
+            name="contract.mock",
+            description="A sample response synthesised from an endpoint's declared schema, so "
+                        "work can proceed against a proposed endpoint before it exists.",
+            schema={"type": "object", "properties": {
+                "operation": {"type": "string"},
+            }, "required": ["operation"], "additionalProperties": False},
+            invoke=_bi_contract_mock,
+        ),
         Tool(
             name="ppos.account.get",
             description="Read the signed-in user's PPOS account profile. Read-only and briefly cached.",

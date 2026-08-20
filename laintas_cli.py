@@ -1180,6 +1180,7 @@ from agent_loop import (
     save_session_snapshot,
     save_resume_state, load_resume_state, save_resume_checkpoint, list_resume_states,
     delete_resume_state, save_fork_state, _ensure_session_id,
+    normalize_fork_lineage,
 )
 
 import tools as tools_mod    # noqa: E402 — load after agent_loop so registry inits once
@@ -5678,10 +5679,15 @@ def _restore_resume_blob(blob: dict, chat_history: list) -> dict:
     except Exception:
         pass
     restored_state = prepare_state_for_repl(blob.get("state") or {})
-    # Inject fork lineage so subsequent /fork calls chain correctly.
-    if blob.get("fork_lineage"):
-        restored_state["_fork_lineage"] = blob["fork_lineage"]
-        restored_state["_fork_name"] = blob.get("fork_name", "")
+    # Inject fork lineage so subsequent /fork calls chain correctly. Every
+    # snapshot kind carries it now (an autosave taken inside a branch belongs
+    # to that branch), so resuming an autosave keeps working on the branch it
+    # was taken on instead of silently returning to the trunk.
+    lineage = normalize_fork_lineage(blob.get("fork_lineage"))
+    if lineage:
+        restored_state["_fork_lineage"] = lineage
+        restored_state["_fork_name"] = str(
+            blob.get("fork_name") or lineage[-1])
     else:
         restored_state.pop("_fork_lineage", None)
         restored_state.pop("_fork_name", None)
@@ -5738,67 +5744,103 @@ def _choose_resume_blob(cwd: str, selector: str = "") -> Optional[dict]:
 def _build_fork_tree_rows(choices: list) -> list[tuple[dict, str]]:
     """Build tree-structured display rows from resume choices.
 
-    Forks (blobs with ``fork_name``) are organized into a trie by their
-    ``fork_lineage`` path and rendered with ``├─``/``└─``/``│`` tree
-    prefixes via DFS. Non-fork blobs (autosave/checkpoint) are listed as
-    root-level entries with no prefix, sorted newest-first as before.
+    Every snapshot (named fork, /q checkpoint, autosave) records the branch it
+    was taken on in ``fork_lineage``. Entries are grouped into a trie by that
+    path and rendered with ``├─``/``└─``/``│`` prefixes via DFS, so a branch's
+    own checkpoints hang under the branch instead of piling up at the root.
+
+    Layout rules:
+      * Snapshots with an empty lineage are the trunk: root-level, no prefix,
+        newest first (unchanged from before).
+      * A branch is headed by its named fork snapshot; if that snapshot was
+        never taken or has been deleted, the branch's newest snapshot heads it
+        instead, so a branch never renders as a dangling indent.
+      * A branch's remaining snapshots (newest first) come before its
+        sub-branches (newest first).
 
     Returns a list of ``(blob, tree_prefix)`` tuples in display order.
     """
-    forks = [c for c in choices if c.get("fork_name")]
-    non_forks = [c for c in choices if not c.get("fork_name")]
+    def _ts(blob: dict) -> float:
+        try:
+            return float(blob.get("timestamp") or 0)
+        except (TypeError, ValueError):
+            return 0.0
 
-    # Build a trie from fork lineage paths.
-    # Each node: {"blob": dict|None, "children": {name: node}}
-    root = {"blob": None, "children": {}, "name": ""}
-    for fork in forks:
-        lineage = fork.get("fork_lineage") or [fork["fork_name"]]
+    def _lineage_of(blob: dict) -> list:
+        lineage = normalize_fork_lineage(blob.get("fork_lineage"))
+        if lineage:
+            return lineage
+        # Forks written before lineage existed only carry their own name.
+        name = blob.get("fork_name")
+        return normalize_fork_lineage([name]) if name else []
+
+    trunk = []
+    root = {"blobs": [], "children": {}}
+    for choice in choices:
+        lineage = _lineage_of(choice)
+        if not lineage:
+            trunk.append(choice)
+            continue
         node = root
-        for i, name in enumerate(lineage):
-            if name not in node["children"]:
-                node["children"][name] = {
-                    "blob": None, "children": {}, "name": name,
-                }
-            node = node["children"][name]
-            if i == len(lineage) - 1:
-                node["blob"] = fork
+        for name in lineage:
+            node = node["children"].setdefault(
+                name, {"blobs": [], "children": {}})
+        node["blobs"].append(choice)
+
+    def _node_newest(node: dict) -> float:
+        newest = max((_ts(b) for b in node["blobs"]), default=0.0)
+        for child in node["children"].values():
+            newest = max(newest, _node_newest(child))
+        return newest
+
+    def _items_for(node: dict) -> list:
+        """Display items this node contributes: ``[{blob, children}]``.
+
+        A node with no snapshot of its own (its fork was deleted but a
+        sub-branch survives) contributes its children directly, collapsing
+        the empty level rather than leaving an unattached prefix.
+        """
+        blobs = sorted(node["blobs"], key=_ts, reverse=True)
+        # The named fork snapshot heads its branch; otherwise the newest one.
+        blobs.sort(key=lambda b: 0 if b.get("kind") == "fork" else 1)
+        child_items = []
+        for child in sorted(node["children"].values(),
+                            key=_node_newest, reverse=True):
+            child_items.extend(_items_for(child))
+        if not blobs:
+            return child_items
+        return [{
+            "blob": blobs[0],
+            "children": [{"blob": b, "children": []} for b in blobs[1:]]
+                        + child_items,
+        }]
 
     rows: list[tuple[dict, str]] = []
 
-    # Non-forks first (root level, no prefix), newest first.
-    non_forks.sort(key=lambda item: item.get("timestamp", 0), reverse=True)
-    for item in non_forks:
+    # Trunk first (root level, no prefix), newest first.
+    trunk.sort(key=_ts, reverse=True)
+    for item in trunk:
         rows.append((item, ""))
 
-    # Then DFS the fork trie. Root-level forks (depth 1) get no prefix -
-    # they are peers of non-fork entries. Only their children get tree
-    # connectors (├─ / └─ / │).
-    def _dfs(node, prefix: str, depth: int):
-        children = list(node["children"].values())
-        # Sort children by their blob timestamp (newest first), or by name
-        # for nodes without a direct blob.
-        def _child_sort_key(child):
-            blob = child["blob"]
-            if blob:
-                return -(blob.get("timestamp", 0))
-            return 0
-
-        children.sort(key=_child_sort_key)
-        for i, child in enumerate(children):
-            is_last = i == len(children) - 1
+    def _emit(items: list, prefix: str, depth: int) -> None:
+        for index, item in enumerate(items):
+            is_last = index == len(items) - 1
             if depth == 0:
-                # Root-level fork: no tree prefix, just like non-forks.
-                tree_prefix = ""
-                child_prefix = ""
-            else:
-                connector = symbols.TREE_LAST if is_last else symbols.TREE_BRANCH
-                tree_prefix = prefix + connector + " "
-                child_prefix = prefix + (symbols.TREE_VERT + " " if not is_last else "  ")
-            if child["blob"]:
-                rows.append((child["blob"], tree_prefix))
-            _dfs(child, child_prefix, depth + 1)
+                # Root-level branch: no tree prefix, a peer of trunk entries.
+                rows.append((item["blob"], ""))
+                _emit(item["children"], "", 1)
+                continue
+            connector = symbols.TREE_LAST if is_last else symbols.TREE_BRANCH
+            rows.append((item["blob"], prefix + connector + " "))
+            # The continuation pad must be as wide as the connector it sits
+            # under (2 columns + the trailing space), or deeper levels drift
+            # one column left of their parent.
+            _emit(item["children"],
+                  prefix + ("   " if is_last else symbols.TREE_VERT + "  "),
+                  depth + 1)
 
-    _dfs(root, "", 0)
+    # Root-level branches, newest first, after the trunk entries.
+    _emit(_items_for(root), "", 0)
     return rows
 
 
@@ -5895,12 +5937,14 @@ def _show_resume_detail(item: dict) -> None:
     console.print(f"[dim]Type:[/dim] {item.get('kind', 'session')}   "
                   f"[dim]When:[/dim] {_format_time_ago(item.get('timestamp', 0))}   "
                   f"[dim]Turns:[/dim] {item.get('turn_count') or _resume_turn_count(item)}")
-    # Show fork lineage if this blob is part of a fork tree.
-    if item.get("fork_lineage"):
-        lineage_str = " › ".join(item["fork_lineage"])
+    # Show the branch this snapshot sits on (named forks and the autosaves /
+    # checkpoints taken while working on that branch alike).
+    _lineage = normalize_fork_lineage(item.get("fork_lineage"))
+    if _lineage:
+        lineage_str = " › ".join(_lineage)
         console.print(f"[dim]Lineage:[/dim] [magenta]{lineage_str}[/magenta]")
-        if len(item["fork_lineage"]) > 1:
-            console.print(f"[dim]Parent:[/dim] [magenta]{item['fork_lineage'][-2]}[/magenta]")
+        if len(_lineage) > 1:
+            console.print(f"[dim]Parent:[/dim] [magenta]{_lineage[-2]}[/magenta]")
     history = item.get("chat_history") or []
     console.print(f"[dim]Events:[/dim] {len(history)}\n")
     for msg in history[-6:]:
@@ -21458,11 +21502,24 @@ def main():
             if _fork_name:
                 # /fork <name> - save current context as named fork snapshot.
                 # Reject if an identical lineage path already exists.
-                _current_lineage = list(agent_state.get("_fork_lineage") or [])
-                _new_lineage = _current_lineage + [_fork_name]
+                _current_lineage = normalize_fork_lineage(
+                    agent_state.get("_fork_lineage"))
+                _new_lineage = normalize_fork_lineage(
+                    _current_lineage + [_fork_name])
+                if not _new_lineage or _new_lineage == _current_lineage:
+                    console.print(
+                        "[red]Invalid fork name.[/red] "
+                        "[dim]Use a non-empty name (max 64 chars).[/dim]")
+                    if injected_done is not None:
+                        injected_done.set()
+                    continue
                 _existing = list_resume_states(_session_start_cwd)
+                # Any snapshot sitting on that path already owns the branch -
+                # named forks and auto-named branches alike - so the name has
+                # to be unique among siblings, not just among named forks.
                 _lineage_exists = any(
-                    item.get("fork_lineage") == _new_lineage
+                    normalize_fork_lineage(item.get("fork_lineage"))
+                    == _new_lineage
                     for item in _existing
                 )
                 if _lineage_exists:
@@ -21500,9 +21557,29 @@ def main():
                 # Inherit chat_history (copy) + state; new session_id.
                 _inherited_history = list(chat_history)
                 _inherited_state = dict(agent_state)
-                # Clear fork lineage for the new branch root - it starts fresh.
-                _inherited_state.pop("_fork_lineage", None)
-                _inherited_state.pop("_fork_name", None)
+                # The unnamed branch grows UNDER the current one: it gets an
+                # auto-generated name that is unique among its siblings, so
+                # its snapshots nest below the parent in the resume tree
+                # instead of re-rooting at the trunk.
+                _parent_lineage = normalize_fork_lineage(
+                    agent_state.get("_fork_lineage"))
+                _taken_paths = {
+                    tuple(normalize_fork_lineage(item.get("fork_lineage")))
+                    for item in list_resume_states(_session_start_cwd)
+                }
+                _branch_n = 1
+                while tuple(_parent_lineage
+                            + [f"branch-{_branch_n}"]) in _taken_paths:
+                    _branch_n += 1
+                _auto_branch = f"branch-{_branch_n}"
+                _branch_lineage = normalize_fork_lineage(
+                    _parent_lineage + [_auto_branch])
+                if _branch_lineage == _parent_lineage:
+                    # Depth cap reached - stay on the parent branch rather
+                    # than silently dropping the lineage to the trunk.
+                    _auto_branch = _parent_lineage[-1] if _parent_lineage else ""
+                _inherited_state["_fork_lineage"] = _branch_lineage
+                _inherited_state["_fork_name"] = _auto_branch
                 _inherited_state.pop("_session_id", None)
                 chat_history.clear()
                 chat_history.extend(_inherited_history)
@@ -21516,8 +21593,10 @@ def main():
                 handle_meta_command._last_chat_history = chat_history
                 handle_meta_command._last_original_input = None
                 _n = _resume_turn_count({"chat_history": chat_history})
+                _branch_path = " › ".join(_branch_lineage) or _auto_branch
                 console.print(
                     f"[green]Started a new branched session[/green] "
+                    f"[magenta]{_branch_path}[/magenta] "
                     f"[dim]{symbols.BULLET} {_n} turn(s) inherited "
                     f"{symbols.BULLET} Previous context saved for /resume[/dim]")
                 if injected_done is not None:

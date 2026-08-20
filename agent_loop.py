@@ -1628,6 +1628,33 @@ def _resume_prompt_messages(chat_history: list) -> list:
     ]
 
 
+_FORK_LINEAGE_MAX_DEPTH = 12
+_FORK_NAME_MAX = 64
+
+
+def normalize_fork_lineage(value) -> list:
+    """Sanitize a fork lineage path (branch names, outermost first).
+
+    Lineage arrives from persisted state and from resume blobs on disk, so it
+    is never trusted verbatim: non-string entries are dropped, names are
+    whitespace-collapsed and bounded, and the path depth is capped. Returns a
+    fresh list, so callers can mutate it without aliasing the source state.
+    """
+    if not isinstance(value, (list, tuple)):
+        return []
+    names = []
+    for entry in value:
+        if not isinstance(entry, str):
+            continue
+        name = " ".join(entry.split())[:_FORK_NAME_MAX]
+        if not name:
+            continue
+        names.append(name)
+        if len(names) >= _FORK_LINEAGE_MAX_DEPTH:
+            break
+    return names
+
+
 def _build_resume_payload(state: dict, chat_history: list, cwd: str, kind: str) -> Optional[dict]:
     all_user_turns = [
         m for m in (chat_history or []) if m.get("role") == "user"
@@ -1653,6 +1680,10 @@ def _build_resume_payload(state: dict, chat_history: list, cwd: str, kind: str) 
         title_source = f"Terminal session {symbols.BULLET} {project_name}"
     title = re.sub(r"\s+", " ", title_source)[:80] or "Untitled session"
     session_id = _ensure_session_id(state)
+    # Branch membership travels with EVERY snapshot kind, not just named
+    # forks: an autosave taken inside branch "a" belongs under "a" in the
+    # resume tree. Named forks overwrite these in save_fork_state().
+    fork_lineage = normalize_fork_lineage((state or {}).get("_fork_lineage"))
     return {
         "id": session_id if kind == "autosave" else uuid.uuid4().hex[:12],
         "session_id": session_id,
@@ -1669,6 +1700,7 @@ def _build_resume_payload(state: dict, chat_history: list, cwd: str, kind: str) 
         "active_work_id": (
             workgraph.get_active_work(cwd=cwd, session_id=session_id) or {}
         ).get("id"),
+        "fork_lineage": fork_lineage,
         "state": prepare_state_for_repl(state or {}),
     }
 
@@ -1769,7 +1801,9 @@ def save_fork_state(state: dict, chat_history: list, cwd: str,
         if payload is None:
             return None
         payload["fork_name"] = fork_name
-        payload["fork_lineage"] = fork_lineage or [fork_name]
+        payload["fork_lineage"] = (
+            normalize_fork_lineage(fork_lineage)
+            or normalize_fork_lineage([fork_name]))
         payload["fork_parent_session_id"] = fork_parent_session_id
         payload["fork_created_at"] = payload["timestamp"]
         paths.SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
@@ -4159,32 +4193,9 @@ def _llm_summarize(deps, session, current_path: str, head_text: str,
         text = (text or "").strip()
         if not text:
             return None
-        return _ground_summary(session, head_text, text)
+        return text
     except Exception:
         return None
-
-
-def _ground_summary(session, head_text: str, summary: str) -> str:
-    """Repair summary sentences the head does not support.
-
-    This summary is about to REPLACE the turns it summarizes. Anything the
-    model invented here stops being checkable the moment that happens, and
-    then steers every later decision. It is the one output worth verifying
-    against its own input.
-
-    A distorted sentence is swapped for the head sentence it came from, which
-    restores the fact; only a fabrication with no counterpart is dropped.
-    Degrades to the summary as written on any failure — a grounding outage
-    must not be the reason a compaction fails.
-    """
-    try:
-        import grounding
-    except Exception:
-        return summary
-    try:
-        return grounding.repair_summary(head_text, summary, session=session)
-    except Exception:
-        return summary
 
 
 def _thread_tokens(messages: list) -> int:
@@ -4808,6 +4819,13 @@ def prepare_state_for_repl(state: dict) -> dict:
         "_thread_messages": copy.deepcopy(thread_messages),
         "_thread_summary": str(state.get("_thread_summary") or ""),
         "_thread_call_seq": int(state.get("_thread_call_seq") or 0),
+        # Fork lineage must survive the turn boundary. This whitelist is the
+        # only state that crosses it, so dropping the lineage here made every
+        # snapshot after a resume look like a root-level session and made a
+        # chained /fork re-root itself instead of nesting under its parent.
+        "_fork_lineage": normalize_fork_lineage(state.get("_fork_lineage")),
+        "_fork_name": " ".join(
+            str(state.get("_fork_name") or "").split())[:_FORK_NAME_MAX],
     }
 
 

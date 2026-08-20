@@ -90,10 +90,20 @@ class _PeerCoordinator:
         self._instance_id = paths.PROCESS_INSTANCE_ID
         self._cwd_hash = ""
         self._reg_file: Optional[Path] = None
-        self._read_fps: dict[str, str] = {}    # realpath -> etag
-        self._fp_order: list[str] = []         # LRU order of realpaths
+        self._read_fps: dict[str, str] = {}    # (actor, realpath) -> etag
+        self._fp_order: list[str] = []         # LRU order of those keys
         self._last_scan = 0.0
         self._last_heartbeat = 0.0
+        # Writers sharing this process's working directory that are NOT this
+        # process's agent loop — today that means an attached Helpwo, reaching
+        # the disk through the P2P filesystem RPC or the local bridge.
+        #
+        # Without this, two AIs editing one repo through one CLI were invisible
+        # to each other: the peer scan counts processes, and Helpwo's writes
+        # land inside this one. A frontend agent and a backend agent would then
+        # silently overwrite each other's edits with no error on either side,
+        # which is exactly the case this module exists to prevent.
+        self._actors: set = set()
 
     # ── lifecycle ────────────────────────────────────────────────────
     def register(self, cwd: str) -> None:
@@ -119,6 +129,37 @@ class _PeerCoordinator:
             self._reg_file = dest
         except OSError:
             self._reg_file = None   # best-effort: coordination silently off
+
+    def attach_actor(self, actor: str) -> None:
+        """Declare a second writer inside this process (e.g. an attached Helpwo).
+
+        Coordination activates immediately: unlike a peer process, an actor is
+        known the moment it connects, so there is nothing to discover by
+        scanning and no reason to wait for the next turn's rescan.
+        """
+        if not actor or actor == self._instance_id:
+            return
+        self._actors.add(actor)
+        if not _explicitly_off():
+            self._enabled = True
+
+    def detach_actor(self, actor: str) -> None:
+        """That writer went away; drop what it had read."""
+        self._actors.discard(actor)
+        self._forget_actor(actor)
+        if not self._actors and len(self._active_peers()) < 2:
+            self._enabled = False
+            self._read_fps.clear()
+            self._fp_order.clear()
+
+    def _forget_actor(self, actor: str) -> None:
+        prefix = f"{actor}\0"
+        stale = [k for k in self._read_fps if k.startswith(prefix)]
+        for key in stale:
+            self._read_fps.pop(key, None)
+        if stale:
+            keep = set(stale)
+            self._fp_order = [k for k in self._fp_order if k not in keep]
 
     def unregister(self) -> None:
         """Remove this instance's registration (process exit)."""
@@ -147,7 +188,7 @@ class _PeerCoordinator:
         if now - self._last_scan < _INSTANCE_SCAN_INTERVAL:
             return self._enabled
         self._last_scan = now
-        want = len(self._active_peers()) >= 2
+        want = len(self._active_peers()) >= 2 or bool(self._actors)
         if want != self._enabled:
             self._enabled = want
             if not want:
@@ -193,55 +234,65 @@ class _PeerCoordinator:
             pass
 
     # ── L1: read fingerprints (CAS) ──────────────────────────────────
-    def note_read(self, abs_path: str) -> dict:
+    def _key(self, actor: Optional[str], real: str) -> str:
+        return f"{actor or self._instance_id}\0{real}"
+
+    def note_read(self, abs_path: str, actor: Optional[str] = None) -> dict:
         """Record the current etag of abs_path; report if it changed since
-        the last read by this instance.
+        the last read by this actor.
 
         Returns {"changed": bool, "prev": str} — changed is True when the
-        file was previously read by this instance and its etag differs now.
+        file was previously read by this actor and its etag differs now.
         Zero overhead (no tracking) while coordination is inactive.
+
+        `actor` defaults to this process's agent loop. An attached Helpwo
+        passes its own id so the two keep separate views of the same file:
+        each is protected against the other's edits, and neither trips over
+        its own.
         """
         if not self._enabled:
             return {"changed": False, "prev": ""}
         real = os.path.realpath(abs_path)
         cur = file_etag(real)
-        prev = self._read_fps.get(real, "")
-        self._set_fp(real, cur)
+        key = self._key(actor, real)
+        prev = self._read_fps.get(key, "")
+        self._set_fp(key, cur)
         return {"changed": bool(prev) and prev != cur, "prev": prev}
 
-    def note_write(self, abs_path: str) -> None:
-        """Refresh the tracked fingerprint after this instance wrote the
-        file, so its own subsequent CAS checks don't false-positive."""
+    def note_write(self, abs_path: str, actor: Optional[str] = None) -> None:
+        """Refresh this actor's tracked fingerprint after it wrote the file,
+        so its own subsequent CAS checks don't false-positive."""
         if not self._enabled:
             return
         real = os.path.realpath(abs_path)
-        self._set_fp(real, file_etag(real))
+        self._set_fp(self._key(actor, real), file_etag(real))
 
-    def assert_unchanged(self, abs_path: str) -> Optional[str]:
+    def assert_unchanged(self, abs_path: str, actor: Optional[str] = None) -> Optional[str]:
         """CAS check before a write.  Returns None if safe to write, or an
-        error message when the file changed since this instance last read it.
+        error message when the file changed since this actor last read it.
         Never-read files and inactive coordination always pass."""
         if not self._enabled:
             return None
         real = os.path.realpath(abs_path)
-        prev = self._read_fps.get(real, "")
+        prev = self._read_fps.get(self._key(actor, real), "")
         if not prev:
             return None          # never read it — nothing to protect
         if prev != file_etag(real):
-            return ("file changed since this instance last read it "
-                    "(another instance/process modified it) — re-read and retry")
+            return ("file changed since it was last read here "
+                    "(another instance, process or attached client modified "
+                    "it) — re-read and retry")
         return None
 
-    def _set_fp(self, real: str, etag: str) -> None:
-        if real not in self._read_fps:
-            self._fp_order.append(real)
+    def _set_fp(self, key: str, etag: str) -> None:
+        if key not in self._read_fps:
+            self._fp_order.append(key)
             if len(self._fp_order) > _FP_CACHE_LIMIT:
                 old = self._fp_order.pop(0)
                 self._read_fps.pop(old, None)
-        self._read_fps[real] = etag
+        self._read_fps[key] = etag
 
     # ── L2: write log ────────────────────────────────────────────────
-    def log_write(self, abs_path: str, op: str) -> None:
+    def log_write(self, abs_path: str, op: str, actor: Optional[str] = None) -> None:
         """Append one write event to the per-day log (attribution only)."""
         if not self._enabled:
             return
@@ -256,6 +307,7 @@ class _PeerCoordinator:
             entry = {
                 "t": time.time(),
                 "instance_id": self._instance_id,
+                "actor": actor or self._instance_id,
                 "pid": os.getpid(),
                 "path": abs_path,
                 "etag": file_etag(abs_path),
@@ -444,3 +496,74 @@ def _normalize_session_id(value: str) -> str:
 
 def uuid_hex() -> str:
     return uuid.uuid4().hex[:8]
+
+
+# ── External writers (Helpwo over P2P or the local bridge) ─────────────
+#
+# Helpwo edits the same working directory as the CLI's own agent loop, but it
+# does so *through this process* — the P2P filesystem RPC in webrtc_channel.py
+# and the /api/local-fs endpoints in helpwo_server.py both write the disk from
+# inside the CLI. That made the two agents invisible to each other here: the
+# activation scan counts processes, and both writers live in one.
+#
+# These wrappers give an external client its own actor identity so the same
+# L1 compare-and-swap and L2 write log that protect two CLI instances from
+# each other now also protect a Helpwo frontend agent and a CLI backend agent
+# working the same repository. Every one of them is best-effort: coordination
+# is an accuracy improvement, never a reason for a file operation to fail
+# because the bookkeeping itself broke.
+
+# The two transports attach independently: a user can have the local bridge
+# serving this machine's browser AND a remote Helpwo peered in at the same
+# time. Sharing one actor name would let either one's teardown revoke the
+# other's protection, so each gets its own.
+HELPWO_ACTOR = "helpwo"
+HELPWO_BRIDGE_ACTOR = "helpwo:bridge"
+HELPWO_P2P_ACTOR = "helpwo:p2p"
+
+
+def attach_external_actor(actor: str = HELPWO_ACTOR) -> None:
+    """Declare an external writer; activates coordination for this process."""
+    try:
+        get_coord().attach_actor(actor)
+    except Exception:
+        pass
+
+
+def detach_external_actor(actor: str = HELPWO_ACTOR) -> None:
+    try:
+        get_coord().detach_actor(actor)
+    except Exception:
+        pass
+
+
+def note_external_read(abs_path: str, actor: str = HELPWO_ACTOR) -> dict:
+    """Record what this external writer just saw. Returns note_read's answer."""
+    try:
+        return get_coord().note_read(abs_path, actor=actor)
+    except Exception:
+        return {"changed": False, "prev": ""}
+
+
+def guard_external_write(abs_path: str, actor: str = HELPWO_ACTOR) -> Optional[str]:
+    """CAS gate before an external writer overwrites a file.
+
+    Returns None when the write is safe, or the reason it is not. A caller
+    that gets a reason must refuse the write and say so — silently landing it
+    is precisely the lost update this guards against.
+    """
+    try:
+        return get_coord().assert_unchanged(abs_path, actor=actor)
+    except Exception:
+        return None
+
+
+def note_external_write(abs_path: str, op: str = "write",
+                        actor: str = HELPWO_ACTOR) -> None:
+    """Record that this external writer landed a change."""
+    try:
+        coord = get_coord()
+        coord.note_write(abs_path, actor=actor)
+        coord.log_write(abs_path, op, actor=actor)
+    except Exception:
+        pass

@@ -248,6 +248,30 @@ def install_event_intercept(agent_registry) -> None:
     agent_registry._push_events = _local_push
 
 
+def push_unsolicited(events: list) -> bool:
+    """Deliver events nobody requested to the browser's update stream.
+
+    Every other event this bridge carries answers a `reqId` the frontend sent.
+    A CLI-initiated announcement — "the API contract changed, re-read it" — has
+    no request to answer, and the normal path drops it: `_push_events` returns
+    early when there is no cloud agent id, which is exactly the offline local
+    mode this bridge exists to serve.
+
+    Returns whether the events were buffered.
+    """
+    reg = _agent_registry()
+    if reg is None or not events:
+        return False
+    prepared = []
+    for raw in events:
+        event = dict(raw)
+        event.setdefault("meta", {})
+        event.setdefault("reqId", None)
+        prepared.append(event)
+    _event_buffer.append(_effective_agent_id(reg), prepared)
+    return True
+
+
 def uninstall_event_intercept(agent_registry) -> None:
     """Restore the original event dispatcher."""
     orig = getattr(agent_registry, "_orig_push_events_for_helpwo", None)
@@ -518,6 +542,12 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
         # API routes
         if path == "/api/vnc":
             return self._handle_vnc(parsed)
+        if path == "/api/local-pty":
+            return self._handle_local_pty(parsed)
+        if path == "/api/local-runtime":
+            return self._handle_local_runtime()
+        if path.startswith("/api/local-proxy/"):
+            return self._handle_local_proxy(parsed, "GET")
         if path == "/api/agents":
             return self._handle_list_agents()
         m = re.match(r"^/api/agents/([^/]+)/updates$", path)
@@ -559,6 +589,13 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
 
+        # The tunnel carries whatever content type the previewed app posts, so
+        # it cannot pass through _guard_write's JSON requirement. It keeps the
+        # two checks that actually matter (token + same-origin) and skips only
+        # the one that exists to force a CORS preflight on a form post.
+        if path.startswith("/api/local-proxy/"):
+            return self._handle_local_proxy(parsed, "POST")
+
         if not self._guard_write(parsed):
             return  # response already written
 
@@ -596,8 +633,42 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
             return self._handle_local_fs_rename(self._read_body())
         if path == "/api/local-fs/move":
             return self._handle_local_fs_move(self._read_body())
+        if path == "/api/local-exec":
+            return self._handle_local_exec()
+        if path == "/api/local-exec/approval":
+            return self._handle_local_exec_approval(self._read_body())
+        if path == "/api/local-exec/abort":
+            return self._handle_local_exec_abort(self._read_body())
+        if path == "/api/local-pty/close":
+            return self._handle_local_pty_close(self._read_body())
 
         self._json(404, {"error": "not found"})
+
+    def do_PUT(self) -> None:
+        return self._proxy_only_method("PUT")
+
+    def do_PATCH(self) -> None:
+        return self._proxy_only_method("PATCH")
+
+    def do_DELETE(self) -> None:
+        return self._proxy_only_method("DELETE")
+
+    def do_HEAD(self) -> None:
+        return self._proxy_only_method("HEAD")
+
+    def _proxy_only_method(self, method: str) -> None:
+        """Methods the bridge answers only for the loopback HTTP tunnel.
+
+        A previewed dev server is a whole app: it does PUT/PATCH/DELETE and the
+        browser sends HEAD. None of them mean anything to the bridge's own API,
+        so they are routed to the tunnel and refused everywhere else.
+        """
+        if not self._trusted_host():
+            return
+        parsed = urlparse(self.path)
+        if parsed.path.startswith("/api/local-proxy/"):
+            return self._handle_local_proxy(parsed, method)
+        self._json(405, {"error": "method not allowed"})
 
     def do_OPTIONS(self) -> None:
         """Handle CORS preflight."""
@@ -1018,6 +1089,186 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
                 pass
             self.close_connection = True
 
+    # -- Loopback runtime: exec, PTY and the HTTP tunnel --
+    #
+    # The same five surfaces the P2P channel offers, over the origin that
+    # already serves this page. See local_runtime.py for why these exist at
+    # all: without them a local /helpwo session negotiates ICE with itself to
+    # run a command, and a CLI installed without the optional aiortc extra
+    # cannot run one at all — on the very machine hosting the page.
+
+    def _handle_local_runtime(self) -> None:
+        """What this bridge can do — the frontend's topology negotiation.
+
+        Answering this at all is the signal: a page that gets a 200 here is
+        being served by a CLI on its own machine and should choose the
+        loopback transport for every surface, not just the filesystem.
+        """
+        import local_runtime
+        reg = _agent_registry()
+        body = {
+            "topology": "loopback",
+            "agentId": _effective_agent_id(reg) if reg is not None else "",
+            "root": str(_local_root() or ""),
+            "surfaces": {
+                "fs": "/api/local-fs",
+                "exec": "/api/local-exec",
+                "pty": "/api/local-pty",
+                "proxy": "/api/local-proxy",
+                "screen": "/api/vnc",
+            },
+            "status": local_runtime.status(),
+        }
+        self._json(200, body)
+
+    def _sse_open(self) -> "Any":
+        """Start a server-sent-events response and return its writer."""
+        import local_runtime
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache, no-transform")
+        self.send_header("Connection", "close")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("Access-Control-Allow-Origin", _self_origin())
+        self.send_header("Access-Control-Allow-Credentials", "true")
+        self.end_headers()
+        self.close_connection = True
+        return local_runtime.SseWriter(self.wfile)
+
+    def _handle_local_exec(self) -> None:
+        import local_runtime
+        body = self._read_body()
+        reg = _agent_registry()
+        agent_id = getattr(reg, "agent_id", None) if reg is not None else None
+        sse = self._sse_open()
+        try:
+            local_runtime.run_exec(body, sse, _resolve_local_path, agent_id)
+        except Exception as e:  # never leave the stream hanging open
+            sse.event({"t": "final", "status": "fail", "error": str(e)})
+
+    def _handle_local_exec_approval(self, body: dict) -> None:
+        import local_runtime
+        req_id = str(body.get("reqId") or "")
+        decision = str(body.get("decision") or "reject")
+        ok = local_runtime.respond_approval(req_id, decision)
+        self._json(200 if ok else 404,
+                   {"ok": ok} if ok else {"error": "no such pending request"})
+
+    def _handle_local_exec_abort(self, body: dict) -> None:
+        import local_runtime
+        ok = local_runtime.abort_exec(str(body.get("reqId") or ""))
+        self._json(200 if ok else 404,
+                   {"ok": ok} if ok else {"error": "no such request"})
+
+    def _handle_local_pty_close(self, body: dict) -> None:
+        import local_runtime
+        ok = local_runtime.close_terminal(str(body.get("id") or ""))
+        self._json(200, {"ok": ok})
+
+    def _handle_local_pty(self, parsed) -> None:
+        import local_runtime
+        key = (self.headers.get("Sec-WebSocket-Key") or "").strip()
+        upgrade = (self.headers.get("Upgrade") or "").strip().lower()
+        if upgrade != "websocket" or not key:
+            self._json(400, {"error": "expected a WebSocket upgrade"})
+            return
+        if _local_root() is None:
+            self._json(503, {"error": "local runtime unavailable"})
+            return
+
+        qs = parse_qs(parsed.query)
+        session_id = (qs.get("id") or [""])[0].strip() or f"pty-{secrets.token_hex(6)}"
+        if not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", session_id):
+            self._json(400, {"error": "invalid session id"})
+            return
+        try:
+            cols = int((qs.get("cols") or ["80"])[0])
+            rows = int((qs.get("rows") or ["24"])[0])
+        except ValueError:
+            cols, rows = 80, 24
+        requested_cwd = (qs.get("cwd") or [""])[0]
+        resolved = _resolve_local_path(requested_cwd)
+        cwd = str(resolved) if resolved is not None and resolved.is_dir() else str(_local_root())
+
+        term, resumed, err = local_runtime.open_terminal(session_id, cwd, cols, rows)
+        if term is None:
+            self._json(503, {"error": err or "cannot open a terminal"})
+            return
+
+        handshake = (
+            "HTTP/1.1 101 Switching Protocols\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Accept: {_ws_accept_key(key)}\r\n"
+            "\r\n"
+        ).encode("ascii")
+        try:
+            self.wfile.write(handshake)
+            self.wfile.flush()
+        except OSError:
+            term.detach(self.connection)
+            return
+
+        try:
+            local_runtime.serve_terminal(term, self.connection, resumed)
+        finally:
+            self.close_connection = True
+
+    def _handle_local_proxy(self, parsed, method: str) -> None:
+        """`/api/local-proxy/<port>/<rest>` → 127.0.0.1:<port>/<rest>.
+
+        The same-machine counterpart of the P2P service-worker tunnel: a dev
+        server running on this host, rendered inside Helpwo's preview iframe
+        without a service worker, a DataChannel or an ICE negotiation.
+        """
+        import local_runtime
+        if not self._require_auth(parsed):
+            return
+        if method != "GET" and method != "HEAD" and not self._same_origin():
+            self._json(403, {"error": "cross-site request refused"})
+            return
+        if _local_root() is None:
+            self._json(503, {"error": "local runtime unavailable"})
+            return
+
+        m = re.match(r"^/api/local-proxy/(\d{1,5})(/.*)?$", parsed.path)
+        if not m:
+            self._json(400, {"error": "expected /api/local-proxy/<port>/<path>"})
+            return
+        port = int(m.group(1))
+        rest = m.group(2) or "/"
+        if parsed.query:
+            rest = f"{rest}?{parsed.query}"
+
+        body = b""
+        try:
+            length = int(self.headers.get("Content-Length", 0) or 0)
+        except ValueError:
+            length = 0
+        if length > 0:
+            if length > local_runtime.MAX_PROXY_BODY:
+                self._json(413, {"error": "request body too large"})
+                return
+            body = self.rfile.read(length)
+
+        forward = {k: v for k, v in self.headers.items()}
+        result = local_runtime.proxy_request(port, method, rest, forward, body)
+        if not result.get("ok"):
+            self._json(502, {"error": result.get("error") or "tunnel failed"})
+            return
+
+        payload = result.get("body") or b""
+        self.send_response(int(result.get("status") or 200))
+        for name, value in (result.get("headers") or {}).items():
+            self.send_header(name, value)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        if method != "HEAD":
+            try:
+                self.wfile.write(payload)
+            except OSError:
+                pass
+
     # -- Web search / fetch: served here, not proxied --
     #
     # These used to forward to the cloud backend. Running them in-process means
@@ -1199,6 +1450,11 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
         except OSError as e:
             self._json(500, {"error": str(e)})
             return
+        # Same bookkeeping the P2P read does: remember the version Helpwo now
+        # holds, so a later write can tell an intentional overwrite from a
+        # blind one. Without it the loopback path would be the unprotected
+        # half of a pair that is supposed to behave identically.
+        _peer_note_read(str(p))
         mime, _ = mimetypes.guess_type(p.name)
         self._json(200, {
             "contentBase64": base64.b64encode(data).decode("ascii"),
@@ -1214,6 +1470,10 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
         if not p.parent.is_dir():
             self._json(400, {"error": "parent directory does not exist"})
             return
+        stale = _peer_guard_write(str(p))
+        if stale is not None:
+            self._json(409, {"error": f"Blocked by cross-writer coordination: {stale}"})
+            return
         try:
             raw_b64 = body.get("contentBase64")
             data = (base64.b64decode(raw_b64, validate=True) if raw_b64 is not None
@@ -1225,6 +1485,7 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
         except (OSError, ValueError) as e:
             self._json(500, {"error": str(e)})
             return
+        _peer_note_write(str(p), "write")
         self._json(200, {"ok": True})
 
     def _handle_local_fs_mkdir(self, body: dict) -> None:
@@ -1248,6 +1509,10 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
         if p == root:
             self._json(400, {"error": "cannot delete the workspace root"})
             return
+        stale = _peer_guard_write(str(p))
+        if stale is not None:
+            self._json(409, {"error": f"Blocked by cross-writer coordination: {stale}"})
+            return
         try:
             if p.is_dir() and not p.is_symlink():
                 shutil.rmtree(p)
@@ -1259,6 +1524,7 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
         except OSError as e:
             self._json(500, {"error": str(e)})
             return
+        _peer_note_write(str(p), "delete")
         self._json(200, {"ok": True})
 
     def _handle_local_fs_rename(self, body: dict) -> None:
@@ -1274,11 +1540,17 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
         if target.exists():
             self._json(409, {"error": "target already exists"})
             return
+        stale = _peer_guard_write(str(p))
+        if stale is not None:
+            self._json(409, {"error": f"Blocked by cross-writer coordination: {stale}"})
+            return
         try:
             p.rename(target)
         except OSError as e:
             self._json(500, {"error": str(e)})
             return
+        _peer_note_write(str(p), "rename")
+        _peer_note_write(str(target), "rename")
         self._json(200, {"ok": True})
 
     def _handle_local_fs_move(self, body: dict) -> None:
@@ -1291,11 +1563,17 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
         if target.exists():
             self._json(409, {"error": "target already exists"})
             return
+        stale = _peer_guard_write(str(p))
+        if stale is not None:
+            self._json(409, {"error": f"Blocked by cross-writer coordination: {stale}"})
+            return
         try:
             shutil.move(str(p), str(target))
         except OSError as e:
             self._json(500, {"error": str(e)})
             return
+        _peer_note_write(str(p), "move")
+        _peer_note_write(str(target), "move")
         self._json(200, {"ok": True})
 
 
@@ -1348,6 +1626,37 @@ def _effective_agent_id(registry: Any = None) -> str:
 
 _MAX_LOCAL_FILE_BYTES = 10 * 1024 * 1024  # 10MB, same order as the P2P get/put cap
 _MAX_BODY_BYTES = 2 * _MAX_LOCAL_FILE_BYTES  # raw request body cap (base64 inflates ~33%)
+
+
+def _peer_note_read(path: str) -> None:
+    """Mirror of webrtc_channel's helper for the loopback filesystem path.
+
+    Helpwo writes this machine's disk through this process either way, so both
+    transports must register the same external actor with peer_coordination —
+    otherwise the CLI's agent loop and the browser's agent silently overwrite
+    each other whenever the user happens to be in local mode.
+    """
+    try:
+        import peer_coordination
+        peer_coordination.note_external_read(path, peer_coordination.HELPWO_BRIDGE_ACTOR)
+    except Exception:
+        pass
+
+
+def _peer_guard_write(path: str):
+    try:
+        import peer_coordination
+        return peer_coordination.guard_external_write(path, peer_coordination.HELPWO_BRIDGE_ACTOR)
+    except Exception:
+        return None
+
+
+def _peer_note_write(path: str, op: str) -> None:
+    try:
+        import peer_coordination
+        peer_coordination.note_external_write(path, op, peer_coordination.HELPWO_BRIDGE_ACTOR)
+    except Exception:
+        pass
 
 
 def _resolve_local_path(path_str: str, *, follow_leaf: bool = True) -> Optional[Path]:
@@ -1472,6 +1781,16 @@ def start_server(agent_registry: Any, dist_dir: Optional[Path] = None,
     # Intercept events so they stay in-process instead of HTTP-round-tripping.
     install_event_intercept(agent_registry)
 
+    # From here on there are two writers in this working directory: this
+    # process's agent loop and whoever is driving the browser. Declaring the
+    # second one is what turns on the compare-and-swap that keeps them from
+    # silently overwriting each other.
+    try:
+        import peer_coordination
+        peer_coordination.attach_external_actor(peer_coordination.HELPWO_BRIDGE_ACTOR)
+    except Exception:
+        pass
+
     try:
         srv = ThreadingHTTPServer(
             (_bind_host, port), _HelpwoHandler,
@@ -1506,6 +1825,19 @@ def start_server(agent_registry: Any, dist_dir: Optional[Path] = None,
 def stop_server() -> None:
     """Stop the local Helpwo gateway server."""
     global _server, _server_thread, _registry_ref, _dist_dir_ref, _session_ref, _local_root_ref, _local_agent_id_ref
+
+    # Kill the PTYs and commands this bridge owns before dropping the socket;
+    # otherwise a `/helpwo stop` leaves orphaned shells attached to nothing.
+    try:
+        import local_runtime
+        local_runtime.shutdown()
+    except Exception:
+        pass
+    try:
+        import peer_coordination
+        peer_coordination.detach_external_actor(peer_coordination.HELPWO_BRIDGE_ACTOR)
+    except Exception:
+        pass
 
     if _server is not None:
         _server.shutdown()

@@ -150,7 +150,25 @@ class PeerCoordinationTestCase(unittest.TestCase):
         p = self._make_file(content="v1")
         note = self._coord.note_read(p)
         self.assertFalse(note["changed"])
-        self.assertIn(os.path.realpath(p), self._coord._read_fps)
+        # Fingerprints are keyed per writer, not per path: an attached Helpwo
+        # writes this same directory from inside this process, so the two must
+        # keep separate views of the same file (see attach_actor).
+        self.assertIn(self._coord._key(None, os.path.realpath(p)),
+                      self._coord._read_fps)
+
+    def test_fingerprints_are_scoped_to_the_writer(self):
+        """One writer's read must not satisfy another writer's CAS."""
+        self._activate()
+        p = self._make_file(content="v1")
+        self._coord.note_read(p)
+        self.assertIsNone(self._coord.assert_unchanged(p))
+        # A second writer that never read this file is unprotected, by design.
+        self.assertIsNone(self._coord.assert_unchanged(p, actor="helpwo"))
+        self._coord.note_read(p, actor="helpwo")
+        Path(p).write_text("v2", encoding="utf-8")
+        self._coord.note_write(p)                       # this instance wrote it
+        self.assertIsNone(self._coord.assert_unchanged(p))
+        self.assertIsNotNone(self._coord.assert_unchanged(p, actor="helpwo"))
 
     def test_note_read_reports_external_change(self):
         self._activate()

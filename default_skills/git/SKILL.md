@@ -1,7 +1,7 @@
 ---
 name: git
 description: Working with git on the user's real repository — inspecting state, staging and committing atomically, branching, and staying away from destructive or history-rewriting commands. Load this before any git command that writes.
-version: 1.0.0
+version: 1.1.0
 triggers:
   - commit
   - git
@@ -63,6 +63,17 @@ user or to another agent working concurrently.
   Check the staged diff for them; `.gitignore` is not a guarantee.
 - If a pre-commit hook fails, read what it reported and fix it. Do not reach
   for `--no-verify`.
+
+## Attribution
+
+The user is the author of every commit; laintas-cli is recorded as co-author.
+You do not have to write that trailer — `shell.exec` adds
+`Co-Authored-By: laintas <…@users.noreply.github.com>` to a `git commit` for
+you, which is why the command that runs has a `--trailer` you did not type. Do
+not add a second one by hand: a trailer you write yourself switches the
+automatic one off, so the message ends up with whatever you wrote and nothing
+else. A user who wants a different identity, or none, sets `gitCoAuthor` in
+`~/.laintas/config.json` (an empty string turns it off).
 
 ## Destructive commands
 
