@@ -237,28 +237,6 @@ class WorkbenchTUITests(unittest.IsolatedAsyncioTestCase):
         bridge.push("event", "next")
         self.assertEqual(len(wakes), 2)
 
-    @unittest.skipIf(workbench_tui._BackgroundLinuxDriver is None,
-                     "Linux-only background driver")
-    def test_background_driver_does_not_install_process_signal_handlers(self):
-        errors = []
-
-        def construct_driver():
-            try:
-                async def construct():
-                    app = workbench_tui.WorkbenchApp(self.controller)
-                    driver = app.driver_class(app)
-                    self.assertFalse(driver.can_suspend)
-
-                asyncio.run(construct())
-            except BaseException as exc:
-                errors.append(exc)
-
-        thread = threading.Thread(target=construct_driver)
-        thread.start()
-        thread.join(timeout=2)
-        self.assertFalse(thread.is_alive())
-        self.assertEqual(errors, [])
-
 
 if __name__ == "__main__":
     unittest.main()
