@@ -87,7 +87,10 @@ def _terminal_identity_source() -> str:
 
     try:
         tty_name = os.ttyname(0)
-    except OSError:
+    except (AttributeError, OSError):
+        # os.ttyname does not exist on Windows at all, so the AttributeError
+        # matters as much as the OSError — without it this module cannot even
+        # be imported there. os.getsid below already guards both.
         tty_name = ""
     try:
         session_id = str(os.getsid(0))
