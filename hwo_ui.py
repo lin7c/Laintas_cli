@@ -18,7 +18,7 @@ Input syntax:
   #A#[N]-x>           delete task at position N
   #A#[N]-x>text       replace task at position N
 
-Task icons:  {symbols.SQUARE_OPEN} pending   ◰◳◲◱ running   {symbols.OK} done   {symbols.FAIL} error
+Task icons:  {symbols.SQUARE_OPEN} pending   L· L› L» L› running   {symbols.OK} done   {symbols.FAIL} error
 Scroll:      {symbols.ARROW_U} {symbols.ARROW_D} PgUp PgDn Home End
 Exit:        /q  or  Ctrl-C
 """
@@ -47,7 +47,7 @@ from prompt_toolkit.layout import (
 from prompt_toolkit.layout.controls import BufferControl
 from prompt_toolkit.styles import Style
 
-_SPIN  = list(symbols.SPINNER_GEO)
+_SPIN  = list(symbols.SPINNER_RELAY)
 _IDLE  = symbols.SQUARE_OPEN
 _DONE  = symbols.OK
 _ERROR = symbols.FAIL

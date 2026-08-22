@@ -3039,7 +3039,7 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec("/tell", "Send a message to an agent", "Agents & Terminals", "/tell <agent-id> <message|json>"),
     CommandSpec("/abort", "Abort an agent", "Agents & Terminals", "/abort <agent-id>"),
     CommandSpec("/hwo", "Open or run an orchestration workflow", "Planning & Tasks", "/hwo [file|run <file>|compile <file>]", subcommands=("run", "compile")),
-    CommandSpec("/hwg", "Compile, run, or resume an HWO graph workflow", "Planning & Tasks", "/hwg {run|compile|resume|status|cancel} ...", subcommands=("run", "compile", "resume", "status", "cancel")),
+    CommandSpec("/hwg", "Compile, run, visualize, or resume an HWO graph workflow", "Planning & Tasks", "/hwg {<file.hwg>|run|compile|resume|status|cancel} ...", subcommands=("run", "compile", "resume", "status", "cancel")),
     CommandSpec("/mode", "Show, switch, or create agent modes", "Planning & Tasks", "/mode [act [always]|plan [task]|review|study|list|create|delete]", subcommands=("act", "always", "plan", "review", "study", "list", "create", "delete")),
     CommandSpec("/plan", "Create, revise, review, or approve versioned plans", "Planning & Tasks", "/plan [enter <task>|submit|revise <feedback>|approve|exit|status|list]", subcommands=("enter", "submit", "revise", "approve", "exit", "status", "list")),
     CommandSpec("/prompt", "Open Prompt Lab or manage tested prompt overlays", "Planning & Tasks", "/prompt [issue|subcommand]", subcommands=("status", "branches", "open", "chat", "review", "test", "activate", "disable", "patches", "profiles", "profile", "use", "rollback", "feedback", "fail", "optimize", "apply", "discard", "list", "skill", "export", "install", "publish")),
@@ -3312,7 +3312,10 @@ class MetaCompleter(Completer):
         import agent_loop as _agent_loop
         enum_choices = _agent_loop._RUNTIME_ENUM_CHOICES.get(key)
         if enum_choices is not None:
-            candidates = sorted(enum_choices)
+            # Declaration order, not sorted: these vocabularies are scales, and
+            # offering `reasoning_effort` as high/low/max/medium/none would put
+            # the ladder in an order that means nothing.
+            candidates = list(enum_choices)
         else:
             try:
                 meta = describe_runtime_config().get(key)
@@ -4460,8 +4463,14 @@ def _normalize_model_entry(item) -> dict:
     name = item.get("name") or item.get("displayName") or item.get("label") or model_id
     desc = item.get("description") or item.get("desc") or item.get("provider") or ""
     tier = item.get("tier") or ""
+    supply = item.get("supply") or ""
     return {"id": str(model_id), "name": str(name), "description": str(desc),
-            "tier": str(tier)}
+            "tier": str(tier), "supply": str(supply)}
+
+
+def _model_supply_label(provider_id: str) -> str:
+    """Collapse routing providers into the two user-facing supply groups."""
+    return "Laintas Supply" if provider_id == "laintas" else "Third-party Supply"
 
 
 def _extract_model_entries(data) -> list[dict]:
@@ -4472,12 +4481,13 @@ def _extract_model_entries(data) -> list[dict]:
             if not isinstance(provider, dict):
                 continue
             provider_id = str(provider.get("id") or "")
-            provider_label = str(provider.get("label") or provider_id)
+            supply_label = _model_supply_label(provider_id)
             for model in provider.get("models") or []:
                 row = _normalize_model_entry(model)
                 if row.get("id"):
                     row["provider"] = provider_id
-                    row["description"] = row.get("description") or provider_label
+                    row["supply"] = supply_label
+                    row["description"] = row.get("description") or supply_label
                     rows.append(row)
         return rows
 
@@ -4605,8 +4615,11 @@ def _safe_status(message, *, spinner="dots", **_ignored):
     except Exception:
         text = message
     try:
+        relay = Spinner(spinner, text=text)
+        relay.frames = list(symbols.SPINNER_RELAY)
+        relay.interval = symbols.SPINNER_INTERVAL_MS
         status_live = Live(
-            Spinner(spinner, text=text), console=console,
+            relay, console=console,
             refresh_per_second=12.5, transient=True,
             redirect_stdout=False, redirect_stderr=False)
     except Exception:
@@ -4708,7 +4721,8 @@ def show_model_selector(models: list[dict], current: str = "") -> Optional[dict]
         sel_idx = 0
     for i, model in enumerate(models):
         model_id = model.get("id", "")
-        provider = model.get("description") or model.get("provider") or ""
+        provider = model.get("supply") or model.get("description") or _model_supply_label(
+            str(model.get("provider") or ""))
         mark = " *" if current and model_id == current else "  "
         labels.append(f"{mark}[cyan]{model_id:30}[/cyan] {provider}")
         if current and model_id == current:
@@ -5616,6 +5630,29 @@ def _resume_last_assistant_excerpt(blob: Optional[dict], max_len: int = 80) -> s
     return str(blob.get("title") or "")[:max_len]
 
 
+def _resume_effective_session_id(blob: Optional[dict]) -> str:
+    """Return the branch identity to lease/restore for a resume record.
+
+    v1 named forks reused their parent's session id. Give such a fork a stable
+    virtual child id so resuming it neither collides with the live parent lease
+    nor overwrites the parent's autosave on the next turn.
+    """
+    if not blob:
+        return ""
+    session_id = str(
+        blob.get("session_id")
+        or (blob.get("state") or {}).get("_session_id") or "")
+    parent_session_id = str(
+        blob.get("parent_session_id")
+        or blob.get("fork_parent_session_id") or "")
+    if (blob.get("kind") == "fork" and session_id
+            and session_id == parent_session_id):
+        legacy_id = re.sub(
+            r"[^A-Za-z0-9_-]", "-", str(blob.get("id") or "fork"))[:48]
+        return f"legacy-fork-{legacy_id}"
+    return session_id
+
+
 def _acquire_resume_lease(blob: dict) -> Optional[dict]:
     """Try to take ownership of a resumed session before restoring it.
 
@@ -5624,9 +5661,7 @@ def _acquire_resume_lease(blob: dict) -> Optional[dict]:
     progress.  Returns the blob to resume on success, or None (with a
     warning printed) when another live instance currently owns it.
     """
-    session_id = str(
-        blob.get("session_id")
-        or (blob.get("state") or {}).get("_session_id") or "")
+    session_id = _resume_effective_session_id(blob)
     if not session_id:
         return blob   # no session id → nothing to lock
     try:
@@ -5660,9 +5695,7 @@ def _restore_resume_blob(blob: dict, chat_history: list) -> dict:
     if older:
         chat_history.append({"role": "knowledge", "content": f"[resumed session context]\n{older}"})
     chat_history.extend(blob.get("chat_history") or [])
-    restored_session_id = str(
-        blob.get("session_id")
-        or (blob.get("state") or {}).get("_session_id") or "")
+    restored_session_id = _resume_effective_session_id(blob)
     try:
         if blob.get("active_work_id"):
             workgraph.set_active_work(
@@ -5679,6 +5712,8 @@ def _restore_resume_blob(blob: dict, chat_history: list) -> dict:
     except Exception:
         pass
     restored_state = prepare_state_for_repl(blob.get("state") or {})
+    if restored_session_id:
+        restored_state["_session_id"] = restored_session_id
     # Inject fork lineage so subsequent /fork calls chain correctly. Every
     # snapshot kind carries it now (an autosave taken inside a branch belongs
     # to that branch), so resuming an autosave keeps working on the branch it
@@ -5687,10 +5722,14 @@ def _restore_resume_blob(blob: dict, chat_history: list) -> dict:
     if lineage:
         restored_state["_fork_lineage"] = lineage
         restored_state["_fork_name"] = str(
-            blob.get("fork_name") or lineage[-1])
+            blob.get("branch_name") or blob.get("fork_name") or lineage[-1])
+        restored_state["_fork_parent_session_id"] = str(
+            blob.get("parent_session_id")
+            or blob.get("fork_parent_session_id") or "")
     else:
         restored_state.pop("_fork_lineage", None)
         restored_state.pop("_fork_name", None)
+        restored_state.pop("_fork_parent_session_id", None)
     return restored_state
 
 
@@ -5742,23 +5781,13 @@ def _choose_resume_blob(cwd: str, selector: str = "") -> Optional[dict]:
 
 
 def _build_fork_tree_rows(choices: list) -> list[tuple[dict, str]]:
-    """Build tree-structured display rows from resume choices.
+    """Group snapshots by logical session, then render the session tree.
 
-    Every snapshot (named fork, /q checkpoint, autosave) records the branch it
-    was taken on in ``fork_lineage``. Entries are grouped into a trie by that
-    path and rendered with ``├─``/``└─``/``│`` prefixes via DFS, so a branch's
-    own checkpoints hang under the branch instead of piling up at the root.
-
-    Layout rules:
-      * Snapshots with an empty lineage are the trunk: root-level, no prefix,
-        newest first (unchanged from before).
-      * A branch is headed by its named fork snapshot; if that snapshot was
-        never taken or has been deleted, the branch's newest snapshot heads it
-        instead, so a branch never renders as a dangling indent.
-      * A branch's remaining snapshots (newest first) come before its
-        sub-branches (newest first).
-
-    Returns a list of ``(blob, tree_prefix)`` tuples in display order.
+    ``session_id`` identifies a conversation branch and ``parent_session_id``
+    identifies the session it forked from. Checkpoints and autosaves belonging
+    to one session therefore render below one resumable tip instead of becoming
+    dozens of unrelated roots. ``fork_lineage`` is only a v1 compatibility
+    hint; branch names are not stable identity.
     """
     def _ts(blob: dict) -> float:
         try:
@@ -5766,61 +5795,136 @@ def _build_fork_tree_rows(choices: list) -> list[tuple[dict, str]]:
         except (TypeError, ValueError):
             return 0.0
 
-    def _lineage_of(blob: dict) -> list:
-        lineage = normalize_fork_lineage(blob.get("fork_lineage"))
-        if lineage:
-            return lineage
-        # Forks written before lineage existed only carry their own name.
-        name = blob.get("fork_name")
-        return normalize_fork_lineage([name]) if name else []
+    def _lineage(blob: dict) -> tuple[str, ...]:
+        value = normalize_fork_lineage(blob.get("fork_lineage"))
+        if not value and blob.get("kind") == "fork" and blob.get("fork_name"):
+            value = normalize_fork_lineage([blob.get("fork_name")])
+        return tuple(value)
 
-    trunk = []
-    root = {"blobs": [], "children": {}}
+    # First reserve a node for every fork. This lets v1 autosaves that only
+    # carry fork_lineage join the correct branch even though they lack a
+    # parent_session_id.
+    fork_keys: dict[int, str] = {}
+    lineage_to_key: dict[tuple[str, ...], str] = {}
     for choice in choices:
-        lineage = _lineage_of(choice)
-        if not lineage:
-            trunk.append(choice)
+        if choice.get("kind") != "fork":
             continue
-        node = root
-        for name in lineage:
-            node = node["children"].setdefault(
-                name, {"blobs": [], "children": {}})
-        node["blobs"].append(choice)
+        sid = str(choice.get("session_id") or choice.get("id") or "")
+        parent = str(choice.get("parent_session_id")
+                     or choice.get("fork_parent_session_id") or "")
+        # v1 named forks reused their parent's session id. Give those records a
+        # virtual child identity at read time; never rewrite user history.
+        key = (f"legacy-fork:{choice.get('id') or id(choice)}"
+               if sid and parent == sid else sid)
+        if not key:
+            key = f"fork:{choice.get('id') or id(choice)}"
+        fork_keys[id(choice)] = key
+        if _lineage(choice):
+            lineage_to_key[_lineage(choice)] = key
 
-    def _node_newest(node: dict) -> float:
+    nodes: dict[str, dict] = {}
+
+    def _node(key: str) -> dict:
+        return nodes.setdefault(key, {
+            "key": key, "blobs": [], "parent": "", "parent_rank": 0,
+            "branch_name": "", "lineage": (), "children": [],
+        })
+
+    for choice in choices:
+        sid = str(choice.get("session_id") or choice.get("id") or "")
+        lineage = _lineage(choice)
+        explicit_parent = str(choice.get("parent_session_id")
+                              or choice.get("fork_parent_session_id") or "")
+        if choice.get("kind") == "fork":
+            key = fork_keys[id(choice)]
+        elif lineage and lineage in lineage_to_key:
+            key = lineage_to_key[lineage]
+        elif lineage and not choice.get("session_id"):
+            key = "legacy-lineage:" + "\x1f".join(lineage)
+        else:
+            key = sid or f"snapshot:{choice.get('id') or id(choice)}"
+
+        node = _node(key)
+        node["blobs"].append(choice)
+        if lineage and not node["lineage"]:
+            node["lineage"] = lineage
+        branch_name = str(choice.get("branch_name")
+                          or choice.get("fork_name") or "").strip()
+        if branch_name:
+            node["branch_name"] = branch_name
+
+        parent_key = ""
+        parent_rank = 0
+        if explicit_parent and explicit_parent != key:
+            if (choice.get("kind") == "fork" and sid
+                    and explicit_parent == sid):
+                # Self-parent is the v1 encoding. Prefer the containing lineage
+                # for nested legacy forks; top-level legacy forks hang from sid.
+                parent_key = lineage_to_key.get(lineage[:-1], sid)
+                parent_rank = 1
+            else:
+                parent_key = explicit_parent
+                parent_rank = 3
+        elif lineage:
+            parent_key = lineage_to_key.get(lineage[:-1], "")
+            parent_rank = 1 if parent_key else 0
+        if parent_key and parent_key != key and parent_rank >= node["parent_rank"]:
+            node["parent"] = parent_key
+            node["parent_rank"] = parent_rank
+
+    # Break corrupt parent cycles before linking. Resume history is best-effort
+    # user data; one malformed record must not make an entire component vanish.
+    for key, node in nodes.items():
+        cursor = node["parent"]
+        seen = {key}
+        while cursor in nodes:
+            if cursor in seen:
+                node["parent"] = ""
+                break
+            seen.add(cursor)
+            cursor = nodes[cursor]["parent"]
+
+    # Link only to parents that survived retention/filtering. A missing parent
+    # promotes the branch to a safe root instead of creating an invisible row.
+    for key, node in nodes.items():
+        parent = node["parent"]
+        if parent in nodes and parent != key:
+            nodes[parent]["children"].append(key)
+
+    def _node_newest(key: str, seen: Optional[set] = None) -> float:
+        seen = set(seen or ())
+        if key in seen:
+            return 0.0
+        seen.add(key)
+        node = nodes[key]
         newest = max((_ts(b) for b in node["blobs"]), default=0.0)
-        for child in node["children"].values():
-            newest = max(newest, _node_newest(child))
+        for child_key in node["children"]:
+            newest = max(newest, _node_newest(child_key, seen))
         return newest
 
-    def _items_for(node: dict) -> list:
-        """Display items this node contributes: ``[{blob, children}]``.
-
-        A node with no snapshot of its own (its fork was deleted but a
-        sub-branch survives) contributes its children directly, collapsing
-        the empty level rather than leaving an unattached prefix.
-        """
+    def _item_for(key: str, ancestry: Optional[set] = None) -> Optional[dict]:
+        ancestry = set(ancestry or ())
+        if key in ancestry:
+            return None
+        ancestry.add(key)
+        node = nodes[key]
         blobs = sorted(node["blobs"], key=_ts, reverse=True)
-        # The named fork snapshot heads its branch; otherwise the newest one.
-        blobs.sort(key=lambda b: 0 if b.get("kind") == "fork" else 1)
-        child_items = []
-        for child in sorted(node["children"].values(),
-                            key=_node_newest, reverse=True):
-            child_items.extend(_items_for(child))
         if not blobs:
-            return child_items
-        return [{
-            "blob": blobs[0],
-            "children": [{"blob": b, "children": []} for b in blobs[1:]]
-                        + child_items,
-        }]
+            return None
+        # Enter on the branch header resumes its latest state. Older fork points
+        # and checkpoints remain selectable as children.
+        header = blobs[0]
+        if node["branch_name"]:
+            header["_tree_branch_name"] = node["branch_name"]
+        children = [{"blob": blob, "children": []} for blob in blobs[1:]]
+        for child_key in sorted(set(node["children"]),
+                                key=_node_newest, reverse=True):
+            child = _item_for(child_key, ancestry)
+            if child is not None:
+                children.append(child)
+        return {"blob": header, "children": children}
 
     rows: list[tuple[dict, str]] = []
-
-    # Trunk first (root level, no prefix), newest first.
-    trunk.sort(key=_ts, reverse=True)
-    for item in trunk:
-        rows.append((item, ""))
 
     def _emit(items: list, prefix: str, depth: int) -> None:
         for index, item in enumerate(items):
@@ -5839,8 +5943,15 @@ def _build_fork_tree_rows(choices: list) -> list[tuple[dict, str]]:
                   prefix + ("   " if is_last else symbols.TREE_VERT + "  "),
                   depth + 1)
 
-    # Root-level branches, newest first, after the trunk entries.
-    _emit(_items_for(root), "", 0)
+    child_keys = {
+        child for node in nodes.values() for child in node["children"]
+    }
+    root_items = []
+    for key in sorted((set(nodes) - child_keys), key=_node_newest, reverse=True):
+        item = _item_for(key)
+        if item is not None:
+            root_items.append(item)
+    _emit(root_items, "", 0)
     return rows
 
 
@@ -5856,18 +5967,20 @@ def show_resume_picker(cwd: str) -> Optional[dict]:
         console.print("[yellow]No saved session to resume in this directory.[/yellow]")
         return None
 
-    # Build tree-structured rows: [(blob, tree_prefix), ...]
-    # Forks are arranged hierarchically; non-forks are root-level entries.
+    # Build tree-structured rows: [(blob, tree_prefix), ...]. Snapshots sharing
+    # a session are grouped below its latest tip; child sessions nest by id.
     tree_rows = _build_fork_tree_rows(choices)
 
     def _build_labels():
         labels = []
         for item, tree_prefix in tree_rows:
             kind = item.get("kind", "session")
-            if kind == "fork":
+            branch_name = str(item.get("_tree_branch_name")
+                              or item.get("branch_name")
+                              or item.get("fork_name") or "").strip()
+            if branch_name:
                 badge = f"[magenta]{symbols.DOT}[/magenta]"
-                name = item.get("fork_name", "fork")
-                name_part = f"[magenta]{name}[/magenta]"
+                name_part = f"[magenta]{branch_name}[/magenta]"
             elif kind == "checkpoint":
                 badge = f"[magenta]{symbols.DOT}[/magenta]"
                 name_part = ""
@@ -6445,6 +6558,10 @@ def call_backend_stream(
         "systemPrompt": system_prompt,
         "lang": lang,
         "maxTokens": int(get_runtime_config("max_tokens")),
+        # The gear, not a provider parameter: the gateway maps it onto whatever
+        # the account that ends up serving this call was measured to accept.
+        # See /config reasoning_effort.
+        "reasoningEffort": str(get_runtime_config("reasoning_effort")),
         # Billing attribution: without this the gateway books the call under
         # its default product ("helpwo") — quota and /usage stats then miss it.
         "source": "cli",
@@ -6633,7 +6750,14 @@ def call_backend_stream(
                 if accumulated:
                     # Backend post-processing failed but content was already streamed — use it.
                     break
-                return {"reply": f"Server Error: {evt['error']}", "tool_calls": [], "done": True, "error": True}
+                # `details` is the part a user can act on ("nothing was
+                # charged", "lower the thinking effort"); `error` alone is the
+                # headline. Dropping the detail turned an explained failure
+                # back into an opaque one.
+                _detail = str(evt.get("details") or "").strip()
+                return {"reply": f"Server Error: {evt['error']}" + (f" — {_detail}" if _detail else ""),
+                        "tool_calls": [], "done": True, "error": True,
+                        "error_code": str(evt.get("code") or "")}
             if "_budget" in evt:
                 # The gateway's answer to "how many output tokens do I actually
                 # have?" — the clamped ceiling, plus the window room left after
@@ -9975,6 +10099,7 @@ _SLASH_ARG_RULES: dict[tuple[str, ...], SlashArgRule] = {
     ("/work", "resume"): _arg_rule(2, "/work resume <id>"),
     ("/work", "history"): _arg_rule(1, "/work history"),
     ("/hwg", "status"): _arg_rule(2, "/hwg status [runId]"),
+    ("/hwg", "gantt"): _arg_rule(2, "/hwg gantt <runId>"),
     ("/hwg", "cancel"): _arg_rule(2, "/hwg cancel <runId>"),
     ("/task", "list"): _arg_rule(1, "/task list"),
     ("/task", "show"): _arg_rule(2, "/task show <id>"),
@@ -11710,7 +11835,8 @@ def _cmd_model_aux(args: list, session: dict) -> None:
     model_id = selected.get("id", "") if isinstance(selected, dict) else selected
     provider_id = selected.get("provider", "") if isinstance(selected, dict) else ""
     _apply(model_id, provider_id)
-    info = f"[bold]{model_id}[/bold]" + (f" ([dim]{provider_id}[/dim])" if provider_id else "")
+    info = f"[bold]{model_id}[/bold]" + (
+        f" ([dim]{_model_supply_label(provider_id)}[/dim])" if provider_id else "")
     console.print(f"[green]Auxiliary model set to {info}[/green]")
     if model_id != current:
         console.print("[dim]Applies to compaction, the critic and memory "
@@ -11805,7 +11931,7 @@ def _cmd_model(parts: list, raw_args: str, session: dict) -> None:
                     _apply(model_id, provider_id)
                     info = f"[bold]{model_id}[/bold]"
                     if provider_id:
-                        info += f" ([dim]{provider_id}[/dim])"
+                        info += f" ([dim]{_model_supply_label(provider_id)}[/dim])"
                     console.print(
                         f"[green]Model for [bold]{target_terminal}[/bold] "
                         f"set to: {info}[/green]")
@@ -11834,13 +11960,15 @@ def _cmd_model(parts: list, raw_args: str, session: dict) -> None:
                         marker,
                         m["id"],
                         m.get("name", ""),
-                        m.get("provider", ""),
+                        m.get("supply") or _model_supply_label(
+                            str(m.get("provider") or "")),
                     )
                 if not models:
                     table.add_row("", "", "(none)", "", "")
                 console.print(table)
                 console.print(f"Terminal {target_terminal} override: [bold]{current or '(none)'}[/bold]" +
-                              (f" ([dim]{current_provider}[/dim])" if current_provider else ""))
+                              (f" ([dim]{_model_supply_label(current_provider)}[/dim])"
+                               if current_provider else ""))
                 if models and not sys.stdin.isatty():
                     console.print(
                         "[dim]Non-interactive terminal: select explicitly with "
@@ -18502,8 +18630,20 @@ def _cmd_hwo(parts: list, session: dict) -> None:
                 events_cb=_hwo_progress,
             )
         _workflow_result("HWO", r)
-    elif len(parts) >= 2 and sub not in ("run", "compile"):
-        # /hwo <file>  — load .hwo into TUI
+    elif sub == "view" and len(parts) >= 3:
+        # /hwo view <file.hwo> - open the interactive lane viewer
+        path = " ".join(parts[2:])
+        if not (path.endswith(".hwo") and Path(path).is_file()):
+            console.print(f"[red]hwo view: no such file: {path}[/]")
+        else:
+            try:
+                import hwo_view
+                hwo_view.open_lane_viewer(path)
+            except Exception as exc:
+                console.print(
+                    f"[red]hwo view failed: {type(exc).__name__}: {exc}[/]")
+    elif len(parts) >= 2 and sub not in ("run", "compile", "view"):
+        # /hwo <file>  - load .hwo into TUI
         file_path = " ".join(parts[1:])
         loaded, err = hwo_ui_mod.load_hwo_file(file_path)
         if err:
@@ -18587,21 +18727,40 @@ def _cmd_hwg(parts: list, session: dict) -> None:
         )
     elif sub == "status":
         r = hwg_runner.status(parts[2] if len(parts) >= 3 else None)
+    elif sub == "gantt" and len(parts) >= 3:
+        r = hwg_runner.gantt(parts[2])
     elif sub == "cancel" and len(parts) >= 3:
         r = hwg_runner.cancel(parts[2])
+    elif sub and sub not in ("run", "compile", "resume", "status",
+                             "gantt", "cancel") and len(parts) >= 2:
+        # /hwg <file.hwg> - open the interactive graph viewer.
+        path = " ".join(parts[1:])
+        if not (path.endswith(".hwg") and Path(path).is_file()):
+            r = {"ok": False, "msg": f"hwg view: no such file: {path}"}
+        else:
+            try:
+                import hwg_view
+                hwg_view.open_viewer(path)
+                r = None  # viewer handled its own reporting
+            except Exception as exc:
+                r = {"ok": False,
+                     "msg": f"hwg view failed: {type(exc).__name__}: {exc}"}
     else:
         r = {
             "ok": False,
             "msg": (
                 "Usage:\n"
+                "  /hwg <file.hwg>            open the graph viewer\n"
                 "  /hwg compile <file.hwg>\n"
                 "  /hwg run <file.hwg>\n"
                 "  /hwg resume <runId> [PASS|FAIL|verdict] [outputs-json]\n"
                 "  /hwg status [runId]\n"
+                "  /hwg gantt <runId>\n"
                 "  /hwg cancel <runId>"
             ),
         }
-    _workflow_result("HWG", r)
+    if r is not None:
+        _workflow_result("HWG", r)
 
 
 
@@ -21578,9 +21737,19 @@ def main():
                     # Depth cap reached - stay on the parent branch rather
                     # than silently dropping the lineage to the trunk.
                     _auto_branch = _parent_lineage[-1] if _parent_lineage else ""
-                _inherited_state["_fork_lineage"] = _branch_lineage
-                _inherited_state["_fork_name"] = _auto_branch
-                _inherited_state.pop("_session_id", None)
+                _parent_session_id = str(agent_state.get("_session_id") or "")
+                _fork_blob = save_fork_state(
+                    agent_state, chat_history, _session_start_cwd,
+                    _auto_branch, _branch_lineage, _parent_session_id)
+                if _fork_blob:
+                    _inherited_state = dict(_fork_blob.get("state") or {})
+                else:
+                    # A conversation-less branch has nothing resumable to
+                    # persist yet, but it still receives correct live lineage.
+                    _inherited_state["_fork_lineage"] = _branch_lineage
+                    _inherited_state["_fork_name"] = _auto_branch
+                    _inherited_state["_fork_parent_session_id"] = _parent_session_id
+                    _inherited_state.pop("_session_id", None)
                 chat_history.clear()
                 chat_history.extend(_inherited_history)
                 agent_state.clear()

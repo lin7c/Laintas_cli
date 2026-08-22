@@ -40,7 +40,8 @@ except Exception:  # pragma: no cover - the CLI always ships symbols.py
     class _Fallback:
         OK = "✓"; FAIL = "✗"; WARN = "⚠"; INFO = "›"; BULLET = "·"
         DOT = "●"; DOT_HALF = "◐"; DOT_OPEN = "○"
-        SPINNER_BRAILLE = tuple("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
+        SPINNER_RELAY = ("L·", "L›", "L»", "L›")
+        SPINNER_BRAILLE = SPINNER_RELAY
         ARROW_U = "↑"; ARROW_D = "↓"
     _sym = _Fallback()
 
@@ -829,8 +830,8 @@ class Arena:
                    f"对局 {self.index + 1}/{len(self.rounds)}")]
         parts += [("class:muted", f"  {_sym.BULLET}  ")]
         if status == "running":
-            spin = _sym.SPINNER_BRAILLE[
-                int(time.monotonic() * 8) % len(_sym.SPINNER_BRAILLE)]
+            frames = getattr(_sym, "SPINNER_RELAY", _sym.SPINNER_BRAILLE)
+            spin = frames[int(time.monotonic() * 7) % len(frames)]
             parts += [("class:running", f"{spin} 两边同时执行中 "
                                         f"{_elapsed(row)}")]
         elif status == "pending":

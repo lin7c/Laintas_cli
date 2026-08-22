@@ -2670,10 +2670,12 @@ def _bi_spawn_parallel(params: dict, ctx: ToolCtx) -> dict:
     # Final one-line status per child once it stops running.
     _final: dict = {}
     _final_elapsed: dict = {}
-    _SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+    _SPINNER_FRAMES = symbols.SPINNER_RELAY
 
     def _spinner_glyph() -> str:
-        return _SPINNER_FRAMES[int(time.time() * 10) % len(_SPINNER_FRAMES)]
+        interval = symbols.SPINNER_INTERVAL_MS / 1000.0
+        return _SPINNER_FRAMES[
+            int(time.time() / interval) % len(_SPINNER_FRAMES)]
 
     def _render_agents_block():
         """One-line-per-agent live view: status glyph, id, current tool
@@ -2696,7 +2698,7 @@ def _bi_spawn_parallel(params: dict, ctx: ToolCtx) -> dict:
         _table = _RichTable(
             box=None, show_header=False, show_edge=False, pad_edge=False,
             padding=(0, 1), expand=True)
-        _table.add_column(width=1, no_wrap=True)
+        _table.add_column(width=2, no_wrap=True)
         _table.add_column(style="agent", no_wrap=True)
         _table.add_column(ratio=1, no_wrap=True, overflow="ellipsis")
         _table.add_column(style="muted", justify="right", no_wrap=True)
@@ -3214,9 +3216,20 @@ def _bi_hwo_agent_return(params: dict, ctx: ToolCtx) -> dict:
         return {"ok": False, "error": "current agent not found in registry"}
     if isinstance(value, (dict, list)):
         import json
-        info.state['_hwo_return'] = json.dumps(value, ensure_ascii=False)
+        payload = json.dumps(value, ensure_ascii=False)
     else:
-        info.state['_hwo_return'] = str(value)
+        payload = str(value)
+    # Write to BOTH the registry entry and the loop's own state dict.
+    #
+    # run_agent_loop copies the caller's state on entry (`state = dict(state)`)
+    # and assigns that copy back to the registry when it exits, so anything
+    # written only into info.state during the run is overwritten and lost. That
+    # silently discarded every agent_return payload: HWO then fell back to
+    # scraping JSON out of the model's closing prose, which works only when the
+    # model happens to repeat it.
+    info.state['_hwo_return'] = payload
+    if isinstance(getattr(ctx, "state", None), dict):
+        ctx.state['_hwo_return'] = payload
     return {
         "ok": True,
         "result": "Outputs submitted. Continue the remaining workflow steps.",

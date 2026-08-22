@@ -3,7 +3,6 @@
 
 import hashlib
 import copy
-import fnmatch
 import os
 import re
 import json
@@ -80,15 +79,6 @@ This block is supplied by the runtime after loading user customization.
 # Mutable defaults — these are the "factory" values; runtime overrides stored in _runtime_config
 _DEFAULT_CONFIG = {
     "max_loops": 30,
-    # How hard the model thinks before answering. Five gears, sent to the
-    # gateway as the gear name — the gateway translates it into whatever the
-    # account serving the request actually accepts, because that differs by
-    # account for the same model. A gear the account cannot do maps down to
-    # its nearest lower one rather than failing.
-    # Thinking is billed as output tokens, so this is a cost knob as well as
-    # a quality one. Default matches the gateway's (models.py
-    # DEFAULT_EFFORT_GEAR): the lowest gear that still thinks.
-    "reasoning_effort": "low",
     "max_tokens": 0,              # 0 = ask the gateway for everything that fits (provider ceiling ∩ remaining window). A positive value is a deliberate cap, never a floor — the gateway clamps but never raises it.
     "max_debug_entries": 50,
     "loop_delay": 0.2,           # normal inter-iteration delay; failures back off adaptively
@@ -300,7 +290,7 @@ _SHIMMER_GRAD = (
     "#b7f7c0", "#7ee787", "#4ade80", "#3fb950",
 )
 
-_THINKING_SPINNER_FRAMES = symbols.SPINNER_RELAY
+_THINKING_SPINNER_FRAMES = symbols.SPINNER_BRAILLE
 
 
 def _shimmer_segments(label: str, elapsed: float) -> list[tuple[str, str]]:
@@ -329,9 +319,8 @@ def _shimmer_segments(label: str, elapsed: float) -> list[tuple[str, str]]:
 
 
 def _thinking_spinner_frame(elapsed: float) -> str:
-    """Return the branded Relay frame used by the prompt-owned status row."""
-    interval = symbols.SPINNER_INTERVAL_MS / 1000.0
-    index = int(max(0.0, float(elapsed)) / interval)
+    """Return the dots spinner frame used by the prompt-owned status row."""
+    index = int(max(0.0, float(elapsed)) * 10.0)
     return _THINKING_SPINNER_FRAMES[index % len(_THINKING_SPINNER_FRAMES)]
 
 
@@ -580,7 +569,6 @@ def _active_mode_label() -> str:
 _runtime_config: dict[str, object] = {}
 
 _RUNTIME_CONFIG_DESCRIPTIONS = {
-    "reasoning_effort": "How hard the model thinks before answering (none/low/medium/high/max). Thinking is billed as output tokens, so higher costs more; a model that cannot do the chosen gear gets its nearest lower one",
     "context_window_adopt_cap": "Ceiling on the auto-adopted provider window — lower it to compact earlier. Every turn re-sends the thread, so this is a cost knob, not just an overflow guard",
     "compact_chunk_tokens": "Largest slice of thread handed to the summarizer in one call",
     "aux_model": "Model for compaction / critic / memory-extraction (empty = use the main model)",
@@ -664,25 +652,18 @@ _RUNTIME_LIMITS = {
 }
 
 # Fixed-vocabulary config keys — single source for validation, /config help,
-# and completion value hints. Each entry also enumerates the valid choices.
-#
-# Ordered tuples rather than sets, and read in declaration order rather than
-# sorted: every vocabulary here is a scale of some kind, and sorting one
-# alphabetically hides that. `reasoning_effort` sorted reads
-# "high, low, max, medium, none", which tells a user nothing about which way is
-# more; in declaration order it reads as the ladder it is.
-_RUNTIME_ENUM_CHOICES: dict[str, tuple[str, ...]] = {
-    "reasoning_effort": ("none", "low", "medium", "high", "max"),
-    "repetition_policy": ("warn", "interrupt"),
-    "stream_preview": ("off", "one", "detail"),
-    "theme": ("dark", "light", "mono"),
-    "markdown_theme": ("default", "green-red", "custom"),
+# and completion value hints. Each set also enumerates the valid choices.
+_RUNTIME_ENUM_CHOICES: dict[str, frozenset] = {
+    "repetition_policy": frozenset({"warn", "interrupt"}),
+    "stream_preview": frozenset({"off", "one", "detail"}),
+    "theme": frozenset({"dark", "light", "mono"}),
+    "markdown_theme": frozenset({"default", "green-red", "custom"}),
     # search_engine is deliberately not enumerated here: the set of valid names
     # now depends on the user's own engine registry, and a fixed vocabulary
     # would reject the very entries they added. web_search.resolve_chain
     # validates it against the live registry and reports unknown names.
-    "search_proxy_mode": ("off", "auto", "always"),
-    "fetch_render": ("off", "auto", "always"),
+    "search_proxy_mode": frozenset({"off", "auto", "always"}),
+    "fetch_render": frozenset({"off", "auto", "always"}),
 }
 
 
@@ -721,7 +702,7 @@ def _coerce_runtime_config_value(key: str, value):
         parsed = str(parsed).strip().lower()
         if parsed not in _RUNTIME_ENUM_CHOICES[key]:
             raise ValueError(
-                f"{key} expects " + ", ".join(_RUNTIME_ENUM_CHOICES[key]))
+                f"{key} expects " + ", ".join(sorted(_RUNTIME_ENUM_CHOICES[key])))
 
     if key in _RUNTIME_POSITIVE and parsed <= 0:
         raise ValueError(f"{key} must be greater than 0")
@@ -1703,12 +1684,7 @@ def _build_resume_payload(state: dict, chat_history: list, cwd: str, kind: str) 
     # forks: an autosave taken inside branch "a" belongs under "a" in the
     # resume tree. Named forks overwrite these in save_fork_state().
     fork_lineage = normalize_fork_lineage((state or {}).get("_fork_lineage"))
-    parent_session_id = str(
-        (state or {}).get("_fork_parent_session_id") or "").strip()
-    branch_name = " ".join(
-        str((state or {}).get("_fork_name") or "").split())[:_FORK_NAME_MAX]
     return {
-        "schema_version": 2,
         "id": session_id if kind == "autosave" else uuid.uuid4().hex[:12],
         "session_id": session_id,
         "kind": kind,
@@ -1725,11 +1701,6 @@ def _build_resume_payload(state: dict, chat_history: list, cwd: str, kind: str) 
             workgraph.get_active_work(cwd=cwd, session_id=session_id) or {}
         ).get("id"),
         "fork_lineage": fork_lineage,
-        "parent_session_id": parent_session_id,
-        # Keep the old spelling while v1 resume records are still within the
-        # retention window. New readers use parent_session_id as authoritative.
-        "fork_parent_session_id": parent_session_id,
-        "branch_name": branch_name,
         "state": prepare_state_for_repl(state or {}),
     }
 
@@ -1754,8 +1725,8 @@ def _resume_fork_pattern(cwd: str) -> str:
     return f"{_session_key(cwd)}_fork_*.json"
 
 
-def _resume_fork_path(cwd: str, fork_key: str):
-    safe = re.sub(r"[^A-Za-z0-9_-]", "-", fork_key.strip())[:64]
+def _resume_fork_path(cwd: str, fork_name: str):
+    safe = re.sub(r"[^A-Za-z0-9_-]", "-", fork_name.strip())[:64]
     return paths.SESSIONS_DIR / f"{_session_key(cwd)}_fork_{safe}.json"
 
 
@@ -1816,51 +1787,27 @@ def save_resume_checkpoint(state: dict, chat_history: list, cwd: str) -> Optiona
 
 def save_fork_state(state: dict, chat_history: list, cwd: str,
                     fork_name: str, fork_lineage: list = None,
-                    fork_parent_session_id: str = "",
-                    child_session_id: str = "") -> Optional[dict]:
+                    fork_parent_session_id: str = "") -> Optional[dict]:
     """Save a named fork snapshot of the current session context.
 
-    Like ``save_resume_checkpoint`` but tagged with stable parent/child session
-    metadata so the resume picker can render it as a tree node. The fork file
-    is keyed by the child session id; display names may repeat under different
-    parents without colliding. Also writes the child's per-session file.
+    Like ``save_resume_checkpoint`` but tagged with fork metadata so the
+    resume picker can render it as a tree node. The fork file uses a
+    human-readable name in its filename (sanitized) so duplicate detection
+    by lineage path is straightforward. Also writes the per-session file so
+    ``list_resume_states`` discovers it via its glob pattern.
     """
     try:
         payload = _build_resume_payload(state, chat_history, cwd, "fork")
         if payload is None:
             return None
-        parent_session_id = _normalize_session_id(
-            fork_parent_session_id or payload.get("session_id"))
-        # A fork is a child conversation, not another filename for its parent.
-        # Reserving the child id at creation time also gives it an independent
-        # resume lease before anyone checks the branch out.
-        child_session_id = _normalize_session_id(
-            child_session_id or uuid.uuid4().hex[:16])
-        if child_session_id == parent_session_id:
-            child_session_id = uuid.uuid4().hex[:16]
-        lineage = (
+        payload["fork_name"] = fork_name
+        payload["fork_lineage"] = (
             normalize_fork_lineage(fork_lineage)
             or normalize_fork_lineage([fork_name]))
-        branch_name = " ".join(str(fork_name or "").split())[:_FORK_NAME_MAX]
-        branch_state = prepare_state_for_repl(state or {})
-        branch_state["_session_id"] = child_session_id
-        branch_state["_fork_parent_session_id"] = parent_session_id
-        branch_state["_fork_lineage"] = lineage
-        branch_state["_fork_name"] = branch_name
-
-        payload["schema_version"] = 2
-        payload["session_id"] = child_session_id
-        payload["fork_name"] = branch_name
-        payload["branch_name"] = branch_name
-        payload["fork_lineage"] = lineage
-        payload["parent_session_id"] = parent_session_id
-        payload["fork_parent_session_id"] = parent_session_id
+        payload["fork_parent_session_id"] = fork_parent_session_id
         payload["fork_created_at"] = payload["timestamp"]
-        payload["state"] = branch_state
         paths.SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
-        # Key by immutable branch identity. Name-keyed files collide when two
-        # different parents both have a child called e.g. "experiment".
-        _atomic_write_json(_resume_fork_path(cwd, child_session_id), payload)
+        _atomic_write_json(_resume_fork_path(cwd, fork_name), payload)
         _atomic_write_json(_resume_session_path(cwd, payload["session_id"]), payload)
         return payload
     except Exception:
@@ -1970,21 +1917,8 @@ def delete_resume_state(cwd: str, blob: dict) -> None:
         if blob.get("kind") == "checkpoint" and blob_id:
             (paths.SESSIONS_DIR / f"{key}_resume_{blob_id}.json").unlink(missing_ok=True)
 
-        if blob.get("kind") == "fork":
-            # New fork files are keyed by child session id. Remove the exact
-            # discovered path first; the name-keyed candidate is only for v1.
-            source_path = blob.get("_path")
-            if source_path:
-                candidate = Path(source_path)
-                try:
-                    if candidate.parent.resolve() == paths.SESSIONS_DIR.resolve():
-                        candidate.unlink(missing_ok=True)
-                except OSError:
-                    pass
-            if session_id:
-                _resume_fork_path(cwd, session_id).unlink(missing_ok=True)
-            if blob.get("fork_name"):
-                _resume_fork_path(cwd, blob["fork_name"]).unlink(missing_ok=True)
+        if blob.get("kind") == "fork" and blob.get("fork_name"):
+            _resume_fork_path(cwd, blob["fork_name"]).unlink(missing_ok=True)
 
         if session_id:
             sess_path = paths.SESSIONS_DIR / f"{key}_session_{_normalize_session_id(session_id)}.json"
@@ -3413,11 +3347,6 @@ def spawn_subagent(parent_id: str, task: str, deps,
     # in a child worktree. Runtime-owned identity cannot be overridden by a
     # model-supplied child state.
     child.state["_session_id"] = _ensure_session_id(parent.state)
-    # A tool scope is inherited, never widened: spawning a child would otherwise
-    # be the way out of every restriction its parent was given.
-    _parent_scope = parent.state.get("_tool_allowlist")
-    if _parent_scope:
-        child.state["_tool_allowlist"] = list(_parent_scope)
     # _task_cwd is parent-owned EXCEPT when the caller pinned one in
     # state_overrides. state_overrides is a trusted-code-only parameter
     # (extensions / CLI internals, never model tool input), and a caller
@@ -4264,9 +4193,32 @@ def _llm_summarize(deps, session, current_path: str, head_text: str,
         text = (text or "").strip()
         if not text:
             return None
-        return text
+        return _ground_summary(session, head_text, text)
     except Exception:
         return None
+
+
+def _ground_summary(session, head_text: str, summary: str) -> str:
+    """Repair summary sentences the head does not support.
+
+    This summary is about to REPLACE the turns it summarizes. Anything the
+    model invented here stops being checkable the moment that happens, and
+    then steers every later decision. It is the one output worth verifying
+    against its own input.
+
+    A distorted sentence is swapped for the head sentence it came from, which
+    restores the fact; only a fabrication with no counterpart is dropped.
+    Degrades to the summary as written on any failure — a grounding outage
+    must not be the reason a compaction fails.
+    """
+    try:
+        import grounding
+    except Exception:
+        return summary
+    try:
+        return grounding.repair_summary(head_text, summary, session=session)
+    except Exception:
+        return summary
 
 
 def _thread_tokens(messages: list) -> int:
@@ -4897,8 +4849,6 @@ def prepare_state_for_repl(state: dict) -> dict:
         "_fork_lineage": normalize_fork_lineage(state.get("_fork_lineage")),
         "_fork_name": " ".join(
             str(state.get("_fork_name") or "").split())[:_FORK_NAME_MAX],
-        "_fork_parent_session_id": str(
-            state.get("_fork_parent_session_id") or "").strip(),
     }
 
 
@@ -6181,26 +6131,6 @@ def _format_parallel_results(inbox_msgs: list) -> str:
     return f"{header}\n\n" + "\n\n---\n\n".join(results)
 
 
-# Tools the completion protocol needs. A node that cannot report its result is
-# a hung node, not a contained one, so a tool scope never removes these.
-_PROTOCOL_TOOLS = ("task.complete", "agent_return")
-
-
-def _tool_in_scope(name: str, scope: Optional[list]) -> bool:
-    """Whether a workflow node's tool scope permits ``name``.
-
-    ``scope`` is a list of exact names or fnmatch globs; empty/None means the
-    node was never scoped. Scoping only ever *narrows*: it is intersected with
-    mode, role, workflow-phase and employee restrictions and can never grant
-    access those would refuse.
-    """
-    if not scope:
-        return True
-    if name in _PROTOCOL_TOOLS:
-        return True
-    return any(name == pat or fnmatch.fnmatchcase(name, pat) for pat in scope)
-
-
 def _allowed_tool_names_for_state(
         state: dict, agent_id: Optional[str] = None) -> set[str]:
     """Return the exact internal tool set the current runtime may dispatch.
@@ -6243,9 +6173,6 @@ def _allowed_tool_names_for_state(
         if policy.allowed_tools is not None:
             names &= set(policy.allowed_tools)
         names -= set(policy.denied_tools or [])
-    scope = state.get("_tool_allowlist")
-    if scope:
-        names = {name for name in names if _tool_in_scope(name, scope)}
     return names
 
 
@@ -7171,8 +7098,6 @@ def run_agent_loop(
                 # Create the Spinner ONCE — a fresh Spinner resets start_time
                 # on each draw, freezing the animation on frame 0.
                 _spinner = Spinner("dots", style="#3fb950")
-                _spinner.frames = list(symbols.SPINNER_RELAY)
-                _spinner.interval = symbols.SPINNER_INTERVAL_MS
 
                 def _fmt_tokens(n: int) -> str:
                     if n >= 1_000_000:
@@ -7405,24 +7330,6 @@ def run_agent_loop(
 
         if response.get("error"):
             _err_text = response.get("reply", "") or ""
-            # Preserve the old empty-response recovery behavior for providers
-            # that close a successful SSE response before producing an answer.
-            # The gateway now labels that condition explicitly so it can cancel
-            # billing, but it is still safe to retry the turn just as we did
-            # when the same failure arrived as an unlabelled empty response.
-            if response.get("error_code") == "upstream_truncated":
-                silent_count = state.get("_silent_fail_count", 0) + 1
-                state["_silent_fail_count"] = silent_count
-                if silent_count <= 2:
-                    if events_cb is not None:
-                        deps.console.print(
-                            "[dim yellow](empty response — asking AI to retry)[/dim yellow]")
-                    _append_short_memory(
-                        state,
-                        f"\n  -Empty-response retry {silent_count}/2: "
-                        "The upstream stream ended before the model finished.")
-                    add_debug_log(debug_entry)
-                    continue
             # ── Reactive overflow recovery (opencode compactAfterOverflow) ──
             # If the provider returned a context-overflow error, force-compaction
             # the thread and retry the turn ONCE. Our cheap token estimate may
@@ -8037,25 +7944,6 @@ def run_agent_loop(
                     result = {"ok": False,
                               "error": f"BLOCKED: tool '{name}' not allowed in current workflow phase",
                               "tool": name, "returncode": -1}
-                    formatted_outputs.append(
-                        _format_tool_result_for_loop(name, result, int(get_runtime_config("output_truncate") or 3000)))
-                    per_call_rows.append({
-                        "command": salient, "output": result.get("error", ""),
-                        "returncode": -1, "tool": name, "call_id": call_id,
-                    })
-                    continue
-                _tool_scope = state.get("_tool_allowlist")
-                if not _tool_in_scope(name, _tool_scope):
-                    result = {
-                        "ok": False,
-                        "error": (
-                            f"BLOCKED: tool '{name}' is outside this workflow node's tool "
-                            f"scope ({', '.join(_tool_scope)}). The scope is declared in the "
-                            f".hwg node policy and cannot be widened from here. Do the task "
-                            f"with the tools listed, or report why it cannot be done."
-                        ),
-                        "tool": name, "returncode": -1,
-                    }
                     formatted_outputs.append(
                         _format_tool_result_for_loop(name, result, int(get_runtime_config("output_truncate") or 3000)))
                     per_call_rows.append({

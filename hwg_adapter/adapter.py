@@ -24,13 +24,18 @@ Grammar:
   #find# -> #analyze#               an edge: find then analyze
   #review# -> { on: PASS } #report#                  conditional edge
   #review# -> { on: FAIL, maxLoops: 2 } #analyze#    loop-back edge (bounded)
+  #plan# => #lint#  /  #plan# => #test#   fan-out: every => branch runs
+  (merge.hwo)#merge# { join: "all" }      where the fan-out branches converge
+  @include "contracts.hwg"          splice another file's declarations here
   (schedule) { start: "09:00", days: ["Mon","Fri"], tz: "Asia/Shanghai" }   schedule block
   ```...```                         comment block
   ->                                no-op separator (ignored)
 
 Node ids must be unique. Every edge endpoint must reference a declared node.
 A node with >1 outgoing edge is a branch — every outgoing edge must then carry
-`on:`. A self-loop (from === to) must carry `maxLoops`. At least one start node
+`on:`. `=>` edges are a fan-out instead: all of them run, and they must converge
+on one node declaring `{ join: "all" }`.
+A self-loop (from === to) must carry `maxLoops`. At least one start node
 (no incoming edges) and one end node (no outgoing edges) must exist.
 """
 from __future__ import annotations
@@ -173,17 +178,43 @@ def _extract_retry(content: str) -> Optional[int]:
     return max(0, int(m.group(1)))
 
 
+_TOOL_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.*?-]*$")
+
+
+def _extract_tools(content: str) -> Optional[list]:
+    """`tools: [fs.read, fs.grep]` — the tools this node's agents may call.
+
+    Names or fnmatch globs. Always a *narrowing*: it can remove access, never
+    grant it, so it composes with every other restriction already in force.
+    """
+    m = re.search(r"\btools\s*:\s*\[([^\]]*)\]", content)
+    if m is None:
+        return None
+    names = []
+    for raw in m.group(1).split(","):
+        name = raw.strip().strip('"').strip("'")
+        if name:
+            names.append(name)
+    return names
+
+
 def _extract_policy(content: str) -> dict:
     policy: dict[str, Any] = {}
     retry = _extract_retry(content)
     timeout = _extract_string(content, "timeout")
     cache = _extract_string(content, "cache")
+    join = _extract_string(content, "join")
+    tools = _extract_tools(content)
     if retry is not None:
         policy["retry"] = retry
     if timeout:
         policy["timeout"] = timeout
     if cache:
         policy["cache"] = cache
+    if join:
+        policy["join"] = join
+    if tools is not None:
+        policy["tools"] = tools
     return policy
 
 
@@ -247,10 +278,245 @@ def _refs_from_io(io: Optional[dict]) -> list[tuple[str, str, bool]]:
 
 
 def _condition_field(on: Optional[str]) -> Optional[str]:
+    """Left-hand field of a single-atom condition (legacy shape).
+
+    Still used as the validation fallback for conditions parse_condition()
+    does not cover, so a typo like `score >= a b` keeps its field check.
+    """
     if not on:
         return None
     m = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_-]*)\s*(?:==|!=|in\b|>=|<=|>|<)", on)
     return m.group(1) if m else None
+
+
+# ── Edge conditions ─────────────────────────────────────────────────────
+#
+# The original grammar allowed exactly one atom per edge:
+#
+#   PASS                     bare verdict
+#   verdict == "PASS"        comparison against a declared output
+#   score >= 3               numeric comparison
+#   status in [OK, WARN]     membership
+#
+# Atoms may now be composed with and/or/not (&&/||/!) and grouped with
+# parentheses, and a filesystem predicate is available so a branch can turn on
+# a fact rather than on a model's word:
+#
+#   exists(dist/app.js) and tests == "PASS"
+#   not exists("$input.report") or force == true
+#
+# This layer stays pure: exists() is recognised here and evaluated by each
+# product's runtime. parse_condition() returns None for anything the structured
+# grammar does not cover, and callers then fall back to the legacy "compare the
+# whole string against the verdict" behaviour — which is what keeps every
+# pre-existing condition working unchanged.
+
+_COND_TOKEN_RE = re.compile(
+    r"""(?:
+        (?P<lparen>\()
+      | (?P<rparen>\))
+      | (?P<op>==|!=|>=|<=|>|<)
+      | (?P<andor>&&|\|\|)
+      | (?P<bang>!)
+      | (?P<list>\[[^\]]*\])
+      | (?P<str>"[^"]*"|'[^']*')
+      | (?P<word>[^\s()\[\]!<>=&|]+)
+    )""",
+    re.X,
+)
+
+# A condition using any of these is *meant* to be structured, so failing to
+# parse it is a compile error rather than a silent fall back to verdict compare.
+_COND_STRUCTURED_RE = re.compile(r"(?i)(?:\bexists\s*\(|&&|\|\||\bnot\b|\band\b|\bor\b|^\s*!|\()")
+
+_COND_FIELD_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*$")
+
+
+class _CondError(Exception):
+    """Internal: this string is not a structured condition."""
+
+
+def _tokenize_condition(on: str) -> list:
+    tokens: list = []
+    i = 0
+    while i < len(on):
+        if on[i].isspace():
+            i += 1
+            continue
+        m = _COND_TOKEN_RE.match(on, i)
+        if not m:
+            raise _CondError(f"unexpected character {on[i]!r}")
+        kind = m.lastgroup
+        tokens.append((kind, m.group(kind)))
+        i = m.end()
+    return tokens
+
+
+class _CondParser:
+    """Recursive descent over the token list. Precedence: not > and > or."""
+
+    def __init__(self, tokens: list):
+        self.tokens = tokens
+        self.i = 0
+
+    def _peek(self) -> tuple:
+        return self.tokens[self.i] if self.i < len(self.tokens) else (None, None)
+
+    def _next(self) -> tuple:
+        token = self._peek()
+        self.i += 1
+        return token
+
+    def _is_keyword(self, word: str) -> bool:
+        kind, value = self._peek()
+        return kind == "word" and value.lower() == word
+
+    def parse(self) -> dict:
+        node = self._parse_or()
+        if self.i != len(self.tokens):
+            raise _CondError("unexpected trailing input")
+        return node
+
+    def _parse_or(self) -> dict:
+        items = [self._parse_and()]
+        while True:
+            kind, value = self._peek()
+            if (kind == "andor" and value == "||") or self._is_keyword("or"):
+                self._next()
+                items.append(self._parse_and())
+            else:
+                break
+        return items[0] if len(items) == 1 else {"kind": "or", "items": items}
+
+    def _parse_and(self) -> dict:
+        items = [self._parse_unary()]
+        while True:
+            kind, value = self._peek()
+            if (kind == "andor" and value == "&&") or self._is_keyword("and"):
+                self._next()
+                items.append(self._parse_unary())
+            else:
+                break
+        return items[0] if len(items) == 1 else {"kind": "and", "items": items}
+
+    def _parse_unary(self) -> dict:
+        kind, _value = self._peek()
+        if kind == "bang" or self._is_keyword("not"):
+            self._next()
+            return {"kind": "not", "item": self._parse_unary()}
+        return self._parse_primary()
+
+    def _parse_primary(self) -> dict:
+        kind, value = self._next()
+        if kind == "lparen":
+            node = self._parse_or()
+            if self._peek()[0] != "rparen":
+                raise _CondError("missing )")
+            self._next()
+            return node
+        if kind != "word":
+            raise _CondError(f"unexpected token {value!r}")
+        if value.lower() == "exists" and self._peek()[0] == "lparen":
+            self._next()
+            path_kind, path_value = self._next()
+            if path_kind not in ("word", "str"):
+                raise _CondError("exists() needs a path")
+            if self._peek()[0] != "rparen":
+                raise _CondError("missing ) after exists(")
+            self._next()
+            return {"kind": "exists", "path": _strip_quotes(path_value)}
+        next_kind, next_value = self._peek()
+        if next_kind == "op":
+            if not _COND_FIELD_RE.match(value):
+                raise _CondError(f"{value!r} is not a field name")
+            self._next()
+            operand_kind, operand_value = self._next()
+            if operand_kind not in ("word", "str"):
+                raise _CondError("comparison needs a value")
+            return {"kind": "cmp", "field": value, "op": next_value, "value": operand_value}
+        if next_kind == "word" and next_value == "in":
+            if not _COND_FIELD_RE.match(value):
+                raise _CondError(f"{value!r} is not a field name")
+            self._next()
+            list_kind, list_value = self._next()
+            if list_kind != "list":
+                raise _CondError("in needs a [list]")
+            inner = list_value[1:-1].strip()
+            return {"kind": "in", "field": value,
+                    "values": [v.strip() for v in inner.split(",")] if inner else []}
+        if value.lower() in ("and", "or", "not", "in"):
+            raise _CondError(f"{value!r} is a keyword, not a verdict")
+        return {"kind": "verdict", "value": value}
+
+
+def _strip_quotes(value: str) -> str:
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        return value[1:-1]
+    return value
+
+
+def parse_condition(on: Optional[str]) -> Optional[dict]:
+    """Structured form of an edge condition, or None if it has none.
+
+    None is not an error: a bare verdict like `NEEDS_WORK` parses, but anything
+    outside the grammar (`on: some free text`) returns None so runtimes keep
+    their legacy verdict-string comparison.
+    """
+    if not on or not on.strip():
+        return None
+    try:
+        return _CondParser(_tokenize_condition(on.strip())).parse()
+    except _CondError:
+        return None
+
+
+def condition_error(on: Optional[str]) -> Optional[str]:
+    """Compile error for a condition that reaches for the structured grammar
+    (exists/and/or/not/parens) and gets it wrong. Plain verdicts return None."""
+    if not on or parse_condition(on) is not None:
+        return None
+    if not _COND_STRUCTURED_RE.search(on):
+        return None
+    return (f'condition "{on.strip()}" is not valid. Use atoms '
+            f'(PASS, field == "x", score >= 3, field in [A, B], exists(path)) '
+            f'combined with and/or/not and ().')
+
+
+def condition_fields(node: Optional[dict]) -> list:
+    """Every output field a parsed condition reads."""
+    if not node:
+        return []
+    kind = node.get("kind")
+    if kind in ("and", "or"):
+        fields = []
+        for item in node.get("items", []):
+            for field in condition_fields(item):
+                if field not in fields:
+                    fields.append(field)
+        return fields
+    if kind == "not":
+        return condition_fields(node.get("item"))
+    if kind in ("cmp", "in"):
+        return [node["field"]]
+    return []
+
+
+def condition_exists_refs(node: Optional[dict]) -> list:
+    """#node.field# references appearing inside exists() paths."""
+    if not node:
+        return []
+    kind = node.get("kind")
+    if kind in ("and", "or"):
+        refs = []
+        for item in node.get("items", []):
+            refs.extend(condition_exists_refs(item))
+        return refs
+    if kind == "not":
+        return condition_exists_refs(node.get("item"))
+    if kind == "exists":
+        return [(m.group(1), m.group(2)) for m in
+                re.finditer(r"#([A-Za-z_][A-Za-z0-9_-]*)\.([A-Za-z_][A-Za-z0-9_-]*)#", node.get("path", ""))]
+    return []
 
 
 # ── Parser ──────────────────────────────────────────────────────────────
@@ -274,6 +540,9 @@ class _Parser:
                 continue
             if self._starts("@graph"):
                 statements.append(self._parse_graph())
+                continue
+            if self._starts("@include"):
+                statements.append(self._parse_include())
                 continue
             if self._starts("->"):
                 self.i += 2
@@ -339,6 +608,23 @@ class _Parser:
             raise HwgParseError("@graph must be followed by [in(...), out(...)]", self.i)
         return {"type": "graph", "io": _parse_io_block(self._read_bracket_content())}
 
+    # ── Includes ──
+    def _parse_include(self) -> dict:
+        self._expect("@include")
+        self._skip_ws()
+        quote = self._peek()
+        if quote not in ('"', "'"):
+            raise HwgParseError('@include must be followed by a quoted path, e.g. @include "contracts.hwg"', self.i)
+        self.i += 1
+        start = self.i
+        while not self._eof() and self._peek() != quote:
+            self.i += 1
+        if self._eof():
+            raise HwgParseError("Unterminated @include path", start)
+        path = self.source[start:self.i]
+        self.i += 1
+        return {"type": "include", "path": path}
+
     # ── Edges ──
     def _parse_edge(self) -> dict:
         start = self.i
@@ -346,12 +632,17 @@ class _Parser:
         from_id = self._read_name(start)
         self._expect("#")
         self._skip_ws()
-        if not self._starts("->"):
+        # `->` routes to exactly one target; `=>` fans out to all its targets.
+        fanout = self._starts("=>")
+        if fanout:
+            self._expect("=>")
+        elif self._starts("->"):
+            self._expect("->")
+        else:
             raise HwgParseError(
-                f'Expected -> after #{from_id}# (a bare #name# must start an edge: #from# -> #to#)',
+                f'Expected -> or => after #{from_id}# (a bare #name# must start an edge: #from# -> #to#)',
                 self.i,
             )
-        self._expect("->")
         self._skip_ws()
 
         on: Optional[str] = None
@@ -362,15 +653,19 @@ class _Parser:
             on = _extract_on(meta)
             max_loops = _extract_max_loops(meta)
 
+        arrow = "=>" if fanout else "->"
         if self._peek() != "#":
             raise HwgParseError(
-                f'Expected target #name# after -> in edge from #{from_id}#',
+                f'Expected target #name# after {arrow} in edge from #{from_id}#',
                 self.i,
             )
         self._expect("#")
         to_id = self._read_name(start)
         self._expect("#")
-        return {"type": "edge", "from": from_id, "to": to_id, "on": on, "maxLoops": max_loops}
+        edge = {"type": "edge", "from": from_id, "to": to_id, "on": on, "maxLoops": max_loops}
+        if fanout:
+            edge["fanout"] = True
+        return edge
 
     # ── Schedule block ──
     def _parse_schedule_block(self, label: str) -> dict:
@@ -491,6 +786,126 @@ class _Parser:
         return self.i >= len(self.source)
 
 
+# ── Includes ────────────────────────────────────────────────────────────
+#
+#   @include "contracts.hwg"
+#
+# Splices another file's statements in place. It exists so a set of node
+# declarations — the contracts several graphs agree on — can be written once
+# and wired differently by each graph.
+#
+# This module stays pure: parse() emits the include statement, and
+# resolve_includes() does the splicing through a reader callback the caller
+# supplies. Validation refuses to run on an unresolved include rather than
+# quietly validating a graph with a hole in it.
+
+MAX_INCLUDE_DEPTH = 10
+
+
+def _normalise_path(path: str) -> str:
+    """POSIX-style normalisation, identical in both languages.
+
+    Not os.path: the Python and TS mirrors must agree byte for byte, and the
+    TS side runs against a virtual filesystem with no OS path module.
+    """
+    absolute = path.startswith("/")
+    parts: list = []
+    for part in path.split("/"):
+        if not part or part == ".":
+            continue
+        if part == "..":
+            if parts and parts[-1] != "..":
+                parts.pop()
+            elif not absolute:
+                parts.append("..")
+            continue
+        parts.append(part)
+    joined = "/".join(parts)
+    return ("/" + joined) if absolute else joined
+
+
+def _resolve_relative(base_file: str, path: str) -> str:
+    """`path` as written inside `base_file`, resolved against its directory."""
+    if path.startswith("/"):
+        return _normalise_path(path)
+    cut = base_file.rfind("/")
+    directory = base_file[:cut] if cut != -1 else ""
+    return _normalise_path(f"{directory}/{path}" if directory else path)
+
+
+def include_targets(statements: list, path: str) -> list:
+    """Resolved paths the @includes in ``statements`` point at.
+
+    Exists for callers whose file reads are asynchronous: they walk this to
+    preload every referenced file, then hand resolve_includes a synchronous
+    lookup over what they loaded. Keeping the traversal here means there is
+    only one definition of how an include path resolves.
+    """
+    targets = []
+    for statement in statements:
+        if statement.get("type") != "include":
+            continue
+        target = _resolve_relative(path, statement.get("path") or "")
+        if target and target not in targets:
+            targets.append(target)
+    return targets
+
+
+def resolve_includes(statements: list, path: str, read,
+                     _stack: Optional[list] = None, _seen: Optional[set] = None) -> tuple:
+    """Splice every @include, depth-first. Returns (statements, errors).
+
+    ``read(resolved_path)`` returns the file's source, or None when it does not
+    exist.
+
+    A file is spliced at most once per resolution, so the diamond case (two
+    libraries that both include the same contracts file) is not a duplicate-id
+    error. A file that includes itself, directly or through a chain, is a cycle
+    and is reported rather than quietly dropped.
+    """
+    stack = list(_stack or [_normalise_path(path)])
+    seen = _seen if _seen is not None else {_normalise_path(path)}
+    if len(stack) > MAX_INCLUDE_DEPTH:
+        return [], [f'@include nesting deeper than {MAX_INCLUDE_DEPTH} levels (from "{path}").']
+
+    resolved: list = []
+    errors: list = []
+    for statement in statements:
+        if statement.get("type") != "include":
+            resolved.append(statement)
+            continue
+        target = _resolve_relative(path, statement.get("path") or "")
+        if not target:
+            errors.append(f'@include in "{path}" has an empty path.')
+            continue
+        if target in stack:
+            chain = " -> ".join([*stack, target])
+            errors.append(f"@include cycle: {chain}.")
+            continue
+        if target in seen:
+            continue  # already spliced on another branch (diamond)
+        seen.add(target)
+        try:
+            source = read(target)
+        except Exception as e:  # a reader is product code; never let it escape
+            source = None
+            errors.append(f'@include "{target}" could not be read: {e}.')
+            continue
+        if source is None:
+            errors.append(f'@include "{target}" not found (included from "{path}").')
+            continue
+        try:
+            inner = parse(source)
+        except HwgParseError as e:
+            errors.append(f'@include "{target}" failed to parse: {e}')
+            continue
+        inner_statements, inner_errors = resolve_includes(
+            inner, target, read, [*stack, target], seen)
+        resolved.extend(inner_statements)
+        errors.extend(inner_errors)
+    return resolved, errors
+
+
 def parse(source: str) -> list:
     """Parse HWG ``source`` into the canonical AST (a flat list of statements)."""
     return _Parser(source).parse()
@@ -508,6 +923,12 @@ def validate(statements: list) -> list[str]:
     schedules = [s for s in statements if s["type"] == "schedule"]
     errors.extend(_validate_io_params(statements))
 
+    for statement in statements:
+        if statement.get("type") == "include":
+            errors.append(
+                f'@include "{statement.get("path")}" was not resolved — '
+                f'includes must be spliced in before the graph is validated.')
+
     # Unique node ids.
     by_id: dict[str, dict] = {}
     for node in nodes:
@@ -518,6 +939,17 @@ def validate(statements: list) -> list[str]:
         policy = node.get("policy") or {}
         if policy.get("retry") is not None and (not isinstance(policy["retry"], int) or policy["retry"] < 0):
             errors.append(f'#{node["id"]}#: retry policy must be a non-negative integer.')
+        tools = policy.get("tools")
+        if tools is not None:
+            if not tools:
+                errors.append(
+                    f'#{node["id"]}#: tools: [] would leave the node with nothing to '
+                    f'call. Omit the key to inherit the full set.')
+            for name in tools:
+                if not _TOOL_NAME_RE.match(name):
+                    errors.append(
+                        f'#{node["id"]}#: "{name}" is not a tool name or glob '
+                        f'(e.g. fs.read, fs.*).')
 
     # At most one schedule block.
     if len(schedules) > 1:
@@ -556,12 +988,26 @@ def validate(statements: list) -> list[str]:
                 errors.append(f'#{node["id"]}#: input references #{ref_node}.{ref_field}, but #{ref_node}# cannot execute before #{node["id"]}# (no path #{ref_node}# -> ... -> #{node["id"]}#).')
 
     for edge in edges:
-        field = _condition_field(edge.get("on"))
-        if not field:
+        on = edge.get("on")
+        cond_error = condition_error(on)
+        if cond_error:
+            errors.append(f'Edge #{edge["from"]}# -> #{edge["to"]}# {cond_error}')
             continue
+        parsed = parse_condition(on)
         from_node = by_id.get(edge["from"])
-        if from_node and field not in _node_outs(from_node):
-            errors.append(f'Edge #{edge["from"]}# -> #{edge["to"]}# condition references "{field}", but #{edge["from"]}# does not declare it in out(...).')
+        fields = condition_fields(parsed)
+        if not fields:
+            legacy = _condition_field(on)
+            fields = [legacy] if legacy else []
+        for field in fields:
+            if from_node and field not in _node_outs(from_node):
+                errors.append(f'Edge #{edge["from"]}# -> #{edge["to"]}# condition references "{field}", but #{edge["from"]}# does not declare it in out(...).')
+        for ref_node, ref_field in condition_exists_refs(parsed):
+            target = by_id.get(ref_node)
+            if target is None:
+                errors.append(f'Edge #{edge["from"]}# -> #{edge["to"]}# exists() references undeclared node #{ref_node}#.')
+            elif ref_field not in _node_outs(target):
+                errors.append(f'Edge #{edge["from"]}# -> #{edge["to"]}# exists() references undeclared output #{ref_node}.{ref_field}#.')
 
     # Self-loops require maxLoops.
     for edge in edges:
@@ -584,7 +1030,8 @@ def validate(statements: list) -> list[str]:
     for edge in edges:
         outgoing.setdefault(edge["from"], []).append(edge)
     for from_id, outs in outgoing.items():
-        if len(outs) > 1:
+        # A fan-out takes every branch by design, so its edges need no condition.
+        if len(outs) > 1 and not any(e.get("fanout") for e in outs):
             unconditional = [e for e in outs if not e.get("on")]
             if unconditional:
                 errors.append(
@@ -609,6 +1056,103 @@ def validate(statements: list) -> list[str]:
         if not ends:
             errors.append("No end node — every node has an outgoing edge (cycle with no exit point).")
 
+    errors.extend(_validate_fanout(nodes, edges, by_id))
+
+    return errors
+
+
+def _node_join_mode(node: Optional[dict]) -> Optional[str]:
+    return ((node or {}).get("policy") or {}).get("join")
+
+
+def _reachable_from(start: str, edges: list) -> set:
+    """Every node reachable from ``start``, including ``start`` itself."""
+    outgoing: dict[str, list] = {}
+    for edge in edges:
+        outgoing.setdefault(edge["from"], []).append(edge["to"])
+    seen = {start}
+    stack = [start]
+    while stack:
+        node_id = stack.pop()
+        for nxt in outgoing.get(node_id, []):
+            if nxt not in seen:
+                seen.add(nxt)
+                stack.append(nxt)
+    return seen
+
+
+def fanout_joins(nodes: list, edges: list) -> dict:
+    """Map each fan-out node id to the join node its branches converge on.
+
+    A fan-out (``#a# => #b#``) runs every branch instead of picking one, so it
+    only makes sense if the branches come back together somewhere. That meeting
+    point is a node declaring ``{ join: "all" }``, and it must be reachable from
+    every branch — otherwise the join would wait forever for a branch that can
+    never arrive. Nodes whose branches do not resolve to exactly one such join
+    are left out; ``validate`` turns those into errors.
+    """
+    by_id = {n["id"]: n for n in nodes}
+    outgoing: dict[str, list] = {}
+    for edge in edges:
+        outgoing.setdefault(edge["from"], []).append(edge)
+    resolved: dict[str, str] = {}
+    for node_id, outs in outgoing.items():
+        branches = [e for e in outs if e.get("fanout")]
+        if len(branches) < 2:
+            continue
+        common: Optional[set] = None
+        for edge in branches:
+            joins = {n for n in _reachable_from(edge["to"], edges)
+                     if _node_join_mode(by_id.get(n))}
+            common = joins if common is None else (common & joins)
+        if common and len(common) == 1:
+            resolved[node_id] = next(iter(common))
+    return resolved
+
+
+def _validate_fanout(nodes: list, edges: list, by_id: dict) -> list:
+    errors: list[str] = []
+    outgoing: dict[str, list] = {}
+    for edge in edges:
+        outgoing.setdefault(edge["from"], []).append(edge)
+    resolved = fanout_joins(nodes, edges)
+
+    for node_id, outs in outgoing.items():
+        branches = [e for e in outs if e.get("fanout")]
+        if not branches:
+            continue
+        if len(branches) != len(outs):
+            errors.append(
+                f'#{node_id}# mixes -> and => edges. A node either routes to one '
+                f'target (->) or fans out to all of them (=>), not both.')
+            continue
+        if len(branches) < 2:
+            errors.append(
+                f'#{node_id}# has a single => edge. Fan-out needs at least two '
+                f'branches; use -> for a single next node.')
+            continue
+        looping = [e for e in branches if e.get("maxLoops")]
+        if looping:
+            errors.append(
+                f'#{node_id}#: => edges cannot carry maxLoops. Loop with -> edges '
+                f'outside the fan-out.')
+        if node_id not in resolved:
+            errors.append(
+                f'#{node_id}# fans out but its branches do not converge on one '
+                f'join node. Every branch must reach the same node declaring '
+                f'{{ join: "all" }}.')
+
+    joined = set(resolved.values())
+    for node in nodes:
+        mode = _node_join_mode(node)
+        if not mode:
+            continue
+        if mode != "all":
+            errors.append(f'#{node["id"]}#: join policy must be "all" (got "{mode}").')
+        elif node["id"] not in joined:
+            errors.append(
+                f'#{node["id"]}# declares {{ join: "all" }} but no fan-out (=>) '
+                f'converges on it.')
     return errors
 
 

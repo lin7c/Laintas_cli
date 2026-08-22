@@ -332,6 +332,26 @@ def _parse_structured_return(value: str) -> Optional[dict]:
     return None
 
 
+# An agent that reached one of these is done; its name is free to reuse.
+_FINISHED_AGENT_STATUS = frozenset({"done", "error", "aborted"})
+
+
+def _reclaim_finished_agent(name: str) -> None:
+    """Free a workflow agent id left behind by an earlier run.
+
+    HWO agents are registered under their declared name and stay in the registry
+    after they finish so the run can still be inspected. Running the same
+    workflow again — which is exactly what a node's ``retry:`` policy does —
+    then hit "agent id is already in use" and failed on every attempt after the
+    first, making retry useless for any .hwo with named agents. Only a
+    *finished* agent is reclaimed; two live agents still cannot share a name.
+    """
+    import agent_loop as _al
+    existing = _al.get_agent(name)
+    if existing is not None and existing.status in _FINISHED_AGENT_STATUS:
+        _al.unregister_agent(name)
+
+
 def _declared_outputs(agent: HwoAgent, value: str) -> dict:
     parsed = _parse_structured_return(value) or {}
     if not agent.io or not agent.io.get("out"):
@@ -557,6 +577,7 @@ class HwoCtx:
     workflow_manifest: Optional[dict] = None   # name -> {parent_name, sibling_names, child_names, prompt_file}
     prompt_override: Optional[str] = None      # resolved (prompt.md) content, inherited down the tree
     model_override: Optional[str] = None       # #name@model# backend-model pin, inherited down the tree
+    tool_scope: Optional[list] = None          # HWG node tool allowlist; narrows every agent in this file
     workflow_inputs: Optional[dict] = None     # structured inputs from hwo(...) or HWG
     workflow_input_types: Optional[dict] = None
     output_scope: Optional[dict] = None         # completed sibling outputs in the current sequence scope
@@ -801,6 +822,8 @@ def _run_task_group(texts: list[str], ctx: HwoCtx, inherited: str = "") -> dict:
     )
     if ctx.prompt_override:
         child.state['_prompt_override'] = ctx.prompt_override
+    if ctx.tool_scope:
+        child.state['_tool_allowlist'] = list(ctx.tool_scope)
     if ctx.model_override:
         child.state['_model_override'] = ctx.model_override
 
@@ -902,6 +925,7 @@ def _run_agent(agent_step: HwoAgent, ctx: HwoCtx, inherited: str = "") -> dict:
     depth = (parent.depth + 1) if parent else 0
     full_name = "/".join([*ctx.name_path, agent_step.name])
 
+    _reclaim_finished_agent(agent_step.name)
     try:
         child = register_agent(
             name=agent_step.name, depth=depth, parent_id=parent_id,
@@ -925,6 +949,10 @@ def _run_agent(agent_step: HwoAgent, ctx: HwoCtx, inherited: str = "") -> dict:
             prompt_override = loaded
     if prompt_override:
         child.state['_prompt_override'] = prompt_override
+    # Applies to every agent in the file, not just the first: a scoped node
+    # must not be able to delegate its way out of the scope.
+    if ctx.tool_scope:
+        child.state['_tool_allowlist'] = list(ctx.tool_scope)
 
     # Model pin: this agent's own `@model` wins, else inherit the parent's pin.
     model_override = agent_step.model or ctx.model_override
@@ -976,6 +1004,7 @@ def _run_agent(agent_step: HwoAgent, ctx: HwoCtx, inherited: str = "") -> dict:
                     workflow_manifest=ctx.workflow_manifest,
                     prompt_override=prompt_override,
                     model_override=model_override,
+                    tool_scope=ctx.tool_scope,
                     workflow_inputs=ctx.workflow_inputs,
                     workflow_input_types=ctx.workflow_input_types,
                     output_scope=ctx.output_scope,
@@ -1023,6 +1052,7 @@ def _run_agent(agent_step: HwoAgent, ctx: HwoCtx, inherited: str = "") -> dict:
                     workflow_manifest=ctx.workflow_manifest,
                     prompt_override=prompt_override,
                     model_override=model_override,
+                    tool_scope=ctx.tool_scope,
                     workflow_inputs=ctx.workflow_inputs,
                     workflow_input_types=ctx.workflow_input_types,
                     output_scope={},
@@ -1154,6 +1184,7 @@ def run_hwo_file(
     caller_context: str = "",
     inputs: Optional[dict] = None,
     events_cb=None,
+    tool_scope: Optional[list] = None,
 ) -> dict:
     """Parse and execute a .hwo workflow file.
 
@@ -1210,6 +1241,7 @@ def run_hwo_file(
         workflow_manifest=manifest,
         workflow_inputs=effective_inputs,
         workflow_input_types=effective_input_types,
+        tool_scope=list(tool_scope) if tool_scope else None,
         output_scope={},
         agent_output_types=agent_output_types,
         run_state=run_state,
@@ -1256,7 +1288,16 @@ def compile_hwo_file(path: str) -> dict:
     steps = [_to_node(d) for d in ast if d.get("type") != "workflow"]
 
     summary = "\n".join(summarize_steps(steps))
-    return {"ok": True, "msg": f"HWO compile OK\n{summary}", "summary": summary}
+    msg = f"HWO compile OK\n{summary}"
+    # Lane diagram (best-effort: a viz failure must not fail compile).
+    try:
+        import workflow_viz
+        diagram = workflow_viz.render_lane_plain(
+            workflow_viz.tree_from_steps(ast))
+        msg += "\n\n" + diagram
+    except Exception:
+        pass
+    return {"ok": True, "msg": msg, "summary": summary}
 
 
 def status(run_id: Optional[str] = None) -> dict:

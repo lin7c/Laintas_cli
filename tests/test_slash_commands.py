@@ -878,6 +878,24 @@ class SlashRegistryTests(unittest.TestCase):
             selected = laintas_cli.show_model_selector(models, "model-a")
         self.assertEqual(selected, models[1])
 
+    def test_model_catalog_uses_two_supply_labels_without_losing_routing_provider(self):
+        rows = laintas_cli._extract_model_entries({
+            "providers": [
+                {"id": "laintas", "label": "internal name", "models": ["self-model"]},
+                {"id": "openrouter", "label": "vendor name", "models": ["vendor-model"]},
+                {"id": "custom-account", "label": "custom name", "models": ["custom-model"]},
+            ],
+        })
+
+        self.assertEqual(
+            [(row["id"], row["provider"], row["supply"]) for row in rows],
+            [
+                ("self-model", "laintas", "Laintas Supply"),
+                ("vendor-model", "openrouter", "Third-party Supply"),
+                ("custom-model", "custom-account", "Third-party Supply"),
+            ],
+        )
+
     def test_model_command_persists_selected_provider(self):
         models = [{
             "id": "model-x", "name": "Model X",

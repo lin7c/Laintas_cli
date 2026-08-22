@@ -24,7 +24,7 @@ _FRAME_CONTROL_RE = re.compile(
     r"\x1b\[(?:\d*[ABCDEFGJKSTLM]|\?\d+[hl]|\d*(?:;\d*)?[Hfr])")
 _ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _LIVE_STATUS_RE = re.compile(
-    r"^\s*[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s+(?:Thinking|Writing)…\s+"
+    r"^\s*(?:L[·›»]|[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏])\s+(?:Thinking|Writing)…\s+"
     r"\d+(?:\.\d+)?s(?:\s+·.*)?\s*$",
     re.IGNORECASE,
 )

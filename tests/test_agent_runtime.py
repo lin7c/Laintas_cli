@@ -280,6 +280,78 @@ class AgentIsolationTests(unittest.TestCase):
         agent_loop.close_all_agents()
         agent_loop.reset_runtime_config()
 
+    def test_upstream_truncated_retries_twice_before_success(self):
+        attempts = []
+        responses = iter([
+            {
+                "reply": "Server Error: Upstream ended the response early",
+                "tool_calls": [], "done": True, "error": True,
+                "error_code": "upstream_truncated",
+            },
+            {
+                "reply": "Server Error: Upstream ended the response early",
+                "tool_calls": [], "done": True, "error": True,
+                "error_code": "upstream_truncated",
+            },
+            {
+                "reply": "recovered", "tool_calls": [],
+                "finish_reason": "stop", "done": True, "error": False,
+            },
+        ])
+        deps = _deps()
+
+        def backend(**kwargs):
+            attempts.append(kwargs)
+            return next(responses)
+
+        deps.call_backend = backend
+        child = agent_loop.register_agent(
+            name="truncated-retry", depth=1, role="subagent")
+
+        with tempfile.TemporaryDirectory() as tmp, _chdir(tmp), \
+                mock.patch.object(
+                    agent_persistence, "AGENTS_DIR", Path(tmp) / "agents"):
+            Path(".laintas").mkdir()
+            result = agent_loop.run_agent_loop(
+                deps, "retry a dropped stream", {}, child.state,
+                child.chat_history, depth=1, agent_id=child.id,
+                events_cb=lambda events: None, max_loops_override=3)
+
+        self.assertEqual(len(attempts), 3)
+        self.assertNotEqual(
+            result["exit_reason"], agent_loop.TRANSITION_BACKEND_ERROR)
+        self.assertIn("Empty-response retry 2/2", result["state"]["shortTermMemory"])
+
+    def test_upstream_truncated_stops_after_old_retry_budget(self):
+        attempts = []
+        truncated = {
+            "reply": "Server Error: Upstream ended the response early",
+            "tool_calls": [], "done": True, "error": True,
+            "error_code": "upstream_truncated",
+        }
+        deps = _deps()
+
+        def backend(**kwargs):
+            attempts.append(kwargs)
+            return dict(truncated)
+
+        deps.call_backend = backend
+        child = agent_loop.register_agent(
+            name="truncated-give-up", depth=1, role="subagent")
+
+        with tempfile.TemporaryDirectory() as tmp, _chdir(tmp), \
+                mock.patch.object(
+                    agent_persistence, "AGENTS_DIR", Path(tmp) / "agents"):
+            Path(".laintas").mkdir()
+            result = agent_loop.run_agent_loop(
+                deps, "retry a dropped stream", {}, child.state,
+                child.chat_history, depth=1, agent_id=child.id,
+                events_cb=lambda events: None, max_loops_override=5)
+
+        self.assertEqual(len(attempts), 3)
+        self.assertEqual(
+            result["exit_reason"], agent_loop.TRANSITION_BACKEND_ERROR)
+
     def test_child_does_not_drain_primary_supplementary_messages(self):
         child = agent_loop.register_agent(
             name="child", depth=1, role="subagent")

@@ -71,6 +71,32 @@ class PromptContractTests(unittest.TestCase):
         self.assertIn("Continue", result["result"])
         self.assertEqual(info.state["_hwo_return"], '{"x": 1}')
 
+    def test_agent_return_reaches_the_loop_state_the_runner_reads(self):
+        """run_agent_loop copies the caller's state on entry and writes that copy
+        back to the registry on exit, so a payload left only in info.state is
+        discarded. HWO then silently fell back to scraping JSON out of the
+        model's closing prose. agent_return must land in ctx.state too."""
+        info = mock.Mock()
+        info.state = {}
+        loop_state = {}
+        ctx = tools.ToolCtx(agent_id="a1", get_agent=lambda _id: info, state=loop_state)
+        result = tools.get_registry().invoke(
+            "agent_return", {"value": {"verdict": "PASS"}}, ctx)
+        self.assertTrue(result["ok"])
+        self.assertEqual(loop_state["_hwo_return"], '{"verdict": "PASS"}')
+        self.assertEqual(info.state["_hwo_return"], '{"verdict": "PASS"}')
+
+    def test_agent_return_survives_the_state_copy_write_back(self):
+        """The end-to-end invariant: whatever the loop hands back to the registry
+        must still carry the payload the runner pops."""
+        info = mock.Mock()
+        info.state = {"shortTermMemory": ""}
+        loop_state = dict(info.state)          # run_agent_loop: state = dict(state)
+        ctx = tools.ToolCtx(agent_id="a1", get_agent=lambda _id: info, state=loop_state)
+        tools.get_registry().invoke("agent_return", {"value": {"r": "ok"}}, ctx)
+        info.state = loop_state                # run_agent_loop exit: self_info.state = state
+        self.assertEqual(info.state.pop("_hwo_return", None), '{"r": "ok"}')
+
     def test_summary_is_english_for_all_language_modes(self):
         prompt = summary_prompt("ZH")
         self.assertIn("## Durable User Rules", prompt)

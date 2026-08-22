@@ -39,6 +39,11 @@ ZAP = "⚡"        # interrupt / fast action
 RETURN = "⏎"     # line return / enter
 
 # ── Spinners ───────────────────────────────────────────────────────────────
-SPINNER_BRAILLE = tuple("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
-SPINNER_GEO = tuple("◰◳◲◱")
+# A fixed Laintas "L" launches a forward pulse. Every frame is exactly two
+# terminal cells wide, so status text never shifts as the animation advances.
+# The old names remain aliases for compatibility with project extensions.
+SPINNER_RELAY = ("L·", "L›", "L»", "L›")
+SPINNER_INTERVAL_MS = 140.0
+SPINNER_BRAILLE = SPINNER_RELAY
+SPINNER_GEO = SPINNER_RELAY
 SQUARE_OPEN = "□"

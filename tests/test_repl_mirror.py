@@ -16,7 +16,7 @@ class ReplMirrorTransientTests(unittest.TestCase):
         with mock.patch.object(sys, "stdout", output):
             tee.write("before\n")
             with tee.transient_output():
-                tee.write("⠋ Thinking… 0.0s · default · ACT")
+                tee.write("L› Thinking… 0.0s · default · ACT")
             tee.write("after\n")
 
         self.assertEqual(hub.read_lines("primary"), ["before", "after"])
@@ -31,7 +31,7 @@ class ReplMirrorTransientTests(unittest.TestCase):
         with mock.patch.object(sys, "stdout", output):
             hub.set_owner("agents")
             with tee.transient_output():
-                tee.write("⠸ Writing… 1.8s · model · ACT")
+                tee.write("L» Writing… 1.8s · model · ACT")
             hub.set_owner("cli")
 
         self.assertEqual(output.getvalue(), "")
@@ -40,7 +40,14 @@ class ReplMirrorTransientTests(unittest.TestCase):
     def test_split_live_status_text_is_filtered_defensively(self):
         self.assertEqual(
             repl_mirror._filter_for_mirror(
-                "⠋ \x1b[1mT\x1b[0mhinking… 0.0s · default · ACT"),
+                "L› \x1b[1mT\x1b[0mhinking… 0.0s · default · ACT"),
+            "",
+        )
+
+    def test_legacy_braille_status_is_still_filtered(self):
+        self.assertEqual(
+            repl_mirror._filter_for_mirror(
+                "⠋ Thinking… 0.0s · default · ACT"),
             "",
         )
 

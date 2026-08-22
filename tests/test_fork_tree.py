@@ -69,11 +69,13 @@ class ForkTreeRowTests(unittest.TestCase):
         ]
         branch = symbols.TREE_BRANCH + " "
         last = symbols.TREE_LAST + " "
+        # The newest branch state is the resumable header; its older snapshots
+        # are children. Root sessions are ordered by latest activity.
         self.assertEqual(_rows(choices), [
+            ("a-auto", ""),
+            ("a-ckpt", branch),
+            ("fork-a", last),
             ("trunk", ""),
-            ("fork-a", ""),
-            ("a-auto", branch),
-            ("a-ckpt", last),
         ])
 
     def test_sub_branches_render_after_own_snapshots_with_connectors(self):
@@ -88,10 +90,10 @@ class ForkTreeRowTests(unittest.TestCase):
         last = symbols.TREE_LAST + " "
         vert = symbols.TREE_VERT + " "
         self.assertEqual(_rows(choices), [
-            ("fork-a", ""),
-            ("a-auto", branch),
-            ("fork-b", last),
-            ("b-auto", "   " + last),
+            ("a-auto", ""),
+            ("fork-a", branch),
+            ("b-auto", last),
+            ("fork-b", "   " + last),
         ])
 
     def test_continuation_pad_matches_connector_width(self):
@@ -140,8 +142,8 @@ class ForkTreeRowTests(unittest.TestCase):
         choices = [_blob("fork", 10, fork_name="a", blob_id="legacy"),
                    _blob("autosave", 20, lineage=["a"], blob_id="a-auto")]
         self.assertEqual(_rows(choices), [
-            ("legacy", ""),
-            ("a-auto", symbols.TREE_LAST + " "),
+            ("a-auto", ""),
+            ("legacy", symbols.TREE_LAST + " "),
         ])
 
     def test_every_choice_appears_exactly_once(self):
@@ -162,13 +164,32 @@ class ForkTreeRowTests(unittest.TestCase):
                          blob_id="junk")]
         self.assertEqual(_rows(choices), [("junk", "")])
 
+    def test_same_session_checkpoints_group_under_latest_tip(self):
+        tip = _blob("autosave", 30, blob_id="tip")
+        checkpoint = _blob("checkpoint", 20, blob_id="checkpoint")
+        tip["session_id"] = checkpoint["session_id"] = "session-a"
+        self.assertEqual(_rows([checkpoint, tip]), [
+            ("tip", ""),
+            ("checkpoint", symbols.TREE_LAST + " "),
+        ])
+
+    def test_corrupt_parent_cycle_keeps_every_record_visible(self):
+        first = _blob("autosave", 20, blob_id="first")
+        second = _blob("autosave", 10, blob_id="second")
+        first.update(session_id="a", parent_session_id="b")
+        second.update(session_id="b", parent_session_id="a")
+        rows = _rows([first, second])
+        self.assertEqual(sorted(item[0] for item in rows), ["first", "second"])
+
 
 class LineagePersistenceTests(unittest.TestCase):
     def test_prepare_state_for_repl_keeps_lineage_across_turns(self):
-        state = {"_fork_lineage": ["a", "b"], "_fork_name": "b"}
+        state = {"_fork_lineage": ["a", "b"], "_fork_name": "b",
+                 "_fork_parent_session_id": "parent-session"}
         carried = agent_loop.prepare_state_for_repl(state)
         self.assertEqual(carried["_fork_lineage"], ["a", "b"])
         self.assertEqual(carried["_fork_name"], "b")
+        self.assertEqual(carried["_fork_parent_session_id"], "parent-session")
         # Still bounded on the way through.
         dirty = agent_loop.prepare_state_for_repl(
             {"_fork_lineage": ["a", 7, ""], "_fork_name": "  x  y "})
@@ -182,16 +203,21 @@ class LineagePersistenceTests(unittest.TestCase):
 
     def test_autosave_payload_records_the_branch_it_was_taken_on(self):
         payload = agent_loop._build_resume_payload(
-            {"_fork_lineage": ["a", "b"]},
+            {"_fork_lineage": ["a", "b"], "_fork_name": "b",
+             "_fork_parent_session_id": "parent"},
             [{"role": "user", "content": "hi", "input_kind": "prompt"}],
             "/tmp/project", "autosave")
         self.assertEqual(payload["fork_lineage"], ["a", "b"])
+        self.assertEqual(payload["parent_session_id"], "parent")
+        self.assertEqual(payload["branch_name"], "b")
 
     def test_restore_injects_lineage_for_a_branch_autosave(self):
-        blob = {"fork_lineage": ["a", "b"], "chat_history": [], "state": {}}
+        blob = {"fork_lineage": ["a", "b"], "branch_name": "b",
+                "parent_session_id": "parent", "chat_history": [], "state": {}}
         restored = laintas_cli._restore_resume_blob(blob, [])
         self.assertEqual(restored["_fork_lineage"], ["a", "b"])
         self.assertEqual(restored["_fork_name"], "b")
+        self.assertEqual(restored["_fork_parent_session_id"], "parent")
 
     def test_restore_clears_lineage_for_a_trunk_snapshot(self):
         blob = {"chat_history": [], "state": {"_fork_lineage": ["stale"]}}
@@ -215,19 +241,24 @@ class ForkRoundTripTests(unittest.TestCase):
             trunk_state = {"_session_id": "trunk-session"}
             agent_loop.save_resume_state(
                 trunk_state, self._history("trunk work"), cwd)
-            agent_loop.save_fork_state(
+            fork_blob = agent_loop.save_fork_state(
                 trunk_state, self._history("trunk work"), cwd,
                 "alt", ["alt"], "trunk-session")
+            child_session_id = fork_blob["session_id"]
 
-            # Resuming the fork carries the lineage into the live state, and
-            # the next turn's autosave must stay on that branch.
-            fork_blob = agent_loop.load_resume_state(cwd, "trunk-session")
-            branch_state = laintas_cli._restore_resume_blob(
-                {"fork_lineage": ["alt"], "fork_name": "alt",
-                 "chat_history": [], "state": {}}, [])
+            # Fork creation reserves a distinct child identity without
+            # overwriting the parent's independently resumable tip.
+            self.assertNotEqual(child_session_id, "trunk-session")
+            self.assertEqual(fork_blob["parent_session_id"], "trunk-session")
+            self.assertEqual(
+                agent_loop.load_resume_state(cwd, "trunk-session")["kind"],
+                "autosave")
+
+            # Resuming the real persisted fork carries its identity and parent
+            # through a turn boundary into the child autosave.
+            branch_state = laintas_cli._restore_resume_blob(fork_blob, [])
             self.assertEqual(branch_state["_fork_lineage"], ["alt"])
-            branch_state["_session_id"] = "branch-session"
-            # A full turn boundary happens between resume and autosave.
+            self.assertEqual(branch_state["_session_id"], child_session_id)
             branch_state = agent_loop.prepare_state_for_repl(branch_state)
             agent_loop.save_resume_state(
                 branch_state, self._history("branch work"), cwd)
@@ -236,11 +267,62 @@ class ForkRoundTripTests(unittest.TestCase):
             rows = laintas_cli._build_fork_tree_rows(choices)
             by_kind = {(row[0].get("kind"), row[0].get("session_id")): row[1]
                        for row in rows}
-            # Fork heads the branch at root level; its autosave nests under it.
-            self.assertEqual(by_kind[("fork", "trunk-session")], "")
-            self.assertEqual(by_kind[("autosave", "branch-session")],
+            self.assertEqual(by_kind[("autosave", "trunk-session")], "")
+            self.assertEqual(by_kind[("autosave", child_session_id)],
                              symbols.TREE_LAST + " ")
             self.assertIsNotNone(fork_blob)
+
+    def test_new_named_fork_is_visible_as_a_child_before_first_resume(self):
+        cwd = "/work/project"
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(paths, "SESSIONS_DIR", Path(tmp)):
+            parent = {"_session_id": "parent-session"}
+            agent_loop.save_resume_state(parent, self._history("parent"), cwd)
+            fork_blob = agent_loop.save_fork_state(
+                parent, self._history("parent"), cwd,
+                "experiment", ["experiment"], "parent-session")
+
+            rows = laintas_cli._build_fork_tree_rows(
+                agent_loop.list_resume_states(cwd))
+            prefixes = {row[0].get("session_id"): row[1] for row in rows}
+            self.assertEqual(prefixes["parent-session"], "")
+            self.assertEqual(prefixes[fork_blob["session_id"]],
+                             symbols.TREE_LAST + " ")
+
+    def test_legacy_self_parent_fork_attaches_without_rewriting_disk(self):
+        parent = _blob("autosave", 20, blob_id="parent-tip")
+        parent["session_id"] = "legacy-session"
+        fork = _blob("fork", 10, lineage=["alt"], fork_name="alt",
+                     blob_id="legacy-fork")
+        fork["session_id"] = "legacy-session"
+        fork["fork_parent_session_id"] = "legacy-session"
+
+        self.assertEqual(_rows([parent, fork]), [
+            ("parent-tip", ""),
+            ("legacy-fork", symbols.TREE_LAST + " "),
+        ])
+
+        restored = laintas_cli._restore_resume_blob(fork, [])
+        self.assertNotEqual(restored["_session_id"], "legacy-session")
+        self.assertEqual(restored["_fork_parent_session_id"],
+                         "legacy-session")
+
+    def test_same_branch_name_under_different_parents_does_not_collide(self):
+        cwd = "/work/project"
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(paths, "SESSIONS_DIR", Path(tmp)):
+            first = agent_loop.save_fork_state(
+                {"_session_id": "parent-a"}, self._history("a"), cwd,
+                "experiment", ["a", "experiment"], "parent-a")
+            second = agent_loop.save_fork_state(
+                {"_session_id": "parent-b"}, self._history("b"), cwd,
+                "experiment", ["b", "experiment"], "parent-b")
+
+            self.assertNotEqual(first["session_id"], second["session_id"])
+            fork_files = list(Path(tmp).glob("*_fork_*.json"))
+            self.assertEqual(len(fork_files), 2)
+            self.assertTrue(all("experiment" not in path.name
+                                for path in fork_files))
 
     def test_chained_fork_keeps_its_parent_after_a_turn_boundary(self):
         state = {"_session_id": "s1", "_fork_lineage": ["a"], "_fork_name": "a"}

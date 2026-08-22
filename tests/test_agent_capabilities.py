@@ -115,3 +115,82 @@ class WritePolicyTests(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertFalse(result["ok"])
         self.assertIn("no approval channel", result["error"].lower())
+
+
+class NodeToolScopeTests(unittest.TestCase):
+    """`{ tools: [...] }` on an HWG node narrows what every agent in that node's
+    .hwo file may call. Narrowing only — it can never grant access."""
+
+    def test_scope_matches_names_and_globs(self):
+        scope = ["fs.read", "fs.gr*"]
+        self.assertTrue(agent_loop._tool_in_scope("fs.read", scope))
+        self.assertTrue(agent_loop._tool_in_scope("fs.grep", scope))
+        self.assertFalse(agent_loop._tool_in_scope("fs.write", scope))
+        self.assertFalse(agent_loop._tool_in_scope("shell.exec", scope))
+
+    def test_no_scope_permits_everything(self):
+        self.assertTrue(agent_loop._tool_in_scope("fs.write", None))
+        self.assertTrue(agent_loop._tool_in_scope("fs.write", []))
+
+    def test_completion_protocol_is_never_scoped_out(self):
+        """A node that cannot report its result is hung, not contained."""
+        scope = ["fs.read"]
+        self.assertTrue(agent_loop._tool_in_scope("task.complete", scope))
+        self.assertTrue(agent_loop._tool_in_scope("agent_return", scope))
+
+    def test_scope_narrows_the_visible_tool_set(self):
+        with mock.patch.object(agent_loop.plan_mode, "is_plan_mode", return_value=False), \
+                mock.patch.object(agent_loop.mode_manager, "is_tool_allowed",
+                                  return_value=True), \
+                mock.patch.object(agent_loop.agent_roles, "is_tool_allowed_for_role",
+                                  return_value=True), \
+                mock.patch.object(agent_loop.workflow_engine, "is_tool_allowed_in_workflow",
+                                  return_value=True):
+            names = agent_loop._allowed_tool_names_for_state(
+                {"_tool_allowlist": ["fs.read", "fs.grep"]})
+        self.assertIn("fs.read", names)
+        self.assertIn("fs.grep", names)
+        self.assertNotIn("fs.write", names)
+        self.assertNotIn("shell.exec", names)
+        # The protocol survives, so the node can still finish and report.
+        self.assertIn("task.complete", names)
+
+    def test_scope_cannot_be_widened_by_another_layer(self):
+        """Mode says yes to everything; the node scope still says no."""
+        with mock.patch.object(agent_loop.plan_mode, "is_plan_mode", return_value=False), \
+                mock.patch.object(agent_loop.mode_manager, "is_tool_allowed",
+                                  side_effect=lambda name: name == "fs.write"), \
+                mock.patch.object(agent_loop.agent_roles, "is_tool_allowed_for_role",
+                                  return_value=True), \
+                mock.patch.object(agent_loop.workflow_engine, "is_tool_allowed_in_workflow",
+                                  return_value=True):
+            names = agent_loop._allowed_tool_names_for_state(
+                {"_tool_allowlist": ["fs.read"]})
+        # Intersection of "only fs.write" and "only fs.read" is empty, not either one.
+        self.assertNotIn("fs.write", names)
+        self.assertNotIn("fs.read", names)
+
+    def test_a_child_agent_cannot_spawn_its_way_out_of_the_scope(self):
+        """Delegation would otherwise be the exit from every restriction."""
+        parent = agent_loop.register_agent(
+            name="scope-parent", depth=0, role="pool", replace_existing=True)
+        parent.state["_tool_allowlist"] = ["fs.read"]
+        child_ids = []
+        try:
+            with mock.patch.object(agent_loop, "schedule_agent",
+                                   side_effect=lambda *a, **k: None), \
+                    mock.patch.object(agent_loop, "can_spawn", return_value=True):
+                child_id = agent_loop.spawn_subagent(
+                    parent.id, "look at something", deps=None,
+                    name="scope-child", report_to_parent=False)
+            child_ids.append(child_id)
+            child = agent_loop.get_agent(child_id)
+            self.assertEqual(child.state.get("_tool_allowlist"), ["fs.read"])
+            # A copy, so a child mutating its own scope cannot reach the parent's.
+            self.assertIsNot(child.state["_tool_allowlist"],
+                             parent.state["_tool_allowlist"])
+        finally:
+            for cid in child_ids:
+                if cid:
+                    agent_loop.unregister_agent(cid)
+            agent_loop.unregister_agent(parent.id)
