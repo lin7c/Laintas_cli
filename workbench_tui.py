@@ -9,8 +9,11 @@ through Textual messages.
 from __future__ import annotations
 
 from collections import deque
+from contextlib import contextmanager
 from functools import partial
 import os
+import shutil
+import sys
 import threading
 from typing import Any, Callable, Iterable, Optional
 
@@ -21,6 +24,7 @@ from textual.app import App, ComposeResult, SystemCommand
 from textual.containers import Horizontal, Vertical
 from textual.message import Message
 from textual.css.query import NoMatches
+from textual.geometry import Size
 from textual.screen import ModalScreen
 from textual.widgets import (
     Button, Footer, Input, Label, OptionList, RichLog, Static,
@@ -30,6 +34,66 @@ from textual.widgets.option_list import Option
 import agent_loop
 import agent_ui_events
 import symbols
+
+
+if sys.platform != "win32":
+    from textual.drivers import linux_driver as _textual_linux_driver
+    from textual.drivers.linux_driver import LinuxDriver
+
+    _driver_signal_lock = threading.RLock()
+
+    class _NoInstallSignalProxy:
+        """Expose signal constants while suppressing handler installation.
+
+        Textual's Linux driver installs process signal handlers, which Python
+        only permits in the main thread. The CLI deliberately gives the TUI a
+        worker thread while its main thread services injected Agent messages.
+        """
+
+        def __init__(self, source):
+            self._source = source
+
+        def __getattr__(self, name):
+            return getattr(self._source, name)
+
+        def signal(self, signal_number, _handler):
+            return self._source.getsignal(signal_number)
+
+    @contextmanager
+    def _without_driver_signal_installation():
+        # Patch only Textual's module-local reference, never Python's global
+        # signal module. The lock also protects against a second TUI startup.
+        with _driver_signal_lock:
+            original = _textual_linux_driver.signal
+            _textual_linux_driver.signal = _NoInstallSignalProxy(original)
+            try:
+                yield
+            finally:
+                _textual_linux_driver.signal = original
+
+    class _BackgroundLinuxDriver(LinuxDriver):
+        """Linux terminal driver safe to construct and stop off main thread."""
+
+        def __init__(self, *args, **kwargs):
+            with _without_driver_signal_installation():
+                super().__init__(*args, **kwargs)
+
+        @property
+        def can_suspend(self) -> bool:
+            # Ctrl+Z depends on the process-level handlers deliberately
+            # omitted above. Exposing it would leave the CLI suspended.
+            return False
+
+        def start_application_mode(self):
+            with _without_driver_signal_installation():
+                return super().start_application_mode()
+
+        def disable_input(self) -> None:
+            with _without_driver_signal_installation():
+                return super().disable_input()
+
+else:  # pragma: no cover - selected only by Textual on Windows
+    _BackgroundLinuxDriver = None
 
 
 STATUS_META = {
@@ -224,7 +288,12 @@ class WorkbenchApp(App[Optional[str]]):
     ]
 
     def __init__(self, controller, *, mirror=None):
-        super().__init__()
+        driver_class = None
+        if (_BackgroundLinuxDriver is not None
+                and threading.current_thread() is not threading.main_thread()):
+            driver_class = _BackgroundLinuxDriver
+        super().__init__(driver_class=driver_class)
+        self._poll_resize = driver_class is not None
         self.controller = controller
         self.mirror = mirror
         self._bridge = _EventBridge(self._wake_from_thread)
@@ -237,6 +306,7 @@ class WorkbenchApp(App[Optional[str]]):
         self._narrow = False
         self._console_partial = ""
         self._deferred_line: Optional[str] = None
+        self._terminal_size = (0, 0)
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="topbar"):
@@ -280,6 +350,10 @@ class WorkbenchApp(App[Optional[str]]):
             self.mirror.subscribe(self._console_event)
         self.set_interval(0.10, self._refresh_fast)
         self.set_interval(0.75, self._refresh_metadata)
+        # The background driver cannot own SIGWINCH. Polling is cheap and
+        # keeps resize behavior reliable across SSH, tmux, and web terminals.
+        if self._poll_resize:
+            self.set_interval(0.25, self._poll_terminal_size)
         self._apply_breakpoint(self.size.width, self.size.height)
         self._refresh_agents(force=True)
         self._rebuild_conversation()
@@ -736,7 +810,18 @@ class WorkbenchApp(App[Optional[str]]):
     def on_resize(self, event: events.Resize) -> None:
         if isinstance(self.screen, ApprovalScreen):
             return
+        self._terminal_size = (event.size.width, event.size.height)
         self._apply_breakpoint(event.size.width, event.size.height)
+
+    def _poll_terminal_size(self) -> None:
+        if not self.is_mounted:
+            return
+        terminal = shutil.get_terminal_size(fallback=(80, 24))
+        measured = (terminal.columns, terminal.lines)
+        if measured == self._terminal_size:
+            return
+        size = Size(*measured)
+        self.post_message(events.Resize(size, size))
 
     def _apply_breakpoint(self, width: int, height: int) -> None:
         self._narrow = width < 96
