@@ -15,7 +15,6 @@ from contextlib import contextmanager
 import re
 import sys
 import threading
-from typing import Callable
 
 # Cursor movement / erase / scroll-region sequences mean "repaint in place"
 # (Rich Live, spinners, progress bars).  A line-oriented mirror cannot replay
@@ -80,18 +79,6 @@ class MirrorHub:
         # calls such as the dialogue echo). Terminal decoration (startup
         # banner, idle REPL chatter) never enters an Agent's screen.
         self._recording = 0
-        # Full-screen workbenches may observe console chunks without owning
-        # Rich's output stream. Callbacks run after the hub lock is released;
-        # subscribers must hand work to their own UI event loop.
-        self._subscribers: set[Callable[[str, str, bool], None]] = set()
-
-    def subscribe(self, callback: Callable[[str, str, bool], None]) -> None:
-        with self._lock:
-            self._subscribers.add(callback)
-
-    def unsubscribe(self, callback: Callable[[str, str, bool], None]) -> None:
-        with self._lock:
-            self._subscribers.discard(callback)
 
     # ── recording gate ─────────────────────────────────────────────────
     def start_recording(self) -> None:
@@ -145,9 +132,6 @@ class MirrorHub:
         if not text:
             return
         filtered = _filter_for_mirror(text)
-        subscribers = ()
-        recording = False
-        target = str(agent_id or "primary")
         with self._lock:
             if self._transient_output:
                 if self._owner == "cli":
@@ -157,7 +141,7 @@ class MirrorHub:
                         pass
                 return
             if filtered and self._recording > 0:
-                self._append_locked(target, filtered)
+                self._append_locked(str(agent_id or "primary"), filtered)
             if self._owner == "cli":
                 try:
                     sys.stdout.write(text)
@@ -165,14 +149,6 @@ class MirrorHub:
                     pass
             elif filtered and len(self._missed) < _MAX_MISSED_CHUNKS:
                 self._missed.append(filtered)
-            if filtered and self._owner == "agents":
-                subscribers = tuple(self._subscribers)
-                recording = self._recording > 0
-        for callback in subscribers:
-            try:
-                callback(target, filtered, recording)
-            except Exception:
-                pass
 
     def _append_locked(self, agent_id: str, text: str) -> None:
         buffer = self._buffers.setdefault(agent_id, _AgentBuffer())

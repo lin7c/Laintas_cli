@@ -314,15 +314,6 @@ For new domain behavior, prefer composing roles and workflows with registered sk
 
 Theme and terminal behavior are user preferences exposed by commands such as `/theme` and `/config`. Resource screens inherit shared styles and key bindings; specialized live workspaces add only interactions required by their domain.
 
-`/agents` opens the responsive Workbench by default. Its agent rail, conversation,
-context inspector, activity feed, composer, and approval actions all support both
-mouse and keyboard input. On narrow terminals the rail becomes a `Ctrl+A` drawer
-and secondary panels collapse before the conversation does. Enter ordinary text to
-message the selected agent, use `/...` for CLI commands, `$ ...` for shell commands,
-or `Ctrl+P` for the command palette. Commands that need exclusive terminal control
-are handed back to the main REPL safely. Use `/agents --classic` when a terminal or
-Textual installation is incompatible with the Workbench.
-
 ## Security Boundaries
 
 Customization is intentionally split into declarative and executable surfaces:

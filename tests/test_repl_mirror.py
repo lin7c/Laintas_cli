@@ -7,35 +7,6 @@ import repl_mirror
 
 
 class ReplMirrorTransientTests(unittest.TestCase):
-    def test_workbench_subscriber_receives_visible_chunks_after_lock(self):
-        hub = repl_mirror.MirrorHub()
-        tee = repl_mirror.TeeFile(lambda: "primary", hub)
-        observed = []
-        hub.subscribe(lambda agent_id, text, recording: observed.append(
-            (agent_id, text, recording)))
-
-        hub.set_owner("agents")
-        tee.write("command output\n")
-        hub.start_recording()
-        tee.write("agent output\n")
-        hub.stop_recording()
-
-        self.assertEqual(observed, [
-            ("primary", "command output\n", False),
-            ("primary", "agent output\n", True),
-        ])
-
-    def test_workbench_subscriber_can_be_removed(self):
-        hub = repl_mirror.MirrorHub()
-        tee = repl_mirror.TeeFile(lambda: "primary", hub)
-        observed = []
-        callback = lambda *_args: observed.append(True)
-        hub.subscribe(callback)
-        hub.unsubscribe(callback)
-        hub.set_owner("agents")
-        tee.write("not observed\n")
-        self.assertEqual(observed, [])
-
     def test_transient_live_output_reaches_cli_but_not_history(self):
         hub = repl_mirror.MirrorHub()
         tee = repl_mirror.TeeFile(lambda: "primary", hub)

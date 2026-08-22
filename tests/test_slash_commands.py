@@ -444,17 +444,6 @@ class SlashRegistryTests(unittest.TestCase):
 
         plain.assert_called_once_with(["/agents", "tree"])
 
-    def test_agents_workbench_routes_commands_through_main_repl(self):
-        with mock.patch.object(laintas_cli, "_inject_input") as inject, \
-                mock.patch.object(laintas_cli.repl_mirror.hub, "write"):
-            ok, detail = laintas_cli._agents_repl_submit(
-                "/model list", kind="line")
-
-        self.assertTrue(ok)
-        self.assertEqual(detail, "Command queued")
-        self.assertEqual(inject.call_args.args[0], "/model list")
-        self.assertEqual(inject.call_args.kwargs["kind"], "line")
-
     def test_agents_rejects_extra_arguments_consistently(self):
         output = io.StringIO()
         old_console = laintas_cli.console
@@ -485,8 +474,8 @@ class SlashRegistryTests(unittest.TestCase):
         try:
             with mock.patch.object(
                     laintas_cli.sys.stdin, "isatty", return_value=True), \
-                    mock.patch(
-                        "workbench_tui.run_workbench",
+                    mock.patch.object(
+                        agents_mode.AgentsModeController, "run",
                         side_effect=RuntimeError("no screen")), \
                     mock.patch.object(
                         laintas_cli.threading, "Thread",
@@ -532,10 +521,7 @@ class SlashRegistryTests(unittest.TestCase):
                         return_value=controller) as controller_cls, \
                     mock.patch.object(
                         laintas_cli.threading, "Thread",
-                        side_effect=immediate_thread), \
-                    mock.patch(
-                        "workbench_tui.run_workbench") as run_workbench:
-                run_workbench.return_value = None
+                        side_effect=immediate_thread):
                 returned = laintas_cli._cmd_agents(
                     ["/agents"], {}, _Registry(), existing)
         finally:
@@ -549,8 +535,7 @@ class SlashRegistryTests(unittest.TestCase):
         self.assertIs(primary.chat_history, repl_history)
         self.assertIs(
             controller_cls.call_args.kwargs["existing_session"], existing)
-        run_workbench.assert_called_once_with(
-            controller, mirror=laintas_cli.repl_mirror.hub)
+        controller.run.assert_called_once_with()
 
     def test_clear_dispatches_as_new_session_command(self):
         output = io.StringIO()

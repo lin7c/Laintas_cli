@@ -13,7 +13,6 @@
     "local_runtime",
     "resource_ui",
     "agents_mode",
-    "workbench_tui",
     "tools",
     "symbols",
     "skills",
@@ -121,7 +120,6 @@
     "certifi>=2024.0.0",
     "rich>=13.0.0",
     "prompt_toolkit>=3.0.0",
-    "textual~=8.2.8",
     "pysocks>=1.7"
   ]
 }
