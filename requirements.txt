@@ -4,6 +4,7 @@ requests>=2.28.0
 certifi>=2024.0.0
 rich>=13.0.0
 prompt_toolkit>=3.0.0
+textual~=8.2.8
 pysocks>=1.7
 
 # Optional extras - install via pip install .[<extra>]  (e.g. .[browser,webrtc])

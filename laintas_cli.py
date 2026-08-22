@@ -2988,15 +2988,17 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
         )),
     CommandSpec(
         "/agents", "Open the full-screen multi-Agent focus and activity view",
-        "Agents & Terminals", "/agents [agent-id|tree|--plain]",
-        subcommands=("tree", "--plain"),
+        "Agents & Terminals", "/agents [agent-id|tree|--plain|--classic]",
+        subcommands=("tree", "--plain", "--classic"),
         help_text=(
-            "Opens a dedicated Focus + Agent Rail + Event Feed interface. Passing "
+            "Opens the Textual Workbench with Agent rail, conversation, activity, "
+            "context, command palette, slash commands, shell routing, and approvals. Passing "
             "an Agent ID selects its conversation view without changing deployment "
-            "or shell ownership. Use --plain for a script-friendly snapshot. Inside "
-            "Agents Mode, Enter sends to the focused Agent, @Agent performs one-shot "
-            "routing, Tab opens the Agent rail, Alt+arrow switches "
-            "Agent/terminal, PageUp/PageDown scrolls, and Esc exits."
+            "or shell ownership. Use --plain for a script-friendly snapshot or "
+            "--classic for the legacy prompt_toolkit view. In the Workbench, Enter "
+            "sends to the focused Agent, / runs a CLI command, $ runs a shell command, "
+            "Ctrl+P opens the command palette, Ctrl+A opens Agents, Alt+arrow switches "
+            "Agent/terminal, and Ctrl+Q exits."
         )),
     CommandSpec("/term", "List, create, or rename terminals", "Agents & Terminals", "/term [name|rename <old> <new>]", aliases=("/t",), subcommands=("rename",)),
     CommandSpec("/helpwo", "Connect this CLI to Helpwo as a runtime environment (this folder = its workspace), or open the local/hosted app; /helpwo stop to go offline", "Agents & Terminals", "/helpwo [--port N] [--host ADDR] [--dist <path>] [--remote] | stop", subcommands=("stop",)),
@@ -16195,7 +16197,8 @@ def _cmd_agents_plain(parts: list) -> None:
             _employee_capability_text(agent),
             title=f"Employee: {agent.name}", border_style="cyan"))
     else:
-        console.print("[yellow]Usage: /agents \\[tree|agent-id|--plain][/yellow]")
+        console.print(
+            "[yellow]Usage: /agents \\[tree|agent-id|--plain|--classic][/yellow]")
 
 
 def _submit_primary_runtime_task(agent, text: str, deps, session: dict,
@@ -16370,7 +16373,7 @@ def _exit_agents_view() -> None:
     repl_mirror.hub.set_owner("cli")
 
 
-def _agents_repl_submit(text: str) -> tuple[bool, str]:
+def _agents_repl_submit(text: str, *, kind: str = "dialogue") -> tuple[bool, str]:
     """Forward one /agents input line to the outer REPL as Agent dialogue.
 
     Non-command input in the /agents view means "talk to this Agent", so the
@@ -16383,8 +16386,9 @@ def _agents_repl_submit(text: str) -> tuple[bool, str]:
     # Echo the accepted line into the mirror the way the prompt would.
     repl_mirror.hub.write(
         _mirror_target_agent_id(), f"\x1b[2m› {text}\x1b[0m\n")
-    _inject_input(text, threading.Event(), kind="dialogue")
-    return True, "Sent"
+    input_kind = "line" if kind == "line" else "dialogue"
+    _inject_input(text, threading.Event(), kind=input_kind)
+    return True, "Command queued" if input_kind == "line" else "Sent"
 
 
 def _cmd_agents(parts: list, session: dict, agent_registry=None,
@@ -16392,9 +16396,11 @@ def _cmd_agents(parts: list, session: dict, agent_registry=None,
     """Open Agents Mode; retain a plain snapshot for scripts and fallback."""
     args = list(parts[1:])
     plain = "--plain" in args or not sys.stdin.isatty()
-    args = [item for item in args if item != "--plain"]
+    classic = "--classic" in args
+    args = [item for item in args if item not in {"--plain", "--classic"}]
     if len(args) > 1:
-        console.print("[yellow]Usage: /agents \\[tree|agent-id|--plain][/yellow]")
+        console.print(
+            "[yellow]Usage: /agents \\[tree|agent-id|--plain|--classic][/yellow]")
         return
     # `tree` is an output command, not an initial selection for Agents Mode.
     # Keep it deterministic in both interactive and non-interactive shells.
@@ -16459,7 +16465,22 @@ def _cmd_agents(parts: list, session: dict, agent_registry=None,
         _enter_agents_view(controller)
 
         def _view():
+            deferred_line = None
             try:
+                # Textual is the default full workbench. Keep the proven
+                # prompt_toolkit implementation as a zero-network fallback
+                # for constrained installs and as an emergency classic mode.
+                if (classic or os.environ.get(
+                        "LAINTAS_AGENTS_UI", "").casefold() == "classic"):
+                    controller.run()
+                else:
+                    import workbench_tui
+                    deferred_line = workbench_tui.run_workbench(
+                        controller, mirror=repl_mirror.hub)
+            except ImportError as exc:
+                console.print(
+                    f"[yellow]Textual workbench unavailable ({escape(str(exc))}); "
+                    "using classic Agents Mode.[/yellow]")
                 controller.run()
             except Exception as exc:
                 console.print(
@@ -16469,6 +16490,8 @@ def _cmd_agents(parts: list, session: dict, agent_registry=None,
                 _cmd_agents_plain(["/agents", *args])
             finally:
                 _exit_agents_view()
+            if deferred_line:
+                _agents_repl_submit(deferred_line, kind="line")
 
         threading.Thread(
             target=_view, daemon=True, name="agents-view").start()
