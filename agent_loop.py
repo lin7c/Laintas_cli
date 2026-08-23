@@ -7582,6 +7582,9 @@ def run_agent_loop(
             # misconfiguration and chased through the routing code instead.
             _spin_model = _live_status_model() or "\u2014"
             _spin_mode = _active_mode_label()
+            # Captured once per call like the model/mode labels: the gear is a
+            # per-request payload field, so it cannot change mid-call.
+            _spin_effort = str(get_runtime_config("reasoning_effort") or "").strip()
             try:
                 from rich.live import Live
                 from rich.spinner import Spinner
@@ -7625,7 +7628,8 @@ def run_agent_loop(
                             style="#8b949e",
                         )
                     if _cw >= 72:
-                        _txt.append(f" {symbols.BULLET} {_spin_model} {symbols.BULLET} {_spin_mode}", style="#8b949e")
+                        _gear = f" {symbols.BULLET} {_spin_effort}" if _spin_effort else ""
+                        _txt.append(f" {symbols.BULLET} {_spin_model}{_gear} {symbols.BULLET} {_spin_mode}", style="#8b949e")
                     _spinner.text = _txt
                     parts.append(_spinner)
                     # Reserve a constant number of preview rows for the whole
@@ -7744,7 +7748,7 @@ def run_agent_loop(
                 # too, and on the shared TeeFile console its default
                 # redirect_stdout=True feedback-loops into a deadlock. A static
                 # print is deadlock-free and works without rich Live.
-                deps.console.print(f"[#3fb950]thinking… {symbols.BULLET} {_spin_model} {symbols.BULLET} {_spin_mode}[/#3fb950]")
+                deps.console.print(f"[#3fb950]thinking… {symbols.BULLET} {_spin_model} {symbols.BULLET} {_spin_effort} {symbols.BULLET} {_spin_mode}[/#3fb950]")
                 with nullcontext():
                     try:
                         response = deps.call_backend(

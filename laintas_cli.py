@@ -4070,6 +4070,19 @@ def _render_rprompt():
             (f"class:rprompt-sep", f" {symbols.BULLET} "),
             ("class:rprompt-model", _model_display),
         ])
+        # Reasoning-effort gear sits right after the model: it qualifies the
+        # model the same way the mode does, and /config reasoning_effort is
+        # where it is changed.
+        try:
+            import agent_loop as _al
+            _effort = str(_al.get_runtime_config("reasoning_effort") or "").strip()
+        except Exception:
+            _effort = ""
+        if _effort:
+            result.extend([
+                (f"class:rprompt-sep", f" {symbols.BULLET} "),
+                ("class:rprompt-model", _effort),
+            ])
     if width >= 108 and not _status_cache.get("multi_agent"):
         agent = _status_cache.get("agent", "")
         terminal = _status_cache.get("terminal", "")
