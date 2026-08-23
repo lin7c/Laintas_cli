@@ -9380,20 +9380,35 @@ def run_agent_loop(
         # ── Repetition circuit breaker (mirrors TokenBudgetTracker stop decision) ──
         if _no_progress_count >= _repetition_threshold:
             if get_runtime_config("repetition_policy") == "interrupt":
-                _exit_reason = TRANSITION_REPETITION
-                if events_cb is not None:
+                # Gradient before enforcement: warn once and let the model
+                # adapt; only force-exit if repetition persists past the
+                # warning. Straight to break on step 3 would kill legitimate
+                # similar-output work (batch reads, incremental builds).
+                if not _output_repetition_warned:
                     deps.console.print(
                         f"[yellow]{symbols.WARN} Output repetition detected: last {_no_progress_count} steps "
-                        f"produced highly similar output. Exiting to prevent infinite loop.[/yellow]"
+                        f"produced highly similar output. Change strategy or the loop will exit.[/yellow]"
                     )
-                _append_short_memory(state, (
-                    f"\n  {symbols.WARN} Loop exited: {_no_progress_count} consecutive steps with "
-                    f"near-identical output. Task may be stuck."
-                ))
-                if events_cb is not None and pending_events:
-                    events_cb(pending_events)
-                    pending_events.clear()
-                break
+                    _append_short_memory(state, (
+                        f"\n  {symbols.WARN} {_no_progress_count} consecutive steps with "
+                        f"near-identical output; will force-exit if repetition continues."
+                    ))
+                    _output_repetition_warned = True
+                else:
+                    _exit_reason = TRANSITION_REPETITION
+                    if events_cb is not None:
+                        deps.console.print(
+                            f"[yellow]{symbols.WARN} Output repetition detected: last {_no_progress_count} steps "
+                            f"produced highly similar output. Exiting to prevent infinite loop.[/yellow]"
+                        )
+                    _append_short_memory(state, (
+                        f"\n  {symbols.WARN} Loop exited: {_no_progress_count} consecutive steps with "
+                        f"near-identical output. Task may be stuck."
+                    ))
+                    if events_cb is not None and pending_events:
+                        events_cb(pending_events)
+                        pending_events.clear()
+                    break
             if not _output_repetition_warned:
                 _warning = (
                     f"Output repetition detected: the last {_no_progress_count} steps "

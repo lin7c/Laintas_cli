@@ -445,7 +445,9 @@ class AgentTerminationTests(unittest.TestCase):
         } for _ in range(5)]
         result, calls, _ = self._run(repeated_calls, max_loops=6)
 
-        self.assertEqual(len(calls), 4)
+        # Gradient: interrupt warns once before force-exiting, so all five
+        # repeated calls execute (previously the loop broke after 4).
+        self.assertEqual(len(calls), 5)
         self.assertFalse(result["success"])
         self.assertEqual(
             result["exit_reason"], agent_loop.TRANSITION_REPETITION)
