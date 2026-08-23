@@ -174,6 +174,8 @@ _DEFAULT_CONFIG = {
     "critic_interval": 8,              # Run the critic every N loop iterations (0 disables). One extra (billed) model call each time it fires.
     "critic_min_loop": 4,             # Don't run the critic before this loop index — no point critiquing the first few exploratory steps.
     "critic_score_threshold": 50,      # Critic progress score (0-100) below this — or an explicit on_track=false — triggers a corrective nudge.
+    "critic_nudge_cooldown": 2,       # Minimum critic intervals between injections of a SIMILAR nudge (same issue); a different issue is injected immediately.
+    "critic_max_failures": 3,         # Consecutive critic call failures (LLM error / unparseable reply) before the critic auto-disables for the rest of the task, with a visible warning.
     "enable_mouse": False,             # REPL input box: click-to-position the cursor. Off by default: terminal mouse reporting hijacks native drag-to-select of scrollback (Shift+drag is the only workaround), which costs more than click-to-position gains
     "confirm_direct_commands": False,  # False = commands the USER types directly at the REPL run like a normal terminal (no policy approval prompt, e.g. rm); True = subject direct commands to the same needs_approval prompt as AI-issued ones. Hard `deny` policy rules always apply regardless.
     "trigger_scan_interval": 0.5,      # seconds between trigger scanner sweeps
@@ -701,6 +703,8 @@ _RUNTIME_CONFIG_DESCRIPTIONS = {
     "critic_interval": "Run the long-task critic every N loop iterations (0 disables)",
     "critic_min_loop": "Don't run the critic before this loop index",
     "critic_score_threshold": "Critic progress score (0-100) below this triggers a corrective nudge",
+    "critic_nudge_cooldown": "Minimum critic intervals between injections of a similar (same-issue) nudge",
+    "critic_max_failures": "Consecutive critic failures before it auto-disables for the rest of the task",
     "confirm_direct_commands": "Ask for approval on commands YOU type directly at the REPL (False = run like a normal terminal; hard deny rules still apply)",
     "enable_mouse": "Enable mouse click-to-position in the REPL input box",
     "tool_output_fold": "Max lines of tool output shown before folding (first half + … + last half); 0 = suppress preview",
@@ -6809,6 +6813,19 @@ def run_agent_loop(
     done = False
     _exit_reason = TRANSITION_MAX_LOOPS  # default: assume exhaustion unless overridden by a break
     _completion_source = ""
+    # ── Long-task critic per-task state (see critic.py) ──────────────────
+    # Nudge persistence + cooldown: the injected <progress_check> message is
+    # appended to thread_messages (the durable local history), not just to the
+    # one-shot _thread_to_send, so both the model and the NEXT critic pass see
+    # that the correction was already given. A near-identical issue inside the
+    # cooldown window is suppressed and counted; three suppressed repeats
+    # escalate to a critic_escalation event for upper-layer policy.
+    _critic_last_nudge_loop = -1          # loop index of the last injected nudge
+    _critic_last_issue = ""               # issue text of the last injected nudge
+    _critic_similar_streak = 0            # suppressed similar-issue nudges in a row
+    _critic_fail_streak = 0               # consecutive assess failures
+    _critic_anchor_idx = 0                # thread_messages index at last assessment
+    _critic_disabled = False              # auto-disabled after persistent failures
     _run_id = uuid.uuid4().hex
     # Published on `state` so the auxiliary calls that run outside this frame
     # (compaction, memory consolidation) can stamp the same trajectory on their
@@ -7286,6 +7303,14 @@ def run_agent_loop(
         system_prompt = (
             system_prompt.rstrip() + "\n\n" + _RUNTIME_OWNERSHIP_PROMPT
         )
+        # Critic hook (thread mode only): teach the model to recognise
+        # <progress_check> blocks as harness-authored so mid-conversation
+        # nudges carry system-level trust instead of being read as user prose
+        # or adversarial tool output (Claude Code system-reminder pattern).
+        if _thread_mode and get_runtime_config("critic_enabled"):
+            system_prompt = (
+                system_prompt.rstrip() + "\n\n" + critic.HOOK_SECTION
+            )
         # Hired employees keep a persistent capability/persona overlay.  A
         # deployment assignment is a fresh work context layered on top of it.
         employee_profile = getattr(current_agent, "profile", None)
@@ -7450,11 +7475,15 @@ def run_agent_loop(
         # Runs before redaction so the nudge is scrubbed and sent normally.
         try:
             _crit_interval = int(get_runtime_config("critic_interval") or 0)
+            _crit_min = int(get_runtime_config("critic_min_loop") or 0)
+            # First assessment at critic_min_loop (early drift is the most
+            # common kind), then every critic_interval loops after that.
             if (_thread_to_send is not None
                     and get_runtime_config("critic_enabled")
+                    and not _critic_disabled
                     and _crit_interval > 0
-                    and loop >= int(get_runtime_config("critic_min_loop") or 0)
-                    and loop % _crit_interval == 0):
+                    and (loop == _crit_min
+                         or (loop > _crit_min and loop % _crit_interval == 0))):
                 _crit_cwd = state.get("cwd") or os.getcwd()
 
                 _aux_m, _aux_p = aux_model_override()
@@ -7480,28 +7509,86 @@ def run_agent_loop(
                         task_kind="critic", trajectory_id=_traj)
                     return (resp or {}).get("reply", "") if isinstance(resp, dict) else ""
 
-                _verdict = critic.assess(original_input, _thread_to_send, _crit_llm_fn)
-                # Persist critic score for local diagnostics only. The server
-                # training pipeline does not read client critic scores.
-                # Local diagnostics only; server-side training ignores it.
-                if isinstance(_verdict, dict) and _verdict.get("score") is not None:
-                    event_log.append("critic_assessment",
-                                     score=_verdict.get("score"),
-                                     on_track=_verdict.get("on_track", True),
-                                     issue=_verdict.get("issue", ""))
-                _crit_thresh = int(get_runtime_config("critic_score_threshold") or 50)
-                if critic.is_off_track(_verdict, _crit_thresh):
-                    _thread_to_send = _thread_to_send + [{
-                        "role": "user",
-                        "content": critic.nudge_text(original_input, _verdict),
-                    }]
-                    if events_cb is not None:
+                _anchor = (thread_messages[_critic_anchor_idx]
+                           if 0 < _critic_anchor_idx < len(thread_messages) else None)
+                _verdict, _crit_fail = critic.assess_detailed(
+                    original_input, _thread_to_send, _crit_llm_fn, anchor=_anchor)
+                if _verdict is None:
+                    # Failure visibility: a silently broken critic (bad aux
+                    # model config, unparseable replies) used to fail forever
+                    # with no symptom. Log the reason and auto-disable after
+                    # a streak so we stop burning calls on a dead path.
+                    _critic_fail_streak += 1
+                    event_log.append("critic_failure", loop=_loop_id,
+                                     reason=_crit_fail or "unknown",
+                                     streak=_critic_fail_streak)
+                    if _critic_fail_streak >= int(get_runtime_config("critic_max_failures") or 3):
+                        _critic_disabled = True
+                        event_log.append("critic_disabled", loop=_loop_id,
+                                         streak=_critic_fail_streak)
                         try:
                             deps.console.print(
-                                f"[yellow]{symbols.WARN} Progress check: off track (score "
-                                f"{_verdict.get('score')}/100) — corrective guidance injected[/yellow]")
+                                f"[yellow]{symbols.WARN} Progress critic disabled after "
+                                f"{_critic_fail_streak} consecutive failures "
+                                f"({_crit_fail}); goal-drift checks are off for the rest "
+                                f"of this task.[/yellow]")
                         except Exception:
                             pass
+                else:
+                    _critic_fail_streak = 0
+                    _critic_anchor_idx = len(thread_messages)
+                    # Persist critic score for local diagnostics only. The server
+                    # training pipeline does not read client critic scores.
+                    if _verdict.get("score") is not None:
+                        event_log.append("critic_assessment",
+                                         score=_verdict.get("score"),
+                                         on_track=_verdict.get("on_track", True),
+                                         issue=_verdict.get("issue", ""))
+                    _crit_thresh = int(get_runtime_config("critic_score_threshold") or 50)
+                    if critic.is_off_track(_verdict, _crit_thresh):
+                        _issue = _verdict.get("issue", "")
+                        _cooldown_loops = _crit_interval * max(
+                            1, int(get_runtime_config("critic_nudge_cooldown") or 2))
+                        _is_repeat = (critic.similar_issues(_issue, _critic_last_issue)
+                                      and (loop - _critic_last_nudge_loop) < _cooldown_loops)
+                        if _is_repeat:
+                            # Same problem, nudge already given, cooldown active:
+                            # re-injecting teaches nothing. Count and escalate.
+                            _critic_similar_streak += 1
+                            event_log.append("critic_nudge_suppressed", loop=_loop_id,
+                                             issue=_issue,
+                                             streak=_critic_similar_streak)
+                            if _critic_similar_streak >= 3:
+                                event_log.append("critic_escalation", loop=_loop_id,
+                                                 score=_verdict.get("score"),
+                                                 issue=_issue)
+                                try:
+                                    deps.console.print(
+                                        f"[yellow]{symbols.WARN} Progress check: still off track "
+                                        f"(score {_verdict.get('score')}/100) after repeated "
+                                        f"corrections — escalated.[/yellow]")
+                                except Exception:
+                                    pass
+                                _critic_similar_streak = 0
+                        else:
+                            _nudge = critic.nudge_text(original_input, _verdict)
+                            # Durable: append to thread_messages so the model AND
+                            # the next critic pass both see the correction was
+                            # already given; _thread_to_send (built before this
+                            # point as a new list) carries its own copy.
+                            thread_messages.append({"role": "user", "content": _nudge})
+                            _thread_to_send = _thread_to_send + [
+                                {"role": "user", "content": _nudge}]
+                            _critic_last_nudge_loop = loop
+                            _critic_last_issue = _issue
+                            _critic_similar_streak = 0
+                            if events_cb is not None:
+                                try:
+                                    deps.console.print(
+                                        f"[yellow]{symbols.WARN} Progress check: off track (score "
+                                        f"{_verdict.get('score')}/100) — corrective guidance injected[/yellow]")
+                                except Exception:
+                                    pass
         except Exception:
             pass
 
