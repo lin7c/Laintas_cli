@@ -9331,8 +9331,18 @@ def run_agent_loop(
         if _step_signal and _step_signal.strip():
             _current_fp = _output_fingerprint(_step_signal)
             if _output_fingerprints:
-                _sim = _output_similarity(_output_fingerprints[-1], _current_fp)
-                if _sim > _sim_threshold and _current_fp:
+                # Periodic loops (A,B,A,B) never match their immediate
+                # predecessor, so also compare against the whole rolling
+                # window: matching >=2 stored fingerprints means this step is
+                # re-visiting old ground, not extending it. Progressive work
+                # (growing logs, incremental builds) only matches the most
+                # recent fingerprint and stays below the bar.
+                _adjacent_sim = _output_similarity(_output_fingerprints[-1], _current_fp)
+                _window_matches = sum(
+                    1 for _prev_fp in _output_fingerprints
+                    if _output_similarity(_prev_fp, _current_fp) > _sim_threshold
+                )
+                if (_adjacent_sim > _sim_threshold or _window_matches >= 2) and _current_fp:
                     _no_progress_count += 1
                 else:
                     _no_progress_count = 0

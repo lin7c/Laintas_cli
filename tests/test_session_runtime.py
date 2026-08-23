@@ -450,6 +450,70 @@ class AgentTerminationTests(unittest.TestCase):
         self.assertEqual(
             result["exit_reason"], agent_loop.TRANSITION_REPETITION)
 
+    def test_output_similarity_window_detects_periodic_loop(self):
+        # ABAB never matches its immediate predecessor; the rolling-window
+        # match (>=2 similar stored fingerprints) must still count it.
+        fingerprints = []
+        count = 0
+        threshold = 0.85
+        for signal in ["alpha beta gamma delta", "omega zeta eta theta"] * 3:
+            current = agent_loop._output_fingerprint(signal)
+            if fingerprints:
+                adjacent = agent_loop._output_similarity(fingerprints[-1], current)
+                window_matches = sum(
+                    1 for prev in fingerprints
+                    if agent_loop._output_similarity(prev, current) > threshold)
+                if (adjacent > threshold or window_matches >= 2) and current:
+                    count += 1
+                else:
+                    count = 0
+            fingerprints.append(current)
+            if len(fingerprints) > 5:
+                fingerprints = fingerprints[-5:]
+        self.assertGreaterEqual(count, 2)
+
+    def test_output_similarity_window_ignores_progressive_growth(self):
+        # Output gaining tokens each step is real work, not repetition.
+        fingerprints = []
+        count = 0
+        threshold = 0.85
+        for n in (10, 20, 30, 40, 50, 60):
+            signal = " ".join(f"word{i}" for i in range(n))
+            current = agent_loop._output_fingerprint(signal)
+            if fingerprints:
+                adjacent = agent_loop._output_similarity(fingerprints[-1], current)
+                window_matches = sum(
+                    1 for prev in fingerprints
+                    if agent_loop._output_similarity(prev, current) > threshold)
+                if (adjacent > threshold or window_matches >= 2) and current:
+                    count += 1
+                else:
+                    count = 0
+            fingerprints.append(current)
+            if len(fingerprints) > 5:
+                fingerprints = fingerprints[-5:]
+        self.assertEqual(count, 0)
+
+    def test_output_similarity_window_counts_exact_repeats(self):
+        fingerprints = []
+        count = 0
+        threshold = 0.85
+        for _ in range(5):
+            current = agent_loop._output_fingerprint("same output line")
+            if fingerprints:
+                adjacent = agent_loop._output_similarity(fingerprints[-1], current)
+                window_matches = sum(
+                    1 for prev in fingerprints
+                    if agent_loop._output_similarity(prev, current) > threshold)
+                if (adjacent > threshold or window_matches >= 2) and current:
+                    count += 1
+                else:
+                    count = 0
+            fingerprints.append(current)
+            if len(fingerprints) > 5:
+                fingerprints = fingerprints[-5:]
+        self.assertGreaterEqual(count, 4)
+
     def test_repeated_failures_warn_without_hard_blocking_by_default(self):
         repeated_calls = [{
             "reply": "",
