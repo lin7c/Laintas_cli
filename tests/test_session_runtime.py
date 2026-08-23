@@ -450,6 +450,21 @@ class AgentTerminationTests(unittest.TestCase):
         self.assertEqual(
             result["exit_reason"], agent_loop.TRANSITION_REPETITION)
 
+    def test_output_fingerprint_keeps_short_number_and_path_distinction(self):
+        # Blanket <N>/<PATH> collapsing made distinct outputs share a
+        # fingerprint (repetition false positives). Short numbers and paths
+        # must keep their distinguishing power; only timestamps, ANSI, hex,
+        # and epoch-like long numbers are normalized away.
+        fp = agent_loop._output_fingerprint
+        self.assertNotEqual(fp("read /tmp/a.py line 42 ok"),
+                            fp("read /tmp/b.py line 42 ok"))
+        self.assertNotEqual(fp("attempt 1 failed"), fp("attempt 2 failed"))
+        self.assertEqual(fp("2026-08-23 15:00:00 done"),
+                         fp("2026-08-23 15:00:05 done"))
+        self.assertEqual(fp("epoch 1755941821.123 ok"),
+                         fp("epoch 1755941899.456 ok"))
+        self.assertEqual(fp("at 0x1a2b3c done"), fp("at 0x9f8e7d done"))
+
     def test_output_similarity_window_detects_periodic_loop(self):
         # ABAB never matches its immediate predecessor; the rolling-window
         # match (>=2 similar stored fingerprints) must still count it.

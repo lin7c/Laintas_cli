@@ -5492,17 +5492,22 @@ def _call_fingerprint(name: str, salient: str) -> str:
 def _output_fingerprint(text: str) -> str:
     """Normalize command output for similarity detection.
 
-    Strips ANSI, timestamps, hex addresses, numbers, paths, and collapses
-    whitespace. Two outputs with the same fingerprint are semantically
-    identical modulo variable data. Used for detecting diminishing returns.
+    Strips ANSI, timestamps, hex addresses, and long (>=7 digit) numbers,
+    then collapses whitespace. Only demonstrably information-free noise is
+    normalized: blanket number and path collapsing (<N>/<PATH>) used to make
+    distinct outputs (ten different files, differently-numbered lines) share
+    a fingerprint, which fired repetition false positives. Long numbers are
+    kept normalized because they are almost always epochs/ids/hashes;
+    short numbers (line numbers, counts) carry real signal. Counter-only
+    repeats are still caught by the rolling-window match over the
+    surviving tokens.
     """
     if not text:
         return ""
     fp = re.sub(r'\x1b\[[0-9;?]*[a-zA-Z]', '', text)   # ANSI escape codes
     fp = re.sub(r'\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}[^\s]*', '<TS>', fp)
     fp = re.sub(r'0x[0-9a-fA-F]+', '<HEX>', fp)
-    fp = re.sub(r'\b\d+\b', '<N>', fp)
-    fp = re.sub(r'/[^\s]+', '<PATH>', fp)
+    fp = re.sub(r'\b\d{7,}(?:\.\d+)?\b', '<N>', fp)     # epoch/id-like long numbers
     fp = re.sub(r'\s+', ' ', fp).strip()
     return fp
 
