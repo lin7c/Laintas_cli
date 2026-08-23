@@ -18,7 +18,9 @@ usable. Token estimate ~= chars/4 (opencode ``Token.estimate``).
 from __future__ import annotations
 
 import json
+import math
 import os
+import re
 from typing import Optional
 
 _POLICY_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "policy.json")
@@ -41,8 +43,11 @@ def reload(path: str = _POLICY_PATH) -> dict:
     return load(path)
 
 
+_CJK_RE = re.compile(r"[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af]")
+
+
 def estimate_tokens(text: str) -> int:
-    """Cheap token estimate (~chars/4), matching opencode's Token.estimate.
+    """CJK-aware conservative token estimate.
 
     Accepts any value; non-str is JSON-serialized first so callers can pass a
     messages array directly.
@@ -52,7 +57,11 @@ def estimate_tokens(text: str) -> int:
             text = json.dumps(text, ensure_ascii=False)
         except (TypeError, ValueError):
             text = str(text)
-    return (len(text) + 3) // 4
+    if not text:
+        return 0
+    cjk_count = len(_CJK_RE.findall(text))
+    latin_count = len(text) - cjk_count
+    return math.ceil(latin_count / 4 + cjk_count / 2)
 
 
 def usable_tokens(window: int, max_output: int, policy: Optional[dict] = None) -> int:

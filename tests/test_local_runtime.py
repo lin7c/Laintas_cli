@@ -18,12 +18,14 @@ The bug being guarded against in each case is a real one that shipped:
 import base64
 import json
 import os
+import signal
 import socket
 import struct
 import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
@@ -33,6 +35,17 @@ from urllib.request import Request, urlopen
 import helpwo_server
 import local_runtime
 import peer_coordination
+
+
+class ProcessGroupCleanupTests(unittest.TestCase):
+    def test_kill_process_group_reaps_the_leader(self):
+        proc = mock.Mock()
+        proc.pid = 4242
+        with mock.patch.object(local_runtime.os, "getpgid", return_value=4242), \
+             mock.patch.object(local_runtime.os, "killpg") as killpg:
+            local_runtime._kill_process_group(proc)
+        killpg.assert_called_once_with(4242, signal.SIGKILL)
+        proc.wait.assert_called_once_with(timeout=2)
 
 
 class _Registry:
@@ -201,11 +214,14 @@ class LoopbackRuntimeTests(unittest.TestCase):
             # rejection that was never requested.
             self.assertEqual(final["status"], "success")
 
-    def test_exec_times_out_and_kills_the_process(self):
+    def test_a_silent_command_is_stopped_and_killed(self):
+        """`timeout` is an idle budget: a command that says nothing for that
+        long is presumed wedged. A command that keeps printing is not — see
+        test_shell_idle_budget for the other half of that contract."""
         events = self._exec("r-slow", "sleep 30", timeout=2)
         final = events[-1]
         self.assertEqual(final["status"], "fail")
-        self.assertIn("timeout", final.get("error", ""))
+        self.assertIn("no output", final.get("error", ""))
 
     def test_abort_stops_a_running_command(self):
         req_id = "r-abort"

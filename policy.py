@@ -587,12 +587,34 @@ def is_delete_command(command: str) -> bool:
     stripped = _unwrap_parent(command)
     stripped = re.sub(r"^sudo(?:\s+-\S+)*\s+", "", stripped)
     patterns = (
-        r"(?:^|[;&|]\s*|\n\s*)(?:\S*/)?(?:rm|rmdir|unlink|shred)(?:\s|$)",
+        # Shell control-flow keywords are command boundaries too. Without
+        # these, `for d in ...; do rm -rf "$d"; done` bypasses the always-ask
+        # tier even though the same rm outside a loop is caught.
+        r"(?:^|[;&|]\s*|\n\s*|\b(?:do|then|else)\s+)(?:\S*/)?"
+        r"(?:rm|rmdir|unlink|shred)(?:\s|$)",
         r"\bxargs\s+(?:\S*/)?(?:rm|rmdir|unlink|shred)(?:\s|$)",
         r"(?:^|[;&|]\s*|\n\s*)find(?:\s|$)[^\n;&|]*\s-delete(?:\s|$)",
         r"(?:^|[;&|]\s*|\n\s*)find(?:\s|$)[^\n;&|]*\s-exec(?:dir)?\s+(?:\S*/)?(?:rm|rmdir|unlink|shred)(?:\s|$)",
     )
     return any(re.search(pattern, stripped) for pattern in patterns)
+
+
+def is_unsafe_shared_temp_cleanup(command: str) -> bool:
+    """Catch shared-temp sweeps capable of selecting the root itself.
+
+    GNU find evaluates its starting point. Therefore `find /tmp ... -name
+    'tmp*'` can yield `/tmp`; feeding that result to rm recursively deletes the
+    shared root. A depth guard makes owned-child sweeps safe, so preserve those.
+    """
+    stripped = _unwrap_parent(command)
+    shared_root = r"(?:/tmp/?|/var/tmp/?|\$\{?TMPDIR\}?)(?=\s|$)"
+    find_from_root = re.search(
+        rf"(?:^|[;&|()]|\$\()\s*find\s+{shared_root}", stripped)
+    if not find_from_root:
+        return False
+    if re.search(r"\s-mindepth\s+[1-9]\d*\b", stripped):
+        return False
+    return is_delete_command(stripped)
 
 
 def evaluate(command: str, cwd: str = None,
@@ -666,6 +688,17 @@ def evaluate(command: str, cwd: str = None,
                   "what will execute cannot be determined before it runs")
         _write_audit(_audit_entry(command, "needs_approval", reason, cwd, req_id, agent_id))
         return PolicyDecision("needs_approval", "", reason)
+
+    # Shared temporary roots are multi-tenant state. This is denied rather
+    # than approved because the target set is dynamic and cannot be reviewed
+    # reliably: the exact incident command selected `/tmp` itself and erased
+    # tmux's control socket while its detached processes kept running.
+    if mode != "disabled" and is_unsafe_shared_temp_cleanup(stripped):
+        reason = ("unsafe shared-temp cleanup: find starts at the shared root "
+                  "without -mindepth 1 and feeds a delete operation")
+        _write_audit(_audit_entry(command, "deny", reason,
+                                  cwd, req_id, agent_id))
+        return PolicyDecision("deny", "shared-temp-root", reason)
 
     # ── Destructive delete utilities: always-ask tier ───────────────────
     # rm/rmdir/unlink/shred (direct or via xargs) are treated like

@@ -35,7 +35,6 @@ TREE_LAST = "└─"     # last child node (no sibling below)
 TREE_VERT = "│"      # vertical continuation line
 
 # ── Special ────────────────────────────────────────────────────────────────
-ZAP = "⚡"        # interrupt / fast action
 RETURN = "⏎"     # line return / enter
 
 # ── Spinners ───────────────────────────────────────────────────────────────

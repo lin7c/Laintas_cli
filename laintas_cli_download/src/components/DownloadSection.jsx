@@ -7,7 +7,7 @@ import {
 } from 'lucide-react';
 import { useLanguage } from '@/contexts/LanguageContext';
 
-const RELEASE = 'v1.18.0';
+const RELEASE = 'v1.19.0';
 const RELEASE_BASE = `https://cli.laintas.com/releases/${RELEASE}`;
 const INSTALL_COMMAND = 'curl -fsSL https://cli.laintas.com/install.sh | bash';
 

@@ -23,3 +23,4 @@ from .adapter import (  # noqa: F401
     repeat_stop,
 )
 from .summary_prompt import summary_prompt  # noqa: F401
+from .review_prompt import review_prompt  # noqa: F401

@@ -843,8 +843,18 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
         headers, cookies = backend_profiles.request_auth(profile, _session())
         headers["Content-Type"] = "application/json"
         try:
-            resp = _requests.post(url, json=body, headers=headers, cookies=cookies,
-                                  stream=True, timeout=120, allow_redirects=False)
+            resp = _requests.post(
+                url, json=body, headers=headers, cookies=cookies,
+                stream=True,
+                # Must match the CLI's own streaming budget (laintas_cli.py's
+                # 420s), not undercut it. This is a read timeout — silence
+                # between bytes — and a reasoning model can buffer its thinking
+                # for minutes. At 120s this hop gave up first and surfaced it as
+                # "backend unreachable": a timeout dressed up as a broken
+                # backend. The gateway's 10s SSE keepalives are what make the
+                # difference invisible today; they are a courtesy, not a
+                # guarantee to design against.
+                timeout=420, allow_redirects=False)
         except Exception as e:
             self._json(502, {"error": f"backend unreachable: {e}"})
             return

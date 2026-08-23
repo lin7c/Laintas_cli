@@ -16,16 +16,43 @@ from __future__ import annotations
 
 import hashlib
 import re
+import threading
+from collections import OrderedDict
 from typing import Optional
 
 import skills
 import embeddings
 
 
-# Per-run cache of the ranking result, keyed by (task, catalog fingerprint, k).
-# The task is constant within a run and skills rarely change, so this collapses
-# the every-loop prompt rebuild into a single /api/rank call per run.
-_rank_cache: dict = {"key": None, "result": None}
+# Cache of ranking results, keyed by (task, catalog fingerprint, k). The task is
+# constant within a run and skills rarely change, so this collapses the
+# every-loop prompt rebuild into a single /api/rank call per run.
+#
+# It holds MANY entries, not one, because agents run concurrently: with a
+# single slot, N sub-agents working on N different tasks evicted each other on
+# every loop and the hit rate collapsed to zero — turning "one rank call per
+# run" into one per agent per iteration, each of them a network round trip on
+# the critical path of building the prompt. Bounded so a long session cannot
+# grow it without limit, and locked because the evicting write is not atomic.
+_RANK_CACHE_MAX = 32
+_rank_cache: "OrderedDict[tuple, list]" = OrderedDict()
+_rank_cache_lock = threading.Lock()
+
+
+def _rank_cache_get(key: tuple):
+    with _rank_cache_lock:
+        if key not in _rank_cache:
+            return None
+        _rank_cache.move_to_end(key)
+        return _rank_cache[key]
+
+
+def _rank_cache_put(key: tuple, result: list) -> None:
+    with _rank_cache_lock:
+        _rank_cache[key] = result
+        _rank_cache.move_to_end(key)
+        while len(_rank_cache) > _RANK_CACHE_MAX:
+            _rank_cache.popitem(last=False)
 
 
 def _skill_text(meta) -> str:
@@ -80,8 +107,9 @@ def rank(task: str, *, k: int = 3, session: Optional[dict] = None) -> list:
 
     items = [(name, _skill_text(meta)) for name, meta in metas.items()]
     key = (q, _catalog_fingerprint(items), int(k))
-    if _rank_cache["key"] == key and _rank_cache["result"] is not None:
-        return _rank_cache["result"]
+    _cached = _rank_cache_get(key)
+    if _cached is not None:
+        return _cached
 
     # Shared gateway ranking (semantic, with server-side lexical fallback).
     ranked = embeddings.rank(q, items, top_k=k, session=session)
@@ -94,8 +122,7 @@ def rank(task: str, *, k: int = 3, session: Optional[dict] = None) -> list:
         # Endpoint unreachable → offline local fallback.
         result = _local_lexical(q, items, k)
 
-    _rank_cache["key"] = key
-    _rank_cache["result"] = result
+    _rank_cache_put(key, result)
     return result
 
 

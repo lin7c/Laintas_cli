@@ -528,7 +528,7 @@ class AgentTerminationTests(unittest.TestCase):
 
     def test_manual_compaction_summarizes_head_and_keeps_recent_user_turns(self):
         deps, calls = _deps([{
-            "reply": "anchored compact summary",
+            "reply": "## Goal\n- initial task\n## Constraints & Preferences\n- (none)\n## Durable User Rules\n- (none)\n## Progress\n### Done\n- (none)\n### In Progress\n- task\n### Blocked\n- (none)\n## Key Decisions\n- (none)\n## Next Steps\n- continue\n## Critical Context\n- anchored compact summary\n## Relevant Files\n- (none)",
             "tool_calls": [],
             "finish_reason": "stop",
             "done": True,
@@ -554,7 +554,11 @@ class AgentTerminationTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertTrue(result["changed"])
         self.assertTrue(result["summary_created"])
-        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(calls), 2)  # Gemma draft + DeepSeek review
+        self.assertEqual(calls[0]["model_override"], "google/gemma-4-26b-a4b-it")
+        self.assertIsNone(calls[0]["provider_override"])
+        self.assertEqual(calls[1]["model_override"], "deepseek-v4-flash")
+        self.assertIsNone(calls[1]["provider_override"])
         compacted = state["_thread_messages"]
         # The obsolete first task is summarized instead of permanently pinned;
         # the live objective and durable rules are injected separately.
@@ -597,13 +601,51 @@ class AgentTerminationTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(state, original)
 
+    def test_chunked_summary_is_atomic_when_later_chunk_fails(self):
+        head = [
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "second"},
+        ]
+        with mock.patch.object(agent_loop, "_thread_tokens", return_value=5000), \
+                mock.patch.object(agent_loop, "get_runtime_config",
+                                  side_effect=lambda key: 6000 if key == "compact_chunk_tokens" else None), \
+                mock.patch.object(agent_loop, "_llm_summarize",
+                                  side_effect=["complete first chunk", None]), \
+                mock.patch.object(agent_loop, "_llm_review_summary",
+                                  return_value="complete first chunk"):
+            result = agent_loop._summarize_head_in_chunks(
+                mock.Mock(), {}, head, None, "EN", "test-run")
+        self.assertIsNone(result)
+
+    def test_chunked_summary_does_not_reuse_old_summary_on_first_failure(self):
+        head = [{"role": "user", "content": "new history"}]
+        with mock.patch.object(agent_loop, "_llm_summarize", return_value=None):
+            result = agent_loop._summarize_head_in_chunks(
+                mock.Mock(), {}, head, "trusted old summary", "EN", "test-run")
+        self.assertIsNone(result)
+
+    def test_auxiliary_model_never_pins_a_supplier(self):
+        agent_loop.set_runtime_config("aux_model", "google/gemma-4-26b-a4b-it")
+        agent_loop.set_runtime_config("aux_provider", "openrouter")
+        self.assertEqual(agent_loop.aux_model_override(),
+                         ("google/gemma-4-26b-a4b-it", ""))
+
+    def test_summary_review_failure_keeps_gemma_draft(self):
+        draft = "## Goal\n- keep me\n## Progress\n### Done\n- none\n## Next Steps\n- continue\n## Critical Context\n- fact"
+        deps, calls = _deps([{"reply": "not the required structure"}])
+        result = agent_loop._llm_review_summary(
+            deps, {}, "/tmp", "[User]: evidence", draft, None, "EN")
+        self.assertEqual(result, draft)
+        self.assertEqual(calls[0]["model_override"], "deepseek-v4-flash")
+        self.assertIsNone(calls[0]["provider_override"])
+
     def test_compaction_triggers_memory_consolidation(self):
         # When mem_extract_on_compact is on, a successful compaction fires a
         # background pass that mines the just-compacted context for durable
         # memories. Run the worker inline (patch Thread) for determinism.
         agent_loop.set_runtime_config("mem_extract_on_compact", True)
         deps, calls = _deps([{
-            "reply": "anchored compact summary",
+            "reply": "## Goal\n- initial task\n## Constraints & Preferences\n- (none)\n## Durable User Rules\n- (none)\n## Progress\n### Done\n- (none)\n### In Progress\n- task\n### Blocked\n- (none)\n## Key Decisions\n- (none)\n## Next Steps\n- continue\n## Critical Context\n- anchored compact summary\n## Relevant Files\n- (none)",
             "tool_calls": [], "finish_reason": "stop", "done": True, "error": False,
         }])
         messages = [{"role": "user", "content": "initial task"}]
@@ -636,7 +678,7 @@ class AgentTerminationTests(unittest.TestCase):
         self.assertTrue(result["changed"])
         self.assertIn("text", seen)                 # consolidation ran
         self.assertIn("summary", seen["text"].lower())
-        self.assertEqual(len(calls), 2)             # summarizer + consolidation llm_fn
+        self.assertEqual(len(calls), 3)             # draft + review + consolidation
 
     def test_missing_tool_calls_and_content_filter_are_not_success(self):
         missing, calls, _ = self._run([{

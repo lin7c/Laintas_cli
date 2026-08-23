@@ -26,6 +26,13 @@ import paths
 
 _BACKEND_URL = os.environ.get("LAINTAS_BACKEND") or "https://laintas.com"
 _TIMEOUT = float(os.environ.get("LAINTAS_EMBED_TIMEOUT", "30"))
+# rank() gets a much shorter leash than embed(). An embedding is the answer the
+# caller asked for and is worth waiting on; a ranking is an ENHANCEMENT with a
+# local lexical fallback, and it sits on the critical path of every prompt
+# rebuild — so a slow ranker must degrade, not stall the agent. Waiting the full
+# 30s here once cost two lost minutes per turn per agent and the result was
+# thrown away anyway when the timeout finally fired.
+_RANK_TIMEOUT = float(os.environ.get("LAINTAS_RANK_TIMEOUT", "8"))
 _MAX_BATCH = 64          # must stay ≤ the gateway's EMBED_MAX_INPUTS
 _MAX_CHARS = 8000        # must stay ≤ the gateway's EMBED_MAX_CHARS
 
@@ -50,6 +57,19 @@ def _cache_put(key: str, vec) -> None:
         for old in list(_embed_cache.keys())[: max(1, _EMBED_CACHE_MAX // 8)]:
             _embed_cache.pop(old, None)
     _embed_cache[key] = vec
+
+
+def _with_client_budget(headers: dict, timeout: float) -> dict:
+    """Tell the gateway how long we will actually wait.
+
+    Without it the gateway spends its own (longer) budget upstream, finishes
+    after we have already given up, and meters the call anyway — we pay for an
+    answer delivered into a closed socket. With it, the gateway degrades inside
+    our window instead of billing past it.
+    """
+    out = dict(headers or {})
+    out["X-Client-Timeout"] = str(int(max(1.0, float(timeout))))
+    return out
 
 
 def _load_session() -> Optional[dict]:
@@ -107,6 +127,7 @@ def embed(texts, *, session: Optional[dict] = None) -> Optional[list]:
     try:
         profile = backend_profiles.resolve(_BACKEND_URL)
         headers, cookies = backend_profiles.request_auth(profile, session)
+        headers = _with_client_budget(headers, _TIMEOUT)
     except Exception:
         return None
 
@@ -157,6 +178,30 @@ def embed_one(text: str, *, session: Optional[dict] = None) -> Optional[list]:
 
 _rank_disabled = False
 
+# Cooldown after a rank call fails or times out. Ranking runs on every prompt
+# rebuild, so a ranker that is slow or down was being paid for once per turn per
+# agent — seconds of dead wait each time, for a result that was discarded anyway
+# in favour of the local lexical fallback. One failure now silences it briefly
+# instead of re-learning the same thing every turn. Short enough that recovery
+# is picked up on its own.
+_RANK_COOLDOWN_S = float(os.environ.get("LAINTAS_RANK_COOLDOWN", "120"))
+# A ranking that ARRIVES but takes this long is treated the same way. Success is
+# not the bar: the bar is whether blocking the prompt rebuild was worth it, and
+# a multi-second wait for a relevance hint that has a local fallback never is.
+_RANK_SLOW_S = float(os.environ.get("LAINTAS_RANK_SLOW", "3"))
+_rank_cooldown_until = 0.0
+
+
+def _rank_cooldown_start() -> None:
+    global _rank_cooldown_until
+    import time as _time
+    _rank_cooldown_until = _time.time() + _RANK_COOLDOWN_S
+
+
+def _rank_in_cooldown() -> bool:
+    import time as _time
+    return _time.time() < _rank_cooldown_until
+
 
 def rank(query, candidates, *, top_k: Optional[int] = None,
          session: Optional[dict] = None) -> Optional[list]:
@@ -173,7 +218,7 @@ def rank(query, candidates, *, top_k: Optional[int] = None,
     q = str(query or "").strip()
     if not q or not candidates:
         return []
-    if _rank_disabled:
+    if _rank_disabled or _rank_in_cooldown():
         return None
 
     payload_cands = []
@@ -197,21 +242,30 @@ def rank(query, candidates, *, top_k: Optional[int] = None,
     session = session or _load_session()
     if session is None:
         return None
+    import time as _time
+    _t0 = _time.time()
     try:
         profile = backend_profiles.resolve(_BACKEND_URL)
         headers, cookies = backend_profiles.request_auth(profile, session)
+        headers = _with_client_budget(headers, _RANK_TIMEOUT)
         resp = requests.post(
             f"{profile.base_url}/api/rank",
             headers=headers, cookies=cookies,
-            json=body, timeout=_TIMEOUT, allow_redirects=False,
+            json=body, timeout=_RANK_TIMEOUT, allow_redirects=False,
         )
     except Exception:
+        _rank_cooldown_start()          # timeout / network error
         return None
     if resp.status_code == 404:
         _rank_disabled = True  # old gateway without /api/rank — stop trying
         return None
     if resp.status_code != 200:
+        _rank_cooldown_start()
         return None
+    if _time.time() - _t0 >= _RANK_SLOW_S:
+        # Keep this answer — it is already paid for — but stop paying that
+        # price on every turn until the ranker is quick again.
+        _rank_cooldown_start()
     try:
         data = resp.json()
         ranked = data.get("ranked")

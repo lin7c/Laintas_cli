@@ -802,6 +802,62 @@ def _prepare_workflow_tasks(steps: list, run_id: str, cwd: str,
     return mapping
 
 
+_CHILD_WAIT_POLL_SECONDS = 5.0
+
+
+def _stall_budget() -> int:
+    from agent_loop import AGENT_STALL_SECONDS
+    return int(AGENT_STALL_SECONDS)
+
+
+def _child_partial_reply(child_id: str) -> str:
+    """The child's own last words, read before it is aborted."""
+    try:
+        import tools as _tools
+        return _tools.rescue_partial_reply(child_id)[:800]
+    except Exception:
+        return ""
+
+
+def _await_child_completion(done_event, child_id: str) -> bool:
+    """Wait for a child's completion event. True = finished, False = went silent.
+
+    Bounded by SILENCE, not by a fixed total. A HWO task or agent block is a
+    whole unit of work, and the fixed 300s/600s budgets this replaces cut off
+    precisely the blocks that had the most to do — indistinguishably from the
+    wedged ones. Queued (no concurrency slot yet) and awaiting-approval both
+    hold the clock: neither can progress, and neither is the child's fault.
+    """
+    from agent_loop import (
+        AGENT_QUEUE_HOLD_MAX_SECONDS, AGENT_STALL_SECONDS,
+        agent_progress_token, get_agent,
+    )
+    last_token = agent_progress_token(get_agent(child_id))
+    quiet_since = time.time()
+    queued_since = time.time()
+    while not done_event.wait(timeout=_CHILD_WAIT_POLL_SECONDS):
+        info = get_agent(child_id)
+        token = agent_progress_token(info)
+        if info is not None and info.status == "queued":
+            # Bounded: an unconditional hold turns a slot that never frees into
+            # a silent permanent hang instead of a reported stall.
+            held = (time.time() - queued_since) < AGENT_QUEUE_HOLD_MAX_SECONDS
+        else:
+            queued_since = time.time()
+            try:
+                import tools as _tools
+                held = _tools.is_awaiting_approval(child_id)
+            except Exception:
+                held = False
+        if token != last_token or held:
+            last_token = token
+            quiet_since = time.time()
+            continue
+        if time.time() - quiet_since >= AGENT_STALL_SECONDS:
+            return False
+    return True
+
+
 def _run_task_group(texts: list[str], ctx: HwoCtx, inherited: str = "") -> dict:
     """Execute one or more plain-text HWO steps as one ordered todo run."""
     import agent_loop as _al
@@ -884,15 +940,20 @@ def _run_task_group(texts: list[str], ctx: HwoCtx, inherited: str = "") -> dict:
             daemon=True, name=f"hwo-task-{child.id}",
         )
         t.start()
-        done_event.wait(timeout=300)
+        _await_child_completion(done_event, child.id)
     finally:
         if parent_id:
             exit_waiting(parent_id)
 
     if not result_holder:
+        _partial = _child_partial_reply(child.id)
         abort_agent(child.id)
         first = texts[0] if texts else ""
-        return {"ok": False, "msg": f"Task timed out; cancellation requested: {first[:80]}"}
+        _tail = f" Partial result before cutoff: {_partial}" if _partial else ""
+        return {"ok": False,
+                "msg": (f"Task stopped: no progress for "
+                        f"{_stall_budget()}s; cancellation requested: "
+                        f"{first[:80]}.{_tail}")}
     return result_holder
 
 
@@ -1107,14 +1168,18 @@ def _run_agent(agent_step: HwoAgent, ctx: HwoCtx, inherited: str = "") -> dict:
             daemon=True, name=f"hwo-agent-{child.id}",
         )
         t.start()
-        done_event.wait(timeout=600)
+        _await_child_completion(done_event, child.id)
     finally:
         if parent_id:
             exit_waiting(parent_id)
 
     if not result_holder:
+        _partial = _child_partial_reply(child.id)
         abort_agent(child.id)
-        return {"ok": False, "msg": f"#{full_name}# timed out; cancellation requested."}
+        _tail = f" Partial result before cutoff: {_partial}" if _partial else ""
+        return {"ok": False,
+                "msg": (f"#{full_name}# stopped: no progress for "
+                        f"{_stall_budget()}s; cancellation requested.{_tail}")}
 
     ok = result_holder.get("ok", False)
     nested_outputs = result_holder.get("outputs") or {}

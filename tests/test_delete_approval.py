@@ -73,7 +73,24 @@ class DeletePolicyTests(unittest.TestCase):
         self.assertTrue(policy.is_delete_command("sudo rm file.txt"))
         self.assertTrue(policy.is_delete_command("echo ok && /bin/unlink file"))
         self.assertTrue(policy.is_delete_command("find . | xargs rm"))
+        self.assertTrue(policy.is_delete_command(
+            'for d in $(find /tmp -name "tmp*"); do rm -rf "$d"; done'))
         self.assertFalse(policy.is_delete_command("echo rm is a command"))
+
+    def test_shared_temp_root_sweep_is_denied(self):
+        incident = (
+            'for d in $(find /tmp -maxdepth 1 -name "tmp*" -type d); '
+            'do rm -rf "$d"; done'
+        )
+        self.assertTrue(policy.is_unsafe_shared_temp_cleanup(incident))
+        self.assertEqual(policy.evaluate(incident).action, "deny")
+        safe_child_sweep = (
+            'find /tmp -mindepth 1 -maxdepth 1 -name "owned-*" '
+            '-type d -exec rm -rf {} +'
+        )
+        self.assertFalse(policy.is_unsafe_shared_temp_cleanup(safe_child_sweep))
+        self.assertEqual(policy.evaluate(safe_child_sweep).action,
+                         "needs_approval")
 
     def test_existing_config_is_migrated_with_delete_rules(self):
         with tempfile.TemporaryDirectory() as tmp, \

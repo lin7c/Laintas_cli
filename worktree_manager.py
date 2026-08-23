@@ -231,6 +231,18 @@ def create_isolated_worktree(base_cwd: str, label: str = "agent") -> WorktreeInf
                         base_commit=head, baseline_hashes=baseline)
 
 
+def _merge_write_allowed(dest_path: str, repo_root: str) -> bool:
+    """Policy check for one merge-back destination. Fails closed on error."""
+    try:
+        import policy
+    except Exception:
+        return True
+    try:
+        return policy.evaluate_file_write(dest_path, repo_root).action != "deny"
+    except Exception:
+        return False
+
+
 def merge_worktree_back(info: WorktreeInfo) -> dict:
     """Copy the child's changes back into repo_root wherever the parent tree
     hasn't diverged from `info.baseline_hashes` for that path. Returns
@@ -243,6 +255,7 @@ def merge_worktree_back(info: WorktreeInfo) -> dict:
     much smaller window instead of eliminated."""
     applied: List[str] = []
     conflicts: List[str] = []
+    blocked: List[str] = []
 
     with _lock_for(info.repo_root):
         try:
@@ -259,6 +272,17 @@ def merge_worktree_back(info: WorktreeInfo) -> dict:
                 continue  # child never touched this file
 
             parent_path = os.path.join(info.repo_root, rel)
+            # The merge is a real write to the user's tree, performed by
+            # shutil.copy2 rather than fs.write — so it is the one file-write
+            # path that never met the policy engine. Evaluate the DESTINATION
+            # (the child was only ever evaluated against its worktree copy):
+            # a deny rule that protects ~/.ssh or a key file must protect it
+            # here too. Approval-tier decisions are not re-asked — the child
+            # already obtained one for this exact content — but a deny is a
+            # deny, and the file stays behind in the worktree, reported.
+            if not _merge_write_allowed(parent_path, info.repo_root):
+                blocked.append(rel)
+                continue
             parent_hash = _file_hash(parent_path) if os.path.exists(parent_path) else None
             if parent_hash != baseline_hash:
                 # Parent tree moved on this exact path since the worktree was
@@ -277,7 +301,7 @@ def merge_worktree_back(info: WorktreeInfo) -> dict:
             except OSError:
                 conflicts.append(rel)
 
-    return {"applied": applied, "conflicts": conflicts}
+    return {"applied": applied, "conflicts": conflicts, "blocked": blocked}
 
 
 def remove_worktree(info: WorktreeInfo) -> bool:

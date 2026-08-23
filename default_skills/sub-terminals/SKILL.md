@@ -32,9 +32,12 @@ Tools:
   their final output remain readable for 10 minutes or until explicitly
   terminated/replaced.
 - `terminal.wait({ name, timeout?, poll_interval?, cursor?, max_chars? })` —
-  wait for a finite background job to finish (up to 300 seconds) and return its
-  output delta, completion state, and real exit code. A timeout is not process
-  completion; inspect `completed`/`timed_out` rather than guessing.
+  wait for a background job to finish and return its output delta, completion
+  state, and real exit code. `timeout` bounds SILENCE, not runtime: a job that
+  keeps printing is waited on for as long as it keeps printing, and the wait
+  ends only once it has produced nothing for `timeout` seconds (default 60). A
+  timeout is not process completion; inspect `completed`/`timed_out` rather
+  than guessing.
 - `terminal.list()` — list terminals and their status.
 - `terminal.terminate({ name })` — stop and destroy a terminal subtree. This
   recursively ends its child terminals, deployed agents, and owned temporary

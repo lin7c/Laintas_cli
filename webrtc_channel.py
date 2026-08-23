@@ -32,6 +32,47 @@ import threading
 import fcntl
 from typing import Any, Callable, Optional
 
+async def _read_until_idle(proc, idle_seconds: float):
+    """Drain a subprocess, bounded by SILENCE rather than by total runtime.
+
+    Returns ``(output, stopped_for_idleness)``. Output collected before the
+    stop is always returned — a command killed for going quiet has usually
+    already said the useful part.
+    """
+    chunks: list = []
+    stopped = False
+    while True:
+        try:
+            data = await asyncio.wait_for(proc.stdout.read(65536),
+                                          timeout=idle_seconds)
+        except asyncio.TimeoutError:
+            stopped = True
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            break
+        if not data:
+            break                      # EOF: the command finished
+        chunks.append(data)
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=5)
+    except (asyncio.TimeoutError, ProcessLookupError):
+        pass
+    return b"".join(chunks).decode("utf-8", "replace"), stopped
+
+
+# ── Waiting budgets ────────────────────────────────────────────────────
+# Silence a command may produce before it is presumed wedged. Not a cap on how
+# long it may RUN: the previous 30s wall clock killed any remote build, install
+# or test run outright, which is most of what a remote shell is for.
+REMOTE_EXEC_IDLE_SECONDS = 120.0
+# How long to wait for a PERSON to answer an approval prompt on their phone.
+# Long, because a human is not a stalled process; and silence is reported as
+# "no answer", never as a refusal.
+P2P_APPROVAL_WAIT_SECONDS = 3600.0
+
+
 # File RPC limits (Layer 2). Bytes flow as raw binary DataChannel messages.
 _CHUNK = 16 * 1024            # per binary message (safe under SCTP message size)
 _MAX_FILE_BYTES = 5 * 1024 * 1024
@@ -681,15 +722,17 @@ class WebrtcManager:
             proc = await asyncio.create_subprocess_shell(
                 cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
             )
-            out_b, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
-            out = (out_b or b"").decode("utf-8", "replace")
+            out, _idle_stop = await _read_until_idle(proc, REMOTE_EXEC_IDLE_SECONDS)
             if len(out) > 256 * 1024:
                 out = out[:256 * 1024]
-            channel.send(json.dumps({"t": "exec-res", "id": rid, "ok": proc.returncode == 0,
-                                     "code": proc.returncode, "out": out}))
-        except asyncio.TimeoutError:
-            channel.send(json.dumps({"t": "exec-res", "id": rid, "ok": False, "code": -1,
-                                     "out": "command timed out"}))
+            if _idle_stop:
+                channel.send(json.dumps({
+                    "t": "exec-res", "id": rid, "ok": False, "code": -1,
+                    "out": (out + f"\n[no output for {int(REMOTE_EXEC_IDLE_SECONDS)}s; "
+                                  "command stopped]").strip()}))
+            else:
+                channel.send(json.dumps({"t": "exec-res", "id": rid, "ok": proc.returncode == 0,
+                                         "code": proc.returncode, "out": out}))
         except Exception as e:
             channel.send(json.dumps({"t": "exec-res", "id": rid, "ok": False, "code": -1, "out": str(e)}))
 
@@ -907,7 +950,17 @@ class WebrtcManager:
     # its reqId-tagged request through this path when a P2P channel is
     # available — the browser side no longer has a server-relay fallback
     # for this either (see remoteHostExec.ts).
-    async def _request_p2p_approval(self, channel, req_id: str, cmd: str, cwd: str, destructive: bool) -> bool:
+    async def _request_p2p_approval(self, channel, req_id: str, cmd: str, cwd: str,
+                                    destructive: bool) -> str:
+        """Ask the remote human. Returns "approve", "deny" or "no_answer".
+
+        The clock here measures a PERSON, so it is generous and it does not
+        pretend that silence is a decision. Five minutes turned "the user put
+        their phone down" into "the user said no", which is both wrong and
+        indistinguishable from a real refusal in the log. Waiting long and
+        reporting `no_answer` lets the caller say what actually happened and
+        lets the request be re-sent later.
+        """
         fut = self._loop.create_future()
         self._ai_exec_approvals[req_id] = fut
         try:
@@ -916,12 +969,13 @@ class WebrtcManager:
                 "destructive": destructive,
             }))
             try:
-                decision = await asyncio.wait_for(fut, timeout=300)
+                decision = await asyncio.wait_for(
+                    fut, timeout=P2P_APPROVAL_WAIT_SECONDS)
             except asyncio.TimeoutError:
-                decision = "deny"
+                decision = "no_answer"
         finally:
             self._ai_exec_approvals.pop(req_id, None)
-        return decision == "approve"
+        return decision
 
     def _handle_ai_exec_approval_response(self, msg: dict) -> None:
         req_id = str(msg.get("id") or "")
@@ -972,13 +1026,16 @@ class WebrtcManager:
             return
         if (decision.action == "needs_approval"
                 or not get_runtime_config("allow_remote_exec_without_approval")):
-            approved = await self._request_p2p_approval(
+            decision = await self._request_p2p_approval(
                 channel, req_id, cmd, cwd,
                 destructive=(_policy.is_delete_command(cmd)
                              or _policy.is_destructive_git_command(cmd)))
-            if not approved:
+            if decision != "approve":
+                _why = ("No answer from the user (still unapproved; ask again "
+                        "if it is still needed)" if decision == "no_answer"
+                        else "User denied")
                 channel.send(json.dumps({"t": "ai-exec-final", "id": req_id, "status": "aborted",
-                                         "error": f"User denied: {cmd[:100]}"}))
+                                         "error": f"{_why}: {cmd[:100]}"}))
                 return
 
         channel.send(json.dumps({"t": "ai-exec-start", "id": req_id, "cwd": cwd}))

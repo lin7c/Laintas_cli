@@ -61,9 +61,15 @@ from typing import Any, Optional
 # Bounds. Deliberately the same order as the P2P path's so a command does not
 # behave differently depending on which transport carried it.
 MAX_EXEC_OUTPUT = 256 * 1024
-DEFAULT_EXEC_TIMEOUT = 30
-MAX_EXEC_TIMEOUT = 5 * 60
-APPROVAL_TIMEOUT = 300
+# Seconds of SILENCE before a command is presumed wedged (not a runtime cap —
+# see _stream_process). The old 30s/5min pair capped how long a remote command
+# could run at all, which killed every build and test run this endpoint exists
+# to serve.
+DEFAULT_EXEC_TIMEOUT = 120
+MAX_EXEC_TIMEOUT = 30 * 60
+# Waiting for a PERSON to approve. Generous on purpose: silence from a human is
+# not a decision, and the old 5 minutes turned "stepped away" into a refusal.
+APPROVAL_TIMEOUT = 3600
 MAX_CONCURRENT_EXEC = 8
 MAX_TERMINALS = 8
 TERM_GRACE_SECONDS = 120
@@ -134,7 +140,7 @@ def abort_exec(req_id: str) -> bool:
 
 
 def _kill_process_group(proc: subprocess.Popen) -> None:
-    """Kill the whole group — a shell command usually spawns children."""
+    """Kill the whole group and reap its leader before returning."""
     try:
         os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
     except (ProcessLookupError, PermissionError, OSError):
@@ -142,6 +148,10 @@ def _kill_process_group(proc: subprocess.Popen) -> None:
             proc.kill()
         except OSError:
             pass
+    try:
+        proc.wait(timeout=2)
+    except (subprocess.TimeoutExpired, ChildProcessError, OSError):
+        pass
 
 
 def shutdown() -> None:
@@ -226,6 +236,7 @@ def run_exec(body: dict, sse: SseWriter, resolve_cwd, agent_id: Optional[str] = 
                    "error": "too many commands are already running"})
         return
 
+    proc = None
     try:
         _policy, get_runtime_config = _policy_modules()
         decision = _policy.evaluate(cmd, cwd, req_id=req_id, agent_id=agent_id)
@@ -244,7 +255,8 @@ def run_exec(body: dict, sse: SseWriter, resolve_cwd, agent_id: Optional[str] = 
                 return
             if not req.approval.wait(timeout=APPROVAL_TIMEOUT):
                 sse.event({"t": "final", "status": "aborted",
-                           "error": "approval timed out"})
+                           "error": ("No answer from the user — still unapproved, "
+                                     "not refused; send it again if still needed")})
                 return
             if req.decision != "approve" or req.abort.is_set():
                 sse.event({"t": "final", "status": "aborted",
@@ -268,13 +280,21 @@ def run_exec(body: dict, sse: SseWriter, resolve_cwd, agent_id: Optional[str] = 
         req.proc = proc
         _stream_process(proc, req, sse, timeout)
     finally:
+        if proc is not None and proc.stdout is not None:
+            try:
+                proc.stdout.close()
+            except OSError:
+                pass
         _release_exec(req_id)
 
 
 def _stream_process(proc: subprocess.Popen, req: _ExecRequest,
                     sse: SseWriter, timeout: int) -> None:
     """Pump stdout to the client until exit, abort, timeout or a dead client."""
-    deadline = time.monotonic() + timeout
+    # Idle budget: `timeout` bounds SILENCE, not runtime. This pump already
+    # sees every byte as it arrives, so idleness is directly observable — and a
+    # remote build that streams for twenty minutes is working, not stuck.
+    last_output = time.monotonic()
     total = 0
     truncated = False
     stdout = proc.stdout
@@ -291,11 +311,11 @@ def _stream_process(proc: subprocess.Popen, req: _ExecRequest,
             # Nobody is listening any more; killing beats leaking the process.
             _kill_process_group(proc)
             return
-        remaining = deadline - time.monotonic()
+        remaining = (last_output + timeout) - time.monotonic()
         if remaining <= 0:
             _kill_process_group(proc)
             sse.event({"t": "final", "status": "fail",
-                       "error": f"timeout after {timeout}s"})
+                       "error": f"no output for {timeout}s; command stopped"})
             return
         try:
             ready, _w, _x = select.select([fd], [], [], min(remaining, 1.0))
@@ -315,6 +335,7 @@ def _stream_process(proc: subprocess.Popen, req: _ExecRequest,
             break
         if not chunk:
             break
+        last_output = time.monotonic()      # sign of life; resets the idle clock
         if total < MAX_EXEC_OUTPUT:
             room = MAX_EXEC_OUTPUT - total
             sse.event({"t": "out", "data": chunk[:room].decode("utf-8", "replace")})
@@ -438,14 +459,32 @@ class LocalTerminal:
     def _finish(self) -> None:
         import helpwo_server
         code = -1
-        try:
-            _pid, status = os.waitpid(self.pid, os.WNOHANG)
-            if _pid:
-                code = os.WEXITSTATUS(status) if os.WIFEXITED(status) else -1
-        except ChildProcessError:
-            pass
-        except OSError:
-            pass
+        deadline = time.monotonic() + 1.0
+        while True:
+            try:
+                _pid, status = os.waitpid(self.pid, os.WNOHANG)
+                if _pid:
+                    code = os.WEXITSTATUS(status) if os.WIFEXITED(status) else -1
+                    break
+            except (ChildProcessError, OSError):
+                break
+            if time.monotonic() >= deadline:
+                # Closing a PTY normally delivers SIGHUP, but shells can trap
+                # or ignore it. Reclaim the owned process group and then reap
+                # the leader so a detached terminal cannot become a zombie.
+                try:
+                    os.killpg(os.getpgid(self.pid), signal.SIGKILL)
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
+                try:
+                    _pid, status = os.waitpid(self.pid, 0)
+                    if _pid:
+                        code = (os.WEXITSTATUS(status)
+                                if os.WIFEXITED(status) else -1)
+                except (ChildProcessError, OSError):
+                    pass
+                break
+            time.sleep(0.01)
         self.exit_code = code
         self.closed.set()
         with self.lock:

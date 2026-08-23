@@ -97,7 +97,7 @@ def set_decompose_callback(fn: Optional[callable]) -> None:
     _decompose_cb = fn
 
 
-def decompose_task(task: str, strategy: str, timeout: float = 3.0) -> Optional[list[str]]:
+def decompose_task(task: str, strategy: str, timeout: float = 20.0) -> Optional[list[str]]:
     """Decompose a task into subtasks using LLM with timeout fallback.
 
     Returns a list of 2+ subtask strings, or None if decomposition is not
@@ -130,7 +130,7 @@ def decompose_task(task: str, strategy: str, timeout: float = 3.0) -> Optional[l
     return heuristic_result
 
 
-def _run_with_timeout(fn, *args, timeout: float = 3.0):
+def _run_with_timeout(fn, *args, timeout: float = 20.0):
     """Run ``fn(*args)`` in a thread with a hard timeout.
 
     Returns the function's return value, or raises ``TimeoutError`` if the

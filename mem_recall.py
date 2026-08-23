@@ -15,6 +15,8 @@ Only depends on ``memory_system`` + ``embeddings`` + ``paths`` (all light).
 from __future__ import annotations
 
 import os
+import threading
+from collections import OrderedDict
 from typing import Optional
 
 import paths
@@ -36,10 +38,31 @@ _MAX_CANDIDATES = 180
 # changes the fingerprint and invalidates the cache, so recall stays correct.
 _entries_cache: dict = {"key": None, "entries": None}
 
-# Per-run ranking-result cache. The task is constant within a run and the memory
-# set rarely changes, so this collapses the every-loop prompt rebuild into at
-# most one /api/rank call per run (mirrors skill_router's cache).
-_rank_cache: dict = {"key": None, "result": None}
+# Ranking-result cache. The task is constant within a run and the memory set
+# rarely changes, so this collapses the every-loop prompt rebuild into at most
+# one /api/rank call per run (mirrors skill_router's cache) — including its
+# reason for holding many entries instead of one: concurrent agents work on
+# different queries, and a single slot means they evict each other every loop
+# and never hit, putting a network round trip back on every prompt rebuild.
+_RANK_CACHE_MAX = 32
+_rank_cache: "OrderedDict[tuple, list]" = OrderedDict()
+_rank_cache_lock = threading.Lock()
+
+
+def _rank_cache_get(key: tuple):
+    with _rank_cache_lock:
+        if key not in _rank_cache:
+            return None
+        _rank_cache.move_to_end(key)
+        return _rank_cache[key]
+
+
+def _rank_cache_put(key: tuple, result: list) -> None:
+    with _rank_cache_lock:
+        _rank_cache[key] = result
+        _rank_cache.move_to_end(key)
+        while len(_rank_cache) > _RANK_CACHE_MAX:
+            _rank_cache.popitem(last=False)
 
 
 def _dir_fingerprint() -> object:
@@ -111,8 +134,9 @@ def recall(query: str, *, mem_type: str = None, k: int = 5,
     by_name = {e.get("name", ""): (e, b) for e, b in entries}
 
     cache_key = (q, mem_type, int(k), fingerprint, len(by_name))
-    if _rank_cache["key"] == cache_key and _rank_cache["result"] is not None:
-        return _rank_cache["result"]
+    _cached = _rank_cache_get(cache_key)
+    if _cached is not None:
+        return _cached
 
     candidates = [(name, _text_of(entry, body))
                   for name, (entry, body) in by_name.items()]
@@ -139,8 +163,7 @@ def recall(query: str, *, mem_type: str = None, k: int = 5,
             })
         result = out[: max(1, int(k))]
 
-    _rank_cache["key"] = cache_key
-    _rank_cache["result"] = result
+    _rank_cache_put(cache_key, result)
     return result
 
 

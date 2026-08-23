@@ -34,7 +34,7 @@ import traceback
 import difflib
 import unicodedata
 import symbols                # Centralized UI symbol constants
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -2518,26 +2518,51 @@ def _bi_spawn(params: dict, ctx: ToolCtx) -> dict:
     try:
         _parent = _al.get_agent(parent_id)
         _abort_ev = _parent.abort_event if _parent is not None else None
-        info = _al.wait_for_agent(child_id, timeout=300, abort_event=_abort_ev)
+        # Stall budget, not a total one: a child doing real work on a big task
+        # must not be killed for taking longer than a number picked in advance.
+        info = _al.wait_for_agent(
+            child_id, abort_event=_abort_ev,
+            stall_seconds=_al.AGENT_STALL_SECONDS)
     finally:
         _al.exit_waiting(parent_id)
     if info is None:
+        _partial = rescue_partial_reply(child_id)
         _al.abort_agent(child_id)
         if _abort_ev is not None and _abort_ev.is_set():
-            return {"ok": False, "error": f"spawn interrupted: {goal[:80]}"}
-        return {"ok": False, "error": f"spawn timed out: {goal[:80]}"}
+            return {"ok": False, "error": f"spawn interrupted: {goal[:80]}",
+                    **({"result": _partial} if _partial else {})}
+        return {
+            "ok": False,
+            "error": (f"spawn stopped: no progress for "
+                      f"{int(_al.AGENT_STALL_SECONDS)}s on: {goal[:80]}"),
+            **({"result": f"[{child_id}] partial before cutoff:\n{_partial}"}
+               if _partial else {}),
+        }
     if info.status != "done":
         return {"ok": False, "result": f"[{child_id}] {info.error or info.status}"}
     return {"ok": True, "result": f"[{child_id}] {info.result or info.last_reply or '(done)'}",
             "child_id": child_id}
 
 
-# Wall-clock budget for one spawn_parallel batch, and how long before that
-# deadline each still-running child gets a wrap-up nudge (see
-# _bi_spawn_parallel). Module-level so tests/tuning don't need to touch the
-# function body.
-SPAWN_PARALLEL_TIMEOUT_SECONDS = 600
+# A spawn_parallel batch has NO total wall-clock budget, for the same reason
+# the primary agent has none: how long honest work takes is not knowable in
+# advance, and a fixed batch budget punishes the big task rather than the stuck
+# one. A child that keeps making progress runs until it finishes or exhausts
+# max_loops (agent_loop's per-run iteration cap) — the same bound the primary
+# agent lives under.
+#
+# What IS bounded is being stuck. Each child gets its own stall clock, reset by
+# any observable progress: a finished tool call, a new reply, a status change,
+# or the start of a long-running tool call (so a 5-minute test run reads as
+# working, not wedged). Waiting on a user approval pauses the clock entirely —
+# a human thinking is not a stalled agent.
+SPAWN_PARALLEL_STALL_SECONDS = 300
+# How long before its own stall cutoff a child is nudged to wrap up, so it can
+# hand back a partial conclusion instead of being cut off with nothing.
 SPAWN_PARALLEL_WRAP_UP_LEAD_SECONDS = 100
+# Escape hatch only: >0 reinstates a hard total budget for the whole batch.
+# Left at 0 (disabled) by design — see above.
+SPAWN_PARALLEL_TOTAL_TIMEOUT_SECONDS = 0
 
 # Registered while a spawn_parallel Live display is on screen so the CLI's
 # shutdown handler can force it closed before printing its own messages.
@@ -2547,6 +2572,39 @@ SPAWN_PARALLEL_WRAP_UP_LEAD_SECONDS = 100
 # up looking corrupted/hung until the user force-exits.
 _active_parallel_lives_lock = threading.Lock()
 _active_parallel_lives: list = []
+
+
+@contextmanager
+def _synchronized_update(console):
+    """Ask the terminal to present one repaint atomically (DECSET 2026).
+
+    A rich Live frame is "erase N lines, then draw N lines" — two writes with
+    a gap. A terminal that composites between them shows the block missing,
+    which is exactly what a full-screen repaint at several frames per second
+    looks like to a person: flicker. Terminals that implement synchronized
+    output hold the screen until the closing sequence; the rest ignore an
+    unknown private mode, which is why this is safe to send unconditionally.
+    """
+    stream = None
+    try:
+        if getattr(console, "is_terminal", False):
+            stream = getattr(console, "file", None)
+    except Exception:
+        stream = None
+    if stream is not None:
+        try:
+            stream.write("\x1b[?2026h")
+        except Exception:
+            stream = None
+    try:
+        yield
+    finally:
+        if stream is not None:
+            try:
+                stream.write("\x1b[?2026l")
+                stream.flush()
+            except Exception:
+                pass
 
 
 def stop_all_parallel_live_displays() -> None:
@@ -2575,7 +2633,16 @@ def pause_all_parallel_live_displays() -> list:
         lives = list(_active_parallel_lives)
     for live in lives:
         try:
-            live.stop()
+            # Clear the region instead of freezing it into the scrollback.
+            # rich's non-transient stop() prints the final frame and leaves
+            # it behind, so every approval prompt used to deposit another
+            # copy of the whole table above the prompt.
+            _was_transient = live.transient
+            live.transient = True
+            try:
+                live.stop()
+            finally:
+                live.transient = _was_transient
         except Exception:
             pass
     return lives
@@ -2585,6 +2652,15 @@ def resume_all_parallel_live_displays(lives: list) -> None:
     """Restart Live displays previously paused by pause_all_parallel_live_displays."""
     for live in lives:
         try:
+            # Forget the pre-pause geometry. start(refresh=True) begins by
+            # erasing `last_render_height` lines above the cursor — which,
+            # after a pause, are the approval prompt and the user's answer,
+            # not the old table. Anything printed during the pause must
+            # survive the resume.
+            try:
+                live._live_render._shape = None
+            except Exception:
+                pass
             live.start(refresh=True)
         except Exception:
             pass
@@ -2596,18 +2672,112 @@ def resume_all_parallel_live_displays(lives: list) -> None:
 # agent that's stuck behind a policy gate.
 _pending_approvals_lock = threading.Lock()
 _pending_approvals: dict = {}
+# agent_id -> how many of its descendants are currently parked on a human
+# decision. Keeps a supervisor's stall watchdog quiet while someone further
+# down the tree waits for the user (any depth, not just direct children).
+_blocked_supervisors: dict = {}
+# agent_id -> the ancestor chain credited when it started waiting, so the
+# release decrements exactly what the acquire incremented even if the tree
+# was pruned in between.
+_approval_ancestors: dict = {}
+
+
+def _approval_ancestry(agent_id: str) -> list:
+    """[agent, parent, …] — every supervisor blocked by this one's prompt."""
+    try:
+        import agent_loop as _al
+        chain = _al.agent_ancestry(agent_id)
+    except Exception:
+        chain = []
+    return chain or [str(agent_id)]
 
 
 def mark_awaiting_approval(agent_id: str, text: str) -> None:
+    """Record that *agent_id* is parked on a human decision.
+
+    Also credits every ancestor: a supervisor waiting on a child that is
+    waiting on a person is not stalled either. Without this, a grandchild's
+    approval prompt let the middle agent's stall watchdog fire and kill the
+    branch out from under the prompt the user was still looking at.
+    """
     if not agent_id:
         return
+    # Resolved before taking the lock: _approval_ancestry reads the agent
+    # registry under its own lock, and nesting the two in one order here
+    # while a watchdog nests them in the other is how deadlocks are built.
+    ancestors = _approval_ancestry(agent_id)[1:]
     with _pending_approvals_lock:
         _pending_approvals[agent_id] = text
+        _approval_ancestors[agent_id] = ancestors
+        for ancestor in ancestors:
+            _blocked_supervisors[ancestor] = _blocked_supervisors.get(ancestor, 0) + 1
+
+
+def rescue_partial_reply(agent_id: str) -> str:
+    """Whatever the agent had already concluded, before we tear it down.
+
+    Every place that aborts a child on a watchdog used to throw this away and
+    report "no output", losing minutes of real work over the last few seconds
+    of it. Read it BEFORE abort_agent().
+    """
+    try:
+        import agent_loop as _al
+        info = _al.get_agent(agent_id)
+    except Exception:
+        return ""
+    if info is None:
+        return ""
+    direct = (((info.state or {}).get("lastReply") or "")
+              or info.last_reply or info.result or "").strip()
+    if direct:
+        return direct
+    # An agent that worked entirely through tool calls has an empty lastReply
+    # even after real work. Its last assistant message is the next-best
+    # account of what it found — far better than reporting "no output".
+    try:
+        return _al.harvest_agent_reply({}, info.chat_history)
+    except Exception:
+        return ""
+
+
+def is_awaiting_approval(agent_id: str) -> bool:
+    """True while this agent — or anything below it — is blocked on a human.
+
+    Public because every watchdog needs it: an agent parked on an approval
+    prompt is not making progress and never will until a person answers, so a
+    stall timer that cannot see this state kills exactly the agents that were
+    waiting politely. The subtree clause matters at depth ≥ 2, where the
+    agent that is visibly idle is the supervisor, not the one asking.
+    """
+    if not agent_id:
+        return False
+    with _pending_approvals_lock:
+        return (agent_id in _pending_approvals
+                or _blocked_supervisors.get(agent_id, 0) > 0)
+
+
+def approval_text_for(agent_id: str) -> str:
+    """What this agent (or a descendant) is waiting for; '' when nothing is."""
+    if not agent_id:
+        return ""
+    with _pending_approvals_lock:
+        direct = _pending_approvals.get(agent_id)
+        if direct:
+            return direct
+        if _blocked_supervisors.get(agent_id, 0) > 0:
+            return "a sub-agent is waiting for your approval"
+    return ""
 
 
 def clear_awaiting_approval(agent_id: str) -> None:
     with _pending_approvals_lock:
         _pending_approvals.pop(agent_id, None)
+        for ancestor in _approval_ancestors.pop(agent_id, ()):
+            remaining = _blocked_supervisors.get(ancestor, 0) - 1
+            if remaining > 0:
+                _blocked_supervisors[ancestor] = remaining
+            else:
+                _blocked_supervisors.pop(ancestor, None)
 
 
 def _bi_spawn_parallel(params: dict, ctx: ToolCtx) -> dict:
@@ -2623,12 +2793,29 @@ def _bi_spawn_parallel(params: dict, ctx: ToolCtx) -> dict:
     if not parent_id:
         return {"ok": False, "error": "no current agent"}
 
+    # Spelled out because the caller sees ONLY this text. A parallel child's
+    # tool output, files read and reasoning never reach its supervisor — a
+    # child that finishes with an empty final answer has thrown away
+    # everything it did, and the batch reports it as "no reply". spawn_chain
+    # has always told its steps this; parallel children were told nothing.
+    _REPORT_CONTRACT = (
+        "[PARALLEL TASK {index}/{total}] You are one of {total} agents working "
+        "at the same time. Your caller sees only your final answer — not your "
+        "tool calls, not the files you read, not this conversation. Finish by "
+        "calling task_complete with a summary that stands on its own: what you "
+        "found, the concrete evidence (paths, names, numbers), and what you "
+        "could not determine. An empty or one-word summary loses all of your "
+        "work.")
+
     normalized = []
-    for task in tasks:
+    for index, task in enumerate(tasks, start=1):
         goal = str(task.get("goal") or task.get("task") or "").strip()
         if not goal:
             return {"ok": False, "error": "every parallel task requires a goal"}
-        normalized.append({**task, "task": goal})
+        contract = _REPORT_CONTRACT.format(index=index, total=len(tasks))
+        hint = str(task.get("hint") or "").strip()
+        normalized.append({**task, "task": goal,
+                           "hint": f"{contract}\n\n{hint}" if hint else contract})
 
     # Suppress per-tool console display for parallel children.  The parent
     # prints a 1-line summary per child when it finishes, giving a clean
@@ -2639,17 +2826,35 @@ def _bi_spawn_parallel(params: dict, ctx: ToolCtx) -> dict:
         parent_id, normalized, ctx.deps,
         session=ctx.session, events_cb=None)
     if len(child_ids) != len(normalized):
-        return {"ok": False, "error": "one or more child agents could not be spawned"}
+        # Partial spawn: the ones that DID start are already running, and
+        # nothing below this point will ever wait for them or shut them down.
+        # Abandoning them leaves orphans burning tokens against a batch whose
+        # result is discarded — tear them down before reporting the failure.
+        for _orphan in child_ids:
+            try:
+                _al.abort_agent(_orphan)
+            except Exception:
+                pass
+        return {"ok": False,
+                "error": (f"only {len(child_ids)}/{len(normalized)} child agents "
+                          "could be spawned (depth or concurrency limit); the "
+                          "started ones were stopped")}
 
     ctx.deps.console.print(
         f"  [muted]▾ {len(child_ids)} parallel agents launched[/muted]",
         highlight=False)
     _term_w = getattr(ctx.deps.console, 'width', 80) or 80
     _goal_w = max(30, _term_w - 22)
+    from rich.markup import escape as _esc_markup
     for _cid, _task in zip(child_ids, normalized):
-        _goal = _disp_truncate(_task['task'], _goal_w)
+        # Escaped: goals, tool names and command arguments are model- and
+        # tool-supplied text. A bracket in any of them ("[0-9]+", a JSON
+        # fragment, "[error]") is read by Rich as a markup tag and silently
+        # deleted from the display, so the operator sees a truncated command
+        # and cannot tell what the agent is actually doing.
+        _goal = _esc_markup(_disp_truncate(_task['task'], _goal_w))
         ctx.deps.console.print(
-            f"    [agent]{_cid}[/agent]  [muted]{_goal}[/muted]",
+            f"    [agent]{_esc_markup(_cid)}[/agent]  [muted]{_goal}[/muted]",
             highlight=False)
 
     # Track spawn times for per-child elapsed display.
@@ -2657,8 +2862,16 @@ def _bi_spawn_parallel(params: dict, ctx: ToolCtx) -> dict:
     _total_start = time.time()
     # Track seen tool call_ids per child so we only count new ones once.
     _seen_calls = {cid: set() for cid in child_ids}
+    # Last reply text seen per child; a change is progress even in a stretch
+    # with no tool calls (a child reasoning its way to a written conclusion).
+    _last_reply_seen = {cid: "" for cid in child_ids}
+    # When each child last held a concurrency slot (or was spawned), so the
+    # "queued holds the clock" rule can be bounded.
+    _queued_since = {cid: time.time() for cid in child_ids}
     # Track per-child tool count for status display.
     _tool_counts = {cid: 0 for cid in child_ids}
+    # Last observed liveness of each child's whole subtree (see below).
+    _subtree_seen: dict = {}
     # Current single-line activity per child: (tool, arg). Overwritten as
     # new tool calls land -- this is the "live" line, not a scrolling log.
     _activity: dict = {cid: ("", "starting…") for cid in child_ids}
@@ -2672,10 +2885,27 @@ def _bi_spawn_parallel(params: dict, ctx: ToolCtx) -> dict:
     _final_elapsed: dict = {}
     _SPINNER_FRAMES = symbols.SPINNER_RELAY
 
+    # Repaint budget. Every refresh erases the whole block and rewrites it —
+    # two separate writes with no synchronized-output guard — so a terminal
+    # that samples between them shows the rows missing. That is the flicker.
+    # Poll fast (state must stay current), draw slowly, and never draw a
+    # frame identical to the one already on screen.
+    _REDRAW_MIN_INTERVAL = 0.25
+    # The spinner is quantized to the redraw cadence: animating it faster than
+    # we are willing to repaint only forces repaints that show nothing new.
+    _SPINNER_PERIOD = max(_REDRAW_MIN_INTERVAL,
+                          symbols.SPINNER_INTERVAL_MS / 1000.0)
+    # Columns held back from the table width. Rich (and _disp_truncate) count
+    # East-Asian *Ambiguous* characters as one column — '·', '›', '◯', '…' are
+    # all Ambiguous, and a CJK-configured terminal renders them two wide. With
+    # expand=True every row is padded to exactly the full width, so a single
+    # miscounted column wraps the row, Live's cursor-up count comes up short,
+    # and the repaint stops erasing what it drew.
+    _AMBIGUOUS_WIDTH_MARGIN = 4
+
     def _spinner_glyph() -> str:
-        interval = symbols.SPINNER_INTERVAL_MS / 1000.0
         return _SPINNER_FRAMES[
-            int(time.time() / interval) % len(_SPINNER_FRAMES)]
+            int(time.time() / _SPINNER_PERIOD) % len(_SPINNER_FRAMES)]
 
     def _render_agents_block():
         """One-line-per-agent live view: status glyph, id, current tool
@@ -2697,50 +2927,69 @@ def _bi_spawn_parallel(params: dict, ctx: ToolCtx) -> dict:
             _head = f"[dim]{symbols.OK} {len(child_ids)}/{len(child_ids)} done {symbols.BULLET} {_elapsed_total:.0f}s[/dim]"
         _table = _RichTable(
             box=None, show_header=False, show_edge=False, pad_edge=False,
-            padding=(0, 1), expand=True)
+            padding=(0, 1), expand=True,
+            width=max(24, (getattr(ctx.deps.console, 'width', 80) or 80)
+                      - _AMBIGUOUS_WIDTH_MARGIN))
         _table.add_column(width=2, no_wrap=True)
         _table.add_column(style="agent", no_wrap=True)
         _table.add_column(ratio=1, no_wrap=True, overflow="ellipsis")
         _table.add_column(style="muted", justify="right", no_wrap=True)
+        _rows: list = []
         for cid in child_ids:
             if cid in _final:
                 _glyph, _text = _final[cid]
                 _meta = f"{_tool_counts[cid]} tools {symbols.BULLET} {_final_elapsed.get(cid, 0):.0f}s"
             else:
-                with _pending_approvals_lock:
-                    _awaiting = _pending_approvals.get(cid)
+                _awaiting = approval_text_for(cid)
                 if _awaiting:
                     _glyph = f"[warning]{symbols.WAIT}[/warning]"
                     _text = f"[warning]awaiting approval:[/warning] {_awaiting}"
                 elif time.time() - _activity_ts[cid] >= _IDLE_HINT_AFTER:
                     _tool, _arg = _activity[cid]
                     _glyph = f"[accent]{_spinner_glyph()}[/accent]"
-                    _prev = f"{_tool} {_arg}".strip() or "starting…"
+                    _prev = _esc_markup(f"{_tool} {_arg}".strip()) or "starting…"
                     _text = f"[muted]still on:[/muted] {_prev} [muted](may be waiting on approval)[/muted]"
                 else:
                     _glyph = f"[accent]{_spinner_glyph()}[/accent]"
                     _tool, _arg = _activity[cid]
+                    _tool, _arg = _esc_markup(_tool), _esc_markup(_arg)
                     _text = f"[muted]{_tool}[/muted] {_arg}" if _tool else f"[muted]{_arg}[/muted]"
                 _meta = f"{_tool_counts[cid]} tools {symbols.BULLET} {time.time() - _start[cid]:.0f}s"
             _table.add_row(_glyph, cid, _text, _meta)
-        return _RichGroup(_RichText.from_markup(_head), _table)
+            _rows.append((_glyph, cid, _text, _meta))
+        # The signature is what the frame will LOOK like. Identical signature
+        # means repainting would produce the same pixels, so we skip it.
+        return _RichGroup(_RichText.from_markup(_head), _table), repr((_head, _rows))
 
     # Concurrent wait: poll all children at once.  Wall time = max(child
     # times), not sum - the old list-comprehension waited sequentially,
     # so one slow child blocked detection of the rest.
-    _timeout = SPAWN_PARALLEL_TIMEOUT_SECONDS
-    _deadline = time.time() + _timeout
-    # Soft-timeout wrap-up: nudge each still-running child a bit before the
-    # hard deadline so it has a chance to hand back whatever it has found
-    # instead of being cut off with nothing to show. Reuses the existing
-    # inbox mechanism -- run_agent_loop drains and prompts with inbox
-    # messages every iteration, no new plumbing needed.
-    _wrap_up_deadline = _deadline - SPAWN_PARALLEL_WRAP_UP_LEAD_SECONDS
+    #
+    # No shared deadline: each child is judged on its own progress (see the
+    # constants above). _stall_deadline_for() returns the moment THIS child is
+    # declared stuck, recomputed every poll from its last sign of life.
+    _deadline = (time.time() + SPAWN_PARALLEL_TOTAL_TIMEOUT_SECONDS
+                 if SPAWN_PARALLEL_TOTAL_TIMEOUT_SECONDS > 0 else None)
+    _stall_limit = float(SPAWN_PARALLEL_STALL_SECONDS)
+
+    def _stall_deadline_for(cid: str) -> float:
+        """When ``cid`` will be considered stalled, given what it last did."""
+        return _activity_ts[cid] + _stall_limit
+
+    # Wrap-up nudge: sent to a child that is closing in on ITS OWN stall
+    # cutoff, so it can hand back whatever it has found instead of being cut
+    # off with nothing to show. Reuses the existing inbox mechanism --
+    # run_agent_loop drains and prompts with inbox messages every iteration,
+    # no new plumbing needed. Re-armed whenever the child makes progress
+    # again: a nudge is about being near a cutoff, not a one-time event.
     _nudged: set = set()
     # Best-effort partial conclusion captured from a child that got cut off
     # by the timeout/interrupt, so the final report can show what it found
     # instead of a bare "timed out" with nothing behind it.
     _partial_replies: dict = {}
+    # Children cut off for making no progress, so the report can say "stalled"
+    # rather than blaming a batch budget that no longer exists.
+    _stalled: set = set()
     _al.enter_waiting(parent_id)
     try:
         infos: list = [None] * len(child_ids)
@@ -2751,58 +3000,104 @@ def _bi_spawn_parallel(params: dict, ctx: ToolCtx) -> dict:
             _transient_factory()
             if callable(_transient_factory) else nullcontext())
         _live = None
+        _last_signature = None
+        _last_redraw = 0.0
         with _transient_ctx:
-            try:
-                from rich.live import Live
-                # transient=False: the final frame (all rows resolved) stays
-                # in the scrollback as the permanent record, instead of
-                # vanishing and being replaced by a separate summary print.
-                # auto_refresh=False: our own polling loop below already
-                # calls .update(refresh=True) every ~100ms, so Live's default
-                # background refresh thread would just be a second, redundant
-                # writer racing the same terminal -- notably against a
-                # per-child approval prompt printed from a different thread.
-                _live = Live(_render_agents_block(), console=ctx.deps.console,
-                             auto_refresh=False, transient=False,
-                             redirect_stdout=False, redirect_stderr=False)
-                _live.__enter__()
-                with _active_parallel_lives_lock:
-                    _active_parallel_lives.append(_live)
-            except Exception:
-                _live = None
+            # ── One live region per screen, at any depth ──
+            # A batch spawned INSIDE a child of another batch shares this
+            # process's single console. rich then marks the second Live
+            # "nested": it draws nothing while running and, on stop, dumps its
+            # whole renderable into the scrollback under the outer table. The
+            # outer batch already reports this subtree's progress, so the
+            # inner one runs headless instead.
+            with _active_parallel_lives_lock:
+                _display_owner = not _active_parallel_lives
+            if _display_owner:
+                try:
+                    from rich.live import Live
+                    # transient=False: the final frame (all rows resolved)
+                    # stays in the scrollback as the permanent record, instead
+                    # of vanishing and being replaced by a separate summary
+                    # print. auto_refresh=False: the polling loop below owns
+                    # the repaint cadence, so Live's background refresh thread
+                    # would just be a second writer racing the same terminal
+                    # -- notably against a per-child approval prompt printed
+                    # from a different thread.
+                    _frame, _last_signature = _render_agents_block()
+                    _live = Live(_frame, console=ctx.deps.console,
+                                 auto_refresh=False, transient=False,
+                                 redirect_stdout=False, redirect_stderr=False)
+                    _live.__enter__()
+                    _last_redraw = time.time()
+                    with _active_parallel_lives_lock:
+                        _active_parallel_lives.append(_live)
+                except Exception:
+                    _live = None
             _interrupted = False
+
+            def _repaint(force: bool = False) -> None:
+                """Redraw only when the frame would actually differ.
+
+                Rate-limited and content-diffed: an unchanged block repainted
+                ten times a second is pure flicker, since each repaint erases
+                every row before rewriting it.
+                """
+                nonlocal _last_signature, _last_redraw
+                if _live is None:
+                    return
+                _now_draw = time.time()
+                if not force and _now_draw - _last_redraw < _REDRAW_MIN_INTERVAL:
+                    return
+                _frame, _signature = _render_agents_block()
+                if not force and _signature == _last_signature:
+                    return
+                _last_signature = _signature
+                _last_redraw = _now_draw
+                with _synchronized_update(ctx.deps.console):
+                    _live.update(_frame, refresh=True)
+
+            def _cut_off(cid: str, label: str) -> None:
+                """Tear down a child that will not finish, keeping its answer.
+
+                Snapshots whatever it had already said before abort_agent()
+                takes it apart -- the wrap-up nudge exists so this is a real
+                partial conclusion, not whatever stale text happened to sit
+                there.
+                """
+                _last_info = _al.get_agent(cid)
+                if _last_info is not None:
+                    _partial = ((_last_info.state or {}).get("lastReply") or "").strip()
+                    if _partial:
+                        _partial_replies[cid] = _partial
+                _al.abort_agent(cid)
+                _final_elapsed[cid] = time.time() - _start[cid]
+                _final[cid] = (f"[error]{symbols.FAIL}[/error]", f"[muted]{label}[/muted]")
+
             try:
-                while _pending and time.time() < _deadline:
+                while _pending and (_deadline is None or time.time() < _deadline):
                     _parent_info = _al.get_agent(parent_id)
                     if _parent_info is not None and _parent_info.abort_event.is_set():
                         # User requested interrupt (Ctrl+C/Esc). Without this
-                        # check the loop only stops on the 600s timeout, so a
-                        # single Ctrl+C had no effect on an in-flight
-                        # spawn_parallel call and the CLI looked hung.
+                        # check the loop would only stop when every child
+                        # finishes or stalls, so a single Ctrl+C had no effect
+                        # on an in-flight spawn_parallel call and the CLI
+                        # looked hung.
                         _interrupted = True
                         break
-                    if time.time() >= _wrap_up_deadline:
-                        for cid in _pending:
-                            if cid in _nudged:
-                                continue
-                            _nudged.add(cid)
-                            _al.send_to_agent(cid, {
-                                "type": "budget_warning",
-                                "text": (
-                                    f"Only ~{SPAWN_PARALLEL_WRAP_UP_LEAD_SECONDS}s left in this batch's "
-                                    "time budget. Stop opening new exploration now and reply "
-                                    "with the best conclusion you can support from what "
-                                    "you've already found — a partial, honest answer beats "
-                                    "being cut off with nothing."),
-                            })
+                    _now = time.time()
                     for i, cid in enumerate(child_ids):
                         if infos[i] is not None:
                             continue
                         info = _al.get_agent(cid)
                         if info is not None:
+                            _cstate = info.state or {}
                             # Update this child's single activity line from the
                             # most recent tool call -- no per-call scrollback.
-                            _hist = info.state.get("terminalHistory") or []
+                            # _pending_history carries the calls of a turn that
+                            # is still running; without it a six-call turn looks
+                            # motionless until its last call lands.
+                            _hist = list(_cstate.get("terminalHistory") or [])
+                            _hist.extend(_cstate.get("_pending_history") or [])
                             for _row in _hist:
                                 if not isinstance(_row, dict):
                                     continue
@@ -2815,7 +3110,61 @@ def _bi_spawn_parallel(params: dict, ctx: ToolCtx) -> dict:
                                 _cmd = _disp_truncate(
                                     (_row.get("command") or "").strip(), _goal_w)
                                 _activity[cid] = (_tool, _cmd)
-                                _activity_ts[cid] = time.time()
+                                _activity_ts[cid] = _now
+                                _nudged.discard(cid)
+                            # A tool call still running is work, not silence.
+                            # Dating the stall clock from its START (not from
+                            # now) keeps the watchdog meaningful: a tool wedged
+                            # forever still trips it, a slow one does not.
+                            _act = _cstate.get("_active_tool")
+                            if isinstance(_act, dict):
+                                _act_start = float(_act.get("started") or 0.0)
+                                if _act_start > _activity_ts[cid]:
+                                    _activity_ts[cid] = _act_start
+                                    _activity[cid] = (
+                                        str(_act.get("name") or ""),
+                                        _disp_truncate(str(_act.get("arg") or ""), _goal_w))
+                                    _nudged.discard(cid)
+                            # Progress can also be pure text: a child reasoning
+                            # its way to a written conclusion calls no tools.
+                            _reply_now = str(_cstate.get("lastReply") or "").strip()
+                            if _reply_now and _reply_now != _last_reply_seen[cid]:
+                                _last_reply_seen[cid] = _reply_now
+                                _activity_ts[cid] = _now
+                                _nudged.discard(cid)
+                            # …and a delegating child shows no signs of its
+                            # own at all: it sits on one open spawn call while
+                            # ITS children do the work. Their progress is its
+                            # progress, or the watchdog kills every supervisor
+                            # in a tree deeper than one level.
+                            _subtree_now = _al.subtree_progress_token(cid)
+                            if _subtree_now != _subtree_seen.get(cid):
+                                if _subtree_seen.get(cid) is not None:
+                                    _activity_ts[cid] = _now
+                                    _nudged.discard(cid)
+                                _subtree_seen[cid] = _subtree_now
+                        # Subtree-aware: a child whose OWN child is parked on
+                        # an approval prompt is waiting on a person too, and
+                        # must not be killed for "no progress".
+                        if is_awaiting_approval(cid):
+                            # A human deciding is not a stalled agent. Hold the
+                            # clock instead of killing the child out from under
+                            # the prompt it is blocked on.
+                            _activity_ts[cid] = _now
+                            _nudged.discard(cid)
+                        elif (info is not None and info.status == "queued"
+                              and _now - _queued_since[cid] < _al.AGENT_QUEUE_HOLD_MAX_SECONDS):
+                            # Waiting for a concurrency slot is not stalling
+                            # either: a queued child cannot make progress by
+                            # definition, and killing it for that would make the
+                            # watchdog fire hardest exactly when the machine is
+                            # busiest. Its clock starts when it starts running.
+                            # Bounded, so a slot that never frees is reported as
+                            # a stall rather than hanging the batch forever.
+                            _activity_ts[cid] = _now
+                            _nudged.discard(cid)
+                        elif info is not None and info.status != "queued":
+                            _queued_since[cid] = _now
                         if info is not None and info.status in ("done", "aborted", "error"):
                             infos[i] = info
                             _pending.discard(cid)
@@ -2827,29 +3176,41 @@ def _bi_spawn_parallel(params: dict, ctx: ToolCtx) -> dict:
                             elif info.status == "done" and not info.error:
                                 _final[cid] = ("[warning]◯[/warning]", "[muted]empty reply[/muted]")
                             else:
-                                _label = _disp_truncate(info.error or info.status, 60)
+                                _label = _esc_markup(
+                                    _disp_truncate(info.error or info.status, 60))
                                 _final[cid] = (f"[error]{symbols.FAIL}[/error]", f"[muted]{_label}[/muted]")
-                    if _live is not None:
-                        _live.update(_render_agents_block(), refresh=True)
+                            continue
+                        # ── Per-child stall watchdog ──
+                        _stall_at = _stall_deadline_for(cid)
+                        if (cid not in _nudged
+                                and _now >= _stall_at - SPAWN_PARALLEL_WRAP_UP_LEAD_SECONDS):
+                            _nudged.add(cid)
+                            _al.send_to_agent(cid, {
+                                "type": "budget_warning",
+                                "text": (
+                                    f"You have shown no progress for a while and will be stopped in "
+                                    f"~{SPAWN_PARALLEL_WRAP_UP_LEAD_SECONDS}s if that does not change. "
+                                    "Stop opening new exploration now and reply with the best "
+                                    "conclusion you can support from what you've already found — "
+                                    "a partial, honest answer beats being cut off with nothing."),
+                            })
+                        if _now >= _stall_at:
+                            _stalled.add(cid)
+                            _pending.discard(cid)
+                            infos[i] = None
+                            _cut_off(cid, f"stalled {symbols.BULLET} "
+                                          f"no progress for {int(_stall_limit)}s")
+                    _repaint()
                     if _pending:
                         time.sleep(0.1)
                 for cid in _pending:
-                    # Snapshot whatever the child had already said before
-                    # abort_agent() tears it down -- the wrap-up nudge above
-                    # exists so this is a real partial conclusion, not just
-                    # whatever stale text happened to be sitting there.
-                    _last_info = _al.get_agent(cid)
-                    if _last_info is not None:
-                        _partial = (_last_info.state.get("lastReply") or "").strip()
-                        if _partial:
-                            _partial_replies[cid] = _partial
-                    _al.abort_agent(cid)
                     infos[child_ids.index(cid)] = None
-                    _final_elapsed[cid] = time.time() - _start[cid]
-                    _label = "interrupted" if _interrupted else f"timed out {symbols.BULLET} {_timeout}s"
-                    _final[cid] = (f"[error]{symbols.FAIL}[/error]", f"[muted]{_label}[/muted]")
-                if _live is not None:
-                    _live.update(_render_agents_block(), refresh=True)
+                    _cut_off(cid, "interrupted" if _interrupted
+                             else f"batch timeout {symbols.BULLET} "
+                                  f"{int(SPAWN_PARALLEL_TOTAL_TIMEOUT_SECONDS)}s")
+                # Final frame: every row resolved, drawn unconditionally so
+                # the permanent scrollback record is the finished table.
+                _repaint(force=True)
             finally:
                 if _live is not None:
                     with _active_parallel_lives_lock:
@@ -2877,6 +3238,22 @@ def _bi_spawn_parallel(params: dict, ctx: ToolCtx) -> dict:
     def _self_reports_incomplete(text: str) -> bool:
         return any(kw in text for kw in _INCOMPLETE_SELF_REPORT)
 
+    # Per-child share of the tool-result budget. A fixed 400 chars meant a
+    # two-agent batch wasted most of the budget while a six-agent batch
+    # overflowed it — and 400 chars is barely a paragraph, so the findings the
+    # batch exists to collect were cut off mid-sentence.
+    _result_budget = int(_al.get_runtime_config("output_truncate") or 3000)
+    _per_child = max(400, (_result_budget - 200) // max(1, len(child_ids)))
+
+    def _fit(text: str, limit: int) -> str:
+        """Keep both ends: a report's conclusion is usually its last line."""
+        text = text.strip()
+        if len(text) <= limit:
+            return text
+        head = int(limit * 0.6)
+        tail = limit - head - 24
+        return f"{text[:head]}\n… [{len(text) - head - tail} chars elided] …\n{text[-tail:]}"
+
     lines = [f"═══ Parallel Results ({len(child_ids)} agents) ═══"]
     succeeded = 0
     partial = 0
@@ -2884,16 +3261,21 @@ def _bi_spawn_parallel(params: dict, ctx: ToolCtx) -> dict:
         if info is None:
             ok = False
             _partial_text = _partial_replies.get(cid, "")
+            if _interrupted:
+                _cause = "interrupted"
+            elif cid in _stalled:
+                _cause = (f"stopped after {int(_stall_limit)}s with no observable "
+                          "progress (no tool call, no reply)")
+            else:
+                _cause = "stopped by the batch timeout"
             if _partial_text:
                 partial += 1
-                _cause = "interrupted" if _interrupted else "ran out of its time budget"
                 message = (
                     f"Did not finish — {_cause} before completing, but reported "
                     f"this partial conclusion before being cut off:\n{_partial_text}"
                 )
             else:
-                message = ("interrupted before producing any output" if _interrupted
-                           else "ran out of its time budget before producing any output")
+                message = f"{_cause}; produced no output"
         else:
             ok = info.status == "done" and not info.error
             message = (info.result or info.last_reply or "").strip()
@@ -2901,8 +3283,11 @@ def _bi_spawn_parallel(params: dict, ctx: ToolCtx) -> dict:
                 message = info.error
             if ok and not message:
                 ok = False
-                message = ("(agent completed but produced no reply - "
-                           "consider retrying or rephrasing the task)")
+                message = (
+                    f"(agent finished after {_tool_counts.get(cid, 0)} tool "
+                    "call(s) but returned no final answer — its findings were "
+                    "not reported; re-run this sub-task yourself or reissue it "
+                    "with a narrower goal)")
             elif ok and _self_reports_incomplete(message):
                 # The agent itself says it isn't done -- e.g. "I haven't
                 # finished reading X yet" -- don't count that as succeeded
@@ -2912,7 +3297,7 @@ def _bi_spawn_parallel(params: dict, ctx: ToolCtx) -> dict:
         succeeded += int(ok)
         lines.append(
             f"\n─── [{f'{symbols.OK}' if ok else f'{symbols.FAIL}'}] {cid} ───\n"
-            f"Goal: {task['task'][:80]}\nResult: {message[:400]}"
+            f"Goal: {task['task'][:80]}\nResult: {_fit(message, _per_child)}"
         )
     _summary = f"\n═══ Summary: {succeeded}/{len(child_ids)} succeeded"
     if partial:
@@ -2968,15 +3353,24 @@ def _bi_spawn_chain(params: dict, ctx: ToolCtx) -> dict:
         child_ids.append(cid)
         _al.enter_waiting(parent_id)
         try:
-            info = _al.wait_for_agent(cid, timeout=300, abort_event=_abort_ev)
+            # Stall budget per step. A pipeline step is a whole task; capping it
+            # at a fixed 300s made "analyze → implement → verify" fail on the
+            # step that had the most to do.
+            info = _al.wait_for_agent(cid, abort_event=_abort_ev,
+                                      stall_seconds=_al.AGENT_STALL_SECONDS)
         finally:
             _al.exit_waiting(parent_id)
         if info is None:
+            _partial = rescue_partial_reply(cid)
             _al.abort_agent(cid)
             if _abort_ev is not None and _abort_ev.is_set():
                 return {"ok": False, "result": f"Chain {chain_id} interrupted at step {index + 1}",
                         "child_ids": child_ids}
-            return {"ok": False, "result": f"Chain {chain_id} timed out at step {index + 1}",
+            _tail = (f"\nPartial result from that step before cutoff:\n{_partial}"
+                     if _partial else "")
+            return {"ok": False,
+                    "result": (f"Chain {chain_id} stopped at step {index + 1}: no progress "
+                               f"for {int(_al.AGENT_STALL_SECONDS)}s{_tail}"),
                     "child_ids": child_ids}
         if info.status != "done":
             return {
@@ -3187,21 +3581,51 @@ def _bi_hwo_agent_receive(params: dict, ctx: ToolCtx) -> dict:
     """Block until a message arrives from a specific HWO teammate (or anyone)."""
     import hwo_runner
 
+    import agent_loop as _al
+
     from_ = (params.get("from") or "").strip() or None
     try:
         timeout = float(params.get("timeout", 60) or 60)
     except (TypeError, ValueError):
         timeout = 60.0
-    timeout = max(0.0, min(timeout, 300.0))
+    timeout = max(0.0, timeout)
     caller_id = ctx.agent_id
     if not caller_id:
         return {"ok": False, "error": "no current agent"}
 
-    msg = hwo_runner.hwo_receive(caller_id, from_, timeout)
-    if msg is None:
-        who = f"#{from_}#" if from_ else "any sender"
-        return {"ok": False, "error": f"agent_receive timed out after {timeout:.0f}s waiting for {who}."}
-    return {"ok": True, "result": f"[{msg.get('from')}] {msg.get('text', '')}"}
+    # The old hard ceiling of 300s made this tool useless for its main job:
+    # waiting on a named teammate that is genuinely working. Instead of a fixed
+    # cap, the wait is extended for as long as that teammate keeps showing
+    # progress — and ends immediately when it can no longer send anything
+    # (finished/aborted) or when it goes silent. With no named sender there is
+    # no liveness to read, so the caller's own budget stands.
+    _deadline = time.time() + timeout
+    _waited_from = time.time()
+    _sender = _al.get_agent(from_) if from_ else None
+    _token = _al.agent_progress_token(_sender)
+    while True:
+        _slice = max(0.0, _deadline - time.time())
+        msg = hwo_runner.hwo_receive(caller_id, from_, min(_slice, 30.0))
+        if msg is not None:
+            return {"ok": True, "result": f"[{msg.get('from')}] {msg.get('text', '')}"}
+        if time.time() < _deadline:
+            continue                       # slice expired, budget remains
+        _sender = _al.get_agent(from_) if from_ else None
+        if _sender is None or _sender.status in ("done", "aborted", "error"):
+            break                          # nothing can arrive any more
+        _new_token = _al.agent_progress_token(_sender)
+        _alive = (_new_token != _token
+                  or _sender.status == "queued"
+                  or is_awaiting_approval(from_))
+        if not _alive:
+            break                          # the sender is stuck too
+        _token = _new_token
+        _deadline = time.time() + min(timeout or 60.0, 60.0)
+    who = f"#{from_}#" if from_ else "any sender"
+    _elapsed = time.time() - _waited_from
+    return {"ok": False,
+            "error": (f"agent_receive gave up after {_elapsed:.0f}s waiting for {who} "
+                      f"(no message, and the sender is no longer making progress).")}
 
 
 def _bi_hwo_agent_return(params: dict, ctx: ToolCtx) -> dict:
@@ -3370,6 +3794,11 @@ def _bi_agent_wait(params: dict, ctx: ToolCtx) -> dict:
     target_id = (params.get("agent_id") or "").strip()
     if not target_id:
         return {"ok": False, "error": "missing 'agent_id'"}
+    # An explicit timeout is the caller polling on purpose ("check back in
+    # 10s") and must be honoured as a total budget. Only the DEFAULT becomes a
+    # stall budget — that is where a guessed number would otherwise cut off an
+    # agent that is plainly still working.
+    _explicit_timeout = params.get("timeout") is not None
     timeout = float(params.get("timeout", 300))
     if ctx.wait_for_agent is None:
         return {"ok": False, "error": "wait not available"}
@@ -3382,14 +3811,26 @@ def _bi_agent_wait(params: dict, ctx: ToolCtx) -> dict:
     if ctx.agent_id:
         _al.enter_waiting(ctx.agent_id)
     try:
-        info = ctx.wait_for_agent(target_id, timeout, abort_event=_abort_ev)
+        # Waiting on a working agent is bounded by ITS silence, not by a number
+        # the caller guessed. An explicit, larger `timeout` still raises the
+        # stall budget for callers that know the target is slow by nature.
+        info = _al.wait_for_agent(
+            target_id, timeout=timeout, abort_event=_abort_ev,
+            stall_seconds=(None if _explicit_timeout
+                           else _al.AGENT_STALL_SECONDS))
     finally:
         if ctx.agent_id:
             _al.exit_waiting(ctx.agent_id)
     if info is None:
         if _abort_ev is not None and _abort_ev.is_set():
             return {"ok": False, "error": f"wait interrupted: agent '{target_id}'"}
-        return {"ok": False, "error": f"agent '{target_id}' not found or timed out"}
+        _partial = rescue_partial_reply(target_id)
+        _why = (f"did not finish within the requested {int(timeout)}s"
+                if _explicit_timeout
+                else f"made no progress for {int(_al.AGENT_STALL_SECONDS)}s")
+        return {"ok": False,
+                "error": f"agent '{target_id}' not found, or {_why}",
+                **({"result": _partial} if _partial else {})}
     return {"ok": True, "result": f"Agent {target_id}: {info.status}", "status": info.status}
 
 
@@ -3789,6 +4230,20 @@ def _bi_terminal_read(params: dict, ctx: ToolCtx) -> dict:
     return result
 
 
+def _terminal_output_len(term: Any) -> int:
+    """Total bytes this terminal has produced — the sign-of-life counter."""
+    try:
+        total = getattr(term.session, "output_total", None)
+        if isinstance(total, int):
+            return total
+        raw = getattr(term.session, "raw_output", None)
+        if raw is None:
+            raw = getattr(term.session, "full_output", "")
+        return len(raw)
+    except Exception:
+        return 0
+
+
 def _bi_terminal_wait(params: dict, ctx: ToolCtx) -> dict:
     """Wait for a background terminal to finish, then return its final delta."""
     target = (params.get("name") or "").strip()
@@ -3804,12 +4259,15 @@ def _bi_terminal_wait(params: dict, ctx: ToolCtx) -> dict:
         poll_interval = float(params.get("poll_interval", 0.2))
     except (TypeError, ValueError):
         return {"ok": False, "error": "timeout and poll_interval must be numbers"}
-    if not (0.0 <= timeout <= 300.0):
-        return {"ok": False, "error": "timeout must be between 0 and 300 seconds"}
+    if timeout < 0.0:
+        return {"ok": False, "error": "timeout must not be negative"}
     if not (0.05 <= poll_interval <= 2.0):
         return {"ok": False, "error": "poll_interval must be between 0.05 and 2 seconds"}
 
-    deadline = time.monotonic() + timeout
+    # Idle budget: a terminal running a long build is not something to give up
+    # on at a fixed deadline. `timeout` bounds how long it may stay SILENT.
+    _last_output = time.monotonic()
+    _seen_len = _terminal_output_len(term)
     while True:
         try:
             term.session.read_output(timeout=min(poll_interval, 0.2))
@@ -3818,7 +4276,11 @@ def _bi_terminal_wait(params: dict, ctx: ToolCtx) -> dict:
                 break
         except Exception as exc:
             return {"ok": False, "error": f"failed while waiting for '{target}': {exc}"}
-        remaining = deadline - time.monotonic()
+        _now_len = _terminal_output_len(term)
+        if _now_len != _seen_len:
+            _seen_len = _now_len
+            _last_output = time.monotonic()
+        remaining = (_last_output + timeout) - time.monotonic()
         if remaining <= 0:
             break
         time.sleep(min(poll_interval, remaining))
@@ -4060,7 +4522,9 @@ def _bi_session_start(params: dict, ctx: ToolCtx) -> dict:
 
     cwd = str(params.get("cwd") or ctx.cwd or os.getcwd())
     try:
-        timeout = max(1, int(params.get("timeout", 300)))
+        # Idle budget (seconds of silence), not a runtime cap — see
+        # SHELL_IDLE_TIMEOUT_SECONDS.
+        timeout = max(1, int(params.get("timeout", int(SHELL_IDLE_TIMEOUT_SECONDS))))
     except (TypeError, ValueError):
         return {"ok": False, "error": "timeout must be an integer"}
 
@@ -4766,9 +5230,14 @@ def _exec_in_deployed_shell(command: str, session: Any, timeout: int,
                     "_shell_stuck": True,
                 }
         session.send_keys(wrapped + "\n")
-        deadline = time.monotonic() + timeout
+        # Idle clock: `timeout` bounds SILENCE, not runtime. A command that
+        # keeps printing keeps its lease for as long as it needs.
+        _idle_budget = max(1.0, float(timeout or SHELL_IDLE_TIMEOUT_SECONDS))
+        _started_at = time.monotonic()
+        _last_output = time.monotonic()
+        _seen_len = 0
         new_content = ""
-        while time.monotonic() < deadline:
+        while time.monotonic() - _last_output < _idle_budget:
             if abort_event is not None and abort_event.is_set():
                 try:
                     session.send_keys("\x03")
@@ -4791,6 +5260,10 @@ def _exec_in_deployed_shell(command: str, session: Any, timeout: int,
                     new_content = raw[old_len:] if old_len else raw
             except Exception:
                 new_content = ""
+
+            if len(new_content) != _seen_len:
+                _seen_len = len(new_content)
+                _last_output = time.monotonic()
 
             end_match = re.search(
                 rf"{re.escape(end_marker)}:(\d+)", new_content)
@@ -4842,14 +5315,117 @@ def _exec_in_deployed_shell(command: str, session: Any, timeout: int,
         else:
             hint = ("; the terminal is still busy — the command may be "
                     "long-running or waiting on interactive input")
+        _idle_for = int(time.monotonic() - _last_output)
+        _ran_for = int(time.monotonic() - _started_at)
         return {"ok": False,
-                "error": f"Command timed out ({timeout}s){hint}",
+                "error": (f"Command produced no output for {_idle_for}s "
+                          f"(ran {_ran_for}s){hint}"),
                 "result": scrub_marker_noise(new_content).strip(), "returncode": -1,
                 "via": via, "_shell_stuck": not recovered,
                 "terminal_recovered": bool(recovered)}
     finally:
         if entered:
             lock.release()
+
+
+# Seconds a command may produce NOTHING before it is presumed wedged. There is
+# no cap on how long a command may RUN — a build, a migration or a test suite
+# takes what it takes, and the wall-clock budget this replaces killed exactly
+# those: it signalled the foreground process group of commands that had been
+# streaming output the whole time. Silence is the real symptom: a hung process,
+# a pager, a prompt waiting for input that will never come.
+SHELL_IDLE_TIMEOUT_SECONDS = 120.0
+SHELL_PROCESS_EXIT_WAIT_SECONDS = 5.0
+SHELL_PROCESS_TERM_GRACE_SECONDS = 0.5
+SHELL_PROCESS_KILL_WAIT_SECONDS = 2.0
+
+
+class _ProcessGroupOwner:
+    """Idempotent owner for one ``start_new_session`` subprocess tree."""
+
+    def __init__(self, process: subprocess.Popen):
+        self.process = process
+        # start_new_session makes the child's pid its process-group id.  Save
+        # it now: getpgid(pid) stops working after the leader is reaped while
+        # background descendants can still be alive in that same group.
+        self.pgid = process.pid
+        self._closed = False
+        self._lock = threading.Lock()
+
+    def _signal_group(self, sig: int) -> bool:
+        try:
+            os.killpg(self.pgid, sig)
+            return True
+        except (ProcessLookupError, PermissionError, OSError):
+            return False
+
+    def _group_alive(self) -> bool:
+        try:
+            os.killpg(self.pgid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except (PermissionError, OSError):
+            return False
+
+    def close(self) -> None:
+        """Terminate all descendants and reap the process-group leader."""
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+
+        process = self.process
+        try:
+            if process.poll() is None or self._group_alive():
+                self._signal_group(signal.SIGTERM)
+            try:
+                process.wait(timeout=SHELL_PROCESS_TERM_GRACE_SECONDS)
+            except subprocess.TimeoutExpired:
+                self._signal_group(signal.SIGKILL)
+                try:
+                    process.wait(timeout=SHELL_PROCESS_KILL_WAIT_SECONDS)
+                except subprocess.TimeoutExpired:
+                    try:
+                        process.kill()
+                        process.wait(timeout=SHELL_PROCESS_KILL_WAIT_SECONDS)
+                    except (OSError, subprocess.TimeoutExpired):
+                        pass
+
+            # The leader may have exited before a background descendant.  Its
+            # saved pgid remains the authority for the whole tree.
+            if self._group_alive():
+                self._signal_group(signal.SIGKILL)
+        finally:
+            # wait() above is the reap.  Keep one last best-effort wait here in
+            # case a signal raced with leader exit, then release both pipe fds.
+            try:
+                if process.poll() is None:
+                    process.wait(timeout=SHELL_PROCESS_KILL_WAIT_SECONDS)
+            except subprocess.TimeoutExpired:
+                pass
+            for stream in (process.stdout, process.stderr):
+                try:
+                    if stream is not None:
+                        stream.close()
+                except Exception:
+                    pass
+
+
+def _read_shell_pipe(stream) -> bytes:
+    """Read one direct-shell pipe chunk (small seam for error-path tests)."""
+    return os.read(stream.fileno(), 65536)
+
+
+def _shell_idle_budget(params: dict) -> float:
+    """Idle budget for one command. `timeout` from the model means idle now."""
+    try:
+        value = params.get("timeout")
+        if value is None:
+            return SHELL_IDLE_TIMEOUT_SECONDS
+        return max(1.0, float(value))
+    except (TypeError, ValueError):
+        return SHELL_IDLE_TIMEOUT_SECONDS
 
 
 def _command_has_cd_prefix(command: str) -> bool:
@@ -4996,49 +5572,65 @@ def _bi_shell_exec(params: dict, ctx: ToolCtx) -> dict:
         return result
 
     cwd = params.get("cwd") or ctx.cwd or os.getcwd()
+    idle_budget = _shell_idle_budget(params)
 
     # Direct subprocess execution. Use a process group and poll the owning
     # agent's abort event so cancelling a task also cancels the command and its
     # descendants instead of waiting for subprocess.run's timeout.
     try:
+        import select as _select
         import subprocess as _sp
         process = _sp.Popen(
-            command, shell=True, stdout=_sp.PIPE, stderr=_sp.PIPE, text=True,
+            command, shell=True, stdout=_sp.PIPE, stderr=_sp.PIPE,
             cwd=cwd, start_new_session=True,
         )
-        deadline = time.monotonic() + timeout
+        process_owner = _ProcessGroupOwner(process)
+        # Read incrementally instead of communicate(): the budget is an IDLE
+        # one, and idleness is only observable if we watch the output as it
+        # arrives. Selecting on both pipes also keeps the classic
+        # full-pipe deadlock away, which is the reason communicate() existed
+        # here in the first place.
+        _chunks: list = []
+        _open = [process.stdout, process.stderr]
+        _last_output = time.monotonic()
         cancelled = False
         timed_out = False
-        while True:
-            try:
-                stdout, stderr = process.communicate(timeout=0.1)
-                break
-            except _sp.TimeoutExpired:
+        try:
+            while _open:
+                _ready, _, _ = _select.select(_open, [], [], 0.2)
+                for _f in list(_ready):
+                    _data = _read_shell_pipe(_f)
+                    if _data:
+                        _chunks.append(_data)
+                        _last_output = time.monotonic()
+                    else:
+                        _open.remove(_f)        # EOF on this pipe
                 if abort_event is not None and abort_event.is_set():
                     cancelled = True
-                elif time.monotonic() >= deadline:
+                    break
+                if time.monotonic() - _last_output >= idle_budget:
                     timed_out = True
-                else:
-                    continue
+                    break
+            if not (cancelled or timed_out):
                 try:
-                    os.killpg(process.pid, signal.SIGTERM)
-                    stdout, stderr = process.communicate(timeout=0.5)
+                    process.wait(timeout=SHELL_PROCESS_EXIT_WAIT_SECONDS)
                 except _sp.TimeoutExpired:
-                    os.killpg(process.pid, signal.SIGKILL)
-                    stdout, stderr = process.communicate()
-                except ProcessLookupError:
-                    stdout, stderr = process.communicate()
-                break
-        output = ((stdout or "") + (stderr or "")).strip()
-        if cancelled:
-            return {"ok": False, "error": "Command aborted", "result": output,
-                    "returncode": -1, "via": "subprocess"}
-        if timed_out:
-            return {"ok": False,
-                    "error": f"Command timed out ({timeout}s): {command[:120]}",
-                    "result": output, "returncode": -1, "via": "subprocess"}
-        return {"ok": process.returncode == 0, "result": output or "(no output)",
-                "returncode": process.returncode, "via": "subprocess"}
+                    pass
+            output = b"".join(_chunks).decode("utf-8", "replace").strip()
+            if cancelled:
+                return {"ok": False, "error": "Command aborted", "result": output,
+                        "returncode": -1, "via": "subprocess"}
+            if timed_out:
+                _idle = int(time.monotonic() - _last_output)
+                return {"ok": False,
+                        "error": (f"Command produced no output for {_idle}s and was "
+                                  f"stopped: {command[:120]}"),
+                        "result": output, "returncode": -1, "via": "subprocess"}
+            return {"ok": process.returncode == 0,
+                    "result": output or "(no output)",
+                    "returncode": process.returncode, "via": "subprocess"}
+        finally:
+            process_owner.close()
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}", "returncode": -1}
 
@@ -5429,7 +6021,9 @@ def _bi_browser_navigate(params: dict, ctx: ToolCtx) -> dict:
         except ValueError as e:
             return {"ok": False, "error": str(e)}
     wait_until = params.get("wait_until", "domcontentloaded")
-    timeout = int(params.get("timeout", 30) or 30) * 1000
+    # Navigation budget. 30s was tight for slow or heavily-scripted sites, and a
+    # navigation that fails here costs a whole extra agent turn to retry.
+    timeout = int(params.get("timeout", 60) or 60) * 1000
     _browser_antibot_delay()
     try:
         page = sess.get_page()
@@ -6652,7 +7246,11 @@ def register_builtin_tools() -> None:
                 "properties": {
                     "command": {"type": "string"},
                     "cwd": {"type": "string"},
-                    "timeout": {"type": "integer", "default": 30},
+                    "timeout": {"type": "integer", "default": 120,
+                                "description": "seconds of NO OUTPUT before the command is "
+                                               "presumed stuck and stopped. There is no limit "
+                                               "on how long a command may run while it keeps "
+                                               "producing output."},
                     "stdin": {"type": "string"},
                 },
                 "required": ["command"],
@@ -7184,7 +7782,7 @@ def register_builtin_tools() -> None:
                         "silent-failure-hunter, simplifier, tester) and fire-and-forget "
                         "parallel spawning via the 'tasks' parameter (check inbox for results). "
                         "wait=true hands the whole batch to spawn_parallel instead (live status "
-                        "table, 600s shared budget, max 6 tasks) -- prefer calling spawn_parallel "
+                        "table, max 6 tasks) -- prefer calling spawn_parallel "
                         "directly when you already know you want to wait.",
             schema={
                 "type": "object",
@@ -7209,7 +7807,7 @@ def register_builtin_tools() -> None:
                     },
                     "wait": {"type": "boolean", "default": False,
                              "description": "Block until all children complete. Delegates to "
-                                            "spawn_parallel's fixed 600s budget (ignores 'timeout')."},
+                                            "spawn_parallel (ignores 'timeout')."},
                 },
                 "required": [],
             },
@@ -7255,12 +7853,17 @@ def register_builtin_tools() -> None:
         ),
         Tool(
             name="agent.wait",
-            description="Wait for another agent to finish (blocking, max 300s).",
+            description=("Wait for another agent to finish (blocking). Without a timeout it "
+                         "waits as long as that agent keeps making progress, and gives up "
+                         "only once it goes silent."),
             schema={
                 "type": "object",
                 "properties": {
                     "agent_id": {"type": "string", "description": "Target agent ID"},
-                    "timeout": {"type": "number", "default": 300, "description": "Max seconds to wait"},
+                    "timeout": {"type": "number",
+                                "description": "Optional. Set it to poll ('check back in Ns') — "
+                                               "then it IS a hard cap. Omit it to wait on real "
+                                               "progress instead."},
                 },
                 "required": ["agent_id"],
             },
@@ -7358,10 +7961,12 @@ def register_builtin_tools() -> None:
                 "Returns a combined structured report. Max 6 agents per batch. "
                 "Each member must work on DIFFERENT files — decompose by file boundaries. "
                 "Agents beyond the concurrency cap queue automatically. "
-                "The whole batch shares a 600s wall-clock budget: scope each task to a "
-                "reviewable slice (roughly <=300-400 lines of code, or an equivalently "
-                "bounded unit) — an oversized slice risks a forced cutoff mid-review with "
-                "nothing to show for it. Inside a child, prefer fs.read/fs.grep for reading "
+                "There is no batch time budget — a child runs until it finishes or exhausts "
+                "its loop cap — but a child that shows no progress for several minutes is "
+                "stopped on its own. Still scope each task to a reviewable slice (roughly "
+                "<=300-400 lines of code, or an equivalently bounded unit): an oversized "
+                "slice returns a shallower review, not a better one. "
+                "Inside a child, prefer fs.read/fs.grep for reading "
                 "code over shell one-liners that slice files — each distinct ad-hoc command "
                 "re-triggers a policy approval and burns the same budget waiting on it."
             ),
@@ -7595,7 +8200,10 @@ def register_builtin_tools() -> None:
                 "type": "object",
                 "properties": {
                     "name": {"type": "string", "description": "Terminal name"},
-                    "timeout": {"type": "number", "default": 60, "description": "Wait seconds, capped at 300"},
+                    "timeout": {"type": "number", "default": 60,
+                                "description": "Seconds of NO OUTPUT before giving up. A "
+                                               "terminal that keeps printing is waited on for "
+                                               "as long as it keeps printing."},
                     "poll_interval": {"type": "number", "default": 0.2},
                     "cursor": {"type": "integer", "description": "Optional explicit output cursor"},
                     "max_chars": {"type": "integer", "default": 4000},
@@ -7907,7 +8515,7 @@ def register_builtin_tools() -> None:
                     "session": {"type": "string", "description": "session name (uses most recent if omitted)"},
                     "wait_until": {"type": "string", "enum": ["load", "domcontentloaded", "networkidle"],
                                     "default": "domcontentloaded"},
-                    "timeout": {"type": "integer", "default": 30, "description": "navigation timeout in seconds"},
+                    "timeout": {"type": "integer", "default": 60, "description": "navigation timeout in seconds"},
                 },
                 "required": ["url"],
             },

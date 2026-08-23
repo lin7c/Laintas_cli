@@ -1181,6 +1181,8 @@ from agent_loop import (
     save_resume_state, load_resume_state, save_resume_checkpoint, list_resume_states,
     delete_resume_state, save_fork_state, _ensure_session_id,
     normalize_fork_lineage,
+    thread_agent, get_thread_agent_id, agent_ancestry,
+    harvest_agent_reply, describe_exit_reason,
 )
 
 import tools as tools_mod    # noqa: E402 — load after agent_loop so registry inits once
@@ -1345,9 +1347,23 @@ def pty_passthrough(command: str, timeout: int = 120) -> dict:
 
 
 
-def _marker_poll_exec(session, command: str, timeout: int = 60,
+# How long a command may produce NOTHING before the terminal is presumed stuck.
+# There is deliberately no cap on how long a command may RUN: a build, a test
+# suite or an install legitimately takes as long as it takes, and the previous
+# wall-clock budget killed exactly those — it sent SIGINT/SIGTERM/SIGKILL to the
+# foreground process group of a command that was streaming output the whole
+# time. Silence is the signal that something is actually wrong: a wedged
+# program, a pager, a prompt waiting for input nobody will type.
+SHELL_IDLE_TIMEOUT_SECONDS = 120.0
+
+
+def _marker_poll_exec(session, command: str, timeout: int = None,
                       strip_ansi_codes: bool = True) -> dict:
-    """Serialize a command on a persistent terminal session."""
+    """Serialize a command on a persistent terminal session.
+
+    ``timeout`` is an IDLE budget (seconds without new output), not a total
+    runtime budget. None uses SHELL_IDLE_TIMEOUT_SECONDS.
+    """
     lock = getattr(session, "command_lock", None)
     if lock is None:
         return _marker_poll_exec_unlocked(
@@ -1357,7 +1373,7 @@ def _marker_poll_exec(session, command: str, timeout: int = 60,
             session, command, timeout, strip_ansi_codes)
 
 
-def _marker_poll_exec_unlocked(session, command: str, timeout: int = 60,
+def _marker_poll_exec_unlocked(session, command: str, timeout: int = None,
                                strip_ansi_codes: bool = True) -> dict:
     """Execute a command through a persistent bash session via marker-poll.
 
@@ -1401,8 +1417,14 @@ def _marker_poll_exec_unlocked(session, command: str, timeout: int = 60,
     cmd_output = ""
     returncode = -1
     new_content = ""
+    # Idle clock: reset by any new byte from the command. A 40-minute build that
+    # keeps printing is working; two minutes of total silence is not.
+    _idle_budget = float(timeout if timeout is not None
+                         else SHELL_IDLE_TIMEOUT_SECONDS)
+    _last_output_at = time.time()
+    _seen_len = 0
 
-    while time.time() - poll_start < timeout:
+    while time.time() - _last_output_at < _idle_budget:
         time.sleep(0.08)
         session.read_output(timeout=0.1)
         output_from_fn = getattr(session, "output_from", None)
@@ -1417,6 +1439,11 @@ def _marker_poll_exec_unlocked(session, command: str, timeout: int = 60,
             except AttributeError:
                 raw = session.full_output
             new_content = raw[old_len:] if old_len > 0 else raw
+
+        # Any new byte is a sign of life; that is what resets the idle clock.
+        if len(new_content) != _seen_len:
+            _seen_len = len(new_content)
+            _last_output_at = time.time()
 
         end_match = _re.search(rf'{_re.escape(end_marker)}:(\d+)', new_content)
         if end_match:
@@ -1450,11 +1477,13 @@ def _marker_poll_exec_unlocked(session, command: str, timeout: int = 60,
         # The command never signalled completion (pager, prompt, or genuinely
         # long-running). Reclaim the shell so the next command doesn't type
         # into the stuck program and time out too.
+        _idle_for = int(time.time() - _last_output_at)
+        _ran_for = int(time.time() - poll_start)
         if tools_mod.recover_stuck_shell(session):
-            stderr_note = (f"command timed out ({timeout}s); "
+            stderr_note = (f"no output for {_idle_for}s (ran {_ran_for}s); "
                            "foreground process stopped, terminal recovered")
         else:
-            stderr_note = (f"command timed out ({timeout}s); "
+            stderr_note = (f"no output for {_idle_for}s (ran {_ran_for}s); "
                            "terminal still busy")
     elif returncode != -1:
         try:
@@ -6372,6 +6401,7 @@ def _native_to_tool_calls(frags: dict, name_map: Optional[dict] = None,
         if not name:
             continue
         args_raw = (slot.get("arguments") or "").strip()
+        _is_damaged = False
         if not args_raw:
             args = {}
         else:
@@ -6382,11 +6412,19 @@ def _native_to_tool_calls(frags: dict, name_map: Optional[dict] = None,
                     args = json.loads(_repair_json_candidate(args_raw))
                 except json.JSONDecodeError:
                     args = {}
+                    _is_damaged = True
                     if damaged is not None:
                         damaged.append(name)
         if not isinstance(args, dict):
             args = {"value": args}
-        out.append({"name": name, "arguments": args})
+        call = {"name": name, "arguments": args}
+        if _is_damaged:
+            # Tagged per CALL, not just per turn: a cut-off batch usually has
+            # intact calls in front of the one that ran out of budget, and the
+            # caller must be able to keep those instead of discarding the whole
+            # turn's work.
+            call["_damaged"] = True
+        out.append(call)
     return out
 
 
@@ -6516,6 +6554,56 @@ def _iter_lines_interruptible(response,
                 response.close()
             except Exception:
                 pass
+
+
+def _salvage_broken_stream(kind: str, error_message: str,
+                           frame_locals: dict, name_map: dict) -> dict:
+    """Turn a stream that died mid-flight into a TRUNCATED TURN, not a lost one.
+
+    A reasoning turn can stream for minutes before the transport gives up — the
+    outermost read timeout, a key whose upstream cuts long thinking streams, a
+    dropped connection. Everything already received was paid for and is usually
+    most of the answer, and the loop has a well-tested path for "the model got
+    cut off": the truncation ladder, which carries the partial turn into the
+    next iteration so the model continues from where it stopped. Reporting an
+    error instead threw all of it away and ended the turn — the one outcome
+    that is both the most expensive and the least useful.
+
+    Only COMPLETE tool calls survive. A call whose arguments stopped mid-JSON is
+    dropped rather than run with the fragment that arrived: executing half a
+    write is worse than not writing.
+    """
+    accumulated = frame_locals.get("accumulated") or ""
+    reasoning = frame_locals.get("reasoning_accumulated") or ""
+    if not accumulated and not reasoning:
+        # Nothing arrived — there is nothing to continue from.
+        return {"reply": error_message, "tool_calls": [], "done": True, "error": True}
+
+    damaged: list = []
+    calls: list = []
+    try:
+        frags = frame_locals.get("native_tc_frags") or {}
+        if frags:
+            calls = _native_to_tool_calls(frags, name_map or {}, damaged=damaged)
+            if damaged:
+                calls = [c for c in calls if c.get("name") not in set(damaged)]
+    except Exception:
+        calls, damaged = [], []
+
+    return {
+        "reply": accumulated,
+        "tool_calls": calls,
+        "finish_reason": "length",
+        "done": False,
+        "error": False,
+        "_truncated": True,
+        "_truncation_kind": kind,
+        "_truncation_detail": error_message,
+        "_reasoning": reasoning,
+        "_billing": frame_locals.get("billing_info") or {},
+        "_budget": frame_locals.get("budget_info") or {},
+        "_diag_events": (frame_locals.get("_diag_events") or []) + [kind],
+    }
 
 
 def call_backend_stream(
@@ -6725,6 +6813,7 @@ def call_backend_stream(
         prev_reply_for_chunks = ""
         prev_command_for_chunks = ""
         native_tc_frags: dict = {}  # index -> {id,name,arguments} for native tool_calls
+        _upstream_cut = ""           # set when the stream died after content
         for line in _iter_lines_interruptible(response, interrupt_event):
             # Check for soft-interrupt between SSE chunks
             if interrupt_event is not None and interrupt_event.is_set():
@@ -6748,7 +6837,16 @@ def call_backend_stream(
             got_any_event = True
             if evt.get("error"):
                 if accumulated:
-                    # Backend post-processing failed but content was already streamed — use it.
+                    # Content was already streamed and the failure came after
+                    # it. Keep the content — but do NOT let it pass as a
+                    # finished turn: an upstream that dies mid-answer (a key
+                    # that cuts long thinking streams, a dropped provider
+                    # connection) leaves a partial that reads like a complete
+                    # one. Flagged as truncated so the loop continues it in the
+                    # next iteration instead of accepting half an answer.
+                    _upstream_cut = (str(evt.get("details") or "").strip()
+                                     or str(evt.get("error") or "").strip()
+                                     or "upstream ended the response early")
                     break
                 # `details` is the part a user can act on ("nothing was
                 # charged", "lower the thinking effort"); `error` alone is the
@@ -6930,8 +7028,35 @@ def call_backend_stream(
         #   "tool_args"  — cut off mid tool-call; the write was too big
         #   "reasoning"  — reasoning ate the budget, nothing came out
         #   "output"     — prose ran past the ceiling
+        # An upstream that cut the stream after partial content is a truncated
+        # turn no matter what finish_reason says — there usually is none.
+        if _upstream_cut:
+            _truncated_turn = True
+        # Unparseable arguments are not, by themselves, evidence of a token
+        # overrun. A model that emits invalid JSON, or a proxy that drops
+        # bytes mid-frame, produces the same damaged call while finishing far
+        # under the granted ceiling — and the "output hit the token limit,
+        # write fewer lines" remedy is then both wrong and useless, because
+        # there was no limit involved. Separate the two where the evidence
+        # allows: well under the grant, with no provider truncation signal,
+        # means malformed, not too long. (Deliberately conservative — a
+        # completion anywhere near the ceiling stays classified as a real
+        # overrun, since a genuinely cut-off write can still report a clean
+        # finish_reason.)
+        _malformed_only = (
+            bool(_damaged_calls)
+            and finish_reason != "length"
+            and not _hit_ceiling
+            and not _upstream_cut
+            and _max_tokens > 0
+            and _completion_tokens < _max_tokens * 0.5
+        )
         _truncation_kind = ""
-        if _truncated_turn:
+        if _upstream_cut:
+            _truncation_kind = "stream_dropped"
+        elif _malformed_only:
+            _truncation_kind = "tool_args_malformed"
+        elif _truncated_turn:
             if native_tc_frags:
                 _truncation_kind = "tool_args"
             elif not accumulated.strip() and reasoning_accumulated:
@@ -6994,24 +7119,42 @@ def call_backend_stream(
         # passes the provider's native tool_calls straight through.
         if native_calls:
             # L4: If the turn was truncated mid-tool-call, the JSON arguments
-            # are incomplete and _native_to_tool_calls falls back to args={}
-            # (or partial args).  Drop the calls so they are not silently
-            # executed with empty/invalid arguments; the truncation handler
-            # in agent_loop will nudge the model to retry.
+            # of THAT call are incomplete and _native_to_tool_calls falls back
+            # to args={}. Drop the damaged calls so they are not silently
+            # executed with empty/invalid arguments — but keep the intact ones.
+            #
+            # Dropping the whole turn is what turned one over-long write into a
+            # dead end: a batch is normally "read A, read B, write C", so
+            # discarding A and B as well left the turn with nothing to show,
+            # the thread unchanged, and the model with every reason to emit the
+            # exact same batch again — cut at the exact same place. Three of
+            # those in a row is the "cut off 3 consecutive times (tool_args)"
+            # stop. Executing the intact prefix advances the conversation, so
+            # the retry is a genuinely different request.
             if _truncated_turn:
+                _intact = [dict(c) for c in native_calls if not c.get("_damaged")]
+                for _c in _intact:
+                    _c.pop("_damaged", None)
                 return {
                     "reply": prose_reply,
-                    "tool_calls": [],
+                    "tool_calls": _intact,
                     "finish_reason": finish_reason or "tool_calls",
                     "done": False,
                     "error": False,
                     "_truncated": True,
                     "_truncation_kind": _truncation_kind or "tool_args",
+                    "_truncation_detail": _upstream_cut,
+                    "_dropped_calls": [c.get("name") for c in native_calls
+                                       if c.get("_damaged")],
                     "_reasoning": reasoning_accumulated,
                     "_billing": billing_info,
                     "_budget": budget_info,
-                    "_diag_events": _diag_events + ["truncated_native_tool_calls_dropped"],
+                    "_diag_events": _diag_events + (
+                        ["truncated_native_tool_calls_partially_kept"]
+                        if _intact else ["truncated_native_tool_calls_dropped"]),
                 }
+            for _c in native_calls:
+                _c.pop("_damaged", None)
             return {
                 "reply": prose_reply,
                 "tool_calls": native_calls,
@@ -7041,6 +7184,7 @@ def call_backend_stream(
                     "error": False,
                     "_truncated": True,
                     "_truncation_kind": _truncation_kind or "tool_args",
+                    "_truncation_detail": _upstream_cut,
                     "_reasoning": reasoning_accumulated,
                     "_billing": billing_info,
                     "_budget": budget_info,
@@ -7071,6 +7215,7 @@ def call_backend_stream(
             "error": False,
             "_truncated": _truncated_turn,
             "_truncation_kind": _truncation_kind,
+            "_truncation_detail": _upstream_cut,
             "_reasoning": reasoning_accumulated,
             "_billing": billing_info,
             "_budget": budget_info,
@@ -7078,9 +7223,15 @@ def call_backend_stream(
         }
 
     except requests.Timeout:
-        return {"reply": "Request timed out. Please try again.", "tool_calls": [], "done": True, "error": True}
+        return _salvage_broken_stream(
+            "stream_timeout",
+            "Request timed out. Please try again.",
+            locals(), tool_name_map)
     except requests.ConnectionError:
-        return {"reply": f"Cannot connect to backend ({backend_url}). Check your network.", "tool_calls": [], "done": True, "error": True}
+        return _salvage_broken_stream(
+            "stream_dropped",
+            f"Cannot connect to backend ({backend_url}). Check your network.",
+            locals(), tool_name_map)
     except InterruptedError:
         # Soft-interrupt from _on_chunk callback during streaming
         _partial = ""
@@ -7096,7 +7247,8 @@ def call_backend_stream(
             "_interrupted": True,
         }
     except Exception as e:
-        return {"reply": f"Error: {e}", "tool_calls": [], "done": True, "error": True}
+        return _salvage_broken_stream(
+            "stream_dropped", f"Error: {e}", locals(), tool_name_map)
 
 
 # ── Agent Registration with Helpwo Backend ─────────────────────────────
@@ -11375,7 +11527,14 @@ def _cmd_training(parts: list, session: dict) -> None:
 
 
 def _show_usage_command(args: list, session: dict) -> None:
-    """/usage — local token accounting + Laintas backend usage (product=cli)."""
+    """/usage — local token accounting + Laintas backend usage.
+
+    The backend figures cover EVERY product, not just the CLI: the call
+    allowance is one pool shared across them, so splitting the spend by
+    product would report a smaller number than the one the quota is actually
+    drawn from. The header says so rather than leaving "product=cli" on a
+    figure that no longer means that.
+    """
     words = [a.strip().lower() for a in args if a.strip()]
     if words and words[0] == "buy":
         what = words[1] if len(words) > 1 else ""
@@ -11558,7 +11717,7 @@ def _show_usage_command(args: list, session: dict) -> None:
                 plan = ((bal.get("subscription") or {}).get("plan") or "").upper()
 
                 body.append(_usage_section("agent", "LAINTAS",
-                                           f"{profile.origin} {symbols.BULLET} product=cli {symbols.BULLET} {rng}"))
+                                           f"{profile.origin} {symbols.BULLET} all products {symbols.BULLET} {rng}"))
                 body.append(Text())
                 grid = Table(box=None, show_edge=False, show_header=False,
                              pad_edge=False, padding=(0, 1))
@@ -11794,7 +11953,6 @@ def _cmd_model_aux(args: list, session: dict) -> None:
     deepseek-v4-flash or whatever else is equally selectable.
     """
     current = str(get_runtime_config("aux_model") or "")
-    current_provider = str(get_runtime_config("aux_provider") or "")
 
     def _apply(model: str, provider: str = "") -> None:
         set_runtime_config("aux_model", model)
@@ -11833,11 +11991,12 @@ def _cmd_model_aux(args: list, session: dict) -> None:
         console.print("[dim]Unchanged.[/dim]")
         return
     model_id = selected.get("id", "") if isinstance(selected, dict) else selected
-    provider_id = selected.get("provider", "") if isinstance(selected, dict) else ""
-    _apply(model_id, provider_id)
-    info = f"[bold]{model_id}[/bold]" + (
-        f" ([dim]{_model_supply_label(provider_id)}[/dim])" if provider_id else "")
-    console.print(f"[green]Auxiliary model set to {info}[/green]")
+    # Store only the canonical model id. The gateway routes duplicate providers
+    # by supplier priority and can fail over without changing this setting.
+    _apply(model_id, "")
+    console.print(
+        f"[green]Auxiliary model set to [bold]{model_id}[/bold] "
+        "(supplier priority routing)[/green]")
     if model_id != current:
         console.print("[dim]Applies to compaction, the critic and memory "
                       "extraction. The terminal's own model is unchanged.[/dim]")
@@ -15575,8 +15734,12 @@ def _cmd_why(parts: list) -> None:
         tail_lines = output.splitlines()[-6:]
         lines.append("[muted]Output tail[/muted]")
         lines.extend(f"  {escape(line)}" for line in tail_lines)
+    # Plated with `surface`, the same background the failing tool line carries.
+    # /why is read right after that line and explains it, so the two reading as
+    # one surface is the point; a bare panel floated on the terminal background
+    # looked like output from something else.
     console.print(Panel("\n".join(lines), title="Why the last tool failed",
-                        border_style="error", expand=False))
+                        border_style="error", style="surface", expand=False))
 
 
 
@@ -17831,7 +17994,7 @@ def _cmd_max() -> None:
     # Crank every capacity knob to its ceiling and lift every auto-exit
     # circuit breaker. Process-global → applies to all agents. /config reset reverts.
     applied = apply_max_config()
-    console.print(f"[green]{symbols.ZAP} MAX mode — all limits lifted (applies to every agent):[/green]")
+    console.print("[green]MAX mode — all limits lifted (applies to every agent):[/green]")
     for k, v in applied.items():
         console.print(f"  [cyan]{k}[/cyan] = {v}")
     console.print("[dim]Note: max_tokens may be capped lower by the provider. Revert with /config reset.[/dim]")
@@ -19463,6 +19626,72 @@ _TERMINAL_EOF_ERRNOS = frozenset({
 })
 
 
+class _StartupCwdIdentity:
+    """Stable identity for the directory from which this CLI was launched.
+
+    Keeping the directory fd open lets the watchdog observe ``st_nlink == 0``
+    after an owned temporary directory is recursively removed, even though the
+    process can continue using its inherited cwd.  The saved path identity also
+    catches a removed-and-recreated directory.  Neither check depends on the
+    process's *current* cwd, so an ordinary ``cd`` is harmless.
+    """
+
+    def __init__(self, path: str, fd: int, device: int, inode: int):
+        self.path = path
+        self.fd = fd
+        self.device = device
+        self.inode = inode
+        self._lock = threading.Lock()
+
+    @classmethod
+    def capture(cls, path: Optional[str] = None) -> Optional["_StartupCwdIdentity"]:
+        try:
+            stable_path = os.path.abspath(path or os.getcwd())
+            flags = os.O_RDONLY
+            flags |= getattr(os, "O_DIRECTORY", 0)
+            flags |= getattr(os, "O_CLOEXEC", 0)
+            fd = os.open(stable_path, flags)
+            info = os.fstat(fd)
+            return cls(stable_path, fd, info.st_dev, info.st_ino)
+        except (OSError, ValueError):
+            try:
+                os.close(fd)
+            except (NameError, OSError):
+                pass
+            return None
+
+    def is_lost(self) -> bool:
+        """Return true only for definite unlink/replacement evidence."""
+        with self._lock:
+            if self.fd is None:
+                return False
+            try:
+                held = os.fstat(self.fd)
+            except (OSError, ValueError):
+                # Sandboxes and non-POSIX compatibility layers can deny these
+                # probes.  A watchdog uncertainty must not terminate the CLI.
+                return False
+            if getattr(held, "st_nlink", 1) == 0:
+                return True
+            try:
+                current = os.stat(self.path)
+            except OSError as exc:
+                if exc.errno in (errno.ENOENT, errno.ENOTDIR):
+                    return True
+                return False
+            return ((current.st_dev, current.st_ino)
+                    != (self.device, self.inode))
+
+    def close(self) -> None:
+        with self._lock:
+            fd, self.fd = self.fd, None
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
 def _stdin_terminal_disconnected() -> bool:
     """Return True when stdin is a PTY whose peer has disappeared."""
     try:
@@ -19478,8 +19707,9 @@ def _stdin_terminal_disconnected() -> bool:
     return False
 
 
-def _install_terminal_watchdog(shutdown_fn, *, interval: float = 30.0, grace: float = 8.0):
-    """Exit when the controlling terminal disappears.
+def _install_terminal_watchdog(shutdown_fn, *, startup_cwd=None,
+                               interval: float = 30.0, grace: float = 8.0):
+    """Exit when the controlling terminal or launch directory disappears.
 
     The REPL already turns a dead terminal into EOF and shuts down — but only
     while it is actually reading from it. A session parked anywhere else (a
@@ -19494,25 +19724,37 @@ def _install_terminal_watchdog(shutdown_fn, *, interval: float = 30.0, grace: fl
     the main thread, so it still runs when the main thread cannot, and it can
     end the process itself.
     """
+    fd = None
+    tty_path = None
     try:
-        fd = sys.stdin.fileno()
-        if not os.isatty(fd):
-            return          # piped input or a headless run: no terminal to lose
-        tty_path = os.ttyname(fd)
+        candidate_fd = sys.stdin.fileno()
+        if os.isatty(candidate_fd):
+            fd = candidate_fd
+            tty_path = os.ttyname(fd)
     except (AttributeError, OSError, ValueError):
+        pass
+
+    # Headless/piped sessions have no terminal identity, but they can still be
+    # stranded in an unlinked temporary launch directory.  Only opt out when
+    # there is genuinely nothing for this watchdog to observe.
+    if tty_path is None and startup_cwd is None:
         return
 
     def terminal_gone() -> bool:
         # The slave device is unlinked from /dev/pts the moment the master
         # closes, so its absence is the earliest reliable signal. tcgetpgrp
         # covers the rarer case where the path lingers but the line hung up.
-        if not os.path.exists(tty_path):
-            return True
-        try:
-            os.tcgetpgrp(fd)
-        except OSError as exc:
-            return exc.errno in _TERMINAL_EOF_ERRNOS
-        except ValueError:
+        if tty_path is not None:
+            if not os.path.exists(tty_path):
+                return True
+            try:
+                os.tcgetpgrp(fd)
+            except OSError as exc:
+                if exc.errno in _TERMINAL_EOF_ERRNOS:
+                    return True
+            except ValueError:
+                return True
+        if startup_cwd is not None and startup_cwd.is_lost():
             return True
         return False
 
@@ -19974,6 +20216,11 @@ def _start_bg_input_reader(target_queue: queue.Queue,
     _bg_reader_thread = threading.Thread(
         target=_reader, daemon=True, name="bg-input-reader")
     _bg_reader_thread.start()
+    # The reader only exists during a run, and stopping it for an approval
+    # prompt marks the input state idle. Restoring it here (rather than at
+    # each restart site) keeps the status line honest for every path that
+    # pauses the reader mid-run.
+    _set_run_input_state("running")
 
 
 def _stop_bg_input_reader() -> bool:
@@ -20043,7 +20290,7 @@ def _flush_deferred_notices() -> None:
     if _approval_star_pending and not _approval_star_announced:
         _approval_star_announced = True
         console.print(
-            f"[dim]{symbols.ZAP} Auto-approve active ([bold]*[/bold]). "
+            f"[dim]Auto-approve active ([bold]*[/bold]). "
             "Use /mode to change.[/dim]")
     _approval_star_pending = False
 
@@ -20127,7 +20374,12 @@ def _arrow_approval_prompt(title: str, body_lines: list[str],
     )
 
 
-_parallel_approval_lock = threading.Lock()
+# One approval prompt at a time, process-wide. Reentrant because the compact
+# sub-agent prompt is reached from inside _blocking_approval_prompt, which
+# already holds it. Two prompts sharing one terminal is never right: they
+# print over each other and race for the same keystroke, and the second one
+# to stop the background reader can restart it under the first.
+_parallel_approval_lock = threading.RLock()
 
 
 def _read_single_key_choice(*, allow_always: bool,
@@ -20174,29 +20426,68 @@ def _read_single_key_choice(*, allow_always: bool,
                     if ch == "a" and allow_always:
                         return "always"
                 # any other key: keep waiting
-    except TerminalBusy:
+    except TerminalBusy as busy:
         # Fail closed: an approval we cannot ask about is not an approval.
-        return None
+        # Distinguishable from Esc on purpose — a denial nobody was asked
+        # about must be reported as such, not silently counted as "the user
+        # said no" (which is how sub-agent approvals became invisible).
+        _diag_busy = getattr(busy, "owner", "") or "another component"
+        return f"unavailable:{_diag_busy}"
+
+
+def _requesting_agent_label() -> str:
+    """Which agent is asking for approval, at any depth.
+
+    The thread-local identity is authoritative: it is bound around every
+    agent loop (primary, sub-agent, grandchild, employee assignment). The
+    thread-name fallback exists only for callers that pre-date it — and it
+    strips the whole prefix, because agent ids contain '-' and rsplit gave
+    "2" for "laintas-sched-AI-2", a key that matched no agent anywhere.
+    """
+    label = get_thread_agent_id()
+    if label:
+        return label
+    name = threading.current_thread().name or ""
+    for prefix in ("laintas-sched-", "laintas-assignment-"):
+        if name.startswith(prefix):
+            return name[len(prefix):] or "agent"
+    # Last resort for a caller with no bound identity (a runner outside the
+    # agent loop, e.g. Agents Mode's own executor): the globally selected
+    # agent is a worse answer than the thread's own, but a real registry id
+    # beats a placeholder — consumers look the id up and treat a miss as
+    # "that agent is gone", which silently denies the prompt.
+    current = get_current_agent()
+    return current.id if current is not None else "agent"
+
+
+_PARALLEL_APPROVAL_BODY_LINES = 8
 
 
 def _compact_parallel_approval_prompt(title: str, body: str, question: str, *,
                                       allow_always: bool, destructive: bool,
                                       auto_confirm_seconds) -> str:
-    """Lean one-line approval prompt used while a spawn_parallel status
-    table is on screen.
+    """Compact approval prompt used while a spawn_parallel status table is on
+    screen — the sub-agent counterpart of _arrow_approval_prompt.
 
-    Same decision semantics as _arrow_approval_prompt (respects /mode's
-    auto-confirm timeout, same yes/no/always outcomes) — only the render
-    differs: one line instead of a multi-line body plus a full arrow-key
-    selector, and the parallel table is paused/resumed around it instead
-    of racing it for the terminal.
+    Same decision semantics (respects /mode's auto-confirm timeout, same
+    yes/no/always outcomes); only the render differs: a short header plus a
+    bounded body preview instead of a full arrow-key selector, with the
+    parallel table paused around it instead of racing it for the terminal.
+
+    Two things it must get right, both of which it used to get wrong:
+      * The background stdin reader owns the terminal for the whole run.
+        Not stopping it first meant every sub-agent approval sat 2s on a
+        TerminalBusy and was then silently recorded as a denial — the user
+        was never asked, and (with deny_exits_loop) the child died on the
+        spot with an empty reply.
+      * A prompt nobody could see is not a decision. When the terminal
+        genuinely cannot be taken, say so out loud instead of returning a
+        quiet "no" that reads like the user pressed a key.
     """
     import tools as tools_mod
 
     _cmd = body.split("\n", 1)[0]
-    _thread_name = threading.current_thread().name or ""
-    _agent_label = (_thread_name.rsplit("-", 1)[-1]
-                   if _thread_name.startswith("laintas-sched-") else "agent")
+    _agent_label = _requesting_agent_label()
     _color = "#f85149" if destructive else "#e3b341"
     # Parentheses, not brackets: a literal "[y/a/n]" would be parsed by Rich
     # as an (unrecognized, zero-width) markup tag and silently vanish --
@@ -20204,27 +20495,54 @@ def _compact_parallel_approval_prompt(title: str, body: str, question: str, *,
     # AI narration line (agent_loop.py _stripped MarkupError).
     _opts = ("y" + ("/a" if allow_always else "") + "/n")
     _cmd_disp = _cmd if len(_cmd) <= 70 else _cmd[:67] + "…"
+    _action = title.split(" — ")[0] if " — " in title else (title or "approve")
+    _body_rest = [ln for ln in body.split("\n")[1:]]
 
+    # Serialized: two children hitting an approval at once must not both
+    # print into (and read keys from) the same terminal region.
     with _parallel_approval_lock:
         tools_mod.mark_awaiting_approval(_agent_label, escape(_cmd_disp))
         _paused = tools_mod.pause_all_parallel_live_displays()
+        _reader_was_running = bool(
+            _bg_reader_thread is not None and _bg_reader_thread.is_alive())
+        _reader_was_running = _stop_bg_input_reader() and _reader_was_running
         try:
             console.print(
-                f"  [bold {_color}]⚠[/bold {_color}] "
-                f"[agent]{escape(_agent_label)}[/agent] wants to run: "
+                f"  [bold {_color}]⚠ {escape(_action)}[/bold {_color}] "
+                f"[agent]{escape(_agent_label)}[/agent]: "
                 f"[dim]{escape(_cmd_disp)}[/dim]  ({_opts})",
                 highlight=False)
+            _shown = 0
+            for _ln in _body_rest:
+                if not _ln.strip():
+                    continue
+                if _shown >= _PARALLEL_APPROVAL_BODY_LINES:
+                    console.print("    [muted]…[/muted]", highlight=False)
+                    break
+                console.print(f"    [#c0c0c0]{escape(_ln[:160])}[/#c0c0c0]",
+                              highlight=False)
+                _shown += 1
             try:
                 choice = _read_single_key_choice(
                     allow_always=allow_always,
                     auto_confirm_seconds=auto_confirm_seconds)
             except (EOFError, KeyboardInterrupt):
                 choice = None
-            console.print(
-                f"  [dim]↳ {choice or 'no'}[/dim]" if choice != "always"
-                else "  [dim]↳ always (auto-approved for this session)[/dim]",
-                highlight=False)
+            if choice and choice.startswith("unavailable:"):
+                _holder = choice.split(":", 1)[1]
+                console.print(
+                    f"  [yellow]↳ denied — could not ask you: the terminal is "
+                    f"held by {escape(_holder)}[/yellow]", highlight=False)
+                choice = None
+            else:
+                console.print(
+                    f"  [dim]↳ {choice or 'no'}[/dim]" if choice != "always"
+                    else "  [dim]↳ always (auto-approved for this session)[/dim]",
+                    highlight=False)
         finally:
+            if _reader_was_running:
+                _start_bg_input_reader(get_user_message_queue(),
+                                       get_user_interrupt_event())
             tools_mod.resume_all_parallel_live_displays(_paused)
             tools_mod.clear_awaiting_approval(_agent_label)
     return choice or "no"
@@ -20245,10 +20563,13 @@ def _blocking_approval_prompt(title: str, body: str, question: str,
     # the view's y/n approval UI instead ("always" is not offered there).
     _view_controller = _agents_view_controller()
     if _view_controller is not None:
-        _current = get_current_agent()
+        # The asker is whoever is running on THIS thread — not whichever
+        # agent the view happens to have selected. Misattributing it put a
+        # sub-agent's prompt under a stranger's name and left the view's
+        # abort-cancels-the-prompt check watching the wrong agent.
         try:
             approved = _view_controller._request_approval(
-                _current.id if _current is not None else "primary",
+                _requesting_agent_label(),
                 "confirm", f"{title} — {question}", body)
         except Exception:
             approved = False
@@ -20262,6 +20583,17 @@ def _blocking_approval_prompt(title: str, body: str, question: str,
     auto_confirm_seconds = mode_manager.get_auto_confirm_timeout(
         destructive=destructive)
 
+    # Serialized process-wide: see _parallel_approval_lock.
+    with _parallel_approval_lock:
+        return _prompt_for_approval(
+            title, body, question, allow_always=allow_always,
+            destructive=destructive,
+            auto_confirm_seconds=auto_confirm_seconds)
+
+
+def _prompt_for_approval(title: str, body: str, question: str, *,
+                         allow_always: bool, destructive: bool,
+                         auto_confirm_seconds) -> str:
     # A spawn_parallel batch keeps its own live-updating status table on
     # screen. The arrow-key selector below runs its own prompt_toolkit
     # render loop with no awareness of that table's cursor bookkeeping —
@@ -20315,6 +20647,14 @@ def _blocking_approval_prompt(title: str, body: str, question: str,
         _key_choice = _read_single_key_choice(
             allow_always=allow_always,
             auto_confirm_seconds=auto_confirm_seconds)
+        if _key_choice and _key_choice.startswith("unavailable:"):
+            # Denying is right; doing it silently is not — the user never saw
+            # this prompt and would otherwise read the refusal as their own.
+            console.print(
+                f"  [yellow]↳ denied — could not ask you: the terminal is held "
+                f"by {escape(_key_choice.split(':', 1)[1])}[/yellow]",
+                highlight=False)
+            return None
         return {"yes": "y ", "always": "a ", "no": "n "}.get(_key_choice or "no")
 
     try:
@@ -20648,16 +20988,17 @@ def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
 
     try:
         loop_agent_id = active_agent.id if active_agent is not None else None
-        response = run_agent_loop(
-            deps, effective_input, session, agent_state, chat_history,
-            events_cb=events_cb,
-            existing_session=existing_session,
-            depth=(active_agent.depth if loop_agent_id else 0),
-            agent_id=loop_agent_id,
-            interrupt_event=_interrupt_event,
-            message_queue=_msg_queue,
-            continue_thread=continue_thread,
-        )
+        with thread_agent(loop_agent_id or "primary"):
+            response = run_agent_loop(
+                deps, effective_input, session, agent_state, chat_history,
+                events_cb=events_cb,
+                existing_session=existing_session,
+                depth=(active_agent.depth if loop_agent_id else 0),
+                agent_id=loop_agent_id,
+                interrupt_event=_interrupt_event,
+                message_queue=_msg_queue,
+                continue_thread=continue_thread,
+            )
     except Exception as exc:
         run_error = f"{type(exc).__name__}: {exc}"
         raise
@@ -20862,6 +21203,19 @@ def main():
     parser.add_argument("--connect", action="store_true", default=False,
                         help="Hand this sub-terminal over to Helpwo at startup (internal; used by term-new)")
     args = parser.parse_args()
+
+    # Capture this before startup work can change cwd.  The watchdog owns the
+    # lifecycle decision; atexit merely closes the fd on ordinary return and
+    # startup failures that never reach the shutdown handler.
+    _startup_cwd_identity = None
+    if not args.monitor_only:
+        _startup_cwd_identity = _StartupCwdIdentity.capture()
+        if _startup_cwd_identity is not None:
+            try:
+                import atexit
+                atexit.register(_startup_cwd_identity.close)
+            except Exception:
+                pass
 
     # ── Cross-instance coordination: register this process in the peer
     # registry so other laintas_cli instances sharing this cwd can see it.
@@ -21330,6 +21684,8 @@ def main():
 
     # Setup graceful shutdown
     def shutdown(signum=None, frame=None, *, input_closed=False):
+        if _startup_cwd_identity is not None:
+            _startup_cwd_identity.close()
         # A disconnected SSH/PTY leaves fd 0/1/2 pointing at a dead terminal.
         # Reads then fail immediately with EIO and writes can fail too. Silence
         # only that dead output before cleanup; normal Ctrl+D keeps its message.
@@ -21452,7 +21808,8 @@ def main():
     # one mode meant to outlive its terminal, so it opts out; every other mode
     # gets a watchdog that exits if the terminal it was started from is gone.
     if not args.monitor_only:
-        _install_terminal_watchdog(shutdown)
+        _install_terminal_watchdog(
+            shutdown, startup_cwd=_startup_cwd_identity)
 
     # ── Create term0: a real persistent bash session ──
     # Direct user terminal commands route through this via marker-poll.

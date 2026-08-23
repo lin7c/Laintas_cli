@@ -264,6 +264,104 @@ class AgentSchedulerTests(unittest.TestCase):
                     if a.role == "subagent" and a.status == "done"]
         self.assertEqual(len(retained), 100)
 
+    def test_wait_for_agent_stall_mode_follows_progress(self):
+        """stall_seconds turns `timeout` from a total budget into a silence
+        budget: an agent that keeps working is waited on, one that goes quiet
+        is not."""
+        child = agent_loop.register_agent(name="worker", role="subagent")
+        child.status = "running"
+        stop = threading.Event()
+
+        def _work():
+            for step in range(8):        # 8 * 0.25s = 2s, well past the 1s window
+                if stop.is_set():
+                    return
+                child.state.setdefault("terminalHistory", []).append(
+                    {"tool": "fs.read", "call_id": f"c{step}"})
+                time.sleep(0.25)
+            child.status = "done"
+
+        t = threading.Thread(target=_work, daemon=True)
+        t.start()
+        info = agent_loop.wait_for_agent(child.id, stall_seconds=1.0)
+        stop.set()
+        self.assertIsNotNone(info)       # progress kept extending the wait
+        self.assertEqual(info.status, "done")
+
+        quiet = agent_loop.register_agent(name="quiet", role="subagent")
+        quiet.status = "running"
+        started = time.time()
+        self.assertIsNone(agent_loop.wait_for_agent(quiet.id, stall_seconds=0.5))
+        self.assertLess(time.time() - started, 5.0)
+
+    def test_wait_for_agent_holds_the_clock_while_queued(self):
+        """A child with no concurrency slot cannot progress; the watchdog must
+        not treat that as its fault."""
+        child = agent_loop.register_agent(name="queued-child", role="subagent")
+        child.status = "queued"
+
+        def _release():
+            time.sleep(2.0)              # 4x the stall window, still queued
+            child.status = "done"
+
+        threading.Thread(target=_release, daemon=True).start()
+        info = agent_loop.wait_for_agent(child.id, stall_seconds=0.5)
+        self.assertIsNotNone(info)
+        self.assertEqual(info.status, "done")
+
+    def test_working_child_outlives_the_stall_window(self):
+        """Progress buys time. A batch has no total budget, so a child that
+        keeps working runs past any fixed window — only silence is bounded."""
+        parent = agent_loop.register_agent(name="parent", role="primary")
+        ctx = tools.ToolCtx(
+            deps=_deps(), agent_id=parent.id, session={}, events_cb=None)
+
+        def _busy(deps, task, session, state, chat_history, **kwargs):
+            info = agent_loop.get_agent(state.get("_agent_id") or kwargs.get("agent_id"))
+            for step in range(8):        # 8 * 0.15s = 1.2s >> the 0.3s window
+                state.setdefault("terminalHistory", []).append(
+                    {"tool": "fs.read", "call_id": f"c{step}", "command": "x"})
+                agent_loop._publish_live_state(info, state)
+                time.sleep(0.15)
+            return {"state": {"lastReply": "finished the whole review"}}
+
+        with mock.patch("worktree_manager.is_git_repo", return_value=False), \
+                mock.patch.object(tools, "SPAWN_PARALLEL_STALL_SECONDS", 0.3), \
+                mock.patch.object(tools, "SPAWN_PARALLEL_WRAP_UP_LEAD_SECONDS", 0.1), \
+                mock.patch.object(agent_loop, "run_agent_loop", _busy):
+            result = tools._bi_spawn_parallel({"tasks": [{"goal": "slow but working"}]}, ctx)
+
+        self.assertTrue(result["ok"])
+        self.assertIn("finished the whole review", result["result"])
+        self.assertNotIn("no observable progress", result["result"])
+
+    def test_stalled_child_is_cut_off_with_its_partial_answer(self):
+        """Silence is what gets bounded — and the partial conclusion the child
+        had already produced comes back instead of a bare 'no output'."""
+        parent = agent_loop.register_agent(name="parent", role="primary")
+        ctx = tools.ToolCtx(
+            deps=_deps(), agent_id=parent.id, session={}, events_cb=None)
+
+        def _wedged(deps, task, session, state, chat_history, **kwargs):
+            info = agent_loop.get_agent(state.get("_agent_id") or kwargs.get("agent_id"))
+            state["lastReply"] = "found one leak so far"
+            agent_loop._publish_live_state(info, state)
+            deadline = time.time() + 10
+            while time.time() < deadline:      # never progresses again
+                if info is not None and info.abort_event.is_set():
+                    break
+                time.sleep(0.05)
+            return {"state": {"lastReply": state["lastReply"]}}
+
+        with mock.patch("worktree_manager.is_git_repo", return_value=False), \
+                mock.patch.object(tools, "SPAWN_PARALLEL_STALL_SECONDS", 0.4), \
+                mock.patch.object(tools, "SPAWN_PARALLEL_WRAP_UP_LEAD_SECONDS", 0.1), \
+                mock.patch.object(agent_loop, "run_agent_loop", _wedged):
+            result = tools._bi_spawn_parallel({"tasks": [{"goal": "gets stuck"}]}, ctx)
+
+        self.assertIn("no observable progress", result["result"])
+        self.assertIn("found one leak so far", result["result"])
+
 
 class AgentIsolationTests(unittest.TestCase):
     def setUp(self):

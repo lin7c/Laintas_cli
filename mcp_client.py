@@ -78,7 +78,11 @@ import paths
 import trust_store
 
 CONFIG_PATH = paths.MCP_FILE
-DEFAULT_CALL_TIMEOUT = 30.0     # seconds — per tool call
+# Per tool call. MCP servers front real work — a database query, a page scrape,
+# a remote API — and 30s cut off the slow-but-fine ones as if they had hung,
+# with nothing to show for the wait. Per-server `call_timeout` in mcp.json still
+# overrides this (clamped to 300s), so a known-fast server can tighten it.
+DEFAULT_CALL_TIMEOUT = 120.0
 CONNECT_TIMEOUT = 15.0          # seconds — per server initialize
 LIST_TOOLS_TIMEOUT = 10.0
 ALLOWED_CAPABILITIES = {

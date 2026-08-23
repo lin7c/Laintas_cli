@@ -65,6 +65,22 @@ class ReapStaleTempDirs(unittest.TestCase):
         self.tmp.return_value = os.path.join(self.root, "does-not-exist")
         self.assertEqual(browser_session._reap_stale_temp_dirs(), 0)
 
+    def test_shared_temp_root_is_rejected_even_if_its_name_matches(self):
+        # The incident cleanup matched the starting point itself ("/tmp"
+        # matches "tmp*").  Prefix checks never make the shared root owned.
+        self.assertIsNone(browser_session._owned_temp_child(
+            self.root, self.root, (os.path.basename(self.root),)))
+
+    def test_symlink_outside_temp_root_is_rejected(self):
+        outside = os.path.join(os.path.dirname(self.root), "foreign-temp-state")
+        os.makedirs(outside, exist_ok=True)
+        self.addCleanup(browser_session.shutil.rmtree, outside, True)
+        link = os.path.join(self.root, "hwo-chrome-link")
+        os.symlink(outside, link)
+
+        self.assertIsNone(browser_session._owned_temp_child(
+            self.root, link, browser_session._STALE_TEMP_PREFIXES))
+
 
 class ReapStaleDisplays(unittest.TestCase):
     """Orphaned Xvfb/x11vnc stacks and the display numbers they strand.

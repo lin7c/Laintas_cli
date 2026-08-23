@@ -377,7 +377,56 @@ Release assets use architecture-specific names because native ELF binaries are C
 
 The history below is curated from the repository tags and changes, following an Added/Changed/Fixed-style release-note structure rather than reproducing raw commit messages. The tagged public history currently represented in this repository begins at v1.3.0.
 
-### Unreleased
+### [v1.19.0](https://github.com/lin7c/Laintas_cli/releases/tag/v1.19.0) — 2026-08-23
+
+**Added**
+
+- Added an evidence-bound second-pass review for compaction summaries: an
+  independent reviewer model decomposes the candidate into atomic claims,
+  checks each against the source transcript, and applies minimal corrections.
+- Added chunked summarization (`summary_chunk_tokens`) so long sessions compact
+  without truncation, plus dedicated `summary_model` and
+  `summary_review_model` settings in `context_policy/policy.json`.
+- Added stream salvage: a transport that dies mid-answer now produces a
+  truncated-but-usable turn instead of silently losing the whole reply.
+- Added a terminal watchdog that detects launch-directory loss at startup and
+  recovers instead of failing every subsequent command.
+- Added silence-based budgets for shell, remote (WebRTC), and MCP tool calls:
+  commands are bounded by output silence, not a fixed wall clock, so long
+  builds and slow-but-streaming servers finish instead of being killed
+  mid-run. Per-server MCP `call_timeout` still overrides (clamped to 300s).
+- Added bounded ranking-result caches to memory recall and skill routing,
+  collapsing per-loop rank calls into roughly one per run even with many
+  concurrent agents.
+
+**Changed**
+
+- Hardened sub-agent supervision: failed children, denied writes, and silent
+  children are now surfaced and harvested instead of disappearing; approval
+  ancestry is tracked across agent generations.
+- Raised the compaction protection window to 40k tokens so loaded skills,
+  memories, and rules survive context pruning.
+- Shared `/tmp` cleanup commands now pass an explicit safety check, and
+  `os.ttyname` absence is guarded on platforms that lack it.
+- Registered `hwg_view`, `hwo_view`, and `workflow_viz` in
+  `package_manifest.json` so the interactive workflow viewers ship in every
+  release artifact.
+
+### [v1.18.0](https://github.com/lin7c/Laintas_cli/releases/tag/v1.18.0) — 2026-08-20
+
+**Added**
+
+- Added an API contract store where backend and frontend agree on endpoint
+  shapes through propose/agree/implement/verify states with drift detection.
+- Added local-runtime loopback so spawned runtimes answer on a local port,
+  git attribution recording which agent produced each change, and fork
+  lineage hardening for worktrees.
+
+**Fixed**
+
+- Self-healed the stale asyncio running-loop flag that froze the REPL after
+  certain interrupts, and stopped the background input reader before
+  restoring the SIGINT handler.
 
 **Removed**
 

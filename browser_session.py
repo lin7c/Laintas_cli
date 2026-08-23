@@ -296,6 +296,23 @@ def _remove_display_files(display_n: int) -> None:
             pass
 
 
+def _owned_temp_child(root: str, candidate: str,
+                      prefixes: tuple[str, ...]) -> Optional[str]:
+    """Resolve one app-owned temp child, never the shared temp root itself."""
+    try:
+        resolved_root = os.path.realpath(root)
+        resolved = os.path.realpath(candidate)
+        if resolved == resolved_root:
+            return None
+        if os.path.dirname(resolved) != resolved_root:
+            return None
+        if not os.path.basename(resolved).startswith(prefixes):
+            return None
+        return resolved
+    except (OSError, TypeError, ValueError):
+        return None
+
+
 def _reap_stale_temp_dirs(max_age: float = _STALE_TEMP_AGE) -> int:
     """Delete profile/log dirs left behind by sessions that never shut down.
 
@@ -313,9 +330,10 @@ def _reap_stale_temp_dirs(max_age: float = _STALE_TEMP_AGE) -> int:
         root = tempfile.gettempdir()
         now = time.time()
         for name in os.listdir(root):
-            if not name.startswith(_STALE_TEMP_PREFIXES):
+            path = _owned_temp_child(
+                root, os.path.join(root, name), _STALE_TEMP_PREFIXES)
+            if path is None:
                 continue
-            path = os.path.join(root, name)
             try:
                 if not os.path.isdir(path) or now - os.path.getmtime(path) < max_age:
                     continue
@@ -964,6 +982,10 @@ class BrowserSession:
             try:
                 if self._chrome is not None:
                     self._chrome.kill()
+                    try:
+                        self._chrome.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        pass
             except OSError:
                 pass
             self._start_chrome(no_sandbox=True)
@@ -999,6 +1021,10 @@ class BrowserSession:
                         proc.wait(timeout=3)
                     except subprocess.TimeoutExpired:
                         proc.kill()
+                        try:
+                            proc.wait(timeout=2)
+                        except subprocess.TimeoutExpired:
+                            pass
                 except Exception:
                     pass
 

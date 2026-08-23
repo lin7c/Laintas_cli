@@ -15,7 +15,7 @@ import sys
 import threading
 import time
 import uuid
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from typing import Optional, Callable, Any
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -36,6 +36,7 @@ import workflow_engine        # Structured multi-phase workflow engine
 import task_manager          # Structured task tracking (session + persisted)
 import workgraph             # Unified objective/plan/steps/workflow authority
 import paths                 # Centralized path management
+import json_store            # atomic small-JSON read/write
 import peer_coordination     # Cross-instance file-conflict coordination
 import skills as skills_mod   # Progressive skill metadata + context loading
 import symbols                # Centralized UI symbol constants
@@ -147,7 +148,9 @@ _DEFAULT_CONFIG = {
     # high-volume; pointing them at a cheaper long-context model separates the
     # "reasoning" bill from the "context plumbing" bill.
     "aux_model": "google/gemma-4-26b-a4b-it",
-    "aux_provider": "openrouter",
+    # Canonical model id only: the gateway resolves duplicate upstreams using
+    # supplier priority/failover. Never pin compaction to OpenRouter here.
+    "aux_provider": "",
     "auto_format": True,            # run the best-available code formatter in place after a full-file write (no-op if none installed); surgical edits stay byte-precise
     "auto_snapshot": True,          # lazily checkpoint before the first workspace-mutating tool call in a top-level task (no-op outside a git repo)
     "browser_action_delay_min": 0.3,   # min seconds of anti-bot delay before browser actions
@@ -177,7 +180,13 @@ _DEFAULT_CONFIG = {
     "trigger_debounce_ms": 500.0,      # idle window before flushing buffered trigger matches
     "trigger_max_per_scan": 50,        # hard cap on matches dispatched per terminal per scan
     "auto_pilot_enabled": True,        # master switch for heuristic task classification + hint injection
-    "auto_pilot_decompose_timeout": 3.0,   # seconds to wait for LLM decomposition before falling back to heuristic
+    # Seconds to wait for LLM decomposition before falling back to the
+    # heuristic. 3.0 was below the floor: the fastest measured round trip on
+    # this path is ~5-7s, so the call was billed and then discarded EVERY
+    # time and the "LLM decomposition" feature never once ran. This budget
+    # still has to stay short enough to sit inside a user keystroke-to-first
+    # -token wait, hence 20 rather than a model-sized number.
+    "auto_pilot_decompose_timeout": 20.0,
     "auto_pilot_decompose_max_tokens": 500, # max tokens for decomposition LLM call
     "auto_pilot_auto_execute": False,  # Phase 3: auto-spawn sub-agents for decomposed tasks (opt-in)
     "auto_pilot_max_parallel": 4,      # Phase 3: max parallel sub-agents for auto-execution
@@ -538,10 +547,80 @@ TRANSITION_WARNING_FORCE = "warning_force_exit"         # warning circuit breake
 TRANSITION_PARSE_GAVE_UP = "parse_gave_up"              # parse failure counter exhausted
 TRANSITION_USER_DENIED = "user_denied"                  # user explicitly denied an approval prompt
 
+_EXIT_REASON_TEXT = {
+    TRANSITION_MAX_LOOPS: "ran out of loop budget before finishing",
+    TRANSITION_STALENESS: "stopped producing output (idle-step limit)",
+    TRANSITION_ABORTED: "aborted by the control plane",
+    TRANSITION_INTERRUPTED: "interrupted",
+    TRANSITION_BACKEND_ERROR: "backend error",
+    TRANSITION_PROVIDER_ERROR: "provider ended the turn (filter/safety)",
+    TRANSITION_SILENT_FAILURE: "provider returned empty turns (silent failure)",
+    TRANSITION_REPAIR_GAVE_UP: "gave up repairing malformed tool calls",
+    TRANSITION_REPETITION: "stopped repeating itself (repetition breaker)",
+    TRANSITION_WARNING_FORCE: "warning circuit breaker tripped",
+    TRANSITION_PARSE_GAVE_UP: "gave up parsing the model's responses",
+    TRANSITION_USER_DENIED: "user denied an approval prompt",
+}
+
+
+def describe_exit_reason(result: dict) -> str:
+    """Human-readable cause for a loop that did not finish cleanly.
+
+    Sub-agents run with events_cb=None, so every console explanation the loop
+    prints for these exits is suppressed. This is the only channel through
+    which the failure can reach the supervising agent — and, through its
+    report, the user.
+    """
+    if not isinstance(result, dict):
+        return "agent loop returned no result"
+    reason = str(result.get("exit_reason") or "").strip()
+    text = _EXIT_REASON_TEXT.get(reason, reason or "ended without completing")
+    return f"Agent loop did not complete: {text}"
+
+
+def harvest_agent_reply(result: dict, chat_history: list = None) -> str:
+    """Best available final text from a finished agent loop.
+
+    ``state["lastReply"]`` only holds the LAST turn's prose (or a
+    task_complete summary). An agent that worked entirely through tool calls
+    and finished with `task_complete(summary="")` leaves it empty, throwing
+    away everything it found. Fall back to the loop's accumulated transcript
+    and then to the last assistant message before reporting "no reply".
+    """
+    if isinstance(result, dict):
+        state = result.get("state") or {}
+        for candidate in (state.get("lastReply"), result.get("msg")):
+            text = str(candidate or "").strip()
+            if text:
+                return text
+    for message in reversed(list(chat_history or [])):
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        text = _stringify_message_content(message.get("content", "")).strip()
+        if text:
+            return text
+    return ""
+
+
 # ── Live status (read by REPL bottom toolbar) ─────────────────────────
 # Updated after each backend call within run_agent_loop; consumed by
 # laintas_cli._render_bottom_toolbar() for the "last thinking time" field.
 _last_thinking_time: float = 0.0
+
+
+def _is_signature_typeerror(exc: BaseException) -> bool:
+    """True only for "this callable does not accept that argument".
+
+    The backend-call fallbacks below exist for injected backends with an
+    older signature. Catching *every* TypeError meant a type error raised
+    INSIDE the provider call (serializing a bad value, say) silently
+    triggered a second, billed call with tools and message thread stripped
+    out — a degraded answer, charged twice, with nothing in the log.
+    """
+    text = str(exc)
+    return ("unexpected keyword argument" in text
+            or "positional argument" in text
+            or "takes no arguments" in text)
 
 
 def _set_last_thinking_time(seconds: float) -> None:
@@ -2724,23 +2803,20 @@ def start_agent_assignment(agent_id: str, task: str, deps,
             # persisted profile carries depth=0. Never enable primary-only
             # snapshot/workflow/process-cwd behavior for them.
             runtime_depth = max(1, int(employee.depth or 0))
-            result = run_agent_loop(
-                deps, task, session or {}, employee.state,
-                employee.chat_history, events_cb=_assignment_events,
-                depth=runtime_depth, agent_id=employee.id,
-                interrupt_event=employee.abort_event,
-                message_queue=employee.message_queue,
-            )
-            reply = ((result.get("state") or {}).get("lastReply", "")
-                     if isinstance(result, dict) else "")
+            with thread_agent(employee.id):
+                result = run_agent_loop(
+                    deps, task, session or {}, employee.state,
+                    employee.chat_history, events_cb=_assignment_events,
+                    depth=runtime_depth, agent_id=employee.id,
+                    interrupt_event=employee.abort_event,
+                    message_queue=employee.message_queue,
+                )
+            reply = harvest_agent_reply(result, employee.chat_history)
             if isinstance(result, dict) and result.get("success", True) is False:
-                reason = str(result.get("exit_reason") or "incomplete")
                 if employee.abort_event.is_set():
                     _finish(result=reply)
                 else:
-                    _finish(
-                        result=reply,
-                        error=f"Agent loop ended without completion: {reason}")
+                    _finish(result=reply, error=describe_exit_reason(result))
             else:
                 _finish(result=reply)
         except Exception as exc:
@@ -2919,6 +2995,78 @@ def get_current_agent() -> Optional[AgentInfo]:
         if _current_agent_id:
             return _agent_registry.get(_current_agent_id)
         return None
+
+
+# ── Which agent is THIS thread running? ────────────────────────────────────
+# _current_agent_id is a single global: it answers "which agent does the UI
+# have selected", not "who is calling me". Anything reached from a worker
+# thread (approval callbacks, policy gates) needs the latter, and used to
+# guess it by parsing the thread's NAME — which breaks at every depth
+# (ids contain '-', and a queued agent is started from whichever thread
+# freed the slot, so the name belongs to someone else entirely).
+_thread_agent = threading.local()
+
+
+def get_thread_agent_id() -> str:
+    """The agent whose loop is running on the calling thread ('' if none)."""
+    return getattr(_thread_agent, "agent_id", "") or ""
+
+
+@contextmanager
+def thread_agent(agent_id: str):
+    """Bind *agent_id* to the calling thread for the duration of the block."""
+    previous = getattr(_thread_agent, "agent_id", "")
+    _thread_agent.agent_id = str(agent_id or "")
+    try:
+        yield
+    finally:
+        _thread_agent.agent_id = previous
+
+
+def agent_ancestry(agent_id: str, include_self: bool = True) -> list:
+    """[agent_id, parent, grandparent, ...] up to the primary.
+
+    Cycle-safe and depth-bounded: a corrupt parent_id must never hang a
+    watchdog that walks the chain.
+    """
+    chain: list = []
+    seen: set = set()
+    current = str(agent_id or "")
+    if include_self and current:
+        chain.append(current)
+        seen.add(current)
+    with _registry_lock:
+        for _ in range(16):
+            info = _agent_registry.get(current)
+            if info is None or not info.parent_id:
+                break
+            current = str(info.parent_id)
+            if current in seen:
+                break
+            seen.add(current)
+            chain.append(current)
+    return chain
+
+
+def agent_descendants(agent_id: str) -> set:
+    """Every agent whose ancestry passes through *agent_id* (excluding it)."""
+    root = str(agent_id or "")
+    if not root:
+        return set()
+    with _registry_lock:
+        children: dict = {}
+        for info in _agent_registry.values():
+            if info.parent_id:
+                children.setdefault(str(info.parent_id), []).append(str(info.id))
+    out: set = set()
+    stack = list(children.get(root, ()))
+    while stack:
+        node = stack.pop()
+        if node in out or node == root:
+            continue
+        out.add(node)
+        stack.extend(children.get(node, ()))
+    return out
 
 
 def switch_to_agent(agent_id: str) -> bool:
@@ -3326,22 +3474,102 @@ def abort_agent(agent_id: str) -> bool:
     return True
 
 
+# Default stall budget for waits that supervise a working agent. Same number
+# and same reasoning as tools.SPAWN_PARALLEL_STALL_SECONDS: bound silence, not
+# work.
+AGENT_STALL_SECONDS = 300.0
+
+# Ceiling on how long "it is only queued" may hold a stall clock. Holding the
+# clock for a child with no concurrency slot is right — it cannot progress, and
+# that is the scheduler's doing, not the child's — but held UNCONDITIONALLY it
+# stops being a watchdog: a slot that never frees (a bug, or every slot held by
+# agents waiting on this one) turns the wait into a permanent deadlock with no
+# diagnostic. After this long, a queued child is treated as stuck like any
+# other.
+AGENT_QUEUE_HOLD_MAX_SECONDS = 1800.0
+
+
+def agent_progress_token(info: Optional[AgentInfo]):
+    """A cheap value that changes on any observable sign of life.
+
+    Compared, never interpreted. Covers the four ways an agent can show it is
+    alive: it finished a tool call, it started one (a long call is work, not
+    silence), it wrote a reply, or its lifecycle status moved.
+    """
+    if info is None:
+        return None
+    state = info.state or {}
+    active = state.get("_active_tool")
+    return (
+        info.status,
+        len(state.get("terminalHistory") or ()),
+        len(state.get("_pending_history") or ()),
+        (active or {}).get("started") if isinstance(active, dict) else None,
+        len(str(state.get("lastReply") or "")),
+    )
+
+
+def subtree_progress_token(agent_id: str):
+    """Progress of an agent OR of anything it is waiting on.
+
+    An agent that delegates spends most of its life with a single tool call
+    open (agent.spawn / spawn_parallel) and no state changes of its own — it
+    is indistinguishable from a wedged agent to any watchdog that looks only
+    at its own token, so the supervisor of a busy subtree was being killed at
+    the stall cutoff while its children worked. The subtree is the unit of
+    liveness; the descendant set is part of the token, so gaining a child is
+    itself a sign of life.
+    """
+    ids = [str(agent_id or "")] + sorted(agent_descendants(agent_id))
+    return tuple(agent_progress_token(get_agent(i)) for i in ids)
+
+
 def wait_for_agent(agent_id: str, timeout: float = 30.0,
-                   abort_event=None) -> Optional[AgentInfo]:
+                   abort_event=None,
+                   stall_seconds: Optional[float] = None) -> Optional[AgentInfo]:
     """Block until the target agent finishes (status in {done, aborted, error}).
 
     Returns the final AgentInfo, or None if timed out / agent missing.
     If *abort_event* is provided and becomes set, returns None immediately
     so the caller can clean up and yield to its own interrupt handling.
+
+    ``stall_seconds`` switches the wait from a total budget to a stall budget,
+    and is what a supervisor of *working* agents should use. ``timeout`` is then
+    ignored: the wait ends only when the agent has shown no sign of progress for
+    ``stall_seconds`` (see ``agent_progress_token``). A fixed total budget
+    cannot tell a big job from a wedged one, so it cuts off the honest worker at
+    the same moment as the stuck one — and, because the caller then aborts the
+    child, the work already done is thrown away.
+
+    Two states hold the stall clock rather than advancing toward a cutoff:
+    queued (no slot yet — it cannot progress by definition, and the watchdog
+    would bite hardest exactly when the machine is busiest) and awaiting a
+    human's approval.
     """
     info = get_agent(agent_id)
     if info is None:
         return None
     waiting_for_assignment = info.active_assignment is not None
-    deadline = time.time() + timeout
+    _stall_mode = stall_seconds is not None and stall_seconds > 0
+    deadline = time.time() + (float(stall_seconds) if _stall_mode else timeout)
+    _last_token = subtree_progress_token(agent_id)
+    _queued_since = time.time()
     while time.time() < deadline:
         if abort_event is not None and abort_event.is_set():
             return None
+        if _stall_mode:
+            _token = subtree_progress_token(agent_id)
+            if info.status == "queued":
+                # Bounded hold: see AGENT_QUEUE_HOLD_MAX_SECONDS.
+                _held = (time.time() - _queued_since) < AGENT_QUEUE_HOLD_MAX_SECONDS
+            else:
+                _queued_since = time.time()
+                # A human deciding is genuinely unbounded, and correctly so:
+                # the person is present and can interrupt.
+                _held = tools_mod.is_awaiting_approval(agent_id)
+            if _token != _last_token or _held:
+                _last_token = _token
+                deadline = time.time() + float(stall_seconds)
         if info.status in ("done", "aborted", "error"):
             return info
         if (waiting_for_assignment and info.active_assignment is None
@@ -3519,6 +3747,13 @@ def spawn_subagent(parent_id: str, task: str, deps,
             import worktree_manager
             merge_result = worktree_manager.merge_worktree_back(_worktree_info)
             applied, conflicts = merge_result["applied"], merge_result["conflicts"]
+            blocked = merge_result.get("blocked") or []
+            if blocked:
+                return (
+                    f"\n\n[worktree] {len(applied)} file(s) merged back; "
+                    f"{len(blocked)} refused by write policy and left at "
+                    f"{_worktree_info.path}: {', '.join(blocked[:10])}"
+                )
             if conflicts:
                 # Parent tree moved on these exact paths while the child was
                 # working — leave the worktree in place for manual review
@@ -3572,34 +3807,51 @@ def spawn_subagent(parent_id: str, task: str, deps,
                     summary=task, status="running")
             except Exception:
                 pass
-            result = run_agent_loop(
-                deps, effective_task, session or {}, child.state,
-                child.chat_history,
-                events_cb=events_cb,
-                depth=child.depth,
-                agent_id=child.id,
-            )
-            reply = (result.get("state") or {}).get("lastReply", "") if isinstance(result, dict) else ""
+            with thread_agent(child.id):
+                result = run_agent_loop(
+                    deps, effective_task, session or {}, child.state,
+                    child.chat_history,
+                    events_cb=events_cb,
+                    depth=child.depth,
+                    agent_id=child.id,
+                )
+            reply = harvest_agent_reply(result, child.chat_history)
             reply = (reply or "") + _merge_worktree_note()
             child.last_reply = reply
-            status = "aborted" if child.abort_event.is_set() else "done"
-            mark_agent_finished(child.id, result=reply)
+            # A loop that ended on a backend error, a silent-failure exit, a
+            # denied approval or an exhausted budget is NOT a completed agent.
+            # Reporting every one of those as status="done" with an empty
+            # reply is what made a failed child indistinguishable from a
+            # child that simply had nothing to say.
+            _loop_error = ""
+            if isinstance(result, dict) and result.get("success", True) is False:
+                _loop_error = describe_exit_reason(result)
+            if child.abort_event.is_set():
+                status = "aborted"
+                mark_agent_finished(child.id, result=reply)
+            elif _loop_error:
+                status = "error"
+                mark_agent_finished(child.id, result=reply, error=_loop_error)
+            else:
+                status = "done"
+                mark_agent_finished(child.id, result=reply)
             try:
                 import agent_ui_events
                 agent_ui_events.hub.emit(
                     "agent_done", agent_id=child.id,
                     parent_agent_id=parent.id,
                     terminal_name=agent_scope_terminal(child),
-                    summary=reply or task, status=status)
+                    summary=reply or _loop_error or task, status=status)
             except Exception:
                 pass
             if report_to_parent:
                 send_to_agent(parent_id, {
                     "from": child.id,
-                    "kind": "child-done",
+                    "kind": "child-error" if status == "error" else "child-done",
                     "status": status,
                     "role": role or "general",
-                    "summary": reply or "(no reply)",
+                    **({"error": _loop_error} if status == "error" else {}),
+                    "summary": reply or _loop_error or "(no reply)",
                 })
         except Exception as e:
             error_text = repr(e) + _merge_worktree_note()
@@ -4247,11 +4499,16 @@ def _llm_summarize(deps, session, current_path: str, head_text: str,
     if ctxpol is None or not head_text.strip():
         return None
     try:
-        sys_prompt = ctxpol.summary_prompt(lang, previous_summary=prev_summary)
+        sys_prompt = ctxpol.summary_prompt(lang)
+        message = head_text
+        if prev_summary:
+            message = ("<trusted-previous-summary>\n" + prev_summary.strip() +
+                       "\n</trusted-previous-summary>\n\n<source-transcript>\n" +
+                       head_text + "\n</source-transcript>")
         _aux_m, _aux_p = aux_model_override()
         resp = deps.call_backend(
             session=session,
-            message=head_text,
+            message=message,
             system_prompt=sys_prompt,
             current_path=current_path,
             history=[],
@@ -4267,6 +4524,50 @@ def _llm_summarize(deps, session, current_path: str, head_text: str,
         return text
     except Exception:
         return None
+
+
+def _valid_structured_summary(text: str, lang: str) -> bool:
+    """Reject reviewer protocol drift without risking loss of the draft."""
+    if not text or text.lstrip().startswith("```"):
+        return False
+    heading_sets = (
+        ["## Goal", "## Progress", "## Next Steps", "## Critical Context"],
+        ["## 当前目标", "## 进度", "## 下一步", "## 关键上下文"],
+    )
+    for required in heading_sets:
+        positions = [text.find(heading) for heading in required]
+        if all(pos >= 0 for pos in positions) and positions == sorted(positions):
+            return True
+    return False
+
+
+def _llm_review_summary(deps, session, current_path: str, source_text: str,
+                        candidate: str, prev_summary: Optional[str], lang: str,
+                        trajectory_id: str = "") -> str:
+    """Evidence-review a candidate with DeepSeek; fail closed to the draft."""
+    if ctxpol is None or not source_text.strip() or not candidate.strip():
+        return candidate
+    try:
+        prompt = ctxpol.review_prompt(lang, previous_summary=prev_summary)
+        evidence = (("<trusted-previous-summary>\n" + prev_summary.strip() +
+                     "\n</trusted-previous-summary>\n\n") if prev_summary else "") + (
+                    "<source-transcript>\n" + source_text.strip() +
+                    "\n</source-transcript>\n\n<candidate-summary>\n" +
+                    candidate.strip() + "\n</candidate-summary>")
+        review_model = str(ctxpol.load().get("summary_review_model")
+                           or "deepseek-v4-flash").strip()
+        resp = deps.call_backend(
+            session=session, message=evidence, system_prompt=prompt,
+            current_path=current_path, history=[], lang=lang,
+            tools_enabled=False, model_override=review_model,
+            provider_override=None, task_kind="compaction_review",
+            trajectory_id=trajectory_id,
+        )
+        reviewed = ((resp or {}).get("reply", "")
+                    if isinstance(resp, dict) else "").strip()
+        return reviewed if _valid_structured_summary(reviewed, lang) else candidate
+    except Exception:
+        return candidate
 
 
 def _thread_tokens(messages: list) -> int:
@@ -4300,6 +4601,8 @@ def _serialize_thread_msg(m: dict) -> str:
             parts.append(f"[Assistant tool call(s)]: {calls}")
         return "\n".join(parts)
     if role == "user":
+        if "[CONVERSATION SUMMARY — earlier turns compacted]" in content:
+            return ""
         return f"[User]: {content}" if content.strip() else ""
     return ""
 
@@ -4374,6 +4677,7 @@ def _summarize_head_in_chunks(deps, session, head: list,
         slices.append(current)
 
     summary = prev_summary
+    completed_any = False
     for index, part in enumerate(slices):
         text = "\n".join(s for s in (_serialize_thread_msg(m) for m in part) if s)
         if not text.strip():
@@ -4381,12 +4685,15 @@ def _summarize_head_in_chunks(deps, session, head: list,
         merged = _llm_summarize(deps, session, cwd, text, summary, lang,
                                 trajectory_id)
         if not merged:
-            # Keep whatever was folded in so far. A partial summary of the older
-            # turns beats discarding the compaction entirely and re-sending the
-            # whole head on the next turn.
-            break
-        summary = merged
-    return summary
+            # Atomic commit: a partial fold does not cover the whole head and
+            # therefore must never replace it. The caller keeps the original.
+            return None
+        summary = _llm_review_summary(
+            deps, session, cwd, text, merged, summary, lang, trajectory_id)
+        if not _valid_structured_summary(summary, lang):
+            return None
+        completed_any = True
+    return summary if completed_any else None
 
 
 def _compact_thread_messages(thread_messages: list, deps, session, lang: str, state: dict,
@@ -4488,10 +4795,71 @@ def _compact_thread_messages(thread_messages: list, deps, session, lang: str, st
 _provider_context_window: int = 0
 
 
+# Remembered across restarts, per model. The live value only arrives with the
+# first response of a process, so until then the CLI budgets against the 64000
+# default — which on a million-token model means the FIRST turn after every
+# restart, /reload or --continue compacts a resumed thread that was nowhere
+# near the real window, paying for a summarization call and losing verbatim
+# history for nothing.
+_provider_window_cache_loaded = False
+# What we believe is already on disk, per model. Without it the "has this
+# changed?" test has to read the file on every response, and answering it from
+# the in-memory window instead is wrong: that value can already equal `tokens`
+# for reasons that never reached disk, and the write is then skipped forever.
+_provider_window_persisted: dict = {}
+
+
+def _provider_window_file():
+    """Resolved per call, not at import: LAINTAS_HOME is what isolates one
+    run's state from another's, and a path captured at import time ignores it —
+    which is how a test run ends up writing into the user's real ~/.laintas."""
+    return paths.LAINTAS_HOME / "model_windows.json"
+
+
+def _provider_window_key() -> str:
+    try:
+        return str(_live_status_model() or "").strip()
+    except Exception:
+        return ""
+
+
+def _load_remembered_provider_window() -> None:
+    """Seed _provider_context_window from the last run that saw the real one."""
+    global _provider_context_window, _provider_window_cache_loaded
+    if _provider_window_cache_loaded:
+        return
+    _provider_window_cache_loaded = True
+    key = _provider_window_key()
+    if not key:
+        return
+    try:
+        remembered = json_store.load_json(_provider_window_file(), {}) or {}
+        value = int(remembered.get(key) or 0)
+    except Exception:
+        value = 0
+    if value > 0 and value > _provider_context_window:
+        _provider_context_window = value
+
+
 def _note_provider_context_window(tokens: int) -> None:
     global _provider_context_window
-    if tokens and tokens > 0:
-        _provider_context_window = int(tokens)
+    if not tokens or tokens <= 0:
+        return
+    tokens = int(tokens)
+    _provider_context_window = tokens
+    key = _provider_window_key()
+    if not key or _provider_window_persisted.get(key) == tokens:
+        return
+    try:
+        remembered = json_store.load_json(_provider_window_file(), {}) or {}
+        if not isinstance(remembered, dict):
+            remembered = {}
+        if int(remembered.get(key) or 0) != tokens:
+            remembered[key] = tokens
+            json_store.save_json_atomic(_provider_window_file(), remembered)
+        _provider_window_persisted[key] = tokens
+    except Exception:
+        pass
 
 
 # A bigger window is not a licence to fill it. Compaction bounds cost and
@@ -4503,6 +4871,7 @@ _CONTEXT_WINDOW_ADOPT_CAP = 200_000
 
 
 def _effective_context_window() -> int:
+    _load_remembered_provider_window()
     configured = int(get_runtime_config("model_context_window") or 64000)
     if (configured == _DEFAULT_CONFIG["model_context_window"]
             and _provider_context_window > configured):
@@ -4524,7 +4893,9 @@ def aux_model_override() -> tuple[str, str]:
     model = str(get_runtime_config("aux_model") or "").strip()
     if not model:
         return "", ""
-    return model, str(get_runtime_config("aux_provider") or "").strip()
+    # Auxiliary jobs name a canonical model; duplicate upstreams are selected
+    # by the gateway's supplier priority. Ignore stale legacy provider pins.
+    return model, ""
 
 
 def session_context_status(state: dict) -> dict:
@@ -4774,26 +5145,46 @@ def _write_cap_violation(state: dict, name: str, arguments: dict):
     approach. Rejecting the call converts the advice into a constraint it
     cannot ignore, and the rejection is far cheaper than another truncated
     generation. The cap only exists after a truncation (_max_write_lines is
-    cleared on any clean turn), so normal large writes are untouched.
+    cleared on any productive turn), so normal large writes are untouched.
 
     Returns a tool-result dict to use instead of invoking, or None to proceed.
     """
     cap = state.get("_max_write_lines")
-    if not cap or name != "fs.write":
+    if not cap:
         return None
-    content = arguments.get("content")
-    if not isinstance(content, str):
+    # fs.edit and fs.multi_edit count too. Capping only fs.write left the
+    # advice ("write the first part, then append the rest with fs.edit")
+    # pointing at an uncapped tool — and a multi_edit carrying a dozen long
+    # replacements is the single biggest tool-call payload the model emits,
+    # so it is the one most likely to be cut off mid-arguments.
+    if name == "fs.write":
+        payload = arguments.get("content")
+        written = payload if isinstance(payload, str) else ""
+    elif name == "fs.edit":
+        payload = arguments.get("new_string")
+        written = payload if isinstance(payload, str) else ""
+    elif name == "fs.multi_edit":
+        edits = arguments.get("edits")
+        if not isinstance(edits, list):
+            return None
+        written = "\n".join(
+            str(e.get("new_string") or "") for e in edits
+            if isinstance(e, dict))
+    else:
         return None
-    lines = content.count("\n") + 1
+    if not written:
+        return None
+    lines = written.count("\n") + 1
     if lines <= cap:
         return None
     return {
         "ok": False,
         "error": (
-            f"Rejected: {lines} lines in one fs.write, over the current "
-            f"{cap}-line cap. Your previous response was cut off at the output "
-            f"token limit, so this write would be cut off too. Write the first "
-            f"{cap} lines with fs.write, then append the rest with fs.edit."
+            f"Rejected: {lines} lines written in one {name} call, over the "
+            f"current {cap}-line cap. Your previous response was cut off at "
+            f"the output token limit, so this call would be cut off too. "
+            f"Write at most {cap} lines per call: the first part now, the rest "
+            f"in a follow-up call."
         ),
     }
 
@@ -6170,9 +6561,14 @@ def _format_parallel_results(inbox_msgs: list) -> str:
             )
         else:
             error = msg.get("error", "(no error)")
-            results.append(
-                f"[{from_agent}] {symbols.FAIL} error: {error[:300]}"
-            )
+            # A failed child usually got somewhere before it failed. Reporting
+            # only the error throws that away — the same loss the parallel
+            # batch's partial-result rescue exists to prevent.
+            partial = str(msg.get("summary") or "").strip()
+            entry = f"[{from_agent}] {symbols.FAIL} error: {error[:300]}"
+            if partial and partial not in ("(no reply)", error):
+                entry += f"\nwhat it had before failing:\n{partial[:500]}"
+            results.append(entry)
 
     if not results:
         return ""
@@ -6249,6 +6645,29 @@ def _allowed_tool_names_for_state(
     return names
 
 
+def _publish_live_state(info, state: dict) -> None:
+    """Expose the running loop's own state dict on its registry entry.
+
+    ``run_agent_loop`` works on a private copy (``state = dict(state)``) and
+    used to hand it back only on exit, so for the whole run every observer read
+    the pre-run snapshot: a supervisor's live table counted 0 tool calls no
+    matter how much the child did, its activity line stayed on "starting…", and
+    a parent salvaging a partial answer on cutoff always found lastReply empty
+    and reported "no output" over ten minutes of real work. Publishing the live
+    dict (not a copy) also means an out-of-band write to ``info.state`` — e.g.
+    agent_return's ``_hwo_return`` — lands where the loop will actually see it.
+
+    Attribute rebinding is atomic under the GIL: a reader gets either the old
+    dict or this one, never a torn view.
+    """
+    if info is None:
+        return
+    try:
+        info.state = state
+    except Exception:
+        pass
+
+
 def run_agent_loop(
     deps: LoopDeps,
     original_input: str,
@@ -6293,7 +6712,8 @@ def run_agent_loop(
         _runtime_info.message_queue if depth > 0 and _runtime_info is not None
         else _user_message_queue
     )
-    state = dict(state)  # copy
+    state = dict(state)  # copy — published back below so observers track it live
+    _publish_live_state(_runtime_info, state)
     _ensure_session_id(state)
     state.setdefault("_task_cwd", state.get("cwd") or os.getcwd())
     state["_agent_id"] = agent_id or ""
@@ -6556,7 +6976,7 @@ def run_agent_loop(
         # ── Soft-interrupt check (Ctrl+C from user) ──────────────────
         if _interrupt.is_set():
             state["lastReply"] = "(interrupted by user)"
-            deps.console.print(f"\n[yellow]{symbols.ZAP} Interrupted by user (Ctrl+C).[/yellow]")
+            deps.console.print("\n[yellow]Interrupted by user (Ctrl+C).[/yellow]")
             _exit_reason = TRANSITION_INTERRUPTED
             break
 
@@ -7268,9 +7688,11 @@ def run_agent_loop(
                             provider_override=_request_provider or None,
                             task_kind=_task_kind, trajectory_id=_run_id,
                         )
-                    except TypeError:
+                    except TypeError as _sig_err:
                         # Compatibility with injected backends that support the
                         # older model_override argument but not provider_override.
+                        if not _is_signature_typeerror(_sig_err):
+                            raise
                         try:
                             return deps.call_backend(
                                 session=session,
@@ -7285,7 +7707,9 @@ def run_agent_loop(
                                 allowed_tool_names=_allowed_tool_names,
                                 model_override=_request_model or None,
                             )
-                        except TypeError:
+                        except TypeError as _sig_err2:
+                            if not _is_signature_typeerror(_sig_err2):
+                                raise
                             return deps.call_backend(
                                 session=session,
                                 message=user_input,
@@ -7337,7 +7761,9 @@ def run_agent_loop(
                             provider_override=_request_provider or None,
                             task_kind=_task_kind, trajectory_id=_run_id,
                         )
-                    except TypeError:
+                    except TypeError as _sig_err3:
+                        if not _is_signature_typeerror(_sig_err3):
+                            raise
                         response = deps.call_backend(
                             session=session,
                             message=user_input,
@@ -7371,7 +7797,9 @@ def run_agent_loop(
                     provider_override=_request_provider or None,
                     task_kind=_task_kind, trajectory_id=_run_id,
                 )
-            except TypeError:
+            except TypeError as _sig_err4:
+                if not _is_signature_typeerror(_sig_err4):
+                    raise
                 response = deps.call_backend(
                     session=session,
                     message=user_input,
@@ -7548,6 +7976,9 @@ def run_agent_loop(
                 _reply_rendered_normally = True
             step_replies.append(display_reply)
             state["lastReply"] = display_reply
+            # Published as it is produced: this is the text a supervisor
+            # salvages as a partial answer if the agent is cut short.
+            _publish_live_state(self_info, state)
             # Preserve the real sequence. Historically intermediate assistant
             # narration was buffered until the whole run ended while tool
             # results were appended immediately, producing a persisted order
@@ -7600,8 +8031,28 @@ def run_agent_loop(
                 # Backend predates _truncation_kind — fall back to the old
                 # (imprecise) inference rather than guessing "output".
                 _kind = "reasoning" if (not reply and _reasoning) else "output"
-            _trunc_count = state.get("_truncation_retry_count", 0) + 1
-            state["_truncation_retry_count"] = _trunc_count
+            # A cut-off turn that still delivered usable tool calls MADE
+            # PROGRESS. The three-strike stop exists for "cannot get anywhere",
+            # not for "keeps having to write in smaller pieces" — counting a
+            # productive turn as a strike aborts exactly the long, legitimate
+            # jobs the chunking advice is there to enable.
+            _dropped = [n for n in (response.get("_dropped_calls") or []) if n]
+            _trunc_progress = bool(tool_calls)
+            if _trunc_progress:
+                _trunc_count = 1
+                state["_truncation_retry_count"] = 0
+            else:
+                _trunc_count = state.get("_truncation_retry_count", 0) + 1
+                state["_truncation_retry_count"] = _trunc_count
+            if _dropped:
+                _append_short_memory(state, (
+                    f"\n  {symbols.WARN} Your response was cut off while writing the "
+                    f"arguments of: {', '.join(_dropped[:4])}. "
+                    + ("The earlier calls in that turn ran and their results are "
+                       "above — do NOT repeat them. Reissue only the cut-off call, "
+                       "smaller." if _trunc_progress else
+                       "Reissue it in smaller pieces.")
+                ))
 
             # Truncation is recoverable, so on its own it is not worth
             # interrupting the user over. What matters is whether recovery
@@ -7618,14 +8069,16 @@ def run_agent_loop(
             # maximum room and forced chunking, which is a real anomaly.
             _record_truncation(state, _kind)
 
-            if _trunc_count >= 3:
+            if _trunc_count >= 3 and not _trunc_progress:
+                _why = ("even with maximum output budget and forced chunking"
+                        if _kind not in ("stream_timeout", "stream_dropped")
+                        else "the connection to the model keeps breaking mid-answer")
                 if events_cb is not None:
                     deps.console.print(
-                        f"[yellow]{symbols.WARN} Response truncated {_trunc_count} consecutive times "
-                        f"({_kind}) even with maximum output budget and forced chunking - "
-                        f"stopping.[/yellow]")
+                        f"[yellow]{symbols.WARN} Response cut off {_trunc_count} consecutive times "
+                        f"({_kind}) - {_why} - stopping.[/yellow]")
                 _append_short_memory(state,
-                    f"\n  -Error: Response truncated {_trunc_count} consecutive times ({_kind}); "
+                    f"\n  -Error: Response cut off {_trunc_count} consecutive times ({_kind}); "
                     "unable to make progress.")
                 _exit_reason = TRANSITION_SILENT_FAILURE
                 break
@@ -7634,9 +8087,47 @@ def run_agent_loop(
             # Free window room so the next turn's output ceiling is larger:
             # the ceiling is (context window - prompt), so dropping old tool
             # output directly buys back output budget.
-            state["_force_micro_keep"] = 4 if _trunc_count == 1 else 2
+            if _kind != "tool_args_malformed":
+                state["_force_micro_keep"] = 4 if _trunc_count == 1 else 2
+            # _force_micro_keep only trims terminalHistory — the legacy
+            # state-dump. In message-thread mode (the default) the prompt IS
+            # thread_messages, so that rung freed almost nothing and the
+            # "more room next time" promise was never kept: the ceiling stayed
+            # exactly as small, and the next attempt was cut at the same place.
+            # Compact the thread itself once the cheap rung has failed.
+            if (_thread_mode and _trunc_count >= 2 and thread_messages
+                    and _kind != "tool_args_malformed"):
+                _compact_thread_messages(
+                    thread_messages, deps, session, lang, state, force=True)
 
-            if _kind == "reasoning":
+            if _kind == "tool_args_malformed":
+                # No limit was hit — the arguments simply did not parse. Write
+                # caps and window compaction are the wrong medicine and cost a
+                # turn each; what this needs is the call reissued.
+                _append_short_memory(state, (
+                    f"\n  {symbols.WARN} The arguments of that tool call were not valid "
+                    "JSON, so the call was dropped. This was NOT a length limit — do "
+                    "not shorten your work. Reissue the same call with well-formed "
+                    "arguments (mind the escaping inside strings)."
+                ))
+                _msg = "tool arguments did not parse - asking for a clean reissue"
+            elif _kind in ("stream_timeout", "stream_dropped"):
+                # A transport cut, not a token-limit overrun. The write-size cap
+                # below would be nonsense advice here — the model did nothing
+                # wrong and shortening its writes fixes nothing. What it needs
+                # is to know where it stopped and to carry on. Freeing window
+                # room still helps: a smaller next request is a faster one, and
+                # speed is exactly what ran out.
+                _detail = str(response.get("_truncation_detail") or "").strip()
+                _append_short_memory(state, (
+                    f"\n  {symbols.WARN} Your previous response was cut off in transit "
+                    f"({_detail or _kind}) — not by you, and not by a token limit. "
+                    "The part that arrived is above and has been kept. Continue from "
+                    "exactly where it stops; do not restart the answer, and do not "
+                    "repeat what is already there."
+                ))
+                _msg = "response cut off in transit - continuing from the partial answer"
+            elif _kind == "reasoning":
                 _append_short_memory(state, (
                     f"\n  {symbols.WARN} Your reasoning consumed the entire token "
                     "budget, leaving no room for output. Be more concise in "
@@ -7651,14 +8142,21 @@ def run_agent_loop(
                 _append_short_memory(state, (
                     f"\n  {symbols.WARN} Your last response was cut off at the output token "
                     "limit - it was too long to finish. Do NOT rewrite the whole "
-                    f"file in one call. Write at most {_cap} lines per call: write the "
-                    "first part with fs.write, then append the rest with fs.edit."
+                    f"file in one call. Write at most {_cap} lines per call (this is "
+                    "now enforced for fs.write, fs.edit and fs.multi_edit): write the "
+                    "first part, then append the rest in a follow-up call."
                 ))
                 _msg = f"output hit the token limit - capping writes at {_cap} lines"
 
             if _trunc_count >= 2 and events_cb is not None:
                 deps.console.print(f"[dim]{symbols.WARN} {_msg}[/dim]")
-        else:
+        elif tool_calls or (reply and not response.get("_parse_failed")):
+            # Cleared only by a turn that actually DELIVERED something. An
+            # empty or malformed turn is not evidence that the size problem is
+            # gone, and wiping the ladder there sent the model straight back to
+            # the oversized write it had just been cut off on — the counter
+            # then restarted from zero every time, so the mitigations never
+            # took effect and the ceiling never grew.
             state["_truncation_retry_count"] = 0
             state.pop("_force_micro_keep", None)
             state.pop("_max_write_lines", None)
@@ -7785,7 +8283,7 @@ def run_agent_loop(
             for idx, tc in enumerate(tool_calls):
                 # ── Soft-interrupt check before each tool call ──
                 if _interrupt.is_set():
-                    deps.console.print(f"\n[yellow]{symbols.ZAP} Interrupted — skipping remaining {len(tool_calls) - idx} tool call(s).[/yellow]")
+                    deps.console.print(f"\n[yellow]Interrupted — skipping remaining {len(tool_calls) - idx} tool call(s).[/yellow]")
                     break
 
                 name = tc.get("name", "")
@@ -7809,6 +8307,13 @@ def run_agent_loop(
                 call_id = f"call_{loop+1:02d}_{idx+1:02d}"
                 _tool_t0 = time.monotonic()
                 salient = _salient_arg(name, arguments)
+                # In-flight marker: lets a supervisor tell "busy inside one long
+                # tool call" apart from "stalled". Without it, a legitimate
+                # 5-minute test run and a wedged agent look identical from
+                # outside — both are just an absence of new history rows.
+                state["_active_tool"] = {
+                    "name": name, "arg": salient, "started": time.time()}
+                _publish_live_state(self_info, state)
                 _trace_before = (
                     detail_trace.capture_before(
                         name, arguments, state.get("cwd") or os.getcwd())
@@ -8256,6 +8761,7 @@ def run_agent_loop(
                                         _owner.ephemeral_session = interactive_session
 
                 _tool_elapsed = max(0.0, time.monotonic() - _tool_t0)
+                state.pop("_active_tool", None)
                 if isinstance(result, dict):
                     result.setdefault("elapsed_seconds", round(_tool_elapsed, 3))
 
@@ -8338,6 +8844,12 @@ def run_agent_loop(
                     "call_id": call_id,
                     "elapsed_seconds": round(_tool_elapsed, 3),
                 })
+                # Progress is published per CALL, not per turn: a turn with six
+                # tool calls must not look motionless to a supervisor until the
+                # last one lands. The rows only join terminalHistory at the end
+                # of the turn (below), so expose them as a pending tail here.
+                state["_pending_history"] = list(per_call_rows)
+                _publish_live_state(self_info, state)
 
                 if not result.get("ok", False):
                     _failure = {
@@ -8462,8 +8974,19 @@ def run_agent_loop(
                             _matches = result.get("matches", 0)
                             _meta2 = f"{_matches} match{'es' if _matches != 1 else ''}"
                         elif name == "web.search" and result.get("ok"):
-                            _results = result.get("results") or []
-                            _meta2 = f"{len(_results)} result{'s' if len(_results) != 1 else ''}"
+                            # web_search.search reports the count as "count" and
+                            # the hits under "result" (tools.py then nests them
+                            # again under result["results"] beside the untrusted
+                            # -content notice). There has never been a top-level
+                            # "results" key, so reading one printed "0 results"
+                            # on every search that actually returned hits.
+                            _n = result.get("count")
+                            if not isinstance(_n, int):
+                                _payload = result.get("result")
+                                if isinstance(_payload, dict):
+                                    _payload = _payload.get("results")
+                                _n = len(_payload) if isinstance(_payload, list) else 0
+                            _meta2 = f"{_n} result{'s' if _n != 1 else ''}"
                         elif not result.get("ok"):
                             _cause = str(result.get("error") or formatted or "").strip()
                             _cause = re.sub(r"\s+", " ", _cause).replace("[", "\\[")
@@ -8566,7 +9089,7 @@ def run_agent_loop(
             _exit_reason = TRANSITION_USER_DENIED
             if events_cb is not None:
                 deps.console.print(
-                    f"\n[yellow]{symbols.ZAP} User denied approval — terminating task.[/yellow]")
+                    f"\n[yellow]User denied approval — terminating task.[/yellow]")
                 if pending_events:
                     events_cb(pending_events)
                     pending_events.clear()
@@ -8742,6 +9265,8 @@ def run_agent_loop(
                 f"\n  Step {loop+1}: {_step_note}"
             )
         state["terminalHistory"].extend(per_call_rows)
+        state.pop("_pending_history", None)
+        _publish_live_state(self_info, state)
 
         # ── Commit this turn to the native message thread (Stage B) ──
         # Only on a successful (non-nudge) turn, so failed/retry turns never
@@ -9011,7 +9536,7 @@ def run_agent_loop(
                 repeated=bool(_no_progress_count),
             )
             if _interrupt.wait(timeout=_delay):
-                deps.console.print(f"\n[yellow]{symbols.ZAP} Agent loop interrupted during delay.[/yellow]")
+                deps.console.print("\n[yellow]Agent loop interrupted during delay.[/yellow]")
                 _exit_reason = TRANSITION_INTERRUPTED
                 break
 
@@ -9132,6 +9657,11 @@ def run_agent_loop(
     if events_cb is not None and pending_events:
         events_cb(pending_events)
         pending_events.clear()
+
+    # Liveness markers describe a run in progress; a finished (or resumed) agent
+    # must not carry them into its persisted state.
+    state.pop("_active_tool", None)
+    state.pop("_pending_history", None)
 
     if _thread_mode:
         # Carry the authoritative structured transcript into the next top-level

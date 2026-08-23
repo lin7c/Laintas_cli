@@ -13,7 +13,7 @@
 
   "tool_output_max_chars": 2000,
   "prune_minimum_tokens": 20000,
-  "prune_protect_tokens": 12000,
+  "prune_protect_tokens": 40000,
   "prune_protected_tools": [
     "skill_load", "skill_unload", "skill.load", "skill.unload",
     "memory_save", "mem.save",
@@ -21,6 +21,9 @@
   ],
 
   "summary_output_tokens": 4096,
+  "summary_chunk_tokens": 24000,
+  "summary_model": "google/gemma-4-26b-a4b-it",
+  "summary_review_model": "deepseek-v4-flash",
 
   "file_read_retention": {
     "description": "Shared rules for retaining file-read content so the agent does not re-read files it already has (the re-read amnesia loop). Each product keeps its OWN per-path cache + file I/O; this only standardizes the BEHAVIOR. Modeled on Helpwo's fileViewStates.",
@@ -28,8 +31,8 @@
     "serve_cached_on_reread": true,
     "cache_full_reads_only": true,
     "invalidate_on_edit": true,
-    "edit_tools": ["edit", "write", "multi_edit", "move", "delete", "fs.edit", "fs.write", "fs.multi_edit", "fs.move", "fs.delete", "patch", "create", "build", "destroy"],
-    "read_tools": ["read", "fs.read", "view"],
+    "edit_tools": ["edit", "write", "multi_edit", "move", "delete", "fs.edit", "fs.write", "fs.multi_edit", "fs.move", "fs.delete", "patch", "create", "build", "destroy", "cp", "truncate", "mktemp", "symlink"],
+    "read_tools": ["read", "fs.read", "view", "stat", "wc", "diff", "head", "tail", "file", "readlink"],
     "repeat_stop": 6,
     "max_cached_files": 64,
     "max_cached_chars_per_file": 200000
