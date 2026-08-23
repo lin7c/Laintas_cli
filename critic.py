@@ -44,11 +44,19 @@ SYSTEM_PROMPT = (
     "Return ONLY a JSON object, no prose:\n"
     '{"on_track": true|false, "score": 0-100, "issue": "one line or empty", '
     '"suggestion": "one concrete corrective action or empty"}\n\n'
-    "score = how well recent actions serve the original goal (100 = perfectly, "
-    "0 = completely lost). Set on_track=false when the agent is looping on a dead "
-    "end, chasing a tangent, fighting the same error repeatedly, or drifting from "
-    "the goal. If it is progressing sensibly, on_track=true and leave issue/"
-    "suggestion empty. Be tolerant of normal exploration; only flag REAL trouble."
+    "score is a BAND judgment, not a fine-grained number. Pick exactly one of "
+    "these five bands and return its score:\n"
+    "  90 — clearly on track: actions directly advance the goal.\n"
+    "  70 — acceptable: mostly on track; includes normal exploration detours.\n"
+    "  50 — stalling: actions are plausible but no real progress toward the "
+    "goal for a while.\n"
+    "  30 — drifting: recent actions serve a different goal or a tangent.\n"
+    "  10 — stuck/looping: same failing approach repeated, or no meaningful "
+    "action at all.\n"
+    "Do NOT return any other number. Set on_track=false for the 30 and 10 "
+    "bands (and for 50 if the stall has persisted across several steps); "
+    "on_track=true otherwise. When on_track=true, leave issue/suggestion "
+    "empty. Be tolerant of normal exploration; only flag REAL trouble."
 )
 
 # Appended to the system prompt (thread mode only) so mid-conversation
@@ -139,6 +147,16 @@ def build_messages(task: str, actions_summary: str) -> list:
     }]
 
 
+# The five score bands the prompt asks for. parse_verdict snaps any other
+# number to the nearest band so downstream threshold logic (and the event log)
+# stays consistent even when the model ignores the instruction.
+SCORE_BANDS = (90, 70, 50, 30, 10)
+
+
+def _snap_to_band(score: int) -> int:
+    return min(SCORE_BANDS, key=lambda b: (abs(score - b), -b))
+
+
 def parse_verdict(reply: str) -> Optional[dict]:
     """Parse the critic reply into {on_track, score, issue, suggestion}, or None
     if it can't be understood (caller then treats it as 'no verdict')."""
@@ -162,10 +180,11 @@ def parse_verdict(reply: str) -> Optional[dict]:
         return None
 
     try:
-        score = int(round(float(obj.get("score", 100))))
+        score = int(round(float(obj.get("score", 90))))
     except (TypeError, ValueError):
-        score = 100
+        score = 90
     score = max(0, min(100, score))
+    score = _snap_to_band(score)
     on_track = obj.get("on_track", True)
     on_track = bool(on_track) if isinstance(on_track, bool) else str(on_track).lower() not in ("false", "no", "0")
     return {

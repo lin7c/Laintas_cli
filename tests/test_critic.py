@@ -48,10 +48,10 @@ class AssessDetailedTests(unittest.TestCase):
     def test_success(self):
         verdict, fail = critic.assess_detailed(
             "t", self.MESSAGES,
-            lambda m: '{"on_track": true, "score": 80}')
+            lambda m: '{"on_track": true, "score": 90}')
         self.assertIsNone(fail)
         self.assertTrue(verdict["on_track"])
-        self.assertEqual(verdict["score"], 80)
+        self.assertEqual(verdict["score"], 90)
 
     def test_llm_failure_classified(self):
         def boom(m):
@@ -121,9 +121,20 @@ class ParseVerdictTests(unittest.TestCase):
         v = critic.parse_verdict('Sure! {"on_track": true, "score": 99} done')
         self.assertTrue(v["on_track"])
 
-    def test_score_clamped(self):
-        v = critic.parse_verdict('{"score": 500}')
-        self.assertEqual(v["score"], 100)
+    def test_score_snapped_to_band(self):
+        # Out-of-band scores snap to the nearest of (90,70,50,30,10) so the
+        # threshold logic and event log stay consistent.
+        self.assertEqual(critic.parse_verdict('{"score": 500}')["score"], 90)
+        self.assertEqual(critic.parse_verdict('{"score": 82}')["score"], 90)
+        self.assertEqual(critic.parse_verdict('{"score": 61}')["score"], 70)
+        self.assertEqual(critic.parse_verdict('{"score": 5}')["score"], 10)
+        # 40 is equidistant between 30 and 50; the tie-break prefers the
+        # higher band (less aggressive intervention on ambiguous input).
+        self.assertEqual(critic.parse_verdict('{"score": 40}')["score"], 50)
+
+    def test_missing_score_defaults_on_track(self):
+        v = critic.parse_verdict('{"on_track": true}')
+        self.assertEqual(v["score"], 90)
 
     def test_string_on_track(self):
         v = critic.parse_verdict('{"on_track": "false", "score": 20}')
