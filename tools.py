@@ -80,6 +80,10 @@ class ToolCtx:
     parent_agent_id: Optional[str] = None
     # ── Loop-local context (populated by agent_loop at dispatch time) ──
     interactive_session: Any = None
+    # Soft-interrupt signal (Esc / single Ctrl+C). Long-running tools poll
+    # this between blocking steps and raise InterruptedError to return early
+    # instead of letting the agent loop wait out the full tool timeout.
+    interrupt_event: Any = None
     stationed_terminal: Any = None    # TerminalInfo/session that owns deployed shell execution
     get_terminal: Optional[Callable] = None
     get_all_terminals: Optional[Callable] = None
@@ -2210,7 +2214,8 @@ def _bi_web_search(params: dict, ctx: ToolCtx) -> dict:
     timelimit = params.get("timelimit")
 
     out = _ws.search(query=query, max_results=max_results, engine=engine,
-                     engines=engines, region=region, timelimit=timelimit)
+                     engines=engines, region=region, timelimit=timelimit,
+                     interrupt_event=getattr(ctx, "interrupt_event", None))
     if out.get("ok") and isinstance(out.get("result"), list):
         try:
             _ws.persist_cookies()
@@ -2383,7 +2388,8 @@ def _bi_web_fetch(params: dict, ctx: ToolCtx) -> dict:
     timeout = int(params.get("timeout", 15))
     identity = (params.get("identity") or "").strip() or None
 
-    out = _ws.fetch(url=url, max_bytes=max_bytes, timeout=timeout, identity=identity)
+    out = _ws.fetch(url=url, max_bytes=max_bytes, timeout=timeout, identity=identity,
+                    interrupt_event=getattr(ctx, "interrupt_event", None))
     if out.get("ok") and isinstance(out.get("result"), str):
         try:
             _ws.persist_cookies()
@@ -2517,7 +2523,11 @@ def _bi_spawn(params: dict, ctx: ToolCtx) -> dict:
     _al.enter_waiting(parent_id)
     try:
         _parent = _al.get_agent(parent_id)
-        _abort_ev = _parent.abort_event if _parent is not None else None
+        # Esc sets ctx.interrupt_event (primary's abort_event, or
+        # _user_interrupt otherwise); abort_event alone missed the
+        # non-primary foreground case, so its spawns ignored Esc.
+        _abort_ev = (getattr(ctx, "interrupt_event", None)
+                     or (_parent.abort_event if _parent is not None else None))
         # Stall budget, not a total one: a child doing real work on a big task
         # must not be killed for taking longer than a number picked in advance.
         info = _al.wait_for_agent(
@@ -3076,7 +3086,10 @@ def _bi_spawn_parallel(params: dict, ctx: ToolCtx) -> dict:
             try:
                 while _pending and (_deadline is None or time.time() < _deadline):
                     _parent_info = _al.get_agent(parent_id)
-                    if _parent_info is not None and _parent_info.abort_event.is_set():
+                    _interrupt_ev = getattr(ctx, "interrupt_event", None)
+                    if ((_interrupt_ev is not None and _interrupt_ev.is_set())
+                            or (_parent_info is not None
+                                and _parent_info.abort_event.is_set())):
                         # User requested interrupt (Ctrl+C/Esc). Without this
                         # check the loop would only stop when every child
                         # finishes or stalls, so a single Ctrl+C had no effect
@@ -3326,7 +3339,10 @@ def _bi_spawn_chain(params: dict, ctx: ToolCtx) -> dict:
     child_ids = []
     handoff = ""
     _parent = _al.get_agent(parent_id)
-    _abort_ev = _parent.abort_event if _parent is not None else None
+    # Esc sets ctx.interrupt_event; abort_event alone missed the
+    # non-primary foreground case (same fix as spawn / agent_wait).
+    _abort_ev = (getattr(ctx, "interrupt_event", None)
+                 or (_parent.abort_event if _parent is not None else None))
     for index, step in enumerate(steps):
         goal = str(step.get("goal") or "").strip()
         if not goal:
@@ -3419,7 +3435,10 @@ def _bi_await_spawns(params: dict, ctx: ToolCtx) -> dict:
     interrupted = False
 
     _parent = _al.get_agent(parent_id) if parent_id else None
-    _abort_ev = _parent.abort_event if _parent is not None else None
+    # Esc sets ctx.interrupt_event; abort_event alone missed the non-primary
+    # foreground case (same fix as spawn / agent_wait / spawn_chain).
+    _abort_ev = (getattr(ctx, "interrupt_event", None)
+                 or (_parent.abort_event if _parent is not None else None))
 
     if parent_id:
         _al.enter_waiting(parent_id)
@@ -3604,6 +3623,10 @@ def _bi_hwo_agent_receive(params: dict, ctx: ToolCtx) -> dict:
     _sender = _al.get_agent(from_) if from_ else None
     _token = _al.agent_progress_token(_sender)
     while True:
+        # hwo_receive slices its own queue wait into 2s pieces, so a check
+        # at the loop top bounds Esc latency to ~2s instead of the full
+        # (renewable) deadline.
+        _check_tool_interrupt(ctx)
         _slice = max(0.0, _deadline - time.time())
         msg = hwo_runner.hwo_receive(caller_id, from_, min(_slice, 30.0))
         if msg is not None:
@@ -3803,8 +3826,10 @@ def _bi_agent_wait(params: dict, ctx: ToolCtx) -> dict:
     if ctx.wait_for_agent is None:
         return {"ok": False, "error": "wait not available"}
     import agent_loop as _al
-    _abort_ev = None
-    if ctx.agent_id:
+    # Esc sets ctx.interrupt_event; abort_event alone missed the non-primary
+    # foreground case, so its waits ignored Esc.
+    _abort_ev = getattr(ctx, "interrupt_event", None)
+    if _abort_ev is None and ctx.agent_id:
         _parent = _al.get_agent(ctx.agent_id)
         if _parent is not None:
             _abort_ev = _parent.abort_event
@@ -4269,6 +4294,7 @@ def _bi_terminal_wait(params: dict, ctx: ToolCtx) -> dict:
     _last_output = time.monotonic()
     _seen_len = _terminal_output_len(term)
     while True:
+        _check_tool_interrupt(ctx)
         try:
             term.session.read_output(timeout=min(poll_interval, 0.2))
             if not term.session.is_alive():
@@ -5471,7 +5497,12 @@ def _bi_shell_exec(params: dict, ctx: ToolCtx) -> dict:
     timeout = int(params.get("timeout", 60))
     owner = (ctx.get_agent(ctx.agent_id)
              if ctx.get_agent is not None and ctx.agent_id else None)
-    abort_event = getattr(owner, "abort_event", None)
+    # Prefer the loop-injected interrupt event: it is the one Esc / single
+    # Ctrl+C actually sets (primary's abort_event for the primary agent,
+    # _user_interrupt otherwise). owner.abort_event alone missed the
+    # non-primary foreground case, so its shell commands ignored Esc.
+    abort_event = (getattr(ctx, "interrupt_event", None)
+                   or getattr(owner, "abort_event", None))
 
     deployed_session = _deployed_shell_session(ctx.stationed_terminal)
     if ctx.stationed_terminal is not None:
@@ -5937,6 +5968,19 @@ def _browser_should_auto_snapshot() -> bool:
         return True
 
 
+def _check_tool_interrupt(ctx: ToolCtx) -> None:
+    """Raise InterruptedError if the agent loop has signalled a soft interrupt.
+
+    Long-running tools call this between blocking steps so Esc / single Ctrl+C
+    stops them promptly instead of letting the full tool timeout run out. The
+    agent loop already catches tool exceptions and turns them into an ordinary
+    {ok: False, error} result, so raising here is safe on every path.
+    """
+    ev = getattr(ctx, "interrupt_event", None)
+    if ev is not None and ev.is_set():
+        raise InterruptedError("interrupted by user")
+
+
 def _bi_browser_open(params: dict, ctx: ToolCtx) -> dict:
     """Open a new headless-browser session with live-view relay."""
     blocked = _browser_check_action("navigate", params, ctx)
@@ -6023,11 +6067,33 @@ def _bi_browser_navigate(params: dict, ctx: ToolCtx) -> dict:
     wait_until = params.get("wait_until", "domcontentloaded")
     # Navigation budget. 30s was tight for slow or heavily-scripted sites, and a
     # navigation that fails here costs a whole extra agent turn to retry.
-    timeout = int(params.get("timeout", 60) or 60) * 1000
+    timeout_ms = int(params.get("timeout", 60) or 60) * 1000
     _browser_antibot_delay()
     try:
         page = sess.get_page()
-        page.goto(url, wait_until=wait_until, timeout=timeout)
+        _check_tool_interrupt(ctx)
+        # Split the navigation budget into slices so Esc can abort promptly
+        # instead of waiting out a single long goto(). Playwright's sync API
+        # blocks for the whole call; re-issuing goto() on the same URL simply
+        # continues the in-flight navigation, so a short per-slice timeout is
+        # safe, and only a timeout is worth re-slicing — a hard failure (bad
+        # DNS, refused connection, invalid URL) fails fast instead.
+        _slice_ms = 5000
+        _deadline = time.monotonic() + timeout_ms / 1000.0
+        while True:
+            _check_tool_interrupt(ctx)
+            _remaining = max(200, int((_deadline - time.monotonic()) * 1000))
+            try:
+                page.goto(url, wait_until=wait_until,
+                          timeout=min(_slice_ms, _remaining))
+                break
+            except Exception as e:
+                if time.monotonic() >= _deadline:
+                    raise
+                _name = type(e).__name__.lower()
+                if "timeout" not in _name and "timed out" not in str(e).lower():
+                    raise
+                continue
         title = page.title()
         result = f"navigated to {url}\ntitle: {title}"
         if _browser_should_auto_snapshot():
@@ -6311,10 +6377,29 @@ def _bi_browser_wait_for(params: dict, ctx: ToolCtx) -> dict:
     if not selector:
         return {"ok": False, "error": "missing 'selector'"}
     state = params.get("state", "visible")
-    timeout = int(params.get("timeout", 15) or 15) * 1000
+    timeout_ms = int(params.get("timeout", 15) or 15) * 1000
     try:
         page = sess.get_page()
-        el = page.wait_for_selector(selector, state=state, timeout=timeout)
+        _check_tool_interrupt(ctx)
+        # Slice the wait so Esc aborts promptly instead of sitting out the
+        # whole wait_for_selector() budget (same reasoning as navigate).
+        _slice_ms = 5000
+        _deadline = time.monotonic() + timeout_ms / 1000.0
+        el = None
+        while True:
+            _check_tool_interrupt(ctx)
+            _remaining = max(200, int((_deadline - time.monotonic()) * 1000))
+            try:
+                el = page.wait_for_selector(
+                    selector, state=state, timeout=min(_slice_ms, _remaining))
+                break
+            except Exception as e:
+                if time.monotonic() >= _deadline:
+                    raise
+                _name = type(e).__name__.lower()
+                if "timeout" not in _name and "timed out" not in str(e).lower():
+                    raise
+                continue
         if state in ("hidden", "detached"):
             return {"ok": True, "result": f"element '{selector}' is now {state}"}
         if el is None:

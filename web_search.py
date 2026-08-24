@@ -1635,7 +1635,7 @@ def search(query: str, max_results: int = 10,
            engine: str | None = None,
            region: str | None = None,
            timelimit: str | None = None,
-           engines=None) -> dict:
+           engines=None, interrupt_event=None) -> dict:
     """Run the search engine chain.
 
     engines is an ordered list of engine names to try; engine is the older
@@ -1708,6 +1708,8 @@ def search(query: str, max_results: int = 10,
             })
             continue
 
+        if interrupt_event is not None and interrupt_event.is_set():
+            raise InterruptedError("interrupted by user")
         try:
             results, err, msg = entry["driver"](query, max_results, region, timelimit)
         except Exception as e:
@@ -1918,10 +1920,13 @@ def _looks_like_empty_shell(body: str, text: str) -> bool:
 # ── web.fetch ────────────────────────────────────────────────────────
 
 
-def _read_capped(resp, max_bytes: int) -> tuple[bytes, bool]:
+def _read_capped(resp, max_bytes: int, interrupt_event=None) -> tuple[bytes, bool]:
     """Read a streamed response body, stopping just past the cap."""
     raw = b""
     for chunk in resp.iter_content(chunk_size=8192):
+        if interrupt_event is not None and interrupt_event.is_set():
+            resp.close()
+            raise InterruptedError("interrupted by user")
         if not chunk:
             continue
         if len(raw) + len(chunk) > max_bytes + 1:
@@ -1973,7 +1978,7 @@ def _apply_identity_cookies(session, cookies) -> None:
 
 
 def _http_get(url: str, max_bytes: int, timeout: int,
-              identity_cookies=None) -> dict:
+              identity_cookies=None, interrupt_event=None) -> dict:
     """One guarded HTTP GET, following redirects by hand.
 
     Returns {ok, status, headers, body, final_url, content_type, truncated} or
@@ -1983,6 +1988,8 @@ def _http_get(url: str, max_bytes: int, timeout: int,
     host = _host_of(url)
     session = None
     for hop in range(_MAX_REDIRECTS + 1):
+        if interrupt_event is not None and interrupt_event.is_set():
+            raise InterruptedError("interrupted by user")
         try:
             current = _guard_url(current, via_proxy=bool(_proxy_for_host(_host_of(current))))
         except ValueError as e:
@@ -2026,7 +2033,8 @@ def _http_get(url: str, max_bytes: int, timeout: int,
             continue
 
         content_type = resp.headers.get("Content-Type", "")
-        raw, body_truncated = _read_capped(resp, _download_cap(max_bytes))
+        raw, body_truncated = _read_capped(
+            resp, _download_cap(max_bytes), interrupt_event)
         apparent = None
         try:
             apparent = resp.apparent_encoding
@@ -2050,7 +2058,7 @@ def _http_get(url: str, max_bytes: int, timeout: int,
 
 
 def fetch(url: str, max_bytes: int = 65536, timeout: int = 15,
-          identity: str | None = None) -> dict:
+          identity: str | None = None, interrupt_event=None) -> dict:
     """Fetch a URL and extract text content.
 
     Uses the same proxy and cookie jar as web.search. Every hop is checked
@@ -2091,7 +2099,8 @@ def fetch(url: str, max_bytes: int = 65536, timeout: int = 15,
             return {"ok": False, "url": url,
                     "error": "[identity] identity_store is unavailable in this build"}
 
-    got = _http_get(url, max_bytes, timeout, identity_cookies=identity_cookies)
+    got = _http_get(url, max_bytes, timeout, identity_cookies=identity_cookies,
+                    interrupt_event=interrupt_event)
     if not got["ok"]:
         return {"ok": False, "url": url,
                 "error": f"[{got['error_type']}] {got['error']}"}
@@ -2113,7 +2122,8 @@ def fetch(url: str, max_bytes: int = 65536, timeout: int = 15,
             blocked = "client_rendered"
 
     if blocked is not None:
-        return _blocked_result(url, got, blocked, max_bytes, timeout)
+        return _blocked_result(url, got, blocked, max_bytes, timeout,
+                               interrupt_event=interrupt_event)
 
     if _render_mode() == "always" and _render_unavailable_reason() is None:
         # "always" means render even when the plain fetch looked fine — for
@@ -2536,7 +2546,8 @@ def _wayback_enabled() -> bool:
 
 
 def _blocked_result(url: str, got: dict, blocked: str,
-                    max_bytes: int, timeout: int) -> dict:
+                    max_bytes: int, timeout: int,
+                    interrupt_event=None) -> dict:
     """Escalate past a wall: browser render → hand to the user → Wayback.
 
     Ordered by what it costs: a render is seconds, a manual unlock is the
@@ -2545,6 +2556,12 @@ def _blocked_result(url: str, got: dict, blocked: str,
     final_url = got.get("final_url", url)
     attempts: list[str] = [f"http: {blocked}"]
 
+    def _check():
+        if interrupt_event is not None and interrupt_event.is_set():
+            raise InterruptedError("interrupted by user")
+
+    _check()
+
     # A browser may already be open on this site from an earlier unlock, and
     # the user may have just cleared the challenge in it. Inheriting those
     # cookies and retrying the cheap path first is the difference between the
@@ -2552,7 +2569,9 @@ def _blocked_result(url: str, got: dict, blocked: str,
     # A retry that succeeds means the wall is behind us; the live view should
     # stop pointing here.
     if _cookie_enabled() and refresh_cookies_from_browser():
-        retried = _http_get(final_url, max_bytes, timeout)
+        _check()
+        retried = _http_get(final_url, max_bytes, timeout,
+                            interrupt_event=interrupt_event)
         if retried.get("ok"):
             retry_block = _detect_block(retried["status"], retried["headers"],
                                         retried["body"])
@@ -2578,6 +2597,7 @@ def _blocked_result(url: str, got: dict, blocked: str,
             attempts.append(f"retry with unlocked cookies: {retry_block or 'no readable text'}")
 
     if blocked != "client_rendered":
+        _check()
         impersonated = _impersonate_get(final_url, max_bytes, timeout)
         if impersonated is None:
             attempts.append("impersonate: curl_cffi not installed")
@@ -2587,6 +2607,7 @@ def _blocked_result(url: str, got: dict, blocked: str,
             attempts.append(f"impersonate: {impersonated.get('reason')}")
 
     if _render_mode() != "off":
+        _check()
         reason = _render_unavailable_reason()
         if reason:
             attempts.append(f"browser: unavailable — {reason}")
@@ -2628,7 +2649,9 @@ def _blocked_result(url: str, got: dict, blocked: str,
                     return _unlock_result(url, final_url, blocked, attempts, adopted)
 
     if _wayback_enabled():
-        snapshot, reason = _wayback_fetch(final_url, max_bytes, timeout)
+        _check()
+        snapshot, reason = _wayback_fetch(final_url, max_bytes, timeout,
+                                          interrupt_event=interrupt_event)
         if snapshot is not None:
             return snapshot
         attempts.append(f"wayback: {reason}")
@@ -2760,7 +2783,8 @@ def _impersonate_get(url: str, max_bytes: int, timeout: int) -> dict | None:
 _WAYBACK_MIN_TIMEOUT = 25
 
 
-def _wayback_fetch(url: str, max_bytes: int, timeout: int) -> tuple[dict | None, str]:
+def _wayback_fetch(url: str, max_bytes: int, timeout: int,
+                   interrupt_event=None) -> tuple[dict | None, str]:
     """The closest archived snapshot, plus why there isn't one.
 
     Not the live page, and labelled as such — but for a page that is dead,
@@ -2803,7 +2827,8 @@ def _wayback_fetch(url: str, max_bytes: int, timeout: int) -> tuple[dict | None,
     stamp = str(timestamp)
     captured = (f"{stamp[0:4]}-{stamp[4:6]}-{stamp[6:8]}"
                 if len(stamp) >= 8 and stamp[:8].isdigit() else stamp)
-    got = _http_get(snapshot_url, max_bytes, timeout)
+    got = _http_get(snapshot_url, max_bytes, timeout,
+                    interrupt_event=interrupt_event)
     if not got.get("ok") or got.get("status", 0) >= 400:
         return None, "the snapshot itself could not be read"
     text = _extract_readable(got["body"], got["content_type"], snapshot_url).strip()

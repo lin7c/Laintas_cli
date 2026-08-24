@@ -8783,6 +8783,7 @@ def run_agent_loop(
                             switch_to_agent=switch_to_agent,
                             register_agent_fn=register_agent,
                             depth=depth,
+                            interrupt_event=_interrupt,
                         )
 
                         # A terminal is a single ordered byte stream. Serialize
