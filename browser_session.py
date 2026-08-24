@@ -20,6 +20,7 @@ Required system packages (probed at start; missing → clear error, no crash):
 from __future__ import annotations
 
 import os
+import contextlib
 import sys
 import glob
 import signal
@@ -605,6 +606,149 @@ def egress_from_env() -> dict:
     return out
 
 
+# ── Playwright sync-API guard ───────────────────────────────────────────
+#
+# Playwright's sync API waits for every call like this (_impl/_sync_base.py):
+#
+#     task = loop.create_task(coro)
+#     task.add_done_callback(lambda _: g_self.switch())
+#     while not task.done():
+#         self._dispatcher_fiber.switch()
+#
+# The dispatcher fiber is a greenlet running `loop.run_until_complete(
+# connection.run_as_sync())`. While it is alive, switching into it parks the
+# process in the event loop's select() until a reply arrives — cheap and
+# correct. But once that greenlet *finishes* — the connection to the driver
+# closed, run_as_sync returned — switching to a dead greenlet returns to its
+# parent immediately, i.e. straight back to us. The task can never complete,
+# because nothing is pumping the loop any more, so the `while` becomes an
+# infinite loop with no sleep, no timeout and no exit: one core at 100%,
+# the GIL hogged, the CLI wedged until it is killed. It burned 47 minutes on
+# a browser.close() before anyone noticed.
+#
+# The precise root cause is that upstream's loop has no exit condition other
+# than task completion. Patching _sync gives it two, for every sync call in
+# the process rather than the one that happened to hang first:
+#
+#   * dispatcher fiber dead  -> raise at once (this is the real failure mode,
+#     and it is detectable with certainty)
+#   * wall-clock cap exceeded -> raise (belt for anything else that could
+#     wedge the loop; set far above any legitimate action timeout)
+#
+# Both turn "spin forever" into an ordinary exception the caller can handle,
+# which is what every call site here already expects.
+
+_PW_GUARD_INSTALLED = False
+
+# Far above any legitimate action: Playwright's own default timeout is 30s and
+# the longest thing we ask for (browser.expect) is minutes, not hours.
+_PW_SYNC_CAP = float(os.environ.get("LAINTAS_PW_SYNC_CAP", "600") or 600)
+
+# Teardown gets a much shorter one: a disconnect that is not answered in
+# seconds is not going to be answered, and Chrome cannot be killed until it
+# returns.
+_PW_TEARDOWN_CAP = 20.0
+
+# Per-thread override of the cap, for calls that must not be allowed to block
+# for the full default — teardown, most of all. Thread-local because two
+# sessions on two threads have two independent connections.
+_PW_CAP_TLS = threading.local()
+
+
+@contextlib.contextmanager
+def _pw_sync_cap(seconds: float):
+    """Lower (or raise) the no-progress cap for calls made in this block."""
+    previous = getattr(_PW_CAP_TLS, "cap", None)
+    _PW_CAP_TLS.cap = float(seconds)
+    try:
+        yield
+    finally:
+        if previous is None:
+            del _PW_CAP_TLS.cap
+        else:
+            _PW_CAP_TLS.cap = previous
+
+
+_PW_LOST_MSG = (
+    "Playwright's connection to its driver is gone (dispatcher fiber dead) — "
+    "the session must be reconnected before it can be driven again."
+)
+
+
+def _install_pw_sync_guard() -> None:
+    """Replace SyncBase._sync with a version that cannot spin forever.
+
+    Idempotent, and a no-op if the installed Playwright's internals do not
+    look like the version this was written against (1.60) — a guard that
+    guesses at internals it does not recognise would be worse than the bug.
+    """
+    global _PW_GUARD_INSTALLED
+    if _PW_GUARD_INSTALLED:
+        return
+
+    import asyncio
+    import inspect
+    import traceback
+
+    import greenlet
+    from playwright._impl._sync_base import SyncBase
+    from playwright._impl._errors import Error as PWError
+
+    original = getattr(SyncBase, "_sync", None)
+    if original is None or getattr(original, "_laintas_guarded", False):
+        _PW_GUARD_INSTALLED = True
+        return
+    # Upstream's signature is _sync(self, coro). A different shape means a
+    # Playwright we have not read; leave it alone.
+    try:
+        params = list(inspect.signature(original).parameters)
+    except (TypeError, ValueError):
+        return
+    if params[:2] != ["self", "coro"] or len(params) != 2:
+        return
+
+    def _guarded_sync(self, coro):
+        __tracebackhide__ = True
+        if self._loop.is_closed():
+            coro.close()
+            raise PWError("Event loop is closed! Is Playwright already stopped?")
+
+        fiber = self._dispatcher_fiber
+        if getattr(fiber, "dead", False):
+            coro.close()
+            raise PWError(_PW_LOST_MSG)
+
+        g_self = greenlet.getcurrent()
+        task = self._loop.create_task(coro)
+        setattr(task, "__pw_stack__", inspect.stack(0))
+        setattr(task, "__pw_stack_trace__", traceback.extract_stack(limit=10))
+
+        task.add_done_callback(lambda _: g_self.switch())
+        cap = getattr(_PW_CAP_TLS, "cap", _PW_SYNC_CAP)
+        deadline = time.monotonic() + cap
+        while not task.done():
+            # Checked before the switch as well as after: the fiber can die
+            # inside the switch that services this very call.
+            if getattr(fiber, "dead", False):
+                task.cancel()
+                raise PWError(_PW_LOST_MSG)
+            if time.monotonic() > deadline:
+                task.cancel()
+                raise PWError(
+                    f"Playwright call made no progress for {cap:.0f}s and was "
+                    f"abandoned (raise LAINTAS_PW_SYNC_CAP if a legitimate "
+                    f"call needs longer)."
+                )
+            fiber.switch()
+        asyncio._set_running_loop(self._loop)
+        return task.result()
+
+    _guarded_sync._laintas_guarded = True
+    _guarded_sync.__doc__ = original.__doc__
+    SyncBase._sync = _guarded_sync
+    _PW_GUARD_INSTALLED = True
+
+
 # ── BrowserSession ──────────────────────────────────────────────────────
 
 @dataclass
@@ -670,6 +814,11 @@ class BrowserSession:
         self._pw = None          # sync_playwright().start() instance
         self._pw_browser = None  # chromium.connect_over_cdp() browser
         self._pw_lock = threading.Lock()
+        # Thread that owns the Playwright connection. The sync API is
+        # thread-affine (its dispatcher greenlet belongs to the creating
+        # thread), so every call has to come from this thread — see
+        # _pw_owned_here(). None until the connection is made.
+        self._pw_tid: Optional[int] = None
 
         # ── runtime capture (for website testing) ───────────────────────────
         # console messages, uncaught JS errors, and failed/4xx-5xx network
@@ -774,22 +923,105 @@ class BrowserSession:
         return bool(self._chrome and self._chrome.poll() is None)
 
 
+    # ── Playwright connection state ─────────────────────────────────────
+    #
+    # Three things can be wrong with a Playwright connection, and all three
+    # used to be found out the hard way — by making a call and hanging:
+    #   * it belongs to another thread   -> _pw_owned_here()
+    #   * its dispatcher greenlet is dead -> _pw_alive()
+    #   * it is fine                      -> use it
+    # Every one of these is answerable locally, without touching the wire.
+
+    def _pw_owned_here(self) -> bool:
+        """True if this thread may call Playwright on this session."""
+        return self._pw_tid is None or self._pw_tid == threading.get_ident()
+
+    def _pw_alive(self) -> bool:
+        """True if the Playwright connection can still carry a call.
+
+        Reads only local state (`is_connected` is a cached flag, not a round
+        trip), so it is safe to ask even when the driver is wedged.
+        """
+        browser = self._pw_browser
+        if browser is None:
+            return False
+        loop = getattr(browser, "_loop", None)
+        if loop is None or loop.is_closed():
+            return False
+        fiber = getattr(browser, "_dispatcher_fiber", None)
+        if fiber is not None and getattr(fiber, "dead", False):
+            return False
+        try:
+            return bool(browser.is_connected)
+        except Exception:
+            return False
+
+    def _drop_pw(self) -> None:
+        """Forget a Playwright connection without calling into Playwright.
+
+        For a connection that is already dead or belongs to another thread,
+        the ordinary teardown (`browser.close()`, `pw.stop()`) either raises
+        or hangs. Dropping the references is the only safe move — but the
+        driver is a child process of ours, so it has to be killed here or it
+        leaks for the life of the CLI.
+        """
+        pw, self._pw = self._pw, None
+        self._pw_browser = None
+        self._pw_tid = None
+        if pw is None:
+            return
+        try:
+            proc = pw._impl_obj._connection._transport._proc
+            pid = proc.pid
+        except Exception:
+            return
+        if proc.returncode is not None:
+            return
+        # returncode comes from the event loop, which is exactly what has
+        # stopped running here — it can say "alive" about a process that
+        # exited minutes ago, and that pid may have been reused since. Confirm
+        # it is still a node process before signalling it.
+        stat = _proc_stat(pid)
+        if stat is None or "node" not in stat[1]:
+            return
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+
     def get_page(self):
         """Lazily connect to Chrome via Playwright CDP and return the active
         Page.  All browser.* tools call this to get a handle to the page.
 
         The connection is created on first call and reused.  Playwright's sync
         API requires all calls from the same thread — the agent loop is
-        single-threaded so this is safe.  If Chrome was restarted, the
-        connection is re-established automatically.
+        single-threaded so this is safe, and a session driven from another
+        thread (web.fetch's render worker) owns its own connection.  If Chrome
+        was restarted, or the driver connection died under us, the connection
+        is re-established automatically.
         """
         if self._closed.is_set():
             raise RuntimeError("browser session is closed")
 
         with self._pw_lock:
+            if self._pw is not None and not self._pw_owned_here():
+                raise RuntimeError(
+                    f"browser session '{self.session_id}' is driven from "
+                    f"thread {self._pw_tid}; Playwright's sync API cannot be "
+                    f"called from another thread")
+            # A connection whose dispatcher greenlet has exited is not a
+            # connection any more: every call on it would raise (or, before
+            # the _sync guard, spin). Drop it and reconnect — Chrome itself
+            # usually outlives the driver link, so this is invisible to the
+            # caller.
+            if self._pw is not None and not self._pw_alive():
+                self._drop_pw()
+
             if self._pw is None:
                 from playwright.sync_api import sync_playwright
+                _install_pw_sync_guard()
                 self._pw = sync_playwright().start()
+                self._pw_tid = threading.get_ident()
                 self._pw_browser = self._pw.chromium.connect_over_cdp(
                     self.cdp_endpoint())
 
@@ -925,20 +1157,40 @@ class BrowserSession:
         self._api_log.clear()
 
     def _close_playwright(self) -> None:
-        """Disconnect Playwright from Chrome (called by close())."""
+        """Disconnect Playwright from Chrome (called by close()).
+
+        A graceful disconnect is only attempted when it can actually work:
+        this thread owns the connection and the connection is still live.
+        Otherwise the references are dropped and the driver is killed
+        outright — teardown must never be able to block, because everything
+        that frees real memory (Chrome, Xvfb, x11vnc) happens after it.
+        """
         with self._pw_lock:
-            if self._pw_browser is not None:
-                try:
-                    self._pw_browser.close()
-                except Exception:
-                    pass
-                self._pw_browser = None
-            if self._pw is not None:
-                try:
-                    self._pw.stop()
-                except Exception:
-                    pass
+            if self._pw is None and self._pw_browser is None:
+                return
+            if not self._pw_owned_here() or not self._pw_alive():
+                self._drop_pw()
+                return
+            graceful = False
+            with _pw_sync_cap(_PW_TEARDOWN_CAP):
+                if self._pw_browser is not None:
+                    try:
+                        self._pw_browser.close()
+                    except Exception:
+                        pass
+                if self._pw is not None:
+                    try:
+                        self._pw.stop()
+                        graceful = True
+                    except Exception:
+                        pass
+            if graceful:
+                # stop() reaped the driver itself; nothing left to kill.
                 self._pw = None
+                self._pw_browser = None
+                self._pw_tid = None
+            else:
+                self._drop_pw()
 
     def start(self) -> None:
         """Spawn the full host stack. Raises RuntimeError on missing deps."""
@@ -1006,11 +1258,23 @@ class BrowserSession:
             return
         self._closed.set()
 
-        # Disconnect Playwright before killing Chrome so it doesn't hang.
-        self._close_playwright()
+        # Disconnect Playwright before killing Chrome so it doesn't hang —
+        # but never *because of* Playwright: everything below frees real
+        # resources (a browser stack is well over a gigabyte), so a failure
+        # up here must not skip it. _close_playwright is bounded and swallows
+        # its own errors; the try/finally is the backstop for the rest.
+        try:
+            self._close_playwright()
+        finally:
+            self._close_host_stack()
 
+    def _close_host_stack(self) -> None:
+        """Kill Chrome/Xvfb/x11vnc and remove this session's files on disk."""
         if self._relay is not None:
-            self._relay.close()
+            try:
+                self._relay.close()
+            except Exception:
+                pass
             self._relay = None
 
         for proc in (self._x11vnc, self._chrome, self._xvfb):
