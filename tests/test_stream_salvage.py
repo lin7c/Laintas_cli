@@ -55,6 +55,33 @@ def _run(lines, boom=None):
 
 
 class StreamSalvageTests(unittest.TestCase):
+    def test_context_receipt_is_requested_and_captured_out_of_band(self):
+        profile = backend_profiles.BackendProfile(
+            "custom", "custom", "https://ai.example.com")
+        capture = {}
+        lines = _sse(
+            {"_context": {
+                "verified": True, "effective_system_prompt": "final system",
+                "messages": [{"role": "system", "content": "final system"}],
+                "tools": [],
+            }},
+            {"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]},
+        )
+        with mock.patch.object(laintas_cli, "get_backend_profile", return_value=profile), \
+                mock.patch.object(laintas_cli.requests, "post",
+                                  return_value=_FakeResponse(lines)) as post, \
+                mock.patch.object(laintas_cli, "get_selected_model", return_value=""), \
+                mock.patch.object(laintas_cli, "get_selected_provider", return_value=""):
+            result = laintas_cli.call_backend_stream(
+                {}, "hello", "local system", "/tmp", tools_enabled=False,
+                context_capture=capture)
+
+        self.assertEqual(result["reply"], "ok")
+        self.assertTrue(post.call_args.kwargs["json"]["contextReceipt"])
+        self.assertEqual(capture["client_payload"]["systemPrompt"], "local system")
+        self.assertEqual(
+            capture["gateway_receipt"]["effective_system_prompt"], "final system")
+
     def test_timeout_after_content_keeps_the_partial_answer(self):
         lines = _sse(
             {"choices": [{"delta": {"content": "I checked the first module and "}}]},

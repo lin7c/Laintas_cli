@@ -142,6 +142,8 @@ class UIOutcome:
 
 ItemLoader = Callable[[], Iterable[UIItem]]
 DetailLoader = Callable[[UIItem], UIDetail]
+AssistantHandler = Callable[
+    [Optional[UIItem], Optional[UIDetail], str, threading.Event], Any]
 
 
 _STYLE = Style.from_dict({
@@ -184,6 +186,8 @@ _STYLE = Style.from_dict({
     "search.prompt": "bg:#161b22 #4ade80 bold",
     "search.match": "bg:#3b275f #f0f6fc bold",
     "search.match.current": "bg:#238636 #ffffff bold",
+    "assistant": "bg:#161b22 #f0f6fc",
+    "assistant.prompt": "bg:#161b22 #a78bfa bold",
     "footer": "bg:#161b22 #8b949e",
     "footer.key": "bg:#161b22 #e6edf3 bold",
     "help": "bg:#161b22 #c9d1d9",
@@ -224,6 +228,8 @@ class ResourceBrowser:
                  empty_message: str = "Nothing here yet.",
                  initial_key: str = "", presentation: str = "operations",
                  pane_labels: Optional[tuple[str, str]] = None,
+                 assistant_handler: Optional[AssistantHandler] = None,
+                 assistant_placeholder: str = "Ask about this context",
                  input=None, output=None):
         self.title = title
         self.load_items = load_items
@@ -238,6 +244,8 @@ class ResourceBrowser:
         self.presentation = (presentation if presentation in _PRESENTATIONS
                              else "operations")
         self.pane_labels = pane_labels or _PANE_LABELS[self.presentation]
+        self.assistant_handler = assistant_handler
+        self.assistant_placeholder = assistant_placeholder
         self._input = input
         self._output = output
 
@@ -254,6 +262,10 @@ class ResourceBrowser:
         self.status = ""
         self.status_style = "class:muted"
         self.search_active = False
+        self.assistant_active = False
+        self.assistant_busy = False
+        self._assistant_interrupt = threading.Event()
+        self._assistant_thread: Optional[threading.Thread] = None
         self.search_scope = "list"
         self._list_query = ""
         self._detail_query = ""
@@ -271,6 +283,7 @@ class ResourceBrowser:
 
         self.search = Buffer(name="resource_search", multiline=False)
         self.search.on_text_changed += self._on_search_changed
+        self.assistant = Buffer(name="resource_assistant", multiline=False)
         self._build_application()
 
     @property
@@ -720,6 +733,8 @@ class ResourceBrowser:
         ]
         if self.searchable:
             rows.append(("SEARCH", "/  find in focused pane    n/N  next/previous match"))
+        if self.assistant_handler is not None:
+            rows.append(("AI", "a  focus AI input    Enter  submit    Esc  return"))
         action_text = "    ".join(f"{action.key}  {action.label}"
                                   for action in self.actions)
         if action_text:
@@ -780,6 +795,55 @@ class ResourceBrowser:
         label = "Find in detail" if self.search_scope == "detail" else "Filter list"
         return [("class:search.prompt", f"  {label}  ")]
 
+    def _assistant_prompt_fragments(self):
+        label = "Thinking…" if self.assistant_busy else self.assistant_placeholder
+        return [("class:assistant.prompt", f"  AI  {label}  ")]
+
+    def _submit_assistant(self) -> None:
+        """Run the optional inspector assistant without blocking terminal repaint."""
+        prompt = self.assistant.text.strip()
+        if not prompt or self.assistant_handler is None or self.assistant_busy:
+            return
+        item, detail = self._selected_item(), self.detail
+        self._assistant_interrupt.clear()
+        self.assistant_busy = True
+        self.status = "AI is inspecting the selected context…"
+        self.status_style = "class:muted"
+
+        def work() -> None:
+            try:
+                result = self.assistant_handler(
+                    item, detail, prompt, self._assistant_interrupt)
+                if isinstance(result, UIActionResult):
+                    action_result = result
+                elif isinstance(result, UIDetail):
+                    action_result = UIActionResult(detail=result)
+                else:
+                    action_result = UIActionResult(
+                        detail=UIDetail.text("AI RESPONSE", result))
+                if action_result.detail is not None:
+                    self.detail = action_result.detail
+                    self.detail_key = "__assistant__"
+                    self.detail_scroll = 0
+                    self.focus = "detail"
+                    if not self.is_wide:
+                        self.mode = "detail"
+                self.status = action_result.message or "AI response ready"
+                self.status_style = action_result.message_style
+                if action_result.refresh:
+                    self.reload(preserve=True)
+            except Exception as exc:
+                self.status = f"AI request failed: {type(exc).__name__}: {exc}"
+                self.status_style = "class:error"
+            finally:
+                self.assistant_busy = False
+                if hasattr(self, "app") and self.app.is_running:
+                    self.app.invalidate()
+
+        self._assistant_thread = threading.Thread(
+            target=work, name="resource-ui-assistant", daemon=True)
+        self._assistant_thread.start()
+
     def _footer_fragments(self):
         width = max(24, shutil.get_terminal_size((100, 30)).columns)
         if not self.is_wide and self.mode == "detail":
@@ -804,6 +868,8 @@ class ResourceBrowser:
                         parts.append(("n/N", "Match"))
             parts.append(("?", "Keys"))
             parts.append(("Esc", "Close"))
+        if self.assistant_handler is not None and not self.assistant_active:
+            parts.insert(-1, ("a", "Ask AI"))
         fragments = []
         if self.status:
             # A one-line footer must never wrap over the body. While feedback
@@ -838,44 +904,46 @@ class ResourceBrowser:
 
     def _build_application(self) -> None:
         kb = KeyBindings()
+        browsing = Condition(
+            lambda: not self.search_active and not self.assistant_active)
 
-        @kb.add("up", filter=Condition(lambda: not self.search_active))
+        @kb.add("up", filter=browsing)
         def _up(event):
             if self.focus == "detail" or (not self.is_wide and self.mode == "detail"):
                 self._move_detail(-1)
             else:
                 self._move_selection(-1)
 
-        @kb.add("down", filter=Condition(lambda: not self.search_active))
+        @kb.add("down", filter=browsing)
         def _down(event):
             if self.focus == "detail" or (not self.is_wide and self.mode == "detail"):
                 self._move_detail(1)
             else:
                 self._move_selection(1)
 
-        @kb.add("k", filter=Condition(lambda: not self.search_active))
+        @kb.add("k", filter=browsing)
         def _vim_up(event):
             _up(event)
 
-        @kb.add("j", filter=Condition(lambda: not self.search_active))
+        @kb.add("j", filter=browsing)
         def _vim_down(event):
             _down(event)
 
-        @kb.add("pageup", filter=Condition(lambda: not self.search_active))
+        @kb.add("pageup", filter=browsing)
         def _page_up(event):
             if self.focus == "detail" or (not self.is_wide and self.mode == "detail"):
                 self._move_detail(-10)
             else:
                 self._move_selection(-10)
 
-        @kb.add("pagedown", filter=Condition(lambda: not self.search_active))
+        @kb.add("pagedown", filter=browsing)
         def _page_down(event):
             if self.focus == "detail" or (not self.is_wide and self.mode == "detail"):
                 self._move_detail(10)
             else:
                 self._move_selection(10)
 
-        @kb.add("home", filter=Condition(lambda: not self.search_active))
+        @kb.add("home", filter=browsing)
         def _home(event):
             if self.focus == "detail" or (not self.is_wide and self.mode == "detail"):
                 self.detail_scroll = 0
@@ -883,7 +951,7 @@ class ResourceBrowser:
                 self.selected = 0
                 self._sync_detail()
 
-        @kb.add("end", filter=Condition(lambda: not self.search_active))
+        @kb.add("end", filter=browsing)
         def _end(event):
             if self.focus == "detail" or (not self.is_wide and self.mode == "detail"):
                 self.detail_scroll = max(0, len(self.detail.lines) - 1) if self.detail else 0
@@ -891,27 +959,29 @@ class ResourceBrowser:
                 self.selected = len(self.filtered) - 1
                 self._sync_detail()
 
-        @kb.add("g", filter=Condition(lambda: not self.search_active))
+        @kb.add("g", filter=browsing)
         def _first(event):
             _home(event)
 
-        @kb.add("G", filter=Condition(lambda: not self.search_active))
+        @kb.add("G", filter=browsing)
         def _last(event):
             _end(event)
 
-        @kb.add("]", filter=Condition(lambda: not self.search_active))
+        @kb.add("]", filter=browsing)
         def _next_anchor(event):
             if self.focus == "detail" or (not self.is_wide and self.mode == "detail"):
                 self._jump_detail_anchor(True)
 
-        @kb.add("[", filter=Condition(lambda: not self.search_active))
+        @kb.add("[", filter=browsing)
         def _previous_anchor(event):
             if self.focus == "detail" or (not self.is_wide and self.mode == "detail"):
                 self._jump_detail_anchor(False)
 
         @kb.add("enter")
         def _enter(event):
-            if self.search_active:
+            if self.assistant_active:
+                self._submit_assistant()
+            elif self.search_active:
                 self.search_active = False
                 pane = (self.mode if not self.is_wide else self.focus)
                 self._focus_pane(pane, event.app)
@@ -921,7 +991,7 @@ class ResourceBrowser:
             else:
                 self._primary()
 
-        @kb.add("/", filter=Condition(lambda: not self.search_active))
+        @kb.add("/", filter=browsing)
         def _search(event):
             if not self.searchable:
                 return
@@ -942,7 +1012,7 @@ class ResourceBrowser:
                 self._rebuild_detail_matches(reset=True)
             event.app.layout.focus(self.search_window)
 
-        @kb.add("tab", filter=Condition(lambda: not self.search_active))
+        @kb.add("tab", filter=browsing)
         def _tab(event):
             if self.is_wide:
                 self.focus = "detail" if self.focus == "list" else "list"
@@ -952,7 +1022,7 @@ class ResourceBrowser:
 
         @kb.add("?")
         def _help(event):
-            if self.search_active:
+            if self.search_active or self.assistant_active:
                 return
             if not self.help_open:
                 self._help_return_focus = self.focus
@@ -975,6 +1045,14 @@ class ResourceBrowser:
                 if not self.is_wide:
                     self.mode = self._help_return_mode
                 self._focus_pane(self._help_return_focus, event.app)
+            elif self.assistant_active:
+                if self.assistant_busy:
+                    self._assistant_interrupt.set()
+                    self.status = "Cancelling AI inspection…"
+                    self.status_style = "class:muted"
+                self.assistant_active = False
+                pane = (self.mode if not self.is_wide else self.focus)
+                self._focus_pane(pane, event.app)
             elif self.search_active:
                 restore_detail = self.search_scope == "detail"
                 if self.search.text:
@@ -1000,18 +1078,20 @@ class ResourceBrowser:
             else:
                 event.app.exit(result=UIOutcome("cancel"))
 
-        @kb.add("q", filter=Condition(lambda: not self.search_active))
+        @kb.add("q", filter=browsing)
         @kb.add("c-c")
         def _quit(event):
             event.app.exit(result=UIOutcome("cancel"))
 
         @kb.add("n", filter=Condition(
-            lambda: not self.search_active and self._detail_search_ready()))
+            lambda: not self.search_active and not self.assistant_active and
+            self._detail_search_ready()))
         def _next_match(event):
             self._jump_detail_match(1)
 
         @kb.add("N", filter=Condition(
-            lambda: not self.search_active and self._detail_search_ready()))
+            lambda: not self.search_active and not self.assistant_active and
+            self._detail_search_ready()))
         def _previous_match(event):
             self._jump_detail_match(-1)
 
@@ -1020,12 +1100,20 @@ class ResourceBrowser:
                 continue
 
             action_filter = Condition(
-                lambda key=action.key: not self.search_active and not (
+                lambda key=action.key: not self.search_active and
+                not self.assistant_active and not (
                     key in {"n", "N"} and self._detail_search_ready()))
 
             @kb.add(action.key, filter=action_filter)
             def _action(event, selected_action=action):
                 self._execute_action(selected_action)
+
+        @kb.add("a", filter=Condition(
+            lambda: self.assistant_handler is not None and
+            not self.search_active and not self.assistant_active))
+        def _ask_assistant(event):
+            self.assistant_active = True
+            event.app.layout.focus(self.assistant_window)
 
         header = Window(
             FormattedTextControl(self._header_fragments), height=1,
@@ -1038,6 +1126,14 @@ class ResourceBrowser:
         search_container = ConditionalContainer(
             self.search_window,
             filter=Condition(lambda: self.searchable and self.search_active))
+        self.assistant_window = Window(
+            BufferControl(
+                buffer=self.assistant,
+                input_processors=[BeforeInput(self._assistant_prompt_fragments)]),
+            height=1, style="class:assistant")
+        assistant_container = ConditionalContainer(
+            self.assistant_window,
+            filter=Condition(lambda: self.assistant_handler is not None))
         self.list_window = Window(
             _MouseControl(
                 self._list_fragments, focusable=True,
@@ -1078,7 +1174,8 @@ class ResourceBrowser:
         footer = Window(
             FormattedTextControl(self._footer_fragments), height=1,
             style="class:footer", always_hide_cursor=True)
-        root = HSplit([header, search_container, body, footer])
+        root = HSplit([
+            header, search_container, body, assistant_container, footer])
         io_options = {}
         if self._input is not None:
             io_options["input"] = self._input
@@ -1121,6 +1218,10 @@ class ResourceBrowser:
             return UIOutcome("cancel")
         finally:
             self._running = False
+            self._assistant_interrupt.set()
+            if (self._assistant_thread is not None
+                    and self._assistant_thread.is_alive()):
+                self._assistant_thread.join(timeout=3.0)
             try:
                 import laintas_cli
                 laintas_cli._clear_stale_running_loop()

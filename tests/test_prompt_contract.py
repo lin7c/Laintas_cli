@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -16,14 +17,52 @@ from context_policy.summary_prompt import summary_prompt
 
 
 class PromptContractTests(unittest.TestCase):
+    def test_product_authored_runtime_surfaces_are_english_only(self):
+        roots = [Path("context_policy"), Path("default_skills"), Path("extensions")]
+        files = list(Path.cwd().glob("*.py"))
+        for root in roots:
+            files.extend(
+                path for path in root.rglob("*")
+                if path.is_file() and path.suffix in {".py", ".md", ".json", ".prop"}
+            )
+        chinese = re.compile(r"[\u3400-\u9fff]")
+        offenders = []
+        for path in files:
+            text = path.read_text(encoding="utf-8")
+            if chinese.search(text):
+                offenders.append(str(path))
+        self.assertEqual([], sorted(set(offenders)))
+
     def test_generated_prompt_is_versioned_and_has_durable_rule_slot(self):
         prompt = laintas_cli.generate_cli_prop_template()
-        self.assertIn("laintas-managed-prompt:v2", prompt)
+        self.assertIn("laintas-managed-prompt:v3", prompt)
         self.assertIn("{{durableRules}}", prompt)
         self.assertNotIn("session_continue", prompt)
         self.assertNotIn("The session's full context", prompt)
-        self.assertIn("an observed completion state", prompt)
-        self.assertIn("started background command is not evidence of success", prompt)
+        self.assertIn("observable result has been checked", prompt)
+        self.assertIn("exact callable tool set", prompt)
+        self.assertIn("call `tool.search`", prompt)
+        self.assertNotIn("unknown will re-show catalog", prompt)
+        self.assertNotIn("autonomous coding agent", prompt)
+        self.assertTrue(prompt.isascii())
+
+    def test_only_managed_v3_suppresses_the_legacy_gateway_guide(self):
+        self.assertFalse(laintas_cli._should_inject_gateway_tool_guide(
+            "<!-- laintas-managed-prompt:v3 -->"))
+        self.assertTrue(laintas_cli._should_inject_gateway_tool_guide(
+            "<!-- laintas-managed-prompt:v2 -->"))
+        self.assertTrue(laintas_cli._should_inject_gateway_tool_guide(
+            "custom project prompt"))
+
+    def test_tool_search_expands_context_without_granting_authority(self):
+        state = {}
+        ctx = tools.ToolCtx(state=state)
+        result = tools.get_registry().invoke(
+            "tool.search", {"query": "browser screenshot"}, ctx)
+        self.assertTrue(result["ok"])
+        self.assertIn("browser.screenshot", result["result"])
+        self.assertIn("browser screenshot", state["_dynamic_context_query"])
+        self.assertIn("authorization permits", result["instruction"])
 
     def test_runtime_orchestration_prompt_routes_task_hwo_and_hwg(self):
         prompt = agent_loop._WORK_ORCHESTRATION_PROMPT
@@ -179,38 +218,72 @@ class PrefixCacheStabilityTests(unittest.TestCase):
         self.assertIn("<now>", bare)
 
     def test_memory_and_skill_highlights_are_split_from_their_bulk(self):
-        # The bulk half must be identical regardless of the task, so it can sit
-        # in the cached prefix while only the highlight moves to the tail.
+        # Dynamic mode keeps a stable on-demand pointer in the cached prefix;
+        # only locally selected summaries move to the task-specific tail.
+        config = {
+            "dynamic_context": True,
+            "mem_recall_highlight": True,
+            "dynamic_memory_limit": 5,
+            "dynamic_skill_limit": 3,
+        }
         with mock.patch("agent_loop.memory_system.get_memory_context",
-                        return_value="BULK"), \
-                mock.patch("agent_loop.get_runtime_config", return_value=True), \
+                        return_value="SHOULD NOT LOAD") as full_memory, \
+                mock.patch("agent_loop.get_runtime_config",
+                           side_effect=lambda key: config.get(key)), \
                 mock.patch("agent_loop.mem_recall.relevant_block",
-                           return_value="HL"):
+                           return_value="HL") as recall:
             bulk_a, hl_a = agent_loop._persistent_memory_parts("task a", None)
             bulk_b, hl_b = agent_loop._persistent_memory_parts("task b", None)
         self.assertEqual(bulk_a, bulk_b)
-        self.assertEqual(bulk_a, "BULK")
+        self.assertIn("loaded on demand", bulk_a)
         self.assertEqual(hl_a, "HL")
         self.assertNotIn("HL", bulk_a)
+        full_memory.assert_not_called()
+        self.assertTrue(recall.call_args.kwargs["local_only"])
 
-        with mock.patch("agent_loop.get_runtime_config", return_value=True), \
-                mock.patch("agent_loop.skill_router.annotate_catalog",
-                           side_effect=lambda t, base, **k: f"★ {t}\n{base}"):
+        meta = type("Meta", (), {"description": "A useful skill"})()
+        with mock.patch("agent_loop.get_runtime_config",
+                        side_effect=lambda key: config.get(key)), \
+                mock.patch("agent_loop.skills_mod.get_all_metadata",
+                           return_value={"useful": meta}), \
+                mock.patch("agent_loop.skills_mod.loaded_skill_names", return_value=[]), \
+                mock.patch("agent_loop.skill_router.rank_local",
+                           return_value=[("useful", 1.0, "lexical")]):
             cat_a, s_hl = agent_loop._skill_catalog_parts("task a", "CATALOG", None)
             cat_b, _ = agent_loop._skill_catalog_parts("task b", "CATALOG", None)
         self.assertEqual(cat_a, cat_b)
-        self.assertEqual(cat_a, "CATALOG")
-        self.assertEqual(s_hl, "★ task a")
+        self.assertNotIn("CATALOG", cat_a)
+        self.assertIn("progressive disclosure", cat_a)
+        self.assertIn("useful [available]", s_hl)
 
     def test_highlight_failure_leaves_the_cached_half_intact(self):
+        config = {
+            "dynamic_context": True,
+            "mem_recall_highlight": True,
+            "dynamic_memory_limit": 5,
+        }
         with mock.patch("agent_loop.memory_system.get_memory_context",
-                        return_value="BULK"), \
-                mock.patch("agent_loop.get_runtime_config", return_value=True), \
+                        return_value="SHOULD NOT LOAD") as full_memory, \
+                mock.patch("agent_loop.get_runtime_config",
+                           side_effect=lambda key: config.get(key)), \
                 mock.patch("agent_loop.mem_recall.relevant_block",
                            side_effect=RuntimeError("recall down")):
             bulk, hl = agent_loop._persistent_memory_parts("task", None)
-        self.assertEqual(bulk, "BULK")
+        self.assertIn("loaded on demand", bulk)
         self.assertEqual(hl, "")
+        full_memory.assert_not_called()
+
+    def test_legacy_project_memory_is_locally_filtered_and_truncated(self):
+        entries = [
+            {"id": 1, "content": "数据库迁移需要先备份" + "x" * 400},
+            {"id": 2, "content": "unrelated frontend preference"},
+        ]
+        pointer, relevant = agent_loop._legacy_memory_parts(
+            "检查数据库迁移", entries, limit=2)
+        self.assertIn("loaded on demand", pointer)
+        self.assertIn("[1]", relevant)
+        self.assertNotIn("[2]", relevant)
+        self.assertLess(len(relevant), 320)
 
 
 class DurableRuleTests(unittest.TestCase):

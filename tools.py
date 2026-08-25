@@ -127,6 +127,15 @@ def infer_capabilities(name: str) -> frozenset[str]:
         caps.add("process.exec")
     if name.startswith(("web.", "browser.")):
         caps.add("network")
+    if name.startswith("image."):
+        # Both labels, and the second one is the point: these read a local file
+        # and send its CONTENTS to a model. `fs.read` alone would understate
+        # that (it never leaves the machine) and `network` alone would
+        # understate it too (web.fetch takes a URL the model already had, not
+        # a file off this disk). Whatever policy governs either has to govern
+        # this.
+        caps.add("fs.read")
+        caps.add("network")
     if name.startswith("browser.") and name not in {
             "browser.snapshot", "browser.query", "browser.get_url",
             "browser.get_title", "browser.screenshot"}:
@@ -503,9 +512,8 @@ class ToolRegistry:
             self, allowed_names: Optional[set[str]] = None) -> str:
         """One-line tool reminder for follow-up turns (saves prompt tokens).
 
-        After turn 1, the model has already seen the full catalog and the
-        examples; we only need to remind it of available names. If it tries
-        an unknown name, the dispatch loop re-injects the full catalog.
+        Native schemas remain authoritative; this prose is only a compact
+        orientation aid and must not imply that hidden names are callable.
         """
         with self._lock:
             names = sorted(
@@ -516,11 +524,12 @@ class ToolRegistry:
         head = names[:18]
         tail_count = max(0, n - len(head))
         head_str = ", ".join(head)
-        tail_str = f", … (+{tail_count} more — emit any name; unknown will re-show catalog)" if tail_count else ""
+        tail_str = f", … (+{tail_count} more in the native schemas)" if tail_count else ""
         return (
-            f"## Tools available ({n})\n"
+            f"## Active native tools ({n})\n"
             f"Names: {head_str}{tail_str}\n"
-            f"Call them via the native function-calling interface."
+            "Only names present in this request's native function schemas are "
+            "callable. Use tool.search when a required capability is absent."
         )
 
     def to_openai_tools(self, unified: bool = False,
@@ -742,6 +751,37 @@ def _bi_skill_list(params: dict, ctx: ToolCtx) -> dict:
     import skills as _skills
     items = _skills.list_skills()
     return {"ok": True, "result": items, "count": len(items)}
+
+
+def _bi_tool_search(params: dict, ctx: ToolCtx) -> dict:
+    """Request additional native tool schemas for the next model turn."""
+    import context_router
+
+    query = str(params.get("query") or "").strip()
+    if not query:
+        return {"ok": False, "error": "missing 'query'"}
+    limit = min(max(int(params.get("limit", 12)), 1), 24)
+    matches = context_router.discover_tool_names(
+        query, get_registry().list(), limit=limit)
+
+    # The next loop rebuilds visibility from this task-local request and still
+    # intersects it with runtime authorization. Discovery never grants access.
+    ctx.state["_dynamic_context_query"] = "\n".join(filter(None, (
+        str(ctx.state.get("_dynamic_context_query") or ""), query,
+    )))
+    prior = set(ctx.state.get("_dynamic_tool_names") or [])
+    prior.update(matches)
+    ctx.state["_dynamic_tool_names"] = sorted(prior)
+    return {
+        "ok": True,
+        "result": matches,
+        "count": len(matches),
+        "instruction": (
+            "Matching schemas will be available on the next model turn when "
+            "runtime authorization permits them. Continue with the newly "
+            "available native tool; do not probe logs or source code for it."
+        ),
+    }
 
 
 def _bi_skill_load(params: dict, ctx: ToolCtx) -> dict:
@@ -5782,11 +5822,11 @@ def _browser_resolve_session(params: dict):
     except ImportError:
         return None, "browser_session module not available"
 
-    # web.fetch's render tier owns a session and drives it from its own thread.
-    # Playwright's sync API is thread-affine, so handing that session to a
-    # browser.* call on the agent's thread would corrupt both. It stays visible
-    # to the live view (the user has to be able to see and unblock it) but is
-    # never auto-selected here.
+    # web.fetch's render tier owns a session for its own use. Driving it is no
+    # longer unsafe — every session marshals to its own thread now — but it is
+    # still the wrong session to pick by accident: it holds the cookies from a
+    # challenge the user solved and it is the page they are looking at in the
+    # live view. It stays visible there and is never auto-selected here.
     def _fetch_owned(session) -> bool:
         return bool(getattr(session, "_owned_by_web_fetch", False))
 
@@ -5796,7 +5836,7 @@ def _browser_resolve_session(params: dict):
         if sess is None:
             return None, f"no browser session named '{name}'"
         if _fetch_owned(sess):
-            return None, (f"browser session '{name}' belongs to web.fetch and cannot be "
+            return None, (f"browser session '{name}' belongs to web.fetch and is not "
                           f"driven by browser tools; open your own with browser.open")
         if not sess.is_alive():
             return None, f"browser session '{name}' is not alive"
@@ -5926,36 +5966,37 @@ def _browser_auto_snapshot(sess, max_chars: int = 2000) -> str:
                 time.sleep(min(wait_s, 5.0))
         except Exception:
             pass
-        page = sess.get_page()
-        url = page.url
-        title = page.title()
-        text = page.inner_text("body")
-        if len(text) > max_chars:
-            text = text[:max_chars] + f"\n... (truncated, {len(text)} total chars)"
-        result = f"url: {url}\ntitle: {title}\n\n{text}"
-        try:
-            refs = sess.inject_refs()
-            if refs:
-                ref_lines = []
-                for r in refs[:30]:
-                    parts = [f"[{r['ref']}] <{r['tag']}>"]
-                    if r.get("text"):
-                        parts.append(f"text={r['text'][:60]}")
-                    if r.get("href"):
-                        parts.append(f"href={r['href'][:60]}")
-                    if r.get("placeholder"):
-                        parts.append(f"placeholder={r['placeholder'][:60]}")
-                    if r.get("role"):
-                        parts.append(f"role={r['role']}")
-                    if r.get("type"):
-                        parts.append(f"type={r['type']}")
-                    if r.get("value"):
-                        parts.append(f"value={r['value'][:60]}")
-                    ref_lines.append(" | ".join(parts))
-                result += "\n\n── Interactive elements (ref) ──\n" + "\n".join(ref_lines)
-        except Exception:
-            pass
-        return result
+        def _job(page):
+            url = page.url
+            title = page.title()
+            text = page.inner_text("body")
+            if len(text) > max_chars:
+                text = text[:max_chars] + f"\n... (truncated, {len(text)} total chars)"
+            result = f"url: {url}\ntitle: {title}\n\n{text}"
+            try:
+                refs = sess.inject_refs()
+                if refs:
+                    ref_lines = []
+                    for r in refs[:30]:
+                        parts = [f"[{r['ref']}] <{r['tag']}>"]
+                        if r.get("text"):
+                            parts.append(f"text={r['text'][:60]}")
+                        if r.get("href"):
+                            parts.append(f"href={r['href'][:60]}")
+                        if r.get("placeholder"):
+                            parts.append(f"placeholder={r['placeholder'][:60]}")
+                        if r.get("role"):
+                            parts.append(f"role={r['role']}")
+                        if r.get("type"):
+                            parts.append(f"type={r['type']}")
+                        if r.get("value"):
+                            parts.append(f"value={r['value'][:60]}")
+                        ref_lines.append(" | ".join(parts))
+                    result += "\n\n── Interactive elements (ref) ──\n" + "\n".join(ref_lines)
+            except Exception:
+                pass
+            return result
+        return sess.run(_job)
     except Exception as e:
         return f"(snapshot failed: {e})"
 
@@ -5979,6 +6020,241 @@ def _check_tool_interrupt(ctx: ToolCtx) -> None:
     ev = getattr(ctx, "interrupt_event", None)
     if ev is not None and ev.is_set():
         raise InterruptedError("interrupted by user")
+
+
+# ── Images: reading a picture on behalf of a model that cannot see ───
+
+def _vision_backend(ctx: ToolCtx):
+    """The gateway call vision.describe_image makes, bound to this session.
+
+    Imported here rather than at module scope because laintas_cli imports
+    tools, and tools importing laintas_cli at load time would close the loop.
+    """
+    import laintas_cli
+    return laintas_cli.call_backend_stream
+
+
+def _gateway_post_json(ctx: ToolCtx):
+    """A `post_json(route, body) -> (status, json)` bound to this session.
+
+    Goes through the configured backend profile, so the OCR call is billed,
+    metered and switchable exactly like every other gateway call — which is
+    the whole reason it is not a direct call to the provider.
+    """
+    import backend_profiles
+    import laintas_cli
+    import requests
+
+    def post_json(route: str, body: dict):
+        # The profile lives on laintas_cli (it tracks /backend switches);
+        # backend_profiles only knows how to authenticate against one.
+        profile = laintas_cli.get_backend_profile()
+        headers, cookies = backend_profiles.request_auth(profile, ctx.session)
+        resp = requests.post(profile.base_url.rstrip("/") + route,
+                             headers=headers, cookies=cookies, json=body,
+                             timeout=180)
+        try:
+            return resp.status_code, resp.json()
+        except ValueError:
+            return resp.status_code, {"detail": resp.text[:300]}
+
+    return post_json
+
+
+def _vision_catalogue(ctx: ToolCtx):
+    """Reads the models this deployment actually serves.
+
+    Passed in so vision.py can intersect its preference order with reality
+    instead of calling a model an administrator switched off months ago.
+    """
+    import laintas_cli
+
+    def list_models():
+        return laintas_cli.fetch_available_models(ctx.session)[0]
+
+    return list_models
+
+
+def _bi_image_describe(params: dict, ctx: ToolCtx) -> dict:
+    """Ask a vision model a question about an image file."""
+    import vision
+    try:
+        out = vision.describe_image(
+            str(params.get("path") or ""),
+            str(params.get("question") or ""),
+            session=ctx.session, call_backend=_vision_backend(ctx),
+            list_models=_vision_catalogue(ctx))
+    except vision.VisionError as e:
+        return {"ok": False, "error": f"image.describe: {e}"}
+    except Exception as e:
+        return {"ok": False, "error": f"image.describe: {type(e).__name__}: {e}"}
+    # The model is named in the result because this call is billed on a
+    # different tier from the session that made it: an unexplained T3 line in
+    # /usage is the kind of thing nobody can trace back a day later.
+    head = f"[image: {params.get('path')}] (read by {out['model']})"
+    return {"ok": True, "result": f"{head}\n{out['text']}",
+            "model": out["model"], "cached": out.get("cached", False)}
+
+
+def _bi_image_to_text(params: dict, ctx: ToolCtx) -> dict:
+    """Reproduce a document or image as text, via OCR."""
+    import vision
+    pages = params.get("pages")
+    pages = [int(p) for p in pages] if isinstance(pages, list) else None
+    try:
+        out = vision.image_to_text(
+            str(params.get("path") or ""), session=ctx.session,
+            post_json=_gateway_post_json(ctx), pages=pages)
+    except vision.VisionError as e:
+        return {"ok": False, "error": f"image.to_text: {e}"}
+    except Exception as e:
+        return {"ok": False, "error": f"image.to_text: {type(e).__name__}: {e}"}
+    head = f"[text of: {params.get('path')}]"
+    if out.get("pages"):
+        head += f" ({out['pages']} page(s))"
+    return {"ok": True, "result": f"{head}\n{out['text']}",
+            "pages": out.get("pages"), "cached": out.get("cached", False)}
+
+
+# ── Whiteboards ──────────────────────────────────────────────────────────
+# The agent draws through the same element-level operations a person does,
+# never by writing a board file wholesale: a whole-file write pushes back the
+# shapes somebody is dragging in Helpwo, and it does it silently. Everything
+# created here is stamped `author="ai"` with the run as its turn, which is
+# what Helpwo's editor groups its Show / Keep / Undo banner by — work the
+# model did stays reviewable instead of just appearing on somebody's board.
+
+
+def _canvas_board(params: dict, ctx: ToolCtx, create: bool = False):
+    """Resolve a board path against the working directory. (editor, error)."""
+    import os
+    import canvas as canvas_mod
+    import canvas_edit
+
+    raw = str(params.get("path") or "").strip()
+    if not raw:
+        return (None, "canvas: a board path is required")
+    path = raw if os.path.isabs(raw) else os.path.join(ctx.cwd or os.getcwd(), raw)
+    if not canvas_mod.is_canvas_path(path):
+        path += canvas_mod.CANVAS_EXTENSION
+    if create and not os.path.exists(path):
+        try:
+            canvas_mod.write_scene(path, canvas_mod.empty_scene())
+        except (canvas_mod.CanvasError, OSError) as e:
+            return (None, f"canvas: {e}")
+    try:
+        editor = canvas_edit.BoardEditor(
+            path, canvas_mod, author="ai", turn=ctx.run_id or "cli-run")
+    except canvas_mod.CanvasError as e:
+        return (None, f"canvas: {e}")
+    except OSError as e:
+        return (None, f"canvas: {e}")
+    return (editor, "")
+
+
+def _bi_canvas_list(params: dict, ctx: ToolCtx) -> dict:
+    """Boards under the working directory, newest first."""
+    import os
+    import canvas as canvas_mod
+    boards = canvas_mod.find_boards(ctx.cwd or os.getcwd())
+    if not boards:
+        return {"ok": True, "result": "no .excalidraw boards here"}
+    lines = []
+    for path in boards:
+        try:
+            live = canvas_mod.live_elements(canvas_mod.read_scene(path))
+            lines.append(f"{os.path.relpath(path, ctx.cwd or os.getcwd())}  "
+                         f"{len(live)} element(s)")
+        except canvas_mod.CanvasError as e:
+            lines.append(f"{os.path.relpath(path)}  [{e}]")
+    return {"ok": True, "result": "\n".join(lines)}
+
+
+def _bi_canvas_read(params: dict, ctx: ToolCtx) -> dict:
+    """What is on a board: ids, labels, and what each arrow connects."""
+    import canvas as canvas_mod
+    editor, error = _canvas_board(params, ctx)
+    if error:
+        return {"ok": False, "error": error}
+    return {"ok": True,
+            "result": canvas_mod.describe_scene(editor.scene),
+            "path": editor.path}
+
+
+def _bi_canvas_draw(params: dict, ctx: ToolCtx) -> dict:
+    """Add shapes (and the arrows between them) to a board in one write."""
+    shapes = params.get("shapes")
+    if not isinstance(shapes, list) or not shapes:
+        return {"ok": False, "error": "canvas.draw: shapes must be a non-empty list"}
+    connect = params.get("connect")
+    connect = connect if isinstance(connect, list) else []
+    editor, error = _canvas_board(params, ctx, create=True)
+    if error:
+        return {"ok": False, "error": error}
+    try:
+        ok, message, names = editor.draw_batch(shapes, connect)
+    except (ValueError, KeyError, TypeError) as e:
+        return {"ok": False, "error": f"canvas.draw: {type(e).__name__}: {e}"}
+    if not ok:
+        return {"ok": False, "error": f"canvas.draw: {message}"}
+    drawn = f"{len(shapes)} shape(s)"
+    if connect:
+        drawn += f", {len(connect)} arrow(s)"
+    return {"ok": True,
+            "result": f"drew {drawn} on {editor.path}\n"
+                      f"ids: {names}" if names else f"drew {drawn} on {editor.path}",
+            "ids": names}
+
+
+def _bi_canvas_update(params: dict, ctx: ToolCtx) -> dict:
+    """Relabel, move or erase elements that are already on a board."""
+    editor, error = _canvas_board(params, ctx)
+    if error:
+        return {"ok": False, "error": error}
+
+    import canvas_edit
+    elements = list(editor.elements)
+    done: list[str] = []
+    missing: list[str] = []
+
+    for entry in (params.get("label") or []):
+        element_id = str(entry.get("id") or "")
+        if editor._in(elements, element_id) is None:
+            missing.append(element_id)
+            continue
+        elements = canvas_edit.label(elements, element_id,
+                                    str(entry.get("text") or ""),
+                                    author=editor.author)
+        done.append(f"labelled {element_id}")
+    for entry in (params.get("move") or []):
+        element_id = str(entry.get("id") or "")
+        if editor._in(elements, element_id) is None:
+            missing.append(element_id)
+            continue
+        elements = canvas_edit.move(elements, element_id,
+                                    float(entry.get("dx") or 0),
+                                    float(entry.get("dy") or 0))
+        done.append(f"moved {element_id}")
+    for element_id in (params.get("erase") or []):
+        element_id = str(element_id)
+        if editor._in(elements, element_id) is None:
+            missing.append(element_id)
+            continue
+        elements = canvas_edit.delete(elements, element_id)
+        done.append(f"erased {element_id}")
+
+    if not done:
+        return {"ok": False,
+                "error": ("canvas.update: nothing to do"
+                          + (f"; no such element: {', '.join(missing)}"
+                             if missing else ""))}
+    ok, message = editor.apply(elements)
+    if not ok:
+        return {"ok": False, "error": f"canvas.update: {message}"}
+    result = "; ".join(done)
+    if missing:
+        result += f" (not found: {', '.join(missing)})"
+    return {"ok": True, "result": result}
 
 
 def _bi_browser_open(params: dict, ctx: ToolCtx) -> dict:
@@ -6012,16 +6288,25 @@ def _bi_browser_open(params: dict, ctx: ToolCtx) -> dict:
         return {"ok": False, "error": f"start failed: {e}"}
 
     registered = _bs.register_browser_session(sess, name=name)
+    result = (
+        f"Browser session '{registered}' is up.\n"
+        f"  url      : {sess.url}\n"
+        f"  display  :{sess.display_n}\n"
+        f"  cdp      : {sess.cdp_endpoint()}\n"
+        f"  vnc      : 127.0.0.1:{sess.rfb_port}\n"
+    )
+    if sess.initial_nav_error:
+        # The session is real and usable; the page is not there. Chrome used to
+        # absorb this into an error page that snapshot would dutifully read
+        # back as the site's content.
+        result += (f"  WARNING  : the opening navigation FAILED "
+                   f"({sess.initial_nav_error}) — the page is not loaded\n")
     return {
         "ok": True,
-        "result": (
-            f"Browser session '{registered}' is up.\n"
-            f"  url      : {sess.url}\n"
-            f"  display  :{sess.display_n}\n"
-            f"  cdp      : {sess.cdp_endpoint()}\n"
-            f"  vnc      : 127.0.0.1:{sess.rfb_port}\n"
-        ),
+        "result": result,
         "name": registered,
+        "navigated": not sess.initial_nav_error,
+        "navError": sess.initial_nav_error or "",
         "cdp_endpoint": sess.cdp_endpoint(),
         "rfb_port": sess.rfb_port,
     }
@@ -6070,35 +6355,36 @@ def _bi_browser_navigate(params: dict, ctx: ToolCtx) -> dict:
     timeout_ms = int(params.get("timeout", 60) or 60) * 1000
     _browser_antibot_delay()
     try:
-        page = sess.get_page()
-        _check_tool_interrupt(ctx)
-        # Split the navigation budget into slices so Esc can abort promptly
-        # instead of waiting out a single long goto(). Playwright's sync API
-        # blocks for the whole call; re-issuing goto() on the same URL simply
-        # continues the in-flight navigation, so a short per-slice timeout is
-        # safe, and only a timeout is worth re-slicing — a hard failure (bad
-        # DNS, refused connection, invalid URL) fails fast instead.
-        _slice_ms = 5000
-        _deadline = time.monotonic() + timeout_ms / 1000.0
-        while True:
+        def _job(page):
             _check_tool_interrupt(ctx)
-            _remaining = max(200, int((_deadline - time.monotonic()) * 1000))
-            try:
-                page.goto(url, wait_until=wait_until,
-                          timeout=min(_slice_ms, _remaining))
-                break
-            except Exception as e:
-                if time.monotonic() >= _deadline:
-                    raise
-                _name = type(e).__name__.lower()
-                if "timeout" not in _name and "timed out" not in str(e).lower():
-                    raise
-                continue
-        title = page.title()
-        result = f"navigated to {url}\ntitle: {title}"
-        if _browser_should_auto_snapshot():
-            result += "\n\n" + _browser_auto_snapshot(sess)
-        return {"ok": True, "result": result, "title": title, "url": page.url}
+            # Split the navigation budget into slices so Esc can abort promptly
+            # instead of waiting out a single long goto(). Playwright's sync API
+            # blocks for the whole call; re-issuing goto() on the same URL simply
+            # continues the in-flight navigation, so a short per-slice timeout is
+            # safe, and only a timeout is worth re-slicing — a hard failure (bad
+            # DNS, refused connection, invalid URL) fails fast instead.
+            _slice_ms = 5000
+            _deadline = time.monotonic() + timeout_ms / 1000.0
+            while True:
+                _check_tool_interrupt(ctx)
+                _remaining = max(200, int((_deadline - time.monotonic()) * 1000))
+                try:
+                    page.goto(url, wait_until=wait_until,
+                              timeout=min(_slice_ms, _remaining))
+                    break
+                except Exception as e:
+                    if time.monotonic() >= _deadline:
+                        raise
+                    _name = type(e).__name__.lower()
+                    if "timeout" not in _name and "timed out" not in str(e).lower():
+                        raise
+                    continue
+            title = page.title()
+            result = f"navigated to {url}\ntitle: {title}"
+            if _browser_should_auto_snapshot():
+                result += "\n\n" + _browser_auto_snapshot(sess)
+            return {"ok": True, "result": result, "title": title, "url": page.url}
+        return sess.run(_job)
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
@@ -6117,15 +6403,16 @@ def _bi_browser_click(params: dict, ctx: ToolCtx) -> dict:
     timeout = int(params.get("timeout", 10) or 10) * 1000
     _browser_antibot_delay()
     try:
-        page = sess.get_page()
-        el = page.wait_for_selector(selector, state="visible", timeout=timeout)
-        if el is None:
-            return {"ok": False, "error": f"element not found: {selector}"}
-        el.click()
-        result = f"clicked: {selector}"
-        if _browser_should_auto_snapshot():
-            result += "\n\n" + _browser_auto_snapshot(sess)
-        return {"ok": True, "result": result}
+        def _job(page):
+            el = page.wait_for_selector(selector, state="visible", timeout=timeout)
+            if el is None:
+                return {"ok": False, "error": f"element not found: {selector}"}
+            el.click()
+            result = f"clicked: {selector}"
+            if _browser_should_auto_snapshot():
+                result += "\n\n" + _browser_auto_snapshot(sess)
+            return {"ok": True, "result": result}
+        return sess.run(_job)
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
@@ -6149,20 +6436,21 @@ def _bi_browser_type(params: dict, ctx: ToolCtx) -> dict:
     timeout = int(params.get("timeout", 10) or 10) * 1000
     _browser_antibot_delay()
     try:
-        page = sess.get_page()
-        el = page.wait_for_selector(selector, state="visible", timeout=timeout)
-        if el is None:
-            return {"ok": False, "error": f"element not found: {selector}"}
-        if clear:
-            el.fill("")
-        if delay > 0:
-            el.type(text, delay=delay)
-        else:
-            el.type(text)
-        result = f"typed {len(text)} chars into {selector}"
-        if _browser_should_auto_snapshot():
-            result += "\n\n" + _browser_auto_snapshot(sess)
-        return {"ok": True, "result": result}
+        def _job(page):
+            el = page.wait_for_selector(selector, state="visible", timeout=timeout)
+            if el is None:
+                return {"ok": False, "error": f"element not found: {selector}"}
+            if clear:
+                el.fill("")
+            if delay > 0:
+                el.type(text, delay=delay)
+            else:
+                el.type(text)
+            result = f"typed {len(text)} chars into {selector}"
+            if _browser_should_auto_snapshot():
+                result += "\n\n" + _browser_auto_snapshot(sess)
+            return {"ok": True, "result": result}
+        return sess.run(_job)
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
@@ -6178,11 +6466,12 @@ def _bi_browser_screenshot(params: dict, ctx: ToolCtx) -> dict:
         import tempfile as _tf
         path = _tf.mktemp(prefix="browser-shot-", suffix=".png")
     try:
-        page = sess.get_page()
-        page.screenshot(path=path, full_page=full_page)
-        import os as _os
-        size = _os.path.getsize(path)
-        return {"ok": True, "result": f"screenshot saved: {path} ({size} bytes)", "path": path}
+        def _job(page):
+            page.screenshot(path=path, full_page=full_page)
+            import os as _os
+            size = _os.path.getsize(path)
+            return {"ok": True, "result": f"screenshot saved: {path} ({size} bytes)", "path": path}
+        return sess.run(_job)
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
@@ -6198,34 +6487,35 @@ def _bi_browser_query(params: dict, ctx: ToolCtx) -> dict:
     limit = int(params.get("limit", 20) or 20)
     attribute = params.get("attribute", "").strip()
     try:
-        page = sess.get_page()
-        elements = page.query_selector_all(selector)
-        if not elements:
-            return {"ok": True, "result": f"no elements matched: {selector}", "count": 0}
-        results = []
-        for el in elements[:limit]:
-            entry = {"tag": el.evaluate("e => e.tagName.toLowerCase()")}
-            if attribute:
-                val = el.get_attribute(attribute)
-                entry[attribute] = val or ""
-            else:
-                for attr in ("href", "src", "value", "placeholder", "type", "id", "class", "name", "role", "aria-label"):
-                    val = el.get_attribute(attr)
-                    if val:
-                        entry[attr] = val
-            entry["text"] = (el.inner_text() or "").strip()[:500]
-            results.append(entry)
-        lines = []
-        for r in results:
-            parts = [f"  {r['tag']}"]
-            for k, v in r.items():
-                if k == "tag":
-                    continue
-                if v:
-                    parts.append(f"{k}={v[:120]}")
-            lines.append(" | ".join(parts))
-        return {"ok": True, "result": f"{len(results)} element(s):\n" + "\n".join(lines),
-                "count": len(results), "elements": results}
+        def _job(page):
+            elements = page.query_selector_all(selector)
+            if not elements:
+                return {"ok": True, "result": f"no elements matched: {selector}", "count": 0}
+            results = []
+            for el in elements[:limit]:
+                entry = {"tag": el.evaluate("e => e.tagName.toLowerCase()")}
+                if attribute:
+                    val = el.get_attribute(attribute)
+                    entry[attribute] = val or ""
+                else:
+                    for attr in ("href", "src", "value", "placeholder", "type", "id", "class", "name", "role", "aria-label"):
+                        val = el.get_attribute(attr)
+                        if val:
+                            entry[attr] = val
+                entry["text"] = (el.inner_text() or "").strip()[:500]
+                results.append(entry)
+            lines = []
+            for r in results:
+                parts = [f"  {r['tag']}"]
+                for k, v in r.items():
+                    if k == "tag":
+                        continue
+                    if v:
+                        parts.append(f"{k}={v[:120]}")
+                lines.append(" | ".join(parts))
+            return {"ok": True, "result": f"{len(results)} element(s):\n" + "\n".join(lines),
+                    "count": len(results), "elements": results}
+        return sess.run(_job)
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
@@ -6238,40 +6528,41 @@ def _bi_browser_snapshot(params: dict, ctx: ToolCtx) -> dict:
         return {"ok": False, "error": err}
     max_chars = int(params.get("max_chars", 5000) or 5000)
     try:
-        page = sess.get_page()
-        text = page.inner_text("body")
-        url = page.url
-        title = page.title()
-        if len(text) > max_chars:
-            text = text[:max_chars] + f"\n... (truncated, {len(text)} total chars)"
-        result = f"url: {url}\ntitle: {title}\n\n{text}"
-        refs = []
-        try:
-            refs = sess.inject_refs()
-            if refs:
-                ref_lines = []
-                for r in refs:
-                    parts = [f"[{r['ref']}] <{r['tag']}>"]
-                    if r.get("text"):
-                        parts.append(f"text={r['text'][:80]}")
-                    if r.get("href"):
-                        parts.append(f"href={r['href'][:80]}")
-                    if r.get("placeholder"):
-                        parts.append(f"placeholder={r['placeholder'][:80]}")
-                    if r.get("role"):
-                        parts.append(f"role={r['role']}")
-                    if r.get("type"):
-                        parts.append(f"type={r['type']}")
-                    if r.get("value"):
-                        parts.append(f"value={r['value'][:80]}")
-                    if r.get("aria_label"):
-                        parts.append(f"aria-label={r['aria_label'][:80]}")
-                    ref_lines.append(" | ".join(parts))
-                result += "\n\n── Interactive elements (use ref number in browser.click/type/select) ──\n"
-                result += "\n".join(ref_lines)
-        except Exception:
-            pass
-        return {"ok": True, "result": result, "url": url, "title": title, "refs": refs}
+        def _job(page):
+            text = page.inner_text("body")
+            url = page.url
+            title = page.title()
+            if len(text) > max_chars:
+                text = text[:max_chars] + f"\n... (truncated, {len(text)} total chars)"
+            result = f"url: {url}\ntitle: {title}\n\n{text}"
+            refs = []
+            try:
+                refs = sess.inject_refs()
+                if refs:
+                    ref_lines = []
+                    for r in refs:
+                        parts = [f"[{r['ref']}] <{r['tag']}>"]
+                        if r.get("text"):
+                            parts.append(f"text={r['text'][:80]}")
+                        if r.get("href"):
+                            parts.append(f"href={r['href'][:80]}")
+                        if r.get("placeholder"):
+                            parts.append(f"placeholder={r['placeholder'][:80]}")
+                        if r.get("role"):
+                            parts.append(f"role={r['role']}")
+                        if r.get("type"):
+                            parts.append(f"type={r['type']}")
+                        if r.get("value"):
+                            parts.append(f"value={r['value'][:80]}")
+                        if r.get("aria_label"):
+                            parts.append(f"aria-label={r['aria_label'][:80]}")
+                        ref_lines.append(" | ".join(parts))
+                    result += "\n\n── Interactive elements (use ref number in browser.click/type/select) ──\n"
+                    result += "\n".join(ref_lines)
+            except Exception:
+                pass
+            return {"ok": True, "result": result, "url": url, "title": title, "refs": refs}
+        return sess.run(_job)
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
@@ -6285,17 +6576,18 @@ def _bi_browser_scroll(params: dict, ctx: ToolCtx) -> dict:
     x = params.get("x")
     y = params.get("y")
     try:
-        page = sess.get_page()
-        if selector:
-            el = page.query_selector(selector)
-            if el is None:
-                return {"ok": False, "error": f"element not found: {selector}"}
-            el.scroll_into_view_if_needed()
-            return {"ok": True, "result": f"scrolled '{selector}' into view"}
-        dx = int(x) if x is not None else 0
-        dy = int(y) if y is not None else 0
-        page.mouse.wheel(dx, dy)
-        return {"ok": True, "result": f"scrolled by ({dx}, {dy})"}
+        def _job(page):
+            if selector:
+                el = page.query_selector(selector)
+                if el is None:
+                    return {"ok": False, "error": f"element not found: {selector}"}
+                el.scroll_into_view_if_needed()
+                return {"ok": True, "result": f"scrolled '{selector}' into view"}
+            dx = int(x) if x is not None else 0
+            dy = int(y) if y is not None else 0
+            page.mouse.wheel(dx, dy)
+            return {"ok": True, "result": f"scrolled by ({dx}, {dy})"}
+        return sess.run(_job)
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
@@ -6312,9 +6604,10 @@ def _bi_browser_evaluate(params: dict, ctx: ToolCtx) -> dict:
     if not script:
         return {"ok": False, "error": "missing 'script'"}
     try:
-        page = sess.get_page()
-        result = page.evaluate(script)
-        return {"ok": True, "result": str(result)[:5000], "value": result}
+        def _job(page):
+            result = page.evaluate(script)
+            return {"ok": True, "result": str(result)[:5000], "value": result}
+        return sess.run(_job)
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
@@ -6332,12 +6625,13 @@ def _bi_browser_press_key(params: dict, ctx: ToolCtx) -> dict:
         return {"ok": False, "error": "missing 'key'"}
     _browser_antibot_delay()
     try:
-        page = sess.get_page()
-        page.keyboard.press(key)
-        result = f"pressed: {key}"
-        if _browser_should_auto_snapshot():
-            result += "\n\n" + _browser_auto_snapshot(sess)
-        return {"ok": True, "result": result}
+        def _job(page):
+            page.keyboard.press(key)
+            result = f"pressed: {key}"
+            if _browser_should_auto_snapshot():
+                result += "\n\n" + _browser_auto_snapshot(sess)
+            return {"ok": True, "result": result}
+        return sess.run(_job)
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
@@ -6348,9 +6642,10 @@ def _bi_browser_get_url(params: dict, ctx: ToolCtx) -> dict:
     if sess is None:
         return {"ok": False, "error": err}
     try:
-        page = sess.get_page()
-        url = page.url
-        return {"ok": True, "result": url, "url": url}
+        def _job(page):
+            url = page.url
+            return {"ok": True, "result": url, "url": url}
+        return sess.run(_job)
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
@@ -6361,9 +6656,10 @@ def _bi_browser_get_title(params: dict, ctx: ToolCtx) -> dict:
     if sess is None:
         return {"ok": False, "error": err}
     try:
-        page = sess.get_page()
-        title = page.title()
-        return {"ok": True, "result": title, "title": title}
+        def _job(page):
+            title = page.title()
+            return {"ok": True, "result": title, "title": title}
+        return sess.run(_job)
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
@@ -6379,32 +6675,33 @@ def _bi_browser_wait_for(params: dict, ctx: ToolCtx) -> dict:
     state = params.get("state", "visible")
     timeout_ms = int(params.get("timeout", 15) or 15) * 1000
     try:
-        page = sess.get_page()
-        _check_tool_interrupt(ctx)
-        # Slice the wait so Esc aborts promptly instead of sitting out the
-        # whole wait_for_selector() budget (same reasoning as navigate).
-        _slice_ms = 5000
-        _deadline = time.monotonic() + timeout_ms / 1000.0
-        el = None
-        while True:
+        def _job(page):
             _check_tool_interrupt(ctx)
-            _remaining = max(200, int((_deadline - time.monotonic()) * 1000))
-            try:
-                el = page.wait_for_selector(
-                    selector, state=state, timeout=min(_slice_ms, _remaining))
-                break
-            except Exception as e:
-                if time.monotonic() >= _deadline:
-                    raise
-                _name = type(e).__name__.lower()
-                if "timeout" not in _name and "timed out" not in str(e).lower():
-                    raise
-                continue
-        if state in ("hidden", "detached"):
-            return {"ok": True, "result": f"element '{selector}' is now {state}"}
-        if el is None:
-            return {"ok": False, "error": f"element not found: {selector}"}
-        return {"ok": True, "result": f"element '{selector}' is {state}"}
+            # Slice the wait so Esc aborts promptly instead of sitting out the
+            # whole wait_for_selector() budget (same reasoning as navigate).
+            _slice_ms = 5000
+            _deadline = time.monotonic() + timeout_ms / 1000.0
+            el = None
+            while True:
+                _check_tool_interrupt(ctx)
+                _remaining = max(200, int((_deadline - time.monotonic()) * 1000))
+                try:
+                    el = page.wait_for_selector(
+                        selector, state=state, timeout=min(_slice_ms, _remaining))
+                    break
+                except Exception as e:
+                    if time.monotonic() >= _deadline:
+                        raise
+                    _name = type(e).__name__.lower()
+                    if "timeout" not in _name and "timed out" not in str(e).lower():
+                        raise
+                    continue
+            if state in ("hidden", "detached"):
+                return {"ok": True, "result": f"element '{selector}' is now {state}"}
+            if el is None:
+                return {"ok": False, "error": f"element not found: {selector}"}
+            return {"ok": True, "result": f"element '{selector}' is {state}"}
+        return sess.run(_job)
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
@@ -6426,18 +6723,19 @@ def _bi_browser_select(params: dict, ctx: ToolCtx) -> dict:
         return {"ok": False, "error": "missing 'value' or 'label'"}
     _browser_antibot_delay()
     try:
-        page = sess.get_page()
-        el = page.query_selector(selector)
-        if el is None:
-            return {"ok": False, "error": f"select element not found: {selector}"}
-        if label:
-            selected = el.select_option(label=label)
-        else:
-            selected = el.select_option(value=value)
-        result = f"selected '{selected}' in {selector}"
-        if _browser_should_auto_snapshot():
-            result += "\n\n" + _browser_auto_snapshot(sess)
-        return {"ok": True, "result": result}
+        def _job(page):
+            el = page.query_selector(selector)
+            if el is None:
+                return {"ok": False, "error": f"select element not found: {selector}"}
+            if label:
+                selected = el.select_option(label=label)
+            else:
+                selected = el.select_option(value=value)
+            result = f"selected '{selected}' in {selector}"
+            if _browser_should_auto_snapshot():
+                result += "\n\n" + _browser_auto_snapshot(sess)
+            return {"ok": True, "result": result}
+        return sess.run(_job)
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
@@ -6449,12 +6747,13 @@ def _bi_browser_go_back(params: dict, ctx: ToolCtx) -> dict:
         return {"ok": False, "error": err}
     _browser_antibot_delay()
     try:
-        page = sess.get_page()
-        page.go_back(wait_until="domcontentloaded", timeout=15000)
-        result = f"went back, now at: {page.url}"
-        if _browser_should_auto_snapshot():
-            result += "\n\n" + _browser_auto_snapshot(sess)
-        return {"ok": True, "result": result, "url": page.url}
+        def _job(page):
+            page.go_back(wait_until="domcontentloaded", timeout=15000)
+            result = f"went back, now at: {page.url}"
+            if _browser_should_auto_snapshot():
+                result += "\n\n" + _browser_auto_snapshot(sess)
+            return {"ok": True, "result": result, "url": page.url}
+        return sess.run(_job)
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
@@ -6466,12 +6765,13 @@ def _bi_browser_go_forward(params: dict, ctx: ToolCtx) -> dict:
         return {"ok": False, "error": err}
     _browser_antibot_delay()
     try:
-        page = sess.get_page()
-        page.go_forward(wait_until="domcontentloaded", timeout=15000)
-        result = f"went forward, now at: {page.url}"
-        if _browser_should_auto_snapshot():
-            result += "\n\n" + _browser_auto_snapshot(sess)
-        return {"ok": True, "result": result, "url": page.url}
+        def _job(page):
+            page.go_forward(wait_until="domcontentloaded", timeout=15000)
+            result = f"went forward, now at: {page.url}"
+            if _browser_should_auto_snapshot():
+                result += "\n\n" + _browser_auto_snapshot(sess)
+            return {"ok": True, "result": result, "url": page.url}
+        return sess.run(_job)
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
@@ -6485,7 +6785,13 @@ def _bi_browser_get_console(params: dict, ctx: ToolCtx) -> dict:
     level = (params.get("level") or "all").strip()
     msgs = sess.get_console(level)
     if not msgs:
-        return {"ok": True, "result": "(no console messages)", "count": 0}
+        if not sess.is_monitoring():
+            return {"ok": True, "count": 0, "monitored": False,
+                    "result": "(nothing captured — no page on this session has "
+                              "been instrumented yet, so this is not the same "
+                              "as an empty console)"}
+        return {"ok": True, "result": "(no console messages)", "count": 0,
+                "monitored": True}
     shown = msgs[-200:]
     lines = [f"  [{m['type']}] {m['text']}" + (f"  ({m['location']})" if m.get('location') else "") for m in shown]
     return {"ok": True, "result": f"{len(msgs)} console message(s):\n" + "\n".join(lines),
@@ -6503,7 +6809,19 @@ def _bi_browser_get_errors(params: dict, ctx: ToolCtx) -> dict:
     net_errs = sess.get_network_errors()
     total = len(page_errs) + len(console_errs) + len(net_errs)
     if total == 0:
-        return {"ok": True, "clean": True, "count": 0,
+        # "Nothing was captured" and "nothing went wrong" are different claims,
+        # and this tool used to make the first one in the words of the second.
+        # A session whose page loaded before any listener existed reported a
+        # clean bill of health for an app that was crashing on every load, and
+        # that answer is what ends an investigation.
+        if not sess.is_monitoring():
+            return {"ok": True, "clean": False, "count": 0, "monitored": False,
+                    "result": "Nothing has been captured on this session yet "
+                              "because no page has been instrumented — this is "
+                              "NOT a clean result. Navigate with "
+                              "browser.navigate (which attaches the listeners "
+                              "first) and check again."}
+        return {"ok": True, "clean": True, "count": 0, "monitored": True,
                 "result": "No runtime errors captured (no JS exceptions, console errors, or failed/4xx-5xx requests)."}
     lines = []
     if page_errs:
@@ -6515,7 +6833,7 @@ def _bi_browser_get_errors(params: dict, ctx: ToolCtx) -> dict:
     if net_errs:
         lines.append(f"network failures ({len(net_errs)}):")
         lines += [f"  - {e.get('status','FAIL')} {e['method']} {e['url']}" + (f" ({e.get('failure')})" if e.get('failure') else "") for e in net_errs[-20:]]
-    return {"ok": True, "clean": False, "count": total,
+    return {"ok": True, "clean": False, "count": total, "monitored": True,
             "result": f"{total} runtime problem(s):\n" + "\n".join(lines),
             "page_errors": page_errs, "console_errors": console_errs, "network_errors": net_errs}
 
@@ -6551,35 +6869,36 @@ def _bi_browser_expect(params: dict, ctx: ToolCtx) -> dict:
                           f"title_contains (with selector or ref).")}
 
     try:
-        page = sess.get_page()
-        url_c = params.get("url_contains")
-        if url_c is not None:
-            return _expect_result(url_c in (page.url or ""), f"url contains {url_c!r}", f"url is {page.url!r}")
-        title_c = params.get("title_contains")
-        if title_c is not None:
-            t = page.title() or ""
-            return _expect_result(title_c in t, f"title contains {title_c!r}", f"title is {t!r}")
-        selector, serr = _browser_resolve_selector(params)
-        if serr:
-            return {"ok": False, "error": serr}
-        if not selector:
-            return {"ok": False, "error": "expect needs selector + a condition (text/state/count), or url_contains/title_contains"}
-        els = page.query_selector_all(selector)
-        if params.get("count") is not None:
-            want = int(params["count"])
-            return _expect_result(len(els) == want, f"{selector} count == {want}", f"found {len(els)}")
-        state = params.get("state")
-        if state in ("visible", "hidden"):
-            visible = bool(els) and els[0].is_visible()
-            ok = visible if state == "visible" else (not visible)
-            return _expect_result(ok, f"{selector} is {state}", f"visible={visible}, matched={len(els)}")
-        text = params.get("text")
-        if text is not None:
-            if not els:
-                return _expect_result(False, f"{selector} text contains {text!r}", "selector not found")
-            actual = (els[0].inner_text() or "")
-            return _expect_result(text in actual, f"{selector} text contains {text!r}", f"text is {actual.strip()[:200]!r}")
-        return _expect_result(len(els) > 0, f"{selector} exists", f"matched {len(els)}")
+        def _job(page):
+            url_c = params.get("url_contains")
+            if url_c is not None:
+                return _expect_result(url_c in (page.url or ""), f"url contains {url_c!r}", f"url is {page.url!r}")
+            title_c = params.get("title_contains")
+            if title_c is not None:
+                t = page.title() or ""
+                return _expect_result(title_c in t, f"title contains {title_c!r}", f"title is {t!r}")
+            selector, serr = _browser_resolve_selector(params)
+            if serr:
+                return {"ok": False, "error": serr}
+            if not selector:
+                return {"ok": False, "error": "expect needs selector + a condition (text/state/count), or url_contains/title_contains"}
+            els = page.query_selector_all(selector)
+            if params.get("count") is not None:
+                want = int(params["count"])
+                return _expect_result(len(els) == want, f"{selector} count == {want}", f"found {len(els)}")
+            state = params.get("state")
+            if state in ("visible", "hidden"):
+                visible = bool(els) and els[0].is_visible()
+                ok = visible if state == "visible" else (not visible)
+                return _expect_result(ok, f"{selector} is {state}", f"visible={visible}, matched={len(els)}")
+            text = params.get("text")
+            if text is not None:
+                if not els:
+                    return _expect_result(False, f"{selector} text contains {text!r}", "selector not found")
+                actual = (els[0].inner_text() or "")
+                return _expect_result(text in actual, f"{selector} text contains {text!r}", f"text is {actual.strip()[:200]!r}")
+            return _expect_result(len(els) > 0, f"{selector} exists", f"matched {len(els)}")
+        return sess.run(_job)
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
@@ -7149,6 +7468,30 @@ def register_builtin_tools() -> None:
                         "Use this when deciding whether specialized instructions are available.",
             schema={"type": "object", "properties": {}},
             invoke=_bi_skill_list,
+        ),
+        Tool(
+            name="tool.search",
+            description=(
+                "Find and request native tools that are not currently visible. "
+                "Use this instead of shell, source code, or event logs when a "
+                "task needs a missing capability. Matching schemas are exposed "
+                "on the next model turn only when runtime policy permits them."
+            ),
+            schema={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Describe the action or capability needed",
+                    },
+                    "limit": {
+                        "type": "integer", "minimum": 1, "maximum": 24,
+                        "default": 12,
+                    },
+                },
+                "required": ["query"],
+            },
+            invoke=_bi_tool_search,
         ),
         Tool(
             name="skill.load",
@@ -8515,6 +8858,166 @@ def register_builtin_tools() -> None:
             invoke=_bi_task_complete,
         ),
         # ── Browser live-view debug tools (P1) ───────────────────────
+        Tool(
+            name="canvas.list",
+            description=(
+                "List the whiteboards (.excalidraw files) under the working "
+                "directory. A board is where a diagram lives that a person "
+                "will look at and edit — use it for architecture sketches, "
+                "flows and layouts, not for anything you would rather write "
+                "as text."),
+            schema={"type": "object", "properties": {}},
+            capabilities=frozenset({"fs.read"}),
+            invoke=_bi_canvas_list,
+        ),
+        Tool(
+            name="canvas.read",
+            description=(
+                "Read what is on a board: every element's id, its label, and "
+                "what each arrow connects. Read before you update — the ids "
+                "in this listing are the ones canvas.update needs."),
+            schema={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "board path, e.g. flow.excalidraw"},
+                },
+                "required": ["path"],
+            },
+            capabilities=frozenset({"fs.read"}),
+            invoke=_bi_canvas_read,
+        ),
+        Tool(
+            name="canvas.draw",
+            description=(
+                "Draw on a board (created if it does not exist), in one "
+                "write. Not only box-and-arrow diagrams: `line` and "
+                "`freedraw` take a list of points, so you can draw a curve, "
+                "an axis, a sketch, a route — anything a path describes — and "
+                "every element takes colour, fill and stroke width. For "
+                "diagrams: give each shape a short `id` of your own and use "
+                "those ids in `connect`, without reading the file back first; "
+                "shapes with no coordinates are laid out in rows below "
+                "whatever is already on the board. What you draw is marked as "
+                "yours, so the person can review or undo it in the editor."),
+            schema={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "board path, e.g. flow.excalidraw"},
+                    "shapes": {
+                        "type": "array",
+                        "description": "shapes to add, in reading order",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {"type": "string", "description": "your name for it, used in connect"},
+                                "kind": {"type": "string", "enum": ["rectangle", "ellipse", "diamond", "text", "line", "freedraw"]},
+                                "label": {"type": "string", "description": "text on the shape (or the text itself for kind=text)"},
+                                "x": {"type": "number"}, "y": {"type": "number"},
+                                "width": {"type": "number"}, "height": {"type": "number"},
+                                "points": {"type": "array",
+                                           "description": "for line/freedraw: [[x,y], …] in board coordinates, at least two",
+                                           "items": {"type": "array", "items": {"type": "number"}}},
+                                "color": {"type": "string", "description": "stroke colour, e.g. #1971c2"},
+                                "background": {"type": "string", "description": "fill colour, e.g. #a5d8ff"},
+                                "fill": {"type": "string", "enum": ["solid", "hachure", "cross-hatch"]},
+                                "strokeWidth": {"type": "number", "description": "1 thin, 2 medium, 4 thick"},
+                                "strokeStyle": {"type": "string", "enum": ["solid", "dashed", "dotted"]},
+                                "opacity": {"type": "number", "description": "0-100"},
+                                "sloppy": {"type": "boolean", "description": "true = hand-drawn look, false = clean lines"},
+                            },
+                            "required": ["kind"],
+                        },
+                    },
+                    "connect": {
+                        "type": "array",
+                        "description": "arrows: from/to are shape ids from this call or from canvas.read",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "from": {"type": "string"}, "to": {"type": "string"},
+                                "label": {"type": "string"},
+                            },
+                            "required": ["from", "to"],
+                        },
+                    },
+                },
+                "required": ["path", "shapes"],
+            },
+            capabilities=frozenset({"fs.read", "fs.write"}),
+            invoke=_bi_canvas_draw,
+        ),
+        Tool(
+            name="canvas.update",
+            description=(
+                "Change elements already on a board: relabel, move by an "
+                "offset, or erase. Ids come from canvas.read. Erasing leaves "
+                "the element recoverable in the editor rather than shredding "
+                "it."),
+            schema={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "label": {
+                        "type": "array",
+                        "items": {"type": "object",
+                                  "properties": {"id": {"type": "string"},
+                                                 "text": {"type": "string"}},
+                                  "required": ["id", "text"]},
+                    },
+                    "move": {
+                        "type": "array",
+                        "items": {"type": "object",
+                                  "properties": {"id": {"type": "string"},
+                                                 "dx": {"type": "number"},
+                                                 "dy": {"type": "number"}},
+                                  "required": ["id"]},
+                    },
+                    "erase": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["path"],
+            },
+            capabilities=frozenset({"fs.read", "fs.write"}),
+            invoke=_bi_canvas_update,
+        ),
+        Tool(
+            name="image.describe",
+            description=(
+                "Look at an image file and answer a question about it. Use for "
+                "screenshots, mockups, diagrams, photos — anything where you "
+                "need to know what it LOOKS like: is the layout broken, what "
+                "does this chart show, why is this page blank. Costs a call on "
+                "a vision model, so ask a specific question rather than "
+                "requesting a general description twice. To read a document "
+                "word for word, use image.to_text instead."),
+            schema={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "path to a png/jpg/webp/gif/bmp/tiff file"},
+                    "question": {"type": "string", "description": "what you need to know, e.g. 'do any elements overlap?' — defaults to a general description"},
+                },
+                "required": ["path"],
+            },
+            invoke=_bi_image_describe,
+        ),
+        Tool(
+            name="image.to_text",
+            description=(
+                "Reproduce a document or image as text, page by page, keeping "
+                "headings and tables. Use for scans, photographed pages, "
+                "receipts, image-only PDFs — anything where a summary would "
+                "lose the content. Accepts .pdf as well as image files. To ask "
+                "what a picture LOOKS like, use image.describe instead."),
+            schema={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "path to an image or .pdf file"},
+                    "pages": {"type": "array", "items": {"type": "integer"},
+                              "description": "0-based page numbers to read (PDF only); omit for all"},
+                },
+                "required": ["path"],
+            },
+            invoke=_bi_image_to_text,
+        ),
         Tool(
             name="browser._debug_open",
             description=(

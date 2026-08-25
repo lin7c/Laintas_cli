@@ -48,6 +48,7 @@ import mem_recall             # Semantic memory recall (embedding-ranked, lexica
 import mem_extract            # Task-end LLM memory extraction (write side of the memory network)
 import critic                 # Long-task external progress critic (drift/looping supervisor)
 import skill_router           # Dynamic skill routing: rank skills by task relevance (embedding, lexical fallback)
+import context_router         # Zero-network task routing for advertised tool schemas
 import durable_rules         # Structured long-lived user obligations
 import auto_pilot            # Heuristic task classification + decomposition + auto-exec
 import trust_store            # workspace trust for executable project hooks
@@ -166,6 +167,9 @@ _DEFAULT_CONFIG = {
     "redact_capture": False,           # Training-content capture is explicit opt-in. Secret enforcement remains a separate control.
     "redact_enforce": False,           # True = actually scrub detected secrets/PII from context BEFORE upload. Default False: measure via capture first, flip on once confident it won't strip context the model needs.
     "rag_capture": False,              # Training-content capture is explicit opt-in; no passive coding-session collection.
+    "dynamic_context": True,           # core + task-relevant tool schemas, memory summaries, and skill metadata
+    "dynamic_skill_limit": 3,          # relevant skill summaries advertised before explicit skill.list/load
+    "dynamic_memory_limit": 5,         # relevant memory summaries advertised before explicit mem.list/read
     "mem_recall_highlight": True,      # True = append a "most relevant to this task" section (semantic recall over all persistent memories, lexical fallback) to the injected memory context. Purely additive — never drops memories. See mem_recall.py.
     "skill_route_highlight": True,      # True = prepend a "most relevant skills for this task" line to the skill catalog (semantic ranking, lexical fallback) so the model loads the right skill first. Purely additive — the full catalog is preserved. See skill_router.py.
     "mem_extract_on_complete": False,  # True = ALSO extract durable memories on every successful task completion. Default OFF: consolidation now happens at compaction time only (mem_extract_on_compact) to keep it rare and cheap. See mem_extract.py.
@@ -695,6 +699,9 @@ _RUNTIME_CONFIG_DESCRIPTIONS = {
     "redact_capture": "Log local redacted secret/PII diagnostics to .laintas/redact_samples.jsonl (never uploaded by laintas_cli)",
     "redact_enforce": "Actually scrub detected secrets/PII from context before upload (default off — capture-only until confident)",
     "rag_capture": "Log local retrieval diagnostics to .laintas/rag_signals.jsonl (never uploaded by laintas_cli)",
+    "dynamic_context": "Send only core plus task-relevant tool schemas, relevant memory summaries, and top relevant skill summaries (zero-network prompt routing)",
+    "dynamic_skill_limit": "Maximum relevant skills advertised before explicit skill.list/load",
+    "dynamic_memory_limit": "Maximum relevant memory summaries advertised before explicit mem.list/read",
     "mem_recall_highlight": "Append a task-relevant memory highlight (semantic recall, lexical fallback) to the injected memory context (additive; never drops memories)",
     "skill_route_highlight": "Prepend a task-relevant 'most relevant skills' line to the skill catalog (semantic ranking, lexical fallback; additive)",
     "mem_extract_on_complete": "ALSO extract durable memories on task completion (default off; consolidation runs at compaction time instead)",
@@ -737,6 +744,7 @@ _RUNTIME_POSITIVE = {
     "history_max_messages", "message_truncate", "short_memory_max_chars",
     "model_context_window", "remote_max_workers", "remote_control_workers",
     "context_window_adopt_cap", "compact_chunk_tokens",
+    "dynamic_skill_limit", "dynamic_memory_limit",
 }
 
 _RUNTIME_LIMITS = {
@@ -4023,20 +4031,63 @@ def _read_memory(deps: LoopDeps) -> list[dict]:
     return []
 
 
+def _legacy_memory_parts(query: str, entries: list[dict], limit: int = 3) -> tuple[str, str]:
+    """Route legacy ``.laintas/memory.json`` locally without bulk injection."""
+    pointer = (
+        "Legacy project memory is loaded on demand from `.laintas/memory.json`; "
+        "only matching summaries appear in live context."
+    )
+    if not entries or not str(query or "").strip():
+        return pointer, ""
+
+    def terms(value: str) -> set[str]:
+        text = str(value or "").casefold()
+        found = set(re.findall(r"[a-z0-9_-]{2,}", text))
+        cjk = "".join(re.findall(r"[\u3400-\u9fff]", text))
+        found.update(cjk[i:i + 2] for i in range(max(0, len(cjk) - 1)))
+        return found
+
+    wanted = terms(query)
+    ranked = []
+    for entry in entries:
+        content = str(entry.get("content") or "").strip()
+        score = len(wanted & terms(content))
+        if score:
+            ranked.append((score, str(entry.get("id") or "?"), content))
+    ranked.sort(key=lambda row: (-row[0], row[1]))
+    if not ranked:
+        return pointer, ""
+    lines = ["Relevant legacy project-memory summaries:"]
+    for _, entry_id, content in ranked[:max(1, int(limit))]:
+        summary = re.sub(r"\s+", " ", content)[:240]
+        lines.append(f"- [{entry_id}] {summary}")
+    return pointer, "\n".join(lines)
+
+
 def _persistent_memory_parts(query: str, session) -> tuple[str, str]:
     """Persistent-memory context, split into ``(bulk, highlight)``.
 
-    ``bulk`` is the full memory context — identical for every task, so it
-    belongs in the system prompt where the provider's prefix cache can keep it.
-    ``highlight`` is the additive 'most relevant to THIS task' block, which
-    changes with the user's input and therefore rides in the transient
-    live-state message at the tail instead; putting it in the system prompt
-    would invalidate the cached prefix on every new task.
-
-    The highlight is best-effort and never removes memories — semantic when the
-    gateway embedding endpoint is available, lexical otherwise. On any error
-    the highlight is empty and the bulk context is unaffected.
+    In dynamic mode, ``bulk`` is a stable on-demand pointer and ``highlight``
+    contains only locally selected summaries. Legacy mode preserves the former
+    full-bulk plus remote-ranked-highlight behavior.
     """
+    if get_runtime_config("dynamic_context"):
+        base = (
+            "Persistent memory is loaded on demand. Only task-relevant summaries "
+            "appear in live context; use `mem.list` and `mem.read` for details."
+        )
+        try:
+            if get_runtime_config("mem_recall_highlight") and str(query or "").strip():
+                return base, (mem_recall.relevant_block(
+                    str(query),
+                    k=int(get_runtime_config("dynamic_memory_limit") or 5),
+                    session=session,
+                    local_only=True,
+                ) or "")
+        except Exception:
+            pass
+        return base, ""
+
     base = memory_system.get_memory_context()
     try:
         if get_runtime_config("mem_recall_highlight") and str(query or "").strip():
@@ -4048,11 +4099,43 @@ def _persistent_memory_parts(query: str, session) -> tuple[str, str]:
 
 
 def _skill_catalog_parts(query: str, base_catalog: str, session) -> tuple[str, str]:
-    """Skill catalog, split into ``(catalog, highlight)`` — same reasoning as
-    ``_persistent_memory_parts``: the catalog is task-independent and stays in
-    the cached system prompt, while the task-relevance line is per-task and
-    moves to the live-state tail. Never raises; on any error the highlight is
-    empty and the catalog is returned unchanged. See skill_router.py."""
+    """Return stable skill-discovery guidance plus task-relevant metadata.
+
+    Dynamic mode never sends the full catalog or calls the remote reranker on
+    the prompt-construction path. Legacy mode retains the additive catalog.
+    """
+    if get_runtime_config("dynamic_context"):
+        pointer = (
+            "Skills use progressive disclosure. Relevant skill summaries appear "
+            "in live context; use `skill.list` to discover more and `skill.load` "
+            "before relying on a skill's instructions."
+        )
+        try:
+            limit = int(get_runtime_config("dynamic_skill_limit") or 3)
+            metadata = skills_mod.get_all_metadata()
+            loaded = set(skills_mod.loaded_skill_names())
+            ranked = skill_router.rank_local(str(query or ""), k=limit)
+            names = [name for name, score, _ in ranked if score > 0]
+            # Relevant available skills get priority. Loaded skills already
+            # contribute their full bodies below, so their metadata only fills
+            # otherwise-unused catalog slots.
+            names = list(dict.fromkeys([*names, *sorted(loaded)]))[:limit]
+            if not names:
+                return pointer, ""
+            lines = [
+                "Relevant skills for this task (metadata only; call `skill.load` for instructions):"
+            ]
+            for name in names:
+                meta = metadata.get(name)
+                if meta is None:
+                    continue
+                status = "loaded" if name in loaded else "available"
+                desc = str(getattr(meta, "description", "") or "(no description)")[:160]
+                lines.append(f"- {name} [{status}]: {desc}")
+            return pointer, "\n".join(lines) if len(lines) > 1 else ""
+        except Exception:
+            return pointer, ""
+
     try:
         if get_runtime_config("skill_route_highlight") and str(query or "").strip():
             annotated = skill_router.annotate_catalog(
@@ -4536,7 +4619,6 @@ def _valid_structured_summary(text: str, lang: str) -> bool:
         return False
     heading_sets = (
         ["## Goal", "## Progress", "## Next Steps", "## Critical Context"],
-        ["## 当前目标", "## 进度", "## 下一步", "## 关键上下文"],
     )
     for required in heading_sets:
         positions = [text.find(heading) for heading in required]
@@ -6654,6 +6736,19 @@ def _allowed_tool_names_for_state(
     return names
 
 
+def _visible_tool_names_for_task(
+        query: str, state: dict, authorized_names: set[str]) -> set[str]:
+    """Intersect runtime authorization with task-relevant schema visibility."""
+    if (not get_runtime_config("dynamic_context")
+            or plan_mode.is_plan_mode()
+            or state.get("_prompt_lab_branch")
+            or state.get("_evolution_lab_branch")):
+        return set(authorized_names)
+    routed = context_router.stable_visible_names(
+        query, tools_mod.get_registry().list(), state)
+    return set(authorized_names) & routed
+
+
 def _publish_live_state(info, state: dict) -> None:
     """Expose the running loop's own state dict on its registry entry.
 
@@ -6732,6 +6827,13 @@ def run_agent_loop(
     state.setdefault("lastReply", "")
     state.setdefault("lastOutput", "")
     state.setdefault("terminalHistory", [])
+    # Dynamic capability visibility is task-scoped. A normal new prompt starts
+    # from the compact core and routes afresh; /continue preserves the active
+    # task's accumulated schemas so an interrupted workflow does not forget a
+    # capability it already discovered.
+    if not continue_thread:
+        state.pop("_dynamic_tool_names", None)
+        state.pop("_dynamic_context_query", None)
     # New top-level task: shrink command outputs inherited from the previous
     # task so a stale large dump doesn't ride along in every prompt of an
     # unrelated question. Follow-ups keep a short tail for continuity. depth==0
@@ -6981,8 +7083,16 @@ def run_agent_loop(
         _loop_id = next_debug_loop()
         history_context = _history_without_current_turn(chat_history, original_input)
         skill_context = skills_mod.get_activated_skills_context()
-        skill_catalog = skills_mod.describe_skills_for_prompt()
-        _allowed_tool_names = _allowed_tool_names_for_state(state, agent_id)
+        skill_catalog = (skills_mod.describe_skills_for_prompt()
+                         if not get_runtime_config("dynamic_context") else "")
+        _authorized_tool_names = _allowed_tool_names_for_state(state, agent_id)
+        _routing_query = "\n".join(filter(None, (
+            original_input,
+            str(state.get("_assignment_task") or ""),
+            str(state.get("_dynamic_context_query") or ""),
+        )))
+        _allowed_tool_names = _visible_tool_names_for_task(
+            _routing_query, state, _authorized_tool_names)
 
         # ── Phase 2: abort check + inbox drain ────────────────────────
         if self_info is not None:
@@ -7126,6 +7236,15 @@ def run_agent_loop(
         _supplementary = _ordinary_supplementary
         if _supplementary:
             supp_text = "\n".join(_supplementary)
+            state["_dynamic_context_query"] = "\n".join(filter(None, (
+                str(state.get("_dynamic_context_query") or ""), supp_text)))
+            # The supplementary instruction participates in THIS request, so
+            # expose any newly relevant specialist schemas immediately rather
+            # than making the model wait one extra loop to discover them.
+            _allowed_tool_names = _visible_tool_names_for_task(
+                "\n".join(filter(None, (
+                    _routing_query, str(state["_dynamic_context_query"])))),
+                state, _authorized_tool_names)
             deps.console.print(
                 f"\n[accent.dim]↳[/accent.dim] [muted]Applied instruction: "
                 f"{supp_text}[/muted]")
@@ -7159,7 +7278,12 @@ def run_agent_loop(
         )
 
         # 2. Build global memory string for system prompt
-        if memory_entries:
+        _legacy_memory_highlight = ""
+        if get_runtime_config("dynamic_context"):
+            global_memory_str, _legacy_memory_highlight = _legacy_memory_parts(
+                original_input, memory_entries,
+                limit=int(get_runtime_config("dynamic_memory_limit") or 5))
+        elif memory_entries:
             global_memory_lines = []
             for e in memory_entries:
                 global_memory_lines.append(f"[{e['id']}] {e['content']}")
@@ -7247,7 +7371,8 @@ def run_agent_loop(
         _volatile_context = {
             "inbox": inbox_str,
             "parallel_results": _format_parallel_results(inbox_msgs),
-            "memory_highlight": _memory_highlight,
+            "memory_highlight": "\n".join(filter(None, (
+                _memory_highlight, _legacy_memory_highlight))),
             "skill_highlight": _skill_highlight,
         }
 
@@ -7391,6 +7516,66 @@ def run_agent_loop(
             + system_prompt
             + "\n</user_customization>"
         )
+        _system_sections = [
+            {
+                "id": "platform_safety",
+                "title": "Platform safety policy",
+                "origin": "agent_loop.PLATFORM_SAFETY_POLICY",
+                "editable": False,
+                "content": PLATFORM_SAFETY_POLICY,
+            },
+            {
+                "id": "cli_template",
+                "title": "CLI prompt template and overlays",
+                "origin": str(paths.project_file(paths.CWD_CLI_PROP)),
+                "editable": True,
+                "content": prompt_template,
+            },
+            {
+                "id": "mode",
+                "title": "Mode guidance",
+                "origin": "mode_manager",
+                "editable": False,
+                "content": mode_section,
+            },
+            {
+                "id": "prompt_lab",
+                "title": "Prompt Lab active patch",
+                "origin": "prompt_lab",
+                "editable": True,
+                "content": _prompt_lab_section,
+            },
+            {
+                "id": "durable_rules",
+                "title": "Durable user rules",
+                "origin": "durable_rules",
+                "editable": True,
+                "content": durable_rules.format_for_prompt(os.getcwd()),
+            },
+            {
+                "id": "runtime",
+                "title": "Runtime-owned protocols",
+                "origin": "agent_loop runtime",
+                "editable": False,
+                "content": "\n\n".join(filter(None, (
+                    _RUNTIME_OWNERSHIP_PROMPT,
+                    critic.HOOK_SECTION if (_thread_mode and get_runtime_config("critic_enabled")) else "",
+                    _PRODUCT_PROTOCOL_PROMPT,
+                    _WORK_ORCHESTRATION_PROMPT,
+                    "" if _terminal_style_has_block else _TERMINAL_OUTPUT_STYLE_PROMPT,
+                ))),
+            },
+            {
+                "id": "workflow_role_skill",
+                "title": "Workflow, role, and loaded skill context",
+                "origin": "runtime extensions",
+                "editable": False,
+                "content": "\n\n".join(filter(None, (
+                    workflow_section, role_prompt, confidence_guidance,
+                    skill_context,
+                ))),
+            },
+        ]
 
         # The current date/time is deliberately NOT appended here — it now
         # rides in the transient live-state message at the tail of the request
@@ -7663,6 +7848,17 @@ def run_agent_loop(
             state.get('_model_override', ''),
             state.get('_provider_override', ''),
         )
+        _context_capture = {
+            "system_sections": _system_sections,
+            "metadata": {
+                "loop": _loop_id,
+                "task_kind": _task_kind,
+                "trajectory_id": _run_id,
+                "cwd": state.get("cwd") or os.getcwd(),
+                "local_system_sha256": hashlib.sha256(
+                    system_prompt.encode("utf-8", "replace")).hexdigest(),
+            },
+        }
         if events_cb is not None:
             # Streaming render: use rich.live.Live to render the reply as it arrives
             # via on_chunk. Falls back to spinner if backend doesn't accept on_chunk.
@@ -7676,7 +7872,9 @@ def run_agent_loop(
             _spin_mode = _active_mode_label()
             # Captured once per call like the model/mode labels: the gear is a
             # per-request payload field, so it cannot change mid-call.
-            _spin_effort = str(get_runtime_config("reasoning_effort") or "").strip()
+            # Detail off hides it: the compact spinner keeps model + mode only.
+            _spin_effort = (str(get_runtime_config("reasoning_effort") or "").strip()
+                            if get_runtime_config("detail") else "")
             try:
                 from rich.live import Live
                 from rich.spinner import Spinner
@@ -7783,6 +7981,7 @@ def run_agent_loop(
                             model_override=_request_model or None,
                             provider_override=_request_provider or None,
                             task_kind=_task_kind, trajectory_id=_run_id,
+                            context_capture=_context_capture,
                         )
                     except TypeError as _sig_err:
                         # Compatibility with injected backends that support the
@@ -7840,7 +8039,8 @@ def run_agent_loop(
                 # too, and on the shared TeeFile console its default
                 # redirect_stdout=True feedback-loops into a deadlock. A static
                 # print is deadlock-free and works without rich Live.
-                deps.console.print(f"[#3fb950]thinking… {symbols.BULLET} {_spin_model} {symbols.BULLET} {_spin_effort} {symbols.BULLET} {_spin_mode}[/#3fb950]")
+                _effort_part = f" {symbols.BULLET} {_spin_effort}" if _spin_effort else ""
+                deps.console.print(f"[#3fb950]thinking… {symbols.BULLET} {_spin_model}{_effort_part} {symbols.BULLET} {_spin_mode}[/#3fb950]")
                 with nullcontext():
                     try:
                         response = deps.call_backend(
@@ -7856,6 +8056,7 @@ def run_agent_loop(
                             model_override=_request_model or None,
                             provider_override=_request_provider or None,
                             task_kind=_task_kind, trajectory_id=_run_id,
+                            context_capture=_context_capture,
                         )
                     except TypeError as _sig_err3:
                         if not _is_signature_typeerror(_sig_err3):
@@ -7892,6 +8093,7 @@ def run_agent_loop(
                     model_override=_request_model or None,
                     provider_override=_request_provider or None,
                     task_kind=_task_kind, trajectory_id=_run_id,
+                    context_capture=_context_capture,
                 )
             except TypeError as _sig_err4:
                 if not _is_signature_typeerror(_sig_err4):
@@ -7907,6 +8109,55 @@ def run_agent_loop(
 
         # Store thinking time for the REPL status bar
         _set_last_thinking_time(time.monotonic() - _thinking_t0)
+
+        # Persist exactly what was sent for this main-loop model call. A modern
+        # gateway returns its final provider-facing context; custom/older
+        # gateways retain the complete local payload and are labeled unverified.
+        try:
+            import context_snapshot
+            _client_payload = _context_capture.get("client_payload") or {}
+            _receipt = _context_capture.get("gateway_receipt") or {}
+            _captured_system = (
+                _receipt.get("effective_system_prompt") or system_prompt)
+            _captured_messages = _receipt.get("messages")
+            if not isinstance(_captured_messages, list):
+                if isinstance(_client_payload.get("messages"), list):
+                    _captured_messages = [
+                        {"role": "system", "content": system_prompt},
+                        *_client_payload["messages"],
+                    ]
+                else:
+                    _captured_messages = [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": _client_payload.get(
+                            "message", user_input)},
+                    ]
+            _captured_tools = _receipt.get("tools")
+            if not isinstance(_captured_tools, list):
+                _captured_tools = _client_payload.get("tools") or []
+            _snapshot_meta = dict(_context_capture.get("metadata") or {})
+            _snapshot_meta.update({
+                "verified_gateway_context": bool(_receipt.get("verified")),
+                "model": _receipt.get("model") or _request_model or "",
+                "provider": _receipt.get("provider") or _request_provider or "",
+                "gateway_additions": _receipt.get("additions") or [],
+            })
+            # Injected test/extension backends may accept arbitrary kwargs but
+            # cannot expose the actual request they sent. Do not fabricate a
+            # snapshot in that case.
+            if _client_payload:
+                context_snapshot.append_call(
+                    _session_id or "default", _run_id,
+                    system_prompt=_captured_system,
+                    messages=_captured_messages,
+                    tool_schemas=_captured_tools,
+                    metadata=_snapshot_meta,
+                    system_sections=_context_capture.get("system_sections"),
+                    gateway_context_receipt=_receipt or None,
+                )
+        except Exception as _snapshot_error:
+            event_log.append("context_snapshot_failed", loop=_loop_id,
+                             error=str(_snapshot_error)[:300])
 
         # ── Handle soft-interrupt during backend call ──
         if response.get("_interrupted"):

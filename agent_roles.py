@@ -281,6 +281,7 @@ def _register_builtin_roles() -> None:
             allowed_tools=[
                 "fs.read", "fs.ls", "fs.grep", "fs.glob",
                 "web.search", "web.fetch",
+                "tool.search",
             ],
             output_format="Entry points with file:line, execution flow, architecture layers, key files list",
         ),
@@ -292,6 +293,7 @@ def _register_builtin_roles() -> None:
             allowed_tools=[
                 "fs.read", "fs.ls", "fs.grep", "fs.glob",
                 "web.search", "web.fetch",
+                "tool.search",
                 "plan.read", "plan.update", "plan.list",
                 "task.create", "task.update", "task.list",
             ],
@@ -304,6 +306,7 @@ def _register_builtin_roles() -> None:
             color="red",
             allowed_tools=[
                 "fs.read", "fs.ls", "fs.grep", "fs.glob",
+                "tool.search",
             ],
             output_format="Confidence-scored issues (>=80 only), grouped by severity, with fix suggestions",
             confidence_threshold=80,
@@ -315,6 +318,7 @@ def _register_builtin_roles() -> None:
             color="yellow",
             allowed_tools=[
                 "fs.read", "fs.ls", "fs.grep", "fs.glob",
+                "tool.search",
             ],
             output_format="CRITICAL/HIGH/MEDIUM issues with location, hidden error types, fix examples",
             confidence_threshold=70,
@@ -328,6 +332,7 @@ def _register_builtin_roles() -> None:
                 "fs.read", "fs.write", "fs.edit", "fs.multi_edit", "fs.delete", "fs.diff",
                 "fs.ls", "fs.grep", "fs.glob",
                 "shell.exec",
+                "tool.search",
             ],
             output_format="Simplified code with explanation of changes, functionality preserved",
         ),
@@ -338,6 +343,7 @@ def _register_builtin_roles() -> None:
             color="cyan",
             allowed_tools=[
                 "fs.read", "fs.ls", "fs.grep", "fs.glob",
+                "tool.search",
             ],
             output_format="Coverage summary, critical gaps (rated 1-10), quality issues, positive observations",
             confidence_threshold=50,

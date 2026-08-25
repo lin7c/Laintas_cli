@@ -179,13 +179,68 @@ class ConnectionState(unittest.TestCase):
         sess._pw_tid = threading.get_ident() + 1
         self.assertFalse(sess._pw_owned_here())
 
-    def test_get_page_refuses_a_foreign_thread(self):
+    def test_a_foreign_thread_is_served_rather_than_refused(self):
+        """The contract inverted on purpose.
+
+        It used to be the caller's job to call from the right thread, and the
+        penalty for getting it wrong was an exception at best and a wrong
+        answer at worst. Now the session owns a thread and every caller is
+        marshalled onto it, so "the wrong thread" is not a state a caller can
+        reach.
+        """
         sess = _session()
-        sess._pw = mock.Mock()
-        sess._pw_tid = threading.get_ident() + 1
-        with self.assertRaises(RuntimeError) as caught:
-            sess.get_page()
-        self.assertIn("another thread", str(caught.exception))
+        page = mock.Mock()
+        ran_on = []
+        with mock.patch.object(type(sess), "_get_page", lambda self: page):
+            def from_another_thread():
+                ran_on.append(sess.run(lambda p: threading.get_ident()))
+            t = threading.Thread(target=from_another_thread)
+            t.start(); t.join(10)
+        self.assertEqual(len(ran_on), 1)
+        # It ran on the session's thread, not the caller's and not the test's.
+        self.assertNotEqual(ran_on[0], threading.get_ident())
+        self.assertEqual(ran_on[0], sess._worker.ident)
+        sess.close()
+
+    def test_two_sessions_never_share_a_thread(self):
+        """The failure this whole design exists to prevent.
+
+        Playwright's sync API keeps the current asyncio loop in thread-global
+        state: two connections on one thread cannot both work, and the second
+        one's arrival silently breaks the first. Separate threads is the only
+        arrangement in which that cannot happen.
+        """
+        a, b = _session(), _session()
+        page = mock.Mock()
+        with mock.patch.object(type(a), "_get_page", lambda self: page), \
+                mock.patch.object(type(b), "_get_page", lambda self: page):
+            tid_a = a.run(lambda p: threading.get_ident())
+            tid_b = b.run(lambda p: threading.get_ident())
+        self.assertNotEqual(tid_a, tid_b)
+        a.close(); b.close()
+
+    def test_run_is_reentrant(self):
+        """A job that calls run() again (inject_refs inside a snapshot) must
+        execute inline instead of queueing behind itself forever."""
+        sess = _session()
+        page = mock.Mock()
+        with mock.patch.object(type(sess), "_get_page", lambda self: page):
+            outer = sess.run(lambda p: sess.run(lambda p2: "inner"))
+        self.assertEqual(outer, "inner")
+        sess.close()
+
+    def test_the_job_exception_reaches_the_caller_unchanged(self):
+        sess = _session()
+        page = mock.Mock()
+
+        def boom(_page):
+            raise ValueError("from the worker")
+
+        with mock.patch.object(type(sess), "_get_page", lambda self: page):
+            with self.assertRaises(ValueError) as caught:
+                sess.run(boom)
+        self.assertEqual(str(caught.exception), "from the worker")
+        sess.close()
 
     def test_get_page_reconnects_over_a_dead_connection(self):
         sess = _session()
@@ -202,7 +257,7 @@ class ConnectionState(unittest.TestCase):
         # connection was discarded rather than called into.
         with mock.patch.object(type(sess), "_drop_pw",
                                lambda self: dropped.append(True)):
-            self.assertIs(sess.get_page(), page)
+            self.assertIs(sess._get_page(), page)
         self.assertEqual(dropped, [True])
 
 
@@ -293,7 +348,7 @@ class DropAndTeardown(unittest.TestCase):
         sess._chrome = chrome
         sess._xvfb = xvfb
         sess.display_n = 4242        # not a real display; only lock paths
-        with mock.patch.object(type(sess), "_close_playwright",
+        with mock.patch.object(type(sess), "_shutdown_worker",
                                side_effect=RuntimeError("driver is wedged")):
             with self.assertRaises(RuntimeError):
                 sess.close()
@@ -303,11 +358,49 @@ class DropAndTeardown(unittest.TestCase):
     def test_close_is_idempotent(self):
         sess = _session()
         calls = []
-        with mock.patch.object(type(sess), "_close_playwright",
+        with mock.patch.object(type(sess), "_shutdown_worker",
                                lambda self: calls.append(True)):
             sess.close()
             sess.close()
         self.assertEqual(calls, [True])
+
+    def test_teardown_runs_on_the_thread_that_owns_the_connection(self):
+        """Disconnecting from a foreign thread either raises or hangs, so the
+        worker has to do it on its way out."""
+        sess = _session()
+        page = mock.Mock()
+        closed_on = []
+        with mock.patch.object(type(sess), "_get_page", lambda self: page), \
+                mock.patch.object(type(sess), "_close_playwright",
+                                  lambda self: closed_on.append(threading.get_ident())):
+            worker_tid = sess.run(lambda p: threading.get_ident())
+            sess.close()
+        self.assertEqual(closed_on, [worker_tid])
+
+    def test_a_wedged_worker_does_not_block_teardown(self):
+        """Everything that frees real memory happens after this, so close()
+        must return even when the worker never will."""
+        sess = _session()
+        started = threading.Event()
+
+        def _wedged(_page):
+            started.set()
+            time.sleep(30)
+
+        page = mock.Mock()
+        with mock.patch.object(type(sess), "_get_page", lambda self: page):
+            threading.Thread(target=lambda: sess.run(_wedged, timeout=30),
+                             daemon=True).start()
+            self.assertTrue(started.wait(10))
+            dropped = []
+            with mock.patch.object(type(sess), "_drop_pw",
+                                   lambda self: dropped.append(True)), \
+                    mock.patch.object(browser_session, "_PW_TEARDOWN_CAP", 0.2):
+                began = time.monotonic()
+                sess.close()
+                elapsed = time.monotonic() - began
+        self.assertLess(elapsed, 20)
+        self.assertEqual(dropped, [True])
 
 
 if __name__ == "__main__":

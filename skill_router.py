@@ -64,7 +64,24 @@ def _skill_text(meta) -> str:
 
 
 def _tokens(text: str) -> set:
-    return set(re.findall(r"[a-z0-9]+", str(text or "").lower()))
+    value = str(text or "").casefold()
+    found = set(re.findall(r"[a-z0-9]+", value))
+    for run in re.findall(r"[\u3400-\u9fff]+", value):
+        found.update(run[i:i + 2] for i in range(max(0, len(run) - 1)))
+        if len(run) == 1:
+            found.add(run)
+    aliases = {
+        "\u76ee\u524d": {"current"}, "\u5f53\u524d": {"current"},
+        "\u6700\u65b0": {"latest"}, "\u641c\u7d22": {"search"},
+        "\u67e5\u627e": {"search"}, "\u8054\u7f51": {"web"},
+        "\u63a8\u8350": {"recommend"}, "\u516c\u8ba4": {"recommend", "popular"},
+        "\u8bba\u6587": {"paper", "research", "writing"},
+        "\u6587\u6863": {"docs", "documentation"},
+    }
+    for phrase, terms in aliases.items():
+        if phrase in value:
+            found.update(terms)
+    return found
 
 
 def _local_lexical(task: str, items: list, k: int) -> list:
@@ -124,6 +141,19 @@ def rank(task: str, *, k: int = 3, session: Optional[dict] = None) -> list:
 
     _rank_cache_put(key, result)
     return result
+
+
+def rank_local(task: str, *, k: int = 3) -> list:
+    """Zero-network ranking for latency-sensitive prompt construction."""
+    q = str(task or "").strip()
+    if not q:
+        return []
+    try:
+        metas = skills.get_all_metadata()
+    except Exception:
+        return []
+    items = [(name, _skill_text(meta)) for name, meta in metas.items()]
+    return _local_lexical(q, items, k)
 
 
 def annotate_catalog(task: str, base_catalog: str, *,

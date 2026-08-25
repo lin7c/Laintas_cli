@@ -68,9 +68,9 @@ ORPHAN_MAX_AGE = 24 * 3600
 KEEP_ROUNDS = 20
 KEEP_DAYS = 14
 
-STATUS_LABELS = {"applied": "已应用", "discarded": "已丢弃", "tie": "平局",
-                 "both_bad": "都不行", "failed": "失败", "pending": "待裁决",
-                 "running": "进行中"}
+STATUS_LABELS = {"applied": "applied", "discarded": "discarded", "tie": "tie",
+                 "both_bad": "both rejected", "failed": "failed", "pending": "awaiting decision",
+                 "running": "running"}
 # A just-started round has no child ids yet (spawns happen inside the worker
 # thread), so its liveness cannot be proven. /reload re-runs setup() and would
 # otherwise reap a round that is actually alive.
@@ -274,37 +274,37 @@ def _pick_challenger() -> bool:
     incumbent_label, incumbent_model, _ = _incumbent()
     session = laintas_cli.load_session()
     if not session:
-        _say("[red]未登录，无法获取模型列表（先 /login）。[/red]")
+        _say("[red]Not signed in. Run /login before requesting the model list.[/red]")
         return False
     try:
         with laintas_cli._safe_status(
-                "[dim]正在获取可用模型… Esc/Ctrl+C 取消[/dim]"):
+                "[dim]Fetching available models... Esc/Ctrl+C to cancel[/dim]"):
             models, _endpoint = laintas_cli.run_cancellable_blocking(
                 lambda cancel: laintas_cli.fetch_available_models(
                     session, cancel_event=cancel))
     except laintas_cli.BlockingOperationCancelled:
-        _say("[dim]已取消。[/dim]")
+        _say("[dim]Cancelled.[/dim]")
         return False
     except Exception as exc:
-        _say(f"[red]获取模型列表失败：{exc}[/red]")
+        _say(f"[red]Could not fetch the model list: {exc}[/red]")
         return False
     if not models:
-        _say("[red]后端没有返回任何可用模型。[/red]")
+        _say("[red]The backend returned no available models.[/red]")
         return False
     selected = laintas_cli.show_model_selector(models, incumbent_model)
     if not selected:
-        _say("[dim]已取消。[/dim]")
+        _say("[dim]Cancelled.[/dim]")
         return False
     challenger = str(selected.get("id") or "")
     provider = str(selected.get("provider") or "")
     if _model_label(challenger) == incumbent_label:
-        _say(f"[red]挑战者不能和当前模型相同（当前：{incumbent_label}）。[/red]")
+        _say(f"[red]The challenger must differ from the current model ({incumbent_label}).[/red]")
         return False
     _state["challenger"] = challenger
     _state["challenger_provider"] = provider
     _save_state()
-    _say(f"[green]挑战者已设为 [bold]{_model_label(challenger)}[/bold]"
-         f"（对阵当前模型 {incumbent_label}）。[/green]")
+    _say(f"[green]Challenger set to [bold]{_model_label(challenger)}[/bold] "
+         f"against the current model {incumbent_label}.[/green]")
     return True
 
 
@@ -385,7 +385,7 @@ def _cleanup_worktrees(round_row: dict) -> list[str]:
         if branch:
             code, out, _ = _git(root, "branch", "--list", branch)
             if code == 0 and out.strip():
-                leftovers.append(f"分支 {branch}")
+                leftovers.append(f"branch {branch}")
         if path:
             code, out, _ = _git(root, "worktree", "list")
             if code == 0 and path in out:
@@ -528,32 +528,32 @@ def _run_round(task: str) -> bool:
     """Start one round: two worktrees, two children, one background thread."""
     challenger = str(_state.get("challenger") or "")
     if not challenger:
-        _say("[red]还没有挑战者。先 /blindpick challenger 选一个（或进入 /blindpick 菜单）。[/red]")
+        _say("[red]No challenger is configured. Use /blindpick challenger or open the /blindpick menu.[/red]")
         return False
     incumbent_label, incumbent_model, incumbent_provider = _incumbent()
     if _model_label(challenger) == incumbent_label:
-        _say(f"[red]挑战者和当前模型相同（{incumbent_label}），没有对比意义。"
-             f"换个挑战者或切换当前模型。[/red]")
+        _say(f"[red]The challenger matches the current model ({incumbent_label}). "
+             f"Choose a different challenger or switch the current model.[/red]")
         return False
     root = _repo_root(str(_ctx.cwd))
     if not root:
         _say(
-            f"[red]无法开局：blindpick 探测的启动目录不在任何 git 仓库里。[/red]\n"
-            f"blindpick 按 CLI [bold]启动时[/bold]的工作目录探测仓库，"
-            f"启动后再 cd 到别处不会更新（本次探测的目录：{_ctx.cwd}）。\n"
-            f"请退出后到 git 仓库根目录（或其子目录）重新启动 CLI，再运行 /blindpick。"
-            f"退出请用 [bold]/quit[/bold]（[red]/exit[/red] 会同时清除登录态）。"
+            f"[red]Cannot start a round: the startup directory is not inside a Git repository.[/red]\n"
+            f"Blindpick resolves the repository from the CLI working directory at startup; "
+            f"changing directories later does not update it (detected: {_ctx.cwd}).\n"
+            f"Quit, restart the CLI from the repository root or a subdirectory, and run /blindpick again. "
+            f"Use [bold]/quit[/bold]; [red]/exit[/red] also clears sign-in state."
         )
         return False
     code, _, _ = _git(root, "rev-parse", "--verify", "HEAD")
     if code != 0:
-        _say("[red]仓库还没有任何提交，无法开局（先 commit 一次）。[/red]")
+        _say("[red]The repository has no commits. Create one before starting a round.[/red]")
         return False
     if _in_progress() is not None:
-        _say("[red]已经有一局在跑，等它结束（/blindpick status）。[/red]")
+        _say("[red]A round is already running. Wait for it to finish; use /blindpick status.[/red]")
         return False
     if not RUN_LOCK.acquire(blocking=False):
-        _say("[yellow]上一局刚启动，稍等一秒再试。[/yellow]")
+        _say("[yellow]The previous round just started. Wait a moment and try again.[/yellow]")
         return False
 
     round_id = uuid.uuid4().hex[:12]
@@ -565,7 +565,7 @@ def _run_round(task: str) -> bool:
     parent = agent_loop.get_current_agent()
     if parent is None:
         RUN_LOCK.release()
-        _say("[red]没有活动的 agent，无法派生子 agent。[/red]")
+        _say("[red]No active agent is available to spawn the competitors.[/red]")
         return False
 
     # Worktrees are created on the CALLING thread so the approval below can
@@ -592,7 +592,7 @@ def _run_round(task: str) -> bool:
             except Exception:
                 pass
         RUN_LOCK.release()
-        _say(f"[red]创建 worktree 失败：{exc}[/red]")
+        _say(f"[red]Could not create the worktrees: {exc}[/red]")
         return False
 
     # One approval up front, asked while the main thread owns the terminal.
@@ -602,16 +602,16 @@ def _run_round(task: str) -> bool:
     # disposable git worktrees; the only path back into the user's tree
     # remains the explicit `pick` decision later.
     body = (
-        "两个模型将在以下一次性沙箱（git worktree）中自由读写：\n"
+        "Two models will read and write freely in these disposable Git worktree sandboxes:\n"
         f"  · {sides['incumbent']['info'].path}  ({_model_label(incumbent_model)})\n"
         f"  · {sides['challenger']['info'].path}  ({_model_label(challenger)})\n"
-        "沙箱与你的工作区完全隔离；只有你稍后 pick 的一侧 diff 会进入工作区。")
+        "The sandboxes are isolated from your workspace; only the side you pick can be applied.")
     approved = False
     try:
         import laintas_cli
         choice = laintas_cli._blocking_approval_prompt(
             "blindpick", body,
-            "允许本轮两个子 agent 写入这两个沙箱？", allow_always=True)
+            "Allow both child agents to write to these sandboxes for this round?", allow_always=True)
         approved = str(choice) in ("yes", "always")
     except Exception:
         approved = False
@@ -622,7 +622,7 @@ def _run_round(task: str) -> bool:
             except Exception:
                 pass
         RUN_LOCK.release()
-        _say("[yellow]未授权沙箱写入，对局已取消（未产生模型调用）。[/yellow]")
+        _say("[yellow]Sandbox writes were not authorized. The round was cancelled before any model call.[/yellow]")
         return False
 
     # Runtime sandbox write grant: children's fs-tool writes inside the
@@ -673,7 +673,7 @@ def _run_round(task: str) -> bool:
     except OSError as exc:
         _teardown()
         RUN_LOCK.release()
-        _say(f"[red]无法写对局文件：{exc}[/red]")
+        _say(f"[red]Could not write the round record: {exc}[/red]")
         return False
 
     def _runner() -> None:
@@ -693,10 +693,10 @@ def _run_round(task: str) -> bool:
         RUN_LOCK.release()
         _update_round(round_id, status="failed", error=f"thread start: {exc}")
         return False
-    _say(f"[green]对局 {round_id[:8]} 已启动：[bold]{incumbent_label}[/bold] vs "
-         f"[bold]{_model_label(challenger)}[/bold]（约两倍成本）。[/green]")
-    _hint(f"  任务: {task[:100]}")
-    _hint("  进度: /blindpick status · 完成后 /blindpick show + pick")
+    _say(f"[green]Round {round_id[:8]} started: [bold]{incumbent_label}[/bold] vs "
+         f"[bold]{_model_label(challenger)}[/bold] (approximately twice the cost).[/green]")
+    _hint(f"  Task: {task[:100]}")
+    _hint("  Progress: /blindpick status; when complete, use /blindpick show and pick")
     return True
 
 
@@ -704,9 +704,9 @@ def _run_round(task: str) -> bool:
 # leak which side a child is on, and it teaches the one rule the isolation
 # depends on: relative paths only.
 _SANDBOX_DISCIPLINE = (
-    "\n\n[工作区纪律] 你在独立的一次性 git worktree 沙箱中完成任务："
-    "所有文件读写一律使用相对路径（相对当前工作目录）；"
-    "不要构造或改写本沙箱之外的任何路径，仓库其余部分与你无关。")
+    "\n\n[Workspace boundary] Complete the task inside an isolated disposable Git worktree. "
+    "Use paths relative to the current working directory for every file operation. "
+    "Do not construct or modify paths outside this sandbox; the rest of the repository is out of scope.")
 
 
 class _NullWriter:
@@ -866,7 +866,7 @@ def _run_round_worker(round_row: dict, sides: dict) -> None:
             if info is None:
                 agent_loop.abort_agent(child_id)
                 _update_round(round_row["round_id"], status="failed",
-                              error=f"{side} 未在 {ROUND_TIMEOUT // 60} 分钟内完成")
+                              error=f"{side} did not finish within {ROUND_TIMEOUT // 60} minutes")
                 return
             if info.status == "error":
                 _update_round(round_row["round_id"], status="failed",
@@ -901,8 +901,8 @@ def _run_round_worker(round_row: dict, sides: dict) -> None:
             _update_round(round_row["round_id"], **{f"{side}_diff": out[:DIFF_KEEP]})
         _update_round(round_row["round_id"], status="pending")
         _record_match(_load_rounds_by_id(round_row["round_id"]))
-        _say(f"[green]对局 {round_row['round_id'][:8]} 完成，等你裁决。[/green]")
-        _hint("  /blindpick show 看两边的结果，然后 /blindpick pick a|b|tie|bad")
+        _say(f"[green]Round {round_row['round_id'][:8]} is complete and awaits your decision.[/green]")
+        _hint("  Use /blindpick show, then /blindpick pick a|b|tie|bad")
     except Exception as exc:
         _update_round(round_row["round_id"], status="failed",
                       error=str(exc)[:300])
@@ -1026,22 +1026,22 @@ def _apply(round_row: dict, side: str) -> bool:
     base = str(round_row.get(f"{side}_base") or "")
     result = str(round_row.get(f"{side}_result") or "")
     if not (root and base and result):
-        _say("[red]缺少分支信息，无法应用。[/red]")
+        _say("[red]Branch information is missing; the result cannot be applied.[/red]")
         return False
     code, patch, _ = _git(root, "diff", "--binary", base, result,
                            "--", ":(exclude).laintas")
     if code != 0 or not patch.strip():
-        _say(f"[yellow]这一侧（{_model_label(str(round_row.get(side + '_model') or ''))}）"
-             f"没有产生任何改动。[/yellow]")
+        _say(f"[yellow]This side ({_model_label(str(round_row.get(side + '_model') or ''))}) "
+             f"produced no changes.[/yellow]")
         return False
     code, _out, err = _git(root, "apply", "-", stdin_text=patch)
     if code != 0:
-        _say(f"[red]补丁未能干净应用 —— 工作区在这局期间变了（git 未改动你的文件）。[/red]")
+        _say("[red]The patch did not apply cleanly because the workspace changed during the round. Git did not modify your files.[/red]")
         _say_raw(f"  {err.splitlines()[0] if err else 'apply failed'}")
         for name in ("incumbent", "challenger"):
-            _say(f"  分支保留：{round_row.get(name + '_branch')} "
+            _say(f"  Preserved branch: {round_row.get(name + '_branch')} "
                  f"({_model_label(str(round_row.get(name + '_model') or ''))})")
-        _say("  手动处理后可 /blindpick discard 清理 worktree。")
+        _say("  Resolve it manually, then use /blindpick discard to clean the worktree.")
         return False
     # Count files with numstat, not by grepping "+++ " out of the patch body:
     # an added line whose own text starts with "++ " renders as "+++ ..." and
@@ -1057,9 +1057,9 @@ def _apply(round_row: dict, side: str) -> bool:
     _cleanup_side(round_row, loser, keep_branch=True)
     _update_round(round_row["round_id"], status="applied",
                   applied_side=side, applied_at=time.time())
-    _say(f"[green]已应用所选一侧的改动，{changed} 个文件。[/green]")
-    _say(f"  落选分支保留待查：{round_row.get(loser + '_branch')}，"
-         f"不要了就 git branch -D")
+    _say(f"[green]Applied the selected side: {changed} files changed.[/green]")
+    _say(f"  The losing branch is preserved for inspection: {round_row.get(loser + '_branch')}. "
+         f"Delete it with git branch -D when no longer needed.")
     return True
 
 
@@ -1069,17 +1069,17 @@ def _settle(round_row: dict, status: str, order: Optional[list] = None) -> None:
         _record_vote(round_row, status, order or ["incumbent", "challenger"])
     leftovers = _cleanup_worktrees(round_row)
     _update_round(round_row["round_id"], status=status, decided_at=time.time())
-    label = {"discarded": "已丢弃", "tie": "平局，两边都未应用",
-             "both_bad": "两边都不行，都未应用"}.get(status, status)
+    label = {"discarded": "discarded", "tie": "tie; neither side applied",
+             "both_bad": "both rejected; neither side applied"}.get(status, status)
     if leftovers:
-        _say(f"[yellow]对局 {round_row['round_id'][:8]}：{label}，"
-             f"但以下资源未能自动清理：[/yellow]")
+        _say(f"[yellow]Round {round_row['round_id'][:8]}: {label}; "
+             f"these resources could not be cleaned automatically:[/yellow]")
         for item in leftovers:
             _say(f"  · {item}")
-        _say("  手动清理：git worktree remove --force <路径> / git branch -D <名>")
+        _say("  Clean manually: git worktree remove --force <path> / git branch -D <name>")
     else:
-        _say(f"[yellow]对局 {round_row['round_id'][:8]}：{label}，"
-             f"worktree 与分支已清理。[/yellow]")
+        _say(f"[yellow]Round {round_row['round_id'][:8]}: {label}; "
+             f"worktrees and branches were cleaned.[/yellow]")
 
 
 MAX_FILES_SHOWN = 12
@@ -1152,13 +1152,13 @@ def _render_side(head: str, round_row: dict, side: str) -> None:
     """One side's work: a stat ribbon, the model's own summary, the diff."""
     diff_text = _side_diff(round_row, side)
     files, adds, dels = _diff_stat(diff_text)
-    _say(f"[bold]{head}[/bold]  [dim]{files} 个文件[/dim] "
+    _say(f"[bold]{head}[/bold]  [dim]{files} files[/dim] "
          f"[green]+{adds}[/green] [red]−{dels}[/red]")
     reply = str(round_row.get(f"{side}_reply") or "").strip()
     if reply:
-        _say_raw("  说明: " + " ".join(reply.split())[:240])
+        _say_raw("  Summary: " + " ".join(reply.split())[:240])
     if not diff_text.strip():
-        _say("  [dim](这一侧没有产生任何改动)[/dim]\n")
+        _say("  [dim](this side produced no changes)[/dim]\n")
         return
     chunks = _split_diff_files(diff_text)
     rendered = False
@@ -1185,10 +1185,10 @@ def _render_side(head: str, round_row: dict, side: str) -> None:
         # Fallback: raw text, still without Rich markup parsing.
         _say_raw(diff_text[:6000])
         if len(diff_text) > 6000:
-            _say("  [dim]…（已截断，完整改动见分支）[/dim]")
+            _say("  [dim]... (truncated; inspect the branch for the complete diff)[/dim]")
     elif len(chunks) > MAX_FILES_SHOWN:
-        _say(f"  [dim]… 还有 {len(chunks) - MAX_FILES_SHOWN} 个文件未展开"
-             f"（完整改动见分支 {round_row.get(side + '_branch')}）[/dim]")
+        _say(f"  [dim]... {len(chunks) - MAX_FILES_SHOWN} additional files omitted "
+             f"(complete diff on branch {round_row.get(side + '_branch')})[/dim]")
     _say("")
 
 
@@ -1203,7 +1203,7 @@ def _round_order(round_row: dict) -> list:
 def _show_round(round_row: dict, blind: bool) -> list:
     """Print both diffs. Returns the display order (which side was A/B)."""
     order = _round_order(round_row)
-    _say(f"[bold]── 对局 {str(round_row.get('round_id'))[:8]} · 任务 ──[/bold]")
+    _say(f"[bold]-- Round {str(round_row.get('round_id'))[:8]} / Task --[/bold]")
     _say_raw(str(round_row.get("task") or "")[:600])
     _say("")
     for label, side in zip(("A", "B"), order):
@@ -1211,9 +1211,9 @@ def _show_round(round_row: dict, blind: bool) -> list:
         head = f"【{label}】" if blind else f"【{label}】{_model_label(model)}"
         _render_side(head, round_row, side)
     if blind:
-        _say("[dim]模型名已隐藏，裁决后揭晓。[/dim]")
+        _say("[dim]Model identities are hidden until the decision.[/dim]")
     else:
-        _say("[dim]A/B 的归属每局随机，见上面各自的标注 · "
+        _say("[dim]A/B placement is randomized for each round; see the labels above. "
              "/blindpick pick a|b|tie|bad[/dim]")
     return order
 
@@ -1235,9 +1235,9 @@ def _reveal(round_row: dict, order: list, winner: str = "") -> None:
     """Name both sides after the verdict, and mark the one that won."""
     for label, side in zip(("A", "B"), order):
         model = _model_label(str(round_row.get(side + "_model") or ""))
-        role = "当前模型" if side == "incumbent" else "挑战者"
-        mark = "  [green]← 你选的[/green]" if side == winner else ""
-        _say(f"[dim]揭晓[/dim] {label} = [bold]{model}[/bold]（{role}）{mark}")
+        role = "current model" if side == "incumbent" else "challenger"
+        mark = "  [green]<- selected[/green]" if side == winner else ""
+        _say(f"[dim]Revealed[/dim] {label} = [bold]{model}[/bold] ({role}){mark}")
 
 
 def _do_pick(round_row: dict, answer: str) -> None:
@@ -1290,7 +1290,7 @@ def _child_state(child_id: str) -> str:
     try:
         import agent_loop
         info = agent_loop.get_agent(str(child_id))
-        return str(info.status) if info else "已结束"
+        return str(info.status) if info else "finished"
     except Exception:
         return "—"
 
@@ -1301,9 +1301,9 @@ def _round_summary(row: dict) -> str:
     label = STATUS_LABELS.get(status, status or "?")
     if status == "applied":
         side = str(row.get("applied_side") or "")
-        role = "当前模型" if side == "incumbent" else "挑战者"
+        role = "current model" if side == "incumbent" else "challenger"
         return (f"{label} {_model_label(str(row.get(side + '_model') or ''))}"
-                f"（{role}）")
+                f" ({role})")
     if status == "failed":
         return f"{label} {str(row.get('error') or '')[:120]}"
     return label
@@ -1312,41 +1312,41 @@ def _round_summary(row: dict) -> str:
 def _cmd_status() -> None:
     incumbent_label, _, _ = _incumbent()
     challenger = _challenger_label()
-    _say(f"当前模型  [bold]{incumbent_label}[/bold]")
+    _say(f"Current model  [bold]{incumbent_label}[/bold]")
     if challenger:
-        _say(f"挑战者    [bold]{challenger}[/bold]")
+        _say(f"Challenger    [bold]{challenger}[/bold]")
     else:
-        _say("挑战者    [dim]未设置 · /blindpick challenger[/dim]")
+        _say("Challenger    [dim]not configured; use /blindpick challenger[/dim]")
     running = _in_progress()
     if running:
         mins = (time.time() - float(running.get("created_at") or 0)) / 60
-        _say(f"\n进行中    {str(running.get('round_id'))[:8]} · "
-             f"已跑 {mins:.0f} 分钟 / 上限 {ROUND_TIMEOUT // 60} 分钟")
-        _say_raw(f"          任务 {str(running.get('task') or '')[:120]}")
-        for side, role in (("incumbent", "当前模型"), ("challenger", "挑战者")):
+        _say(f"\nRunning    {str(running.get('round_id'))[:8]} · "
+             f"elapsed {mins:.0f} min / limit {ROUND_TIMEOUT // 60} min")
+        _say_raw(f"          Task {str(running.get('task') or '')[:120]}")
+        for side, role in (("incumbent", "current model"), ("challenger", "challenger")):
             cid = str(running.get(f"{side}_child") or "")
             _say(f"          {role}: {_child_state(cid)}")
     pending = _pending()
     if pending:
-        _say(f"\n待裁决    {len(pending)} 局 · /blindpick show")
+        _say(f"\nAwaiting decision    {len(pending)} rounds · /blindpick show")
         for row in pending:
             _say_raw(f"          {str(row.get('round_id'))[:8]}  "
                      f"{str(row.get('task') or '')[:80]}")
     else:
-        _say("\n待裁决    无")
+        _say("\nAwaiting decision    none")
     rounds = _load_rounds()
     keep = int(_state.get("keep_rounds", KEEP_ROUNDS))
     days = int(_state.get("keep_days", KEEP_DAYS))
     limits = " · ".join(
-        part for part in ((f"最多 {keep} 局" if keep else ""),
-                          (f"{days} 天" if days else "")) if part)
-    _say(f"\n留存      {len(rounds)} 局在册 · "
-         + (f"自动清理（{limits}）" if limits else "不自动清理")
+        part for part in ((f"up to {keep} rounds" if keep else ""),
+                          (f"{days} days" if days else "")) if part)
+    _say(f"\nRetention      {len(rounds)} recorded rounds · "
+         + (f"automatic cleanup ({limits})" if limits else "automatic cleanup disabled")
          + " · /blindpick prune")
     done = [r for r in rounds if r.get("status") in
             ("applied", "discarded", "tie", "both_bad", "failed")]
     if done:
-        _say("\n最近")
+        _say("\nRecent")
         for row in done[-3:]:
             _say_raw(f"          {str(row.get('round_id'))[:8]}  "
                      f"{_round_summary(row)}")
@@ -1359,14 +1359,14 @@ def _cmd_ratings() -> None:
         table = store.ratings(_project_dir())
         bias = store.position_bias(_project_dir())
     except Exception as exc:
-        _say(f"[red]读取对局记录失败：{exc}[/red]")
+        _say(f"[red]Could not read round records: {exc}[/red]")
         return
     if not table:
-        _say("[dim]还没有任何裁决记录。跑一局并 pick 之后这里才有数。[/dim]")
+        _say("[dim]No decisions have been recorded. Run and judge a round first.[/dim]")
         return
     rows = sorted(table.values(), key=lambda r: -r["rating"])
     width = max(len(r["model"]) for r in rows)
-    _say(f"[bold]{'模型'.ljust(width)}   评分    胜  负  平   局数[/bold]")
+    _say(f"[bold]{'Model'.ljust(width)}   Rating   W   L   T   Rounds[/bold]")
     for row in rows:
         _say_raw(f"{row['model'].ljust(width)}  {row['rating']:6.0f}  "
                  f"{row['wins']:3d} {row['losses']:3d} {row['ties']:3d}  "
@@ -1374,12 +1374,12 @@ def _cmd_ratings() -> None:
     rate = bias.get("rate")
     if rate is None:
         return
-    note = (f"\n位置偏差  先显示的一侧胜率 {rate * 100:.0f}%"
-            f"（{bias['decisive']} 次有胜负的裁决）")
+    note = (f"\nPosition bias  first-shown side won {rate * 100:.0f}%"
+            f" ({bias['decisive']} decisive votes)")
     # Far from 50% means the ordering is doing the choosing. Flagged rather
     # than corrected: the fix is more blind rounds, not a fudge factor.
     if bias["decisive"] >= 8 and abs(rate - 0.5) > 0.2:
-        _say(f"[yellow]{note} —— 偏离 50% 太多，这更像在测布局而不是质量。[/yellow]")
+        _say(f"[yellow]{note} -- too far from 50%; layout may be influencing decisions.[/yellow]")
     else:
         _say(f"[dim]{note}[/dim]")
 
@@ -1391,12 +1391,12 @@ def _cmd_export(target: str = "") -> None:
     try:
         written = _store().export_preferences(_project_dir(), out)
     except Exception as exc:
-        _say(f"[red]导出失败：{exc}[/red]")
+        _say(f"[red]Export failed: {exc}[/red]")
         return
     if not written:
-        _say("[dim]没有可导出的偏好对（平局和“都不行”不计入）。[/dim]")
+        _say("[dim]No preference pairs are available; ties and dual rejections are excluded.[/dim]")
         return
-    _say(f"[green]已导出 {written} 组偏好对 → {out}[/green]")
+    _say(f"[green]Exported {written} preference pairs -> {out}[/green]")
 
 
 # ── the arena (TTY) ─────────────────────────────────────────────────────────
@@ -1473,7 +1473,7 @@ def _cmd_delete(token: str) -> None:
     hits = [row for row in _load_rounds()
             if str(row.get("round_id", "")).lower().startswith(token)]
     if len(hits) != 1:
-        _say(f"[red]{'没有' if not hits else '不止一个'}对局匹配 “{token}”。[/red]")
+        _say(f"[red]{'No' if not hits else 'More than one'} round matched '{token}'.[/red]")
         for row in _load_rounds():
             _say_raw(f"  {str(row.get('round_id'))[:8]}  "
                      f"{STATUS_LABELS.get(str(row.get('status')), '?')}  "
@@ -1481,11 +1481,11 @@ def _cmd_delete(token: str) -> None:
         return
     row = hits[0]
     if row.get("status") == "running":
-        _say("[red]这一局还在跑，不能删除（等它结束或 /blindpick reset）。[/red]")
+        _say("[red]A running round cannot be deleted. Wait for completion or use /blindpick reset.[/red]")
         return
     if row.get("status") == "pending":
-        _say("[yellow]注意：这是还没裁决的对局，删掉就没有了。[/yellow]")
-    _report_cleanup(f"对局 {str(row.get('round_id'))[:8]} 已删除",
+        _say("[yellow]Warning: this round has not been judged and deletion is permanent.[/yellow]")
+    _report_cleanup(f"Round {str(row.get('round_id'))[:8]} deleted",
                     *_delete_rounds([row]))
 
 
@@ -1503,26 +1503,26 @@ def _cmd_prune(args: list) -> None:
                 keep = int(arg)
         deleted, leftovers = _prune(keep=keep, days=days)
     branches = _sweep_orphan_branches(max_age=0)
-    _report_cleanup(f"清理了 {deleted} 局", deleted, leftovers)
+    _report_cleanup(f"Pruned {deleted} rounds", deleted, leftovers)
     for branch in branches:
-        _say(f"  [dim]顺带删掉无主分支 {branch}[/dim]")
+        _say(f"  [dim]Removed orphan branch {branch}[/dim]")
     if not deleted and not branches:
-        _say("[dim]没有可清理的东西。[/dim]")
+        _say("[dim]Nothing needed cleanup.[/dim]")
 
 
 def _report_cleanup(headline: str, deleted: int, leftovers: list) -> None:
     if deleted:
-        _say(f"[yellow]{headline}，worktree 与分支已回收。[/yellow]")
+        _say(f"[yellow]{headline}; worktrees and branches were reclaimed.[/yellow]")
     if leftovers:
-        _say("[yellow]以下资源未能自动清理：[/yellow]")
+        _say("[yellow]These resources could not be cleaned automatically:[/yellow]")
         for item in leftovers:
             _say_raw(f"  · {item}")
-        _say("  手动清理：git worktree remove --force <路径> / git branch -D <名>")
+        _say("  Clean manually: git worktree remove --force <path> / git branch -D <name>")
 
 
 def _cmd_reset() -> None:
     if _in_progress() is not None:
-        _say("[red]有一局正在跑，不能 reset。[/red]")
+        _say("[red]Cannot reset while a round is running.[/red]")
         return
     leftovers: list[str] = []
     kept: list[str] = []
@@ -1544,16 +1544,16 @@ def _cmd_reset() -> None:
         leftovers += _cleanup_worktrees(row)
     _save_rounds([])
     if leftovers:
-        _say("[yellow]已清空对局记录（挑战者设置保留），"
-             "但这些资源未能自动清理：[/yellow]")
+        _say("[yellow]Round records were cleared and the challenger setting was preserved, "
+             "but these resources could not be cleaned automatically:[/yellow]")
         for item in leftovers:
             _say(f"  · {item}")
-        _say("  手动清理：git worktree remove --force <路径> / git branch -D <名>")
+        _say("  Clean manually: git worktree remove --force <path> / git branch -D <name>")
     else:
-        _say("[yellow]已清空对局记录（挑战者设置保留）。[/yellow]")
+        _say("[yellow]Round records were cleared; the challenger setting was preserved.[/yellow]")
     for branch in kept:
-        _say(f"  [dim]已应用对局的落选分支保留：{branch}[/dim]")
-    _say("[dim]评分与裁决记录不受影响（.laintas/blindpick/）。[/dim]")
+        _say(f"  [dim]Preserved losing branch from an applied round: {branch}[/dim]")
+    _say("[dim]Ratings and decision records under .laintas/blindpick/ were not changed.[/dim]")
 
 
 def _resolve_round(token: str = "") -> Optional[dict]:
@@ -1564,7 +1564,7 @@ def _resolve_round(token: str = "") -> Optional[dict]:
     """
     waiting = _pending()
     if not waiting:
-        _say("没有待判的对局。")
+        _say("No rounds are awaiting a decision.")
         return None
     token = (token or "").strip().lower()
     if token:
@@ -1572,12 +1572,12 @@ def _resolve_round(token: str = "") -> Optional[dict]:
                 if str(r.get("round_id", "")).lower().startswith(token)]
         if len(hits) == 1:
             return hits[0]
-        _say(f"[red]{'没有' if not hits else '不止一个'}待判对局匹配 "
-             f"“{token}”。[/red]")
+        _say(f"[red]{'No' if not hits else 'More than one'} pending round matched "
+             f"'{token}'.[/red]")
     elif len(waiting) == 1:
         return waiting[0]
     else:
-        _say(f"[yellow]有 {len(waiting)} 局待判，请指定对局 id：[/yellow]")
+        _say(f"[yellow]{len(waiting)} rounds await a decision; specify a round id:[/yellow]")
     for row in waiting:
         _say_raw(f"  {str(row.get('round_id'))[:8]}  "
                  f"{' '.join(str(row.get('task') or '').split())[:60]}")
@@ -1586,11 +1586,11 @@ def _resolve_round(token: str = "") -> Optional[dict]:
 
 # Printed with _say_raw: Rich would parse "[id]" as a style tag and eat it,
 # which is how the usage line lost the very argument it documents.
-_USAGE = ("子命令：challenger · run <task> · show [id] · "
+_USAGE = ("Subcommands: challenger · run <task> · show [id] · "
           "pick a|b|tie|bad [id] · discard [id] · delete <id> · "
-          "prune [--all] · status · ratings · export [路径] · reset；"
-          "无参数进入全屏同台界面。")
-_PICK_USAGE = "用法：/blindpick pick a|b|tie|bad [对局 id]"
+          "prune [--all] · status · ratings · export [path] · reset; "
+          "use no arguments to open the full-screen arena.")
+_PICK_USAGE = "Usage: /blindpick pick a|b|tie|bad [round id]"
 
 
 def handle(parts, raw_line: str = "") -> None:
@@ -1608,7 +1608,7 @@ def handle(parts, raw_line: str = "") -> None:
     elif action == "run":
         task = " ".join(argv[1:]).strip()
         if not task:
-            _say("用法：/blindpick run <任务描述>")
+            _say("Usage: /blindpick run <task description>")
             return
         _run_round(task)
     elif action == "show":
@@ -1624,7 +1624,7 @@ def handle(parts, raw_line: str = "") -> None:
             _do_pick(row, argv[1])
     elif action in ("delete", "rm"):
         if len(argv) < 2:
-            _say("用法：/blindpick delete <对局 id>")
+            _say("Usage: /blindpick delete <round id>")
             return
         _cmd_delete(argv[1])
     elif action == "prune":
@@ -1651,19 +1651,19 @@ def setup(ctx) -> None:
     _load_state()
     ctx.register_command(
         "blindpick", handle,
-        description="当前模型 vs 挑战者模型：同任务双分支对垒，裁决后只应用胜者",
+        description="Current model versus challenger on isolated branches; apply only the selected result",
         subcommands=[
-            ("challenger", "从模型选择器里挑一个挑战者"),
-            ("run <task>", "开一局（后台运行，两倍成本）"),
-            ("show [id]", "查看待判对局的两份 diff（直接模式，标注模型）"),
-            ("pick a|b|tie|bad [id]", "应用某一侧 / 平局 / 都不行"),
-            ("discard", "丢弃待判对局"),
-            ("status", "状态"),
-            ("delete <id>", "删除某一局（连 worktree 和分支一起）"),
-            ("prune [--all]", "按留存策略清理旧对局"),
-            ("ratings", "累计评分与位置偏差"),
-            ("export [路径]", "导出裁决过的对局为 DPO 偏好对"),
-            ("reset", "清空对局记录"),
+            ("challenger", "Choose a challenger from the model picker"),
+            ("run <task>", "Start a background round at approximately twice the cost"),
+            ("show [id]", "Show both pending diffs with model labels in direct mode"),
+            ("pick a|b|tie|bad [id]", "Apply one side, record a tie, or reject both"),
+            ("discard", "Discard a pending round"),
+            ("status", "Show status"),
+            ("delete <id>", "Delete a round, its worktrees, and its branches"),
+            ("prune [--all]", "Clean old rounds according to retention policy"),
+            ("ratings", "Show cumulative ratings and position bias"),
+            ("export [path]", "Export judged rounds as DPO preference pairs"),
+            ("reset", "Clear round records"),
         ])
     try:
         _reap_interrupted()
@@ -1679,4 +1679,3 @@ def setup(ctx) -> None:
 def teardown() -> None:
     global _ctx
     _ctx = None
-

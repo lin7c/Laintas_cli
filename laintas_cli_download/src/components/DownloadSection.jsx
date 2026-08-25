@@ -6,8 +6,9 @@ import {
   Radar, RotateCcw, ShieldCheck, TerminalSquare, Waypoints,
 } from 'lucide-react';
 import { useLanguage } from '@/contexts/LanguageContext';
+import ExtensionsSection from './ExtensionsSection';
 
-const RELEASE = 'v1.19.0';
+const RELEASE = 'v1.20.0';
 const RELEASE_BASE = `https://cli.laintas.com/releases/${RELEASE}`;
 const INSTALL_COMMAND = 'curl -fsSL https://cli.laintas.com/install.sh | bash';
 
@@ -159,6 +160,8 @@ export default function DownloadSection() {
       </section>
 
       <section className="pricing-band page-shell"><div><p className="section-kicker">{c.priceKicker}</p><h2>{c.priceTitle}</h2><p>{c.priceIntro}</p></div><a className="button button-light" href="https://laintas.com/pricing" target="_blank" rel="noreferrer">{c.pricing}<ExternalLink size={16} /></a></section>
+
+      <ExtensionsSection />
 
       <section id="download" className="download-section page-shell">
         <div className="download-heading"><div><p className="section-kicker">{c.downloadKicker}</p><h2>{c.downloadTitle}</h2></div><p>{c.downloadIntro}</p></div>

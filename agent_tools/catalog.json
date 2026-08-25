@@ -244,6 +244,15 @@
     },
 
     {
+      "name": "tool_search", "category": "discovery", "execContext": "host",
+      "description": "Find relevant authorized native capabilities by intent and expose matching schemas on the next model turn. Discovery never grants permission.",
+      "params": {"type": "object", "properties": {
+        "query": {"type": "string", "description": "the action or capability needed"},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 24, "default": 12}
+      }, "required": ["query"]},
+      "aliases": {"laintas_cli": "tool.search"}
+    },
+    {
       "name": "web_fetch", "category": "web", "execContext": "backend",
       "description": "Fetch a URL and extract its text content.",
       "params": {"type": "object", "properties": {

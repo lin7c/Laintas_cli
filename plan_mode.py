@@ -171,6 +171,7 @@ def arm_plan_mode() -> None:
 _PLAN_ALLOWED_TOOLS = {
     "fs.read", "fs.ls", "fs.grep", "fs.glob",
     "web.search", "web.fetch", "time.now",
+    "tool.search",
     "plan.read", "plan.update", "plan.list", "plan.submit",
     "task.list", "task.get",
     "skill.list", "skill.reference",

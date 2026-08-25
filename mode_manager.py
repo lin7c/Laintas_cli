@@ -57,6 +57,7 @@ _CACHE_CONFIG: Optional[dict] = None
 _READ_ONLY_TOOLS = [
     "fs.read", "fs.ls", "fs.grep", "fs.glob",
     "web.search", "web.fetch", "time.now",
+    "tool.search",
     "task.list", "task.get",
     "skill.list", "skill.reference",
     "agent.spawn", "agent.tell", "agent.list", "agent.wait", "agent.inbox",
@@ -72,6 +73,7 @@ _READ_ONLY_TOOLS = [
 _STUDY_TOOLS = [
     "fs.read", "fs.ls", "fs.grep", "fs.glob", "fs.diff",
     "web.search", "web.fetch", "time.now",
+    "tool.search",
     "skill.list", "skill.reference",
     "task.create", "task.update", "task.list", "task.get",
     "mem.read", "mem.list", "mem.save", "mem.delete",

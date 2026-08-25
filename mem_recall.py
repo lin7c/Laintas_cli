@@ -106,7 +106,7 @@ def _text_of(entry: dict, body: str) -> str:
 
 
 def recall(query: str, *, mem_type: str = None, k: int = 5,
-           session: Optional[dict] = None) -> list:
+           session: Optional[dict] = None, local_only: bool = False) -> list:
     """Return up to ``k`` memories most relevant to ``query``, each as a dict
     with ``name``/``description``/``type``/``body_preview``/``score``/``method``.
 
@@ -140,7 +140,10 @@ def recall(query: str, *, mem_type: str = None, k: int = 5,
 
     candidates = [(name, _text_of(entry, body))
                   for name, (entry, body) in by_name.items()]
-    ranked = embeddings.rank(q, candidates, top_k=k, session=session)
+    # Prompt construction is latency-sensitive.  Dynamic context callers use
+    # local_only so a remote reranker can never delay the model's first token.
+    ranked = None if local_only else embeddings.rank(
+        q, candidates, top_k=k, session=session)
 
     if ranked is None:
         # Endpoint unreachable → local lexical fallback.
@@ -167,13 +170,15 @@ def recall(query: str, *, mem_type: str = None, k: int = 5,
     return result
 
 
-def relevant_block(query: str, *, k: int = 5, session: Optional[dict] = None) -> str:
-    """Formatted '★ most relevant to this task' section for the prompt, or "" if
-    there is nothing to add. Purely additive — the caller still injects the full
-    memory context, so this can never drop an important memory; it only surfaces
-    the ones (across the WHOLE store, past any per-type cap) that match the task."""
+def relevant_block(query: str, *, k: int = 5, session: Optional[dict] = None,
+                   local_only: bool = False) -> str:
+    """Formatted task-relevant summary section for the prompt, or ``""``.
+
+    Full entries remain available through ``mem.list``/``mem.read``; callers do
+    not need to bulk-inject the store.
+    """
     try:
-        hits = recall(query, k=k, session=session)
+        hits = recall(query, k=k, session=session, local_only=local_only)
     except Exception:
         return ""
     if not hits:

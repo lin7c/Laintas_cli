@@ -82,7 +82,7 @@ class LabelTests(BlindpickTestCase):
         self.main._state = {"challenger": "", "challenger_provider": ""}
         self.main._incumbent = lambda: ("auto-routing", "", "")
         self.main._cmd_status()
-        self.assertIn("未设置", self.ctx.text)
+        self.assertIn("not configured", self.ctx.text)
 
 
 class DiffRenderTests(BlindpickTestCase):
@@ -112,7 +112,7 @@ class DiffRenderTests(BlindpickTestCase):
     def test_empty_diff_is_reported_not_rendered(self):
         row = self._round(incumbent_diff="")
         self.main._render_side("【A】", row, "incumbent")
-        self.assertIn("没有产生任何改动", self.ctx.text)
+        self.assertIn("produced no changes", self.ctx.text)
 
 
 class RoundResolutionTests(BlindpickTestCase):
@@ -125,7 +125,7 @@ class RoundResolutionTests(BlindpickTestCase):
         self._round(round_id="a" * 12)
         self._round(round_id="b" * 12)
         self.assertIsNone(self.main._resolve_round())
-        self.assertIn("请指定对局 id", self.ctx.text)
+        self.assertIn("specify a round id", self.ctx.text)
 
     def test_id_prefix_selects_the_round(self):
         self._round(round_id="a" * 12)
@@ -136,7 +136,7 @@ class RoundResolutionTests(BlindpickTestCase):
     def test_unknown_id_is_rejected(self):
         self._round(round_id="a" * 12)
         self.assertIsNone(self.main._resolve_round("zzz"))
-        self.assertIn("没有", self.ctx.text)
+        self.assertIn("No pending round", self.ctx.text)
 
 
 class LedgerTests(BlindpickTestCase):
@@ -217,10 +217,10 @@ class OutputSinkTests(BlindpickTestCase):
         sink: list[str] = []
         self.main.capture_output(sink)
         self.addCleanup(self.main.capture_output, None)
-        worker = threading.Thread(target=self.main._say, args=("从后台线程",))
+        worker = threading.Thread(target=self.main._say, args=("from worker thread",))
         worker.start()
         worker.join(5)
-        self.assertEqual(["从后台线程"], sink)
+        self.assertEqual(["from worker thread"], sink)
         self.assertEqual("", self.ctx.text)
 
 
@@ -245,13 +245,13 @@ class ArenaRenderTests(BlindpickTestCase):
 
     def test_crop_never_exceeds_its_budget(self):
         for width in (1, 2, 3, 4, 12, 30):
-            for text in ("abcdefghijkl", "中文中文中文中文", "a中b中c中d中"):
+            for text in ("abcdefghijkl", "\u4e2d\u6587" * 4, "a\u4e2db\u4e2dc\u4e2dd\u4e2d"):
                 cropped = self.ui._crop(text, width)
                 self.assertLessEqual(self.ui._disp_len(cropped), width)
 
     def test_wrap_fits_the_width_and_keeps_every_character(self):
-        for text in ("短", "the quick brown fox jumps over the lazy dog",
-                     "把这段中文折行不能丢字也不能超宽" * 3):
+        for text in ("\u77ed", "the quick brown fox jumps over the lazy dog",
+                     "\u628a\u8fd9\u6bb5\u4e2d\u6587\u6298\u884c\u4e0d\u80fd\u4e22\u5b57\u4e5f\u4e0d\u80fd\u8d85\u5bbd" * 3):
             for width in (8, 17, 40):
                 rows = self.ui._wrap(text, width)
                 for row in rows:
@@ -275,7 +275,7 @@ class ArenaRenderTests(BlindpickTestCase):
             "Binary files a/x.png and b/x.png differ\n"))
         text = "\n".join(t for _s, t in self.ui._diff_stream(
             self.main, row, "incumbent", 60))
-        self.assertIn("二进制", text)
+        self.assertIn("binary", text)
 
     def test_diff_stream_respects_the_cap(self):
         big = ("diff --git a/b.py b/b.py\n@@ -1,600 +1,600 @@\n"
@@ -283,7 +283,7 @@ class ArenaRenderTests(BlindpickTestCase):
         row = self._row(incumbent_diff=big)
         lines = self.ui._diff_stream(self.main, row, "incumbent", 60)
         self.assertLessEqual(len(lines), self.ui.DIFF_CAP + 2)
-        self.assertIn("截断", "\n".join(t for _s, t in lines))
+        self.assertIn("truncated", "\n".join(t for _s, t in lines))
 
     def test_control_characters_never_reach_the_screen(self):
         row = self._row(incumbent_diff=(
@@ -308,7 +308,7 @@ class ArenaLiveTests(BlindpickTestCase):
         self.hub.emit(kind, agent_id=agent_id, **fields)
 
     def test_stream_renders_assistant_text_tools_and_errors(self):
-        self._emit("child-A", "ai_stream", detail="正在读取 ")
+        self._emit("child-A", "ai_stream", detail="reading ")
         self._emit("child-A", "ai_stream", detail="app.py")
         self._emit("child-A", "ai_end")
         self._emit("child-A", "tool_started", summary="fs.read app.py",
@@ -318,19 +318,19 @@ class ArenaLiveTests(BlindpickTestCase):
         self._emit("child-A", "agent_error", summary="boom")
         lines = self.ui._side_stream("child-A", 40)
         text = "\n".join(t for _s, t in lines)
-        self.assertIn("正在读取 app.py", text)
+        self.assertIn("reading app.py", text)
         # The finished call replaces its own started line, never stacks.
         self.assertEqual(1, text.count("fs.read app.py"))
         self.assertIn("2.1kB", text)
         self.assertIn("boom", text)
 
     def test_stream_wraps_to_the_column_width(self):
-        self._emit("child-A", "ai", detail="很长的一段中文输出" * 12)
+        self._emit("child-A", "ai", detail="a long streamed response " * 12)
         for _style, text in self.ui._side_stream("child-A", 30):
             self.assertLessEqual(self.ui._disp_len(text), 30)
 
     def test_stream_is_empty_before_the_child_exists(self):
-        self.assertIn("等待启动", self.ui._side_stream("", 40)[0][1])
+        self.assertIn("waiting to start", self.ui._side_stream("", 40)[0][1])
 
     def test_arena_never_shows_a_model_name_before_the_verdict(self):
         row = self._round(
@@ -380,20 +380,20 @@ class ArenaShellTests(BlindpickTestCase):
         return self.ui.Arena(self.main)
 
     def test_key_hints_fit_and_always_keep_the_exit_key(self):
-        self._round(status="pending", task="判一个很长的任务描述 " * 4)
+        self._round(status="pending", task="judge a long task description " * 4)
         for cols in (200, 100, 72, 50, 30):
             arena = self._arena(cols)
             width = sum(self.ui._disp_len(text)
                         for _style, text in arena.key_fragments())
             self.assertLessEqual(width, cols, f"key hints overflowed at {cols}")
             text = "".join(t for _s, t in arena.key_fragments())
-            self.assertIn("退出", text)
+            self.assertIn("quit", text)
 
     def test_header_has_no_dangling_separator(self):
         arena = self._arena()
         text = "".join(t for _s, t in arena.header_fragments())
         self.assertFalse(text.rstrip().endswith(self.ui._sym.BULLET))
-        self.assertIn("空闲", text)
+        self.assertIn("idle", text)
 
     def test_narrow_terminals_stack_instead_of_splitting(self):
         self.assertTrue(self._arena(cols=120).split())
@@ -416,7 +416,7 @@ class ArenaShellTests(BlindpickTestCase):
 
         def _ask():
             answer["value"] = arena._request_approval(
-                "child-A", "confirm", "写入沙箱？", "细节")
+                "child-A", "confirm", "Write to sandbox?", "details")
         worker = threading.Thread(target=_ask)
         worker.start()
         for _ in range(50):
@@ -425,7 +425,7 @@ class ArenaShellTests(BlindpickTestCase):
             time.sleep(0.02)
         self.assertIsNotNone(arena.pending_approval(),
                              "approval never reached the UI")
-        self.assertIn("写入沙箱", "".join(
+        self.assertIn("Write to sandbox", "".join(
             t for _s, t in arena.approval_fragments()))
         self.assertNotIn("value", answer, "request returned before an answer")
         arena.resolve_approval(True)
@@ -457,29 +457,29 @@ class ArenaShellTests(BlindpickTestCase):
         def _slow():
             started.set()
             release.wait(5)
-            self.main._say("[green]开局成功[/green]")
+            self.main._say("[green]round started[/green]")
 
-        arena.run_action("开局", _slow)
+        arena.run_action("starting round", _slow)
         self.assertTrue(started.wait(5), "action did not start")
-        self.assertEqual("开局", arena.busy)     # the loop is not blocked
+        self.assertEqual("starting round", arena.busy)     # the loop is not blocked
         release.set()
         for _ in range(100):
             if not arena.busy:
                 break
             time.sleep(0.02)
         self.assertEqual("", arena.busy)
-        self.assertEqual("开局成功", arena.notice)   # markup stripped
+        self.assertEqual("round started", arena.notice)   # markup stripped
 
     def test_a_second_action_is_refused_while_one_runs(self):
         arena = self._arena()
         release = threading.Event()
-        arena.run_action("开局", lambda: release.wait(5))
+        arena.run_action("starting round", lambda: release.wait(5))
         for _ in range(50):
             if arena.busy:
                 break
             time.sleep(0.02)
-        arena.run_action("裁决", lambda: None)
-        self.assertIn("稍等", arena.notice)
+        arena.run_action("recording decision", lambda: None)
+        self.assertIn("please wait", arena.notice)
         release.set()
 
 
@@ -536,16 +536,16 @@ class ArenaKeyPathTests(BlindpickTestCase):
 
         def _fake_run_round(task):
             started["task"] = task
-            self.main._say("[green]对局已启动[/green]")
+            self.main._say("[green]round started[/green]")
             return True
         self.main._run_round = _fake_run_round
 
-        arena = self._drive(["n", "修一个 bug", "\r"],
+        arena = self._drive(["n", "fix a bug", "\r"],
                             wait_for=lambda a: bool(started))
-        self.assertEqual("修一个 bug", started.get("task"),
+        self.assertEqual("fix a bug", started.get("task"),
                          "Enter in the composer never reached _run_round")
         # And the message it printed is on screen, not swallowed.
-        self.assertIn("对局已启动", arena.notice)
+        self.assertIn("round started", arena.notice)
 
     def test_an_empty_task_just_closes_the_composer(self):
         self.main._run_round = lambda task: self.fail("should not run")
@@ -562,7 +562,7 @@ class ArenaKeyPathTests(BlindpickTestCase):
             # whichever view owns the screen — which is why the round can now
             # start without the view stepping aside first.
             decision["choice"] = laintas_cli._blocking_approval_prompt(
-                "blindpick", "两个模型将写入沙箱", "允许？", allow_always=True)
+                "blindpick", "Two models will write to sandboxes", "Allow?", allow_always=True)
         self.main._run_round = _fake_run_round
 
         def _answer(arena, pipe):
@@ -573,9 +573,9 @@ class ArenaKeyPathTests(BlindpickTestCase):
             while "choice" not in decision and time.time() < deadline:
                 time.sleep(0.05)
 
-        self._drive(["n", "任务", "\r"], then=_answer, register=True,
+        self._drive(["n", "task", "\r"], then=_answer, register=True,
                     wait_for=lambda a: a.pending_approval() is not None)
-        self.assertIn("两个模型将写入沙箱", seen.get("bar", ""),
+        self.assertIn("Two models will write to sandboxes", seen.get("bar", ""),
                       "the approval never appeared in the arena")
         self.assertTrue(seen.get("blocked"),
                         "the prompt returned before the user answered")
@@ -585,7 +585,7 @@ class ArenaKeyPathTests(BlindpickTestCase):
         self._round(status="running")
         arena = self.ui.Arena(self.main)
         arena.judge("a")
-        self.assertIn("还不能裁决", arena.notice)
+        self.assertIn("cannot be judged yet", arena.notice)
 
     def test_refresh_notices_the_worker_finishing_the_round(self):
         row = self._round(status="running")
@@ -637,8 +637,8 @@ class ArenaKeyPathTests(BlindpickTestCase):
         self._round(
             round_id="m" * 12, status="pending",
             display_order=["incumbent", "challenger"],
-            incumbent_reply="# 结论\n\n这是 **laintas_cli** 项目。\n\n"
-                            "- 一个 `CLI` 工具\n- 还有别的\n",
+            incumbent_reply="# Conclusion\n\nThis is the **laintas_cli** project.\n\n"
+                            "- A `CLI` tool\n- Other features\n",
             incumbent_diff="diff --git a/x b/x\n@@ -1 +1 @@\n+one\n")
         arena = self.ui.Arena(self.main)
         row = arena.current()
@@ -647,12 +647,12 @@ class ArenaKeyPathTests(BlindpickTestCase):
         text = "\n".join(t for _s, t in lines)
         self.assertIn("md.h", styles)
         self.assertIn("md.list", styles)
-        self.assertIn("结论", text)
+        self.assertIn("Conclusion", text)
         # Emphasis markers are stripped, not left on screen unrendered.
         self.assertNotIn("**", text)
         self.assertNotIn("`", text)
         self.assertIn("laintas_cli", text)
-        self.assertIn("改动 1 个文件 +1 −0", text)
+        self.assertIn("Changed 1 files +1 −0", text)
 
     def test_a_side_with_nothing_to_show_says_so(self):
         self._round(round_id="e" * 12, status="pending",
@@ -660,11 +660,11 @@ class ArenaKeyPathTests(BlindpickTestCase):
         arena = self.ui.Arena(self.main)
         text = "\n".join(t for _s, t in arena._reply_lines(
             arena.current(), "incumbent", 40))
-        self.assertIn("既没有改动，也没有留下说明", text)
+        self.assertIn("neither changes nor a summary", text)
 
     def test_markdown_never_exceeds_the_column(self):
-        body = ("## 很长的标题" * 3 + "\n\n- " + "很长的条目" * 8
-                + "\n\n```\n" + "x" * 200 + "\n```\n> " + "引用" * 30)
+        body = ("## A very long heading" * 3 + "\n\n- " + "a long item" * 8
+                + "\n\n```\n" + "x" * 200 + "\n```\n> " + "quoted text" * 30)
         for width in (24, 40, 70):
             for _style, text in self.ui._markdown_lines(body, width):
                 self.assertLessEqual(self.ui._disp_len(text), width)
@@ -678,21 +678,21 @@ class ArenaKeyPathTests(BlindpickTestCase):
                           display_order=["incumbent", "challenger"])
         arena = self.ui.Arena(self.main)
         head = arena.head_line("A", row, 40)[1]
-        self.assertNotIn("都不行", head)
-        self.assertIn("无改动", head)
+        self.assertNotIn("both rejected", head)
+        self.assertIn("no changes", head)
 
     def test_the_applied_side_is_marked_after_the_verdict(self):
         row = self._round(status="applied", applied_side="incumbent",
                           display_order=["incumbent", "challenger"])
         arena = self.ui.Arena(self.main)
-        self.assertIn("已采纳", arena.head_line("A", row, 40)[1])
-        self.assertIn("未采纳", arena.head_line("B", row, 40)[1])
+        self.assertIn("selected", arena.head_line("A", row, 40)[1])
+        self.assertIn("not selected", arena.head_line("B", row, 40)[1])
 
     def test_action_output_is_shown_in_full_not_just_its_first_line(self):
         arena = self.ui.Arena(self.main)
         arena.show_log([f"line {i}" for i in range(20)])
         self.assertEqual(arena.LOG_ROWS + 1, len(arena.reveal))
-        self.assertIn("还有", arena.reveal[-1][1])
+        self.assertIn("more lines", arena.reveal[-1][1])
 
 
 class RetentionTests(BlindpickTestCase):

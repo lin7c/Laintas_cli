@@ -78,6 +78,7 @@ class WorkflowInstance:
 _READ_ONLY_PHASE_TOOLS = [
     "fs.read", "fs.ls", "fs.grep", "fs.glob",
     "web.search", "web.fetch", "time.now",
+    "tool.search",
     "agent.spawn", "agent.tell", "agent.wait", "agent.list", "agent.inbox",
     "task.list", "task.get", "plan.read", "plan.update", "plan.list",
 ]

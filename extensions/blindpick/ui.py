@@ -186,15 +186,15 @@ def _elapsed(row: dict) -> str:
 
 
 STATE_TEXT = {
-    "running": "进行中", "pending": "等你裁决", "applied": "已应用",
-    "discarded": "已丢弃", "tie": "平局", "both_bad": "都不行",
-    "failed": "失败",
+    "running": "running", "pending": "awaiting decision", "applied": "applied",
+    "discarded": "discarded", "tie": "tie", "both_bad": "both rejected",
+    "failed": "failed",
 }
 CHILD_STATE = {
-    "queued": ("queued", "排队中"), "running": ("running", "执行中"),
-    "thinking": ("thinking", "思考中"), "waiting": ("thinking", "等待中"),
-    "done": ("done", "已完成"), "error": ("error", "出错"),
-    "aborted": ("error", "已中止"), "idle": ("queued", "待启动"),
+    "queued": ("queued", "queued"), "running": ("running", "running"),
+    "thinking": ("thinking", "thinking"), "waiting": ("thinking", "waiting"),
+    "done": ("done", "complete"), "error": ("error", "error"),
+    "aborted": ("error", "aborted"), "idle": ("queued", "not started"),
 }
 
 
@@ -276,13 +276,13 @@ def _side_stream(agent_id: str, width: int) -> list[tuple[str, str]]:
     full wrap treatment.
     """
     if not agent_id:
-        return [("subtle", " 等待启动…")]
+        return [("subtle", " waiting to start...")]
     try:
         import agent_ui_events
         _revision, events = agent_ui_events.hub.agent_events_snapshot(
             agent_id, limit=EVENT_LIMIT)
     except Exception:
-        return [("subtle", " (无法读取事件流)")]
+        return [("subtle", " (event stream unavailable)")]
     lines: list[tuple[str, str]] = []
     stream = ""
     live: dict[str, int] = {}
@@ -330,13 +330,13 @@ def _side_stream(agent_id: str, width: int) -> list[tuple[str, str]]:
                 lines.append(("subtle", "   " + _crop(row, width - 5)))
         elif kind == "approval_requested":
             lines.append(("approval",
-                          f" {_sym.WARN} 等待授权：" + _crop(event.summary,
+                          f" {_sym.WARN} awaiting approval: " + _crop(event.summary,
                                                           width - 8)))
         elif kind == "approval_resolved":
             ok = event.status == "approved"
             lines.append(("done" if ok else "error",
                           f" {_sym.OK if ok else _sym.FAIL} "
-                          + ("已授权" if ok else "已拒绝")))
+                          + ("approved" if ok else "denied")))
         elif kind in ("agent_error", "input_rejected"):
             lines.append(("error", f" {_sym.FAIL} "
                                    + _crop(event.summary, width - 4)))
@@ -350,7 +350,7 @@ def _side_stream(agent_id: str, width: int) -> list[tuple[str, str]]:
                                     + _crop(event.summary, width - 4)))
     flush()
     if not lines:
-        return [("subtle", " 还没有输出…")]
+        return [("subtle", " no output yet...")]
     while lines and lines[-1][1] == "":
         lines.pop()
     return lines
@@ -361,7 +361,7 @@ def _diff_stream(bp, row: dict, side: str, width: int) -> list[tuple[str, str]]:
     diff = bp._side_diff(row, side)
     chunks = bp._split_diff_files(_clean(diff))
     if not chunks:
-        return [("subtle", " (这一侧没有产生任何改动)")]
+        return [("subtle", " (this side produced no changes)")]
     lines: list[tuple[str, str]] = []
     for path, chunk in chunks:
         _f, adds, dels = bp._diff_stat(chunk)
@@ -371,7 +371,7 @@ def _diff_stream(bp, row: dict, side: str, width: int) -> list[tuple[str, str]]:
         body = 0
         for line in chunk.splitlines():
             if len(lines) >= DIFF_CAP:
-                lines.append(("subtle", "   … 截断，完整改动见分支"))
+                lines.append(("subtle", "   ... truncated; inspect the branch for the complete diff"))
                 return lines
             if line.startswith("diff --git "):
                 in_hunk = False
@@ -388,7 +388,7 @@ def _diff_stream(bp, row: dict, side: str, width: int) -> list[tuple[str, str]]:
             lines.append((style, "  " + _crop(line, width - 3)))
             body += 1
         if body == 0:
-            lines.append(("subtle", "   (二进制或仅元数据变更)"))
+            lines.append(("subtle", "   (binary or metadata-only change)"))
     return lines
 
 
@@ -499,15 +499,15 @@ class Arena:
         child_id = str(row.get(f"{side}_child") or "")
         status = str(row.get("status") or "")
         if not child_id:
-            return ("queued", "排队中") if status == "running" else (
-                "done", "已完成")
+            return ("queued", "queued") if status == "running" else (
+                "done", "complete")
         try:
             import agent_loop
             info = agent_loop.get_agent(child_id)
         except Exception:
             info = None
         if info is None:
-            return ("done", "已完成")
+            return ("done", "complete")
         return CHILD_STATE.get(str(info.status), ("queued", str(info.status)))
 
     def is_running(self) -> bool:
@@ -589,7 +589,7 @@ class Arena:
         request["approved"] = bool(approved)
         request["done"].set()
         self.say("ok" if approved else "warn",
-                 "已授权" if approved else "已拒绝")
+                 "approved" if approved else "denied")
 
     def close_approvals(self) -> None:
         """Nothing may block on a screen that is going away."""
@@ -609,7 +609,7 @@ class Arena:
         rows = [("text", " " + _crop(line, self.size()[0] - 2))
                 for line in lines[:self.LOG_ROWS]]
         if len(lines) > self.LOG_ROWS:
-            rows.append(("muted", f" … 还有 {len(lines) - self.LOG_ROWS} 行"))
+            rows.append(("muted", f" ... {len(lines) - self.LOG_ROWS} more lines"))
         self.reveal = rows
 
     def run_action(self, label: str, func: Callable, *args: Any,
@@ -620,7 +620,7 @@ class Arena:
         the approval this very action raises could never be answered.
         """
         if self.busy:
-            self.say("warn", f"正在{self.busy}，稍等")
+            self.say("warn", f"{self.busy} is in progress; please wait")
             return
         self.busy = label
 
@@ -630,7 +630,7 @@ class Arena:
             try:
                 func(*args)
             except Exception as exc:
-                buffer.append(f"[内部错误] {type(exc).__name__}: {exc}")
+                buffer.append(f"[internal error] {type(exc).__name__}: {exc}")
             finally:
                 self.bp.capture_output(previous)
                 self.busy = ""
@@ -644,19 +644,19 @@ class Arena:
                 self.show_log(lines)
             self.refresh(force=True)
             self.say("ok" if lines else "warn",
-                     lines[0] if lines else f"{label}完成")
+                     lines[0] if lines else f"{label} complete")
 
         threading.Thread(target=_worker, daemon=True,
                          name=f"blindpick-{label}").start()
         self.invalidate()
 
     def start_round(self, task: str) -> None:
-        self.run_action("开局", self.bp._run_round, task)
+        self.run_action("starting round", self.bp._run_round, task)
 
     def judge(self, answer: str) -> None:
         row = self.current()
         if row is None or row.get("status") != "pending":
-            self.say("warn", "这一局还不能裁决")
+            self.say("warn", "This round cannot be judged yet")
             return
         order = self.order()
         frozen = dict(row)
@@ -667,7 +667,7 @@ class Arena:
 
         # log=False: the verdict's own reveal is what belongs on screen,
         # and the worker finishes later — it would overwrite it.
-        self.run_action("裁决", _decide, log=False)
+        self.run_action("recording decision", _decide, log=False)
         self.reveal = self._reveal_lines(frozen, order, answer)
 
     def _reveal_lines(self, row: dict, order: list,
@@ -676,8 +676,8 @@ class Arena:
         out: list[tuple[str, str]] = []
         for label, side in zip(("A", "B"), order):
             model = self.bp._model_label(str(row.get(f"{side}_model") or ""))
-            role = "当前模型" if side == "incumbent" else "挑战者"
-            mark = f" {_sym.OK} 你选的" if side == winner else ""
+            role = "current model" if side == "incumbent" else "challenger"
+            mark = f" {_sym.OK} selected" if side == winner else ""
             out.append(("win" if side == winner else "text",
                         f" 〔{label}〕 {model}（{role}）{mark}"))
         return out
@@ -721,22 +721,22 @@ class Arena:
             style, text = self.child_state(row, side)
         elif status == "applied":
             # The verdict belongs to the round, not to a side: printing
-            # "都不行" as each competitor's status read as if neither had
+            # "both rejected" as each competitor's status would suggest that neither had
             # produced anything.
             won = str(row.get("applied_side")) == side
-            style, text = ("win", f"{_sym.OK} 已采纳") if won else (
-                "subtle", "未采纳")
+            style, text = ("win", f"{_sym.OK} selected") if won else (
+                "subtle", "not selected")
         elif status == "failed":
-            style, text = "error", "失败"
+            style, text = "error", "failed"
         else:
-            style, text = "done", "已完成"
+            style, text = "done", "complete"
         shape = ""
         if status != "running":
             try:
                 files, adds, dels = self.bp._diff_stat(
                     self.bp._side_diff(row, side))
-                shape = (f"  {files} 文件 +{adds} −{dels}" if files
-                         else "  无改动")
+                shape = (f"  {files} files +{adds} −{dels}" if files
+                         else "  no changes")
             except Exception:
                 shape = ""
         head = f"〔{label}〕 {text}{shape}"
@@ -766,18 +766,18 @@ class Arena:
             files = adds = dels = 0
         if files:
             lines.append(("muted", " " + _crop(
-                f"改动 {files} 个文件 +{adds} −{dels} · 按 d 看 diff",
+                f"Changed {files} files +{adds} −{dels}; press d for the diff",
                 width - 2)))
             lines.append(("", ""))
         reply = str(row.get(f"{side}_reply") or "")
         if reply.strip():
             lines += _markdown_lines(reply, width)
         elif files:
-            lines.append(("subtle", " （没有留下说明，按 d 看改动）"))
+            lines.append(("subtle", " (no summary was provided; press d to inspect changes)"))
         else:
             # Neither words nor changes: say so plainly instead of leaving an
             # empty pane that looks like a rendering failure.
-            lines.append(("subtle", " 这一侧既没有改动，也没有留下说明。"))
+            lines.append(("subtle", " This side produced neither changes nor a summary."))
             if str(row.get("status")) == "failed":
                 lines.append(("error", " " + _crop(
                     str(row.get("error") or ""), width - 2)))
@@ -800,17 +800,17 @@ class Arena:
         challenger = self.bp._challenger_label()
         incumbent = self.bp._incumbent()[0]
         return [
-            ("brand", " 还没有对局"),
+            ("brand", " No rounds yet"),
             ("", ""),
-            ("text", " 同一个任务交给两个模型，各自在独立 worktree 里做，"),
-            ("text", " 你在这里同时看着两边跑完，选一个更好的，"),
-            ("text", " 然后才揭晓谁是谁 —— 只有胜者的改动进入工作区。"),
+            ("text", " Give the same task to two models in isolated worktrees,"),
+            ("text", " watch both complete here, and select the better result."),
+            ("text", " Identities are revealed afterward; only the winner is applied."),
             ("", ""),
-            ("text", f" 当前模型   {incumbent}"),
-            ("text", " 挑战者     " + (challenger or "未设置，先按 c 选一个")),
+            ("text", f" Current model   {incumbent}"),
+            ("text", " Challenger      " + (challenger or "not configured; press c to choose")),
             ("", ""),
-            ("muted", " 按 " + ("n 输入任务开一局" if challenger
-                                else "c 选挑战者，再按 n 开一局")),
+            ("muted", " Press " + ("n to enter a task and start" if challenger
+                                else "c to choose a challenger, then n to start")),
         ]
 
     # ── fragments ─────────────────────────────────────────────────────
@@ -822,28 +822,28 @@ class Arena:
         parts = [("class:brand", " blindpick")]
         if row is None:
             parts += [("class:muted", f"  {_sym.BULLET}  "),
-                      ("class:subtle", "空闲")]
+                      ("class:subtle", "idle")]
             return parts
         status = str(row.get("status") or "")
         parts += [("class:muted", f"  {_sym.BULLET}  "),
                   ("class:subtle",
-                   f"对局 {self.index + 1}/{len(self.rounds)}")]
+                   f"Round {self.index + 1}/{len(self.rounds)}")]
         parts += [("class:muted", f"  {_sym.BULLET}  ")]
         if status == "running":
             frames = getattr(_sym, "SPINNER_RELAY", _sym.SPINNER_BRAILLE)
             spin = frames[int(time.monotonic() * 7) % len(frames)]
-            parts += [("class:running", f"{spin} 两边同时执行中 "
+            parts += [("class:running", f"{spin} both sides running "
                                         f"{_elapsed(row)}")]
         elif status == "pending":
-            parts += [("class:approval", f"{_sym.DOT_HALF} 等你裁决")]
+            parts += [("class:approval", f"{_sym.DOT_HALF} awaiting your decision")]
         else:
             parts += [("class:subtle", STATE_TEXT.get(status, status))]
         if self.busy:
             parts += [("class:muted", f"  {_sym.BULLET}  "),
-                      ("class:thinking", f"{self.busy}中…")]
+                      ("class:thinking", f"{self.busy}...")]
         parts += [("class:muted", f"  {_sym.BULLET}  "),
-                  ("class:key", {"diff": "改动", "reply": "回复"}.get(
-                      self.mode(), "实况"))]
+                  ("class:key", {"diff": "changes", "reply": "reply"}.get(
+                      self.mode(), "live"))]
         return parts
 
     def task_fragments(self):
@@ -915,17 +915,17 @@ class Arena:
         width = self.size()[0] - 4
         with self._approval_lock:
             queued = len(self._approvals)
-        head = f" {_sym.WARN} 需要授权"
+        head = f" {_sym.WARN} Approval required"
         if queued > 1:
-            head += f"（还有 {queued - 1} 个等待）"
+            head += f" ({queued - 1} more waiting)"
         frags = [("class:approval", head), ("", "\n"),
                  ("class:text", " " + _crop(request["summary"], width)),
                  ("", "\n")]
         for line in request["detail"].splitlines()[:2]:
             frags += [("class:muted", "   " + _crop(line, width - 2)),
                       ("", "\n")]
-        frags += [("class:key", " y"), ("class:text", " 允许    "),
-                  ("class:key", "n"), ("class:text", " 拒绝"), ("", "\n")]
+        frags += [("class:key", " y"), ("class:text", " allow    "),
+                  ("class:key", "n"), ("class:text", " deny"), ("", "\n")]
         return frags
 
     def notice_fragments(self):
@@ -937,11 +937,11 @@ class Arena:
         row = self.current()
         if row is not None and str(row.get("status")) == "pending":
             return [("class:approval",
-                     " 两边都跑完了 —— a / b 选一个更好的，t 平局，x 都不行；"
-                     "选完才揭晓模型名")]
+                     " Both sides finished -- choose a or b, use t for a tie, or x to reject both; "
+                     "model identities are revealed after the decision")]
         if row is not None and str(row.get("status")) == "failed":
             return [("class:error",
-                     " " + _crop(str(row.get("error") or "失败"),
+                     " " + _crop(str(row.get("error") or "failed"),
                                  self.size()[0] - 2))]
         return [("class:muted", "")]
 
@@ -949,22 +949,22 @@ class Arena:
         row = self.current()
         cols = self.size()[0]
         if self.composing:
-            items = [("Enter", "开局"), ("Esc", "取消")]
+            items = [("Enter", "start"), ("Esc", "cancel")]
         elif self.pending_approval() is not None:
-            items = [("y", "允许"), ("n", "拒绝")]
+            items = [("y", "allow"), ("n", "deny")]
         else:
             items = []
             if row is not None and str(row.get("status")) == "pending":
-                items += [("a", "A 更好"), ("b", "B 更好"),
-                          ("t", "平局"), ("x", "都不行")]
+                items += [("a", "A better"), ("b", "B better"),
+                          ("t", "tie"), ("x", "reject both")]
             if row is not None:
-                items += [("d", "改动/回复" if str(row.get("status")) != "running"
-                           else "改动/实况"), ("PgUp/PgDn", "滚动")]
-            items += [("n", "新对局"), ("c", "挑战者"),
-                      ("[ ]", "切换对局"), ("v", "评分")]
+                items += [("d", "changes/reply" if str(row.get("status")) != "running"
+                           else "changes/live"), ("PgUp/PgDn", "scroll")]
+            items += [("n", "new round"), ("c", "challenger"),
+                      ("[ ]", "switch round"), ("v", "ratings")]
             if row is not None:
-                items.append(("D×2", "删除本局"))
-        items.append(("q", "退出"))
+                items.append(("D×2", "delete round"))
+        items.append(("q", "quit"))
 
         def width_of(rows) -> int:
             return sum(_disp_len(f" {k} {d} {_sym.BULLET}") for k, d in rows)
@@ -1031,10 +1031,10 @@ class Arena:
             if in_grace():
                 return
             if not str(self.bp._state.get("challenger") or ""):
-                self.say("warn", "先按 c 选一个挑战者模型")
+                self.say("warn", "Press c to choose a challenger first")
                 return
             if self.is_running():
-                self.say("warn", "已经有一局在跑，等它结束")
+                self.say("warn", "A round is already running; wait for it to finish")
                 return
             self.composing = True
             buffer.reset()
@@ -1083,20 +1083,20 @@ class Arena:
             if row is None:
                 return
             if str(row.get("status")) == "running":
-                self.say("warn", "这一局还在跑，不能删除")
+                self.say("warn", "A running round cannot be deleted")
                 event.app.invalidate()
                 return
             rid = str(row.get("round_id"))
             pending = str(row.get("status")) == "pending"
             if not confirm("D" + rid):
-                self.say("warn", "再按一次 D 确认删除这一局"
-                                 + ("（还没裁决过）" if pending else "")
-                                 + " —— worktree 和分支一起清掉")
+                self.say("warn", "Press D again to confirm deletion"
+                                 + (" (not yet judged)" if pending else "")
+                                 + "; its worktrees and branches will also be removed")
                 event.app.invalidate()
                 return
             frozen = dict(row)
             self.reveal = []
-            self.run_action("删除", lambda: self.bp._delete_rounds([frozen]))
+            self.run_action("deleting", lambda: self.bp._delete_rounds([frozen]))
             event.app.invalidate()
 
         @kb.add("d", filter=idle)
@@ -1149,7 +1149,7 @@ class Arena:
         def _(event):
             if in_grace():
                 return
-            self.run_action("评分", self.bp._cmd_ratings)
+            self.run_action("ratings", self.bp._cmd_ratings)
             event.app.invalidate()
 
         @kb.add("c", filter=idle)
@@ -1196,7 +1196,7 @@ class Arena:
         ])
         self.input_window = Window(
             BufferControl(buffer, input_processors=[
-                BeforeInput(" 任务描述 > ", style="class:input.label")]),
+                BeforeInput(" Task description > ", style="class:input.label")]),
             height=1, style="class:input.field", wrap_lines=False)
         root = HSplit([
             header,
@@ -1276,7 +1276,7 @@ def run_ui(bp) -> None:
     """
     import laintas_cli
     if laintas_cli._agents_view_is_active():
-        bp._say("[yellow]另一个全屏视图正在占用终端（/agents），先退出它。[/yellow]")
+        bp._say("[yellow]Another full-screen view (/agents) owns the terminal. Exit it first.[/yellow]")
         return
     while True:
         arena = Arena(bp)
@@ -1291,4 +1291,4 @@ def run_ui(bp) -> None:
         try:
             bp._pick_challenger()
         except Exception as exc:
-            bp._say(f"[red]选择挑战者失败：{exc}[/red]")
+            bp._say(f"[red]Could not select a challenger: {exc}[/red]")

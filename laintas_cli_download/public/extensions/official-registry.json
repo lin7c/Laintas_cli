@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "extensions": [
+    {
+      "id": "laintas/blindpick",
+      "name": "blindpick",
+      "version": "3.1.0",
+      "description": "Run the same task with two models, compare them blind, and apply only the selected result",
+      "url": "https://cli.laintas.com/extensions/official/blindpick-3.1.0.lext",
+      "sha256": "ad3fe5da3e398749c01287ba0439d99ad286b4139321a3fc168d4bb6b08cfea4"
+    },
+    {
+      "id": "laintas/code-atlas",
+      "name": "Code Atlas",
+      "version": "0.2.0",
+      "description": "Deterministic code topology maps, exact dependency paths, semantic annotations, and terminal or browser exploration",
+      "url": "https://cli.laintas.com/extensions/official/code-atlas-0.2.0.lext",
+      "sha256": "80da9de17b5bb655c9c5d4497c1bff435620ff7697cda4f3d3ce1e2101850434"
+    }
+  ]
+}

@@ -31,6 +31,7 @@
     "evolution_runner",
     "extension_runtime",
     "extension_manager",
+    "extension_scanner",
     "task_manager",
     "workgraph",
     "agent_persistence",
@@ -81,7 +82,15 @@
     "tokenizer",
     "web_search",
     "cookie_store",
-    "identity_store"
+    "identity_store",
+    "canvas",
+    "canvas_edit",
+    "canvas_view",
+    "context_router",
+    "context_snapshot",
+    "infinite_canvas",
+    "prop_ui",
+    "vision"
   ],
 
   "packages": [

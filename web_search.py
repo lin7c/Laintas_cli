@@ -2386,31 +2386,33 @@ def _render_page(url: str, timeout: int, settle_ms: int = 1500) -> dict:
     """Load a URL in the browser and return its rendered HTML and cookies."""
 
     def job(session):
-        page = session.get_page()
-        _seed_browser_cookies(session, page)
-        page.goto(url, timeout=timeout * 1000, wait_until="domcontentloaded")
-        try:
-            page.wait_for_load_state("networkidle", timeout=settle_ms * 2)
-        except Exception:
-            page.wait_for_timeout(settle_ms)
-        html = page.content()
-        try:
-            cookies = page.context.cookies()
-        except Exception:
-            cookies = []
-        return {"html": html, "url": page.url, "cookies": cookies}
+        def _job(page):
+            _seed_browser_cookies(session, page)
+            page.goto(url, timeout=timeout * 1000, wait_until="domcontentloaded")
+            try:
+                page.wait_for_load_state("networkidle", timeout=settle_ms * 2)
+            except Exception:
+                page.wait_for_timeout(settle_ms)
+            html = page.content()
+            try:
+                cookies = page.context.cookies()
+            except Exception:
+                cookies = []
+            return {"html": html, "url": page.url, "cookies": cookies}
 
+        return session.run(_job)
     return _RENDER_WORKER.submit(job, timeout=timeout + 30)
 
 
 def _collect_browser_cookies() -> list:
     """Cookies from the live render session (after the user unlocked a site)."""
     def job(session):
-        page = session.get_page()
-        try:
-            return page.context.cookies()
-        except Exception:
-            return []
+        def _job(page):
+            try:
+                return page.context.cookies()
+            except Exception:
+                return []
+        return session.run(_job)
     out = _RENDER_WORKER.submit(job, timeout=30)
     if not out.get("ok"):
         return []
@@ -2432,15 +2434,16 @@ def capture_identity(name: str, domains=None, probe: dict | None = None) -> dict
         return {"ok": False, "error": "no browser session is open to capture"}
 
     def job(session):
-        page = session.get_page()
-        context = page.context
-        state = context.storage_state()
-        try:
-            agent = page.evaluate("navigator.userAgent")
-        except Exception:
-            agent = ""
-        return {"state": state, "user_agent": agent}
+        def _job(page):
+            context = page.context
+            state = context.storage_state()
+            try:
+                agent = page.evaluate("navigator.userAgent")
+            except Exception:
+                agent = ""
+            return {"state": state, "user_agent": agent}
 
+        return session.run(_job)
     out = _RENDER_WORKER.submit(job, timeout=60)
     if not out.get("ok"):
         return {"ok": False, "error": out.get("error", "capture failed")}
@@ -2466,10 +2469,11 @@ def open_for_login(url: str, timeout: int = 30) -> dict:
         return {"ok": False, "error": str(e)}
 
     def job(session):
-        page = session.get_page()
-        page.goto(safe_url, timeout=timeout * 1000, wait_until="domcontentloaded")
-        return page.url
+        def _job(page):
+            page.goto(safe_url, timeout=timeout * 1000, wait_until="domcontentloaded")
+            return page.url
 
+        return session.run(_job)
     out = _RENDER_WORKER.submit(job, timeout=timeout + 30)
     if not out.get("ok"):
         return {"ok": False, "error": out.get("error", "navigation failed")}

@@ -281,11 +281,21 @@ Installation and trust paths:
 
 | Source | Command | Trust mechanism |
 |---|---|---|
-| Official extension | `/v` | Ed25519 signature |
-| Community/local package | `/extensions` | Explicit content-hash approval |
+| Official extension | `/extensions install laintas/<name>` | Official registry hash plus explicit approval |
+| Community package | `/extensions install @author/<name>` | Immutable artifact hash, fresh static and AI source review, explicit approval |
+| Local package | `/extensions install <path-or-url>` | Explicit content-hash approval |
 | Evolution Lab candidate | `/evolve` | Test, activation, and rollback workflow |
 
-Use `/extensions create` to scaffold a package and `/extensions pack` to produce a distributable `.lext` archive. `toolPrefix` must be lower-case and dot-terminated. Without a custom prefix, the runtime assigns an extension-owned namespace. Legacy manifests without an `install` block remain loadable for backward compatibility.
+Browse the marketplace with `/extensions available`, narrow it with
+`/extensions available official` or `/extensions available community`, and
+search both sources with `/extensions search <keyword>`. `/extensions list`
+continues to show only extensions installed on the current machine.
+
+Use `/extensions create` to scaffold a package and `/extensions pack` to produce a distributable `.lext` archive. An installed extension can be published with `/extensions publish <name>`: the CLI uploads `extension.lext` and `publish.json` under `Extensions/<name>` in Laintas Storage, then commits an immutable community-registry version. Community packages are never presented as official packages and cannot use the `laintas` publisher namespace.
+
+Every community installation verifies the published SHA-256, extracts within strict size and file-count limits, runs deterministic checks, and submits the source to a fresh tool-less AI review. The report is advisory rather than a sandbox: community Python still executes with the local user's permissions, every installation requires confirmation, critical findings are blocked, and scanner failure stops installation.
+
+`toolPrefix` must be lower-case and dot-terminated. Without a custom prefix, the runtime assigns an extension-owned namespace. Legacy manifests without an `install` block remain loadable for backward compatibility.
 
 ### 7. Hooks
 

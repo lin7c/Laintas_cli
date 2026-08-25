@@ -1,4 +1,5 @@
 import os
+import threading
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -44,6 +45,29 @@ class ResourceBrowserModelTests(unittest.TestCase):
         self.assertEqual(color("error"), "f85149")
         self.assertEqual(color("timeline.user"), "d2a8ff")
         self.assertEqual(color("timeline.tool"), "a78bfa")
+        self.assertEqual(color("assistant.prompt"), "a78bfa")
+
+    def test_optional_assistant_returns_detail_without_blocking_caller(self):
+        finished = threading.Event()
+
+        def assistant(item, detail, prompt, interrupt_event):
+            self.assertEqual(item.key, "a")
+            self.assertEqual(prompt, "translate this")
+            self.assertFalse(interrupt_event.is_set())
+            finished.set()
+            return resource_ui.UIDetail.text("Translation", "translated")
+
+        browser = self._browser(assistant_handler=assistant)
+        browser.reload(preserve=False)
+        browser.assistant.text = "translate this"
+        browser._submit_assistant()
+        self.assertTrue(finished.wait(1))
+        for _ in range(100):
+            if not browser.assistant_busy:
+                break
+            threading.Event().wait(0.005)
+        self.assertEqual(browser.detail.title, "Translation")
+        self.assertEqual(browser.detail.lines[0].text, "translated")
 
     def test_reload_preserves_selected_stable_key(self):
         browser = self._browser()

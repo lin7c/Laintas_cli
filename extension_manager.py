@@ -26,6 +26,7 @@ import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import quote
 
 import paths
 import trust_store
@@ -46,6 +47,28 @@ _TRUST_KIND = "runtime"
 
 #: Archive extension.
 ARCHIVE_SUFFIX = ".lext"
+
+COMMUNITY_REGISTRY_ORIGIN = os.environ.get(
+    "LAINTAS_COMMUNITY_EXTENSION_ORIGIN",
+    "https://cli.laintas.com").rstrip("/")
+OFFICIAL_REGISTRY_URL = os.environ.get(
+    "LAINTAS_OFFICIAL_EXTENSION_REGISTRY",
+    "https://cli.laintas.com/extensions/official-registry.json")
+MAX_REMOTE_ARCHIVE_BYTES = 10 * 1024 * 1024
+MAX_REGISTRY_BYTES = 1024 * 1024
+MAX_ARCHIVE_FILES = 200
+MAX_UNPACKED_BYTES = 20 * 1024 * 1024
+_COMMUNITY_ID = re.compile(
+    r"^@([a-z0-9][a-z0-9-]{1,38}[a-z0-9])/"
+    r"([a-z0-9][a-z0-9-]{0,62}[a-z0-9])$")
+
+
+def _escape_markup(value: Any) -> str:
+    try:
+        from rich.markup import escape
+        return escape(str(value))
+    except Exception:
+        return str(value).replace("[", "\\[")
 
 
 # ── result type ────────────────────────────────────────────────────────────
@@ -153,6 +176,12 @@ def _safe_extract_zip(data: bytes, target: Path) -> None:
     """Extract a ZIP archive into *target*, refusing path-traversal entries."""
     root = target.resolve()
     with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        entries = archive.infolist()
+        if len(entries) > MAX_ARCHIVE_FILES:
+            raise RuntimeError(
+                f"Extension archive contains more than {MAX_ARCHIVE_FILES} entries.")
+        if sum(entry.file_size for entry in entries) > MAX_UNPACKED_BYTES:
+            raise RuntimeError("Extension archive exceeds the unpacked size limit.")
         for entry in archive.infolist():
             destination = (target / entry.filename).resolve()
             if root not in destination.parents and destination != root:
@@ -173,6 +202,61 @@ def create_archive(source_dir: Path, output: Path) -> Path:
                 arcname = file_path.relative_to(source_dir)
                 archive.write(file_path, arcname)
     return output
+
+
+def create_publication_archive(source_dir: Path, output: Path) -> Path:
+    """Pack source without local install provenance or transient files."""
+    with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
+        for file_path in sorted(source_dir.rglob("*")):
+            if (not file_path.is_file() or file_path.is_symlink()
+                    or "__pycache__" in file_path.parts
+                    or file_path.suffix in {".pyc", ".pyo"}):
+                continue
+            relative = file_path.relative_to(source_dir)
+            if relative.as_posix() == "extension.json":
+                manifest = read_manifest(source_dir)
+                manifest.pop("install", None)
+                data = (json.dumps(manifest, indent=2, ensure_ascii=False)
+                        + "\n").encode("utf-8")
+            else:
+                data = file_path.read_bytes()
+            # A publication hash must describe content, not the time it was
+            # packed. Fixed metadata makes repeated builds byte-identical.
+            info = zipfile.ZipInfo(relative.as_posix(), (1980, 1, 1, 0, 0, 0))
+            info.compress_type = zipfile.ZIP_DEFLATED
+            info.create_system = 3
+            info.external_attr = 0o100644 << 16
+            archive.writestr(info, data)
+    return output
+
+
+def _fetch_registry_json(url: str) -> dict:
+    """Fetch a bounded marketplace registry without trusting its shape."""
+    import requests
+
+    try:
+        with requests.get(url, timeout=15, stream=True) as response:
+            response.raise_for_status()
+            declared = response.headers.get("Content-Length")
+            if declared and int(declared) > MAX_REGISTRY_BYTES:
+                raise RuntimeError("Extension registry exceeds the 1 MB limit.")
+            chunks: list[bytes] = []
+            size = 0
+            for chunk in response.iter_content(64 * 1024):
+                if not chunk:
+                    continue
+                size += len(chunk)
+                if size > MAX_REGISTRY_BYTES:
+                    raise RuntimeError("Extension registry exceeds the 1 MB limit.")
+                chunks.append(chunk)
+        value = json.loads(b"".join(chunks).decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Extension registry returned invalid JSON.") from exc
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("Extension registry returned an invalid response.") from exc
+    if not isinstance(value, dict) or not isinstance(value.get("extensions"), list):
+        raise RuntimeError("Extension registry has an invalid document shape.")
+    return value
 
 
 # ── scaffold template ──────────────────────────────────────────────────────
@@ -237,9 +321,10 @@ Edit `main.py` and `extension.json`, then install locally:
 class ExtensionManager:
     """Install, uninstall, list, pack, scaffold, and trust extensions."""
 
-    def __init__(self, runtime=None, console=None):
+    def __init__(self, runtime=None, console=None, community_scanner=None):
         self._rt = runtime
         self._console = console
+        self._community_scanner = community_scanner
 
     # ── output helper ──────────────────────────────────────────────────
     def _print(self, message: str = "") -> None:
@@ -252,7 +337,9 @@ class ExtensionManager:
         """Ask the user for a yes/no confirmation."""
         if self._console is not None and hasattr(self._console, "input"):
             try:
-                answer = self._console.input(f"{prompt} [y/N] ").strip().lower()
+                # markup=False: "[y/N]" must not be parsed as a Rich style tag
+                answer = self._console.input(
+                    f"{prompt} [y/N] ", markup=False).strip().lower()
             except (EOFError, KeyboardInterrupt):
                 return False
             return answer in ("y", "yes")
@@ -292,11 +379,11 @@ class ExtensionManager:
                 return self._install_from_url(
                     source, global_install=global_install, force=force)
             else:
-                return InstallResult(
-                    ok=False,
-                    message=f"Marketplace install is not yet available. "
-                            f"Use a local path, .lext file, or URL.\n"
-                            f"  Source: {source}")
+                if source.startswith("@"):
+                    return self._install_community(
+                        source, global_install=global_install, force=force)
+                return self._install_official(
+                    source, global_install=global_install, force=force)
         except Exception as exc:
             return InstallResult(ok=False, message=str(exc))
 
@@ -355,6 +442,74 @@ class ExtensionManager:
                 })
         return results
 
+    def list_available(self, source: str = "all", query: str = "") -> list[dict]:
+        """Return normalized official and community marketplace entries."""
+        source = str(source or "all").strip().lower()
+        if source not in {"all", "official", "community"}:
+            raise ValueError("Source must be all, official, or community.")
+        needle = str(query or "").strip().casefold()
+        results: list[dict] = []
+
+        if source in {"all", "official"}:
+            registry = _fetch_registry_json(OFFICIAL_REGISTRY_URL)
+            for raw in registry.get("extensions", []):
+                if not isinstance(raw, dict):
+                    continue
+                identifier = str(raw.get("id") or "")
+                if not identifier.startswith("laintas/"):
+                    continue
+                results.append({
+                    "id": identifier,
+                    "name": str(raw.get("name") or identifier.split("/", 1)[-1]),
+                    "version": str(raw.get("version") or ""),
+                    "description": str(raw.get("description") or ""),
+                    "source": "official",
+                })
+
+        if source in {"all", "community"}:
+            url = f"{COMMUNITY_REGISTRY_ORIGIN}/api/extensions/community?limit=200"
+            registry = _fetch_registry_json(url)
+            latest: dict[str, dict] = {}
+            for candidate in registry.get("extensions", []):
+                if not isinstance(candidate, dict):
+                    continue
+                identifier = str(candidate.get("id") or "")
+                if not _COMMUNITY_ID.fullmatch(identifier):
+                    continue
+                previous = latest.get(identifier)
+                try:
+                    published = float(candidate.get("publishedAt") or 0)
+                    previous_published = float(
+                        (previous or {}).get("publishedAt") or 0)
+                except (TypeError, ValueError):
+                    published = previous_published = 0
+                if previous is None or published > previous_published:
+                    latest[identifier] = candidate
+            for raw in latest.values():
+                if not isinstance(raw, dict):
+                    continue
+                identifier = str(raw.get("id") or "")
+                manifest = raw.get("manifest")
+                manifest = manifest if isinstance(manifest, dict) else {}
+                results.append({
+                    "id": identifier,
+                    "name": str(manifest.get("displayName") or raw.get("slug")
+                                or identifier.split("/", 1)[-1]),
+                    "version": str(raw.get("version") or ""),
+                    "description": str(manifest.get("summary")
+                                       or manifest.get("description") or ""),
+                    "source": "community",
+                })
+
+        if needle:
+            results = [item for item in results if needle in " ".join((
+                item["id"], item["name"], item["description"],
+                item["version"], item["source"],
+            )).casefold()]
+        return sorted(results, key=lambda item: (
+            item["source"] != "official", item["id"].casefold(),
+            _version_tuple(item["version"])), reverse=False)
+
     def trust(self, name: str) -> tuple[bool, str]:
         """Approve an extension's current hashes in trust_store."""
         directory = self._find_directory(name)
@@ -403,6 +558,45 @@ class ExtensionManager:
             output = Path.cwd() / f"{name}.lext"
         create_archive(directory, output)
         return output
+
+    def publish(self, name: str, shared_storage) -> dict:
+        """Package an installed extension into Laintas Storage and publish it."""
+        directory = self._find_directory(name)
+        if directory is None:
+            raise RuntimeError(f"Extension {name!r} is not installed.")
+        manifest = read_manifest(directory)
+        errors = validate_manifest(manifest, directory.name)
+        if errors:
+            raise RuntimeError("Manifest validation failed:\n  " + "\n  ".join(errors))
+        slug = str(manifest["name"])
+        version = str(manifest["version"])
+        remote_folder = f"Extensions/{slug}"
+        with tempfile.TemporaryDirectory(prefix=".lext-publish-") as tmp:
+            archive_path = Path(tmp) / "extension.lext"
+            publication_path = Path(tmp) / "publish.json"
+            create_publication_archive(directory, archive_path)
+            digest = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+            publication = {
+                "schemaVersion": 1,
+                "slug": slug,
+                "version": version,
+                "artifact": "extension.lext",
+                "sha256": digest,
+                "displayName": manifest.get("displayName") or slug,
+                "summary": manifest.get("description", ""),
+                "minCliVersion": manifest.get("minCliVersion", ""),
+                "capabilities": manifest.get("capabilities") or [],
+                "visibility": "public",
+            }
+            publication_path.write_text(
+                json.dumps(publication, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8")
+            shared_storage.push_file(
+                str(archive_path), f"{remote_folder}/extension.lext")
+            # Uploaded last: readers never observe a marker for an incomplete package.
+            shared_storage.push_file(
+                str(publication_path), f"{remote_folder}/publish.json")
+            return shared_storage.publish_extension(remote_folder)
 
     def create(self, name: str, directory: Optional[Path] = None,
                description: str = "") -> Path:
@@ -502,21 +696,31 @@ class ExtensionManager:
 
         # 6. Trust confirmation
         if trust_mode == "user-confirm":
-            desc = manifest.get("description", "(no description)")
+            desc = _escape_markup(manifest.get("description", "(no description)"))
             author = (manifest.get("author") or {})
-            author_name = author.get("name", "unknown") if isinstance(author, dict) else str(author)
+            author_name = _escape_markup(
+                author.get("name", "unknown") if isinstance(author, dict) else author)
             self._print(
                 f"[bold]Extension:[/bold] {name} v{version}\n"
                 f"  [dim]description : {desc}[/dim]\n"
                 f"  [dim]author       : {author_name}[/dim]\n"
                 f"  [dim]integrity    : {integrity[:16]}[/dim]\n"
-                f"  [dim]source       : {source_label}[/dim]\n"
+                f"  [dim]source       : {_escape_markup(source_label)}[/dim]\n"
                 f"  [yellow]This extension will execute Python code with your "
                 f"permissions.[/yellow]")
             if not self._confirm("Install and trust this extension?"):
                 return InstallResult(ok=False, message="Installation cancelled.")
 
-        # 7. Atomic install: unload old -> swap directories -> load new
+        # 7. Atomic install: keep the old tree until the new setup succeeds.
+        old_was_trusted = False
+        if target.exists():
+            try:
+                old_entry = target / "main.py"
+                old_was_trusted = bool(trust_store.extension_status(
+                    _TRUST_KIND, name, old_entry,
+                    related_paths=_related_files(target)).get("trusted"))
+            except Exception:
+                old_was_trusted = False
         if self._rt is not None:
             self._rt.unload(name)
         backup = target.with_name(f".{target.name}.old")
@@ -525,7 +729,6 @@ class ExtensionManager:
             os.replace(target, backup)
         try:
             shutil.copytree(staging, target)
-            shutil.rmtree(backup, ignore_errors=True)
         except Exception:
             # Roll back
             if backup.exists():
@@ -548,18 +751,27 @@ class ExtensionManager:
         except Exception:
             pass  # Non-fatal: the extension still works without install metadata.
 
-        # 9. Record trust (for user-confirm mode)
-        if trust_mode == "user-confirm":
+        # 9. Record trust for explicitly confirmed executable code.
+        if trust_mode in {"user-confirm", "community-ai-confirm"}:
             self.trust(name)
 
         # 10. Load
         if self._rt is not None:
             ok, msg = self._rt.load(name)
             if not ok:
+                self._rt.unload(name)
+                trust_store.revoke_extension(_TRUST_KIND, name)
+                shutil.rmtree(target, ignore_errors=True)
+                if backup.exists():
+                    os.replace(backup, target)
+                    if old_was_trusted:
+                        self.trust(name)
+                    self._rt.load(name)
                 return InstallResult(
                     ok=False, name=name, version=version, integrity=integrity,
                     source=source_label,
-                    message=f"Installed but failed to load: {msg}")
+                    message=f"Extension failed to load and was rolled back: {msg}")
+        shutil.rmtree(backup, ignore_errors=True)
         return InstallResult(
             ok=True, name=name, version=version, integrity=integrity,
             source=source_label,
@@ -601,9 +813,16 @@ class ExtensionManager:
         """Download and install from a URL."""
         import requests
         self._print(f"[dim]Downloading {url}…[/dim]")
-        response = requests.get(url, timeout=120)
-        response.raise_for_status()
-        data = response.content
+        with requests.get(url, timeout=120, stream=True) as response:
+            response.raise_for_status()
+            chunks = []
+            size = 0
+            for chunk in response.iter_content(256 * 1024):
+                size += len(chunk)
+                if size > MAX_REMOTE_ARCHIVE_BYTES:
+                    raise RuntimeError("Extension download exceeds the 10 MB limit.")
+                chunks.append(chunk)
+            data = b"".join(chunks)
         with tempfile.TemporaryDirectory(prefix=".lext-install-") as tmp:
             staging = Path(tmp) / "content"
             _safe_extract_zip(data, staging)
@@ -614,6 +833,142 @@ class ExtensionManager:
                 staging, global_install=global_install, force=force,
                 trust_mode="user-confirm",
                 source_label=f"url:{url}")
+
+    def _install_community(self, identifier: str, *,
+                           global_install: bool,
+                           force: bool) -> InstallResult:
+        match = _COMMUNITY_ID.fullmatch(identifier)
+        if not match:
+            return InstallResult(
+                ok=False,
+                message="Community extension IDs must use @author/slug.")
+        if self._community_scanner is None:
+            return InstallResult(
+                ok=False,
+                message="AI source review is unavailable; community installation was stopped.")
+        author, slug = match.groups()
+        import requests
+        info_url = (f"{COMMUNITY_REGISTRY_ORIGIN}/api/extensions/community/"
+                    f"{quote(author)}/{quote(slug)}")
+        info_response = requests.get(info_url, timeout=30)
+        info_response.raise_for_status()
+        info = info_response.json()
+        version = str(info.get("version") or "")
+        download_response = requests.post(
+            info_url + "/download", timeout=30)
+        download_response.raise_for_status()
+        download = download_response.json()
+        archive_url = str(download.get("downloadUrl") or "")
+        expected_sha = str(download.get("sha256") or info.get("sha256") or "").lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_sha):
+            raise RuntimeError("Community registry returned an invalid artifact hash.")
+        self._print(f"[dim]Downloading {identifier} v{version}…[/dim]")
+        with requests.get(archive_url, timeout=120, stream=True) as response:
+            response.raise_for_status()
+            chunks = []
+            size = 0
+            for chunk in response.iter_content(256 * 1024):
+                size += len(chunk)
+                if size > MAX_REMOTE_ARCHIVE_BYTES:
+                    raise RuntimeError("Extension download exceeds the 10 MB limit.")
+                chunks.append(chunk)
+        data = b"".join(chunks)
+        if not hashlib.sha256(data).hexdigest() == expected_sha:
+            raise RuntimeError("Downloaded extension does not match the published SHA-256.")
+        with tempfile.TemporaryDirectory(prefix=".lext-community-") as tmp:
+            staging = Path(tmp) / "content"
+            _safe_extract_zip(data, staging)
+            entries = [p for p in staging.iterdir() if not p.name.startswith(".")]
+            if len(entries) == 1 and entries[0].is_dir():
+                staging = entries[0]
+            manifest = read_manifest(staging)
+            if manifest.get("name") != slug or str(manifest.get("version")) != version:
+                raise RuntimeError("Downloaded package identity does not match the registry.")
+            report = self._community_scanner(staging)
+            risk = str(report.get("risk") or "").lower()
+            if risk not in {"low", "medium", "high", "critical"}:
+                raise RuntimeError("AI source review returned an invalid risk level.")
+            self._print(
+                "[bold yellow]COMMUNITY EXTENSION — NOT REVIEWED BY LAINTAS[/bold yellow]\n\n"
+                f"  [bold]Extension:[/bold] {identifier} v{version}\n"
+                f"  [bold]Artifact:[/bold]  {expected_sha[:16]}\n"
+                f"  [bold]Risk:[/bold]      {risk.upper()}\n"
+                f"  [bold]Review:[/bold]    {_escape_markup(report.get('summary', ''))}\n\n"
+                "  [yellow]This extension executes Python code with your user permissions.\n"
+                "  AI-assisted analysis cannot guarantee that the code is safe.[/yellow]")
+            for finding in (report.get("findings") or [])[:12]:
+                severity = str(finding.get("severity", "medium")).upper()
+                self._print(
+                    f"  [bold]{severity}[/bold] "
+                    f"{_escape_markup(finding.get('file', 'unknown'))}:"
+                    f"{finding.get('line', 1)} — "
+                    f"{_escape_markup(finding.get('description', ''))}")
+            if risk == "critical":
+                return InstallResult(
+                    ok=False, message="Critical-risk community extensions cannot be installed.")
+            prompt = (f"Type {identifier} to install this high-risk extension:"
+                      if risk == "high" else
+                      f"Install and trust {identifier}?")
+            if risk == "high":
+                try:
+                    answer = self._console.input(f"{prompt} ", markup=False).strip() \
+                        if self._console is not None else ""
+                except (EOFError, KeyboardInterrupt):
+                    answer = ""
+                confirmed = answer == identifier
+            else:
+                confirmed = self._confirm(prompt)
+            if not confirmed:
+                return InstallResult(ok=False, message="Installation cancelled.")
+            return self._install_staged(
+                staging, global_install=global_install, force=force,
+                trust_mode="community-ai-confirm",
+                source_label=f"community:{identifier}@{version}")
+
+    def _install_official(self, identifier: str, *,
+                          global_install: bool,
+                          force: bool) -> InstallResult:
+        official_id = identifier if "/" in identifier else f"laintas/{identifier}"
+        import requests
+        response = requests.get(OFFICIAL_REGISTRY_URL, timeout=30)
+        response.raise_for_status()
+        registry = response.json()
+        item = next((entry for entry in registry.get("extensions", [])
+                     if entry.get("id") == official_id), None)
+        if item is None:
+            return InstallResult(
+                ok=False,
+                message=f"No official extension named {official_id!r} was found. "
+                        "Community extensions must use @author/slug.")
+        url = str(item.get("url") or "")
+        expected_sha = str(item.get("sha256") or "").lower()
+        if not url.startswith("https://") or not re.fullmatch(r"[0-9a-f]{64}", expected_sha):
+            raise RuntimeError("Official extension registry entry is invalid.")
+        with requests.get(url, timeout=120, stream=True) as download:
+            download.raise_for_status()
+            chunks = []
+            size = 0
+            for chunk in download.iter_content(256 * 1024):
+                size += len(chunk)
+                if size > MAX_REMOTE_ARCHIVE_BYTES:
+                    raise RuntimeError("Extension download exceeds the 10 MB limit.")
+                chunks.append(chunk)
+        data = b"".join(chunks)
+        if hashlib.sha256(data).hexdigest() != expected_sha:
+            raise RuntimeError("Official extension does not match the registry SHA-256.")
+        with tempfile.TemporaryDirectory(prefix=".lext-official-") as tmp:
+            staging = Path(tmp) / "content"
+            _safe_extract_zip(data, staging)
+            entries = [p for p in staging.iterdir() if not p.name.startswith(".")]
+            if len(entries) == 1 and entries[0].is_dir():
+                staging = entries[0]
+            manifest = read_manifest(staging)
+            if manifest.get("name") != official_id.split("/", 1)[1]:
+                raise RuntimeError("Official package identity does not match the registry.")
+            return self._install_staged(
+                staging, global_install=global_install, force=force,
+                trust_mode="user-confirm",
+                source_label=f"official:{official_id}@{item.get('version', '')}")
 
 
 def _now_iso() -> str:

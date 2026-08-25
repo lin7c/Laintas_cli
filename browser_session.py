@@ -26,6 +26,7 @@ import glob
 import signal
 import socket
 import subprocess
+import queue
 import threading
 import time
 import json
@@ -649,6 +650,11 @@ _PW_SYNC_CAP = float(os.environ.get("LAINTAS_PW_SYNC_CAP", "600") or 600)
 # returns.
 _PW_TEARDOWN_CAP = 20.0
 
+#: Ceiling for the session's opening navigation. Generous: it is one page load
+#: on a browser that has just booted, and failing it early would report a slow
+#: site as a broken session.
+_INITIAL_NAV_TIMEOUT_MS = int(os.environ.get("LAINTAS_BROWSER_OPEN_TIMEOUT_MS", "45000"))
+
 # Per-thread override of the cap, for calls that must not be allowed to block
 # for the full default — teardown, most of all. Thread-local because two
 # sessions on two threads have two independent connections.
@@ -810,15 +816,31 @@ class BrowserSession:
         self._closed = threading.Event()
         self._log_dir: Optional[str] = None
 
-        # Playwright CDP connection (lazily connected by get_page()).
+        # Playwright CDP connection. Created, used and destroyed on this
+        # session's own worker thread and nowhere else — see run().
         self._pw = None          # sync_playwright().start() instance
         self._pw_browser = None  # chromium.connect_over_cdp() browser
         self._pw_lock = threading.Lock()
-        # Thread that owns the Playwright connection. The sync API is
-        # thread-affine (its dispatcher greenlet belongs to the creating
-        # thread), so every call has to come from this thread — see
-        # _pw_owned_here(). None until the connection is made.
+        # Thread that owns the Playwright connection. Set when the worker
+        # starts; _pw_owned_here() is now an assertion rather than a branch,
+        # because run() is the only way in.
         self._pw_tid: Optional[int] = None
+
+        # The worker itself. One thread per session, for the whole life of the
+        # session — see the class docstring for why this is ownership rather
+        # than a convention callers follow.
+        self._jobs: "queue.Queue" = queue.Queue()
+        self._worker: Optional[threading.Thread] = None
+        self._worker_lock = threading.Lock()
+
+        # Whether a page has ever been instrumented on this session. The
+        # difference between "watched, and nothing went wrong" and "never
+        # watched" is the difference between evidence and its absence, and
+        # get_page_errors()'s callers have to be able to tell them apart.
+        self._monitoring = False
+        #: Set when the opening navigation failed, so open() can say so
+        #: instead of handing back a session showing an error page.
+        self.initial_nav_error: Optional[str] = None
 
         # ── runtime capture (for website testing) ───────────────────────────
         # console messages, uncaught JS errors, and failed/4xx-5xx network
@@ -852,8 +874,7 @@ class BrowserSession:
         (navigate, click, type, etc.) may invalidate them — call snapshot or
         inject_refs again to get fresh refs.
         """
-        page = self.get_page()
-        return page.evaluate("""
+        return self.run(lambda page: page.evaluate("""
             () => {
                 const selectors = [
                     'a[href]', 'button', 'input', 'select', 'textarea',
@@ -906,7 +927,7 @@ class BrowserSession:
                 });
                 return refs;
             }
-        """)
+        """))
 
     def _log(self, name: str) -> str:
         """Path to a per-component stderr log file (lazily created)."""
@@ -933,7 +954,7 @@ class BrowserSession:
     # Every one of these is answerable locally, without touching the wire.
 
     def _pw_owned_here(self) -> bool:
-        """True if this thread may call Playwright on this session."""
+        """True if this thread is the session's owner (or none exists yet)."""
         return self._pw_tid is None or self._pw_tid == threading.get_ident()
 
     def _pw_alive(self) -> bool:
@@ -989,26 +1010,104 @@ class BrowserSession:
         except OSError:
             pass
 
-    def get_page(self):
-        """Lazily connect to Chrome via Playwright CDP and return the active
-        Page.  All browser.* tools call this to get a handle to the page.
+    # ── the one door to the page ───────────────────────────────────────
 
-        The connection is created on first call and reused.  Playwright's sync
-        API requires all calls from the same thread — the agent loop is
-        single-threaded so this is safe, and a session driven from another
-        thread (web.fetch's render worker) owns its own connection.  If Chrome
-        was restarted, or the driver connection died under us, the connection
-        is re-established automatically.
+    _JOB_SHUTDOWN = object()
+
+    def _worker_loop(self) -> None:
+        """Own the Playwright connection for the life of the session."""
+        self._pw_tid = threading.get_ident()
+        while True:
+            job = self._jobs.get()
+            if job is self._JOB_SHUTDOWN:
+                try:
+                    self._close_playwright()
+                finally:
+                    self._pw_tid = None
+                return
+            fn, box, done = job
+            try:
+                box["value"] = fn(self._get_page())
+            except BaseException as e:      # noqa: BLE001 — re-raised in caller
+                box["error"] = e
+            finally:
+                done.set()
+
+    def _ensure_worker(self) -> None:
+        with self._worker_lock:
+            if self._worker is not None and self._worker.is_alive():
+                return
+            if self._closed.is_set():
+                raise RuntimeError("browser session is closed")
+            self._worker = threading.Thread(
+                target=self._worker_loop,
+                name=f"browser-{self.session_id}", daemon=True)
+            self._worker.start()
+
+    def run(self, fn, timeout: Optional[float] = None):
+        """Run ``fn(page)`` on the thread that owns this session, and return
+        what it returned (or raise what it raised).
+
+        This is the ONLY supported way to touch the page, and the reason it
+        exists is not tidiness. Playwright's sync API keeps the "current
+        asyncio loop" in **thread-global** state: a second connection on the
+        same thread cannot even start ("Playwright Sync API inside the asyncio
+        loop"), closing one connection clears that state for every other one
+        on the thread, and a call made in the window that follows either
+        raises `no running event loop` or — worse — returns a wrong answer
+        with no error at all. Sessions used to be handed out as bare Page
+        objects and driven from whichever thread called first, with a comment
+        asking callers to be careful. That is not a contract a caller can
+        keep: it depends on what every OTHER session on the thread is doing.
+
+        Here, each session owns one thread for its whole life, so no two
+        connections ever share thread-global state, and no caller has to know
+        that the rule exists.
+
+        Re-entrant: a job that calls run() again (inject_refs inside a
+        snapshot, say) executes inline instead of deadlocking on itself.
+        """
+        if self._closed.is_set():
+            raise RuntimeError("browser session is closed")
+        if threading.get_ident() == self._pw_tid:
+            return fn(self._get_page())
+
+        self._ensure_worker()
+        box: dict = {}
+        done = threading.Event()
+        self._jobs.put((fn, box, done))
+        # Above any Playwright call's own ceiling (_PW_SYNC_CAP), because a
+        # call that outlives that cap is already being abandoned by the sync
+        # guard — this timeout is for a worker that is not coming back at all.
+        if not done.wait(timeout if timeout is not None else _PW_SYNC_CAP + 60):
+            raise RuntimeError(
+                f"browser session '{self.session_id}' did not answer in time; "
+                f"its worker thread is wedged and the session should be closed")
+        if "error" in box:
+            raise box["error"]
+        return box.get("value")
+
+    def _get_page(self):
+        """Connect (lazily) and return the active Page.
+
+        Only ever called on the worker thread — run() is the only caller, and
+        _pw_owned_here() below is the assertion that says so. If Chrome was
+        restarted, or the driver connection died under us, the connection is
+        re-established automatically.
         """
         if self._closed.is_set():
             raise RuntimeError("browser session is closed")
 
         with self._pw_lock:
             if self._pw is not None and not self._pw_owned_here():
+                # Unreachable through run(). Kept as an assertion because the
+                # failure it catches is silent corruption, not an exception:
+                # a Playwright call from a foreign thread can return a wrong
+                # answer rather than raising.
                 raise RuntimeError(
-                    f"browser session '{self.session_id}' is driven from "
-                    f"thread {self._pw_tid}; Playwright's sync API cannot be "
-                    f"called from another thread")
+                    f"browser session '{self.session_id}' is owned by thread "
+                    f"{self._pw_tid}; use session.run(fn) instead of touching "
+                    f"the page directly")
             # A connection whose dispatcher greenlet has exited is not a
             # connection any more: every call on it would raise (or, before
             # the _sync guard, spin). Drop it and reconnect — Chrome itself
@@ -1048,6 +1147,9 @@ class BrowserSession:
             if id(page) in self._instrumented:
                 return
             self._instrumented.add(id(page))
+            # From here on, "nothing captured" is evidence. Before it, it was
+            # only ignorance — and the two must never read the same.
+            self._monitoring = True
 
             def _on_console(msg):
                 try:
@@ -1136,6 +1238,15 @@ class BrowserSession:
         if level and level != "all":
             items = [m for m in items if m.get("type") == level]
         return items
+
+    def is_monitoring(self) -> bool:
+        """Whether any page on this session has ever had listeners attached.
+
+        False means the capture buffers are empty because nothing was
+        watching, not because nothing happened. Callers that report "no
+        errors" to a human or a model must check this first.
+        """
+        return self._monitoring
 
     def get_page_errors(self) -> list:
         return list(self._page_errors)
@@ -1253,6 +1364,28 @@ class BrowserSession:
         # view attaches to it peer-to-peer when a viewer asks (webrtc_channel.py's
         # VNC bridge). Nothing is pushed to the backend from here.
 
+        # Connect Playwright, attach the capture listeners, and only then go
+        # to the requested page — see _start_chrome for why the URL is not
+        # handed to Chrome's argv. run() instruments as part of handing over
+        # the page, so by the time goto() is issued the listeners are live.
+        if self.url and not self.url.startswith("about:"):
+            target = self.url
+
+            def _open(page):
+                page.goto(target, wait_until="domcontentloaded",
+                          timeout=_INITIAL_NAV_TIMEOUT_MS)
+
+            try:
+                self.run(_open, timeout=(_INITIAL_NAV_TIMEOUT_MS / 1000.0) + 30)
+            except Exception as e:
+                # A session whose first navigation failed is still a usable
+                # session — Chrome is up, the live view works, and the caller
+                # may want to navigate somewhere else. But it must not be
+                # handed back as if it had loaded the page, which is what
+                # happened when Chrome swallowed the failure into an error
+                # page nobody parsed.
+                self.initial_nav_error = f"{type(e).__name__}: {e}"[:300]
+
     def close(self) -> None:
         if self._closed.is_set():
             return
@@ -1264,9 +1397,35 @@ class BrowserSession:
         # up here must not skip it. _close_playwright is bounded and swallows
         # its own errors; the try/finally is the backstop for the rest.
         try:
-            self._close_playwright()
+            self._shutdown_worker()
         finally:
             self._close_host_stack()
+
+    def _shutdown_worker(self) -> None:
+        """Stop the worker and let it disconnect Playwright from its own thread.
+
+        Teardown has to happen where the connection lives — `browser.close()`
+        and `pw.stop()` from a foreign thread either raise or hang — but it
+        must also never block the caller, because everything that frees real
+        memory (Chrome, Xvfb, x11vnc) runs after this returns. So the worker
+        is asked to leave, given a bounded moment to do it gracefully, and
+        otherwise abandoned: _drop_pw needs no cooperation from Playwright and
+        kills the driver process itself.
+        """
+        with self._worker_lock:
+            worker = self._worker
+            self._worker = None
+        if worker is None or not worker.is_alive():
+            # No worker ever ran, or it is already gone: nothing owns the
+            # connection, so dropping it here is safe.
+            with self._pw_lock:
+                self._drop_pw()
+            return
+        self._jobs.put(self._JOB_SHUTDOWN)
+        worker.join(timeout=_PW_TEARDOWN_CAP + 5)
+        if worker.is_alive():
+            with self._pw_lock:
+                self._drop_pw()
 
     def _close_host_stack(self) -> None:
         """Kill Chrome/Xvfb/x11vnc and remove this session's files on disk."""
@@ -1417,7 +1576,16 @@ class BrowserSession:
         if no_sandbox and "--no-sandbox" not in args:
             args.append("--no-sandbox")
 
-        args.append(self.url)
+        # Always about:blank, never the session's URL. Chrome resolves an
+        # argv URL while it boots — before Playwright has connected and before
+        # a single listener exists — so every console error, uncaught
+        # exception and failed request of the FIRST page load used to happen
+        # where nothing could see it. That is the load during which a broken
+        # app actually breaks, and get_errors() would then truthfully report
+        # having captured nothing, which reads exactly like "no errors". The
+        # opening navigation is done in start(), through the instrumented
+        # page, so there is no unwatched window to miss it in.
+        args.append("about:blank")
 
         self._chrome = subprocess.Popen(
             args, stdout=subprocess.DEVNULL,

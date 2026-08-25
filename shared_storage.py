@@ -178,6 +178,13 @@ class SharedStorage:
                 f"Upload of {local_path} rejected by storage (HTTP {resp.status_code})")
         return size
 
+    def publish_extension(self, remote_folder: str) -> dict:
+        """Publish a prepared ``Extensions/<slug>`` storage folder."""
+        folder = clean_remote_path(remote_folder)
+        return self._call("POST", "/api/extensions/community/publish", json={
+            "path": folder,
+        })
+
     def pull_file(self, remote_path: str, local_path: str) -> int:
         """Download one file. Returns the byte count written."""
         remote = clean_remote_path(remote_path)
