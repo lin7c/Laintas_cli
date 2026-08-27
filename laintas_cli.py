@@ -3613,13 +3613,39 @@ def _build_prompt_style() -> Style:
 # opencode's pasteText/pasteInputText, adapted to prompt_toolkit.
 _paste_registry: dict = {}
 _paste_counter = 0
+_paste_nonce = uuid.uuid4().hex[:8]
 
 
 def _reset_paste_registry() -> None:
     """Clear pending placeholder→content mappings (called after each submit)."""
-    global _paste_registry, _paste_counter
+    global _paste_registry, _paste_counter, _paste_nonce
     _paste_registry = {}
     _paste_counter = 0
+    _paste_nonce = uuid.uuid4().hex[:8]
+
+
+def _register_placeholder(content: str, kind: str = "Pasted") -> tuple[str, int]:
+    """Register content under a new unique placeholder token.
+
+    Paste summarization and the manual collapse shortcut (Ctrl+X Ctrl+S)
+    share this registry and this counter, so token texts stay globally
+    unique: the registry is keyed by the literal token and _expand_pastes
+    matches by plain substring, so a duplicate number would expand every
+    copy at once.
+    """
+    global _paste_counter
+    _paste_counter += 1
+    line_count = content.count("\n") + 1 if content else 0
+    # The random per-input namespace matters even though the counter is unique
+    # within the registry. A user can legitimately type text such as
+    # ``[Snippet #1 ~1 lines]`` before the first real segment is created. If
+    # the generated token had the same literal spelling, _expand_pastes()
+    # would replace both occurrences and silently corrupt the submitted text.
+    placeholder = (
+        f"[{kind} #{_paste_counter} ~{line_count} lines @{_paste_nonce}]"
+    )
+    _paste_registry[placeholder] = content
+    return placeholder, line_count
 
 
 def _maybe_summarize_paste(data: str):
@@ -3649,10 +3675,7 @@ def _maybe_summarize_paste(data: str):
     except Exception:
         min_chars = 150
     if line_count >= min_lines or len(normalized) >= min_chars:
-        _paste_counter += 1
-        placeholder = f"[Pasted #{_paste_counter} ~{line_count} lines]"
-        _paste_registry[placeholder] = normalized
-        return placeholder, line_count
+        return _register_placeholder(normalized)
     return None, line_count
 
 
@@ -3666,7 +3689,9 @@ def _expand_pastes(text: str) -> str:
     return text
 
 
-_PASTE_PLACEHOLDER_RE = re.compile(r"\[Pasted #\d+ ~\d+ lines\]")
+_PASTE_PLACEHOLDER_RE = re.compile(
+    r"\[(?:Pasted|Snippet) #\d+ ~\d+ lines(?: @[0-9a-f]{8})?\]"
+)
 
 
 def _paste_span_at(text: str, pos: int):
@@ -3684,8 +3709,64 @@ def _paste_span_at(text: str, pos: int):
     return None
 
 
+def _collapse_selection_to_placeholder(buffer) -> bool:
+    """Replace the selection with a [Snippet #N ~L lines] token.
+
+    The selected text enters the same registry a summarized paste uses, so
+    the token inherits everything that system already provides: it is atomic
+    (the cursor cannot land inside it), colored by the lexer, restored to
+    its real content on submit, and Ctrl+Z undoes the collapse wholesale.
+    Inner placeholders inside the selection are flattened to their real
+    content first - a nested token would survive submit as its literal text.
+
+    No-ops (returning False, registry untouched): no selection, whitespace
+    only, or a short single-line selection whose token would be longer than
+    the text it replaces. Multi-line text always collapses - one line beats
+    N lines whatever the character count says.
+    """
+    if buffer.selection_state is None:
+        return False
+    start, end = buffer.document.selection_range()
+    sel = buffer.text[start:end]
+    for placeholder, real in _paste_registry.items():
+        if placeholder in sel:
+            sel = sel.replace(placeholder, real)
+    if not sel.strip():
+        return False
+    prospective = f"[Snippet #{_paste_counter + 1} ~1 lines @{_paste_nonce}]"
+    if "\n" not in sel and len(sel) < len(prospective):
+        return False
+    token, _lines = _register_placeholder(sel, kind="Snippet")
+    buffer.selection_state = None
+    buffer.text = buffer.text[:start] + token + buffer.text[end:]
+    buffer.cursor_position = start + len(token)
+    return True
+
+
+def _expand_placeholder_at_cursor(buffer) -> bool:
+    """Replace the placeholder token at the cursor with its real content.
+
+    The registry entry is deliberately kept: Ctrl+Z after an expansion
+    restores the token text, and a deleted entry would leave that restored
+    token unexpandable at submit. Lingering entries whose token no longer
+    appears anywhere are ignored by _expand_pastes, so keeping them is free.
+    """
+    span = _paste_span_at(buffer.text, buffer.cursor_position)
+    if span is None:
+        return False
+    start, end = span
+    content = _paste_registry.get(buffer.text[start:end])
+    if content is None:
+        return False          # hand-typed lookalike: must stay literal text
+    if buffer.selection_state is not None:
+        buffer.selection_state = None
+    buffer.text = buffer.text[:start] + content + buffer.text[end:]
+    buffer.cursor_position = start + len(content)
+    return True
+
+
 class _PastePlaceholderLexer(Lexer):
-    """Colorize [Pasted #N ~L lines] placeholders in the input buffer."""
+    """Colorize [Pasted|Snippet #N ~L lines] placeholders in the input buffer."""
 
     def lex_document(self, document):
         placeholder_style = "class:paste-placeholder"
@@ -3714,8 +3795,9 @@ class _PastePlaceholderLexer(Lexer):
 class _PasteGuardBuffer(Buffer):
     """Buffer whose cursor cannot enter a paste-placeholder span.
 
-    [Pasted #N ~L lines] tokens are atomic and non-editable: arrow keys and
-    mouse clicks skip over the whole token instead of landing inside it.
+    [Pasted/Snippet #N ~L lines] tokens are atomic and non-editable: arrow
+    keys and mouse clicks skip over the whole token instead of landing
+    inside it.
 
     The cursor_position setter is the single chokepoint — Buffer.cursor_left/
     right/up/down all go through ``self.cursor_position += ...``, and
@@ -3802,17 +3884,53 @@ def _build_keybindings() -> KeyBindings:
 
     @kb.add("c-f")
     def _(event):
-        """Ctrl+F: accept auto-suggest ghost text (fish-style)."""
+        """Ctrl+F: accept auto-suggest ghost text (fish-style).
+
+        With no suggestion, fall through to the emacs default (forward-char)
+        instead of swallowing the keypress.
+        """
         buf = event.current_buffer
         if buf.suggestion:
             buf.insert_text(buf.suggestion.text)
+        else:
+            buf.cursor_right(count=event.arg)
 
     @kb.add("c-e")
     def _(event):
-        """Ctrl+E: accept auto-suggest ghost text."""
+        """Ctrl+E: accept auto-suggest ghost text; otherwise end-of-line.
+
+        The fallback matters: emacs binds Ctrl+E to end-of-line, and the
+        accept-suggestion shortcut must not eat the key when there is nothing
+        to accept.
+        """
         buf = event.current_buffer
         if buf.suggestion:
             buf.insert_text(buf.suggestion.text)
+        else:
+            buf.cursor_position += buf.document.get_end_of_line_position()
+
+    # save_before=False on both: the key processor snapshots the buffer before
+    # every binding by default, and that snapshot clears the redo stack - which
+    # would make Ctrl+Y a no-op before its handler ever ran. Emacs' own undo
+    # binding disables save_before for exactly this reason.
+    @kb.add("c-z", save_before=lambda e: False)
+    def _(event):
+        r"""Ctrl+Z: undo the last edit in the input buffer.
+
+        prompt_toolkit's default Ctrl+Z handler inserts the literal \x1a
+        control character into the buffer, which then travels to the model as
+        part of the message. Undo is what the key means everywhere else.
+        """
+        event.current_buffer.undo()
+
+    @kb.add("c-y", save_before=lambda e: False)
+    def _(event):
+        """Ctrl+Y: redo the last undone edit.
+
+        Shadows emacs yank (kill-ring paste); pasting in a modern terminal
+        arrives through bracketed paste instead.
+        """
+        event.current_buffer.redo()
 
     @kb.add("c-o")
     def _(event):
@@ -3842,6 +3960,21 @@ def _build_keybindings() -> KeyBindings:
     def _(event):
         """Alt+Enter (escape then enter): insert a newline without submitting."""
         event.current_buffer.insert_text("\n")
+
+    @kb.add("c-x", "c-s")
+    def _(event):
+        """Ctrl+X Ctrl+S: collapse the selection into a content segment.
+
+        Shift+arrows create the selection; the segment is the same
+        [Snippet #N ~L lines] token a summarized paste becomes, and it
+        submits with its full content restored.
+        """
+        _collapse_selection_to_placeholder(event.current_buffer)
+
+    @kb.add("c-x", "c-o")
+    def _(event):
+        """Ctrl+X Ctrl+O: expand the content segment at the cursor."""
+        _expand_placeholder_at_cursor(event.current_buffer)
 
     @kb.add("escape")
     def _(event):
@@ -4228,6 +4361,7 @@ def get_prompt_session() -> PromptSession:
             lexer=_PastePlaceholderLexer(),
             enable_history_search=False,
             vi_mode=False,
+            enable_open_in_editor=True,
             complete_while_typing=True,
             mouse_support=Condition(lambda: bool(get_runtime_config("enable_mouse"))),
         )
