@@ -121,8 +121,59 @@ class ExtensionContext:
                                        description=description,
                                        subcommands=subcommands)
 
-    def register_tool(self, tool: Tool) -> None:
-        self._runtime.register_tool(self.name, tool)
+    def register_tool(self, tool, handler: Optional[Callable] = None,
+                      spec: Optional[dict] = None) -> None:
+        """Expose one extension capability to the MODEL, not just to the user.
+
+        Two accepted forms:
+
+        * ``register_tool(Tool(...))`` — full control, for an extension that
+          already imports the CLI's tool module.
+        * ``register_tool("name", fn, spec)`` — the plain form, where `fn` takes
+          the schema's properties as keyword arguments and returns a str/dict.
+
+        The second form exists because an extension lives outside this package
+        and has no clean way to build a `Tool`: `code-atlas` shipped calling it
+        this way, the call raised `TypeError`, its own `except Exception: pass`
+        swallowed that, and `atlas.lookup` was silently absent from every
+        request for the extension's whole life. An extension that registers no
+        tool is invisible to the model no matter what its manifest declares --
+        slash commands are typed by the user and never reach the request.
+        """
+        if isinstance(tool, Tool):
+            if handler is not None or spec is not None:
+                raise TypeError("pass either a Tool or (name, handler, spec)")
+            self._runtime.register_tool(self.name, tool)
+            return
+        if not callable(handler):
+            raise TypeError("register_tool(name, handler, spec) needs a callable handler")
+        spec = spec or {}
+
+        def _invoke(params: dict, _ctx, _fn=handler) -> dict:
+            args = params or {}
+            # Bind BEFORE calling. Wrapping the call in `except TypeError`
+            # instead would label a TypeError raised inside the handler's own
+            # body as "invalid parameters" — the same mislabelling that let
+            # code-atlas's registration failure look like a compatibility
+            # downgrade for as long as it was installed.
+            try:
+                inspect.signature(_fn).bind(**args)
+            except TypeError as exc:
+                return {"ok": False, "error": f"invalid parameters: {exc}"}
+            except (ValueError, KeyError):
+                pass          # builtin/C handler with no introspectable signature
+            try:
+                out = _fn(**args)
+            except Exception as exc:
+                return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+            return {"ok": True, "result": out}
+
+        self._runtime.register_tool(self.name, Tool(
+            name=str(tool),
+            description=str(spec.get("description") or ""),
+            schema=spec.get("parameters") or {"type": "object", "properties": {}},
+            invoke=_invoke,
+        ))
 
     def register_loop(self, handler: Callable) -> None:
         self._runtime.register_loop(self.name, handler)

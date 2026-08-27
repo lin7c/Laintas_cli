@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 2,
+  "name": "swebench",
+  "version": "1.0.0",
+  "entrypoint": "main.py",
+  "description": "Generate SWE-bench predictions with laintas-cli; scoring stays with the official harness",
+  "capabilities": [
+    "fs.read",
+    "fs.write"
+  ],
+  "minCliVersion": "1.0.0"
+}

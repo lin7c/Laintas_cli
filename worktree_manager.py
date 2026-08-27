@@ -27,6 +27,7 @@ import os
 import shutil
 import subprocess
 import threading
+import time
 import uuid
 import hashlib
 from dataclasses import dataclass, field
@@ -195,6 +196,11 @@ def create_isolated_worktree(base_cwd: str, label: str = "agent") -> WorktreeInf
     if rc != 0:
         raise WorktreeError(f"git worktree add failed: {err or out}")
 
+    # Stamp ownership as soon as the tree exists, before the WIP replication
+    # below — a crash partway through that copy still leaves a checkout on
+    # disk, and it should be reclaimable like any other orphan.
+    _write_owner(root, name)
+
     # Replicate the parent's uncommitted WIP into the new worktree so the
     # child continues real work instead of a stale clean checkout. Locked
     # against concurrent merge_worktree_back calls from sibling agents
@@ -315,4 +321,221 @@ def remove_worktree(info: WorktreeInfo) -> bool:
         except OSError:
             pass
     _git(info.repo_root, "branch", "-D", info.branch)
+    _clear_owner(info.repo_root, os.path.basename(info.path.rstrip(os.sep)))
     return ok
+
+
+# ── Orphan reclamation ─────────────────────────────────────────────────────
+# `remove_worktree` is correct but only runs when the spawn frame reaches its
+# teardown. Three paths skip it: a merge conflict and a merge exception both
+# deliberately leave the checkout "for manual review", and a killed CLI never
+# gets to run teardown at all. None of those is ever revisited, so worktrees
+# accumulate — one deployment reached 78 of them, 8.8 GB, and every recursive
+# grep in that repo returned each hit 78 times.
+#
+# The reaper does not override the deliberate keeps; it puts a clock on them.
+# What survives is the *content* (a patch), not a full checkout of the repo.
+
+_OWNERS_DIRNAME = ".owners"
+_REAPED_DIRNAME = ".reaped"
+DEFAULT_ORPHAN_GRACE_SECONDS = 6 * 3600
+MAX_REAPED_ARCHIVES = 50
+
+
+def _worktrees_dir(root: str) -> str:
+    return os.path.join(root, ".laintas", "worktrees")
+
+
+def _owner_path(root: str, name: str) -> str:
+    return os.path.join(_worktrees_dir(root), _OWNERS_DIRNAME, f"{name}.json")
+
+
+def _write_owner(root: str, name: str) -> None:
+    """Record which live process owns a worktree.
+
+    Age alone cannot tell a crashed run from a slow one, and reaping a
+    still-running sub-agent's checkout out from under it is far worse than
+    leaving a stale directory another few hours.
+    """
+    import json
+    path = _owner_path(root, name)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"pid": os.getpid(), "started": time.time()}, fh)
+    except OSError:
+        pass          # ownership is an optimisation; the age gate still applies
+
+
+def _clear_owner(root: str, name: str) -> None:
+    try:
+        os.remove(_owner_path(root, name))
+    except OSError:
+        pass
+
+
+def _pid_alive(pid: int) -> bool:
+    """True if `pid` is running. Unknown states answer True (do not reap)."""
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True                      # alive, owned by another user
+    except OSError:
+        return True                      # unknown → assume alive
+    return True
+
+
+def _cwds_in_use() -> set:
+    """Every directory some live process is sitting in, resolved once.
+
+    Backstop for worktrees created before ownership records existed: without
+    it, the age gate alone could reap a long-running legacy sub-agent.
+    """
+    seen = set()
+    try:
+        pids = [p for p in os.listdir("/proc") if p.isdigit()]
+    except OSError:
+        return seen
+    for pid in pids:
+        try:
+            seen.add(os.readlink(f"/proc/{pid}/cwd"))
+        except OSError:
+            continue
+    return seen
+
+
+def _archive_before_reap(path: str, root: str, name: str) -> List[str]:
+    """Save an orphan's unique content as patches before the tree is deleted.
+
+    A worktree kept "for manual review" holds real work. Deleting it outright
+    to reclaim disk would discard that; a diff keeps it at a thousandth of the
+    size, which is what makes reaping safe enough to do automatically.
+    """
+    written: List[str] = []
+    out_dir = os.path.join(_worktrees_dir(root), _REAPED_DIRNAME)
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+    except OSError:
+        return written
+
+    rc, head, _ = _git(root, "rev-parse", "HEAD")
+    pieces = [("diff", ("diff", "HEAD"))]
+    if rc == 0 and head:
+        # Commits the parent does not have. Usually none — the checkout is a
+        # snapshot, not a branch someone pushed to — but it costs one call.
+        pieces.append(("patch", ("format-patch", "--stdout", f"{head.strip()}..HEAD")))
+
+    for suffix, args in pieces:
+        try:
+            rc2, body, _ = _git(path, *args, timeout=120)
+        except Exception:
+            continue
+        if rc2 != 0 or not (body or "").strip():
+            continue
+        dest = os.path.join(out_dir, f"{name}.{suffix}")
+        try:
+            with open(dest, "w", encoding="utf-8") as fh:
+                fh.write(body)
+            written.append(dest)
+        except OSError:
+            pass
+    return written
+
+
+def _prune_reaped_archives(root: str, keep: int = MAX_REAPED_ARCHIVES) -> None:
+    """Cap the archive so reclaiming disk does not start its own slow leak."""
+    out_dir = os.path.join(_worktrees_dir(root), _REAPED_DIRNAME)
+    try:
+        entries = [os.path.join(out_dir, f) for f in os.listdir(out_dir)]
+    except OSError:
+        return
+    files = [(os.path.getmtime(f), f) for f in entries if os.path.isfile(f)]
+    files.sort(reverse=True)
+    for _, stale in files[keep:]:
+        try:
+            os.remove(stale)
+        except OSError:
+            pass
+
+
+def reap_orphan_worktrees(base_cwd: str, *,
+                          grace_seconds: int = DEFAULT_ORPHAN_GRACE_SECONDS,
+                          dry_run: bool = False) -> dict:
+    """Remove worktrees whose owning process is gone. Best-effort, never raises.
+
+    A worktree is reaped only when BOTH gates agree: its owner is provably
+    dead (or unrecorded), AND it is older than `grace_seconds`. Requiring both
+    means a recycled PID or a missing record costs a delay, never a deletion.
+    """
+    result = {"reaped": [], "kept": [], "archived": [], "error": ""}
+    try:
+        root = repo_root(base_cwd)
+        if not root:
+            return result
+        wt_dir = _worktrees_dir(root)
+        if not os.path.isdir(wt_dir):
+            return result
+
+        import json
+        now = time.time()
+        me = os.getpid()
+        in_use = None                     # scanned lazily; only legacy needs it
+
+        for entry in sorted(os.listdir(wt_dir)):
+            if entry.startswith("."):     # .owners / .reaped are not worktrees
+                continue
+            path = os.path.join(wt_dir, entry)
+            if not os.path.isdir(path):
+                continue
+
+            owner = None
+            try:
+                with open(_owner_path(root, entry), encoding="utf-8") as fh:
+                    owner = json.load(fh)
+            except (OSError, ValueError):
+                owner = None
+
+            if owner is not None:
+                pid = owner.get("pid")
+                if pid == me or _pid_alive(pid):
+                    result["kept"].append(path)
+                    continue
+                born = float(owner.get("started") or 0)
+            else:
+                # No record: created by an older build, or the record was lost.
+                # Fall back to mtime, and refuse to touch anything a live
+                # process is sitting in.
+                if in_use is None:
+                    in_use = _cwds_in_use()
+                if path in in_use or os.path.realpath(path) in in_use:
+                    result["kept"].append(path)
+                    continue
+                try:
+                    born = os.path.getmtime(path)
+                except OSError:
+                    result["kept"].append(path)
+                    continue
+
+            if now - born < grace_seconds:
+                result["kept"].append(path)
+                continue
+            if dry_run:
+                result["reaped"].append(path)
+                continue
+
+            result["archived"].extend(_archive_before_reap(path, root, entry))
+            remove_worktree(WorktreeInfo(path=path, branch=f"laintas/{entry}",
+                                         repo_root=root, base_commit=""))
+            _clear_owner(root, entry)
+            result["reaped"].append(path)
+
+        if result["reaped"] and not dry_run:
+            _git(root, "worktree", "prune")
+            _prune_reaped_archives(root)
+    except Exception as exc:              # never let housekeeping break startup
+        result["error"] = str(exc)
+    return result

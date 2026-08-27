@@ -13,6 +13,7 @@ import socket
 import subprocess
 import sys
 import threading
+import concurrent.futures
 import time
 import uuid
 from contextlib import contextmanager, nullcontext
@@ -552,6 +553,72 @@ TRANSITION_REPETITION = "repetition"                    # output similarity thre
 TRANSITION_WARNING_FORCE = "warning_force_exit"         # warning circuit breaker tripped
 TRANSITION_PARSE_GAVE_UP = "parse_gave_up"              # parse failure counter exhausted
 TRANSITION_USER_DENIED = "user_denied"                  # user explicitly denied an approval prompt
+
+
+#: Exits where the user asked something and got no answer. The turn is over;
+#: the QUESTION is not, and that difference is invisible in a transcript.
+_UNANSWERED_EXITS = {
+    TRANSITION_BACKEND_ERROR, TRANSITION_PROVIDER_ERROR,
+    TRANSITION_SILENT_FAILURE, TRANSITION_REPAIR_GAVE_UP,
+    TRANSITION_PARSE_GAVE_UP,
+}
+
+
+def _close_failed_turn(chat_history, thread_messages, exit_reason, deps, state):
+    """Write a failed turn's ending into the transcript.
+
+    Without this a turn that dies before answering leaves the user's message as
+    the last thing in the thread with nothing after it. Nothing is wrong until
+    the next question arrives hours later: it is appended right behind the old
+    one, the provider sees two consecutive user turns, and the model reasonably
+    tries to serve both at once. Observed 2026-08-26 — a question that failed at
+    14:19 resurfaced inside an unrelated one at 17:30, and the two interleaved
+    for 45 minutes.
+
+    The marker is an assistant turn rather than a system note on purpose: it has
+    to survive into `_thread_messages`, which is what the next request actually
+    sends.
+    """
+    if exit_reason not in _UNANSWERED_EXITS:
+        return
+    last_user = None
+    for msg in reversed(chat_history or []):
+        role = msg.get("role")
+        if role == "assistant":
+            return          # something did answer; nothing is dangling
+        if role == "user":
+            last_user = msg
+            break
+    if last_user is None:
+        return
+
+    detail = (state.get("shortTermMemory") or "").strip().splitlines()
+    detail = next((ln.strip()[len("-Error:"):].strip()
+                   for ln in detail if ln.strip().startswith("-Error:")), "")
+    label = _EXIT_REASON_TEXT.get(exit_reason, exit_reason)
+    note = (f"[This turn ended without an answer: {label}."
+            + (f" {detail}" if detail else "")
+            + " The question above was NOT answered and is NOT in progress. Do"
+              " not resume it on your own — a later message starts a new task"
+              " unless the user asks for this one again.]")
+    chat_history.append({"role": "assistant", "content": note,
+                         "message_kind": "turn_failed"})
+    if thread_messages is not None:
+        thread_messages.append({"role": "assistant", "content": note})
+    state["_unanswered_prompt"] = {
+        "text": (last_user.get("content") or "")[:400],
+        "reason": exit_reason,
+        "ts": time.time(),
+    }
+    if deps is not None:
+        try:
+            preview = " ".join((last_user.get("content") or "").split())[:60]
+            deps.console.print(
+                f"[yellow]Your question was not answered ({label}).[/yellow] "
+                f"[dim]“{preview}…” — it will not resume by itself; "
+                f"ask again to retry it.[/dim]")
+        except Exception:
+            pass
 
 _EXIT_REASON_TEXT = {
     TRANSITION_MAX_LOOPS: "ran out of loop budget before finishing",
@@ -6051,7 +6118,9 @@ def _build_user_message(original_input: str, state: dict, memory_entries: list,
     # task carries none of them.
     vol = volatile or {}
     volatile_block = ""
-    for tag, value in (("inbox", vol.get("inbox")),
+    _env = vol.get("env") or {}
+    for tag, value in (("plan_mode", _env.get("plan_mode")),
+                       ("inbox", vol.get("inbox")),
                        ("sub_agent_results", vol.get("parallel_results")),
                        ("relevant_memory", vol.get("memory_highlight")),
                        ("relevant_skills", vol.get("skill_highlight"))):
@@ -6068,6 +6137,14 @@ def _build_user_message(original_input: str, state: dict, memory_entries: list,
     # but sits after everything else, where it costs only itself.
     now_block = f"\n<now>\n{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} (local)\n</now>\n"
 
+    # Same reasoning as `now_block`, for the same reason: these move, so they
+    # live after everything else, where a change costs only itself.
+    _env_bits = [f"{label}: {_env[key]}"
+                 for key, label in (("cwd", "CWD"), ("children", "Children"))
+                 if str(_env.get(key) or "").strip()]
+    env_block = ("\n<environment_now>\n" + "\n".join(_env_bits) + "\n</environment_now>\n"
+                 if _env_bits else "")
+
     if thread_mode:
         task_block = f"<task>\n{original_input}\n</task>\n" if first_turn else ""
         return f"""{task_block}{objective_block}{approved_plan_block}
@@ -6082,7 +6159,7 @@ step {loop+1}/{max_loops} — {n_steps} command(s) executed so far
 <sub_terminals>
 {terminals_snapshot or "(none)"}
 </sub_terminals>
-{volatile_block}{now_block}"""
+{volatile_block}{env_block}{now_block}"""
 
     return f"""<task>
 {original_input}
@@ -6107,7 +6184,7 @@ step {loop+1}/{max_loops} — {n_steps} command(s) executed so far
 <sub_terminals>
 {terminals_snapshot or "(none)"}
 </sub_terminals>
-{volatile_block}{now_block}"""
+{volatile_block}{env_block}{now_block}"""
 
 
 def _detect_lang(text: str) -> str:
@@ -6502,6 +6579,154 @@ def _policy_command_arg(name: str, arguments: dict) -> str:
     return ""
 
 
+# Bytes held back from the character budget so the middle-cut marker always
+# fits without eating into the head/tail halves it describes.
+_TRUNC_NOTE_RESERVE = 120
+
+
+def _truncate_middle(body: str, max_chars: int, *,
+                     header: str = "", footer: str = "") -> str:
+    """Fit `body` into `max_chars`, dropping the MIDDLE rather than the tail.
+
+    Head-only truncation throws away the end of the output, which for
+    line-oriented results is exactly where the answer often sits: a `grep`
+    whose first twenty hits are vendored noise and whose last hit is the real
+    one reads as "no match" once the tail is cut. Keeping both ends costs the
+    same budget and preserves the two places a result carries signal — what it
+    started with and what it ended with.
+
+    `header` (a prefix such as "[command exit 1]") and `footer` (the metadata
+    line) are kept verbatim and charged against the same budget, so the result
+    is never longer than `max_chars`.
+    """
+    total = len(body)
+    if len(header) + total + len(footer) <= max_chars:
+        return header + body + footer
+
+    budget = max_chars - len(header) - len(footer) - _TRUNC_NOTE_RESERVE
+    if budget <= 0:
+        # No room to keep two halves plus an explanation — degrade to the
+        # plain head cut rather than emitting a marker with nothing around it.
+        return (header + body + footer)[:max_chars]
+
+    head_len = (budget * 3) // 5          # 60/40 split: context first, answer last
+    tail_len = budget - head_len
+    head, tail = body[:head_len], body[total - tail_len:]
+
+    # Snap both halves to line boundaries so neither starts or ends mid-line.
+    # The guards keep a body with no early/late newline (one huge line, minified
+    # JSON) from collapsing a half to nothing.
+    cut = head.rfind("\n")
+    if cut > head_len // 2:
+        head = head[:cut]
+    cut = tail.find("\n")
+    if cut != -1 and cut < tail_len // 2:
+        tail = tail[cut + 1:]
+
+    omitted = total - len(head) - len(tail)
+    omitted_lines = body.count("\n", len(head), total - len(tail))
+    marker = (f"\n...[middle cut: {omitted} chars, {omitted_lines} lines omitted "
+              f"— narrow the query or raise output_truncate]...\n")
+    if len(marker) > _TRUNC_NOTE_RESERVE:   # unreachable for realistic sizes
+        marker = marker[:_TRUNC_NOTE_RESERVE - 1] + "\n"
+    return header + head + marker + tail + footer
+
+
+#: Tools whose result is ONE CONTIGUOUS SPAN the caller explicitly asked for.
+#: Cutting their middle destroys the only property that makes them useful: a
+#: file read exists to say "these lines, in order". A patchwork of two halves
+#: cannot be reasoned about, cannot anchor an `edit`, and — worst — arrives
+#: alongside metadata describing the whole span, so the model believes it read
+#: a file it only saw pieces of. Observed 2026-08-27: a 511-line file came back
+#: as 60 lines under `total_lines=511`, and the review written from it opened
+#: with "I have read all four files in full".
+_CONTIGUOUS_RESULT_TOOLS = frozenset({"fs.read", "read"})
+
+#: Per-tool output budget, as a multiple of `output_truncate`.
+#:
+#: `output_truncate` was never sized for this job. It was introduced (2026-05-06)
+#: to bound ONE cosmetic string — the `Last Result:` recap in the prompt header —
+#: and was silently reused as the budget for every tool result when
+#: `_format_tool_result_for_loop` was written. 3000 chars is right for output
+#: whose size nobody chose (a build log, a test run); it is absurd for output
+#: whose size the caller already bounded with `limit`/`max_results` and which
+#: costs under 1% of a modern context window.
+#:
+#: Scaled rather than absolute so `/max` and a user's `/config output_truncate`
+#: still move every budget together.
+_TOOL_BUDGET_SCALE = {
+    "fs.read": 8, "read": 8,          # ~24k chars: most source files, whole
+    "fs.grep": 3, "grep": 3,
+    "fs.diff": 3, "diff": 3,
+    "fs.glob": 2, "glob": 2,
+    "fs.ls": 2, "ls": 2,
+}
+
+
+def _tool_output_budget(tool_name: str, base: int) -> int:
+    """Budget for one tool's result. See `_TOOL_BUDGET_SCALE`."""
+    return max(1, base) * _TOOL_BUDGET_SCALE.get(tool_name, 1)
+
+
+def _fit_contiguous_read(result: dict, body: str, max_chars: int) -> str:
+    """Fit a file read into `max_chars` WITHOUT breaking its contiguity.
+
+    Two rules, both load-bearing:
+
+    * The kept text is a prefix ending on a line boundary, so what arrives is
+      always "lines X through Y", never two disjoint fragments.
+    * The footer describes what was DELIVERED, not what the tool found. The
+      previous behaviour reported the tool's own `lines_returned`/`total_lines`
+      next to a body this function had already cut, which is how a truncated
+      read came to look like a complete one. Anything dropped here is named
+      here, together with the exact `offset` that resumes the read.
+    """
+    offset = int(result.get("offset") or 1)
+    total = result.get("total_lines")
+    path = str(result.get("path") or "")
+    changed = str(result.get("external_change") or "")
+    lines = body.split("\n") if body else []
+
+    def _footer(kept: int, dropped: int) -> str:
+        if kept:
+            bits = [f"read {path}" if path else "read",
+                    f"lines {offset}-{offset + kept - 1}"]
+        else:
+            bits = [f"read {path}" if path else "read", "no lines fit"]
+        bits.append(f"of {total}" if total else "of unknown total")
+        if dropped:
+            bits.append(f"| {dropped} requested line(s) NOT shown - "
+                        f"continue with offset={offset + kept}")
+        elif result.get("truncated"):
+            # The tool itself stopped early (limit/max_bytes), so the window is
+            # short for a reason this layer did not cause.
+            bits.append(f"| more lines exist - continue with offset={offset + kept}")
+        if changed:
+            bits.append(f"| {changed}")
+        return "\n[" + " ".join(bits) + "]"
+
+    whole = _footer(len(lines), 0)
+    if len(body) + len(whole) <= max_chars:
+        return body + whole
+
+    # Reserve the longest footer this call can emit, so trimming the body can
+    # never push the footer back over the budget.
+    budget = max_chars - len(_footer(len(lines), len(lines)))
+    kept: list[str] = []
+    used = 0
+    for line in lines:
+        if used + len(line) + 1 > budget:
+            break
+        kept.append(line)
+        used += len(line) + 1
+    if not kept:
+        # A single line longer than the whole budget (minified file). Give the
+        # head of it and say so rather than returning an empty body.
+        head = lines[0][:max(0, budget)] if lines else ""
+        return head + _footer(0, len(lines))
+    return "\n".join(kept) + _footer(len(kept), len(lines) - len(kept))
+
+
 def _format_tool_result_for_loop(tool_name: str, result: dict, max_chars: int) -> str:
     """Render a tool result as the string the AI sees in [recent_terminal_output].
 
@@ -6513,9 +6738,13 @@ def _format_tool_result_for_loop(tool_name: str, result: dict, max_chars: int) -
       - result is a list/dict → pretty-printed JSON of just the `result` field
         plus a short metadata footer ("matches=N truncated=true")
       - no `result` key → pretty-print the whole dict
+
+    `max_chars` is the BASE budget; each tool's actual budget is derived from
+    it by `_tool_output_budget`.
     """
+    max_chars = _tool_output_budget(tool_name, max_chars)
     if not isinstance(result, dict):
-        return str(result)[:max_chars]
+        return _truncate_middle(str(result), max_chars)
 
     if not result.get("ok", True):
         err = str(result.get("error") or "").strip()
@@ -6528,8 +6757,9 @@ def _format_tool_result_for_loop(tool_name: str, result: dict, max_chars: int) -
         if rc is not None and output:
             prefix = f"[command exit {rc}]"
             if err:
-                return f"{prefix} {err}\n{output}"[:max_chars]
-            return f"{prefix}\n{output}"[:max_chars]
+                return _truncate_middle(output, max_chars,
+                                        header=f"{prefix} {err}\n")
+            return _truncate_middle(output, max_chars, header=f"{prefix}\n")
         if output:
             # No returncode (not a shell command), but the tool still
             # returned a substantive result payload alongside ok=False -
@@ -6539,8 +6769,9 @@ def _format_tool_result_for_loop(tool_name: str, result: dict, max_chars: int) -
             # actually produced real, useful partial findings.
             prefix = f"[{tool_name} reported ok=false]"
             if err:
-                return f"{prefix} {err}\n{output}"[:max_chars]
-            return f"{prefix}\n{output}"[:max_chars]
+                return _truncate_middle(output, max_chars,
+                                        header=f"{prefix} {err}\n")
+            return _truncate_middle(output, max_chars, header=f"{prefix}\n")
         if err:
             # An advisory is a tool declining ON PURPOSE and telling the caller
             # what to do next — the soft test gate, for one. It has to return
@@ -6560,7 +6791,12 @@ def _format_tool_result_for_loop(tool_name: str, result: dict, max_chars: int) -
             text = json.dumps(clone, ensure_ascii=False, indent=2, default=str)
         except (TypeError, ValueError):
             text = str(clone)
-        return text[:max_chars]
+        return _truncate_middle(text, max_chars)
+
+    # A file read is one contiguous span and reports its own window, so it
+    # builds its footer AFTER the cut instead of from the tool's own counts.
+    if tool_name in _CONTIGUOUS_RESULT_TOOLS and isinstance(payload, str):
+        return _fit_contiguous_read(result, payload, max_chars)
 
     # Build a one-line footer of "interesting" metadata fields so the AI sees
     # truncation / counts without needing to parse a giant dict.
@@ -6599,14 +6835,90 @@ def _format_tool_result_for_loop(tool_name: str, result: dict, max_chars: int) -
         except (TypeError, ValueError):
             body = str(payload)
 
-    text = body + footer
-    if len(text) > max_chars:
-        truncation = f"\n...(truncated to {max_chars} chars)"
-        # Metadata such as completion/exit status is often more important than
-        # another few output bytes. Preserve the footer when truncating.
-        body_budget = max(0, max_chars - len(truncation) - len(footer))
-        text = body[:body_budget] + truncation + footer
-    return text
+    # Metadata such as completion/exit status is often more important than
+    # another few output bytes, so the footer survives truncation intact.
+    return _truncate_middle(body, max_chars, footer=footer)
+
+
+# Tools that only look at things: no machine state changes, no shared mutable
+# runtime state, and nothing that has to observe another call in this turn.
+# Verified against the implementations — none of these writes ctx.state or
+# ctx.session, which is what makes one shared ToolCtx safe across threads.
+#
+# Deliberately NOT here: `shell` and `terminal.*` (one agent owns one persistent
+# PTY, so two concurrent commands interleave on the same byte stream), every
+# write tool, `skill.load`/`skill.unload` and `tool.search` (they change what the
+# next turn sees), and the task/memory stores (fast and local — concurrency buys
+# nothing and only adds risk).
+#
+# Both spellings are listed because this set is consulted with whichever
+# taxonomy is active: internal registry names, and the unified wire names the
+# model is served (`fs.read` -> `read`).
+_READ_ONLY_TOOLS = frozenset({
+    "fs.read", "fs.grep", "fs.glob", "fs.ls", "fs.diff",
+    "web.search", "web.fetch",
+    "read", "grep", "glob", "ls", "diff",
+    "web_search", "web_fetch",
+})
+
+
+def _can_batch_read_only(tool_calls: list, interrupted: bool) -> bool:
+    """Whether this turn's calls may all be dispatched together.
+
+    All three conditions are load-bearing. More than one call, because a batch
+    of one is just the sequential path with extra machinery. Not interrupted,
+    because starting work the user just cancelled is the wrong direction. And
+    EVERY call read-only, not merely the read-only ones among them: a turn that
+    also runs a shell command has to stay ordered, since the agent's shell is a
+    single persistent PTY and two commands on it interleave into one byte
+    stream.
+    """
+    return (
+        len(tool_calls) > 1
+        and not interrupted
+        and all(tc.get("name", "") in _READ_ONLY_TOOLS for tc in tool_calls)
+    )
+
+
+def _dispatch_read_only_batch(tool_calls: list, tool_ctx) -> list:
+    """Run an all-read-only turn concurrently, in call order.
+
+    Serial dispatch made a turn cost the SUM of its calls; three greps over a
+    large tree, or two web fetches, paid for each other. Only turns where every
+    call is read-only take this path, so a turn containing a shell command --
+    or any write -- stays strictly sequential and the PTY is never shared.
+
+    Results come back positionally, so the caller's loop keeps running its
+    hooks, policy checks, display and history in the original order. Only the
+    I/O moved.
+    """
+    registry = tools_mod.get_registry()
+
+    def _one(tc: dict) -> dict:
+        name = tc.get("name", "")
+        arguments = tc.get("arguments", {}) or {}
+        if not isinstance(arguments, dict):
+            # Same normalization the sequential path applies, so a malformed
+            # argument payload behaves identically on both routes.
+            arguments = {"value": arguments}
+        return registry.invoke(name, arguments, tool_ctx)
+
+    results: list = [None] * len(tool_calls)
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(len(tool_calls), 8),
+            thread_name_prefix="ro-batch") as pool:
+        futures = {pool.submit(_one, tc): i for i, tc in enumerate(tool_calls)}
+        for fut in concurrent.futures.as_completed(futures):
+            i = futures[fut]
+            try:
+                results[i] = fut.result()
+            except Exception as exc:
+                # `invoke` swallows tool exceptions itself; this only catches a
+                # failure of the executor machinery, and must still yield a
+                # result dict so the caller's loop is not left with a None.
+                results[i] = {"ok": False, "tool": tool_calls[i].get("name", ""),
+                              "error": f"parallel dispatch failed: {exc}"}
+    return results
 
 
 def _render_tool_catalog(state: dict, loop: int,
@@ -7369,6 +7681,19 @@ def run_agent_loop(
         _skill_catalog, _skill_highlight = _skill_catalog_parts(
             original_input, skill_catalog, session)
         _volatile_context = {
+            # The half of <environment> that changes WITHIN a session: a cd, a
+            # spawned child, a plan-mode toggle. Each of those edits the system
+            # prompt, which every provider caches and matches literally, so the
+            # first differing byte re-bills the whole request — system prompt,
+            # tool schemas and the entire conversation behind them. Measured at
+            # 8% of calls on this deployment, essentially all of them a cd.
+            # The stable half (OS, shell, terminal, depth, parent) stays in the
+            # cached prefix where it belongs.
+            "env": {
+                "cwd": state.get("cwd") or os.getcwd(),
+                "children": children_str,
+                "plan_mode": plan_mode.get_plan_prompt(),
+            },
             "inbox": inbox_str,
             "parallel_results": _format_parallel_results(inbox_msgs),
             "memory_highlight": "\n".join(filter(None, (
@@ -8532,9 +8857,13 @@ def run_agent_loop(
         if len(tool_calls) > MAX_TC_PER_TURN:
             _truncated_n = len(tool_calls)
             tool_calls = tool_calls[:MAX_TC_PER_TURN]
+            # Says what happened, not "batch less". The earlier wording told a
+            # model that had correctly issued a large independent batch to be
+            # "more selective", which is the opposite of the behaviour wanted —
+            # and it persists in short memory for the rest of the task.
             _append_short_memory(state, (
-                f"\n  {symbols.WARN} Emitted {_truncated_n} tool calls; only first {MAX_TC_PER_TURN} ran. "
-                f"Be more selective next turn."
+                f"\n  {symbols.WARN} Emitted {_truncated_n} tool calls; the first "
+                f"{MAX_TC_PER_TURN} ran and the rest were dropped. Re-issue the dropped ones."
             ))
 
         if (depth == 0 and tool_calls and not _snapshot_attempted
@@ -8627,6 +8956,14 @@ def run_agent_loop(
             _compact_read_hints.clear()
 
         if tool_calls:
+            # A turn whose calls are ALL read-only is dispatched together: its
+            # cost becomes the slowest call instead of the sum of them. One
+            # non-read-only call anywhere in the turn disqualifies the whole
+            # turn, which is what keeps the agent's single PTY unshared and
+            # every write ordered. Filled lazily below, once `tool_ctx` exists.
+            _ro_parallel = _can_batch_read_only(tool_calls, _interrupt.is_set())
+            _ro_batch = None
+
             for idx, tc in enumerate(tool_calls):
                 # ── Soft-interrupt check before each tool call ──
                 if _interrupt.is_set():
@@ -9064,9 +9401,15 @@ def run_agent_loop(
                             if _cap_err is not None:
                                 result = _cap_err
                             else:
-                                result = tools_mod.get_registry().invoke(
-                                    name, arguments, tool_ctx
-                                )
+                                if _ro_batch is None and _ro_parallel:
+                                    _ro_batch = _dispatch_read_only_batch(
+                                        tool_calls, tool_ctx)
+                                if _ro_batch is not None:
+                                    result = _ro_batch[idx]
+                                else:
+                                    result = tools_mod.get_registry().invoke(
+                                        name, arguments, tool_ctx
+                                    )
 
                         if (name in {"task.create", "task.update"}
                                 and result.get("ok")
@@ -10035,6 +10378,10 @@ def run_agent_loop(
     # must not carry them into its persisted state.
     state.pop("_active_tool", None)
     state.pop("_pending_history", None)
+
+    _close_failed_turn(chat_history, thread_messages if _thread_mode else None,
+                       _exit_reason, deps if events_cb is not None else None,
+                       state)
 
     if _thread_mode:
         # Carry the authoritative structured transcript into the next top-level

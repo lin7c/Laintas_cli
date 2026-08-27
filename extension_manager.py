@@ -205,11 +205,12 @@ def create_archive(source_dir: Path, output: Path) -> Path:
 
 
 def create_publication_archive(source_dir: Path, output: Path) -> Path:
-    """Pack source without local install provenance or transient files."""
+    """Pack source without local install provenance, CLI state, or transient files."""
     with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
         for file_path in sorted(source_dir.rglob("*")):
             if (not file_path.is_file() or file_path.is_symlink()
                     or "__pycache__" in file_path.parts
+                    or ".laintas" in file_path.parts
                     or file_path.suffix in {".pyc", ".pyo"}):
                 continue
             relative = file_path.relative_to(source_dir)

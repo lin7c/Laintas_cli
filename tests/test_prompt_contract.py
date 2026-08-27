@@ -41,10 +41,96 @@ class PromptContractTests(unittest.TestCase):
         self.assertNotIn("The session's full context", prompt)
         self.assertIn("observable result has been checked", prompt)
         self.assertIn("exact callable tool set", prompt)
-        self.assertIn("call `tool.search`", prompt)
+        # The prompt names tools in the WIRE taxonomy the model is served
+        # (`fs.read` -> `read`, `tool.search` -> `tool_search`); the dotted
+        # forms elsewhere in the tests are internal registry names.
+        self.assertIn("call `tool_search`", prompt)
+        self.assertNotIn("`tool.search`", prompt)
         self.assertNotIn("unknown will re-show catalog", prompt)
         self.assertNotIn("autonomous coding agent", prompt)
         self.assertTrue(prompt.isascii())
+
+    def test_the_prompt_names_the_native_tool_for_each_shell_habit(self):
+        """Abstract "prefer a native tool" produced 22 shell greps per native one.
+
+        The model has to be told which tool replaces which shell idiom; left to
+        infer the mapping it reached for the shell, which the prompt separately
+        licensed for "operating-system commands" -- and grep and cat are exactly
+        that.
+
+        What this locks in is the MAPPING, never a prohibition. The two were
+        conflated when this test was written and the distinction matters: the
+        22:1 ratio was measured while `read` was returning a shredded middle
+        under metadata claiming the whole file, so the shell was the better
+        instrument and the model was right to reach for it. A ban would have
+        forced the wrong tool AND destroyed the only signal that said so.
+        Naming the mapping is free and stays; the ban was removed 2026-08-27
+        once `read` returned contiguous windows again.
+        """
+        prompt = laintas_cli.generate_cli_prop_template()
+        for habit, native in (("`cat`", "`read`"), ("`find`", "`glob`")):
+            self.assertIn(habit, prompt)
+            self.assertIn(native, prompt)
+        self.assertNotIn("operating-system commands", prompt,
+                         "licensing shell for OS commands re-authorizes shell grep/cat")
+
+    def test_the_prompt_never_asks_for_fewer_tool_calls(self):
+        """Narrowing a call and making fewer calls are opposite instructions.
+
+        The old wording asked for "the smallest sufficient set of ... tools" in
+        the role and "the smallest relevant surface first" immediately before
+        the batching rule, so the two prominent statements both read as "call
+        fewer tools" and the single batching clause lost.
+        """
+        prompt = laintas_cli.generate_cli_prop_template()
+        self.assertNotIn("smallest sufficient set of context, tools", prompt)
+        self.assertNotIn("Inspect the smallest relevant surface first", prompt)
+        self.assertIn("Narrow the call, never the number of calls", prompt)
+
+    def test_the_system_prompt_does_not_move_when_the_session_does(self):
+        """The cached prefix must not carry anything that changes mid-session.
+
+        Providers match the prompt prefix literally, so one `cd` inside the
+        system prompt re-bills the whole request — prompt, tool schemas and the
+        entire conversation behind them. The working directory, spawned
+        children and plan mode all belong to the live-state tail instead.
+        """
+        template = laintas_cli.generate_cli_prop_template()
+        for placeholder in ("{{currentPath}}", "{{children}}", "{{planMode}}"):
+            self.assertNotIn(placeholder, template,
+                             f"{placeholder} changes within a session and must "
+                             f"not sit in the cached prefix")
+
+        def rendered(cwd, children, plan):
+            return (template
+                    .replace("{{currentPath}}", cwd)
+                    .replace("{{children}}", children)
+                    .replace("{{planMode}}", plan))
+
+        self.assertEqual(rendered("/a", "(none)", ""),
+                         rendered("/b/elsewhere", "child-1, child-2",
+                                  "[PLAN MODE ACTIVE]"))
+
+    def test_the_moved_environment_fields_still_reach_the_model(self):
+        """Dropping them from the prompt only helps if live state carries them."""
+        volatile = {"env": {"cwd": "/root/agent_gateway",
+                            "children": "child-1",
+                            "plan_mode": "[PLAN MODE ACTIVE]"}}
+        for thread_mode in (True, False):
+            message = agent_loop._build_user_message(
+                "task", {"cwd": "/root/agent_gateway"}, [], [], 1, 30,
+                thread_mode=thread_mode, first_turn=False, volatile=volatile)
+            self.assertIn("CWD: /root/agent_gateway", message)
+            self.assertIn("Children: child-1", message)
+            self.assertIn("[PLAN MODE ACTIVE]", message)
+            self.assertLess(message.index("<environment_now>"),
+                            message.index("<now>"))
+
+    def test_live_state_survives_a_volatile_payload_without_env(self):
+        message = agent_loop._build_user_message(
+            "task", {}, [], [], 1, 30, thread_mode=True, first_turn=True,
+            volatile={"inbox": ""})
+        self.assertNotIn("<environment_now>", message)
 
     def test_only_managed_v3_suppresses_the_legacy_gateway_guide(self):
         self.assertFalse(laintas_cli._should_inject_gateway_tool_guide(

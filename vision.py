@@ -328,7 +328,7 @@ def image_to_text(path: str, *, session=None, post_json=None,
     if status == 503:
         raise VisionError(
             "no OCR model is available — add one in the admin page under "
-            "System -> API Keys (系统 → 密钥), or ask an administrator to "
+            "System -> API Keys, or ask an administrator to "
             "switch one back on")
     if status != 200:
         detail = ""

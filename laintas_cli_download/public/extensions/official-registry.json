@@ -16,6 +16,14 @@
       "description": "Deterministic code topology maps, exact dependency paths, semantic annotations, and terminal or browser exploration",
       "url": "https://cli.laintas.com/extensions/official/code-atlas-0.2.0.lext",
       "sha256": "80da9de17b5bb655c9c5d4497c1bff435620ff7697cda4f3d3ce1e2101850434"
+    },
+    {
+      "id": "laintas/swebench",
+      "name": "swebench",
+      "version": "1.0.0",
+      "description": "Generate SWE-bench predictions with laintas-cli; scoring stays with the official harness",
+      "url": "https://cli.laintas.com/extensions/official/swebench-1.0.0.lext",
+      "sha256": "29315187eb19a4a5a5f0a5863025dde23e7db76b038a414e1b68a7a863f386d3"
     }
   ]
 }

@@ -213,7 +213,7 @@ class ToText(unittest.TestCase):
         with self.assertRaises(vision.VisionError) as caught:
             vision.image_to_text(self.path,
                                  post_json=lambda r, b: (503, {"detail": "x"}))
-        self.assertIn("密钥", str(caught.exception))
+        self.assertIn("System -> API Keys", str(caught.exception))
 
     def test_an_empty_transcription_points_at_describe(self):
         """A photograph has nothing to transcribe, and saying only 'no text'

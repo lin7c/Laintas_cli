@@ -334,6 +334,24 @@ def _validate_params(params: dict, schema: dict) -> Optional[str]:
 
 # ── Registry ───────────────────────────────────────────────────────────
 
+def _rewrite_tool_refs(text: str, wire_of: dict) -> str:
+    """Rename tool references inside prose to the names being emitted.
+
+    Longest names first so `fs.multi_edit` is not clipped by `fs.multi`. The
+    boundaries reject partial hits — `fs.read` must not match inside
+    `xfs.read` or `fs.readlink` — while still matching a name that ends a
+    sentence, where the next character is a period ("prefer it over fs.write.").
+    """
+    if not text or not wire_of:
+        return text
+    for internal in sorted(wire_of, key=len, reverse=True):
+        wire = wire_of[internal]
+        if wire == internal:
+            continue
+        text = re.sub(rf"(?<![\w.]){re.escape(internal)}(?!\w)(?!\.\w)", wire, text)
+    return text
+
+
 class ToolRegistry:
     def __init__(self):
         self._tools: dict[str, Tool] = {}
@@ -567,9 +585,11 @@ class ToolRegistry:
         tools: list[dict] = []
         name_map: dict[str, str] = {}
         used: set[str] = set()
+        # Pass 1 runs over the WHOLE registry, not just the authorized subset,
+        # so a description may reference a tool that is filtered out of this
+        # request and still name it in the taxonomy actually in force.
+        wire_of: dict[str, str] = {}
         for t in self.list():
-            if allowed_names is not None and t.name not in allowed_names:
-                continue
             wire = None
             if _canon is not None:
                 wire = _canon.canonical(t.name, "laintas_cli")
@@ -583,11 +603,24 @@ class ToolRegistry:
                     i += 1
                 wire = f"{wire}_{i}"
             used.add(wire)
+            wire_of[t.name] = wire
+
+        for t in self.list():
+            if allowed_names is not None and t.name not in allowed_names:
+                continue
+            wire = wire_of[t.name]
             name_map[wire] = t.name
             params = t.schema if isinstance(t.schema, dict) and t.schema else {
                 "type": "object", "properties": {},
             }
-            desc = (t.description or "").strip()
+            # Descriptions cross-reference each other ("prefer this over
+            # fs.write"). Emitting that prose unrewritten next to a tool the
+            # model sees as `write` names a function that is not in its schema
+            # list, and the safe reading of a name it cannot call is to fall
+            # back to `shell`. Rewrite references through the same map that
+            # produced the wire names, so prose and schema always agree in
+            # whichever taxonomy is active.
+            desc = _rewrite_tool_refs((t.description or "").strip(), wire_of)
             if len(desc) > 1024:
                 desc = desc[:1021] + "..."
             tools.append({
@@ -827,6 +860,13 @@ def _bi_skill_unload(params: dict, ctx: ToolCtx) -> dict:
     }
 
 
+#: Counting a file's lines means walking it to EOF. That is free for source
+#: files and not free for a multi-gigabyte log, so past this size fs.read
+#: reports the window it read and leaves total_lines unknown rather than
+#: paying a full scan the caller did not ask for.
+_COUNT_LINES_MAX_BYTES = 64 * 1024 * 1024
+
+
 def _bi_fs_read(params: dict, ctx: ToolCtx) -> dict:
     """Read a file as UTF-8 with optional line range and cat-style numbering.
 
@@ -852,26 +892,52 @@ def _bi_fs_read(params: dict, ctx: ToolCtx) -> dict:
     max_bytes = int(params.get("max_bytes", 200_000) or 200_000)
     line_numbers = bool(params.get("line_numbers", True))
 
+    # Walk the file by LINES, never by a byte prefix. Slicing a prefix looks
+    # equivalent and is not: on a file larger than max_bytes every offset past
+    # the prefix selects nothing, so the call returns an empty body plus a
+    # total_lines taken from the prefix — which reads as "your offset is out of
+    # range" and sends the caller hunting for a line number that was never the
+    # problem. Verified 2026-08-26 on laintas_cli.py (23,474 lines, ~1MB): the
+    # 200KB prefix ends at line 4,721 and every read past it came back blank.
+    selected: list[str] = []
+    used = 0
+    byte_truncated = False
+    total_lines = 0
+    end_line = offset + limit - 1
     try:
+        size = os.path.getsize(abs_path)
         with open(abs_path, "rb") as f:
-            raw = f.read(max_bytes + 1)
+            for lineno, raw_line in enumerate(f, 1):
+                total_lines = lineno
+                if lineno < offset or lineno > end_line or byte_truncated:
+                    # Past the window we keep going only to count lines, and
+                    # only while counting is cheap — see _COUNT_LINES_MAX_BYTES.
+                    if lineno > end_line and size > _COUNT_LINES_MAX_BYTES:
+                        total_lines = 0
+                        break
+                    continue
+                chunk = raw_line.rstrip(b"\n").rstrip(b"\r")
+                if used + len(chunk) + 1 > max_bytes:
+                    byte_truncated = True
+                    continue
+                used += len(chunk) + 1
+                selected.append(chunk.decode("utf-8", errors="replace"))
     except OSError as e:
         return {"ok": False, "error": str(e)}
 
-    byte_truncated = len(raw) > max_bytes
-    text = raw[:max_bytes].decode("utf-8", errors="replace")
-    all_lines = text.split("\n")
-    total_lines = len(all_lines)
+    # An offset past EOF is a caller mistake worth naming. Returning ok with an
+    # empty body is what let a broken read masquerade as a bad line number.
+    if not selected and total_lines and offset > total_lines:
+        return {"ok": False,
+                "error": f"offset {offset} is past end of file "
+                         f"({total_lines} lines)",
+                "path": abs_path, "total_lines": total_lines}
 
-    start_idx = offset - 1
-    end_idx = min(start_idx + limit, total_lines)
-    selected = all_lines[start_idx:end_idx]
-
-    line_truncated = end_idx < total_lines
+    line_truncated = bool(total_lines) and (offset + len(selected) - 1) < total_lines
     if line_numbers:
-        width = len(str(end_idx))
+        width = len(str(offset + max(0, len(selected) - 1)))
         body = "\n".join(
-            f"{(start_idx + i + 1):>{width}}→{ln}" for i, ln in enumerate(selected)
+            f"{(offset + i):>{width}}\u2192{ln}" for i, ln in enumerate(selected)
         )
     else:
         body = "\n".join(selected)
@@ -885,7 +951,7 @@ def _bi_fs_read(params: dict, ctx: ToolCtx) -> dict:
         "path": abs_path,
         "offset": offset,
         "lines_returned": len(selected),
-        "total_lines": total_lines,
+        "total_lines": total_lines or None,
         "truncated": byte_truncated or line_truncated,
         "byte_truncated": byte_truncated,
     }
@@ -2018,6 +2084,50 @@ def _bi_fs_diff(params: dict, ctx: ToolCtx) -> dict:
             "changed": bool(body), "a": a_abs}
 
 
+# Directories and files that a content search is never actually looking for.
+# Stored as (glob, path-segment) pairs: the glob does the filtering, and the
+# segment lets an explicit search INTO one of these switch that entry off — see
+# `_fs_active_excludes` — so a deliberate path="venv/x" still returns matches.
+_FS_DEFAULT_EXCLUDES: tuple[tuple[str, str], ...] = (
+    ("**/.git/**", ".git"),
+    ("**/node_modules/**", "node_modules"),
+    ("**/__pycache__/**", "__pycache__"),
+    ("**/.venv/**", ".venv"),
+    ("**/venv/**", "venv"),
+    # A virtualenv living under some other name (agent_gateway keeps one in
+    # `helpwo/`). Vendored third-party source is the single largest source of
+    # false hits, and it is what pushed the real answer out of a truncated
+    # grep result during a live investigation.
+    ("**/site-packages/**", "site-packages"),
+    # This CLI's own sub-agent checkouts: dozens of full copies of the repo
+    # under one root, so every unfiltered recursive search returns each hit
+    # multiplied by the number of live worktrees.
+    ("**/.laintas/worktrees/**", ".laintas/worktrees"),
+    (".laintas/worktrees/**", ".laintas/worktrees"),
+    ("**/.mypy_cache/**", ".mypy_cache"),
+    ("**/.pytest_cache/**", ".pytest_cache"),
+    ("**/*.pyc", ""),
+    ("**/.DS_Store", ""),
+    ("**/*.min.js", ""),
+    ("**/*.min.css", ""),
+    ("**/dist/**", "dist"),
+    ("**/build/**", "build"),
+)
+
+
+def _fs_active_excludes(search_root: str) -> list[str]:
+    """The default exclude globs, minus any the caller has searched INTO.
+
+    Skipping `venv` by default is right for a repo-wide search and wrong for
+    `path="venv/somepkg"`, where the caller has said exactly where to look. An
+    explicit path is an explicit intent, so an entry whose directory is on the
+    search root's own path is dropped rather than silently returning nothing.
+    """
+    root = search_root.replace(os.sep, "/").rstrip("/") + "/"
+    return [pat for pat, seg in _FS_DEFAULT_EXCLUDES
+            if not (seg and f"/{seg}/" in root)]
+
+
 def _bi_fs_grep(params: dict, ctx: ToolCtx) -> dict:
     """Search for a regex pattern in files under a directory.
 
@@ -2051,10 +2161,8 @@ def _bi_fs_grep(params: dict, ctx: ToolCtx) -> dict:
         return {"ok": False, "error": f"Path not found: {abs_path}"}
 
     # Exclude common directories
-    default_excludes = ["**/.git/**", "**/node_modules/**", "**/__pycache__/**",
-                        "**/.venv/**", "**/venv/**", "**/*.pyc", "**/.DS_Store",
-                        "**/*.min.js", "**/*.min.css", "**/dist/**", "**/build/**"]
-    exclude_patterns = [e for e in exclude.split(",") if e.strip()] + default_excludes
+    exclude_patterns = ([e for e in exclude.split(",") if e.strip()]
+                        + _fs_active_excludes(abs_path))
 
     results = []
     files_scanned = 0
@@ -2133,6 +2241,7 @@ def _bi_fs_glob(params: dict, ctx: ToolCtx) -> dict:
     Returns matching file/directory paths with type and size.
     """
     import glob as glob_mod
+    import fnmatch
 
     patterns = params.get("pattern", "**/*")
     base_path = params.get("path", ".")
@@ -2146,6 +2255,11 @@ def _bi_fs_glob(params: dict, ctx: ToolCtx) -> dict:
     abs_base = os.path.abspath(os.path.join(ctx.cwd or os.getcwd(), base_path)) \
         if not os.path.isabs(base_path) else base_path
 
+    # Same skip list as `fs.grep`: without it a single `**/*` under a repo
+    # that holds sub-agent worktrees fills the entire result budget with
+    # copies before reaching anything the caller meant to find.
+    exclude_patterns = _fs_active_excludes(abs_base)
+
     results = []
     truncated = False
 
@@ -2158,6 +2272,8 @@ def _bi_fs_glob(params: dict, ctx: ToolCtx) -> dict:
             if len(results) >= max_results:
                 truncated = True
                 break
+            if any(fnmatch.fnmatch(f, exc) for exc in exclude_patterns):
+                continue
             try:
                 rel = os.path.relpath(f, ctx.cwd or os.getcwd())
             except ValueError:
