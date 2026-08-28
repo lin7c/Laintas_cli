@@ -1003,6 +1003,40 @@ class SessionStoreTests(unittest.TestCase):
 
 
 class RemoteAgentIdentityTests(unittest.TestCase):
+    def test_foreground_runtime_error_is_recoverable_and_does_not_exit_cli(self):
+        agent_loop.close_all_agents()
+        primary = agent_loop.register_agent(
+            name="primary", depth=0, role="primary")
+        agent_loop.set_current_agent_id(primary.id)
+        history = [{"role": "user", "content": "do the task"}]
+        deps, _calls = _deps([{
+            "reply": "unused", "tool_calls": [], "done": True,
+            "error": False,
+        }])
+        try:
+            with mock.patch.object(
+                    laintas_cli, "run_agent_loop",
+                    side_effect=RuntimeError("render exploded")), \
+                    mock.patch.object(laintas_cli, "_start_bg_input_reader"), \
+                    mock.patch.object(laintas_cli, "_stop_bg_input_reader"), \
+                    mock.patch.object(laintas_cli.event_log, "append"):
+                result = laintas_cli._run_agent_loop_with_interrupt(
+                    deps, "do the task", {}, primary.state, history,
+                    events_cb=lambda _events: None)
+
+            self.assertFalse(result["success"])
+            self.assertEqual(
+                result["exit_reason"], agent_loop.TRANSITION_RUNTIME_ERROR)
+            self.assertIn("render exploded", result["error"])
+            self.assertEqual(history[-1].get("message_kind"), "turn_failed")
+            self.assertTrue(session_store.is_continuable_reason(
+                result["exit_reason"]))
+            admitted, _detail = agent_loop.begin_primary_run(primary.id)
+            self.assertTrue(admitted, "runtime error must release primary lease")
+            agent_loop.finish_primary_run(primary.id)
+        finally:
+            agent_loop.close_all_agents()
+
     def test_foreground_wrapper_queues_into_existing_primary_run(self):
         agent_loop.close_all_agents()
         primary = agent_loop.register_agent(

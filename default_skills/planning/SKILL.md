@@ -2,6 +2,16 @@
 name: planning
 description: Read and maintain durable plan files for multi-phase work.
 version: 1.0.0
+triggers:
+  - plan
+  - roadmap
+  - milestone
+  - phases
+  - break this down
+  - before implementing
+  - design first
+  - approach
+  - strategy
 ---
 
 # Planning

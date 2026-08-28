@@ -15,6 +15,18 @@ Resolution policy (documented, deterministic):
     the attribute name matches exactly one indexed class/function, preferring
     the same module; everything else is counted as external.
   - typing.overload stubs are skipped (they are type stubs, not definitions).
+
+Tree policy (documented, deterministic):
+  - packages are the root's subdirectories that hold .py files, plus the root
+    itself scanned non-recursively, so a flat repo's top-level application is
+    on the map and packages below it are still indexed exactly once.
+  - hidden directories and SKIP_DIRS are excluded everywhere: `.laintas/
+    worktrees/` holds whole copies of the repo being indexed, and a copy is
+    not a second module.
+  - a path that cannot be imported as a module (a dot or dash in a component)
+    gets a digest-suffixed id, so it can never collide with a package path.
+  - a symbol defined twice in one scope (a property and its setter) is one
+    node -- the first in source order -- and the rest become notes.
 """
 from __future__ import annotations
 
@@ -26,7 +38,46 @@ from pathlib import Path
 
 from .graph import Graph, Node
 
-SKIP_DIRS = {"__pycache__", "node_modules", ".git", ".venv", "venv", "build", "dist"}
+SKIP_DIRS = {"__pycache__", "node_modules", ".git", ".venv", "venv",
+             "build", "dist", "site-packages"}
+
+
+ROOT_DIR_ID = "dir:."
+
+
+def mod_id_for(rel: Path) -> str:
+    """Module node id for a repo-relative path. The one implementation.
+
+    The verifier checks that every indexed file has a module node, so it has
+    to derive ids by exactly this rule; deriving it twice is how a hash
+    contract drifts.
+    """
+    parts = rel.with_suffix("").parts
+    mid = "mod:" + ".".join(parts)
+    if all(part.isidentifier() for part in parts):
+        return mid          # importable: the dotted id *is* the import path
+    # Not importable as a module (a dot or a dash in a path component), so its
+    # dotted form can collide with a real package path -- `a.b.py` and `a/b.py`
+    # both flattened to `mod:a.b`. Disambiguate by path digest; no dotted
+    # import string can produce an id containing "#", so _resolve_absolute
+    # correctly never resolves onto one of these.
+    return mid + "#" + hashlib.sha256(str(rel).encode()).hexdigest()[:8]
+
+
+def file_hash(p: Path) -> str:
+    """Content hash of one source file. The one implementation."""
+    return hashlib.sha256(p.read_bytes()).hexdigest()[:16]
+
+
+def _skip_dir(name: str) -> bool:
+    """Directories that never carry indexable first-party source.
+
+    Hidden directories are skipped as a class rather than by name: `.git` and
+    `.venv` were already listed individually, and `.laintas/worktrees/` holds
+    whole copies of the repository being indexed -- which is how the same
+    module reached the graph twice and tripped the duplicate-id assertion.
+    """
+    return name in SKIP_DIRS or name.startswith(".")
 
 
 class Indexer:
@@ -37,18 +88,26 @@ class Indexer:
         self.stats: Counter = Counter()
         self._py_files: list[tuple[Path, Path]] = []   # (rel, abs)
         self._trees: dict[Path, ast.Module] = {}       # rel -> parsed tree
+        self._pkgs: list[tuple[Path, tuple[str, ...], str, bool]] | None = None
+        self._by_name: dict[str, list[str]] = {}   # short name -> node ids
 
     # ---- public API ----
 
     def run(self) -> Graph:
         pkgs = self._find_packages()
+        # The graph has exactly one root. Top-level modules of a flat repo have
+        # nowhere else to hang, and the verifier requires every non-dir node's
+        # parent chain to end at a dir.
+        self.graph.add_node(Node(ROOT_DIR_ID, "dir", self.root.name, None,
+                                 None, None))
         # phase 0: skeleton (order-independent)
-        for pkg_dir, chain, pkg_name in pkgs:
-            self._skeleton(pkg_dir, chain, pkg_name)
+        for pkg_dir, chain, pkg_name, recursive in pkgs:
+            self._skeleton(pkg_dir, chain, pkg_name, recursive)
         # phase 1: declarations
         for rel, path in self._py_files:
             self._declare(rel, path)
         # phase 2: references (all symbols known)
+        self._index_names()
         for rel, path in self._py_files:
             self._references(rel)
         self.graph.stats = dict(self.stats)
@@ -56,54 +115,103 @@ class Indexer:
 
     # ---- phase 0 ----
 
-    def _find_packages(self) -> list[tuple[Path, tuple[str, ...], str]]:
+    def _find_packages(self) -> list[tuple[Path, tuple[str, ...], str, bool]]:
+        """(dir, package chain, package name, index recursively).
+
+        Memoised: phase 2 resolves every absolute import against this list, so
+        recomputing it per import statement meant one directory scan per import.
+        """
+        if self._pkgs is not None:
+            return self._pkgs
         if self.package_hint:
             pkg_dir = self.root / self.package_hint
             if not pkg_dir.is_dir():
                 raise FileNotFoundError(f"package dir not found: {pkg_dir}")
             chain = tuple(pkg_dir.relative_to(self.root).parts)
-            return [(pkg_dir, chain, pkg_dir.name)]
+            self._pkgs = [(pkg_dir, chain, pkg_dir.name, True)]
+            return self._pkgs
         out = []
         for child in sorted(self.root.iterdir()):
-            if child.is_dir() and child.name not in SKIP_DIRS:
+            if child.is_dir() and not _skip_dir(child.name):
                 if any(py.is_file() for py in child.glob("*.py")):
-                    out.append((child, (child.name,), child.name))
+                    out.append((child, (child.name,), child.name, True))
+        # A flat repository keeps its application at the top level; indexing
+        # only subdirectories left every top-level module off the map. The root
+        # is indexed non-recursively, so packages below it are still indexed
+        # exactly once by their own entry above.
+        if any(p.is_file() for p in self.root.glob("*.py")):
+            out.append((self.root, (), self.root.name, False))
+        self._pkgs = out
         return out
 
     def _skeleton(self, pkg_dir: Path, chain: tuple[str, ...],
-                  pkg_name: str) -> None:
+                  pkg_name: str, recursive: bool = True) -> None:
+        files = self._py_sources(pkg_dir, recursive)
         # dir node for the package root and every subdir containing py files
-        dirs: set[Path] = set()
-        for p in pkg_dir.rglob("*.py"):
-            if "__pycache__" in p.parts or p.name.startswith("."):
-                continue
-            dirs.add(p.parent)
-        for d in sorted(dirs):
+        for d in sorted({p.parent for p in files}):
+            if d == self.root:
+                continue        # already added as ROOT_DIR_ID
             rel = d.relative_to(self.root)
             nid = "dir:" + str(rel)
             if nid not in self.graph.nodes:
                 parent = self._dir_parent(rel)
                 self.graph.add_node(Node(nid, "dir", d.name, parent,
                                          None, None))
-        for p in sorted(pkg_dir.rglob("*.py")):
-            if "__pycache__" in p.parts or p.name.startswith("."):
-                continue
+        for p in files:
             rel = p.relative_to(self.root)
             mod_id = self._mod_id(rel)
-            parent = "dir:" + str(rel.parent)
+            if mod_id in self.graph.nodes:
+                # Deterministic first-wins: `files` is sorted, so the same tree
+                # always keeps the same file. Recorded rather than asserted --
+                # a colliding path is a fact about the tree, not a bug here.
+                self.stats["duplicate_modules"] += 1
+                self.graph.notes.append(
+                    f"duplicate-module-id {rel} collides with "
+                    f"{self.graph.nodes[mod_id].file}")
+                continue
+            parent = (ROOT_DIR_ID if rel.parent == Path(".")
+                      else "dir:" + str(rel.parent))
             self.graph.add_node(Node(mod_id, "module", p.stem, parent,
                                      str(rel), 1, "", not p.stem.startswith("_")))
             self.graph.files[str(rel)] = self._file_hash(p)
             self._py_files.append((rel, p))
 
+    def source_files(self) -> list[tuple[Path, Path]]:
+        """(rel, abs) for every file this indexer would index -- without parsing.
+
+        The staleness check has to compare against exactly the set the index
+        covers. Deriving that set a second time is how two implementations of
+        one rule drift apart, so it is derived here, from the same two calls
+        the skeleton phase makes.
+        """
+        seen: dict[str, tuple[Path, Path]] = {}
+        for pkg_dir, _chain, _name, recursive in self._find_packages():
+            for p in self._py_sources(pkg_dir, recursive):
+                rel = p.relative_to(self.root)
+                seen.setdefault(mod_id_for(rel), (rel, p))
+        return sorted(seen.values())
+
+    def _py_sources(self, pkg_dir: Path, recursive: bool) -> list[Path]:
+        """Indexable .py files under pkg_dir, sorted (order-independent input)."""
+        it = pkg_dir.rglob("*.py") if recursive else pkg_dir.glob("*.py")
+        out = []
+        for p in it:
+            if p.name.startswith(".") or not p.is_file():
+                continue
+            if any(_skip_dir(part) for part in p.relative_to(pkg_dir).parts[:-1]):
+                continue
+            out.append(p)
+        return sorted(out)
+
     def _dir_parent(self, rel: Path) -> str | None:
-        return "dir:" + str(rel.parent) if rel.parent != Path(".") else None
+        return ("dir:" + str(rel.parent) if rel.parent != Path(".")
+                else ROOT_DIR_ID)
 
     def _mod_id(self, rel: Path) -> str:
-        return "mod:" + ".".join(rel.with_suffix("").parts)
+        return mod_id_for(rel)
 
     def _file_hash(self, p: Path) -> str:
-        return hashlib.sha256(p.read_bytes()).hexdigest()[:16]
+        return file_hash(p)
 
     # ---- phase 1 ----
 
@@ -134,9 +242,11 @@ class Indexer:
     def _declare_class(self, stmt: ast.ClassDef, mod_id: str, rel: Path) -> None:
         cid = self._member_id(mod_id, None, stmt.name)
         doc = ast.get_docstring(stmt, clean=True) or ""
-        self.graph.add_node(Node(cid, "class", stmt.name, mod_id, str(rel),
-                                 stmt.lineno, doc.split("\n")[0] if doc else "",
-                                 not stmt.name.startswith("_")))
+        if not self._add_member(Node(cid, "class", stmt.name, mod_id, str(rel),
+                                     stmt.lineno,
+                                     doc.split("\n")[0] if doc else "",
+                                     not stmt.name.startswith("_"))):
+            return
         if doc:
             self.graph.glossary.append({
                 "term": f"{mod_id.split(':')[-1]}.{stmt.name}",
@@ -153,10 +263,11 @@ class Indexer:
                               else None, stmt.name)
         doc = ast.get_docstring(stmt, clean=True) or ""
         public = not stmt.name.startswith("_")
-        self.graph.add_node(Node(fid, "function", stmt.name, parent_id or mod_id,
-                                 str(rel), stmt.lineno,
-                                 doc.split("\n")[0] if doc else "",
-                                 public))
+        if not self._add_member(Node(fid, "function", stmt.name,
+                                     parent_id or mod_id, str(rel), stmt.lineno,
+                                     doc.split("\n")[0] if doc else "",
+                                     public)):
+            return
         # A documented public module-level function is a term: `click.echo` is
         # the first thing anyone learns about click, and leaving functions out
         # of the glossary made the most citable symbols in a library the ones
@@ -168,6 +279,23 @@ class Indexer:
                 "source": f"{rel}:{stmt.lineno}"})
 
     # ---- phase 2 ----
+
+    def _index_names(self) -> None:
+        """Short name -> class/function ids, in node insertion order.
+
+        Attribute-call and base-class resolution used to scan every node for
+        every name, which is quadratic: on a 5.5k-node tree that scan was the
+        whole run time. Phase 1 adds every class and function before phase 2
+        starts and phase 2 adds only edges, so one snapshot taken here is
+        exactly the list the old scan produced -- same members, same order.
+        """
+        self._by_name = {}
+        for n in self.graph.nodes.values():
+            if n.kind in ("class", "function"):
+                self._by_name.setdefault(n.name, []).append(n.id)
+
+    def _named(self, name: str) -> list[str]:
+        return self._by_name.get(name, [])
 
     def _references(self, rel: Path) -> None:
         tree = self._trees.get(rel)
@@ -239,7 +367,7 @@ class Indexer:
         if direct in nodes:
             return direct
         # map package-local absolute imports (<pkg>.<mod>) onto the indexed tree
-        for pkg_dir, chain, pkg_name in self._find_packages():
+        for pkg_dir, chain, pkg_name, _rec in self._find_packages():
             parts = dotted.split(".")
             if parts[0] == pkg_name and len(parts) > 1:
                 cand = "mod:" + ".".join(chain + tuple(parts[1:]))
@@ -265,9 +393,7 @@ class Indexer:
             name = self._base_name(base)
             if not name:
                 continue
-            matches = [n.id for n in self.graph.nodes.values()
-                       if n.kind in ("class", "function")
-                       and n.id.endswith("." + name)]
+            matches = self._named(name)
             if not matches:
                 self.stats["external_imports"] += 1  # stdlib/external base
                 continue
@@ -335,9 +461,7 @@ class Indexer:
         if name.startswith("__"):
             self.stats["external_calls"] += 1
             return
-        matches = [n.id for n in self.graph.nodes.values()
-                   if n.kind in ("class", "function")
-                   and n.id.endswith("." + name)]
+        matches = self._named(name)
         if not matches:
             self.stats["external_calls"] += 1
             return
@@ -363,6 +487,24 @@ class Indexer:
             if isinstance(d, ast.Attribute) and d.attr == "overload":
                 return True
         return False
+
+    def _add_member(self, node: Node) -> bool:
+        """Add a class/function node, or record a redefinition and decline.
+
+        A property and its setter are two `def cursor_position` statements for
+        one attribute; conditional definitions do the same. From a caller's
+        side there is one symbol, so the map keeps one node -- the first in
+        source order, which is deterministic -- and records the rest.
+        """
+        seen = self.graph.nodes.get(node.id)
+        if seen is not None:
+            self.stats["redefinitions"] += 1
+            self.graph.notes.append(
+                f"redefinition {node.file}:{node.line} {node.id} "
+                f"(first defined at line {seen.line})")
+            return False
+        self.graph.add_node(node)
+        return True
 
     def _member_id(self, mod_id: str, class_name: str | None, name: str) -> str:
         if class_name:

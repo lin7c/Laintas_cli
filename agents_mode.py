@@ -956,6 +956,7 @@ class AgentsModeController:
         if console is None:
             console = Console(file=_NullWriter(), force_terminal=False,
                               width=self._console_width)
+            console.render_terminal = False
             self._agent_consoles[agent_id] = console
         return console
 

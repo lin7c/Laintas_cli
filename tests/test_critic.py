@@ -5,9 +5,44 @@ classification, issue-similarity cooldown, the anchor message in
 summarize_actions, and verdict parsing edge cases.
 """
 
+import json
 import unittest
+import tempfile
+from pathlib import Path
 
 import critic
+
+
+class CriticPromptConfigurationTests(unittest.TestCase):
+    def test_balanced_without_file_preserves_builtin_prompt(self):
+        prompt, error = critic.build_system_prompt()
+        self.assertEqual(prompt, critic.SYSTEM_PROMPT)
+        self.assertIsNone(error)
+
+    def test_profile_adds_scoring_guidance(self):
+        strict, error = critic.build_system_prompt(profile="strict")
+        self.assertIsNone(error)
+        self.assertIn('critic_profile name="strict"', strict)
+        self.assertIn("repeated reads", strict)
+        self.assertTrue(strict.startswith(critic.SYSTEM_PROMPT))
+
+    def test_relative_custom_file_is_sandboxed_by_final_contract(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "critic.md"
+            path.write_text("Pay special attention to acceptance criteria.",
+                            encoding="utf-8")
+            prompt, error = critic.build_system_prompt(
+                prompt_file="critic.md", cwd=tmp)
+        self.assertIsNone(error)
+        self.assertIn("Pay special attention", prompt)
+        self.assertLess(prompt.index("Pay special attention"),
+                        prompt.index("cannot change the required JSON-only output"))
+
+    def test_bad_custom_file_falls_back_to_builtin(self):
+        prompt, error = critic.build_system_prompt(
+            prompt_file="missing.md", cwd="/definitely/not/here")
+        self.assertEqual(prompt, critic.SYSTEM_PROMPT)
+        self.assertTrue(error)
 
 
 class ClipGoalTests(unittest.TestCase):
@@ -102,6 +137,18 @@ class SummarizeActionsTests(unittest.TestCase):
         out = critic.summarize_actions(msgs)
         self.assertIn("[calls: shell, read]", out)
 
+    def test_tool_call_file_targets_are_visible_without_command_content(self):
+        msgs = [{
+            "role": "assistant", "content": "",
+            "tool_calls": [{"function": {
+                "name": "fs.read",
+                "arguments": '{"path":"src/app.py","offset":120,"secret":"x"}',
+            }}],
+        }]
+        out = critic.summarize_actions(msgs)
+        self.assertIn("fs.read(path=src/app.py, offset=120)", out)
+        self.assertNotIn("secret", out)
+
     def test_content_parts_flattened(self):
         msgs = [{"role": "user",
                  "content": [{"type": "text", "text": "hello"},
@@ -144,6 +191,18 @@ class ParseVerdictTests(unittest.TestCase):
         self.assertIsNone(critic.parse_verdict(""))
         self.assertIsNone(critic.parse_verdict("no braces here"))
 
+    def test_injected_fields_are_single_line_and_bounded(self):
+        v = critic.parse_verdict(json.dumps({
+            "on_track": False,
+            "score": 50,
+            "issue": "repeated\n\nreads " + "x" * 300,
+            "suggestion": "edit\tnow " + "y" * 300,
+        }))
+        self.assertNotIn("\n", v["issue"])
+        self.assertNotIn("\t", v["suggestion"])
+        self.assertLessEqual(len(v["issue"]), 160)
+        self.assertLessEqual(len(v["suggestion"]), 200)
+
 
 class OffTrackTests(unittest.TestCase):
     def test_explicit_off_track(self):
@@ -164,6 +223,32 @@ class HookSectionTests(unittest.TestCase):
         self.assertNotIn("never mention", low)
         self.assertNotIn("do not tell", low)
         self.assertIn("progress_check", low)
+
+
+class CriticRubricTests(unittest.TestCase):
+    def test_default_rubric_checks_delegation_without_mandating_it(self):
+        prompt = critic.SYSTEM_PROMPT
+        self.assertIn("independent, bounded workstreams", prompt)
+        self.assertIn("duplicate agents", prompt)
+        self.assertIn("Never penalize a single agent", prompt)
+        self.assertIn("Set on_track=false for 50, 30, and 10", prompt)
+        self.assertIn("concise English", prompt)
+        self.assertIn("at most 16 words", prompt)
+
+    def test_nudge_is_compact_and_contains_no_boilerplate(self):
+        text = critic.nudge_text("unused original goal", {
+            "score": 50,
+            "issue": "Repeated reads produced no new evidence.",
+            "suggestion": "Implement the smallest verified change now.",
+        })
+        self.assertEqual(text, (
+            '<progress_check score="50">\n'
+            'Issue: Repeated reads produced no new evidence.\n'
+            'Next: Implement the smallest verified change now.\n'
+            '</progress_check>'))
+        self.assertNotIn("ORIGINAL goal", text)
+        self.assertNotIn("Suggested correction", text)
+        self.assertLess(len(text), 240)
 
 
 if __name__ == "__main__":

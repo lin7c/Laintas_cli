@@ -28,6 +28,14 @@ class AgentRole:
     output_format: str = ""                 # structured output guidance
     confidence_threshold: int = 0           # 0-100, 0 = no filtering
     model: str = "inherit"                  # model hint
+    #: Contract every child of this role owes, whether or not the caller wrote
+    #: one (agent_contract). A role whose whole product is a judgement needs
+    #: this most: measured 2026-08-28, a reviewer child spent 47 tool calls,
+    #: 17 of them greps, on a file whose target range it had been given, and
+    #: nothing could tell afterwards whether its findings pointed at real
+    #: lines. Requiring citations that the runtime resolves against the files
+    #: makes "I reviewed it" checkable.
+    default_contract: Optional[dict] = None
 
 
 # ── Built-in Roles ──────────────────────────────────────────────────────
@@ -284,6 +292,26 @@ def _register_builtin_roles() -> None:
                 "tool.search",
             ],
             output_format="Entry points with file:line, execution flow, architecture layers, key files list",
+            #: An explorer's whole product is "here is where this happens", and
+            #: its own output_format already promises file:line. Unlike a
+            #: reviewer, it cannot honestly have nothing to point at: a trace
+            #: with no locations is not a trace. So the citations are required
+            #: unconditionally, and two of them, because a path has an entry
+            #: and a destination.
+            default_contract={
+                "outputs": [
+                    {"name": "explanation", "type": "string",
+                     "description": "how the feature works, tracing entry point "
+                                    "to effect, each step citing path:line"},
+                    {"name": "entry_point", "type": "string",
+                     "description": "path:line where this feature starts"},
+                ],
+                "acceptance": [
+                    {"kind": "min_length", "output": "explanation", "value": 200},
+                    {"kind": "line_ref", "output": "explanation", "value": 2},
+                    {"kind": "line_ref", "output": "entry_point", "value": 1},
+                ],
+            },
         ),
         AgentRole(
             name="architect",
@@ -310,6 +338,24 @@ def _register_builtin_roles() -> None:
             ],
             output_format="Confidence-scored issues (>=80 only), grouped by severity, with fix suggestions",
             confidence_threshold=80,
+            default_contract={
+                "outputs": [
+                    {"name": "findings", "type": "string",
+                     "description": "your review, each finding citing path:line"},
+                    {"name": "issue_count", "type": "number",
+                     "description": "how many issues you are reporting (0 is a "
+                                    "valid answer and needs no citation)"},
+                ],
+                "acceptance": [
+                    {"kind": "min_length", "output": "findings", "value": 120},
+                    # Conditional on purpose: a reviewer that correctly found
+                    # nothing owes no citation, and a gate it cannot satisfy
+                    # honestly is a gate that teaches it to invent findings.
+                    {"kind": "line_ref", "output": "findings",
+                     "value": "issue_count",
+                     "when": {"output": "issue_count", "nonzero": True}},
+                ],
+            },
         ),
         AgentRole(
             name="silent-failure-hunter",
@@ -322,6 +368,24 @@ def _register_builtin_roles() -> None:
             ],
             output_format="CRITICAL/HIGH/MEDIUM issues with location, hidden error types, fix examples",
             confidence_threshold=70,
+            default_contract={
+                "outputs": [
+                    {"name": "findings", "type": "string",
+                     "description": "each silent failure you found, citing path:line"},
+                    {"name": "issue_count", "type": "number",
+                     "description": "how many issues you are reporting (0 is a "
+                                    "valid answer and needs no citation)"},
+                ],
+                "acceptance": [
+                    {"kind": "min_length", "output": "findings", "value": 120},
+                    # Conditional on purpose: a reviewer that correctly found
+                    # nothing owes no citation, and a gate it cannot satisfy
+                    # honestly is a gate that teaches it to invent findings.
+                    {"kind": "line_ref", "output": "findings",
+                     "value": "issue_count",
+                     "when": {"output": "issue_count", "nonzero": True}},
+                ],
+            },
         ),
         AgentRole(
             name="simplifier",
@@ -347,6 +411,24 @@ def _register_builtin_roles() -> None:
             ],
             output_format="Coverage summary, critical gaps (rated 1-10), quality issues, positive observations",
             confidence_threshold=50,
+            default_contract={
+                "outputs": [
+                    {"name": "findings", "type": "string",
+                     "description": "the coverage gaps you found, citing path:line"},
+                    {"name": "issue_count", "type": "number",
+                     "description": "how many issues you are reporting (0 is a "
+                                    "valid answer and needs no citation)"},
+                ],
+                "acceptance": [
+                    {"kind": "min_length", "output": "findings", "value": 120},
+                    # Conditional on purpose: a reviewer that correctly found
+                    # nothing owes no citation, and a gate it cannot satisfy
+                    # honestly is a gate that teaches it to invent findings.
+                    {"kind": "line_ref", "output": "findings",
+                     "value": "issue_count",
+                     "when": {"output": "issue_count", "nonzero": True}},
+                ],
+            },
         ),
     ]
     for role in builtins:
@@ -392,12 +474,27 @@ def get_role_system_prompt(name: str) -> str:
     return "\n".join(parts)
 
 
+#: Tools the completion protocol needs. A role scope narrows what an agent may
+#: DO; it must never remove the agent's ability to say what it did. The reviewer
+#: role shipped without these while its prompt instructed it to call them, so
+#: review children ended on `provider_stop` instead of reporting — measured on
+#: the 2026-08-28 batch, where both surviving children exited that way.
+#: agent_loop._PROTOCOL_TOOLS enforces the same rule for workflow tool scopes;
+#: this is the role-filter half of it.
+PROTOCOL_TOOLS = frozenset({"task.complete", "agent_return",
+                            "agent.ask_parent"})
+
+
 def is_tool_allowed_for_role(tool_name: str, role_name: Optional[str]) -> bool:
     """Check if a tool is allowed for the given role.
 
     If role_name is None or the role has no whitelist, all tools are allowed.
+    The completion-protocol tools are always allowed: an agent that cannot
+    report is a hung agent, not a contained one.
     """
     if not role_name:
+        return True
+    if tool_name in PROTOCOL_TOOLS:
         return True
     role = get_role(role_name)
     if role is None or not role.allowed_tools:

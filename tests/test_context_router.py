@@ -19,6 +19,8 @@ class DynamicToolRoutingTests(unittest.TestCase):
             _tool("task.complete"), _tool("web.search"), _tool("web.fetch"),
             _tool("browser.open"), _tool("browser.screenshot"),
             _tool("canvas.draw"), _tool("fs.delete"),
+            _tool("agent.spawn"), _tool("agent.wait"), _tool("await_spawns"),
+            _tool("agent.hire"), _tool("agent.station"),
             _tool("special.lookup", source="skill:special"),
         ]
 
@@ -66,6 +68,29 @@ class DynamicToolRoutingTests(unittest.TestCase):
             visible = agent_loop._visible_tool_names_for_task(
                 "搜索网页", {}, authorized)
         self.assertEqual(visible, authorized)
+
+    def test_delegation_is_reachable_without_delegation_vocabulary(self):
+        """Users describe the work, not the mechanism.
+
+        Routing spawn behind the words "parallel"/"delegate"/"sub-task" meant a
+        plainly decomposable task advertised no way to delegate, while the
+        system prompt kept telling the model to delegate independent work.
+        """
+        for task in (
+            "fix all failing tests in this repo and update the docs",
+            "investigate the 502 in the gateway logs and fix it",
+            "refactor this module and write tests for it",
+            "review the auth code while I finish the migration",
+        ):
+            with self.subTest(task=task):
+                names = context_router.select_tool_names(task, self.tools)
+                self.assertIn("agent.spawn", names)
+                self.assertIn("agent.wait", names)
+        # Resident does not mean the whole agent surface is resident.
+        names = context_router.select_tool_names(
+            "fix all failing tests in this repo", self.tools)
+        self.assertNotIn("agent.hire", names)
+        self.assertNotIn("agent.station", names)
 
 
 if __name__ == "__main__":

@@ -741,6 +741,7 @@ def _child_deps(laintas_cli):
     try:
         deps.console = Console(file=_NullWriter(), force_terminal=False,
                                width=100)
+        deps.console.render_terminal = False
     except Exception:
         pass
     for renderer in ("display_command_output", "display_sub_terminal_preview",

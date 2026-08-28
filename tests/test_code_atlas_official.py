@@ -69,6 +69,91 @@ class CodeAtlasOfficialTests(unittest.TestCase):
             self.assertIn("viewer/index.html", names)
             self.assertFalse(any("__pycache__" in name for name in names))
 
+    def test_query_tools_are_registered_and_answer_from_the_vendored_core(self):
+        """The tools the code-reading skill sends the model to must exist.
+
+        The extension shipped for a while with only `atlas.lookup` while the
+        standalone repo had grown the four query tools, so a skill telling the
+        model to ask the index would have named tools with no schema.
+        """
+        spec = _load_extension_module().TOOL_SPEC
+        self.assertEqual(
+            {"atlas.lookup", "atlas.find", "atlas.outline", "atlas.neighbors",
+             "atlas.stale"},
+            set(spec))
+        registered = []
+
+        class _Ctx:
+            cwd = "."
+
+            def register_command(self, *a, **k):
+                pass
+
+            def register_tool(self, name, fn, schema):
+                registered.append(name)
+
+        _load_extension_module().setup(_Ctx())
+        self.assertEqual(set(spec), set(registered))
+
+    def test_vendored_core_answers_find_outline_and_stale(self):
+        # The published package must stay free of .pyc files, and this test
+        # imports the vendored core (which imports the indexer lazily, inside
+        # store.stale) -- so bytecode stays off for the whole test.
+        previous = sys.dont_write_bytecode
+        sys.dont_write_bytecode = True
+        self.addCleanup(setattr, sys, "dont_write_bytecode", previous)
+        module = _load_extension_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "sample"
+            package = source / "pkg"
+            package.mkdir(parents=True)
+            (package / "__init__.py").write_text("", encoding="utf-8")
+            (package / "module.py").write_text(
+                "def answer():\n    return 42\n", encoding="utf-8")
+            output = Path(tmp) / "atlas"
+            index = subprocess.run(
+                [sys.executable, str(EXTENSION / "atlas_cli.py"), "index",
+                 str(source), "--out", str(output)],
+                capture_output=True, text=True, check=False,
+                env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+            self.assertEqual(index.returncode, 0, index.stderr)
+            sys.path.insert(0, str(EXTENSION))
+            try:
+                from code_atlas_core import store
+            finally:
+                sys.path.remove(str(EXTENSION))
+            db = output / "graph.db"
+            found = store.find_symbol(db, "answer")
+            self.assertEqual("exact", found["match"])
+            self.assertEqual("pkg/module.py", found["matches"][0]["file"])
+            outline = store.outline(db, "pkg.module")
+            self.assertEqual(["answer"],
+                             [f["name"] for f in outline["functions"]])
+            # stale is the tool that keeps the other four honest.
+            self.assertFalse(store.stale(db, str(source))["stale"])
+            (package / "module.py").write_text(
+                "def answer():\n    return 43\n", encoding="utf-8")
+            self.assertTrue(store.stale(db, str(source))["stale"])
+        del module
+
+
+def _load_extension_module():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "code_atlas_extension_under_test", EXTENSION / "main.py")
+    module = importlib.util.module_from_spec(spec)
+    # Importing the extension must not leave a __pycache__ inside the package
+    # that gets published -- the sibling test asserts the package is clean.
+    previous = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.dont_write_bytecode = previous
+    return module
+
+
 
 if __name__ == "__main__":
     unittest.main()

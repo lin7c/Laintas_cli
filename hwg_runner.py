@@ -13,9 +13,11 @@ import re
 import subprocess
 import threading
 import time
+import concurrent.futures
 from pathlib import Path
 from typing import Optional
 
+import agent_contract
 import hwo_runner
 import workflow_state
 from hwg_adapter import HwgParseError, as_graph, parse as parse_hwg, validate as validate_hwg
@@ -216,17 +218,43 @@ def _declared_out_names(node: dict) -> list:
     return [p.get("name") for p in ((node.get("io") or {}).get("out") or []) if p.get("name")]
 
 
-def _output_contract_errors(node: dict, msg: str, raw: dict) -> list:
-    """A node that declares out(...) must actually return it. Staying silent is
-    a protocol error, not a PASS."""
+def _output_contract_errors(node: dict, msg: str, raw: dict,
+                            cwd: Optional[str] = None) -> list:
+    """A node that declares out(...) must actually return it, and return the
+    thing it declared.
+
+    Presence was checked here already; WHAT came back was not, so
+    `out(report: file)` passed with a path to a file that had never been
+    written — the one mistake HWO's own type guidance exists to prevent. The
+    checking is delegated to agent_contract so a declared output means the same
+    thing in a .hwg node and in an agent.spawn contract.
+    """
     declared = _declared_out_names(node)
     if not declared:
         return []
     errors = []
-    missing = [n for n in declared
-               if n not in _PROTOCOL_OUTPUTS and raw.get(n) in (None, "")]
-    if missing:
-        errors.append("missing declared output(s): " + ", ".join(missing))
+    # A misspelled type is not a smaller contract, it is no contract: `fil`
+    # degrades to `string`, and the file check the author was asking for never
+    # runs. Say so on the node that declared it rather than passing silently.
+    for bad in agent_contract.unknown_io_types(node.get("io")):
+        errors.append(f"unknown declared type in out({bad}) — it was treated as "
+                      f"a plain string, so no type check ran for it")
+    contract = agent_contract.from_io(node.get("io"),
+                                      protocol_outputs=_PROTOCOL_OUTPUTS)
+    if contract:
+        result = agent_contract.verify(contract, raw, cwd or str(Path.cwd()))
+        gaps = result.get("gaps") or []
+        # Keep the established HWG diagnostic stable while the type/value
+        # checks now come from agent_contract. Existing callers key off this
+        # aggregate phrase, and one message is clearer than N per-field misses.
+        required = {out["name"] for out in contract.get("outputs") or []
+                    if out.get("required")}
+        missing = [name for name in declared
+                   if name in required and raw.get(name) in (None, "")]
+        if missing:
+            errors.append("missing declared output(s): " + ", ".join(missing))
+        errors.extend(gap for gap in gaps
+                      if not gap.startswith("missing required output "))
     if "verdict" in declared and _explicit_verdict(msg, raw) is None:
         errors.append("declared out(verdict) but returned no verdict")
     return errors
@@ -238,7 +266,7 @@ def _contract_violation(node: dict, result: dict) -> Optional[dict]:
     msg = str(result.get("msg", ""))
     raw = _parse_structured_return(msg)
     raw.update(result.get("outputs") or {})
-    errors = _output_contract_errors(node, msg, raw)
+    errors = _output_contract_errors(node, msg, raw, cwd=result.get("cwd"))
     if not errors:
         return None
     return {
@@ -591,7 +619,7 @@ def run_hwg_file(path: str, deps, session: dict, parent_id: Optional[str] = None
 
     if resume_run:
         run = resume_run
-        current = node_by_id.get(run.get("currentNode"))
+        current = node_by_id.get(run.get("currentNode")) if run.get("currentNode") else None
     else:
         run = workflow_state.new_run("hwg", path, inputs or {})
         # Recorded so a resumed run resolves exists(...) paths against the same
@@ -607,96 +635,219 @@ def run_hwg_file(path: str, deps, session: dict, parent_id: Optional[str] = None
 
     outputs_text = []
     steps = run.get("stepCount", 0) if resume_run else 0
-    # Branches queued by a fan-out and joins still waiting for them. Both live on
-    # the run so a pause inside a branch can be resumed without losing the others.
-    pending = run.setdefault("pending", [])
+    # ── Ready queue ───────────────────────────────────────────────────────
+    # The executor is a scheduler, not a walker. One FIFO of nodes whose
+    # predecessors have delivered, drained until it is empty:
+    #
+    #   * fan-out stops being a special case — it enqueues N instead of 1;
+    #   * a join that is still waiting is simply not enqueued yet, so the
+    #     "park the branch and drain a side list" dance disappears;
+    #   * the queue IS the resume state, so a run that pauses mid-graph comes
+    #     back with exactly the work that was outstanding, in order.
+    #
+    # Runs checkpointed by the old walker carry `currentNode` + `pending`
+    # instead; seed the queue from them so an in-flight run survives the change.
     run.setdefault("joins", {})
-    while current:
-        if _join_blocks(current, run):
-            current = node_by_id.get(pending.pop(0)) if pending else None
+    ready = run.get("ready")
+    if not isinstance(ready, list):
+        ready = ([current["id"]] if current else []) + list(run.get("pending") or [])
+    run["ready"] = ready
+    run.pop("pending", None)
+
+    while ready:
+        # Drain one frontier, capped to the same six-worker budget used by HWO
+        # parallel blocks. Nodes added by routing below wait for the next
+        # frontier, so no node can race an upstream value it consumes.
+        batch = []
+        while ready and len(batch) < 6:
+            candidate_id = ready.pop(0)
+            candidate = node_by_id.get(candidate_id)
+            if candidate is None:
+                continue
+            if _join_blocks(candidate, run):
+                # Another branch is still out. The last arrival in this same
+                # frontier makes the join runnable exactly once.
+                continue
+            if candidate.get("manual"):
+                if batch:
+                    # Finish already-selected siblings first, then pause at a
+                    # deterministic frontier boundary. Nothing is launched
+                    # after a human interrupt has become ready.
+                    ready.insert(0, candidate_id)
+                    break
+                current = candidate
+                if steps + 1 > MAX_GRAPH_STEPS:
+                    run["status"] = "failed"
+                    workflow_state.checkpoint(
+                        run, "step_limit_exceeded", {"limit": MAX_GRAPH_STEPS})
+                    return {
+                        "ok": False,
+                        "msg": f"HWG run exceeded {MAX_GRAPH_STEPS} steps.",
+                        "runId": run["runId"],
+                    }
+                steps += 1
+                run["stepCount"] = steps
+                run["currentNode"] = current["id"]
+                run = workflow_state.checkpoint(
+                    run, "node_started", {"node": current["id"]})
+                _update_node_task(run, current["id"], "in_progress", 0)
+                run = _emit_run(run, "node_started", {
+                    "node": current["id"], "file": current["file"]}, events_cb)
+                interrupt = {
+                    "id": f"{run['runId']}:{current['id']}",
+                    "node": current["id"],
+                    "file": current["file"],
+                    "message": f"Manual node #{current['id']}# requires human action.",
+                    "resumeOptions": ["PASS", "FAIL", "custom verdict"],
+                }
+                run["status"] = "paused"
+                run["pendingInterrupt"] = interrupt
+                _update_node_task(
+                    run, current["id"], "blocked",
+                    notes="Manual node requires human action")
+                workflow_state.checkpoint(run, "interrupt", interrupt)
+                run = _emit_run(run, "workflow_paused", interrupt, events_cb)
+                return {
+                    "ok": False,
+                    "paused": True,
+                    "runId": run["runId"],
+                    "msg": (
+                        f"HWG run paused at manual node #{current['id']}# "
+                        f"({current['file']}).\nResume with: /hwg resume "
+                        f"{run['runId']} PASS"
+                    ),
+                }
+            batch.append(candidate)
+
+        if not batch:
             continue
-        if steps > MAX_GRAPH_STEPS:
+        if steps + len(batch) > MAX_GRAPH_STEPS:
             run["status"] = "failed"
-            workflow_state.checkpoint(run, "step_limit_exceeded", {"limit": MAX_GRAPH_STEPS})
-            return {"ok": False, "msg": f"HWG run exceeded {MAX_GRAPH_STEPS} steps.", "runId": run["runId"]}
-        steps += 1
-        run["stepCount"] = steps
-        run["currentNode"] = current["id"]
-        run = workflow_state.checkpoint(run, "node_started", {"node": current["id"]})
-        _update_node_task(run, current["id"], "in_progress", 0)
-        run = _emit_run(run, "node_started", {"node": current["id"], "file": current["file"]}, events_cb)
+            workflow_state.checkpoint(
+                run, "step_limit_exceeded", {"limit": MAX_GRAPH_STEPS})
+            return {"ok": False,
+                    "msg": f"HWG run exceeded {MAX_GRAPH_STEPS} steps.",
+                    "runId": run["runId"]}
 
-        if current.get("manual"):
-            interrupt = {
-                "id": f"{run['runId']}:{current['id']}",
-                "node": current["id"],
-                "file": current["file"],
-                "message": f"Manual node #{current['id']}# requires human action.",
-                "resumeOptions": ["PASS", "FAIL", "custom verdict"],
-            }
-            run["status"] = "paused"
-            run["pendingInterrupt"] = interrupt
-            _update_node_task(run, current["id"], "blocked", notes="Manual node requires human action")
-            workflow_state.checkpoint(run, "interrupt", interrupt)
-            run = _emit_run(run, "workflow_paused", interrupt, events_cb)
-            return {
+        # Inputs are captured before any peer in the frontier commits. This is
+        # both the dependency guarantee and what makes a run deterministic
+        # when faster branches finish in a different wall-clock order.
+        work = []
+        for current in batch:
+            steps += 1
+            run["stepCount"] = steps
+            run["currentNode"] = current["id"]
+            run = workflow_state.checkpoint(
+                run, "node_started", {"node": current["id"]})
+            _update_node_task(run, current["id"], "in_progress", 0)
+            run = _emit_run(run, "node_started", {
+                "node": current["id"], "file": current["file"]}, events_cb)
+            node_inputs = _build_node_inputs(
+                current, run.get("inputs") or {}, run.get("nodeOutputs") or {},
+                run.get("nodeOutputHistory"))
+            work.append((current, node_inputs))
+
+        results = [None] * len(work)
+
+        def _execute(index: int) -> None:
+            current, node_inputs = work[index]
+            try:
+                results[index] = _run_hwo_with_policy(
+                    current, deps, session, parent_id, node_inputs, events_cb)
+            except Exception as exc:
+                results[index] = {
+                    "ok": False,
+                    "msg": f"HWG node #{current['id']}# crashed: {exc!r}",
+                }
+
+        if len(work) == 1:
+            _execute(0)
+        else:
+            with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=len(work), thread_name_prefix="hwg-frontier") as pool:
+                futures = [pool.submit(_execute, i) for i in range(len(work))]
+                for future in futures:
+                    future.result()
+
+        # Commit in queue order, never completion order. Events, history and
+        # successor ordering are therefore stable across repeated runs.
+        next_ready = []
+        fatal = None
+        for (current, _node_inputs), result in zip(work, results):
+            result = result or {
                 "ok": False,
-                "paused": True,
-                "runId": run["runId"],
-                "msg": (
-                    f"HWG run paused at manual node #{current['id']}# ({current['file']}).\n"
-                    f"Resume with: /hwg resume {run['runId']} PASS"
-                ),
+                "msg": f"HWG node #{current['id']}# returned no result.",
             }
+            if result.get("contractError"):
+                _update_node_task(
+                    run, current["id"], "blocked", None, result.get("msg", ""))
+                run = workflow_state.checkpoint(
+                    run, "output_contract_violated", {"node": current["id"]})
+                run = _emit_run(run, "node_failed", {
+                    "node": current["id"], "file": current["file"],
+                    "verdict": "CONTRACT_ERROR", "outputs": {},
+                }, events_cb)
+                outputs_text.append(
+                    f"[#{current['id']}# -> CONTRACT_ERROR]\n{result.get('msg', '')}")
+                fatal = fatal or {
+                    "node": current["id"], "reason": "output_contract"}
+                continue
 
-        node_inputs = _build_node_inputs(current, run.get("inputs") or {}, run.get("nodeOutputs") or {}, run.get("nodeOutputHistory"))
-        result = _run_hwo_with_policy(current, deps, session, parent_id, node_inputs, events_cb)
-        if result.get("contractError"):
-            # An authoring/protocol bug, not a domain verdict: stop instead of
-            # routing down a FAIL edge as if the node had judged something.
-            run["status"] = "failed"
-            _update_node_task(run, current["id"], "blocked", None, result.get("msg", ""))
-            run = workflow_state.checkpoint(run, "output_contract_violated", {"node": current["id"]})
-            run = _emit_run(run, "node_failed", {
-                "node": current["id"], "file": current["file"],
-                "verdict": "CONTRACT_ERROR", "outputs": {},
-            }, events_cb)
-            run = _emit_run(run, "workflow_failed", {
-                "node": current["id"], "reason": "output_contract",
-            }, events_cb)
-            outputs_text.append(f"[#{current['id']}# -> CONTRACT_ERROR]\n{result.get('msg', '')}")
-            return {"ok": False, "msg": "\n\n".join(outputs_text), "runId": run["runId"]}
-        raw_outputs = _parse_structured_return(result.get("msg", ""))
-        raw_outputs.update(result.get("outputs") or {})
-        current_outputs = _declared_node_outputs(current, raw_outputs)
-        verdict = _extract_verdict(result.get("msg", ""), bool(result.get("ok")), current_outputs)
-        current_outputs.setdefault("verdict", verdict)
-        run.setdefault("nodeOutputHistory", {}).setdefault(current["id"], []).append(current_outputs)
-        run.setdefault("nodeOutputs", {})[current["id"]] = current_outputs
-        run.setdefault("history", []).append(current["id"])
-        outputs_text.append(f"[#{current['id']}# -> {verdict}]\n{result.get('msg', '')}")
-        _update_node_task(
-            run, current["id"], "completed" if result.get("ok") else "blocked",
-            100 if result.get("ok") else None,
-            None if result.get("ok") else result.get("msg", ""),
-        )
-        run = workflow_state.checkpoint(run, "node_finished", {"node": current["id"], "verdict": verdict, "outputs": current_outputs})
-        run = _emit_run(run, "node_completed" if result.get("ok") else "node_failed", {
-            "node": current["id"], "file": current["file"],
-            "verdict": verdict, "outputs": current_outputs,
-        }, events_cb)
+            raw_outputs = _parse_structured_return(result.get("msg", ""))
+            raw_outputs.update(result.get("outputs") or {})
+            current_outputs = _declared_node_outputs(current, raw_outputs)
+            verdict = _extract_verdict(
+                result.get("msg", ""), bool(result.get("ok")), current_outputs)
+            current_outputs.setdefault("verdict", verdict)
+            run.setdefault("nodeOutputHistory", {}).setdefault(
+                current["id"], []).append(current_outputs)
+            run.setdefault("nodeOutputs", {})[current["id"]] = current_outputs
+            run.setdefault("history", []).append(current["id"])
+            outputs_text.append(
+                f"[#{current['id']}# -> {verdict}]\n{result.get('msg', '')}")
+            _update_node_task(
+                run, current["id"],
+                "completed" if result.get("ok") else "blocked",
+                100 if result.get("ok") else None,
+                None if result.get("ok") else result.get("msg", ""),
+            )
+            run = workflow_state.checkpoint(run, "node_finished", {
+                "node": current["id"], "verdict": verdict,
+                "outputs": current_outputs})
+            run = _emit_run(
+                run, "node_completed" if result.get("ok") else "node_failed", {
+                    "node": current["id"], "file": current["file"],
+                    "verdict": verdict, "outputs": current_outputs,
+                }, events_cb)
 
-        next_node = _route_from(current, outgoing.get(current["id"], []), verdict, current_outputs,
-                                run, join_map, node_failed=not result.get("ok"))
-        if isinstance(next_node, dict) and next_node.get("error"):
+            successors = _route_from(
+                current, outgoing.get(current["id"], []), verdict,
+                current_outputs, run, join_map,
+                node_failed=not result.get("ok"))
+            if isinstance(successors, dict) and successors.get("error"):
+                fatal = fatal or {**successors, "reason": "routing",
+                                  "node": current["id"]}
+            else:
+                next_ready.extend(successors)
+
+        if fatal:
             run["status"] = "failed"
-            workflow_state.checkpoint(run, "routing_failed", next_node)
-            run = _emit_run(run, "workflow_failed", next_node, events_cb)
-            return {"ok": False, "msg": next_node["error"] + "\n\n" + "\n\n".join(outputs_text), "runId": run["runId"]}
-        current = node_by_id.get(next_node) if next_node else None
-        if current is None and pending:
-            # This branch ended; pick up the next one the fan-out queued.
-            current = node_by_id.get(pending.pop(0))
+            event = ("output_contract_violated"
+                     if fatal.get("reason") == "output_contract"
+                     else "routing_failed")
+            workflow_state.checkpoint(run, event, fatal)
+            run = _emit_run(run, "workflow_failed", fatal, events_cb)
+            prefix = (fatal.get("error", "") + "\n\n") if fatal.get("error") else ""
+            return {"ok": False, "msg": prefix + "\n\n".join(outputs_text),
+                    "runId": run["runId"]}
+
+        ready.extend(next_ready)
+        run["ready"] = ready
+        run = workflow_state.checkpoint(
+            run, "frontier_completed", {
+                "nodes": [node["id"] for node, _ in work],
+                "ready": list(ready),
+            })
 
     if run.get("joins"):
         waiting = ", ".join(f"#{n}#" for n in run["joins"])
@@ -768,10 +919,19 @@ def _join_blocks(node: dict, run: dict) -> bool:
 
 def _route_from(node: dict, outs: list, verdict: str, outputs: dict, run: dict, join_map: dict,
                 node_failed: bool = False):
-    """Next node id, an {'error': ...} dict, or None when the walk ends here."""
+    """Successor node ids as a LIST, an {'error': ...} dict, or [] to end here.
+
+    Fan-out used to be the odd case: routing returned one id and pushed the
+    rest onto a side list the walker drained when a branch died out. As a list
+    there is no odd case — one successor, three, or none all enqueue the same
+    way, and the scheduler never has to know which kind of edge produced them.
+    """
     if any(e.get("fanout") for e in outs):
         return _open_fanout(node, outs, verdict, outputs, run, join_map)
-    return _choose_next(node, outs, verdict, outputs, run, node_failed)
+    nxt = _choose_next(node, outs, verdict, outputs, run, node_failed)
+    if isinstance(nxt, dict):
+        return nxt
+    return [nxt] if nxt else []
 
 
 def _note_unhandled_failure(node: dict, run: dict) -> None:
@@ -790,9 +950,9 @@ def _note_unhandled_failure(node: dict, run: dict) -> None:
 def _open_fanout(node: dict, outs: list, verdict: str, outputs: dict, run: dict, join_map: dict):
     """Take every matching => branch instead of exactly one.
 
-    Records how many branches the join must wait for, queues the rest, and
-    returns the first. The walk stays single-threaded: branches run one after
-    another, and the join node fires once the last of them arrives.
+    Records how many branches the join must wait for and returns all of them;
+    the scheduler decides the order they actually run in. The join fires once
+    the last branch arrives at it.
     """
     taken = [e for e in outs if _edge_matches(e, verdict, outputs, _edge_context(run))]
     if not taken:
@@ -801,8 +961,7 @@ def _open_fanout(node: dict, outs: list, verdict: str, outputs: dict, run: dict,
     if not join_id:
         return {"error": f"HWG stopped at #{node['id']}#: its => branches do not converge on a join node."}
     run.setdefault("joins", {})[join_id] = {"expected": len(taken), "arrived": 0}
-    run.setdefault("pending", []).extend(e["to"] for e in taken[1:])
-    return taken[0]["to"]
+    return [e["to"] for e in taken]
 
 
 def _choose_next(current: dict, outs: list, verdict: str, outputs: dict, run: dict,
@@ -859,13 +1018,16 @@ def resume_hwg_run(run_id: str, deps, session: dict, parent_id: Optional[str] = 
         run["status"] = "failed"
         workflow_state.checkpoint(run, "resume_node_missing", {"node": node_id})
         return {"ok": False, "msg": f"HWG run {run_id} paused at node #{node_id}#, but that node no longer exists in the source file. Update the .hwg file or cancel the run."}
-    next_id = _route_from(node, outgoing.get(node_id, []), node_outputs["verdict"], node_outputs, run,
-                          fanout_joins(graph["nodes"], graph["edges"]))
-    if isinstance(next_id, dict) and next_id.get("error"):
+    successors = _route_from(node, outgoing.get(node_id, []), node_outputs["verdict"], node_outputs, run,
+                             fanout_joins(graph["nodes"], graph["edges"]))
+    if isinstance(successors, dict) and successors.get("error"):
         run["status"] = "failed"
-        workflow_state.checkpoint(run, "resume_routing_failed", next_id)
-        return {"ok": False, "msg": next_id["error"], "runId": run_id}
-    run["currentNode"] = next_id
+        workflow_state.checkpoint(run, "resume_routing_failed", successors)
+        return {"ok": False, "msg": successors["error"], "runId": run_id}
+    # The manual node has now delivered its verdict, so its successors join the
+    # queue behind whatever was already outstanding when the run paused.
+    run["ready"] = list(run.get("ready") or []) + list(successors)
+    run["currentNode"] = None
     workflow_state.checkpoint(run, "interrupt_resumed", {"node": node_id, "verdict": node_outputs["verdict"]})
     return run_hwg_file(
         run["source"], deps, session, parent_id=parent_id,

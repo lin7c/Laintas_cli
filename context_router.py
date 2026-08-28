@@ -24,6 +24,16 @@ CORE_TOOLS = frozenset({
     "mem.list", "mem.read", "mem.save",
     "task.complete", "task.create", "task.get", "task.list", "task.update",
     "agent_return", "workflow.phase_complete", "time.now",
+    # Delegation is resident, not routed. Whether to hand part of a task to a
+    # child is a judgement about the SHAPE of the work — are these pieces
+    # independent — and the keyword groups below can only see the vocabulary of
+    # the mechanism ("parallel", "sub-task", "delegate"). Users describe the
+    # work, not the mechanism, so "fix the failing tests and update the docs"
+    # routed no spawn tool at all: the prompt told the model to delegate
+    # independent work while the schema for doing it was withheld. Three
+    # schemas is a cheap price for closing that gap. The rest of the agent
+    # surface (hire, station, tell, abort, …) stays routed.
+    "agent.spawn", "agent.wait", "await_spawns",
 })
 
 

@@ -74,6 +74,33 @@ class PromptContractTests(unittest.TestCase):
         self.assertNotIn("operating-system commands", prompt,
                          "licensing shell for OS commands re-authorizes shell grep/cat")
 
+    def test_code_reading_method_is_a_skill_the_prompt_points_at(self):
+        """Methodology belongs in a loadable skill, not the cached prefix.
+
+        The prompt keeps only what the model needs before it has loaded
+        anything: which native tool replaces which shell idiom, and where the
+        rest of the method lives. Window sizing, truncation discipline, the
+        index-first order and review reading are in the skill, which is paid
+        for only by the tasks that read code.
+        """
+        prompt = laintas_cli.generate_cli_prop_template()
+        self.assertIn("`code-reading` skill", prompt)
+        self.assertIn("atlas.", prompt)
+        # Moved out of the prefix; still stated by the gateway's core-tool
+        # guide and by the skill.
+        self.assertNotIn("leading line-number prefixes are display only", prompt)
+
+        skill = Path("default_skills/code-reading/SKILL.md")
+        self.assertTrue(skill.is_file())
+        text = skill.read_text(encoding="utf-8")
+        self.assertTrue(text.isascii())
+        # The index-first order is the point of the skill; atlas.stale is what
+        # keeps a cached index from answering confidently and wrongly.
+        for tool in ("atlas.stale", "atlas.find", "atlas.outline",
+                     "atlas.neighbors", "atlas.lookup"):
+            self.assertIn(tool, text)
+        self.assertLess(text.index("atlas.stale"), text.index("atlas.find"))
+
     def test_the_prompt_never_asks_for_fewer_tool_calls(self):
         """Narrowing a call and making fewer calls are opposite instructions.
 
@@ -164,6 +191,16 @@ class PromptContractTests(unittest.TestCase):
         self.assertIn("REUSABLE", prompt)
         # Promotion ladder must include spawn_parallel
         self.assertIn("TASK -> spawn_parallel ->", prompt)
+        self.assertIn("at least two workstreams", prompt)
+        self.assertIn("exclusive scope", prompt)
+        self.assertIn("never send several children", prompt)
+        self.assertIn("parent retains the original requirements", prompt)
+        self.assertIn("spawn_parallel is asynchronous by default", prompt)
+        self.assertIn("Use await_spawns", prompt)
+        self.assertIn("do not\n  launch a batch and immediately wait", prompt)
+        self.assertIn("Before task_complete", prompt)
+        self.assertIn("explicitly abort any", prompt)
+        self.assertIn("avoids\n  wasteful polling", prompt)
 
     def test_legacy_internal_tool_names_are_canonicalized(self):
         text = "Use `task.create`, fs.delete and agent_return."

@@ -867,19 +867,174 @@ def _bi_skill_unload(params: dict, ctx: ToolCtx) -> dict:
 _COUNT_LINES_MAX_BYTES = 64 * 1024 * 1024
 
 
+def _open_page(params: dict, ctx: ToolCtx, abs_path: str) -> tuple:
+    """Move this agent's cursor for one file and return (entry, page, reads, notes).
+
+    Everything that changes cursor state happens here so `_bi_fs_read` keeps
+    one code path for actually reading bytes. Returns ``(None, 0, 0, [])`` when
+    the file has no pages (empty or unreadable).
+    """
+    import file_pager
+
+    state = ctx.state
+    try:
+        import agent_loop as _al
+        if not _al.get_runtime_config("paged_reads"):
+            return None, 0, 0, []          # kill switch: plain windowed reads
+    except Exception:
+        pass
+    fp = file_pager.fingerprint(abs_path)
+    headroom = int(state.get("_ctx_headroom_chars") or 0)
+    entry = file_pager.get_file_state(state, abs_path, fp, headroom, time.time())
+    if not entry.get("pages"):
+        return None, 0, 0, []
+
+    notes: list = []
+    if entry.pop("repaged", False):
+        notes.append("file changed since it was last read: pages recomputed, "
+                     "earlier page numbers and line references may have moved")
+
+    previous = int(entry.get("page") or 0)
+    page = file_pager.resolve_page(entry, params.get("page"))
+
+    # The note describes the page being LEFT. Attaching it before the cursor
+    # moves is what makes `read(path, page="next", note="...")` one call.
+    _note = params.get("note")
+    if _note and previous:
+        if file_pager.attach_note(entry, abs_path, previous, str(_note)):
+            notes.append(f"note recorded on page {previous}")
+    elif _note and not previous:
+        notes.append("note ignored: no page was open to summarise")
+
+    if params.get("pin") is not None:
+        dropped = file_pager.set_pin(entry, page, bool(params.get("pin")))
+        if bool(params.get("pin")):
+            notes.append(f"page {page} pinned")
+        if dropped:
+            notes.append(f"pin budget is {file_pager.MAX_PINS}: page {dropped} "
+                         f"unpinned")
+
+    reads = file_pager.note_page_delivered(entry, abs_path, page)
+    if reads >= file_pager.REPEAT_STOP:
+        notes.append(f"this page has now been delivered {reads} times - the "
+                     f"answer is not in re-reading it")
+    elif previous and previous != page:
+        notes.append(f"page {previous} dropped from your context"
+                     + ("" if params.get("note") else
+                        " with no summary (pass note= next time to keep one)"))
+    return entry, page, reads, notes
+
+
+def _read_already_visible(ctx: ToolCtx, abs_path: str, start: int, end: int,
+                          pinning: bool):
+    """Decline a read whose lines are already in the model's context.
+
+    Returns an advisory result (ok=False, `_advisory`) or None. Four things
+    make it safe to refuse, and all four are needed:
+      * the range must be FULLY inside what is still visible — a partial
+        overlap means the caller is asking for something new;
+      * the file must not have been edited by our own tools since (line
+        numbers move, so old coverage must not block a fresh read);
+      * an evicted page is never "visible", so re-reading one is always
+        allowed;
+      * a pin is a context instruction, not a content request.
+    """
+    if pinning:
+        return None
+    state = getattr(ctx, "state", None)
+    if not isinstance(state, dict):
+        return None
+    try:
+        import agent_loop as _al
+        if not _al.get_runtime_config("read_block_visible"):
+            return None
+    except Exception:
+        pass
+    import file_pager
+    entry = (state.get("_pager") or {}).get(abs_path)
+    if isinstance(entry, dict) and entry.get("edited"):
+        return None
+    ranges = file_pager.visible_ranges(state, abs_path)
+    if not ranges or not file_pager.covered(ranges, start, end):
+        return None
+    shown = ", ".join(f"{a}-{b}" for a, b in ranges[:4])
+    return {
+        "ok": False,
+        "_advisory": True,
+        "error": (f"lines {start}-{end} of {abs_path} are already in your "
+                  f"context above (you hold {shown}); re-reading them returns "
+                  f"the same bytes. Use what you have, read a range you do not "
+                  f"hold, or grep for what you are looking for."),
+        "path": abs_path,
+        "visible_ranges": ranges,
+    }
+
+
+#: Out-of-band signals a tool result may carry to the loop, and what each one
+#: means. A tool result is an untyped dict, so these are its only contract —
+#: and an untyped contract is one typo away from silence: `_page_ref` was
+#: renamed to `_read_ref` during the paging work and the consumer kept reading
+#: the old name, which no test and no import could catch. Nothing here changes
+#: at runtime; the registry exists so a typo is a test failure rather than a
+#: feature that quietly stops working.
+RESULT_FLAGS: dict = {
+    "_advisory": "the tool declined on purpose and said what to do instead",
+    "_user_denied": "a person refused this action",
+    "_repeat_blocked": "identical call refused by the repetition guard",
+    "_interrupted": "the caller's interrupt landed mid-call",
+    "_truncated": "the payload was cut to fit a budget",
+    "_truncated_items": "how many items the cut dropped",
+    "_task_complete": "the completion protocol fired",
+    "_plan_submitted": "a plan was submitted for approval",
+    "_workflow_phase_complete": "a workflow phase boundary was reached",
+    "_shell_stuck": "the shell did not return to a prompt",
+    "_validation_error": "arguments failed schema validation",
+    "_test_warning": "a test-gate advisory rides along with the result",
+    "_history_recorded": "the caller already recorded this in history",
+    "_read_ref": "which file lines this read delivered (file_pager)",
+    "_budget_chars": "this result brings its own output budget",
+    "_prompt_lab_branch": "prompt-lab sandbox routing",
+    "_evolution_lab_branch": "evolution-lab sandbox routing",
+}
+
+
+def unknown_result_flags(result: dict) -> list:
+    """Underscore keys a result carries that nothing is documented to read."""
+    if not isinstance(result, dict):
+        return []
+    return sorted(key for key in result
+                  if key.startswith("_") and key not in RESULT_FLAGS)
+
+
 def _bi_fs_read(params: dict, ctx: ToolCtx) -> dict:
     """Read a file as UTF-8 with optional line range and cat-style numbering.
 
+    Two modes, chosen by the arguments (see file_pager for the why):
+
+      PAGED (no offset/limit) - the file as a paged document. `read(path)`
+        opens page 1 and reports "page 1/N"; `page="next"` turns the page,
+        which DROPS the page being left from the model's context and leaves a
+        stub carrying its line range plus a generated index of what it
+        defined. `note` records the reader's own summary on that stub; `pin`
+        holds a page open across turns. One file therefore costs one page of
+        context however large it is.
+
+      WINDOW (offset and/or limit) - the classic byte-honest window. Unchanged,
+        does not move the cursor, and is never evicted: checking thirty lines
+        around a grep hit must stay cheap.
+
     params:
       path:       file path (required)
-      offset:     1-based starting line (default 1)
-      limit:      max lines to return (default 2000)
+      page:       PAGED mode: 1-based page, or "next"/"prev"/"first"/"last"
+      note:       PAGED mode: summary of the page being LEFT, kept on its stub
+      pin:        PAGED mode: hold this page in context past the next turn
+      offset:     WINDOW mode: 1-based starting line
+      limit:      WINDOW mode: max lines to return (default 2000)
       max_bytes:  hard byte cap on returned payload (default 200_000)
       line_numbers: prepend each line with "N→ " (default True)
 
-    Prefer offset/limit over
-    max_bytes for large files; line numbers make follow-up fs.edit calls
-    trivial because the AI can refer to exact lines.
+    Line numbers make follow-up fs.edit calls trivial because the AI can refer
+    to exact lines.
     """
     path = params.get("path")
     if not path:
@@ -887,10 +1042,74 @@ def _bi_fs_read(params: dict, ctx: ToolCtx) -> dict:
     abs_path = os.path.abspath(os.path.join(ctx.cwd or os.getcwd(), path)) \
         if not os.path.isabs(path) else path
 
-    offset = max(1, int(params.get("offset", 1) or 1))
-    limit = max(1, int(params.get("limit", 2000) or 2000))
     max_bytes = int(params.get("max_bytes", 200_000) or 200_000)
     line_numbers = bool(params.get("line_numbers", True))
+
+    # ── Mode selection ────────────────────────────────────────────────────
+    # An explicit window is a targeted look and is honoured verbatim. Paging
+    # owns the rest, including the bare `read(path)` that used to mean "the
+    # first 2000 lines and then work it out yourself".
+    _windowed = params.get("offset") is not None or params.get("limit") is not None
+    _page_state = None
+    _page_no = 0
+    _repeat_count = 0
+    _page_notice: list = []
+    if not _windowed and isinstance(getattr(ctx, "state", None), dict):
+        try:
+            _page_state, _page_no, _repeat_count, _page_notice = _open_page(
+                params, ctx, abs_path)
+        except Exception:
+            _page_state = None                      # never fail a read on this
+    if _windowed and params.get("page") is not None:
+        # Both modes at once: the window wins (it is the more specific ask),
+        # but a silently ignored `page` would read as a broken cursor.
+        _page_notice.append("page ignored: offset/limit is the targeted window "
+                            "and does not move the page cursor")
+    if _page_state is not None:
+        offset, _end = _page_state["pages"][_page_no - 1]
+        limit = _end - offset + 1
+        max_bytes = max(max_bytes, 4_000)
+    else:
+        offset = max(1, int(params.get("offset", 1) or 1))
+        limit = max(1, int(params.get("limit", 2000) or 2000))
+
+    # ── Already in front of you? ──────────────────────────────────────────
+    # Helpwo refuses a read whose range it has already served; the piece it is
+    # missing is whether the model can still SEE that range, so after its
+    # compaction the refusal outlives the content. Here the eviction
+    # projection publishes exactly what survived into the request, so the
+    # refusal is conditioned on visibility and a dropped page stays re-readable.
+    _blocked = _read_already_visible(ctx, abs_path, offset, offset + limit - 1,
+                                     bool(params.get("pin")))
+    if _blocked:
+        return _blocked
+
+    # A windowed read that resumes where the last one ended is a page turn the
+    # caller is doing by hand — the one read pattern that is distinguishable
+    # from a targeted look without guessing.
+    if _page_state is None and not _blocked and isinstance(
+            getattr(ctx, "state", None), dict):
+        try:
+            import file_pager as _fpw
+            _streak = _fpw.note_window(ctx.state, abs_path, offset,
+                                       offset + limit - 1)
+            _walk = _fpw.walk_notice(
+                abs_path, offset, _streak,
+                int(ctx.state.get("_ctx_headroom_chars") or 0))
+            if _walk:
+                _page_notice.append(_walk)
+        except Exception:
+            pass
+
+    # A page of an unchanged file is byte-identical to what was delivered
+    # before, so serve it from the process cache (Helpwo's tryServeCachedView):
+    # no disk round-trip, and one page number can never yield two bodies.
+    _cached = ""
+    _fingerprint_for_cache = (0, 0)
+    if _page_state is not None:
+        import file_pager as _fp
+        _fingerprint_for_cache = _fp.fingerprint(abs_path)
+        _cached = _fp.cached_body(abs_path, _fingerprint_for_cache, _page_no)
 
     # Walk the file by LINES, never by a byte prefix. Slicing a prefix looks
     # equivalent and is not: on a file larger than max_bytes every offset past
@@ -904,6 +1123,32 @@ def _bi_fs_read(params: dict, ctx: ToolCtx) -> dict:
     byte_truncated = False
     total_lines = 0
     end_line = offset + limit - 1
+    if _cached:
+        # Byte-identical by construction (same path, same fingerprint, same
+        # page), so skip the walk and the re-render entirely.
+        _page_notice.append("served from cache (file unchanged since that read)")
+        body = _cached["body"]
+        result = {
+            "ok": True,
+            "result": body,
+            "path": abs_path,
+            "offset": offset,
+            "lines_returned": int(_cached["lines_returned"]),
+            "total_lines": _cached["total_lines"],
+            "truncated": bool(_cached["truncated"]),
+            "byte_truncated": bool(_cached["byte_truncated"]),
+            "cached_view": True,
+            "page": _page_no,
+            "pages": len(_page_state["pages"]),
+            "page_reads": _repeat_count,
+            "_budget_chars": len(body) + 4_000,
+            "_read_ref": {"path": abs_path, "page": _page_no,
+                          "lines": [offset, offset + max(
+                              0, int(_cached["lines_returned"]) - 1)]},
+        }
+        if _page_notice:
+            result["note"] = "; ".join(_page_notice)
+        return result
     try:
         size = os.path.getsize(abs_path)
         with open(abs_path, "rb") as f:
@@ -955,6 +1200,33 @@ def _bi_fs_read(params: dict, ctx: ToolCtx) -> dict:
         "truncated": byte_truncated or line_truncated,
         "byte_truncated": byte_truncated,
     }
+    # Every read - paged or windowed - reports the lines it delivered, so the
+    # loop can tell later what the model can still see (see _project_reads).
+    result["_read_ref"] = {"path": abs_path, "page": _page_no,
+                           "lines": [offset, offset + max(0, len(selected) - 1)]}
+    if _page_state is None and _page_notice:
+        result["note"] = "; ".join(_page_notice)
+    if _page_state is not None:
+        # `_page_ref` is what lets the agent loop find this message again when
+        # the page is turned: the loop owns tool_call_ids, this layer does not.
+        result["page"] = _page_no
+        result["pages"] = len(_page_state["pages"])
+        result["page_reads"] = _repeat_count
+        # A page is sized from the context headroom; the loop's generic
+        # per-result budget (8 x output_truncate) would then cut it back to
+        # 24k and hand the model a page it cannot finish. The page carries its
+        # own allowance so the two sizings cannot contradict each other.
+        result["_budget_chars"] = len(body) + 4_000
+        import file_pager as _fp2
+        _fp2.cache_body(abs_path, _fingerprint_for_cache, _page_no, {
+            "body": body,
+            "lines_returned": len(selected),
+            "total_lines": total_lines or None,
+            "truncated": byte_truncated or line_truncated,
+            "byte_truncated": byte_truncated,
+        })
+        if _page_notice:
+            result["note"] = "; ".join(_page_notice)
     try:
         import peer_coordination
         note = peer_coordination.get_coord().note_read(abs_path)
@@ -976,6 +1248,15 @@ def _check_file_write_policy(abs_path: str, ctx: ToolCtx, diff_preview: str) -> 
     without one (headless/automated contexts with no human to ask), it proceeds —
     the decision is still audited, it just can't be confirmed live.
     """
+    # The contract's own boundary comes first: it is narrower than policy, it
+    # is per-agent, and unlike policy it is what this particular child agreed
+    # to when it was spawned.
+    _contract = ((ctx.state or {}).get("_contract")
+                 if isinstance(getattr(ctx, "state", None), dict) else None)
+    if _contract:
+        import agent_contract
+        if not agent_contract.path_in_scope(_contract, abs_path, ctx.cwd):
+            return agent_contract.scope_violation(_contract, abs_path)
     if _policy_mod is None:
         return None
     try:
@@ -1004,6 +1285,12 @@ def _check_file_write_policy(abs_path: str, ctx: ToolCtx, diff_preview: str) -> 
 def _check_file_delete_policy(abs_path: str, ctx: ToolCtx,
                               preview: str) -> Optional[dict]:
     """Authorize deletion before any filesystem mutation occurs."""
+    _contract = ((ctx.state or {}).get("_contract")
+                 if isinstance(getattr(ctx, "state", None), dict) else None)
+    if _contract:
+        import agent_contract
+        if not agent_contract.path_in_scope(_contract, abs_path, ctx.cwd):
+            return agent_contract.scope_violation(_contract, abs_path)
     if _policy_mod is None:
         return None
     try:
@@ -1811,8 +2098,10 @@ def _bi_fs_edit(params: dict, ctx: ToolCtx) -> dict:
     If old_string is not unique, requires replace_all: true.
     """
     path = params.get("path")
-    old = params.get("old_string", "")
-    new = params.get("new_string", "")
+    # fs.read's "N\u2192" prefixes are display only; anchors arrive carrying
+    # them because every prompt says to copy verbatim from what was read.
+    old = _strip_read_line_numbers(params.get("old_string", ""))
+    new = _strip_read_line_numbers(params.get("new_string", ""))
     replace_all = params.get("replace_all", False)
 
     if not path:
@@ -1842,7 +2131,10 @@ def _bi_fs_edit(params: dict, ctx: ToolCtx) -> dict:
         except Exception:
             _fuzzy_new, _fuzzy_strategy = None, None
         if _fuzzy_new is None:
-            return {"ok": False, "error": "old_string not found in file",
+            return {"ok": False,
+                    "error": ("old_string not found (tried exact, whitespace- "
+                              "and indentation-tolerant matching)."
+                              + _edit_anchor_hint(content, old)),
                     "hint": "Check exact whitespace and indentation"}
         new_content = _fuzzy_new
         diff = _make_unified_diff(content, new_content, abs_path, abs_path)
@@ -1929,6 +2221,65 @@ def _bi_fs_edit(params: dict, ctx: ToolCtx) -> dict:
     }, abs_path)
 
 
+_READ_LINE_NUMBER_RE = re.compile(r"^[ \t]*\d+\u2192")
+
+
+def _strip_read_line_numbers(text: str) -> str:
+    """Remove ``fs.read``'s ``N\u2192`` display prefixes from an edit anchor.
+
+    ``fs.read`` renders ``{n:>width}\u2192{line}``, every prompt tells the model
+    to copy its anchor "verbatim from what you read", and nothing told it the
+    prefix is decoration -- so anchors arrive carrying it and match nothing.
+    The prefix width also depends on the window's largest line number, so the
+    same line comes back as `` 8\u2192code`` in one read and ``  8\u2192code``
+    in another; a model reproducing indentation from that is guessing.
+
+    Only strips when EVERY non-empty line carries a prefix, which real source
+    never does -- a file whose every line begins with digits followed by
+    U+2192 is a numbered listing, not code.
+    """
+    if not text or "\u2192" not in text:
+        return text
+    lines = text.split("\n")
+    body = [ln for ln in lines if ln.strip()]
+    if not body or not all(_READ_LINE_NUMBER_RE.match(ln) for ln in body):
+        return text
+    return "\n".join(
+        _READ_LINE_NUMBER_RE.sub("", ln) if ln.strip() else ln for ln in lines)
+
+
+def _edit_anchor_hint(content: str, old: str, limit: int = 160) -> str:
+    """Point at the closest thing in the file to a failed anchor.
+
+    "old_string not found" tells the model nothing about WHICH part is wrong,
+    so it re-guesses the whole anchor. Naming the nearest line, and showing the
+    bytes actually there, turns that into a one-line correction.
+    """
+    probe = next((ln for ln in old.split("\n") if ln.strip()), "")
+    if not probe:
+        return ""
+    best_ratio, best_no, best_line = 0.0, 0, ""
+    matcher = difflib.SequenceMatcher(a=probe.strip())
+    for no, line in enumerate(content.split("\n"), 1):
+        if not line.strip():
+            continue
+        matcher.set_seq2(line.strip())
+        if matcher.real_quick_ratio() <= best_ratio:
+            continue
+        ratio = matcher.ratio()
+        if ratio > best_ratio:
+            best_ratio, best_no, best_line = ratio, no, line
+    if best_ratio < 0.6:
+        return ""
+    shown = best_line if len(best_line) <= limit else best_line[:limit] + "..."
+    same = "identical once whitespace is ignored" if best_line.strip() == probe.strip() else "similar"
+    hint = (f" Closest match is line {best_no} of the file as it stands on disk "
+            f"({same}): {shown!r}. Anchor on those exact bytes.")
+    if "\u2192" in old:
+        hint += " Your anchor carries fs.read's 'N\u2192' display prefixes; drop them."
+    return hint
+
+
 def _bi_fs_multi_edit(params: dict, ctx: ToolCtx) -> dict:
     """Apply multiple sequential exact-string edits to one file atomically.
 
@@ -1956,25 +2307,82 @@ def _bi_fs_multi_edit(params: dict, ctx: ToolCtx) -> dict:
     except OSError as e:
         return {"ok": False, "error": str(e)}
 
-    working = content
-    applied = []
+    # Normalize every anchor up front so the dry-run report below describes the
+    # same edits that would actually be attempted.
+    prepared = []
     for i, edit in enumerate(edits):
         if not isinstance(edit, dict):
             return {"ok": False, "error": f"edit #{i+1} is not an object"}
-        old = edit.get("old_string", "")
-        new = edit.get("new_string", "")
-        replace_all = bool(edit.get("replace_all", False))
+        old = _strip_read_line_numbers(edit.get("old_string", ""))
+        new = _strip_read_line_numbers(edit.get("new_string", ""))
         if old == new:
             return {"ok": False, "error": f"edit #{i+1}: old_string equals new_string"}
-        count = working.count(old)
-        if count == 0:
-            return {"ok": False, "error": f"edit #{i+1}: old_string not found"}
-        if count > 1 and not replace_all:
+        if not old:
+            return {"ok": False, "error": f"edit #{i+1}: old_string is empty"}
+        prepared.append((old, new, bool(edit.get("replace_all", False))))
+
+    def _apply_one(text: str, old: str, new: str, replace_all: bool):
+        """(new_text, replacements, strategy) or (None, 0, reason)."""
+        count = text.count(old)
+        if count == 1 or (count > 1 and replace_all):
+            return ((text.replace(old, new) if replace_all
+                     else text.replace(old, new, 1)),
+                    count if replace_all else 1, "exact")
+        if count > 1:
+            return None, count, "ambiguous"
+        # Exact match failed. Same vendored opencode replacers fs.edit uses --
+        # whitespace and indentation drift is the #1 cause of edit failures, and
+        # a batch that refuses what a single edit would have accepted is the
+        # reason multi_edit looked broken while fs.edit worked on the same
+        # anchor.
+        try:
+            from patch_adapter import apply_edit as _apply_edit
+            fuzzy, strategy = _apply_edit(text, old, new, replace_all)
+        except Exception:
+            fuzzy, strategy = None, None
+        if fuzzy is not None:
+            return fuzzy, 1, strategy or "fuzzy"
+        return None, 0, "not_found"
+
+    working = content
+    applied = []
+    for i, (old, new, replace_all) in enumerate(prepared):
+        result, n, how = _apply_one(working, old, new, replace_all)
+        if result is None:
+            # All-or-nothing means one bad anchor discards the whole batch, and
+            # "old_string not found" gave the model nothing to correct -- so it
+            # re-guessed all of them and the batch never converged. Say which
+            # anchor failed, which ones were fine, and what is actually there.
+            # Everything before this index already matched in this pass; the
+            # rest is dry-run from where the buffer stands.
+            others = list(range(1, i + 1))
+            probe = working
+            for j in range(i + 1, len(prepared)):
+                o2, n2, r2 = prepared[j]
+                r, _, _ = _apply_one(probe, o2, n2, r2)
+                if r is not None:
+                    others.append(j + 1)
+                    probe = r
+            if how == "ambiguous":
+                reason = (f"old_string appears {n} times "
+                          f"(set replace_all:true or add more context)")
+            else:
+                reason = ("old_string not found (tried exact, whitespace- and "
+                          "indentation-tolerant matching)")
+                # `content`, not `working`: the batch is all-or-nothing, so the
+                # file on disk is still the original. A line number from the
+                # mid-batch buffer would point at a line the model cannot see.
+                reason += _edit_anchor_hint(content, old)
+            detail = (f" Edits {others} match and would apply; re-send the batch "
+                      f"with only edit #{i+1} corrected."
+                      if others else "")
             return {"ok": False,
-                    "error": f"edit #{i+1}: old_string appears {count} times "
-                             f"(set replace_all:true or add more context)"}
-        working = working.replace(old, new) if replace_all else working.replace(old, new, 1)
-        applied.append({"index": i + 1, "replacements": count if replace_all else 1})
+                    "error": f"edit #{i+1}: {reason}{detail}",
+                    "failed_edit": i + 1,
+                    "matching_edits": others,
+                    "path": abs_path}
+        working = result
+        applied.append({"index": i + 1, "replacements": n, "match": how})
 
     diff = _make_unified_diff(content, working, abs_path, abs_path)
 
@@ -2616,7 +3024,7 @@ def _bi_agent_spawn(params: dict, ctx: ToolCtx) -> dict:
                 {**t, "goal": (t.get("goal") or t.get("task") or "")}
                 for t in tasks_list if isinstance(t, dict)
             ]
-            return _bi_spawn_parallel({"tasks": remapped}, ctx)
+            return _bi_spawn_parallel({"tasks": remapped, "wait": True}, ctx)
 
         # Import the parallel spawner from agent_loop
         import agent_loop as _al
@@ -2647,15 +3055,73 @@ def _bi_agent_spawn(params: dict, ctx: ToolCtx) -> dict:
     parent_id = _runtime_parent_agent_id(ctx)
     if parent_id is None:
         return {"ok": False, "error": "no agent_id in context"}
+    import agent_contract
+    try:
+        contract = agent_contract.normalize(params.get("contract"))
+    except agent_contract.ContractError as exc:
+        return {"ok": False, "error": f"contract is not checkable: {exc}"}
     child_id = ctx.spawn_subagent(
         parent_id=parent_id, task=task, deps=ctx.deps,
         name=name, session=ctx.session, events_cb=ctx.events_cb,
-        role=role,
+        role=role, contract=contract,
     )
     if child_id is None:
         return {"ok": False, "error": f"spawn failed (parent '{parent_id}' not found)"}
     role_note = f" (role: {role})" if role else ""
-    return {"ok": True, "result": f"Spawned child agent '{child_id}'{role_note} for task: {task[:120]}", "child_id": child_id}
+    contract_note = (
+        f" under a contract for {', '.join(o['name'] for o in contract['outputs'])}"
+        if contract else "")
+    return {"ok": True,
+            "result": (f"Spawned child agent '{child_id}'{role_note}"
+                       f"{contract_note} for task: {task[:120]}"),
+            "child_id": child_id}
+
+
+_PARENT_DECISION_NOTE = (
+    "Runtime did not retry. Parent decides whether to accept the partial "
+    "result, revise/follow up, re-spawn, or stop."
+)
+
+
+def _child_diagnostic(info) -> dict:
+    """Structured child outcome mirrored from the runtime-owned AgentInfo."""
+    if info is None:
+        return {}
+    state = info.state or {}
+    verification = info.verification or {}
+    if info.status == "aborted":
+        failure_kind = "aborted"
+    elif verification and not verification.get("ok"):
+        failure_kind = "contract_rejected"
+    elif info.error:
+        failure_kind = "execution_failed"
+    else:
+        failure_kind = ""
+    bounded_outputs = {}
+    for index, (name, value) in enumerate((info.submitted or {}).items()):
+        if index >= 20:
+            bounded_outputs["_omitted_outputs"] = len(info.submitted) - 20
+            break
+        if isinstance(value, str) and len(value) > 2000:
+            bounded_outputs[name] = value[:1400] + "\n… [output truncated] …\n" + value[-500:]
+        else:
+            bounded_outputs[name] = value
+    capability_gaps = list(state.get("_capability_gaps") or [])[:10]
+    return {
+        "status": info.status,
+        "stage": info.stage,
+        **({"failure_kind": failure_kind} if failure_kind else {}),
+        **({"error": info.error[:600]} if info.error else {}),
+        **({"outputs": bounded_outputs} if bounded_outputs else {}),
+        **({"contract_gaps": list(verification.get("gaps") or [])[:6]}
+           if verification and not verification.get("ok") else {}),
+        **({"capability_gaps": capability_gaps,
+            "needed_tools": list(dict.fromkeys(
+                str(gap.get("tool") or "") for gap in capability_gaps
+                if isinstance(gap, dict) and gap.get("tool")))}
+           if capability_gaps else {}),
+        "retry_policy": "parent_decides",
+    }
 
 
 def _bi_spawn(params: dict, ctx: ToolCtx) -> dict:
@@ -2669,13 +3135,26 @@ def _bi_spawn(params: dict, ctx: ToolCtx) -> dict:
     parent_id = _runtime_parent_agent_id(ctx)
     if not parent_id:
         return {"ok": False, "error": "no current agent"}
+    import agent_contract
+    try:
+        contract = agent_contract.normalize(params.get("contract"))
+    except agent_contract.ContractError as exc:
+        return {"ok": False, "error": f"contract is not checkable: {exc}"}
     child_id = _al.spawn_subagent(
         parent_id=parent_id, task=goal, deps=ctx.deps,
         session=ctx.session, events_cb=ctx.events_cb,
-        spawn_context=context,
+        spawn_context=context, contract=contract,
     )
     if child_id is None:
         return {"ok": False, "error": "Cannot spawn child agent."}
+    # A single errand is a branch of one. It blocks the caller by design — the
+    # caller asked for the answer — but its supervision comes from the same
+    # place as every other branch's, so there is exactly one watchdog in the
+    # system rather than one per call site.
+    import branch as _branch
+    _single = _branch.open_branch(
+        parent_id, "single", [(child_id, goal)],
+        budget=_branch.Budget(stall_seconds=float(_al.AGENT_STALL_SECONDS)))
     _al.enter_waiting(parent_id)
     try:
         _parent = _al.get_agent(parent_id)
@@ -2691,6 +3170,10 @@ def _bi_spawn(params: dict, ctx: ToolCtx) -> dict:
             stall_seconds=_al.AGENT_STALL_SECONDS)
     finally:
         _al.exit_waiting(parent_id)
+        # The branch closes with the call that opened it: a branch of one that
+        # outlived its own barrier would show up in `branch_status` and block
+        # the caller's completion forever.
+        _branch.close(_single.branch_id, "single spawn returned")
     if info is None:
         _partial = rescue_partial_reply(child_id)
         _al.abort_agent(child_id)
@@ -2705,7 +3188,13 @@ def _bi_spawn(params: dict, ctx: ToolCtx) -> dict:
                if _partial else {}),
         }
     if info.status != "done":
-        return {"ok": False, "result": f"[{child_id}] {info.error or info.status}"}
+        return {
+            "ok": False,
+            "result": (f"[{child_id}] {info.error or info.status}\n"
+                       f"{_PARENT_DECISION_NOTE}"),
+            "child_id": child_id,
+            "child": _child_diagnostic(info),
+        }
     return {"ok": True, "result": f"[{child_id}] {info.result or info.last_reply or '(done)'}",
             "child_id": child_id}
 
@@ -2906,6 +3395,18 @@ def rescue_partial_reply(agent_id: str) -> str:
         return ""
 
 
+def _awaiting_caller(agent_id: str) -> bool:
+    """True while this child is blocked on a question to its own caller."""
+    try:
+        import agent_contract
+        import agent_loop as _al
+        info = _al.get_agent(agent_id)
+        return bool(info is not None
+                    and info.stage == agent_contract.STAGE_WAITING_PARENT)
+    except Exception:
+        return False
+
+
 def is_awaiting_approval(agent_id: str) -> bool:
     """True while this agent — or anything below it — is blocked on a human.
 
@@ -2947,7 +3448,7 @@ def clear_awaiting_approval(agent_id: str) -> None:
 
 
 def _bi_spawn_parallel(params: dict, ctx: ToolCtx) -> dict:
-    """Fan out through ``spawn_subagent`` and join all canonical children."""
+    """Fan out through ``spawn_subagent``; join only when explicitly asked."""
     import agent_loop as _al
 
     tasks = params.get("tasks") or []
@@ -2964,7 +3465,7 @@ def _bi_spawn_parallel(params: dict, ctx: ToolCtx) -> dict:
     # child that finishes with an empty final answer has thrown away
     # everything it did, and the batch reports it as "no reply". spawn_chain
     # has always told its steps this; parallel children were told nothing.
-    _REPORT_CONTRACT = (
+    _REPORT_PREAMBLE = (
         "[PARALLEL TASK {index}/{total}] You are one of {total} agents working "
         "at the same time. Your caller sees only your final answer — not your "
         "tool calls, not the files you read, not this conversation. Finish by "
@@ -2978,10 +3479,13 @@ def _bi_spawn_parallel(params: dict, ctx: ToolCtx) -> dict:
         goal = str(task.get("goal") or task.get("task") or "").strip()
         if not goal:
             return {"ok": False, "error": "every parallel task requires a goal"}
-        contract = _REPORT_CONTRACT.format(index=index, total=len(tasks))
+        # Renamed from `contract`: a task's `contract` key is now a real
+        # AgentContract that rides through to the child, and two different
+        # things called `contract` in one function is how they get mixed up.
+        preamble = _REPORT_PREAMBLE.format(index=index, total=len(tasks))
         hint = str(task.get("hint") or "").strip()
         normalized.append({**task, "task": goal,
-                           "hint": f"{contract}\n\n{hint}" if hint else contract})
+                           "hint": f"{preamble}\n\n{hint}" if hint else preamble})
 
     # Suppress per-tool console display for parallel children.  The parent
     # prints a 1-line summary per child when it finishes, giving a clean
@@ -3023,74 +3527,90 @@ def _bi_spawn_parallel(params: dict, ctx: ToolCtx) -> dict:
             f"    [agent]{_esc_markup(_cid)}[/agent]  [muted]{_goal}[/muted]",
             highlight=False)
 
-    # Track spawn times for per-child elapsed display.
-    _start = {cid: time.time() for cid in child_ids}
-    _total_start = time.time()
-    # Track seen tool call_ids per child so we only count new ones once.
-    _seen_calls = {cid: set() for cid in child_ids}
-    # Last reply text seen per child; a change is progress even in a stretch
-    # with no tool calls (a child reasoning its way to a written conclusion).
-    _last_reply_seen = {cid: "" for cid in child_ids}
-    # When each child last held a concurrency slot (or was spawned), so the
-    # "queued holds the clock" rule can be bounded.
-    _queued_since = {cid: time.time() for cid in child_ids}
-    # Track per-child tool count for status display.
-    _tool_counts = {cid: 0 for cid in child_ids}
-    # Last observed liveness of each child's whole subtree (see below).
-    _subtree_seen: dict = {}
-    # Current single-line activity per child: (tool, arg). Overwritten as
-    # new tool calls land -- this is the "live" line, not a scrolling log.
-    _activity: dict = {cid: ("", "starting…") for cid in child_ids}
-    # When _activity[cid] was last updated, so a child stuck on one tool
-    # call (e.g. blocked behind a policy approval elsewhere) can fall back
-    # to an explanatory line instead of looking frozen forever.
-    _activity_ts: dict = {cid: time.time() for cid in child_ids}
-    _IDLE_HINT_AFTER = 15.0
-    # Final one-line status per child once it stops running.
-    _final: dict = {}
-    _final_elapsed: dict = {}
-    _SPINNER_FRAMES = symbols.SPINNER_RELAY
+    # Parallel fan-out is asynchronous by default. Child completion and error
+    # messages already flow through the canonical parent inbox, so holding the
+    # parent's model/tool loop here merely prevents it from doing independent
+    # work while the children run. Keep the old live-table/join implementation
+    # below as an explicit barrier for callers that genuinely need every result
+    # before their next action.
+    # One branch owns this fan-out: its budget, its supervision and its
+    # outcome ledger. The supervisor runs on its own thread, so an
+    # asynchronous batch is watched exactly as closely as a blocking one —
+    # before this, the stall clock lived inside the display loop below and an
+    # async child that wedged had no bound at all.
+    # `spawn_subagents_parallel` already opened the branch — it is the single
+    # place a fan-out is created, so it is the single place a branch is. Fetch
+    # it rather than opening a second one for the same children.
+    import branch as _branch
+    _first = _al.get_agent(child_ids[0]) if child_ids else None
+    _branch_obj = _branch.get(_first.group_id) if _first is not None else None
+    if _branch_obj is None:                  # defensive: never lose supervision
+        _branch_obj = _branch.open_branch(
+            parent_id, "parallel",
+            [(cid, task.get("task", "")) for cid, task in zip(child_ids, normalized)])
+    batch_id = _branch_obj.branch_id
+    if not params.get("wait", False):
+        return {
+            "ok": True,
+            "result": (
+                f"Spawned {len(child_ids)} agents asynchronously in branch "
+                f"'{batch_id}'. Continue independent parent work; results and "
+                f"errors arrive through your inbox, and branch_status('{batch_id}') "
+                "shows live progress. Use await_spawns only when a real result "
+                "barrier is needed. You cannot finish your own task while this "
+                "branch is still open."
+            ),
+            "batch_id": batch_id,
+            "branch_id": batch_id,
+            "child_ids": child_ids,
+            "waiting": False,
+        }
 
-    # Repaint budget. Every refresh erases the whole block and rewrites it —
-    # two separate writes with no synchronized-output guard — so a terminal
-    # that samples between them shows the rows missing. That is the flicker.
-    # Poll fast (state must stay current), draw slowly, and never draw a
-    # frame identical to the one already on screen.
+    # ── Barrier mode ──────────────────────────────────────────────────────
+    # The branch supervisor above already watches every member: stall clock,
+    # wrap-up nudge, cut-off and partial rescue all run on its thread whether
+    # or not anyone is waiting. What is left here is a RENDERER — it draws the
+    # supervisor's state and returns when the branch has settled. Supervision
+    # used to live inside this loop, which is why deleting the loop (async
+    # default) silently deleted the watchdog with it.
+    _branch_obj.budget.stall_seconds = float(SPAWN_PARALLEL_STALL_SECONDS)
+    _members = _branch_obj.members
+    _IDLE_HINT_AFTER = 15.0
+    _SPINNER_FRAMES = symbols.SPINNER_RELAY
     _REDRAW_MIN_INTERVAL = 0.25
-    # The spinner is quantized to the redraw cadence: animating it faster than
-    # we are willing to repaint only forces repaints that show nothing new.
     _SPINNER_PERIOD = max(_REDRAW_MIN_INTERVAL,
                           symbols.SPINNER_INTERVAL_MS / 1000.0)
-    # Columns held back from the table width. Rich (and _disp_truncate) count
-    # East-Asian *Ambiguous* characters as one column — '·', '›', '◯', '…' are
-    # all Ambiguous, and a CJK-configured terminal renders them two wide. With
-    # expand=True every row is padded to exactly the full width, so a single
-    # miscounted column wraps the row, Live's cursor-up count comes up short,
-    # and the repaint stops erasing what it drew.
     _AMBIGUOUS_WIDTH_MARGIN = 4
+    _total_start = _branch_obj.opened_at
 
     def _spinner_glyph() -> str:
         return _SPINNER_FRAMES[
             int(time.time() / _SPINNER_PERIOD) % len(_SPINNER_FRAMES)]
 
+    def _outcome_row(member) -> tuple:
+        if member.outcome == _branch.OUTCOME_VERIFIED:
+            return f"[success]{symbols.OK}[/success]", "[muted]done[/muted]"
+        label = _esc_markup(_disp_truncate(member.detail or member.outcome, 60))
+        return f"[error]{symbols.FAIL}[/error]", f"[muted]{label}[/muted]"
+
     def _render_agents_block():
-        """One-line-per-agent live view: status glyph, id, current tool
-        (or final result once stopped), tool count, elapsed. Mirrors the
-        subagent panels of mainstream coding-agent CLIs -- a fixed set of
-        rows that update in place rather than an ever-growing tool log.
-        """
+        """One line per member: glyph, id, current tool (or outcome), tools,
+        elapsed. A fixed set of rows updated in place, not a scrolling log."""
         from rich.table import Table as _RichTable
         from rich.text import Text as _RichText
         from rich.console import Group as _RichGroup
 
         _elapsed_total = time.time() - _total_start
-        _running = len(child_ids) - len(_final)
-        _total_tools = sum(_tool_counts.values())
+        _settled = [m for m in _members.values() if m.settled]
+        _running = len(_members) - len(_settled)
+        _total_tools = sum(m.tool_calls for m in _members.values())
         if _running > 0:
-            _head = (f"[dim]{_spinner_glyph()} {_running}/{len(child_ids)} running {symbols.BULLET} "
-                      f"{_total_tools} tool calls {symbols.BULLET} {_elapsed_total:.0f}s[/dim]")
+            _head = (f"[dim]{_spinner_glyph()} {_running}/{len(_members)} running "
+                     f"{symbols.BULLET} {_total_tools} tool calls {symbols.BULLET} "
+                     f"{_elapsed_total:.0f}s[/dim]")
         else:
-            _head = f"[dim]{symbols.OK} {len(child_ids)}/{len(child_ids)} done {symbols.BULLET} {_elapsed_total:.0f}s[/dim]"
+            _head = (f"[dim]{symbols.OK} {len(_members)}/{len(_members)} done "
+                     f"{symbols.BULLET} {_elapsed_total:.0f}s[/dim]")
         _table = _RichTable(
             box=None, show_header=False, show_edge=False, pad_edge=False,
             padding=(0, 1), expand=True,
@@ -3102,112 +3622,69 @@ def _bi_spawn_parallel(params: dict, ctx: ToolCtx) -> dict:
         _table.add_column(style="muted", justify="right", no_wrap=True)
         _rows: list = []
         for cid in child_ids:
-            if cid in _final:
-                _glyph, _text = _final[cid]
-                _meta = f"{_tool_counts[cid]} tools {symbols.BULLET} {_final_elapsed.get(cid, 0):.0f}s"
+            member = _members.get(cid)
+            if member is None:
+                continue
+            if member.settled:
+                _glyph, _text = _outcome_row(member)
             else:
                 _awaiting = approval_text_for(cid)
+                _tool, _arg = member.activity
                 if _awaiting:
                     _glyph = f"[warning]{symbols.WAIT}[/warning]"
                     _text = f"[warning]awaiting approval:[/warning] {_awaiting}"
-                elif time.time() - _activity_ts[cid] >= _IDLE_HINT_AFTER:
-                    _tool, _arg = _activity[cid]
+                elif _awaiting_caller(cid):
+                    _glyph = f"[warning]{symbols.WAIT}[/warning]"
+                    _text = "[warning]waiting on you[/warning] (agent_answer)"
+                elif time.time() - member.last_progress_at >= _IDLE_HINT_AFTER:
                     _glyph = f"[accent]{_spinner_glyph()}[/accent]"
                     _prev = _esc_markup(f"{_tool} {_arg}".strip()) or "starting…"
-                    _text = f"[muted]still on:[/muted] {_prev} [muted](may be waiting on approval)[/muted]"
+                    _text = (f"[muted]still on:[/muted] {_prev} "
+                             f"[muted](may be waiting on approval)[/muted]")
                 else:
                     _glyph = f"[accent]{_spinner_glyph()}[/accent]"
-                    _tool, _arg = _activity[cid]
                     _tool, _arg = _esc_markup(_tool), _esc_markup(_arg)
-                    _text = f"[muted]{_tool}[/muted] {_arg}" if _tool else f"[muted]{_arg}[/muted]"
-                _meta = f"{_tool_counts[cid]} tools {symbols.BULLET} {time.time() - _start[cid]:.0f}s"
+                    _text = (f"[muted]{_tool}[/muted] {_arg}" if _tool
+                             else f"[muted]{_arg}[/muted]")
+            _meta = (f"{member.tool_calls} tools {symbols.BULLET} "
+                     f"{member.elapsed():.0f}s")
             _table.add_row(_glyph, cid, _text, _meta)
             _rows.append((_glyph, cid, _text, _meta))
-        # The signature is what the frame will LOOK like. Identical signature
-        # means repainting would produce the same pixels, so we skip it.
         return _RichGroup(_RichText.from_markup(_head), _table), repr((_head, _rows))
 
-    # Concurrent wait: poll all children at once.  Wall time = max(child
-    # times), not sum - the old list-comprehension waited sequentially,
-    # so one slow child blocked detection of the rest.
-    #
-    # No shared deadline: each child is judged on its own progress (see the
-    # constants above). _stall_deadline_for() returns the moment THIS child is
-    # declared stuck, recomputed every poll from its last sign of life.
-    _deadline = (time.time() + SPAWN_PARALLEL_TOTAL_TIMEOUT_SECONDS
-                 if SPAWN_PARALLEL_TOTAL_TIMEOUT_SECONDS > 0 else None)
-    _stall_limit = float(SPAWN_PARALLEL_STALL_SECONDS)
-
-    def _stall_deadline_for(cid: str) -> float:
-        """When ``cid`` will be considered stalled, given what it last did."""
-        return _activity_ts[cid] + _stall_limit
-
-    # Wrap-up nudge: sent to a child that is closing in on ITS OWN stall
-    # cutoff, so it can hand back whatever it has found instead of being cut
-    # off with nothing to show. Reuses the existing inbox mechanism --
-    # run_agent_loop drains and prompts with inbox messages every iteration,
-    # no new plumbing needed. Re-armed whenever the child makes progress
-    # again: a nudge is about being near a cutoff, not a one-time event.
-    _nudged: set = set()
-    # Best-effort partial conclusion captured from a child that got cut off
-    # by the timeout/interrupt, so the final report can show what it found
-    # instead of a bare "timed out" with nothing behind it.
-    _partial_replies: dict = {}
-    # Children cut off for making no progress, so the report can say "stalled"
-    # rather than blaming a batch budget that no longer exists.
-    _stalled: set = set()
     _al.enter_waiting(parent_id)
     try:
-        infos: list = [None] * len(child_ids)
-        _pending = set(child_ids)
-        _console_file = getattr(ctx.deps.console, "file", None)
-        _transient_factory = getattr(_console_file, "transient_output", None)
-        _transient_ctx = (
-            _transient_factory()
-            if callable(_transient_factory) else nullcontext())
         _live = None
         _last_signature = None
         _last_redraw = 0.0
+        _console_file = getattr(ctx.deps.console, "file", None)
+        _transient_factory = getattr(_console_file, "transient_output", None)
+        _transient_ctx = (_transient_factory()
+                          if callable(_transient_factory) else nullcontext())
         with _transient_ctx:
-            # ── One live region per screen, at any depth ──
-            # A batch spawned INSIDE a child of another batch shares this
-            # process's single console. rich then marks the second Live
-            # "nested": it draws nothing while running and, on stop, dumps its
-            # whole renderable into the scrollback under the outer table. The
-            # outer batch already reports this subtree's progress, so the
-            # inner one runs headless instead.
-            with _active_parallel_lives_lock:
-                _display_owner = not _active_parallel_lives
-            if _display_owner:
-                try:
-                    from rich.live import Live
-                    # transient=False: the final frame (all rows resolved)
-                    # stays in the scrollback as the permanent record, instead
-                    # of vanishing and being replaced by a separate summary
-                    # print. auto_refresh=False: the polling loop below owns
-                    # the repaint cadence, so Live's background refresh thread
-                    # would just be a second writer racing the same terminal
-                    # -- notably against a per-child approval prompt printed
-                    # from a different thread.
-                    _frame, _last_signature = _render_agents_block()
-                    _live = Live(_frame, console=ctx.deps.console,
-                                 auto_refresh=False, transient=False,
-                                 redirect_stdout=False, redirect_stderr=False)
-                    _live.__enter__()
-                    _last_redraw = time.time()
-                    with _active_parallel_lives_lock:
-                        _active_parallel_lives.append(_live)
-                except Exception:
-                    _live = None
-            _interrupted = False
+            # One live region per screen at any depth: rich permits one Live
+            # per Console, and a batch spawned inside another batch shares this
+            # process's console. Check, enter and register under one lock — the
+            # old check-then-enter let two batches race into that guard.
+            _may_render = (
+                getattr(ctx.deps.console, "render_terminal", True) is not False)
+            if _may_render:
+                with _active_parallel_lives_lock:
+                    if not _active_parallel_lives:
+                        try:
+                            from rich.live import Live
+                            _frame, _last_signature = _render_agents_block()
+                            _live = Live(
+                                _frame, console=ctx.deps.console,
+                                auto_refresh=False, transient=False,
+                                redirect_stdout=False, redirect_stderr=False)
+                            _live.__enter__()
+                            _last_redraw = time.time()
+                            _active_parallel_lives.append(_live)
+                        except Exception:
+                            _live = None
 
             def _repaint(force: bool = False) -> None:
-                """Redraw only when the frame would actually differ.
-
-                Rate-limited and content-diffed: an unchanged block repainted
-                ten times a second is pure flicker, since each repaint erases
-                every row before rewriting it.
-                """
                 nonlocal _last_signature, _last_redraw
                 if _live is None:
                     return
@@ -3222,163 +3699,21 @@ def _bi_spawn_parallel(params: dict, ctx: ToolCtx) -> dict:
                 with _synchronized_update(ctx.deps.console):
                     _live.update(_frame, refresh=True)
 
-            def _cut_off(cid: str, label: str) -> None:
-                """Tear down a child that will not finish, keeping its answer.
-
-                Snapshots whatever it had already said before abort_agent()
-                takes it apart -- the wrap-up nudge exists so this is a real
-                partial conclusion, not whatever stale text happened to sit
-                there.
-                """
-                _last_info = _al.get_agent(cid)
-                if _last_info is not None:
-                    _partial = ((_last_info.state or {}).get("lastReply") or "").strip()
-                    if _partial:
-                        _partial_replies[cid] = _partial
-                _al.abort_agent(cid)
-                _final_elapsed[cid] = time.time() - _start[cid]
-                _final[cid] = (f"[error]{symbols.FAIL}[/error]", f"[muted]{label}[/muted]")
-
             try:
-                while _pending and (_deadline is None or time.time() < _deadline):
-                    _parent_info = _al.get_agent(parent_id)
+                while True:
                     _interrupt_ev = getattr(ctx, "interrupt_event", None)
+                    _parent_info = _al.get_agent(parent_id)
                     if ((_interrupt_ev is not None and _interrupt_ev.is_set())
                             or (_parent_info is not None
                                 and _parent_info.abort_event.is_set())):
-                        # User requested interrupt (Ctrl+C/Esc). Without this
-                        # check the loop would only stop when every child
-                        # finishes or stalls, so a single Ctrl+C had no effect
-                        # on an in-flight spawn_parallel call and the CLI
-                        # looked hung.
-                        _interrupted = True
+                        # A single Ctrl+C used to have no effect on an
+                        # in-flight batch, so the CLI looked hung.
+                        _branch.interrupt(_branch_obj.branch_id)
                         break
-                    _now = time.time()
-                    for i, cid in enumerate(child_ids):
-                        if infos[i] is not None:
-                            continue
-                        info = _al.get_agent(cid)
-                        if info is not None:
-                            _cstate = info.state or {}
-                            # Update this child's single activity line from the
-                            # most recent tool call -- no per-call scrollback.
-                            # _pending_history carries the calls of a turn that
-                            # is still running; without it a six-call turn looks
-                            # motionless until its last call lands.
-                            _hist = list(_cstate.get("terminalHistory") or [])
-                            _hist.extend(_cstate.get("_pending_history") or [])
-                            for _row in _hist:
-                                if not isinstance(_row, dict):
-                                    continue
-                                _call_id = _row.get("call_id", "")
-                                if not _call_id or _call_id in _seen_calls[cid]:
-                                    continue
-                                _seen_calls[cid].add(_call_id)
-                                _tool_counts[cid] += 1
-                                _tool = _row.get("tool", "?")
-                                _cmd = _disp_truncate(
-                                    (_row.get("command") or "").strip(), _goal_w)
-                                _activity[cid] = (_tool, _cmd)
-                                _activity_ts[cid] = _now
-                                _nudged.discard(cid)
-                            # A tool call still running is work, not silence.
-                            # Dating the stall clock from its START (not from
-                            # now) keeps the watchdog meaningful: a tool wedged
-                            # forever still trips it, a slow one does not.
-                            _act = _cstate.get("_active_tool")
-                            if isinstance(_act, dict):
-                                _act_start = float(_act.get("started") or 0.0)
-                                if _act_start > _activity_ts[cid]:
-                                    _activity_ts[cid] = _act_start
-                                    _activity[cid] = (
-                                        str(_act.get("name") or ""),
-                                        _disp_truncate(str(_act.get("arg") or ""), _goal_w))
-                                    _nudged.discard(cid)
-                            # Progress can also be pure text: a child reasoning
-                            # its way to a written conclusion calls no tools.
-                            _reply_now = str(_cstate.get("lastReply") or "").strip()
-                            if _reply_now and _reply_now != _last_reply_seen[cid]:
-                                _last_reply_seen[cid] = _reply_now
-                                _activity_ts[cid] = _now
-                                _nudged.discard(cid)
-                            # …and a delegating child shows no signs of its
-                            # own at all: it sits on one open spawn call while
-                            # ITS children do the work. Their progress is its
-                            # progress, or the watchdog kills every supervisor
-                            # in a tree deeper than one level.
-                            _subtree_now = _al.subtree_progress_token(cid)
-                            if _subtree_now != _subtree_seen.get(cid):
-                                if _subtree_seen.get(cid) is not None:
-                                    _activity_ts[cid] = _now
-                                    _nudged.discard(cid)
-                                _subtree_seen[cid] = _subtree_now
-                        # Subtree-aware: a child whose OWN child is parked on
-                        # an approval prompt is waiting on a person too, and
-                        # must not be killed for "no progress".
-                        if is_awaiting_approval(cid):
-                            # A human deciding is not a stalled agent. Hold the
-                            # clock instead of killing the child out from under
-                            # the prompt it is blocked on.
-                            _activity_ts[cid] = _now
-                            _nudged.discard(cid)
-                        elif (info is not None and info.status == "queued"
-                              and _now - _queued_since[cid] < _al.AGENT_QUEUE_HOLD_MAX_SECONDS):
-                            # Waiting for a concurrency slot is not stalling
-                            # either: a queued child cannot make progress by
-                            # definition, and killing it for that would make the
-                            # watchdog fire hardest exactly when the machine is
-                            # busiest. Its clock starts when it starts running.
-                            # Bounded, so a slot that never frees is reported as
-                            # a stall rather than hanging the batch forever.
-                            _activity_ts[cid] = _now
-                            _nudged.discard(cid)
-                        elif info is not None and info.status != "queued":
-                            _queued_since[cid] = _now
-                        if info is not None and info.status in ("done", "aborted", "error"):
-                            infos[i] = info
-                            _pending.discard(cid)
-                            _final_elapsed[cid] = time.time() - _start[cid]
-                            _has_reply = bool(
-                                (info.result or info.last_reply or "").strip())
-                            if info.status == "done" and not info.error and _has_reply:
-                                _final[cid] = (f"[success]{symbols.OK}[/success]", "[muted]done[/muted]")
-                            elif info.status == "done" and not info.error:
-                                _final[cid] = ("[warning]◯[/warning]", "[muted]empty reply[/muted]")
-                            else:
-                                _label = _esc_markup(
-                                    _disp_truncate(info.error or info.status, 60))
-                                _final[cid] = (f"[error]{symbols.FAIL}[/error]", f"[muted]{_label}[/muted]")
-                            continue
-                        # ── Per-child stall watchdog ──
-                        _stall_at = _stall_deadline_for(cid)
-                        if (cid not in _nudged
-                                and _now >= _stall_at - SPAWN_PARALLEL_WRAP_UP_LEAD_SECONDS):
-                            _nudged.add(cid)
-                            _al.send_to_agent(cid, {
-                                "type": "budget_warning",
-                                "text": (
-                                    f"You have shown no progress for a while and will be stopped in "
-                                    f"~{SPAWN_PARALLEL_WRAP_UP_LEAD_SECONDS}s if that does not change. "
-                                    "Stop opening new exploration now and reply with the best "
-                                    "conclusion you can support from what you've already found — "
-                                    "a partial, honest answer beats being cut off with nothing."),
-                            })
-                        if _now >= _stall_at:
-                            _stalled.add(cid)
-                            _pending.discard(cid)
-                            infos[i] = None
-                            _cut_off(cid, f"stalled {symbols.BULLET} "
-                                          f"no progress for {int(_stall_limit)}s")
+                    if not _branch_obj.open_members():
+                        break
                     _repaint()
-                    if _pending:
-                        time.sleep(0.1)
-                for cid in _pending:
-                    infos[child_ids.index(cid)] = None
-                    _cut_off(cid, "interrupted" if _interrupted
-                             else f"batch timeout {symbols.BULLET} "
-                                  f"{int(SPAWN_PARALLEL_TOTAL_TIMEOUT_SECONDS)}s")
-                # Final frame: every row resolved, drawn unconditionally so
-                # the permanent scrollback record is the finished table.
+                    time.sleep(0.1)
                 _repaint(force=True)
             finally:
                 if _live is not None:
@@ -3391,6 +3726,19 @@ def _bi_spawn_parallel(params: dict, ctx: ToolCtx) -> dict:
                         pass
     finally:
         _al.exit_waiting(parent_id)
+
+    _branch.close(_branch_obj.branch_id, "barrier completed")
+    _interrupted = _branch_obj.interrupted
+    _stalled = {m.agent_id for m in _members.values()
+                if m.outcome == _branch.OUTCOME_ABORTED
+                and "no observable progress" in (m.detail or "")}
+    _partial_replies = {m.agent_id: m.partial
+                        for m in _members.values() if m.partial}
+    # `None` marks a member that never produced a result of its own — the
+    # report below renders those from the branch ledger (cause + rescued
+    # partial) instead of from an agent record that says nothing useful.
+    infos = [None if _members[cid].outcome == _branch.OUTCOME_ABORTED
+             else _al.get_agent(cid) for cid in child_ids]
 
     # A reply that admits it isn't actually finished must not count as a
     # clean success just because the loop returned status="done" — that
@@ -3426,17 +3774,19 @@ def _bi_spawn_parallel(params: dict, ctx: ToolCtx) -> dict:
     lines = [f"═══ Parallel Results ({len(child_ids)} agents) ═══"]
     succeeded = 0
     partial = 0
+    child_diagnostics = []
     for cid, task, info in zip(child_ids, normalized, infos):
+        diagnostic = _child_diagnostic(info)
+        child_diagnostics.append({"child_id": cid, **diagnostic})
         if info is None:
             ok = False
             _partial_text = _partial_replies.get(cid, "")
-            if _interrupted:
+            # The branch ledger already says exactly why this member has no
+            # result, in the supervisor's own words. Re-deriving the reason
+            # here is how the report and the watchdog drifted apart before.
+            _cause = (_members[cid].detail or "stopped")
+            if _interrupted and _members[cid].outcome == _branch.OUTCOME_ABORTED:
                 _cause = "interrupted"
-            elif cid in _stalled:
-                _cause = (f"stopped after {int(_stall_limit)}s with no observable "
-                          "progress (no tool call, no reply)")
-            else:
-                _cause = "stopped by the batch timeout"
             if _partial_text:
                 partial += 1
                 message = (
@@ -3463,6 +3813,15 @@ def _bi_spawn_parallel(params: dict, ctx: ToolCtx) -> dict:
                 # just because the loop exited cleanly.
                 ok = False
                 partial += 1
+            if not ok:
+                if diagnostic.get("contract_gaps"):
+                    message += "\nContract gaps: " + "; ".join(
+                        str(gap) for gap in diagnostic["contract_gaps"])
+                if diagnostic.get("capability_gaps"):
+                    message += "\nCapability gaps: " + "; ".join(
+                        f"{gap.get('tool', '?')} ({gap.get('kind', 'blocked')})"
+                        for gap in diagnostic["capability_gaps"]
+                        if isinstance(gap, dict))
         succeeded += int(ok)
         lines.append(
             f"\n─── [{f'{symbols.OK}' if ok else f'{symbols.FAIL}'}] {cid} ───\n"
@@ -3473,8 +3832,12 @@ def _bi_spawn_parallel(params: dict, ctx: ToolCtx) -> dict:
         _summary += f", {partial} partial (ran out of budget or self-reported incomplete)"
     _summary += " ═══"
     lines.append(_summary)
+    if succeeded != len(child_ids):
+        lines.append(_PARENT_DECISION_NOTE)
     return {"ok": succeeded == len(child_ids), "result": "\n".join(lines),
-            "child_ids": child_ids}
+            "batch_id": batch_id, "waiting": True,
+            "child_ids": child_ids, "children": child_diagnostics,
+            "retry_policy": "parent_decides"}
 
 
 def _bi_spawn_chain(params: dict, ctx: ToolCtx) -> dict:
@@ -3573,9 +3936,17 @@ def _bi_await_spawns(params: dict, ctx: ToolCtx) -> dict:
 
     parent_id = _runtime_parent_agent_id(ctx)
     agent_ids = params.get("agent_ids")
+    batch_id = str(params.get("batch_id") or "").strip()
 
     if agent_ids:
         target_ids = list(agent_ids)
+    elif batch_id and parent_id:
+        parent = _al.get_agent(parent_id)
+        target_ids = [
+            child_id for child_id in (parent.child_ids if parent else [])
+            if ((_al.get_agent(child_id) is not None)
+                and _al.get_agent(child_id).group_id == batch_id)
+        ]
     elif parent_id:
         parent = _al.get_agent(parent_id)
         target_ids = list(parent.child_ids) if parent else []
@@ -3716,13 +4087,18 @@ def _bi_hwg(params: dict, ctx: ToolCtx) -> dict:
 
 
 def _hwo_is_sibling_or_ancestor(caller_id: str, target_id: str) -> bool:
-    """Compatibility wrapper for the runtime's topology authorization."""
+    """Compatibility wrapper for the runtime's topology authorization.
+
+    The name is historical: HWO used to let parallel members message each
+    other. Authorization now follows tree edges only (see
+    agent_loop.can_agents_communicate), so a sibling is no longer reachable.
+    """
     import agent_loop as _al
     return _al.can_agents_communicate(caller_id, target_id)
 
 
 def _bi_hwo_agent_send(params: dict, ctx: ToolCtx) -> dict:
-    """Send a message to a sibling or parent agent within the current HWO workflow."""
+    """Send a mailbox message to the parent, or to one of this agent's children."""
     import agent_loop as _al
     import hwo_runner
 
@@ -3741,9 +4117,10 @@ def _bi_hwo_agent_send(params: dict, ctx: ToolCtx) -> dict:
         return {
             "ok": False,
             "error": (
-                f"'{to}' is outside '{caller_id}' communication scope; only "
-                "same-terminal peers, direct parent/child terminals, and direct "
-                "agent parent/child links are reachable."
+                f"'{to}' is not on a tree edge from '{caller_id}': only your "
+                "parent and your own children are reachable. A parallel member "
+                "cannot message another parallel member - declare the value in "
+                "out(...) and let the parent scope pass it on."
             ),
         }
     ok = hwo_runner.hwo_send(to=to, from_=caller_id, text=str(message))
@@ -3837,6 +4214,83 @@ def _bi_hwo_agent_return(params: dict, ctx: ToolCtx) -> dict:
         "ok": True,
         "result": "Outputs submitted. Continue the remaining workflow steps.",
     }
+
+
+def _bi_branch_status(params: dict, ctx: ToolCtx) -> dict:
+    """What the work you delegated is doing, right now."""
+    import branch as _branch
+
+    if not ctx.agent_id:
+        return {"ok": False, "error": "no current agent"}
+    branch_id = str(params.get("branch_id") or "").strip()
+    if branch_id:
+        found = _branch.get(branch_id)
+        if found is None:
+            return {"ok": False, "error": f"no such branch '{branch_id}'"}
+        if found.owner_agent_id != ctx.agent_id:
+            return {"ok": False,
+                    "error": f"branch '{branch_id}' belongs to another agent"}
+        report = _branch.status_report(found)
+        return {"ok": True, "result": json.dumps(report, ensure_ascii=False,
+                                                 indent=1), **report}
+    reports = [_branch.status_report(b)
+               for b in _branch.branches_for(ctx.agent_id)]
+    if not reports:
+        return {"ok": True, "result": "You have not delegated any work."}
+    return {"ok": True,
+            "result": json.dumps(reports, ensure_ascii=False, indent=1),
+            "branches": reports}
+
+
+def _bi_agent_ask_parent(params: dict, ctx: ToolCtx) -> dict:
+    """Ask the caller a question this agent cannot answer for itself."""
+    import agent_loop as _al
+
+    question = str(params.get("question") or "").strip()
+    if not question:
+        return {"ok": False, "error": "missing 'question'"}
+    if not ctx.agent_id:
+        return {"ok": False, "error": "no current agent"}
+    needed = [str(t).strip() for t in (params.get("needed_capabilities") or [])
+              if str(t).strip()]
+    options = [str(o).strip() for o in (params.get("options") or [])
+               if str(o).strip()]
+    result = _al.ask_parent_for_help(ctx.agent_id, {
+        "question": question,
+        "blocker": str(params.get("blocker") or "").strip(),
+        "needed_capabilities": needed,
+        "options": options or ["revise the task", "widen my tools",
+                               "accept a partial result", "stop"],
+    })
+    if not result.get("ok"):
+        return {"ok": False, "_advisory": True,
+                "error": result.get("error", "cannot ask")}
+    if result.get("answered"):
+        return {"ok": True,
+                "result": (f"Caller decided: {result['decision']}\n"
+                           f"{result.get('guidance', '')}").strip()}
+    return {"ok": True, "result": result.get("guidance", "")}
+
+
+def _bi_agent_answer(params: dict, ctx: ToolCtx) -> dict:
+    """Answer a child that is waiting on you."""
+    import agent_loop as _al
+
+    child_id = str(params.get("agent_id") or "").strip()
+    decision = str(params.get("decision") or "").strip()
+    if not child_id:
+        return {"ok": False, "error": "missing 'agent_id'"}
+    if not decision:
+        return {"ok": False, "error": "missing 'decision'"}
+    if not ctx.agent_id:
+        return {"ok": False, "error": "no current agent"}
+    result = _al.answer_child_help(ctx.agent_id, child_id, decision,
+                                   str(params.get("guidance") or ""))
+    if not result.get("ok"):
+        return result
+    note = ("" if result.get("waiting") else
+            " (it was not waiting; the answer is in its inbox for its next turn)")
+    return {"ok": True, "result": f"Answered {child_id}{note}."}
 
 
 def _bi_agent_tell(params: dict, ctx: ToolCtx) -> dict:
@@ -4145,22 +4599,29 @@ def _bi_agent_hire(params: dict, ctx: ToolCtx) -> dict:
 
 
 def _bi_agent_list(params: dict, ctx: ToolCtx) -> dict:
-    """List all agents."""
-    if ctx.get_all_agents is None:
-        return {"ok": False, "error": "agent listing not available"}
-    agents = ctx.get_all_agents()
-    current = (
-        ctx.get_agent(ctx.agent_id)
-        if ctx.get_agent is not None and ctx.agent_id
-        else None
-    )
-    lines = []
-    for a in agents:
-        marker = " <-- self" if (current and a.id == current.id) else ""
+    """List the agents this one may actually reach: its parent and children.
+
+    It used to dump the whole registry. Listing an agent that `agent.tell` will
+    refuse is worse than not listing it: the model reads the roster as a set of
+    available collaborators and spends turns discovering, one refusal at a
+    time, that most of them are not. Visibility and reachability are now the
+    same set (agent_loop.agent_neighbourhood).
+    """
+    import agent_loop as _al
+
+    if not ctx.agent_id:
+        return {"ok": False, "error": "no current agent"}
+    me = _al.get_agent(ctx.agent_id)
+    if me is None:
+        return {"ok": False, "error": "current agent not found in registry"}
+    lines = [f"  {me.id}: {me.name} [{me.status}] <-- self"]
+    for a in _al.agent_neighbourhood(ctx.agent_id):
+        relation = "parent" if a.id == me.parent_id else "child"
         st = f" [stationed: {a.stationed_terminal}]" if a.stationed_terminal else ""
-        st += f" [{a.status}]" if a.status != "idle" else ""
-        lines.append(f"  {a.id}: {a.name}{st}{marker}")
-    return {"ok": True, "result": "\n".join(lines) if lines else "(no agents)"}
+        lines.append(f"  {a.id}: {a.name} ({relation}) [{a.status}]{st}")
+    if len(lines) == 1:
+        lines.append("  (no parent, no children - you are alone in this tree)")
+    return {"ok": True, "result": "\n".join(lines)}
 
 
 def _bi_agent_rename(params: dict, ctx: ToolCtx) -> dict:
@@ -4973,6 +5434,76 @@ def _bi_task_complete(params: dict, ctx: ToolCtx) -> dict:
     longer infers "done" from a turn that simply lacks a tool call.
     """
     summary = (params.get("summary") or "").strip()
+    # Declared outputs, when the caller was spawned under a contract. Recorded
+    # on the loop's own state (the registry entry is overwritten when the loop
+    # exits, which is how HWO's agent_return payloads used to get lost).
+    outputs = params.get("outputs")
+    if isinstance(outputs, str):
+        try:
+            outputs = json.loads(outputs)
+        except (TypeError, ValueError):
+            outputs = None
+    if isinstance(outputs, dict) and isinstance(getattr(ctx, "state", None), dict):
+        ctx.state["_submitted_outputs"] = outputs
+        if ctx.get_agent is not None and ctx.agent_id:
+            _info = ctx.get_agent(ctx.agent_id)
+            if _info is not None:
+                _info.submitted = dict(outputs)
+    # ── The closed loop ───────────────────────────────────────────────────
+    # A parent may not declare its task finished while a branch it opened is
+    # still running. Nothing used to stop it: child threads are daemons and
+    # close_all_agents() only fires at CLI shutdown, so children kept burning
+    # tokens against an account whose owner had walked away. The rule was a
+    # sentence in a prompt; this is the mechanism behind it.
+    #
+    # Refused ONCE, with the branch state attached, because the decision is the
+    # caller's: collect the results, abort what is no longer needed, or accept
+    # the partial work. A second call proceeds and drains what is left, so the
+    # rule can never deadlock the agent that it is trying to discipline.
+    if ctx.agent_id:
+        try:
+            import branch as _branch
+            _open = _branch.open_branches(ctx.agent_id)
+            _state = getattr(ctx, "state", None)
+            if _open and isinstance(_state, dict):
+                if not _state.get("_branch_completion_warned"):
+                    _state["_branch_completion_warned"] = True
+                    _detail = "\n".join(
+                        _branch.summarize_open(ctx.agent_id).splitlines()[:12])
+                    return {
+                        "ok": False,
+                        "_advisory": True,
+                        "error": (
+                            "you still have delegated work running:\n"
+                            f"{_detail}\n"
+                            "Decide before finishing: await_spawns(batch_id=...) "
+                            "to collect what you need, agent_abort on the "
+                            "children whose results you no longer want, or call "
+                            "task_complete again to finish and drop them. "
+                            "Finishing now would leave them running against "
+                            "your task with nobody reading the results."),
+                    }
+                for _b in _open:
+                    _branch.drain(_b.branch_id,
+                                  "owner completed its task without collecting "
+                                  "this branch")
+        except Exception:
+            pass
+
+    _contract = (ctx.state or {}).get("_contract") if isinstance(
+        getattr(ctx, "state", None), dict) else None
+    if _contract and not isinstance(outputs, dict):
+        # Declining here rather than at the gate: the child is still running,
+        # still has its context, and the fix is one call away.
+        import agent_contract
+        return {
+            "ok": False,
+            "_advisory": True,
+            "error": ("this task was spawned under a contract: call "
+                      "task_complete again with outputs={...} carrying "
+                      + ", ".join(o["name"] for o in _contract.get("outputs") or [])
+                      + ". " + agent_contract.render(_contract)),
+        }
     tree_items = []
     if _task_mgr is not None and ctx.session_id:
         scoped = _task_mgr.list_tasks(
@@ -7639,22 +8170,51 @@ def register_builtin_tools() -> None:
         ),
         Tool(
             name="fs.read",
-            description="Read a file as UTF-8 text. Use offset/limit for large files. "
-                        "Output is prefixed with line numbers (cat -n style) so the AI "
-                        "can refer to specific lines in follow-up fs.edit calls. "
+            description="Read a file as UTF-8 text, as a paged document. "
+                        "`{path}` alone opens page 1 and reports how many pages "
+                        "the file has -- do NOT pass offset/limit to walk a "
+                        "file, use the pages. "
+                        "`{path, page:'next'}` turns the page; the page you "
+                        "leave is REMOVED from your context and replaced by a "
+                        "stub with its line range and an index of what it "
+                        "defined, so one file costs one page however big it is. "
+                        "Pass `note` when turning to keep your own summary of "
+                        "the page you are leaving (write it for someone who "
+                        "cannot see the code, and keep the line numbers that "
+                        "matter); pass `pin:true` to hold a page you are about "
+                        "to edit. `page` also takes a number, 'prev', 'first', "
+                        "'last'. "
+                        "Passing offset/limit instead is the targeted window: "
+                        "use it to check specific lines, say around an fs.grep "
+                        "hit. It does not move the page cursor and is never "
+                        "dropped. "
+                        "Output is prefixed with line numbers (`N\u2192`, cat -n style) so "
+                        "you can refer to exact lines. Those prefixes are DISPLAY ONLY and "
+                        "are not in the file: strip them before using a line as an fs.edit "
+                        "anchor, or pass line_numbers:false to get the raw text. Their width "
+                        "tracks the window's largest line number, so the same line looks "
+                        "differently indented in different reads. "
                         "Prefer this over `cat` for source files.",
             schema={
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "absolute or cwd-relative"},
-                    "offset": {"type": "integer", "default": 1,
-                                "description": "1-based starting line"},
-                    "limit": {"type": "integer", "default": 2000,
-                                "description": "max lines to return"},
+                    "page": {"description": "page number, or 'next'/'prev'/'first'/'last'",
+                             "anyOf": [{"type": "integer", "minimum": 1},
+                                       {"type": "string"}]},
+                    "note": {"type": "string",
+                             "description": "your summary of the page you are leaving; "
+                                            "kept in context after that page is dropped"},
+                    "pin": {"type": "boolean",
+                            "description": "hold this page in context past the next page turn"},
+                    "offset": {"type": "integer",
+                                "description": "targeted window: 1-based starting line"},
+                    "limit": {"type": "integer",
+                                "description": "targeted window: max lines to return"},
                     "max_bytes": {"type": "integer", "default": 200000,
                                   "description": "hard byte cap on the returned payload"},
                     "line_numbers": {"type": "boolean", "default": True,
-                                       "description": "prepend each line with 'N→ '"},
+                                       "description": "prepend each line with 'N\u2192 '"},
                 },
                 "required": ["path"],
             },
@@ -7711,7 +8271,10 @@ def register_builtin_tools() -> None:
         Tool(
             name="fs.edit",
             description="Exact string replacement in a file. Replace old_string with new_string. "
-                        "Use replace_all:true if the string is not unique. "
+                        "Use replace_all:true if the string is not unique. old_string must be "
+                        "the file's RAW bytes: no `N\u2192` line-number prefixes from fs.read. "
+                        "Whitespace/indentation drift is tolerated as a fallback, but an exact "
+                        "anchor is what makes the edit predictable. "
                         "This is the primary tool for editing code — prefer it over fs.write.",
             schema={
                 "type": "object",
@@ -7729,7 +8292,11 @@ def register_builtin_tools() -> None:
         Tool(
             name="fs.multi_edit",
             description="Apply multiple sequential exact-string edits to one file atomically. "
-                        "Edits run in order; if any fails, the file is left untouched. "
+                        "Edits run in order against the result of the previous one; if any "
+                        "fails, the file is left untouched and the error names which edit "
+                        "failed and which ones matched — re-send the batch with only that one "
+                        "corrected, do not re-guess the others. Same anchor rules as fs.edit: "
+                        "raw bytes, no `N\u2192` prefixes. "
                         "Use this when one fs.edit call would conflict with another in the "
                         "same file (e.g. rename + import update).",
             schema={
@@ -8322,6 +8889,11 @@ def register_builtin_tools() -> None:
             description="Spawn a disposable in-process child agent for one sub-task. "
                         "It has an isolated context, runs in its own thread, posts results "
                         "to your inbox, and is not a hired employee. "
+                        "The judgement roles (reviewer, silent-failure-hunter, tester) "
+                        "come with a MANDATORY contract: their findings must cite "
+                        "path:line locations that the runtime resolves against the "
+                        "files, and as many real citations as issues they claim. Your "
+                        "own `contract` is added to that one, never replaces it. "
                         "Supports specialized roles (explorer, architect, reviewer, "
                         "silent-failure-hunter, simplifier, tester) and fire-and-forget "
                         "parallel spawning via the 'tasks' parameter (check inbox for results). "
@@ -8352,14 +8924,119 @@ def register_builtin_tools() -> None:
                     "wait": {"type": "boolean", "default": False,
                              "description": "Block until all children complete. Delegates to "
                                             "spawn_parallel (ignores 'timeout')."},
+                    "contract": {
+                        "type": "object",
+                        "description": (
+                            "What the child must deliver, checked mechanically "
+                            "when it finishes. Prefer this over describing the "
+                            "deliverable in prose: without it, 'done' only means "
+                            "the child stopped talking."),
+                        "properties": {
+                            "outputs": {
+                                "type": "array",
+                                "description": "Declared products: [{name, type: "
+                                               "string|file|object|array|number|"
+                                               "boolean, required, description}]",
+                                "items": {"type": "object"},
+                            },
+                            "acceptance": {
+                                "type": "array",
+                                "description": "Deterministic checks: [{kind: "
+                                               "file_exists|contains|matches|"
+                                               "min_length|json_object|line_ref, "
+                                               "output, value}]",
+                                "items": {"type": "object"},
+                            },
+                            "evidence": {
+                                "type": "array",
+                                "description": "What the child must cite; a "
+                                               "path:line whose line does not "
+                                               "exist fails the check.",
+                                "items": {"type": "string"},
+                            },
+                            "scope": {
+                                "type": "object",
+                                "description": "{paths: [...], max_loops: N}",
+                            },
+                        },
+                    },
                 },
                 "required": [],
             },
             invoke=_bi_agent_spawn,
         ),
         Tool(
+            name="branch_status",
+            description="What the work you delegated is doing: every member of "
+                        "every branch you opened, its outcome or its current "
+                        "activity, elapsed time and tool count. Use it to "
+                        "decide whether to wait, follow up, or stop something "
+                        "— you do not have to block to find out.",
+            schema={
+                "type": "object",
+                "properties": {
+                    "branch_id": {"type": "string",
+                                  "description": "one branch; omit for all of yours"},
+                },
+            },
+            invoke=_bi_branch_status,
+        ),
+        Tool(
+            name="agent.ask_parent",
+            description="Ask the agent that spawned you a question you cannot "
+                        "answer yourself, and WAIT for the answer. Use it the "
+                        "moment you hit a wall that is your caller's to remove "
+                        "-- a tool you were not given, a task that contradicts "
+                        "your scope, a choice with consequences outside your "
+                        "task -- instead of working around it for the rest of "
+                        "your budget and reporting the wall at the end. You "
+                        "keep your context while you wait and continue where "
+                        "you left off. If no answer comes, you are released "
+                        "with instructions to proceed on your own judgement.",
+            schema={
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string",
+                                 "description": "the decision you need, in one sentence"},
+                    "blocker": {"type": "string",
+                                "description": "what is actually stopping you"},
+                    "needed_capabilities": {
+                        "type": "array", "items": {"type": "string"},
+                        "description": "tools you would need to proceed"},
+                    "options": {
+                        "type": "array", "items": {"type": "string"},
+                        "description": "the choices as you see them"},
+                },
+                "required": ["question"],
+            },
+            invoke=_bi_agent_ask_parent,
+        ),
+        Tool(
+            name="agent.answer",
+            description="Answer a child of yours that is blocked waiting on "
+                        "you (its request arrives in your inbox as child-help). "
+                        "It resumes where it stopped, with your decision, "
+                        "keeping everything it had already worked out.",
+            schema={
+                "type": "object",
+                "properties": {
+                    "agent_id": {"type": "string", "description": "the child that asked"},
+                    "decision": {"type": "string",
+                                 "description": "what it should do, e.g. 'proceed without "
+                                                "the shell; report what you could not verify'"},
+                    "guidance": {"type": "string",
+                                 "description": "any detail it needs to act on the decision"},
+                },
+                "required": ["agent_id", "decision"],
+            },
+            invoke=_bi_agent_answer,
+        ),
+        Tool(
             name="agent.tell",
-            description="Send a message to another agent's inbox.",
+            description="Send a message to your parent's or one of your own "
+                        "children's inbox. Only tree edges carry messages: a "
+                        "sibling is not reachable, and work that two siblings "
+                        "must agree on belongs to the parent that owns both.",
             schema={
                 "type": "object",
                 "properties": {
@@ -8439,7 +9116,11 @@ def register_builtin_tools() -> None:
         ),
         Tool(
             name="agent.list",
-            description="List all agents and their statuses.",
+            description="List the agents you can reach: your parent and your own "
+                        "children. Agents elsewhere in the tree (siblings, "
+                        "cousins, anything under another parent) are not "
+                        "listed and cannot be messaged - route through your "
+                        "parent instead.",
             schema={"type": "object", "properties": {}},
             invoke=_bi_agent_list,
         ),
@@ -8501,13 +9182,18 @@ def register_builtin_tools() -> None:
         Tool(
             name="spawn_parallel",
             description=(
-                "Spawn multiple sub-agents in PARALLEL and wait for ALL to finish. "
-                "Returns a combined structured report. Max 6 agents per batch. "
+                "Spawn multiple sub-agents in PARALLEL. Returns batch_id and child_ids "
+                "immediately by default while results continue to arrive through your "
+                "inbox, so continue useful independent work. Set wait=true only for a "
+                "real barrier that requires ALL results before the next action; that "
+                "compatibility mode returns a combined structured report. Max 6 agents "
+                "per batch. "
                 "Each member must work on DIFFERENT files — decompose by file boundaries. "
                 "Agents beyond the concurrency cap queue automatically. "
-                "There is no batch time budget — a child runs until it finishes or exhausts "
-                "its loop cap — but a child that shows no progress for several minutes is "
-                "stopped on its own. Still scope each task to a reviewable slice (roughly "
+                "In wait=true barrier mode there is no batch time budget; its live supervisor "
+                "stops an individual child after several minutes without observable progress. "
+                "The default asynchronous mode does not keep this tool call open to supervise "
+                "the batch. Still scope each task to a reviewable slice (roughly "
                 "<=300-400 lines of code, or an equivalently bounded unit): an oversized "
                 "slice returns a shallower review, not a better one. "
                 "Inside a child, prefer fs.read/fs.grep for reading "
@@ -8525,11 +9211,34 @@ def register_builtin_tools() -> None:
                             "properties": {
                                 "goal": {"type": "string", "description": "Complete task description for this agent."},
                                 "hint": {"type": "string", "description": "Task-specific extra context."},
+                                "role": {"type": "string",
+                                         "description": "Specialized role. Judgement "
+                                                        "roles (reviewer, "
+                                                        "silent-failure-hunter, tester) "
+                                                        "carry a mandatory contract: "
+                                                        "their findings must cite "
+                                                        "path:line locations that "
+                                                        "resolve against the files."},
+                                "contract": {"type": "object",
+                                             "description": "Declared outputs + "
+                                                            "acceptance checks for this "
+                                                            "agent (see agent.spawn). "
+                                                            "Added to the role's own "
+                                                            "contract, never replaces it."},
                             },
                             "required": ["goal"],
                         },
                         "minItems": 1,
                         "maxItems": 6,
+                    },
+                    "wait": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": (
+                            "Explicit barrier: wait for all children and return their "
+                            "combined report. Default false; normally continue parent "
+                            "work and consume inbox results as they arrive."
+                        ),
                     },
                 },
                 "required": ["tasks"],
@@ -8570,7 +9279,9 @@ def register_builtin_tools() -> None:
             name="await_spawns",
             description=(
                 "Wait for spawned sub-agents to finish and collect their results. "
-                "If agent_ids is omitted, waits for ALL children of the current agent."
+                "Select a returned batch_id or child agent_ids. If both are omitted, "
+                "waits for ALL children of the current agent. Use only when the next "
+                "action truly depends on those results."
             ),
             schema={
                 "type": "object",
@@ -8579,6 +9290,10 @@ def register_builtin_tools() -> None:
                         "type": "array",
                         "items": {"type": "string"},
                         "description": "Specific agent IDs to wait for. Omit to await all children.",
+                    },
+                    "batch_id": {
+                        "type": "string",
+                        "description": "Batch ID returned by spawn_parallel.",
                     },
                 },
             },
@@ -8969,6 +9684,14 @@ def register_builtin_tools() -> None:
                 "type": "object",
                 "properties": {
                     "summary": {"type": "string", "description": "Final result summary for the user."},
+                    "outputs": {
+                        "type": "object",
+                        "description": "Declared outputs, when you were spawned "
+                                       "under a <contract>: {name: value} for "
+                                       "every output it declares. Checked "
+                                       "mechanically; a file output is a PATH "
+                                       "that must exist.",
+                    },
                 },
             },
             invoke=_bi_task_complete,

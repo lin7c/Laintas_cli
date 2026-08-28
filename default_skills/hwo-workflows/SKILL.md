@@ -2,6 +2,18 @@
 name: hwo-workflows
 description: Author, validate, or debug HWO multi-agent workflows and HWG graphs.
 version: 1.0.0
+triggers:
+  - hwo
+  - hwg
+  - workflow
+  - pipeline
+  - staged
+  - stages
+  - resumable
+  - conditional workflow
+  - loop until
+  - multi agent workflow
+  - orchestrate
 ---
 
 # HWO and HWG Workflows
@@ -164,9 +176,12 @@ branch's declared outputs through `#branch.field#`. If a branch walks off
 somewhere else and never arrives, the run fails and names the waiting join
 rather than quietly merging a partial set.
 
-Branches currently run **one after another**, not concurrently — the gain is
-expressiveness ("do all of these, then merge"), not wall-clock time. Parallel
-execution can be added later without changing any `.hwg` file.
+Ready fan-out branches run **concurrently** (up to six at a time). Their
+results are committed in source/queue order rather than completion order, so
+history, events, and the join's inputs stay deterministic even when a later
+branch finishes first. A successor is not eligible until the frontier that
+produced its inputs has committed, and the join still runs exactly once after
+every branch arrives.
 
 ## Tool scope
 

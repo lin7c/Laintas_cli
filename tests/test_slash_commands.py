@@ -1617,6 +1617,18 @@ class ConfigAndMemoryTests(unittest.TestCase):
             agent_loop.set_runtime_config("max_loops", "not-a-number")
         self.assertFalse(agent_loop.set_runtime_config("missing", "1"))
 
+    def test_critic_config_validates_profile_and_disables_prompt_file(self):
+        self.assertTrue(agent_loop.set_runtime_config("critic_profile", "strict"))
+        self.assertEqual(agent_loop.get_runtime_config("critic_profile"), "strict")
+        with self.assertRaises(ValueError):
+            agent_loop.set_runtime_config("critic_profile", "paranoid")
+        self.assertTrue(agent_loop.set_runtime_config(
+            "critic_prompt_file", ".laintas/critic.md"))
+        self.assertEqual(agent_loop.get_runtime_config("critic_prompt_file"),
+                         ".laintas/critic.md")
+        self.assertTrue(agent_loop.set_runtime_config("critic_prompt_file", "off"))
+        self.assertEqual(agent_loop.get_runtime_config("critic_prompt_file"), "")
+
     def test_malformed_project_memory_returns_validation_errors(self):
         with tempfile.TemporaryDirectory() as tmp, _chdir(tmp):
             Path(".laintas").mkdir()

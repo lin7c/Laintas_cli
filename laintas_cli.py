@@ -32,6 +32,7 @@ import tempfile
 import platform
 import webbrowser
 import threading
+import traceback
 import warnings
 # The PTY model is fork()+exec on a dedicated pair (InteractiveSession); the
 # child execs a shell immediately, so CPython 3.12's multi-threaded-fork
@@ -1183,6 +1184,7 @@ from agent_loop import (
     normalize_fork_lineage,
     thread_agent, get_thread_agent_id, agent_ancestry,
     harvest_agent_reply, describe_exit_reason,
+    TRANSITION_RUNTIME_ERROR, _close_failed_turn,
 )
 
 import tools as tools_mod    # noqa: E402 — load after agent_loop so registry inits once
@@ -3603,6 +3605,8 @@ def _build_prompt_style() -> Style:
         "rprompt-sep": subtle,
         "rprompt-model": muted,
         "rprompt-context": agent,
+        # Alt+1..9 positional slot-selection highlight (right prompt).
+        "rprompt-slot-selected": f"{selected_bg} {path} bold",
     })
 
 
@@ -3824,6 +3828,429 @@ def _refresh_slash_completion(buffer: Buffer) -> None:
         buffer.start_completion()
 
 
+# ── Right-prompt slot selection (Alt+1..9) ────────────────────────────
+# The right prompt is a row of slots - agent, mode, model, effort,
+# terminal. Alt+N selects the Nth slot that survived config, breakpoints and
+# final path-width fitting. While selected, up/= and down/- preview values,
+# Alt+Left/Right rearrange visible slots, Enter commits, Esc cancels, and
+# ordinary typing cancels before landing in the input buffer.
+
+_RPROMPT_SLOT_IDS = ("agent", "mode", "model", "effort", "terminal")
+# Defaults mirror agent_loop's _DEFAULT_CONFIG entries byte for byte; they
+# exist so a corrupt/unknown config value falls back to the legacy layout.
+_RPROMPT_SLOTS_DEFAULT_ON = ("agent", "mode", "model", "effort", "terminal")
+_RPROMPT_SLOTS_DEFAULT_OFF = ("agent", "mode", "model", "terminal")
+
+#: Selected slot id, or "" when no slot selection is active.
+_rprompt_modal_slot = ""
+_rprompt_modal_value = None
+_rprompt_modal_order: list = []
+_rprompt_modal_original_order: tuple = ()
+_rprompt_notice_queue: list = []
+_rprompt_model_cache: list = []
+_rprompt_model_fetch_state = ""   # "", "pending", "ready", "failed"
+_rprompt_model_cache_key = ""
+_rprompt_model_fetch_error = ""
+_rprompt_model_fetch_lock = threading.Lock()
+
+_rprompt_modal_active = Condition(lambda: bool(_rprompt_modal_slot))
+
+
+def _rprompt_queue_notice(text: str) -> None:
+    """Queue a dim notice; printed between prompts by _flush_deferred_notices.
+
+    Keybinding handlers run while the prompt is live; console writes from
+    there fight prompt_toolkit's screen diff exactly like render-callback
+    prints do, so slot messages go through the same deferred channel.
+    """
+    _rprompt_notice_queue.append(str(text))
+
+
+def _rprompt_parse_slot_list(raw) -> tuple:
+    ids = []
+    for token in str(raw or "").split(","):
+        token = token.strip()
+        if token in _RPROMPT_SLOT_IDS and token not in ids:
+            ids.append(token)
+    return tuple(ids)
+
+
+def _rprompt_configured_slots(detail: bool) -> tuple:
+    """Slots the /config visibility lists allow for this detail state."""
+    key = "rprompt_slots_detail_on" if detail else "rprompt_slots_detail_off"
+    fallback = (_RPROMPT_SLOTS_DEFAULT_ON if detail
+                else _RPROMPT_SLOTS_DEFAULT_OFF)
+    try:
+        raw = get_runtime_config(key)
+    except Exception:
+        return fallback
+    # Empty is a valid visibility profile: it deliberately hides the whole
+    # rprompt. Only an unavailable/corrupt config read falls back.
+    if raw is None:
+        return fallback
+    return _rprompt_parse_slot_list(raw)
+
+
+def _rprompt_effective_order() -> list:
+    """Display order: rprompt_slot_order, canonical order as the base."""
+    try:
+        order = list(_rprompt_parse_slot_list(
+            get_runtime_config("rprompt_slot_order")))
+    except Exception:
+        order = []
+    for slot in _RPROMPT_SLOT_IDS:
+        if slot not in order:
+            order.append(slot)
+    return order
+
+
+def _rprompt_display_order() -> list:
+    """Current visual order, including an uncommitted modal rearrangement."""
+    if _rprompt_modal_slot and _rprompt_modal_order:
+        return list(_rprompt_modal_order)
+    return _rprompt_effective_order()
+
+
+def _rprompt_slot_fits(slot_id: str, width: int, multi_agent: bool) -> bool:
+    """Legacy width breakpoint for one slot."""
+    if slot_id == "mode":
+        return True
+    if slot_id == "agent":
+        return width >= 62
+    if slot_id in ("model", "effort"):
+        return width >= 78
+    if slot_id == "terminal":
+        return width >= 108 and not multi_agent
+    return False
+
+
+def _rprompt_visible_slots(width: int, detail: bool, multi_agent: bool) -> list:
+    """Slots that pass config and legacy breakpoints (fit trimming is later)."""
+    allowed = _rprompt_configured_slots(detail)
+    return [s for s in _rprompt_display_order()
+            if s in allowed and _rprompt_slot_fits(s, width, multi_agent)]
+
+
+def _rprompt_slot_currently_visible(slot_id: str) -> bool:
+    try:
+        return slot_id in _rprompt_final_visible_slot_ids()
+    except Exception:
+        return False
+
+
+def _rprompt_current_mode_choice() -> str:
+    try:
+        import plan_mode as _pm
+        if _pm.is_plan_mode():
+            return "plan"
+    except Exception:
+        pass
+    active = str(mode_manager.get_active_mode().get("name", "act"))
+    if (active == "act"
+            and _session_approval_state.get("all_writes")
+            and _session_approval_state.get("all_commands")):
+        return "act-always"
+    return active
+
+
+def _rprompt_mode_choices() -> list[str]:
+    names = [str(m.get("name") or "") for m in mode_manager.list_modes()]
+    names = [name for name in names if name]
+    if "act" in names:
+        names.insert(names.index("act") + 1, "act-always")
+    return ["plan", *names]
+
+
+def _rprompt_current_value(slot_id: str):
+    if slot_id == "mode":
+        return _rprompt_current_mode_choice()
+    if slot_id == "model":
+        value = str(_status_cache.get("model") or get_selected_model() or "auto")
+        return "auto" if value in ("", "auto", "auto-routing") else value
+    if slot_id == "effort":
+        return str(get_runtime_config("reasoning_effort") or "none")
+    return None
+
+
+def _rprompt_select_slot(slot_id: str, app=None) -> None:
+    """Enter slot selection - a hidden slot is never selectable."""
+    global _rprompt_modal_slot, _rprompt_modal_value
+    global _rprompt_modal_order, _rprompt_modal_original_order
+    if slot_id not in _RPROMPT_SLOT_IDS:
+        return
+    if not _rprompt_slot_currently_visible(slot_id):
+        _rprompt_queue_notice(
+            f"Slot '{slot_id}' is hidden here - widen the terminal or adjust "
+            "/config rprompt_slots_detail_on / rprompt_slots_detail_off.")
+        return
+    _rprompt_modal_slot = slot_id
+    _rprompt_modal_value = _rprompt_current_value(slot_id)
+    _rprompt_modal_order = _rprompt_effective_order()
+    _rprompt_modal_original_order = tuple(_rprompt_modal_order)
+    if app is not None:
+        try:
+            app.invalidate()
+        except Exception:
+            pass
+
+
+def _rprompt_select_index(index: int, app=None) -> None:
+    """Select the Nth slot the user can actually see after final fitting."""
+    slots = _rprompt_final_visible_slot_ids()
+    if index < 0 or index >= len(slots):
+        _rprompt_queue_notice(
+            f"Status slot {index + 1} is not visible in the current layout.")
+        return
+    _rprompt_select_slot(slots[index], app)
+
+
+def _rprompt_modal_exit() -> None:
+    global _rprompt_modal_slot, _rprompt_modal_value
+    global _rprompt_modal_order, _rprompt_modal_original_order
+    _rprompt_modal_slot = ""
+    _rprompt_modal_value = None
+    _rprompt_modal_order = []
+    _rprompt_modal_original_order = ()
+
+
+def _rprompt_cycle_value(delta: int, app=None) -> None:
+    slot = _rprompt_modal_slot
+    if not slot:
+        return
+    if slot in ("agent", "terminal"):
+        # This CLI has exactly one foreground agent per terminal; switching
+        # the conversation target is the agents rail's job, not a cycle.
+        _rprompt_queue_notice(
+            "Agent switching lives in the agents rail (/agents), "
+            "not the slot cycle.")
+        return
+    if slot == "mode":
+        _rprompt_cycle_mode(delta)
+    elif slot == "model":
+        _rprompt_cycle_model(delta, app)
+    elif slot == "effort":
+        _rprompt_cycle_effort(delta)
+
+
+def _rprompt_cycle_mode(delta: int) -> None:
+    global _rprompt_modal_value
+    try:
+        names = _rprompt_mode_choices()
+        current = str(_rprompt_modal_value or _rprompt_current_mode_choice())
+    except Exception as exc:
+        _rprompt_queue_notice(f"Mode cycle failed: {exc}")
+        return
+    if not names:
+        return
+    if current not in names:
+        names.insert(0, current)
+    _rprompt_modal_value = names[(names.index(current) + delta) % len(names)]
+
+
+def _rprompt_cycle_effort(delta: int) -> None:
+    global _rprompt_modal_value
+    import agent_loop as _al
+    choices = list(_al._RUNTIME_ENUM_CHOICES.get("reasoning_effort", ()))
+    if not choices:
+        return
+    current = str(_rprompt_modal_value or
+                  _al.get_runtime_config("reasoning_effort") or "").strip()
+    if current not in choices:
+        choices.append(current)
+    _rprompt_modal_value = choices[(choices.index(current) + delta) % len(choices)]
+
+
+def _rprompt_backend_cache_key() -> str:
+    try:
+        profile = get_backend_profile()
+        session = load_session() or {}
+        identity = str(session.get("userId") or session.get("userEmail") or "")
+        return f"{profile.name}|{profile.kind}|{profile.base_url}|{identity}"
+    except Exception:
+        return ""
+
+
+def _rprompt_refill_model_cache(models, cache_key: str = "") -> None:
+    """Record a model list fetched elsewhere (/model) in the slot cache."""
+    global _rprompt_model_cache, _rprompt_model_fetch_state
+    global _rprompt_model_cache_key, _rprompt_model_fetch_error
+    ids = []
+    for row in models or []:
+        mid = str((row or {}).get("id") or "").strip()
+        if mid and mid not in ids:
+            ids.append(mid)
+    if not ids:
+        return
+    with _rprompt_model_fetch_lock:
+        _rprompt_model_cache = ids
+        _rprompt_model_fetch_state = "ready"
+        _rprompt_model_cache_key = cache_key or _rprompt_backend_cache_key()
+        _rprompt_model_fetch_error = ""
+
+
+def _rprompt_kick_model_fetch(app=None) -> None:
+    """Fetch the model list once, off the keypress path (20s timeout)."""
+    global _rprompt_model_fetch_state, _rprompt_model_fetch_error
+    cache_key = _rprompt_backend_cache_key()
+    with _rprompt_model_fetch_lock:
+        if (_rprompt_model_fetch_state == "ready"
+                and _rprompt_model_cache_key != cache_key):
+            _rprompt_model_cache.clear()
+            _rprompt_model_fetch_state = ""
+        if _rprompt_model_fetch_state in ("pending", "ready"):
+            return
+        _rprompt_model_fetch_state = "pending"
+        _rprompt_model_fetch_error = ""
+
+    def _worker():
+        global _rprompt_model_fetch_state, _rprompt_model_fetch_error
+        try:
+            session = load_session() or {}
+            models, _endpoint = fetch_available_models(session)
+            # A backend switch while this request was in flight makes the
+            # result stale. Never install one backend's catalogue into another.
+            if cache_key != _rprompt_backend_cache_key():
+                with _rprompt_model_fetch_lock:
+                    _rprompt_model_fetch_state = ""
+                return
+            _rprompt_refill_model_cache(models, cache_key)
+            if not _rprompt_model_cache:
+                with _rprompt_model_fetch_lock:
+                    _rprompt_model_fetch_state = "failed"
+                    _rprompt_model_fetch_error = "backend returned no models"
+        except Exception as exc:
+            with _rprompt_model_fetch_lock:
+                _rprompt_model_fetch_state = "failed"
+                _rprompt_model_fetch_error = str(exc)
+        finally:
+            if app is not None:
+                try:
+                    app.invalidate()
+                except Exception:
+                    pass
+
+    threading.Thread(target=_worker, daemon=True,
+                     name="rprompt-model-fetch").start()
+
+
+def _rprompt_cycle_model(delta: int, app=None) -> None:
+    global _rprompt_modal_value
+    if (_rprompt_model_cache_key != _rprompt_backend_cache_key()
+            or not _rprompt_model_cache):
+        _rprompt_kick_model_fetch(app)
+        return
+    current = str(_rprompt_modal_value or _rprompt_current_value("model"))
+    choices = ["auto"]
+    for mid in _rprompt_model_cache:
+        if mid and mid not in choices:
+            choices.append(mid)
+    if current not in choices:
+        choices.append(current)
+    _rprompt_modal_value = choices[(choices.index(current) + delta) % len(choices)]
+
+
+def _rprompt_move_slot(delta: int) -> None:
+    """Move the selected slot among currently visible slots, as a draft."""
+    slot = _rprompt_modal_slot
+    if not slot:
+        return
+    visible = _rprompt_final_visible_slot_ids()
+    if slot not in visible:
+        return
+    i = visible.index(slot)
+    j = i + delta
+    if j < 0 or j >= len(visible):
+        return
+    other = visible[j]
+    order = _rprompt_modal_order or _rprompt_effective_order()
+    a, b = order.index(slot), order.index(other)
+    order[a], order[b] = order[b], order[a]
+    _rprompt_modal_order[:] = order
+
+
+def _rprompt_apply_mode_choice(target: str) -> tuple[bool, str]:
+    """Apply one logical mode choice with the same lifecycle as /mode."""
+    import plan_mode as _pm
+
+    target = str(target or "").strip().lower()
+    in_plan = _pm.is_plan_mode()
+    if target == "plan":
+        if in_plan:
+            return True, "PLAN mode is already active."
+        ok, msg = mode_manager.activate("act")
+        if not ok:
+            return False, msg
+        _sync_session_approval_from_mode()
+        _pm.arm_plan_mode()
+        return True, "PLAN mode armed; describe the task in the next message."
+
+    if in_plan:
+        _pm.exit_plan_mode(approve=False)
+    if target == "act-always":
+        ok, msg = mode_manager.activate("act")
+        if not ok:
+            return False, msg
+        _session_approval_state["all_writes"] = True
+        _session_approval_state["all_commands"] = True
+        return True, "ACT* enabled: writes and commands are auto-approved this session."
+
+    ok, msg = mode_manager.activate(target)
+    if ok:
+        _sync_session_approval_from_mode()
+    return ok, msg
+
+
+def _rprompt_apply_model_choice(value: str) -> tuple[bool, str]:
+    """Apply a model through the live terminal override and durable fallback."""
+    model = "" if value in ("", "auto", "auto-routing") else str(value)
+    agent = get_current_agent()
+    terminal_name = (agent_deployment_terminal(agent)
+                     or agent_scope_terminal(agent) or "term0")
+    terminal = get_terminal(terminal_name)
+    if terminal is None:
+        return False, f"Terminal '{terminal_name}' is unavailable."
+    if not set_terminal_model_selection(terminal_name, model, ""):
+        return False, f"Could not update terminal '{terminal_name}'."
+    if terminal_name == "term0":
+        # A model-only setter leaves a previously pinned provider behind.
+        set_model_selection(model, "")
+    _update_status_cache(model=model or "auto")
+    return True, f"Model set to {model or 'auto-routing'}."
+
+
+def _rprompt_commit() -> tuple[bool, str]:
+    """Commit the selected slot's draft value and order."""
+    slot = _rprompt_modal_slot
+    value = _rprompt_modal_value
+    order = list(_rprompt_modal_order)
+    original_order = tuple(_rprompt_modal_original_order)
+    if not slot:
+        return True, ""
+
+    if order and tuple(order) != original_order:
+        joined = ",".join(order)
+        if not set_runtime_config("rprompt_slot_order", joined):
+            return False, "Could not save the status-slot order."
+        try:
+            terminal_preferences.set_ui_preference("rprompt_slot_order", joined)
+        except Exception as exc:
+            return False, f"Could not persist the status-slot order: {exc}"
+
+    if slot == "mode" and value != _rprompt_current_mode_choice():
+        return _rprompt_apply_mode_choice(str(value))
+    if slot == "model" and value != _rprompt_current_value("model"):
+        return _rprompt_apply_model_choice(str(value))
+    if slot == "effort" and value != get_runtime_config("reasoning_effort"):
+        if not set_runtime_config("reasoning_effort", value):
+            return False, "Could not update reasoning_effort."
+        try:
+            terminal_preferences.set_ui_preference("reasoning_effort", value)
+        except Exception as exc:
+            return False, f"Could not persist reasoning_effort: {exc}"
+        return True, f"Reasoning effort set to {value}."
+    return True, "Status layout updated." if tuple(order) != original_order else ""
+
+
 def _build_keybindings() -> KeyBindings:
     """Build custom keybindings for the prompt."""
     kb = KeyBindings()
@@ -3831,6 +4258,8 @@ def _build_keybindings() -> KeyBindings:
     @kb.add(Keys.BracketedPaste)
     def _(event):
         """Collapse large pastes into a compact placeholder (expanded on submit)."""
+        if _rprompt_modal_slot:
+            _rprompt_modal_exit()
         placeholder, _lc = _maybe_summarize_paste(event.data)
         if placeholder is not None:
             event.current_buffer.insert_text(placeholder)
@@ -3841,6 +4270,8 @@ def _build_keybindings() -> KeyBindings:
     @kb.add("backspace")
     def _(event):
         """Backspace: delete text and refresh valid slash completions."""
+        if _rprompt_modal_slot:
+            _rprompt_modal_exit()
         buf = event.current_buffer
         span = _paste_span_at(buf.text, buf.cursor_position)
         if span is not None and span[1] == buf.cursor_position and span[0] != span[1]:
@@ -3855,6 +4286,8 @@ def _build_keybindings() -> KeyBindings:
     @kb.add("delete")
     def _(event):
         """Delete: remove text and refresh valid slash completions."""
+        if _rprompt_modal_slot:
+            _rprompt_modal_exit()
         buf = event.current_buffer
         span = _paste_span_at(buf.text, buf.cursor_position)
         if span is not None and span[0] == buf.cursor_position and span[0] != span[1]:
@@ -3868,12 +4301,16 @@ def _build_keybindings() -> KeyBindings:
     @kb.add("c-d")
     def _(event):
         """Ctrl+D exits if input is empty, otherwise deletes forward."""
+        if _rprompt_modal_slot:
+            _rprompt_modal_exit()
         if not event.current_buffer.text:
             event.app.exit(result="/exit")
 
     @kb.add("tab")
     def _(event):
-        """Tab: accept suggestion → cycle completions → start completion."""
+        """Tab: accept suggestion -> cycle completions -> start completion."""
+        if _rprompt_modal_slot:
+            _rprompt_modal_exit()
         buf = event.current_buffer
         if buf.suggestion and buf.document.is_cursor_at_the_end and not buf.complete_state:
             buf.insert_text(buf.suggestion.text)
@@ -3889,6 +4326,8 @@ def _build_keybindings() -> KeyBindings:
         With no suggestion, fall through to the emacs default (forward-char)
         instead of swallowing the keypress.
         """
+        if _rprompt_modal_slot:
+            _rprompt_modal_exit()
         buf = event.current_buffer
         if buf.suggestion:
             buf.insert_text(buf.suggestion.text)
@@ -3903,6 +4342,8 @@ def _build_keybindings() -> KeyBindings:
         accept-suggestion shortcut must not eat the key when there is nothing
         to accept.
         """
+        if _rprompt_modal_slot:
+            _rprompt_modal_exit()
         buf = event.current_buffer
         if buf.suggestion:
             buf.insert_text(buf.suggestion.text)
@@ -3921,6 +4362,8 @@ def _build_keybindings() -> KeyBindings:
         control character into the buffer, which then travels to the model as
         part of the message. Undo is what the key means everywhere else.
         """
+        if _rprompt_modal_slot:
+            _rprompt_modal_exit()
         event.current_buffer.undo()
 
     @kb.add("c-y", save_before=lambda e: False)
@@ -3930,11 +4373,15 @@ def _build_keybindings() -> KeyBindings:
         Shadows emacs yank (kill-ring paste); pasting in a modern terminal
         arrives through bracketed paste instead.
         """
+        if _rprompt_modal_slot:
+            _rprompt_modal_exit()
         event.current_buffer.redo()
 
     @kb.add("c-o")
     def _(event):
         """Toggle compact/detail progress without leaving the prompt."""
+        if _rprompt_modal_slot:
+            _rprompt_modal_exit()
         enabled = not bool(get_runtime_config("detail"))
         set_runtime_config("detail", enabled)
         try:
@@ -3953,12 +4400,25 @@ def _build_keybindings() -> KeyBindings:
         user can keep the arrow-key cursor movement of multiline mode while
         Enter still sends the message.  A newline is inserted via Alt+Enter
         (see the escape-enter binding below).
+
+        While a right-prompt slot is selected, Enter commits its draft and
+        never submits the input buffer.
         """
+        if _rprompt_modal_slot:
+            ok, notice = _rprompt_commit()
+            if notice:
+                _rprompt_queue_notice(notice if ok else f"Status update failed: {notice}")
+            if ok:
+                _rprompt_modal_exit()
+            event.app.invalidate()
+            return
         event.current_buffer.validate_and_handle()
 
     @kb.add("escape", "enter")
     def _(event):
         """Alt+Enter (escape then enter): insert a newline without submitting."""
+        if _rprompt_modal_slot:
+            _rprompt_modal_exit()
         event.current_buffer.insert_text("\n")
 
     @kb.add("c-x", "c-s")
@@ -3969,16 +4429,78 @@ def _build_keybindings() -> KeyBindings:
         [Snippet #N ~L lines] token a summarized paste becomes, and it
         submits with its full content restored.
         """
+        if _rprompt_modal_slot:
+            _rprompt_modal_exit()
         _collapse_selection_to_placeholder(event.current_buffer)
 
     @kb.add("c-x", "c-o")
     def _(event):
         """Ctrl+X Ctrl+O: expand the content segment at the cursor."""
+        if _rprompt_modal_slot:
+            _rprompt_modal_exit()
         _expand_placeholder_at_cursor(event.current_buffer)
+
+    # ── Right-prompt slot selection (Alt+1..9) ─────────────────────────
+    for _digit in "123456789":
+
+        def _pick_slot(event, _index=int(_digit) - 1):
+            """Alt+N: select the Nth slot actually visible on screen."""
+            _rprompt_select_index(_index, event.app)
+
+        kb.add("escape", _digit)(_pick_slot)
+
+    @kb.add("up", filter=_rprompt_modal_active)
+    @kb.add("=", filter=_rprompt_modal_active)
+    def _(event):
+        """Slot selected: next value (up or =)."""
+        _rprompt_cycle_value(1, event.app)
+        event.app.invalidate()
+
+    @kb.add("down", filter=_rprompt_modal_active)
+    @kb.add("-", filter=_rprompt_modal_active)
+    def _(event):
+        """Slot selected: previous value (down or -)."""
+        _rprompt_cycle_value(-1, event.app)
+        event.app.invalidate()
+
+    @kb.add("escape", "left", filter=_rprompt_modal_active)
+    def _(event):
+        """Alt+Left: move the selected slot one position left."""
+        _rprompt_move_slot(-1)
+        event.app.invalidate()
+
+    @kb.add("escape", "right", filter=_rprompt_modal_active)
+    def _(event):
+        """Alt+Right: move the selected slot one position right."""
+        _rprompt_move_slot(1)
+        event.app.invalidate()
+
+    @kb.add(Keys.Any, filter=_rprompt_modal_active)
+    def _(event):
+        """Printable typing cancels; control keys are replayed normally."""
+        _rprompt_modal_exit()
+        data = event.data or ""
+        if data and data.isprintable():
+            event.current_buffer.insert_text(data)
+        else:
+            # Keys.Any must not swallow Ctrl+C, cursor keys, Home, or other
+            # controls. Replay the exact KeyPress after clearing the filter so
+            # prompt_toolkit's ordinary binding handles it on the next pass.
+            try:
+                event.app.key_processor.feed(event.key_sequence[-1], first=True)
+            except Exception:
+                pass
 
     @kb.add("escape")
     def _(event):
-        """Esc: clear the current input buffer. Works like Ctrl+C cancel."""
+        """Esc: clear the current input buffer. Works like Ctrl+C cancel.
+
+        While a slot is selected, Esc only drops the selection.
+        """
+        if _rprompt_modal_slot:
+            _rprompt_modal_exit()
+            event.app.invalidate()
+            return
         buf = event.current_buffer
         buf.reset()
         _set_run_input_state("input_active")
@@ -4189,8 +4711,8 @@ def _session_token_totals() -> tuple[int, int]:
         return 0, 0
 
 
-def _render_rprompt():
-    """Formatted text for the right side of the prompt line (mode + model)."""
+def _rprompt_slot_items() -> list[tuple[str, str, str]]:
+    """Build ordered slot items, including modal previews but not separators."""
     try:
         import plan_mode as _pm
         _is_plan = _pm.is_plan_mode()
@@ -4220,62 +4742,99 @@ def _render_rprompt():
             # the prompt used to end up stacked in scrollback. Queue it and let
             # pt_prompt() print it before the next prompt starts.
             _approval_star_pending = True
+    if _rprompt_modal_slot == "mode" and _rprompt_modal_value:
+        _preview = str(_rprompt_modal_value)
+        _mode_label = ("ACT*" if _preview == "act-always"
+                       else _preview.upper())
     # Read-only modes share PLAN's styling — same "I won't touch anything" signal.
     _mode_cls = ("rprompt-mode-plan" if (_is_plan or _read_only)
                  else "rprompt-mode-act")
     _model = _status_cache.get("model", "") or "auto"
+    if _rprompt_modal_slot == "model" and _rprompt_modal_value:
+        _model = str(_rprompt_modal_value)
     width = _terminal_width()
+    _multi = bool(_status_cache.get("multi_agent"))
     _agent_name = _status_cache.get("agent", "") or "primary"
+    # The effort VALUE is read unconditionally; whether it is SHOWN is a
+    # slot-list decision below (rprompt_slots_detail_on/off), so the config
+    # can put effort on the detail-off prompt too.
+    try:
+        import agent_loop as _al
+        _effort = str(_al.get_runtime_config("reasoning_effort") or "").strip()
+    except Exception:
+        _effort = ""
+    if _rprompt_modal_slot == "effort" and _rprompt_modal_value:
+        _effort = str(_rprompt_modal_value)
+    # What exists at this width (legacy breakpoints).
+    slots: dict = {"mode": ("class:" + _mode_cls, _mode_label)}
     if width >= 62:
-        if (_status_cache.get("multi_agent")
-                and not _status_cache.get("input_available", True)):
+        if _multi and not _status_cache.get("input_available", True):
             label = "all busy"
         else:
-            label = (f"to {_agent_name}"
-                     if _status_cache.get("multi_agent") else _agent_name)
-        result = [("class:rprompt-context", label),
-                  (f"class:rprompt-sep", f" {symbols.BULLET} "),
-                  ("class:" + _mode_cls, _mode_label)]
-    else:
-        result = [("class:" + _mode_cls, _mode_label)]
+            label = (f"to {_agent_name}" if _multi else _agent_name)
+        slots["agent"] = ("class:rprompt-context", label)
     if width >= 78:
-        # Show "auto-routing" when auto-routing is active, plain model name otherwise
+        # Show "auto-routing" when auto-routing is active, plain name otherwise
         _model_display = "auto-routing" if _model in ("", "auto") else _model
-        result.extend([
-            (f"class:rprompt-sep", f" {symbols.BULLET} "),
-            ("class:rprompt-model", _model_display),
-        ])
-        # Reasoning-effort gear sits right after the model: it qualifies the
-        # model the same way the mode does, and /config reasoning_effort is
-        # where it is changed. Only shown with detail on — the compact
-        # (detail off) right prompt keeps mode + model only.
-        try:
-            import agent_loop as _al
-            _effort = str(_al.get_runtime_config("reasoning_effort") or "").strip()
-            _effort = _effort if get_runtime_config("detail") else ""
-        except Exception:
-            _effort = ""
+        slots["model"] = ("class:rprompt-model", _model_display)
         if _effort:
-            result.extend([
-                (f"class:rprompt-sep", f" {symbols.BULLET} "),
-                ("class:rprompt-model", _effort),
-            ])
-    if width >= 108 and not _status_cache.get("multi_agent"):
-        agent = _status_cache.get("agent", "")
-        terminal = _status_cache.get("terminal", "")
-        if agent and terminal:
-            result.extend([
-                (f"class:rprompt-sep", f" {symbols.BULLET} "),
-                ("class:rprompt-context", f"{agent}@{terminal}"),
-            ])
-    # The width breakpoints above decide what we WANT to show; this decides
-    # what actually fits. The rprompt shares its row with the path line, and
-    # must still fit if every ambiguous-width glyph in it is drawn double.
-    # One trailing column stays free so the cursor never sits past the edge.
+            slots["effort"] = ("class:rprompt-model", _effort)
+    if width >= 108 and not _multi:
+        _agent = _status_cache.get("agent", "")
+        _terminal = _status_cache.get("terminal", "")
+        if _agent and _terminal:
+            slots["terminal"] = ("class:rprompt-context", f"{_agent}@{_terminal}")
+    # Display order (Alt+Left/Right, persisted) and per-detail visibility
+    # (/config rprompt_slots_detail_*), then separators. The selected slot
+    # (Alt+1..9) is highlighted until Enter/Esc/typing leaves the selection.
+    try:
+        _detail = bool(get_runtime_config("detail"))
+    except Exception:
+        _detail = False
+    _allowed = _rprompt_configured_slots(_detail)
+    result = []
+    for _slot_id in _rprompt_display_order():
+        if _slot_id not in slots or _slot_id not in _allowed:
+            continue
+        _style, _value = slots[_slot_id]
+        if _slot_id == _rprompt_modal_slot:
+            _style = "class:rprompt-slot-selected"
+        result.append((_slot_id, _style, _value))
+    return result
+
+
+def _fit_rprompt_slot_items(items: list[tuple[str, str, str]],
+                            budget: int) -> list[tuple[str, str, str]]:
+    """Drop whole trailing slots until the separator-joined row fits."""
+    items = list(items)
+    while items:
+        text = f" {symbols.BULLET} ".join(value for _sid, _style, value in items)
+        if budget > 0 and _pessimistic_width(text) <= budget:
+            break
+        items.pop()
+    return items
+
+
+def _rprompt_final_visible_slot_ids() -> list[str]:
+    """Exact on-screen slot ids after path-budget fitting."""
+    width = _terminal_width()
     used = _pessimistic_width("  " + (_status_cache.get("prompt_path") or ""))
-    result = _fit_rprompt(result, width - used - 2)
-    if not result:
-        return result
+    return [slot for slot, _style, _value in _fit_rprompt_slot_items(
+        _rprompt_slot_items(), width - used - 2)]
+
+
+def _render_rprompt():
+    """Formatted text for the right side of the prompt line."""
+    width = _terminal_width()
+    used = _pessimistic_width("  " + (_status_cache.get("prompt_path") or ""))
+    items = _fit_rprompt_slot_items(_rprompt_slot_items(), width - used - 2)
+    if not items:
+        return []
+    result = []
+    for _slot, style, value in items:
+        if result:
+            result.append(("class:rprompt-sep", f" {symbols.BULLET} "))
+        result.append((style, value))
     # prompt_toolkit right-aligns the rprompt FLUSH to the terminal edge, so
     # its last glyph lands in the final column. Writing that cell arms the
     # terminal's deferred-wrap flag; the next write spills onto a new row and
@@ -4292,11 +4851,26 @@ def _render_bottom_toolbar():
     Shows: last thinking time | session tokens.
     Mode and model are displayed in the rprompt (right side of prompt line).
     """
+    width = _terminal_width()
+    if _rprompt_modal_slot:
+        value = _rprompt_modal_value
+        if _rprompt_modal_slot == "model":
+            if _rprompt_model_fetch_state == "pending":
+                value = "loading model list…"
+            elif _rprompt_model_fetch_state == "failed":
+                detail = _rprompt_model_fetch_error or "unknown error"
+                value = f"model list failed: {detail}"
+        label = f"edit {_rprompt_modal_slot}"
+        if value not in (None, ""):
+            label += f": {value}"
+        hint = "  ↑↓/-= choose  Alt+←→ move  Enter apply  Esc cancel"
+        text = (label + hint)[:max(1, width - 1)]
+        return [("class:stbar-context", text)]
+
     _tin, _tout = _session_token_totals()
     _think = _status_cache.get("last_thinking_time", 0.0)
     _think_str = _fmt_elapsed(_think) if _think > 0 else "—"
 
-    width = _terminal_width()
     tokens = ("class:stbar-tokens", f"{symbols.ARROW_U}{_fmt_tokens(_tin)} {symbols.ARROW_D}{_fmt_tokens(_tout)}")
     if width < 54:
         return [tokens]
@@ -4389,6 +4963,9 @@ def pt_prompt(cwd: str) -> str:
     # _render_rprompt shares this row and needs the path's real width to know
     # how much room is left.
     _update_status_cache(prompt_path=disp)
+    # A selection carried over from an aborted prompt must not leak into
+    # the next one.
+    _rprompt_modal_exit()
     message = [
         ("class:stbar-sep", "  "),
         ("class:prompt-path", disp),
@@ -5684,13 +6261,21 @@ def generate_cli_prop_template() -> str:
     schemas are authoritative for names and parameters; specialized terminal,
     agent and workflow manuals are loaded progressively through skills.
 
-    Variables substituted at run time (see agent_loop.run_agent_loop):
-      {{agentName}} {{agentId}} {{currentPath}} {{depth}}
+    Slots THIS template uses (all part of the cached prefix, so each one is a
+    promise that its content does not change mid-task):
+      {{agentName}} {{agentId}} {{deploymentStatus}} {{depth}} {{parent}}
+      {{terminalName}} {{parentTerminal}}
       {{globalMemory}} {{persistentMemory}} {{durableRules}} {{lastSession}}
-      {{planMode}} {{tools}} {{children}} {{parent}}
-      {{terminalName}} {{parentTerminal}} {{deploymentStatus}}
-      {{workflowPhase}} {{rolePrompt}} {{confidenceGuidance}}
-      {{skills}} {{skillContext}} {{promptOpt}}
+      {{tools}} {{skills}} {{skillContext}}
+      {{workflowPhase}} {{rolePrompt}} {{confidenceGuidance}} {{promptOpt}}
+
+    Still substituted by run_agent_loop but NOT used here: {{currentPath}},
+    {{children}}, {{planMode}}, {{inbox}}, {{parallelResults}}. Their content is
+    volatile (a cd, a spawn, a plan-mode toggle) and now rides in the transient
+    live-state message at the tail of the request instead — putting any of them
+    back in this template re-bills the whole prefix on every change. The
+    substitutions remain only so a user's older customized .cli.prop keeps
+    working.
 
     {{nextDepth}}, {{activeFile}}, and {{behaviorDiagnostics}} are still computed
     and .replace()'d by run_agent_loop for backward compatibility, but are not
@@ -5760,7 +6345,8 @@ Loaded skill instructions:
 The native function schemas attached to the current request are the exact callable tool set and the authority for tool names, purposes, and parameters.
 
 - `shell` runs programs: builds, tests, package managers, git, servers, and anything that changes machine state. It can also read the repository, and so can the native tools.
-- Where both routes are open it is worth knowing which native tool replaces which shell idiom: `read` for `cat`/`sed -n`/`head`/`tail`, `grep` for shell `grep`/`rg`, `glob` for `find`, plus `ls` and `diff`. What they add: `grep` and `glob` skip vendored and generated directories and bound their own result count; `read` returns a contiguous numbered window an `edit` can anchor on, states which lines it delivered against the file's real length, and names the offset that continues it. Each also has its own output budget, larger than the shell's, because their size is bounded by what you asked for while a program's output is not. Pick whichever fits the job; neither route is mandatory.
+- Where both routes are open it is worth knowing which native tool replaces which shell idiom: `read` for `cat`/`sed -n`/`head`/`tail`, `grep` for shell `grep`/`rg`, `glob` for `find`, plus `ls` and `diff`. What they add: `grep` and `glob` skip vendored and generated directories and bound their own result count; `read` returns a contiguous numbered window an `edit` can anchor on, states which lines it delivered against the file's real length, and names the offset that continues it, and each has its own output budget, larger than the shell's, because their size is bounded by what you asked for while a program's output is not. Pick whichever fits the job; neither route is mandatory.
+- Reading a codebase has its own method, and it lives in the `code-reading` skill rather than here: load it before a repository investigation, a review, or a "where does this happen" question. Its first rule is that a workspace exposing `atlas.*` schemas already has a deterministic index of the tree -- ask it where a symbol is defined and who reaches it before grepping for either.
 - Chaining several operations into one shell string shares one output budget and one exit code across all of them, so a long chain loses its middle and cannot attribute a failure to the command that caused it. Separate calls in the same turn cost the same and keep both.
 - Do not use shell to bypass a capability the runtime withheld.
 - If a required capability is absent, call `tool_search` with the intended action. Its result may expose authorized matching schemas on the next model turn; it never grants permission.
@@ -5778,7 +6364,7 @@ The native function schemas attached to the current request are the exact callab
 - Ask for everything the next decision needs in one turn. Independent calls -- three reads, two greps, a grep plus a git log -- belong in the same turn; only a call whose arguments come from another call's result has to wait for that result.
 - Narrow each individual call: a precise pattern, a specific path, a bounded range. Narrow the call, never the number of calls.
 - Before editing, read the target and follow its existing conventions. Preserve unrelated work in a dirty workspace and avoid broad rewrites unless the task requires them.
-- After a failure, read the returned error, revise the failed assumption, and use a materially different next step. Do not repeat an identical failed call.
+- After a failure, read the returned error, revise the failed assumption, and use a materially different next step. Do not repeat an identical failed call.\n- A rejected `multi_edit` wrote nothing, and its error names the edit that failed and the ones that matched. Correct that one anchor and re-send; do not re-guess the edits it already accepted.
 - Test the cheapest falsifiable hypothesis first. For "X is no longer being called", one end-to-end call to X settles which side of the boundary the fault is on before any source is read.
 - When something that used to work stops working, date the change before reading the code: `git log` or `git diff` over the window in question, especially when this session produced the release.
 - A result carrying a truncation marker is an incomplete result: material was dropped to fit the budget. Do not conclude from it -- narrow the pattern, exclude the noise, or raise the limit, and ask again.
@@ -5792,6 +6378,10 @@ The native function schemas attached to the current request are the exact callab
 
 <orchestration>
 Follow the runtime-owned work-orchestration contract. Use no tracker for a simple informational request or one or two direct actions. Use TASK for multi-step work that needs visible progress, one-off agent delegation for independent parallel work, HWO for reusable or contract-driven staged workflows, and HWG only for conditional, cyclic, resumable, or intervention-driven workflows. Keep one authoritative progress system.
+
+For substantial repository reading, analysis, or review, identify independent workstreams before deciding whether to delegate. Use multiple agents only when two or more disjoint file sets, subsystems, or questions can advance concurrently enough to repay coordination cost. Give each child a bounded non-overlapping scope and expected evidence; do not create duplicate broad readers. The parent owns requirement fidelity, verification, and synthesis. Keep small, sequential, or tightly coupled work with one agent.
+
+When a child cannot finish, the runtime routes its bounded partial summary as a compact escalation through the inbox: blocker/failure kind, contract gaps, submitted outputs, and needed tools. It does not forward the child's chat or tool transcript, and it never automatically retries a rejected or failed child. As the parent, judge the partial evidence and cost, then explicitly choose whether to accept it, revise/follow up, re-spawn, or stop.
 
 In PLAN mode, investigate and update the approved plan through the provided plan tools; do not implement it before approval. `workflow_phase_complete` advances a workflow phase. `agent_return` submits declared HWO output and does not complete the task.
 </orchestration>
@@ -12757,6 +13347,8 @@ def _cmd_model(parts: list, raw_args: str, session: dict) -> None:
             console.print(f"Current model: [bold]{current or 'backend default'}[/bold]")
             console.print("Usage: /model <model-id>  or  /model reset")
         else:
+            # /model already paid for the fetch; reuse it for the Alt+3 cycle.
+            _rprompt_refill_model_cache(models)
             if models and sys.stdin.isatty():
                 selected = show_model_selector(models, current)
                 if selected:
@@ -13741,36 +14333,12 @@ def _cmd_mode(raw_args: str, parts: list) -> bool:
         )
         if chosen:
             target = chosen["name"]
-            if target == "plan":
-                if not _in_plan:
-                    mode_manager.activate("act")
-                    _pm_mode.arm_plan_mode()
-                    console.print(
-                        "[green]PLAN mode armed.[/green] "
-                        "[dim]Describe the task in your next message.[/dim]")
-            elif target == "act-always":
-                if _in_plan:
-                    _pm_mode.exit_plan_mode(approve=False)
-                mode_manager.activate("act")
-                _session_approval_state["all_writes"] = True
-                _session_approval_state["all_commands"] = True
-                console.print(
-                    "[green]ACT [bold]always-approve[/bold] — writes & commands "
-                    "auto-approved this session ([bold]ACT*[/bold]).[/green]\n"
-                    "[dim]Pick ACT to turn confirmations back on.[/dim]")
-            else:
-                if _in_plan:
-                    _pm_mode.exit_plan_mode(approve=False)
-                ok, msg = mode_manager.activate(target)
-                # Sync session auto-approve to the mode's posture (a plain
-                # mode with auto_approve=none clears any prior auto-approve).
-                if ok:
-                    _sync_session_approval_from_mode()
-                console.print(
-                    f"[{'green' if ok else 'red'}]{_escape(msg)}"
-                    f"[/{'green' if ok else 'red'}]")
-                if ok:
-                    _print_mode_activation_note(target)
+            ok, msg = _rprompt_apply_mode_choice(target)
+            console.print(
+                f"[{'green' if ok else 'red'}]{_escape(msg)}"
+                f"[/{'green' if ok else 'red'}]")
+            if ok and target not in {"plan", "act-always"}:
+                _print_mode_activation_note(target)
         elif not sys.stdin.isatty():
             console.print(
                 f"[dim]Current mode: {'plan' if _in_plan else active['name']}[/dim]")
@@ -16909,8 +17477,14 @@ def _cmd_hire(parts: list, session: dict) -> bool:
                 return False
             base_provider = str(matching[0].get("provider") or "")
     try:
+        # An employee is a child of whoever hired it. It used to be registered
+        # with no parent at all and reached through its terminal instead, which
+        # left the registry a forest: half its members were outside the tree
+        # that every rule (messaging, abort, harvest) is written against.
+        _hiring_parent = get_current_agent()
         agent_info = register_agent(
             name=hire_name, depth=1, role="pool",
+            parent_id=_hiring_parent.id if _hiring_parent else None,
             profile=employee_profile, replace_existing=False)
     except ValueError as exc:
         console.print(f"[red]{exc}[/red]")
@@ -21206,6 +21780,11 @@ def _flush_deferred_notices() -> None:
             f"[dim]Auto-approve active ([bold]*[/bold]). "
             "Use /mode to change.[/dim]")
     _approval_star_pending = False
+    while _rprompt_notice_queue:
+        notice = _rprompt_notice_queue.pop(0)
+        # Bracket-escape: notices can carry model/mode names through Rich
+        # markup, which would otherwise parse as tags.
+        console.print(f"[dim]{notice.replace('[', chr(92) + '[')}[/dim]")
 
 
 def _reset_session_approvals():
@@ -21765,6 +22344,14 @@ def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
     Returns the same dict as run_agent_loop().
     """
     active_agent = get_current_agent()
+    _descendants_before = set()
+    if active_agent is not None:
+        try:
+            import agent_loop as _agent_loop_mod
+            _descendants_before = _agent_loop_mod.agent_descendants(
+                active_agent.id)
+        except Exception:
+            _descendants_before = set()
     primary_admitted = False
     if active_agent is not None and active_agent.role == "primary":
         primary_admitted, detail = begin_primary_run(active_agent.id)
@@ -21914,7 +22501,67 @@ def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
             )
     except Exception as exc:
         run_error = f"{type(exc).__name__}: {exc}"
-        raise
+        _trace = traceback.format_exc()
+
+        # Stop only descendants created during this failed foreground run.
+        # Pre-existing deployed/background Agents are independent work and
+        # must survive; newly-created roots cascade to their descendants.
+        if active_agent is not None:
+            try:
+                import agent_loop as _agent_loop_mod
+                _new_descendants = (
+                    _agent_loop_mod.agent_descendants(active_agent.id)
+                    - _descendants_before)
+                for _child_id in list(_new_descendants):
+                    _child = _agent_loop_mod.get_agent(_child_id)
+                    if (_child is not None
+                            and _child.parent_id not in _new_descendants
+                            and _child.status in {
+                                "queued", "running", "thinking", "waiting"}):
+                        _agent_loop_mod.abort_agent(_child_id)
+            except Exception:
+                pass
+
+        for _key in ("_active_tool", "_pending_history",
+                     "_pending_tool_calls"):
+            agent_state.pop(_key, None)
+        try:
+            _close_failed_turn(
+                chat_history, agent_state.get("_thread_messages"),
+                TRANSITION_RUNTIME_ERROR, deps, agent_state)
+        except Exception:
+            pass
+        try:
+            event_log.append(
+                "turn_crashed", error=run_error, traceback=_trace,
+                session_id=str(agent_state.get("_session_id") or ""),
+                agent_id=(active_agent.id if active_agent is not None else ""))
+        except Exception:
+            pass
+        try:
+            add_debug_log(DebugEntry(
+                timestamp=datetime.now().isoformat(timespec="seconds"),
+                user_input=str(user_input or "")[:2000],
+                reply=_trace, error=True, done=True))
+        except Exception:
+            pass
+        console.print(
+            f"[red]{symbols.FAIL} Agent runtime error: "
+            f"{escape(run_error)}[/red]\n"
+            "[dim]The session was preserved. Use /continue to retry from "
+            "the latest checkpoint.[/dim]")
+        response = {
+            "success": False,
+            "msg": "",
+            "state": agent_state,
+            "session": existing_session,
+            "exit_reason": TRANSITION_RUNTIME_ERROR,
+            "turn_status": "failed",
+            "task_status": "incomplete",
+            "completion_source": "",
+            "_history_recorded": True,
+            "error": run_error,
+        }
     finally:
         repl_mirror.hub.stop_recording()
         if primary_admitted and active_agent is not None:
@@ -22476,6 +23123,10 @@ def main():
         primary.home_terminal = "term0"
         primary.parent_terminal = None
         set_current_agent_id("primary")
+        # Anything already in the registry from a restore predates the rule
+        # that every agent has a parent; adopt it once, here.
+        import agent_loop as _al_boot
+        _al_boot.adopt_orphan_agents(primary.id)
 
     def _on_terminal_agent_finished(agent_info, _result):
         try:

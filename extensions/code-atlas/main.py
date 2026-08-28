@@ -11,6 +11,14 @@ Commands
                             run the annotation verifier gate
     /atlas lookup <out_dir> <src_module> <dst_module>
                             deterministic transitive dependency paths
+    /atlas find <name> [--out <dir>] [--kind class|function|module]
+                            where a symbol is defined -> file:line
+    /atlas outline <module> [--out <dir>] [--private]
+                            what a module declares, without reading the file
+    /atlas neighbors <node_id> [--out <dir>]
+                            who reaches a node and what it reaches
+    /atlas stale [--out <dir>]
+                            whether the index still matches the files on disk
     /atlas map [<out_dir>] [--depth N]
                             open the atlas on the terminal's infinite canvas
                             (wheel zooms, and zooming goes deeper: packages ->
@@ -27,8 +35,11 @@ Design notes
 * The indexer is deterministic and lives in the standalone code-atlas repo.
   This extension is a thin adapter: it invokes that repo's main.py and
   core/store.py, and never reimplements indexing logic.
-* atlas.lookup is also exposed as a model-callable tool (toolPrefix
-  "atlas.") so agents can query exact dependency paths instead of grepping.
+* The query commands are also model-callable tools (toolPrefix "atlas.") so
+  agents can ask the index instead of grepping the tree. atlas.stale is the
+  one that keeps the rest honest: a cached index that quietly stopped
+  matching the files answers confidently and wrongly, which is the failure
+  mode every other tool here would otherwise hide.
 * The annotation pipeline is workflows/run.py (a script, not a workflow
   graph — workflows/legacy-hwg/README.md records why). /atlas workflow prints
   the command with inputs filled in rather than launching a job that runs for
@@ -107,6 +118,28 @@ def handle(parts, raw_line: str = "") -> None:
         _print(f"{len(paths)} path(s) {src} -> {dst}:")
         for p in paths:
             _print("  " + " -> ".join(x.replace("mod:", "") for x in p))
+
+    elif cmd in ("find", "outline", "neighbors", "stale"):
+        out = _arg(args, "--out") or ".atlas"
+        db = Path(cwd) / out / "graph.db"
+        if not db.is_file():
+            _print(f"no index at {db} -- run /atlas index {cwd} first")
+            return
+        positional = [a for a in args if not a.startswith("--")]
+        if cmd != "stale" and not positional:
+            _print(f"usage: /atlas {cmd} <argument> [--out <dir>]")
+            return
+        sys.path.insert(0, str(_REPO))
+        from code_atlas_core import store
+        if cmd == "find":
+            result = store.find_symbol(db, positional[0], _arg(args, "--kind"))
+        elif cmd == "outline":
+            result = store.outline(db, positional[0], "--private" in args)
+        elif cmd == "neighbors":
+            result = store.neighbors(db, positional[0])
+        else:
+            result = store.stale(db, cwd)
+        _print(json.dumps(result, ensure_ascii=False, indent=1))
 
     elif cmd == "map":
         # The same scene the web view renders, on the terminal's infinite
@@ -215,7 +248,102 @@ TOOL_SPEC = {
             "required": ["src", "dst"],
         },
     },
+    "atlas.find": {
+        "description": "Locate a class, function or module by name in the "
+                       "deterministic code index. Returns exact file:line "
+                       "definitions -- use this instead of grepping for a "
+                       "definition.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "symbol name"},
+                "kind": {"type": "string", "enum": ["class", "function", "module"],
+                         "description": "restrict to one kind (optional)"},
+                "out_dir": {"type": "string",
+                            "description": "atlas output dir (default .atlas)"},
+            },
+            "required": ["name"],
+        },
+    },
+    "atlas.outline": {
+        "description": "List what a module declares (classes with their "
+                       "methods, and top-level functions) with line numbers, "
+                       "without reading the file.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "module": {"type": "string",
+                           "description": "module id, dotted name, or path"},
+                "include_private": {"type": "boolean",
+                                    "description": "include _underscore names"},
+                "out_dir": {"type": "string",
+                            "description": "atlas output dir (default .atlas)"},
+            },
+            "required": ["module"],
+        },
+    },
+    "atlas.neighbors": {
+        "description": "Every edge touching a node: what it imports, calls or "
+                       "inherits, and -- the direction grep is worst at -- "
+                       "everything that reaches it, with file:line evidence.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "node_id": {"type": "string",
+                            "description": "node id, e.g. mod:gateway.serve"},
+                "out_dir": {"type": "string",
+                            "description": "atlas output dir (default .atlas)"},
+            },
+            "required": ["node_id"],
+        },
+    },
+    "atlas.stale": {
+        "description": "Whether the index still describes the files on disk. "
+                       "Call this before trusting the other atlas tools on a "
+                       "tree that may have changed; if it reports stale, "
+                       "re-index or fall back to reading the files.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "out_dir": {"type": "string",
+                            "description": "atlas output dir (default .atlas)"},
+            },
+            "required": [],
+        },
+    },
 }
+
+
+def _db(out_dir: str) -> Path:
+    return Path(str(Path(_ctx.cwd).resolve())) / out_dir / "graph.db"
+
+
+def _query(fn_name: str, out_dir: str, *args) -> str:
+    db = _db(out_dir)
+    if not db.is_file():
+        return json.dumps({"error": f"no index at {db}",
+                           "hint": "run /atlas index <root> first"})
+    sys.path.insert(0, str(_REPO))
+    from code_atlas_core import store
+    return json.dumps(getattr(store, fn_name)(db, *args), ensure_ascii=False)
+
+
+def atlas_find(name: str = "", kind: str | None = None,
+               out_dir: str = ".atlas") -> str:
+    return _query("find_symbol", out_dir, name, kind)
+
+
+def atlas_outline(module: str = "", include_private: bool = False,
+                  out_dir: str = ".atlas") -> str:
+    return _query("outline", out_dir, module, include_private)
+
+
+def atlas_neighbors(node_id: str = "", out_dir: str = ".atlas") -> str:
+    return _query("neighbors", out_dir, node_id)
+
+
+def atlas_stale(out_dir: str = ".atlas") -> str:
+    return _query("stale", out_dir, str(Path(_ctx.cwd).resolve()))
 
 
 def atlas_lookup(out_dir: str = ".atlas", src: str = "", dst: str = "") -> str:
@@ -241,10 +369,19 @@ def setup(ctx) -> None:
             ("verify [--out <dir>]", "Verify index postconditions"),
             ("annotations <out_dir>", "Verify semantic annotation files"),
             ("lookup <out_dir> <src> <dst>", "Find exact transitive dependency paths"),
+            ("find <name> [--kind k] [--out d]", "Where a symbol is defined -> file:line"),
+            ("outline <module> [--private] [--out d]", "What a module declares"),
+            ("neighbors <node_id> [--out d]", "Who reaches a node and what it reaches"),
+            ("stale [--out d]", "Does the index still match the files on disk"),
             ("serve [--out <dir>] [--port <p>]", "Open the layered browser viewer"),
             ("workflow <out_dir> <source_root> [--lang <l>]", "Print the annotation pipeline command"),
         ])
-    try:
-        ctx.register_tool("atlas.lookup", atlas_lookup, TOOL_SPEC["atlas.lookup"])
-    except Exception:
-        pass  # older CLI without tool registration: commands still work
+    for tool_name, fn in (("atlas.lookup", atlas_lookup),
+                          ("atlas.find", atlas_find),
+                          ("atlas.outline", atlas_outline),
+                          ("atlas.neighbors", atlas_neighbors),
+                          ("atlas.stale", atlas_stale)):
+        try:
+            ctx.register_tool(tool_name, fn, TOOL_SPEC[tool_name])
+        except Exception:
+            pass  # older CLI without tool registration: commands still work

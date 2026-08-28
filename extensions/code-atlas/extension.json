@@ -1,7 +1,7 @@
 {
   "schemaVersion": 2,
   "name": "code-atlas",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "entrypoint": "main.py",
   "displayName": "Code Atlas",
   "description": "Deterministic code topology maps, exact dependency paths, semantic annotations, and terminal or browser exploration",

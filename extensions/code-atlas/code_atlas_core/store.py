@@ -126,3 +126,166 @@ def dependency_paths(db_path: str | Path, src_module: str,
         return paths
     finally:
         con.close()
+
+
+# ---- agent-facing queries ------------------------------------------------
+#
+# These exist so an agent can ask the index a question instead of grepping the
+# tree: where is this symbol, what is in this module, who touches this node,
+# and -- the one that keeps the other three honest -- is the index still
+# describing the files on disk.
+
+_NODE_COLS = "id,kind,name,parent_id,file,line,doc,public"
+
+
+def _row(r) -> dict:
+    return {"id": r[0], "kind": r[1], "name": r[2], "parent": r[3],
+            "file": r[4], "line": r[5], "doc": r[6], "public": bool(r[7])}
+
+
+def _module_id(con, module: str) -> str | None:
+    """Accept a module id, a dotted name, or a path; return the node id."""
+    if module.startswith("mod:"):
+        cand = module
+    else:
+        rel = module[:-3] if module.endswith(".py") else module
+        cand = "mod:" + rel.replace("/", ".").replace("\\", ".")
+    row = con.execute("SELECT id FROM nodes WHERE id=? AND kind='module'",
+                      (cand,)).fetchone()
+    if row:
+        return row[0]
+    # a path is unambiguous even when the id rule mangled it (dotted filenames)
+    row = con.execute("SELECT id FROM nodes WHERE kind='module' AND file=?",
+                      (module,)).fetchone()
+    return row[0] if row else None
+
+
+def find_symbol(db_path: str | Path, name: str, kind: str | None = None,
+                limit: int = 50) -> dict:
+    """Locate a class or function by name -> file:line.
+
+    Exact matches only; if there are none the same query runs as a substring
+    match and the result says so, because "no exact match, here are near
+    misses" and "here is your symbol" must not look alike to the caller.
+    """
+    con = sqlite3.connect(str(db_path))
+    try:
+        kinds = (kind,) if kind else ("class", "function", "module")
+        marks = ",".join("?" * len(kinds))
+        rows = con.execute(
+            f"SELECT {_NODE_COLS} FROM nodes WHERE name=? AND kind IN ({marks})"
+            " ORDER BY id", (name, *kinds)).fetchall()
+        how = "exact"
+        if not rows:
+            rows = con.execute(
+                f"SELECT {_NODE_COLS} FROM nodes WHERE name LIKE ?"
+                f" AND kind IN ({marks}) ORDER BY id",
+                (f"%{name}%", *kinds)).fetchall()
+            how = "substring"
+        return {"query": name, "match": how, "truncated": len(rows) > limit,
+                "matches": [_row(r) for r in rows[:limit]]}
+    finally:
+        con.close()
+
+
+def outline(db_path: str | Path, module: str,
+            include_private: bool = False) -> dict:
+    """What a module declares, without reading the file.
+
+    Classes carry their methods, so one call answers "what is in here" for a
+    file that would otherwise cost a full read.
+    """
+    con = sqlite3.connect(str(db_path))
+    try:
+        mod_id = _module_id(con, module)
+        if mod_id is None:
+            return {"module": module, "error": "not in the index"}
+        rows = con.execute(
+            f"SELECT {_NODE_COLS} FROM nodes WHERE id LIKE ?"
+            " AND kind IN ('class','function') ORDER BY line, id",
+            (mod_id + ".%",)).fetchall()
+        node = con.execute(f"SELECT {_NODE_COLS} FROM nodes WHERE id=?",
+                           (mod_id,)).fetchone()
+        classes: dict[str, dict] = {}
+        functions: list[dict] = []
+        for r in rows:
+            item = _row(r)
+            if not include_private and not item["public"]:
+                continue
+            if item["kind"] == "class":
+                classes[item["id"]] = {**item, "methods": []}
+            elif item["parent"] in classes:
+                classes[item["parent"]]["methods"].append(
+                    {"name": item["name"], "line": item["line"],
+                     "doc": item["doc"]})
+            else:
+                functions.append(item)
+        return {"module": mod_id, "file": node[4] if node else None,
+                "doc": node[6] if node else "",
+                "classes": list(classes.values()), "functions": functions}
+    finally:
+        con.close()
+
+
+def neighbors(db_path: str | Path, node_id: str, limit: int = 100) -> dict:
+    """Who reaches this node and what it reaches, with file:line evidence.
+
+    The reverse direction is the one grep is worst at: finding every caller
+    means searching for a name that also appears as an attribute, a string and
+    a comment, whereas the graph already resolved it.
+    """
+    con = sqlite3.connect(str(db_path))
+    try:
+        if not con.execute("SELECT 1 FROM nodes WHERE id=?",
+                           (node_id,)).fetchone():
+            return {"node": node_id, "error": "not in the index"}
+
+        def side(column: str, other: str) -> list[dict]:
+            rows = con.execute(
+                f"SELECT e.{other},e.kind,e.file,e.line,n.kind,n.file,n.line "
+                f"FROM edges e LEFT JOIN nodes n ON n.id=e.{other} "
+                f"WHERE e.{column}=? ORDER BY e.kind,e.{other},e.line",
+                (node_id,)).fetchall()
+            return [{"id": r[0], "edge": r[1], "at": f"{r[2]}:{r[3]}",
+                     "kind": r[4], "defined_at": f"{r[5]}:{r[6]}"
+                     if r[5] else None} for r in rows[:limit]]
+
+        return {"node": node_id,
+                "out": side("src", "dst"), "in": side("dst", "src")}
+    finally:
+        con.close()
+
+
+def stale(db_path: str | Path, root: str | Path) -> dict:
+    """Is the index still describing the files on disk?
+
+    Without this an agent cannot tell a correct map from a stale one, and a
+    stale map is worse than none: it answers confidently and wrongly. Compares
+    the stored content hashes against the tree the indexer would cover now.
+    """
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from .indexer import Indexer, file_hash
+
+    con = sqlite3.connect(str(db_path))
+    try:
+        stored = dict(con.execute("SELECT path,hash FROM files"))
+    finally:
+        con.close()
+
+    current = {}
+    for rel, abs_path in Indexer(root).source_files():
+        try:
+            current[str(rel)] = file_hash(abs_path)
+        except OSError:
+            continue        # vanished mid-scan: reported as removed below
+    changed = sorted(p for p, h in current.items()
+                     if p in stored and stored[p] != h)
+    added = sorted(set(current) - set(stored))
+    removed = sorted(set(stored) - set(current))
+    return {"stale": bool(changed or added or removed),
+            "indexed_files": len(stored), "current_files": len(current),
+            "changed": changed[:50], "added": added[:50],
+            "removed": removed[:50],
+            "counts": {"changed": len(changed), "added": len(added),
+                       "removed": len(removed)}}

@@ -2,6 +2,21 @@
 name: shell-linux
 description: Shell and Linux command discipline for laintas-cli terminal work.
 version: 1.0.0
+triggers:
+  - shell
+  - bash
+  - command line
+  - terminal command
+  - linux
+  - install
+  - package
+  - permission denied
+  - service
+  - systemd
+  - process
+  - port
+  - disk
+  - log file
 ---
 
 # Shell And Linux

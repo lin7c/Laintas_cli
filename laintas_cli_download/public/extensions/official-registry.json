@@ -7,15 +7,15 @@
       "version": "3.1.0",
       "description": "Run the same task with two models, compare them blind, and apply only the selected result",
       "url": "https://cli.laintas.com/extensions/official/blindpick-3.1.0.lext",
-      "sha256": "ad3fe5da3e398749c01287ba0439d99ad286b4139321a3fc168d4bb6b08cfea4"
+      "sha256": "4ec2f1e650a46ea8b824fcc98eff4526e08af21357d7adce3463b2cd39179c3d"
     },
     {
       "id": "laintas/code-atlas",
       "name": "Code Atlas",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "description": "Deterministic code topology maps, exact dependency paths, semantic annotations, and terminal or browser exploration",
-      "url": "https://cli.laintas.com/extensions/official/code-atlas-0.2.0.lext",
-      "sha256": "80da9de17b5bb655c9c5d4497c1bff435620ff7697cda4f3d3ce1e2101850434"
+      "url": "https://cli.laintas.com/extensions/official/code-atlas-0.3.0.lext",
+      "sha256": "75bc54a297f265978ac8233e2e8a40340ed00b15afaecf147dfdfcb60e51dff1"
     },
     {
       "id": "laintas/swebench",

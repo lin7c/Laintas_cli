@@ -97,6 +97,18 @@ class TerminalPreferenceTests(unittest.TestCase):
             self.assertEqual(saved["mode"], "auto")
             self.assertTrue(saved["ui"]["detail"])
 
+    def test_critic_preferences_are_persisted_per_terminal(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(paths, "SESSIONS_DIR", Path(tmp)), \
+                mock.patch.object(paths, "TERMINAL_ID", "term-a"):
+            terminal_preferences.set_ui_preference("critic_profile", "strict")
+            terminal_preferences.set_ui_preference(
+                "critic_prompt_file", ".laintas/critic.md")
+            terminal_preferences.reset_cache()
+            saved = terminal_preferences.get_ui_preferences()
+        self.assertEqual(saved["critic_profile"], "strict")
+        self.assertEqual(saved["critic_prompt_file"], ".laintas/critic.md")
+
     def test_missing_custom_mode_repairs_only_current_terminal(self):
         with tempfile.TemporaryDirectory() as tmp, \
                 mock.patch.object(paths, "SESSIONS_DIR", Path(tmp)), \

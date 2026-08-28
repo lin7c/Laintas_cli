@@ -11,8 +11,10 @@ per-project copies), where they were the top causes of failed tool calls:
     because the detector matched substrings and missed `python3 -m unittest`
     and `npm run test`.
 """
+import os
 import tempfile
 import shutil
+import types
 import unittest
 
 import agent_loop
@@ -206,6 +208,108 @@ class TaskErrorRecoveryTests(unittest.TestCase):
             {"id": "s1", "status": "in_progress", "progress": "25"}, self.ctx)
         self.assertTrue(result["ok"])
         self.assertEqual(result["result"]["progress"], 25)
+
+
+class EditAnchorTests(unittest.TestCase):
+    """multi_edit used to reject anchors fs.edit accepted.
+
+    Three failure modes, all of them "the anchor does not match the bytes on
+    disk" rather than anything wrong with the applier:
+      * whitespace/indentation drift -- fs.edit fell back to the vendored
+        opencode replacers, multi_edit did not, so the same edit landed through
+        one tool and failed through the other;
+      * anchors carrying fs.read's `N->` display prefixes, which every prompt
+        invited by saying to copy verbatim from what was read;
+      * one bad anchor discarding a whole batch with an error
+        ("old_string not found") that named nothing to correct, so the model
+        re-guessed all of them and the batch never converged.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.src = ("def handler(req):\n"
+                    "    if req.ok:\n"
+                    "        return process(req)\n"
+                    "    return None\n")
+        self.path = os.path.join(self.tmp, "a.py")
+        with open(self.path, "w", encoding="utf-8") as fh:
+            fh.write(self.src)
+        # Writes are policy-gated; grant approval so the test exercises matching.
+        self.ctx = tools.ToolCtx(
+            cwd=self.tmp,
+            deps=types.SimpleNamespace(
+                request_file_write_approval=lambda *a, **k: True))
+
+    def _multi_edit(self, edits):
+        return tools.get_registry().invoke(
+            "fs.multi_edit", {"path": "a.py", "edits": edits}, self.ctx)
+
+    def test_indentation_drift_lands_like_it_does_through_fs_edit(self):
+        result = self._multi_edit([
+            {"old_string": "def handler(req):",
+             "new_string": "def handler(req, cfg):"},
+            # Second line under-indented by four spaces -- the classic drift.
+            {"old_string": "    if req.ok:\n    return process(req)",
+             "new_string": "    if req.ok and req.body:\n        return process(req)"},
+        ])
+        self.assertTrue(result.get("ok"), result.get("error"))
+        self.assertEqual([e["match"] for e in result["edits_applied"]],
+                         ["exact", "line-trimmed"])
+        body = open(self.path, encoding="utf-8").read()
+        self.assertIn("def handler(req, cfg):", body)
+        self.assertIn("    if req.ok and req.body:\n        return process(req)", body)
+
+    def test_anchors_copied_out_of_fs_read_keep_their_prefixes_and_still_match(self):
+        read = tools.get_registry().invoke(
+            "fs.read", {"path": "a.py"}, self.ctx)["result"]
+        # Exactly what the model sees, prefixes and all.
+        first, last = read.split("\n")[0], read.split("\n")[3]
+        self.assertTrue(first.startswith("1\u2192"))
+        result = self._multi_edit([
+            {"old_string": first, "new_string": "def handler(req, cfg):"},
+            {"old_string": last, "new_string": "    return req.fallback"},
+        ])
+        self.assertTrue(result.get("ok"), result.get("error"))
+        body = open(self.path, encoding="utf-8").read()
+        self.assertNotIn("\u2192", body)
+        self.assertIn("def handler(req, cfg):", body)
+        self.assertIn("    return req.fallback", body)
+
+    def test_one_bad_anchor_reports_which_edit_failed_and_which_matched(self):
+        result = self._multi_edit([
+            {"old_string": "def handler(req):",
+             "new_string": "def handler(req, cfg):"},
+            {"old_string": "    raise NotImplementedError()",
+             "new_string": "    pass"},
+            {"old_string": "    return None", "new_string": "    return req.fallback"},
+        ])
+        self.assertFalse(result.get("ok"))
+        self.assertEqual(result.get("failed_edit"), 2)
+        self.assertEqual(result.get("matching_edits"), [1, 3])
+        self.assertIn("only edit #2", result["error"])
+        # All-or-nothing still holds.
+        self.assertEqual(open(self.path, encoding="utf-8").read(), self.src)
+
+    def test_a_near_miss_names_the_line_it_is_closest_to(self):
+        result = self._multi_edit([
+            {"old_string": "def handler(req, ctx):",
+             "new_string": "def handler(req, cfg):"},
+        ])
+        self.assertFalse(result.get("ok"))
+        self.assertIn("line 1", result["error"])
+        self.assertIn("def handler(req):", result["error"])
+
+    def test_prefix_stripping_only_fires_on_a_fully_numbered_anchor(self):
+        # Real code that merely contains the arrow must not be mangled.
+        with open(self.path, "w", encoding="utf-8") as fh:
+            fh.write("label = \"1\u2192one\"\nother = 2\n")
+        result = self._multi_edit([
+            {"old_string": "label = \"1\u2192one\"",
+             "new_string": "label = \"1\u2192uno\""},
+        ])
+        self.assertTrue(result.get("ok"), result.get("error"))
+        self.assertIn("1\u2192uno", open(self.path, encoding="utf-8").read())
 
 
 if __name__ == "__main__":

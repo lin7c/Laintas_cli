@@ -16,6 +16,7 @@ _LAST_WRITE_FINGERPRINTS: dict[str, str] = {}
 
 CONTINUABLE_REASONS = {
     "max_loops",
+    "max_loops_wrapup",
     "interrupted",
     "backend_error",
     "provider_error",
@@ -29,6 +30,7 @@ CONTINUABLE_REASONS = {
     "staleness",
     "aborted",
     "crash_recovery",
+    "runtime_error",
 }
 
 def _session_key(cwd: str) -> str:

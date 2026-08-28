@@ -64,12 +64,60 @@ def _next_seq(path: Path) -> int:
     return _SEQ_BY_PATH[key]
 
 
+#: What each event type must carry to be worth writing down.
+#:
+#: An event log with no schema records whatever the call site happened to pass,
+#: and the gap only shows up when a question cannot be answered from it. That
+#: happened: `critic_assessment` was written without an agent id, so after a
+#: six-agent batch the log held nineteen verdicts and could not say which agent
+#: any of them judged — the one question the log existed to answer.
+#:
+#: Enforcement is deliberately asymmetric with how much a caller can break: a
+#: missing field is recorded as `null` plus a `_schema_gap` marker rather than
+#: dropped or raised, because losing the event is worse than logging an
+#: incomplete one. The test suite treats any `_schema_gap` as a failure, so the
+#: gap is caught where it can still be fixed instead of in a post-mortem.
+REQUIRED_FIELDS: dict = {
+    "prompt_admitted": ("text",),
+    "ai_response": ("loop",),
+    "tool_call": ("name", "call_id"),
+    "tool_result": ("name", "call_id", "ok"),
+    "turn_ended": ("reason",),
+    # Anything that judges or supervises an agent must say WHICH agent.
+    "critic_assessment": ("agent_id", "run_id"),
+    "critic_failure": ("agent_id", "reason"),
+    "contract_checked": ("agent_id", "ok"),
+    "child_help_requested": ("agent_id", "request_id"),
+    "child_help_answered": ("agent_id", "request_id"),
+    "child_help_timeout": ("agent_id", "request_id"),
+    "branch_opened": ("branch_id", "owner"),
+    "branch_closed": ("branch_id", "owner", "reason"),
+    "member_settled": ("branch_id", "agent_id", "outcome"),
+    # A crash record with no error text is a record that something went wrong
+    # and nothing about what.
+    "turn_crashed": ("error", "agent_id"),
+    "context_compacted": ("before_tokens", "after_tokens"),
+    "critic_prompt_warning": ("error",),
+}
+
+
+def schema_gaps(event_type: str, fields: dict) -> list:
+    """Required fields this event is missing. Empty when the event is complete."""
+    return [name for name in REQUIRED_FIELDS.get(event_type, ())
+            if fields.get(name) in (None, "")]
+
+
 def append(event_type: str, **fields) -> int:
     """Append an event to the durable log. Returns the sequence number.
 
     Never raises — a logging failure is swallowed (the loop must not break
     because the event log is unwritable). Returns -1 on failure.
     """
+    _gaps = schema_gaps(event_type, fields)
+    if _gaps:
+        for _name in _gaps:
+            fields.setdefault(_name, None)
+        fields["_schema_gap"] = _gaps
     try:
         p = _log_path()
         with _LOCK:

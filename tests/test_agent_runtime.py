@@ -15,6 +15,7 @@ from rich.console import Console
 from rich.markdown import Markdown
 
 import agent_loop
+import agent_contract
 import agent_persistence
 import agent_roles
 import tools
@@ -237,6 +238,46 @@ class AgentSchedulerTests(unittest.TestCase):
         message = agent_loop.recv_from_inbox(parent.id)
         self.assertEqual(message["kind"], "child-error")
 
+    def test_contract_failure_is_escalated_once_for_parent_decision(self):
+        parent = agent_loop.register_agent(name="contract-parent", role="primary")
+        contract = agent_contract.normalize({
+            "outputs": [{"name": "report", "type": "string"}],
+            "acceptance": [{"kind": "min_length", "output": "report",
+                            "value": 20}],
+        })
+
+        def child_run(_deps, _task, _session, state, _history, **_kwargs):
+            state["_submitted_outputs"] = {"report": "too short"}
+            state["_capability_gaps"] = [{
+                "tool": "shell.exec", "kind": "unavailable",
+                "reason": "not available to reviewer",
+            }]
+            return {
+                "success": True, "msg": "partial review",
+                "exit_reason": "completed", "turn_status": "completed",
+                "task_status": "completed", "completion_source": "task_complete",
+            }
+
+        with mock.patch("worktree_manager.is_git_repo", return_value=False), \
+                mock.patch.object(agent_loop, "run_agent_loop",
+                                  side_effect=child_run) as run:
+            child_id = agent_loop.spawn_subagent(
+                parent.id, "review it", _deps(), contract=contract)
+            child = agent_loop.get_agent(child_id)
+            child.thread.join(timeout=5)
+            info = agent_loop.get_agent(child_id)
+
+        self.assertEqual(1, run.call_count, "runtime must not auto-retry")
+        self.assertFalse(child.thread.is_alive())
+        self.assertEqual("error", info.status)
+        message = agent_loop.recv_from_inbox(parent.id)
+        self.assertEqual("child-error", message["kind"])
+        self.assertEqual("contract_rejected", message["failure"]["kind"])
+        self.assertEqual("parent_decides", message["retry_policy"])
+        self.assertEqual({"report": "too short"}, message["outputs"])
+        self.assertIn("needs 20", message["gaps"][0])
+        self.assertEqual("shell.exec", message["capability_gaps"][0]["tool"])
+
     def test_structured_parallel_uses_canonical_spawner(self):
         parent = agent_loop.register_agent(name="parent", role="primary")
         ctx = tools.ToolCtx(
@@ -247,13 +288,68 @@ class AgentSchedulerTests(unittest.TestCase):
                     return_value={"state": {"lastReply": "complete"}}):
             result = tools._bi_spawn_parallel({"tasks": [
                 {"goal": "first"}, {"goal": "second", "hint": "be brief"},
-            ]}, ctx)
+            ], "wait": True}, ctx)
 
         self.assertTrue(result["ok"])
         self.assertEqual(len(result["child_ids"]), 2)
         children = [agent_loop.get_agent(cid) for cid in result["child_ids"]]
         self.assertTrue(all(child.status == "done" for child in children))
         self.assertEqual(len({child.group_id for child in children}), 1)
+
+    def test_spawn_parallel_is_async_by_default(self):
+        parent = agent_loop.register_agent(name="async-parent", role="primary")
+        ctx = tools.ToolCtx(
+            deps=_deps(), agent_id=parent.id, session={}, events_cb=None)
+        release = threading.Event()
+
+        def _blocked_until_released(*_args, **_kwargs):
+            release.wait(timeout=5)
+            return {"state": {"lastReply": "arrived through inbox"}}
+
+        with mock.patch("worktree_manager.is_git_repo", return_value=False), \
+                mock.patch.object(agent_loop, "run_agent_loop",
+                                  side_effect=_blocked_until_released):
+            started = time.time()
+            result = tools._bi_spawn_parallel({
+                "tasks": [{"goal": "work in background"}],
+            }, ctx)
+            elapsed = time.time() - started
+            child = agent_loop.get_agent(result["child_ids"][0])
+            try:
+                self.assertTrue(result["ok"])
+                self.assertFalse(result["waiting"])
+                # The batch IS a branch now: one object with the budget, the
+                # supervisor and the outcome ledger on it.
+                self.assertTrue(result["batch_id"].startswith("b-"))
+                self.assertEqual(result["batch_id"], result["branch_id"])
+                self.assertLess(elapsed, 1.0)
+                self.assertIn(child.status, {"queued", "running"})
+            finally:
+                release.set()
+                child.thread.join(timeout=5)
+
+        self.assertFalse(child.thread.is_alive())
+        message = agent_loop.recv_from_inbox(parent.id)
+        self.assertEqual("child-done", message["kind"])
+
+    def test_await_spawns_can_select_one_parallel_batch(self):
+        parent = agent_loop.register_agent(name="batch-parent", role="primary")
+        selected = agent_loop.register_agent(
+            name="selected", role="subagent", parent_id=parent.id)
+        unrelated = agent_loop.register_agent(
+            name="unrelated", role="subagent", parent_id=parent.id)
+        selected.group_id = "group-selected"
+        unrelated.group_id = "group-other"
+        agent_loop.mark_agent_finished(selected.id, result="selected result")
+        agent_loop.mark_agent_finished(unrelated.id, result="unrelated result")
+        ctx = tools.ToolCtx(
+            deps=_deps(), agent_id=parent.id, session={}, events_cb=None)
+
+        result = tools._bi_await_spawns({"batch_id": "group-selected"}, ctx)
+
+        self.assertTrue(result["ok"])
+        self.assertIn("selected result", result["result"])
+        self.assertNotIn("unrelated result", result["result"])
 
     def test_finished_task_children_are_bounded(self):
         for index in range(105):
@@ -329,7 +425,9 @@ class AgentSchedulerTests(unittest.TestCase):
                 mock.patch.object(tools, "SPAWN_PARALLEL_STALL_SECONDS", 0.3), \
                 mock.patch.object(tools, "SPAWN_PARALLEL_WRAP_UP_LEAD_SECONDS", 0.1), \
                 mock.patch.object(agent_loop, "run_agent_loop", _busy):
-            result = tools._bi_spawn_parallel({"tasks": [{"goal": "slow but working"}]}, ctx)
+            result = tools._bi_spawn_parallel({
+                "tasks": [{"goal": "slow but working"}], "wait": True,
+            }, ctx)
 
         self.assertTrue(result["ok"])
         self.assertIn("finished the whole review", result["result"])
@@ -357,7 +455,9 @@ class AgentSchedulerTests(unittest.TestCase):
                 mock.patch.object(tools, "SPAWN_PARALLEL_STALL_SECONDS", 0.4), \
                 mock.patch.object(tools, "SPAWN_PARALLEL_WRAP_UP_LEAD_SECONDS", 0.1), \
                 mock.patch.object(agent_loop, "run_agent_loop", _wedged):
-            result = tools._bi_spawn_parallel({"tasks": [{"goal": "gets stuck"}]}, ctx)
+            result = tools._bi_spawn_parallel({
+                "tasks": [{"goal": "gets stuck"}], "wait": True,
+            }, ctx)
 
         self.assertIn("no observable progress", result["result"])
         self.assertIn("found one leak so far", result["result"])
@@ -891,26 +991,83 @@ class PersistentOwnershipTests(unittest.TestCase):
         deps.InteractiveSession = _FakeInteractiveSession
         return deps
 
-    def test_communication_is_limited_to_same_or_adjacent_terminal(self):
+    def test_only_a_tree_edge_carries_a_message(self):
+        """Messaging follows the delegation tree, and nothing else.
+
+        Authorization used to be the union of three graphs: agent parent/child,
+        "same terminal", and "adjacent parent/child terminals". Two of those are
+        not delegation — an employee hired into a terminal is not the peer of
+        everything else stationed there — so who could reach whom depended on
+        runtime placement rather than on the task tree. Siblings are now
+        unreachable BY CONSTRUCTION: work two of them must agree on belongs to
+        the parent that owns both.
+        """
         self._terminal("term0")
         self._terminal("left", "term0")
-        self._terminal("left-child", "left")
-        self._terminal("right", "term0")
         root = agent_loop.register_agent(name="root-agent", role="pool")
-        left = agent_loop.register_agent(name="left-agent", role="pool")
-        peer = agent_loop.register_agent(name="left-peer", role="pool")
-        child = agent_loop.register_agent(name="child-agent", role="pool")
-        right = agent_loop.register_agent(name="right-agent", role="pool")
-        root.home_terminal = "term0"
-        left.home_terminal = peer.home_terminal = "left"
-        child.home_terminal = "left-child"
-        right.home_terminal = "right"
+        left = agent_loop.register_agent(name="left-agent", role="pool",
+                                         parent_id=root.id)
+        right = agent_loop.register_agent(name="right-agent", role="pool",
+                                          parent_id=root.id)
+        grandchild = agent_loop.register_agent(name="grandchild", role="pool",
+                                               parent_id=left.id)
+        housemate = agent_loop.register_agent(name="housemate", role="pool")
+        housemate.home_terminal = left.home_terminal = "left"
 
-        self.assertTrue(agent_loop.can_agents_communicate(left.id, peer.id))
+        # Tree edges, both directions.
         self.assertTrue(agent_loop.can_agents_communicate(root.id, left.id))
-        self.assertTrue(agent_loop.can_agents_communicate(left.id, child.id))
+        self.assertTrue(agent_loop.can_agents_communicate(left.id, root.id))
+        self.assertTrue(agent_loop.can_agents_communicate(left.id, grandchild.id))
+        # Siblings, grandparent, and a terminal housemate: all refused.
         self.assertFalse(agent_loop.can_agents_communicate(left.id, right.id))
-        self.assertFalse(agent_loop.can_agents_communicate(root.id, child.id))
+        self.assertFalse(agent_loop.can_agents_communicate(root.id, grandchild.id))
+        self.assertFalse(agent_loop.can_agents_communicate(left.id, housemate.id))
+
+    def test_agent_list_shows_exactly_what_can_be_messaged(self):
+        """A roster listing an unreachable agent invites turns spent finding out."""
+        self._terminal("term0")
+        root = agent_loop.register_agent(name="root-agent", role="pool")
+        left = agent_loop.register_agent(name="left-agent", role="pool",
+                                         parent_id=root.id)
+        right = agent_loop.register_agent(name="right-agent", role="pool",
+                                          parent_id=root.id)
+        child = agent_loop.register_agent(name="left-child", role="pool",
+                                          parent_id=left.id)
+        listing = tools._bi_agent_list({}, tools.ToolCtx(agent_id=left.id))
+        self.assertTrue(listing["ok"], listing)
+        self.assertIn("root-agent (parent)", listing["result"])
+        self.assertIn("left-child (child)", listing["result"])
+        self.assertNotIn("right-agent", listing["result"])
+        for other in (right.id, root.id):
+            reachable = agent_loop.can_agents_communicate(left.id, other)
+            self.assertEqual(other in listing["result"].replace("<-- self", ""),
+                             reachable)
+
+    def test_registration_leaves_no_agent_outside_the_tree(self):
+        """"No parent given" is a missing edge, not a second kind of agent.
+
+        Hires were registered with no parent and reached through their terminal
+        instead, so half the registry sat outside the tree that messaging,
+        abort and harvest are all written against.
+        """
+        root = agent_loop.register_agent(name="primary", role="primary")
+        hired = agent_loop.register_agent(name="hired", role="pool")
+        self.assertEqual(root.id, hired.parent_id)
+        self.assertIn(hired.id, agent_loop.get_agent(root.id).child_ids)
+        self.assertTrue(agent_loop.can_agents_communicate(root.id, hired.id))
+
+    def test_agents_that_predate_the_rule_are_adopted_once(self):
+        """Repair path for entries restored from before the invariant."""
+        root = agent_loop.register_agent(name="primary", role="primary")
+        legacy = agent_loop.register_agent(name="legacy", role="pool")
+        legacy.parent_id = None                      # as restored from disk
+        agent_loop.get_agent(root.id).child_ids.remove(legacy.id)
+        self.assertFalse(agent_loop.can_agents_communicate(root.id, legacy.id))
+
+        self.assertEqual(1, agent_loop.adopt_orphan_agents(root.id))
+        self.assertEqual(root.id, agent_loop.get_agent(legacy.id).parent_id)
+        self.assertTrue(agent_loop.can_agents_communicate(root.id, legacy.id))
+        self.assertEqual(0, agent_loop.adopt_orphan_agents(root.id))
 
     def test_dialog_focus_is_independent_from_deployed_shell_owner(self):
         self._terminal("term0")
@@ -936,7 +1093,8 @@ class PersistentOwnershipTests(unittest.TestCase):
     def test_agent_tell_attaches_freshness_provenance(self):
         self._terminal("term0")
         sender = agent_loop.register_agent(name="sender", role="pool")
-        receiver = agent_loop.register_agent(name="receiver", role="pool")
+        receiver = agent_loop.register_agent(name="receiver", role="pool",
+                                             parent_id=sender.id)
         sender.home_terminal = receiver.home_terminal = "term0"
         with tempfile.TemporaryDirectory() as tmp:
             ctx = tools.ToolCtx(
@@ -1928,6 +2086,393 @@ class ThinkingLiveTests(unittest.TestCase):
 
         self.assertIs(options["redirect_stdout"], False)
         self.assertIs(options["redirect_stderr"], False)
+
+    def test_live_conflict_falls_back_without_duplicate_backend_call(self):
+        calls = []
+
+        def backend(**kwargs):
+            calls.append(kwargs)
+            on_chunk = kwargs.get("on_chunk")
+            if on_chunk:
+                on_chunk("reply", "hello")
+            return {
+                "reply": "hello", "tool_calls": [], "finish_reason": "stop",
+                "done": True, "error": False,
+            }
+
+        deps = _deps()
+        deps.call_backend = backend
+        from rich.live import Live
+        from rich.text import Text
+
+        with tempfile.TemporaryDirectory() as tmp, _chdir(tmp):
+            Path(".laintas").mkdir()
+            # Deterministically occupy the same Console. The foreground loop
+            # must degrade to event-only streaming rather than raising the
+            # production LiveError or retrying a billed request.
+            outer = Live(Text("occupied"), console=deps.console,
+                         auto_refresh=False)
+            outer.start(refresh=False)
+            try:
+                result = agent_loop.run_agent_loop(
+                    deps, "hello", {}, {}, [],
+                    events_cb=lambda _events: None, max_loops_override=1)
+            finally:
+                outer.stop()
+
+        self.assertEqual(result["msg"], "hello")
+        self.assertEqual(len(calls), 1)
+
+    def test_parent_and_nonblocking_child_stream_concurrently(self):
+        agent_loop.close_all_agents()
+        parent = agent_loop.register_agent(name="primary", role="primary")
+        barrier = threading.Barrier(2, timeout=3)
+        calls = []
+        emitted = []
+
+        def backend(**kwargs):
+            calls.append(agent_loop.get_thread_agent_id() or "foreground")
+            barrier.wait()
+            on_chunk = kwargs.get("on_chunk")
+            if on_chunk:
+                on_chunk("reply", "ok")
+            return {
+                "reply": "ok", "tool_calls": [], "finish_reason": "stop",
+                "done": True, "error": False,
+            }
+
+        deps = _deps()
+        deps.call_backend = backend
+        try:
+            with tempfile.TemporaryDirectory() as tmp, _chdir(tmp), \
+                    mock.patch("worktree_manager.is_git_repo", return_value=False):
+                Path(".laintas").mkdir()
+                child_id = agent_loop.spawn_subagent(
+                    parent.id, "child task", deps, session={},
+                    events_cb=lambda events: emitted.extend(events))
+                result = agent_loop.run_agent_loop(
+                    deps, "parent task", {}, parent.state,
+                    parent.chat_history,
+                    events_cb=lambda events: emitted.extend(events),
+                    agent_id=parent.id, max_loops_override=1)
+                child = agent_loop.wait_for_agent(child_id, timeout=3)
+        finally:
+            agent_loop.close_all_agents()
+
+        self.assertEqual(result["msg"], "ok")
+        self.assertIsNotNone(child)
+        self.assertEqual(child.status, "done")
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(any(event.get("type") == "ai_stream"
+                            for event in emitted))
+
+    def test_parent_and_six_nonblocking_children_stream_concurrently(self):
+        agent_loop.close_all_agents()
+        old_max = agent_loop._max_concurrent
+        agent_loop._max_concurrent = 8
+        parent = agent_loop.register_agent(name="primary", role="primary")
+        barrier = threading.Barrier(7, timeout=5)
+        calls = []
+        calls_lock = threading.Lock()
+
+        def backend(**kwargs):
+            with calls_lock:
+                calls.append(agent_loop.get_thread_agent_id() or "foreground")
+            barrier.wait()
+            on_chunk = kwargs.get("on_chunk")
+            if on_chunk:
+                on_chunk("reply", "ok")
+            return {
+                "reply": "ok", "tool_calls": [], "finish_reason": "stop",
+                "done": True, "error": False,
+            }
+
+        deps = _deps()
+        deps.call_backend = backend
+        children = []
+        try:
+            with tempfile.TemporaryDirectory() as tmp, _chdir(tmp), \
+                    mock.patch("worktree_manager.is_git_repo", return_value=False):
+                Path(".laintas").mkdir()
+                for index in range(6):
+                    children.append(agent_loop.spawn_subagent(
+                        parent.id, f"child {index}", deps, session={},
+                        events_cb=lambda _events: None,
+                        name=f"stream-child-{index}"))
+                result = agent_loop.run_agent_loop(
+                    deps, "parent", {}, parent.state, parent.chat_history,
+                    events_cb=lambda _events: None, agent_id=parent.id,
+                    max_loops_override=1)
+                infos = [agent_loop.wait_for_agent(cid, timeout=5)
+                         for cid in children]
+        finally:
+            agent_loop._max_concurrent = old_max
+            agent_loop.close_all_agents()
+
+        self.assertEqual(result["msg"], "ok")
+        self.assertEqual(len(calls), 7)
+        self.assertTrue(all(info is not None and info.status == "done"
+                            for info in infos))
+        self.assertEqual(agent_loop._running_count, 0)
+
+    def test_depth_zero_subagent_is_still_background(self):
+        agent_loop.close_all_agents()
+        subagent = agent_loop.register_agent(
+            name="hwo-node", role="subagent", depth=0)
+        entered = []
+
+        class ForbiddenLive:
+            def __init__(self, *_args, **_kwargs):
+                entered.append(True)
+                raise AssertionError("background subagent tried to own Live")
+
+        deps = _deps({
+            "reply": "done", "tool_calls": [], "finish_reason": "stop",
+            "done": True, "error": False,
+        })
+        try:
+            with tempfile.TemporaryDirectory() as tmp, _chdir(tmp), \
+                    mock.patch("rich.live.Live", ForbiddenLive):
+                Path(".laintas").mkdir()
+                result = agent_loop.run_agent_loop(
+                    deps, "node", {}, subagent.state, subagent.chat_history,
+                    events_cb=lambda _events: None, depth=0,
+                    agent_id=subagent.id, max_loops_override=1)
+        finally:
+            agent_loop.close_all_agents()
+
+        self.assertEqual(result["msg"], "done")
+        self.assertEqual(entered, [])
+
+
+class BackgroundCriticTests(unittest.TestCase):
+    """The progress critic runs off the user's clock and lands a turn later."""
+
+    def test_critic_call_is_not_serialized_into_the_turn(self):
+        import critic as critic_mod
+
+        main_calls = []
+        critic_calls = []
+        critic_started = threading.Event()
+        release_critic = threading.Event()
+
+        def backend(**kwargs):
+            if kwargs.get("system_prompt") == critic_mod.SYSTEM_PROMPT:
+                critic_calls.append(kwargs)
+                critic_started.set()
+                # Held open until the NEXT main call happens. If the loop
+                # waited for the critic, that call could never happen and this
+                # would sit here for the full timeout — which the elapsed-time
+                # assertion below turns into a failure.
+                release_critic.wait(timeout=6)
+                return {"reply": '{"on_track": true, "score": 90, "issue": ""}',
+                        "tool_calls": [], "done": False, "error": False}
+            main_calls.append(kwargs)
+            if len(main_calls) >= 2:
+                release_critic.set()
+            if len(main_calls) >= 3:
+                return {"reply": "finished", "tool_calls": [],
+                        "finish_reason": "stop", "done": True, "error": False}
+            return {"reply": "working", "tool_calls": [
+                        {"name": "fs.read", "arguments": {"path": "a.txt"}}],
+                    "finish_reason": "tool_calls", "done": False, "error": False}
+
+        deps = _deps()
+        deps.call_backend = backend
+        overrides = {"critic_min_loop": 0, "critic_interval": 1}
+        real_config = agent_loop.get_runtime_config
+
+        with tempfile.TemporaryDirectory() as tmp, _chdir(tmp), \
+                mock.patch.object(agent_persistence, "AGENTS_DIR", Path(tmp) / "agents"), \
+                mock.patch.object(agent_loop, "get_runtime_config",
+                                  side_effect=lambda k: overrides.get(k, real_config(k))):
+            Path(".laintas").mkdir()
+            Path("a.txt").write_text("hello", encoding="utf-8")
+            _t0 = time.monotonic()
+            agent_loop.run_agent_loop(deps, "keep going", {}, {}, [],
+                                      max_loops_override=3)
+            _elapsed = time.monotonic() - _t0
+
+        release_critic.set()
+        self.assertTrue(critic_started.is_set(), "critic never ran")
+        self.assertGreaterEqual(len(main_calls), 2)
+        # Serialized, the second main call would have had to wait out the
+        # critic's 6s hold. Concurrent, it goes straight through.
+        self.assertLess(_elapsed, 4.0,
+                        "the loop blocked on the background critic")
+
+
+class BackendSignatureLadderTests(unittest.TestCase):
+    """One backend entry point; older signatures degrade one rung at a time."""
+
+    def test_older_backend_keeps_thread_and_tool_authorization(self):
+        seen = []
+
+        def legacy_backend(session, message, system_prompt, current_path,
+                           history=None, on_chunk=None, lang="EN",
+                           interrupt_event=None, messages=None,
+                           allowed_tool_names=None, model_override=None):
+            # No provider_override / task_kind / trajectory_id / context_capture.
+            seen.append({"messages": messages,
+                         "allowed_tool_names": allowed_tool_names})
+            return {"reply": "ok", "tool_calls": [], "finish_reason": "stop",
+                    "done": True, "error": False}
+
+        deps = _deps()
+        deps.call_backend = legacy_backend
+        with tempfile.TemporaryDirectory() as tmp, _chdir(tmp), \
+                mock.patch.object(agent_persistence, "AGENTS_DIR", Path(tmp) / "agents"):
+            Path(".laintas").mkdir()
+            agent_loop.run_agent_loop(deps, "hello", {}, {}, [],
+                                      max_loops_override=2)
+
+        self.assertTrue(seen)
+        # It dropped only the fields it cannot accept: the message thread and
+        # the authorization set — the two that actually change the answer —
+        # still made it through.
+        self.assertIsNotNone(seen[-1]["messages"])
+        self.assertTrue(seen[-1]["allowed_tool_names"])
+
+
+class ReadOnlyBatchGateTests(unittest.TestCase):
+    """A concurrent read-only turn must still pass every gate before running."""
+
+    def _run_turn(self, tool_policy=None, hook_denies=None):
+        responses = iter([
+            {"reply": "batch", "tool_calls": [
+                {"name": "fs.read", "arguments": {"path": "a.txt"}},
+                {"name": "web.fetch", "arguments": {"url": "http://example.com"}},
+             ], "finish_reason": "tool_calls", "done": False, "error": False},
+            {"reply": "done", "tool_calls": [], "finish_reason": "stop",
+             "done": True, "error": False},
+        ])
+        deps = _deps()
+        deps.call_backend = lambda **kwargs: next(responses)
+        employee = agent_loop.register_agent(
+            name="ro-batch", depth=1, role="pool",
+            profile=agent_loop.EmployeeProfile(tool_policy=tool_policy))
+        invoked = []
+        real_invoke = tools.get_registry().invoke
+
+        def spy(name, args, ctx, *a, **kw):
+            invoked.append(name)
+            if name == "web.fetch":
+                return {"ok": True, "result": "FETCHED"}
+            return real_invoke(name, args, ctx, *a, **kw)
+
+        def trigger(event, payload):
+            if (event == "pre_tool" and hook_denies
+                    and payload.get("tool") in hook_denies):
+                return False, {}
+            return True, {}
+
+        with tempfile.TemporaryDirectory() as tmp, _chdir(tmp), \
+                mock.patch.object(agent_persistence, "AGENTS_DIR", Path(tmp) / "agents"):
+            Path(".laintas").mkdir()
+            Path("a.txt").write_text("hello", encoding="utf-8")
+            with mock.patch.object(tools.get_registry(), "invoke", side_effect=spy), \
+                    mock.patch.object(agent_loop.hooks_mod, "trigger", side_effect=trigger):
+                result = agent_loop.run_agent_loop(
+                    deps, "read and fetch", {}, employee.state,
+                    employee.chat_history, depth=1, agent_id=employee.id,
+                    max_loops_override=3)
+        return invoked, result
+
+    def test_policy_denied_call_is_not_executed_by_the_batch(self):
+        # The batch used to run the whole turn up front, so a call the gates
+        # were about to refuse had already hit the network by the time the
+        # model was told it was blocked.
+        invoked, result = self._run_turn(
+            tool_policy=agent_loop.AgentToolPolicy(allowed_tools=["fs.read"]))
+        self.assertIn("fs.read", invoked)
+        self.assertNotIn("web.fetch", invoked)
+        self.assertIn("not available to agent", result["state"]["lastOutput"])
+
+    def test_pre_tool_hook_can_block_a_batched_call(self):
+        invoked, _ = self._run_turn(hook_denies={"web.fetch"})
+        self.assertIn("fs.read", invoked)
+        self.assertNotIn("web.fetch", invoked)
+
+    def test_unblocked_batch_still_runs_every_call(self):
+        invoked, _ = self._run_turn()
+        self.assertEqual(sorted(invoked), ["fs.read", "web.fetch"])
+
+
+class FinalTurnWrapUpTests(unittest.TestCase):
+    """The last allowed iteration must be tool-free (mirrors AutonomousKernel)."""
+
+    def _run(self, max_loops):
+        calls = []
+        responses = iter([
+            {
+                "reply": "still working",
+                "tool_calls": [{
+                    "name": "fs.read",
+                    "arguments": {"path": "a.txt"},
+                }],
+                "finish_reason": "tool_calls",
+                "done": False,
+                "error": False,
+            },
+            {
+                "reply": "here is my summary",
+                "tool_calls": [],
+                "finish_reason": "stop",
+                "done": False,
+                "error": False,
+            },
+        ])
+        deps = _deps()
+
+        def backend(**kwargs):
+            calls.append(kwargs)
+            try:
+                return next(responses)
+            except StopIteration:
+                return {"reply": "idle", "tool_calls": [], "finish_reason": "stop",
+                        "done": True, "error": False}
+
+        deps.call_backend = backend
+        with tempfile.TemporaryDirectory() as tmp, _chdir(tmp), \
+                mock.patch.object(agent_persistence, "AGENTS_DIR", Path(tmp) / "agents"):
+            Path(".laintas").mkdir()
+            Path("a.txt").write_text("hello", encoding="utf-8")
+            result = agent_loop.run_agent_loop(
+                deps, "read a.txt then summarize", {}, {}, [],
+                max_loops_override=max_loops)
+        return calls, result
+
+    def test_last_iteration_sends_no_tools_and_asks_for_a_final_answer(self):
+        calls, result = self._run(2)
+        self.assertEqual(len(calls), 2)
+        # First iteration: tools offered as usual.
+        self.assertTrue(calls[0]["allowed_tool_names"])
+        # Final iteration: no schemas at all, so the provider cannot call a tool.
+        self.assertEqual(calls[1]["allowed_tool_names"], set())
+        last_prompt = "\n".join(
+            str(m.get("content") or "") for m in (calls[1]["messages"] or []))
+        self.assertIn("<final_step>", last_prompt)
+        self.assertNotIn("<final_step>", "\n".join(
+            str(m.get("content") or "") for m in (calls[0]["messages"] or [])))
+        # The prose answer is delivered, but the run is still marked as having
+        # hit the budget so /continue stays available (session_store treats
+        # max_loops_wrapup as continuable).
+        self.assertIn("summary", result["state"]["lastReply"])
+        self.assertEqual(result.get("exit_reason"),
+                         agent_loop.TRANSITION_MAX_LOOPS_WRAPUP)
+        self.assertTrue(result["state"].get("_max_loops_exhausted"))
+        import session_store
+        self.assertTrue(session_store.is_continuable_reason(
+            agent_loop.TRANSITION_MAX_LOOPS_WRAPUP))
+
+    def test_single_iteration_run_keeps_its_tools(self):
+        # A one-iteration budget is the whole run, not a wrap-up turn: stripping
+        # its tools would leave it unable to do anything at all.
+        calls, _ = self._run(1)
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(calls[0]["allowed_tool_names"])
+        self.assertNotIn("<final_step>", "\n".join(
+            str(m.get("content") or "") for m in (calls[0]["messages"] or [])))
 
 
 if __name__ == "__main__":

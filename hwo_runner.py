@@ -21,6 +21,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Union
 
+import agent_contract
+
 
 # ── Data model (mirrors hwo.ts types) ────────────────────────────────────
 
@@ -312,7 +314,7 @@ def _format_io_prompt(agent: HwoAgent, resolved_inputs: Optional[dict] = None) -
     for p in agent.io.get("out", []):
         value = _literal_value(p.get("default")) if p.get("default") is not None else None
         lines.append(f"$self.{p.get('name', '')} output({_short_io_type(p.get('type'))}):{_format_var_value(value, p.get('type'))}")
-    lines.append("Use agent_send/agent_receive only for runtime coordination; mailbox messages are not structured outputs.")
+    lines.append("Use agent_send/agent_receive only for runtime coordination with your parent; a parallel member cannot message another parallel member.")
     return "\n".join(lines)
 
 
@@ -368,6 +370,21 @@ def _declared_output_defaults(agent: HwoAgent) -> dict:
         if name and p.get("default") is not None:
             values[name] = _literal_value(p.get("default"))
     return values
+
+
+def _io_contract_gaps(io: Optional[dict], outputs: dict,
+                      cwd: Optional[str] = None) -> list[str]:
+    """Validate one HWO I/O declaration through the shared contract gate."""
+    contract = agent_contract.from_io(io)
+    if not contract:
+        return []
+    return agent_contract.verify(
+        contract, outputs, cwd or str(Path.cwd())).get("gaps") or []
+
+
+def _contract_failure(label: str, gaps: list[str]) -> str:
+    return (f"{label} finished without honouring its output contract: "
+            + "; ".join(gaps))
 
 
 # ── Context inheritance (mirrors appendContext in hwo.ts) ─────────────────
@@ -1026,6 +1043,14 @@ def _run_agent(agent_step: HwoAgent, ctx: HwoCtx, inherited: str = "") -> dict:
     resolved_inputs = _build_agent_inputs(agent_step, ctx.workflow_inputs, ctx.output_scope, parent_self_scope)
     self_scope = {**resolved_inputs, **_declared_output_defaults(agent_step)}
     self_types = _agent_self_types(agent_step)
+    io_contract = agent_contract.from_io(agent_step.io)
+    if io_contract:
+        # HWO runs agents directly rather than through spawn_subagent(), so it
+        # must publish the same contract state explicitly. This makes critic
+        # assessment and task.complete see the same declaration as the final
+        # HWO gate below.
+        child.contract = io_contract
+        child.state['_contract'] = io_contract
     io_prompt = _format_io_prompt(agent_step, resolved_inputs)
     body_parts = [p for p in (team_manifest, io_prompt, inherited) if p]
     body_context = "\n\n".join(body_parts)
@@ -1095,13 +1120,23 @@ def _run_agent(agent_step: HwoAgent, ctx: HwoCtx, inherited: str = "") -> dict:
                     **_declared_outputs(agent_step, reply),
                     **returned_outputs,
                 }
-                msg = (
-                    "Stored outputs for "
-                    f"#{agent_step.name}#: "
-                    + ", ".join(f"$self.{k}" for k in outputs.keys())
-                ) if outputs else (reply or "(done)")
-                mark_agent_finished(child.id, result=msg)
-                result_holder.update({"ok": True, "msg": msg, "outputs": outputs})
+                gaps = _io_contract_gaps(
+                    agent_step.io, outputs, child.state.get("cwd"))
+                if gaps:
+                    msg = _contract_failure(f"HWO agent #{full_name}#", gaps)
+                    mark_agent_finished(child.id, error=msg)
+                    result_holder.update(
+                        {"ok": False, "msg": msg, "outputs": outputs,
+                         "contractError": True})
+                else:
+                    msg = (
+                        "Stored outputs for "
+                        f"#{agent_step.name}#: "
+                        + ", ".join(f"$self.{k}" for k in outputs.keys())
+                    ) if outputs else (reply or "(done)")
+                    mark_agent_finished(child.id, result=msg)
+                    result_holder.update(
+                        {"ok": True, "msg": msg, "outputs": outputs})
             else:
                 sub_ctx = HwoCtx(
                     deps=ctx.deps,
@@ -1137,12 +1172,18 @@ def _run_agent(agent_step: HwoAgent, ctx: HwoCtx, inherited: str = "") -> dict:
                     **_declared_outputs(agent_step, msg),
                     **returned_outputs,
                 }
+                gaps = (_io_contract_gaps(
+                    agent_step.io, outputs, child.state.get("cwd"))
+                    if result.get("ok") else [])
                 if outputs:
                     msg = (
                         "Stored outputs for "
                         f"#{agent_step.name}#: "
                         + ", ".join(f"$self.{k}" for k in outputs.keys())
                     )
+                if gaps:
+                    msg = _contract_failure(f"HWO agent #{full_name}#", gaps)
+                    result = {**result, "ok": False, "contractError": True}
                 if result.get("ok"):
                     mark_agent_finished(child.id, result=msg)
                 else:
@@ -1316,6 +1357,18 @@ def run_hwo_file(
     )
     _emit(ctx, "workflow_started", {"path": path, "stepCount": len(workflow_tasks)})
     result = run_sequence(steps, ctx)
+    workflow = next((item for item in ast if item.get("type") == "workflow"), None)
+    workflow_gaps = (_io_contract_gaps(
+        (workflow or {}).get("io"), result.get("outputs") or {}, str(Path.cwd()))
+        if result.get("ok") else [])
+    if workflow_gaps:
+        result = {
+            **result,
+            "ok": False,
+            "contractError": True,
+            "msg": (str(result.get("msg") or "") + "\n\n"
+                    + _contract_failure("HWO workflow", workflow_gaps)).strip(),
+        }
     cancelled = bool(abort_event is not None and abort_event.is_set()) or bool(result.get("cancelled"))
     status = "cancelled" if cancelled else ("completed" if result.get("ok") else "failed")
     if run_state and workflow_state:

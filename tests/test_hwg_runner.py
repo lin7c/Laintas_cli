@@ -1,5 +1,7 @@
 import os
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -453,6 +455,46 @@ class FanOutTests(unittest.TestCase):
         self.assertEqual(order[4:], ["merge.hwo", "ship.hwo"])
         self.assertEqual(order.count("merge.hwo"), 1)
 
+    def test_ready_fanout_branches_execute_concurrently_but_commit_in_order(self):
+        active = 0
+        peak = 0
+        lock = threading.Lock()
+        both_started = threading.Event()
+        release = threading.Event()
+
+        def responder(path):
+            nonlocal active, peak
+            if path in {"lint.hwo", "test.hwo", "types.hwo"}:
+                with lock:
+                    active += 1
+                    peak = max(peak, active)
+                    if active >= 3:
+                        both_started.set()
+                self.assertTrue(both_started.wait(2),
+                                "fan-out branches were executed serially")
+                release.set()
+                self.assertTrue(release.wait(2))
+                # Make completion order differ from queue order. Durable
+                # history must still be lint, test, types.
+                if path == "lint.hwo":
+                    time.sleep(0.04)
+                with lock:
+                    active -= 1
+            values = {
+                "lint.hwo": {"verdict": "PASS", "findings": "none"},
+                "test.hwo": {"verdict": "PASS", "failures": "0"},
+                "types.hwo": {"verdict": "PASS", "errors": "0"},
+            }
+            return {"ok": True, "msg": "[RETURN #n#]: PASS",
+                    "outputs": values.get(path, {"verdict": "PASS"})}
+
+        result, _calls = self._run(self._GRAPH, responder)
+        self.assertTrue(result["ok"], result["msg"])
+        self.assertEqual(3, peak)
+        self.assertIn(
+            "Path: #plan# -> #lint# -> #test# -> #types# -> #merge# -> #ship#",
+            result["msg"])
+
     def test_join_sees_every_branch_output(self):
         outs = {
             "lint.hwo": {"verdict": "PASS", "findings": "2 warnings"},
@@ -703,3 +745,155 @@ class UnhandledFailureTests(unittest.TestCase):
         result, _calls = self._run(source, responder)
         self.assertFalse(result["ok"], result["msg"])
         self.assertIn("#b#", result["msg"])
+
+
+class ReadyQueueTests(unittest.TestCase):
+    """The executor is a scheduler over a ready queue, not a cursor walk.
+
+    The walker kept one `currentNode` and drained fan-out branches from a side
+    list, so "what is outstanding" was split across two fields with different
+    lifetimes and a branch was only picked up when another had died out. One
+    FIFO of ready nodes makes fan-out an ordinary enqueue, makes a waiting join
+    simply un-enqueued, and makes the queue itself the resume state.
+    """
+
+    _DIAMOND = (
+        '(plan.hwo)#plan# [out(verdict: string)]\n'
+        '(a.hwo)#a# [out(verdict: string)]\n'
+        '(b.hwo)#b# [out(verdict: string)]\n'
+        '(a2.hwo)#a2# [out(verdict: string)]\n'
+        '(b2.hwo)#b2# [out(verdict: string)]\n'
+        '(merge.hwo)#merge# { join: "all" }\n'
+        '#plan# => #a#\n'
+        '#plan# => #b#\n'
+        '#a# -> #a2#\n'
+        '#b# -> #b2#\n'
+        '#a2# -> #merge#\n'
+        '#b2# -> #merge#\n'
+    )
+
+    def _run(self, source, responder, cwd=None):
+        calls = []
+
+        def fake_run(path, **kwargs):
+            calls.append(path)
+            return responder(path)
+
+        with mock.patch.object(hwg_runner.hwo_runner, "run_hwo_file",
+                               side_effect=fake_run):
+            result = hwg_runner.run_hwg_file("flow.hwg", deps=object(), session={})
+        return result, calls
+
+    def test_branches_advance_in_lockstep_not_one_to_exhaustion(self):
+        """FIFO: both branches take their first step before either takes its
+        second. The walker ran a branch until it died before touching the next,
+        which is the behaviour that made a fan-out of long branches serial in
+        the worst possible order."""
+        with tempfile.TemporaryDirectory() as tmp, _Chdir(tmp):
+            Path("flow.hwg").write_text(self._DIAMOND, encoding="utf-8")
+            result, calls = self._run(
+                self._DIAMOND,
+                lambda path: {"ok": True, "msg": "[RETURN #n#]: PASS",
+                              "outputs": {"verdict": "PASS"}})
+        self.assertTrue(result["ok"], result["msg"])
+        self.assertEqual("plan.hwo", calls[0])
+        self.assertEqual({"a.hwo", "b.hwo"}, set(calls[1:3]))
+        self.assertEqual({"a2.hwo", "b2.hwo"}, set(calls[3:5]))
+        self.assertEqual(["merge.hwo"], calls[5:])
+
+    def test_the_queue_is_the_resume_state(self):
+        """A run paused mid-fan-out comes back with the outstanding branch."""
+        with tempfile.TemporaryDirectory() as tmp, _Chdir(tmp):
+            Path("flow.hwg").write_text(
+                '(plan.hwo)#plan# [out(verdict: string)]\n'
+                '(a.hwo)#a# [out(verdict: string)]\n'
+                '!(b.hwo)#b#\n'
+                '(merge.hwo)#merge# { join: "all" }\n'
+                '#plan# => #a#\n'
+                '#plan# => #b#\n'
+                '#a# -> #merge#\n'
+                '#b# -> #merge#\n', encoding="utf-8")
+
+            def responder(path):
+                return {"ok": True, "msg": "[RETURN #n#]: PASS",
+                        "outputs": {"verdict": "PASS"}}
+
+            result, before_pause = self._run(None, responder)
+            self.assertTrue(result.get("paused"), result)
+            self.assertEqual(["plan.hwo", "a.hwo"], before_pause)
+
+            run = workflow_state.load_run(result["runId"])
+            # What was outstanding when the run stopped is on the run itself,
+            # in order, under one field. The old walker split it across
+            # `currentNode` and `pending`.
+            self.assertEqual(["merge"], run.get("ready"))
+            self.assertNotIn("pending", run)
+
+            after = []
+
+            def record(path, **kwargs):
+                after.append(path)
+                return responder(path)
+
+            with mock.patch.object(hwg_runner.hwo_runner, "run_hwo_file",
+                                   side_effect=record):
+                resumed = hwg_runner.resume_hwg_run(
+                    result["runId"], deps=object(), session={}, verdict="PASS")
+            self.assertTrue(resumed["ok"], resumed["msg"])
+            # The join had one arrival before the pause and one after, so it
+            # fires exactly once — on the second.
+            self.assertEqual(["merge.hwo"], after)
+
+    def test_a_run_checkpointed_by_the_old_walker_still_resumes(self):
+        """Migration: in-flight runs carry currentNode + pending, not ready."""
+        with tempfile.TemporaryDirectory() as tmp, _Chdir(tmp):
+            Path("flow.hwg").write_text(
+                '(s.hwo)#s# [out(verdict: string)]\n'
+                '(a.hwo)#a# [out(verdict: string)]\n'
+                '(b.hwo)#b# [out(verdict: string)]\n'
+                '(c.hwo)#c# { join: "all" }\n'
+                '#s# => #a#\n'
+                '#s# => #b#\n'
+                '#a# -> #c#\n'
+                '#b# -> #c#\n', encoding="utf-8")
+            legacy = workflow_state.new_run("hwg", "flow.hwg", {})
+            legacy["cwd"] = tmp
+            # Exactly the shape the old walker left behind mid-fan-out.
+            legacy["currentNode"] = "a"
+            legacy["pending"] = ["b"]
+            legacy["joins"] = {"c": {"expected": 2, "arrived": 0}}
+            legacy["history"] = ["s"]
+            legacy["nodeOutputs"] = {"s": {"verdict": "PASS"}}
+            calls = []
+
+            def fake_run(path, **kwargs):
+                calls.append(path)
+                return {"ok": True, "msg": "[RETURN #n#]: PASS",
+                        "outputs": {"verdict": "PASS"}}
+
+            with mock.patch.object(hwg_runner.hwo_runner, "run_hwo_file",
+                                   side_effect=fake_run):
+                result = hwg_runner.run_hwg_file(
+                    "flow.hwg", deps=object(), session={}, resume_run=legacy)
+            # The working directory is process-global while several suites
+            # chdir into their own temp dirs, some from threads that outlive
+            # the test that started them. When this test failed intermittently
+            # in full-suite runs and never alone, that was the first suspect —
+            # so it is checked explicitly, and a future failure says which of
+            # the two it is instead of surfacing as a confusing assertion on
+            # the call order.
+            self.assertEqual(os.path.realpath(tmp), os.path.realpath(os.getcwd()),
+                             "another test moved the working directory mid-run")
+        self.assertTrue(result["ok"], result["msg"])
+        self.assertEqual(["a.hwo", "b.hwo"], calls[:2])
+        self.assertEqual(1, calls.count("c.hwo"))
+        self.assertNotIn("s.hwo", calls)          # already done before the pause
+
+    def test_a_join_still_runs_exactly_once(self):
+        with tempfile.TemporaryDirectory() as tmp, _Chdir(tmp):
+            Path("flow.hwg").write_text(self._DIAMOND, encoding="utf-8")
+            _result, calls = self._run(
+                self._DIAMOND,
+                lambda path: {"ok": True, "msg": "[RETURN #n#]: PASS",
+                              "outputs": {"verdict": "PASS"}})
+        self.assertEqual(1, calls.count("merge.hwo"))

@@ -47,6 +47,8 @@ import redactor               # Outbound secret/PII redaction + weak-label captu
 import rag_signals            # Retrieval-rerank weak-label capture (search → selection)
 import mem_recall             # Semantic memory recall (embedding-ranked, lexical fallback)
 import mem_extract            # Task-end LLM memory extraction (write side of the memory network)
+import agent_contract        # Declared outputs + deterministic acceptance for a child agent
+import branch as branch_mod   # Run-scoped supervision: one delegated unit of work
 import critic                 # Long-task external progress critic (drift/looping supervisor)
 import skill_router           # Dynamic skill routing: rank skills by task relevance (embedding, lexical fallback)
 import context_router         # Zero-network task routing for advertised tool schemas
@@ -96,10 +98,21 @@ _DEFAULT_CONFIG = {
     "max_debug_entries": 50,
     "loop_delay": 0.2,           # normal inter-iteration delay; failures back off adaptively
     "output_truncate": 3000,      # chars — lastOutput tail truncation
+    "paged_reads": True,          # fs.read without offset/limit reads by page and evicts the page it leaves (file_pager); False restores the plain 2000-line window
+    "read_block_visible": True,   # decline a read whose lines are still visible in the model's own context (evicted content stays re-readable)
     "terminal_tail_lines": 20,    # lines — sub-terminal snapshot
     "paste_summary": True,        # collapse large pastes into a [Pasted #N ~L lines] placeholder in the prompt (expanded on submit)
     "paste_summary_min_lines": 3, # paste line-count threshold that triggers the placeholder
     "paste_summary_min_chars": 150, # paste char-count threshold that triggers the placeholder
+    # rprompt slot visibility. Comma-separated slot ids (agent, mode, model,
+    # effort, terminal); the right prompt shows only slots present in the
+    # list for the current detail state, on top of each slot's own width
+    # breakpoint. Defaults reproduce the pre-slot layout exactly.
+    "rprompt_slots_detail_on": "agent,mode,model,effort,terminal",
+    "rprompt_slots_detail_off": "agent,mode,model,terminal",
+    # Display order of the same slots, left to right. Empty = built-in order;
+    # invalid ids are rejected and omitted valid ids follow in default order.
+    "rprompt_slot_order": "",
     # `/helpwo` is the local opt-in that exposes this CLI as a runtime
     # environment in the user's Helpwo account. The environment's terminal is
     # available by default; security-conscious hosts can opt out with this.
@@ -176,6 +189,8 @@ _DEFAULT_CONFIG = {
     "mem_extract_on_complete": False,  # True = ALSO extract durable memories on every successful task completion. Default OFF: consolidation now happens at compaction time only (mem_extract_on_compact) to keep it rare and cheap. See mem_extract.py.
     "mem_extract_on_compact": True,    # True = when the session context is compacted, run one background LLM pass that extracts + aggressively consolidates durable memories into long-term storage (see mem_extract.py). Off-thread; near-duplicates are merged (summarised) rather than duplicated.
     "critic_enabled": True,            # True = on long thread-mode tasks, an independent LLM critic periodically checks for goal drift/looping and injects a corrective nudge (see critic.py). Complements the deterministic staleness/repetition tripwires.
+    "critic_profile": "balanced",     # lenient / balanced / strict scoring guidance layered onto the built-in critic contract.
+    "critic_prompt_file": "",         # Optional project-relative or absolute UTF-8 file with additional critic guidance; empty disables it.
     "critic_interval": 8,              # Run the critic every N loop iterations (0 disables). One extra (billed) model call each time it fires.
     "critic_min_loop": 4,             # Don't run the critic before this loop index — no point critiquing the first few exploratory steps.
     "critic_score_threshold": 50,      # Critic progress score (0-100) below this — or an explicit on_track=false — triggers a corrective nudge.
@@ -542,6 +557,18 @@ TRANSITION_OVERFLOW_RETRY = "overflow_retry"            # context overflow → c
 TRANSITION_COMPLETED = "completed"                      # explicit task/plan completion
 TRANSITION_END_TURN = "end_turn"                        # no tool_calls, model finished
 TRANSITION_MAX_LOOPS = "max_loops"                      # for-range exhausted
+TRANSITION_MAX_LOOPS_WRAPUP = "max_loops_wrapup"        # budget spent, but the
+                                                        # forced final turn did
+                                                        # answer (still resumable)
+
+# Sent on the last allowed iteration only (see `_final_turn` in run_agent_loop).
+_FINAL_TURN_REMINDER = (
+    "<final_step>This is your LAST step — no tools are available to you on this "
+    "turn and you cannot call any. Based ONLY on what you already know, give the "
+    "user your best final answer now: summarize what you accomplished, state any "
+    "remaining or blocking issues, and give concrete next steps if the task is "
+    "incomplete.</final_step>"
+)
 TRANSITION_STALENESS = "staleness"                      # too many idle steps
 TRANSITION_ABORTED = "aborted"                          # abort_event from control plane
 TRANSITION_INTERRUPTED = "interrupted"                  # Ctrl+C from user
@@ -553,6 +580,7 @@ TRANSITION_REPETITION = "repetition"                    # output similarity thre
 TRANSITION_WARNING_FORCE = "warning_force_exit"         # warning circuit breaker tripped
 TRANSITION_PARSE_GAVE_UP = "parse_gave_up"              # parse failure counter exhausted
 TRANSITION_USER_DENIED = "user_denied"                  # user explicitly denied an approval prompt
+TRANSITION_RUNTIME_ERROR = "runtime_error"              # unexpected runtime exception; resumable
 
 
 #: Exits where the user asked something and got no answer. The turn is over;
@@ -560,7 +588,7 @@ TRANSITION_USER_DENIED = "user_denied"                  # user explicitly denied
 _UNANSWERED_EXITS = {
     TRANSITION_BACKEND_ERROR, TRANSITION_PROVIDER_ERROR,
     TRANSITION_SILENT_FAILURE, TRANSITION_REPAIR_GAVE_UP,
-    TRANSITION_PARSE_GAVE_UP,
+    TRANSITION_PARSE_GAVE_UP, TRANSITION_RUNTIME_ERROR,
 }
 
 
@@ -622,6 +650,7 @@ def _close_failed_turn(chat_history, thread_messages, exit_reason, deps, state):
 
 _EXIT_REASON_TEXT = {
     TRANSITION_MAX_LOOPS: "ran out of loop budget before finishing",
+    TRANSITION_MAX_LOOPS_WRAPUP: "ran out of loop budget and wrapped up",
     TRANSITION_STALENESS: "stopped producing output (idle-step limit)",
     TRANSITION_ABORTED: "aborted by the control plane",
     TRANSITION_INTERRUPTED: "interrupted",
@@ -633,6 +662,7 @@ _EXIT_REASON_TEXT = {
     TRANSITION_WARNING_FORCE: "warning circuit breaker tripped",
     TRANSITION_PARSE_GAVE_UP: "gave up parsing the model's responses",
     TRANSITION_USER_DENIED: "user denied an approval prompt",
+    TRANSITION_RUNTIME_ERROR: "internal runtime error",
 }
 
 
@@ -733,6 +763,9 @@ _runtime_config: dict[str, object] = {}
 
 _RUNTIME_CONFIG_DESCRIPTIONS = {
     "reasoning_effort": "How hard the model thinks before answering (none/low/medium/high/max). Thinking is billed as output tokens, so higher costs more; a model that cannot do the chosen gear gets its nearest lower one",
+    "rprompt_slots_detail_on": "Comma-separated right-prompt slots shown with detail on (agent,mode,model,effort,terminal); empty hides the row",
+    "rprompt_slots_detail_off": "Comma-separated right-prompt slots shown with detail off (agent,mode,model,effort,terminal); empty hides the row",
+    "rprompt_slot_order": "Left-to-right display order of right-prompt slots (agent,mode,model,effort,terminal); omitted slots follow in default order",
     "context_window_adopt_cap": "Ceiling on the auto-adopted provider window — lower it to compact earlier. Every turn re-sends the thread, so this is a cost knob, not just an overflow guard",
     "compact_chunk_tokens": "Largest slice of thread handed to the summarizer in one call",
     "aux_model": "Model for compaction / critic / memory-extraction (empty = use the main model)",
@@ -742,6 +775,8 @@ _RUNTIME_CONFIG_DESCRIPTIONS = {
     "max_debug_entries": "In-memory debug entry limit",
     "loop_delay": "Delay between loop iterations in seconds",
     "output_truncate": "Maximum retained characters per tool-output section",
+    "paged_reads": "Read files as paged documents: one page in context at a time, evicted pages leave an indexed stub",
+    "read_block_visible": "Decline a re-read of lines the model can still see in its own transcript",
     "terminal_tail_lines": "Terminal snapshot line count",
     "disable_remote_terminal": "Opt this runtime environment out of Helpwo's interactive terminal (P2P shell)",
     "allow_remote_exec_without_approval": "Let Helpwo's AI run commands in this environment without local approval (P2P exec)",
@@ -774,6 +809,8 @@ _RUNTIME_CONFIG_DESCRIPTIONS = {
     "mem_extract_on_complete": "ALSO extract durable memories on task completion (default off; consolidation runs at compaction time instead)",
     "mem_extract_on_compact": "On context compaction, run a background LLM pass to extract + aggressively consolidate durable long-term memories (off-thread; merges near-duplicates)",
     "critic_enabled": "Periodically run an independent LLM critic on long tasks to catch goal drift/looping and inject a corrective nudge",
+    "critic_profile": "Critic strictness preset: lenient, balanced, or strict",
+    "critic_prompt_file": "Optional project-relative or absolute UTF-8 file containing additional critic guidance; off/none/reset disables it",
     "critic_interval": "Run the long-task critic every N loop iterations (0 disables)",
     "critic_min_loop": "Don't run the critic before this loop index",
     "critic_score_threshold": "Critic progress score (0-100) below this triggers a corrective nudge",
@@ -835,6 +872,7 @@ _RUNTIME_ENUM_CHOICES: dict[str, tuple[str, ...]] = {
     "stream_preview": ("off", "one", "detail"),
     "theme": ("dark", "light", "mono"),
     "markdown_theme": ("default", "green-red", "custom"),
+    "critic_profile": ("lenient", "balanced", "strict"),
     # search_engine is deliberately not enumerated here: the set of valid names
     # now depends on the user's own engine registry, and a fixed vocabulary
     # would reject the very entries they added. web_search.resolve_chain
@@ -842,6 +880,8 @@ _RUNTIME_ENUM_CHOICES: dict[str, tuple[str, ...]] = {
     "search_proxy_mode": ("off", "auto", "always"),
     "fetch_render": ("off", "auto", "always"),
 }
+
+_RPROMPT_SLOT_IDS = ("agent", "mode", "model", "effort", "terminal")
 
 
 def _coerce_runtime_config_value(key: str, value):
@@ -874,6 +914,28 @@ def _coerce_runtime_config_value(key: str, value):
             raise ValueError(f"{key} expects a number, got {value!r}") from exc
     else:
         parsed = str(value)
+
+    if key == "critic_prompt_file":
+        parsed = str(parsed).strip()
+        if parsed.casefold() in {"off", "none", "reset"}:
+            parsed = ""
+        if "\x00" in parsed:
+            raise ValueError("critic_prompt_file cannot contain a null byte")
+
+    if key in {"rprompt_slots_detail_on", "rprompt_slots_detail_off",
+               "rprompt_slot_order"}:
+        tokens = []
+        for raw in str(parsed).split(","):
+            token = raw.strip().lower()
+            if not token:
+                continue
+            if token not in _RPROMPT_SLOT_IDS:
+                raise ValueError(
+                    f"{key} contains unknown slot {token!r}; expected "
+                    + ", ".join(_RPROMPT_SLOT_IDS))
+            if token not in tokens:
+                tokens.append(token)
+        parsed = ",".join(tokens)
 
     if key in _RUNTIME_ENUM_CHOICES:
         parsed = str(parsed).strip().lower()
@@ -1030,10 +1092,13 @@ class TerminalInfo:
     created_at: float
     created_by: str  # "depth=0"
     parent_terminal: Optional[str] = None
-    # Exactly one agent may own a terminal's persistent shell.  The plural
-    # field remains as a compatibility mirror for pre-1.9 extensions/state.
+    # Exactly one agent may own a terminal's persistent shell. That used to be
+    # stored TWICE — a singular field and a plural "compatibility mirror" — and
+    # the two were assigned independently at eight sites, so they could
+    # disagree: `station_agent` read the plural when the singular was None,
+    # which is only reachable when somebody updated one and not the other.
+    # The plural is now a derived view, so disagreement is not representable.
     stationed_agent_id: Optional[str] = None
-    stationed_agent_ids: list = field(default_factory=list)
     dialog_agent_id: Optional[str] = None
     model_override: Optional[str] = None
     provider_override: Optional[str] = None
@@ -1056,6 +1121,21 @@ class TerminalInfo:
     # start an assignment, so they begin in the same directory the stationed
     # agent left behind rather than in the Python process cwd.
     last_cwd: Optional[str] = None
+
+    @property
+    def stationed_agent_ids(self) -> list:
+        """The occupant as a list — a view, never a second store.
+
+        Kept because callers and the UI read it, and because "who is stationed
+        here" reads naturally as a collection. Assigning to it writes the
+        singular field; there is nowhere else for the value to live.
+        """
+        return [self.stationed_agent_id] if self.stationed_agent_id else []
+
+    @stationed_agent_ids.setter
+    def stationed_agent_ids(self, value) -> None:
+        items = [item for item in (value or []) if item]
+        self.stationed_agent_id = items[0] if items else None
 
 
 _debug_logs: list[DebugEntry] = []
@@ -2279,6 +2359,15 @@ class AgentInfo:
     group_id: Optional[str] = None            # parallel group this agent belongs to
     result: str = ""                          # final result text (set by mark_agent_finished)
     error: str = ""                           # error text if status=error
+    # ── Contract (agent_contract) ──────────────────────────────────────
+    # `status` stays the coarse legacy view (idle/running/done/error).
+    # `stage` is the one that separates the child's CLAIM (returned) from the
+    # runtime's FINDING (verified/rejected) — conflating those is what let a
+    # stopped agent count as a finished one.
+    contract: Optional[dict] = None
+    stage: str = "queued"
+    submitted: dict = field(default_factory=dict)
+    verification: dict = field(default_factory=dict)
     # ── Employee / assignment model ─────────────────────────────────
     profile: EmployeeProfile = field(default_factory=EmployeeProfile)
     active_assignment: Optional[AgentAssignment] = None
@@ -2317,12 +2406,26 @@ def agent_scope_terminal(agent: Optional[AgentInfo]) -> Optional[str]:
 
 
 def can_agents_communicate(caller_id: str, target_id: str) -> bool:
-    """Authorize direct agent messaging within the local terminal tree.
+    """Authorize direct agent messaging along a TREE EDGE, and nothing else.
 
-    Peers may communicate when they share a terminal, occupy directly adjacent
-    parent/child terminals, or have a direct agent parent/child relationship.
-    Sibling terminals, grandparents and arbitrary registry-wide sends are
-    intentionally excluded.
+    An agent may talk to its parent and to its own children. Siblings may not
+    talk to each other, and neither may grandparents, cousins, or two agents
+    that merely happen to share a terminal.
+
+    This used to be the union of three different graphs: agent parent/child,
+    "same terminal", and "adjacent parent/child terminals". Two of those are
+    not the delegation structure — an agent hired into a terminal is not the
+    peer of everything else stationed there — and their union is a mesh in
+    which any pair may or may not be able to reach each other depending on
+    which terminal they were placed in. That made a sub-agent's reachable set
+    a property of runtime placement rather than of the task tree, which is the
+    definition of a structure you cannot reason about.
+
+    With one edge type the tree carries everything: work goes down through the
+    parent, results come back up through the parent, and two siblings that need
+    to agree on something must do it through the parent that owns both. That is
+    also what makes queue scheduling safe, because a node's inputs can then only
+    come from its declared inputs and its parent.
     """
     if not caller_id or not target_id or caller_id == target_id:
         return False
@@ -2331,20 +2434,56 @@ def can_agents_communicate(caller_id: str, target_id: str) -> bool:
         target = _agent_registry.get(target_id)
         if caller is None or target is None:
             return False
-        if caller.parent_id == target_id or target.parent_id == caller_id:
-            return True
-        caller_terminal = agent_scope_terminal(caller)
-        target_terminal = agent_scope_terminal(target)
-        if not caller_terminal or not target_terminal:
-            return False
-        if caller_terminal == target_terminal:
-            return True
-        caller_info = _terminal_registry.get(caller_terminal)
-        target_info = _terminal_registry.get(target_terminal)
-        return bool(
-            (caller_info and caller_info.parent_terminal == target_terminal)
-            or (target_info and target_info.parent_terminal == caller_terminal)
-        )
+        return bool(caller.parent_id == target_id
+                    or target.parent_id == caller_id)
+
+
+def agent_neighbourhood(agent_id: str) -> list:
+    """The agents `agent_id` may see and reach: its parent and its children.
+
+    One function so the visibility surface (agent.list) and the messaging
+    surface (agent.tell / agent_send) can never drift apart — a listing that
+    shows an agent you are not allowed to message is an invitation to try.
+    """
+    with _registry_lock:
+        me = _agent_registry.get(agent_id)
+        if me is None:
+            return []
+        out = []
+        parent = _agent_registry.get(me.parent_id) if me.parent_id else None
+        if parent is not None:
+            out.append(parent)
+        for cid in list(me.child_ids):
+            child = _agent_registry.get(cid)
+            if child is not None:
+                out.append(child)
+        return out
+
+
+def adopt_orphan_agents(root_id: str) -> int:
+    """Give every parentless non-root agent a parent, so the tree is total.
+
+    Hired employees are registered with depth=1 and no parent (they were
+    reachable through their terminal instead), which left the registry a forest
+    while every rule that matters is written against a tree. Anything still
+    parentless is adopted by the root, once, at registration time — an agent
+    with no parent has no way to report and no one authorised to talk to it.
+    """
+    adopted = 0
+    with _registry_lock:
+        root = _agent_registry.get(root_id)
+        if root is None:
+            return 0
+        for info in _agent_registry.values():
+            if info.id == root_id or info.parent_id:
+                continue
+            if info.role == "primary":
+                continue
+            info.parent_id = root_id
+            if info.id not in root.child_ids:
+                root.child_ids.append(info.id)
+            adopted += 1
+    return adopted
 
 
 def register_agent(name: str = None, depth: int = 0,
@@ -2367,6 +2506,16 @@ def register_agent(name: str = None, depth: int = 0,
             if not replace_existing:
                 raise ValueError(f"Agent '{agent_id}' already exists")
             unregister_agent(agent_id)
+        # Every agent but the root has a parent. A parentless agent cannot
+        # report and no one is authorised to talk to it (see
+        # can_agents_communicate), so "no parent given" is not a second kind of
+        # agent — it is a missing edge, and the root adopts it here rather than
+        # leaving the registry a forest.
+        if not parent_id and role != "primary":
+            _root = next((a for a in _agent_registry.values()
+                          if a.role == "primary"), None)
+            if _root is not None and _root.id != agent_id:
+                parent_id = _root.id
         info = AgentInfo(
             id=agent_id,
             name=agent_id,
@@ -2415,6 +2564,9 @@ def register_agent(name: str = None, depth: int = 0,
                 inherited_info.stationed_agent_ids = [agent_id]
                 inherited_info.dialog_agent_id = agent_id
         if parent_id and parent_id in _agent_registry:
+            # The edge is registered on both ends: an agent whose parent does
+            # not list it is invisible to every tree walk that authorises,
+            # aborts and harvests.
             parent = _agent_registry[parent_id]
             if agent_id not in parent.child_ids:
                 parent.child_ids.append(agent_id)
@@ -2448,8 +2600,8 @@ def unregister_agent(agent_id: str, delete_persisted: bool = False) -> bool:
         terminal_name = agent_deployment_terminal(info)
         if terminal_name and terminal_name in _terminal_registry:
             term = _terminal_registry[terminal_name]
-            if agent_id in term.stationed_agent_ids:
-                term.stationed_agent_ids.remove(agent_id)
+            if term.stationed_agent_id == agent_id:
+                term.stationed_agent_id = None
             term.stationed_agent_id = (
                 term.stationed_agent_ids[0] if term.stationed_agent_ids else None)
             if term.dialog_agent_id == agent_id:
@@ -2864,11 +3016,16 @@ def start_agent_assignment(agent_id: str, task: str, deps,
             pass
 
         def _assignment_events(events):
+            # Descendants inherit this transport callback. Attribute events to
+            # the Agent actually running on this thread, not permanently to
+            # the employee whose assignment created the closure.
+            _event_agent_id = get_thread_agent_id() or employee.id
             try:
                 import agent_ui_events
                 agent_ui_events.hub.ingest(
-                    employee.id, events,
-                    agent_scope_terminal(employee))
+                    _event_agent_id, events,
+                    agent_scope_terminal(
+                        get_agent(_event_agent_id) or employee))
             except Exception:
                 pass
             if callable(events_cb):
@@ -2987,10 +3144,25 @@ only a secondary signal; coordination and durability requirements decide.
   delegation that does NOT need a durable, reusable workflow file. This covers
   code review, batch analysis, multi-file edits, and any fan-out where the
   orchestration is throwaway. Prefer this over HWO unless you specifically need
-  persistence. A spawn_parallel batch shares one 600s wall-clock budget across
-  all members — scope each task to a reviewable slice (roughly <=300-400 lines
-  of code) rather than splitting a large file into a few oversized chunks, or
-  members risk a forced cutoff mid-review with nothing to show for it.
+  persistence. spawn_parallel is asynchronous by default: it returns batch and
+  child IDs immediately, child results arrive through the parent inbox, and the
+  parent should continue useful independent work. Use await_spawns (or explicit
+  wait=true) only when the next action truly requires a result barrier; do not
+  launch a batch and immediately wait without dependency. Before task_complete,
+  consume every batch result the answer depends on and explicitly abort any
+  disposable children that are no longer needed. Scope each task to a reviewable
+  slice (roughly <=300-400 lines of code).
+  Before spawning, name at least two workstreams that can proceed independently
+  without waiting for the same next fact. For substantial repository analysis,
+  review, or investigation, prefer bounded parallel agents split by disjoint
+  subsystem/file set or distinct question when that will reduce wall-clock time.
+  Give every child an exclusive scope, required evidence, and a concrete output;
+  never send several children to broadly reread the same files or solve the same
+  question. The parent retains the original requirements, continues useful
+  non-overlapping work after asynchronous fan-out, avoids
+  wasteful polling, verifies material child claims against current state, and
+  owns the final synthesis. A single agent remains correct for small, tightly
+  coupled, sequential, or coordination-heavy work.
 - HWO: use a durable .hwo workflow only when the orchestration is REUSABLE or
   needs STRUCTURED input/output contracts between specialist agents — i.e.
   explicit roles with declared file outputs, ordered stages with handoff
@@ -3199,8 +3371,8 @@ def station_agent(agent_id: str, terminal_name: str) -> bool:
         # Remove from old terminal's list
         if old_terminal_name and old_terminal_name in _terminal_registry:
             old_term = _terminal_registry[old_terminal_name]
-            if agent_id in old_term.stationed_agent_ids:
-                old_term.stationed_agent_ids.remove(agent_id)
+            if old_term.stationed_agent_id == agent_id:
+                old_term.stationed_agent_id = None
             old_term.stationed_agent_id = old_term.stationed_agent_ids[0] if old_term.stationed_agent_ids else None
         agent.stationed_terminal = terminal_name
         agent.deployment_terminal = terminal_name
@@ -3354,8 +3526,8 @@ def close_all_agents() -> None:
                 pass
             terminal_name = agent_deployment_terminal(info)
             term = _terminal_registry.get(terminal_name) if terminal_name else None
-            if term and info.id in term.stationed_agent_ids:
-                term.stationed_agent_ids.remove(info.id)
+            if term and term.stationed_agent_id == info.id:
+                term.stationed_agent_id = None
                 term.stationed_agent_id = (
                     term.stationed_agent_ids[0]
                     if term.stationed_agent_ids else None)
@@ -3588,6 +3760,51 @@ def agent_progress_token(info: Optional[AgentInfo]):
     )
 
 
+class _BranchRuntime:
+    """The slice of this module a branch supervisor is allowed to see.
+
+    Explicit, and deliberately small: the supervisor reads liveness and can
+    stop or nudge a member — it never touches the registry's structure. Passing
+    this instead of the module keeps the dependency one-way (branch never
+    imports agent_loop back) and keeps the supervisor testable with a fake.
+    """
+
+    @staticmethod
+    def get_agent(agent_id: str):
+        return get_agent(agent_id)
+
+    @staticmethod
+    def abort_agent(agent_id: str) -> bool:
+        return abort_agent(agent_id)
+
+    @staticmethod
+    def send_to_agent(agent_id: str, message: dict) -> bool:
+        return send_to_agent(agent_id, message)
+
+    @staticmethod
+    def subtree_progress_token(agent_id: str):
+        return subtree_progress_token(agent_id)
+
+    @staticmethod
+    def is_blocked_on_a_decision(agent_id: str) -> bool:
+        """Waiting on a person, or on its own caller — never a stall.
+
+        Both are states where the member is right to be idle and where a
+        watchdog fires hardest on exactly the agents that behaved correctly.
+        """
+        try:
+            info = get_agent(agent_id)
+            if info is not None and info.stage == agent_contract.STAGE_WAITING_PARENT:
+                return True
+            import tools as _tools
+            return bool(_tools.is_awaiting_approval(agent_id))
+        except Exception:
+            return False
+
+
+branch_mod.bind_runtime(_BranchRuntime)
+
+
 def subtree_progress_token(agent_id: str):
     """Progress of an agent OR of anything it is waiting on.
 
@@ -3661,6 +3878,68 @@ def wait_for_agent(agent_id: str, timeout: float = 30.0,
     return None
 
 
+def _settle_contract(child: "AgentInfo", result: dict, deps,
+                     session: Optional[dict], events_cb) -> dict:
+    """Verify a contracted child exactly once.
+
+    Verification is runtime-owned, but retry policy belongs to the parent that
+    knows the wider task and token trade-off. The rejected submission and its
+    gaps are reported through the normal child-to-parent inbox; this function
+    never calls the model. The unused orchestration parameters remain for
+    compatibility with extension callers.
+    """
+    if not child.contract:
+        child.stage = agent_contract.STAGE_DONE
+        return result
+    child.submitted = dict(child.state.get("_submitted_outputs") or {})
+    child.stage = agent_contract.STAGE_RETURNED
+    cwd = child.state.get("cwd") or os.getcwd()
+    child.verification = agent_contract.verify(
+        child.contract, child.submitted, cwd)
+    event_log.append("contract_checked", agent_id=child.id,
+                     ok=bool(child.verification.get("ok")),
+                     checks=int(child.verification.get("checked") or 0),
+                     gaps=list(child.verification.get("gaps") or [])[:6],
+                     round=1, automatic_retry=False)
+    child.stage = (agent_contract.STAGE_VERIFIED
+                   if child.verification.get("ok")
+                   else agent_contract.STAGE_REJECTED)
+    return result
+
+
+def _bounded_parent_text(value, limit: int = 1500) -> str:
+    """Keep child escalation text useful without forwarding its context."""
+    text = str(value or "").strip()
+    if len(text) <= limit:
+        return text
+    head = max(1, int(limit * 0.7))
+    tail = max(1, limit - head - 32)
+    return f"{text[:head]}\n… [{len(text) - head - tail} chars omitted] …\n{text[-tail:]}"
+
+
+def _bounded_parent_outputs(outputs: dict) -> dict:
+    """Bound declared output values before placing them in the parent inbox."""
+    bounded = {}
+    for index, (name, value) in enumerate((outputs or {}).items()):
+        if index >= 20:
+            bounded["_omitted_outputs"] = len(outputs) - 20
+            break
+        if isinstance(value, str):
+            bounded[name] = _bounded_parent_text(value, 2000)
+        elif isinstance(value, (dict, list)):
+            try:
+                encoded = json.dumps(value, ensure_ascii=False)
+            except (TypeError, ValueError):
+                encoded = str(value)
+            bounded[name] = (value if len(encoded) <= 2000 else {
+                "_truncated": True,
+                "preview": _bounded_parent_text(encoded, 2000),
+            })
+        else:
+            bounded[name] = value
+    return bounded
+
+
 def spawn_subagent(parent_id: str, task: str, deps,
                    name: Optional[str] = None,
                    session: Optional[dict] = None,
@@ -3671,6 +3950,7 @@ def spawn_subagent(parent_id: str, task: str, deps,
                    group_id: Optional[str] = None,
                    spawn_context: str = "",
                    state_overrides: Optional[dict] = None,
+                   contract: Optional[dict] = None,
                    report_to_parent: bool = True) -> Optional[str]:
     """Start an in-process child agent via the HWO scheduler.
 
@@ -3691,8 +3971,13 @@ def spawn_subagent(parent_id: str, task: str, deps,
             send_to_agent(parent_id, {
                 "from": "scheduler",
                 "kind": "child-error",
+                "status": "error",
                 "role": role or "general",
                 "error": "Cannot spawn: maximum agent depth (3) reached.",
+                "failure_kind": "spawn_denied",
+                "failure": {"kind": "spawn_denied",
+                            "message": "maximum agent depth reached"},
+                "retry_policy": "parent_decides",
             })
         return None
 
@@ -3790,8 +4075,18 @@ def spawn_subagent(parent_id: str, task: str, deps,
                 send_to_agent(parent_id, {
                     "from": child.id,
                     "kind": "child-error",
+                    "status": "error",
                     "role": role or "general",
                     "error": error_text,
+                    "failure": {"kind": "runtime_exception",
+                                "message": error_text},
+                    "execution": {"success": False,
+                                  "reason": "runtime_exception",
+                                  "message": error_text},
+                    **({"capability_gaps": list(
+                        child.state.get("_capability_gaps") or [])[:20]}
+                       if child.state.get("_capability_gaps") else {}),
+                    "retry_policy": "parent_decides",
                 })
             return child.id
 
@@ -3805,8 +4100,31 @@ def spawn_subagent(parent_id: str, task: str, deps,
                 f"[Role: {role_obj.name} — {role_obj.description}]\n\n"
                 f"{task}"
             )
+            # A role whose product is a judgement carries its own contract, and
+            # it applies whether or not the caller wrote one. Measured: when
+            # the contract was purely opt-in, the spawning model never opted
+            # in — four reviewer children in a live session, not one contract.
+            if role_obj.default_contract:
+                try:
+                    contract = agent_contract.merge(
+                        agent_contract.normalize(role_obj.default_contract),
+                        contract)
+                except agent_contract.ContractError:
+                    pass
     if spawn_context:
         effective_task = f"{spawn_context}\n\n{effective_task}"
+
+    # The contract goes at the END of the task, where the last thing the child
+    # reads is what it will be checked against.
+    if contract:
+        child.contract = contract
+        child.state["_contract"] = contract
+        effective_task = f"{effective_task}\n\n{agent_contract.render(contract)}"
+        _scope = contract.get("scope") or {}
+        if _scope.get("max_loops"):
+            child.state["_contract_max_loops"] = int(_scope["max_loops"])
+        if _scope.get("tools"):
+            child.state["_contract_tools"] = list(_scope["tools"])
 
     def _merge_worktree_note() -> str:
         """Merge the child's isolated worktree back into the parent tree
@@ -3872,8 +4190,13 @@ def spawn_subagent(parent_id: str, task: str, deps,
                 send_to_agent(parent_id, {
                     "from": child.id,
                     "kind": "child-error",
+                    "status": "aborted",
                     "role": role or "general",
                     "error": "Cancelled while queued.",
+                    "failure_kind": "aborted",
+                    "failure": {"kind": "aborted",
+                                "message": "Cancelled while queued."},
+                    "retry_policy": "parent_decides",
                 })
             return
         try:
@@ -3886,6 +4209,7 @@ def spawn_subagent(parent_id: str, task: str, deps,
                     summary=task, status="running")
             except Exception:
                 pass
+            child.stage = agent_contract.STAGE_RUNNING
             with thread_agent(child.id):
                 result = run_agent_loop(
                     deps, effective_task, session or {}, child.state,
@@ -3894,6 +4218,16 @@ def spawn_subagent(parent_id: str, task: str, deps,
                     depth=child.depth,
                     agent_id=child.id,
                 )
+                # ── Acceptance gate ──────────────────────────────────────
+                # "The child stopped" and "the child delivered" are different
+                # findings. With a contract the second one is decided here, by
+                # reading the workspace — never by reading the child's account
+                # of the workspace. A rejection is reported with its specific
+                # gaps. The parent owns the wider task and decides whether to
+                # accept partial work, revise the assignment, or re-spawn; the
+                # runtime never starts another model run automatically.
+                result = _settle_contract(child, result, deps, session,
+                                          events_cb)
             reply = harvest_agent_reply(result, child.chat_history)
             reply = (reply or "") + _merge_worktree_note()
             child.last_reply = reply
@@ -3905,15 +4239,74 @@ def spawn_subagent(parent_id: str, task: str, deps,
             _loop_error = ""
             if isinstance(result, dict) and result.get("success", True) is False:
                 _loop_error = describe_exit_reason(result)
+            # A contract that was checked and not satisfied is a failure, even
+            # when the loop itself exited cleanly: "it stopped" was never the
+            # question.
+            _rejected = (child.contract is not None
+                         and child.stage == agent_contract.STAGE_REJECTED)
+            if _rejected and not _loop_error:
+                _loop_error = "contract not satisfied: " + "; ".join(
+                    (child.verification.get("gaps") or [])[:4])
             if child.abort_event.is_set():
                 status = "aborted"
+                child.stage = agent_contract.STAGE_FAILED
                 mark_agent_finished(child.id, result=reply)
             elif _loop_error:
                 status = "error"
+                child.stage = agent_contract.STAGE_FAILED
                 mark_agent_finished(child.id, result=reply, error=_loop_error)
             else:
                 status = "done"
+                if child.contract is not None:
+                    child.stage = agent_contract.STAGE_DONE
                 mark_agent_finished(child.id, result=reply)
+            _execution = {
+                "success": bool(isinstance(result, dict)
+                                and result.get("success", True)),
+                "reason": (str(result.get("exit_reason") or "")
+                           if isinstance(result, dict) else ""),
+                "turn_status": (str(result.get("turn_status") or "")
+                                if isinstance(result, dict) else ""),
+                "task_status": (str(result.get("task_status") or "")
+                                if isinstance(result, dict) else ""),
+                "completion_source": (
+                    str(result.get("completion_source") or "")
+                    if isinstance(result, dict) else ""),
+            }
+            if _loop_error:
+                _execution["message"] = _loop_error
+            if status == "aborted":
+                _failure_kind = "aborted"
+            elif _execution["success"] is False:
+                _failure_kind = _execution["reason"] or "execution_failed"
+            elif _rejected:
+                _failure_kind = "contract_rejected"
+            else:
+                _failure_kind = ""
+            _parent_summary = _bounded_parent_text(
+                reply or _loop_error or "(no reply)")
+            _parent_outputs = _bounded_parent_outputs(child.submitted)
+            _capability_gaps = list(
+                child.state.get("_capability_gaps") or [])[:10]
+            _needed_tools = list(dict.fromkeys(
+                str(gap.get("tool") or "") for gap in _capability_gaps
+                if isinstance(gap, dict) and gap.get("tool")))
+            _contract_gaps = [
+                _bounded_parent_text(gap, 400)
+                for gap in (child.verification.get("gaps") or [])[:6]
+            ]
+            _blocker = (_loop_error or (_contract_gaps[0]
+                        if _contract_gaps else
+                        (_capability_gaps[0].get("reason", "")
+                         if _capability_gaps else "")))
+            _escalation = ({
+                "blocker": _bounded_parent_text(_blocker, 600),
+                "needed_capabilities": _needed_tools,
+                "attempted": _parent_summary,
+                "question": "How should this child task proceed?",
+                "options": ["accept_partial", "revise_or_follow_up",
+                            "re_spawn", "stop"],
+            } if (_failure_kind or _capability_gaps) else {})
             try:
                 import agent_ui_events
                 agent_ui_events.hub.emit(
@@ -3926,11 +4319,36 @@ def spawn_subagent(parent_id: str, task: str, deps,
             if report_to_parent:
                 send_to_agent(parent_id, {
                     "from": child.id,
-                    "kind": "child-error" if status == "error" else "child-done",
+                    "kind": "child-error" if status != "done" else "child-done",
                     "status": status,
+                    "stage": child.stage,
                     "role": role or "general",
+                    "execution": _execution,
+                    **({"failure": {
+                        "kind": _failure_kind,
+                        "message": _loop_error or status,
+                    }} if _failure_kind else {}),
+                    **({"failure_kind": _failure_kind}
+                       if _failure_kind else {}),
                     **({"error": _loop_error} if status == "error" else {}),
-                    "summary": reply or _loop_error or "(no reply)",
+                    # The declared outputs travel as DATA. A parent that has to
+                    # parse them back out of prose is the thing the contract
+                    # exists to remove.
+                    **({"outputs": _parent_outputs} if _parent_outputs else {}),
+                    **({"gaps": _contract_gaps}
+                       if child.verification and not child.verification.get("ok")
+                       else {}),
+                    **({"contract": {
+                        "ok": bool(child.verification.get("ok")),
+                        "checked": int(child.verification.get("checked") or 0),
+                        "gaps": _contract_gaps,
+                    }} if child.contract is not None else {}),
+                    **({"capability_gaps": _capability_gaps,
+                        "needed_tools": _needed_tools}
+                       if _capability_gaps else {}),
+                    **({"escalation": _escalation} if _escalation else {}),
+                    "retry_policy": "parent_decides",
+                    "summary": _parent_summary,
                 })
         except Exception as e:
             error_text = repr(e) + _merge_worktree_note()
@@ -3948,8 +4366,20 @@ def spawn_subagent(parent_id: str, task: str, deps,
                 send_to_agent(parent_id, {
                     "from": child.id,
                     "kind": "child-error",
+                    "status": "error",
                     "role": role or "general",
                     "error": error_text,
+                    "failure_kind": "runtime_exception",
+                    "failure": {"kind": "runtime_exception",
+                                "message": _bounded_parent_text(error_text, 600)},
+                    "execution": {"success": False,
+                                  "reason": "runtime_exception",
+                                  "message": _bounded_parent_text(error_text, 600)},
+                    **({"capability_gaps": list(
+                        child.state.get("_capability_gaps") or [])[:10]}
+                       if child.state.get("_capability_gaps") else {}),
+                    "retry_policy": "parent_decides",
+                    "summary": _bounded_parent_text(child.last_reply),
                 })
 
     t = threading.Thread(target=lambda: schedule_agent(child.id, _runner),
@@ -3964,13 +4394,24 @@ def spawn_subagents_parallel(parent_id: str, tasks: list[dict], deps,
                               events_cb=None) -> list[str]:
     """Start multiple sub-agents in parallel.
 
-    tasks: [{"task": "...", "role": "explorer", "name": "explorer-1"}, ...]
+    tasks: [{"task": "...", "role": "explorer", "name": "explorer-1",
+             "contract": {...}}, ...]
     Returns list of child agent IDs.
     """
     child_ids = []
-    group_id = f"group-{uuid.uuid4().hex[:10]}"
+    # The batch's identity IS its branch: one object carrying the members, the
+    # budget, the supervisor and the outcome ledger. `group_id` stays on each
+    # child as the legacy mirror so await_spawns and older callers keep working.
+    _branch_obj = branch_mod.open_branch(
+        parent_id, "parallel",
+        [], budget=branch_mod.Budget())
+    group_id = _branch_obj.branch_id
     for t in tasks:
         task_text = t.get("task") or t.get("goal") or ""
+        try:
+            _contract = agent_contract.normalize(t.get("contract"))
+        except agent_contract.ContractError:
+            _contract = None      # the role's own contract still applies
         cid = spawn_subagent(
             parent_id=parent_id,
             task=task_text,
@@ -3981,9 +4422,18 @@ def spawn_subagents_parallel(parent_id: str, tasks: list[dict], deps,
             role=t.get("role"),
             group_id=group_id,
             spawn_context=t.get("hint") or "",
+            contract=_contract,
         )
         if cid:
             child_ids.append(cid)
+            _branch_obj.members[cid] = branch_mod.Member(
+                agent_id=cid, goal=task_text)
+    # Sealed only once every member that will exist has been registered: the
+    # supervisor reads "no open members" as "finished", and that is only true
+    # of a branch somebody has finished filling.
+    branch_mod.seal(_branch_obj.branch_id)
+    if not child_ids:
+        branch_mod.close(_branch_obj.branch_id, "no member could be spawned")
     return child_ids
 
 
@@ -4849,6 +5299,106 @@ def _summarize_head_in_chunks(deps, session, head: list,
     return summary if completed_any else None
 
 
+def _publish_context_headroom(thread_messages: list, state: dict) -> None:
+    """Tell the pager how much context is free, in characters.
+
+    A page is sized from the headroom at the moment a file is first opened
+    (file_pager freezes the table after that), so this has to be published
+    before tools run, not after. Best-effort: the pager has its own default.
+    """
+    try:
+        window = _effective_context_window()
+        usable = ctxpol.usable_tokens(
+            window, int(get_runtime_config("max_tokens") or 8192))
+        free = max(0, usable - _thread_tokens(thread_messages)
+                   - _per_request_overhead_tokens(state))
+        state["_ctx_headroom_chars"] = int(free * 3.5)
+    except Exception:
+        state.pop("_ctx_headroom_chars", None)
+
+
+#: Marker `context_policy.truncate_tool_output` leaves on a pruned tool result.
+#: A pruned message is no longer a copy of what it delivered, so whatever it
+#: held stops counting as visible — this is the exact condition Helpwo's read
+#: gate cannot see, and the reason its "already fully read" refusal outlives
+#: the content it refers to.
+_PRUNED_TOOL_MARKER = "chars for compaction]"
+
+#: Tools whose success means the file on disk no longer matches what the model
+#: read. Their targets are announced as stale and stop blocking re-reads.
+_FILE_MUTATING_TOOLS = frozenset({
+    "fs.write", "fs.edit", "fs.multi_edit", "fs.apply_patch", "fs.move",
+    "fs.delete", "write", "edit", "multi_edit", "apply_patch",
+})
+
+
+def _project_paged_reads(thread_messages: list, state: dict) -> list:
+    """Return the thread as the model should SEE it: one page per file.
+
+    The durable thread keeps every page verbatim — resume, debug and the
+    post-mortem all need it, and eviction stays reversible. What goes out is a
+    projection in which a paged read that is no longer the cursor page (and is
+    not pinned) is replaced by its stub: line range, generated index of what it
+    defined, and the reader's own note if it wrote one.
+
+    Cheap and allocation-light: unchanged messages are passed through by
+    reference, so a thread with nothing to evict costs one list copy.
+    """
+    refs = state.get("_pager_msgs")
+    if not isinstance(refs, dict) or not refs:
+        return thread_messages
+    try:
+        import file_pager
+    except Exception:
+        return thread_messages
+    keep: dict = {}
+    seen: set = set()
+    visible: dict = {}
+    out = []
+    # Walked newest-first: when one page was delivered more than once, only the
+    # most recent copy can be the live one. The older copies are the same bytes
+    # twice — the exact duplication paging exists to remove.
+    for msg in reversed(thread_messages):
+        ref = refs.get(msg.get("tool_call_id")) if msg.get("role") == "tool" else None
+        if not ref:
+            out.append(msg)
+            continue
+        path = ref.get("path") or ""
+        page = int(ref.get("page") or 0)
+        lines = ref.get("lines") or []
+
+        def _keep(message):
+            # Content that survives whole is content the model can still read
+            # off its own transcript — unless compaction already pruned it.
+            if (len(lines) == 2
+                    and _PRUNED_TOOL_MARKER not in (message.get("content") or "")):
+                visible.setdefault(path, []).append([int(lines[0]), int(lines[1])])
+            out.append(message)
+
+        if page == 0:
+            # A targeted window is never evicted (see file_pager), but it does
+            # count towards what is visible.
+            _keep(msg)
+            continue
+        if path not in keep:
+            keep[path] = file_pager.live_pages(state, path)
+        if page in keep[path] and (path, page) not in seen:
+            seen.add((path, page))
+            _keep(msg)
+            continue
+        stub = file_pager.stub_for(state, path, page)
+        if not stub:
+            _keep(msg)
+            continue
+        evicted = dict(msg)
+        evicted["content"] = stub
+        out.append(evicted)
+    out.reverse()
+    state["_visible_reads"] = {
+        path: file_pager.merge_ranges(spans) for path, spans in visible.items()}
+    return out
+
+
 def _compact_thread_messages(thread_messages: list, deps, session, lang: str, state: dict,
                              *, force: bool = False) -> bool:
     """opencode-style compaction of the native message thread, IN PLACE.
@@ -5408,6 +5958,52 @@ def _history_without_current_turn(chat_history: list, original_input: str) -> li
     return chat_history
 
 
+#: Every `state["_…"]` key the runtime writes, and whether it survives the turn
+#: boundary. `prepare_state_for_repl` builds a FRESH dict from a hand-written
+#: list, so a key added anywhere else is silently dropped at the end of the
+#: turn — the failure is invisible at the write site, invisible in review, and
+#: shows up as state that "randomly resets".
+#:
+#: CARRIED   the next turn needs it (a cursor, a lineage, a transcript).
+#: TURN_ONLY it belongs to one turn and must NOT leak into the next.
+#:
+#: This is a declaration, not a mechanism that copies things: the copy below
+#: still names its keys. What it buys is a test that fails when a new key
+#: appears in the code and in neither list, which is exactly the moment the
+#: author still remembers which one it should be.
+STATE_KEYS_CARRIED = frozenset({
+    "_files_seen", "_pager", "_pager_msgs", "_session_id", "_task_cwd",
+    "_thread_messages", "_thread_summary", "_thread_call_seq",
+    "_fork_lineage", "_fork_name", "_fork_parent_session_id",
+})
+
+STATE_KEYS_TURN_ONLY = frozenset({
+    "_active_tool", "_agent_id", "_branch_completion_warned", "_capability_gaps",
+    "_contract", "_contract_max_loops", "_contract_tools", "_ctx_headroom_chars",
+    "_dynamic_context_query", "_dynamic_tool_names", "_escalation_suggested",
+    "_exhaustion_loop_count", "_force_full_catalog_next", "_force_micro_keep",
+    "_help_request", "_hwo_return", "_inbox", "_keep_worktree",
+    "_max_loops_exhausted", "_no_action_count", "_pending_history",
+    "_persisted_employee", "_recent_failures", "_retry_count", "_role_name",
+    "_snapshot_done", "_snapshot_pending", "_snapshot_sha", "_submitted_outputs",
+    "_suppress_terminal_render", "_sys_prompt_churn", "_sys_prompt_digest",
+    "_thread_mode", "_visible_reads", "_workflow_phase",
+    # Run-scoped identity and bookkeeping. All turn-only by current behaviour:
+    # none of them appears in the copy below, so none of them crosses.
+    "_assignment_task", "_evolution_lab_branch", "_max_write_lines",
+    "_overflow_retry", "_parent_agent_id", "_prompt_lab_branch",
+    "_prompt_lab_root", "_run_id", "_satisfied_rule_ids", "_silent_fail_count",
+    "_sys_prompt_churn_causes", "_sys_prompt_parts", "_task_kind",
+    "_test_warning_issued", "_tool_allowlist", "_truncation_retry_count",
+    "_truncation_counts", "_unanswered_prompt", "_work_id", "_worktree_branch",
+    "_worktree_path",
+})
+
+
+def declared_state_keys() -> frozenset:
+    return STATE_KEYS_CARRIED | STATE_KEYS_TURN_ONLY
+
+
 def prepare_state_for_repl(state: dict) -> dict:
     """Bound agent state before carrying it into the next REPL interaction."""
     state = state or {}
@@ -5423,6 +6019,12 @@ def prepare_state_for_repl(state: dict) -> dict:
         "lastOutput": _trim_text(state.get("lastOutput", ""), output_limit),
         "terminalHistory": _microcompact_history(history, keep_recent=5),
         "_files_seen": (state.get("_files_seen") or [])[-20:],
+        # The page cursor and its call-id map must cross the turn boundary:
+        # thread_messages do, so a cursor that reset here would leave whole
+        # pages sitting in context with nothing left that knows how to evict
+        # them (see _project_paged_reads).
+        "_pager": state.get("_pager") or {},
+        "_pager_msgs": state.get("_pager_msgs") or {},
         # Carry the active objective across REPL turns so explicit continuation
         # has a stable fallback (the live session also stores last_user_input).
         "objective": (state.get("objective") or "").strip(),
@@ -6069,10 +6671,40 @@ def _build_user_message(original_input: str, state: dict, memory_entries: list,
     warnings = _detect_loop_warnings(state, original_input)
     files_seen = state.get("_files_seen", [])
 
+    # Files this agent edited after reading them: the copy it holds no longer
+    # matches disk, so an `edit` anchored on it will not match. Helpwo injects
+    # the same reminder ([STALE FILES]); we had nothing.
+    try:
+        import file_pager as _fp
+        for _stale in _fp.stale_files(state)[:5]:
+            warnings.append(
+                f"`{os.path.basename(_stale)}` changed since you read it - "
+                f"re-read before anchoring an edit on your copy")
+    except Exception:
+        pass
+
     warnings_block = ""
     if warnings:
         bullets = "\n".join(f"  - {w}" for w in warnings)
         warnings_block = f"\n<warnings>\n{bullets}\n</warnings>\n"
+
+    # Delegated work, every turn, while the reader can still act on it. The
+    # detailed per-member view used to exist only inside the blocking barrier
+    # — available exactly when its reader was blocked and could do nothing
+    # with it.
+    branches_block = ""
+    try:
+        _agent_now = get_current_agent()
+        _branch_lines = (branch_mod.summarize_open(_agent_now.id)
+                         if _agent_now is not None else "")
+        if _branch_lines:
+            branches_block = (
+                f"\n<delegated_work>\n{_branch_lines}\n"
+                "You cannot finish your own task while a branch is open: "
+                "collect what you need, stop what you do not, then finish.\n"
+                "</delegated_work>\n")
+    except Exception:
+        branches_block = ""
 
     files_block = ""
     if files_seen:
@@ -6151,7 +6783,7 @@ def _build_user_message(original_input: str, state: dict, memory_entries: list,
 <progress>
 step {loop+1}/{max_loops} — {n_steps} command(s) executed so far
 </progress>
-{warnings_block}{files_block}{workflow_block}{role_block}{tasks_block}
+{warnings_block}{branches_block}{files_block}{workflow_block}{role_block}{tasks_block}
 <session_memory>
 {memory_section}
 </session_memory>
@@ -6168,7 +6800,7 @@ step {loop+1}/{max_loops} — {n_steps} command(s) executed so far
 <progress>
 step {loop+1}/{max_loops} — {n_steps} command(s) executed so far
 </progress>
-{warnings_block}{files_block}{workflow_block}{role_block}{tasks_block}
+{warnings_block}{branches_block}{files_block}{workflow_block}{role_block}{tasks_block}
 <recent_terminal_output>
 {terminal_section}
 </recent_terminal_output>
@@ -6642,6 +7274,12 @@ def _truncate_middle(body: str, max_chars: int, *,
 #: with "I have read all four files in full".
 _CONTIGUOUS_RESULT_TOOLS = frozenset({"fs.read", "read"})
 
+#: Absolute ceiling for one paged read, however much headroom the pager saw.
+#: A page is dropped when the reader turns it, so a big page is affordable —
+#: but "affordable" is not "unbounded", and one tool result must never be able
+#: to fill a window on its own.
+_PAGED_READ_HARD_MAX_CHARS = 200_000
+
 #: Per-tool output budget, as a multiple of `output_truncate`.
 #:
 #: `output_truncate` was never sized for this job. It was introduced (2026-05-06)
@@ -6687,6 +7325,10 @@ def _fit_contiguous_read(result: dict, body: str, max_chars: int) -> str:
     changed = str(result.get("external_change") or "")
     lines = body.split("\n") if body else []
 
+    page = int(result.get("page") or 0)
+    pages = int(result.get("pages") or 0)
+    note = str(result.get("note") or "").strip()
+
     def _footer(kept: int, dropped: int) -> str:
         if kept:
             bits = [f"read {path}" if path else "read",
@@ -6694,15 +7336,33 @@ def _fit_contiguous_read(result: dict, body: str, max_chars: int) -> str:
         else:
             bits = [f"read {path}" if path else "read", "no lines fit"]
         bits.append(f"of {total}" if total else "of unknown total")
+        if page and pages:
+            # Paged mode: the page, not the byte window, is the unit the model
+            # navigates in — say so first, and say what turning costs.
+            bits.append(f"| page {page}/{pages}")
+            if page < pages:
+                bits.append(f"| next: page='next' (drops page {page} from your "
+                            f"context; add note= to keep a summary of it)")
+            else:
+                bits.append("| last page")
         if dropped:
-            bits.append(f"| {dropped} requested line(s) NOT shown - "
-                        f"continue with offset={offset + kept}")
-        elif result.get("truncated"):
+            # In paged mode this is a page that did not fit its own budget:
+            # name it as an incomplete PAGE, since offset is not the unit the
+            # reader is navigating in.
+            bits.append(
+                (f"| page cut short: {dropped} line(s) of it NOT shown - "
+                 f"read them with offset={offset + kept}") if page else
+                (f"| {dropped} requested line(s) NOT shown - "
+                 f"continue with offset={offset + kept}"))
+        elif result.get("truncated") and not page:
             # The tool itself stopped early (limit/max_bytes), so the window is
-            # short for a reason this layer did not cause.
+            # short for a reason this layer did not cause. Paged reads end
+            # where the page ends, which is not a truncation.
             bits.append(f"| more lines exist - continue with offset={offset + kept}")
         if changed:
             bits.append(f"| {changed}")
+        if note:
+            bits.append(f"| {note}")
         return "\n[" + " ".join(bits) + "]"
 
     whole = _footer(len(lines), 0)
@@ -6743,6 +7403,15 @@ def _format_tool_result_for_loop(tool_name: str, result: dict, max_chars: int) -
     it by `_tool_output_budget`.
     """
     max_chars = _tool_output_budget(tool_name, max_chars)
+    if isinstance(result, dict) and result.get("_budget_chars"):
+        # A paged read brings its own allowance (see file_pager): the page was
+        # sized against the real context headroom, so the generic budget is the
+        # wrong ceiling for it. Still bounded — a page can never be unlimited.
+        try:
+            max_chars = max(max_chars, min(int(result["_budget_chars"]),
+                                           _PAGED_READ_HARD_MAX_CHARS))
+        except (TypeError, ValueError):
+            pass
     if not isinstance(result, dict):
         return _truncate_middle(str(result), max_chars)
 
@@ -6880,7 +7549,9 @@ def _can_batch_read_only(tool_calls: list, interrupted: bool) -> bool:
     )
 
 
-def _dispatch_read_only_batch(tool_calls: list, tool_ctx) -> list:
+def _dispatch_read_only_batch(tool_calls: list, tool_ctx, *,
+                              runnable: set = None,
+                              interrupt: threading.Event = None) -> list:
     """Run an all-read-only turn concurrently, in call order.
 
     Serial dispatch made a turn cost the SUM of its calls; three greps over a
@@ -6888,13 +7559,22 @@ def _dispatch_read_only_batch(tool_calls: list, tool_ctx) -> list:
     call is read-only take this path, so a turn containing a shell command --
     or any write -- stays strictly sequential and the PTY is never shared.
 
-    Results come back positionally, so the caller's loop keeps running its
-    hooks, policy checks, display and history in the original order. Only the
-    I/O moved.
+    ``runnable`` is the set of indices that have already cleared every gate
+    (authorization, lab sandbox, mode/role/workflow scope, repeat-failure
+    ledger, pre_tool hook). Anything outside it is left as ``None`` and never
+    executed: this used to run the WHOLE turn up front, so a call the gates
+    were about to refuse had already hit the disk or the network by the time it
+    was "blocked". Callers must treat ``None`` as "not run" and fall back to a
+    sequential invoke.
+
+    ``interrupt`` is checked before each queued call starts, so Ctrl+C stops
+    everything that has not begun instead of waiting out the whole batch.
     """
     registry = tools_mod.get_registry()
 
-    def _one(tc: dict) -> dict:
+    def _one(tc: dict) -> Optional[dict]:
+        if interrupt is not None and interrupt.is_set():
+            return None
         name = tc.get("name", "")
         arguments = tc.get("arguments", {}) or {}
         if not isinstance(arguments, dict):
@@ -6904,10 +7584,14 @@ def _dispatch_read_only_batch(tool_calls: list, tool_ctx) -> list:
         return registry.invoke(name, arguments, tool_ctx)
 
     results: list = [None] * len(tool_calls)
+    indices = [i for i in range(len(tool_calls))
+               if runnable is None or i in runnable]
+    if not indices:
+        return results
     with concurrent.futures.ThreadPoolExecutor(
-            max_workers=min(len(tool_calls), 8),
+            max_workers=min(len(indices), 8),
             thread_name_prefix="ro-batch") as pool:
-        futures = {pool.submit(_one, tc): i for i, tc in enumerate(tool_calls)}
+        futures = {pool.submit(_one, tool_calls[i]): i for i in indices}
         for fut in concurrent.futures.as_completed(futures):
             i = futures[fut]
             try:
@@ -6940,6 +7624,118 @@ def _render_tool_catalog_enhanced(
     return _render_tool_catalog(state, loop, allowed_names)
 
 
+#: How long a child waits for its caller before deciding for itself. Bounded on
+#: purpose: a child that hangs forever on an unanswered question is worse than
+#: one that proceeds and says what it assumed.
+HELP_WAIT_SECONDS = 300.0
+
+
+def ask_parent_for_help(child_id: str, request: dict,
+                        timeout: float = HELP_WAIT_SECONDS) -> dict:
+    """Block a child on a question only its caller can answer.
+
+    Escalation used to happen exactly once, at the end: a child that hit a wall
+    on step two spent the rest of its budget working around it and reported the
+    wall in its post-mortem. The caller is the one holding the authority the
+    child is missing (a wider tool scope, a revised task, permission to stop),
+    and it is cheapest to ask while the child still has the context that raised
+    the question.
+
+    Returns the caller's decision, or a timeout verdict. It never returns
+    nothing: a child released by a timeout is told to proceed on its own
+    judgement and record what it assumed.
+    """
+    child = get_agent(child_id)
+    if child is None:
+        return {"ok": False, "error": "no such agent"}
+    if not child.parent_id or get_agent(child.parent_id) is None:
+        return {"ok": False, "answered": False,
+                "error": "you have no caller to ask; decide yourself and "
+                         "record the decision in your result"}
+    parent = get_agent(child.parent_id)
+    # A caller parked in a synchronous barrier is not reading its inbox, so
+    # asking it would burn the whole timeout for an answer that cannot come.
+    # Say so immediately instead.
+    if parent.status == "waiting":
+        return {"ok": True, "answered": False, "reason": "caller_blocked",
+                "guidance": ("your caller is blocked waiting for this batch to "
+                             "finish and cannot answer while it waits; proceed "
+                             "on your own judgement and record the blocker in "
+                             "your result")}
+    request_id = uuid.uuid4().hex[:12]
+    child.state["_help_request"] = {"id": request_id, **request}
+    previous_stage = child.stage
+    child.stage = agent_contract.STAGE_WAITING_PARENT
+    event_log.append("child_help_requested", agent_id=child_id,
+                     parent_id=child.parent_id, request_id=request_id,
+                     blocker=str(request.get("blocker") or "")[:300])
+    send_to_agent(child.parent_id, {
+        "from": child_id,
+        "kind": "child-help",
+        "request_id": request_id,
+        **request,
+    })
+    # Release the concurrency slot: a child waiting on a person-shaped decision
+    # is not work in progress, and holding a slot here is what would stop the
+    # very agents that could answer from running.
+    enter_waiting(child_id)
+    deadline = time.time() + max(1.0, float(timeout))
+    answer = None
+    deferred: list = []
+    try:
+        while time.time() < deadline:
+            if child.abort_event.is_set():
+                break
+            msg = recv_from_inbox(child_id, timeout=min(1.0, max(0.1, deadline - time.time())))
+            if msg is None:
+                continue
+            if (isinstance(msg, dict) and msg.get("kind") == "help-response"
+                    and msg.get("request_id") in (None, request_id)):
+                answer = msg
+                break
+            deferred.append(msg)          # not ours: put it back below
+    finally:
+        exit_waiting(child_id)
+        child.stage = previous_stage
+        child.state.pop("_help_request", None)
+        for msg in deferred:
+            send_to_agent(child_id, msg)
+    if answer is None:
+        event_log.append("child_help_timeout", agent_id=child_id,
+                         request_id=request_id)
+        return {"ok": True, "answered": False, "reason": "timeout",
+                "guidance": (f"no answer within {int(timeout)}s; proceed on "
+                             f"your own judgement and record in your result "
+                             f"what you assumed and why")}
+    event_log.append("child_help_answered", agent_id=child_id,
+                     request_id=request_id,
+                     decision=str(answer.get("decision") or "")[:120])
+    return {"ok": True, "answered": True,
+            "decision": str(answer.get("decision") or ""),
+            "guidance": str(answer.get("guidance") or "")}
+
+
+def answer_child_help(parent_id: str, child_id: str, decision: str,
+                      guidance: str = "") -> dict:
+    """Release a child that is waiting on its caller."""
+    child = get_agent(child_id)
+    if child is None:
+        return {"ok": False, "error": f"no such agent '{child_id}'"}
+    if child.parent_id != parent_id:
+        return {"ok": False,
+                "error": f"'{child_id}' is not your child; only the agent that "
+                         f"spawned it can answer it"}
+    pending = (child.state or {}).get("_help_request") or {}
+    send_to_agent(child_id, {
+        "from": parent_id,
+        "kind": "help-response",
+        "request_id": pending.get("id"),
+        "decision": decision,
+        "guidance": guidance,
+    })
+    return {"ok": True, "waiting": bool(pending)}
+
+
 def _format_parallel_results(inbox_msgs: list) -> str:
     """Aggregate child-done / child-error messages into a structured block.
 
@@ -6953,6 +7749,28 @@ def _format_parallel_results(inbox_msgs: list) -> str:
         if not isinstance(msg, dict):
             continue
         kind = msg.get("kind", "")
+        if kind == "child-help":
+            # A child stopped mid-task on something only this agent can
+            # settle. It is holding its context open and waiting, so this is
+            # the cheapest possible moment to answer — and the most expensive
+            # one to ignore.
+            entry = (f"[{msg.get('from', 'unknown')}] {symbols.WARN} needs a "
+                     f"decision from you\nquestion: "
+                     f"{str(msg.get('question') or '')[:400]}")
+            if msg.get("blocker"):
+                entry += f"\nblocked by: {str(msg['blocker'])[:300]}"
+            if msg.get("needed_capabilities"):
+                entry += ("\ntools it would need: "
+                          + ", ".join(str(t) for t in msg["needed_capabilities"][:8]))
+            if msg.get("options"):
+                entry += ("\noptions it sees: "
+                          + " | ".join(str(o) for o in msg["options"][:6]))
+            entry += (f"\nIt is WAITING. Answer with agent_answer(agent_id="
+                      f"'{msg.get('from', '')}', decision=..., guidance=...) — "
+                      f"it resumes with everything it already worked out. "
+                      f"Ignoring this wastes the rest of its budget.")
+            results.append(entry)
+            continue
         if kind not in ("child-done", "child-error"):
             continue
         from_agent = msg.get("from", "unknown")
@@ -6971,18 +7789,60 @@ def _format_parallel_results(inbox_msgs: list) -> str:
             entry = f"[{from_agent}] {symbols.FAIL} error: {error[:300]}"
             if partial and partial not in ("(no reply)", error):
                 entry += f"\nwhat it had before failing:\n{partial[:500]}"
+            failure = msg.get("failure") or {}
+            if failure.get("kind"):
+                entry += f"\nfailure kind: {failure['kind']}"
+            gaps = msg.get("gaps") or []
+            if gaps:
+                entry += "\ncontract gaps:\n" + "\n".join(
+                    f"- {str(gap)[:300]}" for gap in gaps[:6])
+            capability_gaps = msg.get("capability_gaps") or []
+            if capability_gaps:
+                entry += "\ncapability gaps:\n" + "\n".join(
+                    f"- {gap.get('tool', '?')} ({gap.get('kind', 'blocked')}): "
+                    f"{str(gap.get('reason') or '')[:240]}"
+                    for gap in capability_gaps[:10]
+                    if isinstance(gap, dict))
+            if msg.get("outputs"):
+                try:
+                    outputs = json.dumps(msg["outputs"], ensure_ascii=False)
+                except (TypeError, ValueError):
+                    outputs = str(msg["outputs"])
+                entry += f"\nsubmitted outputs: {outputs[:500]}"
+            entry += ("\nRuntime did not retry. As the parent, decide whether "
+                      "to accept the partial result, revise/follow up, re-spawn, "
+                      "or stop.")
             results.append(entry)
 
     if not results:
         return ""
 
-    header = f"## Sub-Agent Results ({len(results)} agent(s) completed)"
+    header = f"## Sub-Agent Results ({len(results)} agent(s) reporting)"
     return f"{header}\n\n" + "\n\n---\n\n".join(results)
+
+
+# Lab sandboxes: a worker diagnosing a prompt or designing an evolution
+# candidate inspects the workspace but must never change it.
+_PROMPT_LAB_ALLOWED_TOOLS = frozenset({
+    "fs.read", "fs.ls", "fs.grep", "fs.glob",
+    "skill.list", "skill.reference",
+    "prompt.lab_draft", "task.complete", "time.now",
+})
+_EVOLUTION_LAB_ALLOWED_TOOLS = frozenset({
+    "fs.read", "fs.ls", "fs.grep", "fs.glob",
+    "skill.list", "skill.reference", "evolve.lab_draft",
+    "task.complete", "time.now",
+})
 
 
 # Tools the completion protocol needs. A node that cannot report its result is
 # a hung node, not a contained one, so a tool scope never removes these.
-_PROTOCOL_TOOLS = ("task.complete", "agent_return")
+#: `agent.ask_parent` is here for the same reason as the completion tools, and
+#: for a sharper one: the child most likely to need it is the child whose scope
+#: is too narrow for its task, which is precisely the child a scope filter
+#: would silence. An agent that can neither finish nor ask is contained into
+#: uselessness.
+_PROTOCOL_TOOLS = ("task.complete", "agent_return", "agent.ask_parent")
 
 
 def _tool_in_scope(name: str, scope: Optional[list]) -> bool:
@@ -7059,6 +7919,271 @@ def _visible_tool_names_for_task(
     routed = context_router.stable_visible_names(
         query, tools_mod.get_registry().list(), state)
     return set(authorized_names) & routed
+
+
+def _prepare_tool_call(tc: dict, idx: int, loop: int) -> Optional[dict]:
+    """Normalize one raw provider tool call into the fields the loop needs.
+
+    Returns None for a call with no name (nothing to dispatch). Shared by the
+    sequential executor and the read-only batch pre-pass so the two cannot
+    disagree about what a call *is* before they decide whether it may run.
+    """
+    name = tc.get("name", "")
+    if not name:
+        return None
+    arguments = tc.get("arguments", {}) or {}
+    if not isinstance(arguments, dict):
+        arguments = {"value": arguments}
+    # User/model-facing display name: show the unified canonical name the model
+    # actually used (fs.read -> read) while dispatch keeps the internal name.
+    # Only when the unified catalog is on.
+    display_name = name
+    if get_runtime_config("use_unified_catalog"):
+        try:
+            from agent_tools import load as _load_catalog
+            display_name = _load_catalog().canonical(name, "laintas_cli") or name
+        except Exception:
+            display_name = name
+    return {
+        "name": name,
+        "arguments": arguments,
+        "display_name": display_name,
+        "call_id": f"call_{loop+1:02d}_{idx+1:02d}",
+        "salient": _salient_arg(name, arguments),
+        "is_shell_flavored": name in (
+            "shell.exec", "terminal.create", "terminal.send", "terminal.exec"),
+    }
+
+
+def _authorize_tool_call(
+        name: str, salient: str, state: dict, *,
+        agent_id: Optional[str],
+        allowed_tool_names: set,
+        is_shell_flavored: bool,
+        fail_ledger: dict,
+        fail_ledger_err: dict,
+        repeat_block_limit: int,
+) -> Optional[dict]:
+    """Every deterministic gate that can refuse a tool call before it runs.
+
+    Returns the refusal result dict, or None when the call may proceed.
+
+    Pure by design (no printing, no history writes, no hook execution): the
+    caller owns the reporting.  That is what lets the read-only batch
+    dispatcher ask the SAME question the sequential executor asks, instead of
+    keeping a second, drifting copy of "what is allowed".  Before this existed
+    the batch ran every call in the turn up front and the gates below could
+    only discard the result afterwards — a policy-denied `web.fetch` still hit
+    the network, and a `pre_tool` hook could not actually block anything on a
+    batched turn.
+
+    The advisory ("warn") half of the repeat-failure ledger is NOT here: it
+    does not block, so it stays with the caller that reports it.
+    """
+    # ── Deterministic repeat-FAILURE hard block ──────────────
+    # If this EXACT call (tool + salient args) has already failed
+    # `repeat_block_limit` times this session, re-running it is pointless
+    # (missing path, non-matching edit, dead URL, …) and, for destructive
+    # tools, actively dangerous.  Unlike the windowed loop detectors, this
+    # fires even when the repeats are interleaved with other (succeeding)
+    # calls — the exact pattern that let a goal-less loop retry `fs.delete`
+    # ~10× in the incident log.  Scope: non-shell registry tools only (shell
+    # commands are legitimately re-run after fixes), never control tools.
+    if (not is_shell_flavored
+            and name not in _LEDGER_EXEMPT_TOOLS
+            and fail_ledger.get(_call_fingerprint(name, salient), 0) >= repeat_block_limit
+            and get_runtime_config("repetition_policy") != "warn"):
+        _fp = _call_fingerprint(name, salient)
+        _prev_n = fail_ledger[_fp]
+        _last_err = fail_ledger_err.get(_fp, "(no error text)")
+        return {
+            "ok": False,
+            "error": (
+                f"BLOCKED: you have already called `{name}` on "
+                f"`{salient[:100]}` {_prev_n} times and it failed every "
+                f"time with the same deterministic error:\n{_last_err[:300]}\n"
+                f"Re-running it will fail identically. Stop repeating this "
+                f"call — either fix the underlying cause with a DIFFERENT "
+                f"action, or if this sub-goal is impossible, move on / call "
+                f"task_complete and report it."
+            ),
+            "tool": name, "returncode": -1, "_repeat_blocked": True,
+            "_repeat_count": _prev_n,
+        }
+
+    # Lab workers must never gain side effects in the real workspace.
+    # Diagnosis workers get read-only inspection plus the draft recorder.
+    prompt_lab_worker = bool(state.get("_prompt_lab_branch"))
+    evolution_lab_worker = bool(state.get("_evolution_lab_branch"))
+    if prompt_lab_worker and name not in _PROMPT_LAB_ALLOWED_TOOLS:
+        return {
+            "ok": False,
+            "error": (
+                f"BLOCKED: tool '{name}' is disabled in the "
+                "Prompt Lab no-side-effects test sandbox."
+            ),
+            "tool": name, "returncode": -1,
+        }
+    if evolution_lab_worker and name not in _EVOLUTION_LAB_ALLOWED_TOOLS:
+        return {
+            "ok": False,
+            "error": (
+                f"BLOCKED: tool '{name}' is disabled while an "
+                "Evolution Lab worker is designing a candidate."
+            ),
+            "tool": name, "returncode": -1,
+        }
+
+    # A path contract can mediate structured fs.* mutations because every one
+    # reaches tools._check_file_{write,delete}_policy. Arbitrary shell text and
+    # terminal keystrokes have no such complete path model: allowing them would
+    # turn ``scope.paths`` into a prompt suggestion (``ln``, redirection, a
+    # script, or simply ``cd`` can write anywhere). Refuse the unbounded escape
+    # hatch; reads and tests remain available through structured tools.
+    _contract = state.get("_contract") if isinstance(state, dict) else None
+    if (is_shell_flavored and _contract
+            and ((_contract.get("scope") or {}).get("paths") or [])):
+        return {
+            "ok": False,
+            "error": (
+                f"BLOCKED: tool '{name}' cannot be used while this agent has "
+                "a scope.paths write boundary. Use structured fs tools, whose "
+                "targets are checked against the declared paths."
+            ),
+            "tool": name, "returncode": -1,
+        }
+
+    # ── Role / Workflow tool filtering ──
+    if name not in allowed_tool_names:
+        return {
+            "ok": False,
+            "error": (
+                f"BLOCKED: tool '{name}' is not available to agent "
+                f"'{agent_id or 'current'}'."
+            ),
+            "tool": name, "returncode": -1,
+        }
+    if (not prompt_lab_worker and not evolution_lab_worker
+            and not plan_mode.is_tool_allowed(name)):
+        return {
+            "ok": False,
+            "error": (
+                f"BLOCKED: tool '{name}' is not allowed in Plan Mode. "
+                "Use read-only exploration or plan.update, then obtain "
+                "user approval before implementation."
+            ),
+            "tool": name, "returncode": -1,
+        }
+    if (not prompt_lab_worker and not evolution_lab_worker
+            and not plan_mode.is_plan_mode()
+            and not mode_manager.is_tool_allowed(name)):
+        active_mode = mode_manager.get_active_mode()
+        active_mode_name = active_mode["name"]
+        blocked_hint = ""
+        if active_mode_name == "study":
+            blocked_hint = (
+                " STUDY mode is read-only on purpose: the user makes "
+                "every change. Do not retry through another tool — "
+                "teach the step instead and wait for them to do it."
+            )
+        elif mode_manager.is_read_only_mode(active_mode):
+            blocked_hint = (
+                " This mode is read-only. Do not retry through "
+                "another tool; report what you found instead."
+            )
+        return {
+            "ok": False,
+            "error": (
+                f"BLOCKED: tool '{name}' is not allowed in "
+                f"{active_mode_name.upper()} mode.{blocked_hint}"
+            ),
+            "tool": name, "returncode": -1,
+        }
+    if not agent_roles.is_tool_allowed_for_role(name, state.get("_role_name")):
+        return {
+            "ok": False,
+            "error": (f"BLOCKED: tool '{name}' not allowed for role "
+                      f"'{state.get('_role_name')}'"),
+            "tool": name, "returncode": -1,
+        }
+    if (not prompt_lab_worker and not evolution_lab_worker
+            and not workflow_engine.is_tool_allowed_in_workflow(name)):
+        return {
+            "ok": False,
+            "error": f"BLOCKED: tool '{name}' not allowed in current workflow phase",
+            "tool": name, "returncode": -1,
+        }
+    tool_scope = state.get("_tool_allowlist")
+    if not _tool_in_scope(name, tool_scope):
+        return {
+            "ok": False,
+            "error": (
+                f"BLOCKED: tool '{name}' is outside this workflow node's tool "
+                f"scope ({', '.join(tool_scope)}). The scope is declared in the "
+                f".hwg node policy and cannot be widened from here. Do the task "
+                f"with the tools listed, or report why it cannot be done."
+            ),
+            "tool": name, "returncode": -1,
+        }
+    return None
+
+
+def _suggest_escalation(refusal: dict, state: dict, depth: int,
+                        info) -> dict:
+    """Point a refused CHILD at its caller, without nagging.
+
+    Not for the root agent (it has nobody to ask) and not repeated for a
+    refusal kind the child has already been told about: a suggestion the child
+    has declined once is noise the second time.
+    """
+    try:
+        if depth <= 0 or info is None or not getattr(info, "parent_id", ""):
+            return refusal
+        gaps = state.get("_capability_gaps") or []
+        kind = gaps[-1].get("kind") if gaps else "blocked"
+        told = state.setdefault("_escalation_suggested", [])
+        if kind in told:
+            return refusal
+        told.append(kind)
+        hint = (" If this capability is what the task actually requires, ask "
+                "the agent that spawned you with agent_ask_parent(question=..., "
+                "blocker=..., needed_capabilities=[...]) instead of working "
+                "around it — it can widen your scope, revise the task, or tell "
+                "you to proceed without it. You keep your context while you "
+                "wait.")
+        out = dict(refusal)
+        out["error"] = str(out.get("error") or "") + hint
+        return out
+    except Exception:
+        return refusal
+
+
+def _record_capability_gap(state: dict, name: str, refusal: dict) -> None:
+    """Remember a policy/capability refusal for the supervising parent.
+
+    A refused call remains an ordinary tool result: the child can choose an
+    authorized fallback and continue.  Recording it separately prevents that
+    useful constraint from disappearing inside a long transcript when the
+    child's final outcome is reported.  Exact duplicates are collapsed so a
+    confused child cannot inflate the parent message by repeating one call.
+    """
+    if (refusal or {}).get("_repeat_blocked"):
+        return
+    error = str((refusal or {}).get("error") or "tool call was refused")
+    if "not available to agent" in error:
+        kind = "unavailable"
+    elif "not allowed for role" in error:
+        kind = "role_denied"
+    elif "outside this workflow node's tool scope" in error:
+        kind = "scope_denied"
+    elif "not allowed" in error or "disabled" in error:
+        kind = "policy_denied"
+    else:
+        kind = "blocked"
+    gap = {"tool": str(name), "kind": kind, "reason": error[:600]}
+    gaps = state.setdefault("_capability_gaps", [])
+    if gap not in gaps and len(gaps) < 20:
+        gaps.append(gap)
 
 
 def _publish_live_state(info, state: dict) -> None:
@@ -7240,6 +8365,10 @@ def run_agent_loop(
     _critic_fail_streak = 0               # consecutive assess failures
     _critic_anchor_idx = 0                # thread_messages index at last assessment
     _critic_disabled = False              # auto-disabled after persistent failures
+    _critic_prompt_error_reported = ""    # avoid repeating one bad custom-file warning
+    _critic_thread = None                 # in-flight background assessment
+    _critic_result: dict = {}             # filled by that thread
+    _critic_launch_idx = 0                # thread length when it was launched
     _run_id = uuid.uuid4().hex
     # Published on `state` so the auxiliary calls that run outside this frame
     # (compaction, memory consolidation) can stamp the same trajectory on their
@@ -7262,13 +8391,30 @@ def run_agent_loop(
     # not pay the checkpoint cost at all.
     _snapshot_attempted = bool(state.get("_snapshot_done"))
 
-    # In execute/non-interactive mode, suppress Rich console output.
-    # Child laintas terminals capture PTY output; Rich markup pollutes it.
-    if events_cb is None:
+    # The physical terminal belongs to the foreground Agent only. Background
+    # children still publish through events_cb, but must never inherit its Rich
+    # Console: concurrent Live regions on one Console raise LiveError and
+    # ordinary prints from worker threads corrupt the parent's display.
+    # Execute/non-interactive mode is quiet for the same reason as before.
+    _is_background_agent = bool(
+        depth > 0
+        or (_runtime_info is not None and _runtime_info.role != "primary")
+    )
+    _owns_local_render = bool(
+        events_cb is not None
+        and not _is_background_agent
+        and not state.get("_suppress_terminal_render")
+        and getattr(deps.console, "render_terminal", True) is not False
+    )
+    if not _owns_local_render:
         # LoopDeps is commonly shared by parent and child agents. Never replace
         # display callbacks on the shared object from a background thread.
         deps = copy.copy(deps)
         class _QuietConsole:
+            width = 80
+            is_terminal = False
+            file = None
+            render_terminal = False
             def print(self, *a, **kw): pass
             def status(self, *a, **kw):
                 from contextlib import nullcontext
@@ -7279,6 +8425,7 @@ def run_agent_loop(
         deps.display_command_output = lambda *a, **kw: None
         deps.display_sub_terminal_preview = lambda *a, **kw: None
         deps.display_file_diff = lambda *a, **kw: None
+        deps.display_task_list = lambda *a, **kw: None
 
     max_loops = (int(max_loops_override) if max_loops_override is not None
                  else int(get_runtime_config("max_loops")))
@@ -7392,6 +8539,13 @@ def run_agent_loop(
         # completion source.  Workflow phase advancement can turn a nominal
         # completion back into continuation.
         _completion_source = ""
+        # Final-turn graceful wrap-up (mirrors AutonomousKernel.ts): on the LAST
+        # allowed iteration the model is told to stop calling tools AND the tool
+        # schemas are withheld from the request, so the provider cannot emit a
+        # call we would have to discard. Turns the common "ran out of loop
+        # budget mid-action" ending into a usable summary. Unbounded runs
+        # (/max) never reach the cap, so the flag simply never fires there.
+        _final_turn = max_loops > 1 and loop == max_loops - 1
         _loop_id = next_debug_loop()
         history_context = _history_without_current_turn(chat_history, original_input)
         skill_context = skills_mod.get_activated_skills_context()
@@ -7701,10 +8855,23 @@ def run_agent_loop(
             "skill_highlight": _skill_highlight,
         }
 
+        # Rendered once and reused: the durable-rules block was formatted twice
+        # (here and in the no-slot fallback below), which is two reads of the
+        # rules file per iteration for one identical string. The tool reminder
+        # is hoisted for the same reason plus one more — the churn attribution
+        # below needs to see each prefix component separately.
+        _durable_rules_text = durable_rules.format_for_prompt(os.getcwd())
+        _tools_reminder = _render_tool_catalog_enhanced(
+            state, loop, depth, _allowed_tool_names)
+        # NOTE: {{planMode}}, {{children}} and {{currentPath}} are no longer in
+        # the generated template — their content moved to the transient tail so
+        # a cd or a spawn stops invalidating the cached prefix. They are still
+        # substituted because a user's customized .cli.prop may predate that
+        # move; do not put volatile values back into the template itself.
         system_prompt = prompt_template \
             .replace("{{globalMemory}}", global_memory_str) \
             .replace("{{persistentMemory}}", _memory_bulk) \
-            .replace("{{durableRules}}", durable_rules.format_for_prompt(os.getcwd())) \
+            .replace("{{durableRules}}", _durable_rules_text) \
             .replace("{{planMode}}", plan_mode.get_plan_prompt()) \
             .replace("{{promptOpt}}", _prompt_lab_section) \
             .replace("{{agentName}}", agent_name) \
@@ -7719,8 +8886,7 @@ def run_agent_loop(
             .replace("{{terminalName}}", terminal_name_str) \
             .replace("{{parentTerminal}}", parent_terminal_str) \
             .replace("{{deploymentStatus}}", deployment_status_str) \
-            .replace("{{tools}}", _render_tool_catalog_enhanced(
-                state, loop, depth, _allowed_tool_names)) \
+            .replace("{{tools}}", _tools_reminder) \
             .replace("{{skills}}", _skill_catalog)
         mode_section = (
             "" if plan_mode.is_plan_mode()
@@ -7733,7 +8899,7 @@ def run_agent_loop(
         if not _durable_rules_has_slot:
             system_prompt += (
                 "\n\n<durable_user_rules authoritative=\"true\">\n"
-                + durable_rules.format_for_prompt(os.getcwd())
+                + _durable_rules_text
                 + "\n</durable_user_rules>"
             )
         system_prompt += (
@@ -7921,12 +9087,37 @@ def run_agent_loop(
         _sys_prompt_changed = bool(_sys_prompt_prev
                                    and _sys_prompt_prev != _sys_prompt_digest)
         state["_sys_prompt_digest"] = _sys_prompt_digest
+        # Which component moved. "The prefix changed" alone cannot answer the
+        # question the tripwire exists for — whether dynamic tool routing (a
+        # default-on feature that grows the visible schema set mid-task) is
+        # paying for itself, or whether something with no business being in the
+        # prefix crept back in. Per-component digests make the invoice legible.
+        _prefix_parts = {
+            "tools": _tools_reminder,
+            "skills": _skill_catalog,
+            "skill_context": skill_context,
+            "memory": _memory_bulk,
+            "durable_rules": _durable_rules_text,
+            "mode": mode_section,
+            "deployment": deployment_status_str,
+        }
+        _prefix_digests = {
+            _k: hashlib.sha256(str(_v or "").encode("utf-8", "replace")).hexdigest()[:8]
+            for _k, _v in _prefix_parts.items()
+        }
+        _prev_digests = state.get("_sys_prompt_parts") or {}
+        _churn_causes = sorted(
+            _k for _k, _v in _prefix_digests.items()
+            if _prev_digests.get(_k) not in (None, _v))
+        state["_sys_prompt_parts"] = _prefix_digests
         if _sys_prompt_changed:
             state["_sys_prompt_churn"] = int(state.get("_sys_prompt_churn", 0)) + 1
+            state["_sys_prompt_churn_causes"] = _churn_causes or ["unattributed"]
             event_log.append("system_prompt_changed", loop=_loop_id,
                              digest=_sys_prompt_digest,
                              previous=_sys_prompt_prev,
-                             churn=state["_sys_prompt_churn"])
+                             churn=state["_sys_prompt_churn"],
+                             causes=_churn_causes or ["unattributed"])
 
         # 5. Build user message via the structured-section helper.
         terminal_section = _build_terminal_section(state)
@@ -7950,22 +9141,22 @@ def run_agent_loop(
             # (`lang` is assigned later in the loop, so derive it here.)
             _compact_thread_messages(thread_messages, deps, session,
                                      _detect_lang(original_input), state)
+            _publish_context_headroom(thread_messages, state)
             _live_state = _build_user_message(
                 original_input, state, memory_entries, history_context, loop, max_loops,
                 thread_mode=True, first_turn=False, volatile=_volatile_context,
             )
             user_input = _live_state  # for debug display
-            _thread_to_send = thread_messages + (
+            _thread_to_send = _project_paged_reads(thread_messages, state) + (
                 [{"role": "user", "content": _live_state}] if _live_state.strip() else []
             )
             # Last-step wrap-up (opencode MAX_STEPS_PROMPT): on the final allowed
             # iteration, tell the model to stop calling tools and answer now, so it
             # isn't cut off mid-action at the loop cap. Ephemeral — not committed.
-            if loop == max_loops - 1:
+            if _final_turn:
                 _thread_to_send = _thread_to_send + [{
                     "role": "user",
-                    "content": "<final_step>This is your last step — do NOT call more tools. "
-                               "Give your final answer or summary now.</final_step>",
+                    "content": _FINAL_TURN_REMINDER,
                 }]
             _thread_to_send = _canonicalize_messages_for_provider(_thread_to_send)
         else:
@@ -7974,55 +9165,36 @@ def run_agent_loop(
                 original_input, state, memory_entries, history_context, loop, max_loops,
                 volatile=_volatile_context,
             )
+            # Same wrap-up in the legacy non-thread payload: tools are withheld
+            # below either way, so without this the model would be silently
+            # stripped of its tools with no explanation.
+            if _final_turn:
+                user_input = user_input + "\n\n" + _FINAL_TURN_REMINDER
             _thread_to_send = None
 
         # ── Long-task critic (#2): periodic external progress supervisor ──────
         # On a long thread-mode task, every `critic_interval` loops an independent
         # cheap LLM call judges whether we're still on track toward the ORIGINAL
-        # goal; if it flags drift/looping, inject a focused nudge before sending.
+        # goal; if it flags drift/looping, a focused nudge is injected.
         # Complements (does not replace) the deterministic staleness/repetition
-        # tripwires. Foreground + gated so it only fires on genuinely long tasks.
-        # Runs before redaction so the nudge is scrubbed and sent normally.
+        # tripwires.
+        #
+        # It runs in the BACKGROUND and is harvested on a later iteration. Its
+        # verdict was always advice for the next turn, so waiting for it made
+        # the user watch a spinner through a whole extra model call every
+        # `critic_interval` loops for nothing. Launch here, act on it whenever
+        # it lands. Injection happens before redaction, so a nudge is scrubbed
+        # and sent like any other content.
         try:
             _crit_interval = int(get_runtime_config("critic_interval") or 0)
             _crit_min = int(get_runtime_config("critic_min_loop") or 0)
-            # First assessment at critic_min_loop (early drift is the most
-            # common kind), then every critic_interval loops after that.
-            if (_thread_to_send is not None
-                    and get_runtime_config("critic_enabled")
-                    and not _critic_disabled
-                    and _crit_interval > 0
-                    and (loop == _crit_min
-                         or (loop > _crit_min and loop % _crit_interval == 0))):
-                _crit_cwd = state.get("cwd") or os.getcwd()
 
-                _aux_m, _aux_p = aux_model_override()
-
-                def _crit_llm_fn(messages, _s=session, _cwd=_crit_cwd,
-                                 _traj=_run_id, _aux_m=_aux_m, _aux_p=_aux_p):
-                    # tools_enabled=False is load-bearing, not tidiness. The
-                    # critic returns a JSON verdict and can never call a tool,
-                    # but the default (True) attaches the whole tool registry
-                    # AND leaves injectToolGuide on, so the gateway appends the
-                    # core-tool guide too. Measured before this was fixed: the
-                    # critic averaged 23.4k prompt tokens a call — larger than
-                    # the main loop's 17.4k — for 10.1% of all input spend, and
-                    # every captured critic sample carried a tool catalogue the
-                    # judging task has no use for.
-                    resp = deps.call_backend(
-                        session=_s, message="",
-                        system_prompt=critic.SYSTEM_PROMPT,
-                        current_path=_cwd, messages=messages,
-                        tools_enabled=False,
-                        model_override=_aux_m or None,
-                        provider_override=_aux_p or None,
-                        task_kind="critic", trajectory_id=_traj)
-                    return (resp or {}).get("reply", "") if isinstance(resp, dict) else ""
-
-                _anchor = (thread_messages[_critic_anchor_idx]
-                           if 0 < _critic_anchor_idx < len(thread_messages) else None)
-                _verdict, _crit_fail = critic.assess_detailed(
-                    original_input, _thread_to_send, _crit_llm_fn, anchor=_anchor)
+            # (a) Harvest a finished assessment.
+            if _critic_thread is not None and not _critic_thread.is_alive():
+                _critic_thread = None
+                _verdict = _critic_result.get("verdict")
+                _crit_fail = _critic_result.get("fail")
+                _critic_result = {}
                 if _verdict is None:
                     # Failure visibility: a silently broken critic (bad aux
                     # model config, unparseable replies) used to fail forever
@@ -8030,6 +9202,8 @@ def run_agent_loop(
                     # a streak so we stop burning calls on a dead path.
                     _critic_fail_streak += 1
                     event_log.append("critic_failure", loop=_loop_id,
+                                     agent_id=agent_id or "primary",
+                                     run_id=_run_id,
                                      reason=_crit_fail or "unknown",
                                      streak=_critic_fail_streak)
                     if _critic_fail_streak >= int(get_runtime_config("critic_max_failures") or 3):
@@ -8046,14 +9220,24 @@ def run_agent_loop(
                             pass
                 else:
                     _critic_fail_streak = 0
-                    _critic_anchor_idx = len(thread_messages)
+                    # The anchor is where the thread stood when this assessment
+                    # was LAUNCHED, not where it stands now: the loop kept
+                    # working while the critic thought, and the next critic pass
+                    # must diff from what this one actually saw.
+                    _critic_anchor_idx = _critic_launch_idx
                     # Persist critic score for local diagnostics only. The server
                     # training pipeline does not read client critic scores.
                     if _verdict.get("score") is not None:
                         event_log.append("critic_assessment",
                                          score=_verdict.get("score"),
                                          on_track=_verdict.get("on_track", True),
-                                         issue=_verdict.get("issue", ""))
+                                         issue=_verdict.get("issue", ""),
+                                         # Untagged verdicts made "was this
+                                         # child supervised?" unanswerable from
+                                         # the log: 19 assessments in the
+                                         # 2026-08-28 batch, none attributable.
+                                         agent_id=agent_id or "primary",
+                                         run_id=_run_id, loop=_loop_id)
                     _crit_thresh = int(get_runtime_config("critic_score_threshold") or 50)
                     if critic.is_off_track(_verdict, _crit_thresh):
                         _issue = _verdict.get("issue", "")
@@ -8080,7 +9264,7 @@ def run_agent_loop(
                                 except Exception:
                                     pass
                                 _critic_similar_streak = 0
-                        else:
+                        elif _thread_to_send is not None:
                             _nudge = critic.nudge_text(original_input, _verdict)
                             # Durable: append to thread_messages so the model AND
                             # the next critic pass both see the correction was
@@ -8099,8 +9283,101 @@ def run_agent_loop(
                                         f"{_verdict.get('score')}/100) — corrective guidance injected[/yellow]")
                                 except Exception:
                                     pass
+
+            # (b) Launch the next assessment in the background. First one at
+            # critic_min_loop (early drift is the most common kind), then every
+            # critic_interval loops. Never on the final turn: nothing could act
+            # on the answer.
+            if (_thread_to_send is not None
+                    and get_runtime_config("critic_enabled")
+                    and not _critic_disabled
+                    and not _final_turn
+                    and _critic_thread is None
+                    and _crit_interval > 0
+                    and (loop == _crit_min
+                         or (loop > _crit_min and loop % _crit_interval == 0))):
+                _crit_cwd = state.get("cwd") or os.getcwd()
+
+                _aux_m, _aux_p = aux_model_override()
+                _crit_system_prompt, _crit_prompt_error = critic.build_system_prompt(
+                    profile=str(get_runtime_config("critic_profile") or "balanced"),
+                    prompt_file=str(get_runtime_config("critic_prompt_file") or ""),
+                    cwd=_crit_cwd,
+                )
+                if (_crit_prompt_error
+                        and _crit_prompt_error != _critic_prompt_error_reported):
+                    _critic_prompt_error_reported = _crit_prompt_error
+                    event_log.append(
+                        "critic_prompt_warning", loop=_loop_id,
+                        error=_crit_prompt_error)
+                    try:
+                        deps.console.print(
+                            f"[yellow]{symbols.WARN} Critic prompt file ignored: "
+                            f"{_crit_prompt_error}[/yellow]")
+                    except Exception:
+                        pass
+
+                def _crit_llm_fn(messages, _s=session, _cwd=_crit_cwd,
+                                 _traj=_run_id, _aux_m=_aux_m, _aux_p=_aux_p,
+                                 _system_prompt=_crit_system_prompt):
+                    # tools_enabled=False is load-bearing, not tidiness. The
+                    # critic returns a JSON verdict and can never call a tool,
+                    # but the default (True) attaches the whole tool registry
+                    # AND leaves injectToolGuide on, so the gateway appends the
+                    # core-tool guide too. Measured before this was fixed: the
+                    # critic averaged 23.4k prompt tokens a call — larger than
+                    # the main loop's 17.4k — for 10.1% of all input spend, and
+                    # every captured critic sample carried a tool catalogue the
+                    # judging task has no use for.
+                    resp = deps.call_backend(
+                        session=_s, message="",
+                        system_prompt=_system_prompt,
+                        current_path=_cwd, messages=messages,
+                        tools_enabled=False,
+                        model_override=_aux_m or None,
+                        provider_override=_aux_p or None,
+                        task_kind="critic", trajectory_id=_traj)
+                    return (resp or {}).get("reply", "") if isinstance(resp, dict) else ""
+
+                _anchor = (thread_messages[_critic_anchor_idx]
+                           if 0 < _critic_anchor_idx < len(thread_messages) else None)
+
+                # A contracted child is judged against what it owes, not
+                # against a paraphrase of its goal.
+                _crit_contract = ""
+                try:
+                    _crit_c = state.get("_contract")
+                    if _crit_c:
+                        _crit_contract = agent_contract.render(_crit_c)
+                except Exception:
+                    _crit_contract = ""
+
+                def _critic_worker(_msgs=list(_thread_to_send), _anchor=_anchor,
+                                   _fn=_crit_llm_fn, _out=_critic_result,
+                                   _goal=original_input,
+                                   _contract=_crit_contract):
+                    try:
+                        _v, _f = critic.assess_detailed(
+                            _goal, _msgs, _fn, anchor=_anchor,
+                            contract_text=_contract)
+                    except Exception as _exc:      # never raise on a daemon thread
+                        _v, _f = None, f"critic thread error: {_exc}"
+                    _out["verdict"], _out["fail"] = _v, _f
+
+                _critic_launch_idx = len(thread_messages)
+                _critic_thread = threading.Thread(
+                    target=_critic_worker, name="critic", daemon=True)
+                _critic_thread.start()
         except Exception:
             pass
+
+        # ── Final turn: withhold tool schemas from the request ───────────────
+        # `_allowed_tool_names` still drives the system-prompt catalog and the
+        # inbound authorization check below; only what the provider is offered
+        # for THIS request changes. An empty set makes to_openai_tools() emit no
+        # schemas, so no `tools`/`tool_choice` is sent at all — the CLI's
+        # equivalent of the browser kernel's toolChoice='none'.
+        _request_tool_names = set() if _final_turn else _allowed_tool_names
 
         # ── Outbound secret/PII redaction + weak-label capture (capability #2) ──
         # Last stop before context leaves the machine. `_thread_to_send` carries
@@ -8147,6 +9424,7 @@ def run_agent_loop(
                 # without a skill/mode/workflow change behind it is lost cache.
                 "promptDigest": _sys_prompt_digest,
                 "promptChurn": int(state.get("_sys_prompt_churn", 0)),
+                "promptChurnCauses": state.get("_sys_prompt_churn_causes") or [],
                 "promptPreview": system_prompt[:500],
                 "memorySection": memory_section[:500],
             },
@@ -8184,9 +9462,72 @@ def run_agent_loop(
                     system_prompt.encode("utf-8", "replace")).hexdigest(),
             },
         }
+        def _invoke_backend(on_chunk=None) -> dict:
+            """The one place this loop talks to the provider.
+
+            There used to be four copies of this call (streaming, the no-rich
+            fallback, the non-streaming branch, plus the signature-compat
+            retries), which meant every new request field had to be added in
+            four places and was silently missing wherever it was forgotten.
+
+            The ladder below exists for INJECTED backends with an older
+            signature (tests, embedders). Each rung drops only what the rung
+            above it could not accept, and a drop is now reported instead of
+            being silent: the bottom rung loses the message thread and the tool
+            authorization set, which is a materially worse — and still billed —
+            answer.
+            """
+            _base = dict(
+                session=session,
+                message=user_input,
+                system_prompt=system_prompt,
+                current_path=state.get("cwd") or os.getcwd(),
+                history=history_for_backend,
+                lang=lang,
+                interrupt_event=_interrupt,
+                messages=_thread_to_send,
+                allowed_tool_names=_request_tool_names,
+                model_override=_request_model or None,
+                provider_override=_request_provider or None,
+                task_kind=_task_kind,
+                trajectory_id=_run_id,
+                context_capture=_context_capture,
+            )
+            if on_chunk is not None:
+                _base["on_chunk"] = on_chunk
+            _rungs = (
+                ((), ""),
+                (("provider_override", "task_kind", "trajectory_id",
+                  "context_capture"),
+                 "provider/labelling fields"),
+                (("provider_override", "task_kind", "trajectory_id",
+                  "context_capture", "messages", "allowed_tool_names",
+                  "model_override", "interrupt_event", "on_chunk"),
+                 "the message thread and tool authorization"),
+            )
+            _last_exc = None
+            for _drop, _what in _rungs:
+                _kwargs = {k: v for k, v in _base.items() if k not in _drop}
+                try:
+                    if _what:
+                        _diag("backend signature fallback", dropped=_what)
+                        deps.console.print(
+                            f"[yellow]{symbols.WARN} Backend does not accept the full "
+                            f"request; retrying without {_what}.[/yellow]")
+                    return deps.call_backend(**_kwargs)
+                except TypeError as _sig_err:
+                    if not _is_signature_typeerror(_sig_err):
+                        raise
+                    _last_exc = _sig_err
+            raise _last_exc
+
         if events_cb is not None:
-            # Streaming render: use rich.live.Live to render the reply as it arrives
-            # via on_chunk. Falls back to spinner if backend doesn't accept on_chunk.
+            # Every Agent may stream events, but only the foreground (depth 0)
+            # Agent owns the physical terminal.  Background children used to
+            # inherit the parent's Console and each opened a Rich Live here;
+            # Rich permits one Live per Console, so ordinary non-blocking
+            # agent.spawn races crashed the entire CLI with LiveError.
+            _render_stream_live = _owns_local_render
             stream_state = {"reply": "", "command": "", "started": False}
             # Capture model/mode labels once for the spinner text
             # Not "auto": that is a real routing mode, so an unknown model
@@ -8200,8 +9541,28 @@ def run_agent_loop(
             # Detail off hides it: the compact spinner keeps model + mode only.
             _spin_effort = (str(get_runtime_config("reasoning_effort") or "").strip()
                             if get_runtime_config("detail") else "")
-            try:
+            def _on_chunk(field, value):
+                # Check for soft-interrupt during streaming
+                if _interrupt.is_set():
+                    raise InterruptedError("user interrupt during streaming")
+                if field == "reply":
+                    stream_state["reply"] += value
+                    # Event delivery is independent of local terminal
+                    # ownership: silent children must still stream to Helpwo
+                    # and /agents.
+                    events_cb([{"type": "ai_stream", "content": value}])
+                elif field == "command":
+                    stream_state["command"] = value
+                stream_state["started"] = True
+
+            def _do_stream_call():
+                return _invoke_backend(on_chunk=_on_chunk)
+
+            if not _render_stream_live:
+                response = _do_stream_call()
+            else:
                 from rich.live import Live
+                from rich.errors import LiveError
                 from rich.spinner import Spinner
                 from rich.console import Group
                 from rich.text import Text
@@ -8273,74 +9634,6 @@ def run_agent_loop(
                     def __rich__(self):
                         return _render()
 
-                _live_holder = {"live": None, "last": 0.0}
-
-                def _on_chunk(field, value):
-                    # Check for soft-interrupt during streaming
-                    if _interrupt.is_set():
-                        raise InterruptedError("user interrupt during streaming")
-                    if field == "reply":
-                        stream_state["reply"] += value
-                        # Push each chunk to Helpwo UI for live streaming display
-                        if events_cb is not None:
-                            events_cb([{"type": "ai_stream", "content": value}])
-                    elif field == "command":
-                        stream_state["command"] = value
-                    stream_state["started"] = True
-                    # No need to call live.update() — the _LiveWrapper
-                    # re-computes _render() on every auto-refresh tick.
-
-                def _do_stream_call():
-                    try:
-                        return deps.call_backend(
-                            session=session,
-                            message=user_input,
-                            system_prompt=system_prompt,
-                            current_path=state.get("cwd") or os.getcwd(),
-                            history=history_for_backend,
-                            on_chunk=_on_chunk,
-                            lang=lang,
-                            interrupt_event=_interrupt,
-                            messages=_thread_to_send,
-                            allowed_tool_names=_allowed_tool_names,
-                            model_override=_request_model or None,
-                            provider_override=_request_provider or None,
-                            task_kind=_task_kind, trajectory_id=_run_id,
-                            context_capture=_context_capture,
-                        )
-                    except TypeError as _sig_err:
-                        # Compatibility with injected backends that support the
-                        # older model_override argument but not provider_override.
-                        if not _is_signature_typeerror(_sig_err):
-                            raise
-                        try:
-                            return deps.call_backend(
-                                session=session,
-                                message=user_input,
-                                system_prompt=system_prompt,
-                                current_path=state.get("cwd") or os.getcwd(),
-                                history=history_for_backend,
-                                on_chunk=_on_chunk,
-                                lang=lang,
-                                interrupt_event=_interrupt,
-                                messages=_thread_to_send,
-                                allowed_tool_names=_allowed_tool_names,
-                                model_override=_request_model or None,
-                            )
-                        except TypeError as _sig_err2:
-                            if not _is_signature_typeerror(_sig_err2):
-                                raise
-                            return deps.call_backend(
-                                session=session,
-                                message=user_input,
-                                system_prompt=system_prompt,
-                                current_path=state.get("cwd") or os.getcwd(),
-                                history=history_for_backend,
-                                lang=lang,
-                            )
-
-                # (Removed a dead _laintas_event_console fast-path: that flag was
-                # never set by any caller. Always render the stream via Live.)
                 _console_file = getattr(deps.console, "file", None)
                 _transient_factory = getattr(
                     _console_file, "transient_output", None)
@@ -8348,52 +9641,33 @@ def run_agent_loop(
                     _transient_factory()
                     if callable(_transient_factory) else nullcontext())
                 with _transient_ctx:
-                    with Live(_LiveWrapper(), console=deps.console,
-                              refresh_per_second=10.0, auto_refresh=True,
-                              transient=True, redirect_stdout=False,
-                              redirect_stderr=False) as live:
-                        _live_holder["live"] = live
-                        response = _do_stream_call()
-                        try:
-                            live.refresh()
-                        except Exception:
-                            pass
-            except ImportError:
-                # rich.live/spinner is unavailable here (that is why we are in this
-                # handler), so do NOT use deps.console.status() — it needs rich Live
-                # too, and on the shared TeeFile console its default
-                # redirect_stdout=True feedback-loops into a deadlock. A static
-                # print is deadlock-free and works without rich Live.
-                _effort_part = f" {symbols.BULLET} {_spin_effort}" if _spin_effort else ""
-                deps.console.print(f"[#3fb950]thinking… {symbols.BULLET} {_spin_model}{_effort_part} {symbols.BULLET} {_spin_mode}[/#3fb950]")
-                with nullcontext():
+                    live = Live(
+                        _LiveWrapper(), console=deps.console,
+                        refresh_per_second=10.0, auto_refresh=True,
+                        transient=True, redirect_stdout=False,
+                        redirect_stderr=False)
                     try:
-                        response = deps.call_backend(
-                            session=session,
-                            message=user_input,
-                            system_prompt=system_prompt,
-                            current_path=state.get("cwd") or os.getcwd(),
-                            history=history_for_backend,
-                            lang=lang,
-                            interrupt_event=_interrupt,
-                            messages=_thread_to_send,
-                            allowed_tool_names=_allowed_tool_names,
-                            model_override=_request_model or None,
-                            provider_override=_request_provider or None,
-                            task_kind=_task_kind, trajectory_id=_run_id,
-                            context_capture=_context_capture,
-                        )
-                    except TypeError as _sig_err3:
-                        if not _is_signature_typeerror(_sig_err3):
-                            raise
-                        response = deps.call_backend(
-                            session=session,
-                            message=user_input,
-                            system_prompt=system_prompt,
-                            current_path=state.get("cwd") or os.getcwd(),
-                            history=history_for_backend,
-                            lang=lang,
-                        )
+                        live.__enter__()
+                    except LiveError:
+                        # Defensive fallback for any other terminal UI that
+                        # currently owns this Console. Live.start failed before
+                        # the backend request, so falling back cannot duplicate
+                        # a billed model call.
+                        response = _do_stream_call()
+                    else:
+                        try:
+                            response = _do_stream_call()
+                            try:
+                                live.refresh()
+                            except Exception:
+                                pass
+                        finally:
+                            try:
+                                live.__exit__(None, None, None)
+                            except Exception:
+                                # Rendering cleanup must never discard an
+                                # already-received model response.
+                                pass
             # Live painted only a transient tail PREVIEW (cleared on exit), so
             # the full reply still must be printed once below regardless of
             # detail mode. _ui_streamed tracks whether ai_stream chunks were
@@ -8404,33 +9678,7 @@ def run_agent_loop(
         else:
             _reply_already_rendered = False
             _ui_streamed = False
-            try:
-                response = deps.call_backend(
-                    session=session,
-                    message=user_input,
-                    system_prompt=system_prompt,
-                    current_path=state.get("cwd") or os.getcwd(),
-                    history=history_for_backend,
-                    lang=lang,
-                    interrupt_event=_interrupt,
-                    messages=_thread_to_send,
-                    allowed_tool_names=_allowed_tool_names,
-                    model_override=_request_model or None,
-                    provider_override=_request_provider or None,
-                    task_kind=_task_kind, trajectory_id=_run_id,
-                    context_capture=_context_capture,
-                )
-            except TypeError as _sig_err4:
-                if not _is_signature_typeerror(_sig_err4):
-                    raise
-                response = deps.call_backend(
-                    session=session,
-                    message=user_input,
-                    system_prompt=system_prompt,
-                    current_path=state.get("cwd") or os.getcwd(),
-                    history=history_for_backend,
-                    lang=lang,
-                )
+            response = _invoke_backend()
 
         # Store thinking time for the REPL status bar
         _set_last_thinking_time(time.monotonic() - _thinking_t0)
@@ -8963,6 +10211,54 @@ def run_agent_loop(
             # every write ordered. Filled lazily below, once `tool_ctx` exists.
             _ro_parallel = _can_batch_read_only(tool_calls, _interrupt.is_set())
             _ro_batch = None
+            # pre_tool verdicts computed by the batch pre-pass, consumed by the
+            # sequential pass so a user hook is never triggered twice for the
+            # same call.
+            _pre_tool_verdicts: dict[int, bool] = {}
+
+            def _ro_batch_runnable(current_idx: int) -> set:
+                """Indices of this turn's calls that may actually be executed.
+
+                Asks the gates about the REST of the turn before running any of
+                it. Concurrency is not a licence to execute a call the gates are
+                about to refuse: the batch used to run everything up front, so a
+                policy-denied web.fetch had already hit the network by the time
+                the model was told it was blocked, and a pre_tool hook could not
+                block a batched call at all.
+
+                Judging later calls before earlier ones have run is legitimate
+                here and only here: _can_batch_read_only guarantees an
+                all-read-only turn, so no call in it can change the cwd, mode,
+                role or policy that a sibling is judged by.
+                """
+                runnable = {current_idx}   # already cleared its own gates
+                for _j, _tc in enumerate(tool_calls):
+                    if _j == current_idx:
+                        continue
+                    _jcall = _prepare_tool_call(_tc, _j, loop)
+                    if _jcall is None:
+                        continue
+                    if _authorize_tool_call(
+                            _jcall["name"], _jcall["salient"], state,
+                            agent_id=agent_id,
+                            allowed_tool_names=_allowed_tool_names,
+                            is_shell_flavored=_jcall["is_shell_flavored"],
+                            fail_ledger=_fail_ledger,
+                            fail_ledger_err=_fail_ledger_err,
+                            repeat_block_limit=_repeat_block_limit,
+                    ) is not None:
+                        continue
+                    _jallowed, _ = hooks_mod.trigger("pre_tool", {
+                        "tool": _jcall["name"],
+                        "args": _jcall["arguments"],
+                        "agent_id": agent_id, "depth": depth,
+                        "call_id": _jcall["call_id"],
+                        "loop": loop + 1,
+                    })
+                    _pre_tool_verdicts[_j] = bool(_jallowed)
+                    if _jallowed:
+                        runnable.add(_j)
+                return runnable
 
             for idx, tc in enumerate(tool_calls):
                 # ── Soft-interrupt check before each tool call ──
@@ -8970,27 +10266,15 @@ def run_agent_loop(
                     deps.console.print(f"\n[yellow]Interrupted — skipping remaining {len(tool_calls) - idx} tool call(s).[/yellow]")
                     break
 
-                name = tc.get("name", "")
-                arguments = tc.get("arguments", {}) or {}
-                if not name:
+                _call = _prepare_tool_call(tc, idx, loop)
+                if _call is None:
                     continue
-                if not isinstance(arguments, dict):
-                    arguments = {"value": arguments}
-
-                # User/model-facing display name: show the unified canonical
-                # name the model actually used (fs.read -> read) while dispatch
-                # keeps the internal name. Only when the unified catalog is on.
-                display_name = name
-                if get_runtime_config("use_unified_catalog"):
-                    try:
-                        from agent_tools import load as _load_catalog
-                        display_name = _load_catalog().canonical(name, "laintas_cli") or name
-                    except Exception:
-                        display_name = name
-
-                call_id = f"call_{loop+1:02d}_{idx+1:02d}"
+                name = _call["name"]
+                arguments = _call["arguments"]
+                display_name = _call["display_name"]
+                call_id = _call["call_id"]
+                salient = _call["salient"]
                 _tool_t0 = time.monotonic()
-                salient = _salient_arg(name, arguments)
                 # In-flight marker: lets a supervisor tell "busy inside one long
                 # tool call" apart from "stalled". Without it, a legitimate
                 # 5-minute test run and a wedged agent look identical from
@@ -9003,7 +10287,7 @@ def run_agent_loop(
                         name, arguments, state.get("cwd") or os.getcwd())
                     if _trace_recording else {}
                 )
-                is_shell_flavored = name in ("shell.exec", "terminal.send", "terminal.exec")
+                is_shell_flavored = _call["is_shell_flavored"]
                 _tool_definition = tools_mod.get_registry().get(name)
                 event_log.append(
                     "tool_call",
@@ -9030,234 +10314,79 @@ def run_agent_loop(
                 # goal-less loop retry `fs.delete` ~10× in the incident log.
                 # Scope: non-shell registry tools only (shell commands are
                 # legitimately re-run after fixes) and never control tools.
+                # ── Repeat-FAILURE ledger: advisory half ──────────────────
+                # The blocking half is a gate and lives in
+                # _authorize_tool_call; this branch only warns, so it stays
+                # with the code that does the reporting.
                 _ledger_fp = _call_fingerprint(name, salient)
-                _ledger_eligible = (
-                    not is_shell_flavored
-                    and name not in _LEDGER_EXEMPT_TOOLS
-                )
-                if (_ledger_eligible
+                if (not is_shell_flavored
+                        and name not in _LEDGER_EXEMPT_TOOLS
                         and _fail_ledger.get(_ledger_fp, 0) >= _repeat_block_limit
-                        and get_runtime_config("repetition_policy") == "warn"):
-                    if _ledger_fp not in _warned_repeat_failures:
-                        _prev_n = _fail_ledger[_ledger_fp]
-                        _warning = (
-                            f"Repeated failing call: `{name}` on `{salient[:100]}` "
-                            f"has already failed {_prev_n} times. Monitoring remains "
-                            f"advisory; change strategy instead of repeating it."
-                        )
-                        _append_short_memory(state, f"\n  {symbols.WARN} {_warning}")
-                        if events_cb is not None:
-                            deps.console.print(f"[yellow]{symbols.WARN} {_warning}[/yellow]")
-                        _warned_repeat_failures.add(_ledger_fp)
-                elif (_ledger_eligible
-                        and _fail_ledger.get(_ledger_fp, 0) >= _repeat_block_limit):
-                    _prev_n = _fail_ledger[_ledger_fp]
-                    _last_err = _fail_ledger_err.get(_ledger_fp, "(no error text)")
-                    result = {
-                        "ok": False,
-                        "error": (
-                            f"BLOCKED: you have already called `{name}` on "
-                            f"`{salient[:100]}` {_prev_n} times and it failed every "
-                            f"time with the same deterministic error:\n{_last_err[:300]}\n"
-                            f"Re-running it will fail identically. Stop repeating this "
-                            f"call — either fix the underlying cause with a DIFFERENT "
-                            f"action, or if this sub-goal is impossible, move on / call "
-                            f"task_complete and report it."
-                        ),
-                        "tool": name, "returncode": -1, "_repeat_blocked": True,
-                    }
-                    formatted_outputs.append(
-                        _format_tool_result_for_loop(
-                            name, result,
-                            int(get_runtime_config("output_truncate") or 3000)))
-                    per_call_rows.append({
-                        "command": salient, "output": result["error"],
-                        "returncode": -1, "tool": name, "call_id": call_id,
-                        "_repeat_blocked": True,
-                    })
-                    _repeat_blocked_this_turn = True
+                        and get_runtime_config("repetition_policy") == "warn"
+                        and _ledger_fp not in _warned_repeat_failures):
+                    _warning = (
+                        f"Repeated failing call: `{name}` on `{salient[:100]}` "
+                        f"has already failed {_fail_ledger[_ledger_fp]} times. "
+                        f"Monitoring remains advisory; change strategy instead "
+                        f"of repeating it."
+                    )
+                    _append_short_memory(state, f"\n  {symbols.WARN} {_warning}")
                     if events_cb is not None:
-                        deps.console.print(
-                            f"[red]{symbols.WARN} Blocked repeated failing call `{name} {salient[:60]}` "
-                            f"(failed {_prev_n}× already).[/red]")
+                        deps.console.print(f"[yellow]{symbols.WARN} {_warning}[/yellow]")
+                    _warned_repeat_failures.add(_ledger_fp)
+
+                # ── Authorization gates ───────────────────────────────────
+                # One call, one verdict — the same question the read-only
+                # batch dispatcher asks before it runs anything.
+                _block = _authorize_tool_call(
+                    name, salient, state,
+                    agent_id=agent_id,
+                    allowed_tool_names=_allowed_tool_names,
+                    is_shell_flavored=is_shell_flavored,
+                    fail_ledger=_fail_ledger,
+                    fail_ledger_err=_fail_ledger_err,
+                    repeat_block_limit=_repeat_block_limit,
+                )
+                if _block is not None:
+                    _record_capability_gap(state, name, _block)
+                    # A child refused a capability has two honest moves: work
+                    # around it, or ask the caller who can grant it. Only one
+                    # of those was ever suggested, so children worked around
+                    # walls for the rest of their budget and reported them in
+                    # the post-mortem. Name the other move, once per refusal
+                    # kind, and only to an agent that actually has a caller.
+                    _block = _suggest_escalation(_block, state, depth,
+                                                 _runtime_info)
+                    result = _block
+                    formatted_outputs.append(
+                        _format_tool_result_for_loop(
+                            name, result,
+                            int(get_runtime_config("output_truncate") or 3000)))
+                    _row = {
+                        "command": salient, "output": result.get("error", ""),
+                        "returncode": -1, "tool": name, "call_id": call_id,
+                    }
+                    if result.get("_repeat_blocked"):
+                        _row["_repeat_blocked"] = True
+                        _repeat_blocked_this_turn = True
+                        if events_cb is not None:
+                            deps.console.print(
+                                f"[red]{symbols.WARN} Blocked repeated failing call "
+                                f"`{name} {salient[:60]}` "
+                                f"(failed {result.get('_repeat_count')}× already).[/red]")
+                    per_call_rows.append(_row)
                     continue
 
-                # Prompt Lab workers must never gain side effects in the real
-                # workspace. Diagnosis workers get read-only inspection plus
-                # the draft recorder.
-                _prompt_lab_worker = bool(state.get("_prompt_lab_branch"))
-                _evolution_lab_worker = bool(state.get("_evolution_lab_branch"))
-                _prompt_lab_allowed = {
-                    "fs.read", "fs.ls", "fs.grep", "fs.glob",
-                    "skill.list", "skill.reference",
-                    "prompt.lab_draft", "task.complete", "time.now",
-                }
-                if _prompt_lab_worker and name not in _prompt_lab_allowed:
-                    result = {
-                        "ok": False,
-                        "error": (
-                            f"BLOCKED: tool '{name}' is disabled in the "
-                            "Prompt Lab no-side-effects test sandbox."
-                        ),
-                        "tool": name,
-                        "returncode": -1,
-                    }
-                    formatted_outputs.append(
-                        _format_tool_result_for_loop(
-                            name, result,
-                            int(get_runtime_config("output_truncate") or 3000)))
-                    per_call_rows.append({
-                        "command": salient, "output": result["error"],
-                        "returncode": -1, "tool": name, "call_id": call_id,
-                    })
-                    continue
-                _evolution_lab_allowed = {
-                    "fs.read", "fs.ls", "fs.grep", "fs.glob",
-                    "skill.list", "skill.reference", "evolve.lab_draft",
-                    "task.complete", "time.now",
-                }
-                if _evolution_lab_worker and name not in _evolution_lab_allowed:
-                    result = {
-                        "ok": False,
-                        "error": (
-                            f"BLOCKED: tool '{name}' is disabled while an "
-                            "Evolution Lab worker is designing a candidate."
-                        ),
-                        "tool": name, "returncode": -1,
-                    }
-                    formatted_outputs.append(
-                        _format_tool_result_for_loop(
-                            name, result,
-                            int(get_runtime_config("output_truncate") or 3000)))
-                    per_call_rows.append({
-                        "command": salient, "output": result["error"],
-                        "returncode": -1, "tool": name, "call_id": call_id,
-                    })
-                    continue
-
-                # ── Role / Workflow tool filtering ──
-                _role_name = state.get("_role_name")
-                if name not in _allowed_tool_names:
-                    result = {
-                        "ok": False,
-                        "error": (
-                            f"BLOCKED: tool '{name}' is not available to agent "
-                            f"'{agent_id or 'current'}'."
-                        ),
-                        "tool": name,
-                        "returncode": -1,
-                    }
-                    formatted_outputs.append(
-                        _format_tool_result_for_loop(
-                            name, result,
-                            int(get_runtime_config("output_truncate") or 3000)))
-                    per_call_rows.append({
-                        "command": salient, "output": result["error"],
-                        "returncode": -1, "tool": name, "call_id": call_id,
-                    })
-                    continue
-                if (not _prompt_lab_worker and not _evolution_lab_worker
-                        and not plan_mode.is_tool_allowed(name)):
-                    result = {
-                        "ok": False,
-                        "error": (
-                            f"BLOCKED: tool '{name}' is not allowed in Plan Mode. "
-                            "Use read-only exploration or plan.update, then obtain "
-                            "user approval before implementation."
-                        ),
-                        "tool": name, "returncode": -1,
-                    }
-                    formatted_outputs.append(
-                        _format_tool_result_for_loop(
-                            name, result,
-                            int(get_runtime_config("output_truncate") or 3000)))
-                    per_call_rows.append({
-                        "command": salient, "output": result.get("error", ""),
-                        "returncode": -1, "tool": name, "call_id": call_id,
-                    })
-                    continue
-                if (not _prompt_lab_worker and not _evolution_lab_worker
-                        and not plan_mode.is_plan_mode()
-                        and not mode_manager.is_tool_allowed(name)):
-                    _active_mode = mode_manager.get_active_mode()
-                    _active_mode_name = _active_mode["name"]
-                    _blocked_hint = ""
-                    if _active_mode_name == "study":
-                        _blocked_hint = (
-                            " STUDY mode is read-only on purpose: the user makes "
-                            "every change. Do not retry through another tool — "
-                            "teach the step instead and wait for them to do it."
-                        )
-                    elif mode_manager.is_read_only_mode(_active_mode):
-                        _blocked_hint = (
-                            " This mode is read-only. Do not retry through "
-                            "another tool; report what you found instead."
-                        )
-                    result = {
-                        "ok": False,
-                        "error": (
-                            f"BLOCKED: tool '{name}' is not allowed in "
-                            f"{_active_mode_name.upper()} mode.{_blocked_hint}"
-                        ),
-                        "tool": name, "returncode": -1,
-                    }
-                    formatted_outputs.append(
-                        _format_tool_result_for_loop(
-                            name, result,
-                            int(get_runtime_config("output_truncate") or 3000)))
-                    per_call_rows.append({
-                        "command": salient, "output": result.get("error", ""),
-                        "returncode": -1, "tool": name, "call_id": call_id,
-                    })
-                    continue
-                if not agent_roles.is_tool_allowed_for_role(name, _role_name):
-                    result = {"ok": False,
-                              "error": f"BLOCKED: tool '{name}' not allowed for role '{_role_name}'",
-                              "tool": name, "returncode": -1}
-                    formatted_outputs.append(
-                        _format_tool_result_for_loop(name, result, int(get_runtime_config("output_truncate") or 3000)))
-                    per_call_rows.append({
-                        "command": salient, "output": result.get("error", ""),
-                        "returncode": -1, "tool": name, "call_id": call_id,
-                    })
-                    continue
-                if (not _prompt_lab_worker and not _evolution_lab_worker
-                        and not workflow_engine.is_tool_allowed_in_workflow(name)):
-                    result = {"ok": False,
-                              "error": f"BLOCKED: tool '{name}' not allowed in current workflow phase",
-                              "tool": name, "returncode": -1}
-                    formatted_outputs.append(
-                        _format_tool_result_for_loop(name, result, int(get_runtime_config("output_truncate") or 3000)))
-                    per_call_rows.append({
-                        "command": salient, "output": result.get("error", ""),
-                        "returncode": -1, "tool": name, "call_id": call_id,
-                    })
-                    continue
-                _tool_scope = state.get("_tool_allowlist")
-                if not _tool_in_scope(name, _tool_scope):
-                    result = {
-                        "ok": False,
-                        "error": (
-                            f"BLOCKED: tool '{name}' is outside this workflow node's tool "
-                            f"scope ({', '.join(_tool_scope)}). The scope is declared in the "
-                            f".hwg node policy and cannot be widened from here. Do the task "
-                            f"with the tools listed, or report why it cannot be done."
-                        ),
-                        "tool": name, "returncode": -1,
-                    }
-                    formatted_outputs.append(
-                        _format_tool_result_for_loop(name, result, int(get_runtime_config("output_truncate") or 3000)))
-                    per_call_rows.append({
-                        "command": salient, "output": result.get("error", ""),
-                        "returncode": -1, "tool": name, "call_id": call_id,
-                    })
-                    continue
 
                 # ── pre_tool hook (universal, can block) ──
-                pre_tool_allowed, _ = hooks_mod.trigger("pre_tool", {
-                    "tool": name, "args": arguments, "agent_id": agent_id,
-                    "depth": depth, "call_id": call_id, "loop": loop + 1,
-                })
+                if idx in _pre_tool_verdicts:
+                    # Already asked during the read-only batch pre-pass.
+                    pre_tool_allowed = _pre_tool_verdicts.pop(idx)
+                else:
+                    pre_tool_allowed, _ = hooks_mod.trigger("pre_tool", {
+                        "tool": name, "args": arguments, "agent_id": agent_id,
+                        "depth": depth, "call_id": call_id, "loop": loop + 1,
+                    })
                 if not pre_tool_allowed:
                     result = {"ok": False, "error": "blocked by pre_tool hook",
                               "tool": name, "returncode": -1}
@@ -9403,8 +10532,15 @@ def run_agent_loop(
                             else:
                                 if _ro_batch is None and _ro_parallel:
                                     _ro_batch = _dispatch_read_only_batch(
-                                        tool_calls, tool_ctx)
-                                if _ro_batch is not None:
+                                        tool_calls, tool_ctx,
+                                        runnable=_ro_batch_runnable(idx),
+                                        interrupt=_interrupt)
+                                # A None entry means the batch did not run this
+                                # call (gate refusal or interrupt), so it falls
+                                # back to the sequential invoke — which its own
+                                # gates, reached later in this loop, may still
+                                # refuse.
+                                if _ro_batch is not None and _ro_batch[idx] is not None:
                                     result = _ro_batch[idx]
                                 else:
                                     result = tools_mod.get_registry().invoke(
@@ -9526,8 +10662,33 @@ def run_agent_loop(
                         name, arguments, result, formatted,
                         session_id=_session_id, run_id=_run_id, loop=loop + 1)
 
+                # ── Paged read bookkeeping (part 1 of 2) ──
+                # The pager owns the cursor but cannot see tool_call_ids. The
+                # id that matters is NOT this dispatch id: the thread is
+                # assembled below with its own ids, and keying the map here was
+                # the bug that made eviction silently never fire. Carry the ref
+                # on the row and key it where the thread id is minted.
+                _page_ref = (result.pop("_read_ref", None)
+                             if isinstance(result, dict) else None)
+                # Our own writes move line numbers, so a file we edited stops
+                # blocking reads of it and is announced as stale (Helpwo's
+                # [STALE FILES] reminder, which we had no equivalent of).
+                if (isinstance(result, dict) and result.get("ok")
+                        and name in _FILE_MUTATING_TOOLS):
+                    try:
+                        import file_pager as _fp
+                        _target = str((arguments or {}).get("path")
+                                      or result.get("path") or "")
+                        if _target:
+                            _fp.mark_edited(state, os.path.abspath(
+                                os.path.join(state.get("cwd") or os.getcwd(),
+                                             _target)))
+                    except Exception:
+                        pass
+
                 # ── Per-call terminalHistory row ──
                 per_call_rows.append({
+                    "page_ref": _page_ref,
                     "command": salient,
                     "output": formatted,
                     "returncode": _rc,
@@ -9976,6 +11137,17 @@ def run_agent_loop(
                 _row = _rows_by_id.get(_row_cid)
                 _thread_call_seq += 1
                 _cid = f"call_{state['_session_id'][:8]}_{_thread_call_seq:06d}"
+                # ── Paged read bookkeeping (part 2 of 2) ──
+                # Key the page map by the id the THREAD will carry, which is
+                # the only id _project_paged_reads can match on. Bounded so a
+                # long session cannot grow it without limit.
+                if _row and _row.get("page_ref"):
+                    _pager_msgs = state.setdefault("_pager_msgs", {})
+                    if isinstance(_pager_msgs, dict):
+                        _pager_msgs[_cid] = _row["page_ref"]
+                        if len(_pager_msgs) > 512:
+                            for _stale in list(_pager_msgs)[:len(_pager_msgs) - 512]:
+                                _pager_msgs.pop(_stale, None)
                 _out = _row.get("output") if _row else "[not executed: interrupted before dispatch]"
                 executed.append({
                     "id": _cid,
@@ -10202,7 +11374,27 @@ def run_agent_loop(
             if events_cb is not None and pending_events:
                 events_cb(pending_events)
                 pending_events.clear()
-            if _completion_source in ("task_complete", "provider_done", "plan_submitted"):
+            if _final_turn and _completion_source == "provider_stop":
+                # Prose-only ending on the forced wrap-up turn: the model was
+                # TOLD to stop and had no tools, so its summary is a report, not
+                # evidence the task finished. Ending as a plain completion here
+                # would clear pending_continuation and make /continue refuse to
+                # resume a run that merely ran out of budget. An explicit
+                # task.complete / plan.submit / provider done flag is still a
+                # real completion and keeps its reason.
+                _exit_reason = TRANSITION_MAX_LOOPS_WRAPUP
+                state["_max_loops_exhausted"] = True
+                state["_exhaustion_loop_count"] = max_loops
+                _wrapup_msg = (
+                    f"Turn limit reached ({max_loops}/{max_loops}) — the summary "
+                    f"above is a wrap-up, not necessarily a finished task. "
+                    f"Use /continue to resume, or /max then /continue to lift "
+                    f"the limit."
+                )
+                if events_cb is not None:
+                    deps.console.print(f"[yellow]{symbols.WARN} {_wrapup_msg}[/yellow]")
+                _append_short_memory(state, f"\n  {symbols.WARN} {_wrapup_msg}")
+            elif _completion_source in ("task_complete", "provider_done", "plan_submitted"):
                 _exit_reason = TRANSITION_COMPLETED
             elif _completion_source == "provider_stop":
                 _exit_reason = TRANSITION_END_TURN

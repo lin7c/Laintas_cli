@@ -61,6 +61,10 @@ _READ_ONLY_TOOLS = [
     "task.list", "task.get",
     "skill.list", "skill.reference",
     "agent.spawn", "agent.tell", "agent.list", "agent.wait", "agent.inbox",
+    # Asking your caller and answering your children are read-only with
+    # respect to the workspace, and a read-only mode is exactly where an agent
+    # is most likely to need to ask for something it was not given.
+    "agent.ask_parent", "agent.answer",
     "task.complete",
 ]
 
