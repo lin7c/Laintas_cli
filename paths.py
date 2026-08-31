@@ -16,6 +16,7 @@ Layout:
     ├── hooks.py                         # Python function hooks
     ├── mcp.json                         # MCP server configurations
     ├── tasks.json                       # Structured task list
+    ├── messages_read.json               # Read receipts for the L> message list
     ├── memory/                          # Cross-session persistent memory
     │   ├── MEMORY.md                    # Memory index
     │   └── *.md                         # Individual memory files
@@ -141,6 +142,7 @@ BACKENDS_FILE     = LAINTAS_HOME / "backends.json"
 PPOS_POLICY_FILE  = LAINTAS_HOME / "ppos_policy.json"
 TRUST_FILE        = LAINTAS_HOME / "trust.json"
 TASKS_FILE        = LAINTAS_HOME / "tasks.json"
+MESSAGES_READ_FILE = LAINTAS_HOME / "messages_read.json"
 INTERACTIVE_COMMANDS_FILE = LAINTAS_HOME / "interactive_commands.json"
 
 # Subdirectories
@@ -284,6 +286,7 @@ def ensure_home() -> None:
     for private_file in (
         CONFIG_FILE, SESSION_FILE, POLICY_FILE, PPOS_POLICY_FILE, HOOKS_FILE, PYTHON_HOOKS_FILE,
         MCP_FILE, BACKENDS_FILE, TRUST_FILE, INTERACTIVE_COMMANDS_FILE,
+        MESSAGES_READ_FILE,
     ):
         ensure_private_file(private_file)
 

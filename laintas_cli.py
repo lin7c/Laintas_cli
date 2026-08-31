@@ -14,6 +14,7 @@ import asyncio
 import copy
 import io
 import symbols
+import textwrap
 import os
 import re
 import sys
@@ -207,6 +208,8 @@ from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.layout.controls import BufferControl
 from prompt_toolkit.lexers import Lexer
 from prompt_toolkit.filters import Condition
+from prompt_toolkit.mouse_events import MouseEvent, MouseEventType
+from prompt_toolkit.application.current import get_app
 
 # ── Central UI theme ──────────────────────────────────────────────────
 # Minimal palette: one accent, muted secondaries, semantic status colors.
@@ -1180,6 +1183,7 @@ from agent_loop import (
     set_trigger_wake_callback,
     save_session_snapshot,
     save_resume_state, load_resume_state, save_resume_checkpoint, list_resume_states,
+    latest_resume_summary,
     delete_resume_state, save_fork_state, _ensure_session_id,
     normalize_fork_lineage,
     thread_agent, get_thread_agent_id, agent_ancestry,
@@ -1211,6 +1215,7 @@ import mode_manager              # declarative user-selectable agent modes
 import auto_pilot                # heuristic task classification + hint injection
 import detail_trace              # /detail trace conversation/tool browser
 import resource_ui               # unified responsive resource browsers/managers
+import startup_mail              # session messages behind the L> mark
 
 # MCP client: lazy import (saves ~1.8s on startup)
 _mcp_mod = None
@@ -2950,6 +2955,29 @@ class CommandSpec:
 COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec("/help", "Show command help", "Basics", "/help [command]"),
     CommandSpec("/cwd", "Show the working directory", "Basics"),
+    CommandSpec(
+        "/messages", "Read the notices behind the L> mark", "Basics",
+        "/messages [list|read <n>|seen|dismiss <n>|clear]",
+        aliases=("/msg",),
+        subcommands=("list", "read", "seen", "dismiss", "clear"),
+        completion_descriptions=(
+            ("list", "Print every message without marking any read"),
+            ("read", "Print one message in full and mark it read"),
+            ("seen", "Mark every message read"),
+            ("dismiss", "Remove one message"),
+            ("clear", "Remove every message"),
+        ),
+        help_text=(
+            "Startup advisories - usage tips, the training-data opt-in, an "
+            "available update, a resumable session, extension load failures - "
+            "are collected behind the L> mark on the prompt instead of being "
+            "printed above it. With no argument this opens the reader, the "
+            "same one Alt+0 reaches, where arrows move, Enter reads, d "
+            "dismisses and c clears. The subcommands do the same things "
+            "without a full-screen terminal, which is what a sub-terminal, a "
+            "piped session or --execute has. <n> is the position shown by "
+            "/messages list; a message key works too."
+        )),
     CommandSpec("/scan", "List user-facing PATH commands", "Basics"),
     CommandSpec(
         "/canvas", "Whiteboards: open a canvas, draw on it, list boards", "Basics",
@@ -3583,6 +3611,10 @@ def _build_prompt_style() -> Style:
         "mono": ("", "", "", "", "", "", "", "", "reverse"),
     }
     path, accent, success, warning, muted, subtle, agent, menu, selected = palettes.get(mode, palettes["dark"])
+    # The logo's red has no other job in the chrome, so it is not part of the
+    # shared palette tuple. Mono deliberately gets nothing: that theme is
+    # colourless by contract and bold alone still reads.
+    logo_red = {"dark": "#f85149", "light": "#cf222e", "mono": ""}.get(mode, "#f85149")
     menu_bg = f"bg:{menu}" if menu.startswith("#") else menu
     selected_bg = f"bg:{selected}" if selected.startswith("#") else selected
     return Style.from_dict({
@@ -3612,6 +3644,10 @@ def _build_prompt_style() -> Style:
         "stbar-dot-act": f"{success} bold",
         "stbar-dot-plan": f"{warning} bold",
         # rprompt (right side of prompt line — no background)
+        # The L> mark, same two colours as the banner logo.
+        "rprompt-logo-l": f"{success} bold",
+        "rprompt-logo-gt": f"{logo_red} bold",
+        "rprompt-logo-count": f"{accent} bold",
         "rprompt-mode-act": f"{success} bold",
         "rprompt-mode-plan": f"{warning} bold",
         "rprompt-sep": subtle,
@@ -3841,17 +3877,27 @@ def _refresh_slash_completion(buffer: Buffer) -> None:
 
 
 # ── Right-prompt slot selection (Alt+1..9) ────────────────────────────
-# The right prompt is a row of slots - agent, mode, model, effort,
-# terminal. Alt+N selects the Nth slot that survived config, breakpoints and
-# final path-width fitting. While selected, up/= and down/- preview values,
-# Alt+Left/Right rearrange visible slots, Enter commits, Esc cancels, and
-# ordinary typing cancels before landing in the input buffer.
+# The right prompt is a row of slots - the L> messages mark, then agent,
+# mode, model, effort, terminal. Alt+N selects the Nth SETTING slot that
+# survived config, breakpoints and final path-width fitting. While selected,
+# up/= and down/- preview values, Alt+Left/Right rearrange visible slots,
+# Enter commits, Esc cancels, and ordinary typing cancels before landing in
+# the input buffer.
 
-_RPROMPT_SLOT_IDS = ("agent", "mode", "model", "effort", "terminal")
+_RPROMPT_SLOT_IDS = ("messages", "agent", "mode", "model", "effort", "terminal")
+#: Slots that are settings you can select and change. The messages mark is an
+#: indicator, not a setting: it is skipped by Alt+N (so Alt+1 keeps meaning
+#: the agent slot, as it always has) and by the Alt+Left/Right reordering,
+#: and it is pinned leftmost. Clicking it, or Alt+0, opens the messages.
+_RPROMPT_SETTING_SLOT_IDS = ("agent", "mode", "model", "effort", "terminal")
+#: Pinned to the head of every display order — it is the logo, not a column
+#: the layout may shuffle.
+_RPROMPT_PINNED_FIRST = "messages"
 # Defaults mirror agent_loop's _DEFAULT_CONFIG entries byte for byte; they
 # exist so a corrupt/unknown config value falls back to the legacy layout.
-_RPROMPT_SLOTS_DEFAULT_ON = ("agent", "mode", "model", "effort", "terminal")
-_RPROMPT_SLOTS_DEFAULT_OFF = ("agent", "mode", "model", "terminal")
+_RPROMPT_SLOTS_DEFAULT_ON = ("messages", "agent", "mode", "model", "effort",
+                             "terminal")
+_RPROMPT_SLOTS_DEFAULT_OFF = ("messages", "agent", "mode", "model", "terminal")
 
 #: Selected slot id, or "" when no slot selection is active.
 _rprompt_modal_slot = ""
@@ -3866,6 +3912,21 @@ _rprompt_model_fetch_error = ""
 _rprompt_model_fetch_lock = threading.Lock()
 
 _rprompt_modal_active = Condition(lambda: bool(_rprompt_modal_slot))
+
+#: Text carried into the next prompt. Alt+0 leaves the prompt to print the
+#: message list; the line the user had already typed is parked here and
+#: restored underneath the re-opened prompt, so reading never costs a
+#: half-written message.
+_pending_prompt_default = ""
+
+#: Set once the REPL prompt has been handed the terminal. Deferred startup
+#: work waits on this so its CPU-bound parsing cannot steal GIL slices from
+#: the first paint — the whole point of deferring it.
+_first_prompt_started = threading.Event()
+
+#: Private pt_prompt result meaning "the user pressed Alt+0". Not a command,
+#: not something the REPL ever sees — pt_prompt consumes it and re-prompts.
+_MAILBOX_SENTINEL = "\x00laintas-messages\x00"
 
 
 def _rprompt_queue_notice(text: str) -> None:
@@ -3904,7 +3965,12 @@ def _rprompt_configured_slots(detail: bool) -> tuple:
 
 
 def _rprompt_effective_order() -> list:
-    """Display order: rprompt_slot_order, canonical order as the base."""
+    """Display order: rprompt_slot_order, canonical order as the base.
+
+    The messages mark is forced to the head whatever the saved order says: a
+    logo that moves around the row is not a logo, and Alt+Left/Right cannot
+    reach it anyway.
+    """
     try:
         order = list(_rprompt_parse_slot_list(
             get_runtime_config("rprompt_slot_order")))
@@ -3913,6 +3979,9 @@ def _rprompt_effective_order() -> list:
     for slot in _RPROMPT_SLOT_IDS:
         if slot not in order:
             order.append(slot)
+    if _RPROMPT_PINNED_FIRST in order:
+        order.remove(_RPROMPT_PINNED_FIRST)
+    order.insert(0, _RPROMPT_PINNED_FIRST)
     return order
 
 
@@ -3925,6 +3994,10 @@ def _rprompt_display_order() -> list:
 
 def _rprompt_slot_fits(slot_id: str, width: int, multi_agent: bool) -> bool:
     """Legacy width breakpoint for one slot."""
+    if slot_id == "messages":
+        # Two to four columns, and the leftmost slot survives trimming
+        # longest, so there is no width at which hiding it buys anything.
+        return True
     if slot_id == "mode":
         return True
     if slot_id == "agent":
@@ -3973,7 +4046,48 @@ def _rprompt_mode_choices() -> list[str]:
     return ["plan", *names]
 
 
+def _rprompt_agent_choices() -> list[str]:
+    """Every registered agent id, in creation order — primary first."""
+    try:
+        agents = get_all_agents()
+    except Exception:
+        return []
+    ordered = [a for a in agents if getattr(a, "role", "") == "primary"]
+    ordered += [a for a in agents if getattr(a, "role", "") != "primary"]
+    ids = []
+    for agent in ordered:
+        agent_id = str(getattr(agent, "id", "") or "")
+        if agent_id and agent_id not in ids:
+            ids.append(agent_id)
+    return ids
+
+
+def _rprompt_agent_label(agent_id: str) -> str:
+    """Display name for an agent id, falling back to the id itself."""
+    try:
+        agent = get_agent(agent_id)
+    except Exception:
+        agent = None
+    if agent is None:
+        return str(agent_id or "")
+    return str(getattr(agent, "name", "") or agent_id)
+
+
 def _rprompt_current_value(slot_id: str):
+    if slot_id == "messages":
+        # Land on the first thing not yet read — that is what the count on
+        # the mark is pointing at.
+        unread = startup_mail.unread()
+        if unread:
+            return unread[0].key
+        items = startup_mail.items()
+        return items[0].key if items else ""
+    if slot_id == "agent":
+        try:
+            current = get_current_agent()
+        except Exception:
+            current = None
+        return str(getattr(current, "id", "") or "")
     if slot_id == "mode":
         return _rprompt_current_mode_choice()
     if slot_id == "model":
@@ -3989,6 +4103,9 @@ def _rprompt_select_slot(slot_id: str, app=None) -> None:
     global _rprompt_modal_slot, _rprompt_modal_value
     global _rprompt_modal_order, _rprompt_modal_original_order
     if slot_id not in _RPROMPT_SLOT_IDS:
+        return
+    if slot_id == "messages" and not startup_mail.count():
+        _rprompt_queue_notice("No messages.")
         return
     if not _rprompt_slot_currently_visible(slot_id):
         _rprompt_queue_notice(
@@ -4007,8 +4124,11 @@ def _rprompt_select_slot(slot_id: str, app=None) -> None:
 
 
 def _rprompt_select_index(index: int, app=None) -> None:
-    """Select the Nth slot the user can actually see after final fitting."""
-    slots = _rprompt_final_visible_slot_ids()
+    """Select the Nth SETTING slot the user can see after final fitting.
+
+    The messages mark is skipped so Alt+1 keeps meaning what it always meant.
+    """
+    slots = _rprompt_final_visible_slot_ids(settings_only=True)
     if index < 0 or index >= len(slots):
         _rprompt_queue_notice(
             f"Status slot {index + 1} is not visible in the current layout.")
@@ -4029,12 +4149,17 @@ def _rprompt_cycle_value(delta: int, app=None) -> None:
     slot = _rprompt_modal_slot
     if not slot:
         return
-    if slot in ("agent", "terminal"):
-        # This CLI has exactly one foreground agent per terminal; switching
-        # the conversation target is the agents rail's job, not a cycle.
+    if slot == "terminal":
+        # A terminal lease is deployment, not display state: moving it is
+        # /station's job and has to be able to fail loudly.
         _rprompt_queue_notice(
-            "Agent switching lives in the agents rail (/agents), "
-            "not the slot cycle.")
+            "Terminal ownership is changed with /station, not the slot cycle.")
+        return
+    if slot == "messages":
+        _rprompt_cycle_message(delta)
+        return
+    if slot == "agent":
+        _rprompt_cycle_agent(delta)
         return
     if slot == "mode":
         _rprompt_cycle_mode(delta)
@@ -4042,6 +4167,44 @@ def _rprompt_cycle_value(delta: int, app=None) -> None:
         _rprompt_cycle_model(delta, app)
     elif slot == "effort":
         _rprompt_cycle_effort(delta)
+
+
+def _rprompt_cycle_message(delta: int) -> None:
+    """Step the draft through the message list.
+
+    The draft is a message key, previewed in the status bar rather than in the
+    mark itself — a two-column logo is no place to render a headline, and the
+    mark must not change width while it is being skimmed.
+    """
+    global _rprompt_modal_value
+    keys = [item.key for item in startup_mail.items()]
+    if not keys:
+        return
+    current = str(_rprompt_modal_value or "")
+    if current not in keys:
+        _rprompt_modal_value = keys[0 if delta > 0 else -1]
+        return
+    _rprompt_modal_value = keys[(keys.index(current) + delta) % len(keys)]
+
+
+def _rprompt_cycle_agent(delta: int) -> None:
+    """Step the draft through the registered agents.
+
+    Only the draft moves here. The switch itself happens on Enter, through
+    the same ``/agent`` path the typed command uses, because switching has to
+    rebind the REPL's state/history objects and a keybinding handler is not
+    where that can safely happen.
+    """
+    global _rprompt_modal_value
+    ids = _rprompt_agent_choices()
+    if len(ids) < 2:
+        _rprompt_queue_notice(
+            "Only one agent is registered - /hire <name> adds another.")
+        return
+    current = str(_rprompt_modal_value or _rprompt_current_value("agent"))
+    if current not in ids:
+        ids.insert(0, current)
+    _rprompt_modal_value = ids[(ids.index(current) + delta) % len(ids)]
 
 
 def _rprompt_cycle_mode(delta: int) -> None:
@@ -4166,7 +4329,7 @@ def _rprompt_move_slot(delta: int) -> None:
     slot = _rprompt_modal_slot
     if not slot:
         return
-    visible = _rprompt_final_visible_slot_ids()
+    visible = _rprompt_final_visible_slot_ids(settings_only=True)
     if slot not in visible:
         return
     i = visible.index(slot)
@@ -4230,37 +4393,48 @@ def _rprompt_apply_model_choice(value: str) -> tuple[bool, str]:
     return True, f"Model set to {model or 'auto-routing'}."
 
 
-def _rprompt_commit() -> tuple[bool, str]:
-    """Commit the selected slot's draft value and order."""
+def _rprompt_commit() -> tuple[bool, str, str]:
+    """Commit the selected slot's draft value and order.
+
+    Returns ``(ok, notice, submit_text)``. ``submit_text`` is a slash command
+    the prompt should submit on the caller's behalf instead of the typed line:
+    switching agent has to rebind the REPL's state/history objects, and the
+    only place that happens correctly is the ``/agent`` command the main loop
+    already knows how to follow up on.
+    """
     slot = _rprompt_modal_slot
     value = _rprompt_modal_value
     order = list(_rprompt_modal_order)
     original_order = tuple(_rprompt_modal_original_order)
     if not slot:
-        return True, ""
+        return True, "", ""
 
     if order and tuple(order) != original_order:
         joined = ",".join(order)
         if not set_runtime_config("rprompt_slot_order", joined):
-            return False, "Could not save the status-slot order."
+            return False, "Could not save the status-slot order.", ""
         try:
             terminal_preferences.set_ui_preference("rprompt_slot_order", joined)
         except Exception as exc:
-            return False, f"Could not persist the status-slot order: {exc}"
+            return False, f"Could not persist the status-slot order: {exc}", ""
 
+    if slot == "agent" and value and value != _rprompt_current_value("agent"):
+        return True, "", f"/agent {value}"
     if slot == "mode" and value != _rprompt_current_mode_choice():
-        return _rprompt_apply_mode_choice(str(value))
+        return (*_rprompt_apply_mode_choice(str(value)), "")
     if slot == "model" and value != _rprompt_current_value("model"):
-        return _rprompt_apply_model_choice(str(value))
+        return (*_rprompt_apply_model_choice(str(value)), "")
     if slot == "effort" and value != get_runtime_config("reasoning_effort"):
         if not set_runtime_config("reasoning_effort", value):
-            return False, "Could not update reasoning_effort."
+            return False, "Could not update reasoning_effort.", ""
         try:
             terminal_preferences.set_ui_preference("reasoning_effort", value)
         except Exception as exc:
-            return False, f"Could not persist reasoning_effort: {exc}"
-        return True, f"Reasoning effort set to {value}."
-    return True, "Status layout updated." if tuple(order) != original_order else ""
+            return False, f"Could not persist reasoning_effort: {exc}", ""
+        return True, f"Reasoning effort set to {value}.", ""
+    return (True,
+            "Status layout updated." if tuple(order) != original_order else "",
+            "")
 
 
 def _build_keybindings() -> KeyBindings:
@@ -4416,12 +4590,37 @@ def _build_keybindings() -> KeyBindings:
         While a right-prompt slot is selected, Enter commits its draft and
         never submits the input buffer.
         """
+        global _pending_prompt_default, _mailbox_initial_key
+        if _rprompt_modal_slot == "messages":
+            # The reader is a full-screen application; it cannot be started
+            # from inside a render pass. Park the typed line, name the message
+            # to open on, and let pt_prompt run it once prompt_toolkit has let
+            # go of the terminal — the same route Alt+0 used to take.
+            _mailbox_initial_key = str(_rprompt_modal_value or "")
+            _rprompt_modal_exit()
+            _pending_prompt_default = _expand_pastes(
+                event.current_buffer.text or "")
+            event.app.exit(result=_MAILBOX_SENTINEL)
+            return
         if _rprompt_modal_slot:
-            ok, notice = _rprompt_commit()
+            ok, notice, submit_text = _rprompt_commit()
             if notice:
                 _rprompt_queue_notice(notice if ok else f"Status update failed: {notice}")
             if ok:
                 _rprompt_modal_exit()
+            if ok and submit_text:
+                # The slot's change is a slash command, not a setting write.
+                # Park the typed line so the detour costs nothing, then submit
+                # the command through the normal REPL path.
+                buf = event.current_buffer
+                _pending_prompt_default = _expand_pastes(buf.text or "")
+                buf.text = submit_text
+                buf.cursor_position = len(buf.text)
+                # complete_while_typing fires on the programmatic write and
+                # flashes the completion menu over the command as it submits.
+                buf.complete_state = None
+                buf.validate_and_handle()
+                return
             event.app.invalidate()
             return
         event.current_buffer.validate_and_handle()
@@ -4451,6 +4650,36 @@ def _build_keybindings() -> KeyBindings:
         if _rprompt_modal_slot:
             _rprompt_modal_exit()
         _expand_placeholder_at_cursor(event.current_buffer)
+
+    @kb.add("escape", "0")
+    def _(event):
+        """Alt+0: the messages, whether or not the mark is on the prompt.
+
+        With something unread the mark is there, so this selects it the way
+        Alt+N selects a slot: up/down skim titles in the status bar, Enter
+        opens the reader on the one you stopped at, Esc drops the selection.
+        Once everything is read the mark is gone from the row and there is
+        nothing to skim, so this opens the reader directly instead of
+        refusing — the messages did not stop existing when they were read.
+        """
+        global _pending_prompt_default, _mailbox_initial_key
+        if _rprompt_modal_slot == "messages":
+            _rprompt_modal_exit()
+            event.app.invalidate()
+            return
+        if not startup_mail.count():
+            _rprompt_queue_notice("No messages.")
+            event.app.invalidate()
+            return
+        if startup_mail.has_unread():
+            _rprompt_select_slot("messages", event.app)
+            event.app.invalidate()
+            return
+        _rprompt_modal_exit()
+        _mailbox_initial_key = ""
+        _pending_prompt_default = _expand_pastes(
+            event.current_buffer.text or "")
+        event.app.exit(result=_MAILBOX_SENTINEL)
 
     # ── Right-prompt slot selection (Alt+1..9) ─────────────────────────
     for _digit in "123456789":
@@ -4767,6 +4996,8 @@ def _rprompt_slot_items() -> list[tuple[str, str, str]]:
     width = _terminal_width()
     _multi = bool(_status_cache.get("multi_agent"))
     _agent_name = _status_cache.get("agent", "") or "primary"
+    if _rprompt_modal_slot == "agent" and _rprompt_modal_value:
+        _agent_name = _rprompt_agent_label(str(_rprompt_modal_value))
     # The effort VALUE is read unconditionally; whether it is SHOWN is a
     # slot-list decision below (rprompt_slots_detail_on/off), so the config
     # can put effort on the detail-off prompt too.
@@ -4777,8 +5008,15 @@ def _rprompt_slot_items() -> list[tuple[str, str, str]]:
         _effort = ""
     if _rprompt_modal_slot == "effort" and _rprompt_modal_value:
         _effort = str(_rprompt_modal_value)
-    # What exists at this width (legacy breakpoints).
+    # What exists at this width (legacy breakpoints). The mark carries plain
+    # text here; _render_rprompt splits it into its two colours. Measurement
+    # and colouring must not disagree, so there is exactly one source string.
     slots: dict = {"mode": ("class:" + _mode_cls, _mode_label)}
+    # Unread only. A mark that never goes away stops meaning "something
+    # arrived" and becomes furniture; once everything is read the row is just
+    # the settings again, and Alt+0 / /messages still reach the reader.
+    if startup_mail.has_unread():
+        slots["messages"] = ("class:rprompt-logo", startup_mail.mark_text())
     if width >= 62:
         if _multi and not _status_cache.get("input_available", True):
             label = "all busy"
@@ -4827,12 +5065,90 @@ def _fit_rprompt_slot_items(items: list[tuple[str, str, str]],
     return items
 
 
-def _rprompt_final_visible_slot_ids() -> list[str]:
-    """Exact on-screen slot ids after path-budget fitting."""
+def _rprompt_final_visible_slot_ids(settings_only: bool = False) -> list[str]:
+    """Exact on-screen slot ids after path-budget fitting.
+
+    With settings_only, the messages mark is dropped — it is an indicator, so
+    it must not consume an Alt+N position or a reordering step.
+    """
     width = _terminal_width()
     used = _pessimistic_width("  " + (_status_cache.get("prompt_path") or ""))
-    return [slot for slot, _style, _value in _fit_rprompt_slot_items(
+    ids = [slot for slot, _style, _value in _fit_rprompt_slot_items(
         _rprompt_slot_items(), width - used - 2)]
+    if settings_only:
+        ids = [slot for slot in ids if slot in _RPROMPT_SETTING_SLOT_IDS]
+    return ids
+
+
+def _rprompt_slot_mouse_handler(slot_id: str):
+    """Mouse/touch handler for one right-prompt slot.
+
+    Same model as Alt+N, reached by pointing at the thing instead of counting
+    it: press selects the slot (pressing the selected slot again drops the
+    selection), and the wheel cycles its value exactly like up/down do. Enter
+    still commits and Esc still cancels, so a click and a keystroke leave the
+    prompt in the same state.
+
+    Only meaningful while ``enable_mouse`` is on — prompt_toolkit does not
+    receive mouse reports otherwise, and turning them on costs the terminal's
+    native drag-to-select, which is why it stays opt-in.
+    """
+    def _handler(mouse_event: MouseEvent):
+        global _pending_prompt_default, _mailbox_initial_key
+        event_type = mouse_event.event_type
+        if slot_id == "messages":
+            # First press selects, like Alt+0 and like every other slot. A
+            # press on the already-selected mark opens the reader instead of
+            # deselecting: on the mark there is nothing to edit, so "click it
+            # again" can only sensibly mean "go in". Esc still cancels.
+            if event_type == MouseEventType.MOUSE_DOWN:
+                app = get_app()
+                if _rprompt_modal_slot == "messages":
+                    _mailbox_initial_key = str(_rprompt_modal_value or "")
+                    _rprompt_modal_exit()
+                    _pending_prompt_default = _expand_pastes(
+                        app.current_buffer.text or "")
+                    app.exit(result=_MAILBOX_SENTINEL)
+                    return None
+                _rprompt_select_slot("messages", app)
+            elif event_type in (MouseEventType.SCROLL_UP,
+                                MouseEventType.SCROLL_DOWN):
+                if _rprompt_modal_slot != "messages":
+                    _rprompt_select_slot("messages", get_app())
+                if _rprompt_modal_slot == "messages":
+                    _rprompt_cycle_message(
+                        1 if event_type == MouseEventType.SCROLL_UP else -1)
+            else:
+                return None
+            try:
+                get_app().invalidate()
+            except Exception:
+                pass
+            return None
+        if event_type == MouseEventType.MOUSE_DOWN:
+            if _rprompt_modal_slot == slot_id:
+                _rprompt_modal_exit()
+            else:
+                _rprompt_select_slot(slot_id, get_app())
+        elif event_type in (MouseEventType.SCROLL_UP,
+                            MouseEventType.SCROLL_DOWN):
+            if _rprompt_modal_slot != slot_id:
+                _rprompt_select_slot(slot_id, get_app())
+            if _rprompt_modal_slot != slot_id:
+                # Selection was refused (hidden slot); nothing to cycle.
+                return None
+            _rprompt_cycle_value(
+                1 if event_type == MouseEventType.SCROLL_UP else -1, get_app())
+        else:
+            # MOUSE_UP / MOUSE_MOVE: swallow rather than letting the Window
+            # move the input cursor to a column inside the right prompt.
+            return None
+        try:
+            get_app().invalidate()
+        except Exception:
+            pass
+        return None
+    return _handler
 
 
 def _render_rprompt():
@@ -4846,7 +5162,22 @@ def _render_rprompt():
     for _slot, style, value in items:
         if result:
             result.append(("class:rprompt-sep", f" {symbols.BULLET} "))
-        result.append((style, value))
+        handler = _rprompt_slot_mouse_handler(_slot)
+        if _slot == "messages":
+            if style == "class:rprompt-slot-selected":
+                # Selected slots are shown by their highlight, and a
+                # two-colour logo inside a highlight reads as neither.
+                result.append((style, value, handler))
+                continue
+            # Green L, red >, then the unread count. Split from the same
+            # string the fitter measured, so colouring can never widen it.
+            head, _, count = value.partition(" ")
+            result.append(("class:rprompt-logo-l", head[:1], handler))
+            result.append(("class:rprompt-logo-gt", head[1:], handler))
+            if count:
+                result.append(("class:rprompt-logo-count", f" {count}", handler))
+            continue
+        result.append((style, value, handler))
     # prompt_toolkit right-aligns the rprompt FLUSH to the terminal edge, so
     # its last glyph lands in the final column. Writing that cell arms the
     # terminal's deferred-wrap flag; the next write spills onto a new row and
@@ -4864,6 +5195,20 @@ def _render_bottom_toolbar():
     Mode and model are displayed in the rprompt (right side of prompt line).
     """
     width = _terminal_width()
+    if _rprompt_modal_slot == "messages":
+        _all = startup_mail.items()
+        _key = str(_rprompt_modal_value or "")
+        _pos = startup_mail.index_of(_key)
+        _message = startup_mail.get(_key)
+        if _message is None:
+            _label = "messages: none"
+        else:
+            _flag = "" if _message.read else "• "
+            _label = (f"messages {_pos + 1}/{len(_all)}  "
+                      f"{_flag}{_message.title}")
+        _hint = "  ↑↓ skim  Enter read  Esc cancel"
+        _room = max(1, width - 1 - len(_hint))
+        return [("class:stbar-context", _label[:_room] + _hint)]
     if _rprompt_modal_slot:
         value = _rprompt_modal_value
         if _rprompt_modal_slot == "model":
@@ -4916,6 +5261,24 @@ def _render_bottom_toolbar():
 _prompt_session: Optional[PromptSession] = None
 
 
+def _refresh_live_prompt() -> None:
+    """Repaint the prompt from another thread, if one is on screen.
+
+    Same reach-into-the-session pattern as _interrupt_prompt, and the same
+    reason it is safe: invalidate only schedules a redraw on the app's own
+    event loop.
+    """
+    session = _prompt_session
+    if session is None:
+        return
+    try:
+        app = session.app
+        if app.is_running:
+            app.invalidate()
+    except Exception:
+        pass
+
+
 def _interrupt_prompt():
     """Force prompt_toolkit to return from another thread.
 
@@ -4961,8 +5324,25 @@ def get_prompt_session() -> PromptSession:
 
 
 def pt_prompt(cwd: str) -> str:
-    """Read input for the terminal's one foreground Agent."""
+    """Read input for the terminal's one foreground Agent.
+
+    Alt+0 leaves the prompt to print the collected messages; that is a UI
+    detour, not input, so it is consumed here and the prompt re-opened. The
+    REPL never sees the sentinel.
+    """
+    while True:
+        result = _pt_prompt_once(cwd)
+        if result != _MAILBOX_SENTINEL:
+            return result
+        _show_mailbox()
+
+
+def _pt_prompt_once(cwd: str) -> str:
+    """One pass of the interactive prompt."""
+    global _pending_prompt_default
     session = get_prompt_session()
+    parked_text = _pending_prompt_default
+    _pending_prompt_default = ""
     width = _terminal_width()
     disp = _shorten_path(cwd, max_len=max(16, min(60, width - 8)))
     try:
@@ -4972,6 +5352,11 @@ def pt_prompt(cwd: str) -> str:
             if _pm.is_plan_mode() else "class:prompt-gutter")
     except Exception:
         gutter_cls = "class:prompt-gutter"
+    # Once per prompt, which is what _sync_status_context is for. Without it
+    # the status cache keeps whatever it was given at startup, and the agent
+    # slot still names the agent you switched away from - the slot is a
+    # control, so it has to show the switch it just made.
+    _sync_status_context()
     # _render_rprompt shares this row and needs the path's real width to know
     # how much room is left.
     _update_status_cache(prompt_path=disp)
@@ -5009,11 +5394,16 @@ def pt_prompt(cwd: str) -> str:
                 with patch_stdout(raw=True):
                     user_input = session.prompt(
                         message,
+                        pre_run=_first_prompt_started.set,
+                        default=parked_text,
                         style=_build_prompt_style(),
                         multiline=True,
                         rprompt=_render_rprompt,
                         complete_while_typing=True,
                     )
+            if user_input == _MAILBOX_SENTINEL:
+                _reset_paste_registry()
+                return _MAILBOX_SENTINEL
             expanded = _expand_pastes(user_input) if user_input else user_input
             _reset_paste_registry()
             return expanded.strip() if expanded else ""
@@ -11035,6 +11425,13 @@ _SLASH_ARG_RULES: dict[tuple[str, ...], SlashArgRule] = {
         )
     },
     ("/help",): _arg_rule(1, "/help [command]"),
+    ("/messages",): _arg_rule(
+        2, "/messages [list|read <n>|seen|dismiss <n>|clear]"),
+    ("/messages", "list"): _arg_rule(1, "/messages list"),
+    ("/messages", "seen"): _arg_rule(1, "/messages seen"),
+    ("/messages", "clear"): _arg_rule(1, "/messages clear"),
+    ("/messages", "read"): _arg_rule(2, "/messages read <n|key>"),
+    ("/messages", "dismiss"): _arg_rule(2, "/messages dismiss <n|key>"),
     ("/fork",): _arg_rule(1, "/fork [name]"),
     ("/training",): _arg_rule(1, "/training [status|on|off]"),
     ("/training", "status"): _arg_rule(1, "/training status"),
@@ -20630,6 +21027,289 @@ def _cmd_extensions(parts: list, session: dict) -> None:
     console.print("[yellow]Usage: /extensions [list|available|search|install|publish|remove|trust|untrust|info|create|pack][/yellow]")
 
 
+def _print_message(item, position: int, *, full: bool = True) -> None:
+    """One message as plain text: the list row, and optionally its detail.
+
+    The single plain-text renderer. /messages list, /messages read and the
+    fallback used when no terminal can host the reader all go through here,
+    so a message looks the same wherever it is printed.
+    """
+    style = startup_mail.LEVEL_STYLES.get(item.level, "muted")
+    flag = "" if item.read else "[accent]•[/accent] "
+    console.print(f"  [accent.dim]{position}.[/accent.dim] {flag}"
+                  f"[{style}]{escape(item.title)}[/{style}]")
+    if not full:
+        return
+    # Wrapped by hand with a hanging indent: Rich would wrap a long body back
+    # to column 0 and the list would stop reading as a list.
+    width = max(24, console.width - 8)
+    for line in textwrap.wrap(item.body, width) if item.body else ():
+        console.print(f"     [muted]{escape(line)}[/muted]")
+    for line in textwrap.wrap(item.action, width) if item.action else ():
+        console.print(f"     [accent]{escape(line)}[/accent]")
+
+
+def _print_messages(*, hint: bool = True) -> None:
+    """Print the whole list under the L> mark.
+
+    Printing is never reading. Only opening a message in the reader,
+    /messages read and /messages seen change what the mark counts — so this
+    can be shown as often as you like, and the fallback path cannot silently
+    consume the unread state it failed to let you browse.
+    """
+    items = startup_mail.items()
+    console.print()
+    if not items:
+        console.print(
+            f"  {startup_mail.LOGO_MARK}  [muted]No messages.[/muted]")
+        console.print()
+        return
+
+    header = f"{len(items)} message" + ("s" if len(items) != 1 else "")
+    unread = startup_mail.unread_count()
+    if unread:
+        header += f" {symbols.BULLET} {unread} new"
+    console.print(f"  {startup_mail.LOGO_MARK}  [accent]{header}[/accent]")
+    console.print()
+    for position, item in enumerate(items, 1):
+        _print_message(item, position)
+    console.print()
+    if hint:
+        console.print(
+            "  [muted]Read one with [/muted][accent]/messages read <n>[/accent]"
+            f"[muted] {symbols.BULLET} mark them all seen with "
+            "[/muted][accent]/messages seen[/accent]")
+
+
+#: Message the browser should open on, set by the prompt before it hands the
+#: terminal over. Empty means "whatever was selected last".
+_mailbox_initial_key = ""
+
+def _build_mailbox_browser(*, input=None,
+                           output=None) -> "resource_ui.ResourceBrowser":
+    """Read, dismiss and clear the messages behind the L> mark.
+
+    Configured like the /memory browser, deliberately: same document
+    presentation, same markdown-styled detail via _ui_text_detail, same x =
+    Delete with a two-press arm, and the same default primary action.
+
+    That last one was a real bug. Passing primary_action="read" without an
+    action of that name makes ResourceBrowser._primary fall through to
+    app.exit() — so Enter, the most obvious key in a list, closed the whole
+    reader the instant it opened. Every other browser in this file leaves the
+    default "view", which opens the detail pane. This one does too now.
+    """
+    def load_items():
+        rows = []
+        for position, item in enumerate(startup_mail.items(), 1):
+            rows.append(resource_ui.UIItem(
+                key=item.key,
+                title=item.title,
+                subtitle=item.action or item.body or "No detail",
+                status="new" if not item.read else "read",
+                status_style=("class:accent" if not item.read
+                              else "class:muted"),
+                badge=item.level if item.level != "info" else "",
+                payload=item.key,
+                search_text=item.body,
+                ordinal=str(position),
+            ))
+        return rows
+
+    def load_detail(item):
+        message = startup_mail.get(item.payload)
+        if message is None:
+            return resource_ui.UIDetail.text(
+                item.title, "This message is no longer there.",
+                style="class:error")
+        # Opening a message is what reading it means; the mark's count drops
+        # as they are read, without a separate "mark read" step.
+        startup_mail.mark_read(message.key)
+        body = message.body or "(no detail)"
+        content = f"{body}\n\n# What to do\n{message.action}" if message.action else body
+        subtitle = (f"{message.level}  {symbols.BULLET}  "
+                    f"{_format_time_ago(message.ts)}")
+        return _ui_text_detail(item.title, content, subtitle, kind="markdown")
+
+    armed = {"key": "", "at": 0.0}
+
+    def dismiss(item):
+        if item is None:
+            return resource_ui.UIActionResult(
+                message="Nothing selected.", message_style="class:warning")
+        now = time.monotonic()
+        if armed["key"] != item.key or now - armed["at"] > 4:
+            armed.update(key=item.key, at=now)
+            return resource_ui.UIActionResult(
+                message=f"Press x again to dismiss {item.title}",
+                message_style="class:warning")
+        removed = startup_mail.delete(item.payload)
+        armed.update(key="", at=0.0)
+        return resource_ui.UIActionResult(
+            message=(f"Dismissed {item.title}" if removed else "Already gone."),
+            message_style="class:success" if removed else "class:warning",
+            refresh=removed)
+
+    def mark_all(_item):
+        changed = startup_mail.mark_all_read()
+        return resource_ui.UIActionResult(
+            message=(f"Marked {changed} read" if changed
+                     else "Nothing was unread"),
+            message_style="class:success", refresh=True)
+
+    def clear_all(_item):
+        now = time.monotonic()
+        if armed["key"] != "*all*" or now - armed["at"] > 4:
+            armed.update(key="*all*", at=now)
+            return resource_ui.UIActionResult(
+                message="Press c again to clear every message",
+                message_style="class:warning")
+        armed.update(key="", at=0.0)
+        startup_mail.clear(remember=True)
+        return resource_ui.UIActionResult(
+            message="Cleared", message_style="class:success", refresh=True)
+
+    return resource_ui.ResourceBrowser(
+        title="Messages",
+        load_items=load_items,
+        load_detail=load_detail,
+        actions=[
+            resource_ui.UIAction("x", "dismiss", "Dismiss", dismiss,
+                                 "class:error"),
+            resource_ui.UIAction("a", "mark-all", "Mark all read", mark_all,
+                                 allow_empty=True),
+            resource_ui.UIAction("c", "clear", "Clear all", clear_all,
+                                 "class:error", allow_empty=True),
+        ],
+        searchable=True,
+        presentation="document",
+        pane_labels=("MESSAGES", "CONTENT"),
+        initial_key=_mailbox_initial_key,
+        empty_message="No messages.",
+        # Left as None in normal use so the browser takes the real terminal.
+        # Tests inject dummies: a prompt_toolkit Application resolves its
+        # input at CONSTRUCTION time, so building one headless binds fd 0 and
+        # leaves the shared stdin of the whole test process disturbed.
+        input=input, output=output,
+    )
+
+
+def _mailbox_can_browse() -> bool:
+    """The reader is a full-screen application; it needs a real terminal."""
+    if _IN_SUB_TERMINAL:
+        return False
+    try:
+        return bool(sys.stdin.isatty() and sys.stdout.isatty())
+    except Exception:
+        return False
+
+
+def _resolve_message(reference: str):
+    """Find one message by 1-based list position or by key.
+
+    Position first, because that is what the list and the reader both show;
+    keys are stable identifiers a script can hold on to.
+    """
+    reference = str(reference or "").strip()
+    if not reference:
+        return None
+    items = startup_mail.items()
+    if reference.isdigit():
+        position = int(reference)
+        if 1 <= position <= len(items):
+            return items[position - 1]
+        return None
+    return startup_mail.get(reference)
+
+
+def _cmd_messages(parts: list) -> None:
+    """``/messages`` — the same notices the L> mark holds, from the keyboard.
+
+    The reader (Alt+0, or no argument here) is the good way to work through
+    them. These subcommands exist for the places it cannot run — a
+    sub-terminal, a piped session, --execute — and for saying exactly which
+    message to act on instead of arrowing to it.
+    """
+    action = parts[1].strip().lower() if len(parts) > 1 else ""
+    argument = parts[2] if len(parts) > 2 else ""
+    items = startup_mail.items()
+
+    if not action:
+        if _mailbox_can_browse():
+            _show_mailbox()
+        else:
+            # No full-screen terminal to hand over: print the list rather
+            # than failing. Nothing is marked read, so the fallback cannot
+            # consume what it could not let the user open.
+            _print_messages()
+        return
+
+    if action == "list":
+        _print_messages()
+        return
+
+    if action == "read":
+        if not argument:
+            raise SlashCommandUsageError("Usage: /messages read <n|key>")
+        item = _resolve_message(argument)
+        if item is None:
+            console.print(f"[red]No message {escape(argument)}.[/red]")
+            return
+        startup_mail.mark_read(item.key)
+        console.print()
+        _print_message(item, startup_mail.index_of(item.key) + 1)
+        console.print()
+        return
+
+    if action == "seen":
+        changed = startup_mail.mark_all_read()
+        console.print(f"[green]Marked {changed} message(s) read.[/green]"
+                      if changed else "[dim]Nothing was unread.[/dim]")
+        return
+
+    if action == "dismiss":
+        if not argument:
+            raise SlashCommandUsageError("Usage: /messages dismiss <n|key>")
+        item = _resolve_message(argument)
+        if item is None:
+            console.print(f"[red]No message {escape(argument)}.[/red]")
+            return
+        title = item.title
+        startup_mail.delete(item.key)
+        console.print(f"[green]Dismissed {escape(title)}.[/green]")
+        return
+
+    if action == "clear":
+        if not items:
+            console.print("[dim]No messages.[/dim]")
+            return
+        startup_mail.clear(remember=True)
+        console.print(f"[green]Cleared {len(items)} message(s).[/green]")
+        return
+
+    raise SlashCommandUsageError(
+        "Usage: /messages [list|read <n>|seen|dismiss <n>|clear]")
+
+
+def _show_mailbox() -> None:
+    """Open the messages, falling back to a printout if the browser can't run.
+
+    KeyboardInterrupt is left alone — Ctrl+C is the user talking. Everything
+    else, SystemExit included, is caught: a message list is a widget, and a
+    widget must never be able to end the session. An uncaught SystemExit from
+    inside a full-screen app would take the whole CLI down with it, which
+    looks exactly like a crash from the outside.
+    """
+    try:
+        _build_mailbox_browser().run()
+    except KeyboardInterrupt:
+        return
+    except BaseException as exc:
+        console.print(f"[yellow]Message browser unavailable: "
+                      f"{type(exc).__name__}: {exc}[/yellow]")
+        _print_messages()
+
+
 def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: dict, interactive_session=None) -> bool:
     """Handle meta commands. Returns True if should exit."""
     action, raw_args, parts = _parse_slash_command(cmd)
@@ -20661,6 +21341,9 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
 
     elif action in _NEW_SESSION_COMMANDS:
         _cmd_new_session_notice()
+
+    elif action in ("/messages", "/msg"):
+        _cmd_messages(parts)
 
     elif action == "/codemap":
         _cmd_codemap(parts, raw_args)
@@ -20902,7 +21585,11 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict,
         return _handle_meta_command_impl(
             cmd, agent_registry, session, interactive_session)
     except SlashCommandUsageError as exc:
-        console.print(f"[yellow]{exc}[/yellow]")
+        # escape(): usage strings are full of "[list|read <n>]", and Rich
+        # reads a bracket as a style tag — every optional-argument group was
+        # being swallowed, so "/training bogus extra" answered "Usage:
+        # /training " and told the user nothing.
+        console.print(f"[yellow]{escape(str(exc))}[/yellow]")
     except KeyboardInterrupt:
         console.print("[dim]Command cancelled.[/dim]")
     except Exception as exc:
@@ -21006,6 +21693,8 @@ def show_help(command: str = ""):
             rows.extend([
                 ("ls, git, …", "PATH commands run directly"),
                 ("<text>", "plain text → AI agent loop"),
+                ("Alt+0", "read the messages behind the L> mark"),
+                ("Alt+1..9", "select a status slot; ↑↓ change it, Enter apply"),
             ])
         for spec in COMMAND_SPECS:
             if spec.group != title:
@@ -21076,6 +21765,10 @@ def get_loop_deps() -> LoopDeps:
 
 
 # ── Main ───────────────────────────────────────────────────────────────
+
+#: Name of the colleague every session starts with. Undeployed: it exists so
+#: the prompt's agent slot has a second value, not because it has work.
+DEFAULT_SUB_AGENT_NAME = "scout"
 
 _LOGO_LINES = [
     " ╷    ╭─╮  ┬  ╷ ╷ ┌┬┐  ╭─╮  ╭─╮",
@@ -21167,23 +21860,31 @@ def show_banner(agent_name: str, session: dict = None):
             f"[accent.dim]│[/accent.dim] {value}"
         )
 
-    console.print()
-    console.print(
-        f"  [muted]PATH commands run directly {symbols.BULLET} plain text → AI {symbols.BULLET} "
-        f"[/muted][accent]/help[/accent][muted] for commands {symbols.BULLET} "
-        f"[/muted][accent]/mode[/accent][muted] plan {symbols.BULLET} "
-        "[/muted][accent]/policy[/accent][muted] approvals[/muted]"
-    )
+    # The advisory block that used to live here (usage tips, training-data
+    # opt-in, and the session/Helpwo/update notices printed by main()) is
+    # posted to the session message list instead and read behind the L> mark
+    # with Alt+0. Startup shows one line, not six.
+    startup_mail.post(
+        "tips", "How input is routed",
+        f"PATH commands run directly {symbols.BULLET} plain text → AI",
+        action="/help for commands, /mode plan, /policy approvals")
     if bool(getattr(
             backend_profile, "sends_laintas_credentials",
             backend_profile.kind == "official")):
-        console.print(
-            "  [muted]Training-data sharing is off by default "
-            f"{symbols.BULLET} [/muted][accent]/training on[/accent]"
-            "[muted] to opt in "
-            f"{symbols.BULLET} [/muted][accent]/training status[/accent]"
-            "[muted] to check[/muted]"
-        )
+        startup_mail.post(
+            "training", "Training-data sharing is off by default",
+            "No interaction leaves this machine for training unless you opt in.",
+            action="/training on to opt in, /training status to check")
+    if not bool(get_runtime_config("enable_mouse")):
+        startup_mail.post(
+            "mouse", "Status slots are clickable with the mouse turned on",
+            "Click a slot on the prompt's right side to select it (same as "
+            "Alt+1..9), then scroll or press up/down to change it and Enter "
+            "to apply; clicking the L> mark opens this list. Mouse reporting "
+            "takes over drag-to-select in scrollback, so it stays off until "
+            "you ask for it.",
+            action="/config enable_mouse true")
+
     console.print()
 
 
@@ -22846,6 +23547,14 @@ def main():
                         help="Hand this sub-terminal over to Helpwo at startup (internal; used by term-new)")
     args = parser.parse_args()
 
+    # The standing advisories (routing tips, the training opt-in, the mouse
+    # hint) are re-posted from scratch on every start, so without a durable
+    # receipt "read" would only ever last until the next launch and the mark
+    # would never go quiet. Receipts are opt-in per process; only the real CLI
+    # turns them on, which keeps library imports and tests off the disk.
+    if args.depth == 0:
+        startup_mail.enable_persistence()
+
     # Capture this before startup work can change cwd.  The watchdog owns the
     # lifecycle decision; atexit merely closes the fd on ordinary return and
     # startup failures that never reach the shutdown handler.
@@ -22997,11 +23706,13 @@ def main():
     try:
         for _ext_name, _ext_ok, _ext_message in _extension_runtime.load_installed():
             if not _ext_ok and args.depth == 0:
-                console.print(
-                    f"[yellow]Extension {_ext_name}: {_ext_message}[/yellow]")
+                startup_mail.post(
+                    f"extension:{_ext_name}", f"Extension {_ext_name} did not load",
+                    str(_ext_message), action="/extensions", level="warn")
     except Exception as _ext_exc:
         if args.depth == 0:
-            console.print(f"[yellow]Extensions: {_ext_exc}[/yellow]")
+            startup_mail.post("extensions", "Extension runtime failed to start",
+                              str(_ext_exc), action="/extensions", level="warn")
 
     # ── Non-interactive execution mode ──
     if args.execute:
@@ -23026,9 +23737,10 @@ def main():
             import updater as _updater_check
             _remote_ver = _updater_check.check_update_available()
             if _remote_ver:
-                console.print(
-                    f"[green]Update available: v{_remote_ver}[/green] "
-                    f"[dim](run /v update)[/dim]")
+                startup_mail.post(
+                    "update", f"Update available: v{_remote_ver}",
+                    f"This session is running v{__version__}.",
+                    action="/v update", level="good")
         except Exception:
             pass
     # Register as remote agent (only if authenticated)
@@ -23046,6 +23758,7 @@ def main():
 
     chat_history = []
     current_live_session = None
+    _startup_advisories = None
     # A normal launch starts clean. Live state is archived for explicit
     # /resume; it is never injected into the new session automatically.
     if args.depth == 0:
@@ -23054,7 +23767,8 @@ def main():
             _session_start_cwd)
         _session_warning = session_store.consume_last_error()
         if _session_warning:
-            console.print(f"[yellow]{_session_warning}[/yellow]")
+            startup_mail.post("session-store", "Session store warning",
+                              str(_session_warning), level="warn")
         if _previous_live_session:
             _prev_ch = _previous_live_session.get("chat_history") or []
             _prev_user_turns = [m for m in _prev_ch if isinstance(m, dict) and m.get("role") == "user"]
@@ -23078,42 +23792,74 @@ def main():
             _session_start_cwd, agent_state, chat_history)
         handle_meta_command._current_live_session = current_live_session
 
-        # Close stale recovery-journal admissions without injecting their text.
-        # The archived live checkpoint above remains available via /resume.
-        _incomplete = event_log.last_incomplete_task()
-        if (_incomplete
-                and not event_log.owner_process_is_alive(_incomplete)):
-            event_log.acknowledge_incomplete(
-                _incomplete, reason="fresh_session_started")
-        # Full-fidelity resume blob: explicit restore by flag or slash command.
-        # Without a flag, just hint so a fresh session stays fresh.
-        _resume_blob = load_resume_state(_session_start_cwd)
+        # "Is there a session to resume here" used to be answered by parsing
+        # every resume blob for this cwd — whole conversations, 60MB across 62
+        # files on a working machine, ~2.1s before the first prompt could be
+        # drawn. The advisory needs the newest one's size and age, which
+        # latest_resume_summary gets in ~0.03s. /resume still uses the full
+        # listing, because a picker really does have to collapse duplicates.
+        if not _explicit_startup_resume:
+            _summary = latest_resume_summary(_session_start_cwd)
+            if _summary:
+                startup_mail.post(
+                    "resume",
+                    "A previous session in this directory can be resumed",
+                    f"{_summary['turn_count']} turn(s), "
+                    f"{_format_time_ago(_summary['timestamp'])}.",
+                    action="/resume, or start with --resume",
+                    # The body ages ("10 hour(s) ago") without the notice
+                    # becoming new, so the checkpoint itself is the identity
+                    # the cross-session read receipt compares.
+                    digest=f"{_session_start_cwd}:{_summary['timestamp']}:"
+                           f"{_summary['turn_count']}")
+
+        # Closing a stale recovery-journal admission means reading a journal
+        # that only grows — 16MB here, ~1s — and nothing before the first
+        # prompt depends on the answer, so it runs behind it. Deferred rather
+        # than merely threaded: this is CPU-bound JSON parsing, and a Python
+        # thread doing that holds the GIL in slices the main thread waits for,
+        # so starting it early bought back none of the delay.
+        def _close_stale_admission() -> None:
+            try:
+                _late = event_log.last_incomplete_task()
+                if _late and not event_log.owner_process_is_alive(_late):
+                    event_log.acknowledge_incomplete(
+                        _late, reason="fresh_session_started")
+                    _text = str(_late.get("text")
+                                or _late.get("user_input") or "").strip()
+                    startup_mail.post(
+                        "interrupted", "A previous run was interrupted",
+                        (f"It was working on: {_text[:160]}" if _text else
+                         "Its recovery journal entry has been closed."),
+                        action="/resume to reopen that conversation",
+                        level="warn")
+            except Exception:
+                pass
+
+        if not _explicit_startup_resume:
+            _startup_advisories = _close_stale_admission
+
+        # Only the explicit-restore path still needs the blob up front.
+        _resume_blob = (load_resume_state(_session_start_cwd)
+                        if _explicit_startup_resume else None)
         if _resume_blob and _resume_blob.get("chat_history"):
-            _n_turns = _resume_turn_count(_resume_blob)
-            _ago = _format_time_ago(_resume_blob.get("timestamp", 0))
-            if args.resume or args.continue_session:
-                _selected_resume = _choose_resume_blob(_session_start_cwd, "latest")
-                if _selected_resume:
-                    _selected_resume = _acquire_resume_lease(_selected_resume)
-                if _selected_resume:
-                    if current_live_session:
-                        session_store.close_session(current_live_session)
-                    agent_state = _restore_resume_blob(_selected_resume, chat_history)
-                    current_live_session = session_store.create_session(_session_start_cwd, agent_state, chat_history)
-                    handle_meta_command._current_live_session = current_live_session
-                    console.print(
-                        f"[green]Resumed previous session in this directory "
-                        f"({_resume_turn_count(_selected_resume)} turn(s), "
-                        f"{_format_time_ago(_selected_resume.get('timestamp', 0))}).[/green]"
-                    )
-                    _print_resume_transcript(_selected_resume, 20)
-            elif not current_live_session or current_live_session.get("turn_count", 0) == 0:
+            _selected_resume = _choose_resume_blob(_session_start_cwd, "latest")
+            if _selected_resume:
+                _selected_resume = _acquire_resume_lease(_selected_resume)
+            if _selected_resume:
+                if current_live_session:
+                    session_store.close_session(current_live_session)
+                agent_state = _restore_resume_blob(_selected_resume, chat_history)
+                current_live_session = session_store.create_session(
+                    _session_start_cwd, agent_state, chat_history)
+                handle_meta_command._current_live_session = current_live_session
                 console.print(
-                    f"[dim]Previous session in this directory "
-                    f"({_n_turns} turn(s), {_ago}). Type [bold]/resume[/bold] "
-                    f"or start with [bold]--resume[/bold] to continue.[/dim]"
+                    f"[green]Resumed previous session in this directory "
+                    f"({_resume_turn_count(_selected_resume)} turn(s), "
+                    f"{_format_time_ago(_selected_resume.get('timestamp', 0))}).[/green]"
                 )
-        elif args.resume or args.continue_session:
+                _print_resume_transcript(_selected_resume, 20)
+        elif _explicit_startup_resume:
             console.print("[yellow]No saved session for this directory.[/yellow]")
 
         # Bind /continue to the exact in-memory objects restored at startup.
@@ -23160,10 +23906,15 @@ def main():
         elif args.depth == 0:
             # Two-end handshake: NO auto-link. The primary CLI goes online in
             # Helpwo only when the user runs /helpwo here.
-            console.print("[dim]Not connected to Helpwo. Run [bold]/helpwo[/bold] to expose this "
-                          "CLI (its shell + this folder) as a runtime environment there.[/dim]")
+            startup_mail.post(
+                "helpwo", "Not connected to Helpwo",
+                "Expose this CLI (its shell and this folder) as a runtime "
+                "environment there.",
+                action="/helpwo")
         else:
-            console.print("[dim]This sub-terminal isn't linked to Helpwo yet.[/dim]")
+            startup_mail.post(
+                "helpwo", "This sub-terminal isn't linked to Helpwo yet.",
+                action="/connect")
 
     # PTY session managed at REPL level (must be before shutdown for nonlocal)
     interactive_session = None
@@ -23209,6 +23960,40 @@ def main():
         # that every agent has a parent; adopt it once, here.
         import agent_loop as _al_boot
         _al_boot.adopt_orphan_agents(primary.id)
+
+        # A registry with exactly one agent in it makes the prompt's agent
+        # slot a control with nothing to control: Alt+select it and there is
+        # no second value to cycle to. Every session therefore starts with one
+        # colleague already registered — undeployed, holding no terminal
+        # lease, costing nothing until it is actually addressed. Switching to
+        # it (Alt+select the agent slot, or /agent scout) gives it its own
+        # conversation and its own state; /hire adds more.
+        if args.depth == 0:
+            try:
+                _scout = get_agent(DEFAULT_SUB_AGENT_NAME)
+                if _scout is None:
+                    _scout = register_agent(
+                        name=DEFAULT_SUB_AGENT_NAME, depth=0,
+                        parent_id=primary.id, role="pool",
+                        load_existing=True)
+                # Undeployed by definition: a restored copy must not come back
+                # holding a terminal lease it was never re-granted.
+                _scout.deployment_terminal = None
+                _scout.stationed_terminal = None
+                startup_mail.post(
+                    "default-sub-agent",
+                    f"'{DEFAULT_SUB_AGENT_NAME}' is registered and undeployed",
+                    "A second agent so the prompt's agent slot has somewhere "
+                    "to switch to. It owns no terminal and does nothing until "
+                    "you address it.",
+                    action=(f"Alt+1 selects the agent slot — then up/down "
+                            f"and Enter — or /agent {DEFAULT_SUB_AGENT_NAME}"))
+            except Exception as _scout_exc:
+                startup_mail.post(
+                    "default-sub-agent",
+                    "Could not register the default sub-agent",
+                    str(_scout_exc), level="warn")
+
 
     def _on_terminal_agent_finished(agent_info, _result):
         try:
@@ -23528,6 +24313,23 @@ def main():
                 time.sleep(3600)
         except (KeyboardInterrupt, SystemExit):
             shutdown()
+
+    # Deferred startup work runs behind the prompt, never in front of it.
+    if _startup_advisories is not None:
+        def _run_after_first_prompt(_work=_startup_advisories) -> None:
+            # pre_run fires at the start of Application.run, before the first
+            # redraw, so wait for it and then let the paint finish. After that
+            # prompt_toolkit is blocked reading stdin and the GIL is free.
+            _first_prompt_started.wait(timeout=30)
+            time.sleep(0.3)
+            _work()
+            # The mark's count is read while rendering, and the prompt only
+            # renders on input. Without this nudge a message that lands here
+            # stays invisible until the next keystroke.
+            _refresh_live_prompt()
+
+        threading.Thread(target=_run_after_first_prompt, daemon=True,
+                         name="startup-advisories").start()
 
     # Main interactive loop
 

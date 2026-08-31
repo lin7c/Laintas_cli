@@ -12,13 +12,38 @@ from types import SimpleNamespace
 from unittest import mock
 
 import laintas_cli
+import symbols
 from prompt_toolkit.keys import Keys
 
 _FIXTURE = Path(__file__).parent / "fixtures" / "rprompt_legacy_render.json"
 
 
 def _text(fragments):
-    return "".join(value for _style, value in fragments)
+    return "".join(fragment[1] for fragment in fragments)
+
+
+def _styled(fragments):
+    """(style, text) pairs — drops the per-slot mouse handler third element."""
+    return [(fragment[0], fragment[1]) for fragment in fragments]
+
+
+def _join(pairs):
+    return "".join(text for _style, text in pairs)
+
+
+def _without_mark(fragments):
+    """Drop the leading L> mark and the separator that follows it.
+
+    The mark is a later addition to the row; everything to its right is what
+    the legacy snapshot pins, and it must still match byte for byte.
+    """
+    pairs = _styled(fragments)
+    head = 0
+    while head < len(pairs) and pairs[head][0].startswith("class:rprompt-logo"):
+        head += 1
+    if head and head < len(pairs) and pairs[head][0] == "class:rprompt-sep":
+        head += 1
+    return pairs[head:]
 
 
 class _SlotTestBase(unittest.TestCase):
@@ -56,8 +81,9 @@ class _SlotTestBase(unittest.TestCase):
         cfg.setdefault("detail", False)
         cfg.setdefault("reasoning_effort", "low")
         cfg.setdefault("rprompt_slots_detail_on",
-                       "agent,mode,model,effort,terminal")
-        cfg.setdefault("rprompt_slots_detail_off", "agent,mode,model,terminal")
+                       "messages,agent,mode,model,effort,terminal")
+        cfg.setdefault("rprompt_slots_detail_off",
+                       "messages,agent,mode,model,terminal")
         cfg.setdefault("rprompt_slot_order", "")
         return mock.patch.object(laintas_cli, "get_runtime_config",
                                  side_effect=lambda k: cfg.get(k))
@@ -83,9 +109,10 @@ class SlotModelTests(_SlotTestBase):
     def test_configured_slots_defaults_match_legacy_layout(self):
         with self._config():
             self.assertEqual(laintas_cli._rprompt_configured_slots(True),
-                             ("agent", "mode", "model", "effort", "terminal"))
+                             ("messages", "agent", "mode", "model", "effort",
+                              "terminal"))
             self.assertEqual(laintas_cli._rprompt_configured_slots(False),
-                             ("agent", "mode", "model", "terminal"))
+                             ("messages", "agent", "mode", "model", "terminal"))
 
     def test_configured_slots_empty_hides_the_row(self):
         with self._config(rprompt_slots_detail_off="", detail=False):
@@ -94,15 +121,25 @@ class SlotModelTests(_SlotTestBase):
     def test_effective_order_default_and_custom(self):
         with self._config():
             self.assertEqual(laintas_cli._rprompt_effective_order(),
-                             ["agent", "mode", "model", "effort", "terminal"])
+                             ["messages", "agent", "mode", "model", "effort",
+                              "terminal"])
         with self._config(rprompt_slot_order="model,mode"):
             self.assertEqual(laintas_cli._rprompt_effective_order(),
-                             ["model", "mode", "agent", "effort", "terminal"])
+                             ["messages", "model", "mode", "agent", "effort",
+                              "terminal"])
 
     def test_effective_order_drops_unknown_ids(self):
         with self._config(rprompt_slot_order="bogus,mode,bogus"):
             self.assertEqual(laintas_cli._rprompt_effective_order(),
-                             ["mode", "agent", "model", "effort", "terminal"])
+                             ["messages", "mode", "agent", "model", "effort",
+                              "terminal"])
+
+    def test_messages_mark_is_pinned_leftmost_whatever_the_saved_order(self):
+        # A saved order that tries to bury the mark must not be honoured:
+        # the logo is not a column the layout may shuffle.
+        with self._config(rprompt_slot_order="mode,messages,agent"):
+            self.assertEqual(laintas_cli._rprompt_effective_order()[0],
+                             "messages")
 
     def test_slot_fits_width_breakpoints(self):
         f = laintas_cli._rprompt_slot_fits
@@ -120,19 +157,21 @@ class SlotModelTests(_SlotTestBase):
     def test_visible_slots_detail_off_excludes_effort(self):
         with self._config(detail=False):
             vis = laintas_cli._rprompt_visible_slots(120, False, False)
-        self.assertEqual(vis, ["agent", "mode", "model", "terminal"])
+        self.assertEqual(vis, ["messages", "agent", "mode", "model", "terminal"])
 
     def test_visible_slots_detail_on_includes_effort(self):
         with self._config(detail=True):
             vis = laintas_cli._rprompt_visible_slots(120, True, False)
-        self.assertEqual(vis, ["agent", "mode", "model", "effort", "terminal"])
+        self.assertEqual(vis, ["messages", "agent", "mode", "model", "effort",
+                               "terminal"])
 
     def test_visible_slots_respect_width(self):
         with self._config():
+            # The mark has no breakpoint: it is two columns and it leads.
             self.assertEqual(laintas_cli._rprompt_visible_slots(50, False, False),
-                             ["mode"])
+                             ["messages", "mode"])
             self.assertEqual(laintas_cli._rprompt_visible_slots(70, False, False),
-                             ["agent", "mode"])
+                             ["messages", "agent", "mode"])
 
     def test_visible_slots_respect_custom_visibility(self):
         with self._config(rprompt_slots_detail_off="mode", detail=False):
@@ -142,7 +181,7 @@ class SlotModelTests(_SlotTestBase):
     def test_visible_slots_respect_custom_order(self):
         with self._config(rprompt_slot_order="mode,agent"):
             vis = laintas_cli._rprompt_visible_slots(120, False, False)
-        self.assertEqual(vis, ["mode", "agent", "model", "terminal"])
+        self.assertEqual(vis, ["messages", "mode", "agent", "model", "terminal"])
 
 
 class SlotSelectionTests(_SlotTestBase):
@@ -265,11 +304,34 @@ class CycleValueTests(_SlotTestBase):
         kick.assert_called_once()
         self.assertEqual(laintas_cli._rprompt_notice_queue, [])
 
-    def test_cycle_agent_slot_is_a_redirect_notice(self):
+    def test_cycle_agent_slot_steps_through_the_registry(self):
         laintas_cli._rprompt_modal_slot = "agent"
+        laintas_cli._rprompt_modal_value = "primary"
+        with mock.patch.object(
+                laintas_cli, "get_all_agents",
+                return_value=[SimpleNamespace(id="primary", role="primary"),
+                              SimpleNamespace(id="scout", role="pool")]):
+            laintas_cli._rprompt_cycle_value(1)
+            self.assertEqual(laintas_cli._rprompt_modal_value, "scout")
+            laintas_cli._rprompt_cycle_value(1)
+        self.assertEqual(laintas_cli._rprompt_modal_value, "primary")
+        self.assertEqual(laintas_cli._rprompt_notice_queue, [])
+
+    def test_cycle_agent_slot_says_so_when_there_is_nowhere_to_go(self):
+        laintas_cli._rprompt_modal_slot = "agent"
+        laintas_cli._rprompt_modal_value = "primary"
+        with mock.patch.object(
+                laintas_cli, "get_all_agents",
+                return_value=[SimpleNamespace(id="primary", role="primary")]):
+            laintas_cli._rprompt_cycle_value(1)
+        self.assertEqual(laintas_cli._rprompt_modal_value, "primary")
+        self.assertIn("Only one agent", laintas_cli._rprompt_notice_queue[0])
+
+    def test_cycle_terminal_slot_is_a_redirect_notice(self):
+        laintas_cli._rprompt_modal_slot = "terminal"
         laintas_cli._rprompt_cycle_value(1)
-        self.assertEqual(laintas_cli._rprompt_modal_slot, "agent")
-        self.assertIn("agents rail", laintas_cli._rprompt_notice_queue[0])
+        self.assertEqual(laintas_cli._rprompt_modal_slot, "terminal")
+        self.assertIn("/station", laintas_cli._rprompt_notice_queue[0])
 
     def test_refill_model_cache_dedups_and_marks_ready(self):
         laintas_cli._rprompt_model_cache = []
@@ -334,7 +396,9 @@ class MoveSlotTests(_SlotTestBase):
             laintas_cli._rprompt_move_slot(-1)   # agent <-> mode
         self.assertEqual(calls, [])
         self.assertEqual(persists, [])
-        self.assertEqual(laintas_cli._rprompt_modal_order[:2], ["mode", "agent"])
+        # The pinned mark keeps index 0; the setting slots swap behind it.
+        self.assertEqual(laintas_cli._rprompt_modal_order[:3],
+                         ["messages", "mode", "agent"])
 
     def test_move_slot_at_boundary_is_a_noop(self):
         laintas_cli._rprompt_modal_slot = "agent"   # first slot
@@ -418,7 +482,7 @@ class CommitSideEffectTests(_SlotTestBase):
                                   side_effect=lambda k, v: calls.append((k, v)) or True), \
                 mock.patch.object(laintas_cli.terminal_preferences,
                                   "set_ui_preference") as persist:
-            ok, _msg = laintas_cli._rprompt_commit()
+            ok, _msg, _submit = laintas_cli._rprompt_commit()
         self.assertTrue(ok)
         self.assertIn(("reasoning_effort", "medium"), calls)
         self.assertIn(("rprompt_slot_order",
@@ -493,7 +557,7 @@ class SlotKeybindingTests(_SlotTestBase):
         buf = mock.Mock()
         laintas_cli._rprompt_modal_slot = "mode"
         with mock.patch.object(laintas_cli, "_rprompt_commit",
-                               return_value=(True, "ok")) as commit:
+                               return_value=(True, "ok", "")) as commit:
             binding.handler(SimpleNamespace(current_buffer=buf, app=mock.Mock()))
         commit.assert_called_once_with()
         self.assertEqual(laintas_cli._rprompt_modal_slot, "")
@@ -515,7 +579,7 @@ class SlotKeybindingTests(_SlotTestBase):
         binding = self._find(Keys.Enter)
         laintas_cli._rprompt_modal_slot = "mode"
         with mock.patch.object(laintas_cli, "_rprompt_commit",
-                               return_value=(False, "nope")):
+                               return_value=(False, "nope", "")):
             binding.handler(SimpleNamespace(
                 current_buffer=mock.Mock(), app=mock.Mock()))
         self.assertEqual(laintas_cli._rprompt_modal_slot, "mode")
@@ -547,25 +611,104 @@ class SlotRenderTests(_SlotTestBase):
     def test_selected_slot_is_highlighted(self):
         laintas_cli._rprompt_modal_slot = "mode"
         frags = self._render(width=100)
-        self.assertIn(("class:rprompt-slot-selected", "ACT"), frags)
+        self.assertIn(("class:rprompt-slot-selected", "ACT"), _styled(frags))
 
     def test_selection_of_hidden_slot_renders_normally(self):
         # effort is detail-off hidden; a stale selection must not style anything
         laintas_cli._rprompt_modal_slot = "effort"
         frags = self._render(width=100, detail=False)
         self.assertNotIn("class:rprompt-slot-selected",
-                          [s for s, _t in frags])
+                          [style for style, _t in _styled(frags)])
         self.assertIn("ACT", _text(frags))
 
     def test_custom_order_renders(self):
         frags = self._render(width=100, rprompt_slot_order="mode,agent")
-        # width 100 < 108: the terminal segment stays hidden.
-        self.assertEqual(_text(frags).strip(),
+        # width 100 < 108: the terminal segment stays hidden. The mark leads
+        # whatever the order says, so compare the settings behind it.
+        self.assertEqual(_join(_without_mark(frags)).strip(),
                          "ACT · primary · glm-5.2")
 
     def test_custom_visibility_renders(self):
         frags = self._render(width=100, rprompt_slots_detail_off="mode")
         self.assertEqual(_text(frags).strip(), "ACT")
+
+
+class MessagesMarkRenderTests(_SlotTestBase):
+    def test_mark_leads_the_row_in_two_colours(self):
+        import startup_mail
+        startup_mail.clear()
+        startup_mail.post("a", "One")
+        startup_mail.post("b", "Two")
+        self.addCleanup(startup_mail.clear)
+        frags = self._render(width=100)
+        self.assertEqual(
+            _styled(frags)[:4],
+            [("class:rprompt-logo-l", "L"),
+             ("class:rprompt-logo-gt", ">"),
+             ("class:rprompt-logo-count", " 2"),
+             ("class:rprompt-sep", f" {symbols.BULLET} ")])
+
+    def test_mark_leaves_the_row_once_everything_is_read(self):
+        import startup_mail
+        startup_mail.clear()
+        startup_mail.post("a", "One")
+        self.addCleanup(startup_mail.clear)
+        self.assertIn("L>", _text(self._render(width=100)))
+        startup_mail.mark_all_read()
+        rendered = self._render(width=100)
+        self.assertNotIn("L>", _text(rendered))
+        # ...and the settings behind it are untouched by its going.
+        self.assertEqual(_join(_without_mark(rendered)).strip(),
+                         "primary · ACT · glm-5.2")
+
+    def test_mark_is_absent_when_there_are_no_messages_at_all(self):
+        import startup_mail
+        startup_mail.clear()
+        self.assertNotIn("L>", _text(self._render(width=100)))
+
+    def test_mark_survives_the_narrowest_row(self):
+        import startup_mail
+        startup_mail.clear()
+        startup_mail.post("a", "One")
+        self.addCleanup(startup_mail.clear)
+        self.assertIn("L>", _text(self._render(width=30)))
+
+    def test_alt_n_still_indexes_the_setting_slots(self):
+        # Alt+1 meant "agent" before the mark existed and must still mean it.
+        with self._config():
+            self.assertEqual(
+                laintas_cli._rprompt_final_visible_slot_ids(
+                    settings_only=True)[0],
+                "agent")
+
+    def test_the_mark_is_selectable_when_there_is_something_to_read(self):
+        import startup_mail
+        startup_mail.clear()
+        startup_mail.post("a", "One")
+        self.addCleanup(startup_mail.clear)
+        with mock.patch.object(laintas_cli,
+                               "_rprompt_slot_currently_visible",
+                               return_value=True):
+            laintas_cli._rprompt_select_slot("messages")
+        self.assertEqual(laintas_cli._rprompt_modal_slot, "messages")
+        self.assertEqual(laintas_cli._rprompt_modal_value, "a")
+
+    def test_the_mark_refuses_selection_with_an_empty_list(self):
+        import startup_mail
+        startup_mail.clear()
+        laintas_cli._rprompt_select_slot("messages")
+        self.assertEqual(laintas_cli._rprompt_modal_slot, "")
+        self.assertIn("No messages", laintas_cli._rprompt_notice_queue[0])
+
+    def test_the_selected_mark_renders_as_a_selected_slot(self):
+        import startup_mail
+        startup_mail.clear()
+        startup_mail.post("a", "One")
+        self.addCleanup(startup_mail.clear)
+        laintas_cli._rprompt_modal_slot = "messages"
+        frags = self._render(width=100)
+        self.assertEqual(_styled(frags)[0],
+                         ("class:rprompt-slot-selected", "L> 1"))
 
 
 class DeferredNoticeTests(_SlotTestBase):
@@ -619,7 +762,7 @@ class LegacyRenderEquivalenceTests(unittest.TestCase):
                     mock.patch.object(laintas_cli, "get_runtime_config",
                                       side_effect=lambda k: cfg.get(k)):
                 fresh = laintas_cli._render_rprompt()
-            if fresh != [tuple(x) for x in legacy]:
+            if _without_mark(fresh) != [tuple(x) for x in legacy]:
                 mismatches.append(key)
         self.assertEqual(mismatches, [],
                          f"{len(mismatches)} render regressions: {mismatches[:5]}")

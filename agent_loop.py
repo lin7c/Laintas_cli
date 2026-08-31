@@ -2,6 +2,7 @@
 """AI Agent Loop for laintas_cli — extracted from laintas_cli.py."""
 
 import hashlib
+import collections
 import copy
 import fnmatch
 import os
@@ -108,8 +109,8 @@ _DEFAULT_CONFIG = {
     # effort, terminal); the right prompt shows only slots present in the
     # list for the current detail state, on top of each slot's own width
     # breakpoint. Defaults reproduce the pre-slot layout exactly.
-    "rprompt_slots_detail_on": "agent,mode,model,effort,terminal",
-    "rprompt_slots_detail_off": "agent,mode,model,terminal",
+    "rprompt_slots_detail_on": "messages,agent,mode,model,effort,terminal",
+    "rprompt_slots_detail_off": "messages,agent,mode,model,terminal",
     # Display order of the same slots, left to right. Empty = built-in order;
     # invalid ids are rejected and omitted valid ids follow in default order.
     "rprompt_slot_order": "",
@@ -763,9 +764,9 @@ _runtime_config: dict[str, object] = {}
 
 _RUNTIME_CONFIG_DESCRIPTIONS = {
     "reasoning_effort": "How hard the model thinks before answering (none/low/medium/high/max). Thinking is billed as output tokens, so higher costs more; a model that cannot do the chosen gear gets its nearest lower one",
-    "rprompt_slots_detail_on": "Comma-separated right-prompt slots shown with detail on (agent,mode,model,effort,terminal); empty hides the row",
-    "rprompt_slots_detail_off": "Comma-separated right-prompt slots shown with detail off (agent,mode,model,effort,terminal); empty hides the row",
-    "rprompt_slot_order": "Left-to-right display order of right-prompt slots (agent,mode,model,effort,terminal); omitted slots follow in default order",
+    "rprompt_slots_detail_on": "Comma-separated right-prompt slots shown with detail on (messages,agent,mode,model,effort,terminal); empty hides the row",
+    "rprompt_slots_detail_off": "Comma-separated right-prompt slots shown with detail off (messages,agent,mode,model,effort,terminal); empty hides the row",
+    "rprompt_slot_order": "Left-to-right display order of right-prompt slots (agent,mode,model,effort,terminal); the messages mark is always leftmost; omitted slots follow in default order",
     "context_window_adopt_cap": "Ceiling on the auto-adopted provider window — lower it to compact earlier. Every turn re-sends the thread, so this is a cost knob, not just an overflow guard",
     "compact_chunk_tokens": "Largest slice of thread handed to the summarizer in one call",
     "aux_model": "Model for compaction / critic / memory-extraction (empty = use the main model)",
@@ -881,7 +882,8 @@ _RUNTIME_ENUM_CHOICES: dict[str, tuple[str, ...]] = {
     "fetch_render": ("off", "auto", "always"),
 }
 
-_RPROMPT_SLOT_IDS = ("agent", "mode", "model", "effort", "terminal")
+_RPROMPT_SLOT_IDS = ("messages", "agent", "mode", "model", "effort",
+                     "terminal")
 
 
 def _coerce_runtime_config_value(key: str, value):
@@ -2105,6 +2107,13 @@ def save_fork_state(state: dict, chat_history: list, cwd: str,
         return None
 
 
+#: Resume blobs older than this are neither offered nor loaded.
+_RESUME_MAX_AGE = 7 * 86400
+#: Grace on the mtime pre-filter, so a file whose clock skewed slightly is
+#: still opened and judged by its own recorded timestamp.
+_RESUME_MTIME_GRACE = 3600
+
+
 def list_resume_states(cwd: str) -> list:
     """Return selectable resume states for this cwd, newest first."""
     states = []
@@ -2116,12 +2125,23 @@ def list_resume_states(cwd: str) -> list:
         latest = _resume_latest_path(cwd)
         if latest.exists():
             files.append(latest)
+        now = time.time()
         for path in files:
+            try:
+                # A blob is discarded below when its recorded timestamp is
+                # older than the cutoff. Its file cannot be older than what it
+                # records, so stat() answers that for free — worth doing,
+                # because these files hold whole conversations and this used
+                # to read and parse every expired one before dropping it.
+                if now - path.stat().st_mtime > _RESUME_MAX_AGE + _RESUME_MTIME_GRACE:
+                    continue
+            except OSError:
+                continue
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
                 if data.get("cwd") != cwd:
                     continue
-                if time.time() - data.get("timestamp", 0) > 7 * 86400:
+                if time.time() - data.get("timestamp", 0) > _RESUME_MAX_AGE:
                     continue
                 rid = data.get("id") or path.stem
                 if rid in seen_ids:
@@ -2140,7 +2160,17 @@ def list_resume_states(cwd: str) -> list:
     # autosaves whose conversation or working state changed after a checkpoint.
     unique = []
     by_snapshot = {}
+    # session_id is part of the fingerprinted payload, so two blobs from
+    # different sessions can never collapse into each other. A session that
+    # contributed exactly one file therefore has nothing to collide with, and
+    # fingerprinting it is pure cost — a deepcopy plus a JSON dump of a whole
+    # conversation, per file, on every startup.
+    _per_session = collections.Counter(
+        str(item.get("session_id") or "") for item in states)
     for item in states:
+        if _per_session[str(item.get("session_id") or "")] < 2:
+            unique.append(item)
+            continue
         stable = {
             "session_id": item.get("session_id"),
             "title": item.get("title"),
@@ -2160,6 +2190,72 @@ def list_resume_states(cwd: str) -> list:
             unique[previous_index] = item
     unique.sort(key=lambda item: item.get("timestamp", 0), reverse=True)
     return unique
+
+
+#: How many of a cwd's resume blobs the startup advisory parses. They are
+#: whole conversations — 60MB across 62 files on a working machine — and the
+#: advisory only reports the newest one's size and age.
+_RESUME_SUMMARY_PROBE = 6
+
+
+def latest_resume_summary(cwd: str) -> Optional[dict]:
+    """Cheap {turn_count, timestamp} for the newest resume blob, or None.
+
+    Bounded on purpose. ``list_resume_states`` parses every live blob for the
+    cwd so the /resume picker can collapse duplicates, which is right for a
+    picker the user asked for and wrong for a line that just says "there is
+    something here". This stats the candidates (free), parses only the newest
+    few by mtime, and reports the newest of those by its own recorded
+    timestamp — so a file whose mtime and contents disagree cannot mislead it
+    unless it also happens to be outside the probe window, in which case the
+    advisory names a slightly older session. /resume itself is unaffected.
+    """
+    try:
+        files = list(paths.SESSIONS_DIR.glob(_resume_checkpoint_pattern(cwd)))
+        files.extend(paths.SESSIONS_DIR.glob(_resume_session_pattern(cwd)))
+        files.extend(paths.SESSIONS_DIR.glob(_resume_fork_pattern(cwd)))
+        latest = _resume_latest_path(cwd)
+        if latest.exists():
+            files.append(latest)
+        now = time.time()
+        dated = []
+        for path in files:
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                continue
+            if now - mtime > _RESUME_MAX_AGE + _RESUME_MTIME_GRACE:
+                continue
+            dated.append((mtime, path))
+        dated.sort(reverse=True)
+        best = None
+        for _mtime, path in dated[:_RESUME_SUMMARY_PROBE]:
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if data.get("cwd") != cwd or not data.get("chat_history"):
+                continue
+            if now - data.get("timestamp", 0) > _RESUME_MAX_AGE:
+                continue
+            if best is None or data.get("timestamp", 0) > best["timestamp"]:
+                stored = data.get("turn_count")
+                if not isinstance(stored, int):
+                    # Same rule as the /resume picker's counter: a turn is a
+                    # user prompt to the agent, not a shell line or a command.
+                    stored = len([
+                        m for m in (data.get("chat_history") or [])
+                        if isinstance(m, dict) and m.get("role") == "user"
+                        and m.get("input_kind") not in {
+                            "shell", "interactive", "slash"}
+                    ])
+                best = {
+                    "turn_count": stored,
+                    "timestamp": data.get("timestamp", 0),
+                }
+        return best
+    except Exception:
+        return None
 
 
 def load_resume_state(cwd: str, session_id: str = None) -> Optional[dict]:

@@ -18,7 +18,7 @@ import symbols
 
 
 def _text(fragments) -> str:
-    return "".join(text for _style, text in fragments)
+    return "".join(fragment[1] for fragment in fragments)
 
 
 class PessimisticWidthTests(unittest.TestCase):

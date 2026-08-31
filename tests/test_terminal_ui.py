@@ -12,11 +12,23 @@ from rich.console import Console
 
 import agent_loop
 import laintas_cli
+import startup_mail
 import tools
 
 
 def _text(fragments):
-    return "".join(value for _style, value in fragments)
+    return "".join(fragment[1] for fragment in fragments)
+
+
+def _settings_text(fragments) -> str:
+    """rprompt text with the leading L> mark and its separator removed."""
+    pairs = [(fragment[0], fragment[1]) for fragment in fragments]
+    head = 0
+    while head < len(pairs) and pairs[head][0].startswith("class:rprompt-logo"):
+        head += 1
+    if head and head < len(pairs) and pairs[head][0] == "class:rprompt-sep":
+        head += 1
+    return "".join(text for _style, text in pairs[head:])
 
 
 class PromptInputLifecycleTests(unittest.TestCase):
@@ -91,7 +103,8 @@ class ResponsiveTerminalChromeTests(unittest.TestCase):
         )
         with common[0], common[1], mock.patch.object(
                 laintas_cli, "_terminal_width", return_value=48):
-            narrow = _text(laintas_cli._render_rprompt())
+            narrow_frags = laintas_cli._render_rprompt()
+            narrow = _text(narrow_frags)
         with mock.patch("plan_mode.is_plan_mode", return_value=False), \
                 mock.patch.object(laintas_cli.mode_manager, "get_active_mode",
                                   return_value={"name": "act"}), \
@@ -110,7 +123,10 @@ class ResponsiveTerminalChromeTests(unittest.TestCase):
         for rendered in (narrow, medium, wide):
             self.assertTrue(rendered.endswith(" "),
                             f"rprompt must reserve the last column: {rendered!r}")
-        self.assertEqual(narrow.rstrip(), "ACT")
+        # The L> mark leads the row when something is unread and has no width
+        # breakpoint; the setting slots behind it disclose progressively.
+        # This suite posts no messages, so the mark is correctly absent.
+        self.assertEqual(_settings_text(narrow_frags).rstrip(), "ACT")
         self.assertIn("model-long", medium)
         self.assertNotIn("primary@term0", medium)
         self.assertIn("primary@term0", wide)
@@ -152,8 +168,9 @@ class ResponsiveTerminalChromeTests(unittest.TestCase):
                 mock.patch.object(laintas_cli.mode_manager, "get_active_mode",
                                   return_value={"name": "act"}), \
                 mock.patch("plan_mode.is_plan_mode", return_value=False):
-            text = _text(laintas_cli._render_rprompt())
-        self.assertTrue(text.startswith("agent1 · ACT"))
+            frags = laintas_cli._render_rprompt()
+        text = _text(frags)
+        self.assertTrue(_settings_text(frags).startswith("agent1 · ACT"))
         self.assertIn("glm-5.2", text)
 
     def test_prompt_uses_one_foreground_without_agent_routing(self):
@@ -221,9 +238,16 @@ class ResponsiveTerminalChromeTests(unittest.TestCase):
         self.assertIn("https://laintas.com", rendered)
         self.assertIn("mode", rendered)
         self.assertIn("policy", rendered)
-        self.assertIn("/mode", rendered)
-        self.assertIn("/policy", rendered)
-        self.assertIn("/training on", rendered)
+        # The advisory lines that used to follow the environment summary are
+        # posted to the session message list instead; the banner keeps the
+        # summary and nothing else.
+        self.assertNotIn("/training on", rendered)
+        keys = [item.key for item in startup_mail.items()]
+        self.assertIn("tips", keys)
+        self.assertIn("training", keys)
+        tips = next(i for i in startup_mail.items() if i.key == "tips")
+        self.assertIn("/mode", tips.action)
+        self.assertIn("/policy", tips.action)
 
     def test_prompt_uses_thin_unbold_chevron(self):
         captured = {}
