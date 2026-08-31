@@ -33,7 +33,9 @@ laintas-cli
 On 64-bit Windows 10 2004+ or Windows 11, the single-file Windows installer imports a
 private `Laintas-CLI` WSL 2 distribution and installs a native
 `laintas-cli.exe` launcher. Normal startup calls `wslapi.dll` directly, does
-not run `wsl.exe`, and does not change the user's default WSL distribution:
+not run `wsl.exe`, and does not change the user's default WSL distribution.
+The installer lets the user choose the local installation drive and offers
+to start Laintas CLI on its final page:
 
 ```powershell
 irm https://cli.laintas.com/install.ps1 | iex

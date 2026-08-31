@@ -15,6 +15,20 @@ function Get-RegisteredDistributions {
     return @($output | ForEach-Object { ($_ -replace "`0", "").Trim() } | Where-Object { $_ })
 }
 
+function Get-DistributionBasePath([string]$Name) {
+    $registry = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Lxss"
+    if (-not (Test-Path -LiteralPath $registry)) {
+        return $null
+    }
+    foreach ($key in Get-ChildItem -LiteralPath $registry -ErrorAction SilentlyContinue) {
+        $values = Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction SilentlyContinue
+        if ($values.DistributionName -eq $Name -and $values.BasePath) {
+            return ([string]$values.BasePath -replace '^\\\\\?\\', '')
+        }
+    }
+    return $null
+}
+
 function Add-UserPath([string]$Directory) {
     $current = [Environment]::GetEnvironmentVariable("Path", "User")
     $parts = @($current -split ";" | Where-Object { $_ })
@@ -86,6 +100,14 @@ if ($registered -notcontains $DistroName) {
         throw
     }
 } else {
+    $registeredBase = Get-DistributionBasePath $DistroName
+    if ($registeredBase) {
+        $selectedBase = [IO.Path]::GetFullPath($DistroDir).TrimEnd('\')
+        $registeredBase = [IO.Path]::GetFullPath($registeredBase).TrimEnd('\')
+        if (-not $selectedBase.Equals($registeredBase, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "$DistroName is already installed at $registeredBase. Keep its existing installation directory ($([IO.Path]::GetDirectoryName($registeredBase))) when upgrading."
+        }
+    }
     Write-Host "$DistroName is already installed; preserving its Linux filesystem and user data."
 }
 

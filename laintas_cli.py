@@ -61,16 +61,19 @@ SYSTEM = platform.system()  # "Linux", "Darwin"
 def _open_external_url(url: str) -> bool:
     """Open a URL on the desktop hosting this CLI.
 
-    A private WSL distribution normally has no Linux browser registered. WSL
-    interop exposes ``explorer.exe`` from the Windows host, so prefer it there
-    and retain Python's normal browser selection everywhere else.
+    A private WSL distribution normally has no Linux browser registered.
+    Ask Windows PowerShell to resolve the URL through the user's default HTTP
+    handler. Passing a URL to explorer.exe is not equivalent: on some Windows
+    builds it opens File Explorer and treats the URL as a path.
     """
     if os.environ.get("WSL_INTEROP") or os.environ.get("WSL_DISTRO_NAME"):
-        explorer = shutil.which("explorer.exe")
-        if explorer:
+        powershell = shutil.which("powershell.exe")
+        if powershell:
             try:
                 subprocess.Popen(
-                    [explorer, url], stdout=subprocess.DEVNULL,
+                    [powershell, "-NoLogo", "-NoProfile", "-NonInteractive",
+                     "-Command", "Start-Process -FilePath $args[0]", url],
+                    stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL, start_new_session=True)
                 return True
             except OSError:
@@ -79,6 +82,21 @@ def _open_external_url(url: str) -> bool:
         return bool(webbrowser.open(url))
     except Exception:
         return False
+
+
+def _initial_ui_preferences_for_host(preferences: dict) -> dict:
+    """Apply host-specific UI defaults without overriding a user choice.
+
+    Mouse reporting remains opt-in on ordinary Linux terminals because it
+    takes over drag-to-select. The private Windows distribution is launched
+    inside a modern Windows terminal where clickable UI is expected, so turn
+    it on there unless the user explicitly saved ``enable_mouse = false``.
+    """
+    result = dict(preferences)
+    if ("enable_mouse" not in result
+            and os.environ.get("WSL_DISTRO_NAME") == "Laintas-CLI"):
+        result["enable_mouse"] = True
+    return result
 
 # Capture restart identity before os.chdir() or an in-place update can alter
 # what argv[0] resolves to.  A PATH launch commonly has argv[0] ==
@@ -24019,7 +24037,9 @@ def main():
     agent_name = args.name or config.get("agentName", socket.gethostname())
     # Restore display/input preferences for this logical terminal. Validation
     # remains centralized in agent_loop; corrupt or obsolete values are ignored.
-    for _key, _value in terminal_preferences.get_ui_preferences().items():
+    _host_ui_preferences = _initial_ui_preferences_for_host(
+        terminal_preferences.get_ui_preferences())
+    for _key, _value in _host_ui_preferences.items():
         try:
             set_runtime_config(_key, _value)
         except (KeyError, TypeError, ValueError):

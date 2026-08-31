@@ -24,7 +24,10 @@ ManifestDPIAware true
 
 Name "${APP_NAME}"
 OutFile "..\..\laintas-cli_windows_amd64_setup.exe"
-InstallDir "$LOCALAPPDATA\Laintas\app"
+; The selected directory is the root for the launcher, private WSL virtual
+; disk, and uninstaller. InstallDirRegKey makes upgrades reopen at the path
+; the user selected previously.
+InstallDir "$LOCALAPPDATA\Laintas"
 InstallDirRegKey HKCU "Software\${APP_SHORT}" "InstallDir"
 RequestExecutionLevel user
 SetCompressor /SOLID lzma
@@ -39,7 +42,10 @@ VIAddVersionKey "FileVersion" "${APP_VERSION}"
 VIAddVersionKey "ProductVersion" "${APP_VERSION}"
 
 !define MUI_ABORTWARNING
+!define MUI_FINISHPAGE_RUN "$INSTDIR\bin\laintas-cli.exe"
+!define MUI_FINISHPAGE_RUN_TEXT "Start Laintas CLI now"
 !insertmacro MUI_PAGE_WELCOME
+!insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
 !insertmacro MUI_PAGE_FINISH
 !insertmacro MUI_UNPAGE_CONFIRM
@@ -48,6 +54,13 @@ VIAddVersionKey "ProductVersion" "${APP_VERSION}"
 !insertmacro MUI_LANGUAGE "SimpChinese"
 
 Function .onInit
+  ; v1.23.0 stored the NSIS app directory instead of the installation root.
+  ; Migrate that one released layout so its upgrade keeps the existing
+  ; Laintas-CLI distro at $LOCALAPPDATA\Laintas\WSL.
+  ReadRegStr $0 HKCU "Software\${APP_SHORT}" "InstallDir"
+  ${If} $0 == "$LOCALAPPDATA\Laintas\app"
+    StrCpy $INSTDIR "$LOCALAPPDATA\Laintas"
+  ${EndIf}
   !insertmacro MUI_LANGDLL_DISPLAY
 FunctionEnd
 
@@ -60,7 +73,7 @@ Section "Install"
   File "${PAYLOAD_DIR}\install.ps1"
 
   DetailPrint "Installing the private Laintas CLI runtime..."
-  nsExec::ExecToLog 'powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$PLUGINSDIR\payload\install.ps1" -InstallRoot "$LOCALAPPDATA\Laintas"'
+  nsExec::ExecToLog 'powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$PLUGINSDIR\payload\install.ps1" -InstallRoot "$INSTDIR"'
   Pop $0
   ${If} $0 != 0
     MessageBox MB_ICONSTOP "Laintas CLI installation failed (exit code $0). WSL 2 must be enabled before installation."
@@ -71,23 +84,28 @@ Section "Install"
   SetOutPath "$INSTDIR"
   File "${PAYLOAD_DIR}\uninstall.ps1"
   WriteUninstaller "$INSTDIR\uninstall.exe"
+  Delete "$INSTDIR\app\uninstall.ps1"
+  Delete "$INSTDIR\app\uninstall.exe"
+  RMDir "$INSTDIR\app"
 
   WriteRegStr HKCU "Software\${APP_SHORT}" "InstallDir" "$INSTDIR"
   WriteRegStr HKCU "${REG_UNINSTALL}" "DisplayName" "${APP_NAME}"
   WriteRegStr HKCU "${REG_UNINSTALL}" "DisplayVersion" "${APP_VERSION}"
   WriteRegStr HKCU "${REG_UNINSTALL}" "Publisher" "${APP_PUBLISHER}"
   WriteRegStr HKCU "${REG_UNINSTALL}" "URLInfoAbout" "${APP_URL}"
-  WriteRegStr HKCU "${REG_UNINSTALL}" "DisplayIcon" "$LOCALAPPDATA\Laintas\bin\laintas-cli.exe"
+  WriteRegStr HKCU "${REG_UNINSTALL}" "DisplayIcon" "$INSTDIR\bin\laintas-cli.exe"
   WriteRegStr HKCU "${REG_UNINSTALL}" "UninstallString" '$\"$INSTDIR\uninstall.exe$\"'
   WriteRegDWORD HKCU "${REG_UNINSTALL}" "NoModify" 1
   WriteRegDWORD HKCU "${REG_UNINSTALL}" "NoRepair" 1
 SectionEnd
 
 Section "Uninstall"
-  nsExec::ExecToLog 'powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$INSTDIR\uninstall.ps1" -InstallRoot "$LOCALAPPDATA\Laintas"'
+  nsExec::ExecToLog 'powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$INSTDIR\uninstall.ps1" -InstallRoot "$INSTDIR"'
+  RMDir "$INSTDIR\bin"
   Delete "$INSTDIR\uninstall.ps1"
   Delete "$INSTDIR\uninstall.exe"
-  RMDir "$INSTDIR"
+  ; Keep $INSTDIR itself because WSL\ext4.vhdx and the user's ~/.laintas
+  ; data intentionally survive a normal uninstall.
   DeleteRegKey HKCU "${REG_UNINSTALL}"
   DeleteRegKey HKCU "Software\${APP_SHORT}"
 SectionEnd

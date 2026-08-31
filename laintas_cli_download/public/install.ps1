@@ -31,7 +31,9 @@ try {
         throw "Checksum mismatch for $Asset."
     }
 
-    $process = Start-Process -FilePath $Installer -ArgumentList "/S" -Wait -PassThru
+    # Keep the one-line bootstrap command, but show the real installer so the
+    # user can choose a drive and decide whether to launch when it finishes.
+    $process = Start-Process -FilePath $Installer -Wait -PassThru
     if ($process.ExitCode -ne 0) {
         throw "The Windows installer failed with exit code $($process.ExitCode)."
     }

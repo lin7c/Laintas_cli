@@ -8,7 +8,7 @@ import {
 import { useLanguage } from '@/contexts/LanguageContext';
 import ExtensionsSection from './ExtensionsSection';
 
-const RELEASE_FALLBACK = 'v1.23.0';
+const RELEASE_FALLBACK = 'v1.23.1';
 const RELEASE_BASE = 'https://cli.laintas.com/releases/latest';
 const INSTALL_COMMANDS = {
   linux: 'curl -fsSL https://cli.laintas.com/install.sh | bash',

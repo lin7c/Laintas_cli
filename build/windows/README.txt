@@ -7,8 +7,11 @@ Requirements:
 
 Install:
 1. Double-click laintas-cli_windows_amd64_setup.exe.
-2. Open a new PowerShell or Command Prompt window.
-3. Run: laintas-cli
+2. Keep the default directory or choose another local NTFS drive.
+3. On the final page, choose whether to start Laintas CLI immediately.
+
+The selected directory contains bin, the private WSL virtual disk, and the
+uninstaller. Upgrades remember and reuse the same directory.
 
 The launcher uses the private WSL distribution named "Laintas-CLI". It does
 not change the user's default WSL distribution and does not use wsl.exe during

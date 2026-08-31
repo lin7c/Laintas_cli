@@ -86,13 +86,13 @@ class DownloadProgressTests(unittest.TestCase):
 
 
 class RestartResolutionTests(unittest.TestCase):
-    def test_wsl_browser_open_uses_windows_host(self):
+    def test_wsl_browser_open_uses_windows_default_url_handler(self):
         with mock.patch.dict(
                 laintas_cli.os.environ,
                 {"WSL_DISTRO_NAME": "Laintas-CLI"}, clear=False), \
                 mock.patch.object(
                     laintas_cli.shutil, "which",
-                    return_value="/mnt/c/Windows/explorer.exe"), \
+                    return_value="/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"), \
                 mock.patch.object(laintas_cli.subprocess, "Popen") as popen, \
                 mock.patch.object(laintas_cli.webbrowser, "open") as browser:
             opened = laintas_cli._open_external_url(
@@ -101,12 +101,29 @@ class RestartResolutionTests(unittest.TestCase):
         self.assertTrue(opened)
         browser.assert_not_called()
         popen.assert_called_once_with(
-            ["/mnt/c/Windows/explorer.exe",
+            ["/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe",
+             "-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
+             "Start-Process -FilePath $args[0]",
              "https://accounts.laintas.com/login"],
             stdout=laintas_cli.subprocess.DEVNULL,
             stderr=laintas_cli.subprocess.DEVNULL,
             start_new_session=True,
         )
+
+    def test_private_windows_runtime_enables_mouse_by_default(self):
+        with mock.patch.dict(
+                laintas_cli.os.environ,
+                {"WSL_DISTRO_NAME": "Laintas-CLI"}, clear=False):
+            preferences = laintas_cli._initial_ui_preferences_for_host({})
+        self.assertIs(preferences["enable_mouse"], True)
+
+    def test_private_windows_runtime_respects_explicit_mouse_choice(self):
+        with mock.patch.dict(
+                laintas_cli.os.environ,
+                {"WSL_DISTRO_NAME": "Laintas-CLI"}, clear=False):
+            preferences = laintas_cli._initial_ui_preferences_for_host(
+                {"enable_mouse": False})
+        self.assertIs(preferences["enable_mouse"], False)
 
     def test_path_launch_resolves_executable_instead_of_cwd_name(self):
         with tempfile.TemporaryDirectory() as tmp:
