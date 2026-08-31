@@ -885,7 +885,15 @@ class ReadyQueueTests(unittest.TestCase):
             self.assertEqual(os.path.realpath(tmp), os.path.realpath(os.getcwd()),
                              "another test moved the working directory mid-run")
         self.assertTrue(result["ok"], result["msg"])
-        self.assertEqual(["a.hwo", "b.hwo"], calls[:2])
+        # `a` and `b` are one frontier, so they are launched together in the
+        # thread pool: which of the two enters the mock first is the pool's
+        # decision, and asserting it made this test fail on roughly four runs
+        # in five. What the migration actually has to get right is the queue
+        # order — currentNode ahead of pending — and the runner commits in
+        # queue order rather than completion order, which is what `history`
+        # records.
+        self.assertEqual({"a.hwo", "b.hwo"}, set(calls[:2]))
+        self.assertEqual(["s", "a", "b", "c"], legacy["history"])
         self.assertEqual(1, calls.count("c.hwo"))
         self.assertNotIn("s.hwo", calls)          # already done before the pause
 

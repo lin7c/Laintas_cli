@@ -37,23 +37,8 @@ jobs:
           # reading like a normal failure.
           pip install pytest pillow
 
-      # Two tests fail on a clean checkout for reasons unrelated to any change
-      # under review (see tests/KNOWN_FAILURES.md). They are deselected so this
-      # job is GREEN on arrival — a gate that is red from day one gets ignored
-      # within a week, and then it gates nothing. Everything else must pass.
+      # No deselect list: the two tests that used to need one now pass, which
+      # the informational step that watched for exactly that reported the
+      # first time this job got far enough to run anything.
       - name: Run test suite
-        run: |
-          python -m pytest tests/ -q \
-            --deselect "tests/test_slash_commands.py::SlashRegistryTests::test_mode_study_switches_and_explains_itself" \
-            --deselect "tests/test_slash_commands.py::SlashRegistryTests::test_usage_model_tier_mapping_and_rendering"
-
-      # Informational only: tells us the day someone fixes them, so the
-      # deselect list above can shrink. Never fails the build.
-      - name: Known failures (informational)
-        if: always()
-        continue-on-error: true
-        run: |
-          python -m pytest tests/ -q \
-            "tests/test_slash_commands.py::SlashRegistryTests::test_mode_study_switches_and_explains_itself" \
-            "tests/test_slash_commands.py::SlashRegistryTests::test_usage_model_tier_mapping_and_rendering" \
-            || echo "Still failing as expected — see tests/KNOWN_FAILURES.md"
+        run: python -m pytest tests/ -q

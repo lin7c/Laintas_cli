@@ -6,6 +6,7 @@ import {
   Radar, RotateCcw, ShieldCheck, TerminalSquare, Waypoints,
 } from 'lucide-react';
 import { useLanguage } from '@/contexts/LanguageContext';
+import SiteFooter from './SiteFooter';
 
 const RELEASE_FALLBACK = 'v1.23.3';
 // Release files are served by GitHub Releases, the one place CI publishes to.
@@ -196,7 +197,7 @@ export default function DownloadSection() {
         <p className="requirements"><CheckCircle2 size={15} />{c.requirements}</p>
       </section>
 
-      <footer className="product-footer page-shell"><BrandMark compact /><p>{c.footer}</p><nav><a href="https://laintas.com/docs" target="_blank" rel="noreferrer">{c.docs}</a><a href="https://github.com/lin7c/Laintas_cli" target="_blank" rel="noreferrer">{c.source}</a><a href="https://laintas.com/pricing" target="_blank" rel="noreferrer">{c.pricing}</a></nav></footer>
+      <SiteFooter />
     </main>
   );
 }
@@ -211,4 +212,4 @@ function CopyButton({ value, labels }) {
   return <button type="button" className="copy-button" onClick={copy} aria-label={labels.copy}>{copied ? <Check size={17} /> : <Copy size={17} />}{copied ? labels.copied : labels.copy}</button>;
 }
 
-export function BrandMark({ compact = false }) { return <span className={`laintas-mark ${compact ? 'compact' : ''}`} aria-label="Laintas CLI"><b>L</b><i>&gt;</i></span>; }
+

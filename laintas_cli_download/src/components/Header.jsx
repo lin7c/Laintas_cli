@@ -5,7 +5,7 @@ import { ChevronDown, LogIn, LogOut, Moon, Settings, Sun, UserRound } from 'luci
 import { useLanguage } from '../contexts/LanguageContext';
 import { useTheme } from '../contexts/ThemeContext';
 import { useAuth } from '../contexts/AuthContext';
-import { BrandMark } from './DownloadSection';
+import BrandMark from './BrandMark';
 
 const NAV = {
   zh: [['流程', '/#workflow'], ['运维能力', '/#operations'], ['安全边界', '/#security'], ['下载', '/#download'], ['插件市场', '/plugins']],

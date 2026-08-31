@@ -24,7 +24,7 @@ python3 -m unittest tests.test_git_policy      # targeted, sub-second — use th
 python3 -m pytest tests/                       # also works, ~85s
 ```
 
-Two tests fail on a clean checkout and are not yours: `test_slash_commands.py::test_mode_study_switches_and_explains_itself` (asserts a string the source no longer contains) and `::test_usage_model_tier_mapping_and_rendering` (exhausted requests mock). Exactly those two = green. Note `-t .` fails — there is no `tests/__init__.py`.
+The suite is green on a clean checkout — no expected failures, and CI runs it with no deselect list. Note `-t .` fails — there is no `tests/__init__.py`.
 
 There is no linter config and no Makefile. Beyond tests, iterate by running the CLI directly. After editing files, force-reload the dev session by typing `/reload` inside the REPL (deletes `.laintas/` project files and restarts).
 
