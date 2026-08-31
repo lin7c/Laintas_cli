@@ -140,18 +140,24 @@ class PromptContractTests(unittest.TestCase):
 
     def test_the_moved_environment_fields_still_reach_the_model(self):
         """Dropping them from the prompt only helps if live state carries them."""
-        volatile = {"env": {"cwd": "/root/agent_gateway",
-                            "children": "child-1",
-                            "plan_mode": "[PLAN MODE ACTIVE]"}}
-        for thread_mode in (True, False):
-            message = agent_loop._build_user_message(
-                "task", {"cwd": "/root/agent_gateway"}, [], [], 1, 30,
-                thread_mode=thread_mode, first_turn=False, volatile=volatile)
-            self.assertIn("CWD: /root/agent_gateway", message)
-            self.assertIn("Children: child-1", message)
-            self.assertIn("[PLAN MODE ACTIVE]", message)
-            self.assertLess(message.index("<environment_now>"),
-                            message.index("<now>"))
+        # A real directory, and one this process may write in: building the
+        # message opens the work graph under <cwd>/.laintas/. A hardcoded path
+        # passed here as sample data was created for real, which passed on the
+        # machine that happened to own it and failed everywhere else.
+        with tempfile.TemporaryDirectory() as cwd:
+            volatile = {"env": {"cwd": cwd,
+                                "children": "child-1",
+                                "plan_mode": "[PLAN MODE ACTIVE]"}}
+            for thread_mode in (True, False):
+                message = agent_loop._build_user_message(
+                    "task", {"cwd": cwd}, [], [], 1, 30,
+                    thread_mode=thread_mode, first_turn=False,
+                    volatile=volatile)
+                self.assertIn(f"CWD: {cwd}", message)
+                self.assertIn("Children: child-1", message)
+                self.assertIn("[PLAN MODE ACTIVE]", message)
+                self.assertLess(message.index("<environment_now>"),
+                                message.index("<now>"))
 
     def test_live_state_survives_a_volatile_payload_without_env(self):
         message = agent_loop._build_user_message(

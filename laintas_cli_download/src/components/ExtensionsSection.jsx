@@ -1,7 +1,11 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Check, Copy, PackageCheck, ShieldAlert, UserRound } from 'lucide-react';
 
-export default function ExtensionsSection() {
+// `standalone` is set when this is the whole page rather than the fourth
+// section of the home page: the "04 /" index counts sections on that page and
+// means nothing on its own, and the page needs the header's height cleared
+// where the section previously followed another one.
+export default function ExtensionsSection({ standalone = false }) {
   const [official, setOfficial] = useState([]);
   const [community, setCommunity] = useState([]);
   const [officialState, setOfficialState] = useState('loading');
@@ -44,10 +48,10 @@ export default function ExtensionsSection() {
   }, [community]);
 
   return (
-    <section id="extensions" className="extensions-section page-shell">
+    <section id="extensions" className={`extensions-section page-shell${standalone ? ' extensions-standalone' : ''}`}>
       <div className="extensions-heading">
         <div>
-          <p className="section-kicker">04 / EXTENSIONS</p>
+          <p className="section-kicker">{standalone ? 'EXTENSIONS' : '04 / EXTENSIONS'}</p>
           <h2>Two sources.<br />No blurred trust.</h2>
         </div>
         <p>Official packages and user-published code remain visibly and technically separate. Community code is unreviewed and receives a fresh AI-assisted source review before every installation.</p>

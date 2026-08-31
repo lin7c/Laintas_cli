@@ -4,6 +4,7 @@ import { LanguageProvider } from './contexts/LanguageContext';
 import { AuthProvider } from './contexts/AuthContext';
 import Header from './components/Header';
 import DownloadSection from './components/DownloadSection';
+import ExtensionsPage from './pages/ExtensionsPage';
 import LoginPage from './pages/LoginPage';
 import RegisterPage from './pages/RegisterPage';
 import SettingsPage from './pages/SettingsPage';
@@ -19,6 +20,17 @@ function AppContent() {
           <div className="relative min-h-screen">
             <Header />
             <DownloadSection />
+          </div>
+        } />
+        {/* /plugins, not /extensions: the registry and the extension packages
+            themselves are served from the static /extensions/ directory, so
+            that path resolves to a directory listing (403), not this page —
+            client-side navigation would work and a refresh or a shared link
+            would not. */}
+        <Route path="/plugins" element={
+          <div className="relative min-h-screen">
+            <Header />
+            <ExtensionsPage />
           </div>
         } />
         <Route path="/login" element={

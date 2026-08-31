@@ -8,8 +8,8 @@ import { useAuth } from '../contexts/AuthContext';
 import { BrandMark } from './DownloadSection';
 
 const NAV = {
-  zh: [['流程', '/#workflow'], ['运维能力', '/#operations'], ['安全边界', '/#security'], ['下载', '/#download']],
-  en: [['Workflow', '/#workflow'], ['Operations', '/#operations'], ['Security', '/#security'], ['Download', '/#download']],
+  zh: [['流程', '/#workflow'], ['运维能力', '/#operations'], ['安全边界', '/#security'], ['下载', '/#download'], ['插件市场', '/plugins']],
+  en: [['Workflow', '/#workflow'], ['Operations', '/#operations'], ['Security', '/#security'], ['Download', '/#download'], ['Plugin Market', '/plugins']],
 };
 
 export default function Header() {
@@ -45,7 +45,9 @@ export default function Header() {
       <div className="header-inner">
         <Link to="/" className="header-brand"><BrandMark compact /><span>laintas_cli</span><small>v1.18</small></Link>
         <nav className="header-nav" aria-label="Product navigation">
-          {NAV[lang].map(([label, href]) => <a href={href} key={href}>{label}</a>)}
+          {NAV[lang].map(([label, href]) => (href.startsWith('/#')
+            ? <a href={href} key={href}>{label}</a>
+            : <Link to={href} key={href}>{label}</Link>))}
         </nav>
         <div className="header-actions">
           <a className="pricing-link" href="https://laintas.com/pricing" target="_blank" rel="noreferrer">{lang === 'zh' ? '定价' : 'Pricing'}</a>

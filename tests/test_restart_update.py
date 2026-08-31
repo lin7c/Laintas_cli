@@ -328,11 +328,8 @@ class UpdateChannelTests(unittest.TestCase):
             "https://github.com/lin7c/Laintas_cli/releases/latest/download",
             page)
         self.assertNotIn("cli.laintas.com/releases/", page)
-        # Every artifact the release publishes, including the two that were
-        # only reachable by going to GitHub by hand.
+        # The two files the page links directly; Linux goes through the
+        # installer script, which picks its own architecture.
         for asset in ("laintas-cli_windows_amd64_setup.exe",
-                      "laintas-cli_linux_amd64.tar.gz",
-                      "laintas-cli_linux_arm64.tar.gz",
-                      "laintas-cli_source.zip",
-                      "_amd64.deb"):
+                      "laintas-cli_source.zip"):
             self.assertIn(asset, page)
