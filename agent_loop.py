@@ -478,6 +478,36 @@ def _adaptive_loop_delay(base: float, *, failed: bool, retry_count: int = 0,
     return min(delay, 4.0)
 
 
+def _recover_cwd_into_state(state: dict, *, agent_id: str = "",
+                            run_id: str = "", loop: int = 0) -> str:
+    """Move out of a deleted working directory, and tell the model it happened.
+
+    The directory a task runs in can disappear while the task is running, and
+    the agent itself is a common culprit — it removes a worktree, a build tree
+    or a scratch directory it is standing in. On Linux the process then holds
+    an unlinked inode: os.getcwd() raises ENOENT and every later path call
+    fails, which used to end the run with a traceback naming getcwd rather
+    than the directory. Recovering silently would be worse than the crash: the
+    model would keep issuing paths relative to a directory it no longer
+    occupies, so the move goes into short-term memory where it will read it.
+    """
+    try:
+        cwd, left_behind = paths.ensure_live_cwd(state.get("cwd") or "")
+    except Exception:
+        return ""
+    if not left_behind or not cwd:
+        return cwd
+    state["cwd"] = cwd
+    _append_short_memory(state, (
+        f"\n  {symbols.WARN} The working directory {left_behind} no longer "
+        f"exists; now working in {cwd}. Paths relative to the old directory "
+        f"are gone."))
+    event_log.append("cwd_recovered", loop=loop,
+                     agent_id=agent_id or "primary", run_id=run_id,
+                     gone=left_behind, now=cwd)
+    return cwd
+
+
 def _bg_print(console, markup_text: str, width: int = 0) -> None:
     """Print Rich markup text with 'surface' background, padded to terminal width."""
     from rich.text import Text
@@ -8659,6 +8689,12 @@ def run_agent_loop(
     # task lifetime.
     state["_overflow_retry"] = 0
     for loop in range(max_loops):
+        # The working directory can vanish mid-task — the agent itself may
+        # have removed it (a worktree, a build tree, a scratch dir). On Linux
+        # the process is then holding an unlinked inode and every path call
+        # after it raises ENOENT, so recover before anything resolves a path.
+        _recover_cwd_into_state(state, agent_id=agent_id, run_id=_run_id,
+                                loop=loop)
         # Cross-instance coordination: refresh heartbeat + (re)detect whether
         # another laintas_cli instance shares this cwd.  Lazy — while alone,
         # this only refreshes the registration mtime and costs one listdir.
@@ -12017,6 +12053,13 @@ def run_agent_loop(
         if loop < max_loops - 1:
             # Use interrupt event.wait() instead of time.sleep() so we can
             # wake up immediately on Ctrl+C rather than waiting for sleep to end.
+            # The tools just ran, and one of them may have removed the
+            # directory we are standing in. Everything after this point
+            # resolves paths (the next user message, the task snapshot, the
+            # plan context), so recover here rather than at the top of the
+            # next iteration, which this turn would never reach.
+            _recover_cwd_into_state(state, agent_id=agent_id, run_id=_run_id,
+                                    loop=loop)
             _step_had_failure = any(
                 row.get("returncode") not in (None, 0)
                 for row in per_call_rows

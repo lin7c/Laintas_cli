@@ -317,3 +317,74 @@ def ensure_project_dir() -> Path:
     except OSError:
         pass
     return d
+
+
+# ── Surviving a deleted working directory ────────────────────────────────
+# Deleting the directory a long-running process sits in is ordinary (a build
+# tree, /tmp cleanup, `git worktree remove`), and on Linux it leaves the
+# process holding an unlinked inode: os.getcwd() then raises ENOENT and every
+# path-resolving call after it fails too. In a REPL that surfaced as a crash
+# on the next command, with a traceback that named getcwd rather than the
+# deleted directory. Recovering means moving somewhere that still exists —
+# which is what a person would do — and saying so.
+
+_last_live_cwd = ""
+
+
+def _cwd_candidates(gone: str, fallback: str) -> list:
+    """Where to land, best first: the path itself (it may have been recreated),
+    then its nearest surviving ancestor, then the caller's fallback, then home."""
+    out = []
+
+    def add(value):
+        text = str(value or "").strip()
+        if text and text not in out:
+            out.append(text)
+
+    if gone:
+        current = Path(gone)
+        add(str(current))
+        for parent in current.parents:
+            add(str(parent))
+    add(fallback)
+    try:
+        add(str(Path.home()))
+    except (OSError, RuntimeError):
+        pass
+    add(os.sep)
+    return out
+
+
+def ensure_live_cwd(fallback: str = "") -> tuple:
+    """Return ``(cwd, left_behind)`` — a usable working directory.
+
+    ``left_behind`` is empty when nothing was wrong. Otherwise it names the
+    directory that disappeared, and the process has already been moved to the
+    first surviving candidate. Never raises: if even the root is unreachable
+    the returned cwd is empty and the caller decides what that means.
+    """
+    global _last_live_cwd
+    try:
+        cwd = os.getcwd()
+    except OSError:
+        cwd = ""
+    if cwd:
+        _last_live_cwd = cwd
+        return cwd, ""
+
+    gone = _last_live_cwd or str(fallback or "")
+    for candidate in _cwd_candidates(gone, fallback):
+        try:
+            os.chdir(candidate)
+            cwd = os.getcwd()
+        except OSError:
+            continue
+        if cwd:
+            _last_live_cwd = cwd
+            return cwd, gone
+    return "", gone
+
+
+def live_cwd(fallback: str = "") -> str:
+    """``ensure_live_cwd`` for callers that only need a path they can use."""
+    return ensure_live_cwd(fallback)[0] or str(fallback or "")

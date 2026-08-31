@@ -60,7 +60,14 @@ SYSTEM = platform.system()  # "Linux", "Darwin"
 # Capture restart identity before os.chdir() or an in-place update can alter
 # what argv[0] resolves to.  A PATH launch commonly has argv[0] ==
 # "laintas-cli"; joining that to the cwd creates a nonexistent file.
-_LAUNCH_CWD = os.getcwd()
+try:
+    _LAUNCH_CWD = os.getcwd()
+except OSError:
+    # Launched from a directory that has already been deleted. Nothing here
+    # is worth dying at import for — this value only helps resolve a relative
+    # argv[0], and a relative argv[0] could not have been found from a
+    # directory that no longer exists anyway.
+    _LAUNCH_CWD = ""
 _LAUNCH_ARGV0 = sys.argv[0] if sys.argv else ""
 _LAUNCH_SCRIPT_PATH = os.path.abspath(__file__)
 
@@ -1523,6 +1530,40 @@ def _quick_pwd(session, timeout: float = 2.0) -> str:
         return os.getcwd()
 
 
+def _recover_deleted_cwd() -> str:
+    """Move out of a working directory that no longer exists, and say so.
+
+    Deleting the directory the CLI is sitting in (a build tree, /tmp cleanup,
+    `git worktree remove`) leaves the process on an unlinked inode, and every
+    later path call raises ENOENT — which used to end the session with a
+    traceback pointing at os.getcwd() rather than at the deleted directory.
+    Term0's bash is the authority on "where we are", so it is moved too;
+    leaving it behind would make the prompt and the shell disagree about the
+    directory, which is worse than the crash it replaced.
+    """
+    cwd, left_behind = paths.ensure_live_cwd()
+    if not left_behind:
+        return cwd
+    if not cwd:
+        console.print("[red]The working directory was deleted and no "
+                      "replacement could be entered.[/red]")
+        return ""
+    console.print(
+        f"[yellow]{symbols.WARN} {escape(left_behind)} no longer exists — "
+        f"moved to {escape(cwd)}.[/yellow]")
+    try:
+        info = get_terminal("term0")
+        session = info.session if info is not None else None
+        if session is not None and session.is_alive():
+            session.send_keys(f"cd {shlex.quote(cwd)}\n")
+            # bash cannot resolve anything from a deleted directory, so a
+            # replacement PTY is the only reliable outcome if the cd fails.
+            setattr(session, "_laintas_last_cwd", cwd)
+    except Exception:
+        pass
+    return cwd
+
+
 def _sync_cwd_from_term0(session) -> None:
     """Sync the parent process CWD to match term0's bash session CWD."""
     if session is None or not session.is_alive():
@@ -1547,9 +1588,9 @@ def _ensure_term0_alive() -> None:
     if alive and not dirty:
         return
     restart_cwd = str(
-        getattr(old_session, "_laintas_last_cwd", "") or os.getcwd())
+        getattr(old_session, "_laintas_last_cwd", "") or paths.live_cwd())
     if not os.path.isdir(restart_cwd):
-        restart_cwd = os.getcwd()
+        restart_cwd = paths.live_cwd()
     replacement = None
     try:
         replacement = InteractiveSession(
@@ -24334,10 +24375,12 @@ def main():
     # Main interactive loop
 
     while True:
+        # ── the directory we are standing in may have been deleted ──
+        _repl_cwd = _recover_deleted_cwd()
         # ── term0 health check ──
         _ensure_term0_alive()
         try:
-            item = _get_input(str(os.getcwd()))
+            item = _get_input(str(_repl_cwd or paths.live_cwd()))
         except KeyboardInterrupt:
             shutdown()
         except EOFError:
@@ -24353,6 +24396,14 @@ def main():
                               "flag; continuing.[/yellow]")
                 continue
             raise
+        except OSError as exc:
+            # Almost always the working directory disappearing between the
+            # check above and the prompt itself. Recover and re-prompt; the
+            # session outliving its directory is the whole point.
+            if getattr(exc, "errno", None) != errno.ENOENT:
+                raise
+            _recover_deleted_cwd()
+            continue
 
         if isinstance(item, _InjectedInput):
             user_input = item.text

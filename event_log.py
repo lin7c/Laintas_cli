@@ -113,6 +113,8 @@ REQUIRED_FIELDS: dict = {
     # cannot answer the only question worth asking of a debate mechanism:
     # whether the cheap judge is overruling the expensive one.
     "intent_resolved": ("agent_id", "run_id", "verdict", "debate_round"),
+    # Which directory vanished, and where the run continued from.
+    "cwd_recovered": ("gone", "now"),
 }
 
 
