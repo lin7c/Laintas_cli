@@ -8,7 +8,7 @@ import {
 import { useLanguage } from '@/contexts/LanguageContext';
 import ExtensionsSection from './ExtensionsSection';
 
-const RELEASE_FALLBACK = 'v1.23.2';
+const RELEASE_FALLBACK = 'v1.23.3';
 // Release files are served by GitHub Releases, the one place CI publishes to.
 // The site's own /releases/ path was the channel until releasing moved into
 // CI; nothing repopulates it now, so these links used to 404.
