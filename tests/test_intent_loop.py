@@ -96,6 +96,9 @@ class IntentLoopTestCase(unittest.TestCase):
         }
         self.critic_reply = json.dumps(
             {"on_track": True, "score": 90, "issue": "", "suggestion": ""})
+        self.compare_reply = json.dumps({
+            "severity": "detail_gap", "aligned": True, "divergences": [],
+            "void_steps": [], "missing": [], "next": ""}, ensure_ascii=False)
 
     def _backend(self, **kw):
         self.calls.append(kw)
@@ -104,6 +107,8 @@ class IntentLoopTestCase(unittest.TestCase):
             reply = (self.intent_replies.pop(0) if self.intent_replies
                      else SPEC_REPLY)
             return {"reply": reply, "done": True, "error": False}
+        if kind == "intent_compare":
+            return {"reply": self.compare_reply, "done": True, "error": False}
         if kind == "critic":
             return {"reply": self.critic_reply, "done": True, "error": False}
         if self.working_turns > 0:
@@ -121,6 +126,10 @@ class IntentLoopTestCase(unittest.TestCase):
             return self.config[key]
         if key == "loop_delay":
             return 0        # no reason to sleep between scripted turns
+        if key in ("skill_route_highlight", "mem_recall_highlight"):
+            # Semantic ranking over skills and memories costs about a second
+            # per iteration and has nothing to do with what is asserted here.
+            return False
         return agent_loop._DEFAULT_CONFIG.get(key)
 
     def run_loop(self, task=TASK, loops=3, state=None):
@@ -150,8 +159,8 @@ class IntentLoopTestCase(unittest.TestCase):
         return [c.get("task_kind", "") for c in self.calls]
 
     def main_calls(self):
-        return [c for c in self.calls
-                if c.get("task_kind") not in ("intent", "critic")]
+        return [c for c in self.calls if c.get("task_kind") not in
+                ("intent", "intent_compare", "critic")]
 
     def prompts(self):
         return [c.get("system_prompt", "") for c in self.main_calls()]
@@ -228,7 +237,7 @@ class SpecBuildTests(IntentLoopTestCase):
         self.config = {"critic_enabled": False}
         state = {"_intent": dict(intent.new_state(), phase=intent.ANALYZING)}
         self.run_loop(loops=3, state=state)
-        self.assertEqual(intent.SPEC_READY, state["_intent"]["phase"])
+        self.assertNotEqual(intent.IDLE, state["_intent"]["phase"])
         self.assertTrue(intent.is_usable(state["_intent"]["spec"]))
 
     def test_spec_is_kept_in_state_for_the_rest_of_the_turn(self):
@@ -236,7 +245,6 @@ class SpecBuildTests(IntentLoopTestCase):
         # next user turn builds its own instead of inheriting this one.
         self.config = {"critic_enabled": False}
         state = self.run_loop(loops=3)["state"]
-        self.assertEqual(intent.SPEC_READY, state["_intent"]["phase"])
         self.assertTrue(intent.is_usable(state["_intent"]["spec"]))
 
 
@@ -329,3 +337,138 @@ class GatingTests(IntentLoopTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ComparisonTests(IntentLoopTestCase):
+    """The three verdicts, and what each is allowed to do to the run."""
+
+    def test_a_scope_error_names_the_void_steps_and_the_files(self):
+        self.config = {"critic_enabled": False}
+        self.compare_reply = json.dumps({
+            "severity": "scope_error", "aligned": False,
+            "divergences": [{"req_id": "R1", "steps": [3],
+                             "what": "建成了单页工具", "why": "没有会话"}],
+            "void_steps": [3], "missing": ["R2"],
+            "next": "改成会话式布局"}, ensure_ascii=False)
+        state = self.run_loop(loops=6)["state"]
+        sent = self.sent_text()
+        self.assertIn("<intent_correction", sent)
+        self.assertIn("Steps considered void: 3", sent)
+        self.assertIn("改成会话式布局", sent)
+        self.assertEqual(intent.CORRECTING, state["_intent"]["phase"])
+
+    def test_a_detail_gap_notes_without_declaring_anything_void(self):
+        # Undoing correct work over a missing detail is the expensive
+        # mistake; a detail gap may point, never void.
+        self.config = {"critic_enabled": False}
+        self.compare_reply = json.dumps({
+            "severity": "detail_gap", "aligned": False,
+            "divergences": [{"req_id": "R2", "steps": [3],
+                             "what": "会话列表还没做", "why": ""}],
+            "void_steps": [3], "missing": ["R2"]}, ensure_ascii=False)
+        state = self.run_loop(loops=6)["state"]
+        sent = self.sent_text()
+        self.assertIn("<intent_note>", sent)
+        self.assertNotIn("<intent_correction", sent)
+        self.assertNotIn("void", sent)
+        self.assertEqual(intent.ALIGNED, state["_intent"]["phase"])
+
+    def test_alignment_interrupts_nothing(self):
+        self.config = {"critic_enabled": False}
+        state = self.run_loop(loops=6)["state"]
+        sent = self.sent_text()
+        self.assertNotIn("<intent_correction", sent)
+        self.assertNotIn("<intent_note>", sent)
+        self.assertEqual(intent.ALIGNED, state["_intent"]["phase"])
+
+    def test_an_unsure_judge_does_not_get_to_interrupt(self):
+        self.config = {"critic_enabled": False}
+        self.compare_reply = json.dumps({
+            "severity": "critic_unsure", "aligned": False,
+            "divergences": [{"req_id": "R1", "steps": [3], "what": "说不好"}],
+        }, ensure_ascii=False)
+        state = self.run_loop(loops=6)["state"]
+        self.assertNotIn("<intent_correction", self.sent_text())
+        self.assertEqual(intent.ALIGNED, state["_intent"]["phase"])
+
+    def test_the_comparison_is_run_once_and_without_tools(self):
+        self.config = {"critic_enabled": False}
+        self.run_loop(loops=6)
+        compares = [c for c in self.calls
+                    if c.get("task_kind") == "intent_compare"]
+        self.assertEqual(1, len(compares))
+        self.assertIs(False, compares[0].get("tools_enabled"))
+
+    def test_the_comparison_sees_thread_step_numbers(self):
+        # A correction that cites "step 3" is worthless if the judge was
+        # shown an unnumbered tail.
+        self.config = {"critic_enabled": False}
+        self.run_loop(loops=6)
+        compares = [c for c in self.calls
+                    if c.get("task_kind") == "intent_compare"]
+        self.assertIn("[step 0]", str(compares[0].get("messages")))
+
+    def test_a_failed_comparison_leaves_the_spec_in_charge(self):
+        self.config = {"critic_enabled": False}
+        self.compare_reply = "not json"
+        state = self.run_loop(loops=6)["state"]
+        self.assertEqual(intent.ALIGNED, state["_intent"]["phase"])
+        self.assertNotIn("<intent_correction", self.sent_text())
+        self.assertIn(_UNDERSTANDING, self.prompts()[-1])
+
+    def test_no_comparison_before_the_agent_has_acted(self):
+        self.config = {"critic_enabled": False, "intent_compare_loop": 99}
+        self.run_loop(loops=4)
+        self.assertNotIn("intent_compare", self.kinds())
+
+
+class TaskBreakdownTests(IntentLoopTestCase):
+    def test_the_breakdown_becomes_real_session_tasks(self):
+        """Advice in a prompt competes with everything else in the context.
+
+        <active_tasks> is rebuilt into every turn, so a task written there is
+        both visible and durable.
+        """
+        self.config = {"critic_enabled": False}
+        import task_manager
+        created = []
+        with mock.patch.object(task_manager, "create_session_task",
+                               side_effect=lambda s, d="", **k: created.append(s)), \
+                mock.patch.object(task_manager, "get_active_tasks_snapshot",
+                                  return_value=""):
+            self.run_loop(loops=4)
+        self.assertEqual(["搭前端骨架", "接流式接口"], created)
+
+    def test_an_agent_that_planned_for_itself_is_left_alone(self):
+        # Two task lists for one job is worse than either.
+        self.config = {"critic_enabled": False}
+        import task_manager
+        created = []
+        with mock.patch.object(task_manager, "create_session_task",
+                               side_effect=lambda s, d="", **k: created.append(s)), \
+                mock.patch.object(task_manager, "get_active_tasks_snapshot",
+                                  return_value="1. 已有任务"):
+            self.run_loop(loops=4)
+        self.assertEqual([], created)
+
+    def test_the_breakdown_is_written_once(self):
+        self.config = {"critic_enabled": False}
+        import task_manager
+        created = []
+        with mock.patch.object(task_manager, "create_session_task",
+                               side_effect=lambda s, d="", **k: created.append(s)), \
+                mock.patch.object(task_manager, "get_active_tasks_snapshot",
+                                  return_value=""):
+            self.run_loop(loops=6)
+        self.assertEqual(2, len(created))
+
+    def test_disabled_by_config(self):
+        self.config = {"critic_enabled": False, "intent_inject_tasks": False}
+        import task_manager
+        created = []
+        with mock.patch.object(task_manager, "create_session_task",
+                               side_effect=lambda s, d="", **k: created.append(s)), \
+                mock.patch.object(task_manager, "get_active_tasks_snapshot",
+                                  return_value=""):
+            self.run_loop(loops=4)
+        self.assertEqual([], created)

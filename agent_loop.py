@@ -201,6 +201,8 @@ _DEFAULT_CONFIG = {
     "intent_enabled": True,            # True = before working on a long thread-mode task, an independent LLM expands the request into an anchored spec (see intent.py) and pins it into the prompt. Complements the progress critic, which judges movement rather than direction.
     "intent_self_ask_rounds": 2,      # Self-questioning rounds used to build that spec (1-4). One auxiliary model call each, tool-less and cheap; they run in the background of the first turn.
     "intent_min_chars": 40,           # Skip the intent pass for requests shorter than this — a short instruction has no room to be misread, and the pass would just be a tax.
+    "intent_compare_loop": 2,         # Don't compare the agent's work against the spec before this loop index — there is nothing to judge until it has acted.
+    "intent_inject_tasks": True,       # True = write the spec's task breakdown into the session task list when the agent has not made one itself.
     "enable_mouse": False,             # REPL input box: click-to-position the cursor. Off by default: terminal mouse reporting hijacks native drag-to-select of scrollback (Shift+drag is the only workaround), which costs more than click-to-position gains
     "confirm_direct_commands": False,  # False = commands the USER types directly at the REPL run like a normal terminal (no policy approval prompt, e.g. rm); True = subject direct commands to the same needs_approval prompt as AI-issued ones. Hard `deny` policy rules always apply regardless.
     "trigger_scan_interval": 0.5,      # seconds between trigger scanner sweeps
@@ -824,6 +826,8 @@ _RUNTIME_CONFIG_DESCRIPTIONS = {
     "intent_enabled": "Expand a long request into an anchored spec before working on it, and pin the agreed reading into the prompt",
     "intent_self_ask_rounds": "Self-questioning rounds used to build the intent spec (1-4)",
     "intent_min_chars": "Skip the intent pass for requests shorter than this many characters",
+    "intent_compare_loop": "Don't compare the agent's work against the intent spec before this loop index",
+    "intent_inject_tasks": "Write the intent spec's task breakdown into the session task list when the agent has not made one",
     "confirm_direct_commands": "Ask for approval on commands YOU type directly at the REPL (False = run like a normal terminal; hard deny rules still apply)",
     "enable_mouse": "Enable mouse click-to-position in the REPL input box",
     "tool_output_fold": "Max lines of tool output shown before folding (first half + … + last half); 0 = suppress preview",
@@ -8488,6 +8492,8 @@ def run_agent_loop(
         state["_intent"] = intent.new_state()
     _intent_thread = None                 # in-flight background spec build
     _intent_result: dict = {}             # filled by that thread
+    _intent_cmp_thread = None             # in-flight background comparison
+    _intent_cmp_result: dict = {}         # filled by that thread
     _run_id = uuid.uuid4().hex
     # Published on `state` so the auxiliary calls that run outside this frame
     # (compaction, memory consolidation) can stamp the same trajectory on their
@@ -8929,6 +8935,144 @@ def run_agent_loop(
                         questions=len(_intent_spec.get("open_questions") or []),
                         dropped_anchors=int(
                             _intent_spec.get("dropped_anchors", 0)))
+                state["_intent"] = _intent_st
+
+            # The spec's task breakdown becomes real session tasks rather than
+            # advice in a prompt: <active_tasks> is already rebuilt into every
+            # turn, so writing there is both visible and durable, where a
+            # "you should plan this" sentence competes with everything else in
+            # the context. Only when the agent has not planned for itself —
+            # two task lists for one job is worse than either.
+            if (_intent_st.get("phase") == intent.SPEC_READY
+                    and not _intent_st.get("tasks_written")
+                    and get_runtime_config("intent_inject_tasks")):
+                _intent_st["tasks_written"] = True
+                state["_intent"] = _intent_st
+                try:
+                    _task_kwargs = {
+                        "cwd": state.get("_task_cwd") or state.get("cwd") or os.getcwd(),
+                        "session_id": str(state.get("_session_id") or "") or None,
+                        "owner_agent_id": state.get("_agent_id") or None,
+                    }
+                    _breakdown = (_intent_st.get("spec") or {}).get(
+                        "task_breakdown") or []
+                    if _breakdown and not task_manager.get_active_tasks_snapshot(
+                            **_task_kwargs):
+                        for _subject in _breakdown:
+                            task_manager.create_session_task(
+                                _subject, "", **_task_kwargs)
+                        event_log.append(
+                            "intent_tasks_created", loop=_loop_id,
+                            agent_id=agent_id or "primary", run_id=_run_id,
+                            count=len(_breakdown))
+                except Exception:
+                    pass
+
+            # (c) Harvest a finished comparison and decide what it earns.
+            if _intent_cmp_thread is not None and not _intent_cmp_thread.is_alive():
+                _intent_cmp_thread = None
+                _cmp = _intent_cmp_result.get("cmp")
+                _cmp_fail = _intent_cmp_result.get("fail")
+                _intent_cmp_result = {}
+                if _cmp is None:
+                    # One bad comparison is not worth disabling the layer: the
+                    # spec is already pinned and doing its job.
+                    _intent_st["phase"] = intent.ALIGNED
+                    event_log.append(
+                        "intent_failure", loop=_loop_id,
+                        agent_id=agent_id or "primary", run_id=_run_id,
+                        reason=_cmp_fail or "comparison failed")
+                else:
+                    _intent_st["last_comparison"] = _cmp
+                    event_log.append(
+                        "intent_compared", loop=_loop_id,
+                        agent_id=agent_id or "primary", run_id=_run_id,
+                        severity=_cmp.get("severity"),
+                        aligned=bool(_cmp.get("aligned")),
+                        divergences=len(_cmp.get("divergences") or []),
+                        void_steps=len(_cmp.get("void_steps") or []))
+                    if _cmp.get("severity") == intent.SCOPE_ERROR:
+                        # The expensive case: work is going into the wrong
+                        # problem. Name the steps, and name the files, because
+                        # an undo would leave every newly created one behind.
+                        _changed = None
+                        try:
+                            import snapshot as _snap_mod
+                            _changed = _snap_mod.changed_since(
+                                state.get("cwd") or os.getcwd(),
+                                state.get("_snapshot_sha"))
+                        except Exception:
+                            _changed = None
+                        _intent_st["pending_injection"] = intent.render_correction(
+                            _cmp, _intent_st.get("spec"), _changed)
+                        _intent_st["phase"] = intent.next_phase(
+                            _intent_st, "diverged")
+                    elif (_cmp.get("severity") == intent.DETAIL_GAP
+                            and (_cmp.get("divergences") or _cmp.get("missing"))):
+                        # Right direction, missing specifics. The pinned
+                        # understanding already carries them; a one-off note
+                        # points at them without declaring anything void.
+                        _intent_st["pending_injection"] = (
+                            "<intent_note>\n"
+                            + (intent.render_flagged(_cmp)
+                               or "- specifics from the agreed reading are not yet addressed")
+                            + "\nThe agreed reading is pinned in "
+                            "<task_understanding>; fold these in as you go.\n"
+                            "</intent_note>")
+                        _intent_st["phase"] = intent.next_phase(
+                            _intent_st, "aligned")
+                    else:
+                        # Aligned, or the judge said it could not tell. Neither
+                        # earns an interruption.
+                        _intent_st["phase"] = intent.next_phase(
+                            _intent_st, "aligned")
+                state["_intent"] = _intent_st
+
+            # (d) Launch a comparison once there is something to compare.
+            if (_intent_cmp_thread is None
+                    and _intent_st.get("phase") == intent.SPEC_READY
+                    and _intent_st.get("questions_sent")
+                    and loop >= int(get_runtime_config("intent_compare_loop") or 2)
+                    and intent.is_usable(_intent_st.get("spec"))):
+                _cmp_cwd = state.get("cwd") or os.getcwd()
+                _cmp_aux_m, _cmp_aux_p = aux_model_override()
+
+                def _compare_llm_fn(messages, _s=session, _cwd=_cmp_cwd,
+                                    _traj=_run_id, _m=_cmp_aux_m, _p=_cmp_aux_p):
+                    resp = deps.call_backend(
+                        session=_s, message="",
+                        system_prompt=intent.COMPARE_SYSTEM,
+                        current_path=_cwd, messages=messages,
+                        tools_enabled=False,
+                        model_override=_m or None,
+                        provider_override=_p or None,
+                        task_kind="intent_compare", trajectory_id=_traj)
+                    return (resp or {}).get("reply", "") if isinstance(resp, dict) else ""
+
+                # The full thread, not a tail: step numbers must be thread
+                # indices, or a correction naming "step 3" names nothing.
+                _cmp_actions = critic.summarize_actions(thread_messages)
+
+                def _compare_worker(_spec=_intent_st.get("spec"),
+                                    _actions=_cmp_actions, _fn=_compare_llm_fn,
+                                    _out=_intent_cmp_result):
+                    try:
+                        _c, _f = intent.compare(_spec, _actions, _fn)
+                    except Exception as _exc:
+                        _c, _f = None, f"intent compare error: {_exc}"
+                    _out["cmp"], _out["fail"] = _c, _f
+
+                _intent_st["phase"] = intent.COMPARING
+                state["_intent"] = _intent_st
+                _intent_cmp_thread = threading.Thread(
+                    target=_compare_worker, name="intent-compare", daemon=True)
+                _intent_cmp_thread.start()
+
+            if (_intent_cmp_thread is None
+                    and _intent_st.get("phase") == intent.COMPARING):
+                # Same orphan case as the spec build: the worker died with the
+                # turn that launched it.
+                _intent_st["phase"] = intent.SPEC_READY
                 state["_intent"] = _intent_st
 
             if (_intent_thread is None
@@ -9440,6 +9584,31 @@ def run_agent_loop(
                         count=len([q for q in (_int_st.get("spec") or {}).get(
                             "open_questions") or []
                             if q.get("needs") == intent.NEEDS_EVIDENCE]))
+
+            # Whatever the comparison earned. Prepared where the comparison is
+            # harvested (above the prompt build, so the pinned understanding is
+            # current) and injected here, where the outgoing thread exists.
+            _pending = _int_st.get("pending_injection")
+            if _pending and _thread_to_send is not None:
+                _int_st["pending_injection"] = ""
+                state["_intent"] = _int_st
+                thread_messages.append({"role": "user", "content": _pending})
+                _thread_to_send = _thread_to_send + [
+                    {"role": "user", "content": _pending}]
+                _int_cmp = _int_st.get("last_comparison") or {}
+                event_log.append(
+                    "intent_correction_injected", loop=_loop_id,
+                    agent_id=agent_id or "primary", run_id=_run_id,
+                    severity=_int_cmp.get("severity") or "unknown",
+                    void_steps=len(_int_cmp.get("void_steps") or []))
+                if _int_cmp.get("severity") == intent.SCOPE_ERROR:
+                    try:
+                        deps.console.print(
+                            f"[yellow]{symbols.WARN} Intent check: the work so far "
+                            f"does not match the request as read — corrective "
+                            f"guidance injected[/yellow]")
+                    except Exception:
+                        pass
         except Exception:
             pass
 

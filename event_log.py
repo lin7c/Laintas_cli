@@ -106,6 +106,9 @@ REQUIRED_FIELDS: dict = {
                           "dropped_anchors"),
     "intent_failure": ("agent_id", "run_id", "reason"),
     "intent_questions_injected": ("agent_id", "run_id", "count"),
+    "intent_tasks_created": ("agent_id", "run_id", "count"),
+    "intent_compared": ("agent_id", "run_id", "severity"),
+    "intent_correction_injected": ("agent_id", "run_id", "severity"),
 }
 
 
