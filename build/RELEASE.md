@@ -48,11 +48,15 @@ The download page's version and download URLs live in:
 laintas_cli_download/src/components/DownloadSection.jsx
 ```
 
-Releasing a new version means updating all three of:
+Releasing a new version means updating:
 
-- `DOWNLOAD_BASE`: `https://cli.laintas.com/releases/v1.8.1`
-- `RELEASE_VERSION`: `v1.8.1`
+- `RELEASE_FALLBACK`: `v1.23.2` — the version shown until the page has
+  answered from the GitHub API, so keep it in step with `version.py`
 - the version shown in the page's compatibility section
+
+`RELEASE_BASE` does not move between releases: it is the release channel's
+rolling `latest/download` pointer, and the cards build their filenames from
+the tag the page looked up.
 
 Then build the download page:
 
@@ -152,40 +156,52 @@ Both manifests must report the version being released, e.g. `1.8.1`.
 `updater.py` is configured with:
 
 ```python
-DEFAULT_DOWNLOAD_BASE = "https://cli.laintas.com"
+DEFAULT_DOWNLOAD_BASE = "https://github.com/lin7c/Laintas_cli"
 ```
 
-so `/v` normally downloads only from these, never from GitHub directly:
+so `/v` reads the same release this workflow publishes:
 
 ```text
-https://cli.laintas.com/releases/latest/manifest.json
-https://cli.laintas.com/releases/latest/src_manifest.zip
-https://cli.laintas.com/releases/latest/laintas-cli_linux_amd64.tar.gz
-https://cli.laintas.com/releases/latest/laintas-cli_linux_arm64.tar.gz
-https://cli.laintas.com/releases/latest/laintas-cli_windows_amd64_setup.exe
+https://github.com/lin7c/Laintas_cli/releases/latest/download/manifest.json
+https://github.com/lin7c/Laintas_cli/releases/latest/download/src_manifest.zip
+https://github.com/lin7c/Laintas_cli/releases/latest/download/SHA256SUMS.txt
+https://github.com/lin7c/Laintas_cli/releases/latest/download/laintas-cli_linux_amd64.tar.gz
+https://github.com/lin7c/Laintas_cli/releases/latest/download/laintas-cli_linux_arm64.tar.gz
 ```
+
+The site used to self-host these under `cli.laintas.com/releases/<channel>/`,
+written by `scripts/build_release_assets.py` during a manual release. Nothing
+repopulated that directory once releasing moved into CI, so `/v update`, the
+page's download buttons and both install scripts all resolved to 404s against
+a channel that had stopped being fed. One channel now, the one CI writes.
+
+A frozen install downloads the **Linux** archive for its architecture on every
+platform, Windows included: there the CLI runs as that same binary inside its
+private WSL distribution. `laintas-cli.exe` and the distribution are replaced
+by re-running the installer, not by `/v`.
 
 To pin a version:
 
 ```bash
-LAINTAS_UPDATE_CHANNEL=v1.8.1 laintas-cli
+LAINTAS_UPDATE_CHANNEL=v1.23.2 laintas-cli
 ```
 
-which reads:
+which reads (GitHub spells a pinned tag differently from `latest`):
 
 ```text
-https://cli.laintas.com/releases/v1.8.1/manifest.json
+https://github.com/lin7c/Laintas_cli/releases/download/v1.23.2/manifest.json
 ```
 
-`LAINTAS_DOWNLOAD_BASE` can point at a test mirror; do not point it at GitHub
-in production.
+`LAINTAS_DOWNLOAD_BASE` points at a test mirror, read with the flat
+`<base>/releases/<channel>/<asset>` layout so any static directory serves.
 
 ## 5. Post-release verification
 
 ```bash
-curl -fsSL https://cli.laintas.com/releases/latest/manifest.json | python3 -m json.tool
-curl -fsSIL https://cli.laintas.com/releases/latest/laintas-cli_linux_amd64.tar.gz
-curl -fsSIL https://cli.laintas.com/releases/latest/laintas-cli_windows_amd64_setup.exe
+base=https://github.com/lin7c/Laintas_cli/releases/latest/download
+curl -fsSL "$base/manifest.json" | python3 -m json.tool
+curl -fsSIL "$base/laintas-cli_linux_amd64.tar.gz"
+curl -fsSIL "$base/laintas-cli_windows_amd64_setup.exe"
 curl -fsSIL https://cli.laintas.com/install.sh
 curl -fsSIL https://cli.laintas.com/install.ps1
 ```

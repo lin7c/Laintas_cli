@@ -395,12 +395,12 @@ The package manifest is intentionally explicit. When adding a runtime module, bu
 - Linux-compatible source archive
 - SHA-256 checksums and source-update manifests
 
-The download page presents one Linux option while `install.sh` selects the
-architecture-specific ELF asset. Windows ships separately as
-`laintas-cli_windows_amd64_setup.exe`, a single-file installer. Self-hosted
-assets used by `/v update` are
-generated with `scripts/build_release_assets.py` and mirrored to
-`cli.laintas.com/releases/latest/`.
+The download page offers the one-line Linux installer, which selects the
+architecture-specific ELF asset, alongside a direct link to every artifact the
+release publishes: the single-file Windows installer
+(`laintas-cli_windows_amd64_setup.exe`), both Linux archives, the Debian
+package and the source zip. Those links, the install scripts and `/v update`
+all read the GitHub release the CI workflow publishes.
 
 ## Version History
 

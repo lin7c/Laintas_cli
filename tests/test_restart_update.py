@@ -274,3 +274,65 @@ class FrozenUpdateTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UpdateChannelTests(unittest.TestCase):
+    """Where `/v` fetches from.
+
+    The site's own /releases/ path stopped being populated when releasing
+    moved into CI, so every update — and every download link on the page —
+    resolved to a 404 that only showed up at the moment a user ran `/v`.
+    """
+
+    def _url(self, channel, asset, base=None):
+        environment = {} if base is None else {"LAINTAS_DOWNLOAD_BASE": base}
+        with mock.patch.dict(updater.os.environ, environment, clear=False):
+            if base is None:
+                updater.os.environ.pop("LAINTAS_DOWNLOAD_BASE", None)
+            return updater._asset_url(channel, asset)
+
+    def test_latest_uses_the_github_rolling_pointer(self):
+        self.assertEqual(
+            self._url("latest", "manifest.json"),
+            "https://github.com/lin7c/Laintas_cli/releases/latest/download/"
+            "manifest.json")
+
+    def test_a_pinned_version_uses_the_tag_form(self):
+        """GitHub spells a pinned tag differently from `latest`.
+
+        `/releases/<tag>/<asset>` is not a URL GitHub serves; getting this
+        wrong 404s only for users who pinned a channel.
+        """
+        expected = ("https://github.com/lin7c/Laintas_cli/releases/download/"
+                    "v1.23.2/laintas-cli_linux_amd64.tar.gz")
+        self.assertEqual(
+            self._url("v1.23.2", "laintas-cli_linux_amd64.tar.gz"), expected)
+        self.assertEqual(
+            self._url("1.23.2", "laintas-cli_linux_amd64.tar.gz"), expected)
+
+    def test_an_overridden_base_keeps_the_flat_mirror_layout(self):
+        """A static directory has to remain usable as a mirror for testing."""
+        self.assertEqual(
+            self._url("latest", "manifest.json", base="http://127.0.0.1:8000"),
+            "http://127.0.0.1:8000/releases/latest/manifest.json")
+        self.assertEqual(
+            self._url("v1.2.3", "manifest.json", base="http://127.0.0.1:8000/"),
+            "http://127.0.0.1:8000/releases/v1.2.3/manifest.json")
+
+    def test_download_page_links_at_the_same_channel(self):
+        """The page's buttons and `/v` must not drift apart again."""
+        page = (Path(__file__).resolve().parents[1]
+                / "laintas_cli_download/src/components/DownloadSection.jsx"
+                ).read_text(encoding="utf-8")
+        self.assertIn(
+            "https://github.com/lin7c/Laintas_cli/releases/latest/download",
+            page)
+        self.assertNotIn("cli.laintas.com/releases/", page)
+        # Every artifact the release publishes, including the two that were
+        # only reachable by going to GitHub by hand.
+        for asset in ("laintas-cli_windows_amd64_setup.exe",
+                      "laintas-cli_linux_amd64.tar.gz",
+                      "laintas-cli_linux_arm64.tar.gz",
+                      "laintas-cli_source.zip",
+                      "_amd64.deb"):
+            self.assertIn(asset, page)

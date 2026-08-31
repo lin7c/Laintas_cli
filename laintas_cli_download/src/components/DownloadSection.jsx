@@ -9,7 +9,11 @@ import { useLanguage } from '@/contexts/LanguageContext';
 import ExtensionsSection from './ExtensionsSection';
 
 const RELEASE_FALLBACK = 'v1.23.2';
-const RELEASE_BASE = 'https://cli.laintas.com/releases/latest';
+// Release files are served by GitHub Releases, the one place CI publishes to.
+// The site's own /releases/ path was the channel until releasing moved into
+// CI; nothing repopulates it now, so these links used to 404.
+const RELEASE_BASE = 'https://github.com/lin7c/Laintas_cli/releases/latest/download';
+const RELEASE_API = 'https://api.github.com/repos/lin7c/Laintas_cli/releases/latest';
 const INSTALL_COMMANDS = {
   linux: 'curl -fsSL https://cli.laintas.com/install.sh | bash',
   windows: "irm https://cli.laintas.com/install.ps1 | iex",
@@ -21,10 +25,18 @@ const RUNTIME_SHOTS = [
   { id: 'agents', src: '/laintas-cli-runtime-agents.png?v=2' },
 ];
 
+// Every artifact the release publishes has a card. The installer script and
+// the two archives it picks between were the only ones listed before, which
+// left the .deb and both tarballs downloadable only from GitHub directly.
+// `file` takes the release tag because the .deb carries the version in its
+// name, the way dpkg expects.
 const DOWNLOADS = [
   { id: 'linux', names: { zh: 'Linux 版本', en: 'Linux' }, details: { zh: 'x86_64 / arm64 · 自动识别', en: 'x86_64 / arm64 · auto-detected' }, href: 'https://cli.laintas.com/install.sh', icon: Package },
-  { id: 'windows', names: { zh: 'Windows 版本', en: 'Windows' }, details: { zh: 'x86_64 · 单文件安装器 · 独立 WSL2', en: 'x86_64 · single installer · private WSL 2' }, file: 'laintas-cli_windows_amd64_setup.exe', icon: Monitor },
-  { id: 'source', names: { zh: '源码包', en: 'Source package' }, details: { zh: 'Python 3.10+ · 可审计', en: 'Python 3.10+ · auditable' }, file: 'laintas-cli_source.zip', icon: Code2 },
+  { id: 'windows', names: { zh: 'Windows 版本', en: 'Windows' }, details: { zh: 'x86_64 · 单文件安装器 · 独立 WSL2', en: 'x86_64 · single installer · private WSL 2' }, file: () => 'laintas-cli_windows_amd64_setup.exe', icon: Monitor },
+  { id: 'linux-amd64', names: { zh: 'Linux x86_64 压缩包', en: 'Linux x86_64 archive' }, details: { zh: 'tar.gz · 免安装 · 自带运行时', en: 'tar.gz · no install step · bundled runtime' }, file: () => 'laintas-cli_linux_amd64.tar.gz', icon: TerminalSquare },
+  { id: 'linux-arm64', names: { zh: 'Linux arm64 压缩包', en: 'Linux arm64 archive' }, details: { zh: 'tar.gz · aarch64 · 自带运行时', en: 'tar.gz · aarch64 · bundled runtime' }, file: () => 'laintas-cli_linux_arm64.tar.gz', icon: TerminalSquare },
+  { id: 'deb', names: { zh: 'Debian / Ubuntu 包', en: 'Debian / Ubuntu package' }, details: { zh: 'amd64 · apt 安装 · 随系统升级', en: 'amd64 · installs with apt' }, file: (version) => `laintas-cli_${version.replace(/^v/, '')}_amd64.deb`, icon: Layers3 },
+  { id: 'source', names: { zh: '源码包', en: 'Source package' }, details: { zh: 'Python 3.10+ · 可审计', en: 'Python 3.10+ · auditable' }, file: () => 'laintas-cli_source.zip', icon: Code2 },
 ];
 
 const COPY = {
@@ -108,9 +120,13 @@ export default function DownloadSection() {
 
   useEffect(() => {
     if (/Windows/i.test(window.navigator.userAgent)) setInstallPlatform('windows');
-    fetch('/releases/latest/manifest.json')
-      .then((response) => response.ok ? response.json() : Promise.reject(new Error('release manifest unavailable')))
-      .then((manifest) => { if (manifest.version) setRelease(`v${manifest.version}`); })
+    // The GitHub API rather than the release's own manifest.json: asset
+    // downloads redirect to a host that does not answer cross-origin, and the
+    // tag is all this needs. A failure leaves the fallback in place, which is
+    // the version this page was built for.
+    fetch(RELEASE_API)
+      .then((response) => response.ok ? response.json() : Promise.reject(new Error('release lookup failed')))
+      .then((data) => { if (data.tag_name) setRelease(data.tag_name); })
       .catch(() => {});
   }, []);
 
@@ -182,7 +198,7 @@ export default function DownloadSection() {
           {['linux', 'windows'].map((platform) => <button type="button" key={platform} className={installPlatform === platform ? 'active' : ''} onClick={() => setInstallPlatform(platform)} aria-pressed={installPlatform === platform}>{c[platform]}</button>)}
         </div>
         <div className="install-block"><div><span>{c.quickInstall} · {c[installPlatform]}</span><code>{INSTALL_COMMANDS[installPlatform]}</code></div><CopyButton value={INSTALL_COMMANDS[installPlatform]} labels={c} /></div>
-        <div className="download-grid">{DOWNLOADS.map(({ id, names, details, file, href, icon: Icon }) => <a className="download-card" href={href || `${RELEASE_BASE}/${file}`} key={id}><div><Icon size={20} /><span>{release}</span></div><h3>{names[lang] || names.en}</h3><p>{details[lang] || details.en}</p><strong>{c.download}<ArrowDownToLine size={16} /></strong></a>)}</div>
+        <div className="download-grid">{DOWNLOADS.map(({ id, names, details, file, href, icon: Icon }) => <a className="download-card" href={href || `${RELEASE_BASE}/${file(release)}`} key={id}><div><Icon size={20} /><span>{release}</span></div><h3>{names[lang] || names.en}</h3><p>{details[lang] || details.en}</p><strong>{c.download}<ArrowDownToLine size={16} /></strong></a>)}</div>
         <p className="requirements"><CheckCircle2 size={15} />{c.requirements}</p>
       </section>
 
