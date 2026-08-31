@@ -8,6 +8,8 @@ on:
         required: false
         default: ""
   push:
+    branches:
+      - main
     tags:
       - "v*"
 
@@ -116,7 +118,7 @@ jobs:
             laintas-cli_source.zip
             src_manifest.zip
 
-  windows:
+  windows-payload:
     needs: linux
     runs-on: ubuntu-latest
     steps:
@@ -140,15 +142,55 @@ jobs:
             -C artifacts/linux-runtime
           test -x artifacts/linux-runtime/laintas-cli
 
-      - name: Build Windows launcher and private WSL package
+      - name: Build Windows launcher and private WSL payload
         run: |
           bash build/windows/build_windows_package.sh amd64 \
             "$PWD/artifacts/linux-runtime/laintas-cli"
 
       - uses: actions/upload-artifact@v4
         with:
+          name: windows-installer-payload
+          path: build/windows/payload/
+          retention-days: 1
+
+  windows:
+    needs: windows-payload
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-installer-payload
+          path: build/windows/payload
+
+      - name: Install NSIS
+        run: choco install nsis -y --no-progress
+
+      - name: Build the single-file Windows installer
+        shell: pwsh
+        run: |
+          $version = python -c "import sys; sys.path.insert(0,'.'); from version import __version__; print(__version__)"
+          $makensis = "C:\Program Files (x86)\NSIS\makensis.exe"
+          if (-not (Test-Path $makensis)) { $makensis = "makensis.exe" }
+          $log = & $makensis "/DAPP_VERSION=$version" build/windows/installer.nsi 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            $log | Select-Object -Last 80 | ForEach-Object { Write-Host $_ }
+            throw "NSIS installer build failed (exit $LASTEXITCODE)"
+          }
+          if (-not (Test-Path laintas-cli_windows_amd64_setup.exe)) {
+            throw "NSIS reported success but produced no installer"
+          }
+          $header = [IO.File]::ReadAllBytes("laintas-cli_windows_amd64_setup.exe")[0..1]
+          if ($header[0] -ne 0x4d -or $header[1] -ne 0x5a) {
+            throw "Windows installer does not have a PE executable header"
+          }
+
+      - uses: actions/upload-artifact@v4
+        with:
           name: windows-amd64
-          path: build/windows/dist/laintas-cli_windows_amd64.zip
+          path: laintas-cli_windows_amd64_setup.exe
 
   deb:
     runs-on: ubuntu-latest
@@ -170,6 +212,7 @@ jobs:
           path: laintas-cli.deb
 
   publish:
+    if: startsWith(github.ref, 'refs/tags/v')
     needs: [linux, windows, source, deb]
     runs-on: ubuntu-latest
     steps:
@@ -190,13 +233,13 @@ jobs:
           mkdir -p release
           cp artifacts/linux-amd64/laintas-cli_linux_amd64.tar.gz release/
           cp artifacts/linux-arm64/laintas-cli_linux_arm64.tar.gz release/
-          cp artifacts/windows-amd64/laintas-cli_windows_amd64.zip release/
+          cp artifacts/windows-amd64/laintas-cli_windows_amd64_setup.exe release/
           cp artifacts/source/laintas-cli_source.zip release/
           cp artifacts/source/src_manifest.zip release/
           cp artifacts/deb/laintas-cli.deb "release/laintas-cli_${{ steps.ver.outputs.version }}_amd64.deb"
           cd release
           sha256sum laintas-cli_linux_amd64.tar.gz laintas-cli_linux_arm64.tar.gz \
-            laintas-cli_windows_amd64.zip \
+            laintas-cli_windows_amd64_setup.exe \
             laintas-cli_source.zip "laintas-cli_${{ steps.ver.outputs.version }}_amd64.deb" > SHA256SUMS.txt
           unzip -o src_manifest.zip -d src/ >/dev/null
           cp src/manifest.json .
@@ -206,11 +249,11 @@ jobs:
         run: |
           gh release create "${{ steps.ver.outputs.tag }}" \
             --title "${{ steps.ver.outputs.tag }}" \
-            --notes "Linux amd64/arm64, Windows amd64 with a private WSL runtime, Debian amd64, and source packages." \
+            --notes "Linux amd64/arm64, a single-file Windows amd64 installer with a private WSL runtime, Debian amd64, and source packages." \
             --generate-notes \
             release/laintas-cli_linux_amd64.tar.gz \
             release/laintas-cli_linux_arm64.tar.gz \
-            release/laintas-cli_windows_amd64.zip \
+            release/laintas-cli_windows_amd64_setup.exe \
             release/laintas-cli_source.zip \
             "release/laintas-cli_${{ steps.ver.outputs.version }}_amd64.deb" \
             release/SHA256SUMS.txt release/manifest.json release/src_manifest.zip

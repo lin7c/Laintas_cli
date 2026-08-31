@@ -8,14 +8,20 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 echo ""
 echo "── Laintas CLI Installer ─────────────────────────────────────"
 
-# Detect OS and CPU architecture before downloading a native binary.
+# Detect OS and CPU architecture before downloading a native package. The
+# existing Linux command remains unchanged; when the same script is run from
+# Git Bash/MSYS/Cygwin on Windows it hands off to the native PowerShell
+# installer, which creates the private Laintas-CLI WSL distribution.
 UNAME_S=$(uname -s)
-if [ "$UNAME_S" = "Linux" ]; then
-    INSTALL_MODE="linux"
-else
-    echo "Unsupported OS: $UNAME_S (Linux only)"
-    exit 1
-fi
+case "$UNAME_S" in
+    Linux) INSTALL_MODE="linux" ;;
+    MINGW*|MSYS*|CYGWIN*) INSTALL_MODE="windows" ;;
+    *)
+        echo "Unsupported OS: $UNAME_S"
+        echo "Supported platforms: Linux and 64-bit Windows with WSL 2"
+        exit 1
+        ;;
+esac
 
 if [ "$INSTALL_MODE" = "linux" ]; then
     case "$(uname -m)" in
@@ -55,6 +61,14 @@ if [ "$INSTALL_MODE" = "linux" ]; then
     fi
 
     printf '\n  Done! Run `laintas-cli` to start.\n\n'
+else
+    echo "  Detected: Windows amd64"
+    if ! command -v powershell.exe >/dev/null 2>&1; then
+        echo "PowerShell is required to install Laintas CLI for Windows."
+        exit 1
+    fi
+    powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command \
+        "Invoke-RestMethod '$BASE_URL/install.ps1' | Invoke-Expression"
 fi
 
 echo "── ────────────────────────────────────────────────────────────"

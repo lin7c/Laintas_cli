@@ -84,7 +84,7 @@ git push origin v1.8.1
 
 - `laintas-cli_linux_amd64.tar.gz`
 - `laintas-cli_linux_arm64.tar.gz`
-- `laintas-cli_windows_amd64.zip`
+- `laintas-cli_windows_amd64_setup.exe`
 - `laintas-cli_source.zip`
 - `laintas-cli_<version>_amd64.deb`
 - `manifest.json`
@@ -126,7 +126,7 @@ by hand and place it in both directories. Both must contain at least:
 ```text
 laintas-cli_linux_amd64.tar.gz
 laintas-cli_linux_arm64.tar.gz
-laintas-cli_windows_amd64.zip
+laintas-cli_windows_amd64_setup.exe
 laintas-cli_source.zip
 laintas-cli_<version>_amd64.deb
 manifest.json
@@ -162,7 +162,7 @@ https://cli.laintas.com/releases/latest/manifest.json
 https://cli.laintas.com/releases/latest/src_manifest.zip
 https://cli.laintas.com/releases/latest/laintas-cli_linux_amd64.tar.gz
 https://cli.laintas.com/releases/latest/laintas-cli_linux_arm64.tar.gz
-https://cli.laintas.com/releases/latest/laintas-cli_windows_amd64.zip
+https://cli.laintas.com/releases/latest/laintas-cli_windows_amd64_setup.exe
 ```
 
 To pin a version:
@@ -185,7 +185,7 @@ in production.
 ```bash
 curl -fsSL https://cli.laintas.com/releases/latest/manifest.json | python3 -m json.tool
 curl -fsSIL https://cli.laintas.com/releases/latest/laintas-cli_linux_amd64.tar.gz
-curl -fsSIL https://cli.laintas.com/releases/latest/laintas-cli_windows_amd64.zip
+curl -fsSIL https://cli.laintas.com/releases/latest/laintas-cli_windows_amd64_setup.exe
 curl -fsSIL https://cli.laintas.com/install.sh
 curl -fsSIL https://cli.laintas.com/install.ps1
 ```
@@ -224,7 +224,7 @@ Make sure `latest/` uses the architecture-suffixed filenames:
 ```text
 laintas-cli_linux_amd64.tar.gz
 laintas-cli_linux_arm64.tar.gz
-laintas-cli_windows_amd64.zip
+laintas-cli_windows_amd64_setup.exe
 ```
 
 ### The release assets vanish after a build

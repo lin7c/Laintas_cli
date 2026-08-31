@@ -30,7 +30,7 @@ curl -fsSL https://cli.laintas.com/install.sh | bash
 laintas-cli
 ```
 
-On 64-bit Windows 10 2004+ or Windows 11, the Windows package imports a
+On 64-bit Windows 10 2004+ or Windows 11, the single-file Windows installer imports a
 private `Laintas-CLI` WSL 2 distribution and installs a native
 `laintas-cli.exe` launcher. Normal startup calls `wslapi.dll` directly, does
 not run `wsl.exe`, and does not change the user's default WSL distribution:
@@ -388,14 +388,15 @@ The package manifest is intentionally explicit. When adding a runtime module, bu
 
 - Linux amd64 standalone archive
 - Linux arm64 standalone archive
-- Windows amd64 launcher with a private WSL 2 root filesystem
+- Single-file Windows amd64 installer with a private WSL 2 root filesystem
 - Linux amd64 Debian package
 - Linux-compatible source archive
 - SHA-256 checksums and source-update manifests
 
 The download page presents one Linux option while `install.sh` selects the
 architecture-specific ELF asset. Windows ships separately as
-`laintas-cli_windows_amd64.zip`. Self-hosted assets used by `/v update` are
+`laintas-cli_windows_amd64_setup.exe`, a single-file installer. Self-hosted
+assets used by `/v update` are
 generated with `scripts/build_release_assets.py` and mirrored to
 `cli.laintas.com/releases/latest/`.
 

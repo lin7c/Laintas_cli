@@ -8,7 +8,7 @@ import {
 import { useLanguage } from '@/contexts/LanguageContext';
 import ExtensionsSection from './ExtensionsSection';
 
-const RELEASE_FALLBACK = 'v1.22.0';
+const RELEASE_FALLBACK = 'v1.23.0';
 const RELEASE_BASE = 'https://cli.laintas.com/releases/latest';
 const INSTALL_COMMANDS = {
   linux: 'curl -fsSL https://cli.laintas.com/install.sh | bash',
@@ -23,7 +23,7 @@ const RUNTIME_SHOTS = [
 
 const DOWNLOADS = [
   { id: 'linux', names: { zh: 'Linux 版本', en: 'Linux' }, details: { zh: 'x86_64 / arm64 · 自动识别', en: 'x86_64 / arm64 · auto-detected' }, href: 'https://cli.laintas.com/install.sh', icon: Package },
-  { id: 'windows', names: { zh: 'Windows 版本', en: 'Windows' }, details: { zh: 'x86_64 · 独立 WSL2 运行时', en: 'x86_64 · private WSL 2 runtime' }, file: 'laintas-cli_windows_amd64.zip', icon: Monitor },
+  { id: 'windows', names: { zh: 'Windows 版本', en: 'Windows' }, details: { zh: 'x86_64 · 单文件安装器 · 独立 WSL2', en: 'x86_64 · single installer · private WSL 2' }, file: 'laintas-cli_windows_amd64_setup.exe', icon: Monitor },
   { id: 'source', names: { zh: '源码包', en: 'Source package' }, details: { zh: 'Python 3.10+ · 可审计', en: 'Python 3.10+ · auditable' }, file: 'laintas-cli_source.zip', icon: Code2 },
 ];
 

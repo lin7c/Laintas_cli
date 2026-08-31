@@ -34,9 +34,13 @@ if (-not (Get-Command wsl.exe -ErrorAction SilentlyContinue)) {
 if (-not [Environment]::Is64BitOperatingSystem) {
     throw "Laintas CLI for Windows requires 64-bit Windows."
 }
+if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64" -or $env:PROCESSOR_ARCHITEW6432 -eq "ARM64") {
+    throw "This package is for x86_64 Windows. Windows ARM64 packaging is not available yet."
+}
 
 $PackageRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Rootfs = Join-Path $PackageRoot "laintas-rootfs.tar.gz"
+$LinuxBinary = Join-Path $PackageRoot "laintas-cli-linux"
 $BundledLauncher = Join-Path $PackageRoot "laintas-cli.exe"
 $BinDir = Join-Path $InstallRoot "bin"
 $DistroDir = Join-Path $InstallRoot "WSL"
@@ -45,12 +49,17 @@ $InstalledLauncher = Join-Path $BinDir "laintas-cli.exe"
 if (-not (Test-Path -LiteralPath $BundledLauncher -PathType Leaf)) {
     throw "The Windows package is incomplete: laintas-cli.exe is missing."
 }
+if (-not (Test-Path -LiteralPath $LinuxBinary -PathType Leaf)) {
+    throw "The Windows installer is incomplete: the Linux runtime is missing."
+}
 
 $registered = Get-RegisteredDistributions
+$importedNow = $false
 if ($registered -notcontains $DistroName) {
     if (-not (Test-Path -LiteralPath $Rootfs -PathType Leaf)) {
         throw "The Windows package is incomplete: laintas-rootfs.tar.gz is missing."
     }
+    $createdDistroDir = $false
     if (Test-Path -LiteralPath $DistroDir) {
         $existing = @(Get-ChildItem -LiteralPath $DistroDir -Force -ErrorAction SilentlyContinue)
         if ($existing.Count -gt 0) {
@@ -58,12 +67,23 @@ if ($registered -notcontains $DistroName) {
         }
     } else {
         New-Item -ItemType Directory -Path $DistroDir -Force | Out-Null
+        $createdDistroDir = $true
     }
 
     Write-Host "Importing the private $DistroName WSL environment..."
-    & wsl.exe --import $DistroName $DistroDir $Rootfs --version 2
-    if ($LASTEXITCODE -ne 0) {
-        throw "WSL import failed with exit code $LASTEXITCODE."
+    try {
+        & wsl.exe --import $DistroName $DistroDir $Rootfs --version 2
+        if ($LASTEXITCODE -ne 0) {
+            throw "WSL import failed with exit code $LASTEXITCODE."
+        }
+        $importedNow = $true
+    } catch {
+        # Only remove a directory this invocation created, and only when WSL
+        # did not register the distribution. Never delete an existing distro.
+        if ($createdDistroDir -and ((Get-RegisteredDistributions) -notcontains $DistroName)) {
+            Remove-Item -LiteralPath $DistroDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        throw
     }
 } else {
     Write-Host "$DistroName is already installed; preserving its Linux filesystem and user data."
@@ -72,10 +92,20 @@ if ($registered -notcontains $DistroName) {
 New-Item -ItemType Directory -Path $BinDir -Force | Out-Null
 Copy-Item -LiteralPath $BundledLauncher -Destination $InstalledLauncher -Force
 
-Write-Host "Verifying the Laintas runtime..."
-& wsl.exe --distribution $DistroName --user root --exec test -x /usr/local/bin/laintas-cli
+Write-Host "Installing the current Laintas runtime without replacing Linux user data..."
+$fullLinuxBinary = [IO.Path]::GetFullPath($LinuxBinary)
+if ($fullLinuxBinary -notmatch '^([A-Za-z]):\\(.*)$') {
+    throw "Cannot translate the installer runtime path for WSL: $fullLinuxBinary"
+}
+$drive = $Matches[1].ToLowerInvariant()
+$relative = $Matches[2] -replace '\\', '/'
+$wslLinuxBinary = "/mnt/$drive/$relative"
+& wsl.exe --distribution $DistroName --user root --exec /usr/bin/install -m 0755 $wslLinuxBinary /usr/local/bin/laintas-cli
 if ($LASTEXITCODE -ne 0) {
-    throw "The imported distribution does not contain /usr/local/bin/laintas-cli."
+    if ($importedNow) {
+        & wsl.exe --unregister $DistroName 2>$null | Out-Null
+    }
+    throw "Could not install the Laintas runtime inside $DistroName."
 }
 
 $pathChanged = Add-UserPath $BinDir

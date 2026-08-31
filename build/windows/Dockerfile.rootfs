@@ -11,12 +11,10 @@ RUN apt-get update \
     && printf 'laintas ALL=(ALL) NOPASSWD:ALL\n' > /etc/sudoers.d/laintas \
     && chmod 0440 /etc/sudoers.d/laintas
 
-COPY laintas-cli /usr/local/bin/laintas-cli
 COPY wsl.conf /etc/wsl.conf
 COPY wsl-distribution.conf /etc/wsl-distribution.conf
 
-RUN chmod 0755 /usr/local/bin/laintas-cli \
-    && chmod 0644 /etc/wsl.conf /etc/wsl-distribution.conf \
+RUN chmod 0644 /etc/wsl.conf /etc/wsl-distribution.conf \
     && chown root:root /etc/wsl.conf /etc/wsl-distribution.conf
 
 WORKDIR /home/laintas

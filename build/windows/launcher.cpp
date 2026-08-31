@@ -1,6 +1,3 @@
-#define UNICODE
-#define _UNICODE
-
 #include <windows.h>
 #include <wslapi.h>
 
@@ -63,7 +60,7 @@ int wmain(int argc, wchar_t** argv) {
         std::fwprintf(
             stderr,
             L"laintas-cli: the private WSL distribution '%ls' is not installed.\n"
-            L"Run install.cmd from the Windows package, then try again.\n",
+            L"Run the Laintas CLI Windows installer, then try again.\n",
             distribution.c_str());
         return 2;
     }

@@ -66,7 +66,7 @@ def test_release_assets_include_source_and_versioned_deb():
     assert build_release_assets._release_asset_names("1.8.3") == [
         "laintas-cli_linux_amd64.tar.gz",
         "laintas-cli_linux_arm64.tar.gz",
-        "laintas-cli_windows_amd64.zip",
+        "laintas-cli_windows_amd64_setup.exe",
         "laintas-cli_source.zip",
         "laintas-cli_1.8.3_amd64.deb",
         "SHA256SUMS.txt",
