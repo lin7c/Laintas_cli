@@ -78,14 +78,13 @@ SEVERITIES = (DETAIL_GAP, SCOPE_ERROR, CRITIC_UNSURE)
 NEEDS_USER = "user"            # only the person who wrote the request knows
 NEEDS_EVIDENCE = "evidence"    # the repo or the web knows; the model can look
 
-#: What kind of work this is, deciding which branch (see branches.py) is
-#: pinned. Kept here rather than in branches.py because it is a property of
-#: the request, decided while reading it — the branch is what someone else
-#: does with that answer.
-KIND_REFACTOR = "refactor"
-KIND_MODIFY = "modify"
-KIND_UNCLEAR = "unclear"
-TASK_KINDS = (KIND_REFACTOR, KIND_MODIFY, KIND_UNCLEAR)
+#: How far down the decision tree (branches.py) the request was placed, as the
+#: ids of the nodes passed through. Carried here because it is decided while
+#: reading the request, in the pass that was reading it anyway; validating the
+#: ids against the actual tree is branches.walk's job, so this module only
+#: checks that they are plausible ids at all.
+MAX_BRANCH_DEPTH = 8
+_BRANCH_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 
 MAX_REQUIREMENTS = 12
 MAX_QUESTIONS = 8
@@ -112,15 +111,14 @@ SELF_ASK_SYSTEM = (
     "3. Prefer few, sharp requirements over many vague ones.\n"
     "4. Keep the requester's own language for `goal`, `text` and `anchor`. "
     "Anchors are compared literally against the request.\n"
-    "5. Classify the work as `task_kind`:\n"
-    "   refactor — restructuring existing code, same behaviour afterwards.\n"
-    "   modify — changing what the code does: a fix, a small feature, an "
-    "adjustment. Also use this for writing something new.\n"
-    "   unclear — the request does not say, or it is not code work at all.\n"
-    "   Answer unclear rather than guessing. A workflow chosen by a coin flip "
-    "is worse than none, because it is followed with confidence.\n\n"
+    "5. If a DECISION TREE is given below, walk it and report the ids of the "
+    "nodes you passed through in `branch_path`, outermost first. Choose from "
+    "the ids offered at each step and nowhere else. Report an empty list when "
+    "the request does not fit: a wrong placement is worse than none, because "
+    "it is followed with confidence. When no tree is given, report an empty "
+    "list.\n\n"
     "Return ONLY a JSON object, no prose:\n"
-    '{"goal": "one sentence", "task_kind": "refactor|modify|unclear", '
+    '{"goal": "one sentence", "branch_path": ["node-id", ...], '
     '"requirements": [{"id": "R1", "text": "...", "anchor": "verbatim words"}], '
     '"out_of_scope": ["..."], "deliverables": ["..."], '
     '"open_questions": [{"id": "Q1", "q": "...", "needs": "user|evidence", '
@@ -297,7 +295,7 @@ def validate_spec(spec, task: str) -> dict:
     or off, so it is logged rather than discarded.
     """
     out = {
-        "goal": "", "task_kind": KIND_UNCLEAR,
+        "goal": "", "branch_path": [], "branch_label": "",
         "requirements": [], "out_of_scope": [], "deliverables": [],
         "open_questions": [], "assumptions": [], "task_breakdown": [],
         "dropped_anchors": 0, "round": 0, "spec_version": 1,
@@ -306,11 +304,16 @@ def validate_spec(spec, task: str) -> dict:
         return out
 
     out["goal"] = _line(spec.get("goal"), 300)
-    # Anything the model did not answer with is "unclear", which selects no
-    # branch. A default of refactor or modify would turn a parse slip into a
-    # confidently wrong workflow.
-    kind = _line(spec.get("task_kind"), 16).casefold()
-    out["task_kind"] = kind if kind in TASK_KINDS else KIND_UNCLEAR
+    # Shape only. Whether these ids form a real path is checked against the
+    # tree itself (branches.walk), which is the only thing that knows.
+    raw_path = spec.get("branch_path")
+    if isinstance(raw_path, str):
+        raw_path = [raw_path]
+    if isinstance(raw_path, (list, tuple)):
+        for item in list(raw_path)[:MAX_BRANCH_DEPTH]:
+            node_id = _line(item, 64)
+            if _BRANCH_ID_RE.match(node_id):
+                out["branch_path"].append(node_id)
 
     seen_ids = set()
     for index, item in enumerate(spec.get("requirements") or []):
@@ -384,27 +387,31 @@ def is_usable(spec) -> bool:
 # ── The three model calls ─────────────────────────────────────────────────
 
 def build_self_ask_messages(task: str, prior: Optional[dict] = None,
-                            round_index: int = 1) -> list:
+                            round_index: int = 1, tree_block: str = "") -> list:
     parts = [f"REQUEST (verbatim — anchors must be quoted from this):\n{task}"]
+    if tree_block:
+        parts.append(tree_block)
     if prior and is_usable(prior):
         parts.append(SELF_ASK_FOLLOWUP)
         parts.append("SPEC SO FAR:\n" + json.dumps(
             {k: prior.get(k) for k in (
-                "goal", "requirements", "out_of_scope", "deliverables",
-                "open_questions", "assumptions", "task_breakdown")},
+                "goal", "branch_path", "requirements", "out_of_scope",
+                "deliverables", "open_questions", "assumptions",
+                "task_breakdown")},
             ensure_ascii=False, indent=1))
     parts.append(f"Round {round_index}. Return the JSON object now.")
     return [{"role": "user", "content": "\n\n".join(parts)}]
 
 
 def self_ask_round(task: str, prior, llm_fn: Callable[[list], str],
-                   round_index: int = 1):
+                   round_index: int = 1, tree_block: str = ""):
     """One round of self-questioning. Returns ``(spec, failure_reason)``."""
     try:
         if not str(task or "").strip():
             return None, FAIL_EMPTY
         try:
-            reply = llm_fn(build_self_ask_messages(task, prior, round_index))
+            reply = llm_fn(build_self_ask_messages(
+                task, prior, round_index, tree_block))
         except Exception:
             return None, FAIL_LLM
         raw = _loads(reply)
@@ -417,7 +424,8 @@ def self_ask_round(task: str, prior, llm_fn: Callable[[list], str],
         return None, FAIL_LLM
 
 
-def build_spec(task: str, llm_fn: Callable[[list], str], rounds: int = 2):
+def build_spec(task: str, llm_fn: Callable[[list], str], rounds: int = 2,
+               tree_block: str = ""):
     """Run the self-ask rounds and return ``(spec, failure_reason)``.
 
     A later round that fails does not throw away an earlier usable spec: two
@@ -426,7 +434,7 @@ def build_spec(task: str, llm_fn: Callable[[list], str], rounds: int = 2):
     """
     spec, last_fail = None, None
     for index in range(1, max(1, int(rounds or 1)) + 1):
-        candidate, fail = self_ask_round(task, spec, llm_fn, index)
+        candidate, fail = self_ask_round(task, spec, llm_fn, index, tree_block)
         if candidate is None:
             last_fail = fail
             break
@@ -603,8 +611,10 @@ def to_contract_text(spec) -> str:
     lines = []
     if spec.get("goal"):
         lines.append(f"Goal: {spec['goal']}")
-    if spec.get("task_kind") in (KIND_REFACTOR, KIND_MODIFY):
-        lines.append(f"Kind: {spec['task_kind']}")
+    if spec.get("branch_label"):
+        # What the run already decided about the shape of the work. "On track"
+        # means something different for a refactor than for a new feature.
+        lines.append(f"Approach: {spec['branch_label']}")
     for req in spec.get("requirements") or []:
         lines.append(f"  {req['id']}. {req['text']}   (\"{req['anchor']}\")")
     for label, key in (("Deliverables", "deliverables"),

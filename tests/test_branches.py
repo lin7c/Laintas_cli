@@ -1,11 +1,9 @@
-"""Task branches: which workflow gets pinned, for whom, and when not to.
+"""The task decision tree: the walk, its validation, and what it renders.
 
-A refactor and a fix are different jobs. Given one set of instructions for
-both, a model does the average — mapping the repository to change three lines,
-or renaming a function without looking for the callers. These tests guard the
-three ways that can go wrong: the wrong branch, a branch for an agent nobody
-enabled, and a branch chosen from a guess.
+Three ways this goes wrong, and one test class each: a path the model invented,
+a tree the user broke, and a branch reaching an agent nobody enabled.
 """
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -16,7 +14,7 @@ import intent
 import paths
 
 
-class _BranchCase(unittest.TestCase):
+class _TreeCase(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.home = Path(self._tmp.name)
@@ -27,206 +25,315 @@ class _BranchCase(unittest.TestCase):
         self._patch.stop()
         self._tmp.cleanup()
 
-    def _write(self, filename, text):
-        directory = branches.branches_dir()
-        directory.mkdir(parents=True, exist_ok=True)
-        path = directory / filename
-        path.write_text(text, encoding="utf-8")
+    def _write(self, data):
+        path = branches.tree_path()
+        path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
         return path
 
-
-class SelectionTests(_BranchCase):
-    def test_each_kind_selects_its_own_workflow(self):
-        for kind in ("refactor", "modify"):
-            branch = branches.select(kind, agent_id="scout", allowed="scout")
-            self.assertIsNotNone(branch)
-            self.assertEqual(kind, branch.when)
-
-    def test_unclear_selects_nothing(self):
-        """A workflow chosen by a coin flip is worse than none — it is
-        followed with confidence."""
-        self.assertIsNone(
-            branches.select("unclear", agent_id="scout", allowed="scout"))
-        self.assertIsNone(
-            branches.select("", agent_id="scout", allowed="scout"))
-        self.assertIsNone(
-            branches.select("something-else", agent_id="scout", allowed="scout"))
-
-    def test_an_agent_nobody_enabled_gets_nothing(self):
-        self.assertIsNone(
-            branches.select("refactor", agent_id="primary", agent_name="primary",
-                            allowed="scout"))
-
-    def test_matching_is_by_id_or_name_and_ignores_case(self):
-        self.assertIsNotNone(branches.select(
-            "modify", agent_id="AI-2", agent_name="Scout", allowed="scout"))
-        self.assertIsNotNone(branches.select(
-            "modify", agent_id="AI-2", agent_name="x", allowed="ai-2"))
-
-    def test_a_star_enables_everyone(self):
-        self.assertIsNotNone(
-            branches.select("modify", agent_id="primary", allowed="*"))
-
-    def test_an_empty_setting_disables_everyone(self):
-        self.assertIsNone(
-            branches.select("modify", agent_id="scout", allowed=""))
-        self.assertIsNone(
-            branches.select("modify", agent_id="scout", allowed="  , "))
+    def _ids(self, path, **kwargs):
+        tree = kwargs.pop("tree", None) or branches.load_tree()
+        return [node.id for node in branches.walk(tree, path, **kwargs)]
 
 
-class UserOverrideTests(_BranchCase):
-    def test_a_user_file_replaces_the_builtin_of_that_name(self):
-        """Replaced, not merged: appending the built-in underneath would leave
-        the user arguing with instructions they thought they had deleted."""
-        self._write("refactor.md",
-                    "---\nname: refactor\nwhen: refactor\n---\n\nMY WORKFLOW\n")
-        branch = branches.select("refactor", agent_id="scout", allowed="scout")
-        self.assertEqual("MY WORKFLOW", branch.body)
-        self.assertNotIn("Map before you move", branch.body)
+class DefaultTreeTests(_TreeCase):
+    def test_the_shipped_tree_is_well_formed(self):
+        tree = branches.load_tree()
+        self.assertTrue(tree.usable)
+        self.assertEqual((), tree.problems)
 
-    def test_a_new_name_adds_a_branch(self):
-        self._write("careful.md",
-                    "---\nname: careful\nwhen: modify\n---\n\nGO SLOWLY\n")
-        names = [b.name for b in branches.load_all()]
-        self.assertIn("careful", names)
-        self.assertIn("refactor", names)
+    def test_every_question_has_exactly_two_live_children(self):
+        tree = branches.load_tree()
+        for node in tree.nodes.values():
+            if node.question:
+                self.assertEqual(2, len(node.children), node.id)
+                for child in node.children:
+                    self.assertIn(child, tree.nodes)
 
-    def test_applies_to_narrows_but_never_widens(self):
-        # Dropping a file into the directory must not switch the behaviour on
-        # for an agent the user did not enable.
-        self._write("refactor.md",
-                    "---\nname: refactor\nwhen: refactor\n"
-                    "applies_to: [primary]\n---\n\nX\n")
-        self.assertIsNone(branches.select(
-            "refactor", agent_id="primary", allowed="scout"))
-        self.assertIsNone(branches.select(
-            "refactor", agent_id="scout", allowed="scout"))
+    def test_the_four_paths_all_walk(self):
+        for path in (["refactor", "adopt-existing"], ["refactor", "in-place"],
+                     ["modify", "general"], ["modify", "one-off"]):
+            self.assertEqual(path, self._ids(path))
 
-    def test_applies_to_accepts_a_yaml_list(self):
-        self._write("refactor.md",
-                    "---\nname: refactor\nwhen: refactor\napplies_to:\n"
-                    "  - scout\n  - AI-2\n---\n\nX\n")
-        self.assertIsNotNone(branches.select(
-            "refactor", agent_id="scout", allowed="scout"))
-
-    def test_an_unknown_when_falls_back_to_matching_anything(self):
-        self._write("odd.md", "---\nname: odd\nwhen: sideways\n---\n\nX\n")
-        branch = next(b for b in branches.load_all() if b.name == "odd")
-        self.assertEqual(branches.ANY, branch.when)
-
-    def test_a_body_less_file_is_skipped(self):
-        self._write("empty.md", "---\nname: empty\nwhen: modify\n---\n\n\n")
-        self.assertNotIn("empty", [b.name for b in branches.load_all()])
-
-    def test_an_unreadable_file_does_not_break_the_others(self):
-        path = self._write("broken.md", "---\nname: broken\n---\n\nX\n")
-        with mock.patch.object(Path, "read_text",
-                               side_effect=OSError("gone")):
-            names = [b.name for b in branches.load_all()]
-        self.assertIn("refactor", names)
-        self.assertNotIn("broken", names)
-        self.assertTrue(path.exists())
-
-    def test_a_hostile_name_is_rejected(self):
-        self._write("bad.md", "---\nname: ../../escape\nwhen: modify\n---\n\nX\n")
-        self.assertNotIn("../../escape", [b.name for b in branches.load_all()])
-
-    def test_no_directory_at_all_still_gives_the_builtins(self):
-        self.assertEqual(["modify", "refactor"],
-                         [b.name for b in branches.load_all()])
+    def test_every_leaf_carries_guidance(self):
+        tree = branches.load_tree()
+        for node in tree.nodes.values():
+            if node.is_leaf and node.id != tree.root:
+                self.assertTrue(node.guidance.strip(), node.id)
 
 
-class DefaultFileTests(_BranchCase):
-    def test_the_builtins_are_written_so_they_can_be_edited(self):
-        created = branches.write_default_files()
-        self.assertEqual({"modify.md", "refactor.md"},
-                         {p.name for p in created})
-        text = (branches.branches_dir() / "refactor.md").read_text("utf-8")
-        self.assertIn("when: refactor", text)
-        self.assertIn("Map before you move", text)
+class WalkTests(_TreeCase):
+    def test_a_partial_path_is_allowed(self):
+        # Stopping early is a real answer: the guidance above still applies.
+        self.assertEqual(["refactor"], self._ids(["refactor"]))
 
-    def test_an_edited_file_is_never_overwritten(self):
+    def test_a_step_that_is_not_a_child_truncates_the_path(self):
+        """An id that is not a child of the previous node is invented. The
+        part that walked cleanly still applies; the rest does not speak."""
+        self.assertEqual(["refactor"], self._ids(["refactor", "general"]))
+
+    def test_an_unknown_first_step_yields_nothing(self):
+        self.assertEqual([], self._ids(["made-up"]))
+
+    def test_an_empty_path_yields_nothing(self):
+        self.assertEqual([], self._ids([]))
+
+    def test_a_non_list_yields_nothing(self):
+        self.assertEqual([], self._ids("refactor"))
+        self.assertEqual([], self._ids(None))
+
+    def test_the_walk_is_depth_bounded(self):
+        nodes = {"root": {"question": "?", "children": ["a", "b"]},
+                 "b": {"label": "B"}}
+        chain = ["a"]
+        for index in range(20):
+            nodes[chain[-1]] = {"label": chain[-1], "question": "?",
+                                "children": [f"n{index}", "b"]}
+            chain.append(f"n{index}")
+        nodes[chain[-1]] = {"label": "end"}
+        self._write({"root": "root", "nodes": nodes})
+        reached = self._ids(chain)
+        self.assertLessEqual(len(reached), branches.MAX_DEPTH)
+
+
+class BrokenTreeTests(_TreeCase):
+    def test_a_question_with_a_missing_child_becomes_a_leaf(self):
+        # Discarding the whole tree over one broken link would throw away the
+        # guidance above it too.
+        self._write({"root": "root", "nodes": {
+            "root": {"question": "?", "children": ["a", "gone"]},
+            "a": {"label": "A", "guidance": "keep me"}}})
+        tree = branches.load_tree()
+        self.assertTrue(tree.usable)
+        self.assertTrue(tree.get("root").is_leaf)
+        self.assertTrue(any("gone" in p for p in tree.problems))
+
+    def test_a_question_with_one_child_becomes_a_leaf(self):
+        self._write({"root": "root", "nodes": {
+            "root": {"question": "?", "children": ["a"]},
+            "a": {"label": "A"}}})
+        self.assertTrue(branches.load_tree().get("root").is_leaf)
+
+    def test_a_cycle_is_reported_and_does_not_hang(self):
+        self._write({"root": "a", "nodes": {
+            "a": {"question": "?", "children": ["b", "c"]},
+            "b": {"question": "?", "children": ["a", "c"]},
+            "c": {"label": "C"}}})
+        tree = branches.load_tree()
+        self.assertTrue(any("cycle" in p for p in tree.problems))
+        self.assertEqual(["b"], self._ids(["b"], tree=tree))
+
+    def test_an_unreachable_node_is_reported_but_harmless(self):
+        self._write({"root": "root", "nodes": {
+            "root": {"question": "?", "children": ["a", "b"]},
+            "a": {"label": "A"}, "b": {"label": "B"},
+            "orphan": {"label": "O"}}})
+        tree = branches.load_tree()
+        self.assertTrue(tree.usable)
+        self.assertTrue(any("orphan" in p for p in tree.problems))
+
+    def test_a_missing_root_makes_the_tree_unusable(self):
+        self._write({"root": "nowhere", "nodes": {"a": {"label": "A"}}})
+        self.assertFalse(branches.load_tree().usable)
+
+    def test_invalid_json_does_not_fall_back_to_the_default(self):
+        """Falling back would hide the mistake and quietly hand the user
+        someone else's workflow."""
+        branches.tree_path().write_text("{not json", encoding="utf-8")
+        tree = branches.load_tree()
+        self.assertFalse(tree.usable)
+        self.assertTrue(tree.problems)
+
+    def test_a_node_with_an_unusable_id_is_dropped(self):
+        self._write({"root": "root", "nodes": {
+            "root": {"question": "?", "children": ["a", "../escape"]},
+            "a": {"label": "A"}, "../escape": {"label": "X"}}})
+        tree = branches.load_tree()
+        self.assertNotIn("../escape", tree.nodes)
+
+    def test_a_non_object_node_is_dropped(self):
+        self._write({"root": "root", "nodes": {
+            "root": {"label": "R"}, "a": "not an object"}})
+        self.assertNotIn("a", branches.load_tree().nodes)
+
+    def test_a_tree_that_is_not_an_object_is_unusable(self):
+        branches.tree_path().write_text("[1, 2]", encoding="utf-8")
+        self.assertFalse(branches.load_tree().usable)
+
+
+class GuidanceFormatTests(_TreeCase):
+    def test_guidance_may_be_a_list_of_lines(self):
+        # The awkward part of prose in JSON is the escaping, not the file.
+        self._write({"root": "root", "nodes": {
+            "root": {"question": "?", "children": ["a", "b"]},
+            "a": {"label": "A", "guidance": ["one", "", "two"]},
+            "b": {"label": "B"}}})
+        node = branches.load_tree().get("a")
+        self.assertEqual("one\n\ntwo", node.guidance)
+
+    def test_guidance_may_be_a_plain_string(self):
+        self._write({"root": "root", "nodes": {
+            "root": {"question": "?", "children": ["a", "b"]},
+            "a": {"label": "A", "guidance": "just text"},
+            "b": {"label": "B"}}})
+        self.assertEqual("just text", branches.load_tree().get("a").guidance)
+
+
+class EnablementTests(_TreeCase):
+    def test_only_named_agents_get_a_branch(self):
+        self.assertEqual([], [n.id for n in branches.select(
+            ["refactor"], agent_id="primary", allowed="scout")])
+        self.assertEqual(["refactor"], [n.id for n in branches.select(
+            ["refactor"], agent_id="scout", allowed="scout")])
+
+    def test_star_enables_everyone_and_empty_enables_nobody(self):
+        self.assertTrue(branches.agent_enabled("anyone", "", "*"))
+        self.assertFalse(branches.agent_enabled("scout", "", ""))
+        self.assertFalse(branches.agent_enabled("scout", "", " , "))
+
+    def test_id_or_name_matches_case_insensitively(self):
+        self.assertTrue(branches.agent_enabled("AI-2", "Scout", "scout"))
+        self.assertTrue(branches.agent_enabled("AI-2", "x", "ai-2"))
+
+    def test_a_subtree_can_narrow_but_never_widen(self):
+        # Adding a node must not switch behaviour on for an agent the user
+        # did not enable.
+        self._write({"root": "root", "nodes": {
+            "root": {"question": "?", "children": ["a", "b"]},
+            "a": {"label": "A", "guidance": "x", "applies_to": ["scout"]},
+            "b": {"label": "B", "guidance": "y"}}})
+        self.assertEqual([], [n.id for n in branches.select(
+            ["a"], agent_id="primary", allowed="scout")])
+        self.assertEqual(["a"], [n.id for n in branches.select(
+            ["a"], agent_id="scout", allowed="scout")])
+        self.assertEqual([], [n.id for n in branches.select(
+            ["a"], agent_id="other", allowed="*")])
+
+    def test_a_narrowed_subtree_is_not_offered_in_the_questions(self):
+        self._write({"root": "root", "nodes": {
+            "root": {"question": "pick", "children": ["a", "b"]},
+            "a": {"label": "A", "choice": "only scout", "applies_to": ["scout"]},
+            "b": {"label": "B", "choice": "anyone"}}})
+        block = branches.render_questions(branches.load_tree(),
+                                          agent_id="primary")
+        self.assertIn('"b"', block)
+        self.assertNotIn('"a"', block)
+
+
+class RenderTests(_TreeCase):
+    def test_guidance_accumulates_down_the_path(self):
+        tree = branches.load_tree()
+        out = branches.render(branches.walk(tree, ["refactor", "in-place"]))
+        self.assertIn("Behaviour does not change", out)   # from the parent
+        self.assertIn("Map before you move", out)         # from the leaf
+
+    def test_the_path_is_stated_even_when_guidance_is_thin(self):
+        """"This is a refactor, we are not adopting a library" are decisions.
+        Stating them stops the model reopening them every turn."""
+        self._write({"root": "root", "nodes": {
+            "root": {"question": "?", "children": ["a", "b"]},
+            "a": {"label": "Chosen"}, "b": {"label": "B"}}})
+        out = branches.render(branches.walk(branches.load_tree(), ["a"]))
+        self.assertIn('path="Chosen"', out)
+        self.assertIn("No further guidance", out)
+
+    def test_nothing_renders_to_nothing(self):
+        self.assertEqual("", branches.render([]))
+        self.assertEqual("", branches.render(None))
+
+    def test_the_question_block_names_ids_not_yes_and_no(self):
+        # An id that is not a child of the previous node is caught; a
+        # mis-ordered "yes" is not.
+        block = branches.render_questions(branches.load_tree())
+        self.assertIn('"refactor"', block)
+        self.assertIn('"in-place"', block)
+        self.assertIn("branch_path", block)
+
+    def test_an_unusable_tree_offers_no_questions(self):
+        branches.tree_path().write_text("{bad", encoding="utf-8")
+        self.assertEqual("", branches.render_questions(branches.load_tree()))
+
+
+class DefaultFileTests(_TreeCase):
+    def test_the_tree_is_written_so_it_can_be_edited(self):
+        path = branches.write_default_tree()
+        self.assertIsNotNone(path)
+        data = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual("kind", data["root"])
+        self.assertIn("refactor", data["nodes"])
+
+    def test_an_edited_tree_is_never_overwritten(self):
         # Pushed defaults overwriting user edits is a mistake this codebase
         # has already paid for once.
-        branches.write_default_files()
-        path = branches.branches_dir() / "refactor.md"
-        path.write_text("---\nname: refactor\n---\n\nMINE\n", encoding="utf-8")
-        self.assertEqual([], branches.write_default_files())
-        self.assertIn("MINE", path.read_text("utf-8"))
+        branches.tree_path().write_text(
+            json.dumps({"root": "mine", "nodes": {"mine": {"label": "M"}}}),
+            encoding="utf-8")
+        self.assertIsNone(branches.write_default_tree())
+        self.assertEqual("mine", branches.load_tree().root)
 
-    def test_writing_the_defaults_round_trips_through_the_parser(self):
-        branches.write_default_files()
-        loaded = {b.name: b for b in branches.load_all()}
-        self.assertEqual("refactor", loaded["refactor"].when)
-        self.assertNotEqual("builtin", loaded["refactor"].source)
-        self.assertIn("Map before you move", loaded["refactor"].body)
+    def test_the_written_tree_round_trips(self):
+        branches.write_default_tree()
+        tree = branches.load_tree()
+        self.assertTrue(tree.usable)
+        self.assertEqual((), tree.problems)
+        self.assertEqual(["modify", "general"],
+                         self._ids(["modify", "general"], tree=tree))
 
     def test_an_unwritable_home_is_not_an_error(self):
         with mock.patch.object(Path, "mkdir", side_effect=OSError("read-only")):
-            self.assertEqual([], branches.write_default_files())
+            self.assertIsNone(branches.write_default_tree())
 
 
-class RenderTests(_BranchCase):
-    def test_the_section_names_the_kind_and_the_branch(self):
-        branch = branches.select("refactor", agent_id="scout", allowed="scout")
-        out = branches.render(branch)
-        self.assertIn('<task_branch kind="refactor" name="refactor">', out)
-        self.assertIn("</task_branch>", out)
-
-    def test_nothing_renders_to_nothing(self):
-        self.assertEqual("", branches.render(None))
-        self.assertEqual("", branches.render(branches.Branch(name="x", body="  ")))
-
-
-class TaskKindTests(unittest.TestCase):
-    """The classification itself lives on the intent spec."""
+class SpecFieldTests(unittest.TestCase):
+    """The path travels on the intent spec; the tree validates it later."""
 
     TASK = "把这个模块重构一下，行为不要变"
 
-    def test_a_valid_kind_survives_validation(self):
-        for kind in ("refactor", "modify", "unclear"):
-            spec = intent.validate_spec({"goal": "g", "task_kind": kind}, self.TASK)
-            self.assertEqual(kind, spec["task_kind"])
+    def test_a_plausible_path_survives(self):
+        spec = intent.validate_spec(
+            {"goal": "g", "branch_path": ["refactor", "in-place"]}, self.TASK)
+        self.assertEqual(["refactor", "in-place"], spec["branch_path"])
 
-    def test_anything_else_is_unclear(self):
-        """A default of refactor or modify would turn a parse slip into a
-        confidently wrong workflow."""
-        for value in ("rewrite", "", None, 7, "REFACTOR "):
-            spec = intent.validate_spec({"goal": "g", "task_kind": value},
-                                        self.TASK)
-            self.assertIn(spec["task_kind"],
-                          ("refactor", "unclear"))     # only a real match wins
-        self.assertEqual("unclear", intent.validate_spec(
-            {"goal": "g", "task_kind": "rewrite"}, self.TASK)["task_kind"])
+    def test_a_bare_string_is_accepted_as_one_step(self):
+        spec = intent.validate_spec(
+            {"goal": "g", "branch_path": "refactor"}, self.TASK)
+        self.assertEqual(["refactor"], spec["branch_path"])
 
-    def test_a_missing_field_is_unclear(self):
-        spec = intent.validate_spec({"goal": "g"}, self.TASK)
-        self.assertEqual("unclear", spec["task_kind"])
+    def test_ids_that_are_not_ids_are_dropped(self):
+        spec = intent.validate_spec(
+            {"goal": "g", "branch_path": ["../escape", "ok", ""]}, self.TASK)
+        self.assertEqual(["ok"], spec["branch_path"])
 
-    def test_case_and_padding_are_tolerated(self):
-        spec = intent.validate_spec({"goal": "g", "task_kind": " Refactor "},
-                                    self.TASK)
-        self.assertEqual("refactor", spec["task_kind"])
+    def test_a_missing_field_is_an_empty_path(self):
+        self.assertEqual([], intent.validate_spec(
+            {"goal": "g"}, self.TASK)["branch_path"])
+        self.assertEqual([], intent.validate_spec(
+            {"goal": "g", "branch_path": 7}, self.TASK)["branch_path"])
 
-    def test_the_kind_reaches_the_progress_critic(self):
-        # The contract the later assessments judge against should carry it:
-        # "is this on track" means something different for a refactor.
-        spec = intent.validate_spec({
-            "goal": "g", "task_kind": "refactor",
-            "requirements": [{"id": "R1", "text": "行为不变",
-                              "anchor": "行为不要变"}]}, self.TASK)
-        self.assertIn("Kind: refactor", intent.to_contract_text(spec))
+    def test_the_path_is_length_bounded(self):
+        spec = intent.validate_spec(
+            {"goal": "g", "branch_path": [f"n{i}" for i in range(40)]},
+            self.TASK)
+        self.assertLessEqual(len(spec["branch_path"]), intent.MAX_BRANCH_DEPTH)
 
-    def test_an_unclear_kind_is_not_stated_as_a_fact(self):
+    def test_the_decided_approach_reaches_the_progress_critic(self):
         spec = intent.validate_spec({
             "goal": "g",
             "requirements": [{"id": "R1", "text": "行为不变",
                               "anchor": "行为不要变"}]}, self.TASK)
-        self.assertNotIn("Kind:", intent.to_contract_text(spec))
+        spec["branch_label"] = "Refactor → Restructure in place"
+        self.assertIn("Approach: Refactor → Restructure in place",
+                      intent.to_contract_text(spec))
 
-    def test_the_self_ask_prompt_asks_for_it(self):
-        self.assertIn("task_kind", intent.SELF_ASK_SYSTEM)
-        self.assertIn("unclear", intent.SELF_ASK_SYSTEM)
+    def test_no_approach_is_not_stated_as_a_fact(self):
+        spec = intent.validate_spec({
+            "goal": "g",
+            "requirements": [{"id": "R1", "text": "行为不变",
+                              "anchor": "行为不要变"}]}, self.TASK)
+        self.assertNotIn("Approach:", intent.to_contract_text(spec))
+
+    def test_the_self_ask_prompt_asks_for_the_path(self):
+        self.assertIn("branch_path", intent.SELF_ASK_SYSTEM)
+        self.assertIn("empty list", intent.SELF_ASK_SYSTEM)
 
 
 if __name__ == "__main__":

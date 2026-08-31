@@ -1,215 +1,487 @@
-"""Task branches — one workflow for restructuring, another for changing.
+"""The task decision tree — a few yes/no questions whose path selects a workflow.
 
-A refactor and a bug fix are not the same job done at different sizes. A
-refactor is worth mapping every caller before touching anything and must not
-change behaviour; a fix should read one region, change it, and verify that.
-Given one set of instructions for both, a model does the average of the two:
-it maps the repository to change three lines, or it renames a function without
-looking for the callers.
+A refactor and a bug fix are not the same job at different sizes, and neither
+are "replace this with a library" and "restructure it in place". Given one set
+of instructions for all of them a model does the average: it maps the whole
+repository to change three lines, or renames a function without looking for
+the callers, or invents an abstraction on the second occurrence of something.
 
-So the intent pass (``intent.py``) already decides which of the two this is —
-it is one more field on the spec it was building anyway, not a second model
-call — and this module supplies the workflow that decision selects. The chosen
-branch is pinned into the system prompt beside the agreed reading.
+So the intent pass (``intent.py``) walks a small binary tree while it is
+already reading the request — one more field on the spec it was building, not
+a second model call — and this module owns the tree, the walk's validation,
+and the guidance the path accumulates.
 
-Two rules shape it:
+Four things shape it:
 
-  * **The user's file wins.** A branch is a markdown file with frontmatter, the
-    same shape as SKILL.md, so ``~/.laintas/branches/refactor.md`` replaces the
-    built-in of that name outright. Defaults are written to disk only when
-    nothing is there, never over an edited copy — pushed defaults that
-    overwrite user edits is a mistake this codebase has already paid for once.
+  * **The path, not the leaf.** Guidance accumulates down the branch: the
+    general refactor rules come from the node that decided "refactor", the
+    migration specifics from the leaf below it. Common advice is written once.
 
-  * **Off unless asked for.** A branch is prescriptive: it tells the agent how
-    to work. That is welcome on a specialist and unwelcome on the agent the
-    user talks to all day, so ``branch_agents`` names who gets one and the
-    primary is not in it by default.
+  * **The path is itself context.** "This is a refactor; we are not building
+    our own; the result is one-off" are decisions, not just a way of choosing
+    text. They are rendered into the prompt even where the guidance is thin,
+    so the model stops re-litigating them every turn.
 
-Never raises: a malformed branch file is skipped, and no branch at all is the
-behaviour that existed before this module.
+  * **The model reports node ids, and every step is checked.** Each id must
+    actually be a child of the previous one. An answer of "yes"/"no" could be
+    mis-ordered without anyone noticing; an id cannot. An invalid step
+    truncates the path there and the part that walked cleanly still applies —
+    the same gate as intent.validate_spec's anchoring.
+
+  * **One file, and the user's version wins.** ``~/.laintas/branches.json``
+    holds the shape and the prose together, because a tree scattered across
+    files is a tree whose shape you cannot see and whose links break on a
+    rename. ``guidance`` accepts a string or a list of lines, since the awkward
+    part of prose in JSON is the escaping, not the file.
+
+Never raises: a malformed tree degrades to no branch, which is how the agent
+worked before this module existed.
 """
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
 import paths
-# One frontmatter parser, not two. A second implementation would drift, and
-# the user writing their first branch file would meet quirks that their skill
-# files do not have.
-from skills import _parse_frontmatter
 
 
-BRANCHES_DIRNAME = "branches"
-
-#: Task kinds a branch can claim. ``any`` matches whatever was decided;
-#: ``unclear`` deliberately has no branch — a workflow chosen by a coin flip
-#: is worse than no workflow, because it is stated with authority.
-REFACTOR = "refactor"
-MODIFY = "modify"
-ANY = "any"
-KINDS = (REFACTOR, MODIFY, ANY)
-
-MAX_BODY_CHARS = 6000
-_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+TREE_FILENAME = "branches.json"
+MAX_DEPTH = 8
+MAX_GUIDANCE_CHARS = 6000
+_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 
 
 @dataclass
-class Branch:
-    name: str
-    when: str = ANY
-    description: str = ""
-    body: str = ""
-    #: Agent ids or names this branch is limited to. Empty means "whoever the
-    #: branch_agents setting already allowed" — the file narrows, it never
-    #: widens, so dropping a file into the directory cannot switch the
-    #: behaviour on for an agent the user did not enable.
+class Node:
+    id: str
+    label: str = ""
+    #: What answering the parent's question this way means. Shown to the model
+    #: beside the id, so it knows which id it is choosing and why.
+    choice: str = ""
+    guidance: str = ""
+    question: str = ""
+    children: tuple = ()
+    #: Agent ids or names this subtree is limited to. Narrows what
+    #: ``branch_agents`` already allowed; it never widens it, so adding a node
+    #: cannot switch the behaviour on for an agent the user did not enable.
     applies_to: tuple = ()
-    source: str = "builtin"
 
-    def matches(self, task_kind: str, agent_id: str, agent_name: str) -> bool:
-        if self.when not in (ANY, str(task_kind or "")):
-            return False
-        if not self.applies_to:
-            return True
-        wanted = {str(item).strip().casefold() for item in self.applies_to}
-        return (str(agent_id or "").casefold() in wanted
-                or str(agent_name or "").casefold() in wanted)
+    @property
+    def is_leaf(self) -> bool:
+        return not (self.question and len(self.children) == 2)
 
 
-_REFACTOR_BODY = """\
-This task restructures existing code. The product is the same behaviour in a
-better shape, so the risks are different from a change that is meant to alter
-what the program does.
+@dataclass
+class Tree:
+    root: str = ""
+    nodes: dict = field(default_factory=dict)
+    problems: tuple = ()
 
-**Map before you move.** Find every caller, import, subclass, test, string
-reference and configuration entry that touches what you are about to change,
-before changing any of it. Searching is the cheap half of a refactor and the
-half that decides whether it works: a rename that misses one call site is not
-a smaller refactor, it is a bug that will look like a merge accident later.
-Use `fs.grep` and `fs.glob` broadly here — this is the one phase where a wide
-search pays for itself.
+    def get(self, node_id: str) -> Optional[Node]:
+        return self.nodes.get(str(node_id or ""))
 
-**Find the safety net first.** Locate the tests that already cover the code
-you are moving and run them before you start, so a failure afterwards means
-something. If nothing covers it, say so plainly and either write a
-characterisation test first or state in your report that the change is
-unverified. Do not discover this at the end.
-
-**Behaviour does not change.** If you find a bug while restructuring, report
-it and leave it. Fixing it in the same change makes the diff impossible to
-review, and makes "did the refactor break anything?" unanswerable.
-
-**Move in steps that each hold.** Prefer several changes that each leave the
-code building and the tests passing over one that only works at the end. Run
-the check between steps, not once at the finish.
-
-**Confirm scope before crossing a boundary.** Renaming or moving something
-that other modules import, that is part of a public API, or that appears in
-documentation or configuration is a decision the user should make. Say what
-you would change and what it would touch, then ask — once, with the list, not
-one file at a time.
-"""
-
-_MODIFY_BODY = """\
-This task changes what the code does — a fix, a small feature, an adjustment.
-The product is the smallest correct change, so wide exploration costs more
-than it returns.
-
-**Locate, read, then edit.** Find the target, read the region you are about to
-change, and patch from text you have actually seen. Search narrowly and on
-demand: mapping the repository to change three lines is time the user is
-paying for and attention spent away from the change itself.
-
-**Change what was asked and nothing else.** An adjacent problem you notice is
-worth reporting; it is not worth fixing in this change. Widening the diff is
-how a two-line fix becomes something nobody wants to review.
-
-**Verify the thing you changed.** Run the nearest real check — the specific
-test, a typecheck, or the command that exercises the path. "It should work" is
-not a verification, and neither is running a test suite that never touches
-your change.
-
-**Ask only when the change stops being reversible or in-scope.** An ordinary
-edit inside the requested scope does not need permission. Deleting something,
-changing an interface other code depends on, or editing a file the request
-never mentioned does — those are the moments to stop and describe what you are
-about to do.
-"""
-
-_BUILTINS = (
-    Branch(
-        name=REFACTOR, when=REFACTOR,
-        description="Restructuring existing code without changing behaviour",
-        body=_REFACTOR_BODY),
-    Branch(
-        name=MODIFY, when=MODIFY,
-        description="Changing behaviour: a fix, a small feature, an adjustment",
-        body=_MODIFY_BODY),
-)
+    @property
+    def usable(self) -> bool:
+        return bool(self.root and self.root in self.nodes)
 
 
-def branches_dir() -> Path:
-    return paths.LAINTAS_HOME / BRANCHES_DIRNAME
+# ── The shipped tree ──────────────────────────────────────────────────────
+# Two levels, four leaves. Small on purpose: a tree you can hold in your head
+# is a tree you will actually edit, and every extra level multiplies the prose
+# that has to be kept in agreement with itself.
+
+DEFAULT_TREE = {
+    "version": 1,
+    "root": "kind",
+    "nodes": {
+        "kind": {
+            "label": "",
+            "question": (
+                "Is this task restructuring existing code, or changing what "
+                "the code does?"),
+            "children": ["refactor", "modify"],
+        },
+        "refactor": {
+            "label": "Refactor",
+            "choice": (
+                "restructuring existing code; the behaviour afterwards is the "
+                "same"),
+            "guidance": [
+                "This task restructures existing code. The product is the same",
+                "behaviour in a better shape, so the risks are not the ones a",
+                "behaviour change carries.",
+                "",
+                "**Behaviour does not change.** If you find a bug while",
+                "restructuring, report it and leave it. Fixing it in the same",
+                "change makes the diff impossible to review and makes \"did the",
+                "refactor break anything?\" unanswerable.",
+                "",
+                "**Move in steps that each hold.** Prefer several changes that",
+                "each leave the code building and the tests passing over one",
+                "that only works at the end. Run the check between steps, not",
+                "once at the finish.",
+                "",
+                "**Confirm before crossing a boundary.** Renaming or moving",
+                "something other modules import, something part of a public",
+                "API, or something named in documentation or configuration is",
+                "the user's decision. Say what you would change and what it",
+                "would touch, then ask — once, with the list.",
+            ],
+            "question": (
+                "Are we replacing this with something that already exists (a "
+                "library, a framework, a platform feature), or restructuring "
+                "what is here?"),
+            "children": ["adopt-existing", "in-place"],
+        },
+        "adopt-existing": {
+            "label": "Adopt what exists",
+            "choice": "replacing our code with an existing library or feature",
+            "guidance": [
+                "**Prove the fit before you commit.** Check the thing actually",
+                "covers the cases our code covers — the awkward ones, not the",
+                "README example. List what it does not cover and say what",
+                "happens to those.",
+                "",
+                "**Migrate behind a seam.** Put our own thin interface in",
+                "front of it, and move callers to the seam before swapping the",
+                "implementation. That is what makes the change reversible and",
+                "reviewable in slices.",
+                "",
+                "**Both paths work until the last one moves.** Do not leave",
+                "the tree in a state where half the callers use the old thing",
+                "and nothing tells you which half.",
+                "",
+                "**Do not redesign while migrating.** Semantics we chose",
+                "deliberately are requirements, not accidents; changing them",
+                "in the same step hides a behaviour change inside a",
+                "dependency change.",
+                "",
+                "**Say what the dependency costs.** A new dependency is a",
+                "decision with a maintenance bill. Name the version, the",
+                "licence if it is unusual, and what we would do if it were",
+                "abandoned.",
+            ],
+        },
+        "in-place": {
+            "label": "Restructure in place",
+            "choice": "reshaping the code we already have",
+            "guidance": [
+                "**Map before you move.** Find every caller, import, subclass,",
+                "test, string reference and configuration entry that touches",
+                "what you are about to change, before changing any of it.",
+                "Searching is the cheap half of a refactor and the half that",
+                "decides whether it works: a rename that misses one call site",
+                "is not a smaller refactor, it is a bug that will look like a",
+                "merge accident later. Search widely here — this is the one",
+                "phase where that pays for itself.",
+                "",
+                "**Find the safety net first.** Locate the tests that already",
+                "cover what you are moving and run them before you start, so a",
+                "failure afterwards means something. If nothing covers it, say",
+                "so and either write a characterisation test first or state in",
+                "your report that the change is unverified. Do not discover",
+                "this at the end.",
+            ],
+        },
+        "modify": {
+            "label": "Change behaviour",
+            "choice": (
+                "changing what the code does: a fix, a feature, an adjustment, "
+                "or something new"),
+            "guidance": [
+                "This task changes what the code does. The product is the",
+                "smallest correct change, so wide exploration costs more than",
+                "it returns.",
+                "",
+                "**Locate, read, then edit.** Find the target, read the region",
+                "you are about to change, and patch from text you have",
+                "actually seen. Search narrowly and on demand: mapping the",
+                "repository to change three lines is time the user pays for",
+                "and attention spent away from the change.",
+                "",
+                "**Change what was asked and nothing else.** An adjacent",
+                "problem you notice is worth reporting; it is not worth fixing",
+                "here. Widening the diff is how a two-line fix becomes",
+                "something nobody wants to review.",
+                "",
+                "**Verify the thing you changed.** Run the nearest real check",
+                "— the specific test, a typecheck, or the command that",
+                "exercises the path. \"It should work\" is not a verification,",
+                "and neither is a suite that never touches your change.",
+                "",
+                "**Ask only when the change stops being reversible or",
+                "in-scope.** An ordinary edit inside the requested scope needs",
+                "no permission. Deleting something, changing an interface other",
+                "code depends on, or editing a file the request never",
+                "mentioned does.",
+            ],
+            "question": (
+                "Is this a general capability other code will use, or a "
+                "one-off for this specific case?"),
+            "children": ["general", "one-off"],
+        },
+        "general": {
+            "label": "General capability",
+            "choice": "something other code is meant to use",
+            "guidance": [
+                "**\"General\" is not permission to abstract yet.** With two",
+                "similar cases you cannot tell whether the similarity is real",
+                "or a coincidence, and the wrong abstraction is more expensive",
+                "than the duplication it replaced — it accumulates parameters",
+                "and flags for callers that no longer match. Either point at a",
+                "third real use, or write down the contract precisely enough",
+                "that a third one would fit it. If you can do neither, build",
+                "the specific thing and say why you did not generalise.",
+                "",
+                "**Duplicated knowledge is the exception.** One business rule,",
+                "one security check, one validated calculation — unify those",
+                "immediately, even with two copies, because divergence there",
+                "is a bug rather than a style problem. Code that merely looks",
+                "similar can wait.",
+                "",
+                "**Define the edges before the internals.** Name the inputs,",
+                "the outputs, the errors, and what is explicitly out of scope.",
+                "A shared thing without a stated boundary grows one caller at",
+                "a time until nobody can change it.",
+                "",
+                "**It needs tests of its own.** Something other code depends",
+                "on is tested at its own boundary, not only through whoever",
+                "happens to call it today.",
+            ],
+        },
+        "one-off": {
+            "label": "One-off",
+            "choice": "solving this case, here, and not building for reuse",
+            "guidance": [
+                "**Keep it where it is used.** Local, concrete and obvious",
+                "beats general and clever. Do not add a module, a base class,",
+                "or a configuration knob for a single caller.",
+                "",
+                "**Name it for what it does here.** A specific name is honest",
+                "about the scope and stops the next reader assuming it is",
+                "safe to reuse.",
+                "",
+                "**Some duplication is the right answer.** If this resembles",
+                "code elsewhere, say so in the report rather than unifying",
+                "them now — the third occurrence is when that decision can",
+                "actually be made.",
+            ],
+        },
+    },
+}
 
 
-def _parse_file(path: Path) -> Optional[Branch]:
-    try:
-        text = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeError):
-        return None
-    try:
-        meta, body = _parse_frontmatter(text)
-    except Exception:
-        return None
-    body = str(body or "").strip()[:MAX_BODY_CHARS]
-    if not body:
-        return None
-    name = str(meta.get("name") or path.stem).strip()
-    if not _NAME_RE.match(name):
-        return None
-    when = str(meta.get("when") or ANY).strip().casefold()
-    if when not in KINDS:
-        when = ANY
-    applies = meta.get("applies_to") or meta.get("agents") or ()
-    if isinstance(applies, str):
-        applies = [item for item in re.split(r"[,\s]+", applies) if item]
-    applies = tuple(str(item).strip() for item in applies if str(item).strip())
-    return Branch(name=name, when=when,
-                  description=str(meta.get("description") or "").strip()[:200],
-                  body=body, applies_to=applies, source=str(path))
+# ── Loading ───────────────────────────────────────────────────────────────
+
+def tree_path() -> Path:
+    return paths.LAINTAS_HOME / TREE_FILENAME
 
 
-def load_all() -> list:
-    """Built-in branches, with any same-named user file replacing one.
+def _text(value, limit: int = MAX_GUIDANCE_CHARS) -> str:
+    """A string, or a list of lines joined — the prose-in-JSON accommodation.
 
-    Replacing rather than merging: a user who wrote ``refactor.md`` wrote the
-    workflow they want, and quietly appending the built-in text underneath
-    would leave them arguing with instructions they thought they had deleted.
+    Escaping multi-paragraph markdown into one JSON string is the genuinely
+    unpleasant part of this format, and a list of lines removes it for three
+    lines of code.
     """
-    found = {branch.name: branch for branch in _BUILTINS}
-    directory = branches_dir()
+    if isinstance(value, (list, tuple)):
+        value = "\n".join(str(item) for item in value)
+    return str(value or "").strip()[:limit]
+
+
+def _parse_tree(data) -> Tree:
+    if not isinstance(data, dict):
+        return Tree(problems=("the tree file is not an object",))
+    raw_nodes = data.get("nodes")
+    if not isinstance(raw_nodes, dict):
+        return Tree(problems=("the tree has no 'nodes' object",))
+
+    problems = []
+    nodes = {}
+    for node_id, raw in raw_nodes.items():
+        node_id = str(node_id or "")
+        if not _ID_RE.match(node_id):
+            problems.append(f"ignored node with an unusable id: {node_id!r}")
+            continue
+        if not isinstance(raw, dict):
+            problems.append(f"ignored node {node_id}: not an object")
+            continue
+        children = raw.get("children") or ()
+        if isinstance(children, str):
+            children = [children]
+        children = tuple(str(c) for c in children if str(c or "").strip())
+        applies = raw.get("applies_to") or ()
+        if isinstance(applies, str):
+            applies = [item for item in re.split(r"[,\s]+", applies) if item]
+        nodes[node_id] = Node(
+            id=node_id,
+            label=_text(raw.get("label"), 60) or node_id,
+            choice=_text(raw.get("choice"), 200),
+            guidance=_text(raw.get("guidance")),
+            question=_text(raw.get("question"), 400),
+            children=children,
+            applies_to=tuple(str(a).strip() for a in applies if str(a).strip()),
+        )
+
+    # A question with anything other than two live children is not a decision.
+    # Demoting it to a leaf keeps the guidance above it usable instead of
+    # discarding the whole tree over one broken link.
+    for node in nodes.values():
+        if not node.question:
+            continue
+        missing = [c for c in node.children if c not in nodes]
+        if missing:
+            problems.append(
+                f"{node.id}: children not found: {', '.join(missing)}")
+        if len(node.children) != 2 or missing:
+            node.question = ""
+            node.children = ()
+
+    root = str(data.get("root") or "")
+    if root not in nodes:
+        problems.append(f"root {root!r} is not a node")
+        return Tree(root="", nodes=nodes, problems=tuple(problems))
+
+    # Cycles: a tree that loops would let a walk run forever and would make
+    # "the path so far" meaningless.
+    seen = set()
+    stack = [root]
+    while stack:
+        current = stack.pop()
+        if current in seen:
+            problems.append(f"{current}: reachable more than once (cycle?)")
+            continue
+        seen.add(current)
+        node = nodes.get(current)
+        if node is not None:
+            stack.extend(node.children)
+    for node_id in nodes:
+        if node_id not in seen:
+            problems.append(f"{node_id}: not reachable from the root")
+
+    return Tree(root=root, nodes=nodes, problems=tuple(problems))
+
+
+def load_tree() -> Tree:
+    """The user's tree if there is one, otherwise the shipped default."""
+    path = tree_path()
     try:
-        files = sorted(directory.glob("*.md"))
+        raw = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return _parse_tree(DEFAULT_TREE)
+    try:
+        data = json.loads(raw)
+    except ValueError as exc:
+        # Falling back to the default would hide the mistake and quietly give
+        # the user someone else's workflow; an unusable tree means no branch.
+        return Tree(problems=(f"{path}: invalid JSON ({exc})",))
+    parsed = _parse_tree(data)
+    if not parsed.usable:
+        return parsed
+    return parsed
+
+
+def write_default_tree() -> Optional[Path]:
+    """Put the shipped tree on disk so it can be read and edited.
+
+    Only when absent. Refreshing it would overwrite an edited tree with the
+    shipped one — the failure mode that made pushed defaults so destructive
+    the last time this codebase did it.
+    """
+    path = tree_path()
+    if path.exists():
+        return None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(DEFAULT_TREE, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8")
+        path.chmod(0o600)
     except OSError:
-        files = []
-    for path in files:
-        branch = _parse_file(path)
-        if branch is not None:
-            found[branch.name] = branch
-    return sorted(found.values(), key=lambda b: b.name)
+        return None
+    return path
+
+
+# ── Walking ───────────────────────────────────────────────────────────────
+
+def render_questions(tree: Tree, *, agent_id: str = "",
+                     agent_name: str = "") -> str:
+    """The tree as the intent pass sees it: ids, questions, and what each means.
+
+    Ids rather than yes/no, because the walk is validated step by step against
+    the tree — an id that is not a child of the previous node is caught, while
+    a mis-ordered "yes" is not.
+    """
+    if not tree.usable:
+        return ""
+    lines = []
+
+    def walk(node_id: str, depth: int):
+        node = tree.get(node_id)
+        if node is None or depth > MAX_DEPTH or not node.question:
+            return
+        indent = "  " * depth
+        lines.append(f"{indent}Q: {node.question}")
+        for child_id in node.children:
+            child = tree.get(child_id)
+            if child is None or not _subtree_allowed(child, agent_id, agent_name):
+                continue
+            lines.append(
+                f"{indent}  -> \"{child.id}\": {child.choice or child.label}")
+            walk(child_id, depth + 1)
+
+    walk(tree.root, 0)
+    if not lines:
+        return ""
+    return ("DECISION TREE — walk it and report the ids of the nodes you pass "
+            "through, in order, as `branch_path`. Stop at the node that asks "
+            "no further question. Report an empty list if the request does not "
+            "fit the tree; a wrong path is worse than none, because it is "
+            "followed with confidence.\n" + "\n".join(lines))
+
+
+def _subtree_allowed(node: Node, agent_id: str, agent_name: str) -> bool:
+    if not node.applies_to:
+        return True
+    wanted = {str(item).casefold() for item in node.applies_to}
+    return (str(agent_id or "").casefold() in wanted
+            or str(agent_name or "").casefold() in wanted)
+
+
+def walk(tree: Tree, path, *, agent_id: str = "", agent_name: str = "") -> list:
+    """Validate a reported path, returning the nodes it actually reaches.
+
+    Each id must be a child of the node before it (and the first a child of
+    the root). The first step that is not truncates the path: what walked
+    cleanly still applies, and nothing invented gets to speak with authority.
+    """
+    if not tree.usable or not isinstance(path, (list, tuple)):
+        return []
+    current = tree.get(tree.root)
+    reached = []
+    for raw in list(path)[:MAX_DEPTH]:
+        node_id = str(raw or "")
+        if current is None or node_id not in current.children:
+            break
+        node = tree.get(node_id)
+        if node is None or not _subtree_allowed(node, agent_id, agent_name):
+            break
+        reached.append(node)
+        current = node
+    return reached
 
 
 def agent_enabled(agent_id: str, agent_name: str, allowed: str) -> bool:
     """Whether this agent gets a branch at all.
 
-    ``allowed`` is the raw ``branch_agents`` setting: a comma-separated list of
-    agent ids or names, or ``*`` for everyone. The default does not include the
-    primary — a prescriptive workflow is welcome on a specialist and unwelcome
-    on the agent the user talks to all day.
+    ``allowed`` is the raw ``branch_agents`` setting: agent ids or names,
+    comma-separated, or ``*``. The default does not include the primary — a
+    prescriptive workflow suits a specialist and not the agent you talk to all
+    day.
     """
     wanted = {item.strip().casefold()
               for item in str(allowed or "").split(",") if item.strip()}
@@ -221,58 +493,37 @@ def agent_enabled(agent_id: str, agent_name: str, allowed: str) -> bool:
             or str(agent_name or "").casefold() in wanted)
 
 
-def select(task_kind: str, *, agent_id: str = "", agent_name: str = "",
-           allowed: str = "") -> Optional[Branch]:
-    """The branch to pin, or None.
+def path_label(reached) -> str:
+    return " → ".join(node.label for node in reached if node.label)
 
-    None is a real answer and the common one: an unclear task kind, a disabled
-    agent, or no branch claiming this kind all mean "work the way you would
-    have worked anyway".
+
+def render(reached) -> str:
+    """The system-prompt section: the decisions, then their accumulated advice.
+
+    The path is rendered even when the guidance under it is thin. "This is a
+    refactor, we are not adopting a library, the result is one-off" are
+    decisions about the task; stating them stops the model re-opening them
+    every turn.
     """
-    kind = str(task_kind or "").strip().casefold()
-    if kind not in (REFACTOR, MODIFY):
-        return None
-    if not agent_enabled(agent_id, agent_name, allowed):
-        return None
-    for branch in load_all():
-        if branch.matches(kind, agent_id, agent_name):
-            return branch
-    return None
-
-
-def render(branch: Optional[Branch]) -> str:
-    """The system-prompt section, or "" when there is no branch."""
-    if branch is None or not str(getattr(branch, "body", "")).strip():
+    reached = [node for node in (reached or [])]
+    if not reached:
         return ""
-    return (f'<task_branch kind="{branch.when}" name="{branch.name}">\n'
-            f"{branch.body.strip()}\n"
-            "</task_branch>")
+    label = path_label(reached)
+    body = "\n\n".join(node.guidance for node in reached if node.guidance)
+    if not body:
+        body = "No further guidance for this path; work the way it implies."
+    return (f'<task_branch path="{label}">\n{body}\n</task_branch>')
 
 
-def write_default_files() -> list:
-    """Put the built-ins on disk so they can be read and edited.
+def select(path, *, agent_id: str = "", agent_name: str = "",
+           allowed: str = "", tree: Optional[Tree] = None) -> list:
+    """The nodes to pin, or an empty list.
 
-    Only what is absent. Refreshing an existing file would overwrite a
-    customised workflow with the shipped one — the failure mode that made
-    pushed defaults so destructive the last time this codebase did it.
-    Returns the paths actually created.
+    Empty is a real answer and a common one: an agent nobody enabled, an
+    unusable tree, or a model that could not place the request all mean "work
+    the way you would have worked anyway".
     """
-    directory = branches_dir()
-    created = []
-    try:
-        directory.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        return created
-    for branch in _BUILTINS:
-        path = directory / f"{branch.name}.md"
-        if path.exists():
-            continue
-        text = (f"---\nname: {branch.name}\nwhen: {branch.when}\n"
-                f"description: {branch.description}\n---\n\n{branch.body}")
-        try:
-            path.write_text(text, encoding="utf-8")
-            path.chmod(0o600)
-            created.append(path)
-        except OSError:
-            continue
-    return created
+    if not agent_enabled(agent_id, agent_name, allowed):
+        return []
+    tree = tree if tree is not None else load_tree()
+    return walk(tree, path, agent_id=agent_id, agent_name=agent_name)

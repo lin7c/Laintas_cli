@@ -659,30 +659,41 @@ class BranchTests(IntentLoopTestCase):
         self._tmp_home.cleanup()
         super().tearDown()
 
-    def _spec_reply(self, kind):
+    def _spec_reply(self, path):
         payload = json.loads(SPEC_REPLY)
-        payload["task_kind"] = kind
+        payload["branch_path"] = list(path)
         return json.dumps(payload, ensure_ascii=False)
 
-    def test_a_refactor_pins_the_refactor_workflow(self):
+    def test_the_path_pins_guidance_from_every_node_it_passed(self):
         self.config = {"critic_enabled": False, "branch_agents": "primary"}
-        self.intent_replies = [self._spec_reply("refactor")] * 2
+        self.intent_replies = [self._spec_reply(["refactor", "in-place"])] * 2
         self.run_loop(loops=3, agent_id="primary")
         prompt = self.prompts()[-1]
-        self.assertIn('<task_branch kind="refactor"', prompt)
-        self.assertIn("Map before you move", prompt)
+        self.assertIn('path="Refactor → Restructure in place"', prompt)
+        self.assertIn("Behaviour does not change", prompt)   # parent node
+        self.assertIn("Map before you move", prompt)         # leaf
 
-    def test_a_modification_pins_the_other_one(self):
+    def test_a_different_path_pins_different_guidance(self):
         self.config = {"critic_enabled": False, "branch_agents": "primary"}
-        self.intent_replies = [self._spec_reply("modify")] * 2
+        self.intent_replies = [self._spec_reply(["modify", "one-off"])] * 2
         self.run_loop(loops=3, agent_id="primary")
         prompt = self.prompts()[-1]
-        self.assertIn('<task_branch kind="modify"', prompt)
+        self.assertIn('path="Change behaviour → One-off"', prompt)
+        self.assertIn("Keep it where it is used", prompt)
         self.assertNotIn("Map before you move", prompt)
 
-    def test_an_unclear_kind_pins_nothing(self):
+    def test_an_invented_step_is_truncated_not_followed(self):
         self.config = {"critic_enabled": False, "branch_agents": "primary"}
-        self.intent_replies = [self._spec_reply("unclear")] * 2
+        self.intent_replies = [self._spec_reply(["refactor", "general"])] * 2
+        self.run_loop(loops=3, agent_id="primary")
+        prompt = self.prompts()[-1]
+        self.assertIn('path="Refactor"', prompt)
+        self.assertNotIn("General capability", prompt)
+        self.assertNotIn("rule of three", prompt.lower())
+
+    def test_an_empty_path_pins_nothing(self):
+        self.config = {"critic_enabled": False, "branch_agents": "primary"}
+        self.intent_replies = [self._spec_reply([])] * 2
         self.run_loop(loops=3, agent_id="primary")
         for prompt in self.prompts():
             self.assertNotIn("<task_branch", prompt)
@@ -691,20 +702,39 @@ class BranchTests(IntentLoopTestCase):
         # The default setting names scout, not the primary: a prescriptive
         # workflow suits a specialist and not the agent you talk to all day.
         self.config = {"critic_enabled": False}     # default: scout only
-        self.intent_replies = [self._spec_reply("refactor")] * 2
+        self.intent_replies = [self._spec_reply(["refactor", "in-place"])] * 2
         self.run_loop(loops=3, agent_id="primary")
         for prompt in self.prompts():
             self.assertNotIn("<task_branch", prompt)
 
-    def test_a_user_file_replaces_the_shipped_workflow(self):
+    def test_a_disabled_agent_is_not_asked_to_walk_the_tree(self):
+        # Asking a model to place a request whose answer is then discarded is
+        # a paragraph of prompt for nothing.
+        self.config = {"critic_enabled": False}
+        self.run_loop(loops=3, agent_id="primary")
+        asked = [c for c in self.calls if c.get("task_kind") == "intent"]
+        self.assertTrue(asked)
+        self.assertNotIn("DECISION TREE", str(asked[0].get("messages")))
+
+    def test_an_enabled_agent_is_given_the_tree(self):
         self.config = {"critic_enabled": False, "branch_agents": "*"}
-        self.intent_replies = [self._spec_reply("refactor")] * 2
-        directory = Path(self._tmp_home.name) / "branches"
-        directory.mkdir(parents=True, exist_ok=True)
-        (directory / "refactor.md").write_text(
-            "---\nname: refactor\nwhen: refactor\n---\n\nDO IT MY WAY\n",
+        self.run_loop(loops=3, agent_id="primary")
+        asked = [c for c in self.calls if c.get("task_kind") == "intent"]
+        body = "".join(str(m.get("content") or "")
+                       for m in asked[0].get("messages") or [])
+        self.assertIn("DECISION TREE", body)
+        self.assertIn('"refactor"', body)
+
+    def test_a_user_tree_replaces_the_shipped_one(self):
+        self.config = {"critic_enabled": False, "branch_agents": "*"}
+        self.intent_replies = [self._spec_reply(["mine"])] * 2
+        (Path(self._tmp_home.name) / "branches.json").write_text(json.dumps({
+            "root": "root",
+            "nodes": {"root": {"question": "?", "children": ["mine", "other"]},
+                      "mine": {"label": "Mine", "guidance": "DO IT MY WAY"},
+                      "other": {"label": "Other", "guidance": "x"}}}),
             encoding="utf-8")
-        self.run_loop(loops=3)
+        self.run_loop(loops=3, agent_id="primary")
         prompt = self.prompts()[-1]
         self.assertIn("DO IT MY WAY", prompt)
         self.assertNotIn("Map before you move", prompt)
@@ -713,6 +743,15 @@ class BranchTests(IntentLoopTestCase):
         # The prefix tripwire must be able to say which component moved, or
         # the one cache-invalidating change of the task is unexplained.
         self.config = {"critic_enabled": False, "branch_agents": "*"}
-        self.intent_replies = [self._spec_reply("refactor")] * 2
-        state = self.run_loop(loops=3)["state"]
+        self.intent_replies = [self._spec_reply(["refactor", "in-place"])] * 2
+        state = self.run_loop(loops=3, agent_id="primary")["state"]
         self.assertIn("branch", state.get("_sys_prompt_churn_causes") or [])
+
+    def test_the_decided_approach_reaches_the_progress_critic(self):
+        self.config = {"critic_enabled": True, "critic_min_loop": 1,
+                       "critic_interval": 1, "branch_agents": "*"}
+        self.intent_replies = [self._spec_reply(["refactor", "in-place"])] * 2
+        self.run_loop(loops=6, agent_id="primary")
+        critic_calls = [c for c in self.calls if c.get("task_kind") == "critic"]
+        self.assertTrue(any("Approach: Refactor" in str(c.get("messages"))
+                            for c in critic_calls))

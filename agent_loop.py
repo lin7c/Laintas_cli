@@ -480,6 +480,16 @@ def _adaptive_loop_delay(base: float, *, failed: bool, retry_count: int = 0,
     return min(delay, 4.0)
 
 
+def _branch_agent_id(current_agent, fallback: str) -> str:
+    """Who the branch setting is checked against.
+
+    The running agent when there is one, the loop's own id otherwise — a
+    sub-agent run with no registry entry still has an identity, and reading
+    the setting against an empty string would silently enable nothing.
+    """
+    return str(getattr(current_agent, "id", "") or fallback or "")
+
+
 def _recover_cwd_into_state(state: dict, *, agent_id: str = "",
                             run_id: str = "", loop: int = 0) -> str:
     """Move out of a deleted working directory, and tell the model it happened.
@@ -9443,12 +9453,31 @@ def run_agent_loop(
                         task_kind="intent", trajectory_id=_traj)
                     return (resp or {}).get("reply", "") if isinstance(resp, dict) else ""
 
+                # Only offer the tree to an agent that would actually get a
+                # branch: asking a model to place a request whose answer is
+                # then discarded is a paragraph of prompt for nothing.
+                _int_tree_block = ""
+                try:
+                    _int_agent = get_current_agent()
+                    if branches.agent_enabled(
+                            _branch_agent_id(_int_agent, agent_id),
+                            str(getattr(_int_agent, "name", "") or ""),
+                            str(get_runtime_config("branch_agents") or "")):
+                        _int_tree_block = branches.render_questions(
+                            branches.load_tree(),
+                            agent_id=_branch_agent_id(_int_agent, agent_id),
+                            agent_name=str(getattr(_int_agent, "name", "") or ""))
+                except Exception:
+                    _int_tree_block = ""
+
                 def _intent_worker(_task=original_input, _fn=_intent_llm_fn,
                                    _out=_intent_result,
+                                   _tree=_int_tree_block,
                                    _rounds=int(get_runtime_config(
                                        "intent_self_ask_rounds") or 2)):
                     try:
-                        _sp, _f = intent.build_spec(_task, _fn, rounds=_rounds)
+                        _sp, _f = intent.build_spec(_task, _fn, rounds=_rounds,
+                                                    tree_block=_tree)
                     except Exception as _exc:   # never raise on a daemon thread
                         _sp, _f = None, f"intent thread error: {_exc}"
                     _out["spec"], _out["fail"] = _sp, _f
@@ -9643,22 +9672,28 @@ def run_agent_loop(
         _branch_section = ""
         if _thread_mode and get_runtime_config("intent_enabled"):
             _intent_spec_now = (state.get("_intent") or {}).get("spec")
-            _intent_section = intent.render_understanding(_intent_spec_now)
-            # The workflow the task kind selects. Pinned beside the agreed
-            # reading and in the same single prefix change, because both are
-            # decided by the same background pass: a refactor and a fix are
-            # different jobs, and one set of instructions for both produces
-            # the average of the two — mapping the repository to change three
-            # lines, or renaming a function without looking for the callers.
+            # The workflow the decision path selects. Resolved BEFORE the
+            # understanding is rendered, because it writes the path's label
+            # onto the spec and the understanding quotes it: doing it after
+            # would leave the label to appear one turn later, and that second
+            # prompt change is a second full prefix cache miss for the task.
+            # (The tripwire below is what caught it.)
             try:
-                _branch_agent = current_agent if current_agent is not None else None
-                _branch_section = branches.render(branches.select(
-                    (_intent_spec_now or {}).get("task_kind", ""),
-                    agent_id=str(getattr(_branch_agent, "id", "") or agent_id or ""),
-                    agent_name=str(getattr(_branch_agent, "name", "") or ""),
-                    allowed=str(get_runtime_config("branch_agents") or "")))
+                _branch_nodes = branches.select(
+                    (_intent_spec_now or {}).get("branch_path") or [],
+                    agent_id=_branch_agent_id(current_agent, agent_id),
+                    agent_name=str(getattr(current_agent, "name", "") or ""),
+                    allowed=str(get_runtime_config("branch_agents") or ""))
+                _branch_section = branches.render(_branch_nodes)
+                # The label rides along on the spec so the progress critic's
+                # contract carries it too: "on track" means something
+                # different for a refactor than for a new feature.
+                if _intent_spec_now is not None:
+                    _intent_spec_now["branch_label"] = branches.path_label(
+                        _branch_nodes)
             except Exception:
                 _branch_section = ""
+            _intent_section = intent.render_understanding(_intent_spec_now)
             system_prompt = (
                 system_prompt.rstrip() + "\n\n" + intent.HOOK_SECTION
                 + (("\n\n" + _intent_section) if _intent_section else "")

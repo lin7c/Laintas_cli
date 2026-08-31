@@ -23853,11 +23853,11 @@ def main():
         terminal_preferences.seed_new_terminal()
     except Exception:
         pass
-    # Put the built-in task workflows on disk the first time, so they can be
-    # read and edited. Only what is absent — never over an edited copy.
+    # Put the built-in decision tree on disk the first time, so it can be
+    # read and edited. Only when absent — never over an edited tree.
     try:
         import branches as _branches_boot
-        _branches_boot.write_default_files()
+        _branches_boot.write_default_tree()
     except Exception:
         pass
     import argparse
