@@ -21815,6 +21815,35 @@ def get_loop_deps() -> LoopDeps:
 #: the prompt's agent slot has a second value, not because it has work.
 DEFAULT_SUB_AGENT_NAME = "scout"
 
+#: What `scout` is for. Written onto the agent only when it has no prompt of
+#: its own, so a user who edited theirs keeps it — pushing defaults over an
+#: edited copy is a mistake this codebase has already paid for once.
+#:
+#: Deliberately short. The how-to-work half lives in the task branches
+#: (branches.py), which are chosen per task and which the user can replace;
+#: repeating that guidance here would mean two sets of instructions to keep
+#: in agreement, and the loser of that disagreement is the model.
+SCOUT_PROFILE_TITLE = "Code Specialist"
+SCOUT_PROFILE_DESCRIPTION = (
+    "Works on existing codebases: reads before changing, changes in "
+    "reviewable steps, verifies what it changed")
+SCOUT_PROFILE_PROMPT = """\
+You work on code that already exists and that someone else has to keep
+working on afterwards. That shapes what a good result looks like:
+
+- Read the surrounding code before you change it, and make your change look
+  like the code around it — its naming, its error handling, its level of
+  comment. A correct change in a foreign style still costs the reader.
+- Evidence over recall. Before you state how something behaves, open it. A
+  confident answer about a function you did not read is the expensive kind of
+  wrong, because nobody checks it.
+- Finish the change, including the check that it works. An edit you have not
+  run is a claim, not a result; say which check you ran and what it said.
+- Report what you did not do. Scope you left out, a test you could not run, a
+  bug you found and deliberately did not fix — those belong in the answer, not
+  in the next person's afternoon.
+"""
+
 _LOGO_LINES = [
     " ╷    ╭─╮  ┬  ╷ ╷ ┌┬┐  ╭─╮  ╭─╮",
     " │    ├─┤  │  │╲│  │   ├─┤  ╰─╮",
@@ -23824,6 +23853,13 @@ def main():
         terminal_preferences.seed_new_terminal()
     except Exception:
         pass
+    # Put the built-in task workflows on disk the first time, so they can be
+    # read and edited. Only what is absent — never over an edited copy.
+    try:
+        import branches as _branches_boot
+        _branches_boot.write_default_files()
+    except Exception:
+        pass
     import argparse
 
     parser = argparse.ArgumentParser(description="Laintas CLI — Autonomous AI agent")
@@ -24302,6 +24338,12 @@ def main():
                 # holding a terminal lease it was never re-granted.
                 _scout.deployment_terminal = None
                 _scout.stationed_terminal = None
+                # Give it its speciality only if it has none. A restored copy
+                # with an edited prompt keeps it.
+                if not str(getattr(_scout.profile, "prompt", "") or "").strip():
+                    _scout.profile.title = SCOUT_PROFILE_TITLE
+                    _scout.profile.description = SCOUT_PROFILE_DESCRIPTION
+                    _scout.profile.prompt = SCOUT_PROFILE_PROMPT
                 startup_mail.post(
                     "default-sub-agent",
                     f"'{DEFAULT_SUB_AGENT_NAME}' is registered and undeployed",

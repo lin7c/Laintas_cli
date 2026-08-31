@@ -52,6 +52,7 @@ import agent_contract        # Declared outputs + deterministic acceptance for a
 import branch as branch_mod   # Run-scoped supervision: one delegated unit of work
 import critic                 # Long-task external progress critic (drift/looping supervisor)
 import intent                 # Pre-work intent alignment: understand the request before acting on it
+import branches               # Per-task-kind workflow pinned beside the agreed reading
 import skill_router           # Dynamic skill routing: rank skills by task relevance (embedding, lexical fallback)
 import context_router         # Zero-network task routing for advertised tool schemas
 import durable_rules         # Structured long-lived user obligations
@@ -205,6 +206,7 @@ _DEFAULT_CONFIG = {
     "intent_inject_tasks": True,       # True = write the spec's task breakdown into the session task list when the agent has not made one itself.
     "intent_debate_rounds": 2,        # Rounds the agent may dispute the intent review before the question goes to the user (0 disables the argument entirely).
     "intent_escalate_to_user": True,   # True = an argument neither side can settle from the request stops and asks the user; unattended runs continue on a named assumption instead.
+    "branch_agents": "scout",         # Comma-separated agent ids/names that get a task-kind workflow pinned into their prompt (see branches.py); "*" = all, empty = none. The primary is deliberately absent: a prescriptive workflow suits a specialist and not the agent you talk to all day.
     "enable_mouse": False,             # REPL input box: click-to-position the cursor. Off by default: terminal mouse reporting hijacks native drag-to-select of scrollback (Shift+drag is the only workaround), which costs more than click-to-position gains
     "confirm_direct_commands": False,  # False = commands the USER types directly at the REPL run like a normal terminal (no policy approval prompt, e.g. rm); True = subject direct commands to the same needs_approval prompt as AI-issued ones. Hard `deny` policy rules always apply regardless.
     "trigger_scan_interval": 0.5,      # seconds between trigger scanner sweeps
@@ -862,6 +864,7 @@ _RUNTIME_CONFIG_DESCRIPTIONS = {
     "intent_inject_tasks": "Write the intent spec's task breakdown into the session task list when the agent has not made one",
     "intent_debate_rounds": "Rounds the agent may dispute the intent review before the question goes to the user (0 disables)",
     "intent_escalate_to_user": "Ask the user when an intent dispute cannot be settled from the request (unattended runs continue on a named assumption)",
+    "branch_agents": "Agents that get a refactor/modify workflow pinned into their prompt (comma-separated ids or names, * for all, empty for none)",
     "confirm_direct_commands": "Ask for approval on commands YOU type directly at the REPL (False = run like a normal terminal; hard deny rules still apply)",
     "enable_mouse": "Enable mouse click-to-position in the REPL input box",
     "tool_output_fold": "Max lines of tool output shown before folding (first half + … + last half); 0 = suppress preview",
@@ -9637,12 +9640,29 @@ def run_agent_loop(
         # until a spec actually survives that gate, so a failed or skipped
         # intent pass adds nothing to the prefix.
         _intent_section = ""
+        _branch_section = ""
         if _thread_mode and get_runtime_config("intent_enabled"):
-            _intent_section = intent.render_understanding(
-                (state.get("_intent") or {}).get("spec"))
+            _intent_spec_now = (state.get("_intent") or {}).get("spec")
+            _intent_section = intent.render_understanding(_intent_spec_now)
+            # The workflow the task kind selects. Pinned beside the agreed
+            # reading and in the same single prefix change, because both are
+            # decided by the same background pass: a refactor and a fix are
+            # different jobs, and one set of instructions for both produces
+            # the average of the two — mapping the repository to change three
+            # lines, or renaming a function without looking for the callers.
+            try:
+                _branch_agent = current_agent if current_agent is not None else None
+                _branch_section = branches.render(branches.select(
+                    (_intent_spec_now or {}).get("task_kind", ""),
+                    agent_id=str(getattr(_branch_agent, "id", "") or agent_id or ""),
+                    agent_name=str(getattr(_branch_agent, "name", "") or ""),
+                    allowed=str(get_runtime_config("branch_agents") or "")))
+            except Exception:
+                _branch_section = ""
             system_prompt = (
                 system_prompt.rstrip() + "\n\n" + intent.HOOK_SECTION
                 + (("\n\n" + _intent_section) if _intent_section else "")
+                + (("\n\n" + _branch_section) if _branch_section else "")
             )
         # Hired employees keep a persistent capability/persona overlay.  A
         # deployment assignment is a fresh work context layered on top of it.
@@ -9770,6 +9790,7 @@ def run_agent_loop(
                     critic.HOOK_SECTION if (_thread_mode and get_runtime_config("critic_enabled")) else "",
                     intent.HOOK_SECTION if (_thread_mode and get_runtime_config("intent_enabled")) else "",
                     _intent_section,
+                    _branch_section,
                     _PRODUCT_PROTOCOL_PROMPT,
                     _WORK_ORCHESTRATION_PROMPT,
                     "" if _terminal_style_has_block else _TERMINAL_OUTPUT_STYLE_PROMPT,
@@ -9814,6 +9835,7 @@ def run_agent_loop(
         _prefix_parts = {
             "tools": _tools_reminder,
             "intent": _intent_section,
+            "branch": _branch_section,
             "skills": _skill_catalog,
             "skill_context": skill_context,
             "memory": _memory_bulk,

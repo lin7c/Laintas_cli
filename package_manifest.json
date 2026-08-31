@@ -69,6 +69,7 @@
     "worktree_manager",
     "critic",
     "intent",
+    "branches",
     "embeddings",
     "mem_extract",
     "mem_recall",

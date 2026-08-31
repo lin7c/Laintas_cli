@@ -164,7 +164,7 @@ class IntentLoopTestCase(unittest.TestCase):
             return False
         return agent_loop._DEFAULT_CONFIG.get(key)
 
-    def run_loop(self, task=TASK, loops=3, state=None):
+    def run_loop(self, task=TASK, loops=3, state=None, agent_id=None):
         deps = mock.Mock()
         deps.call_backend = self._backend
         deps.console = _Console()
@@ -185,6 +185,7 @@ class IntentLoopTestCase(unittest.TestCase):
                     return agent_loop.run_agent_loop(
                         deps, task, {}, state if state is not None else {},
                         [{"role": "user", "content": task}],
+                        agent_id=agent_id,
                         max_loops_override=loops)
         finally:
             os.chdir(cwd)
@@ -641,3 +642,77 @@ class DebateTests(IntentLoopTestCase):
         judged = [c for c in self.calls
                   if c.get("task_kind") == "intent_judge"]
         self.assertTrue(all(c.get("tools_enabled") is False for c in judged))
+
+
+class BranchTests(IntentLoopTestCase):
+    """The judged task kind selects a workflow, and it reaches the prompt."""
+
+    def setUp(self):
+        super().setUp()
+        self._tmp_home = tempfile.TemporaryDirectory()
+        self._home_patch = mock.patch.object(
+            agent_loop.paths, "LAINTAS_HOME", Path(self._tmp_home.name))
+        self._home_patch.start()
+
+    def tearDown(self):
+        self._home_patch.stop()
+        self._tmp_home.cleanup()
+        super().tearDown()
+
+    def _spec_reply(self, kind):
+        payload = json.loads(SPEC_REPLY)
+        payload["task_kind"] = kind
+        return json.dumps(payload, ensure_ascii=False)
+
+    def test_a_refactor_pins_the_refactor_workflow(self):
+        self.config = {"critic_enabled": False, "branch_agents": "primary"}
+        self.intent_replies = [self._spec_reply("refactor")] * 2
+        self.run_loop(loops=3, agent_id="primary")
+        prompt = self.prompts()[-1]
+        self.assertIn('<task_branch kind="refactor"', prompt)
+        self.assertIn("Map before you move", prompt)
+
+    def test_a_modification_pins_the_other_one(self):
+        self.config = {"critic_enabled": False, "branch_agents": "primary"}
+        self.intent_replies = [self._spec_reply("modify")] * 2
+        self.run_loop(loops=3, agent_id="primary")
+        prompt = self.prompts()[-1]
+        self.assertIn('<task_branch kind="modify"', prompt)
+        self.assertNotIn("Map before you move", prompt)
+
+    def test_an_unclear_kind_pins_nothing(self):
+        self.config = {"critic_enabled": False, "branch_agents": "primary"}
+        self.intent_replies = [self._spec_reply("unclear")] * 2
+        self.run_loop(loops=3, agent_id="primary")
+        for prompt in self.prompts():
+            self.assertNotIn("<task_branch", prompt)
+
+    def test_an_agent_nobody_enabled_gets_no_workflow(self):
+        # The default setting names scout, not the primary: a prescriptive
+        # workflow suits a specialist and not the agent you talk to all day.
+        self.config = {"critic_enabled": False}     # default: scout only
+        self.intent_replies = [self._spec_reply("refactor")] * 2
+        self.run_loop(loops=3, agent_id="primary")
+        for prompt in self.prompts():
+            self.assertNotIn("<task_branch", prompt)
+
+    def test_a_user_file_replaces_the_shipped_workflow(self):
+        self.config = {"critic_enabled": False, "branch_agents": "*"}
+        self.intent_replies = [self._spec_reply("refactor")] * 2
+        directory = Path(self._tmp_home.name) / "branches"
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "refactor.md").write_text(
+            "---\nname: refactor\nwhen: refactor\n---\n\nDO IT MY WAY\n",
+            encoding="utf-8")
+        self.run_loop(loops=3)
+        prompt = self.prompts()[-1]
+        self.assertIn("DO IT MY WAY", prompt)
+        self.assertNotIn("Map before you move", prompt)
+
+    def test_the_branch_change_is_attributed_to_the_branch(self):
+        # The prefix tripwire must be able to say which component moved, or
+        # the one cache-invalidating change of the task is unexplained.
+        self.config = {"critic_enabled": False, "branch_agents": "*"}
+        self.intent_replies = [self._spec_reply("refactor")] * 2
+        state = self.run_loop(loops=3)["state"]
+        self.assertIn("branch", state.get("_sys_prompt_churn_causes") or [])

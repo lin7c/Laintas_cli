@@ -22,12 +22,30 @@ import terminal_preferences
 
 @pytest.fixture(autouse=True, scope="session")
 def _isolated_preference_store():
-    with tempfile.TemporaryDirectory(prefix="laintas-test-sessions-") as tmp:
-        real = paths.SESSIONS_DIR
-        paths.SESSIONS_DIR = paths.Path(tmp)
+    """Redirect only the preference file, not SESSIONS_DIR.
+
+    Moving the whole directory reaches further than intended — other subsystems
+    keep run state there, and pointing them at an empty directory changed
+    behaviour that has nothing to do with preferences (it reordered the HWG
+    ready queue). The file is what needs protecting, so the file is what moves.
+    """
+    with tempfile.TemporaryDirectory(prefix="laintas-test-prefs-") as tmp:
+        real = terminal_preferences.preference_path
+        directory = paths.Path(tmp)
+        real_sessions = paths.SESSIONS_DIR
+
+        def _isolated_path():
+            # A test that redirected SESSIONS_DIR itself is already isolated
+            # and means something by it; only the default is moved.
+            base = (directory if paths.SESSIONS_DIR == real_sessions
+                    else paths.SESSIONS_DIR)
+            terminal_id = getattr(paths, "TERMINAL_ID", "terminal-default")
+            return base / f"{terminal_id}_preferences.json"
+
+        terminal_preferences.preference_path = _isolated_path
         terminal_preferences.reset_cache()
         try:
             yield
         finally:
-            paths.SESSIONS_DIR = real
+            terminal_preferences.preference_path = real
             terminal_preferences.reset_cache()
