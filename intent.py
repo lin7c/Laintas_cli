@@ -718,6 +718,7 @@ def new_state() -> dict:
     return {
         "phase": IDLE, "spec": None, "round": 0, "debate_round": 0,
         "fail_streak": 0, "last_comparison": None, "escalated_question": "",
+        "questions_sent": False,
     }
 
 

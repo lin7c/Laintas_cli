@@ -51,6 +51,7 @@ import mem_extract            # Task-end LLM memory extraction (write side of th
 import agent_contract        # Declared outputs + deterministic acceptance for a child agent
 import branch as branch_mod   # Run-scoped supervision: one delegated unit of work
 import critic                 # Long-task external progress critic (drift/looping supervisor)
+import intent                 # Pre-work intent alignment: understand the request before acting on it
 import skill_router           # Dynamic skill routing: rank skills by task relevance (embedding, lexical fallback)
 import context_router         # Zero-network task routing for advertised tool schemas
 import durable_rules         # Structured long-lived user obligations
@@ -197,6 +198,9 @@ _DEFAULT_CONFIG = {
     "critic_score_threshold": 50,      # Critic progress score (0-100) below this — or an explicit on_track=false — triggers a corrective nudge.
     "critic_nudge_cooldown": 2,       # Minimum critic intervals between injections of a SIMILAR nudge (same issue); a different issue is injected immediately.
     "critic_max_failures": 3,         # Consecutive critic call failures (LLM error / unparseable reply) before the critic auto-disables for the rest of the task, with a visible warning.
+    "intent_enabled": True,            # True = before working on a long thread-mode task, an independent LLM expands the request into an anchored spec (see intent.py) and pins it into the prompt. Complements the progress critic, which judges movement rather than direction.
+    "intent_self_ask_rounds": 2,      # Self-questioning rounds used to build that spec (1-4). One auxiliary model call each, tool-less and cheap; they run in the background of the first turn.
+    "intent_min_chars": 40,           # Skip the intent pass for requests shorter than this — a short instruction has no room to be misread, and the pass would just be a tax.
     "enable_mouse": False,             # REPL input box: click-to-position the cursor. Off by default: terminal mouse reporting hijacks native drag-to-select of scrollback (Shift+drag is the only workaround), which costs more than click-to-position gains
     "confirm_direct_commands": False,  # False = commands the USER types directly at the REPL run like a normal terminal (no policy approval prompt, e.g. rm); True = subject direct commands to the same needs_approval prompt as AI-issued ones. Hard `deny` policy rules always apply regardless.
     "trigger_scan_interval": 0.5,      # seconds between trigger scanner sweeps
@@ -817,6 +821,9 @@ _RUNTIME_CONFIG_DESCRIPTIONS = {
     "critic_score_threshold": "Critic progress score (0-100) below this triggers a corrective nudge",
     "critic_nudge_cooldown": "Minimum critic intervals between injections of a similar (same-issue) nudge",
     "critic_max_failures": "Consecutive critic failures before it auto-disables for the rest of the task",
+    "intent_enabled": "Expand a long request into an anchored spec before working on it, and pin the agreed reading into the prompt",
+    "intent_self_ask_rounds": "Self-questioning rounds used to build the intent spec (1-4)",
+    "intent_min_chars": "Skip the intent pass for requests shorter than this many characters",
     "confirm_direct_commands": "Ask for approval on commands YOU type directly at the REPL (False = run like a normal terminal; hard deny rules still apply)",
     "enable_mouse": "Enable mouse click-to-position in the REPL input box",
     "tool_output_fold": "Max lines of tool output shown before folding (first half + … + last half); 0 = suppress preview",
@@ -923,6 +930,12 @@ def _coerce_runtime_config_value(key: str, value):
             parsed = ""
         if "\x00" in parsed:
             raise ValueError("critic_prompt_file cannot contain a null byte")
+
+    if key == "intent_self_ask_rounds":
+        # Clamped rather than rejected: the cost of this setting is one
+        # auxiliary call per round, and a typo'd 40 would quietly turn the
+        # first turn of every task into forty billed calls.
+        parsed = max(1, min(4, int(parsed)))
 
     if key in {"rprompt_slots_detail_on", "rprompt_slots_detail_off",
                "rprompt_slot_order"}:
@@ -6078,7 +6091,7 @@ STATE_KEYS_TURN_ONLY = frozenset({
     "_contract", "_contract_max_loops", "_contract_tools", "_ctx_headroom_chars",
     "_dynamic_context_query", "_dynamic_tool_names", "_escalation_suggested",
     "_exhaustion_loop_count", "_force_full_catalog_next", "_force_micro_keep",
-    "_help_request", "_hwo_return", "_inbox", "_keep_worktree",
+    "_help_request", "_hwo_return", "_inbox", "_intent", "_keep_worktree",
     "_max_loops_exhausted", "_no_action_count", "_pending_history",
     "_persisted_employee", "_recent_failures", "_retry_count", "_role_name",
     "_snapshot_done", "_snapshot_pending", "_snapshot_sha", "_submitted_outputs",
@@ -8465,6 +8478,16 @@ def run_agent_loop(
     _critic_thread = None                 # in-flight background assessment
     _critic_result: dict = {}             # filled by that thread
     _critic_launch_idx = 0                # thread length when it was launched
+    # ── Intent alignment per-task state (see intent.py) ──────────────────
+    # The spec lives in `state` rather than a local, because the system prompt
+    # is rebuilt from `state` on every iteration. It is declared turn-only on
+    # purpose: the reading is anchored to THIS request, so the next user turn
+    # must build its own rather than inherit a spec quoting a different
+    # sentence.
+    if not isinstance(state.get("_intent"), dict):
+        state["_intent"] = intent.new_state()
+    _intent_thread = None                 # in-flight background spec build
+    _intent_result: dict = {}             # filled by that thread
     _run_id = uuid.uuid4().hex
     # Published on `state` so the auxiliary calls that run outside this frame
     # (compaction, memory consolidation) can stamp the same trajectory on their
@@ -8853,6 +8876,111 @@ def run_agent_loop(
         else:
             global_memory_str = "(empty)"
 
+        # ── Intent alignment (#3): understand the request before working ─────
+        # The progress critic asks "is this going somewhere?"; it cannot ask
+        # "was this ever the right somewhere?", because the only statement of
+        # the goal it has is the sentence the working model may already have
+        # misread. So before the work: a couple of tool-less self-ask rounds
+        # expand the request into a spec whose every requirement quotes the
+        # user, and that spec is pinned into the system prompt below.
+        #
+        # Harvested HERE, above the prompt build, so a spec that finished
+        # during the previous turn governs this one instead of the next. The
+        # build itself runs in the background of turn zero — its input is the
+        # request, not the thread, so nothing has to wait for it.
+        try:
+            _intent_st = state.get("_intent") or intent.new_state()
+            # A build that was still running when the previous turn returned
+            # died with it — its worker wrote into a local that is now gone.
+            # Without this the phase would stay "analyzing" forever and the
+            # task would silently never get a spec.
+            if _intent_thread is None and _intent_st.get("phase") == intent.ANALYZING:
+                _intent_st["phase"] = intent.IDLE
+                state["_intent"] = _intent_st
+            if _intent_thread is not None and not _intent_thread.is_alive():
+                _intent_thread = None
+                _intent_spec = _intent_result.get("spec")
+                _intent_fail = _intent_result.get("fail")
+                _intent_result = {}
+                if _intent_spec is None or not intent.is_usable(_intent_spec):
+                    # A spec nobody can quote is not a weaker spec, it is no
+                    # spec: pinning an empty understanding would be worse than
+                    # pinning none. Degrade silently to today's behaviour.
+                    _intent_st["phase"] = intent.next_phase(
+                        _intent_st, "spec_failed")
+                    event_log.append(
+                        "intent_failure", loop=_loop_id,
+                        agent_id=agent_id or "primary", run_id=_run_id,
+                        reason=_intent_fail or "no anchored requirement")
+                else:
+                    _intent_st["spec"] = _intent_spec
+                    _intent_st["phase"] = intent.next_phase(
+                        _intent_st, "spec_ready")
+                    _intent_st["round"] = int(_intent_spec.get("round", 0))
+                    # dropped_anchors is the health metric for this feature:
+                    # it counts the requirements the auxiliary model invented
+                    # and the anchoring gate threw away. A rising count means
+                    # the model has started making things up.
+                    event_log.append(
+                        "intent_spec_built", loop=_loop_id,
+                        agent_id=agent_id or "primary", run_id=_run_id,
+                        rounds=int(_intent_spec.get("round", 0)),
+                        requirements=len(_intent_spec.get("requirements") or []),
+                        questions=len(_intent_spec.get("open_questions") or []),
+                        dropped_anchors=int(
+                            _intent_spec.get("dropped_anchors", 0)))
+                state["_intent"] = _intent_st
+
+            if (_intent_thread is None
+                    and _intent_st.get("phase") == intent.IDLE
+                    and intent.should_start(
+                        original_input,
+                        thread_mode=_thread_mode,
+                        enabled=bool(get_runtime_config("intent_enabled")),
+                        has_contract=bool(state.get("_contract")),
+                        plan_mode=plan_mode.is_plan_mode(),
+                        min_chars=int(get_runtime_config("intent_min_chars") or 0))):
+                _int_cwd = state.get("cwd") or os.getcwd()
+                _int_aux_m, _int_aux_p = aux_model_override()
+
+                def _intent_llm_fn(messages, _s=session, _cwd=_int_cwd,
+                                   _traj=_run_id, _m=_int_aux_m, _p=_int_aux_p):
+                    # tools_enabled=False for the same reason as the critic,
+                    # and for one more: this judge must not be able to look
+                    # anything up. A question it cannot answer from the user's
+                    # own words is meant to reach the working model, which has
+                    # the whole toolset — not to be answered from a 26B
+                    # model's recollection of how some product looks.
+                    resp = deps.call_backend(
+                        session=_s, message="",
+                        system_prompt=intent.SELF_ASK_SYSTEM,
+                        current_path=_cwd, messages=messages,
+                        tools_enabled=False,
+                        model_override=_m or None,
+                        provider_override=_p or None,
+                        task_kind="intent", trajectory_id=_traj)
+                    return (resp or {}).get("reply", "") if isinstance(resp, dict) else ""
+
+                def _intent_worker(_task=original_input, _fn=_intent_llm_fn,
+                                   _out=_intent_result,
+                                   _rounds=int(get_runtime_config(
+                                       "intent_self_ask_rounds") or 2)):
+                    try:
+                        _sp, _f = intent.build_spec(_task, _fn, rounds=_rounds)
+                    except Exception as _exc:   # never raise on a daemon thread
+                        _sp, _f = None, f"intent thread error: {_exc}"
+                    _out["spec"], _out["fail"] = _sp, _f
+
+                _intent_st["phase"] = intent.ANALYZING
+                state["_intent"] = _intent_st
+                event_log.append("intent_started", loop=_loop_id,
+                                 agent_id=agent_id or "primary", run_id=_run_id)
+                _intent_thread = threading.Thread(
+                    target=_intent_worker, name="intent", daemon=True)
+                _intent_thread.start()
+        except Exception:
+            pass
+
         # 3. Read the product prompt. HWO (prompt.md) is a role overlay, never a
         # full replacement: replacing the base used to silently remove safety,
         # lifecycle, tool and completion contracts from child agents.
@@ -9023,6 +9151,20 @@ def run_agent_loop(
             system_prompt = (
                 system_prompt.rstrip() + "\n\n" + critic.HOOK_SECTION
             )
+        # Intent alignment: the agreed reading of the request, pinned where a
+        # thread compaction cannot summarise it away. It is authoritative
+        # because it is quotation — intent.validate_spec drops any requirement
+        # that is not a literal quote of what the user wrote — and it is empty
+        # until a spec actually survives that gate, so a failed or skipped
+        # intent pass adds nothing to the prefix.
+        _intent_section = ""
+        if _thread_mode and get_runtime_config("intent_enabled"):
+            _intent_section = intent.render_understanding(
+                (state.get("_intent") or {}).get("spec"))
+            system_prompt = (
+                system_prompt.rstrip() + "\n\n" + intent.HOOK_SECTION
+                + (("\n\n" + _intent_section) if _intent_section else "")
+            )
         # Hired employees keep a persistent capability/persona overlay.  A
         # deployment assignment is a fresh work context layered on top of it.
         employee_profile = getattr(current_agent, "profile", None)
@@ -9147,6 +9289,8 @@ def run_agent_loop(
                 "content": "\n\n".join(filter(None, (
                     _RUNTIME_OWNERSHIP_PROMPT,
                     critic.HOOK_SECTION if (_thread_mode and get_runtime_config("critic_enabled")) else "",
+                    intent.HOOK_SECTION if (_thread_mode and get_runtime_config("intent_enabled")) else "",
+                    _intent_section,
                     _PRODUCT_PROTOCOL_PROMPT,
                     _WORK_ORCHESTRATION_PROMPT,
                     "" if _terminal_style_has_block else _TERMINAL_OUTPUT_STYLE_PROMPT,
@@ -9190,6 +9334,7 @@ def run_agent_loop(
         # prefix crept back in. Per-component digests make the invoice legible.
         _prefix_parts = {
             "tools": _tools_reminder,
+            "intent": _intent_section,
             "skills": _skill_catalog,
             "skill_context": skill_context,
             "memory": _memory_bulk,
@@ -9267,6 +9412,36 @@ def run_agent_loop(
             if _final_turn:
                 user_input = user_input + "\n\n" + _FINAL_TURN_REMINDER
             _thread_to_send = None
+
+        # Evidence questions go to the working model, once. The intent review
+        # is tool-less on purpose, so anything it could not settle from the
+        # request itself is asked of the agent that can actually look it up —
+        # a lookup answered by the stronger model beats a fact invented by the
+        # cheaper one. This is a question, not a correction: nothing is
+        # declared wrong here.
+        try:
+            _int_st = state.get("_intent") or {}
+            # Persisted in `state`, not a local: a task that continues into
+            # another run_agent_loop call must not be asked the same questions
+            # a second time.
+            if (not _int_st.get("questions_sent")
+                    and _thread_to_send is not None
+                    and _int_st.get("phase") == intent.SPEC_READY):
+                _int_st["questions_sent"] = True
+                state["_intent"] = _int_st
+                _int_q = intent.render_questions(_int_st.get("spec"))
+                if _int_q:
+                    thread_messages.append({"role": "user", "content": _int_q})
+                    _thread_to_send = _thread_to_send + [
+                        {"role": "user", "content": _int_q}]
+                    event_log.append(
+                        "intent_questions_injected", loop=_loop_id,
+                        agent_id=agent_id or "primary", run_id=_run_id,
+                        count=len([q for q in (_int_st.get("spec") or {}).get(
+                            "open_questions") or []
+                            if q.get("needs") == intent.NEEDS_EVIDENCE]))
+        except Exception:
+            pass
 
         # ── Long-task critic (#2): periodic external progress supervisor ──────
         # On a long thread-mode task, every `critic_interval` loops an independent
@@ -9439,12 +9614,19 @@ def run_agent_loop(
                            if 0 < _critic_anchor_idx < len(thread_messages) else None)
 
                 # A contracted child is judged against what it owes, not
-                # against a paraphrase of its goal.
+                # against a paraphrase of its goal. A top-level task has no
+                # such contract — but once the intent layer has settled what
+                # the request actually asks for, that agreed reading is
+                # exactly the same kind of thing, and judging against it beats
+                # judging against the ambiguous sentence that started this.
                 _crit_contract = ""
                 try:
                     _crit_c = state.get("_contract")
                     if _crit_c:
                         _crit_contract = agent_contract.render(_crit_c)
+                    else:
+                        _crit_contract = intent.to_contract_text(
+                            (state.get("_intent") or {}).get("spec"))
                 except Exception:
                     _crit_contract = ""
 

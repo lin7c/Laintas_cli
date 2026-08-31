@@ -98,6 +98,14 @@ REQUIRED_FIELDS: dict = {
     "turn_crashed": ("error", "agent_id"),
     "context_compacted": ("before_tokens", "after_tokens"),
     "critic_prompt_warning": ("error",),
+    # Intent alignment. "Which agent, and what did the anchoring gate throw
+    # away" is the whole diagnostic value: a rising dropped_anchors count is
+    # how you find out the auxiliary model has started inventing requirements.
+    "intent_started": ("agent_id", "run_id"),
+    "intent_spec_built": ("agent_id", "run_id", "requirements",
+                          "dropped_anchors"),
+    "intent_failure": ("agent_id", "run_id", "reason"),
+    "intent_questions_injected": ("agent_id", "run_id", "count"),
 }
 
 
