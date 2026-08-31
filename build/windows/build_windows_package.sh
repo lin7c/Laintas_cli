@@ -15,9 +15,13 @@ if [ ! -x "$LINUX_BINARY" ]; then
   echo "Linux runtime binary not found or not executable: $LINUX_BINARY" >&2
   exit 2
 fi
-if [ -z "$PREBUILT_LAUNCHER" ] && ! command -v x86_64-w64-mingw32-g++ >/dev/null 2>&1; then
-  echo "x86_64-w64-mingw32-g++ is required (Debian/Ubuntu: apt install g++-mingw-w64-x86-64)" >&2
-  exit 2
+if [ -z "$PREBUILT_LAUNCHER" ]; then
+  for tool in x86_64-w64-mingw32-g++ x86_64-w64-mingw32-windres; do
+    command -v "$tool" >/dev/null 2>&1 || {
+      echo "$tool is required (Debian/Ubuntu: apt install g++-mingw-w64-x86-64)" >&2
+      exit 2
+    }
+  done
 fi
 if [ -n "$PREBUILT_LAUNCHER" ] && [ ! -f "$PREBUILT_LAUNCHER" ]; then
   echo "Prebuilt Windows launcher not found: $PREBUILT_LAUNCHER" >&2
@@ -51,9 +55,18 @@ echo "==> Building native Windows launcher"
 if [ -n "$PREBUILT_LAUNCHER" ]; then
   cp "$PREBUILT_LAUNCHER" "$WORK_DIR/package/laintas-cli.exe"
 else
+  # The icon is a linked resource rather than something the installer sets
+  # afterwards: the launcher is what the user pins, alt-tabs to and double
+  # clicks, and an icon that lives only in the shortcut is lost the moment
+  # they make their own.
+  x86_64-w64-mingw32-windres \
+    --include-dir "$PROJECT_DIR/build/windows" \
+    "$PROJECT_DIR/build/windows/launcher.rc" \
+    -O coff -o "$WORK_DIR/launcher.res.o"
   x86_64-w64-mingw32-g++ \
     -std=c++17 -Os -s -municode -static-libgcc -static-libstdc++ \
     "$PROJECT_DIR/build/windows/launcher.cpp" \
+    "$WORK_DIR/launcher.res.o" \
     -o "$WORK_DIR/package/laintas-cli.exe" \
     -lwslapi
 fi

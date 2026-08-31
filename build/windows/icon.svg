@@ -1,0 +1,13 @@
+<svg width="256" height="256" viewBox="0 0 256 256" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Laintas CLI">
+  <!-- The Laintas CLI mark from cli.laintas.com/favicon.svg, adapted for a
+       Windows icon slot: the site draws the mark on a full-bleed white square,
+       which as a desktop icon would be a hard-cornered white tile on every
+       background. Here the white is the rounded body itself and the corners
+       are transparent, and the glyph is a little larger inside a thinner
+       frame so "L>" still reads at 16px. Colours are the site's exactly. -->
+  <rect x="6" y="6" width="244" height="244" rx="44" fill="#ffffff"/>
+  <rect x="10" y="10" width="236" height="236" rx="40" fill="none" stroke="#d8dbd3" stroke-width="8"/>
+  <text x="42" y="180" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="128" font-weight="900" letter-spacing="-20">
+    <tspan fill="#d83b32">L</tspan><tspan fill="#18a266">&gt;</tspan>
+  </text>
+</svg>

@@ -42,6 +42,14 @@ VIAddVersionKey "FileVersion" "${APP_VERSION}"
 VIAddVersionKey "ProductVersion" "${APP_VERSION}"
 
 !define MUI_ABORTWARNING
+; The installer, the uninstaller and the Add/Remove entry all carry the same
+; mark the download site does. build/windows/icon.svg is the source and
+; icon.ico is generated from it by build/windows/build_icon.py; the launcher
+; gets the same file through launcher.rc. Without this NSIS ships its own
+; default icon, which tells a user nothing about who made the program they
+; are about to run.
+!define MUI_ICON   "icon.ico"
+!define MUI_UNICON "icon.ico"
 !define MUI_FINISHPAGE_RUN "$INSTDIR\bin\laintas-cli.exe"
 !define MUI_FINISHPAGE_RUN_TEXT "Start Laintas CLI now"
 !insertmacro MUI_PAGE_WELCOME

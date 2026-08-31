@@ -1,0 +1,8 @@
+/* Resources for the Windows launcher.
+ *
+ * Icon ID 1: Explorer and the taskbar show the numerically first icon in an
+ * executable, so the Laintas mark has to be the first (and here the only)
+ * one. Without it the installed launcher, its taskbar button and its
+ * Start-menu shortcut all fall back to the generic Windows executable icon.
+ * icon.ico is generated from icon.svg by build_icon.py. */
+1 ICON "icon.ico"
