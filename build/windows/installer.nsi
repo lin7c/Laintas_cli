@@ -79,6 +79,8 @@ Section "Install"
   File "${PAYLOAD_DIR}\laintas-cli-linux"
   File "${PAYLOAD_DIR}\laintas-rootfs.tar.gz"
   File "${PAYLOAD_DIR}\install.ps1"
+  File "${PAYLOAD_DIR}\icon.ico"
+  File "${PAYLOAD_DIR}\terminal-fragment.json"
 
   DetailPrint "Installing the private Laintas CLI runtime..."
   nsExec::ExecToLog 'powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$PLUGINSDIR\payload\install.ps1" -InstallRoot "$INSTDIR"'

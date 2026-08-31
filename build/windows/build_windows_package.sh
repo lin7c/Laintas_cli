@@ -80,6 +80,11 @@ CONTAINER_ID=""
 
 cp "$PROJECT_DIR/build/windows/install.ps1" "$WORK_DIR/package/install.ps1"
 cp "$PROJECT_DIR/build/windows/uninstall.ps1" "$WORK_DIR/package/uninstall.ps1"
+# The icon as a standalone file (a Windows Terminal profile references it by
+# path, and the copy linked into the launcher is not reachable that way) and
+# the profile itself.
+cp "$PROJECT_DIR/build/windows/icon.ico" "$WORK_DIR/package/icon.ico"
+cp "$PROJECT_DIR/build/windows/terminal-fragment.json" "$WORK_DIR/package/terminal-fragment.json"
 cp "$LINUX_BINARY" "$WORK_DIR/package/laintas-cli-linux"
 
 rm -rf "$OUT_DIR"

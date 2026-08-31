@@ -56,6 +56,8 @@ $PackageRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Rootfs = Join-Path $PackageRoot "laintas-rootfs.tar.gz"
 $LinuxBinary = Join-Path $PackageRoot "laintas-cli-linux"
 $BundledLauncher = Join-Path $PackageRoot "laintas-cli.exe"
+$BundledIcon = Join-Path $PackageRoot "icon.ico"
+$BundledFragment = Join-Path $PackageRoot "terminal-fragment.json"
 $BinDir = Join-Path $InstallRoot "bin"
 $DistroDir = Join-Path $InstallRoot "WSL"
 $InstalledLauncher = Join-Path $BinDir "laintas-cli.exe"
@@ -132,20 +134,69 @@ if ($LASTEXITCODE -ne 0) {
 
 $pathChanged = Add-UserPath $BinDir
 
+# The icon has to exist as a file on disk, not only inside the executable:
+# a Windows Terminal profile references it by path.
+$InstalledIcon = Join-Path $BinDir "laintas-cli.ico"
+if (Test-Path -LiteralPath $BundledIcon -PathType Leaf) {
+    Copy-Item -LiteralPath $BundledIcon -Destination $InstalledIcon -Force
+}
+
+# A Windows Terminal fragment, which is how an application adds a profile
+# without editing the user's settings.json. Windows Terminal reads this
+# directory whether or not it is installed today, so writing it is worth
+# doing even on a machine that has only the legacy console: it starts
+# working the day the user installs Windows Terminal.
+$terminalProfile = $false
+if (Test-Path -LiteralPath $BundledFragment -PathType Leaf) {
+    try {
+        $FragmentDir = Join-Path $env:LOCALAPPDATA "Microsoft\Windows Terminal\Fragments\Laintas.LaintasCLI"
+        New-Item -ItemType Directory -Path $FragmentDir -Force | Out-Null
+        $fragment = Get-Content -LiteralPath $BundledFragment -Raw -Encoding UTF8
+        # JSON string values: a Windows path's backslashes have to be escaped
+        # or the profile silently fails to parse and never appears.
+        $fragment = $fragment.Replace("__LAUNCHER__", $InstalledLauncher.Replace("\", "\\"))
+        $fragment = $fragment.Replace("__ICON__", $InstalledIcon.Replace("\", "\\"))
+        $FragmentPath = Join-Path $FragmentDir "laintas-cli.json"
+        # No BOM: Windows Terminal rejects a fragment that starts with one.
+        [IO.File]::WriteAllText($FragmentPath, $fragment, (New-Object Text.UTF8Encoding $false))
+        $terminalProfile = $true
+    } catch {
+        Write-Host "Could not register the Windows Terminal profile: $($_.Exception.Message)"
+    }
+}
+
 $Programs = [Environment]::GetFolderPath("Programs")
 if ($Programs) {
     $ShortcutPath = Join-Path $Programs "Laintas CLI.lnk"
     $Shell = New-Object -ComObject WScript.Shell
     $Shortcut = $Shell.CreateShortcut($ShortcutPath)
-    $Shortcut.TargetPath = $InstalledLauncher
+    # Point the shortcut at Windows Terminal when it is available, so the
+    # profile's font, colours and mouse handling apply from the first launch.
+    # Starting the launcher directly gets whatever terminal Windows defaults
+    # to, which on Windows 10 is the legacy console.
+    $wt = Get-Command wt.exe -ErrorAction SilentlyContinue
+    if ($terminalProfile -and $wt) {
+        $Shortcut.TargetPath = $wt.Source
+        $Shortcut.Arguments = '-p "Laintas CLI"'
+    } else {
+        $Shortcut.TargetPath = $InstalledLauncher
+    }
     $Shortcut.WorkingDirectory = [Environment]::GetFolderPath("UserProfile")
     $Shortcut.Description = "Laintas CLI"
+    if (Test-Path -LiteralPath $InstalledIcon -PathType Leaf) {
+        $Shortcut.IconLocation = $InstalledIcon
+    }
     $Shortcut.Save()
 }
 
 Write-Host ""
 Write-Host "Laintas CLI was installed successfully." -ForegroundColor Green
 Write-Host "Launcher: $InstalledLauncher"
+if ($terminalProfile) {
+    Write-Host "Windows Terminal profile: Laintas CLI"
+} else {
+    Write-Host "Install Windows Terminal for the full interface (colours, mouse, box drawing)."
+}
 if ($pathChanged) {
     Write-Host "Open a new terminal, then run: laintas-cli"
 } else {

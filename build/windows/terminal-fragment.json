@@ -1,0 +1,56 @@
+{
+  "$comment": [
+    "A Windows Terminal fragment extension: dropping this file in",
+    "%LOCALAPPDATA%\\Microsoft\\Windows Terminal\\Fragments\\Laintas.LaintasCLI\\",
+    "adds the profile below to every Windows Terminal on the machine, without",
+    "touching the user's own settings.json — which is theirs, and which an",
+    "installer has no business rewriting.",
+    "__LAUNCHER__ and __ICON__ are replaced with real paths at install time;",
+    "the profile GUID is fixed so a reinstall updates this profile rather than",
+    "adding a second one."
+  ],
+  "profiles": [
+    {
+      "guid": "{b9f3a1d2-6c47-5e88-9a01-4d2f7c6e8b13}",
+      "name": "Laintas CLI",
+      "commandline": "__LAUNCHER__",
+      "icon": "__ICON__",
+      "startingDirectory": "%USERPROFILE%",
+      "colorScheme": "Laintas",
+      "font": { "face": "Cascadia Mono", "size": 11 },
+      "antialiasingMode": "grayscale",
+      "cursorShape": "bar",
+      "padding": "12, 10, 12, 10",
+      "scrollbarState": "hidden",
+      "useAcrylic": false,
+      "closeOnExit": "graceful",
+      "snapOnInput": true,
+      "historySize": 20000
+    }
+  ],
+  "schemes": [
+    {
+      "name": "Laintas",
+      "background": "#0D0F0E",
+      "foreground": "#D8DBD3",
+      "cursorColor": "#18A266",
+      "selectionBackground": "#2A3A32",
+      "black": "#0D0F0E",
+      "red": "#D83B32",
+      "green": "#18A266",
+      "yellow": "#C7A14A",
+      "blue": "#4C8FD1",
+      "purple": "#9A6FD1",
+      "cyan": "#3FA8A0",
+      "white": "#D8DBD3",
+      "brightBlack": "#5A625C",
+      "brightRed": "#E85F56",
+      "brightGreen": "#3FC98A",
+      "brightYellow": "#E0BE6B",
+      "brightBlue": "#6FAEE6",
+      "brightPurple": "#B892E6",
+      "brightCyan": "#5FC8C0",
+      "brightWhite": "#F2F4EE"
+    }
+  ]
+}

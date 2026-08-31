@@ -50,7 +50,7 @@ laintas_cli_download/src/components/DownloadSection.jsx
 
 Releasing a new version means updating:
 
-- `RELEASE_FALLBACK`: `v1.23.3` — the version shown until the page has
+- `RELEASE_FALLBACK`: `v1.23.4` — the version shown until the page has
   answered from the GitHub API, so keep it in step with `version.py`
 - the version shown in the page's compatibility section
 

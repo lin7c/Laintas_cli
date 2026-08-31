@@ -103,3 +103,85 @@ def test_one_click_installers_download_from_the_live_release_channel():
     # executable the user is about to run as themselves.
     assert "SHA256SUMS.txt" in powershell
     assert "Checksum mismatch" in powershell
+
+
+def test_launcher_fixes_the_console_it_is_handed():
+    """The legacy console breaks a TUI in three separate ways.
+
+    A shortcut on Windows 10 opens conhost, where QuickEdit eats every mouse
+    event before the application sees it, escape sequences arrive as literal
+    text because virtual-terminal processing is off, and the default raster
+    font has no box-drawing or CJK glyphs. None of it is fixable from the
+    Linux side, and all of it is why the terminal was unusable.
+    """
+    launcher = (ROOT / "build/windows/launcher.cpp").read_text(encoding="utf-8")
+
+    # QuickEdit is the mouse. Clearing its bit does nothing unless
+    # ENABLE_EXTENDED_FLAGS is set in the same call.
+    assert "~static_cast<DWORD>(ENABLE_QUICK_EDIT_MODE)" in launcher
+    assert "ENABLE_EXTENDED_FLAGS" in launcher
+    assert "ENABLE_MOUSE_INPUT" in launcher
+
+    assert "ENABLE_VIRTUAL_TERMINAL_PROCESSING" in launcher
+    assert "ENABLE_VIRTUAL_TERMINAL_INPUT" in launcher
+    assert "SetConsoleOutputCP(CP_UTF8)" in launcher
+    assert "SetCurrentConsoleFontEx" in launcher
+
+    # Whatever was there before is put back: this process does not own the
+    # window it was started in.
+    assert "RestoreConsole" in launcher
+
+    # WslLaunchInteractive hands over the Windows environment, which has no
+    # TERM. An application that finds none assumes it may not draw at all.
+    assert "TERM=" in launcher
+    assert "xterm-256color" in launcher
+
+
+def test_windows_terminal_profile_is_installable_and_consistent():
+    """`wt -p <name>` fails unless every copy of the name agrees.
+
+    The name is written in three places — the fragment that defines the
+    profile, the launcher that selects it, and the shortcut the installer
+    creates — and a mismatch shows up only as a Windows Terminal error at
+    the moment a user clicks the shortcut.
+    """
+    import json
+
+    raw = (ROOT / "build/windows/terminal-fragment.json").read_text(
+        encoding="utf-8")
+    fragment = json.loads(raw)
+
+    profile = fragment["profiles"][0]
+    assert profile["name"] == "Laintas CLI"
+    assert profile["colorScheme"] == fragment["schemes"][0]["name"]
+    # A fixed GUID: a generated one would add a second profile on every
+    # reinstall instead of updating this one.
+    assert profile["guid"].startswith("{") and profile["guid"].endswith("}")
+    assert "__LAUNCHER__" in raw and "__ICON__" in raw
+
+    launcher = (ROOT / "build/windows/launcher.cpp").read_text(encoding="utf-8")
+    assert 'kTerminalProfile[] = L"Laintas CLI"' in launcher
+
+    install = (ROOT / "build/windows/install.ps1").read_text(encoding="utf-8")
+    assert '-p "Laintas CLI"' in install
+    assert "Fragments\\Laintas.LaintasCLI" in install
+    # JSON string values: unescaped backslashes make the fragment unparseable
+    # and the profile simply never appears.
+    assert '.Replace("\\", "\\\\")' in install
+    # A BOM makes Windows Terminal reject the fragment outright.
+    assert "UTF8Encoding $false" in install
+
+    uninstall = (ROOT / "build/windows/uninstall.ps1").read_text(encoding="utf-8")
+    assert "Fragments\\Laintas.LaintasCLI" in uninstall
+
+
+def test_the_installer_ships_what_the_profile_points_at():
+    """A profile that names a missing icon is a broken profile."""
+    build = (ROOT / "build/windows/build_windows_package.sh").read_text(
+        encoding="utf-8")
+    assert "package/icon.ico" in build
+    assert "package/terminal-fragment.json" in build
+
+    script = (ROOT / "build/windows/installer.nsi").read_text(encoding="utf-8")
+    assert 'File "${PAYLOAD_DIR}\\icon.ico"' in script
+    assert 'File "${PAYLOAD_DIR}\\terminal-fragment.json"' in script
