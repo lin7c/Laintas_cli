@@ -3582,13 +3582,49 @@ def agent_descendants(agent_id: str) -> set:
 
 
 def switch_to_agent(agent_id: str) -> bool:
-    """Switch the active agent. Returns True on success."""
-    global _current_agent_id
+    """Switch the active agent. Returns True on success.
+
+    The user-facing switch (``/agent``, and the Alt+A switcher that submits
+    it), so this is where the choice is remembered: for the toggle back, and
+    on disk, because being dropped back on the primary at every launch is a
+    setting the user has to make again every time.
+    """
     with _registry_lock:
         if agent_id not in _agent_registry:
             return False
-        _current_agent_id = agent_id
-        return True
+    set_current_agent_id(agent_id)
+    _persist_current_agent(agent_id)
+    return True
+
+
+def _persist_current_agent(agent_id: str) -> None:
+    """Remember the selection for the next launch of this terminal."""
+    try:
+        import terminal_preferences
+        terminal_preferences.set_value("agent", str(agent_id or ""))
+    except Exception:
+        pass
+
+
+def restore_current_agent(default: str = "") -> str:
+    """Re-select the agent this terminal was last using, if it still exists.
+
+    Returns the id actually selected. A remembered agent that is gone (hired
+    then fired, or a run that never re-registered it) falls back to the
+    default rather than leaving the session pointing at nothing.
+    """
+    remembered = ""
+    try:
+        import terminal_preferences
+        remembered = str(terminal_preferences.get("agent", "") or "")
+    except Exception:
+        remembered = ""
+    with _registry_lock:
+        known = remembered in _agent_registry
+    target = remembered if (remembered and known) else str(default or "")
+    if target:
+        set_current_agent_id(target)
+    return target
 
 
 def set_current_agent_id(agent_id: str) -> None:

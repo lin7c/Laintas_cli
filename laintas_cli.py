@@ -23815,6 +23815,15 @@ def _parse_subtask_json(text: str):
 def main():
     """Entry point."""
     global _pending_agent_switch
+    # A terminal the CLI has not run in before starts from the settings last
+    # used rather than from nothing. TERMINAL_ID is derived from the tty and
+    # POSIX session id when the emulator offers nothing better, and both
+    # change on every SSH login — so without this, every new connection asked
+    # for the model and mode again.
+    try:
+        terminal_preferences.seed_new_terminal()
+    except Exception:
+        pass
     import argparse
 
     parser = argparse.ArgumentParser(description="Laintas CLI — Autonomous AI agent")
@@ -24306,6 +24315,23 @@ def main():
                     "default-sub-agent",
                     "Could not register the default sub-agent",
                     str(_scout_exc), level="warn")
+
+            # Come back to whichever agent this terminal was last using.
+            # Deliberately after every agent is registered: a remembered id
+            # that is not in the registry yet would look like one that no
+            # longer exists, and silently drop the user back on the primary.
+            try:
+                _restored = _al_boot.restore_current_agent("primary")
+                if _restored and _restored != "primary":
+                    _restored_agent = get_agent(_restored)
+                    if _restored_agent is not None:
+                        agent_state = _restored_agent.state
+                        chat_history = _restored_agent.chat_history
+                        interactive_session = (
+                            _restored_agent.runtime_session
+                            or interactive_session)
+            except Exception:
+                pass
 
 
     def _on_terminal_agent_finished(agent_info, _result):

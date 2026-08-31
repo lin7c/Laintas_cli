@@ -69,6 +69,9 @@ class TerminalPreferenceTests(unittest.TestCase):
 
             with mock.patch.object(paths, "TERMINAL_ID", "term-b"):
                 terminal_preferences.reset_cache()
+                # Nothing is inherited by a mere read. A terminal only starts
+                # from another one's settings when the CLI seeds it at
+                # startup (terminal_preferences.seed_new_terminal).
                 self.assertEqual(laintas_cli.get_selected_model(), "")
                 self.assertEqual(mode_manager.get_active_mode()["name"], "act")
                 laintas_cli.set_model_selection("model-b", "provider-b")
