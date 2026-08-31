@@ -179,9 +179,8 @@ _SHAPE_KINDS = {
 def to_canvas_scene(scene: dict, title: str = "") -> dict:
     """Project a board onto the shared canvas-scene contract.
 
-    The contract (``{"shapes": [...], "connectors": [...]}``, same one
-    ``code-atlas`` emits) is what the terminal's infinite canvas renders, so a
-    board and a code map are the same kind of thing to look at. Excalidraw's
+    The contract (``{"shapes": [...], "connectors": [...]}``) is what the
+    terminal's infinite canvas renders. Excalidraw's
     own pixel coordinates are kept verbatim as world units — a board's layout
     is the author's, and re-laying it out would be showing them a different
     board.

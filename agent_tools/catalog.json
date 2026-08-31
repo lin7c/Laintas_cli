@@ -282,6 +282,50 @@
     },
 
     {
+      "name": "code_map_build", "category": "code_map", "execContext": "backend",
+      "description": "Queue a layered architecture map of a public GitHub repository. Returns a map id; the build takes minutes to hours.",
+      "params": {"type": "object", "properties": {
+        "repo_url": {"type": "string", "description": "https://github.com/owner/repository"},
+        "ref": {"type": "string", "description": "branch, tag or commit (default HEAD)"},
+        "title": {"type": "string"},
+        "model": {"type": "string", "description": "model id; omit for the service default"},
+        "prompts": {"type": "object", "description": "replacement prompt text keyed by stage: l1_brief, l1_plan, l2_design"}
+      }, "required": ["repo_url"]},
+      "aliases": {"laintas_cli": "code_map.build", "helpwo": "code_map_build"}
+    },
+    {
+      "name": "code_map_status", "category": "code_map", "execContext": "backend",
+      "description": "How far a queued code map build has got.",
+      "params": {"type": "object", "properties": {
+        "map_id": {"type": "string"}
+      }, "required": ["map_id"]},
+      "aliases": {"laintas_cli": "code_map.status", "helpwo": "code_map_status"}
+    },
+    {
+      "name": "code_map_list", "category": "code_map", "execContext": "backend",
+      "description": "The account's code maps and how many more it may keep.",
+      "params": {"type": "object", "properties": {}},
+      "aliases": {"laintas_cli": "code_map.list", "helpwo": "code_map_list"}
+    },
+    {
+      "name": "code_map_read", "category": "code_map", "execContext": "backend",
+      "description": "Read a finished code map as text: the whole system, one part (node=l1:<id>), or one component's declarations with file:line (node=l2:<part>:<component>).",
+      "params": {"type": "object", "properties": {
+        "map_id": {"type": "string"},
+        "node": {"type": "string", "description": "box id; omit for the whole map"}
+      }, "required": ["map_id"]},
+      "aliases": {"laintas_cli": "code_map.read", "helpwo": "code_map_read"}
+    },
+    {
+      "name": "code_map_delete", "category": "code_map", "execContext": "backend",
+      "description": "Delete one code map, freeing the slot it holds.",
+      "params": {"type": "object", "properties": {
+        "map_id": {"type": "string"}
+      }, "required": ["map_id"]},
+      "aliases": {"laintas_cli": "code_map.delete", "helpwo": "code_map_delete"}
+    },
+
+    {
       "name": "ppos_account", "category": "ppos", "execContext": "either",
       "description": "Read the signed-in PPOS account.", "params": {"type": "object", "properties": {}},
       "aliases": {"laintas_cli": "ppos.account.get", "helpwo": "ppos_account"}

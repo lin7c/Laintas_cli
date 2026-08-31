@@ -13,7 +13,7 @@ sys.path.insert(0, str(ROOT))
 from extension_manager import create_publication_archive, read_manifest  # noqa: E402
 
 
-OFFICIAL_NAMES = ("blindpick", "code-atlas", "swebench")
+OFFICIAL_NAMES = ("blindpick", "swebench")
 
 
 def main() -> None:

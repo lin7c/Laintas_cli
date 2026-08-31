@@ -1099,6 +1099,13 @@ def _gateway_available() -> str:
     return ""
 
 
+#: The signed-in Laintas session, for other modules that talk to the gateway
+#: with the same credential — Code Map does, and a second copy of this logic
+#: would be a second place to get "never send these to a non-Laintas backend"
+#: wrong.
+laintas_session = _gateway_session
+
+
 def _search_laintas_gateway(query: str, max_results: int,
                             region: str | None = None,
                             timelimit: str | None = None,

@@ -2756,6 +2756,80 @@ _UNTRUSTED_WEB_NOTICE = (
 )
 
 
+def _code_map_call(action, params: dict) -> dict:
+    """Run one Code Map action, turning its refusals into readable errors.
+
+    Code Map states why it refused — one build at a time, quota full, unknown
+    model — and those sentences are what the agent should read back to the
+    user, so they are passed through rather than replaced with a status code.
+    """
+    try:
+        import code_map as _cm
+    except ImportError:
+        return {"ok": False, "error": "code_map module not available"}
+    try:
+        return {"ok": True, **action(_cm, params)}
+    except _cm.CodeMapError as problem:
+        return {"ok": False, "error": str(problem)}
+    except Exception as problem:  # noqa: BLE001 - a tool never raises at the loop
+        return {"ok": False, "error": f"code map failed: {problem}"}
+
+
+def _bi_code_map_build(params: dict, ctx: ToolCtx) -> dict:
+    """Queue a map of a public GitHub repository. Does not wait for it."""
+    def run(cm, p):
+        prompts = p.get("prompts") if isinstance(p.get("prompts"), dict) else None
+        job = cm.build(str(p.get("repo_url") or "").strip(),
+                       str(p.get("ref") or "HEAD").strip(),
+                       title=str(p.get("title") or "").strip(),
+                       model=str(p.get("model") or "").strip(),
+                       prompts=prompts)
+        return {"map_id": job.get("id"), "status": job.get("status"),
+                "title": job.get("title"),
+                "note": "Building takes minutes to hours. Poll code_map.status; "
+                        "do other work meanwhile rather than waiting in a loop."}
+    return _code_map_call(run, params)
+
+
+def _bi_code_map_status(params: dict, ctx: ToolCtx) -> dict:
+    def run(cm, p):
+        job = cm.status(str(p.get("map_id") or "").strip())
+        return {"status": job.get("status"), "progress": job.get("progress"),
+                "step": job.get("step"), "error": job.get("error") or "",
+                "title": job.get("title")}
+    return _code_map_call(run, params)
+
+
+def _bi_code_map_list(params: dict, ctx: ToolCtx) -> dict:
+    def run(cm, p):
+        return {"maps": [{"map_id": job.get("id"), "title": job.get("title"),
+                          "repo": job.get("source_url"), "ref": job.get("source_ref"),
+                          "status": job.get("status")} for job in cm.maps()],
+                "capacity": cm.summarize_capacity(cm.capacity())}
+    return _code_map_call(run, params)
+
+
+def _bi_code_map_read(params: dict, ctx: ToolCtx) -> dict:
+    """The finished map as text: names, summaries, arrows — no geometry."""
+    def run(cm, p):
+        node = str(p.get("node") or "").strip()
+        text = cm.outline(str(p.get("map_id") or "").strip(), node)
+        if not text:
+            return {"outline": "", "note": "No such node in this map."}
+        return {"outline": text, "node": node,
+                "note": "Open one part with node='l1:<id>', then one component "
+                        "with node='l2:<part>:<component>' for its declarations "
+                        "and their file:line."}
+    return _code_map_call(run, params)
+
+
+def _bi_code_map_delete(params: dict, ctx: ToolCtx) -> dict:
+    def run(cm, p):
+        cm.delete(str(p.get("map_id") or "").strip())
+        return {"deleted": True}
+    return _code_map_call(run, params)
+
+
 def _bi_web_search(params: dict, ctx: ToolCtx) -> dict:
     """Search the web using the engine chain (Google -> DDG -> laintas_search).
 
@@ -8403,6 +8477,64 @@ def register_builtin_tools() -> None:
                 "required": [],
             },
             invoke=_bi_fs_glob,
+        ),
+        Tool(
+            name="code_map.build",
+            description="Build a layered architecture map of a public GitHub repository on "
+                        "Laintas Code Map. Returns a map id immediately; the build itself takes "
+                        "minutes to hours and is billed to the user's account. Use it when a "
+                        "repository is too large to read file by file and the question is how it "
+                        "is put together. For code already checked out locally, read the files "
+                        "instead — this maps a remote repository, not the working directory.",
+            schema={"type": "object", "properties": {
+                "repo_url": {"type": "string", "description": "https://github.com/owner/repository"},
+                "ref": {"type": "string", "description": "branch, tag or commit (default HEAD)"},
+                "title": {"type": "string", "description": "display name; defaults to the repository name"},
+                "model": {"type": "string", "description": "model id from code_map.list capacity/models; omit for the default"},
+                "prompts": {"type": "object",
+                            "description": "replace a stage's prompt: keys l1_brief (architecture brief), "
+                                           "l1_plan (top layer), l2_design (module layer). Omit to use the built-ins."},
+            }, "required": ["repo_url"], "additionalProperties": False},
+            invoke=_bi_code_map_build,
+        ),
+        Tool(
+            name="code_map.status",
+            description="How far a queued Code Map build has got. Poll this occasionally rather "
+                        "than in a tight loop — a build takes minutes to hours, so do other work "
+                        "between checks and tell the user it is running.",
+            schema={"type": "object", "properties": {
+                "map_id": {"type": "string", "description": "id from code_map.build"},
+            }, "required": ["map_id"], "additionalProperties": False},
+            invoke=_bi_code_map_status,
+        ),
+        Tool(
+            name="code_map.list",
+            description="The account's code maps and how many more it may keep.",
+            schema={"type": "object", "properties": {}, "additionalProperties": False},
+            invoke=_bi_code_map_list,
+        ),
+        Tool(
+            name="code_map.read",
+            description="Read a finished map as text. With no node: the whole system — what it "
+                        "is, every part with its summary, and the arrows between them, in about "
+                        "15 KB. With node='l1:<id>': that part's components. With "
+                        "node='l2:<part>:<component>': its declarations with file:line, which is "
+                        "where to start reading actual source. Prefer this over fetching diagrams: "
+                        "the diagrams carry layout coordinates you cannot use.",
+            schema={"type": "object", "properties": {
+                "map_id": {"type": "string"},
+                "node": {"type": "string", "description": "a box id from a previous read; omit for the whole map"},
+            }, "required": ["map_id"], "additionalProperties": False},
+            invoke=_bi_code_map_read,
+        ),
+        Tool(
+            name="code_map.delete",
+            description="Delete one of the account's code maps, freeing the slot it holds. "
+                        "Ask the user first: a map costs model calls to rebuild.",
+            schema={"type": "object", "properties": {
+                "map_id": {"type": "string"},
+            }, "required": ["map_id"], "additionalProperties": False},
+            invoke=_bi_code_map_delete,
         ),
         Tool(
             name="web.search",

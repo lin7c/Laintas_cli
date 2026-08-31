@@ -2981,6 +2981,18 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
             "that path also accepts a .pdf. With no arguments, lists images in "
             "the working directory and recent browser screenshots. `--text` "
             "is accepted as an alias for the `text` action.")),
+    CommandSpec(
+        "/codemap", "Build and read a Laintas Code Map of a GitHub repository",
+        "Account & Session",
+        "/codemap [list|build <url> [ref] [--model <id>]|status <id>|read <id> [node]|delete <id>]",
+        subcommands=("list", "build", "status", "read", "delete"),
+        help_text=(
+            "Maps a public GitHub repository into layers you can read: what the "
+            "system does, what each part is made of, and the real declarations "
+            "with their file:line. A build runs on the server for minutes to "
+            "hours and is billed to your account, so 'build' queues it and "
+            "returns an id; 'read' prints the finished map as text. Free "
+            "accounts keep 2 maps, memberships 4, and more at $1 a month each.")),
     CommandSpec("/login", "Re-authenticate with Laintas", "Account & Session"),
     CommandSpec(
         "/training", "Manage optional training-data sharing", "Account & Session",
@@ -12305,6 +12317,73 @@ def _training_control_request(session: dict, method: str,
     return body
 
 
+def _cmd_codemap(parts: list, raw_args: str) -> None:
+    """Laintas Code Map from the prompt: queue a build, watch it, read it.
+
+    Deliberately not a blocking wait. A build runs for minutes to hours on the
+    server, and a terminal command that sat on that would be a terminal the
+    user cannot use — so the build is queued and its id is printed, and the
+    same command reads it back later.
+    """
+    try:
+        import code_map as cm
+    except ImportError:
+        console.print("[red]Code Map is unavailable in this build.[/red]")
+        return
+
+    action = parts[1].strip().lower() if len(parts) > 1 else "list"
+    rest = raw_args.split(None, 1)[1].strip() if len(raw_args.split(None, 1)) > 1 else ""
+
+    try:
+        if action in ("list", "ls"):
+            jobs = cm.maps()
+            if not jobs:
+                console.print("[dim]No code maps yet. /codemap build <github url>[/dim]")
+            for job in jobs:
+                console.print(escape(cm.describe(job)))
+            console.print(f"[dim]{escape(cm.summarize_capacity(cm.capacity()))}[/dim]")
+
+        elif action == "build":
+            words = rest.split()
+            if not words:
+                raise SlashCommandUsageError(
+                    "Usage: /codemap build <github url> [ref] [--model <id>]")
+            model = ""
+            if "--model" in words:
+                at = words.index("--model")
+                model = words[at + 1] if at + 1 < len(words) else ""
+                words = words[:at] + words[at + 2:]
+            job = cm.build(words[0], words[1] if len(words) > 1 else "HEAD", model=model)
+            console.print(f"[green]Queued[/green] {escape(str(job.get('id')))} — "
+                          f"{escape(str(job.get('title')))}")
+            console.print("[dim]Takes minutes to hours. /codemap status <id>[/dim]")
+
+        elif action in ("status", "st"):
+            if not rest:
+                raise SlashCommandUsageError("Usage: /codemap status <id>")
+            console.print(escape(cm.describe(cm.status(rest.split()[0]))))
+
+        elif action in ("read", "show"):
+            words = rest.split()
+            if not words:
+                raise SlashCommandUsageError("Usage: /codemap read <id> [node]")
+            console.print(escape(cm.outline(words[0], words[1] if len(words) > 1 else "")
+                                 or "No such node in this map."))
+
+        elif action in ("delete", "rm"):
+            if not rest:
+                raise SlashCommandUsageError("Usage: /codemap delete <id>")
+            cm.delete(rest.split()[0])
+            console.print("[green]Deleted.[/green]")
+
+        else:
+            raise SlashCommandUsageError(
+                "Usage: /codemap [list|build <url> [ref] [--model <id>]|"
+                "status <id>|read <id> [node]|delete <id>]")
+    except cm.CodeMapError as problem:
+        console.print(f"[red]{escape(str(problem))}[/red]")
+
+
 def _cmd_training(parts: list, session: dict) -> None:
     """Manage explicit, account-scoped training-data consent."""
     action = parts[1].strip().lower() if len(parts) > 1 else "status"
@@ -20582,6 +20661,9 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
 
     elif action in _NEW_SESSION_COMMANDS:
         _cmd_new_session_notice()
+
+    elif action == "/codemap":
+        _cmd_codemap(parts, raw_args)
 
     elif action == "/login":
         _cmd_login(session, agent_registry)

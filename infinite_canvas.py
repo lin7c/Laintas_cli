@@ -135,7 +135,7 @@ class Scene:
 
 
 def scene_from_json(data: dict) -> Scene:
-    """Load the shared scene contract (see code-atlas ``core/scene.py``)."""
+    """Load the shared scene contract."""
     shapes = [
         Shape(
             id=str(d["id"]),
