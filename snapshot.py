@@ -166,3 +166,68 @@ def restore(cwd: str, sha: Optional[str] = None) -> tuple:
         if rc != 0:
             return False, f"restore failed: {err}"
     return True, f"restored working tree to checkpoint {sha[:10]}"
+
+
+def changed_since(cwd: str, sha: Optional[str] = None,
+                  *, max_files: int = 60) -> dict:
+    """What the working tree has done since a checkpoint. Read-only.
+
+    Returns ``{"added": [...], "modified": [...], "deleted": [...],
+    "truncated": bool}`` with repo-relative paths, or empty lists when this is
+    not a repo / the checkpoint is gone.
+
+    The intent layer needs this to say *which files* a misread produced, and
+    the answer has to be honest about ``added``: :func:`restore` deliberately
+    never deletes files created since a checkpoint, so a scope error caught
+    after the agent has already written three new files is NOT undone by an
+    undo. Listing them is what lets the correction name them and the model
+    decide, instead of a rollback that silently leaves half a wrong feature on
+    disk.
+    """
+    empty = {"added": [], "modified": [], "deleted": [], "truncated": False}
+    root = repo_root(cwd)
+    if not root:
+        return empty
+    if sha is None:
+        last = latest(cwd)
+        if not last:
+            return empty
+        sha = last["sha"]
+    rc, _, _ = _git(root, "cat-file", "-e", f"{sha}^{{commit}}")
+    if rc != 0:
+        return empty
+
+    out = {"added": [], "modified": [], "deleted": [], "truncated": False}
+    # Tracked changes against the checkpoint's tree.
+    rc, listing, _ = _git(root, "diff", "--name-status", sha, "--")
+    if rc == 0 and listing:
+        for line in listing.splitlines():
+            parts = line.split("\t")
+            if len(parts) < 2:
+                continue
+            code, path = parts[0].strip()[:1], parts[-1].strip()
+            if not path:
+                continue
+            if code == "A":
+                out["added"].append(path)
+            elif code == "D":
+                out["deleted"].append(path)
+            else:                       # M, R, C, T
+                out["modified"].append(path)
+    # Untracked files are the ones `git diff` cannot see and `restore` cannot
+    # remove — precisely the category this function exists to surface.
+    rc, untracked, _ = _git(
+        root, "ls-files", "--others", "--exclude-standard")
+    if rc == 0 and untracked:
+        known = set(out["added"])
+        for path in untracked.splitlines():
+            path = path.strip()
+            if path and path not in known:
+                out["added"].append(path)
+
+    for key in ("added", "modified", "deleted"):
+        out[key] = sorted(set(out[key]))
+        if len(out[key]) > max_files:
+            out[key] = out[key][:max_files]
+            out["truncated"] = True
+    return out

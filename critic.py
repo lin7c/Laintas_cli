@@ -205,36 +205,45 @@ def clip_goal(task: str, *, head: int = 800, tail: int = 700) -> str:
 def summarize_actions(messages, *, max_msgs: int = 14, max_chars: int = 4000,
                       anchor=None) -> str:
     """Render a compact transcript of the recent thread for the critic: the last
-    few messages as role + trimmed content + tool names + tool-result status.
+    few messages as ``[step N] role + trimmed content + tool names``.
 
     ``anchor`` (optional) is a message dict from earlier in the thread —
     typically the first assistant action after the previous critic assessment.
     Including it gives the judge a "where we left off" reference point, so
     gradual drift is visible against the earlier state instead of only an
     amnesiac tail of self-consistent recent actions.
+
+    Every rendered message carries its index in ``messages``. Without a stable
+    number a judge can only say "the recent work drifted", which names nothing
+    the loop can act on; with one it can say *which* step went wrong, and the
+    intent layer can render "steps 3-7 are void" into a correction the model
+    can actually apply. The number is the position in the list handed in — in
+    the loop that is the thread index, so it survives across assessments.
     """
     if not isinstance(messages, list):
         return ""
     lines = []
     if isinstance(anchor, dict):
         lines.append("[anchor: earlier action] " + _render_message(anchor))
-    tail = messages[-max_msgs:]
-    for m in tail:
+    start = max(0, len(messages) - max_msgs)
+    for offset, m in enumerate(messages[start:]):
         if not isinstance(m, dict):
             continue
-        lines.append(_render_message(m))
+        lines.append(_render_message(m, step=start + offset))
     text = "\n".join(lines)
     return text[-max_chars:]
 
 
-def _render_message(m: dict) -> str:
+def _render_message(m: dict, step: Optional[int] = None) -> str:
+    prefix = f"[step {step}] " if step is not None else ""
     role = m.get("role", "?")
     content = m.get("content", "")
     if isinstance(content, list):  # OpenAI content parts
         content = " ".join(
             str(p.get("text", "")) for p in content if isinstance(p, dict))
     content = re.sub(r"\s+", " ", str(content or "")).strip()
-    piece = f"{role}: {content[:400]}" if content else f"{role}:"
+    piece = (f"{prefix}{role}: {content[:400]}" if content
+             else f"{prefix}{role}:")
     calls = m.get("tool_calls") or []
     names = []
     for c in calls:

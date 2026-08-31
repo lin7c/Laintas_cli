@@ -149,6 +149,32 @@ class SummarizeActionsTests(unittest.TestCase):
         self.assertIn("fs.read(path=src/app.py, offset=120)", out)
         self.assertNotIn("secret", out)
 
+    def test_messages_carry_their_thread_index(self):
+        """A judge that cannot cite a step can only say "something drifted".
+
+        The number is the position in the list handed in, so a correction can
+        name which steps to undo instead of gesturing at "recent work".
+        """
+        msgs = [{"role": "user", "content": "task"},
+                {"role": "assistant", "content": "first"},
+                {"role": "assistant", "content": "second"}]
+        out = critic.summarize_actions(msgs)
+        self.assertIn("[step 0] user: task", out)
+        self.assertIn("[step 2] assistant: second", out)
+
+    def test_numbering_survives_the_tail_window(self):
+        msgs = [{"role": "assistant", "content": f"m{i}"} for i in range(20)]
+        out = critic.summarize_actions(msgs, max_msgs=3)
+        self.assertIn("[step 17] assistant: m17", out)
+        self.assertNotIn("[step 0]", out)
+
+    def test_anchor_is_labelled_not_numbered(self):
+        anchor = {"role": "assistant", "content": "way back"}
+        out = critic.summarize_actions(
+            [{"role": "assistant", "content": "now"}], anchor=anchor)
+        self.assertIn("[anchor: earlier action] assistant: way back", out)
+        self.assertIn("[step 0] assistant: now", out)
+
     def test_content_parts_flattened(self):
         msgs = [{"role": "user",
                  "content": [{"type": "text", "text": "hello"},
