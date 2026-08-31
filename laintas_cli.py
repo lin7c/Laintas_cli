@@ -58,6 +58,39 @@ from urllib.parse import urlparse, parse_qs, urlencode
 SYSTEM = platform.system()  # "Linux", "Darwin"
 
 
+# The URL reaches PowerShell through the environment, never on the command
+# line. `-Command <string>` is terminal: PowerShell appends every argument
+# after it to the command *text*, so a URL passed there is never bound to
+# $args — v1.23.1 shipped `Start-Process -FilePath $args[0]` with the URL
+# after it, which resolves to a null path and opens nothing. It would also
+# paste a crafted URL straight into the script.
+#
+# The try/catch is what makes the exit code mean anything: Windows PowerShell
+# 5.1 exits 0 after a cmdlet error unless the script says otherwise, and a
+# silent success is precisely how the broken version reported opening a
+# browser it had not opened.
+_WINDOWS_OPEN_URL_COMMAND = (
+    "try { Start-Process -FilePath $env:LAINTAS_OPEN_URL -ErrorAction Stop } "
+    "catch { exit 1 }"
+)
+
+
+def _windows_open_url_environment(url: str) -> dict:
+    """Environment that carries ``url`` across the WSL/Win32 boundary.
+
+    A Win32 process launched from WSL inherits only the variables named in
+    WSLENV, so the name has to be added there as well as set. ``/w`` marks it
+    as travelling this direction only.
+    """
+    environment = dict(os.environ)
+    environment["LAINTAS_OPEN_URL"] = url
+    shared = [part for part in environment.get("WSLENV", "").split(":")
+              if part and part.split("/")[0] != "LAINTAS_OPEN_URL"]
+    shared.append("LAINTAS_OPEN_URL/w")
+    environment["WSLENV"] = ":".join(shared)
+    return environment
+
+
 def _open_external_url(url: str) -> bool:
     """Open a URL on the desktop hosting this CLI.
 
@@ -70,14 +103,20 @@ def _open_external_url(url: str) -> bool:
         powershell = shutil.which("powershell.exe")
         if powershell:
             try:
-                subprocess.Popen(
+                completed = subprocess.run(
                     [powershell, "-NoLogo", "-NoProfile", "-NonInteractive",
-                     "-Command", "Start-Process -FilePath $args[0]", url],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL, start_new_session=True)
-                return True
-            except OSError:
+                     "-Command", _WINDOWS_OPEN_URL_COMMAND],
+                    env=_windows_open_url_environment(url),
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=20)
+            except (OSError, subprocess.SubprocessError):
                 pass
+            else:
+                # Start-Process returns as soon as the handler is launched, so
+                # a non-zero code means no browser opened. Fall through to the
+                # Linux path rather than claim a window the user cannot see.
+                if completed.returncode == 0:
+                    return True
     try:
         return bool(webbrowser.open(url))
     except Exception:

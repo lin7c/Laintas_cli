@@ -86,29 +86,69 @@ class DownloadProgressTests(unittest.TestCase):
 
 
 class RestartResolutionTests(unittest.TestCase):
-    def test_wsl_browser_open_uses_windows_default_url_handler(self):
+    POWERSHELL = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+    LOGIN_URL = "https://accounts.laintas.com/login?state=a&code=b"
+
+    def _run_wsl_open(self, returncode=0):
+        """Call the opener as it runs inside the private distribution."""
         with mock.patch.dict(
                 laintas_cli.os.environ,
-                {"WSL_DISTRO_NAME": "Laintas-CLI"}, clear=False), \
+                {"WSL_DISTRO_NAME": "Laintas-CLI", "WSLENV": "KEEP/p"},
+                clear=False), \
                 mock.patch.object(
-                    laintas_cli.shutil, "which",
-                    return_value="/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"), \
-                mock.patch.object(laintas_cli.subprocess, "Popen") as popen, \
+                    laintas_cli.shutil, "which", return_value=self.POWERSHELL), \
+                mock.patch.object(
+                    laintas_cli.subprocess, "run",
+                    return_value=SimpleNamespace(returncode=returncode)) as run, \
                 mock.patch.object(laintas_cli.webbrowser, "open") as browser:
-            opened = laintas_cli._open_external_url(
-                "https://accounts.laintas.com/login")
+            opened = laintas_cli._open_external_url(self.LOGIN_URL)
+        return opened, run, browser
+
+    def test_wsl_browser_open_uses_windows_default_url_handler(self):
+        opened, run, browser = self._run_wsl_open()
 
         self.assertTrue(opened)
         browser.assert_not_called()
-        popen.assert_called_once_with(
-            ["/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe",
-             "-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
-             "Start-Process -FilePath $args[0]",
-             "https://accounts.laintas.com/login"],
-            stdout=laintas_cli.subprocess.DEVNULL,
-            stderr=laintas_cli.subprocess.DEVNULL,
-            start_new_session=True,
-        )
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[:5], [
+            self.POWERSHELL, "-NoLogo", "-NoProfile", "-NonInteractive",
+            "-Command"])
+        self.assertEqual(len(argv), 6, "nothing may follow the -Command text")
+
+    def test_wsl_browser_open_never_puts_the_url_on_the_command_line(self):
+        """`-Command <text>` swallows everything after it.
+
+        v1.23.1 passed the URL as a trailing argument expecting $args[0] to
+        pick it up. PowerShell appends it to the command text instead, so
+        Start-Process got a null path, nothing opened, and — because the exit
+        code was ignored — the CLI reported success. Verified against
+        PowerShell: `-Command 'Write-Output $args.Count' x` prints 0.
+        """
+        opened, run, _ = self._run_wsl_open()
+
+        argv = run.call_args.args[0]
+        command = argv[5]
+        self.assertNotIn("$args", command)
+        self.assertNotIn(self.LOGIN_URL, argv,
+                         "the URL must not travel on the command line")
+        self.assertIn("$env:LAINTAS_OPEN_URL", command)
+        # Windows PowerShell 5.1 exits 0 after a cmdlet error unless told not
+        # to, which is what let the failure read as success.
+        self.assertIn("exit 1", command)
+
+        environment = run.call_args.kwargs["env"]
+        self.assertEqual(environment["LAINTAS_OPEN_URL"], self.LOGIN_URL)
+        # A Win32 process sees only what WSLENV names, and an existing entry
+        # belongs to something else that still needs it.
+        self.assertEqual(environment["WSLENV"], "KEEP/p:LAINTAS_OPEN_URL/w")
+        self.assertTrue(opened)
+
+    def test_wsl_browser_open_falls_back_when_windows_opened_nothing(self):
+        """A failed handler must not be reported as an opened browser."""
+        opened, _, browser = self._run_wsl_open(returncode=1)
+
+        browser.assert_called_once_with(self.LOGIN_URL)
+        self.assertIs(opened, bool(browser.return_value))
 
     def test_private_windows_runtime_enables_mouse_by_default(self):
         with mock.patch.dict(

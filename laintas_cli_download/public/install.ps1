@@ -1,7 +1,10 @@
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version 2.0
 
-$BaseUrl = "https://cli.laintas.com"
+# Release assets live on GitHub Releases. The site's own self-hosted release
+# path is retired and its "latest" pointer has not existed since the move, so
+# every download below used to end at a 404.
+$ReleaseBase = "https://github.com/lin7c/Laintas_cli/releases/latest/download"
 $Asset = "laintas-cli_windows_amd64_setup.exe"
 $TempDir = Join-Path ([IO.Path]::GetTempPath()) ("laintas-install-" + [Guid]::NewGuid().ToString("N"))
 $Installer = Join-Path $TempDir $Asset
@@ -19,8 +22,8 @@ try {
     Write-Host "-- Laintas CLI Windows Installer ---------------------------"
     Write-Host "Downloading $Asset..."
 
-    Invoke-WebRequest -UseBasicParsing -Uri "$BaseUrl/releases/latest/$Asset" -OutFile $Installer
-    $checksums = (Invoke-WebRequest -UseBasicParsing -Uri "$BaseUrl/releases/latest/SHA256SUMS.txt").Content
+    Invoke-WebRequest -UseBasicParsing -Uri "$ReleaseBase/$Asset" -OutFile $Installer
+    $checksums = (Invoke-WebRequest -UseBasicParsing -Uri "$ReleaseBase/SHA256SUMS.txt").Content
     $line = @($checksums -split "`r?`n" | Where-Object { $_ -match ("\s+\*?" + [Regex]::Escape($Asset) + "$") })
     if ($line.Count -ne 1) {
         throw "SHA256SUMS.txt does not contain exactly one checksum for $Asset."

@@ -77,3 +77,29 @@ def test_committed_icon_is_a_real_multi_size_ico():
     assert {16, 32, 48, 256} <= sizes, f"missing common sizes: {sorted(sizes)}"
 
     assert (ROOT / "build/windows/icon.svg").is_file(), "icon source is missing"
+
+
+def test_one_click_installers_download_from_the_live_release_channel():
+    """The bootstrap scripts must point at the channel that actually serves.
+
+    Both fetched from `cli.laintas.com/releases/latest/`, the retired
+    self-hosted channel whose `latest/` pointer does not exist — every
+    `curl … | bash` and `irm … | iex` ended at a 404. The site still serves
+    the scripts themselves, so only the package URL moved.
+    """
+    RELEASES = "https://github.com/lin7c/Laintas_cli/releases/latest/download"
+
+    for path in ("laintas_cli_download/public/install.sh",
+                 "laintas_cli_download/public/install.ps1"):
+        script = (ROOT / path).read_text(encoding="utf-8")
+        assert RELEASES in script, f"{path} does not use the release channel"
+        assert "cli.laintas.com/releases/" not in script, (
+            f"{path} still fetches packages from the retired channel")
+
+    powershell = (ROOT / "laintas_cli_download/public/install.ps1").read_text(
+        encoding="utf-8"
+    )
+    # The checksum is the only thing standing between a mirror and an
+    # executable the user is about to run as themselves.
+    assert "SHA256SUMS.txt" in powershell
+    assert "Checksum mismatch" in powershell

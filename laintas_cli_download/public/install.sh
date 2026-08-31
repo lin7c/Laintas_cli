@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Where this script is served from — the Windows hand-off below fetches its
+# sibling from here.
 BASE_URL="https://cli.laintas.com"
+# Where the packages are. The site's own self-hosted release path is retired:
+# its "latest" pointer 404s, which broke this installer on every platform
+# after the move to GitHub Releases.
+RELEASE_BASE="https://github.com/lin7c/Laintas_cli/releases/latest/download"
 TMP_DIR=$(mktemp -d)
 trap 'rm -rf "$TMP_DIR"' EXIT
 
@@ -41,7 +47,7 @@ if [ "$INSTALL_MODE" = "linux" ]; then
     echo "  Downloading $ASSET…"
     curl --fail --location --show-error --progress-bar \
         --retry 2 --retry-delay 2 --connect-timeout 15 --max-time 900 \
-        "$BASE_URL/releases/latest/$ASSET" -o "$TMP_DIR/$ASSET"
+        "$RELEASE_BASE/$ASSET" -o "$TMP_DIR/$ASSET"
     echo "  Download complete."
 
     # Extract
