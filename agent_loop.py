@@ -1145,6 +1145,13 @@ class TerminalInfo:
     created_at: float
     created_by: str  # "depth=0"
     parent_terminal: Optional[str] = None
+    # Switching position, tmux's window index rather than a list offset:
+    # assigned once and never reused while the terminal lives, so "terminal 3"
+    # keeps meaning the same terminal after terminal 2 is closed. Creation
+    # order alone cannot promise that — closing one shifts everything after it,
+    # and a switcher whose numbers move under the user is a switcher nobody
+    # learns. term0 is always 0 (tmux's base-index).
+    index: int = 0
     # Exactly one agent may own a terminal's persistent shell. That used to be
     # stored TWICE — a singular field and a plural "compatibility mirror" — and
     # the two were assigned independently at eight sites, so they could
@@ -1246,6 +1253,105 @@ def get_debug_logs() -> list:
     return _debug_logs
 
 
+# ── Switching order ────────────────────────────────────────────────────
+# Two registries, one problem: what does "the next one" mean when the user is
+# cycling through terminals or agents? Three answers, and tmux is right to keep
+# them separate — a stable index for direct jumps (prefix-3), most-recently-used
+# for the toggle back (prefix-l), and the ownership tree for looking at
+# (choose-tree). Only the first needs storing.
+
+def _next_switch_index(existing) -> int:
+    """The lowest positive index not currently taken.
+
+    Reusing the slot of something that has closed is deliberate: the numbers
+    stay small and typeable, which is the whole point of having them. What must
+    never happen is a LIVE entry changing number, and this cannot do that.
+    """
+    taken = set()
+    for item in existing:
+        try:
+            taken.add(int(getattr(item, "index", 0) or 0))
+        except (TypeError, ValueError):
+            continue
+    candidate = 1
+    while candidate in taken:
+        candidate += 1
+    return candidate
+
+
+def _tree_rows(items, *, key_of, parent_of) -> list:
+    """Depth-first ``(depth, item)`` rows over a parent-linked collection.
+
+    Siblings keep switch-index order, so the tree is a way of *reading* the
+    ring rather than a second ordering to reconcile with it. An item whose
+    parent is missing or forms a cycle is emitted at the root instead of being
+    dropped — an unreachable terminal you cannot switch to is worse than an
+    oddly indented one.
+    """
+    by_key = {}
+    for item in items:
+        key = key_of(item)
+        if key:
+            by_key[key] = item
+    children: dict = {}
+    roots = []
+    for item in sorted(by_key.values(), key=lambda i: int(getattr(i, "index", 0) or 0)):
+        parent = parent_of(item)
+        if parent and parent in by_key and parent != key_of(item):
+            children.setdefault(parent, []).append(item)
+        else:
+            roots.append(item)
+
+    rows = []
+    seen = set()
+
+    def walk(item, depth):
+        key = key_of(item)
+        if key in seen:
+            return
+        seen.add(key)
+        rows.append((depth, item))
+        for child in children.get(key, ()):
+            walk(child, depth + 1)
+
+    for root in roots:
+        walk(root, 0)
+    # A parent cycle leaves its members unvisited; show them rather than lose
+    # them.
+    for item in sorted(by_key.values(), key=lambda i: int(getattr(i, "index", 0) or 0)):
+        if key_of(item) not in seen:
+            walk(item, 0)
+    return rows
+
+
+def ordered_terminals() -> list:
+    """Every terminal in switch-index order (term0 first)."""
+    with _registry_lock:
+        return sorted(_terminal_registry.values(),
+                      key=lambda t: (int(getattr(t, "index", 0) or 0), t.name))
+
+
+def ordered_agents() -> list:
+    """Every agent in switch-index order (the primary first)."""
+    with _registry_lock:
+        return sorted(_agent_registry.values(),
+                      key=lambda a: (int(getattr(a, "index", 0) or 0), a.id))
+
+
+def terminal_tree_rows() -> list:
+    """``(depth, TerminalInfo)`` rows for a choose-tree style display."""
+    return _tree_rows(ordered_terminals(),
+                      key_of=lambda t: t.name,
+                      parent_of=lambda t: t.parent_terminal)
+
+
+def agent_tree_rows() -> list:
+    """``(depth, AgentInfo)`` rows for a choose-tree style display."""
+    return _tree_rows(ordered_agents(),
+                      key_of=lambda a: a.id,
+                      parent_of=lambda a: a.parent_id)
+
+
 # ── Terminal Registry ──────────────────────────────────────────────────
 
 def register_terminal(session, command: str, depth: int, name: str = None,
@@ -1288,6 +1394,8 @@ def register_terminal(session, command: str, depth: int, name: str = None,
             name=name,
             command=command,
             session=session,
+            index=0 if name == "term0" else _next_switch_index(
+                _terminal_registry.values()),
             created_at=time.time(),
             created_by=f"depth={depth}",
             parent_terminal=parent_terminal,
@@ -2475,6 +2583,9 @@ class AgentInfo:
     """Metadata about a logical AI agent managed by the REPL."""
     id: str
     name: str
+    # Stable switching position; see TerminalInfo.index. The primary agent is
+    # always 0.
+    index: int = 0
     stationed_terminal: Optional[str] = None
     chat_history: list = field(default_factory=list)
     state: dict = field(default_factory=dict)
@@ -2666,6 +2777,8 @@ def register_agent(name: str = None, depth: int = 0,
         info = AgentInfo(
             id=agent_id,
             name=agent_id,
+            index=0 if role == "primary" else _next_switch_index(
+                _agent_registry.values()),
             chat_history=[],
             state={"shortTermMemory": "", "lastReply": "", "lastOutput": ""},
             created_at=time.time(),
