@@ -109,6 +109,10 @@ REQUIRED_FIELDS: dict = {
     "intent_tasks_created": ("agent_id", "run_id", "count"),
     "intent_compared": ("agent_id", "run_id", "severity"),
     "intent_correction_injected": ("agent_id", "run_id", "severity"),
+    # Who won, and after how many rounds. Without the verdict this event
+    # cannot answer the only question worth asking of a debate mechanism:
+    # whether the cheap judge is overruling the expensive one.
+    "intent_resolved": ("agent_id", "run_id", "verdict", "debate_round"),
 }
 
 

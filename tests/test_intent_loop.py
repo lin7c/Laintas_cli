@@ -10,6 +10,11 @@ Background threads are made synchronous for the duration of each run. The
 alternative is asserting against a race — the spec build is launched on turn
 zero and harvested on a later turn, and with a scripted backend the loop
 outruns any real thread.
+
+Three other things are neutralised for speed, none of them under test here:
+the inter-turn backoff, the per-request tool-schema rendering, and semantic
+skill/memory ranking. Left in, the fixture rather than the code is what the
+suite spends its time on.
 """
 import json
 import os
@@ -70,6 +75,28 @@ class _SyncThread:
         return None
 
 
+def _memoized_tool_schemas():
+    """Cache the rendered tool schemas for the duration of one scripted run.
+
+    Rendering them costs about 0.7s per request (the prose rewrite runs once
+    per tool per description), and the registry does not change during these
+    runs. Without this the fixture, not the code under test, is what the suite
+    spends its time on.
+    """
+    import tools as tools_mod
+    registry = tools_mod.get_registry()
+    real = registry.to_openai_tools
+    cache = {}
+
+    def cached(unified=False, allowed_names=None):
+        key = (unified, tuple(sorted(allowed_names)) if allowed_names else None)
+        if key not in cache:
+            cache[key] = real(unified=unified, allowed_names=allowed_names)
+        return cache[key]
+
+    return mock.patch.object(registry, "to_openai_tools", cached)
+
+
 class _Console:
     width = 100
 
@@ -113,10 +140,15 @@ class IntentLoopTestCase(unittest.TestCase):
             return {"reply": self.critic_reply, "done": True, "error": False}
         if self.working_turns > 0:
             self.working_turns -= 1
+            # Vary the argument: an identical call every turn is repetition,
+            # and the loop's (correct) backoff then adds a second of delay to
+            # every scripted iteration.
             return {
                 "reply": "看一下目录",
                 "tool_calls": [{"id": f"c{self.working_turns}", "name": "ls",
-                                "arguments": {"path": "."}}],
+                                "arguments": {"path": "."
+                                              if self.working_turns % 2
+                                              else ".laintas"}}],
                 "finish_reason": "tool_calls", "done": False, "error": False,
             }
         return dict(self.main_reply)
@@ -145,6 +177,9 @@ class IntentLoopTestCase(unittest.TestCase):
                 Path(".laintas").mkdir()
                 with mock.patch.object(agent_loop.threading, "Thread",
                                        _SyncThread), \
+                        _memoized_tool_schemas(), \
+                        mock.patch.object(agent_loop, "_adaptive_loop_delay",
+                                          return_value=0), \
                         mock.patch.object(agent_loop, "get_runtime_config",
                                           side_effect=self._config):
                     return agent_loop.run_agent_loop(
@@ -472,3 +507,137 @@ class TaskBreakdownTests(IntentLoopTestCase):
                                   return_value=""):
             self.run_loop(loops=4)
         self.assertEqual([], created)
+
+
+SCOPE_ERROR_REPLY = json.dumps({
+    "severity": "scope_error", "aligned": False,
+    "divergences": [{"req_id": "R1", "steps": [3], "what": "建成了单页工具",
+                     "why": "没有会话"}],
+    "void_steps": [3], "missing": ["R2"], "next": "改成会话式布局",
+}, ensure_ascii=False)
+
+
+class DebateTests(IntentLoopTestCase):
+    """A correction the agent disagrees with is not yet a correction.
+
+    The judge runs on the cheap auxiliary model; letting it overrule a
+    frontier model on what a sentence meant, unchallenged, is precisely how
+    this feature would make things worse than no feature.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.compare_reply = SCOPE_ERROR_REPLY
+        self.judge_replies = []
+        self.working_turns = 10
+
+    def _backend(self, **kw):
+        if kw.get("task_kind") == "intent_judge":
+            self.calls.append(kw)
+            reply = (self.judge_replies.pop(0) if self.judge_replies
+                     else json.dumps({"verdict": "critic_right"}))
+            return {"reply": reply, "done": True, "error": False}
+        return super()._backend(**kw)
+
+    def main_calls(self):
+        return [c for c in self.calls if c.get("task_kind") not in
+                ("intent", "intent_compare", "intent_judge", "critic")]
+
+    def test_the_agent_can_win_and_the_spec_is_rewritten(self):
+        self.config = {"critic_enabled": False}
+        self.judge_replies = [json.dumps({
+            "verdict": "main_right", "reason": "请求里并没有要求会话列表在左侧",
+            "spec_fix": {"drop": ["R2"], "add": [
+                {"id": "R9", "text": "不做移动端", "anchor": "不要做移动端 App"}]},
+        }, ensure_ascii=False)]
+        state = self.run_loop(loops=9)["state"]
+        spec = state["_intent"]["spec"]
+        ids = [r["id"] for r in spec["requirements"]]
+        self.assertNotIn("R2", ids)
+        self.assertIn("R9", ids)
+        self.assertEqual(2, spec["spec_version"])
+        self.assertEqual(intent.ALIGNED, state["_intent"]["phase"])
+        # A changed system prompt is silent to the model; losing the argument
+        # has to be said in the thread.
+        self.assertIn("<intent_revision>", self.sent_text())
+        self.assertIn('version="2"', self.prompts()[-1])
+
+    def test_the_review_can_win_and_nothing_more_is_injected(self):
+        self.config = {"critic_enabled": False}
+        self.judge_replies = [json.dumps({
+            "verdict": "critic_right", "reason": "请求写着左边有会话列表"})]
+        state = self.run_loop(loops=9)["state"]
+        self.assertEqual(intent.ALIGNED, state["_intent"]["phase"])
+        self.assertNotIn("<intent_challenge", self.sent_text())
+        self.assertNotIn("<intent_revision>", self.sent_text())
+
+    def test_an_unsettled_point_gets_another_round_then_the_user(self):
+        self.config = {"critic_enabled": False, "intent_debate_rounds": 2}
+        self.judge_replies = [json.dumps({"verdict": "unresolved",
+                                          "user_question": "要接入哪个模型?"})] * 4
+        state = self.run_loop(loops=12)["state"]
+        sent = self.sent_text()
+        self.assertIn('<intent_challenge round="2"', sent)
+        self.assertIn("<intent_unresolved>", sent)
+        self.assertIn("要接入哪个模型?", sent)
+        self.assertEqual(intent.ESCALATED, state["_intent"]["phase"])
+
+    def test_neither_side_overwrites_the_other_when_unresolved(self):
+        # An ambiguity in the request is not something either model can
+        # resolve by arguing; the spec must come out unchanged.
+        self.config = {"critic_enabled": False, "intent_debate_rounds": 1}
+        self.judge_replies = [json.dumps({
+            "verdict": "unresolved", "user_question": "要接入哪个模型?",
+            "spec_fix": {"drop": ["R1", "R2"]}})] * 3
+        state = self.run_loop(loops=10)["state"]
+        ids = [r["id"] for r in state["_intent"]["spec"]["requirements"]]
+        self.assertEqual(["R1", "R2"], ids)
+        self.assertEqual(1, state["_intent"]["spec"]["spec_version"])
+
+    def test_unattended_runs_continue_on_a_stated_assumption(self):
+        # There is nobody to ask; stalling helps no one, but the assumption
+        # has to be said out loud.
+        self.config = {"critic_enabled": False, "intent_debate_rounds": 1}
+        self.judge_replies = [json.dumps({"verdict": "unresolved",
+                                          "user_question": "要接入哪个模型?"})] * 3
+        import mode_manager
+        with mock.patch.object(mode_manager, "get_auto_approve",
+                               return_value="all"):
+            self.run_loop(loops=10)
+        sent = self.sent_text()
+        self.assertIn("<intent_unresolved>", sent)
+        self.assertIn("nobody to ask", sent)
+        self.assertNotIn("Stop and ask the user", sent)
+
+    def test_the_judge_only_reads_what_came_after_the_correction(self):
+        """Judging the whole thread would read pre-correction work as a
+        rebuttal the agent never made."""
+        self.config = {"critic_enabled": False}
+        self.run_loop(loops=9)
+        judged = [c for c in self.calls
+                  if c.get("task_kind") == "intent_judge"]
+        self.assertTrue(judged)
+        body = "".join(str(m.get("content") or "")
+                       for m in judged[0].get("messages") or [])
+        self.assertIn("THE AGENT'S REBUTTAL", body)
+        self.assertNotIn("<intent_questions>", body)
+
+    def test_debate_can_be_switched_off(self):
+        self.config = {"critic_enabled": False, "intent_debate_rounds": 0}
+        state = self.run_loop(loops=9)["state"]
+        self.assertNotIn("intent_judge", self.kinds())
+        self.assertIn("<intent_correction", self.sent_text())
+        self.assertEqual(intent.ALIGNED, state["_intent"]["phase"])
+
+    def test_a_broken_judge_settles_rather_than_stalls(self):
+        self.config = {"critic_enabled": False}
+        self.judge_replies = ["not json", "still not json"]
+        state = self.run_loop(loops=9)["state"]
+        self.assertEqual(intent.ALIGNED, state["_intent"]["phase"])
+
+    def test_the_judgement_is_tool_less(self):
+        self.config = {"critic_enabled": False}
+        self.run_loop(loops=9)
+        judged = [c for c in self.calls
+                  if c.get("task_kind") == "intent_judge"]
+        self.assertTrue(all(c.get("tools_enabled") is False for c in judged))

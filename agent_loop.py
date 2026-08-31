@@ -203,6 +203,8 @@ _DEFAULT_CONFIG = {
     "intent_min_chars": 40,           # Skip the intent pass for requests shorter than this — a short instruction has no room to be misread, and the pass would just be a tax.
     "intent_compare_loop": 2,         # Don't compare the agent's work against the spec before this loop index — there is nothing to judge until it has acted.
     "intent_inject_tasks": True,       # True = write the spec's task breakdown into the session task list when the agent has not made one itself.
+    "intent_debate_rounds": 2,        # Rounds the agent may dispute the intent review before the question goes to the user (0 disables the argument entirely).
+    "intent_escalate_to_user": True,   # True = an argument neither side can settle from the request stops and asks the user; unattended runs continue on a named assumption instead.
     "enable_mouse": False,             # REPL input box: click-to-position the cursor. Off by default: terminal mouse reporting hijacks native drag-to-select of scrollback (Shift+drag is the only workaround), which costs more than click-to-position gains
     "confirm_direct_commands": False,  # False = commands the USER types directly at the REPL run like a normal terminal (no policy approval prompt, e.g. rm); True = subject direct commands to the same needs_approval prompt as AI-issued ones. Hard `deny` policy rules always apply regardless.
     "trigger_scan_interval": 0.5,      # seconds between trigger scanner sweeps
@@ -828,6 +830,8 @@ _RUNTIME_CONFIG_DESCRIPTIONS = {
     "intent_min_chars": "Skip the intent pass for requests shorter than this many characters",
     "intent_compare_loop": "Don't compare the agent's work against the intent spec before this loop index",
     "intent_inject_tasks": "Write the intent spec's task breakdown into the session task list when the agent has not made one",
+    "intent_debate_rounds": "Rounds the agent may dispute the intent review before the question goes to the user (0 disables)",
+    "intent_escalate_to_user": "Ask the user when an intent dispute cannot be settled from the request (unattended runs continue on a named assumption)",
     "confirm_direct_commands": "Ask for approval on commands YOU type directly at the REPL (False = run like a normal terminal; hard deny rules still apply)",
     "enable_mouse": "Enable mouse click-to-position in the REPL input box",
     "tool_output_fold": "Max lines of tool output shown before folding (first half + … + last half); 0 = suppress preview",
@@ -8494,6 +8498,8 @@ def run_agent_loop(
     _intent_result: dict = {}             # filled by that thread
     _intent_cmp_thread = None             # in-flight background comparison
     _intent_cmp_result: dict = {}         # filled by that thread
+    _intent_judge_thread = None           # in-flight rebuttal judgement
+    _intent_judge_result: dict = {}       # filled by that thread
     _run_id = uuid.uuid4().hex
     # Published on `state` so the auxiliary calls that run outside this frame
     # (compaction, memory consolidation) can stamp the same trajectory on their
@@ -9028,7 +9034,134 @@ def run_agent_loop(
                             _intent_st, "aligned")
                 state["_intent"] = _intent_st
 
-            # (d) Launch a comparison once there is something to compare.
+            # (d) The argument. A correction the agent disagrees with is not
+            # a correction — a 26B judge overruling a frontier model on what a
+            # sentence meant is exactly how this feature would make things
+            # worse. So the agent answers in the turn it was going to take
+            # anyway, and its answer is judged against the REQUEST, not
+            # against who argues better. Nobody wins from confidence.
+            if (_intent_judge_thread is not None
+                    and not _intent_judge_thread.is_alive()):
+                _intent_judge_thread = None
+                _jv = _intent_judge_result.get("verdict")
+                _jfail = _intent_judge_result.get("fail")
+                _intent_judge_result = {}
+                if _jv is None:
+                    _intent_st["phase"] = intent.ALIGNED
+                    event_log.append(
+                        "intent_failure", loop=_loop_id,
+                        agent_id=agent_id or "primary", run_id=_run_id,
+                        reason=_jfail or "judgement failed")
+                else:
+                    _verdict_name = _jv.get("verdict")
+                    if _verdict_name == "main_right":
+                        # Losing the argument has to change the spec, or the
+                        # next assessment re-raises the objection the agent
+                        # just disproved.
+                        _intent_st["spec"] = intent.apply_resolution(
+                            _intent_st.get("spec"), _jv, original_input)
+                        _intent_st["pending_injection"] = intent.render_revision(
+                            _jv, _intent_st["spec"])
+                        _intent_st["phase"] = intent.next_phase(
+                            _intent_st, "main_right")
+                    elif _verdict_name == "critic_right":
+                        _intent_st["phase"] = intent.next_phase(
+                            _intent_st, "critic_right")
+                    else:
+                        _intent_st["debate_round"] = int(
+                            _intent_st.get("debate_round", 0)) + 1
+                        _rounds = int(get_runtime_config(
+                            "intent_debate_rounds") or 0)
+                        _intent_st["phase"] = intent.next_phase(
+                            _intent_st, "unresolved", max_debate_rounds=_rounds)
+                        if _intent_st["phase"] == intent.ESCALATED:
+                            _question = intent.render_escalation(
+                                _intent_st.get("spec"), _jv)
+                            _intent_st["escalated_question"] = _question
+                            # Unattended, there is nobody to ask; stalling the
+                            # run helps no one, so it continues on an
+                            # assumption that is at least stated out loud.
+                            _can_ask = bool(
+                                get_runtime_config("intent_escalate_to_user"))
+                            try:
+                                _can_ask = _can_ask and (
+                                    mode_manager.get_auto_approve() == "none")
+                            except Exception:
+                                pass
+                            _intent_st["pending_injection"] = intent.render_unresolved(
+                                _question, escalate=_can_ask,
+                                assumed=(_intent_st.get("spec") or {}).get("goal", ""))
+                            if _can_ask:
+                                try:
+                                    deps.console.print(
+                                        f"[yellow]{symbols.WARN} Intent check: unresolved "
+                                        f"after {_intent_st['debate_round']} rounds — "
+                                        f"the agent has been asked to put this to you: "
+                                        f"{_question}[/yellow]")
+                                except Exception:
+                                    pass
+                        else:
+                            _intent_st["pending_injection"] = intent.render_challenge(
+                                _intent_st.get("last_comparison") or {},
+                                _intent_st["debate_round"] + 1)
+                    event_log.append(
+                        "intent_resolved", loop=_loop_id,
+                        agent_id=agent_id or "primary", run_id=_run_id,
+                        verdict=_verdict_name,
+                        debate_round=int(_intent_st.get("debate_round", 0)),
+                        phase=_intent_st["phase"])
+                state["_intent"] = _intent_st
+
+            if (_intent_st.get("phase") in (intent.CORRECTING, intent.DEBATING)
+                    and int(get_runtime_config("intent_debate_rounds") or 0) <= 0):
+                # No argument allowed: the correction stands and the layer is
+                # done. Without this the phase would idle in "correcting".
+                _intent_st["phase"] = intent.ALIGNED
+                state["_intent"] = _intent_st
+
+            if (_intent_judge_thread is None
+                    and _intent_st.get("phase") in (intent.CORRECTING, intent.DEBATING)
+                    and not _intent_st.get("pending_injection")
+                    and int(get_runtime_config("intent_debate_rounds") or 0) > 0):
+                # The agent's answer to the block we injected: everything it
+                # said after the injection point.
+                _reply_at = int(_intent_st.get("challenge_idx", 0))
+                _answer = " ".join(
+                    str(m.get("content") or "") for m in thread_messages[_reply_at:]
+                    if isinstance(m, dict) and m.get("role") == "assistant")
+                if _answer.strip():
+                    _judge_cwd = state.get("cwd") or os.getcwd()
+                    _judge_m, _judge_p = aux_model_override()
+
+                    def _judge_llm_fn(messages, _s=session, _cwd=_judge_cwd,
+                                      _traj=_run_id, _m=_judge_m, _p=_judge_p):
+                        resp = deps.call_backend(
+                            session=_s, message="",
+                            system_prompt=intent.JUDGE_SYSTEM,
+                            current_path=_cwd, messages=messages,
+                            tools_enabled=False,
+                            model_override=_m or None,
+                            provider_override=_p or None,
+                            task_kind="intent_judge", trajectory_id=_traj)
+                        return (resp or {}).get("reply", "") if isinstance(resp, dict) else ""
+
+                    def _judge_worker(_task=original_input,
+                                      _spec=_intent_st.get("spec"),
+                                      _cmp=_intent_st.get("last_comparison") or {},
+                                      _reply=_answer, _fn=_judge_llm_fn,
+                                      _out=_intent_judge_result):
+                        try:
+                            _v, _f = intent.judge_rebuttal(
+                                _task, _spec, _cmp, _reply, _fn)
+                        except Exception as _exc:
+                            _v, _f = None, f"intent judge error: {_exc}"
+                        _out["verdict"], _out["fail"] = _v, _f
+
+                    _intent_judge_thread = threading.Thread(
+                        target=_judge_worker, name="intent-judge", daemon=True)
+                    _intent_judge_thread.start()
+
+            # (e) Launch a comparison once there is something to compare.
             if (_intent_cmp_thread is None
                     and _intent_st.get("phase") == intent.SPEC_READY
                     and _intent_st.get("questions_sent")
@@ -9591,6 +9724,10 @@ def run_agent_loop(
             _pending = _int_st.get("pending_injection")
             if _pending and _thread_to_send is not None:
                 _int_st["pending_injection"] = ""
+                # Where the agent's answer to this block begins. Judging the
+                # whole thread would read its pre-correction work as a
+                # rebuttal it never made.
+                _int_st["challenge_idx"] = len(thread_messages) + 1
                 state["_intent"] = _int_st
                 thread_messages.append({"role": "user", "content": _pending})
                 _thread_to_send = _thread_to_send + [

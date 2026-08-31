@@ -699,6 +699,48 @@ def render_challenge(comparison, round_index: int = 1) -> str:
             "</intent_challenge>")
 
 
+def render_revision(verdict, spec) -> str:
+    """Told plainly when the agent wins the argument.
+
+    A prompt section that changes mid-thread produces no signal a model can
+    notice — the prefix is simply different next turn. Saying so in the thread
+    is what makes losing the argument visible to the side that won it.
+    """
+    reason = (verdict or {}).get("reason") or ""
+    version = int((spec or {}).get("spec_version", 1))
+    return ("<intent_revision>\n"
+            "Your reading was better supported by the request. The agreed "
+            f"reading has been revised (now version {version}) and the updated "
+            "<task_understanding> governs from this turn on.\n"
+            + (f"What it got wrong: {reason}\n" if reason else "")
+            + "</intent_revision>")
+
+
+def render_unresolved(question: str, *, escalate: bool, assumed: str = "") -> str:
+    """The end of an argument neither side can win from the request alone.
+
+    ``escalate`` asks the user. Unattended, there is nobody to ask, so the run
+    continues under a named assumption rather than stalling — but the
+    assumption is stated, because an unexamined one is how this whole class of
+    failure starts.
+    """
+    text = _line(question, 300)
+    if escalate:
+        return ("<intent_unresolved>\n"
+                "The request does not settle this, and neither reading follows "
+                "from it. Stop and ask the user before doing more work on this "
+                "point:\n"
+                f"  {text or 'Which reading of the request is intended?'}\n"
+                "</intent_unresolved>")
+    return ("<intent_unresolved>\n"
+            "The request does not settle this and there is nobody to ask, so "
+            "work continues on an unconfirmed assumption. Say so in your final "
+            "report.\n"
+            f"  Open question: {text or 'the disputed reading of the request'}\n"
+            + (f"  Assuming: {_line(assumed, 300)}\n" if assumed else "")
+            + "</intent_unresolved>")
+
+
 def render_escalation(spec, verdict) -> str:
     """The one question to put to the user when the argument does not settle."""
     question = ""
