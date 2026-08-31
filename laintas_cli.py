@@ -1195,6 +1195,8 @@ from agent_loop import (
     normalize_fork_lineage,
     thread_agent, get_thread_agent_id, agent_ancestry,
     harvest_agent_reply, describe_exit_reason,
+    agent_tree_rows, previous_agent_id,
+    _cell_len, _crop_cells,
     TRANSITION_RUNTIME_ERROR, _close_failed_turn,
 )
 
@@ -21736,6 +21738,8 @@ def show_help(command: str = ""):
                 ("<text>", "plain text → AI agent loop"),
                 ("Alt+0", "read the messages behind the L> mark"),
                 ("Alt+1..9", "select a status slot; ↑↓ change it, Enter apply"),
+                ("Alt+A", "switch agent, including while a task is running "
+                          "(applies when the turn finishes)"),
             ])
         for spec in COMMAND_SPECS:
             if spec.group != title:
@@ -22410,16 +22414,74 @@ def _bg_reader_cbreak_mode(target_queue: queue.Queue,
     double Ctrl+C. In CBREAK the terminal turns Ctrl+C into SIGINT before it
     reaches us, so the run's own SIGINT handler still owns that key.
     """
+    global _pending_agent_switch
     stop = stop_event if stop_event is not None else _bg_reader_stop
     buf: list[str] = []
+    # The switcher borrows the same single line the typed buffer uses. Only
+    # one of them is on screen at a time, and `painted` is how many cells the
+    # current occupant is using — without it, erasing guesses.
+    chooser = {"open": False, "rows": [], "sel": "", "painted": 0}
+
+    def _buf_cells():
+        return sum(2 if unicodedata.east_asian_width(c) in ('W', 'F') else 1
+                   for c in buf)
+
+    def _erase_line(cells: int):
+        if cells > 0:
+            sys.stdout.write('\r' + ' ' * cells + '\r')
+            sys.stdout.flush()
 
     def _clear_visible_line():
-        if buf:
-            width = sum(2 if unicodedata.east_asian_width(c) in ('W', 'F') else 1
-                        for c in buf)
-            sys.stdout.write('\r' + ' ' * width + '\r')
-            sys.stdout.flush()
+        _erase_line(_buf_cells())
         buf.clear()
+
+    def _current_agent_id_or_empty() -> str:
+        try:
+            agent = get_current_agent()
+        except Exception:
+            agent = None
+        return str(getattr(agent, "id", "") or "")
+
+    def _chooser_draw():
+        current = _current_agent_id_or_empty()
+        segments = _agent_switch_segments(
+            chooser["rows"], chooser["sel"], current, _terminal_width())
+        _erase_line(chooser["painted"])
+        sys.stdout.write('\r' + _agent_switch_render(segments))
+        sys.stdout.flush()
+        chooser["painted"] = sum(_cell_len(text) for _, text in segments)
+
+    def _chooser_open():
+        rows = _agent_switch_rows()
+        if len(rows) < 2:
+            # Nothing to switch to. Saying so beats a widget that does not
+            # react, which reads as a broken key.
+            _erase_line(_buf_cells())
+            sys.stdout.write(
+                '\r\x1b[38;5;244mOnly one agent is registered — '
+                '/hire <name> adds another.\x1b[0m\n')
+            sys.stdout.flush()
+            if buf:
+                sys.stdout.write(''.join(buf))
+                sys.stdout.flush()
+            return
+        _erase_line(_buf_cells())        # hide the draft, keep it
+        chooser["open"] = True
+        chooser["rows"] = rows
+        chooser["painted"] = 0
+        chooser["sel"] = _agent_switch_initial(
+            rows, _current_agent_id_or_empty())
+        _chooser_draw()
+
+    def _chooser_close(message: str = ""):
+        _erase_line(chooser["painted"])
+        chooser["painted"] = 0
+        chooser["open"] = False
+        if message:
+            sys.stdout.write('\r' + message + '\n')
+        if buf:
+            sys.stdout.write(''.join(buf))
+        sys.stdout.flush()
 
     try:
         with terminal_arbiter.hold("bg-input", TermMode.CBREAK,
@@ -22434,6 +22496,49 @@ def _bg_reader_cbreak_mode(target_queue: queue.Queue,
 
                 if key.name == "eof":
                     break
+
+                # ── the switcher owns the keyboard while it is open ──
+                if chooser["open"]:
+                    if key.name in ("escape", "ctrl-c"):
+                        _chooser_close()
+                        continue
+                    if key.name == "alt" and str(key.text or "").lower() == "a":
+                        _chooser_close()
+                        continue
+                    if key.name in ("up", "left"):
+                        chooser["sel"] = _agent_switch_step(
+                            chooser["rows"], chooser["sel"], -1)
+                        _chooser_draw()
+                        continue
+                    if key.name in ("down", "right"):
+                        chooser["sel"] = _agent_switch_step(
+                            chooser["rows"], chooser["sel"], 1)
+                        _chooser_draw()
+                        continue
+                    if key.name == "enter":
+                        target = chooser["sel"]
+                        if target and target != _current_agent_id_or_empty():
+                            _pending_agent_switch = target
+                            _chooser_close(
+                                f"\x1b[38;5;244mSwitching to "
+                                f"{_agent_switch_label(target)} when this turn "
+                                f"finishes.\x1b[0m")
+                        else:
+                            _chooser_close()
+                        continue
+                    if key.is_text and len(key.text) == 1 and key.text.isdigit():
+                        jumped = _agent_switch_jump(chooser["rows"], key.text)
+                        if jumped:
+                            chooser["sel"] = jumped
+                            _chooser_draw()
+                        continue
+                    # Anything else is not a switcher key; ignore it rather
+                    # than letting it fall through into the draft.
+                    continue
+
+                if key.name == "alt" and str(key.text or "").lower() == "a":
+                    _chooser_open()
+                    continue
 
                 if key.name == "escape":
                     _clear_visible_line()
@@ -22481,6 +22586,172 @@ def _bg_reader_cbreak_mode(target_queue: queue.Queue,
         # so stay silent instead; the run continues, only supplementary
         # typing is unavailable until the next step.
         return
+
+
+# ── Mid-run agent switcher (Alt+A) ──────────────────────────────────────
+# Switching agent rebinds the REPL's state and history objects, and during a
+# run the loop owns both — which is why the prompt's own slot switcher does
+# not do it either, it submits "/agent <id>" and lets the main loop follow up
+# (see _rprompt_commit). So this picks a target and parks it; the main loop
+# performs the switch the moment it is idle again. The alternative, stopping
+# the task to honour a keystroke, throws away work the user never said to
+# discard.
+
+_pending_agent_switch = ""
+
+
+def _agent_switch_rows() -> list:
+    """``(depth, id, label)`` in choose-tree order — the switcher's contents."""
+    rows = []
+    try:
+        tree = agent_tree_rows()
+    except Exception:
+        return rows
+    for depth, agent in tree:
+        agent_id = str(getattr(agent, "id", "") or "")
+        if not agent_id:
+            continue
+        name = str(getattr(agent, "name", "") or "")
+        rows.append((depth, agent_id, name if name and name != agent_id
+                     else agent_id))
+    return rows
+
+
+def _agent_switch_initial(rows, current_id: str) -> str:
+    """Where the switcher opens.
+
+    On the previously selected agent, so Alt+A then Enter is "back to the one
+    I was just on" — tmux's last-window, which is the switch people actually
+    make. Falling back to the next one in the ring keeps a single press useful
+    the first time, when there is no previous.
+    """
+    ids = [row[1] for row in rows]
+    if not ids:
+        return ""
+    try:
+        previous = previous_agent_id()
+    except Exception:
+        previous = ""
+    if previous and previous in ids and previous != current_id:
+        return previous
+    if current_id in ids and len(ids) > 1:
+        return ids[(ids.index(current_id) + 1) % len(ids)]
+    return ids[0]
+
+
+def _agent_switch_step(rows, selected_id: str, delta: int) -> str:
+    """Move the selection around the ring."""
+    ids = [row[1] for row in rows]
+    if not ids:
+        return ""
+    if selected_id not in ids:
+        return ids[0]
+    return ids[(ids.index(selected_id) + delta) % len(ids)]
+
+
+def _agent_switch_jump(rows, digit: str) -> str:
+    """The agent whose stable index is ``digit``, or "" when there is none.
+
+    Indices are the registry's own (agent_loop.AgentInfo.index), not positions
+    in this list: a number that means something different depending on what is
+    open is a number nobody can learn.
+    """
+    try:
+        wanted = int(digit)
+    except (TypeError, ValueError):
+        return ""
+    for _depth, agent_id, _label in rows:
+        agent = get_agent(agent_id)
+        if agent is not None and int(getattr(agent, "index", -1)) == wanted:
+            return agent_id
+    return ""
+
+
+def _apply_pending_agent_switch(session, interactive_session) -> str:
+    """Perform a switch parked by Alt+A. Returns the agent switched to, or "".
+
+    Called from the REPL between turns, never from the key handler: switching
+    rebinds the state and history objects the agent loop holds while it runs.
+    It goes through ``/agent`` rather than reimplementing the switch, because
+    a second implementation of it is a second one to keep correct.
+    """
+    global _pending_agent_switch
+    target = _pending_agent_switch
+    if not target:
+        return ""
+    _pending_agent_switch = ""
+    try:
+        _cmd_agent(["/agent", target], session, interactive_session)
+    except Exception as exc:
+        console.print(f"[yellow]Could not switch to {escape(target)}: "
+                      f"{escape(str(exc))}[/yellow]")
+        return ""
+    return target
+
+
+def _agent_switch_label(agent_id: str) -> str:
+    """The name a person recognises, falling back to the id."""
+    try:
+        agent = get_agent(agent_id)
+    except Exception:
+        agent = None
+    name = str(getattr(agent, "name", "") or "") if agent is not None else ""
+    return name or str(agent_id or "")
+
+
+def _agent_switch_segments(rows, selected_id: str, current_id: str,
+                           width: int) -> list:
+    """``(style, text)`` segments for the one-line switcher.
+
+    One line, because the run's Rich Live region owns the rows below and a
+    taller widget would fight it for them. Segments rather than a rendered
+    string for the same reason _shimmer_segments returns them: the caller owns
+    the escape codes for its own surface.
+    """
+    segments = [("label", "switch agent ")]
+    for depth, agent_id, label in rows:
+        marker = ("  " * depth + ("\u2514 " if depth else ""))
+        agent = get_agent(agent_id)
+        index = int(getattr(agent, "index", 0)) if agent is not None else 0
+        text = f"{index} {marker}{label}"
+        if agent_id == current_id:
+            text += "*"
+        style = ("selected" if agent_id == selected_id
+                 else "current" if agent_id == current_id else "item")
+        segments.append((style, f" {text} "))
+    segments.append(("hint", "  \u2191\u2193 pick \u00b7 0-9 jump \u00b7 "
+                             "Enter switch \u00b7 Esc cancel"))
+    # Trim from the hint end first: the entries are the content, and a hint
+    # that scrolls the line is worse than no hint.
+    budget = max(20, int(width or 80) - 1)
+    used = 0
+    trimmed = []
+    for style, text in segments:
+        cells = _cell_len(text)
+        if used + cells > budget:
+            room = budget - used
+            if room > 1:
+                trimmed.append((style, _crop_cells(text, room)))
+            break
+        trimmed.append((style, text))
+        used += cells
+    return trimmed
+
+
+_AGENT_SWITCH_STYLES = {
+    "label": "\x1b[38;5;244m",
+    "item": "\x1b[38;5;250m",
+    "current": "\x1b[38;5;250m",
+    "selected": "\x1b[7m",
+    "hint": "\x1b[38;5;240m",
+}
+
+
+def _agent_switch_render(segments) -> str:
+    out = []
+    for style, text in segments:
+        out.append(_AGENT_SWITCH_STYLES.get(style, "") + text + "\x1b[0m")
+    return "".join(out)
 
 
 def _start_bg_input_reader(target_queue: queue.Queue,
@@ -23543,6 +23814,7 @@ def _parse_subtask_json(text: str):
 
 def main():
     """Entry point."""
+    global _pending_agent_switch
     import argparse
 
     parser = argparse.ArgumentParser(description="Laintas CLI — Autonomous AI agent")
@@ -24375,6 +24647,12 @@ def main():
     # Main interactive loop
 
     while True:
+        # ── a switch requested with Alt+A while the last turn was running ──
+        # Here, and not where the key was pressed: switching rebinds the state
+        # and history objects the agent loop was holding, and the loop is only
+        # done with them now.
+        _apply_pending_agent_switch(session, interactive_session)
+
         # ── the directory we are standing in may have been deleted ──
         _repl_cwd = _recover_deleted_cwd()
         # ── term0 health check ──

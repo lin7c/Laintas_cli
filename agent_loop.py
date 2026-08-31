@@ -2636,6 +2636,7 @@ class AgentInfo:
 _agent_registry: dict[str, AgentInfo] = {}
 _agent_counter: int = 0
 _current_agent_id: Optional[str] = None
+_previous_agent_id: Optional[str] = None      # most-recently-used, for the toggle back
 # ── HWO concurrency scheduler ──────────────────────────────────────────
 _max_concurrent: int = 8                         # background cap; foreground primary is exempt
 _running_count: int = 0                          # agents currently in 'running' state
@@ -3591,9 +3592,25 @@ def switch_to_agent(agent_id: str) -> bool:
 
 
 def set_current_agent_id(agent_id: str) -> None:
-    global _current_agent_id
+    global _current_agent_id, _previous_agent_id
     with _registry_lock:
+        if agent_id != _current_agent_id and _current_agent_id:
+            _previous_agent_id = _current_agent_id
         _current_agent_id = agent_id
+
+
+def previous_agent_id() -> str:
+    """The agent selected before the current one, if it is still registered.
+
+    tmux's last-window, and in practice the most-used switch there is: people
+    bounce between two things far more than they walk a list. Storing it costs
+    one assignment in the setter; deriving it later would cost a history nobody
+    else needs.
+    """
+    with _registry_lock:
+        if _previous_agent_id and _previous_agent_id in _agent_registry:
+            return _previous_agent_id
+        return ""
 
 
 def rename_agent(agent_id: str, new_name: str) -> bool:
