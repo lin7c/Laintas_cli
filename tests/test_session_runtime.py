@@ -179,7 +179,7 @@ class AgentTerminationTests(unittest.TestCase):
     def test_interactive_history_preserves_assistant_tool_chronology(self):
         deps, _ = _deps([
             {
-                "reply": "我先继续检查。",
+                "reply": "Continuing the check.",
                 "tool_calls": [{
                     "name": "time.now", "arguments": {},
                 }],
@@ -187,17 +187,17 @@ class AgentTerminationTests(unittest.TestCase):
                 "error": False,
             },
             {
-                "reply": "检查完成。", "tool_calls": [],
+                "reply": "Check finished.", "tool_calls": [],
                 "finish_reason": "stop", "done": False, "error": False,
             },
         ])
         history = [{
-            "role": "user", "content": "检查", "input_kind": "prompt",
+            "role": "user", "content": "check", "input_kind": "prompt",
         }]
         with tempfile.TemporaryDirectory() as tmp, _chdir(tmp):
             Path(".laintas").mkdir()
             result = agent_loop.run_agent_loop(
-                deps, "检查", {}, {}, history,
+                deps, "check", {}, {}, history,
                 events_cb=lambda _events: None,
                 max_loops_override=3,
             )
@@ -207,9 +207,9 @@ class AgentTerminationTests(unittest.TestCase):
             [message["role"] for message in history],
             ["user", "assistant", "tool", "assistant"],
         )
-        self.assertEqual(history[1]["content"], "我先继续检查。")
+        self.assertEqual(history[1]["content"], "Continuing the check.")
         self.assertEqual(history[2]["tool_name"], "time.now")
-        self.assertEqual(history[3]["content"], "检查完成。")
+        self.assertEqual(history[3]["content"], "Check finished.")
 
     def test_empty_provider_turn_is_not_success(self):
         result, calls, _ = self._run([{
@@ -589,23 +589,23 @@ class AgentTerminationTests(unittest.TestCase):
 
     def test_short_final_reply_has_no_decorative_dot_prefix(self):
         deps, _ = _deps([{
-            "reply": "你好！有什么可以帮你的？",
+            "reply": "Hello! What can I do for you?",
             "tool_calls": [],
             "finish_reason": "stop",
             "done": False,
             "error": False,
         }])
-        history = [{"role": "user", "content": "你好"}]
+        history = [{"role": "user", "content": "hello"}]
         with tempfile.TemporaryDirectory() as tmp, _chdir(tmp):
             Path(".laintas").mkdir()
             agent_loop.run_agent_loop(
-                deps, "你好", {}, {}, history,
+                deps, "hello", {}, {}, history,
                 events_cb=lambda events: None,
                 max_loops_override=2,
             )
         rendered = deps.console.file.getvalue()
-        self.assertIn("你好！有什么可以帮你的？", rendered)
-        self.assertNotIn("· 你好！有什么可以帮你的？", rendered)
+        self.assertIn("Hello! What can I do for you?", rendered)
+        self.assertNotIn("· Hello! What can I do for you?", rendered)
 
     def test_manual_compaction_summarizes_head_and_keeps_recent_user_turns(self):
         deps, calls = _deps([{

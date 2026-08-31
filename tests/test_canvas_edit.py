@@ -311,14 +311,14 @@ class BoardEditorTests(unittest.TestCase):
 
     def test_the_file_stays_a_readable_board_after_every_op(self):
         _, _, a = self.editor.draw_shape("rectangle", 0, 0, 80, 40)
-        self.editor.set_label(a, "网关")
+        self.editor.set_label(a, "gateway")
         _, _, b = self.editor.draw_shape("diamond", 200, 0, 80, 40)
         self.editor.draw_arrow(self.editor.find(a), self.editor.find(b))
         self.editor.draw_text("note", 0, 200)
         self.editor.erase(b)
         scene = canvas.read_scene(self.path)            # parses, and…
         text = canvas.describe_scene(scene)              # …renders
-        self.assertIn("网关", text)
+        self.assertIn("gateway", text)
         self.assertEqual(scene["type"], "excalidraw")
 
 

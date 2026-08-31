@@ -2,15 +2,18 @@ import { useCallback, useEffect, useState } from 'react';
 import { motion } from 'framer-motion';
 import {
   ArrowDownToLine, ArrowRight, Check, CheckCircle2, ChevronRight, CircleDot,
-  Code2, Copy, ExternalLink, GitBranch, Layers3, Network, Package, Play,
+  Code2, Copy, ExternalLink, GitBranch, Layers3, Monitor, Network, Package, Play,
   Radar, RotateCcw, ShieldCheck, TerminalSquare, Waypoints,
 } from 'lucide-react';
 import { useLanguage } from '@/contexts/LanguageContext';
 import ExtensionsSection from './ExtensionsSection';
 
-const RELEASE = 'v1.21.0';
-const RELEASE_BASE = `https://cli.laintas.com/releases/${RELEASE}`;
-const INSTALL_COMMAND = 'curl -fsSL https://cli.laintas.com/install.sh | bash';
+const RELEASE_FALLBACK = 'v1.22.0';
+const RELEASE_BASE = 'https://cli.laintas.com/releases/latest';
+const INSTALL_COMMANDS = {
+  linux: 'curl -fsSL https://cli.laintas.com/install.sh | bash',
+  windows: "irm https://cli.laintas.com/install.ps1 | iex",
+};
 
 const RUNTIME_SHOTS = [
   { id: 'commands', src: '/laintas-cli-runtime-commands.png?v=2' },
@@ -19,14 +22,14 @@ const RUNTIME_SHOTS = [
 ];
 
 const DOWNLOADS = [
-  { id: 'amd64', name: 'Linux amd64', detail: 'x86_64 · glibc 2.28+', file: 'laintas-cli_linux_amd64.tar.gz', icon: Package },
-  { id: 'arm64', name: 'Linux arm64', detail: 'aarch64 · glibc 2.28+', file: 'laintas-cli_linux_arm64.tar.gz', icon: Package },
-  { id: 'source', name: 'Source package', detail: 'Python 3.10+ · auditable', file: 'laintas-cli_source.zip', icon: Code2 },
+  { id: 'linux', names: { zh: 'Linux 版本', en: 'Linux' }, details: { zh: 'x86_64 / arm64 · 自动识别', en: 'x86_64 / arm64 · auto-detected' }, href: 'https://cli.laintas.com/install.sh', icon: Package },
+  { id: 'windows', names: { zh: 'Windows 版本', en: 'Windows' }, details: { zh: 'x86_64 · 独立 WSL2 运行时', en: 'x86_64 · private WSL 2 runtime' }, file: 'laintas-cli_windows_amd64.zip', icon: Monitor },
+  { id: 'source', names: { zh: '源码包', en: 'Source package' }, details: { zh: 'Python 3.10+ · 可审计', en: 'Python 3.10+ · auditable' }, file: 'laintas-cli_source.zip', icon: Code2 },
 ];
 
 const COPY = {
   zh: {
-    kicker: 'LINUX 原生 · AGENT 运行时 · 运维控制面', titleA: '把复杂工作，', titleB: '变成可运行的流程。',
+    kicker: '跨平台终端 · AGENT 运行时 · 运维控制面', titleA: '把复杂工作，', titleB: '变成可运行的流程。',
     intro: 'Laintas CLI 让 Agent 与真实终端、文件系统和运维流程工作在同一个本地运行时中。拆分任务、约束权限、并行执行，并把每一步留在可观察的事件链里。',
     install: '安装 Laintas CLI', seeWorkflow: '查看运行流程', realEyebrow: 'LIVE RUNTIME · NATIVE CAPTURE', realTitle: '真实 Laintas CLI 运行序列',
     realNote: '三帧均来自同一个 v1.18.0 隔离会话的原生终端截图：Slash 菜单、策略选择与 Agents 控制面，没有重绘终端内容。', realTags: ['native terminal', 'policy: enforce', 'CLI v1.18.0'],
@@ -56,10 +59,10 @@ const COPY = {
     agents: ['Planner', 'Operator', 'Verifier'], policy: 'POLICY GATE', states: ['scope: project', 'mode: act', 'approval: enforce', 'trace: on'],
     priceKicker: 'MODEL & USAGE', priceTitle: '先把运行时装进终端，再按需要选择用量。', priceIntro: '下载与源码入口都在这里。模型服务、额度和账户方案请前往 Laintas 定价页查看。', pricing: '查看 Laintas 定价',
     downloadKicker: '04 / DOWNLOAD', downloadTitle: '现在，把它交给真实终端。', downloadIntro: '推荐一行命令安装。也可以按架构下载独立二进制，或使用源码包进行审计与二次开发。',
-    quickInstall: '一行安装', copied: '已复制', copy: '复制', download: '下载', requirements: '支持 64 位 Linux：x86_64 / aarch64 · glibc 2.28+。源码运行需要 Python 3.10+。', docs: '阅读文档', source: '查看源码', footer: 'Local runtime. Observable work. Controlled execution.',
+    quickInstall: '一行安装', linux: 'Linux', windows: 'Windows', copied: '已复制', copy: '复制', download: '下载', requirements: 'Linux 支持 x86_64 / arm64；Windows 支持 x86_64、Windows 10 2004+ / Windows 11，并需要启用 WSL2。', docs: '阅读文档', source: '查看源码', footer: 'Local runtime. Observable work. Controlled execution.',
   },
   en: {
-    kicker: 'LINUX NATIVE · AGENT RUNTIME · OPS CONTROL PLANE', titleA: 'Turn complex work', titleB: 'into a runnable system.',
+    kicker: 'CROSS-PLATFORM TERMINAL · AGENT RUNTIME · OPS CONTROL PLANE', titleA: 'Turn complex work', titleB: 'into a runnable system.',
     intro: 'Laintas CLI puts agents, the real terminal, the filesystem, and operational workflows inside one local runtime. Decompose work, constrain access, execute in parallel, and keep every step observable.',
     install: 'Install Laintas CLI', seeWorkflow: 'See the workflow', realEyebrow: 'LIVE RUNTIME · NATIVE CAPTURE', realTitle: 'Real Laintas CLI runtime sequence',
     realNote: 'All three frames are native terminal captures from the same isolated v1.18.0 session: slash commands, policy selection, and the Agents control plane. No terminal content was redrawn.', realTags: ['native terminal', 'policy: enforce', 'CLI v1.18.0'],
@@ -89,7 +92,7 @@ const COPY = {
     agents: ['Planner', 'Operator', 'Verifier'], policy: 'POLICY GATE', states: ['scope: project', 'mode: act', 'approval: enforce', 'trace: on'],
     priceKicker: 'MODEL & USAGE', priceTitle: 'Install the runtime first. Choose usage as you need it.', priceIntro: 'Downloads and source are available here. Visit Laintas pricing for model service, allowance, and account options.', pricing: 'View Laintas pricing',
     downloadKicker: '04 / DOWNLOAD', downloadTitle: 'Now put it in a real terminal.', downloadIntro: 'Use the one-line installer, download a standalone build for your architecture, or audit and extend the source package.',
-    quickInstall: 'One-line install', copied: 'Copied', copy: 'Copy', download: 'Download', requirements: '64-bit Linux supported: x86_64 / aarch64 · glibc 2.28+. Source runtime requires Python 3.10+.', docs: 'Read the docs', source: 'View source', footer: 'Local runtime. Observable work. Controlled execution.',
+    quickInstall: 'One-line install', linux: 'Linux', windows: 'Windows', copied: 'Copied', copy: 'Copy', download: 'Download', requirements: 'Linux supports x86_64 / arm64. Windows supports x86_64 on Windows 10 2004+ or Windows 11 with WSL 2 enabled.', docs: 'Read the docs', source: 'View source', footer: 'Local runtime. Observable work. Controlled execution.',
   },
 };
 
@@ -100,6 +103,16 @@ export default function DownloadSection() {
   const c = COPY[lang] || COPY.en;
   const [activeShot, setActiveShot] = useState(0);
   const [runtimePaused, setRuntimePaused] = useState(false);
+  const [release, setRelease] = useState(RELEASE_FALLBACK);
+  const [installPlatform, setInstallPlatform] = useState('linux');
+
+  useEffect(() => {
+    if (/Windows/i.test(window.navigator.userAgent)) setInstallPlatform('windows');
+    fetch('/releases/latest/manifest.json')
+      .then((response) => response.ok ? response.json() : Promise.reject(new Error('release manifest unavailable')))
+      .then((manifest) => { if (manifest.version) setRelease(`v${manifest.version}`); })
+      .catch(() => {});
+  }, []);
 
   useEffect(() => {
     if (runtimePaused || window.matchMedia('(prefers-reduced-motion: reduce)').matches) return undefined;
@@ -120,7 +133,7 @@ export default function DownloadSection() {
             <a className="button button-primary" href="#download"><ArrowDownToLine size={17} />{c.install}</a>
             <a className="button button-ghost" href="#workflow">{c.seeWorkflow}<ArrowRight size={16} /></a>
           </div>
-          <div className="hero-proof-line"><span><CheckCircle2 size={15} /> Linux native</span><span><Network size={15} /> HWO / HWG</span><span><ShieldCheck size={15} /> Policy enforced</span></div>
+          <div className="hero-proof-line"><span><CheckCircle2 size={15} /> Linux / Windows</span><span><Network size={15} /> HWO / HWG</span><span><ShieldCheck size={15} /> Policy enforced</span></div>
         </motion.div>
         <motion.figure className="terminal-proof" initial={{ opacity: 0, scale: 0.98 }} animate={{ opacity: 1, scale: 1 }} transition={{ duration: 0.65, delay: 0.12 }}>
           <div className="proof-label"><span className="live-dot" />{c.realEyebrow}</div>
@@ -165,8 +178,11 @@ export default function DownloadSection() {
 
       <section id="download" className="download-section page-shell">
         <div className="download-heading"><div><p className="section-kicker">{c.downloadKicker}</p><h2>{c.downloadTitle}</h2></div><p>{c.downloadIntro}</p></div>
-        <div className="install-block"><div><span>{c.quickInstall}</span><code>{INSTALL_COMMAND}</code></div><CopyButton value={INSTALL_COMMAND} labels={c} /></div>
-        <div className="download-grid">{DOWNLOADS.map(({ id, name, detail, file, icon: Icon }) => <a className="download-card" href={`${RELEASE_BASE}/${file}`} key={id}><div><Icon size={20} /><span>{RELEASE}</span></div><h3>{name}</h3><p>{detail}</p><strong>{c.download}<ArrowDownToLine size={16} /></strong></a>)}</div>
+        <div className="install-platforms" aria-label={lang === 'zh' ? '选择安装平台' : 'Select install platform'}>
+          {['linux', 'windows'].map((platform) => <button type="button" key={platform} className={installPlatform === platform ? 'active' : ''} onClick={() => setInstallPlatform(platform)} aria-pressed={installPlatform === platform}>{c[platform]}</button>)}
+        </div>
+        <div className="install-block"><div><span>{c.quickInstall} · {c[installPlatform]}</span><code>{INSTALL_COMMANDS[installPlatform]}</code></div><CopyButton value={INSTALL_COMMANDS[installPlatform]} labels={c} /></div>
+        <div className="download-grid">{DOWNLOADS.map(({ id, names, details, file, href, icon: Icon }) => <a className="download-card" href={href || `${RELEASE_BASE}/${file}`} key={id}><div><Icon size={20} /><span>{release}</span></div><h3>{names[lang] || names.en}</h3><p>{details[lang] || details.en}</p><strong>{c.download}<ArrowDownToLine size={16} /></strong></a>)}</div>
         <p className="requirements"><CheckCircle2 size={15} />{c.requirements}</p>
       </section>
 

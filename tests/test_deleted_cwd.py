@@ -172,12 +172,12 @@ class AgentLoopRecoveryTests(_CwdCase):
                 shutil.rmtree(os.path.join(self._root, "a", "b"))
                 # A tool call, so the loop takes another turn: a plain reply
                 # ends the turn and the recovery would never be reached.
-                return {"reply": "继续",
+                return {"reply": "carry on",
                         "tool_calls": [{"id": "c1", "name": "ls",
                                         "arguments": {"path": "."}}],
                         "finish_reason": "tool_calls", "done": False,
                         "error": False}
-            return {"reply": "完成", "tool_calls": [], "finish_reason": "stop",
+            return {"reply": "done", "tool_calls": [], "finish_reason": "stop",
                     "done": True, "error": False}
 
         deps = mock.Mock()

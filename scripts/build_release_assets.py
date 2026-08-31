@@ -34,6 +34,7 @@ DIST_RELEASES = os.path.join(REPO, "laintas_cli_download", "dist", "releases")
 RELEASE_ASSET_TEMPLATES = (
     "laintas-cli_linux_amd64.tar.gz",
     "laintas-cli_linux_arm64.tar.gz",
+    "laintas-cli_windows_amd64.zip",
     "laintas-cli_source.zip",
     "laintas-cli_{version}_amd64.deb",
     "SHA256SUMS.txt",

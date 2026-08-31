@@ -1,0 +1,23 @@
+FROM debian:bookworm-slim
+
+ENV LANG=C.UTF-8
+
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        bash ca-certificates coreutils curl file git less openssh-client procps \
+        sudo tar unzip xz-utils zip \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --shell /bin/bash --uid 1000 laintas \
+    && printf 'laintas ALL=(ALL) NOPASSWD:ALL\n' > /etc/sudoers.d/laintas \
+    && chmod 0440 /etc/sudoers.d/laintas
+
+COPY laintas-cli /usr/local/bin/laintas-cli
+COPY wsl.conf /etc/wsl.conf
+COPY wsl-distribution.conf /etc/wsl-distribution.conf
+
+RUN chmod 0755 /usr/local/bin/laintas-cli \
+    && chmod 0644 /etc/wsl.conf /etc/wsl-distribution.conf \
+    && chown root:root /etc/wsl.conf /etc/wsl-distribution.conf
+
+WORKDIR /home/laintas
+CMD ["/bin/bash", "-l"]

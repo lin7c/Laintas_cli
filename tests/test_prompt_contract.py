@@ -398,11 +398,11 @@ class PrefixCacheStabilityTests(unittest.TestCase):
 
     def test_legacy_project_memory_is_locally_filtered_and_truncated(self):
         entries = [
-            {"id": 1, "content": "数据库迁移需要先备份" + "x" * 400},
+            {"id": 1, "content": "database migration needs a backup first" + "x" * 400},
             {"id": 2, "content": "unrelated frontend preference"},
         ]
         pointer, relevant = agent_loop._legacy_memory_parts(
-            "检查数据库迁移", entries, limit=2)
+            "check the database migration", entries, limit=2)
         self.assertIn("loaded on demand", pointer)
         self.assertIn("[1]", relevant)
         self.assertNotIn("[2]", relevant)

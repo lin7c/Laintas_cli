@@ -184,6 +184,8 @@ class ResourceBrowserModelTests(unittest.TestCase):
             browser.status = "A very long operation status " * 10
             rendered = "".join(value for _style, value in browser._footer_fragments())
             self.assertLessEqual(len(rendered), 79)
+            # Wide characters cost two cells each: the budget is in cells,
+            # so a CJK status is the case a len()-based cap gets wrong.
             browser.status = "操作已经完成，正在刷新详情" * 10
             rendered = "".join(value for _style, value in browser._footer_fragments())
             self.assertLessEqual(resource_ui.display_width(rendered), 79)

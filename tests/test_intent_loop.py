@@ -32,24 +32,24 @@ import intent
 #: than the pinned section.
 _UNDERSTANDING = '<task_understanding authoritative='
 
-TASK = ("我想做一个像 ChatGPT 那样的网站，要能多轮对话，"
-        "并且左边有会话列表。不要做移动端 App。")
+TASK = ("I want a website like ChatGPT. It needs multi-turn "
+        "conversation, and a conversation list down the left. No mobile app.")
 
 SPEC_REPLY = json.dumps({
-    "goal": "做一个对话式网站",
+    "goal": "build a chat website",
     "requirements": [
-        {"id": "R1", "text": "支持多轮对话", "anchor": "要能多轮对话"},
-        {"id": "R2", "text": "左侧会话列表", "anchor": "左边有会话列表"},
+        {"id": "R1", "text": "multi-turn conversation", "anchor": "It needs multi-turn conversation"},
+        {"id": "R2", "text": "conversation list on the left", "anchor": "a conversation list down the left"},
     ],
-    "out_of_scope": ["移动端 App"],
-    "deliverables": ["一个可访问的网站"],
+    "out_of_scope": ["mobile app"],
+    "deliverables": ["a reachable website"],
     "open_questions": [
-        {"id": "Q1", "q": "一个对话式网站的必备界面元素有哪些?",
-         "needs": "evidence", "why": "决定首屏布局"},
-        {"id": "Q2", "q": "要接入哪个模型?", "needs": "user", "why": "决定后端"},
+        {"id": "Q1", "q": "Which interface elements does a chat website need?",
+         "needs": "evidence", "why": "decides the first-screen layout"},
+        {"id": "Q2", "q": "Which model should it call?", "needs": "user", "why": "decides the backend"},
     ],
     "assumptions": [],
-    "task_breakdown": ["搭前端骨架", "接流式接口"],
+    "task_breakdown": ["scaffold the frontend", "wire up streaming"],
 }, ensure_ascii=False)
 
 
@@ -118,7 +118,7 @@ class IntentLoopTestCase(unittest.TestCase):
         # that launched it — so a single-turn script could never see it land.
         self.working_turns = 4
         self.main_reply = {
-            "reply": "开始", "tool_calls": [], "finish_reason": "stop",
+            "reply": "starting", "tool_calls": [], "finish_reason": "stop",
             "done": True, "error": False,
         }
         self.critic_reply = json.dumps(
@@ -144,7 +144,7 @@ class IntentLoopTestCase(unittest.TestCase):
             # and the loop's (correct) backoff then adds a second of delay to
             # every scripted iteration.
             return {
-                "reply": "看一下目录",
+                "reply": "listing the directory",
                 "tool_calls": [{"id": f"c{self.working_turns}", "name": "ls",
                                 "arguments": {"path": "."
                                               if self.working_turns % 2
@@ -231,8 +231,8 @@ class SpecBuildTests(IntentLoopTestCase):
         # Turn one cannot have it — the spec did not exist yet.
         self.assertNotIn(_UNDERSTANDING, prompts[0])
         self.assertIn(_UNDERSTANDING, prompts[-1])
-        self.assertIn("支持多轮对话", prompts[-1])
-        self.assertIn("左侧会话列表", prompts[-1])
+        self.assertIn("multi-turn conversation", prompts[-1])
+        self.assertIn("conversation list on the left", prompts[-1])
 
     def test_the_prefix_change_is_attributed_not_unexplained(self):
         # A system prompt that changes mid-task re-bills the whole prefix at
@@ -247,14 +247,14 @@ class SpecBuildTests(IntentLoopTestCase):
         self.intent_replies = [json.dumps({
             "goal": "",
             "requirements": [
-                {"id": "R1", "text": "支持语音输入", "anchor": "支持语音输入"},
-                {"id": "R2", "text": "接入支付", "anchor": "需要支付功能"},
+                {"id": "R1", "text": "voice input", "anchor": "voice input"},
+                {"id": "R2", "text": "payments", "anchor": "needs payments"},
             ],
         }, ensure_ascii=False)] * 2
         state = self.run_loop(loops=3)["state"]
         for prompt in self.prompts():
             self.assertNotIn(_UNDERSTANDING, prompt)
-            self.assertNotIn("语音输入", prompt)
+            self.assertNotIn("voice input", prompt)
         self.assertEqual(intent.DISABLED, state["_intent"]["phase"])
 
     def test_a_broken_intent_model_does_not_break_the_task(self):
@@ -290,14 +290,14 @@ class EvidenceQuestionTests(IntentLoopTestCase):
         self.run_loop(loops=3)
         sent = self.sent_text()
         self.assertIn("<intent_questions>", sent)
-        self.assertIn("必备界面元素", sent)
+        self.assertIn("Which interface elements", sent)
 
     def test_questions_only_for_the_requester_are_not_asked_of_the_model(self):
         # A question only the user can answer is not research; handing it to
         # the model invites it to invent an answer.
         self.config = {"critic_enabled": False}
         self.run_loop(loops=3)
-        self.assertNotIn("要接入哪个模型", self.sent_text())
+        self.assertNotIn("Which model should it call", self.sent_text())
 
     def test_questions_are_asked_once(self):
         """Asked once into the durable thread, not once per request.
@@ -315,10 +315,10 @@ class EvidenceQuestionTests(IntentLoopTestCase):
     def test_a_spec_without_evidence_questions_injects_nothing(self):
         self.config = {"critic_enabled": False}
         self.intent_replies = [json.dumps({
-            "goal": "做一个对话式网站",
-            "requirements": [{"id": "R1", "text": "支持多轮对话",
-                              "anchor": "要能多轮对话"}],
-            "open_questions": [{"id": "Q2", "q": "要接入哪个模型?",
+            "goal": "build a chat website",
+            "requirements": [{"id": "R1", "text": "multi-turn conversation",
+                              "anchor": "It needs multi-turn conversation"}],
+            "open_questions": [{"id": "Q2", "q": "Which model should it call?",
                                 "needs": "user"}],
         }, ensure_ascii=False)] * 2
         self.run_loop(loops=3)
@@ -338,7 +338,7 @@ class CriticHandoffTests(IntentLoopTestCase):
         critic_calls = [c for c in self.calls if c.get("task_kind") == "critic"]
         self.assertTrue(critic_calls)
         contracted = [c for c in critic_calls
-                      if "支持多轮对话" in str(c.get("messages"))]
+                      if "multi-turn conversation" in str(c.get("messages"))]
         self.assertTrue(contracted, "no critic call carried the agreed reading")
         self.assertIn("THE CHILD OWES THIS CONTRACT",
                       str(contracted[0].get("messages")))
@@ -383,14 +383,14 @@ class ComparisonTests(IntentLoopTestCase):
         self.compare_reply = json.dumps({
             "severity": "scope_error", "aligned": False,
             "divergences": [{"req_id": "R1", "steps": [3],
-                             "what": "建成了单页工具", "why": "没有会话"}],
+                             "what": "built a single-page tool", "why": "no conversation at all"}],
             "void_steps": [3], "missing": ["R2"],
-            "next": "改成会话式布局"}, ensure_ascii=False)
+            "next": "switch to a conversation layout"}, ensure_ascii=False)
         state = self.run_loop(loops=6)["state"]
         sent = self.sent_text()
         self.assertIn("<intent_correction", sent)
         self.assertIn("Steps considered void: 3", sent)
-        self.assertIn("改成会话式布局", sent)
+        self.assertIn("switch to a conversation layout", sent)
         self.assertEqual(intent.CORRECTING, state["_intent"]["phase"])
 
     def test_a_detail_gap_notes_without_declaring_anything_void(self):
@@ -400,7 +400,7 @@ class ComparisonTests(IntentLoopTestCase):
         self.compare_reply = json.dumps({
             "severity": "detail_gap", "aligned": False,
             "divergences": [{"req_id": "R2", "steps": [3],
-                             "what": "会话列表还没做", "why": ""}],
+                             "what": "the conversation list is missing", "why": ""}],
             "void_steps": [3], "missing": ["R2"]}, ensure_ascii=False)
         state = self.run_loop(loops=6)["state"]
         sent = self.sent_text()
@@ -421,7 +421,7 @@ class ComparisonTests(IntentLoopTestCase):
         self.config = {"critic_enabled": False}
         self.compare_reply = json.dumps({
             "severity": "critic_unsure", "aligned": False,
-            "divergences": [{"req_id": "R1", "steps": [3], "what": "说不好"}],
+            "divergences": [{"req_id": "R1", "steps": [3], "what": "cannot tell"}],
         }, ensure_ascii=False)
         state = self.run_loop(loops=6)["state"]
         self.assertNotIn("<intent_correction", self.sent_text())
@@ -473,7 +473,7 @@ class TaskBreakdownTests(IntentLoopTestCase):
                 mock.patch.object(task_manager, "get_active_tasks_snapshot",
                                   return_value=""):
             self.run_loop(loops=4)
-        self.assertEqual(["搭前端骨架", "接流式接口"], created)
+        self.assertEqual(["scaffold the frontend", "wire up streaming"], created)
 
     def test_an_agent_that_planned_for_itself_is_left_alone(self):
         # Two task lists for one job is worse than either.
@@ -483,7 +483,7 @@ class TaskBreakdownTests(IntentLoopTestCase):
         with mock.patch.object(task_manager, "create_session_task",
                                side_effect=lambda s, d="", **k: created.append(s)), \
                 mock.patch.object(task_manager, "get_active_tasks_snapshot",
-                                  return_value="1. 已有任务"):
+                                  return_value="1. an existing task"):
             self.run_loop(loops=4)
         self.assertEqual([], created)
 
@@ -512,9 +512,9 @@ class TaskBreakdownTests(IntentLoopTestCase):
 
 SCOPE_ERROR_REPLY = json.dumps({
     "severity": "scope_error", "aligned": False,
-    "divergences": [{"req_id": "R1", "steps": [3], "what": "建成了单页工具",
-                     "why": "没有会话"}],
-    "void_steps": [3], "missing": ["R2"], "next": "改成会话式布局",
+    "divergences": [{"req_id": "R1", "steps": [3], "what": "built a single-page tool",
+                     "why": "no conversation at all"}],
+    "void_steps": [3], "missing": ["R2"], "next": "switch to a conversation layout",
 }, ensure_ascii=False)
 
 
@@ -547,9 +547,9 @@ class DebateTests(IntentLoopTestCase):
     def test_the_agent_can_win_and_the_spec_is_rewritten(self):
         self.config = {"critic_enabled": False}
         self.judge_replies = [json.dumps({
-            "verdict": "main_right", "reason": "请求里并没有要求会话列表在左侧",
+            "verdict": "main_right", "reason": "the request never asked for the list to be on the left",
             "spec_fix": {"drop": ["R2"], "add": [
-                {"id": "R9", "text": "不做移动端", "anchor": "不要做移动端 App"}]},
+                {"id": "R9", "text": "no mobile app", "anchor": "No mobile app"}]},
         }, ensure_ascii=False)]
         state = self.run_loop(loops=9)["state"]
         spec = state["_intent"]["spec"]
@@ -566,7 +566,7 @@ class DebateTests(IntentLoopTestCase):
     def test_the_review_can_win_and_nothing_more_is_injected(self):
         self.config = {"critic_enabled": False}
         self.judge_replies = [json.dumps({
-            "verdict": "critic_right", "reason": "请求写着左边有会话列表"})]
+            "verdict": "critic_right", "reason": "the request says the list is on the left"})]
         state = self.run_loop(loops=9)["state"]
         self.assertEqual(intent.ALIGNED, state["_intent"]["phase"])
         self.assertNotIn("<intent_challenge", self.sent_text())
@@ -575,12 +575,12 @@ class DebateTests(IntentLoopTestCase):
     def test_an_unsettled_point_gets_another_round_then_the_user(self):
         self.config = {"critic_enabled": False, "intent_debate_rounds": 2}
         self.judge_replies = [json.dumps({"verdict": "unresolved",
-                                          "user_question": "要接入哪个模型?"})] * 4
+                                          "user_question": "Which model should it call?"})] * 4
         state = self.run_loop(loops=12)["state"]
         sent = self.sent_text()
         self.assertIn('<intent_challenge round="2"', sent)
         self.assertIn("<intent_unresolved>", sent)
-        self.assertIn("要接入哪个模型?", sent)
+        self.assertIn("Which model should it call?", sent)
         self.assertEqual(intent.ESCALATED, state["_intent"]["phase"])
 
     def test_neither_side_overwrites_the_other_when_unresolved(self):
@@ -588,7 +588,7 @@ class DebateTests(IntentLoopTestCase):
         # resolve by arguing; the spec must come out unchanged.
         self.config = {"critic_enabled": False, "intent_debate_rounds": 1}
         self.judge_replies = [json.dumps({
-            "verdict": "unresolved", "user_question": "要接入哪个模型?",
+            "verdict": "unresolved", "user_question": "Which model should it call?",
             "spec_fix": {"drop": ["R1", "R2"]}})] * 3
         state = self.run_loop(loops=10)["state"]
         ids = [r["id"] for r in state["_intent"]["spec"]["requirements"]]
@@ -600,7 +600,7 @@ class DebateTests(IntentLoopTestCase):
         # has to be said out loud.
         self.config = {"critic_enabled": False, "intent_debate_rounds": 1}
         self.judge_replies = [json.dumps({"verdict": "unresolved",
-                                          "user_question": "要接入哪个模型?"})] * 3
+                                          "user_question": "Which model should it call?"})] * 3
         import mode_manager
         with mock.patch.object(mode_manager, "get_auto_approve",
                                return_value="all"):

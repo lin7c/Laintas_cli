@@ -86,6 +86,28 @@ class DownloadProgressTests(unittest.TestCase):
 
 
 class RestartResolutionTests(unittest.TestCase):
+    def test_wsl_browser_open_uses_windows_host(self):
+        with mock.patch.dict(
+                laintas_cli.os.environ,
+                {"WSL_DISTRO_NAME": "Laintas-CLI"}, clear=False), \
+                mock.patch.object(
+                    laintas_cli.shutil, "which",
+                    return_value="/mnt/c/Windows/explorer.exe"), \
+                mock.patch.object(laintas_cli.subprocess, "Popen") as popen, \
+                mock.patch.object(laintas_cli.webbrowser, "open") as browser:
+            opened = laintas_cli._open_external_url(
+                "https://accounts.laintas.com/login")
+
+        self.assertTrue(opened)
+        browser.assert_not_called()
+        popen.assert_called_once_with(
+            ["/mnt/c/Windows/explorer.exe",
+             "https://accounts.laintas.com/login"],
+            stdout=laintas_cli.subprocess.DEVNULL,
+            stderr=laintas_cli.subprocess.DEVNULL,
+            start_new_session=True,
+        )
+
     def test_path_launch_resolves_executable_instead_of_cwd_name(self):
         with tempfile.TemporaryDirectory() as tmp:
             executable = Path(tmp) / "laintas-cli"

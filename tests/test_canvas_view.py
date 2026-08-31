@@ -285,10 +285,10 @@ class DrawingTests(unittest.TestCase):
         self.viewer.set_tool("rectangle")
         self.viewer.place_shape_at_centre()
         self.viewer.begin_label()
-        self.viewer.label_text = "网关"
+        self.viewer.label_text = "gateway"
         self.viewer.commit_label()
         text = self.canvas.describe_scene(self.canvas.read_scene(self.path))
-        self.assertIn("网关", text)
+        self.assertIn("gateway", text)
 
     def test_a_label_with_nothing_selected_becomes_standalone_text(self):
         self.viewer.select(None)

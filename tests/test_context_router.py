@@ -25,7 +25,7 @@ class DynamicToolRoutingTests(unittest.TestCase):
         ]
 
     def test_plain_coding_task_gets_safe_core_not_specialist_schemas(self):
-        names = context_router.select_tool_names("分析 reranker 用量", self.tools)
+        names = context_router.select_tool_names("analyse reranker usage", self.tools)
         self.assertIn("fs.read", names)
         self.assertIn("shell.exec", names)
         self.assertIn("tool.search", names)
@@ -38,7 +38,7 @@ class DynamicToolRoutingTests(unittest.TestCase):
 
     def test_implicit_chinese_recommendation_keeps_web_research_available(self):
         names = context_router.select_tool_names(
-            "目前有没有公认比较好的写论文 skill", self.tools)
+            "is there a well-regarded skill for writing papers", self.tools)
         self.assertIn("web.search", names)
         self.assertIn("web.fetch", names)
 
@@ -49,7 +49,7 @@ class DynamicToolRoutingTests(unittest.TestCase):
 
     def test_task_keywords_add_only_the_matching_groups(self):
         names = context_router.select_tool_names(
-            "搜索网页并用浏览器截图", self.tools)
+            "search the web and take a browser screenshot", self.tools)
         self.assertIn("web.search", names)
         self.assertIn("browser.screenshot", names)
         self.assertNotIn("canvas.draw", names)
@@ -58,7 +58,7 @@ class DynamicToolRoutingTests(unittest.TestCase):
     def test_visibility_grows_monotonically_and_authorization_still_wins(self):
         state = {}
         first = context_router.stable_visible_names("inspect code", self.tools, state)
-        second = context_router.stable_visible_names("浏览器截图", self.tools, state)
+        second = context_router.stable_visible_names("browser screenshot", self.tools, state)
         self.assertTrue(first <= second)
 
         authorized = {"fs.read", "task.complete"}
@@ -66,7 +66,7 @@ class DynamicToolRoutingTests(unittest.TestCase):
                 mock.patch("agent_loop.tools_mod.get_registry") as registry:
             registry.return_value.list.return_value = self.tools
             visible = agent_loop._visible_tool_names_for_task(
-                "搜索网页", {}, authorized)
+                "search the web", {}, authorized)
         self.assertEqual(visible, authorized)
 
     def test_delegation_is_reachable_without_delegation_vocabulary(self):

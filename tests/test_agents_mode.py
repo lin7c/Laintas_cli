@@ -634,6 +634,8 @@ class AgentsModeTests(unittest.TestCase):
         class Mirror:
             @staticmethod
             def read_lines(_agent_id):
+                # A wide character, so the trim is exercised in cells
+                # rather than in characters.
                 return ["latest " + ("界" * 80) + " END-LATEST"]
 
         controller = agents_mode.AgentsModeController(

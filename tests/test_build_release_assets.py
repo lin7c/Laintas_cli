@@ -29,7 +29,7 @@ def test_manifest_covers_all_tracked_top_level_modules():
     }
     # setup.py is the packaging entry point, not a shipped module.
     missing = sorted(m for m in tracked_top - modules if m != "setup")
-    assert not missing, f"顶层模块未登记到 package_manifest.json: {missing}"
+    assert not missing, f"top-level modules not registered in package_manifest.json: {missing}"
     assert "stuck_signals" in modules
 
 
@@ -66,6 +66,7 @@ def test_release_assets_include_source_and_versioned_deb():
     assert build_release_assets._release_asset_names("1.8.3") == [
         "laintas-cli_linux_amd64.tar.gz",
         "laintas-cli_linux_arm64.tar.gz",
+        "laintas-cli_windows_amd64.zip",
         "laintas-cli_source.zip",
         "laintas-cli_1.8.3_amd64.deb",
         "SHA256SUMS.txt",

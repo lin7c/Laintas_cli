@@ -286,7 +286,7 @@ class DefaultFileTests(_TreeCase):
 class SpecFieldTests(unittest.TestCase):
     """The path travels on the intent spec; the tree validates it later."""
 
-    TASK = "把这个模块重构一下，行为不要变"
+    TASK = "Refactor this module; the behaviour must not change"
 
     def test_a_plausible_path_survives(self):
         spec = intent.validate_spec(
@@ -318,8 +318,8 @@ class SpecFieldTests(unittest.TestCase):
     def test_the_decided_approach_reaches_the_progress_critic(self):
         spec = intent.validate_spec({
             "goal": "g",
-            "requirements": [{"id": "R1", "text": "行为不变",
-                              "anchor": "行为不要变"}]}, self.TASK)
+            "requirements": [{"id": "R1", "text": "behaviour unchanged",
+                              "anchor": "the behaviour must not change"}]}, self.TASK)
         spec["branch_label"] = "Refactor → Restructure in place"
         self.assertIn("Approach: Refactor → Restructure in place",
                       intent.to_contract_text(spec))
@@ -327,8 +327,8 @@ class SpecFieldTests(unittest.TestCase):
     def test_no_approach_is_not_stated_as_a_fact(self):
         spec = intent.validate_spec({
             "goal": "g",
-            "requirements": [{"id": "R1", "text": "行为不变",
-                              "anchor": "行为不要变"}]}, self.TASK)
+            "requirements": [{"id": "R1", "text": "behaviour unchanged",
+                              "anchor": "the behaviour must not change"}]}, self.TASK)
         self.assertNotIn("Approach:", intent.to_contract_text(spec))
 
     def test_the_self_ask_prompt_asks_for_the_path(self):

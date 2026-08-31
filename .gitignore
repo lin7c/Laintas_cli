@@ -11,6 +11,12 @@ build/linux/build/
 build/linux/dist/
 build/linux/dist-compat/
 build/linux/dist-manylinux/
+build/windows/build/
+build/windows/dist/
+build/windows/out/
+build/windows/*.exe
+build/windows/*.zip
+build/windows/*rootfs*.tar*
 dist/
 dist/
 dist/
@@ -19,6 +25,7 @@ dist/
 laintas_cli_download/node_modules/
 laintas_cli_download/dist/
 laintas_cli_download/**/*_amd64.deb
+laintas_cli_download/**/*_windows_*.zip
 
 # Generated architecture visualization (optional to commit)
 architecture-zh.html

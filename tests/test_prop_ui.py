@@ -123,7 +123,7 @@ class PropUITests(unittest.TestCase):
                 laintas_cli._cmd_prop("sys 2", {"token": "x"})
                 item = prop_ui.context_items(conversation, system_only=True)[0]
                 result = captured["assistant_handler"](
-                    item, prop_ui.item_detail(item), "翻译成中文", threading.Event())
+                    item, prop_ui.item_detail(item), "translate it", threading.Event())
         finally:
             if previous is None:
                 delattr(laintas_cli.handle_meta_command, "_last_agent_state")

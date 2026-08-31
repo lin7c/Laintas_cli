@@ -10,26 +10,26 @@ import unittest
 import intent
 
 
-TASK = ("我想做一个像 ChatGPT 那样的网站，要能多轮对话，"
-        "并且左边有会话列表。不要做移动端 App。")
+TASK = ("I want a website like ChatGPT. It needs multi-turn "
+        "conversation, and a conversation list down the left. No mobile app.")
 
 
 def _spec(**over):
     base = {
-        "goal": "做一个对话网站",
+        "goal": "build a chat website",
         "requirements": [
-            {"id": "R1", "text": "多轮对话", "anchor": "要能多轮对话"},
-            {"id": "R2", "text": "会话列表在左侧", "anchor": "左边有会话列表"},
+            {"id": "R1", "text": "multi-turn conversation", "anchor": "It needs multi-turn conversation"},
+            {"id": "R2", "text": "conversation list on the left", "anchor": "a conversation list down the left"},
         ],
-        "out_of_scope": ["移动端 App"],
-        "deliverables": ["一个可访问的网站"],
+        "out_of_scope": ["mobile app"],
+        "deliverables": ["a reachable website"],
         "open_questions": [
-            {"id": "Q1", "q": "ChatGPT 的界面有哪些必备元素?",
-             "needs": "evidence", "why": "决定首页布局"},
-            {"id": "Q2", "q": "要接哪个模型?", "needs": "user", "why": "决定后端"},
+            {"id": "Q1", "q": "Which interface elements does a chat website need?",
+             "needs": "evidence", "why": "decides the first-screen layout"},
+            {"id": "Q2", "q": "Which model should it call?", "needs": "user", "why": "decides the backend"},
         ],
-        "assumptions": [{"id": "A1", "text": "面向桌面浏览器", "risk": "high"}],
-        "task_breakdown": ["搭前端骨架", "接流式接口"],
+        "assumptions": [{"id": "A1", "text": "desktop browsers only", "risk": "high"}],
+        "task_breakdown": ["scaffold the frontend", "wire up streaming"],
     }
     base.update(over)
     return base
@@ -37,19 +37,19 @@ def _spec(**over):
 
 class AnchoringTests(unittest.TestCase):
     def test_verbatim_anchor_is_accepted(self):
-        self.assertTrue(intent.is_anchored("要能多轮对话", TASK))
+        self.assertTrue(intent.is_anchored("It needs multi-turn conversation", TASK))
 
     def test_whitespace_and_case_differences_still_count_as_quoting(self):
         task = "Build a  DASHBOARD\nwith live charts"
         self.assertTrue(intent.is_anchored("dashboard with live charts", task))
 
     def test_invented_anchor_is_rejected(self):
-        self.assertFalse(intent.is_anchored("要支持语音输入", TASK))
+        self.assertFalse(intent.is_anchored("voice input", TASK))
 
     def test_too_short_anchor_is_rejected(self):
         # A one-character "quote" matches almost anything; treating it as
         # evidence would defeat the whole gate.
-        self.assertFalse(intent.is_anchored("网", TASK))
+        self.assertFalse(intent.is_anchored("a", TASK))
 
     def test_empty_anchor_is_rejected(self):
         self.assertFalse(intent.is_anchored("", TASK))
@@ -63,8 +63,8 @@ class ValidateSpecTests(unittest.TestCase):
 
     def test_unanchored_requirement_is_dropped_and_counted(self):
         raw = _spec(requirements=[
-            {"id": "R1", "text": "多轮对话", "anchor": "要能多轮对话"},
-            {"id": "R2", "text": "语音输入", "anchor": "支持语音输入"},
+            {"id": "R1", "text": "multi-turn conversation", "anchor": "It needs multi-turn conversation"},
+            {"id": "R2", "text": "voice input", "anchor": "voice input"},
         ])
         spec = intent.validate_spec(raw, TASK)
         self.assertEqual(["R1"], [r["id"] for r in spec["requirements"]])
@@ -72,7 +72,7 @@ class ValidateSpecTests(unittest.TestCase):
 
     def test_spec_with_no_surviving_requirement_is_not_usable(self):
         raw = _spec(goal="", requirements=[
-            {"id": "R1", "text": "语音输入", "anchor": "支持语音输入"}])
+            {"id": "R1", "text": "voice input", "anchor": "voice input"}])
         spec = intent.validate_spec(raw, TASK)
         self.assertFalse(intent.is_usable(spec))
         self.assertEqual("", intent.render_understanding(spec))
@@ -85,8 +85,8 @@ class ValidateSpecTests(unittest.TestCase):
 
     def test_duplicate_ids_are_disambiguated(self):
         raw = _spec(requirements=[
-            {"id": "R1", "text": "多轮对话", "anchor": "要能多轮对话"},
-            {"id": "R1", "text": "会话列表", "anchor": "左边有会话列表"},
+            {"id": "R1", "text": "multi-turn conversation", "anchor": "It needs multi-turn conversation"},
+            {"id": "R1", "text": "conversation list", "anchor": "a conversation list down the left"},
         ])
         spec = intent.validate_spec(raw, TASK)
         ids = [r["id"] for r in spec["requirements"]]
@@ -94,7 +94,7 @@ class ValidateSpecTests(unittest.TestCase):
 
     def test_requirements_are_capped(self):
         raw = _spec(requirements=[
-            {"id": f"R{i}", "text": f"需求{i}", "anchor": "要能多轮对话"}
+            {"id": f"R{i}", "text": f"requirement {i}", "anchor": "It needs multi-turn conversation"}
             for i in range(40)])
         spec = intent.validate_spec(raw, TASK)
         self.assertEqual(intent.MAX_REQUIREMENTS, len(spec["requirements"]))
@@ -187,7 +187,7 @@ class CompareTests(unittest.TestCase):
             "severity": "scope_error", "aligned": False,
             "divergences": [{"req_id": "R1", "steps": [3],
                              "what": "building a single-page tool", "why": "no chat"}],
-            "void_steps": [3], "missing": ["R2"], "next": "重新按会话式界面开始"})
+            "void_steps": [3], "missing": ["R2"], "next": "start again from a conversation-shaped interface"})
         self.assertIsNone(fail)
         self.assertEqual([3], result["void_steps"])
         self.assertFalse(result["aligned"])
@@ -235,14 +235,14 @@ class JudgeTests(unittest.TestCase):
     def _judge(self, payload):
         import json
         return intent.judge_rebuttal(
-            TASK, self.spec, self.comparison, "我认为规格误读了",
+            TASK, self.spec, self.comparison, "I think the spec misread the request",
             lambda m: json.dumps(payload, ensure_ascii=False))
 
     def test_main_right_carries_a_spec_fix(self):
         verdict, fail = self._judge({
-            "verdict": "main_right", "reason": "请求里没有这句",
+            "verdict": "main_right", "reason": "the request does not say that",
             "spec_fix": {"drop": ["R2"], "add": [
-                {"id": "R9", "text": "不做移动端", "anchor": "不要做移动端 App"}]}})
+                {"id": "R9", "text": "no mobile app", "anchor": "No mobile app"}]}})
         self.assertIsNone(fail)
         self.assertEqual(["R2"], verdict["drop"])
         self.assertEqual(1, len(verdict["add"]))
@@ -253,11 +253,11 @@ class JudgeTests(unittest.TestCase):
 
     def test_only_unresolved_produces_a_user_question(self):
         verdict, _ = self._judge({"verdict": "critic_right",
-                                  "user_question": "要接哪个模型?"})
+                                  "user_question": "Which model should it call?"})
         self.assertEqual("", verdict["user_question"])
         verdict, _ = self._judge({"verdict": "unresolved",
-                                  "user_question": "要接哪个模型?"})
-        self.assertEqual("要接哪个模型?", verdict["user_question"])
+                                  "user_question": "Which model should it call?"})
+        self.assertEqual("Which model should it call?", verdict["user_question"])
 
     def test_empty_rebuttal_is_refused(self):
         verdict, fail = intent.judge_rebuttal(
@@ -273,7 +273,7 @@ class ApplyResolutionTests(unittest.TestCase):
     def test_losing_the_argument_rewrites_the_spec(self):
         updated = intent.apply_resolution(self.spec, {
             "verdict": "main_right", "drop": ["R1"],
-            "add": [{"id": "R9", "text": "不做移动端", "anchor": "不要做移动端 App"}],
+            "add": [{"id": "R9", "text": "no mobile app", "anchor": "No mobile app"}],
         }, TASK)
         ids = [r["id"] for r in updated["requirements"]]
         self.assertNotIn("R1", ids)
@@ -283,7 +283,7 @@ class ApplyResolutionTests(unittest.TestCase):
     def test_added_requirement_must_still_quote_the_request(self):
         updated = intent.apply_resolution(self.spec, {
             "verdict": "main_right", "drop": [],
-            "add": [{"id": "R9", "text": "语音输入", "anchor": "支持语音输入"}],
+            "add": [{"id": "R9", "text": "voice input", "anchor": "voice input"}],
         }, TASK)
         self.assertNotIn("R9", [r["id"] for r in updated["requirements"]])
         self.assertEqual(1, updated["dropped_anchors"])
@@ -302,7 +302,7 @@ class RenderTests(unittest.TestCase):
     def test_understanding_is_marked_authoritative_and_versioned(self):
         out = intent.render_understanding(self.spec)
         self.assertIn('<task_understanding authoritative="true" version="1">', out)
-        self.assertIn("多轮对话", out)
+        self.assertIn("multi-turn conversation", out)
         self.assertIn("</task_understanding>", out)
 
     def test_understanding_is_empty_for_an_empty_spec(self):
@@ -316,15 +316,15 @@ class RenderTests(unittest.TestCase):
 
     def test_questions_block_is_empty_without_evidence_questions(self):
         spec = intent.validate_spec(_spec(open_questions=[
-            {"id": "Q2", "q": "要接哪个模型?", "needs": "user"}]), TASK)
+            {"id": "Q2", "q": "Which model should it call?", "needs": "user"}]), TASK)
         self.assertEqual("", intent.render_questions(spec))
 
     def test_correction_names_void_steps_and_new_files(self):
         out = intent.render_correction(
             {"severity": "scope_error",
              "divergences": [{"req_id": "R1", "steps": [3, 4],
-                              "what": "建成了单页工具", "why": "没有会话"}],
-             "void_steps": [3, 4], "next": "改成会话式布局"},
+                              "what": "built a single-page tool", "why": "no conversation at all"}],
+             "void_steps": [3, 4], "next": "switch to a conversation layout"},
             self.spec,
             {"added": ["src/tool.tsx"], "modified": ["index.html"],
              "deleted": []})
@@ -333,7 +333,7 @@ class RenderTests(unittest.TestCase):
         self.assertIn("src/tool.tsx", out)
         # The surprising half of undo has to be said out loud.
         self.assertIn("would not remove newly created files", out)
-        self.assertIn("改成会话式布局", out)
+        self.assertIn("switch to a conversation layout", out)
 
     def test_correction_without_file_data_still_renders(self):
         out = intent.render_correction(
@@ -352,14 +352,14 @@ class RenderTests(unittest.TestCase):
         self.assertEqual("", intent.render_challenge({"divergences": []}))
 
     def test_escalation_falls_back_to_a_pending_user_question(self):
-        self.assertEqual("要接哪个模型?",
+        self.assertEqual("Which model should it call?",
                          intent.render_escalation(self.spec, {"verdict": "unresolved"}))
 
     def test_contract_text_feeds_the_progress_critic(self):
         import critic
         text = intent.to_contract_text(self.spec)
-        messages = critic.build_messages("原始那句话", "[step 1] assistant: hi", text)
-        self.assertIn("多轮对话", messages[0]["content"])
+        messages = critic.build_messages("the original sentence", "[step 1] assistant: hi", text)
+        self.assertIn("multi-turn conversation", messages[0]["content"])
         self.assertIn("THE CHILD OWES THIS CONTRACT", messages[0]["content"])
 
 

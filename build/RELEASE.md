@@ -1,19 +1,23 @@
-# Laintas CLI 发布与同步方案
+# Laintas CLI release and sync procedure
 
-本文档说明如何将一个版本发布到 GitHub，并同步到 `cli.laintas.com`，使下载页、安装脚本和 CLI 的 `/v` 更新命令使用同一组发布资源。
+How to publish a version to GitHub and sync it to `cli.laintas.com`, so that
+the download page, the install script and the CLI's `/v` update command all
+use the same set of release assets.
 
-## 1. 发布前检查
+## 1. Pre-release checks
 
-在仓库根目录执行：
+From the repository root:
 
 ```bash
 git status
 python3 -m py_compile version.py
 ```
 
-**顶层模块登记校验**：`package_manifest.json` 是所有打包（setup.py、PyInstaller spec、
-CI source 包、`/v` 自更新 manifest）的单一事实来源。新增任何顶层 `.py` 模块后必须登记到
-`modules`，否则该模块不会进入任何发布产物（正式安装的 CLI 上会 `ImportError`）。发布前运行：
+**Top-level module registration.** `package_manifest.json` is the single
+source of truth for every packaging path (setup.py, the PyInstaller spec, the
+CI source bundle, and the `/v` self-update manifest). A new top-level `.py`
+module must be added to `modules`, or it ships in no release artifact at all
+and an installed CLI raises `ImportError` at runtime. Check before releasing:
 
 ```bash
 python3 - <<'PY'
@@ -22,34 +26,35 @@ pm = json.load(open("package_manifest.json"))
 modules = set(pm["modules"])
 top_py = sorted(f[:-3] for f in os.listdir(".") if f.endswith(".py") and os.path.isfile(f))
 missing = [m for m in top_py if m not in modules and m != "setup"]
-assert not missing, f"顶层模块未登记到 package_manifest.json: {missing}"
-print("package_manifest.json 完整: 所有顶层模块均已登记")
+assert not missing, f"top-level modules not registered in package_manifest.json: {missing}"
+print("package_manifest.json is complete: every top-level module is registered")
 PY
 ```
 
-当前登记在案的本地诊断模块（`event_log` / `critic` / `precheck` /
-`rag_signals` / `mem_signals` / `stuck_signals` / `redactor`）只服务于
-CLI 恢复和本地诊断，不上传到训练管线。
+The local diagnostic modules currently registered (`event_log` / `critic` /
+`precheck` / `rag_signals` / `mem_signals` / `stuck_signals` / `redactor`)
+serve CLI recovery and local diagnostics only; they upload nothing to the
+training pipeline.
 
-修改 [version.py](../version.py) 中的唯一版本号，例如：
+Set the single version number in [version.py](../version.py):
 
 ```python
 __version__ = "1.8.1"
 ```
 
-下载页的版本号和下载地址位于：
+The download page's version and download URLs live in:
 
 ```text
 laintas_cli_download/src/components/DownloadSection.jsx
 ```
 
-发布新版本时，必须同步更新：
+Releasing a new version means updating all three of:
 
-- `DOWNLOAD_BASE`：`https://cli.laintas.com/releases/v1.8.1`
-- `RELEASE_VERSION`：`v1.8.1`
-- 页面兼容性区域的版本展示
+- `DOWNLOAD_BASE`: `https://cli.laintas.com/releases/v1.8.1`
+- `RELEASE_VERSION`: `v1.8.1`
+- the version shown in the page's compatibility section
 
-然后构建下载页：
+Then build the download page:
 
 ```bash
 cd laintas_cli_download
@@ -59,11 +64,13 @@ mv /tmp/laintas-release-assets dist/releases
 cd ..
 ```
 
-构建前后必须保留 `dist/releases`，否则 Vite 的清理过程会删除自托管的安装包和 `/v` 更新包。
+`dist/releases` must be moved aside and restored around the build: Vite's
+clean step deletes the self-hosted installers and the `/v` update packages
+otherwise.
 
-## 2. 创建 GitHub Release
+## 2. Create the GitHub release
 
-提交并推送版本 tag：
+Commit and push the version tag:
 
 ```bash
 git add version.py laintas_cli_download/src/components/DownloadSection.jsx
@@ -73,48 +80,53 @@ git push origin main
 git push origin v1.8.1
 ```
 
-`.github/workflows/release.yml` 会在 tag 推送后构建并发布：
+`.github/workflows/release.yml` builds and publishes on the tag push:
 
 - `laintas-cli_linux_amd64.tar.gz`
 - `laintas-cli_linux_arm64.tar.gz`
+- `laintas-cli_windows_amd64.zip`
 - `laintas-cli_source.zip`
 - `laintas-cli_<version>_amd64.deb`
 - `manifest.json`
 - `src_manifest.zip`
 - `SHA256SUMS.txt`
 
-确认 GitHub Release 已完成且不是 draft：
+Confirm the release finished and is not a draft:
 
 ```bash
 gh release view v1.8.1
 ```
 
-## 3. 同步到 cli.laintas.com
+## 3. Sync to cli.laintas.com
 
-Nginx 文档根目录必须是：
+The nginx document root must be:
 
 ```text
 /root/laintas_cli/laintas_cli_download/dist
 ```
 
-推荐使用同步脚本生成源码 manifest，并从 GitHub Release 下载二进制资产：
+Use the sync script to generate the source manifest and pull the binaries
+from the GitHub release:
 
 ```bash
 python3 scripts/build_release_assets.py
 ```
 
-该脚本依赖 `gh` 已登录，并从 `version.py` 读取版本号。它会写入：
+It needs `gh` to be logged in, reads the version from `version.py`, and
+writes:
 
 ```text
 dist/releases/v1.8.1/
 dist/releases/latest/
 ```
 
-如果 `gh` 登录失效，可手动从 GitHub Release 下载全部资产，再放入上述两个目录。两个目录都必须至少包含：
+If the `gh` login has expired, download every asset from the GitHub release
+by hand and place it in both directories. Both must contain at least:
 
 ```text
 laintas-cli_linux_amd64.tar.gz
 laintas-cli_linux_arm64.tar.gz
+laintas-cli_windows_amd64.zip
 laintas-cli_source.zip
 laintas-cli_<version>_amd64.deb
 manifest.json
@@ -122,7 +134,7 @@ src_manifest.zip
 SHA256SUMS.txt
 ```
 
-同步后校验：
+Verify after syncing:
 
 ```bash
 for dir in \
@@ -133,80 +145,90 @@ for dir in \
 done
 ```
 
-两个目录的 manifest 版本都必须是当前发布版本，例如 `1.8.1`。
+Both manifests must report the version being released, e.g. `1.8.1`.
 
-## 4. `/v` 更新地址
+## 4. Where `/v` updates from
 
-`updater.py` 默认配置为：
+`updater.py` is configured with:
 
 ```python
 DEFAULT_DOWNLOAD_BASE = "https://cli.laintas.com"
 ```
 
-因此正常情况下 `/v` 只从以下地址下载，不直接访问 GitHub：
+so `/v` normally downloads only from these, never from GitHub directly:
 
 ```text
 https://cli.laintas.com/releases/latest/manifest.json
 https://cli.laintas.com/releases/latest/src_manifest.zip
 https://cli.laintas.com/releases/latest/laintas-cli_linux_amd64.tar.gz
 https://cli.laintas.com/releases/latest/laintas-cli_linux_arm64.tar.gz
+https://cli.laintas.com/releases/latest/laintas-cli_windows_amd64.zip
 ```
 
-指定版本时使用：
+To pin a version:
 
 ```bash
 LAINTAS_UPDATE_CHANNEL=v1.8.1 laintas-cli
 ```
 
-它会读取：
+which reads:
 
 ```text
 https://cli.laintas.com/releases/v1.8.1/manifest.json
 ```
 
-如需测试镜像，可设置 `LAINTAS_DOWNLOAD_BASE`；生产环境不要将其设置为 GitHub 地址。
+`LAINTAS_DOWNLOAD_BASE` can point at a test mirror; do not point it at GitHub
+in production.
 
-## 5. 发布后验证
+## 5. Post-release verification
 
 ```bash
 curl -fsSL https://cli.laintas.com/releases/latest/manifest.json | python3 -m json.tool
 curl -fsSIL https://cli.laintas.com/releases/latest/laintas-cli_linux_amd64.tar.gz
+curl -fsSIL https://cli.laintas.com/releases/latest/laintas-cli_windows_amd64.zip
 curl -fsSIL https://cli.laintas.com/install.sh
+curl -fsSIL https://cli.laintas.com/install.ps1
 ```
 
-应确认：
+Confirm that:
 
-- `latest/manifest.json` 的版本是新版本
-- amd64、arm64、源码包和 Deb 包均返回 `200`
-- 下载页显示新版本，下载链接指向正确的版本目录
-- `/v` 检查更新时使用 `cli.laintas.com`
-- `src_manifest.zip` 与 manifest 中的文件校验一致
+- the version in `latest/manifest.json` is the new one
+- amd64, arm64, the source bundle and the .deb all return `200`
+- the download page shows the new version and links into the right version
+  directory
+- `/v` checks `cli.laintas.com` for updates
+- `src_manifest.zip` matches the file checksums in the manifest
 
-静态文件更新不需要重载 Nginx；只有修改 Nginx 配置时才执行：
+Static file updates need no nginx reload; only a configuration change does:
 
 ```bash
 nginx -t && nginx -s reload
 ```
 
-## 6. 常见问题
+## 6. Troubleshooting
 
-### 页面能打开，但下载链接是旧版本
+### The page loads but the download links point at the old version
 
-检查 `DownloadSection.jsx` 中的 `DOWNLOAD_BASE` 和 `RELEASE_VERSION`，然后重新执行下载页构建。
+Check `DOWNLOAD_BASE` and `RELEASE_VERSION` in `DownloadSection.jsx`, then
+rebuild the download page.
 
-### `/v` 报 manifest 版本旧
+### `/v` reports an old manifest version
 
-检查 `dist/releases/latest/manifest.json`，不要只更新 `v1.8.1` 目录；`latest` 是默认更新通道。
+Check `dist/releases/latest/manifest.json` — updating only the `v1.8.1`
+directory is not enough, since `latest` is the default update channel.
 
-### 安装脚本返回 404
+### The install script returns 404
 
-确认 `latest/` 中使用的是带架构后缀的文件名：
+Make sure `latest/` uses the architecture-suffixed filenames:
 
 ```text
 laintas-cli_linux_amd64.tar.gz
 laintas-cli_linux_arm64.tar.gz
+laintas-cli_windows_amd64.zip
 ```
 
-### 构建后发布包消失
+### The release assets vanish after a build
 
-Vite 构建会清空 `dist`。构建前必须备份并在构建后恢复 `dist/releases`，或使用不会清空发布目录的独立构建目录。
+The Vite build empties `dist`. Move `dist/releases` aside before the build and
+restore it afterwards, or build into a separate directory that does not clear
+the release folder.

@@ -334,8 +334,8 @@ class ContractFingerprintTests(unittest.TestCase):
     def test_non_ascii_is_not_escaped(self):
         """ensure_ascii=False matches JSON.stringify, which also leaves it raw."""
         import hashlib
-        spec = {"paths": {"/x": {"get": {"summary": "订单"}}}}
-        blob = '{"summary":"订单"}'
+        spec = {"paths": {"/x": {"get": {"summary": "orders"}}}}
+        blob = '{"summary":"orders"}'
         self.assertEqual(cs._operation_fingerprint(spec, "get", "/x"),
                          hashlib.sha256(blob.encode("utf-8")).hexdigest()[:32])
 

@@ -182,7 +182,7 @@ class BoardFiles(unittest.TestCase):
     def test_the_description_folds_labels_and_names_arrow_ends(self):
         self._write([
             {"id": "gw", "type": "rectangle", "x": 80, "y": 80, "width": 200, "height": 90},
-            {"id": "gwl", "type": "text", "containerId": "gw", "text": "网关",
+            {"id": "gwl", "type": "text", "containerId": "gw", "text": "gateway",
              "x": 0, "y": 0, "width": 1, "height": 1},
             {"id": "a1", "type": "arrow", "x": 290, "y": 125, "width": 120, "height": 0,
              "startBinding": {"elementId": "gw"}, "endBinding": {"elementId": "cli"}},
@@ -190,7 +190,7 @@ class BoardFiles(unittest.TestCase):
              "height": 1, "isDeleted": True},
         ])
         text = canvas.describe_scene(canvas.read_scene(self.path))
-        self.assertIn('gw  rectangle  "网关"', text)
+        self.assertIn('gw  rectangle  "gateway"', text)
         self.assertNotIn("gwl", text)
         self.assertIn("gw → cli", text)
         self.assertNotIn("dead", text)

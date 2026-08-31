@@ -64,6 +64,8 @@ class RpromptFitTests(unittest.TestCase):
             (70, "~"), (62, "~"), (55, "~"), (48, "~"),
             (110, "~/some/deep/project/path"),
             (100, "~/a-very-long-working-directory-name-goes-here"),
+            # A wide-character path: two cells per glyph, so a
+            # character-counting shortener would leave the row too long.
             (90, "~/中文目录/项目"),
         ]
         for width, path in cases:

@@ -1,6 +1,6 @@
 # Laintas CLI
 
-**Linux-native autonomous AI agent for terminal work**
+**Cross-platform autonomous AI agent for terminal work**
 
 [Download](https://cli.laintas.com) · [Documentation](https://laintas.com/docs) · [Releases](https://github.com/lin7c/Laintas_cli/releases) · [Laintas](https://laintas.com)
 
@@ -22,10 +22,21 @@ It is designed for developers, server operators, and remote workspaces that want
 
 ## Install and Start
 
-The standalone release targets 64-bit glibc Linux on `x86_64` and `aarch64`:
+Linux standalone releases target 64-bit glibc systems on `x86_64` and
+`aarch64`; the installer selects the matching binary automatically:
 
 ```bash
 curl -fsSL https://cli.laintas.com/install.sh | bash
+laintas-cli
+```
+
+On 64-bit Windows 10 2004+ or Windows 11, the Windows package imports a
+private `Laintas-CLI` WSL 2 distribution and installs a native
+`laintas-cli.exe` launcher. Normal startup calls `wslapi.dll` directly, does
+not run `wsl.exe`, and does not change the user's default WSL distribution:
+
+```powershell
+irm https://cli.laintas.com/install.ps1 | iex
 laintas-cli
 ```
 
@@ -377,11 +388,16 @@ The package manifest is intentionally explicit. When adding a runtime module, bu
 
 - Linux amd64 standalone archive
 - Linux arm64 standalone archive
+- Windows amd64 launcher with a private WSL 2 root filesystem
 - Linux amd64 Debian package
 - Linux-compatible source archive
 - SHA-256 checksums and source-update manifests
 
-Release assets use architecture-specific names because native ELF binaries are CPU-specific. Self-hosted assets used by `/v update` are generated with `scripts/build_release_assets.py` and mirrored to `cli.laintas.com/releases/latest/`.
+The download page presents one Linux option while `install.sh` selects the
+architecture-specific ELF asset. Windows ships separately as
+`laintas-cli_windows_amd64.zip`. Self-hosted assets used by `/v update` are
+generated with `scripts/build_release_assets.py` and mirrored to
+`cli.laintas.com/releases/latest/`.
 
 ## Version History
 

@@ -57,6 +57,29 @@ from urllib.parse import urlparse, parse_qs, urlencode
 # ── OS Detection (must come before Unix-specific imports) ────────────────
 SYSTEM = platform.system()  # "Linux", "Darwin"
 
+
+def _open_external_url(url: str) -> bool:
+    """Open a URL on the desktop hosting this CLI.
+
+    A private WSL distribution normally has no Linux browser registered. WSL
+    interop exposes ``explorer.exe`` from the Windows host, so prefer it there
+    and retain Python's normal browser selection everywhere else.
+    """
+    if os.environ.get("WSL_INTEROP") or os.environ.get("WSL_DISTRO_NAME"):
+        explorer = shutil.which("explorer.exe")
+        if explorer:
+            try:
+                subprocess.Popen(
+                    [explorer, url], stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL, start_new_session=True)
+                return True
+            except OSError:
+                pass
+    try:
+        return bool(webbrowser.open(url))
+    except Exception:
+        return False
+
 # Capture restart identity before os.chdir() or an in-place update can alter
 # what argv[0] resolves to.  A PATH launch commonly has argv[0] ==
 # "laintas-cli"; joining that to the cwd creates a nonexistent file.
@@ -6176,7 +6199,7 @@ def _login_via_device(
         f"[dim]Waiting for approval (expires in {expires // 60} minutes)…[/dim]"
     )
     try:
-        webbrowser.open(login_url)
+        _open_external_url(login_url)
     except Exception:
         # The URL is already printed; headless/SSH environments can paste it
         # into a browser without requiring a local GUI.
@@ -6318,7 +6341,7 @@ def _login_via_browser_local() -> Optional[dict]:
         title="Laintas Auth"
     ))
 
-    webbrowser.open(login_url)
+    _open_external_url(login_url)
 
     server = HTTPServer(("127.0.0.1", port), CallbackHandler)
     server.timeout = 120
@@ -19264,8 +19287,7 @@ def _cmd_helpwo(raw_args: str, parts: list, agent_registry: AgentRegistry,
                                    workspace=_auto_workspace)
         console.print(f"[dim]Opening {url}[/dim]")
         try:
-            import webbrowser
-            webbrowser.open(url)
+            _open_external_url(url)
         except Exception:
             pass
         return
@@ -19302,8 +19324,7 @@ def _cmd_helpwo(raw_args: str, parts: list, agent_registry: AgentRegistry,
 
     # Open the browser
     try:
-        import webbrowser
-        webbrowser.open(url)
+        _open_external_url(url)
     except Exception:
         pass
 

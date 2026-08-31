@@ -1982,8 +1982,8 @@ class ResumeStateTests(unittest.TestCase):
 
     def test_resume_payload_title_and_turns_ignore_shell_input(self):
         history = [
-            {"role": "user", "content": "修复恢复逻辑", "input_kind": "prompt"},
-            {"role": "assistant", "content": "处理中"},
+            {"role": "user", "content": "fix the resume logic", "input_kind": "prompt"},
+            {"role": "assistant", "content": "working on it"},
             {"role": "user", "content": "clear", "input_kind": "shell"},
             {"role": "user", "content": "ls", "input_kind": "shell"},
             {"role": "shell", "content": "a.py\nb.py", "returncode": 0},
@@ -1991,7 +1991,7 @@ class ResumeStateTests(unittest.TestCase):
 
         payload = agent_loop._build_resume_payload({}, history, "/fake/project", "checkpoint")
 
-        self.assertEqual(payload["title"], "修复恢复逻辑")
+        self.assertEqual(payload["title"], "fix the resume logic")
         self.assertEqual(payload["turn_count"], 1)
 
     def test_identical_quit_autosave_and_checkpoint_are_collapsed(self):
@@ -2160,8 +2160,8 @@ class ResumeTranscriptTests(unittest.TestCase):
     def test_structured_events_use_prompt_shell_and_tool_styles(self):
         blob = {
             "chat_history": [
-                {"role": "user", "content": "检查项目", "input_kind": "prompt"},
-                {"role": "assistant", "content": "我先检查。"},
+                {"role": "user", "content": "check the project", "input_kind": "prompt"},
+                {"role": "assistant", "content": "Checking first."},
                 {"role": "tool", "tool_name": "terminal.create",
                  "display_name": "terminal.create", "summary": "worker",
                  "content": "Created worker", "ok": True},
@@ -2173,8 +2173,8 @@ class ResumeTranscriptTests(unittest.TestCase):
 
         text = self._render(blob, None)
 
-        self.assertIn("❯ 检查项目", text)
-        self.assertIn("我先检查。", text)
+        self.assertIn("❯ check the project", text)
+        self.assertIn("Checking first.", text)
         self.assertIn("terminal.create", text)
         self.assertIn("worker", text)
         self.assertIn("Created worker", text)
