@@ -31,8 +31,11 @@ jobs:
           pip install -r requirements.txt
           # tests/test_auto_pilot.py and tests/test_markdown_theme.py import
           # pytest, so it is a test dependency even though the suite also runs
-          # under unittest.
-          pip install pytest
+          # under unittest. Pillow is a lazy optional import in vision.py but
+          # a hard one in tests/test_vision.py — without it collection died
+          # and this job ran no tests at all, which is how it stayed red while
+          # reading like a normal failure.
+          pip install pytest pillow
 
       # Two tests fail on a clean checkout for reasons unrelated to any change
       # under review (see tests/KNOWN_FAILURES.md). They are deselected so this
