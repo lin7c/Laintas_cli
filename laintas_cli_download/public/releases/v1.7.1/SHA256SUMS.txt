@@ -1,4 +1,0 @@
-f112cdec40a1faab398ad7a9d25675e799881468dfd962c2f42f8e7bfba82e5f  laintas-cli_linux_amd64.tar.gz
-b863a025b06e483aab7e5e58d213a22bc6ab5cb1bd61f48ca375da9c24ea3459  laintas-cli_linux_arm64.tar.gz
-984c92ef5a2b79b3d698eaddfcdeefb4da910f8dfb25f2d4ae143640ad2ef12c  laintas-cli_source.zip
-537742a7fdfd34340bc7f9101ba6bd85c21c997db41592409f1b79db242ca8e8  laintas-cli_1.7.1_amd64.deb

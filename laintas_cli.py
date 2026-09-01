@@ -24045,17 +24045,26 @@ def main():
     # a full copy of the repo per orphan dominated both disk and every
     # recursive search. Startup is the one moment a previous run is provably
     # over. Content is archived as a patch first; see worktree_manager.
+    #
+    # Sweeps every registered repo, not just this cwd's: orphans sit under the
+    # repo the sub-agent worked in, and scoping to os.getcwd() silently swept
+    # nothing whenever the CLI was launched from outside a repository.
     if args.depth == 0:
         try:
             import worktree_manager as _wtm
-            _reaped = _wtm.reap_orphan_worktrees(os.getcwd())
+            _reaped = _wtm.reap_all_worktree_roots(os.getcwd())
             if _reaped["reaped"]:
                 console.print(
                     f"[dim]Reclaimed {len(_reaped['reaped'])} orphaned "
                     f"sub-agent worktree(s); any uncommitted work is saved as "
                     f"a patch under .laintas/worktrees/.reaped/.[/dim]")
-        except Exception:
-            pass          # housekeeping must never block startup
+            if _reaped["error"]:
+                # A sweep that fails must not look like a sweep that found
+                # nothing — that silence is how the orphans went unnoticed.
+                console.print(f"[dim]Worktree sweep incomplete: "
+                              f"{_reaped['error']}[/dim]")
+        except Exception as _exc:
+            console.print(f"[dim]Worktree sweep skipped: {_exc}[/dim]")
 
     # Hint (never auto-overwrite — see ensure_files_exist) when the saved
     # cli.prop no longer matches what this version would generate, so an

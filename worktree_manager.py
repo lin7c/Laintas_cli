@@ -198,8 +198,11 @@ def create_isolated_worktree(base_cwd: str, label: str = "agent") -> WorktreeInf
 
     # Stamp ownership as soon as the tree exists, before the WIP replication
     # below — a crash partway through that copy still leaves a checkout on
-    # disk, and it should be reclaimable like any other orphan.
+    # disk, and it should be reclaimable like any other orphan. Registering
+    # the root is part of the same guarantee: a later CLI has to be able to
+    # find this repo without being launched from inside it.
     _write_owner(root, name)
+    _register_root(root)
 
     # Replicate the parent's uncommitted WIP into the new worktree so the
     # child continues real work instead of a stale clean checkout. Locked
@@ -341,6 +344,82 @@ _REAPED_DIRNAME = ".reaped"
 DEFAULT_ORPHAN_GRACE_SECONDS = 6 * 3600
 MAX_REAPED_ARCHIVES = 50
 
+# Orphans live under the repo a sub-agent worked in, which has nothing to do
+# with the cwd the next CLI happens to start from. Scoping the sweep to
+# `os.getcwd()` meant a CLI launched from a non-repo directory resolved no
+# repo root and returned before looking at anything — 31 orphans and 3.6 GB
+# accumulated under a repo one level down while startup reported success.
+# Each repo that ever hosts a worktree registers itself here instead, so the
+# sweep covers where the worktrees are rather than where the shell was.
+_ROOTS_DIRNAME = "worktree_roots"
+
+
+def _roots_dir() -> str:
+    try:
+        import paths
+        home = str(paths.LAINTAS_HOME)
+    except Exception:
+        home = os.environ.get("LAINTAS_HOME") or os.path.join(
+            os.path.expanduser("~"), ".laintas")
+    return os.path.join(home, _ROOTS_DIRNAME)
+
+
+def _root_marker(root: str) -> str:
+    key = hashlib.sha1(os.path.realpath(root).encode("utf-8")).hexdigest()[:16]
+    return os.path.join(_roots_dir(), key)
+
+
+def _register_root(root: str) -> None:
+    """Note that `root` hosts worktrees, for later sweeps.
+
+    One file per repo rather than one shared list: sub-agents register
+    concurrently from separate processes, and a read-modify-write on a shared
+    file would drop entries under exactly that race — and a dropped entry is
+    a repo that never gets swept, which is the bug this exists to fix.
+    """
+    try:
+        os.makedirs(_roots_dir(), mode=0o700, exist_ok=True)
+        path = _root_marker(root)
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(os.path.realpath(root))
+        os.replace(tmp, path)
+    except OSError:
+        pass          # registration is best-effort; an unswept repo is not fatal
+
+
+def _forget_root(root: str) -> None:
+    try:
+        os.remove(_root_marker(root))
+    except OSError:
+        pass
+
+
+def known_worktree_roots() -> List[str]:
+    """Every registered repo root that still exists on disk."""
+    roots = []
+    try:
+        entries = sorted(os.listdir(_roots_dir()))
+    except OSError:
+        return roots
+    for entry in entries:
+        if entry.endswith(".tmp"):
+            continue
+        marker = os.path.join(_roots_dir(), entry)
+        try:
+            with open(marker, encoding="utf-8") as fh:
+                root = fh.read().strip()
+        except OSError:
+            continue
+        if root and os.path.isdir(root):
+            roots.append(root)
+        else:
+            try:
+                os.remove(marker)         # repo deleted → stop tracking it
+            except OSError:
+                pass
+    return roots
+
 
 def _worktrees_dir(root: str) -> str:
     return os.path.join(root, ".laintas", "worktrees")
@@ -350,19 +429,71 @@ def _owner_path(root: str, name: str) -> str:
     return os.path.join(_worktrees_dir(root), _OWNERS_DIRNAME, f"{name}.json")
 
 
+def _boot_id() -> str:
+    """This boot's unique id, or "" where the kernel does not expose one.
+
+    A pid only identifies a process within one boot. After a reboot the same
+    number is handed out again from 1, so an owner record written before a
+    crash-and-reboot would otherwise vouch for a completely unrelated process.
+    """
+    try:
+        with open("/proc/sys/kernel/random/boot_id", encoding="utf-8") as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def _pid_starttime(pid: int) -> str:
+    """Field 22 of /proc/<pid>/stat: clock ticks since boot at process start.
+
+    (pid, starttime) is unique for a boot even though pid alone is not, which
+    is what lets a recycled pid be told apart from the original owner.
+    """
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as fh:
+            data = fh.read()
+        # comm (field 2) is parenthesised and may itself contain spaces, so
+        # split after the last ')' rather than on whitespace from the start.
+        tail = data[data.rindex(")") + 2:].split()
+        return tail[19]                  # field 22 == index 19 of the tail
+    except (OSError, ValueError, IndexError):
+        return ""
+
+
+def _has_cmdline(pid: int) -> bool:
+    """True if pid is a userspace process. Kernel threads have no cmdline.
+
+    Sole gate for legacy records that predate starttime stamping. Three of
+    those in one deployment carried ``"pid": 2`` — kthreadd, which never
+    exits, so those worktrees were immortal under a bare liveness check.
+    """
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            return bool(fh.read().strip(b"\x00"))
+    except OSError:
+        return False
+
+
 def _write_owner(root: str, name: str) -> None:
     """Record which live process owns a worktree.
 
     Age alone cannot tell a crashed run from a slow one, and reaping a
     still-running sub-agent's checkout out from under it is far worse than
     leaving a stale directory another few hours.
+
+    The record pins the owner to one boot and one process start, so a reused
+    pid cannot inherit a dead agent's claim on a checkout.
     """
     import json
     path = _owner_path(root, name)
+    pid = os.getpid()
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as fh:
-            json.dump({"pid": os.getpid(), "started": time.time()}, fh)
+            json.dump({"pid": pid,
+                       "started": time.time(),
+                       "boot_id": _boot_id(),
+                       "starttime": _pid_starttime(pid)}, fh)
     except OSError:
         pass          # ownership is an optimisation; the age gate still applies
 
@@ -387,6 +518,35 @@ def _pid_alive(pid: int) -> bool:
     except OSError:
         return True                      # unknown → assume alive
     return True
+
+
+def _owner_alive(owner: dict) -> bool:
+    """True if the process that claimed a worktree is still that same process.
+
+    Liveness alone is not identity. A bare `pid` can be reused by an unrelated
+    process, survive a reboot as a different one entirely, or — as happened
+    here — name a kernel thread that never exits, which pins the worktree
+    forever. Each recorded field that is present must agree; a field that is
+    absent (older record) falls back to the weaker check below it.
+    """
+    pid = owner.get("pid")
+    if not isinstance(pid, int) or pid <= 1:
+        return False                     # pid 0/1 are never a sub-agent
+
+    boot = owner.get("boot_id")
+    current_boot = _boot_id()
+    if boot and current_boot and boot != current_boot:
+        return False                     # written before a reboot → gone
+
+    recorded_start = owner.get("starttime")
+    if recorded_start:
+        # Strongest check: exact process identity within this boot.
+        return _pid_starttime(pid) == recorded_start
+
+    # Legacy record with only a pid. Require at minimum that the pid names a
+    # userspace process — a kernel thread is never a sub-agent, whatever the
+    # liveness call says.
+    return _pid_alive(pid) and _has_cmdline(pid)
 
 
 def _cwds_in_use() -> set:
@@ -500,8 +660,7 @@ def reap_orphan_worktrees(base_cwd: str, *,
                 owner = None
 
             if owner is not None:
-                pid = owner.get("pid")
-                if pid == me or _pid_alive(pid):
+                if owner.get("pid") == me or _owner_alive(owner):
                     result["kept"].append(path)
                     continue
                 born = float(owner.get("started") or 0)
@@ -539,3 +698,33 @@ def reap_orphan_worktrees(base_cwd: str, *,
     except Exception as exc:              # never let housekeeping break startup
         result["error"] = str(exc)
     return result
+
+
+def reap_all_worktree_roots(base_cwd: Optional[str] = None, **kwargs) -> dict:
+    """Reap orphans in every repo known to host worktrees.
+
+    The startup entry point. `base_cwd`'s repo is swept too even if it never
+    registered (worktrees created by an older build), and a root whose
+    worktrees directory is gone is dropped from the registry so it is not
+    re-scanned forever.
+    """
+    merged = {"reaped": [], "kept": [], "archived": [], "error": "", "roots": []}
+    roots = known_worktree_roots()
+    if base_cwd:
+        own = repo_root(base_cwd)
+        if own and os.path.realpath(own) not in {os.path.realpath(r) for r in roots}:
+            roots.append(own)
+
+    errors = []
+    for root in roots:
+        if not os.path.isdir(_worktrees_dir(root)):
+            _forget_root(root)
+            continue
+        merged["roots"].append(root)
+        result = reap_orphan_worktrees(root, **kwargs)
+        for key in ("reaped", "kept", "archived"):
+            merged[key].extend(result.get(key) or [])
+        if result.get("error"):
+            errors.append(f"{root}: {result['error']}")
+    merged["error"] = "; ".join(errors)
+    return merged
