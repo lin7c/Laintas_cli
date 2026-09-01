@@ -58,6 +58,9 @@ $LinuxBinary = Join-Path $PackageRoot "laintas-cli-linux"
 $BundledLauncher = Join-Path $PackageRoot "laintas-cli.exe"
 $BundledIcon = Join-Path $PackageRoot "icon.ico"
 $BundledFragment = Join-Path $PackageRoot "terminal-fragment.json"
+$BundledSettings = Join-Path $PackageRoot "terminal-settings.json"
+$BundledTerminal = Join-Path $PackageRoot "terminal"
+$TerminalDir = Join-Path $InstallRoot "terminal"
 $BinDir = Join-Path $InstallRoot "bin"
 $DistroDir = Join-Path $InstallRoot "WSL"
 $InstalledLauncher = Join-Path $BinDir "laintas-cli.exe"
@@ -165,6 +168,45 @@ if (Test-Path -LiteralPath $BundledFragment -PathType Leaf) {
     }
 }
 
+# The bundled Windows Terminal, for machines that have none. conhost reports
+# mouse input only as INPUT_RECORDs and never as VT sequences, so a WSL
+# process running there cannot receive a click at all — on Windows 10 that
+# leaves no terminal on the machine capable of running this CLI. Installed
+# unconditionally so it is there if the user's own Terminal is later removed;
+# the launcher prefers theirs whenever one exists.
+$bundledTerminalInstalled = $false
+if (Test-Path -LiteralPath $BundledTerminal -PathType Container) {
+    try {
+        if (Test-Path -LiteralPath $TerminalDir) {
+            Remove-Item -LiteralPath $TerminalDir -Recurse -Force
+        }
+        New-Item -ItemType Directory -Path $TerminalDir -Force | Out-Null
+        Copy-Item -LiteralPath (Join-Path $BundledTerminal "*") `
+                  -Destination $TerminalDir -Recurse -Force
+        # Portable mode keeps this copy's settings beside its executable, so
+        # it never reads or writes the user's own Windows Terminal profile.
+        $portableMarker = Join-Path $TerminalDir ".portable"
+        if (-not (Test-Path -LiteralPath $portableMarker)) {
+            New-Item -ItemType File -Path $portableMarker -Force | Out-Null
+        }
+        if (Test-Path -LiteralPath $BundledSettings -PathType Leaf) {
+            $SettingsDir = Join-Path $TerminalDir "settings"
+            New-Item -ItemType Directory -Path $SettingsDir -Force | Out-Null
+            $settings = Get-Content -LiteralPath $BundledSettings -Raw -Encoding UTF8
+            $settings = $settings.Replace("__LAUNCHER__", $InstalledLauncher.Replace("\", "\\"))
+            $settings = $settings.Replace("__ICON__", $InstalledIcon.Replace("\", "\\"))
+            [IO.File]::WriteAllText((Join-Path $SettingsDir "settings.json"),
+                                    $settings,
+                                    (New-Object Text.UTF8Encoding $false))
+        }
+        $bundledTerminalInstalled = $true
+    } catch {
+        Write-Host "Could not install the bundled terminal: $($_.Exception.Message)"
+    }
+}
+
+$wt = Get-Command wt.exe -ErrorAction SilentlyContinue
+
 $Programs = [Environment]::GetFolderPath("Programs")
 if ($Programs) {
     $ShortcutPath = Join-Path $Programs "Laintas CLI.lnk"
@@ -174,10 +216,16 @@ if ($Programs) {
     # profile's font, colours and mouse handling apply from the first launch.
     # Starting the launcher directly gets whatever terminal Windows defaults
     # to, which on Windows 10 is the legacy console.
-    $wt = Get-Command wt.exe -ErrorAction SilentlyContinue
+    $bundledExe = Join-Path $TerminalDir "WindowsTerminal.exe"
     if ($terminalProfile -and $wt) {
         $Shortcut.TargetPath = $wt.Source
         $Shortcut.Arguments = '-p "Laintas CLI"'
+    } elseif ($bundledTerminalInstalled -and (Test-Path -LiteralPath $bundledExe -PathType Leaf)) {
+        # Its portable settings name our profile as the default, so it needs
+        # no arguments. Pointing the shortcut straight at it keeps the very
+        # first launch out of conhost rather than relying on the launcher to
+        # escalate out of a console the user has already seen.
+        $Shortcut.TargetPath = $bundledExe
     } else {
         $Shortcut.TargetPath = $InstalledLauncher
     }
@@ -194,8 +242,11 @@ Write-Host "Laintas CLI was installed successfully." -ForegroundColor Green
 Write-Host "Launcher: $InstalledLauncher"
 if ($terminalProfile) {
     Write-Host "Windows Terminal profile: Laintas CLI"
-} else {
-    Write-Host "Install Windows Terminal for the full interface (colours, mouse, box drawing)."
+}
+if ($bundledTerminalInstalled) {
+    Write-Host "Bundled terminal: $TerminalDir (used only if you have no Windows Terminal)"
+} elseif (-not $wt) {
+    Write-Host "No terminal capable of mouse input was found. Install Windows Terminal for the full interface."
 }
 if ($pathChanged) {
     Write-Host "Open a new terminal, then run: laintas-cli"

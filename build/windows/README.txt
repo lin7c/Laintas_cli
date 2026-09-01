@@ -17,6 +17,20 @@ The launcher uses the private WSL distribution named "Laintas-CLI". It does
 not change the user's default WSL distribution and does not use wsl.exe during
 normal CLI startup.
 
+Terminal
+--------
+The CLI opens in Windows Terminal. If one is already installed it is used,
+through a profile named "Laintas CLI"; if not, the copy bundled in the
+installation directory is used instead, in portable mode, so it never reads
+or writes your own Windows Terminal settings.
+
+The bundled copy exists because the legacy console (conhost, what cmd.exe
+opens) reports mouse input only as Windows console events and never as the
+escape sequences a Linux program can read. A WSL application running there
+cannot receive a mouse click at all, whatever it does, and Windows 10 ships
+no other terminal. Set LAINTAS_NO_WT=1 to stay in whatever console started
+the launcher.
+
 Uninstall from Windows Settings > Apps. The private Linux filesystem and
 ~/.laintas data are preserved so a reinstall or upgrade can reuse them.
 

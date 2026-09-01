@@ -201,6 +201,85 @@ def test_windows_terminal_profile_is_installable_and_consistent():
     assert "Fragments\\Laintas.LaintasCLI" in uninstall
 
 
+def test_a_terminal_is_bundled_because_conhost_cannot_deliver_a_click():
+    """Windows 10 ships no terminal this CLI can be used in.
+
+    conhost reports mouse input only as MOUSE_EVENT INPUT_RECORDs and never
+    as VT sequences, which Microsoft states is deliberate
+    (microsoft/terminal#15296). A WSL process reads bytes from a pty and can
+    only ever see VT sequences, so no console mode, flag or font makes a
+    click reach the CLI there. The bundled Terminal is the fix; these are the
+    parts of it that fail silently if they drift.
+    """
+    import json
+
+    build = (ROOT / "build/windows/build_windows_package.sh").read_text(
+        encoding="utf-8")
+    # Pinned by version *and* hash: an unpinned download makes the installer's
+    # contents depend on the day CI ran, and the hash is what makes running
+    # someone else's binary defensible at all.
+    assert "WT_VERSION=" in build and "WT_SHA256=" in build
+    assert "sha256sum -c" in build
+    assert "package/terminal" in build
+    # Portable mode, or the bundled copy edits the user's own Terminal config.
+    assert "package/terminal/.portable" in build
+
+    script = (ROOT / "build/windows/installer.nsi").read_text(encoding="utf-8")
+    assert 'File "${PAYLOAD_DIR}\\terminal-settings.json"' in script
+    # A dotfile is not matched by *.* and has to be named explicitly, and
+    # without it portable mode is silently off.
+    assert 'File "${PAYLOAD_DIR}\\terminal\\.portable"' in script
+    assert 'File /r "${PAYLOAD_DIR}\\terminal\\*.*"' in script
+    assert 'RMDir /r "$INSTDIR\\terminal"' in script
+
+    launcher = (ROOT / "build/windows/launcher.cpp").read_text(encoding="utf-8")
+    # The user's own Terminal wins; the bundled copy is the fallback. Compared
+    # inside the selection function, since the bundled path is also named at
+    # the top of the file where the constants live.
+    start = launcher.index("bool RelaunchInBetterTerminal()")
+    chooser = launcher[start:launcher.index("\n}", start)]
+    assert "wt.exe" in chooser and "BundledTerminalPath" in chooser
+    assert chooser.index("wt.exe") < chooser.index("BundledTerminalPath")
+    # Unpackaged Terminal does not carry the VC++ runtime, and starting it
+    # without one fails with no window and no message.
+    assert "vcruntime140_1.dll" in launcher
+
+    raw = (ROOT / "build/windows/terminal-settings.json").read_text(
+        encoding="utf-8")
+    settings = json.loads(raw)
+    profile = settings["profiles"]["list"][0]
+    # It launches with no arguments, so our profile has to be the default.
+    assert settings["defaultProfile"] == profile["guid"]
+    assert profile["name"] == "Laintas CLI"
+    assert profile["colorScheme"] == settings["schemes"][0]["name"]
+    # Same quoting rule as the fragment: commandline is a command line.
+    assert profile["commandline"] == '"__LAUNCHER__"'
+    assert profile["icon"] == "__ICON__"
+
+    install = (ROOT / "build/windows/install.ps1").read_text(encoding="utf-8")
+    assert "terminal-settings.json" in install
+    assert '.portable' in install
+    uninstall = (ROOT / "build/windows/uninstall.ps1").read_text(
+        encoding="utf-8")
+    assert 'Join-Path $InstallRoot "terminal"' in uninstall
+
+
+def test_the_bundled_and_installed_profiles_agree():
+    """Two files now define the same profile; `wt -p` matches on the name."""
+    import json
+
+    fragment = json.loads((ROOT / "build/windows/terminal-fragment.json")
+                          .read_text(encoding="utf-8"))
+    settings = json.loads((ROOT / "build/windows/terminal-settings.json")
+                          .read_text(encoding="utf-8"))
+    installed = fragment["profiles"][0]
+    bundled = settings["profiles"]["list"][0]
+    assert installed["name"] == bundled["name"]
+    assert installed["guid"] == bundled["guid"]
+    assert installed["commandline"] == bundled["commandline"]
+    assert fragment["schemes"][0] == settings["schemes"][0]
+
+
 def test_the_installer_ships_what_the_profile_points_at():
     """A profile that names a missing icon is a broken profile."""
     build = (ROOT / "build/windows/build_windows_package.sh").read_text(

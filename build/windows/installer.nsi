@@ -81,6 +81,14 @@ Section "Install"
   File "${PAYLOAD_DIR}\install.ps1"
   File "${PAYLOAD_DIR}\icon.ico"
   File "${PAYLOAD_DIR}\terminal-fragment.json"
+  File "${PAYLOAD_DIR}\terminal-settings.json"
+  ; The bundled Windows Terminal. /r keeps its subdirectories, and the
+  ; portable-mode marker is a dotfile that must survive the copy or the
+  ; installed terminal writes into the user's own Terminal settings.
+  SetOutPath "$PLUGINSDIR\payload\terminal"
+  File /r "${PAYLOAD_DIR}\terminal\*.*"
+  File "${PAYLOAD_DIR}\terminal\.portable"
+  SetOutPath "$PLUGINSDIR\payload"
 
   DetailPrint "Installing the private Laintas CLI runtime..."
   nsExec::ExecToLog 'powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$PLUGINSDIR\payload\install.ps1" -InstallRoot "$INSTDIR"'
@@ -111,6 +119,8 @@ SectionEnd
 
 Section "Uninstall"
   nsExec::ExecToLog 'powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$INSTDIR\uninstall.ps1" -InstallRoot "$INSTDIR"'
+  ; The bundled terminal is ours, not the user's data: it goes with us.
+  RMDir /r "$INSTDIR\terminal"
   RMDir "$INSTDIR\bin"
   Delete "$INSTDIR\uninstall.ps1"
   Delete "$INSTDIR\uninstall.exe"

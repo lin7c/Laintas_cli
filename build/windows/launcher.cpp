@@ -40,6 +40,8 @@ namespace {
 constexpr wchar_t kDefaultDistribution[] = L"Laintas-CLI";
 constexpr wchar_t kLinuxExecutable[] = L"/usr/local/bin/laintas-cli";
 constexpr wchar_t kTerminalProfile[] = L"Laintas CLI";
+// Bundled Windows Terminal, relative to the directory holding this launcher.
+constexpr wchar_t kBundledTerminal[] = L"..\\terminal\\WindowsTerminal.exe";
 
 // The console fixes below are all conditional and all reversible. A launcher
 // that refuses to start because it could not set a font would be worse than
@@ -87,20 +89,24 @@ std::wstring PosixQuote(const std::wstring& value) {
 // ── the console we were given ────────────────────────────────────────────
 //
 // A shortcut or the installer's finish page starts this program in whatever
-// terminal Windows picks. On Windows 10 that is conhost, whose defaults are
-// wrong for a full-screen TUI in three separate ways, none of which the Linux
-// side can do anything about:
+// terminal Windows picks. On Windows 10 that is conhost, and these settings
+// are the most that can be salvaged there: virtual-terminal processing so
+// escape sequences are not printed as literal text, UTF-8 code pages so
+// non-ASCII output is not mojibake, and a TrueType font so a drawn frame is
+// not a row of hollow boxes.
 //
-//   * QuickEdit mode swallows every mouse event to drive its own rectangle
-//     selection, so mouse reporting never reaches the application. This is
-//     the whole reason clicking does nothing.
-//   * Virtual-terminal processing is off, so colours, cursor movement and
-//     anything else expressed as an escape sequence arrive as literal text.
-//   * The default font is a raster font that has no box-drawing or CJK
-//     glyphs, which is what turns a drawn frame into a row of hollow boxes.
+// What they cannot salvage is the mouse. conhost delivers mouse input only
+// as MOUSE_EVENT INPUT_RECORDs and never as VT sequences, even with
+// ENABLE_VIRTUAL_TERMINAL_INPUT set — Microsoft states this is deliberate
+// (microsoft/terminal#15296). A Linux process reading bytes from a pty can
+// only ever see VT sequences, so a WSL application in conhost cannot receive
+// a click no matter what this function sets. QuickEdit is still cleared,
+// because leaving it on adds accidental output-freezing selection on top of
+// a mouse that does not work; but clearing it buys nothing else.
 //
-// Windows Terminal gets all three right on its own; setting them there is
-// harmless, so this is not conditional on which terminal we are in.
+// That limit is why the terminal chain below exists: the fix for the mouse
+// is to not be in conhost, and Windows 10 does not ship a terminal that can
+// deliver one.
 
 struct ConsoleState {
     HANDLE input = INVALID_HANDLE_VALUE;
@@ -222,44 +228,109 @@ bool TerminalProfileInstalled() {
         && !(attributes & FILE_ATTRIBUTE_DIRECTORY);
 }
 
-// Reopen ourselves in Windows Terminal, under the profile the installer
-// registered, and let this process end. Only the bare interactive launch is
-// escalated: with arguments the caller is already sitting in a terminal they
-// chose, and wt.exe's own command line treats `;` as a command separator, so
-// forwarding arbitrary arguments through it would corrupt them.
-bool RelaunchInWindowsTerminal() {
-    if (!ReadEnvironment(L"WT_SESSION").empty()) {
-        return false;                       // already there
+std::wstring LauncherDirectory() {
+    wchar_t path[MAX_PATH];
+    const DWORD written = GetModuleFileNameW(nullptr, path, MAX_PATH);
+    if (written == 0 || written >= MAX_PATH) {
+        return std::wstring();
     }
-    if (!ReadEnvironment(L"LAINTAS_NO_WT").empty()) {
-        return false;                       // deliberate opt-out
-    }
-    if (!TerminalProfileInstalled()) {
-        return false;                       // nothing to select; stay put
-    }
-    wchar_t found[MAX_PATH];
-    if (SearchPathW(nullptr, L"wt.exe", nullptr, MAX_PATH, found, nullptr) == 0) {
-        return false;                       // Windows Terminal is not present
-    }
+    std::wstring full(path, written);
+    const size_t slash = full.find_last_of(L'\\');
+    return slash == std::wstring::npos ? std::wstring() : full.substr(0, slash);
+}
 
-    std::wstring command = L"wt.exe -p \"";
-    command += kTerminalProfile;
-    command += L"\"";
+bool FileExists(const std::wstring& path) {
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    return attributes != INVALID_FILE_ATTRIBUTES
+        && !(attributes & FILE_ATTRIBUTE_DIRECTORY);
+}
 
+// The bundled Terminal is unpackaged, so unlike the Store build it does not
+// carry the Visual C++ runtime with it. Asking the loader is the direct test;
+// inferring it from a registry key guesses at the same question.
+bool VisualCppRuntimePresent() {
+    const HMODULE loaded = LoadLibraryExW(L"vcruntime140_1.dll", nullptr,
+                                          LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (loaded == nullptr) {
+        return false;
+    }
+    FreeLibrary(loaded);
+    return true;
+}
+
+std::wstring BundledTerminalPath() {
+    const std::wstring directory = LauncherDirectory();
+    if (directory.empty()) {
+        return std::wstring();
+    }
+    std::wstring path = directory + L"\\" + kBundledTerminal;
+    if (!FileExists(path) || !VisualCppRuntimePresent()) {
+        return std::wstring();
+    }
+    return path;
+}
+
+bool StartDetached(std::wstring command) {
     STARTUPINFOW startup;
     ZeroMemory(&startup, sizeof(startup));
     startup.cb = sizeof(startup);
     PROCESS_INFORMATION process;
     ZeroMemory(&process, sizeof(process));
     // CreateProcessW may write into the command line it is handed, which is
-    // why this is a buffer we own rather than a literal.
+    // why this takes the string by value rather than by const reference.
     if (!CreateProcessW(nullptr, command.data(), nullptr, nullptr,
                         FALSE, 0, nullptr, nullptr, &startup, &process)) {
-        return false;                       // fall through and run in place
+        return false;
     }
     CloseHandle(process.hThread);
     CloseHandle(process.hProcess);
     return true;
+}
+
+// Reopen ourselves in a terminal that can actually run the CLI, and let this
+// process end. Only the bare interactive launch is escalated: with arguments
+// the caller is already sitting in a terminal they chose, and wt.exe's own
+// command line treats `;` as a command separator, so forwarding arbitrary
+// arguments through it would corrupt them.
+//
+// Order of preference:
+//   1. The user's own Windows Terminal, through the profile the installer
+//      registered as a fragment. Their settings, their updates, their tabs.
+//   2. The copy bundled with this product, in portable mode. This is the
+//      Windows 10 case: no Terminal is installed, conhost cannot deliver a
+//      mouse click to a WSL process at all, and there is nothing to install
+//      from a machine that may have no Store access.
+//   3. Neither — run in place and let PrepareConsole salvage what it can.
+bool RelaunchInBetterTerminal() {
+    if (!ReadEnvironment(L"WT_SESSION").empty()) {
+        return false;                       // already in a terminal
+    }
+    if (!ReadEnvironment(L"LAINTAS_NO_WT").empty()) {
+        return false;                       // deliberate opt-out
+    }
+
+    wchar_t found[MAX_PATH];
+    if (TerminalProfileInstalled()
+            && SearchPathW(nullptr, L"wt.exe", nullptr, MAX_PATH, found,
+                           nullptr) != 0) {
+        std::wstring command = L"wt.exe -p \"";
+        command += kTerminalProfile;
+        command += L"\"";
+        if (StartDetached(command)) {
+            return true;
+        }
+    }
+
+    const std::wstring bundled = BundledTerminalPath();
+    if (!bundled.empty()) {
+        // Portable mode: its settings sit next to the executable and name our
+        // profile as the default, so it needs no arguments and cannot read or
+        // write the user's own Terminal configuration.
+        if (StartDetached(L"\"" + bundled + L"\"")) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void PrintLaunchError(HRESULT result, const std::wstring& distribution) {
@@ -284,7 +355,7 @@ int wmain(int argc, wchar_t** argv) {
         return 2;
     }
 
-    if (argc == 1 && RelaunchInWindowsTerminal()) {
+    if (argc == 1 && RelaunchInBetterTerminal()) {
         return 0;
     }
 

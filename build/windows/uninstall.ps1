@@ -37,6 +37,15 @@ if (Test-Path -LiteralPath $FragmentDir) {
     Remove-Item -LiteralPath $FragmentDir -Recurse -Force -ErrorAction SilentlyContinue
 }
 
+# The bundled terminal is this product's own copy, not user data, so it is
+# removed with the rest. Its settings live inside it (portable mode), which
+# is why nothing outside this directory has to be touched. NSIS removes the
+# directory too; doing it here as well keeps a manual uninstall complete.
+$TerminalDir = Join-Path $InstallRoot "terminal"
+if (Test-Path -LiteralPath $TerminalDir) {
+    Remove-Item -LiteralPath $TerminalDir -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 $current = [Environment]::GetEnvironmentVariable("Path", "User")
 $updated = @($current -split ";" | Where-Object { $_ -and $_ -ne $BinDir }) -join ";"
 [Environment]::SetEnvironmentVariable("Path", $updated, "User")

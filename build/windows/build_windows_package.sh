@@ -27,12 +27,24 @@ if [ -n "$PREBUILT_LAUNCHER" ] && [ ! -f "$PREBUILT_LAUNCHER" ]; then
   echo "Prebuilt Windows launcher not found: $PREBUILT_LAUNCHER" >&2
   exit 2
 fi
-for command in docker gzip; do
+for command in docker gzip curl unzip sha256sum; do
   command -v "$command" >/dev/null 2>&1 || {
     echo "$command is required to build the Windows package" >&2
     exit 2
   }
 done
+
+# Windows Terminal, bundled for machines that have none of their own. conhost
+# delivers mouse input only as INPUT_RECORDs and never as VT sequences, which
+# a WSL process cannot receive at all, so on Windows 10 there is no terminal
+# on the machine that can run this CLI properly. Pinned by version and hash:
+# an unpinned download makes the installer's contents depend on the day it
+# was built, and the hash is what makes the download safe to trust.
+WT_VERSION="${LAINTAS_WT_VERSION:-1.24.11911.0}"
+WT_SHA256="${LAINTAS_WT_SHA256:-7691efeb71c8dd0b95536c84e366fa4cf809a42c534912f9cefa1056534383bd}"
+WT_ZIP_NAME="Microsoft.WindowsTerminal_${WT_VERSION}_x64.zip"
+WT_URL="https://github.com/microsoft/terminal/releases/download/v${WT_VERSION}/${WT_ZIP_NAME}"
+WT_CACHE="${LAINTAS_WT_CACHE:-$PROJECT_DIR/build/windows/.cache}"
 
 WORK_DIR="$(mktemp -d -t laintas-windows-build.XXXXXX)"
 CONTAINER_ID=""
@@ -85,7 +97,35 @@ cp "$PROJECT_DIR/build/windows/uninstall.ps1" "$WORK_DIR/package/uninstall.ps1"
 # the profile itself.
 cp "$PROJECT_DIR/build/windows/icon.ico" "$WORK_DIR/package/icon.ico"
 cp "$PROJECT_DIR/build/windows/terminal-fragment.json" "$WORK_DIR/package/terminal-fragment.json"
+cp "$PROJECT_DIR/build/windows/terminal-settings.json" "$WORK_DIR/package/terminal-settings.json"
 cp "$LINUX_BINARY" "$WORK_DIR/package/laintas-cli-linux"
+
+echo "==> Fetching Windows Terminal $WT_VERSION"
+mkdir -p "$WT_CACHE"
+WT_ZIP="$WT_CACHE/$WT_ZIP_NAME"
+if [ ! -f "$WT_ZIP" ] || ! echo "$WT_SHA256  $WT_ZIP" | sha256sum -c - >/dev/null 2>&1; then
+  curl -fsSL "$WT_URL" -o "$WT_ZIP.part"
+  mv "$WT_ZIP.part" "$WT_ZIP"
+fi
+echo "$WT_SHA256  $WT_ZIP" | sha256sum -c - >/dev/null || {
+  echo "Windows Terminal download does not match the pinned hash" >&2
+  exit 2
+}
+# Flatten the archive's single versioned top directory so the installer does
+# not have to know the version, and drop the shell extension: registering a
+# context-menu handler is not something a bundled copy should be doing.
+unzip -q "$WT_ZIP" -d "$WORK_DIR/wt"
+WT_ROOT="$(find "$WORK_DIR/wt" -maxdepth 1 -mindepth 1 -type d | head -n 1)"
+[ -x "$WT_ROOT/WindowsTerminal.exe" ] || [ -f "$WT_ROOT/WindowsTerminal.exe" ] || {
+  echo "Windows Terminal archive did not contain WindowsTerminal.exe" >&2
+  exit 2
+}
+rm -f "$WT_ROOT/WindowsTerminalShellExt.dll"
+mkdir -p "$WORK_DIR/package/terminal"
+cp -a "$WT_ROOT/." "$WORK_DIR/package/terminal/"
+# The portable-mode marker: settings live beside the executable, so this copy
+# never reads or writes the user's own Windows Terminal configuration.
+: > "$WORK_DIR/package/terminal/.portable"
 
 rm -rf "$OUT_DIR"
 mkdir -p "$OUT_DIR"

@@ -1,0 +1,74 @@
+{
+  "$comment": [
+    "Settings for the Windows Terminal copy bundled with Laintas CLI, used",
+    "only on machines that have no Windows Terminal of their own. It runs in",
+    "portable mode, so this file lives beside WindowsTerminal.exe and the",
+    "user's own Terminal settings are never read or written.",
+    "__LAUNCHER__ and __ICON__ are replaced with real paths at install time.",
+    "commandline is a command line, not a path, so the escaped quotes around",
+    "__LAUNCHER__ are what survive an installation path containing a space."
+  ],
+  "$schema": "https://aka.ms/terminal-profiles-schema",
+  "defaultProfile": "{b9f3a1d2-6c47-5e88-9a01-4d2f7c6e8b13}",
+  "initialCols": 120,
+  "initialRows": 34,
+  "copyOnSelect": false,
+  "copyFormatting": "none",
+  "showTabsInTitlebar": true,
+  "alwaysShowTabs": false,
+  "confirmCloseAllTabs": false,
+  "profiles": {
+    "defaults": {
+      "font": { "face": "Cascadia Mono", "size": 11 },
+      "antialiasingMode": "grayscale",
+      "cursorShape": "bar",
+      "padding": "12, 10, 12, 10",
+      "scrollbarState": "hidden",
+      "useAcrylic": false,
+      "snapOnInput": true,
+      "historySize": 20000
+    },
+    "list": [
+      {
+        "guid": "{b9f3a1d2-6c47-5e88-9a01-4d2f7c6e8b13}",
+        "name": "Laintas CLI",
+        "commandline": "\"__LAUNCHER__\"",
+        "icon": "__ICON__",
+        "startingDirectory": "%USERPROFILE%",
+        "colorScheme": "Laintas",
+        "closeOnExit": "graceful",
+        "hidden": false
+      }
+    ]
+  },
+  "schemes": [
+    {
+      "name": "Laintas",
+      "background": "#0D0F0E",
+      "foreground": "#D8DBD3",
+      "cursorColor": "#18A266",
+      "selectionBackground": "#2A3A32",
+      "black": "#0D0F0E",
+      "red": "#D83B32",
+      "green": "#18A266",
+      "yellow": "#C7A14A",
+      "blue": "#4C8FD1",
+      "purple": "#9A6FD1",
+      "cyan": "#3FA8A0",
+      "white": "#D8DBD3",
+      "brightBlack": "#5A625C",
+      "brightRed": "#E85F56",
+      "brightGreen": "#3FC98A",
+      "brightYellow": "#E0BE6B",
+      "brightBlue": "#6FAEE6",
+      "brightPurple": "#B892E6",
+      "brightCyan": "#5FC8C0",
+      "brightWhite": "#F2F4EE"
+    }
+  ],
+  "actions": [
+    { "command": { "action": "copy", "singleLine": false }, "keys": "ctrl+shift+c" },
+    { "command": "paste", "keys": "ctrl+shift+v" },
+    { "command": "find", "keys": "ctrl+shift+f" }
+  ]
+}

@@ -28,3 +28,7 @@ concepts-zh.html
 # tarballs of one version reached 107 MB in the tree, and every sub-agent
 # worktree is a full checkout — 31 of them multiplied that into 3.3 GB.
 laintas_cli_download/public/releases/
+
+# The pinned Windows Terminal download, cached between builds. Fetched by
+# build_windows_package.sh and verified against a hash; never committed.
+build/windows/.cache/
