@@ -1391,6 +1391,10 @@ def pty_passthrough(command: str, timeout: int = 120) -> dict:
 
     Returns {stdout, stderr, returncode, success}.
     """
+    # The child is about to inherit this terminal; nothing of ours may still
+    # be painting on it.
+    import agent_loop as _al_status
+    _al_status.pause_activity_status()
     old_sigint = signal.getsignal(signal.SIGINT)
     old_sigquit = signal.getsignal(signal.SIGQUIT)
     returncode = -1
@@ -23283,6 +23287,10 @@ def _blocking_approval_prompt(title: str, body: str, question: str,
 
     Fails closed (returns "no") when stdin isn't a real TTY.
     """
+    # The tool that is asking may have an activity row painting under it.
+    # Take the terminal back before anything draws a prompt over it.
+    import agent_loop as _al_status
+    _al_status.pause_activity_status()
     # While the /agents view owns the terminal, a full-screen arrow prompt
     # would fight its prompt_toolkit app for stdin. Route the decision to
     # the view's y/n approval UI instead ("always" is not offered there).
@@ -23564,6 +23572,18 @@ def _show_plan_approval_menu() -> bool:
     return False
 
 
+_REPL_PROCESS_DEPTH = 0
+
+
+def _repl_process_depth() -> int:
+    """0 for the CLI the user launched; 1+ for a nested CLI in a sub-terminal.
+
+    A nested CLI's PTY is read back by its parent as tool output, so it keeps
+    the quiet console it has always had.
+    """
+    return _REPL_PROCESS_DEPTH
+
+
 def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
                                    chat_history, events_cb=None,
                                    existing_session=None,
@@ -23728,6 +23748,10 @@ def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
                 existing_session=existing_session,
                 depth=(active_agent.depth if loop_agent_id else 0),
                 agent_id=loop_agent_id,
+                # This process's REPL owns the tty, whoever it is focused on.
+                # A hired agent is registered at depth 1; without this it would
+                # be rendered as if it were someone else's background worker.
+                foreground=(_repl_process_depth() == 0),
                 interrupt_event=_interrupt_event,
                 message_queue=_msg_queue,
                 continue_thread=continue_thread,
@@ -24013,6 +24037,11 @@ def main():
     parser.add_argument("--connect", action="store_true", default=False,
                         help="Hand this sub-terminal over to Helpwo at startup (internal; used by term-new)")
     args = parser.parse_args()
+
+    # Which process this is decides who may draw on the tty (see
+    # _repl_process_depth).
+    global _REPL_PROCESS_DEPTH
+    _REPL_PROCESS_DEPTH = int(args.depth or 0)
 
     # The standing advisories (routing tips, the training opt-in, the mouse
     # hint) are re-posted from scratch on every start, so without a durable

@@ -386,6 +386,162 @@ def _shimmer_label(label: str, elapsed: float):
     return txt
 
 
+# ── Activity status (the row shown while a tool call runs) ─────────────
+# The streaming call has always had a status row ("Thinking…"/"Writing…").
+# Tool execution had none: pressing Enter on "run the tests" left the terminal
+# blank for the whole run, which is indistinguishable from a wedged CLI. This
+# is the same row with a different verb, so the region never goes empty
+# between the model answering and its tool finishing.
+
+#: Verb per tool prefix. Anything unlisted gets the generic "Working".
+_ACTIVITY_VERBS = (
+    ("shell.", "Running"),
+    ("terminal.", "Running"),
+    ("test.", "Testing"),
+    ("fs.read", "Reading"),
+    ("fs.grep", "Searching"),
+    ("fs.glob", "Searching"),
+    ("fs.list", "Reading"),
+    ("fs.", "Editing"),
+    ("web.", "Searching"),
+    ("browser.", "Browsing"),
+    ("image.", "Looking"),
+    ("agent.", "Delegating"),
+    ("task.", "Planning"),
+    ("git.", "Working"),
+)
+
+#: The status object currently painting, so the components that take the
+#: terminal away from us mid-tool (approval prompts, PTY passthrough) can
+#: stop it first instead of drawing over it.
+_active_activity_status = None
+_activity_status_lock = threading.Lock()
+
+
+def activity_verb(tool_name: str) -> str:
+    """Present-participle verb for the status row of `tool_name`."""
+    name = str(tool_name or "")
+    for prefix, verb in _ACTIVITY_VERBS:
+        if name.startswith(prefix):
+            return verb
+    return "Working"
+
+
+class _ActivityStatus:
+    """A Live status row for one tool call. Paints nothing until `delay`.
+
+    The delay is what keeps a turn of ten fast reads from strobing: a call
+    that finishes inside it never paints at all.
+    """
+
+    def __init__(self, console, label: str, detail: str, delay: float = 0.35):
+        self.console = console
+        self.label = label
+        self.detail = detail
+        self.delay = delay
+        self._t0 = time.monotonic()
+        self._live = None
+        self._paused = 0
+
+    def _renderable(self):
+        from rich.console import Group
+        from rich.text import Text
+        from rich.spinner import Spinner
+        spinner = Spinner("dots", style="#3fb950")
+        spinner.frames = list(symbols.SPINNER_RELAY)
+        spinner.interval = symbols.SPINNER_INTERVAL_MS
+        status = self
+
+        class _Wrapper:
+            def __rich__(self):
+                elapsed = time.monotonic() - status._t0
+                if elapsed < status.delay or status._paused:
+                    return Text("")
+                width = max(20, (status.console.width or 80) - 1)
+                text = _shimmer_label(status.label, elapsed)
+                text.append(f" {elapsed:.1f}s", style="#8b949e")
+                if width >= 72:
+                    text.append(
+                        f" {symbols.BULLET} {_live_status_model() or '—'}"
+                        f" {symbols.BULLET} {_active_mode_label()}",
+                        style="#8b949e")
+                spinner.text = text
+                parts = [spinner]
+                if (status.detail
+                        and str(get_runtime_config("stream_preview")
+                                or "one") != "off"):
+                    parts.append(Text(_crop_cells(status.detail, width - 2),
+                                      style="muted"))
+                return Group(*parts)
+
+        return _Wrapper()
+
+    def start(self) -> None:
+        from rich.live import Live
+        try:
+            live = Live(self._renderable(), console=self.console,
+                        refresh_per_second=10.0, auto_refresh=True,
+                        transient=True, redirect_stdout=False,
+                        redirect_stderr=False)
+            live.__enter__()
+        except Exception:
+            # Another Live owns this console (LiveError), or Rich refused to
+            # start. A status row is never worth failing a tool call over.
+            self._live = None
+            return
+        self._live = live
+
+    def stop(self) -> None:
+        live, self._live = self._live, None
+        if live is not None:
+            try:
+                live.__exit__(None, None, None)
+            except Exception:
+                pass
+
+    def pause(self) -> None:
+        """Blank the row and release the cursor for someone else's UI."""
+        self._paused += 1
+        self.stop()
+
+
+@contextmanager
+def activity_status(console, tool_name: str, detail: str = "",
+                    *, enabled: bool = True, delay: float = 0.35):
+    """Paint "Running… 8.4s" while a tool call runs. No-op when not enabled."""
+    if not enabled or console is None:
+        yield None
+        return
+    global _active_activity_status
+    status = _ActivityStatus(
+        console, f"{activity_verb(tool_name)}\u2026", detail, delay=delay)
+    with _activity_status_lock:
+        previous = _active_activity_status
+        _active_activity_status = status
+    status.start()
+    try:
+        yield status
+    finally:
+        status.stop()
+        with _activity_status_lock:
+            _active_activity_status = previous
+
+
+def pause_activity_status() -> None:
+    """Take the terminal back from the activity row (approval, PTY handover).
+
+    It does not resume: whoever draws next owns what is on the screen now, and
+    a status row reappearing underneath a prompt would be worse than no row.
+    """
+    with _activity_status_lock:
+        status = _active_activity_status
+    if status is not None:
+        try:
+            status.pause()
+        except Exception:
+            pass
+
+
 def _cell_len(value: str) -> int:
     """Return terminal display-cell width (CJK/emoji aware)."""
     try:
@@ -8550,6 +8706,7 @@ def run_agent_loop(
     message_queue: queue.Queue = None,         # supplementary user messages
     continue_thread: bool = False,             # resume the same top-level turn (/continue)
     max_loops_override: int = None,             # per-run cap; avoids global config races
+    foreground: bool = False,   # this run is the tty-owning REPL turn (any role/depth)
 ) -> dict:
     """Run the autonomous agent loop (mirrors AutonomousKernel.ts).
 
@@ -8736,9 +8893,24 @@ def run_agent_loop(
     # Console: concurrent Live regions on one Console raise LiveError and
     # ordinary prints from worker threads corrupt the parent's display.
     # Execute/non-interactive mode is quiet for the same reason as before.
+    # "Background" is about who owns the tty for this run, not about role or
+    # tree level. The agent the REPL is focused on after `/agent <name>` is a
+    # pool agent (often depth 1, if it was hired) that the user is sitting in
+    # front of; classifying it as background sent its whole turn into the
+    # quiet console — the loop ran, the reply landed in history, and the
+    # terminal showed nothing at all. `foreground` is set only by the REPL of
+    # a depth-0 process, and only for the agent it is focused on; worker
+    # threads and nested CLI processes (whose PTY a parent reads back as tool
+    # output) stay quiet as before.
+    _foreground_agent = get_current_agent()
     _is_background_agent = bool(
-        depth > 0
-        or (_runtime_info is not None and _runtime_info.role != "primary")
+        threading.current_thread() is not threading.main_thread()
+        # A spawned child is never the tty owner, whatever its tree level.
+        or (_runtime_info is not None and _runtime_info.role == "subagent")
+        or (not foreground and depth > 0)
+        or (_runtime_info is not None
+            and _foreground_agent is not None
+            and _runtime_info.id != _foreground_agent.id)
     )
     _owns_local_render = bool(
         events_cb is not None
@@ -11368,7 +11540,14 @@ def run_agent_loop(
                                 "command": salient,
                                 "content": display_name,
                             }])
-                        with (_command_lock if _command_lock is not None else nullcontext()):
+                        # Between the model answering and this call
+                        # returning, the terminal used to show nothing at all —
+                        # a `sleep 12` or a test run looked exactly like a
+                        # hung CLI. Same status row as streaming, execution
+                        # verb (see activity_status).
+                        with (_command_lock if _command_lock is not None else nullcontext()), \
+                                activity_status(deps.console, name, salient,
+                                                enabled=_owns_local_render):
                             _cap_err = _write_cap_violation(state, name, arguments)
                             if _cap_err is not None:
                                 result = _cap_err

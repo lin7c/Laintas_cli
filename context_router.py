@@ -53,9 +53,17 @@ _GROUPS: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
     (("agent", "delegate", "parallel", "worker", "subagent", "team", "hire"),
      ("agent.", "agent_", "spawn", "await_spawns", "hwo", "hwg")),
     (("terminal", "repl", "process", "service", "server", "daemon", "logs", "port", "deploy"),
-     ("terminal.", "session.", "sleep", "file_push")),
-    (("plan", "roadmap", "milestone"),
-     ("plan.", "workflow.")),
+     ("terminal.", "session.", "sleep")),
+    # Storage used to route on nothing at all: the one tool that reached the
+    # cloud folder (file_push) hung off the "deploy" group, so a user asking
+    # to put a report in their cloud folder got no storage schema whatsoever.
+    (("storage", "upload", "download", "cloud", "cloud folder", "shared folder",
+      "share this file", "send me the file", "helpwo workspace", "quota",
+      "disk space", "allowance"),
+     ("storage.", "file_push")),
+    (("plan", "roadmap", "milestone", "objective", "resume", "where were we",
+      "progress"),
+     ("plan.", "workflow.", "work.status")),
     (("task", "todo", "issue"), ("task.",)),
     (("rule", "always", "from now on", "remember to"),
      ("rule.",)),
@@ -69,6 +77,12 @@ _GROUPS: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
     (("prompt", "system prompt"), ("prompt.",)),
     (("evolve", "experiment"), ("evolve.",)),
     (("ppos",), ("ppos.",)),
+    (("cost", "spend", "budget", "balance", "quota", "usage", "tokens",
+      "how much", "expensive", "bill", "subscription"),
+     ("account.",)),
+    (("failed", "failure", "error", "crashed", "why did", "diagnose",
+      "went wrong"),
+     ("diag.",)),
 )
 
 
@@ -101,6 +115,14 @@ _INPUT_ALIASES = {
     "\u5951\u7ea6": "contract", "\u63a5\u53e3\u7ea6\u5b9a": "interface agreement",
     "\u63d0\u793a\u8bcd": "prompt", "\u7cfb\u7edf\u63d0\u793a": "system prompt",
     "\u6539\u8fdb\u5b9e\u9a8c": "experiment", "\u6f14\u5316": "evolve",
+    "\u5b58\u50a8": "storage", "\u4e91\u7aef": "cloud", "\u4e91\u76d8": "cloud",
+    "\u4e0a\u4f20": "upload", "\u4e0b\u8f7d": "download", "\u7f51\u76d8": "cloud",
+    "\u5171\u4eab\u6587\u4ef6": "shared folder", "\u5bb9\u91cf": "quota",
+    "\u7a7a\u95f4": "disk space", "\u4f59\u989d": "balance",
+    "\u82b1\u8d39": "cost", "\u8d39\u7528": "cost", "\u9884\u7b97": "budget",
+    "\u7528\u91cf": "usage", "\u5931\u8d25": "failed", "\u62a5\u9519": "error",
+    "\u4e3a\u4ec0\u4e48\u5931\u8d25": "why did", "\u591a\u5c11\u94b1": "cost",
+    "\u82b1\u4e86": "spend", "\u8ba2\u9605": "subscription",
 }
 
 

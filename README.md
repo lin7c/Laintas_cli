@@ -362,7 +362,7 @@ Run `/help` for the authoritative list for your installed version, including ext
 | Execution | `/term`, `/spawn`, `/agents`, `/task` | Terminals, delegated agents, and task tracking |
 | Workflows | `/hwo`, `/hwg` | Live orchestration and durable graph execution |
 | Plugins | `/mcp`, `/extensions`, `/evolve`, `/reload`, `/trust` | External tools and executable customization |
-| Connectivity | `/backend`, `/web`, `/identity`, `/helpwo` | Inference, search/fetch, browser identity, remote runtime |
+| Connectivity | `/backend`, `/web`, `/identity`, `/helpwo`, `/shared` | Inference, search/fetch, browser identity, remote runtime, the cloud folder Helpwo mounts |
 | Administration | `/policy`, `/usage`, `/training`, `/v`, `/org` | Policy, allowance, data preference, updates, Enterprise |
 
 ## Development

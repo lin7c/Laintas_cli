@@ -2215,6 +2215,56 @@ class ThinkingLiveTests(unittest.TestCase):
                             for info in infos))
         self.assertEqual(agent_loop._running_count, 0)
 
+    def test_focused_pool_agent_renders_to_the_terminal(self):
+        """`/agent scout` then a prompt: the user watches this run happen.
+
+        A pool agent (scout, or anyone hired) used to be classified as a
+        background worker purely because its role was not "primary", so its
+        whole turn rendered into a quiet console: the loop ran, the reply
+        landed in history, and the terminal stayed empty.
+        """
+        agent_loop.close_all_agents()
+        agent_loop.register_agent(name="primary", role="primary")
+        focused = agent_loop.register_agent(
+            name="scout", role="pool", depth=1)
+        agent_loop.set_current_agent_id(focused.id)
+        lives = []
+
+        class RecordingLive:
+            def __init__(self, *_args, **_kwargs):
+                lives.append(True)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+            def refresh(self):
+                return None
+
+            def update(self, *_args, **_kwargs):
+                return None
+
+        deps = _deps({
+            "reply": "done", "tool_calls": [], "finish_reason": "stop",
+            "done": True, "error": False,
+        })
+        try:
+            with tempfile.TemporaryDirectory() as tmp, _chdir(tmp), \
+                    mock.patch("rich.live.Live", RecordingLive):
+                Path(".laintas").mkdir()
+                result = agent_loop.run_agent_loop(
+                    deps, "hi", {}, focused.state, focused.chat_history,
+                    events_cb=lambda _events: None, depth=focused.depth,
+                    agent_id=focused.id, foreground=True,
+                    max_loops_override=1)
+        finally:
+            agent_loop.close_all_agents()
+
+        self.assertEqual(result["msg"], "done")
+        self.assertTrue(lives, "focused agent did not own the Live region")
+
     def test_depth_zero_subagent_is_still_background(self):
         agent_loop.close_all_agents()
         subagent = agent_loop.register_agent(
@@ -2243,6 +2293,56 @@ class ThinkingLiveTests(unittest.TestCase):
 
         self.assertEqual(result["msg"], "done")
         self.assertEqual(entered, [])
+
+
+class ActivityStatusTests(unittest.TestCase):
+    """The row that says something is happening while a tool call runs."""
+
+    def _console(self):
+        return Console(file=io.StringIO(), force_terminal=True, width=100)
+
+    @staticmethod
+    def _plain(console):
+        """The shimmer wraps single letters in styles; compare on the text."""
+        return re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", console.file.getvalue())
+
+    def test_a_long_tool_call_paints_a_status_row(self):
+        console = self._console()
+        with agent_loop.activity_status(console, "shell.exec", "sleep 12"):
+            time.sleep(0.6)
+        painted = self._plain(console)
+        self.assertIn("Running", painted)
+        self.assertIn("sleep 12", painted)
+
+    def test_a_fast_tool_call_paints_nothing(self):
+        """Ten quick reads must not strobe the screen."""
+        console = self._console()
+        for _ in range(10):
+            with agent_loop.activity_status(console, "fs.read", "a.py"):
+                pass
+        self.assertNotIn("Reading", self._plain(console))
+
+    def test_pause_releases_the_console_for_another_live(self):
+        """An approval prompt or a batch renderer must be able to take over."""
+        from rich.live import Live
+        from rich.errors import LiveError
+        from rich.text import Text
+
+        console = self._console()
+        with agent_loop.activity_status(console, "agent.spawn_parallel", "x"):
+            time.sleep(0.5)
+            with self.assertRaises(LiveError):
+                Live(Text("other"), console=console).__enter__()
+            agent_loop.pause_activity_status()
+            other = Live(Text("other"), console=console)
+            other.__enter__()
+            other.__exit__(None, None, None)
+
+    def test_verbs_follow_the_tool(self):
+        self.assertEqual(agent_loop.activity_verb("shell.exec"), "Running")
+        self.assertEqual(agent_loop.activity_verb("fs.grep"), "Searching")
+        self.assertEqual(agent_loop.activity_verb("fs.edit"), "Editing")
+        self.assertEqual(agent_loop.activity_verb("mcp.whatever"), "Working")
 
 
 class BackgroundCriticTests(unittest.TestCase):

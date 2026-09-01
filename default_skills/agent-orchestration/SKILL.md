@@ -1,7 +1,7 @@
 ---
 name: agent-orchestration
 description: Guidance for spawning or coordinating sub-agents and terminals.
-version: 1.0.0
+version: 1.1.0
 triggers:
   - delegate
   - sub agent
@@ -37,6 +37,11 @@ or coordination-heavy work local.
 - The parent retains the original requirements, verifies material child claims,
   and owns the final synthesis. With default asynchronous spawns, continue
   useful non-overlapping work instead of repeatedly polling child status.
+- When a child reports failure, its own tool errors are not in your transcript.
+  `diag.tool_failures({ agent_id })` returns what it actually hit — the command,
+  the error, the output tail — so the retry can differ from the attempt. Do not
+  re-dispatch the same task on the strength of a summary that only says it
+  failed.
 - Use terminals for stateful interactive processes; use agents for reasoning and task execution.
 - Keep depth shallow. At depth 2 or more, prefer finishing locally unless delegation is clearly valuable.
 

@@ -140,6 +140,16 @@ def infer_capabilities(name: str) -> frozenset[str]:
             "browser.snapshot", "browser.query", "browser.get_url",
             "browser.get_title", "browser.screenshot"}:
         caps.add("browser.mutate")
+    if name.startswith("storage.") or name == "file_push":
+        # Everything here crosses the network to an object store the user
+        # shares with Helpwo. The two transfer directions also touch this
+        # machine, and are labeled for it: a download writes a local file, an
+        # upload reads one and sends its contents off the box.
+        caps.add("network")
+        if name == "storage.get":
+            caps.add("fs.write")
+        if name in {"storage.put", "file_push"}:
+            caps.add("fs.read")
     if name.startswith(("agent.", "spawn", "await_spawns")):
         caps.add("agent.control")
     return frozenset(caps or {"core.other"})
@@ -2909,6 +2919,25 @@ _VIDEO_POLL_INTERVAL_S = 6
 _VIDEO_POLL_TIMEOUT_S = 8 * 60
 
 
+def _resolve_backend_profile():
+    """Import + resolve the active backend profile, following the same
+    fail-closed fallback as laintas_cli.get_backend_profile() (not imported
+    directly to avoid a circular import with the entry-point module).
+
+    Deleted with the mail tools at 1834191 while `media.generate_image`,
+    `media.generate_video` and the storage tools still called it — those raised
+    NameError on every invocation until it came back.
+    """
+    import backend_profiles
+    backend_url = os.environ.get("LAINTAS_BACKEND", "https://laintas.com")
+    try:
+        profile = backend_profiles.resolve(backend_url)
+    except ValueError:
+        profile = backend_profiles.BackendProfile(
+            "safe-fallback", "official", "https://laintas.com")
+    return backend_profiles, profile
+
+
 def _bi_media_generate_image(params: dict, ctx: ToolCtx) -> dict:
     """Generate an image from a text prompt via the gateway."""
     prompt = (params.get("prompt") or "").strip()
@@ -3743,6 +3772,10 @@ def _bi_spawn_parallel(params: dict, ctx: ToolCtx) -> dict:
             _may_render = (
                 getattr(ctx.deps.console, "render_terminal", True) is not False)
             if _may_render:
+                # The loop paints an activity row while this tool runs; rich
+                # allows one Live per console, so take the terminal back
+                # before claiming it (otherwise this batch renders nothing).
+                _al.pause_activity_status()
                 with _active_parallel_lives_lock:
                     if not _active_parallel_lives:
                         try:
@@ -4709,6 +4742,327 @@ def _bi_agent_rename(params: dict, ctx: ToolCtx) -> dict:
     if current and ctx.rename_agent(current.id, new_name):
         return {"ok": True, "result": f"Renamed to {new_name}"}
     return {"ok": False, "error": "no current agent to rename"}
+
+
+# ── Account usage and recent failures ──────────────────────────────────
+# Both of these existed as REPL commands only (`/usage`, `/why`), which meant
+# the agent could spend the user's balance and read its own crash log through
+# a human, or not at all.
+
+
+def _bi_account_usage(params: dict, ctx: ToolCtx) -> dict:
+    """Token accounting for this machine, plus the account's balance/quota."""
+    try:
+        days = int(params.get("days") or 30)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "'days' must be a number"}
+    days = max(1, min(days, 90))
+    local_only = bool(params.get("local_only", False))
+
+    try:
+        import usage_tracker
+        summary = usage_tracker.summarize(days=days)
+    except Exception as exc:
+        return {"ok": False, "error": f"local usage unavailable: {exc}"}
+
+    result = {
+        "days": days,
+        "local": {
+            "session": summary["session"]["totals"],
+            "today": summary["today"]["totals"],
+            "range": summary["range"]["totals"],
+            "models": summary["range"].get("models", {}),
+        },
+    }
+    if local_only:
+        return {"ok": True, "result": result}
+
+    try:
+        import requests
+        backend_profiles, profile = _resolve_backend_profile()
+    except ImportError as exc:
+        return {"ok": False, "error": f"missing dependency: {exc}"}
+    if not profile.sends_laintas_credentials:
+        result["account"] = {"unavailable": "this backend keeps no account usage"}
+        return {"ok": True, "result": result}
+
+    headers, cookies = backend_profiles.request_auth(profile, ctx.session)
+
+    def _get(path: str, **kwargs):
+        try:
+            resp = requests.get(f"{profile.base_url}{path}", headers=headers,
+                                cookies=cookies, timeout=15, **kwargs)
+        except requests.RequestException as exc:
+            return None, f"{type(exc).__name__}"
+        if resp.status_code != 200:
+            return None, f"HTTP {resp.status_code}"
+        try:
+            return resp.json(), ""
+        except ValueError:
+            return None, "non-JSON reply"
+
+    # The allowance is one pool shared by every Laintas product, so this is
+    # deliberately not filtered to the CLI: a per-product figure would be
+    # smaller than the number the quota is actually drawn from.
+    account, usage_err = _get("/api/usage", params={"range": f"{days}d"})
+    balance, balance_err = _get("/api/balance")
+    subscription, _ = _get("/api/subscription")
+    result["account"] = {
+        "usage": account, "balance": balance, "subscription": subscription,
+    }
+    errors = [e for e in (usage_err, balance_err) if e]
+    if errors:
+        result["account"]["errors"] = errors
+    return {"ok": True, "result": result}
+
+
+def _bi_work_status(params: dict, ctx: ToolCtx) -> dict:
+    """The active WorkGraph: objective, status, plan revision, step progress.
+
+    Read-only on purpose. Which work item is active is the user's choice
+    (`/work resume`), not something a running agent should switch under them.
+    """
+    try:
+        import workgraph
+    except ImportError as exc:
+        return {"ok": False, "error": f"missing dependency: {exc}"}
+    cwd = ctx.task_cwd or ctx.cwd or None
+    session_id = str((ctx.state or {}).get("_session_id") or "") or None
+    try:
+        work = workgraph.get_active_work(cwd=cwd, session_id=session_id)
+        if not work:
+            work = workgraph.get_active_work(cwd=cwd)
+        if not work:
+            return {"ok": True, "result": {"active": False}}
+        steps = workgraph.list_steps(work["id"], cwd=cwd)
+    except workgraph.WorkGraphError as exc:
+        return {"ok": False, "error": str(exc)}
+    done = [s for s in steps if s.get("status") in {"completed", "skipped"}]
+    return {"ok": True, "result": {
+        "active": True,
+        "id": work["id"],
+        "objective": work.get("objective", ""),
+        "status": work.get("status", ""),
+        "revision": work.get("current_revision") or 0,
+        "approved_revision": work.get("approved_revision") or 0,
+        "workflow_template": work.get("workflow_template") or "",
+        "workflow_phase": work.get("workflow_phase") or "",
+        "steps_total": len(steps),
+        "steps_done": len(done),
+        "steps": [
+            {"title": s.get("title", ""), "status": s.get("status", "")}
+            for s in steps[:20]
+        ],
+    }}
+
+
+def _bi_diag_tool_failures(params: dict, ctx: ToolCtx) -> dict:
+    """Recent tool failures in this process — including other agents'.
+
+    The failures of the agent asking are already in its own transcript. What
+    is not is what a child, or a run on another terminal, tripped over; that
+    is the case this exists for, and why it takes a scope.
+    """
+    import agent_loop as _al
+    try:
+        limit = int(params.get("limit") or 5)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "'limit' must be a number"}
+    limit = max(1, min(limit, 20))
+    rows = _al.get_recent_tool_failures(
+        agent_id=str(params.get("agent_id") or "").strip(),
+        terminal=str(params.get("terminal") or "").strip(),
+        tool=str(params.get("tool") or "").strip(),
+    )
+    failures = []
+    for row in rows[:limit]:
+        output = str(row.get("output_tail") or "").strip()
+        failures.append({
+            "tool": row.get("display_name") or row.get("tool") or "tool",
+            "agent_id": row.get("agent_id") or "primary",
+            "terminal": row.get("terminal") or "temporary",
+            "command": row.get("command") or "",
+            "error": row.get("error") or "Tool failed",
+            "elapsed_seconds": round(float(row.get("elapsed_seconds") or 0.0), 1),
+            "recovery": row.get("recovery") or "none",
+            "output_tail": "\n".join(output.splitlines()[-6:]),
+        })
+    return {"ok": True, "result": {"count": len(failures), "failures": failures}}
+
+
+# ── Laintas Storage ────────────────────────────────────────────────────
+# The same cloud folder Helpwo mounts as "Laintas Storage" and `/shared`
+# manages from the REPL. `shared_storage.SharedStorage` already wraps every
+# endpoint; these tools exist because the model had only `file_push` — an
+# upload that also notifies a Helpwo agent — and so could write to the folder
+# but never read it back, list it, or find out how full it was.
+
+
+def _storage_client(ctx: ToolCtx):
+    """Return (module, client) for the active backend profile and session."""
+    import shared_storage
+    backend_profiles, profile = _resolve_backend_profile()
+    return shared_storage, shared_storage.SharedStorage(profile, ctx.session)
+
+
+def _storage_call(ctx: ToolCtx, work):
+    """Run one storage operation, turning its errors into tool errors."""
+    try:
+        shared_storage, client = _storage_client(ctx)
+    except ImportError as exc:
+        return {"ok": False, "error": f"missing dependency: {exc}"}
+    except Exception as exc:
+        return {"ok": False, "error": f"storage unavailable: {exc}"}
+    try:
+        return work(shared_storage, client)
+    except shared_storage.SharedStorageError as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def _bi_storage_usage(params: dict, ctx: ToolCtx) -> dict:
+    """How much of the account's storage allowance is in use."""
+    def work(_ss, client):
+        usage = client.usage()
+        return {"ok": True, "result": {
+            "tier": usage.tier,
+            "used_bytes": usage.used_bytes,
+            "free_bytes": usage.free_bytes,
+            "max_bytes": usage.max_bytes,
+            "overage_bytes": usage.overage_bytes,
+            "est_cost_cents": usage.est_cost_cents,
+            "max_file_bytes": usage.max_file_bytes,
+        }}
+    return _storage_call(ctx, work)
+
+
+def _bi_storage_list(params: dict, ctx: ToolCtx) -> dict:
+    """List one folder of the shared storage."""
+    prefix = str(params.get("path") or "").strip()
+
+    def work(shared_storage, client):
+        clean = shared_storage.clean_remote_path(prefix) if prefix else ""
+        entries = client.list(clean)
+        return {"ok": True, "result": {
+            "path": clean,
+            "entries": [
+                {"path": e.path, "name": e.name, "type": e.type,
+                 "size": e.size, "modified": e.modified}
+                for e in entries
+            ],
+        }}
+    return _storage_call(ctx, work)
+
+
+def _bi_storage_get(params: dict, ctx: ToolCtx) -> dict:
+    """Download one remote file to the local filesystem."""
+    remote = str(params.get("path") or "").strip()
+    if not remote:
+        return {"ok": False, "error": "missing 'path' — the remote file to download"}
+    local = str(params.get("local_path") or "").strip()
+
+    def work(shared_storage, client):
+        clean = shared_storage.clean_remote_path(remote)
+        target = local or os.path.basename(clean)
+        if not os.path.isabs(target):
+            target = os.path.join(ctx.cwd or os.getcwd(), target)
+        # A directory for a destination means "keep the remote name", which is
+        # what every cp/scp does and what a model writes when it is thinking
+        # about the folder rather than the file.
+        if os.path.isdir(target):
+            target = os.path.join(target, os.path.basename(clean))
+        # A download is a local write, so it answers to the same boundary
+        # fs.write does: a contract-scoped child must not be able to land a
+        # file outside its scope just because the bytes came over the network.
+        blocked = _check_file_write_policy(
+            os.path.abspath(target), ctx,
+            f"download from Laintas Storage: {clean}")
+        if blocked is not None:
+            return blocked
+        written = client.pull_file(clean, target)
+        return {"ok": True, "result": {
+            "path": clean, "local_path": target, "bytes": written}}
+    return _storage_call(ctx, work)
+
+
+def _bi_storage_put(params: dict, ctx: ToolCtx) -> dict:
+    """Upload one local file to the shared storage."""
+    local = str(params.get("local_path") or "").strip()
+    if not local:
+        return {"ok": False, "error": "missing 'local_path' — the file to upload"}
+    if not os.path.isabs(local):
+        local = os.path.join(ctx.cwd or os.getcwd(), local)
+    if not os.path.isfile(local):
+        return {"ok": False, "error": f"not a file: {local}"}
+    remote = str(params.get("path") or "").strip() or os.path.basename(local)
+
+    def work(shared_storage, client):
+        clean = shared_storage.clean_remote_path(remote)
+        written = client.push_file(local, clean)
+        return {"ok": True, "result": {
+            "path": clean, "local_path": local, "bytes": written}}
+    return _storage_call(ctx, work)
+
+
+def _bi_storage_mkdir(params: dict, ctx: ToolCtx) -> dict:
+    """Create a folder in the shared storage."""
+    path = str(params.get("path") or "").strip()
+    if not path:
+        return {"ok": False, "error": "missing 'path'"}
+
+    def work(shared_storage, client):
+        clean = shared_storage.clean_remote_path(path)
+        client.mkdir(clean)
+        return {"ok": True, "result": {"path": clean, "created": True}}
+    return _storage_call(ctx, work)
+
+
+def _bi_storage_move(params: dict, ctx: ToolCtx) -> dict:
+    """Move or rename something inside the shared storage."""
+    src = str(params.get("from") or params.get("source") or "").strip()
+    dest = str(params.get("to") or params.get("dest") or "").strip()
+    if not src or not dest:
+        return {"ok": False, "error": "both 'from' and 'to' are required"}
+
+    def work(shared_storage, client):
+        a = shared_storage.clean_remote_path(src)
+        b = shared_storage.clean_remote_path(dest)
+        client.move(a, b)
+        return {"ok": True, "result": {"from": a, "to": b}}
+    return _storage_call(ctx, work)
+
+
+def _bi_storage_delete(params: dict, ctx: ToolCtx) -> dict:
+    """Delete a remote file or folder — always after an explicit approval.
+
+    Remote deletion has no undo and no snapshot behind it: the local
+    checkpoint the loop takes before a mutation covers this machine's files,
+    not an object store shared with Helpwo. So this asks every time, in every
+    policy mode, exactly as a shell `rm` does.
+    """
+    path = str(params.get("path") or "").strip()
+    if not path:
+        return {"ok": False, "error": "missing 'path'"}
+
+    def work(shared_storage, client):
+        clean = shared_storage.clean_remote_path(path)
+        approve_fn = (getattr(ctx.deps, "request_file_delete_approval", None)
+                      if ctx.deps is not None else None)
+        if not callable(approve_fn):
+            return {"ok": False, "error": (
+                "Deleting from shared storage requires approval but no "
+                "approval channel is available")}
+        try:
+            approved = approve_fn(
+                f"Laintas Storage: {clean}",
+                f"DELETE from shared cloud storage\n{clean}",
+                "shared storage deletion is permanent and shared with Helpwo")
+        except Exception:
+            approved = False
+        if not approved:
+            return {"ok": False, "error": f"User denied deletion of {clean}"}
+        removed = client.remove(clean)
+        return {"ok": True, "result": {"path": clean, "deleted": removed}}
+    return _storage_call(ctx, work)
 
 
 def _bi_file_push(params: dict, ctx: ToolCtx) -> dict:
@@ -9294,6 +9648,168 @@ def register_builtin_tools() -> None:
                 "required": ["name"],
             },
             invoke=_bi_agent_rename,
+        ),
+        Tool(
+            name="account.usage",
+            description=(
+                "This machine's token accounting plus the Laintas account's "
+                "balance, quota and subscription. Use it before committing to "
+                "an expensive plan (a long parallel batch, a large model), and "
+                "when the user asks what something has cost. The call "
+                "allowance is one pool shared by every Laintas product, so "
+                "these figures are not CLI-only."
+            ),
+            schema={
+                "type": "object",
+                "properties": {
+                    "days": {"type": "integer",
+                             "description": "Window for the totals, 1-90. Default 30."},
+                    "local_only": {"type": "boolean",
+                                   "description": "Skip the network and report local token stats only."},
+                },
+            },
+            invoke=_bi_account_usage,
+        ),
+        Tool(
+            name="work.status",
+            description=(
+                "The active WorkGraph for this project: the objective it was "
+                "opened with, its status and plan revision, the workflow phase "
+                "and how many steps are done. Read this when resuming work, or "
+                "when a long task needs to check it is still serving the "
+                "objective the user set. Read-only: which work item is active "
+                "is the user's choice."
+            ),
+            schema={"type": "object", "properties": {}},
+            invoke=_bi_work_status,
+        ),
+        Tool(
+            name="diag.tool_failures",
+            description=(
+                "Recent tool failures in this CLI process, newest first, with "
+                "the command, the error and a tail of the output. Your own "
+                "failures are already in this conversation — reach for this "
+                "when a CHILD agent or another terminal failed and you need to "
+                "know what it actually hit. Filter by agent_id, terminal or "
+                "tool name."
+            ),
+            schema={
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "description": "How many, 1-20. Default 5."},
+                    "agent_id": {"type": "string", "description": "Only this agent's failures."},
+                    "terminal": {"type": "string", "description": "Only this terminal's failures."},
+                    "tool": {"type": "string", "description": "Only failures of tools matching this name."},
+                },
+            },
+            invoke=_bi_diag_tool_failures,
+        ),
+        # ── Laintas Storage: the cloud folder Helpwo mounts ──────────
+        Tool(
+            name="storage.usage",
+            description=(
+                "How full the account's Laintas Storage is: tier, bytes used, "
+                "free allowance, overage and the per-file size limit. Check "
+                "this before uploading anything large — an upload over the "
+                "allowance is rejected by the gateway, and overage is billed."
+            ),
+            schema={"type": "object", "properties": {}},
+            invoke=_bi_storage_usage,
+        ),
+        Tool(
+            name="storage.list",
+            description=(
+                "List a folder in Laintas Storage — the same cloud folder "
+                "Helpwo mounts as \"Laintas Storage\" and the user manages "
+                "with /shared. Omit 'path' for the root. This is remote "
+                "storage, not this machine: use fs.ls for local files."
+            ),
+            schema={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string",
+                             "description": "Remote folder, e.g. 'reports/2026'. Root when omitted."},
+                },
+            },
+            invoke=_bi_storage_list,
+        ),
+        Tool(
+            name="storage.get",
+            description=(
+                "Download one file from Laintas Storage to this machine. "
+                "Writes to 'local_path' (a directory keeps the remote name), "
+                "or to the remote file's name in the working directory."
+            ),
+            schema={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Remote file path."},
+                    "local_path": {"type": "string",
+                                   "description": "Where to write it locally. Optional."},
+                },
+                "required": ["path"],
+            },
+            invoke=_bi_storage_get,
+        ),
+        Tool(
+            name="storage.put",
+            description=(
+                "Upload one local file to Laintas Storage, where the user and "
+                "their Helpwo sessions can open it. 'path' is the remote "
+                "destination (defaults to the file's own name). To hand files "
+                "to a specific Helpwo agent instead, use file_push."
+            ),
+            schema={
+                "type": "object",
+                "properties": {
+                    "local_path": {"type": "string", "description": "Local file to upload."},
+                    "path": {"type": "string",
+                             "description": "Remote destination path. Optional."},
+                },
+                "required": ["local_path"],
+            },
+            invoke=_bi_storage_put,
+        ),
+        Tool(
+            name="storage.mkdir",
+            description="Create a folder in Laintas Storage.",
+            schema={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Remote folder to create."},
+                },
+                "required": ["path"],
+            },
+            invoke=_bi_storage_mkdir,
+        ),
+        Tool(
+            name="storage.move",
+            description="Move or rename a file or folder inside Laintas Storage.",
+            schema={
+                "type": "object",
+                "properties": {
+                    "from": {"type": "string", "description": "Current remote path."},
+                    "to": {"type": "string", "description": "New remote path."},
+                },
+                "required": ["from", "to"],
+            },
+            invoke=_bi_storage_move,
+        ),
+        Tool(
+            name="storage.delete",
+            description=(
+                "Delete a file or folder from Laintas Storage. Always asks the "
+                "user first, in every policy mode: this store is shared with "
+                "Helpwo and nothing here is covered by the local checkpoint."
+            ),
+            schema={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Remote path to delete."},
+                },
+                "required": ["path"],
+            },
+            invoke=_bi_storage_delete,
         ),
         Tool(
             name="file_push",
