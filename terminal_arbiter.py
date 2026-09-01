@@ -438,6 +438,15 @@ class TerminalArbiter:
         self._reader_wanted = threading.Event()
         self._shutdown = threading.Event()
 
+        # Clear modes an earlier run may have left in this terminal. A process
+        # killed with os._exit, or by a signal, never writes the sequence that
+        # turns mouse reporting off, and the terminal keeps reporting into
+        # whatever starts next — including this process, whose startup output
+        # then arrives interleaved with echoed ``^[[<35;46;1M``. Doing it here
+        # is what lets an already-broken terminal heal by relaunching, rather
+        # than needing the window closed.
+        self._reset_terminal_modes()
+
     # ── introspection ───────────────────────────────────────────────
 
     @property
@@ -495,6 +504,42 @@ class TerminalArbiter:
         except OSError:
             pass
 
+    # Terminal-side state that no tcsetattr can reach. Mouse reporting,
+    # bracketed paste and cursor visibility are DEC private modes held by the
+    # terminal emulator, and they outlive the process that turned them on.
+    #
+    # Restoring only termios is what made this invisible for so long: the
+    # shell echoes again, so the terminal looks recovered, while it keeps
+    # sending mouse reports to whatever runs next. Those arrive while no one
+    # holds the terminal — pristine means canonical mode with echo — and the
+    # line discipline prints them, which is how a screen fills with
+    # ``^[[<35;46;1M``. It stayed hidden because mouse reporting was off by
+    # default everywhere until the Windows build turned it on.
+    _MODE_RESET = (
+        "\x1b[?1000l"      # normal mouse tracking
+        "\x1b[?1002l"      # button-event tracking
+        "\x1b[?1003l"      # any-motion tracking: the flood
+        "\x1b[?1015l"      # urxvt extended coordinates
+        "\x1b[?1006l"      # SGR extended coordinates
+        "\x1b[?2004l"      # bracketed paste
+        "\x1b[?25h"        # cursor visible
+    )
+
+    def _reset_terminal_modes(self) -> None:
+        """Turn off every mode we can leave behind in the terminal itself.
+
+        Written to the terminal fd rather than sys.stdout: this runs on exit
+        and crash paths, where stdout may be redirected, wrapped or closed.
+        The alternate screen is deliberately not touched — a full-screen UI
+        owns that and is entitled to be mid-render when a crash handler runs.
+        """
+        if self._fd < 0:
+            return
+        try:
+            os.write(self._fd, self._MODE_RESET.encode("ascii"))
+        except OSError:
+            pass
+
     def reset_to_pristine(self) -> None:
         """Force the terminal back to its startup state.
 
@@ -502,6 +547,7 @@ class TerminalArbiter:
         """
         if not self.interactive:
             return
+        self._reset_terminal_modes()
         try:
             termios.tcsetattr(self._fd, termios.TCSADRAIN, self._pristine)
         except (termios.error, OSError):

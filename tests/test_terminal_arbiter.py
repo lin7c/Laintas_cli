@@ -10,6 +10,7 @@ import pty
 import queue
 import select
 import sys
+import tempfile
 import termios
 import threading
 import time
@@ -434,6 +435,71 @@ class NonInteractiveTests(unittest.TestCase):
         arbiter = TerminalArbiter(fd=-1)
         self.assertFalse(arbiter.interactive)
         self.assertEqual("", arbiter.current_owner())
+
+
+
+class TerminalModeRestoreTests(unittest.TestCase):
+    """Restoring termios is not restoring the terminal.
+
+    Mouse reporting, bracketed paste and cursor visibility are DEC private
+    modes held by the emulator, and they outlive the process that set them.
+    Putting only termios back makes the shell echo again, so the terminal
+    looks recovered while it keeps sending mouse reports into whatever runs
+    next — which then arrive with no one holding the terminal, in canonical
+    mode with echo, and get printed as ``^[[<35;46;1M``.
+    """
+
+    def setUp(self):
+        self.master, self.slave = os.openpty()
+        self.addCleanup(os.close, self.master)
+        self.addCleanup(os.close, self.slave)
+        from terminal_arbiter import TerminalArbiter
+        self.arbiter = TerminalArbiter(fd=self.slave)
+
+    def _read_available(self):
+        chunks = []
+        while select.select([self.master], [], [], 0.2)[0]:
+            try:
+                data = os.read(self.master, 65536)
+            except OSError:
+                break
+            if not data:
+                break
+            chunks.append(data)
+        return b"".join(chunks)
+
+    def test_construction_clears_modes_a_previous_run_left_behind(self):
+        # A process killed with os._exit or a signal never writes the disable
+        # sequence, so the next start is the only chance to heal the terminal
+        # without the user closing the window.
+        written = self._read_available()
+        self.assertIn(b"\x1b[?1003l", written)
+        self.assertIn(b"\x1b[?1006l", written)
+
+    def test_reset_to_pristine_turns_mouse_reporting_off(self):
+        self._read_available()                    # discard the constructor's
+        self.arbiter.reset_to_pristine()
+        written = self._read_available()
+        for mode in (b"1000l", b"1002l", b"1003l", b"1015l", b"1006l"):
+            self.assertIn(b"\x1b[?" + mode, written,
+                          f"reset must disable mode {mode!r}")
+        self.assertIn(b"\x1b[?2004l", written)   # bracketed paste
+        self.assertIn(b"\x1b[?25h", written)     # cursor visible
+
+    def test_reset_leaves_the_alternate_screen_alone(self):
+        # A full-screen UI owns that buffer and is entitled to be mid-render
+        # when a crash handler runs.
+        self._read_available()
+        self.arbiter.reset_to_pristine()
+        self.assertNotIn(b"\x1b[?1049", self._read_available())
+
+    def test_a_non_terminal_fd_writes_nothing(self):
+        from terminal_arbiter import TerminalArbiter
+        with tempfile.TemporaryFile() as handle:
+            quiet = TerminalArbiter(fd=handle.fileno())
+            quiet.reset_to_pristine()
+            handle.seek(0)
+            self.assertEqual(b"", handle.read())
 
 
 if __name__ == "__main__":

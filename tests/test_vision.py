@@ -72,43 +72,38 @@ class Preparation(unittest.TestCase):
             fit.assert_not_called()
 
 
-class DescribeFallback(unittest.TestCase):
+class DescribeRouting(unittest.TestCase):
     def setUp(self):
         vision._CACHE.clear()
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.path = _png(80, 60, os.path.join(self.tmp.name, "a.png"))
 
-    def test_it_walks_the_chain_until_one_answers(self):
-        tried = []
+    def test_gateway_owns_model_selection(self):
+        calls = []
 
         def backend(**kw):
-            tried.append(kw["model_override"])
-            if kw["model_override"] != "qwen3.6-plus":
-                return {"error": True, "reply": "model is switched off"}
-            return {"reply": "a red square"}
+            calls.append(kw)
+            return {"reply": "a red square", "model": "doubao-seed-2.1-turbo"}
 
         out = vision.describe_image(self.path, "what is it?",
                                     call_backend=backend)
         self.assertEqual(out["text"], "a red square")
-        self.assertEqual(out["model"], "qwen3.6-plus")
-        # Stops at the first one that answers, having tried the earlier
-        # entries in preference order and nothing after.
-        expected = list(vision.VISION_MODELS)
-        expected = expected[:expected.index("qwen3.6-plus") + 1]
-        self.assertEqual(tried, expected)
+        self.assertEqual(out["model"], "doubao-seed-2.1-turbo")
+        self.assertEqual(len(calls), 1)
+        self.assertIsNone(calls[0]["model_override"])
+        self.assertEqual(calls[0]["task_kind"], "vision")
 
-    def test_when_every_model_refuses_the_error_blames_the_models(self):
+    def test_gateway_failure_points_at_the_vision_configuration(self):
         out = vision.describe_image
         with self.assertRaises(vision.VisionError) as caught:
             out(self.path, call_backend=lambda **kw: {"error": True,
                                                       "reply": "no capacity"})
         message = str(caught.exception)
-        self.assertIn("no vision model", message)
+        self.assertIn("no enabled vision model", message)
         # Says plainly that the file was fine, so nobody goes path-hunting.
         self.assertIn("decoded fine", message)
-        for model in vision.VISION_MODELS:
-            self.assertIn(model, message)
+        self.assertIn("System -> API Keys", message)
 
     def test_an_empty_reply_is_a_failure_not_an_answer(self):
         with self.assertRaises(vision.VisionError):
@@ -139,55 +134,6 @@ class DescribeFallback(unittest.TestCase):
         vision.describe_image(self.path, "what?", call_backend=backend)
         vision.describe_image(self.path, "how many?", call_backend=backend)
         self.assertEqual(len(calls), 2)
-
-
-class CatalogueIntersection(unittest.TestCase):
-    """A chain that names models nobody enabled is the tesseract bug again."""
-
-    def setUp(self):
-        vision._CACHE.clear()
-        vision._catalogue = (0.0, frozenset())
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        self.path = _png(80, 60, os.path.join(self.tmp.name, "a.png"))
-
-    def test_only_models_the_deployment_serves_are_tried(self):
-        tried = []
-
-        def backend(**kw):
-            tried.append(kw["model_override"])
-            return {"reply": "ok"}
-
-        served = [{"id": "deepseek-v4-flash"}, {"id": "google/gemma-4-26b-a4b-it"}]
-        vision.describe_image(self.path, call_backend=backend,
-                              list_models=lambda: served)
-        self.assertEqual(tried, ["google/gemma-4-26b-a4b-it"])
-
-    def test_an_unreadable_catalogue_does_not_disable_the_feature(self):
-        """A catalogue that failed to load is not evidence that no model can
-        see, so the full preference order is still tried."""
-        tried = []
-
-        def backend(**kw):
-            tried.append(kw["model_override"])
-            return {"reply": "ok"}
-
-        def boom():
-            raise RuntimeError("gateway unreachable")
-
-        vision.describe_image(self.path, call_backend=backend, list_models=boom)
-        self.assertEqual(tried, [vision.VISION_MODELS[0]])
-
-    def test_when_nothing_is_enabled_the_error_names_what_to_switch_on(self):
-        served = [{"id": "deepseek-v4-flash"}]
-        with self.assertRaises(vision.VisionError) as caught:
-            vision.describe_image(
-                self.path, call_backend=lambda **kw: {"error": True, "reply": "off"},
-                list_models=lambda: served)
-        message = str(caught.exception)
-        self.assertIn("admin page", message)
-        self.assertIn("doubao-seed-2.0-pro", message)
-
 
 class ToText(unittest.TestCase):
     def setUp(self):
@@ -273,14 +219,42 @@ class ToolWiring(unittest.TestCase):
     def test_describe_reaches_the_backend_and_names_the_model(self):
         import tools
         with mock.patch.object(tools, "_vision_backend",
-                               return_value=lambda **kw: {"reply": "a red square"}), \
-                mock.patch.object(tools, "_vision_catalogue", return_value=None):
+                               return_value=lambda **kw: {
+                                   "reply": "a red square",
+                                   "model": "doubao-seed-2.1-turbo",
+                               }):
             out = self._invoke("image.describe", {"path": self.path, "question": "what?"})
         self.assertTrue(out["ok"], out)
         # The model is named because this call is billed on a different tier
         # from the session that made it.
-        self.assertIn(vision.VISION_MODELS[0], out["result"])
+        self.assertIn("doubao-seed-2.1-turbo", out["result"])
         self.assertIn("a red square", out["result"])
+
+    def test_describe_posts_to_vision_route_without_a_model_override(self):
+        import backend_profiles
+        import laintas_cli
+        import requests
+        import tools
+
+        profile = mock.Mock(base_url="https://gateway.example")
+        response = mock.Mock(ok=True, status_code=200)
+        response.json.return_value = {
+            "model": "doubao-seed-2.1-turbo",
+            "choices": [{"message": {"content": "visible"}}],
+        }
+        with mock.patch.object(laintas_cli, "get_backend_profile",
+                               return_value=profile), \
+                mock.patch.object(backend_profiles, "request_auth",
+                                  return_value=({"X-Test": "1"}, {})), \
+                mock.patch.object(requests, "post", return_value=response) as post:
+            out = tools._vision_backend(self.ctx)(
+                session={}, messages=[{"role": "user", "content": []}])
+
+        self.assertEqual(out["model"], "doubao-seed-2.1-turbo")
+        url = post.call_args.args[0]
+        body = post.call_args.kwargs["json"]
+        self.assertEqual(url, "https://gateway.example/api/chat/vision")
+        self.assertNotIn("model", body)
 
     def test_to_text_posts_to_the_gateways_ocr_route(self):
         import tools

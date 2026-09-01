@@ -6746,13 +6746,55 @@ def _check_tool_interrupt(ctx: ToolCtx) -> None:
 # ── Images: reading a picture on behalf of a model that cannot see ───
 
 def _vision_backend(ctx: ToolCtx):
-    """The gateway call vision.describe_image makes, bound to this session.
+    """A non-streaming call to the gateway-owned vision model family.
 
-    Imported here rather than at module scope because laintas_cli imports
-    tools, and tools importing laintas_cli at load time would close the loop.
+    The endpoint, rather than the CLI, selects the first live model in the
+    administrator's image-understanding order.  This keeps CLI, Helpwo and
+    every other client on one failover policy.
     """
+    import backend_profiles
     import laintas_cli
-    return laintas_cli.call_backend_stream
+    import requests
+
+    def call_backend(*, session=None, message="", system_prompt="",
+                     current_path="", messages=None, tools_enabled=False,
+                     model_override=None, task_kind="vision", **_kwargs):
+        profile = laintas_cli.get_backend_profile()
+        headers, cookies = backend_profiles.request_auth(
+            profile, session if session is not None else ctx.session)
+        body = {
+            "message": message,
+            "messages": messages or [],
+            "currentPath": current_path,
+            "systemPrompt": system_prompt,
+            "source": "cli",
+            "taskKind": task_kind or "vision",
+            "injectToolGuide": False,
+        }
+        try:
+            response = requests.post(
+                profile.base_url.rstrip("/") + "/api/chat/vision",
+                headers=headers, cookies=cookies, json=body, timeout=420)
+        except requests.RequestException as exc:
+            return {"error": True, "reply": str(exc)}
+        try:
+            data = response.json()
+        except ValueError:
+            data = {"detail": response.text[:300]}
+        if not response.ok:
+            detail = data.get("detail") or data.get("title") or response.reason
+            return {"error": True, "reply": f"HTTP {response.status_code}: {detail}"}
+        choices = data.get("choices") or []
+        content = ""
+        if choices:
+            content = (choices[0].get("message") or {}).get("content") or ""
+        if isinstance(content, list):
+            content = "".join(
+                str(part.get("text") or "") if isinstance(part, dict) else str(part)
+                for part in content)
+        return {"reply": str(content), "model": data.get("model")}
+
+    return call_backend
 
 
 def _gateway_post_json(ctx: ToolCtx):
@@ -6782,20 +6824,6 @@ def _gateway_post_json(ctx: ToolCtx):
     return post_json
 
 
-def _vision_catalogue(ctx: ToolCtx):
-    """Reads the models this deployment actually serves.
-
-    Passed in so vision.py can intersect its preference order with reality
-    instead of calling a model an administrator switched off months ago.
-    """
-    import laintas_cli
-
-    def list_models():
-        return laintas_cli.fetch_available_models(ctx.session)[0]
-
-    return list_models
-
-
 def _bi_image_describe(params: dict, ctx: ToolCtx) -> dict:
     """Ask a vision model a question about an image file."""
     import vision
@@ -6803,8 +6831,7 @@ def _bi_image_describe(params: dict, ctx: ToolCtx) -> dict:
         out = vision.describe_image(
             str(params.get("path") or ""),
             str(params.get("question") or ""),
-            session=ctx.session, call_backend=_vision_backend(ctx),
-            list_models=_vision_catalogue(ctx))
+            session=ctx.session, call_backend=_vision_backend(ctx))
     except vision.VisionError as e:
         return {"ok": False, "error": f"image.describe: {e}"}
     except Exception as e:

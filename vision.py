@@ -38,7 +38,6 @@ import hashlib
 import io
 import os
 import threading
-import time
 from typing import Optional
 
 #: Long edge for the vision path. Helpwo settled on this value for its own
@@ -64,57 +63,11 @@ OCR_MAX_DATA_URL_CHARS = 6_000_000
 IMAGE_EXTENSIONS = frozenset(
     (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"))
 
-#: Models known to read images, best first. This is a PREFERENCE ORDER, not a
-#: list of what will be called: which of these a deployment actually serves is
-#: decided by its operator in the admin page, so the list is intersected with
-#: the live catalogue before anything is tried (see _pick_models).
-#:
-#: The intersection is the point. A hardcoded chain rots into the same dead
-#: code as the tesseract branch in learn(), which has been telling users to
-#: `apt install tesseract-ocr` for a year on a box where nobody ever did — a
-#: feature that names a dependency nobody provisioned is not a feature. On the
-#: deployment this was written against, exactly one of these was switched on,
-#: and it was the last one.
-VISION_MODELS = ("doubao-seed-2.0-pro", "kimi-k2.5", "qwen3.6-plus",
-                 "google/gemma-4-26b-a4b-it")
-
-#: How long a fetched catalogue is trusted. Long enough that a burst of image
-#: calls costs one request, short enough that switching a model on in the admin
-#: page takes effect in the same sitting.
-_CATALOGUE_TTL = 300.0
-_catalogue: "tuple[float, frozenset]" = (0.0, frozenset())
-
-
-def available_vision_models(list_models=None) -> frozenset:
-    """Which of VISION_MODELS this deployment currently serves.
-
-    Returns an empty set when the catalogue cannot be read — the caller then
-    tries the full preference order rather than refusing, because a catalogue
-    that failed to load is not evidence that no model can see.
-    """
-    global _catalogue
-    if list_models is None:
-        return frozenset()
-    fetched_at, cached = _catalogue
-    if time.monotonic() - fetched_at < _CATALOGUE_TTL and cached:
-        return cached
-    try:
-        served = {str(m.get("id") or "") for m in (list_models() or [])}
-    except Exception:
-        return frozenset()
-    found = frozenset(m for m in VISION_MODELS if m in served)
-    if found:
-        _catalogue = (time.monotonic(), found)
-    return found
-
-
-def _pick_models(models, list_models) -> tuple:
-    """The chain to try, in preference order."""
-    if models is not None:
-        return tuple(models)
-    served = available_vision_models(list_models)
-    # Preference order is VISION_MODELS', not the catalogue's.
-    return tuple(m for m in VISION_MODELS if m in served) or VISION_MODELS
+#: Model ordering deliberately does not live in the CLI.  The gateway's
+#: /api/chat/vision endpoint owns the independently configurable vision order,
+#: while those same models remain eligible for ordinary text chat.  Keeping a
+#: second list here would let an old CLI silently override the administrator's
+#: current choice.
 
 _DESCRIBE_SYSTEM = (
     "You are looking at an image on behalf of an agent that cannot see it. "
@@ -239,42 +192,31 @@ def describe_image(path: str, question: str = "", *, session=None,
     if call_backend is None:
         raise VisionError("no backend callable was provided")
 
-    chain = _pick_models(models, list_models)
-    failures = []
-    for model in chain:
-        try:
-            result = call_backend(
-                session=session, message="", system_prompt=_DESCRIBE_SYSTEM,
-                current_path=os.getcwd(), messages=messages,
-                tools_enabled=False, model_override=model,
-                task_kind="vision") or {}
-        except Exception as e:
-            failures.append(f"{model}: {type(e).__name__}: {e}")
-            continue
-        if result.get("error"):
-            failures.append(f"{model}: {str(result.get('reply'))[:160]}")
-            continue
-        text = (result.get("reply") or "").strip()
-        if not text:
-            failures.append(f"{model}: empty response")
-            continue
-        _cache_put(key, text)
-        return {"ok": True, "text": text, "model": model, "cached": False}
-
-    # Every vision model refused. Say so in a way that points at the models
-    # rather than the file — an agent told only "failed" will start checking
-    # the path, and the path was fine.
-    hint = ""
-    if not available_vision_models(list_models):
-        # Nothing in the preference order is switched on. That is an operator
-        # decision, not a fault, and naming the models is the only thing that
-        # turns this error into an action someone can take.
-        hint = (" None of the models this reads are enabled on this "
-                "deployment — an administrator can switch one on in the admin "
-                "page (System -> API Keys): " + ", ".join(VISION_MODELS) + ".")
-    raise VisionError(
-        "no vision model could read this image (the file itself was read and "
-        "decoded fine). Tried " + "; ".join(failures) + hint)
+    # `models` and `list_models` remain accepted for source compatibility with
+    # extensions built against older CLI releases, but selection now belongs
+    # exclusively to the gateway's vision endpoint.
+    try:
+        result = call_backend(
+            session=session, message="", system_prompt=_DESCRIBE_SYSTEM,
+            current_path=os.getcwd(), messages=messages,
+            tools_enabled=False, model_override=None,
+            task_kind="vision") or {}
+    except Exception as e:
+        raise VisionError(
+            "the vision endpoint could not read this image (the file itself "
+            f"was read and decoded fine): {type(e).__name__}: {e}") from e
+    if result.get("error"):
+        detail = str(result.get("reply") or "vision service unavailable")[:300]
+        raise VisionError(
+            "no enabled vision model could read this image (the file itself "
+            "was read and decoded fine). Configure the image-understanding "
+            f"model order in System -> API Keys. Gateway response: {detail}")
+    text = (result.get("reply") or "").strip()
+    if not text:
+        raise VisionError("the vision endpoint returned an empty response")
+    model = str(result.get("model") or "gateway vision priority")
+    _cache_put(key, text)
+    return {"ok": True, "text": text, "model": model, "cached": False}
 
 
 # ── to_text: OCR reproduces the image as text ────────────────────────

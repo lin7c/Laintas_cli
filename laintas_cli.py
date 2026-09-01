@@ -10234,6 +10234,15 @@ class AgentRegistry:
                     self.unregister()
                 except Exception:
                     pass
+                # os._exit skips atexit, and the terminal outlives this
+                # process: mouse reporting left on would keep reporting into
+                # whatever the user runs next. Every other os._exit in this
+                # file is inside a forked child, which must not touch the
+                # parent's terminal.
+                try:
+                    terminal_arbiter.reset_to_pristine()
+                except Exception:
+                    pass
                 os._exit(0)
             threading.Thread(target=_die, daemon=True).start()
             return
