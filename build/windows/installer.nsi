@@ -82,12 +82,12 @@ Section "Install"
   File "${PAYLOAD_DIR}\icon.ico"
   File "${PAYLOAD_DIR}\terminal-fragment.json"
   File "${PAYLOAD_DIR}\terminal-settings.json"
-  ; The bundled Windows Terminal. /r keeps its subdirectories, and the
-  ; portable-mode marker is a dotfile that must survive the copy or the
-  ; installed terminal writes into the user's own Terminal settings.
+  ; The bundled Windows Terminal. The portable-mode marker is not shipped
+  ; with it: it is a dotfile, and upload-artifact drops hidden files, so a
+  ; payload that carried one here would arrive without it and fail this
+  ; build. install.ps1 creates the marker at the destination instead.
   SetOutPath "$PLUGINSDIR\payload\terminal"
   File /r "${PAYLOAD_DIR}\terminal\*.*"
-  File "${PAYLOAD_DIR}\terminal\.portable"
   SetOutPath "$PLUGINSDIR\payload"
 
   DetailPrint "Installing the private Laintas CLI runtime..."

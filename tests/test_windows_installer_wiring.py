@@ -221,14 +221,14 @@ def test_a_terminal_is_bundled_because_conhost_cannot_deliver_a_click():
     assert "WT_VERSION=" in build and "WT_SHA256=" in build
     assert "sha256sum -c" in build
     assert "package/terminal" in build
-    # Portable mode, or the bundled copy edits the user's own Terminal config.
-    assert "package/terminal/.portable" in build
+    # The marker is a dotfile and upload-artifact drops hidden files, so it
+    # cannot be shipped in the payload — it is created at the destination.
+    assert ': > "$WORK_DIR/package/terminal/.portable"' not in build
 
     script = (ROOT / "build/windows/installer.nsi").read_text(encoding="utf-8")
     assert 'File "${PAYLOAD_DIR}\\terminal-settings.json"' in script
-    # A dotfile is not matched by *.* and has to be named explicitly, and
-    # without it portable mode is silently off.
-    assert 'File "${PAYLOAD_DIR}\\terminal\\.portable"' in script
+    # NSIS must not ask for the dotfile it will never receive.
+    assert '.portable' not in script
     assert 'File /r "${PAYLOAD_DIR}\\terminal\\*.*"' in script
     assert 'RMDir /r "$INSTDIR\\terminal"' in script
 
@@ -258,7 +258,10 @@ def test_a_terminal_is_bundled_because_conhost_cannot_deliver_a_click():
 
     install = (ROOT / "build/windows/install.ps1").read_text(encoding="utf-8")
     assert "terminal-settings.json" in install
+    # Portable mode exists only because install.ps1 creates this marker; the
+    # bundled copy silently edits the user's own Terminal settings without it.
     assert '.portable' in install
+    assert "New-Item -ItemType File -Path $portableMarker" in install
     uninstall = (ROOT / "build/windows/uninstall.ps1").read_text(
         encoding="utf-8")
     assert 'Join-Path $InstallRoot "terminal"' in uninstall

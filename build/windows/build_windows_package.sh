@@ -123,9 +123,11 @@ WT_ROOT="$(find "$WORK_DIR/wt" -maxdepth 1 -mindepth 1 -type d | head -n 1)"
 rm -f "$WT_ROOT/WindowsTerminalShellExt.dll"
 mkdir -p "$WORK_DIR/package/terminal"
 cp -a "$WT_ROOT/." "$WORK_DIR/package/terminal/"
-# The portable-mode marker: settings live beside the executable, so this copy
-# never reads or writes the user's own Windows Terminal configuration.
-: > "$WORK_DIR/package/terminal/.portable"
+# The portable-mode marker is deliberately NOT created here. It is a dotfile,
+# and upload-artifact drops hidden files by default, so one created in the
+# payload arrives missing and the installer build fails looking for it.
+# install.ps1 writes it at the destination, which is the only place it has to
+# exist for Terminal to keep its settings beside its executable.
 
 rm -rf "$OUT_DIR"
 mkdir -p "$OUT_DIR"
