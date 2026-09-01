@@ -22052,6 +22052,21 @@ def show_banner(agent_name: str, session: dict = None):
             "takes over drag-to-select in scrollback, so it stays off until "
             "you ask for it.",
             action="/config enable_mouse true")
+    else:
+        # The other half of the same trade, and the half nobody guesses. Once
+        # an application asks for mouse reporting, the terminal forwards every
+        # click and drag to it instead of running its own selection — that is
+        # how VT mouse mode works everywhere, not something this CLI chose.
+        # Every terminal offers the same escape hatch, and a user who does not
+        # know it concludes that selection is simply broken.
+        startup_mail.post(
+            "mouse", "Hold Shift to select text with the mouse",
+            "Status slots are clickable while mouse reporting is on, and in "
+            "exchange the terminal hands clicks to this CLI instead of "
+            "selecting text. Shift plus drag selects as usual — that works in "
+            "Windows Terminal, and in every other terminal that supports "
+            "mouse reporting.",
+            action="/config enable_mouse false to turn clicking off")
 
     console.print()
 

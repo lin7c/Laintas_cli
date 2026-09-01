@@ -299,6 +299,44 @@ def test_the_installer_checks_the_terminal_actually_landed():
     assert "Write-Warning" in install
 
 
+def test_the_launcher_clears_modes_before_the_distribution_boots():
+    """The CLI's own reset is several seconds too late to be the only one.
+
+    Mouse reporting outlives the process that set it, so a terminal a crashed
+    run left reporting floods the screen with echoed ``^[[<35;46;1M`` for the
+    whole time the distribution is booting and Python is importing. The
+    launcher runs first, so it is where that window closes.
+    """
+    launcher = (ROOT / "build/windows/launcher.cpp").read_text(encoding="utf-8")
+    for mode in ("1000l", "1002l", "1003l", "1015l", "1006l", "2004l"):
+        assert f"\\x1b[?{mode}" in launcher, f"launcher must clear {mode}"
+    # Not the alternate screen: discarding scrollback the user can still see
+    # is not this program's call. (The escape, not the number — the reason it
+    # is excluded is written in a comment right there.)
+    assert "\\x1b[?1049" not in launcher
+    # After PrepareConsole, or the sequence is printed instead of obeyed.
+    assert launcher.index("PrepareConsole()") < launcher.index(
+        "ClearInheritedTerminalModes(console.output)")
+
+
+def test_the_installer_reclaims_what_an_upgrade_costs():
+    """A WSL2 ext4.vhdx only grows; each upgrade wrote a runtime into it."""
+    install = (ROOT / "build/windows/install.ps1").read_text(encoding="utf-8")
+    assert "fstrim" in install
+    # Compare the commands, not the comments that explain them.
+    commands = [line for line in install.splitlines()
+                if "wsl.exe" in line and not line.strip().startswith("#")]
+    joined = "\n".join(commands)
+    assert "--set-sparse" in joined
+    # --set-sparse needs the distribution stopped.
+    assert joined.index("--terminate") < joined.index("--set-sparse")
+    rootfs = (ROOT / "build/windows/Dockerfile.rootfs").read_text(
+        encoding="utf-8")
+    # fstrim ships in util-linux; assuming the base image carries it is how
+    # the trim silently becomes a no-op.
+    assert "util-linux" in rootfs
+
+
 def test_the_bundled_and_installed_profiles_agree():
     """Two files now define the same profile; `wt -p` matches on the name."""
     import json

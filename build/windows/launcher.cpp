@@ -200,6 +200,32 @@ ConsoleState PrepareConsole() {
     return state;
 }
 
+// Mouse reporting, bracketed paste and cursor visibility are held by the
+// terminal, not by any process, so a Laintas run that died without cleaning
+// up leaves the terminal reporting into the next one. The CLI clears them
+// when it starts, but that is several seconds away: the distribution has to
+// boot and Python has to import first, and every mouse movement in that
+// window is echoed as ``^[[<35;46;1M``. Clearing them here closes the window
+// entirely — this is the first thing that runs after the terminal opens.
+void ClearInheritedTerminalModes(HANDLE output) {
+    if (output == INVALID_HANDLE_VALUE) {
+        return;
+    }
+    // Deliberately not the alternate screen: leaving it is the terminal's
+    // business, and a stray 1049l here would discard scrollback the user
+    // can still see.
+    static const char kReset[] =
+        "\x1b[?1000l"      // normal mouse tracking
+        "\x1b[?1002l"      // button-event tracking
+        "\x1b[?1003l"      // any-motion tracking: the flood
+        "\x1b[?1015l"      // urxvt extended coordinates
+        "\x1b[?1006l"      // SGR extended coordinates
+        "\x1b[?2004l"      // bracketed paste
+        "\x1b[?25h";       // cursor visible
+    DWORD written = 0;
+    WriteFile(output, kReset, sizeof(kReset) - 1, &written, nullptr);
+}
+
 void RestoreConsole(const ConsoleState& state) {
     if (state.restore_input) {
         SetConsoleMode(state.input, state.input_mode);
@@ -382,6 +408,9 @@ int wmain(int argc, wchar_t** argv) {
     }
 
     const ConsoleState console = PrepareConsole();
+    // After PrepareConsole, so virtual-terminal processing is on and these
+    // are interpreted rather than printed.
+    ClearInheritedTerminalModes(console.output);
     DWORD exit_code = 1;
     const HRESULT result = WslLaunchInteractive(
         distribution.c_str(), command.c_str(), TRUE, &exit_code);

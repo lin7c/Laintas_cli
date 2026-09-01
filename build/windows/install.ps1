@@ -135,6 +135,28 @@ if ($LASTEXITCODE -ne 0) {
     throw "Could not install the Laintas runtime inside $DistroName."
 }
 
+# Reclaim what the upgrade just cost. A WSL2 distribution lives in an
+# ext4.vhdx that only ever grows: installing a ~55 MB runtime over the old
+# one frees the old blocks inside the filesystem, but the virtual disk keeps
+# every block it has ever touched, so each upgrade added its full size to the
+# C: drive forever. fstrim hands the freed blocks back, and a sparse VHD lets
+# Windows actually shrink the file. Both are best-effort — an older WSL has
+# no --manage, and neither failing is a reason to fail an install.
+try {
+    & wsl.exe --distribution $DistroName --user root -- `
+        /bin/sh -c 'command -v fstrim >/dev/null 2>&1 && fstrim -a || true' 2>$null | Out-Null
+} catch {
+    Write-Host "Could not trim unused blocks inside $DistroName (harmless)."
+}
+try {
+    # --set-sparse needs the distribution stopped, and stopping it here is
+    # free: nothing is running in it yet.
+    & wsl.exe --terminate $DistroName 2>$null | Out-Null
+    & wsl.exe --manage $DistroName --set-sparse true 2>$null | Out-Null
+} catch {
+    Write-Host "Could not make the $DistroName disk sparse (needs a newer WSL)."
+}
+
 $pathChanged = Add-UserPath $BinDir
 
 # The icon has to exist as a file on disk, not only inside the executable:

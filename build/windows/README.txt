@@ -31,6 +31,15 @@ cannot receive a mouse click at all, whatever it does, and Windows 10 ships
 no other terminal. Set LAINTAS_NO_WT=1 to stay in whatever console started
 the launcher.
 
+Selecting text
+--------------
+The CLI turns on mouse reporting so the status slots on the prompt can be
+clicked. While that is on, the terminal hands clicks to the CLI instead of
+selecting text: hold Shift and drag to select as usual. This is how mouse
+reporting works in every terminal, not a Windows limitation. Run
+"/config enable_mouse false" inside the CLI to turn clicking off and get
+plain drag-to-select back.
+
 Uninstall from Windows Settings > Apps. The private Linux filesystem and
 ~/.laintas data are preserved so a reinstall or upgrade can reuse them.
 
