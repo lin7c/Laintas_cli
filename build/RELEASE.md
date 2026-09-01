@@ -39,8 +39,13 @@ training pipeline.
 Set the single version number in [version.py](../version.py):
 
 ```python
-__version__ = "1.8.1"
+__version__ = "1.23.4"
 ```
+
+Every version in this document is the one that is current as of writing.
+`latest` on GitHub is the highest tag, so publishing an example version
+literally — `v1.8.1` against a released `v1.23.4` — creates a release that
+never becomes `latest` and that no installed CLI will ever offer.
 
 The download page's version and download URLs live in:
 
@@ -62,15 +67,17 @@ Then build the download page:
 
 ```bash
 cd laintas_cli_download
-mv dist/releases /tmp/laintas-release-assets
 npm run build
-mv /tmp/laintas-release-assets dist/releases
 cd ..
 ```
 
-`dist/releases` must be moved aside and restored around the build: Vite's
-clean step deletes the self-hosted installers and the `/v` update packages
-otherwise.
+The page links straight at the GitHub release, so the build needs nothing
+preserved across it. Release binaries are never committed to this repository
+either — `laintas_cli_download/public/releases/` is ignored, because `public/`
+is copied into `dist/` wholesale and every sub-agent worktree is a full
+checkout, which turned two committed tarballs into gigabytes of duplicates.
+Only if you run the optional mirror in section 3 does `dist/releases` hold
+anything worth keeping, and that section says what to do about it.
 
 ## 2. Create the GitHub release
 
@@ -78,10 +85,10 @@ Commit and push the version tag:
 
 ```bash
 git add version.py laintas_cli_download/src/components/DownloadSection.jsx
-git commit -m "release: v1.8.1"
-git tag v1.8.1
+git commit -m "release: v1.23.4"
+git tag v1.23.4
 git push origin main
-git push origin v1.8.1
+git push origin v1.23.4
 ```
 
 `.github/workflows/release.yml` builds and publishes on the tag push:
@@ -98,58 +105,56 @@ git push origin v1.8.1
 Confirm the release finished and is not a draft:
 
 ```bash
-gh release view v1.8.1
+gh release view v1.23.4
 ```
 
-## 3. Sync to cli.laintas.com
+## 3. Deploy the download page (the release is already published)
 
-The nginx document root must be:
+**The release is complete once section 2's workflow finishes.** Nothing below
+is required to ship a version, and nothing consumes it: `/v`, the download
+page and both install scripts all read the GitHub release directly. See
+section 4 for why there is only one channel.
+
+What still needs deploying is the *page*, whose nginx document root is:
 
 ```text
 /root/laintas_cli/laintas_cli_download/dist
 ```
 
-Use the sync script to generate the source manifest and pull the binaries
-from the GitHub release:
+`npm run build` from section 1 produces it. It serves the site, `install.sh`
+and `install.ps1` — not release binaries.
+
+### The optional cli.laintas.com mirror
+
+`scripts/build_release_assets.py` still exists and still works. It needs `gh`
+logged in, reads the version from `version.py`, and copies the GitHub release
+into `dist/releases/latest/` and `dist/releases/v<version>/`.
+
+Nothing reads those directories today. Run it only to stage a deliberate test
+mirror for `LAINTAS_DOWNLOAD_BASE` (section 4), and if you do, move
+`dist/releases` aside around any later `npm run build` — Vite empties `dist`
+and will delete it:
 
 ```bash
 python3 scripts/build_release_assets.py
+# ...and around a later page rebuild:
+mv laintas_cli_download/dist/releases /tmp/laintas-release-assets
+(cd laintas_cli_download && npm run build)
+mv /tmp/laintas-release-assets laintas_cli_download/dist/releases
 ```
 
-It needs `gh` to be logged in, reads the version from `version.py`, and
-writes:
-
-```text
-dist/releases/v1.8.1/
-dist/releases/latest/
-```
-
-If the `gh` login has expired, download every asset from the GitHub release
-by hand and place it in both directories. Both must contain at least:
-
-```text
-laintas-cli_linux_amd64.tar.gz
-laintas-cli_linux_arm64.tar.gz
-laintas-cli_windows_amd64_setup.exe
-laintas-cli_source.zip
-laintas-cli_<version>_amd64.deb
-manifest.json
-src_manifest.zip
-SHA256SUMS.txt
-```
-
-Verify after syncing:
+Verify a mirror the same way the release itself is verified:
 
 ```bash
 for dir in \
-  laintas_cli_download/dist/releases/v1.8.1 \
+  laintas_cli_download/dist/releases/v1.23.4 \
   laintas_cli_download/dist/releases/latest; do
   (cd "$dir" && sha256sum -c SHA256SUMS.txt)
   python3 -c "import json; print(json.load(open('$dir/manifest.json'))['version'])"
 done
 ```
 
-Both manifests must report the version being released, e.g. `1.8.1`.
+Both manifests must report the version being released, e.g. `1.23.4`.
 
 ## 4. Where `/v` updates from
 
@@ -209,11 +214,14 @@ curl -fsSIL https://cli.laintas.com/install.ps1
 Confirm that:
 
 - the version in `latest/manifest.json` is the new one
-- amd64, arm64, the source bundle and the .deb all return `200`
-- the download page shows the new version and links into the right version
-  directory
-- `/v` checks `cli.laintas.com` for updates
+- amd64, arm64, the source bundle, the Windows installer and the .deb all
+  return `200`
+- the download page shows the new version and its cards link at the new tag
 - `src_manifest.zip` matches the file checksums in the manifest
+
+`/v` reads the GitHub release, not `cli.laintas.com` — the two `curl` checks
+against that host above cover the install scripts the site serves, and
+nothing else.
 
 Static file updates need no nginx reload; only a configuration change does:
 
@@ -225,13 +233,21 @@ nginx -t && nginx -s reload
 
 ### The page loads but the download links point at the old version
 
-Check `DOWNLOAD_BASE` and `RELEASE_VERSION` in `DownloadSection.jsx`, then
-rebuild the download page.
+The cards build their URLs from the tag the page looks up through the GitHub
+API, and fall back to `RELEASE_FALLBACK` until that answers. Check
+`RELEASE_FALLBACK` (not `RELEASE_VERSION` — no such constant) and
+`RELEASE_BASE` in `DownloadSection.jsx`, then rebuild the download page.
 
 ### `/v` reports an old manifest version
 
-Check `dist/releases/latest/manifest.json` — updating only the `v1.8.1`
-directory is not enough, since `latest` is the default update channel.
+Check the release's own `manifest.json`:
+
+```bash
+curl -fsSL https://github.com/lin7c/Laintas_cli/releases/latest/download/manifest.json
+```
+
+If that is the new version and `/v` still is not, the CLI is pinned:
+`LAINTAS_UPDATE_CHANNEL` or `LAINTAS_DOWNLOAD_BASE` is set in its environment.
 
 ### The install script returns 404
 
@@ -245,6 +261,7 @@ laintas-cli_windows_amd64_setup.exe
 
 ### The release assets vanish after a build
 
-The Vite build empties `dist`. Move `dist/releases` aside before the build and
-restore it afterwards, or build into a separate directory that does not clear
-the release folder.
+Only applies to the optional mirror in section 3. The Vite build empties
+`dist`, so move `dist/releases` aside before the build and restore it
+afterwards. A published release is on GitHub and is unaffected by any local
+build.
