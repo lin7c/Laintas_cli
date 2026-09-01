@@ -267,6 +267,38 @@ def test_a_terminal_is_bundled_because_conhost_cannot_deliver_a_click():
     assert 'Join-Path $InstallRoot "terminal"' in uninstall
 
 
+def test_no_powershell_wildcard_is_passed_to_literalpath():
+    """-LiteralPath does not expand wildcards; it looks for that exact name.
+
+    `Copy-Item -LiteralPath (Join-Path $dir "*")` asked for a file actually
+    named "*", threw, and left an empty directory behind — which is what
+    v1.23.6 installed instead of a terminal. The mistake reads as correct,
+    and its only symptom was a line in a scrolling installer log.
+    """
+    import re
+
+    for name in ("install.ps1", "uninstall.ps1"):
+        script = (ROOT / "build/windows" / name).read_text(encoding="utf-8")
+        for number, line in enumerate(script.splitlines(), 1):
+            if "-LiteralPath" not in line:
+                continue
+            after = line.split("-LiteralPath", 1)[1]
+            # Only the argument, not a later flag or a trailing comment.
+            argument = re.split(r"\s+-\w|#", after, maxsplit=1)[0]
+            assert "*" not in argument and "?" not in argument, (
+                f"{name}:{number} passes a wildcard to -LiteralPath: {line.strip()}")
+
+
+def test_the_installer_checks_the_terminal_actually_landed():
+    """A copy that fails must not leave something that looks installed."""
+    install = (ROOT / "build/windows/install.ps1").read_text(encoding="utf-8")
+    assert 'Join-Path $TerminalDir "WindowsTerminal.exe"' in install
+    # An empty directory reads as a working install to anyone checking, the
+    # launcher included, so a failure has to clean up after itself.
+    assert "Remove-Item -LiteralPath $TerminalDir -Recurse -Force -ErrorAction SilentlyContinue" in install
+    assert "Write-Warning" in install
+
+
 def test_the_bundled_and_installed_profiles_agree():
     """Two files now define the same profile; `wt -p` matches on the name."""
     import json

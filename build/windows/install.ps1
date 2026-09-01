@@ -181,8 +181,13 @@ if (Test-Path -LiteralPath $BundledTerminal -PathType Container) {
             Remove-Item -LiteralPath $TerminalDir -Recurse -Force
         }
         New-Item -ItemType Directory -Path $TerminalDir -Force | Out-Null
-        Copy-Item -LiteralPath (Join-Path $BundledTerminal "*") `
-                  -Destination $TerminalDir -Recurse -Force
+        # Enumerate and copy rather than passing a wildcard: -LiteralPath does
+        # not expand one, so `Join-Path $BundledTerminal "*"` asks for a file
+        # actually named "*", throws, and leaves an empty terminal directory
+        # behind — which is precisely what shipped in v1.23.6. -Force here is
+        # for hidden entries, not for overwriting.
+        Get-ChildItem -LiteralPath $BundledTerminal -Force |
+            Copy-Item -Destination $TerminalDir -Recurse -Force
         # Portable mode keeps this copy's settings beside its executable, so
         # it never reads or writes the user's own Windows Terminal profile.
         $portableMarker = Join-Path $TerminalDir ".portable"
@@ -199,9 +204,21 @@ if (Test-Path -LiteralPath $BundledTerminal -PathType Container) {
                                     $settings,
                                     (New-Object Text.UTF8Encoding $false))
         }
+        # Confirm the thing this exists to provide is actually on disk. The
+        # copy above failed silently for a whole release because its only
+        # report was a line in a scrolling installer log.
+        $bundledExeCheck = Join-Path $TerminalDir "WindowsTerminal.exe"
+        if (-not (Test-Path -LiteralPath $bundledExeCheck -PathType Leaf)) {
+            throw "WindowsTerminal.exe is missing from $TerminalDir after copying."
+        }
         $bundledTerminalInstalled = $true
     } catch {
-        Write-Host "Could not install the bundled terminal: $($_.Exception.Message)"
+        Write-Warning "Could not install the bundled terminal: $($_.Exception.Message)"
+        # Leave nothing half-installed: an empty terminal directory looks like
+        # a working one to anyone checking, including the launcher.
+        if (Test-Path -LiteralPath $TerminalDir) {
+            Remove-Item -LiteralPath $TerminalDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
     }
 }
 
