@@ -99,6 +99,7 @@ cp "$PROJECT_DIR/build/windows/icon.ico" "$WORK_DIR/package/icon.ico"
 cp "$PROJECT_DIR/build/windows/terminal-fragment.json" "$WORK_DIR/package/terminal-fragment.json"
 cp "$PROJECT_DIR/build/windows/terminal-settings.json" "$WORK_DIR/package/terminal-settings.json"
 cp "$LINUX_BINARY" "$WORK_DIR/package/laintas-cli-linux"
+cp "$PROJECT_DIR/LICENSE" "$WORK_DIR/package/LICENSE"
 
 echo "==> Fetching Windows Terminal $WT_VERSION"
 mkdir -p "$WT_CACHE"

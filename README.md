@@ -718,8 +718,17 @@ Tags `v1.6.x` and `v1.7.2` are not present in the repository, so they are intent
 
 ## License
 
-The project is described as MIT-licensed by its existing distribution metadata. Consult the license file included with the distribution you install; this checkout does not currently contain a top-level `LICENSE` file.
+Laintas CLI versions that include the top-level `LICENSE` file are available
+under the Functional Source License 1.1 with an MIT future license
+(`FSL-1.1-MIT`). The software is source-available rather than OSI open source
+during the first two years after each version is made available; competing
+commercial products and services are not a permitted use. Each version receives
+an additional MIT license on its second anniversary.
+
+See [`LICENSE`](LICENSE) for the controlling terms and
+[`docs/LICENSING.md`](docs/LICENSING.md) for scope, exceptions and the status of
+earlier distributions.
 
 ## Contributors
 
-Laintas CLI is maintained by its open-source contributors. Parts of the release packaging and documentation workflow were developed with OpenAI Codex assistance.
+Laintas CLI is maintained by its contributors. Parts of the release packaging and documentation workflow were developed with OpenAI Codex assistance.

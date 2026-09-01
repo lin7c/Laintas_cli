@@ -37,6 +37,21 @@ from typing import Optional
 _SHELL_WRAPPERS = {"sh", "bash", "zsh", "dash", "ksh", "ash", "busybox"}
 _WRAPPER_STRING_FLAGS = {"-c", "--command"}
 
+# The Windows build runs this CLI inside a private WSL distribution with
+# interop on and the Windows PATH appended, so `powershell.exe -Command …` and
+# `cmd.exe /c …` are one word away at all times — and every rule in policy.py
+# was written for the Linux side of that boundary. Treating them as wrappers is
+# what makes the payload visible to those rules instead of the launcher name.
+#
+# PowerShell accepts any unambiguous prefix of a parameter name, so `-Com`,
+# `-Comma` and `-Command` are the same flag; the check below is by prefix for
+# that reason, not for convenience.
+_WINDOWS_WRAPPERS = {"powershell.exe", "powershell", "pwsh.exe", "pwsh",
+                     "cmd.exe", "cmd", "wsl.exe", "wsl"}
+_PS_COMMAND_FLAG_PREFIXES = ("-command", "-c")
+_PS_ENCODED_FLAG_PREFIXES = ("-encodedcommand", "-enc", "-ec", "-e")
+_CMD_STRING_FLAGS = {"/c", "/k"}
+
 # Commands that consume a shell script on stdin. `echo "rm -rf /" | sh` is the
 # canonical form of this trick.
 _STDIN_SHELLS = _SHELL_WRAPPERS | {"eval"}
@@ -251,7 +266,61 @@ def _program_name(word: str) -> str:
     see the other.
     """
     name = word.rsplit("/", 1)[-1]
+    # A Windows program is addressed by either separator and by any casing:
+    # `C:\\Windows\\System32\\CMD.EXE`, `cmd.exe` and `Cmd.Exe` are one program.
+    # Only `.exe` names are folded — Linux filenames are case-sensitive and
+    # `Make` is not `make`.
+    name = name.rsplit("\\", 1)[-1]
+    if name.lower().endswith(".exe"):
+        name = name.lower()
     return name
+
+
+def _windows_payload(program: str, rest: list) -> tuple:
+    """The script a Windows wrapper will run, plus what could not be resolved.
+
+    Returns ``(payload, risks)``. An encoded command is decoded when it decodes
+    cleanly — the point of the guard is to see what runs, and refusing to look
+    at base64 would leave the most deliberate form of hiding as the one that
+    works. Anything still unreadable (a `-File` script, undecodable base64) is
+    reported UNRESOLVED so policy fails closed on it.
+    """
+    import base64
+
+    name = program.lower()
+    risks: set = set()
+    words = [w for w in rest if w]
+    for idx, word in enumerate(words):
+        lowered = word.lower()
+        following = words[idx + 1] if idx + 1 < len(words) else ""
+        if name.startswith(("cmd",)):
+            if lowered in _CMD_STRING_FLAGS and following:
+                return " ".join(words[idx + 1:]), risks
+            continue
+        # powershell / pwsh / wsl
+        if name.startswith(("wsl",)):
+            # `wsl.exe -- <command>` and `wsl.exe <command>` both run a Linux
+            # command line, which every existing rule already understands.
+            if lowered == "--" and following:
+                return " ".join(words[idx + 1:]), risks
+            continue
+        if any(lowered.startswith(flag) for flag in _PS_ENCODED_FLAG_PREFIXES) \
+                and following:
+            try:
+                raw = base64.b64decode(following, validate=True)
+                decoded = raw.decode("utf-16-le").strip()
+            except Exception:
+                decoded = ""
+            if decoded:
+                return decoded, {RISK_WRAPPER}
+            return "", {RISK_WRAPPER, RISK_UNRESOLVED}
+        if any(lowered.startswith(flag) for flag in _PS_COMMAND_FLAG_PREFIXES) \
+                and following:
+            return " ".join(words[idx + 1:]), risks
+        if lowered.startswith("-file"):
+            # The script is on disk; its contents are not knowable here.
+            return "", {RISK_WRAPPER, RISK_UNRESOLVED}
+    return "", risks
 
 
 def analyze(command: str, *, _depth: int = 0) -> Analysis:
@@ -345,6 +414,14 @@ def analyze(command: str, *, _depth: int = 0) -> Analysis:
                 if word in _WRAPPER_STRING_FLAGS and idx + 1 < len(rest):
                     payloads.append(rest[idx + 1])
                     break
+
+        if program.lower() in _WINDOWS_WRAPPERS:
+            windows_payload, windows_risks = _windows_payload(program, rest)
+            if windows_payload:
+                payloads.append(windows_payload)
+            if windows_risks:
+                seg_risks |= windows_risks
+                risks |= windows_risks
 
         if program == "eval" and rest:
             payloads.append(" ".join(rest))

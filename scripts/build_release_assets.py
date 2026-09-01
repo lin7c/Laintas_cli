@@ -51,7 +51,8 @@ def _gen_src_out(dst: str) -> dict:
 
     for f in top:
         src = os.path.join(REPO, f)
-        if os.path.isfile(src) and f.endswith((".py", ".json", ".txt")):
+        if os.path.isfile(src) and (
+                f == "LICENSE" or f.endswith((".py", ".json", ".txt"))):
             shutil.copy(src, dst)
     for d in dirs:
         srcd = os.path.join(REPO, d)

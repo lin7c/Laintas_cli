@@ -1587,6 +1587,32 @@ def _bi_fs_write(params: dict, ctx: ToolCtx) -> dict:
     except Exception:
         pass
 
+    # mkdir -p for the parent chain. Deliberately last of the gates: policy,
+    # contract scope and the CAS check have all already cleared abs_path, and
+    # the directories created here are a prefix of that authorized path, so
+    # this widens no boundary. Helpwo's write has done this since
+    # fs/ensureParentDirs.ts; a write of "docs/x.md" into a fresh tree used to
+    # succeed there and fail here with ENOENT for the same model and prompt.
+    created_dirs = []
+    if not existed:
+        parent = os.path.dirname(abs_path)
+        if parent and not os.path.isdir(parent):
+            missing = []
+            probe = parent
+            while probe and not os.path.isdir(probe):
+                missing.append(probe)
+                up = os.path.dirname(probe)
+                if up == probe:  # reached the filesystem root
+                    break
+                probe = up
+            try:
+                os.makedirs(parent, exist_ok=True)
+            except OSError as e:
+                return {"ok": False,
+                        "error": f"could not create parent directory: {e}",
+                        "path": abs_path}
+            created_dirs = list(reversed(missing))
+
     try:
         with open(abs_path, "w", encoding="utf-8") as f:
             f.write(content)
@@ -1610,11 +1636,18 @@ def _bi_fs_write(params: dict, ctx: ToolCtx) -> dict:
                 content = _formatted
         except OSError:
             pass
+    # Surfaced, never silent: a typo'd path now succeeds instead of failing,
+    # so the directories it invented have to be visible in the same breath.
+    _base = ctx.cwd or os.getcwd()
+    _shown = [(os.path.relpath(d, _base) if d.startswith(_base + os.sep) else d)
+              for d in created_dirs]
+    _suffix = f" [created dir: {', '.join(_shown)}]" if _shown else ""
     return _attach_diagnostics({
         "ok": True,
-        "result": f"{action} {abs_path} ({len(content)} bytes)",
+        "result": f"{action} {abs_path} ({len(content)} bytes){_suffix}",
         "path": abs_path,
         "changed": old_content != content,
+        "created_dirs": created_dirs,
         "diff": diff or "(no differences)",
     }, abs_path)
 
@@ -4813,6 +4846,63 @@ def _bi_account_usage(params: dict, ctx: ToolCtx) -> dict:
     errors = [e for e in (usage_err, balance_err) if e]
     if errors:
         result["account"]["errors"] = errors
+    return {"ok": True, "result": result}
+
+
+def _bi_policy_check(params: dict, ctx: ToolCtx) -> dict:
+    """What the security policy would decide about a command or a write.
+
+    Read-only, and permanently so. A tool that could edit the policy would be
+    a tool that removes the policy, and the point of the gate is that the
+    agent cannot open it — the user changes rules with /policy and
+    ~/.laintas/policy.json. What this closes is the other half: the agent
+    could be refused without ever being able to ask *first*, so it discovered
+    every boundary by tripping over it in front of the user.
+
+    Probes are audited like any other consultation, tagged
+    `policy.check(probe)` so the log still separates asking from running.
+    """
+    try:
+        import policy as _pol
+    except ImportError as exc:
+        return {"ok": False, "error": f"missing dependency: {exc}"}
+
+    command = str(params.get("command") or "").strip()
+    write_path = str(params.get("write_path") or "").strip()
+    delete_path = str(params.get("delete_path") or "").strip()
+    if not (command or write_path or delete_path):
+        return {"ok": False, "error": (
+            "give one of 'command', 'write_path' or 'delete_path'")}
+
+    cfg = _pol.get_config()
+    cwd = ctx.cwd or os.getcwd()
+    result = {"mode": cfg.get("mode", "audit")}
+    try:
+        if command:
+            # The audit log records this, as it records every consultation —
+            # but tagged, so an incident review can tell a question the agent
+            # asked from a command it actually ran.
+            decision = _pol.evaluate(command, cwd,
+                                     req_id="policy.check(probe)",
+                                     agent_id=ctx.agent_id or "")
+            result["command"] = {
+                "input": command,
+                "action": decision.action,
+                "rule": decision.rule,
+                "reason": decision.reason,
+                "always_asks": (_pol.is_delete_command(command)
+                                or _pol.is_destructive_git_command(command)),
+            }
+        if write_path:
+            decision = _pol.evaluate_file_write(write_path, cwd)
+            result["write"] = {"path": write_path, "action": decision.action,
+                               "rule": decision.rule, "reason": decision.reason}
+        if delete_path:
+            decision = _pol.evaluate_file_delete(delete_path, cwd)
+            result["delete"] = {"path": delete_path, "action": decision.action,
+                                "rule": decision.rule, "reason": decision.reason}
+    except Exception as exc:
+        return {"ok": False, "error": f"policy check failed: {exc}"}
     return {"ok": True, "result": result}
 
 
@@ -8677,7 +8767,10 @@ def register_builtin_tools() -> None:
         ),
         Tool(
             name="fs.write",
-            description="Overwrite a file with the provided UTF-8 string content.",
+            description="Overwrite a file with the provided UTF-8 string content. "
+                        "Missing parent directories of a new file are created "
+                        "automatically (mkdir -p), and the result names any "
+                        "directory it had to create.",
             schema={
                 "type": "object",
                 "properties": {
@@ -9669,6 +9762,30 @@ def register_builtin_tools() -> None:
                 },
             },
             invoke=_bi_account_usage,
+        ),
+        Tool(
+            name="policy.check",
+            description=(
+                "Ask the security policy what it would decide about a shell "
+                "command, a file write or a delete — allow, needs_approval or "
+                "deny, and which rule says so. Nothing runs. Use it before a "
+                "long or destructive plan so you can choose a different "
+                "approach, or tell the user what they will be asked to "
+                "approve, instead of discovering the boundary by hitting it. "
+                "Read-only: rules are the user's, changed with /policy."
+            ),
+            schema={
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string",
+                                "description": "Shell command line to test."},
+                    "write_path": {"type": "string",
+                                   "description": "Path a write would target."},
+                    "delete_path": {"type": "string",
+                                    "description": "Path a delete would target."},
+                },
+            },
+            invoke=_bi_policy_check,
         ),
         Tool(
             name="work.status",

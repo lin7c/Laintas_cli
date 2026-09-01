@@ -42,6 +42,7 @@ jobs:
         run: |
           mkdir -p staging
           cp "build/linux/dist-compat/${{ matrix.arch }}/laintas-cli" staging/
+          cp LICENSE staging/
           cat > staging/install.sh <<'EOF'
           #!/usr/bin/env bash
           set -euo pipefail
@@ -84,7 +85,7 @@ jobs:
           os.system("cd bundle && zip -qr ../laintas-cli_source.zip laintas-cli-source")
           os.makedirs("src_out", exist_ok=True)
           for f in top:
-              if os.path.isfile(f) and f.endswith((".py", ".json", ".txt")):
+              if os.path.isfile(f) and (f == "LICENSE" or f.endswith((".py", ".json", ".txt"))):
                   shutil.copy(f, "src_out/")
           for d in dirs:
               if os.path.isdir(d):

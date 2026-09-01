@@ -62,6 +62,29 @@ def test_source_update_bundle_includes_declared_data_files(tmp_path, monkeypatch
     assert (out / "default_skills" / "example" / "SKILL.md").is_file()
 
 
+def test_source_update_bundle_includes_license(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "version.py").write_text('__version__ = "9.9.9"\n')
+    (repo / "LICENSE").write_text("license terms\n")
+    (repo / "package_manifest.json").write_text(json.dumps({
+        "modules": ["version"],
+        "extra_files": ["LICENSE"],
+        "packages": [],
+        "data_dirs": [],
+    }))
+
+    out = tmp_path / "out"
+    out.mkdir()
+    monkeypatch.setattr(build_release_assets, "REPO", str(repo))
+    monkeypatch.syspath_prepend(str(repo))
+
+    manifest = build_release_assets._gen_src_out(str(out))
+
+    assert "LICENSE" in manifest["files"]
+    assert (out / "LICENSE").read_text() == "license terms\n"
+
+
 def test_release_assets_include_source_and_versioned_deb():
     assert build_release_assets._release_asset_names("1.8.3") == [
         "laintas-cli_linux_amd64.tar.gz",

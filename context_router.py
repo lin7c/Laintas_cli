@@ -83,6 +83,9 @@ _GROUPS: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
     (("failed", "failure", "error", "crashed", "why did", "diagnose",
       "went wrong"),
      ("diag.",)),
+    (("policy", "permission", "allowed", "approval", "blocked", "denied",
+      "safe to run", "am i allowed"),
+     ("policy.",)),
 )
 
 
@@ -123,6 +126,9 @@ _INPUT_ALIASES = {
     "\u7528\u91cf": "usage", "\u5931\u8d25": "failed", "\u62a5\u9519": "error",
     "\u4e3a\u4ec0\u4e48\u5931\u8d25": "why did", "\u591a\u5c11\u94b1": "cost",
     "\u82b1\u4e86": "spend", "\u8ba2\u9605": "subscription",
+    "\u7b56\u7565": "policy", "\u6743\u9650": "permission",
+    "\u5141\u8bb8": "allowed", "\u5ba1\u6279": "approval",
+    "\u62e6\u622a": "blocked", "\u5b89\u5168\u9650\u5236": "policy",
 }
 
 

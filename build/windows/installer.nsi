@@ -53,6 +53,7 @@ VIAddVersionKey "ProductVersion" "${APP_VERSION}"
 !define MUI_FINISHPAGE_RUN "$INSTDIR\bin\laintas-cli.exe"
 !define MUI_FINISHPAGE_RUN_TEXT "Start Laintas CLI now"
 !insertmacro MUI_PAGE_WELCOME
+!insertmacro MUI_PAGE_LICENSE "${PAYLOAD_DIR}\LICENSE"
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
 !insertmacro MUI_PAGE_FINISH
@@ -101,6 +102,7 @@ Section "Install"
 
   SetOutPath "$INSTDIR"
   File "${PAYLOAD_DIR}\uninstall.ps1"
+  File /oname=LICENSE "${PAYLOAD_DIR}\LICENSE"
   WriteUninstaller "$INSTDIR\uninstall.exe"
   Delete "$INSTDIR\app\uninstall.ps1"
   Delete "$INSTDIR\app\uninstall.exe"
@@ -124,6 +126,7 @@ Section "Uninstall"
   RMDir "$INSTDIR\bin"
   Delete "$INSTDIR\uninstall.ps1"
   Delete "$INSTDIR\uninstall.exe"
+  Delete "$INSTDIR\LICENSE"
   ; Keep $INSTDIR itself because WSL\ext4.vhdx and the user's ~/.laintas
   ; data intentionally survive a normal uninstall.
   DeleteRegKey HKCU "${REG_UNINSTALL}"

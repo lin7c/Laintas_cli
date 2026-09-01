@@ -118,9 +118,9 @@
     "patch_adapter": []
   },
 
-  "data_dirs": ["default_skills"],
+  "data_dirs": ["default_skills", "docs"],
 
-  "extra_files": ["PROJECT.md", "SECURITY_CUSTOMIZATION.md", "requirements.txt", "setup.py"],
+  "extra_files": ["LICENSE", "PROJECT.md", "SECURITY_CUSTOMIZATION.md", "requirements.txt", "setup.py"],
 
   "frozen_deps": {
     "linux":   ["websockets", "playwright", "aiortc", "av", "cffi"]

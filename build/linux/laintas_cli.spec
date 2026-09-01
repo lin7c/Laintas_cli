@@ -17,6 +17,7 @@ with open(os.path.join(_PROJECT_DIR, 'package_manifest.json'), encoding='utf-8')
 # Top-level .py modules → datas (shipped as data so PyInstaller includes them
 # both as importable modules and as on-disk files for the self-updater).
 _datas = [(os.path.join(_PROJECT_DIR, m + '.py'), '.') for m in _PM['modules']]
+_datas.append((os.path.join(_PROJECT_DIR, 'LICENSE'), '.'))
 
 # Sub-packages → datas (whole directory, preserving structure).
 for _pkg in _PM['packages'] + _PM['data_dirs']:

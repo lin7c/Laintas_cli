@@ -66,8 +66,9 @@ fi
 chmod 755 "$BINARY"
 
 # ── 3. Stage the .deb tree ────────────────────────────────────────────
-mkdir -p "$PKG_DIR/usr/bin"
+mkdir -p "$PKG_DIR/usr/bin" "$PKG_DIR/usr/share/doc/laintas-cli"
 install -m 755 "$BINARY" "$PKG_DIR/usr/bin/laintas-cli"
+install -m 644 "$PROJECT_DIR/LICENSE" "$PKG_DIR/usr/share/doc/laintas-cli/LICENSE"
 
 # ── 4. Build .deb with fpm ────────────────────────────────────────────
 echo "Building laintas-cli v${VERSION} .deb..."
@@ -80,7 +81,7 @@ fpm \
     --description "Laintas CLI - Autonomous AI agent for your terminal (self-contained build)" \
     --url "https://laintas.com" \
     --maintainer "Laintas <support@laintas.com>" \
-    --license "Proprietary" \
+    --license "FSL-1.1-MIT" \
     --architecture amd64 \
     --after-install "$SCRIPT_DIR/postinst.sh" \
     --before-remove "$SCRIPT_DIR/prerm.sh" \
