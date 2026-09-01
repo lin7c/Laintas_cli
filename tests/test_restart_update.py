@@ -165,6 +165,27 @@ class RestartResolutionTests(unittest.TestCase):
                 {"enable_mouse": False})
         self.assertIs(preferences["enable_mouse"], False)
 
+    def test_launcher_marker_enables_mouse_whatever_the_distro_is_called(self):
+        """The launcher's own signal, not the distribution's name.
+
+        LAINTAS_WSL_DISTRO renames the distribution, so a name check loses the
+        mouse for anyone who used it — with nothing on screen connecting the
+        two facts.
+        """
+        with mock.patch.dict(
+                laintas_cli.os.environ,
+                {"LAINTAS_HOST": "windows",
+                 "WSL_DISTRO_NAME": "Laintas-Work"}, clear=False):
+            preferences = laintas_cli._initial_ui_preferences_for_host({})
+        self.assertIs(preferences["enable_mouse"], True)
+
+    def test_an_ordinary_linux_terminal_leaves_the_mouse_off(self):
+        environment = {k: v for k, v in laintas_cli.os.environ.items()
+                       if k not in ("LAINTAS_HOST", "WSL_DISTRO_NAME")}
+        with mock.patch.dict(laintas_cli.os.environ, environment, clear=True):
+            preferences = laintas_cli._initial_ui_preferences_for_host({})
+        self.assertNotIn("enable_mouse", preferences)
+
     def test_path_launch_resolves_executable_instead_of_cwd_name(self):
         with tempfile.TemporaryDirectory() as tmp:
             executable = Path(tmp) / "laintas-cli"

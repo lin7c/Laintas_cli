@@ -31,6 +31,9 @@
 #ifndef ENABLE_MOUSE_INPUT
 #define ENABLE_MOUSE_INPUT 0x0010
 #endif
+#ifndef TMPF_TRUETYPE
+#define TMPF_TRUETYPE 0x04
+#endif
 
 namespace {
 
@@ -125,9 +128,14 @@ void UseTrueTypeFont(HANDLE output) {
     if (!GetCurrentConsoleFontEx(output, FALSE, &font)) {
         return;
     }
-    // A raster font reports family 0 and an empty face name. Leave a font the
-    // user chose deliberately alone; only replace the unusable default.
-    if (font.FontFamily != 0 && font.FaceName[0] != L'\0') {
+    // TMPF_TRUETYPE is the only reliable way to tell the two apart. The
+    // legacy raster font is not "family 0 with an empty face name" — conhost
+    // reports it as face "Terminal", family 48 (FF_MODERN) — so a guard
+    // written that way returns early on exactly the console it was meant to
+    // repair, and the box-drawing and CJK glyphs stay broken. Any TrueType
+    // face is a deliberate choice and is left alone; a raster face can never
+    // draw a frame, whoever selected it.
+    if (font.FontFamily & TMPF_TRUETYPE) {
         return;
     }
     font.FontFamily = FF_DONTCARE;
@@ -155,8 +163,12 @@ ConsoleState PrepareConsole() {
         // Without this the console decodes output as the system code page —
         // 936 on a Chinese install — and every non-ASCII byte the CLI writes
         // comes out as mojibake.
-        state.restore_code_pages =
-            SetConsoleCP(CP_UTF8) && SetConsoleOutputCP(CP_UTF8);
+        // Two independent settings: `&&` would skip the output code page
+        // whenever the input one failed, and record nothing to restore for
+        // the half of the change that did land.
+        const bool input_utf8 = SetConsoleCP(CP_UTF8) != FALSE;
+        const bool output_utf8 = SetConsoleOutputCP(CP_UTF8) != FALSE;
+        state.restore_code_pages = input_utf8 || output_utf8;
     }
 
     if (state.output != INVALID_HANDLE_VALUE
@@ -287,7 +299,11 @@ int wmain(int argc, wchar_t** argv) {
     }
     std::wstring command = L"exec env TERM=";
     command += PosixQuote(term);
-    command += L" COLORTERM=truecolor ";
+    // LAINTAS_HOST is how the Linux side knows it is the Windows product
+    // rather than a Linux install, which is what turns mouse reporting on by
+    // default. Keying that off the distribution name instead would silently
+    // stop working for anyone who set LAINTAS_WSL_DISTRO.
+    command += L" COLORTERM=truecolor LAINTAS_HOST=windows ";
     command += PosixQuote(kLinuxExecutable);
     for (int index = 1; index < argc; ++index) {
         command.push_back(L' ');

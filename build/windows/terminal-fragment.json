@@ -7,13 +7,18 @@
     "installer has no business rewriting.",
     "__LAUNCHER__ and __ICON__ are replaced with real paths at install time;",
     "the profile GUID is fixed so a reinstall updates this profile rather than",
-    "adding a second one."
+    "adding a second one.",
+    "commandline is a command line, not a path: the escaped quotes around",
+    "__LAUNCHER__ are what keep it working when the installation path holds a",
+    "space. The default path contains the account name, so an account called",
+    "'Zhang San' breaks an unquoted profile on the very first launch. icon is",
+    "a plain path and must NOT be quoted."
   ],
   "profiles": [
     {
       "guid": "{b9f3a1d2-6c47-5e88-9a01-4d2f7c6e8b13}",
       "name": "Laintas CLI",
-      "commandline": "__LAUNCHER__",
+      "commandline": "\"__LAUNCHER__\"",
       "icon": "__ICON__",
       "startingDirectory": "%USERPROFILE%",
       "colorScheme": "Laintas",

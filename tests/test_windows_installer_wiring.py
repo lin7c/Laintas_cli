@@ -127,6 +127,18 @@ def test_launcher_fixes_the_console_it_is_handed():
     assert "SetConsoleOutputCP(CP_UTF8)" in launcher
     assert "SetCurrentConsoleFontEx" in launcher
 
+    # The raster font is told apart by the TMPF_TRUETYPE bit and nothing else.
+    # conhost reports the legacy font as face "Terminal", family 48 — not as
+    # "family 0 with an empty name" — so a guard phrased that way returned
+    # early on the exact console it was supposed to repair.
+    assert "TMPF_TRUETYPE" in launcher
+    assert "font.FontFamily != 0" not in launcher
+
+    # LAINTAS_HOST is how the Linux side learns it is the Windows product and
+    # turns the mouse on. The distribution name cannot carry that: it is
+    # user-settable through LAINTAS_WSL_DISTRO.
+    assert "LAINTAS_HOST=windows" in launcher
+
     # Whatever was there before is put back: this process does not own the
     # window it was started in.
     assert "RestoreConsole" in launcher
@@ -158,6 +170,20 @@ def test_windows_terminal_profile_is_installable_and_consistent():
     # reinstall instead of updating this one.
     assert profile["guid"].startswith("{") and profile["guid"].endswith("}")
     assert "__LAUNCHER__" in raw and "__ICON__" in raw
+
+    # `commandline` is a command line, so a path with a space in it has to
+    # arrive quoted. The default install path contains the Windows account
+    # name, which makes an account like "Zhang San" enough to break the
+    # profile on its first launch. `icon` is a plain path and must not be
+    # quoted or Windows Terminal cannot find the file.
+    launcher_path = r"C:\Users\Zhang San\AppData\Local\Laintas\bin\laintas-cli.exe"
+    icon_path = r"C:\Users\Zhang San\AppData\Local\Laintas\bin\laintas-cli.ico"
+    # Exactly what install.ps1 does to the bundled template.
+    substituted = raw.replace("__LAUNCHER__", launcher_path.replace("\\", "\\\\"))
+    substituted = substituted.replace("__ICON__", icon_path.replace("\\", "\\\\"))
+    installed = json.loads(substituted)["profiles"][0]
+    assert installed["commandline"] == f'"{launcher_path}"'
+    assert installed["icon"] == icon_path
 
     launcher = (ROOT / "build/windows/launcher.cpp").read_text(encoding="utf-8")
     assert 'kTerminalProfile[] = L"Laintas CLI"' in launcher

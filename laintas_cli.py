@@ -130,10 +130,17 @@ def _initial_ui_preferences_for_host(preferences: dict) -> dict:
     takes over drag-to-select. The private Windows distribution is launched
     inside a modern Windows terminal where clickable UI is expected, so turn
     it on there unless the user explicitly saved ``enable_mouse = false``.
+
+    The Windows launcher states what it is through LAINTAS_HOST. The
+    distribution name is only a fallback for a launcher older than that
+    variable: it is settable through LAINTAS_WSL_DISTRO, so a user who
+    renamed their distribution would otherwise lose the mouse and have no way
+    to connect the two facts.
     """
     result = dict(preferences)
-    if ("enable_mouse" not in result
-            and os.environ.get("WSL_DISTRO_NAME") == "Laintas-CLI"):
+    windows_host = (os.environ.get("LAINTAS_HOST") == "windows"
+                    or os.environ.get("WSL_DISTRO_NAME") == "Laintas-CLI")
+    if "enable_mouse" not in result and windows_host:
         result["enable_mouse"] = True
     return result
 
