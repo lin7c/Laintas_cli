@@ -133,7 +133,12 @@ class StorageToolTests(unittest.TestCase):
         """Bytes arriving over the network still land as a local file."""
         deps = types.SimpleNamespace(
             request_file_write_approval=lambda *_a: False)
-        out = self.call("storage.get", deps=deps, path="reports/a.md")
+        decision = types.SimpleNamespace(
+            action="needs_approval", reason="test write gate", rule="test")
+        with mock.patch.object(
+                tools._policy_mod, "evaluate_file_write",
+                return_value=decision):
+            out = self.call("storage.get", deps=deps, path="reports/a.md")
         self.assertFalse(out["ok"])
         self.assertEqual(self.client.calls, [])
         self.assertFalse(os.path.exists(os.path.join(self.tmp.name, "a.md")))

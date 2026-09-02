@@ -626,7 +626,7 @@ class SlotRenderTests(_SlotTestBase):
         # width 100 < 108: the terminal segment stays hidden. The mark leads
         # whatever the order says, so compare the settings behind it.
         self.assertEqual(_join(_without_mark(frags)).strip(),
-                         "ACT · primary · glm-5.2")
+                         "ACT | primary | glm-5.2")
 
     def test_custom_visibility_renders(self):
         frags = self._render(width=100, rprompt_slots_detail_off="mode")
@@ -646,7 +646,7 @@ class MessagesMarkRenderTests(_SlotTestBase):
             [("class:rprompt-logo-l", "L"),
              ("class:rprompt-logo-gt", ">"),
              ("class:rprompt-logo-count", " 2"),
-             ("class:rprompt-sep", f" {symbols.BULLET} ")])
+             ("class:rprompt-sep", laintas_cli._RPROMPT_SEPARATOR)])
 
     def test_mark_leaves_the_row_once_everything_is_read(self):
         import startup_mail
@@ -659,7 +659,7 @@ class MessagesMarkRenderTests(_SlotTestBase):
         self.assertNotIn("L>", _text(rendered))
         # ...and the settings behind it are untouched by its going.
         self.assertEqual(_join(_without_mark(rendered)).strip(),
-                         "primary · ACT · glm-5.2")
+                         "primary | ACT | glm-5.2")
 
     def test_mark_is_absent_when_there_are_no_messages_at_all(self):
         import startup_mail
@@ -723,10 +723,12 @@ class DeferredNoticeTests(_SlotTestBase):
 
 
 class LegacyRenderEquivalenceTests(unittest.TestCase):
-    """The slot refactor must not change what the rprompt looks like.
+    """The slot refactor must preserve the rprompt apart from safe separators.
 
-    Byte-level comparison against a snapshot of the pre-refactor renderer
-    across width x detail x multi-agent x path x model combinations.
+    Comparison against a snapshot of the pre-refactor renderer across width x
+    detail x multi-agent x path x model combinations. The old U+00B7 separator
+    is normalized because it has ambiguous terminal width and cannot safely be
+    used in a right-aligned row.
     """
 
     def setUp(self):
@@ -762,7 +764,12 @@ class LegacyRenderEquivalenceTests(unittest.TestCase):
                     mock.patch.object(laintas_cli, "get_runtime_config",
                                       side_effect=lambda k: cfg.get(k)):
                 fresh = laintas_cli._render_rprompt()
-            if _without_mark(fresh) != [tuple(x) for x in legacy]:
+            expected = [
+                (style, (laintas_cli._RPROMPT_SEPARATOR
+                         if style == "class:rprompt-sep" else text))
+                for style, text in legacy
+            ]
+            if _without_mark(fresh) != expected:
                 mismatches.append(key)
         self.assertEqual(mismatches, [],
                          f"{len(mismatches)} render regressions: {mismatches[:5]}")

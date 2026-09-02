@@ -2308,8 +2308,13 @@ class ActivityStatusTests(unittest.TestCase):
 
     def test_a_long_tool_call_paints_a_status_row(self):
         console = self._console()
-        with agent_loop.activity_status(console, "shell.exec", "sleep 12"):
-            time.sleep(0.6)
+        # Render the exact object owned by Live instead of hoping its
+        # auto-refresh thread gets scheduled inside a fixed sleep. Lifecycle
+        # and console release are covered separately below.
+        with agent_loop.activity_status(
+                console, "shell.exec", "sleep 12", delay=0) as status:
+            self.assertIsNotNone(status._live)
+            console.print(status._renderable())
         painted = self._plain(console)
         self.assertIn("Running", painted)
         self.assertIn("sleep 12", painted)
@@ -2325,15 +2330,14 @@ class ActivityStatusTests(unittest.TestCase):
     def test_pause_releases_the_console_for_another_live(self):
         """An approval prompt or a batch renderer must be able to take over."""
         from rich.live import Live
-        from rich.errors import LiveError
         from rich.text import Text
 
         console = self._console()
-        with agent_loop.activity_status(console, "agent.spawn_parallel", "x"):
-            time.sleep(0.5)
-            with self.assertRaises(LiveError):
-                Live(Text("other"), console=console).__enter__()
+        with agent_loop.activity_status(
+                console, "agent.spawn_parallel", "x") as status:
+            self.assertIsNotNone(status._live)
             agent_loop.pause_activity_status()
+            self.assertIsNone(status._live)
             other = Live(Text("other"), console=console)
             other.__enter__()
             other.__exit__(None, None, None)

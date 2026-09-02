@@ -19,7 +19,13 @@ from context_policy.summary_prompt import summary_prompt
 class PromptContractTests(unittest.TestCase):
     def test_product_authored_runtime_surfaces_are_english_only(self):
         roots = [Path("context_policy"), Path("default_skills"), Path("extensions")]
-        files = list(Path.cwd().glob("*.py"))
+        # setup.py is package metadata, not a model/user-facing runtime
+        # surface. Its legal author field may use the company's registered
+        # Chinese name without leaking Chinese instructions into prompts.
+        files = [
+            path for path in Path.cwd().glob("*.py")
+            if path.name != "setup.py"
+        ]
         for root in roots:
             files.extend(
                 path for path in root.rglob("*")

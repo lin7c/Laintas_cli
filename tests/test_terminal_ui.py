@@ -170,7 +170,7 @@ class ResponsiveTerminalChromeTests(unittest.TestCase):
                 mock.patch("plan_mode.is_plan_mode", return_value=False):
             frags = laintas_cli._render_rprompt()
         text = _text(frags)
-        self.assertTrue(_settings_text(frags).startswith("agent1 · ACT"))
+        self.assertTrue(_settings_text(frags).startswith("agent1 | ACT"))
         self.assertIn("glm-5.2", text)
 
     def test_prompt_uses_one_foreground_without_agent_routing(self):

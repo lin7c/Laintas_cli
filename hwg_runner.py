@@ -610,6 +610,17 @@ def run_hwg_file(path: str, deps, session: dict, parent_id: Optional[str] = None
             )}
     graph = as_graph(statements)
     nodes = graph["nodes"]
+    # Tool nodes are part of the shared grammar but only Helpwo executes them:
+    # this runner hands every node to hwo_runner.run_hwo_file(), which would
+    # look for a file literally named "tool:generate_image" and report a
+    # missing file. Refusing by name says what is actually wrong.
+    tool_nodes = [n for n in nodes if n.get("tool")]
+    if tool_nodes:
+        named = ", ".join(f'#{n["id"]}#' for n in tool_nodes)
+        return {"ok": False, "msg": (
+            f"hwg: this graph cannot run here: {named} bind tools "
+            f"((tool:name)#id#), which only Helpwo executes today. "
+            f"Compiling and visualising the graph works.")}
     edges = graph["edges"]
     node_by_id = {n["id"]: n for n in nodes}
     outgoing = {n["id"]: [] for n in nodes}

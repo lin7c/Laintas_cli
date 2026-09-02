@@ -4993,6 +4993,17 @@ def _pessimistic_width(text: str) -> int:
     return total
 
 
+# Keep right-prompt chrome to characters whose terminal width is unambiguous.
+# prompt_toolkit right-aligns rprompt using wcwidth, which treats U+00B7 MIDDLE
+# DOT as one cell.  CJK terminals are allowed to draw that same glyph as two
+# cells.  Fitting the *contents* pessimistically is not enough: the renderer
+# has already chosen the right-aligned start column from the narrower width,
+# so every ambiguous separator still pushes the physical row past the edge.
+# Once that happens, a SIGWINCH repaint is emitted on the wrapped row and old
+# copies accumulate in scrollback.  ASCII `|` is one cell in both models.
+_RPROMPT_SEPARATOR = " | "
+
+
 def _fit_rprompt(segments: list, budget: int) -> list:
     """Drop trailing rprompt segments until the worst-case width fits *budget*.
 
@@ -5192,7 +5203,8 @@ def _fit_rprompt_slot_items(items: list[tuple[str, str, str]],
     """Drop whole trailing slots until the separator-joined row fits."""
     items = list(items)
     while items:
-        text = f" {symbols.BULLET} ".join(value for _sid, _style, value in items)
+        text = _RPROMPT_SEPARATOR.join(
+            value for _sid, _style, value in items)
         if budget > 0 and _pessimistic_width(text) <= budget:
             break
         items.pop()
@@ -5295,7 +5307,7 @@ def _render_rprompt():
     result = []
     for _slot, style, value in items:
         if result:
-            result.append(("class:rprompt-sep", f" {symbols.BULLET} "))
+            result.append(("class:rprompt-sep", _RPROMPT_SEPARATOR))
         handler = _rprompt_slot_mouse_handler(_slot)
         if _slot == "messages":
             if style == "class:rprompt-slot-selected":

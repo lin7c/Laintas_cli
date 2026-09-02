@@ -180,6 +180,28 @@ def _extract_retry(content: str) -> Optional[int]:
 
 _TOOL_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.*?-]*$")
 
+#: `(tool:generate_image)#hero#` — a node bound to a single tool call instead of
+#: a .hwo workflow.
+#:
+#: A .hwo node is an agent: it costs a model call, takes as long as it takes,
+#: and its output is whatever the agent decided to return. That is the right
+#: shape for judgement and the wrong one for a step that is a function — resize
+#: this image, generate that clip. A tool node is the deterministic half, and it
+#: is what makes a graph re-runnable: same inputs, same result, so its output can
+#: be cached on its inputs rather than on the whole workspace.
+#:
+#: The binding is kept in `file` verbatim so every existing consumer (summary,
+#: visualiser, cache key) keeps working, with `tool` as the parsed name. The
+#: pattern deliberately forbids a dot, so an ordinary path like `tool:x.hwo`
+#: stays a file binding and nothing that parses today changes meaning.
+_TOOL_BINDING_RE = re.compile(r"^tool:([A-Za-z_][A-Za-z0-9_]*)$")
+
+
+def tool_binding(file: str) -> str:
+    """The tool name a node binds, or "" when it binds a .hwo file."""
+    match = _TOOL_BINDING_RE.match(str(file or "").strip())
+    return match.group(1) if match else ""
+
 
 def _extract_tools(content: str) -> Optional[list]:
     """`tools: [fs.read, fs.grep]` — the tools this node's agents may call.
@@ -576,6 +598,11 @@ class _Parser:
         if self._peek() != "(":
             raise HwgParseError("A manual node must be !(file.hwo)#name#", start)
         file = self._read_paren()
+        if tool_binding(file):
+            # A manual node is a pause for a person, and what resumes it is a
+            # verdict they supply. A tool call has nothing to pause for.
+            raise HwgParseError(
+                "A manual node must bind a .hwo file, not a tool", start)
         self._skip_ws()
         return self._parse_node_tail(file, True)
 
@@ -595,6 +622,9 @@ class _Parser:
         if self._peek() == "{":
             policy = _extract_policy(self._read_brace_content())
         node = {"type": "node", "id": name, "file": file, "manual": manual}
+        tool = tool_binding(file)
+        if tool:
+            node["tool"] = tool
         if io is not None:
             node["io"] = io
         if policy:
@@ -940,7 +970,14 @@ def validate(statements: list) -> list[str]:
         if policy.get("retry") is not None and (not isinstance(policy["retry"], int) or policy["retry"] < 0):
             errors.append(f'#{node["id"]}#: retry policy must be a non-negative integer.')
         tools = policy.get("tools")
-        if tools is not None:
+        if tools is not None and node.get("tool"):
+            # tools: narrows the agents inside a node. A tool node has no
+            # agents, so accepting the key would announce a containment that
+            # does not exist.
+            errors.append(
+                f'#{node["id"]}#: tools: applies to the agents in a .hwo node; '
+                f'a tool node calls {node["tool"]} and nothing else.')
+        elif tools is not None:
             if not tools:
                 errors.append(
                     f'#{node["id"]}#: tools: [] would leave the node with nothing to '

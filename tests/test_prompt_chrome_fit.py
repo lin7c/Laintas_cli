@@ -2,10 +2,9 @@
 
 Background: the prompt used to stack copies of itself down the screen. The
 mechanism was a width miscount — prompt_toolkit measures East-Asian AMBIGUOUS
-characters (U+00B7 MIDDLE DOT, which separates every rprompt segment) as one
-column, while a CJK-configured terminal draws them as two. The line then ran
-past the right edge, wrapped, and the renderer's cursor model was wrong from
-then on, so every repaint landed on a fresh row.
+characters as one column, while a CJK-configured terminal may draw them as
+two. A right-aligned prompt containing such characters can run past the edge,
+and every resize repaint then lands on a fresh row.
 
 These tests pin both halves of the fix: worst-case fitting, and the reserved
 final column.
@@ -77,6 +76,25 @@ class RpromptFitTests(unittest.TestCase):
                     total, width,
                     f"rprompt overflows: {total} > {width} for {rendered!r}")
 
+    def test_right_alignment_uses_only_unambiguous_width_chrome(self):
+        """Physical and prompt_toolkit widths must agree after right alignment.
+
+        Merely fitting ``path + pessimistic(rprompt)`` is insufficient. The
+        toolkit chooses the rprompt's starting column using its own wcwidth;
+        any wider CJK rendering then extends beyond the terminal edge.
+        Exercise a resize sequence because each overflow used to leave one
+        more copy of the row in scrollback.
+        """
+        from prompt_toolkit.utils import get_cwidth
+
+        for width in range(120, 39, -1):
+            with self.subTest(width=width):
+                rendered = self._render(width, "~")
+                self.assertEqual(
+                    laintas_cli._pessimistic_width(rendered),
+                    get_cwidth(rendered),
+                    f"right-aligned chrome has ambiguous width: {rendered!r}")
+
     def test_last_column_is_always_reserved(self):
         for width in range(40, 130, 7):
             with self.subTest(width=width):
@@ -86,7 +104,9 @@ class RpromptFitTests(unittest.TestCase):
         for width in range(40, 130):
             rendered = self._render(width, "~").rstrip()
             with self.subTest(width=width):
-                self.assertFalse(rendered.endswith(symbols.BULLET), rendered)
+                self.assertFalse(
+                    rendered.endswith(laintas_cli._RPROMPT_SEPARATOR.strip()),
+                    rendered)
 
     def test_still_discloses_progressively_when_there_is_room(self):
         self.assertNotIn("glm-5.2", self._render(62, "~"))

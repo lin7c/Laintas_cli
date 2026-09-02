@@ -905,3 +905,27 @@ class ReadyQueueTests(unittest.TestCase):
                 lambda path: {"ok": True, "msg": "[RETURN #n#]: PASS",
                               "outputs": {"verdict": "PASS"}})
         self.assertEqual(1, calls.count("merge.hwo"))
+
+
+def test_tool_nodes_are_refused_by_name(tmp_path, monkeypatch):
+    """The shared grammar accepts (tool:name)#id#; this runner does not execute it.
+
+    Without an explicit refusal the node would reach hwo_runner.run_hwo_file()
+    with path="tool:generate_image" and come back as a missing file, which
+    sends the author looking for a file they never wrote.
+    """
+    import hwg_runner
+
+    graph = tmp_path / "media.hwg"
+    graph.write_text(
+        '(tool:generate_image)#render# [in(prompt = "x"), out(path: file)]\n'
+        '(judge.hwo)#judge#\n'
+        '#render# -> #judge#\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "judge.hwo").write_text("#j# { -> done }\n", encoding="utf-8")
+
+    result = hwg_runner.run_hwg_file(str(graph), deps=None, session={})
+    assert result["ok"] is False
+    assert "#render#" in result["msg"]
+    assert "only Helpwo executes" in result["msg"]
