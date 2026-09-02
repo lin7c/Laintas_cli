@@ -10961,16 +10961,39 @@ def show_skill_manager() -> None:
 
     def load_items():
         groups = tools_mod.get_registry().list_by_source()
-        return [resource_ui.UIItem(
-            key=str(skill["name"]),
-            title=str(skill["name"]),
-            subtitle=str(skill.get("description") or "No description"),
-            badge="SKILL",
-            status="loaded" if skill.get("loaded") else "available",
-            status_style="class:success" if skill.get("loaded") else "class:muted",
-            payload=skill,
-            search_text=f"{skill.get('managed_by', '')} {len(groups.get('skill:' + skill['name'], []))}",
-        ) for skill in skills_mod.list_skills()]
+        items = []
+        for skill in skills_mod.list_skills():
+            name = str(skill["name"])
+            scope = str(skill.get("scope") or skills_mod.SCOPE_USER)
+            # The badge answers "where does this apply and who wrote it" —
+            # the two questions a learned, repo-scoped skill raises and an
+            # installed one does not.
+            badge = ("LEARNED" if skill.get("learned")
+                     else "PROJECT" if scope == skills_mod.SCOPE_PROJECT
+                     else "SKILL")
+            if skill.get("status") == "stale":
+                status, status_style = "stale", "class:warning"
+            elif skill.get("loaded"):
+                status, status_style = "loaded", "class:success"
+            else:
+                status, status_style = "available", "class:muted"
+            counters = ""
+            if skill.get("helpful") or skill.get("harmful"):
+                counters = (f"  ({skill.get('helpful', 0)} helpful / "
+                            f"{skill.get('harmful', 0)} harmful)")
+            items.append(resource_ui.UIItem(
+                key=name,
+                title=name,
+                subtitle=str(skill.get("description") or "No description") + counters,
+                badge=badge,
+                status=status,
+                status_style=status_style,
+                payload=skill,
+                search_text=(f"{skill.get('managed_by', '')} {scope} "
+                             f"{skill.get('status', '')} "
+                             f"{len(groups.get('skill:' + name, []))}"),
+            ))
+        return items
 
     def load_detail(item):
         name = item.title
@@ -10987,6 +11010,28 @@ def show_skill_manager() -> None:
             lines.append(resource_ui.UILine(title, "class:detail.heading"))
             styled = _ui_text_detail("", content or "(empty)", kind=kind)
             lines.extend(styled.lines)
+
+        scope = str(item.payload.get("scope") or skills_mod.SCOPE_USER)
+        where = {skills_mod.SCOPE_PROJECT: "this project only",
+                 skills_mod.SCOPE_USER: "every project",
+                 skills_mod.SCOPE_BUNDLED: "shipped with laintas_cli"}.get(
+                     scope, scope)
+        origin = ("written by the agent" if item.payload.get("learned")
+                  else "installed")
+        section("Scope", f"{where}  •  {origin}")
+
+        if item.payload.get("status") == "stale":
+            section("Status",
+                    "STALE — a file this skill was learned from has changed:\n"
+                    + str(item.payload.get("stale_reason") or "")
+                    + "\n\nIt is still offered, flagged, because the lesson may "
+                      "well still hold; only re-reading the source can say.")
+        if item.payload.get("evidence"):
+            section("Learned from", str(item.payload.get("evidence")))
+        if item.payload.get("helpful") or item.payload.get("harmful"):
+            section("Utility",
+                    f"{item.payload.get('helpful', 0)} turns ended cleanly with "
+                    f"this loaded, {item.payload.get('harmful', 0)} did not.")
 
         skill_md = skill_dir / "SKILL.md" if skill_dir else None
         if skill_md is None:
@@ -14063,17 +14108,34 @@ def _memory_manager() -> None:
             -float(entry.get("importance", 0.5) or 0.5),
             str(entry.get("name", "")).casefold(),
         ))
-        return [resource_ui.UIItem(
-            key=f"{entry.get('scope', '')}:{entry.get('name', '')}",
-            title=str(entry.get("name") or "(unnamed)"),
-            subtitle=str(entry.get("description") or "No description"),
-            badge=str(memory_system.CATEGORY_LABELS.get(
-                entry.get("type"), entry.get("type") or "memory")),
-            status=str(memory_system.scope_label(entry.get("scope"))),
-            status_style="class:accent" if entry.get("scope") == "user" else "class:muted",
-            payload=entry,
-            search_text=f"{entry.get('type', '')} {entry.get('scope', '')}",
-        ) for entry in entries]
+        items = []
+        for entry in entries:
+            stale = entry.get("status") == memory_system.STATUS_STALE
+            # Staleness outranks scope in the status column. Scope is a
+            # property the user chose and can see from the category anyway;
+            # "the source moved under this claim" is the thing they need to
+            # notice without opening the row.
+            status = ("stale" if stale
+                      else str(memory_system.scope_label(entry.get("scope"))))
+            if stale:
+                status_style = "class:warning"
+            elif entry.get("scope") == "user":
+                status_style = "class:accent"
+            else:
+                status_style = "class:muted"
+            items.append(resource_ui.UIItem(
+                key=f"{entry.get('scope', '')}:{entry.get('name', '')}",
+                title=str(entry.get("name") or "(unnamed)"),
+                subtitle=str(entry.get("description") or "No description"),
+                badge=str(memory_system.CATEGORY_LABELS.get(
+                    entry.get("type"), entry.get("type") or "memory")),
+                status=status,
+                status_style=status_style,
+                payload=entry,
+                search_text=(f"{entry.get('type', '')} {entry.get('scope', '')} "
+                             f"{entry.get('status', '')}"),
+            ))
+        return items
 
     def load_detail(item):
         entry = item.payload
@@ -14089,6 +14151,32 @@ def _memory_manager() -> None:
         description = str(meta.get("description") or "").strip()
         body = str(data.get("body") or "(empty)")
         content = f"{description}\n\n{body}" if description else body
+        # Lifecycle first, above the prose: reading the body of a claim whose
+        # source has moved without being told so is the exact mistake this
+        # subsystem exists to prevent.
+        banner = []
+        status = str(meta.get("status") or memory_system.STATUS_ACTIVE)
+        if status == memory_system.STATUS_STALE:
+            reason = str(meta.get("stale_reason") or "the cited source changed")
+            banner.append(f"> **STALE — unverified, not wrong.** {reason}\n>\n"
+                          f"> Re-read the source, then re-save with fresh "
+                          f"`evidence` to clear this.")
+        elif status == memory_system.STATUS_SUPERSEDED:
+            successor = str(meta.get("superseded_by") or "")
+            banner.append(f"> **SUPERSEDED**"
+                          + (f" by `{successor}`." if successor
+                             else " — retired with no replacement.")
+                          + " Kept for the record; not current knowledge.")
+        evidence = memory_system.parse_evidence(meta.get("evidence"))
+        if evidence:
+            cited = "\n".join(
+                f"- `{item_ev.get('path')}`"
+                + (f" lines {item_ev.get('start')}-{item_ev.get('end')}"
+                   if item_ev.get("start") else "")
+                for item_ev in evidence)
+            banner.append(f"**Evidence**\n{cited}")
+        if banner:
+            content = "\n\n".join(banner) + "\n\n---\n\n" + content
         return _ui_text_detail(item.title, content, subtitle, kind="markdown")
 
     armed = {"key": "", "at": 0.0}

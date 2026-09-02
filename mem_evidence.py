@@ -159,8 +159,32 @@ def _drift(entry: dict, only: Optional[set] = None) -> list[str]:
     return reasons
 
 
+# ── Learned skills ─────────────────────────────────────────────────────
+# A skill the agent wrote is the same shape of claim as a memory — "here is
+# something true about this code" — and rots the same way. The lifecycle lives
+# in `skills`; the fingerprinting and drift detection live here, so there is
+# one definition of "the source moved" rather than two that disagree.
+
+
+def _learned_entries() -> list[dict]:
+    try:
+        import skills as _skills
+        import memory_system as _ms
+    except Exception:
+        return []
+    out = []
+    try:
+        for item in _skills.learned_skills():
+            evidence = _ms.parse_evidence(item.get("evidence"))
+            if evidence:
+                out.append({**item, "evidence": evidence})
+    except Exception:
+        return []
+    return out
+
+
 def propagate(paths: Iterable[str]) -> list[str]:
-    """Flag every memory whose cited source at ``paths`` actually moved.
+    """Flag every memory and learned skill whose cited source actually moved.
 
     Returns the names flagged. A write that leaves the bytes identical (a
     formatter no-op, a rewrite of the same content) flags nothing — the check
@@ -168,18 +192,32 @@ def propagate(paths: Iterable[str]) -> list[str]:
     produce on every save.
     """
     wanted = {os.path.abspath(p) for p in paths if p}
-    if not wanted or not (wanted & cited_paths()):
+    if not wanted:
         return []
     flagged = []
-    for entry in citing_memories(wanted):
-        if entry.get("status") == memory_system.STATUS_STALE:
+    if wanted & cited_paths():
+        for entry in citing_memories(wanted):
+            if entry.get("status") == memory_system.STATUS_STALE:
+                continue
+            reasons = _drift(entry, only=wanted)
+            if not reasons:
+                continue
+            ok, _ = memory_system.mark_stale(entry["name"], "; ".join(reasons))
+            if ok:
+                flagged.append(entry["name"])
+
+    import skills as _skills
+    for item in _learned_entries():
+        if item.get("status") == "stale":
             continue
-        reasons = _drift(entry, only=wanted)
+        if not (_cited_paths(item) & wanted):
+            continue
+        reasons = _drift(item, only=wanted)
         if not reasons:
             continue
-        ok, _ = memory_system.mark_stale(entry["name"], "; ".join(reasons))
+        ok, _ = _skills.mark_skill_stale(item["name"], "; ".join(reasons))
         if ok:
-            flagged.append(entry["name"])
+            flagged.append(item["name"])
     return flagged
 
 
@@ -199,6 +237,16 @@ def reconcile() -> list[str]:
         ok, _ = memory_system.clear_stale(entry["name"])
         if ok:
             healed.append(entry["name"])
+    try:
+        import skills as _skills
+        for item in _learned_entries():
+            if item.get("status") != "stale" or _drift(item):
+                continue
+            ok, _ = _skills.clear_skill_stale(item["name"])
+            if ok:
+                healed.append(item["name"])
+    except Exception:
+        pass
     return healed
 
 

@@ -5137,6 +5137,12 @@ def _skill_catalog_parts(query: str, base_catalog: str, session) -> tuple[str, s
                 if meta is None:
                     continue
                 status = "loaded" if name in loaded else "available"
+                # A learned skill whose source moved is still offered — hiding
+                # it would lose the lesson — but never at face value: acting on
+                # a repo-specific instruction that the repo has since
+                # contradicted is worse than having no instruction.
+                if getattr(meta, "status", "active") == "stale":
+                    status += ", STALE: verify against the current code"
                 desc = str(getattr(meta, "description", "") or "(no description)")[:160]
                 lines.append(f"- {name} [{status}]: {desc}")
             return pointer, "\n".join(lines) if len(lines) > 1 else ""
@@ -12866,6 +12872,21 @@ def run_agent_loop(
             "message_kind": "final",
         })
         history_events_recorded = True
+    # Skill utility counters. The signal is coarse on purpose — did the turn
+    # that had this skill loaded end cleanly — because a finer one would need
+    # an attribution model, and a coarse counter that actually accumulates is
+    # worth more than a precise one that never does. It exists to make
+    # retirement decidable: selection accuracy falls as the catalogue grows, so
+    # the skill whose harmful count outruns its helpful count is the one that
+    # costs every later task. Only skills the agent wrote are annotated.
+    if depth == 0:
+        try:
+            _loaded = list(skills_mod.loaded_skill_names())
+            if _loaded:
+                skills_mod.record_outcome(_loaded, helpful=bool(_clean_end))
+        except Exception:
+            pass
+
     # Sleep-time consolidation. Here, at the top level and only on a turn that
     # actually finished: the thread is complete and uncompacted, and nobody is
     # waiting on it. A sub-agent finishing is not idleness — its parent is

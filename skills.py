@@ -71,6 +71,7 @@ import re
 import shutil
 import sys
 import traceback
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -85,6 +86,33 @@ import trust_store
 
 SKILLS_DIR = paths.SKILLS_DIR
 BUNDLED_SKILLS_DIR = Path(__file__).resolve().parent / "default_skills"
+
+#: Project-scoped skills: `<project>/.laintas/skills/`. A function, not a
+#: constant, because os.chdir() moves the project during a session.
+#:
+#: This scope is what makes a learned, repo-specific skill safe to write at
+#: all. Skill selection degrades monotonically with library size — measured at
+#: -8% pass rate at 52 skills, -14% at 102, -21% at 202 (arXiv 2605.24050),
+#: through "shadowing": a distractor whose description overlaps the right skill
+#: hides it. A global store would pay that price on every project for lessons
+#: that apply to one. Scoped, the catalogue a task actually sees stays small.
+PROJECT_SKILLS_SUBDIR = "skills"
+
+#: Where a skill came from, in precedence order. Project beats user beats
+#: bundled: the most specific description of how to work here wins.
+SCOPE_PROJECT = "project"
+SCOPE_USER = "user"
+SCOPE_BUNDLED = "bundled"
+
+
+def project_skills_dir() -> Path:
+    return paths.project_dir() / PROJECT_SKILLS_SUBDIR
+
+
+def ensure_project_skills_dir() -> Path:
+    target = project_skills_dir()
+    target.mkdir(parents=True, exist_ok=True)
+    return target
 SKILL_MANIFEST = "extension.json"
 ALLOWED_CAPABILITIES = {
     "fs.read", "fs.write", "process.exec", "network", "browser.mutate",
@@ -301,6 +329,17 @@ class SkillMetadata:
     version: str = ""
     dir_path: str = ""
     managed_by: str = ""              # e.g. "org" — see MANAGED_MARKER
+    scope: str = SCOPE_USER           # project / user / bundled
+    #: Assertion lifecycle, mirroring memory_system: a learned skill cites the
+    #: source it was learned from and goes `stale` when that source moves.
+    status: str = "active"
+    evidence: str = ""
+    stale_reason: str = ""
+    superseded_by: str = ""
+    #: Utility counters. A skill library only stays useful if it is repairable,
+    #: and nothing can be repaired that is not measured.
+    helpful: int = 0
+    harmful: int = 0
 
 
 @dataclass
@@ -319,6 +358,21 @@ class SkillState:
 _skill_metadata: dict[str, SkillMetadata] = {}   # name -> metadata (always loaded)
 _skill_states: dict[str, SkillState] = {}         # name -> state (loaded on demand)
 _scan_done: bool = False
+#: Which project the current scan was taken in. The catalogue is cwd-dependent
+#: now, so a scan cached from another directory is not merely stale, it is
+#: wrong — it would offer another repo's skills for this one.
+_scan_project: str = ""
+
+
+def _scan_stale() -> bool:
+    """True when the catalogue must be rebuilt before it is read."""
+    return not _scan_done or _scan_project != str(project_skills_dir())
+
+
+def invalidate_scan() -> None:
+    """Force the next catalogue read to rescan (a skill was written/changed)."""
+    global _scan_done
+    _scan_done = False
 
 
 # ── Frontmatter Parsing ─────────────────────────────────────────────────
@@ -399,12 +453,28 @@ def _parse_skill_md(skill_dir: Path) -> tuple[SkillMetadata, str]:
     if isinstance(triggers, str):
         triggers = [triggers]
 
+    def _count(key: str) -> int:
+        try:
+            return max(0, int(str(meta.get(key, "0")).strip() or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    status = str(meta.get("status", "active")).strip() or "active"
+    if status not in ("active", "stale", "superseded"):
+        status = "active"
+
     return SkillMetadata(
         name=meta.get("name", name),
         description=meta.get("description", ""),
         trigger_patterns=triggers,
         version=meta.get("version", ""),
         dir_path=str(skill_dir),
+        status=status,
+        evidence=str(meta.get("evidence", "") or ""),
+        stale_reason=str(meta.get("stale_reason", "") or ""),
+        superseded_by=str(meta.get("superseded_by", "") or ""),
+        helpful=_count("helpful"),
+        harmful=_count("harmful"),
     ), body
 
 
@@ -416,54 +486,59 @@ def scan_metadata() -> dict[str, SkillMetadata]:
     Called once at startup. Lightweight — only reads frontmatter,
     does NOT import skill.py or register tools.
     """
-    global _skill_metadata, _scan_done
+    global _skill_metadata, _scan_done, _scan_project
     ensure_skills_dir()
     ensure_bundled_skills_installed()
     _skill_metadata.clear()
 
-    if not SKILLS_DIR.exists():
-        _scan_done = True
-        return _skill_metadata
+    def _absorb(root: Path, scope: str, managed: bool = False) -> None:
+        """Add every skill directory under ``root``, first writer wins.
 
-    for child in sorted(SKILLS_DIR.iterdir()):
-        if not child.is_dir():
-            continue
-        # Must have either skill.py or SKILL.md
-        if not (child / "skill.py").is_file() and not (child / "SKILL.md").is_file():
-            continue
-        meta, _ = _parse_skill_md(child)
-        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", meta.name):
-            continue
-        meta.managed_by = managed_owner(child)
-        _skill_metadata[meta.name] = meta
-
-    # Bundled defaults are also usable in-place. User-installed skills with the
-    # same metadata name take precedence because they were scanned first.
-    if BUNDLED_SKILLS_DIR.is_dir():
-        for child in sorted(BUNDLED_SKILLS_DIR.iterdir()):
+        `setdefault`, not assignment: the scopes are visited in precedence
+        order, so a project skill named `git` shadows the user's and the
+        bundled one rather than being overwritten by them.
+        """
+        if not root.is_dir():
+            return
+        for child in sorted(root.iterdir()):
             if not child.is_dir():
                 continue
-            if not (child / "skill.py").is_file() and not (child / "SKILL.md").is_file():
+            # Must have either skill.py or SKILL.md
+            if (not (child / "skill.py").is_file()
+                    and not (child / "SKILL.md").is_file()):
                 continue
             meta, _ = _parse_skill_md(child)
             if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", meta.name):
                 continue
+            # A superseded skill stays on disk for the record but must not be
+            # catalogued: keeping it visible is exactly the shadowing that
+            # makes a growing library cost accuracy.
+            if meta.status == "superseded":
+                continue
+            meta.scope = scope
+            if managed:
+                meta.managed_by = managed_owner(child)
             _skill_metadata.setdefault(meta.name, meta)
+
+    _scan_project = str(project_skills_dir())
+    _absorb(project_skills_dir(), SCOPE_PROJECT)
+    _absorb(SKILLS_DIR, SCOPE_USER, managed=True)
+    _absorb(BUNDLED_SKILLS_DIR, SCOPE_BUNDLED)
 
     _scan_done = True
     return _skill_metadata
 
 
 def get_all_metadata() -> dict[str, SkillMetadata]:
-    """Return all scanned metadata. Scans on first call."""
-    if not _scan_done:
+    """Return all scanned metadata. Scans on first call, or after a `cd`."""
+    if _scan_stale():
         scan_metadata()
     return _skill_metadata
 
 
 def load_skill(name: str) -> tuple[bool, str]:
     """Public wrapper for explicitly loading a skill by name."""
-    if not _scan_done:
+    if _scan_stale():
         scan_metadata()
     return _load_skill_full(name)
 
@@ -477,7 +552,7 @@ def unload_skill(name: str) -> tuple[bool, str]:
     copy. Metadata stays scanned, so the skill remains listable and reloadable.
     Returns ``(ok, message)``.
     """
-    if not _scan_done:
+    if _scan_stale():
         scan_metadata()
     state = _skill_states.get(name)
     if state is None or not state.loaded:
@@ -510,7 +585,7 @@ def unload_all_skills() -> list[tuple[str, bool, str]]:
     context in one shot when a batch of specialized work is finished. Returns
     ``[(name, ok, message), ...]`` for each skill that was loaded.
     """
-    if not _scan_done:
+    if _scan_stale():
         scan_metadata()
     results: list[tuple[str, bool, str]] = []
     for name in loaded_skill_names():
@@ -521,7 +596,7 @@ def unload_all_skills() -> list[tuple[str, bool, str]]:
 
 def list_skills() -> list[dict]:
     """Return lightweight skill catalog for tools/UI."""
-    if not _scan_done:
+    if _scan_stale():
         scan_metadata()
     out = []
     for name, meta in sorted(_skill_metadata.items()):
@@ -533,6 +608,13 @@ def list_skills() -> list[dict]:
             "loaded": bool(state and state.loaded),
             "path": meta.dir_path,
             "managed_by": meta.managed_by,
+            "scope": meta.scope,
+            "learned": is_learned(Path(meta.dir_path)),
+            "status": meta.status,
+            "evidence": meta.evidence,
+            "stale_reason": meta.stale_reason,
+            "helpful": meta.helpful,
+            "harmful": meta.harmful,
         })
     return out
 
@@ -817,7 +899,7 @@ def describe_skills_for_prompt() -> str:
 
     Shows all scanned skills with their descriptions and loaded status.
     """
-    if not _scan_done:
+    if _scan_stale():
         scan_metadata()
     if not _skill_metadata:
         return ""
@@ -874,3 +956,274 @@ the AI calls `skill.load`.
 Add reference documents to the `references/` directory. They are loaded
 on-demand when skill tools request them via `load_reference()`.
 """
+
+
+# ── Learned skills ──────────────────────────────────────────────────────
+#
+# A skill the AGENT wrote, rather than one a human installed. The container is
+# deliberately the same — same directory layout, same catalogue, same
+# `skill.load` — because a second parallel store would need its own routing,
+# its own UI and its own lifecycle, and would then have to compete with this
+# one for the same slot in the prompt.
+#
+# Two properties are not negotiable:
+#
+#   * A learned skill is DOCUMENTATION ONLY. `write_learned_skill` writes
+#     SKILL.md and nothing else, and refuses a directory that holds a skill.py
+#     or a managed marker. An agent that could author skill.py would be an
+#     agent that persists arbitrary code into every later session, behind a
+#     trust prompt the user already answered for somebody else's code.
+#   * It carries the evidence it was learned from and the same
+#     active/stale/superseded lifecycle as a memory. A repo-specific lesson
+#     whose repo has moved is exactly the "stale or harmful guidance" that
+#     makes a growing skill library score below having no skills at all.
+
+LEARNED_SKILL_MAX_BODY = 20_000
+_LEARNED_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,63}$")
+
+
+def _scope_root(scope: str) -> Optional[Path]:
+    if scope == SCOPE_PROJECT:
+        return ensure_project_skills_dir()
+    if scope == SCOPE_USER:
+        return ensure_skills_dir()
+    return None
+
+
+#: Frontmatter stamp marking a skill as written by the agent rather than
+#: installed by a human. Everything in this module edits files in place —
+#: counters, staleness, retirement — and none of that may touch a SKILL.md a
+#: person wrote and keeps in git. Absence of the stamp is the guard.
+AUTHORED_BY_AGENT = "agent"
+
+
+def is_learned(skill_dir: Path) -> bool:
+    md = skill_dir / "SKILL.md"
+    if not md.is_file() or (skill_dir / "skill.py").is_file():
+        return False
+    try:
+        front, _ = _parse_frontmatter(md.read_text(encoding="utf-8"))
+    except OSError:
+        return False
+    return str(front.get("authored_by") or "") == AUTHORED_BY_AGENT
+
+
+def _format_skill_md(meta: dict, body: str) -> str:
+    lines = ["---", f"name: {meta['name']}",
+             f"description: {meta.get('description', '')}"]
+    if meta.get("version"):
+        lines.append(f"version: {meta['version']}")
+    lines.append(f"authored_by: {AUTHORED_BY_AGENT}")
+    if meta.get("evidence"):
+        lines.append(f"evidence: {meta['evidence']}")
+    status = str(meta.get("status") or "active")
+    if status != "active":
+        lines.append(f"status: {status}")
+    if meta.get("stale_reason"):
+        lines.append(f"stale_reason: {str(meta['stale_reason'])[:300]}")
+    if meta.get("superseded_by"):
+        lines.append(f"superseded_by: {meta['superseded_by']}")
+    if meta.get("helpful"):
+        lines.append(f"helpful: {int(meta['helpful'])}")
+    if meta.get("harmful"):
+        lines.append(f"harmful: {int(meta['harmful'])}")
+    lines.append("---")
+    lines.append("")
+    lines.append(body.strip())
+    lines.append("")
+    return "\n".join(lines)
+
+
+def write_learned_skill(name: str, description: str, body: str, *,
+                        scope: str = SCOPE_PROJECT,
+                        evidence: str = "") -> tuple[bool, str]:
+    """Create or update a documentation-only skill written by the agent.
+
+    Updating preserves the utility counters and, when ``evidence`` is not
+    re-supplied, the existing evidence and status — the same rule memories
+    follow, and for the same reason: rewriting the prose of a lesson whose
+    source has moved is not re-checking that source.
+    """
+    name = str(name or "").strip()
+    if not _LEARNED_NAME_RE.fullmatch(name):
+        return False, ("skill name must be a lowercase slug, 2-64 chars "
+                       "(letters, digits, hyphen)")
+    description = " ".join(str(description or "").split())
+    if not description:
+        return False, "description is required — it is what routing ranks"
+    body = str(body or "").strip()
+    if not body:
+        return False, "body is required"
+    if len(body) > LEARNED_SKILL_MAX_BODY:
+        return False, f"body exceeds {LEARNED_SKILL_MAX_BODY} chars"
+    root = _scope_root(scope)
+    if root is None:
+        return False, f"scope must be '{SCOPE_PROJECT}' or '{SCOPE_USER}'"
+
+    skill_dir = root / name
+    if skill_dir.exists() and not skill_dir.is_dir():
+        return False, f"{skill_dir} exists and is not a directory"
+    if (skill_dir / "skill.py").is_file():
+        return False, (f"'{name}' is an executable skill; this tool only "
+                       f"writes documentation and will not touch it")
+    if (skill_dir / MANAGED_MARKER).is_file():
+        return False, (f"'{name}' is managed externally and would be "
+                       f"overwritten on the next sync")
+    if (skill_dir / "SKILL.md").is_file() and not is_learned(skill_dir):
+        return False, (f"'{name}' was written by a person; pick another name "
+                       f"rather than overwriting it")
+
+    prior: dict = {}
+    existing_md = skill_dir / "SKILL.md"
+    if existing_md.is_file():
+        try:
+            prior, _ = _parse_frontmatter(existing_md.read_text(encoding="utf-8"))
+        except OSError:
+            prior = {}
+
+    if evidence:
+        status, stale_reason, evidence_value = "active", "", evidence
+    else:
+        evidence_value = str(prior.get("evidence") or "")
+        status = str(prior.get("status") or "active")
+        stale_reason = str(prior.get("stale_reason") or "")
+    if status not in ("active", "stale", "superseded"):
+        status = "active"
+
+    meta = {
+        "name": name,
+        "description": description,
+        "version": str(prior.get("version") or "1.0.0"),
+        "evidence": evidence_value,
+        "status": status,
+        "stale_reason": stale_reason if status == "stale" else "",
+        "superseded_by": str(prior.get("superseded_by") or ""),
+        "helpful": prior.get("helpful") or 0,
+        "harmful": prior.get("harmful") or 0,
+    }
+    try:
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        tmp = skill_dir / f".SKILL.md.{uuid.uuid4().hex}.tmp"
+        tmp.write_text(_format_skill_md(meta, body), encoding="utf-8")
+        os.replace(str(tmp), str(skill_dir / "SKILL.md"))
+    except OSError as exc:
+        return False, str(exc)
+    invalidate_scan()
+    _skill_states.pop(name, None)
+    return True, str(skill_dir / "SKILL.md")
+
+
+def _rewrite_learned_meta(name: str, updates: dict) -> tuple[bool, str]:
+    """Change a learned skill's frontmatter, never its body."""
+    meta_obj = get_all_metadata().get(name)
+    search = ([Path(meta_obj.dir_path)] if meta_obj else []) + [
+        project_skills_dir() / name, SKILLS_DIR / name]
+    for skill_dir in search:
+        md = skill_dir / "SKILL.md"
+        if not md.is_file():
+            continue
+        if (skill_dir / "skill.py").is_file():
+            return False, f"'{name}' is an executable skill; not editable here"
+        if not is_learned(skill_dir):
+            return False, (f"'{name}' was installed, not learned — this tool "
+                           f"does not edit human-authored skills")
+        try:
+            front, body = _parse_frontmatter(md.read_text(encoding="utf-8"))
+        except OSError as exc:
+            return False, str(exc)
+        front.setdefault("name", name)
+        front.update(updates)
+        try:
+            tmp = skill_dir / f".SKILL.md.{uuid.uuid4().hex}.tmp"
+            tmp.write_text(_format_skill_md(front, body), encoding="utf-8")
+            os.replace(str(tmp), str(md))
+        except OSError as exc:
+            return False, str(exc)
+        invalidate_scan()
+        _skill_states.pop(name, None)
+        return True, str(md)
+    return False, f"learned skill '{name}' not found"
+
+
+def mark_skill_stale(name: str, reason: str) -> tuple[bool, str]:
+    """Flag a learned skill as unverified because its cited source changed."""
+    return _rewrite_learned_meta(
+        name, {"status": "stale", "stale_reason": str(reason or "")[:300]})
+
+
+def clear_skill_stale(name: str, evidence: str = "") -> tuple[bool, str]:
+    updates = {"status": "active", "stale_reason": ""}
+    if evidence:
+        updates["evidence"] = evidence
+    return _rewrite_learned_meta(name, updates)
+
+
+def retire_skill(name: str, reason: str,
+                 successor: str = "") -> tuple[bool, str]:
+    """Retire a learned skill. The file stays; the catalogue entry does not.
+
+    Retirement is the load-bearing half of a skill library. Selection accuracy
+    falls monotonically with catalogue size, so a lesson that stopped being
+    true costs every later task whether or not anything ever loads it.
+    """
+    if successor and successor == name:
+        return False, "a skill cannot supersede itself"
+    return _rewrite_learned_meta(
+        name, {"status": "superseded", "superseded_by": successor,
+               "stale_reason": str(reason or "")[:300]})
+
+
+def record_outcome(names, helpful: bool) -> list[str]:
+    """Increment the utility counters for skills that were loaded in a turn.
+
+    The signal is deliberately crude — did the turn that had this skill loaded
+    end well — because anything finer would need an attribution model, and a
+    crude counter that actually accumulates beats a precise one that never
+    does. What it is FOR is retirement: a skill whose harmful count outruns its
+    helpful count is the one to look at first.
+    """
+    touched = []
+    field_name = "helpful" if helpful else "harmful"
+    for name in dict.fromkeys(str(n or "").strip() for n in (names or [])):
+        if not name:
+            continue
+        meta = get_all_metadata().get(name)
+        # Only agent-written skills are annotated. A shipped or human-authored
+        # SKILL.md is somebody else's file — usually one kept in git — and
+        # counting on it would rewrite it under them. _rewrite_learned_meta
+        # refuses those anyway; skipping here keeps the no-op quiet.
+        if meta is None or not is_learned(Path(meta.dir_path)):
+            continue
+        current = getattr(meta, field_name, 0)
+        ok, _ = _rewrite_learned_meta(name, {field_name: int(current) + 1})
+        if ok:
+            touched.append(name)
+    return touched
+
+
+def learned_skills(include_retired: bool = False) -> list[dict]:
+    """Every agent-written skill in scope, newest-looking first."""
+    out = []
+    for scope, root in ((SCOPE_PROJECT, project_skills_dir()),
+                        (SCOPE_USER, SKILLS_DIR)):
+        if not root.is_dir():
+            continue
+        for child in sorted(root.iterdir()):
+            md = child / "SKILL.md"
+            if not child.is_dir() or not md.is_file():
+                continue
+            if not is_learned(child):
+                continue
+            meta, _ = _parse_skill_md(child)
+            if meta.status == "superseded" and not include_retired:
+                continue
+            meta.scope = scope
+            out.append({
+                "name": meta.name, "description": meta.description,
+                "scope": scope, "status": meta.status,
+                "evidence": meta.evidence, "stale_reason": meta.stale_reason,
+                "superseded_by": meta.superseded_by,
+                "helpful": meta.helpful, "harmful": meta.harmful,
+                "path": str(md),
+            })
+    return out

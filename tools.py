@@ -763,41 +763,11 @@ def _bi_mem_save(params: dict, ctx: ToolCtx) -> dict:
     if not name or not body:
         return {"ok": False, "error": "missing 'name' or 'body'"}
 
-    # Evidence: the files this claim was read off. Fingerprinted HERE, at the
-    # moment of the write, so the recorded hash is what the agent actually saw
-    # rather than whatever the file happens to be later.
-    evidence = None
-    raw_evidence = params.get("evidence")
-    if raw_evidence:
-        try:
-            import mem_evidence as _me
-        except ImportError:
-            _me = None
-        if _me is not None:
-            items = raw_evidence if isinstance(raw_evidence, list) else [raw_evidence]
-            base = ctx.cwd or os.getcwd()
-            built = []
-            for item in items:
-                spec = str(item or "").strip()
-                if not spec:
-                    continue
-                span = None
-                # "path:120-180" — the range is optional and purely advisory;
-                # a bare path is the common and fully supported case.
-                if ":" in spec and re.search(r":\d+-\d+$", spec):
-                    spec, _, rng = spec.rpartition(":")
-                    start, _, end = rng.partition("-")
-                    span = (int(start), int(end))
-                abs_path = (spec if os.path.isabs(spec)
-                            else os.path.abspath(os.path.join(base, spec)))
-                if not os.path.isfile(abs_path):
-                    return {"ok": False,
-                            "error": f"evidence file not found: {spec}"}
-                built.append(_me.evidence_for(
-                    abs_path,
-                    start=span[0] if span else None,
-                    end=span[1] if span else None))
-            evidence = built or None
+    # Evidence: the files this claim was read off. Fingerprinted at write
+    # time, shared with skill.save through _resolve_evidence.
+    evidence, _err = _resolve_evidence(params.get("evidence"), ctx)
+    if _err:
+        return {"ok": False, "error": _err}
 
     ok, msg = _mem_sys.write_memory(
         name, mem_type, description, body,
@@ -836,6 +806,106 @@ def _bi_skill_list(params: dict, ctx: ToolCtx) -> dict:
     """List skills available for explicit progressive loading."""
     import skills as _skills
     items = _skills.list_skills()
+    return {"ok": True, "result": items, "count": len(items)}
+
+
+def _resolve_evidence(raw, ctx: ToolCtx):
+    """Turn 'path' / 'path:START-END' specs into fingerprinted evidence.
+
+    Fingerprinted HERE, at write time, so what is recorded is the content the
+    agent actually read rather than whatever the file happens to hold later.
+    Shared by mem.save and skill.save: one claim-with-a-source mechanism, two
+    containers.
+    """
+    if not raw:
+        return None, ""
+    try:
+        import mem_evidence as _me
+    except ImportError:
+        return None, ""
+    items = raw if isinstance(raw, list) else [raw]
+    base = ctx.cwd or os.getcwd()
+    built = []
+    for item in items:
+        spec = str(item or "").strip()
+        if not spec:
+            continue
+        span = None
+        if ":" in spec and re.search(r":\d+-\d+$", spec):
+            spec, _, rng = spec.rpartition(":")
+            start, _, end = rng.partition("-")
+            span = (int(start), int(end))
+        abs_path = (spec if os.path.isabs(spec)
+                    else os.path.abspath(os.path.join(base, spec)))
+        if not os.path.isfile(abs_path):
+            return None, f"evidence file not found: {spec}"
+        built.append(_me.evidence_for(abs_path,
+                                      start=span[0] if span else None,
+                                      end=span[1] if span else None))
+    return (built or None), ""
+
+
+def _bi_skill_save(params: dict, ctx: ToolCtx) -> dict:
+    """Write what was learned here as a documentation-only skill."""
+    import skills as _skills
+    name = str(params.get("name") or "").strip()
+    description = str(params.get("description") or "").strip()
+    body = str(params.get("body") or "").strip()
+    scope = str(params.get("scope") or _skills.SCOPE_PROJECT).strip()
+    supersedes = str(params.get("supersedes") or "").strip()
+
+    evidence, err = _resolve_evidence(params.get("evidence"), ctx)
+    if err:
+        return {"ok": False, "error": err}
+    encoded = ""
+    if evidence:
+        import memory_system as _ms
+        encoded = _ms.format_evidence(evidence)
+
+    ok, msg = _skills.write_learned_skill(
+        name, description, body, scope=scope, evidence=encoded)
+    if not ok:
+        return {"ok": False, "error": msg}
+
+    retired = ""
+    if supersedes:
+        # Order matters: the successor is on disk before the predecessor is
+        # retired, so a failure here leaves the old guidance standing rather
+        # than removing it with nothing in its place.
+        ok2, msg2 = _skills.retire_skill(
+            supersedes, f"superseded by {name}", successor=name)
+        retired = msg2 if not ok2 else f"retired {supersedes}"
+    try:
+        import mem_evidence as _me
+        _me.invalidate_cache()
+    except Exception:
+        pass
+    return {"ok": True,
+            "result": f"saved skill '{name}' [{scope}] -> {msg}"
+                      + (f"; {retired}" if retired else ""),
+            "path": msg}
+
+
+def _bi_skill_forget(params: dict, ctx: ToolCtx) -> dict:
+    """Retire a learned skill that stopped being true."""
+    import skills as _skills
+    name = str(params.get("name") or "").strip()
+    reason = str(params.get("reason") or "").strip()
+    if not name:
+        return {"ok": False, "error": "missing 'name'"}
+    if not reason:
+        return {"ok": False, "error": (
+            "a reason is required — a retirement with no recorded reason "
+            "cannot be reviewed later")}
+    ok, msg = _skills.retire_skill(name, reason)
+    return {"ok": ok, "result": msg if ok else "", "error": "" if ok else msg}
+
+
+def _bi_skill_learned(params: dict, ctx: ToolCtx) -> dict:
+    """List the skills this agent wrote, with their lifecycle and counters."""
+    import skills as _skills
+    items = _skills.learned_skills(
+        include_retired=bool(params.get("include_retired")))
     return {"ok": True, "result": items, "count": len(items)}
 
 
@@ -8706,6 +8776,77 @@ def register_builtin_tools() -> None:
                 },
             },
             invoke=_bi_mem_list,
+        ),
+        Tool(
+            name="skill.save",
+            description=(
+                "Write down, as a reusable skill, something you learned about "
+                "working in THIS project that you would want on hand next time "
+                "— a pitfall to avoid, a sequence that finally worked, a "
+                "convention this repo enforces. Use it when a lesson is about "
+                "HOW to do something here; use mem.save when it is a FACT "
+                "about the project. Project scope by default, so it never "
+                "shows up in other repos. Documentation only: this writes "
+                "instructions, never code. Saving under an existing name "
+                "updates it."),
+            schema={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{1,63}$",
+                             "description": "lowercase slug, e.g. 'vite-hmr-pitfalls'"},
+                    "description": {"type": "string",
+                                    "description": "one line saying WHEN to use it — "
+                                                   "this is the text routing ranks, so "
+                                                   "write the trigger, not the content"},
+                    "body": {"type": "string",
+                             "description": "the instructions, markdown"},
+                    "scope": {"type": "string", "enum": ["project", "user"],
+                              "description": "project (default) = this repo only; "
+                                             "user = every project"},
+                    "evidence": {"type": "array", "items": {"type": "string"},
+                                 "description": "files this was learned from, "
+                                                "'path' or 'path:START-END'. Their "
+                                                "content is fingerprinted now and the "
+                                                "skill is flagged stale when they change"},
+                    "supersedes": {"type": "string",
+                                   "description": "name of an older learned skill this "
+                                                  "replaces; it is retired, not deleted"},
+                },
+                "required": ["name", "description", "body"],
+                "additionalProperties": False,
+            },
+            invoke=_bi_skill_save,
+            capabilities=frozenset({"fs.write"}),
+        ),
+        Tool(
+            name="skill.forget",
+            description=(
+                "Retire a skill you or a previous session wrote, once it stopped "
+                "being true. The file is kept for the record but leaves the "
+                "catalogue. Retire aggressively: every skill in the catalogue "
+                "makes choosing the right one harder, so a lesson that no longer "
+                "holds costs every later task."),
+            schema={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "reason": {"type": "string",
+                               "description": "why it no longer holds"},
+                },
+                "required": ["name", "reason"],
+                "additionalProperties": False,
+            },
+            invoke=_bi_skill_forget,
+            capabilities=frozenset({"fs.write"}),
+        ),
+        Tool(
+            name="skill.learned",
+            description="List the skills written by this agent, with scope, "
+                        "lifecycle status and usefulness counters.",
+            schema={"type": "object", "properties": {
+                "include_retired": {"type": "boolean"},
+            }, "additionalProperties": False},
+            invoke=_bi_skill_learned,
         ),
         Tool(
             name="skill.list",
