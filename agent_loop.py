@@ -190,7 +190,11 @@ _DEFAULT_CONFIG = {
     "mem_recall_highlight": True,      # True = append a "most relevant to this task" section (semantic recall over all persistent memories, lexical fallback) to the injected memory context. Purely additive — never drops memories. See mem_recall.py.
     "skill_route_highlight": True,      # True = prepend a "most relevant skills for this task" line to the skill catalog (semantic ranking, lexical fallback) so the model loads the right skill first. Purely additive — the full catalog is preserved. See skill_router.py.
     "mem_extract_on_complete": False,  # True = ALSO extract durable memories on every successful task completion. Default OFF: consolidation now happens at compaction time only (mem_extract_on_compact) to keep it rare and cheap. See mem_extract.py.
-    "mem_extract_on_compact": True,    # True = when the session context is compacted, run one background LLM pass that extracts + aggressively consolidates durable memories into long-term storage (see mem_extract.py). Off-thread; near-duplicates are merged (summarised) rather than duplicated.
+    "mem_extract_on_compact": False,   # True = ALSO consolidate at compaction time. Default OFF since idle consolidation exists: compaction is the WORST moment to mine a session, because the head has already been summarised away, and it only ever fired on a manual /compact anyway.
+    "mem_extract_on_idle": True,       # True = consolidate durable memories in the background once a top-level turn finishes and the agent is idle, off the full uncompacted thread. Also re-validates memories whose cited source changed (mem_review.py). Off-thread; see _consolidate_memories_when_idle.
+    "mem_idle_min_turns": 2,           # user turns that must accumulate since the last idle consolidation before another runs.
+    "mem_idle_min_seconds": 180,       # floor between idle consolidations, so a burst of short turns cannot make this frequent.
+    "mem_idle_review_limit": 5,        # stale memories re-validated per idle pass (0 disables review, extraction still runs).
     "critic_enabled": True,            # True = on long thread-mode tasks, an independent LLM critic periodically checks for goal drift/looping and injects a corrective nudge (see critic.py). Complements the deterministic staleness/repetition tripwires.
     "critic_profile": "balanced",     # lenient / balanced / strict scoring guidance layered onto the built-in critic contract.
     "critic_prompt_file": "",         # Optional project-relative or absolute UTF-8 file with additional critic guidance; empty disables it.
@@ -1014,7 +1018,11 @@ _RUNTIME_CONFIG_DESCRIPTIONS = {
     "mem_recall_highlight": "Append a task-relevant memory highlight (semantic recall, lexical fallback) to the injected memory context (additive; never drops memories)",
     "skill_route_highlight": "Prepend a task-relevant 'most relevant skills' line to the skill catalog (semantic ranking, lexical fallback; additive)",
     "mem_extract_on_complete": "ALSO extract durable memories on task completion (default off; consolidation runs at compaction time instead)",
-    "mem_extract_on_compact": "On context compaction, run a background LLM pass to extract + aggressively consolidate durable long-term memories (off-thread; merges near-duplicates)",
+    "mem_extract_on_compact": "ALSO consolidate memories at compaction time (default off; idle consolidation replaces it)",
+    "mem_extract_on_idle": "After a top-level turn ends, consolidate durable memories in the background off the full uncompacted thread, and re-validate memories whose cited source changed",
+    "mem_idle_min_turns": "User turns that must accumulate before another idle consolidation runs",
+    "mem_idle_min_seconds": "Minimum seconds between idle consolidations",
+    "mem_idle_review_limit": "Stale memories re-validated per idle pass (0 disables review)",
     "critic_enabled": "Periodically run an independent LLM critic on long tasks to catch goal drift/looping and inject a corrective nudge",
     "critic_profile": "Critic strictness preset: lenient, balanced, or strict",
     "critic_prompt_file": "Optional project-relative or absolute UTF-8 file containing additional critic guidance; off/none/reset disables it",
@@ -6156,6 +6164,175 @@ def _consolidate_memories_on_compact(deps, session: dict, working: dict) -> None
         pass
 
 
+def _config_int(key: str, default: int) -> int:
+    """Runtime config as an int, WITHOUT treating a deliberate 0 as unset.
+
+    `int(get_runtime_config(k) or default)` reads naturally and is wrong for
+    every knob whose 0 means something — here 0 is "no floor" and "no review".
+    """
+    value = get_runtime_config(key)
+    if value is None or value == "":
+        return int(default)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return int(default)
+
+
+#: One idle consolidation at a time, process-wide. Two terminals in the same
+#: process finishing turns together would otherwise race on the same memory
+#: files, and the loser's writes would be the ones the user notices missing.
+_idle_consolidation_lock = threading.Lock()
+_idle_consolidation_running = False
+
+
+def _idle_consolidation_material(state: dict, chat_history: list) -> tuple[str, int]:
+    """The turns added since the last idle pass, verbatim, and the new mark.
+
+    This is the whole point of moving consolidation off compaction: here the
+    thread has NOT been summarised yet, so extraction reads what actually
+    happened instead of a 4k-token précis of it. Bounded so a very long turn
+    cannot send an unbounded prompt.
+    """
+    messages = state.get("_thread_messages") or []
+    if not isinstance(messages, list):
+        return "", 0
+    mark = int(state.get("_mem_idle_mark") or 0)
+    if mark > len(messages):
+        # The thread was compacted or replaced under us; the mark no longer
+        # points where it did, so restart from what is there now.
+        mark = 0
+    fresh = messages[mark:]
+    if not fresh:
+        return "", len(messages)
+
+    budget = max(4000, int(get_runtime_config("compact_chunk_tokens") or 24000))
+    parts = []
+    used = 0
+    # Newest first, then reversed: when the budget binds, keep the END of the
+    # window (what was concluded) rather than its beginning (what was tried).
+    for item in reversed(fresh):
+        if not isinstance(item, dict):
+            continue
+        text = _serialize_thread_msg(item)
+        if not (text or "").strip():
+            continue
+        cost = _thread_tokens([item])
+        if used + cost > budget:
+            break
+        parts.append(text)
+        used += cost
+    parts.reverse()
+    return "\n".join(parts), len(messages)
+
+
+def _consolidate_memories_when_idle(deps, session: dict, state: dict,
+                                    chat_history: Optional[list] = None) -> bool:
+    """Consolidate durable memories now that the turn is over and nothing waits.
+
+    Sleep-time consolidation, in the sense Letta uses: the work that maintains
+    memory does not belong inside the turn the user is waiting on, and it does
+    not belong at compaction either — compaction fires when the context is
+    FULL, which is both the latest possible moment and the one where the
+    material has already been compressed.
+
+    Two jobs in one background pass: extract new durable facts from the turns
+    that just happened, and re-validate memories whose cited source moved
+    (``mem_review``). Rate-limited by turns AND wall clock so a burst of short
+    exchanges cannot make it frequent. Entirely best-effort: this must never
+    delay, block or fail the turn that just completed.
+    """
+    global _idle_consolidation_running
+    if not get_runtime_config("mem_extract_on_idle"):
+        return False
+    try:
+        messages = state.get("_thread_messages") or []
+        # `or <default>` would silently turn a deliberate 0 into the default,
+        # and 0 is a legitimate setting for both of these ("no floor").
+        min_turns = max(1, _config_int("mem_idle_min_turns", 2))
+        min_seconds = max(0, _config_int("mem_idle_min_seconds", 180))
+
+        mark = int(state.get("_mem_idle_mark") or 0)
+        new_user_turns = sum(
+            1 for item in messages[mark:]
+            if isinstance(item, dict) and item.get("role") == "user")
+        # A claim flagged during this turn is standing in the prompt unverified
+        # right now, which earns a pass even when too little was said to mine.
+        stale_waiting = bool(state.get("_stale_memories"))
+        # A flagged memory is a claim standing in the prompt unverified, so it
+        # earns a pass on its own even when too little was said to extract from.
+        if new_user_turns < min_turns and not stale_waiting:
+            return False
+
+        last = float(state.get("_mem_idle_at") or 0.0)
+        if min_seconds and (time.time() - last) < min_seconds:
+            return False
+
+        convo, new_mark = _idle_consolidation_material(state, chat_history or [])
+        review_limit = max(0, _config_int("mem_idle_review_limit", 5))
+        if not convo.strip() and not (review_limit and stale_waiting):
+            return False
+
+        with _idle_consolidation_lock:
+            if _idle_consolidation_running:
+                return False
+            _idle_consolidation_running = True
+
+        # Advance the watermark now, not in the worker: if the pass fails, the
+        # right behaviour is to move on with the next turns rather than retry
+        # the same material forever at the head of every idle window.
+        state["_mem_idle_mark"] = new_mark
+        state["_mem_idle_at"] = time.time()
+        state.pop("_stale_memories", None)
+
+        _cwd = state.get("cwd") or os.getcwd()
+        _traj = str(state.get("_run_id") or "")
+        _am, _ap = aux_model_override()
+
+        def _llm(messages_arg, *, system_prompt=mem_extract.SYSTEM_PROMPT,
+                 _s=session, _cwd=_cwd, _traj=_traj, _am=_am, _ap=_ap,
+                 _kind="mem_extract"):
+            resp = deps.call_backend(
+                session=_s, message="", system_prompt=system_prompt,
+                current_path=_cwd, messages=messages_arg,
+                tools_enabled=False,
+                model_override=_am or None, provider_override=_ap or None,
+                task_kind=_kind, trajectory_id=_traj)
+            return (resp or {}).get("reply", "") if isinstance(resp, dict) else ""
+
+        def _worker(_text=convo, _limit=review_limit, _s=session):
+            global _idle_consolidation_running
+            try:
+                if _text.strip():
+                    try:
+                        mem_extract.extract_and_store(_text, _llm, session=_s)
+                    except Exception:
+                        pass
+                if _limit:
+                    try:
+                        import mem_review
+
+                        def _review_llm(msgs):
+                            return _llm(msgs,
+                                        system_prompt=mem_review.SYSTEM_PROMPT,
+                                        _kind="mem_review")
+
+                        mem_review.review_stale(_review_llm, limit=_limit)
+                    except Exception:
+                        pass
+            finally:
+                with _idle_consolidation_lock:
+                    _idle_consolidation_running = False
+
+        threading.Thread(target=_worker, daemon=True,
+                         name="mem-idle-consolidation").start()
+        return True
+    except Exception:
+        with _idle_consolidation_lock:
+            _idle_consolidation_running = False
+        return False
+
+
 def compact_session_context(deps, session: dict, state: dict,
                             chat_history: Optional[list] = None) -> dict:
     """Safely force-compact the current session without touching work state.
@@ -6457,6 +6634,12 @@ STATE_KEYS_CARRIED = frozenset({
     "_files_seen", "_pager", "_pager_msgs", "_session_id", "_task_cwd",
     "_thread_messages", "_thread_summary", "_thread_call_seq",
     "_fork_lineage", "_fork_name", "_fork_parent_session_id",
+    # Idle-consolidation bookkeeping. All three must cross the turn boundary:
+    # a watermark that reset each turn would re-consolidate the whole thread
+    # every time, the clock floor would never bind, and a memory flagged in one
+    # turn would lose its claim on the next idle pass if that pass was
+    # rate-limited out of running.
+    "_mem_idle_mark", "_mem_idle_at", "_stale_memories",
 })
 
 STATE_KEYS_TURN_ONLY = frozenset({
@@ -6527,6 +6710,11 @@ def prepare_state_for_repl(state: dict) -> dict:
             str(state.get("_fork_name") or "").split())[:_FORK_NAME_MAX],
         "_fork_parent_session_id": str(
             state.get("_fork_parent_session_id") or "").strip(),
+        # Bounded: this is a hint about what to review next, not a record.
+        "_mem_idle_mark": int(state.get("_mem_idle_mark") or 0),
+        "_mem_idle_at": float(state.get("_mem_idle_at") or 0.0),
+        "_stale_memories": [
+            str(name) for name in (state.get("_stale_memories") or [])[:50]],
     }
 
 
@@ -11697,16 +11885,34 @@ def run_agent_loop(
                 # [STALE FILES] reminder, which we had no equivalent of).
                 if (isinstance(result, dict) and result.get("ok")
                         and name in _FILE_MUTATING_TOOLS):
+                    _abs_target = ""
                     try:
                         import file_pager as _fp
                         _target = str((arguments or {}).get("path")
                                       or result.get("path") or "")
                         if _target:
-                            _fp.mark_edited(state, os.path.abspath(
+                            _abs_target = os.path.abspath(
                                 os.path.join(state.get("cwd") or os.getcwd(),
-                                             _target)))
+                                             _target))
+                            _fp.mark_edited(state, _abs_target)
                     except Exception:
                         pass
+                    # Assertion staleness: a memory that cites this file just
+                    # lost its warrant. Flag, never delete — the claim may
+                    # still hold, and only re-reading the source can say. Gated
+                    # on a cached cited-path set, so the overwhelmingly common
+                    # "nothing cites this file" costs one set lookup.
+                    if _abs_target:
+                        try:
+                            import mem_evidence as _me
+                            _flagged = _me.propagate([_abs_target])
+                            if _flagged:
+                                state.setdefault(
+                                    "_stale_memories", []).extend(
+                                        n for n in _flagged
+                                        if n not in state.get("_stale_memories", []))
+                        except Exception:
+                            pass
 
                 # ── Per-call terminalHistory row ──
                 per_call_rows.append({
@@ -12660,6 +12866,17 @@ def run_agent_loop(
             "message_kind": "final",
         })
         history_events_recorded = True
+    # Sleep-time consolidation. Here, at the top level and only on a turn that
+    # actually finished: the thread is complete and uncompacted, and nobody is
+    # waiting on it. A sub-agent finishing is not idleness — its parent is
+    # still mid-turn — and an aborted or errored turn is not material worth
+    # mining into durable memory.
+    if depth == 0 and _clean_end:
+        try:
+            _consolidate_memories_when_idle(deps, session, state, chat_history)
+        except Exception:
+            pass
+
     result = {
         "success": _clean_end,
         "msg": result_msg,

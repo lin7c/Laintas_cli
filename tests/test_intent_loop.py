@@ -162,6 +162,12 @@ class IntentLoopTestCase(unittest.TestCase):
             # Semantic ranking over skills and memories costs about a second
             # per iteration and has nothing to do with what is asserted here.
             return False
+        if key == "mem_extract_on_idle":
+            # Idle consolidation fires a background thread at loop exit that
+            # calls the same stubbed backend. Nothing here asserts anything
+            # about memory, and a worker appending to self.calls concurrently
+            # would make every prompt-ordering assertion a race.
+            return False
         return agent_loop._DEFAULT_CONFIG.get(key)
 
     def run_loop(self, task=TASK, loops=3, state=None, agent_id=None):
@@ -196,7 +202,8 @@ class IntentLoopTestCase(unittest.TestCase):
 
     def main_calls(self):
         return [c for c in self.calls if c.get("task_kind") not in
-                ("intent", "intent_compare", "critic")]
+                ("intent", "intent_compare", "critic",
+                 "mem_extract", "mem_review")]
 
     def prompts(self):
         return [c.get("system_prompt", "") for c in self.main_calls()]
@@ -542,7 +549,8 @@ class DebateTests(IntentLoopTestCase):
 
     def main_calls(self):
         return [c for c in self.calls if c.get("task_kind") not in
-                ("intent", "intent_compare", "intent_judge", "critic")]
+                ("intent", "intent_compare", "intent_judge", "critic",
+                 "mem_extract", "mem_review")]
 
     def test_the_agent_can_win_and_the_spec_is_rewritten(self):
         self.config = {"critic_enabled": False}

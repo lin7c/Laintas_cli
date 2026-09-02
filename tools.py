@@ -762,10 +762,53 @@ def _bi_mem_save(params: dict, ctx: ToolCtx) -> dict:
     importance = params.get("importance", 0.5)
     if not name or not body:
         return {"ok": False, "error": "missing 'name' or 'body'"}
+
+    # Evidence: the files this claim was read off. Fingerprinted HERE, at the
+    # moment of the write, so the recorded hash is what the agent actually saw
+    # rather than whatever the file happens to be later.
+    evidence = None
+    raw_evidence = params.get("evidence")
+    if raw_evidence:
+        try:
+            import mem_evidence as _me
+        except ImportError:
+            _me = None
+        if _me is not None:
+            items = raw_evidence if isinstance(raw_evidence, list) else [raw_evidence]
+            base = ctx.cwd or os.getcwd()
+            built = []
+            for item in items:
+                spec = str(item or "").strip()
+                if not spec:
+                    continue
+                span = None
+                # "path:120-180" — the range is optional and purely advisory;
+                # a bare path is the common and fully supported case.
+                if ":" in spec and re.search(r":\d+-\d+$", spec):
+                    spec, _, rng = spec.rpartition(":")
+                    start, _, end = rng.partition("-")
+                    span = (int(start), int(end))
+                abs_path = (spec if os.path.isabs(spec)
+                            else os.path.abspath(os.path.join(base, spec)))
+                if not os.path.isfile(abs_path):
+                    return {"ok": False,
+                            "error": f"evidence file not found: {spec}"}
+                built.append(_me.evidence_for(
+                    abs_path,
+                    start=span[0] if span else None,
+                    end=span[1] if span else None))
+            evidence = built or None
+
     ok, msg = _mem_sys.write_memory(
         name, mem_type, description, body,
-        scope=scope, importance=importance,
+        scope=scope, importance=importance, evidence=evidence,
     )
+    if ok and evidence:
+        try:
+            import mem_evidence as _me2
+            _me2.invalidate_cache()
+        except Exception:
+            pass
     return {"ok": ok, "result": msg if ok else "", "error": "" if ok else msg}
 
 
@@ -8622,6 +8665,16 @@ def register_builtin_tools() -> None:
                               "description": "defaults to user for user/feedback and project for project/reference"},
                     "importance": {"type": "number", "minimum": 0, "maximum": 1,
                                    "description": "durable importance, default 0.5"},
+                    "evidence": {"type": "array", "items": {"type": "string"},
+                                 "description": "files this claim was read off, "
+                                                "as 'path' or 'path:START-END'. "
+                                                "The content is fingerprinted now, "
+                                                "and the memory is flagged stale "
+                                                "automatically when any of them "
+                                                "changes. Cite sources for any claim "
+                                                "about code — a memory with evidence "
+                                                "can be re-verified, one without it "
+                                                "silently rots."},
                 },
                 "required": ["name", "type", "description", "body"],
             },

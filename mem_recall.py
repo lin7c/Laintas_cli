@@ -160,6 +160,7 @@ def recall(query: str, *, mem_type: str = None, k: int = 5,
                 "description": entry.get("description", ""),
                 "type": entry.get("type", entry.get("mem_type", "")),
                 "importance": entry.get("importance", 0.5),
+                "status": entry.get("status", memory_system.STATUS_ACTIVE),
                 "body_preview": body[:500],
                 "score": round(float(score), 4),
                 "method": "gateway",
@@ -191,7 +192,12 @@ def relevant_block(query: str, *, k: int = 5, session: Optional[dict] = None,
         typ = h.get("type", "")
         desc = (h.get("description", "") or "").strip()
         head = f"- [{name}]" + (f" ({typ})" if typ else "")
-        lines.append(f"{head} {desc}".rstrip())
+        # Recall is where a stale claim does the most damage: it arrives
+        # labelled "most relevant to this task", which is exactly the framing
+        # that stops the model from checking it. Carry the flag through.
+        flag = (" [STALE — cited source changed; verify before relying on it]"
+                if h.get("status") == memory_system.STATUS_STALE else "")
+        lines.append(f"{head} {desc}{flag}".rstrip())
     return "\n".join(lines)
 
 
