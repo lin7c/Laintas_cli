@@ -8,7 +8,7 @@ import {
 import { useLanguage } from '@/contexts/LanguageContext';
 import SiteFooter from './SiteFooter';
 
-const RELEASE_FALLBACK = 'v1.23.10';
+const RELEASE_FALLBACK = 'v1.23.11';
 // Release files are served by GitHub Releases, the one place CI publishes to.
 // The site's own /releases/ path was the channel until releasing moved into
 // CI; nothing repopulates it now, so these links used to 404.
@@ -211,5 +211,4 @@ function CopyButton({ value, labels }) {
   const copy = useCallback(async () => { await navigator.clipboard.writeText(value); setCopied(true); window.setTimeout(() => setCopied(false), 1600); }, [value]);
   return <button type="button" className="copy-button" onClick={copy} aria-label={labels.copy}>{copied ? <Check size={17} /> : <Copy size={17} />}{copied ? labels.copied : labels.copy}</button>;
 }
-
 
