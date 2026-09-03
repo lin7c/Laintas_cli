@@ -1,7 +1,0 @@
-<svg width="256" height="256" viewBox="0 0 256 256" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Laintas CLI">
-  <rect width="256" height="256" fill="#ffffff"/>
-  <rect x="16" y="16" width="224" height="224" rx="38" fill="none" stroke="#d8dbd3" stroke-width="8"/>
-  <text x="49" y="166" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="104" font-weight="900" letter-spacing="-16">
-    <tspan fill="#d83b32">L</tspan><tspan fill="#18a266">&gt;</tspan>
-  </text>
-</svg>

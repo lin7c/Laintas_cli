@@ -5,14 +5,18 @@ __pycache__/
 .laintas/
 .parent_cmd
 *.bak
+*.bak-*
+log.md
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 build/**/*.deb
 build/**/tmp/
 build/linux/build/
 build/linux/dist/
 build/linux/dist-compat/
 build/linux/dist-manylinux/
-dist/
-dist/
 dist/
 
 # laintas_cli_download (React/Vite)
