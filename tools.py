@@ -6946,6 +6946,25 @@ def _bi_shell_exec(params: dict, ctx: ToolCtx) -> dict:
     elif command == "shell.exec":
         return {"ok": False, "error": "missing shell command after 'shell.exec'"}
 
+    # A PowerShell payload in double quotes is a bash string first. Caught here
+    # rather than left to run: bash's substitution produces a script PowerShell
+    # accepts and misinterprets, so the command "succeeds" with exit 0 and
+    # prints cmdlet-not-found noise about a name nobody wrote. One rejection
+    # naming the variable costs a retry; the alternative cost a whole session.
+    import command_parse
+    _ps_conflict = command_parse.powershell_expansion_conflict(command)
+    if _ps_conflict:
+        return {
+            "ok": False,
+            "returncode": -1,
+            "error": (
+                f"bash will expand {_ps_conflict} before PowerShell ever sees "
+                f"it. Put the PowerShell payload in single quotes "
+                f"(-Command '...'), escape the dollar sign (\\{_ps_conflict}), "
+                f"or write the script to a .ps1 file and run it with -File."
+            ),
+        }
+
     # Commits the agent makes carry it as co-author. No-op for everything that
     # is not a git commit, and for users who switched attribution off.
     command = git_attribution.apply(command)

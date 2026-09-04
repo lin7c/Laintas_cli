@@ -1,7 +1,7 @@
 ---
 name: shell-linux
 description: Shell and Linux command discipline for laintas-cli terminal work.
-version: 1.2.0
+version: 1.3.0
 triggers:
   - shell
   - bash
@@ -37,6 +37,11 @@ Use shell commands when they are the clearest tool:
   one level at a time with `ls` until you know where to look. The native
   `grep`/`glob` tools stop themselves and report a partial search; a shell
   command has nobody to stop it.
+  **The bound replaces the command, not the answer.** Measuring a level at a
+  time is slower to write and returns the same fact; declining to measure and
+  describing what such a tree usually contains returns a different fact,
+  sourced from nothing. If a bounded route cannot reach part of the answer,
+  report which part and what it would take.
 - For the primary agent, bare `shell.exec("cd path")` updates the CLI process
   working directory. Sub-agents should pass `cwd` or use `cd path && command`
   so concurrent agents never mutate one process-global directory.

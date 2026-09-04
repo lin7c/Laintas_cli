@@ -1,7 +1,7 @@
 ---
 name: wsl-windows
 description: Working on a Windows machine from inside the private WSL distribution the Windows build runs in.
-version: 1.0.0
+version: 1.1.0
 triggers:
   - windows
   - wsl
@@ -116,9 +116,17 @@ binary, not a Linux one.
   services in the foreground or with `nohup`, and never write a unit file
   expecting it to start.
 
-## What will ask for approval, and why not to route around it
+## What is approval-gated
 
-By design, and not a malfunction to retry differently:
+Approval is a runtime mechanism. When one of these is called, the runtime
+stops the call and puts the decision to the user; it does not need you to
+introduce it, and it cannot act on a sentence in your reply. Make the call.
+Announcing the command you are about to run and waiting for agreement leaves
+the user with nothing to approve, and the work not done. Batch what belongs
+together into one call -- for the prompt count, not because a prompt is a
+failure.
+
+The gated set, by design and not a malfunction to retry differently:
 
 - `powershell.exe`, `pwsh`, `cmd.exe /c`, `wsl.exe`, and the Windows
   management binaries (`sc`, `net`, `netsh`, `schtasks`, `reg`, `winget`,
@@ -132,6 +140,21 @@ Wrapping a blocked command in an encoded PowerShell payload, a `cmd /c`, or a
 different quoting does not change the answer -- the payload is unwrapped
 before the decision -- and attempting it is a much worse outcome for the user
 than asking them.
+
+## Two shells in one command line
+
+A PowerShell payload written on a bash command line is a bash string first,
+and bash performs its expansions before PowerShell is started. Anything of
+the form `$name` in double quotes or unquoted belongs to bash: `$_`, `$env:X`,
+`$null` and the rest of PowerShell's automatic variables are substituted away,
+and what reaches PowerShell is a different script that is still syntactically
+valid. The result is not an error but wrong output, usually blamed on the
+cmdlet.
+
+Single-quote the payload -- `powershell.exe -Command '...'` -- and bash passes
+it through untouched. Where the payload itself needs single quotes, write it
+to a `.ps1` file and run that with `-File`. The runtime rejects the ambiguous
+form rather than running it, and names the variable it found.
 
 ## The distribution is private
 

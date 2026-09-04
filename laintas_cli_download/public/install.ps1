@@ -38,6 +38,17 @@ try {
     # user can choose a drive and decide whether to launch when it finishes.
     $process = Start-Process -FilePath $Installer -Wait -PassThru
     if ($process.ExitCode -ne 0) {
+        # The installer writes the real reason here before it exits. Without
+        # it this bootstrap could only report a number, which is exactly as
+        # useful as the "WSL 2 must be enabled" message it replaced.
+        $reasonFile = Join-Path $env:TEMP "laintas-cli-install-error.txt"
+        $reason = ""
+        if (Test-Path -LiteralPath $reasonFile) {
+            $reason = (Get-Content -LiteralPath $reasonFile -Raw).Trim()
+        }
+        if ($reason) {
+            throw "$reason (installer exit code $($process.ExitCode); log: $(Join-Path $env:TEMP 'laintas-cli-install.log'))"
+        }
         throw "The Windows installer failed with exit code $($process.ExitCode)."
     }
 } finally {

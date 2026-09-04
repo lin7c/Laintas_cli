@@ -1,7 +1,7 @@
 ---
 name: code-map
 description: Read a public GitHub repository as a layered map instead of file by file - what the parts are, how they connect, and where the declarations live. Load before investigating a large remote repository; not for code checked out in the working directory.
-version: 1.0.0
+version: 1.1.0
 triggers:
   - code map
   - codemap
@@ -41,13 +41,31 @@ checked out here, this skill does not apply - read the files, and load
 5. **`code_map.delete`** - frees a slot and is not reversible without another
    paid build. Ask first.
 
-## What a map is not
+## How to read one: a glance, not a residence
 
-It knows structure, never behavior. Once it has told you *where*, the answer
-to *what it does* still comes from reading those lines.
+Read it the way a person reads the map at a park entrance. Look once, get
+your bearings, take the two or three things you needed, then walk. Nobody
+walks the park holding the map open, and nothing here is worth keeping in
+context after you have used it: read, summarise what the task needs, move on.
+Read it again when you next need bearings.
 
-It is also a snapshot of one ref. If the question is about work in progress,
-the map is stale by construction and the source is the authority - say which
+That is also the honest scope of it. A map answers *where does this live and
+what is it made of*. It does not answer *what does it do* - once it has told
+you where, that comes from reading those lines.
+
+## What a map will not tell you
+
+**It is a partition, so a feature's callers are somewhere else.** Every file
+belongs to exactly one part. Ask the map where the web-search feature lives
+and it names the four files that implement it - the five that *call* it are
+filed under the tool registry, the agent loop and the bridge. Use the map to
+find the home of a thing, then search from there; do not treat a part as the
+complete footprint of a feature.
+
+**It is a picture of one commit.** Every read returns `freshness`: the commit
+the map was built at, measured against the checkout you are standing in. When
+that says the map is many commits behind, its file paths are still roughly
+right and its prose may not be - the source is the authority, and say which
 one you answered from.
 
 ## When the account has no map and the user has not asked for one

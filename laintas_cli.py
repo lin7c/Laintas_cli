@@ -138,6 +138,17 @@ def is_windows_host() -> bool:
             or os.environ.get("WSL_DISTRO_NAME") == "Laintas-CLI")
 
 
+def host_label() -> str:
+    """What to call this machine when showing it to the user.
+
+    ``platform.system()`` answers "Linux" on the Windows product, which is
+    true of the shell and wrong about the computer: the user is sitting at a
+    Windows PC, their files are on the Windows disks, and a banner claiming
+    Linux tells them the installer put something else on their machine.
+    """
+    return "Windows (WSL 2)" if is_windows_host() else SYSTEM
+
+
 def _initial_ui_preferences_for_host(preferences: dict) -> dict:
     """Apply host-specific UI defaults without overriding a user choice.
 
@@ -6846,6 +6857,9 @@ def generate_cli_prop_template() -> str:
     # that correction -- procedure lives in the `wsl-windows` skill. It is
     # host-constant, so it belongs in the cached prefix rather than the
     # live-state tail.
+    # Not host_label(): the model needs to be told the shell is Linux, and
+    # the parenthetical does the correcting. The banner is the other way
+    # round -- the user needs to be told the machine is Windows.
     os_line = SYSTEM
     host_note = ""
     if is_windows_host():
@@ -6855,7 +6869,7 @@ def generate_cli_prop_template() -> str:
 - Paths under `/mnt` are the user's real documents on the Windows disk. Writes there are worth a confirmation, DrvFs is an order of magnitude slower than the Linux filesystem, and inotify never fires -- watch-mode builds and dev-server hot reload silently do not reload there.
 - The distribution holds bash, git, curl, ssh, ripgrep and the standard coreutils, and nothing else: no node, no python, no compilers. `sudo apt-get install` needs no password, persists, and is invisible to Windows and to the user's other distributions.
 - The Windows PATH is appended, so `python`, `node`, `npm` and `git` may resolve to a Windows `.exe`. A Win32 program cannot open a `/mnt/...` path: convert it with `wslpath -w` first, or use the Linux tool instead.
-- `powershell.exe`, `cmd.exe /c`, `wsl.exe` and the Windows management binaries need the user's approval every time, as do writes outside the working directory. That is the design; it is not a failure to route around.
+- `powershell.exe`, `cmd.exe /c`, `wsl.exe` and the Windows management binaries are approval-gated, as are writes outside the working directory. The runtime raises that prompt when you make the call; make it. Routing around the gate is a misuse, and so is stopping in front of it.
 - Opening a URL in the user's browser is handled by the runtime. Do not shell out to PowerShell for it.
 - Load the `wsl-windows` skill before installing a toolchain, running a dev server, moving a project between filesystems, or handing a path to a Windows program."""
 
@@ -6933,7 +6947,9 @@ The native function schemas attached to the current request are the exact callab
 - When something that used to work stops working, date the change before reading the code: `git log` or `git diff` over the window in question, especially when this session produced the release.
 - A result carrying a truncation marker is an incomplete result: material was dropped to fit the budget. Do not conclude from it -- narrow the pattern, exclude the noise, or raise the limit, and ask again.
 - Ask one concise question only when a missing choice would materially change the result and cannot be discovered safely, or when additional authority is required.
-- Before an irreversible, destructive, production, billing, credential, publication, or externally visible action, verify the exact target and obtain any approval required by runtime policy.
+- Before an irreversible, destructive, production, billing, credential, publication, or externally visible action, verify the exact target. Approval is a runtime mechanism, not a conversation: where policy requires consent, the runtime stops the call and puts the decision to the user itself. Verify, then issue the call. Describing an action in prose and waiting for agreement is not a request the runtime can act on -- it leaves the user with nothing to approve and the work not done.
+- A rule that bounds how to work never cancels what was asked. When the direct route is too expensive or is refused, bound it -- one level at a time, a narrower target, a cheaper source of the same fact -- and still return the answer. Presenting general knowledge in place of a measurement you did not take is a fabrication however it is framed; name the part you could not measure instead.
+- Ask the user to run something only when you genuinely cannot run it. Handing back work that was merely slow, noisy, or approval-gated turns their request into their homework.
 
 {{{{workflowPhase}}}}
 {{{{rolePrompt}}}}
@@ -9060,10 +9076,10 @@ class AgentRegistry:
             "name": self.agent_name,
             "instanceId": self.instance_id,
             "hostname": hostname,
-            "os": SYSTEM,
+            "os": host_label(),
             "shell": SHELL_NAME,
             "cwd": cwd,
-            "goal": f"CLI agent '{self.agent_name}' on {hostname} ({SYSTEM})",
+            "goal": f"CLI agent '{self.agent_name}' on {hostname} ({host_label()})",
         }
         if profile.sends_laintas_credentials:
             payload["userEmail"] = user_email
@@ -22099,7 +22115,7 @@ def show_banner(agent_name: str, session: dict = None):
                    or session.get("userId") or "")
         if account:
             rows.append(("account", account))
-    rows.append(("system", f"{SYSTEM} {symbols.BULLET} {shell_info}"))
+    rows.append(("system", f"{host_label()} {symbols.BULLET} {shell_info}"))
     rows.append(("cwd", _shorten_path(os.getcwd())))
     backend_profile = get_backend_profile()
     rows.append((

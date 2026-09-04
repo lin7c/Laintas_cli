@@ -363,6 +363,15 @@ def command_parse_unresolved(risks) -> bool:
         return False
 
 
+def command_parse_opaque(risks) -> bool:
+    """True when the unreadable part is a payload, not the command word."""
+    try:
+        import command_parse
+        return command_parse.RISK_OPAQUE_PAYLOAD in (risks or set())
+    except Exception:
+        return False
+
+
 def _command_variants(command: str) -> tuple:
     """Every command this line will actually run, plus how it was obfuscated.
 
@@ -923,8 +932,19 @@ def evaluate(command: str, cwd: str = None,
     # answer is to put a human in the loop. Approval rather than denial, because
     # command substitution is also ordinary shell usage in legitimate work.
     if mode != "disabled" and command_parse_unresolved(obf_risks):
-        reason = ("Command name is produced at runtime (substitution or variable); "
-                  "what will execute cannot be determined before it runs")
+        # Two different unknowns, and telling them apart matters to whoever
+        # reads the prompt: a command word that does not exist yet, versus a
+        # command we can read perfectly that hands work to a file or blob we
+        # cannot. Reporting the second as the first describes a substitution
+        # that is not in the command, and the agent then rewrites the quoting
+        # instead of showing the script.
+        if command_parse_opaque(obf_risks):
+            reason = ("Runs a script or encoded payload whose contents cannot "
+                      "be read from the command line (PowerShell -File / "
+                      "-EncodedCommand)")
+        else:
+            reason = ("Command name is produced at runtime (substitution or variable); "
+                      "what will execute cannot be determined before it runs")
         _write_audit(_audit_entry(command, "needs_approval", reason, cwd, req_id, agent_id))
         return PolicyDecision("needs_approval", "", reason)
 

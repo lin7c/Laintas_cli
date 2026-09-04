@@ -171,6 +171,50 @@ class PromptContractTests(unittest.TestCase):
             encoding="utf-8")
         self.assertIn("ripgrep", rootfs)
 
+    def test_approval_is_a_runtime_mechanism_not_a_conversation(self):
+        """The model started asking for permission in prose, then stopping.
+
+        Told only that an action "needs the user's approval", it wrote out the
+        command it intended to run and waited for agreement -- which the
+        runtime cannot act on, so the user was left holding a question instead
+        of an approval prompt, and the work simply stopped. The prompt has to
+        say who raises the prompt and when: the runtime, on the call.
+        """
+        prompt = laintas_cli.generate_cli_prop_template()
+        self.assertIn("Approval is a runtime mechanism, not a conversation",
+                      prompt)
+        self.assertIn("issue the call", prompt)
+
+    def test_a_bound_on_method_does_not_cancel_the_outcome(self):
+        """Rules about *how* to work were read as permission to not answer.
+
+        Given a cost rule about unbounded recursion, the model declined to
+        measure at all and answered from general knowledge instead -- an
+        answer with no source, delivered in the register of one that had. The
+        general form is the one that generalises: bound the route, keep the
+        outcome, and name whatever stayed unmeasured.
+        """
+        prompt = laintas_cli.generate_cli_prop_template()
+        self.assertIn("never cancels what was asked", prompt)
+        self.assertIn("fabrication", prompt)
+        self.assertIn("Ask the user to run something only when you genuinely "
+                      "cannot run it", prompt)
+
+        skill = Path("default_skills/shell-linux/SKILL.md").read_text(
+            encoding="utf-8")
+        self.assertIn("The bound replaces the command, not the answer.", skill)
+
+    def test_the_windows_skill_says_who_raises_an_approval(self):
+        text = Path("default_skills/wsl-windows/SKILL.md").read_text(
+            encoding="utf-8")
+        self.assertIn("Approval is a runtime mechanism", text)
+        self.assertNotIn("Every Windows binary invocation needs the user's "
+                         "approval", text)
+        # Two shells on one line: bash expands the payload before PowerShell
+        # is started, and the result is wrong output rather than an error.
+        self.assertIn("bash performs its expansions before PowerShell", text)
+        self.assertIn("-Command '...'", text)
+
     def test_the_prompt_never_asks_for_fewer_tool_calls(self):
         """Narrowing a call and making fewer calls are opposite instructions.
 

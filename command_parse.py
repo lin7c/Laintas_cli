@@ -68,6 +68,7 @@ RISK_SUBSTITUTION = "command_substitution"   # $( … ) or backticks
 RISK_INDIRECT = "indirect_command"           # command word came from a variable
 RISK_WRAPPER = "shell_wrapper"               # eval / sh -c / … | sh
 RISK_UNRESOLVED = "unresolved_command"       # could not determine what runs
+RISK_OPAQUE_PAYLOAD = "opaque_payload"       # a script/blob we cannot read, not a substitution
 
 
 @dataclass
@@ -187,6 +188,96 @@ def _split_tokens(text: str) -> tuple:
 
 
 _OPERATORS = {"&&", "||", ";;", ";", "|", "&", "\n"}
+
+
+_HEREDOC_START_RE = re.compile(
+    r"<<(?P<dash>-?)[ \t]*(?P<quote>['\"]?)(?P<delim>\\?[A-Za-z_][A-Za-z0-9_]*)"
+    r"(?P=quote)")
+
+#: `$( … )` and backticks inside an *unquoted* heredoc body. Nested parens are
+#: not matched; a body that needs them is rare, and the flag below still fires.
+_HEREDOC_SUBSTITUTION_RE = re.compile(r"\$\((?P<paren>[^()]*)\)|`(?P<tick>[^`]*)`")
+
+
+def _is_quoted_at(line: str, index: int) -> bool:
+    """Whether ``line[index]`` sits inside a quoted string."""
+    quote = None
+    for position, ch in enumerate(line):
+        if position >= index:
+            break
+        if quote:
+            if ch == quote:
+                quote = None
+        elif ch in ("'", '"'):
+            quote = ch
+    return quote is not None
+
+
+def _heredoc_starts(line: str) -> list:
+    """Every heredoc opened on ``line`` as (delimiter, strip_tabs, expands)."""
+    specs = []
+    for match in _HEREDOC_START_RE.finditer(line):
+        if line[match.start():match.start() + 3] == "<<<":
+            continue          # herestring: its word is data on one line
+        if _is_quoted_at(line, match.start()):
+            continue
+        delim = match.group("delim")
+        # `<<'EOF'`, `<<"EOF"` and `<<\EOF` all suppress expansion; a bare
+        # `<<EOF` body is expanded, so a substitution in it really runs.
+        quoted = bool(match.group("quote")) or delim.startswith("\\")
+        specs.append((delim.lstrip("\\"), bool(match.group("dash")),
+                      not quoted))
+    return specs
+
+
+def _strip_heredocs(text: str) -> tuple:
+    """Remove heredoc bodies from ``text``.
+
+    Returns ``(text_without_bodies, bodies, substitutions)``.
+
+    A heredoc body is **data**: `cat <<'EOF' > script.ps1` writes lines, it does
+    not run them. Parsing them as commands made every generated script look
+    like a chain of unknown programs -- a PowerShell body opening with
+    `$apps = …` read as "a command whose name comes from a variable", which is
+    the approval prompt that fired on every script the agent wrote. It also
+    reported the *contents* of a file as commands, so a body mentioning `rm -rf`
+    could be denied although nothing would run it.
+
+    The two ways a body is still live are kept: an unquoted delimiter expands
+    `$( … )`, and any body may be piped into a shell (`cat <<EOF | bash`). Both
+    are handed back for the caller to analyse.
+    """
+    if "<<" not in text:
+        return text, [], []
+
+    lines = text.split("\n")
+    kept: list = []
+    bodies: list = []
+    substitutions: list = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        kept.append(line)
+        index += 1
+        for delim, strip_tabs, expands in _heredoc_starts(line):
+            body: list = []
+            while index < len(lines):
+                candidate = lines[index]
+                probe = candidate.lstrip("\t") if strip_tabs else candidate
+                index += 1
+                if probe.strip() == delim:
+                    break
+                body.append(candidate)
+            if not body:
+                continue
+            text_body = "\n".join(body)
+            bodies.append(text_body)
+            if expands:
+                for match in _HEREDOC_SUBSTITUTION_RE.finditer(text_body):
+                    inner = match.group("paren") or match.group("tick") or ""
+                    if inner.strip():
+                        substitutions.append(inner)
+    return "\n".join(kept), bodies, substitutions
 
 
 def _unquote(word: str) -> tuple:
@@ -313,14 +404,78 @@ def _windows_payload(program: str, rest: list) -> tuple:
                 decoded = ""
             if decoded:
                 return decoded, {RISK_WRAPPER}
-            return "", {RISK_WRAPPER, RISK_UNRESOLVED}
+            return "", {RISK_WRAPPER, RISK_UNRESOLVED, RISK_OPAQUE_PAYLOAD}
         if any(lowered.startswith(flag) for flag in _PS_COMMAND_FLAG_PREFIXES) \
                 and following:
             return " ".join(words[idx + 1:]), risks
         if lowered.startswith("-file"):
-            # The script is on disk; its contents are not knowable here.
-            return "", {RISK_WRAPPER, RISK_UNRESOLVED}
+            # The script is on disk; its contents are not knowable here. This
+            # is not a substitution and must not be reported as one: the agent
+            # that is told "the command name is produced at runtime" about
+            # `-File ./report.ps1` has been told something untrue about a
+            # command it wrote, and rewrites the wrong half of it.
+            return "", {RISK_WRAPPER, RISK_UNRESOLVED, RISK_OPAQUE_PAYLOAD}
     return "", risks
+
+
+#: PowerShell variables that bash also expands, and always to the wrong thing.
+#: `$_` is bash's "last argument of the previous command", the rest are unset
+#: and expand to nothing. None of them is ever a deliberate bash reference in a
+#: line that invokes PowerShell.
+_PS_ONLY_VARIABLES = (
+    "$_", "$PSItem", "$env:", "$null", "$true", "$false", "$args", "$input",
+    "$Matches", "$Error", "$Host", "$LASTEXITCODE", "$PSScriptRoot",
+    "$PSCommandPath", "$Using:", "$MyInvocation",
+)
+
+_PS_INVOCATION_RE = re.compile(r"(?:^|[\s;|&(])(?:[^\s;|&]*[/\\])?"
+                               r"(?:powershell|pwsh)(?:\.exe)?(?=\s|$)",
+                               re.IGNORECASE)
+
+
+def powershell_expansion_conflict(command: str) -> str:
+    """The first PowerShell variable bash will eat, or "" if there is none.
+
+    A PowerShell payload written in double quotes is a bash string first:
+    `powershell.exe -Command "… | Where-Object { $_.DisplayName }"` reaches
+    PowerShell as `{ .DisplayName }` because bash already replaced `$_` with
+    the last argument of the previous command. Nothing errors -- PowerShell
+    receives a syntactically valid, semantically different script, and the
+    failure surfaces as unrelated cmdlet-not-found noise several lines later.
+
+    Only lines that actually invoke PowerShell are examined, and only outside
+    single quotes, which is exactly the quoting that fixes it.
+    """
+    if not command or not _PS_INVOCATION_RE.search(command):
+        return ""
+    quote = None
+    index = 0
+    length = len(command)
+    while index < length:
+        ch = command[index]
+        if quote == "'":
+            if ch == "'":
+                quote = None
+            index += 1
+            continue
+        if quote == '"':
+            if ch == "\\" and index + 1 < length:
+                index += 2
+                continue
+            if ch == '"':
+                quote = None
+                index += 1
+                continue
+        elif ch in ("'", '"'):
+            quote = ch
+            index += 1
+            continue
+        if ch == "$":
+            for name in _PS_ONLY_VARIABLES:
+                if command.startswith(name, index):
+                    return name
+        index += 1
+    return ""
 
 
 def analyze(command: str, *, _depth: int = 0) -> Analysis:
@@ -330,6 +485,10 @@ def analyze(command: str, *, _depth: int = 0) -> Analysis:
 
     if _depth > 4 or not command or not command.strip():
         return Analysis(segments, risks)
+
+    # Heredoc bodies are data, not commands. Their two live forms come back
+    # for analysis below; everything else in them is file content.
+    command, heredoc_bodies, heredoc_substitutions = _strip_heredocs(command)
 
     tokens, _ = _split_tokens(command)
 
@@ -437,6 +596,23 @@ def analyze(command: str, *, _depth: int = 0) -> Analysis:
                 continue
             risks.add(RISK_WRAPPER)
             inner = analyze(payload, _depth=_depth + 1)
+            segments.extend(inner.segments)
+            risks |= inner.risks
+
+    # `$( … )` inside an unquoted heredoc body runs when the body is written.
+    for substitution in heredoc_substitutions:
+        risks.add(RISK_SUBSTITUTION)
+        if _depth < 4:
+            inner = analyze(substitution, _depth=_depth + 1)
+            segments.extend(inner.segments)
+            risks |= inner.risks
+
+    # `cat <<EOF | bash` -- there the body is the script after all.
+    if heredoc_bodies and _depth < 4 and any(
+            s.program in _STDIN_SHELLS for s in segments):
+        risks.add(RISK_WRAPPER)
+        for body in heredoc_bodies:
+            inner = analyze(body, _depth=_depth + 1)
             segments.extend(inner.segments)
             risks |= inner.risks
 

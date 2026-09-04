@@ -18,8 +18,10 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import command_parse
+import laintas_cli
 import policy
 
 
@@ -207,3 +209,125 @@ class PolicyCheckToolTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HostLabelTests(unittest.TestCase):
+    """The banner named the shell's kernel, not the user's computer.
+
+    On the Windows product `platform.system()` answers "Linux", which is true
+    of the shell and wrong about the machine: the user is at a Windows PC and
+    a startup line reading "Linux" says the installer put something else on
+    it. The model's own OS line stays "Linux (private WSL 2 distribution…)" —
+    it has to know the shell is Linux — so the two cannot share one string.
+    """
+
+    def test_the_windows_product_calls_itself_windows(self):
+        with mock.patch.dict(os.environ, {"LAINTAS_HOST": "windows"}):
+            self.assertEqual(laintas_cli.host_label(), "Windows (WSL 2)")
+
+    def test_a_renamed_distribution_is_still_the_windows_product(self):
+        environment = {"WSL_DISTRO_NAME": "Laintas-CLI"}
+        with mock.patch.dict(os.environ, environment, clear=False):
+            os.environ.pop("LAINTAS_HOST", None)
+            self.assertEqual(laintas_cli.host_label(), "Windows (WSL 2)")
+
+    def test_a_plain_linux_install_is_unchanged(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("LAINTAS_HOST", None)
+            os.environ.pop("WSL_DISTRO_NAME", None)
+            self.assertEqual(laintas_cli.host_label(), laintas_cli.SYSTEM)
+
+
+class HeredocBodyTests(unittest.TestCase):
+    """A heredoc body is what gets written, not what gets run.
+
+    Parsing it as commands made every generated script look like a chain of
+    unknown programs: a PowerShell body opening with `$apps = …` read as "a
+    command whose name comes from a variable", so policy demanded approval for
+    writing a file. Three approvals in a row for the same harmless write is
+    what teaches an agent that acting is expensive and asking is cheap.
+    """
+
+    def test_writing_a_script_is_not_an_unresolvable_command(self):
+        analysis = command_parse.analyze(
+            "cat << 'EOF' > report.ps1\n"
+            "$apps = Get-ItemProperty HKLM:\\Software\\*\n"
+            "$apps | Export-Csv out.csv\n"
+            "EOF")
+        self.assertNotIn(command_parse.RISK_UNRESOLVED, analysis.risks)
+        self.assertEqual(["cat << EOF > report.ps1"], analysis.commands)
+
+    def test_body_text_is_not_matched_as_a_command(self):
+        """Otherwise a file's *contents* are judged as if they would run."""
+        analysis = command_parse.analyze(
+            "cat << 'EOF' > notes.txt\nrm -rf /\nEOF")
+        self.assertNotIn("rm -rf /", analysis.commands)
+
+    def test_a_body_piped_into_a_shell_is_still_a_script(self):
+        """`cat <<EOF | bash` is the case where the body really does run."""
+        analysis = command_parse.analyze(
+            "cat << 'EOF' | bash\nrm -rf /tmp/victim\nEOF")
+        self.assertIn("rm -rf /tmp/victim", analysis.commands)
+
+    def test_an_unquoted_delimiter_still_expands_substitutions(self):
+        """`<<EOF` (unquoted) runs `$( … )` while writing the file."""
+        analysis = command_parse.analyze(
+            "cat <<EOF > out\nowner=$(whoami)\nEOF")
+        self.assertIn("whoami", analysis.commands)
+        self.assertIn(command_parse.RISK_SUBSTITUTION, analysis.risks)
+
+
+class OpaquePayloadTests(unittest.TestCase):
+    """"Unreadable" has two shapes and the prompt has to name the right one."""
+
+    def test_a_script_file_is_not_reported_as_a_substitution(self):
+        analysis = command_parse.analyze("powershell.exe -File ./report.ps1")
+        self.assertIn(command_parse.RISK_UNRESOLVED, analysis.risks)
+        self.assertIn(command_parse.RISK_OPAQUE_PAYLOAD, analysis.risks)
+
+        _isolated_policy("enforce")
+        decision = policy.evaluate("powershell.exe -File ./report.ps1")
+        self.assertEqual("needs_approval", decision.action)
+        self.assertIn("cannot be read", decision.reason)
+        self.assertNotIn("produced at runtime", decision.reason)
+
+    def test_a_real_substitution_keeps_its_own_message(self):
+        _isolated_policy("enforce")
+        decision = policy.evaluate("$(echo rm) -rf /tmp/x")
+        self.assertEqual("needs_approval", decision.action)
+        self.assertIn("produced at runtime", decision.reason)
+
+
+class PowerShellQuotingTests(unittest.TestCase):
+    """Two shells on one line, and bash goes first.
+
+    `-Command "… { $_.DisplayName } …"` reaches PowerShell with `$_` already
+    replaced by bash -- with the previous command's last argument, which in
+    this runtime is the internal marker it echoes before every command. What
+    ran was valid PowerShell about a name nobody wrote, exit code 0, and
+    several screens of cmdlet-not-found noise blamed on the cmdlet.
+    """
+
+    def test_double_quoted_powershell_variables_are_caught(self):
+        self.assertEqual(
+            "$_",
+            command_parse.powershell_expansion_conflict(
+                'powershell.exe -Command "Get-X | ? { $_.Name }"'))
+        self.assertEqual(
+            "$env:",
+            command_parse.powershell_expansion_conflict(
+                'powershell.exe -Command "ls $env:LOCALAPPDATA"'))
+
+    def test_single_quotes_are_the_fix_and_are_not_flagged(self):
+        self.assertEqual(
+            "",
+            command_parse.powershell_expansion_conflict(
+                "powershell.exe -Command 'Get-X | ? { $_.Name }'"))
+
+    def test_bash_variables_in_ordinary_commands_are_left_alone(self):
+        for command in ('echo "$_ was the last argument"',
+                        'grep "$PATH" file',
+                        'powershell.exe -File ./a.ps1'):
+            self.assertEqual(
+                "", command_parse.powershell_expansion_conflict(command),
+                command)

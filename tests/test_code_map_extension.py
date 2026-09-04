@@ -155,6 +155,39 @@ class CodeMapExtensionTests(unittest.TestCase):
             (REPO / "package_manifest.json").read_text(encoding="utf-8"))
         self.assertNotIn("code_map", manifest["modules"])
 
+    def test_a_read_says_how_stale_the_picture_is(self):
+        """A map is glanced at for weeks; the tree moves under it.
+
+        The failure mode of a park map is not being coarse — it is showing a
+        path that is no longer there, because an orientation error is
+        trusted. So a read carries the commit it was built at, measured
+        against the checkout the agent is standing in.
+        """
+        import importlib.util
+        import subprocess
+        spec = importlib.util.spec_from_file_location(
+            "code_map_main", SOURCE / "main.py")
+        main = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(main)
+
+        head = subprocess.run(("git", "rev-parse", "HEAD"), cwd=REPO,
+                              capture_output=True, text=True).stdout.strip()
+        here = "https://github.com/lin7c/laintas_cli"
+        self.assertIn("same commit",
+                      main._age_against_working_tree(here, head))
+        older = subprocess.run(("git", "rev-parse", "HEAD~3"), cwd=REPO,
+                               capture_output=True, text=True).stdout.strip()
+        self.assertIn("3 commit(s) ahead",
+                      main._age_against_working_tree(here, older))
+        # A map of a different repository is background, not description.
+        self.assertIn("not the repository checked out here",
+                      main._age_against_working_tree(
+                          "https://github.com/openai/codex", head))
+        # And nothing is claimed when nothing is known.
+        self.assertEqual(main._age_against_working_tree(here, ""), "")
+        self.assertIn("not in this checkout",
+                      main._age_against_working_tree(here, "deadbee"))
+
 
 if __name__ == "__main__":
     unittest.main()

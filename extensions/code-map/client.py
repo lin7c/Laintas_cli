@@ -119,11 +119,28 @@ def maps() -> list[dict]:
 
 def outline(map_id: str, node: str = "") -> str:
     """The finished map as Markdown — names, summaries, arrows, no geometry."""
+    return read(map_id, node).get("outline", "")
+
+
+def read(map_id: str, node: str = "") -> dict:
+    """The outline plus what it is a picture of: repository, ref, commit, date.
+
+    A map is built once and read for weeks. Without the commit beside it,
+    a paragraph written against last month's tree reads exactly like one
+    written this morning, and a reader who trusts it walks a path that is no
+    longer there.
+    """
     if not MAP_ID.fullmatch(map_id or ""):
         raise CodeMapError("a map id is 32 hex characters")
     payload = _call("GET", f"/maps/{map_id}/outline",
                     params={"node": node} if node else None)
-    return str(payload.get("outline") or "")
+    return {
+        "outline": str(payload.get("outline") or ""),
+        "repository": str(payload.get("source_url") or ""),
+        "ref": str(payload.get("source_ref") or ""),
+        "commit": str(payload.get("commit") or ""),
+        "built_at": int(payload.get("built_at") or 0),
+    }
 
 
 def delete(map_id: str) -> bool:

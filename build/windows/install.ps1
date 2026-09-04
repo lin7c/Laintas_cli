@@ -7,6 +7,82 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version 2.0
 
+# Where a failed install leaves its evidence. The installer window scrolls and
+# then closes; these two files are what the user still has afterwards, and the
+# one-line .txt is what the NSIS message box actually shows. Anything thrown
+# below therefore has to read as the real reason, addressed to the user.
+$LogFile = Join-Path $env:TEMP "laintas-cli-install.log"
+$ErrorFile = Join-Path $env:TEMP "laintas-cli-install-error.txt"
+Remove-Item -LiteralPath $ErrorFile -Force -ErrorAction SilentlyContinue
+try { Start-Transcript -LiteralPath $LogFile -Force | Out-Null } catch { }
+
+# Exit codes. NSIS prints whichever one it gets; a support log can tell the
+# classes apart without parsing English.
+$EXIT_OTHER = 1
+$EXIT_WSL = 10
+$EXIT_UNSUPPORTED_HOST = 11
+$EXIT_PACKAGE_INCOMPLETE = 12
+$EXIT_INSTALL_STATE = 13
+
+$script:FailureCode = $EXIT_OTHER
+
+function Fail {
+    param([string]$Message, [int]$Code = 1)
+    $script:FailureCode = $Code
+    throw $Message
+}
+
+trap {
+    $message = ($_.Exception.Message -replace "`r?`n", " ").Trim()
+    if (-not $message) { $message = "Unknown installation error." }
+    try {
+        # The system ANSI code page, not UTF-8: NSIS reads this file with
+        # FileRead, which decodes with the ANSI code page, so a path holding
+        # the user's non-Latin account name only survives if both sides agree.
+        [IO.File]::WriteAllText($ErrorFile, $message, [Text.Encoding]::Default)
+    } catch { }
+    Write-Host ""
+    Write-Host "Installation failed: $message"
+    Write-Host "Log: $LogFile"
+    try { Stop-Transcript | Out-Null } catch { }
+    exit $script:FailureCode
+}
+
+function Invoke-Wsl {
+    # wsl.exe writes UTF-16LE, which arrives here as text with a NUL between
+    # every character. Its exit code alone says nothing useful, so the output
+    # is captured too: the HRESULT inside it is the only part of a WSL failure
+    # that is not localised, and it is what names the actual cause.
+    # Merging stderr into the output is what makes the HRESULT readable, and
+    # it is also what makes this assignment necessary: with the script's
+    # "Stop" preference in force, a native command writing to a redirected
+    # stderr raises a terminating NativeCommandError, so reading WSL's own
+    # error message would itself abort the install. The assignment is
+    # function-scoped and gone on return.
+    $ErrorActionPreference = "Continue"
+    $raw = & wsl.exe @args 2>&1
+    $code = $LASTEXITCODE
+    $text = (@($raw) | ForEach-Object { ($_ | Out-String) -replace "`0", "" }) -join ""
+    return [pscustomobject]@{ ExitCode = $code; Output = $text.Trim() }
+}
+
+function Get-WslDiagnosis([string]$Output) {
+    $advice = [ordered]@{
+        "0x8007019e" = "The Windows Subsystem for Linux is not enabled on this machine. Open PowerShell as Administrator, run 'wsl --install --no-distribution', restart Windows, then run this installer again."
+        "0x80370102" = "Hardware virtualisation is off. Enable the 'Virtual Machine Platform' Windows feature and turn on virtualisation (Intel VT-x / AMD-V) in the BIOS/UEFI, then run this installer again."
+        "0x80370114" = "WSL 2 could not start its virtual machine. Enable the 'Virtual Machine Platform' Windows feature and check that virtualisation is on in the BIOS/UEFI and not held by another hypervisor."
+        "0x800701bc" = "The WSL 2 kernel is missing or out of date. Open PowerShell as Administrator, run 'wsl --update', then run this installer again."
+        "0x80070422" = "A Windows service that WSL needs is disabled. Set the 'LxssManager' service to Manual or Automatic, then run this installer again."
+        "0x80070005" = "Windows denied access while creating the WSL distribution. Check that no security software is blocking WSL, then run this installer again."
+    }
+    foreach ($code in $advice.Keys) {
+        if ($Output -match [Regex]::Escape($code)) {
+            return "$($advice[$code]) (WSL reported $code.)"
+        }
+    }
+    return $null
+}
+
 function Get-RegisteredDistributions {
     $output = & wsl.exe --list --quiet 2>$null
     if ($LASTEXITCODE -ne 0) {
@@ -42,14 +118,27 @@ function Add-UserPath([string]$Directory) {
 }
 
 if (-not (Get-Command wsl.exe -ErrorAction SilentlyContinue)) {
-    throw "WSL is not installed. Run 'wsl --install --no-distribution' as Administrator, restart Windows, then run this installer again."
+    Fail "WSL is not installed on this machine. Open PowerShell as Administrator, run 'wsl --install --no-distribution', restart Windows, then run this installer again." $EXIT_WSL
 }
 
 if (-not [Environment]::Is64BitOperatingSystem) {
-    throw "Laintas CLI for Windows requires 64-bit Windows."
+    Fail "Laintas CLI for Windows requires 64-bit Windows." $EXIT_UNSUPPORTED_HOST
 }
 if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64" -or $env:PROCESSOR_ARCHITEW6432 -eq "ARM64") {
-    throw "This package is for x86_64 Windows. Windows ARM64 packaging is not available yet."
+    Fail "This package is for x86_64 Windows. Windows ARM64 packaging is not available yet." $EXIT_UNSUPPORTED_HOST
+}
+
+# wsl.exe exists on every current Windows whether or not the subsystem is
+# actually enabled, so its presence proves nothing. Ask it for its status and
+# fail early only on an HRESULT that names a definite cause -- an old WSL that
+# does not know --status just returns an unrecognised error, which is not a
+# reason to stop.
+$status = Invoke-Wsl --status
+if ($status.ExitCode -ne 0) {
+    $diagnosis = Get-WslDiagnosis $status.Output
+    if ($diagnosis) {
+        Fail $diagnosis $EXIT_WSL
+    }
 }
 
 $PackageRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -66,23 +155,67 @@ $DistroDir = Join-Path $InstallRoot "WSL"
 $InstalledLauncher = Join-Path $BinDir "laintas-cli.exe"
 
 if (-not (Test-Path -LiteralPath $BundledLauncher -PathType Leaf)) {
-    throw "The Windows package is incomplete: laintas-cli.exe is missing."
+    Fail "The Windows package is incomplete: laintas-cli.exe is missing. Download the installer again." $EXIT_PACKAGE_INCOMPLETE
 }
 if (-not (Test-Path -LiteralPath $LinuxBinary -PathType Leaf)) {
-    throw "The Windows installer is incomplete: the Linux runtime is missing."
+    Fail "The Windows installer is incomplete: the Linux runtime is missing. Download the installer again." $EXIT_PACKAGE_INCOMPLETE
 }
 
 $registered = Get-RegisteredDistributions
 $importedNow = $false
-if ($registered -notcontains $DistroName) {
+$needsImport = $registered -notcontains $DistroName
+$rebuilding = $false
+
+if (-not $needsImport) {
+    $registeredBase = Get-DistributionBasePath $DistroName
+    if ($registeredBase) {
+        $selectedBase = [IO.Path]::GetFullPath($DistroDir).TrimEnd('\')
+        $registeredBase = [IO.Path]::GetFullPath($registeredBase).TrimEnd('\')
+        if (-not $selectedBase.Equals($registeredBase, [StringComparison]::OrdinalIgnoreCase)) {
+            Fail "$DistroName is already installed at $registeredBase. Keep its existing installation directory ($([IO.Path]::GetDirectoryName($registeredBase))) when upgrading." $EXIT_INSTALL_STATE
+        }
+
+        # A registered distribution whose virtual disk is gone. Unregistering
+        # is the only way to clear the registration, and WSL will not do it
+        # on its own: it keeps the entry, `wsl --list` keeps naming the
+        # distribution, and every call into it fails. Deleting the multi-GB
+        # ext4.vhdx by hand to reclaim disk space is the ordinary way to get
+        # here, and before this the installer answered it by skipping the
+        # import and then failing on the first command it ran inside the
+        # distribution that no longer had a filesystem.
+        $disk = Join-Path $registeredBase "ext4.vhdx"
+        if (-not (Test-Path -LiteralPath $disk -PathType Leaf)) {
+            Write-Host "$DistroName is registered but its virtual disk is missing; rebuilding it."
+            $drop = Invoke-Wsl --unregister $DistroName
+            if ($drop.ExitCode -ne 0) {
+                $diagnosis = Get-WslDiagnosis $drop.Output
+                if (-not $diagnosis) {
+                    $diagnosis = "$DistroName is registered but its virtual disk ($disk) is gone, and the stale registration could not be removed (exit code $($drop.ExitCode)): $($drop.Output) Run 'wsl --unregister $DistroName' in PowerShell, then run this installer again."
+                }
+                Fail $diagnosis $EXIT_INSTALL_STATE
+            }
+            $needsImport = $true
+            $rebuilding = $true
+        }
+    }
+}
+
+if ($needsImport) {
     if (-not (Test-Path -LiteralPath $Rootfs -PathType Leaf)) {
-        throw "The Windows package is incomplete: laintas-rootfs.tar.gz is missing."
+        Fail "The Windows package is incomplete: laintas-rootfs.tar.gz is missing. Download the installer again." $EXIT_PACKAGE_INCOMPLETE
     }
     $createdDistroDir = $false
     if (Test-Path -LiteralPath $DistroDir) {
-        $existing = @(Get-ChildItem -LiteralPath $DistroDir -Force -ErrorAction SilentlyContinue)
+        # Whatever is left in there when rebuilding is this distribution's own
+        # debris: the relocation check above already established that WSL had
+        # it registered at exactly this path. The guard is for a directory
+        # that holds someone else's files.
+        $existing = @()
+        if (-not $rebuilding) {
+            $existing = @(Get-ChildItem -LiteralPath $DistroDir -Force -ErrorAction SilentlyContinue)
+        }
         if ($existing.Count -gt 0) {
-            throw "The WSL target directory is not empty: $DistroDir"
+            Fail "$DistroDir already contains files but no $DistroName distribution is registered, so importing there would overwrite them. This is what a hand-run 'wsl --unregister $DistroName' leaves behind: delete that directory, or choose another installation directory." $EXIT_INSTALL_STATE
         }
     } else {
         New-Item -ItemType Directory -Path $DistroDir -Force | Out-Null
@@ -91,9 +224,14 @@ if ($registered -notcontains $DistroName) {
 
     Write-Host "Importing the private $DistroName WSL environment..."
     try {
-        & wsl.exe --import $DistroName $DistroDir $Rootfs --version 2
-        if ($LASTEXITCODE -ne 0) {
-            throw "WSL import failed with exit code $LASTEXITCODE."
+        $import = Invoke-Wsl --import $DistroName $DistroDir $Rootfs --version 2
+        if ($import.Output) { Write-Host $import.Output }
+        if ($import.ExitCode -ne 0) {
+            $diagnosis = Get-WslDiagnosis $import.Output
+            if (-not $diagnosis) {
+                $diagnosis = "WSL could not create the private $DistroName distribution (exit code $($import.ExitCode)): $($import.Output) Run 'wsl --status' and 'wsl --update' in PowerShell to check that WSL 2 is working."
+            }
+            Fail $diagnosis $EXIT_WSL
         }
         $importedNow = $true
     } catch {
@@ -105,14 +243,6 @@ if ($registered -notcontains $DistroName) {
         throw
     }
 } else {
-    $registeredBase = Get-DistributionBasePath $DistroName
-    if ($registeredBase) {
-        $selectedBase = [IO.Path]::GetFullPath($DistroDir).TrimEnd('\')
-        $registeredBase = [IO.Path]::GetFullPath($registeredBase).TrimEnd('\')
-        if (-not $selectedBase.Equals($registeredBase, [StringComparison]::OrdinalIgnoreCase)) {
-            throw "$DistroName is already installed at $registeredBase. Keep its existing installation directory ($([IO.Path]::GetDirectoryName($registeredBase))) when upgrading."
-        }
-    }
     Write-Host "$DistroName is already installed; preserving its Linux filesystem and user data."
 }
 
@@ -122,17 +252,21 @@ Copy-Item -LiteralPath $BundledLauncher -Destination $InstalledLauncher -Force
 Write-Host "Installing the current Laintas runtime without replacing Linux user data..."
 $fullLinuxBinary = [IO.Path]::GetFullPath($LinuxBinary)
 if ($fullLinuxBinary -notmatch '^([A-Za-z]):\\(.*)$') {
-    throw "Cannot translate the installer runtime path for WSL: $fullLinuxBinary"
+    Fail "Cannot translate the installer runtime path for WSL: $fullLinuxBinary. Install from a local drive letter, not a UNC path." $EXIT_INSTALL_STATE
 }
 $drive = $Matches[1].ToLowerInvariant()
 $relative = $Matches[2] -replace '\\', '/'
 $wslLinuxBinary = "/mnt/$drive/$relative"
-& wsl.exe --distribution $DistroName --user root --exec /usr/bin/install -m 0755 $wslLinuxBinary /usr/local/bin/laintas-cli
-if ($LASTEXITCODE -ne 0) {
+$runtime = Invoke-Wsl --distribution $DistroName --user root --exec /usr/bin/install -m 0755 $wslLinuxBinary /usr/local/bin/laintas-cli
+if ($runtime.ExitCode -ne 0) {
     if ($importedNow) {
         & wsl.exe --unregister $DistroName 2>$null | Out-Null
     }
-    throw "Could not install the Laintas runtime inside $DistroName."
+    $diagnosis = Get-WslDiagnosis $runtime.Output
+    if (-not $diagnosis) {
+        $diagnosis = "Could not install the Laintas runtime inside $DistroName (exit code $($runtime.ExitCode)): $($runtime.Output) If the distribution is registered but broken, run 'wsl --unregister $DistroName' in PowerShell and install again -- that rebuilds it from scratch."
+    }
+    Fail $diagnosis $EXIT_WSL
 }
 
 # Reclaim what the upgrade just cost. A WSL2 distribution lives in an
@@ -292,3 +426,4 @@ if ($pathChanged) {
 } else {
     Write-Host "Run: laintas-cli"
 }
+try { Stop-Transcript | Out-Null } catch { }

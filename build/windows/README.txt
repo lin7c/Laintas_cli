@@ -40,6 +40,34 @@ reporting works in every terminal, not a Windows limitation. Run
 "/config enable_mouse false" inside the CLI to turn clicking off and get
 plain drag-to-select back.
 
+If the installation fails
+-------------------------
+The message box names the real reason and points at the full log:
+
+  %TEMP%\laintas-cli-install.log
+
+The three causes seen most often, and what each one needs:
+
+- "The Windows Subsystem for Linux is not enabled" - open PowerShell as
+  Administrator, run "wsl --install --no-distribution", restart Windows, then
+  run this installer again.
+- "The WSL 2 kernel is missing or out of date" - run "wsl --update" as
+  Administrator and try again.
+- "Hardware virtualisation is off" - turn on Intel VT-x / AMD-V in the
+  BIOS/UEFI and enable the "Virtual Machine Platform" Windows feature.
+
+If the message says the installation directory already contains files while no
+Laintas-CLI distribution is registered, a previous "wsl --unregister" left the
+folder behind: delete <install directory>\WSL, or install elsewhere.
+
+Deleting ext4.vhdx (the multi-GB file under <install directory>\WSL) to free
+disk space does not uninstall anything: Windows keeps the distribution
+registered, and everything that runs inside it then fails. The installer now
+detects this and rebuilds the distribution. To clear it by hand:
+  wsl.exe --unregister Laintas-CLI
+and then install again. Note that the file is the whole Linux filesystem,
+including ~/.laintas -- deleting it discards that data.
+
 Uninstall from Windows Settings > Apps. The private Linux filesystem and
 ~/.laintas data are preserved so a reinstall or upgrade can reuse them.
 

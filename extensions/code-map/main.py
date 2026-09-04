@@ -133,11 +133,67 @@ def _tool_list(params: dict, ctx) -> dict:
     return _call(run, params)
 
 
+def _age_against_working_tree(repository: str, commit: str) -> str:
+    """How far the working directory has moved since the map was built.
+
+    A map is a park map: glanced at, summarised, put away. That works right
+    up until it shows a path that no longer exists — an orientation error is
+    trusted in a way that having no map never is. So every read says how old
+    the picture is against the tree the agent is actually standing in, and
+    says nothing at all when it cannot tell.
+    """
+    if not commit:
+        return ""
+    try:
+        import subprocess
+        def git(*args: str) -> str:
+            done = subprocess.run(("git", *args), capture_output=True,
+                                  text=True, timeout=10)
+            return done.stdout.strip() if done.returncode == 0 else ""
+        if not git("rev-parse", "--is-inside-work-tree"):
+            return ""
+        # Same repository? A map of someone else's tree says nothing about
+        # this one, and comparing commits across repositories is nonsense.
+        remotes = git("remote", "-v").lower()
+        name = repository.lower().rstrip("/").removesuffix(".git")
+        name = name.split("github.com/")[-1] if "github.com/" in name else ""
+        if name and name not in remotes:
+            return (f"This map is of {repository}, which is not the repository "
+                    "checked out here — read it as background, not as a "
+                    "description of these files.")
+        if not git("cat-file", "-e", f"{commit}^{{commit}}") and git(
+                "rev-parse", "--verify", "--quiet", f"{commit}^{{commit}}") == "":
+            return (f"Built at commit {commit}, which is not in this checkout "
+                    "(shallow clone, or a different branch).")
+        behind = git("rev-list", "--count", f"{commit}..HEAD")
+        dirty = len([line for line in git("status", "--porcelain").splitlines()
+                     if line.strip()])
+        if not behind:
+            return ""
+        parts = [f"Built at commit {commit}"]
+        parts.append("the working tree is at the same commit" if behind == "0"
+                     else f"the working tree is {behind} commit(s) ahead of it")
+        if dirty:
+            parts.append(f"{dirty} file(s) uncommitted")
+        return ". ".join([" — ".join(parts[:2])] + parts[2:]) + "."
+    except Exception:  # noqa: BLE001 - provenance is a nicety, never a failure
+        return ""
+
+
 def _tool_read(params: dict, ctx) -> dict:
     def run(cm, p):
-        text = cm.outline(str(p.get("map_id") or "").strip(),
-                          str(p.get("node") or "").strip())
-        return {"outline": text or "No such node in this map."}
+        found = cm.read(str(p.get("map_id") or "").strip(),
+                        str(p.get("node") or "").strip())
+        text = found.get("outline")
+        if not text:
+            return {"outline": "No such node in this map."}
+        result = {"outline": text, "commit": found.get("commit", ""),
+                  "repository": found.get("repository", "")}
+        age = _age_against_working_tree(found.get("repository", ""),
+                                        found.get("commit", ""))
+        if age:
+            result["freshness"] = age
+        return result
     return _call(run, params)
 
 
@@ -179,12 +235,19 @@ _TOOLS = [
      {"type": "object", "properties": {}, "additionalProperties": False},
      _tool_list),
     ("read",
-     "Read a finished map as text. With no node: the whole system - what it "
-     "is, every part with its summary, and the arrows between them, in about "
-     "15 KB. With node='l1:<id>': that part's components. With "
+     "Glance at a finished map. Read it the way a person reads a park map: "
+     "look once to get your bearings, take what you need, then work from the "
+     "source. With no node: the whole system - what it is, every part with "
+     "its summary, and the arrows between them, in about 15 KB. With "
+     "node='l1:<id>': that part's components. With "
      "node='l2:<part>:<component>': its declarations with file:line, which is "
-     "where to start reading actual source. Prefer this over fetching diagrams: "
-     "the diagrams carry layout coordinates you cannot use.",
+     "where to start reading actual source. Use it to answer 'where does this "
+     "feature live and what is it made of' before searching, not instead of "
+     "searching: the map is a partition, so a feature's callers usually sit "
+     "in a different part. It also returns 'freshness' - how far the working "
+     "tree has moved since the map was built; if that says the map is many "
+     "commits behind, trust its file paths over its prose. Prefer this over "
+     "fetching diagrams: the diagrams carry layout coordinates you cannot use.",
      {"type": "object", "properties": {
          "map_id": {"type": "string"},
          "node": {"type": "string", "description": "a box id from a previous read; omit for the whole map"},

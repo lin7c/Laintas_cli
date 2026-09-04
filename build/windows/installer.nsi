@@ -95,7 +95,23 @@ Section "Install"
   nsExec::ExecToLog 'powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$PLUGINSDIR\payload\install.ps1" -InstallRoot "$INSTDIR"'
   Pop $0
   ${If} $0 != 0
-    MessageBox MB_ICONSTOP "Laintas CLI installation failed (exit code $0). WSL 2 must be enabled before installation."
+    ; install.ps1 leaves the real reason, as one line addressed to the user,
+    ; in %TEMP%. Every failure used to be reported as "WSL 2 must be enabled"
+    ; regardless of what actually happened -- a missing payload file, a
+    ; non-empty target directory, a kernel that needed `wsl --update` -- which
+    ; sent people to fix a setting that was already correct.
+    StrCpy $1 ""
+    ClearErrors
+    FileOpen $2 "$TEMP\laintas-cli-install-error.txt" r
+    ${IfNot} ${Errors}
+      FileRead $2 $1
+      FileClose $2
+      ${TrimNewLines} "$1" $1
+    ${EndIf}
+    ${If} $1 == ""
+      StrCpy $1 "The installer could not set up the private WSL 2 environment. Check that WSL 2 is installed and working: run 'wsl --status' in PowerShell."
+    ${EndIf}
+    MessageBox MB_ICONSTOP "Laintas CLI installation failed (exit code $0).$\n$\n$1$\n$\nFull log: $TEMP\laintas-cli-install.log"
     SetErrorLevel $0
     Quit
   ${EndIf}

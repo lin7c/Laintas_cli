@@ -363,3 +363,74 @@ def test_the_installer_ships_what_the_profile_points_at():
     script = (ROOT / "build/windows/installer.nsi").read_text(encoding="utf-8")
     assert 'File "${PAYLOAD_DIR}\\icon.ico"' in script
     assert 'File "${PAYLOAD_DIR}\\terminal-fragment.json"' in script
+
+
+def test_a_failed_install_reports_the_reason_it_actually_failed_for():
+    """Every failure used to be reported as "WSL 2 must be enabled".
+
+    NSIS showed that one sentence for any non-zero exit from install.ps1, so a
+    missing payload file, a non-empty target directory, a kernel that only
+    needed `wsl --update`, and an unsupported CPU all sent the user to check a
+    Windows feature that was already on, while the real message scrolled past
+    in a window that then closed. install.ps1 now writes the reason as one
+    line and the installer shows that.
+    """
+    install = (ROOT / "build/windows/install.ps1").read_text(encoding="utf-8")
+    nsis = (ROOT / "build/windows/installer.nsi").read_text(encoding="utf-8")
+
+    assert "laintas-cli-install-error.txt" in install
+    assert "laintas-cli-install-error.txt" in nsis
+    assert "WSL 2 must be enabled before installation." not in nsis
+    # The message box has to carry the file's contents, not just its path.
+    assert "FileRead $2 $1" in nsis
+    assert "$1$\\n$\\nFull log:" in nsis
+
+    # A trap, not a try around one section: the reason has to be recorded
+    # wherever the failure happens.
+    assert "\ntrap {" in install
+    assert "exit $script:FailureCode" in install
+    # NSIS decodes the file with the ANSI code page; UTF-8 here would mangle a
+    # path containing the user's non-Latin account name.
+    assert "[Text.Encoding]::Default" in install
+
+
+def test_wsl_failures_are_diagnosed_by_hresult_not_by_message_text():
+    """wsl.exe messages are localised; the HRESULT in them is not.
+
+    Matching on English words means a non-English Windows gets no diagnosis at
+    all, which is the case the generic message was hiding.
+    """
+    install = (ROOT / "build/windows/install.ps1").read_text(encoding="utf-8")
+
+    for code in ("0x8007019e",   # subsystem not enabled
+                 "0x800701bc",   # kernel missing / out of date
+                 "0x80370102"):  # virtualisation off
+        assert code in install, f"{code} has no diagnosis"
+
+    # Reading WSL's message requires merging stderr, and merging stderr under
+    # the script's "Stop" preference is itself a terminating error.
+    assert "$ErrorActionPreference = \"Continue\"" in install
+    assert "& wsl.exe @args 2>&1" in install
+
+
+def test_a_registered_distribution_with_no_virtual_disk_is_rebuilt():
+    """Deleting ext4.vhdx to reclaim disk space leaves the registration.
+
+    `wsl --list` keeps naming the distribution, so the installer saw one
+    installed, skipped the import, and then failed on the first command it
+    ran inside a distribution that no longer had a filesystem -- reported, of
+    course, as "WSL 2 must be enabled". Clearing the stale registration is
+    the only way back, and the installer has to do it itself.
+    """
+    install = (ROOT / "build/windows/install.ps1").read_text(encoding="utf-8")
+
+    assert 'Join-Path $registeredBase "ext4.vhdx"' in install
+    assert "Invoke-Wsl --unregister $DistroName" in install
+    # The relocation check has to come first: unregistering a distribution
+    # registered somewhere else would destroy an installation we do not own.
+    assert (install.index("Keep its existing installation directory")
+            < install.index('Join-Path $registeredBase "ext4.vhdx"'))
+    # The import guard refuses a non-empty target directory. On the rebuild
+    # path the leftovers are this distribution's own, and refusing there
+    # would strand the user in the state the rebuild exists to fix.
+    assert "if (-not $rebuilding) {" in install
