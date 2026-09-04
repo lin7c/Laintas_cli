@@ -319,3 +319,64 @@ def test_every_download_request_carries_that_agent(served, monkeypatch):
     windows_kernel._download(release, into, None)
     assert len(agents) == 2, "both the listing and the installer"
     assert all(a and a.startswith("laintas-cli/") for a in agents)
+
+
+def test_the_installer_is_made_executable_before_it_is_run(tmp_path,
+                                                           monkeypatch):
+    """Python writes files without the execute bit, and a DrvFs mounted
+    with `metadata` keeps that faithfully — so the download that succeeded
+    fails to start with EACCES."""
+    installer = tmp_path / "setup.exe"
+    installer.write_bytes(b"MZ")
+    installer.chmod(0o644)
+    monkeypatch.setattr(windows_kernel.subprocess, "run",
+                        lambda *a, **k: object())
+
+    windows_kernel._run_installer(installer, "C:\\Temp\\setup.exe")
+    assert installer.stat().st_mode & 0o111, "not executable"
+
+
+def test_a_noexec_mount_falls_back_to_letting_windows_run_it(tmp_path,
+                                                             monkeypatch):
+    """`chmod` cannot help on a `/mnt` mounted noexec, which some hardened
+    setups use. Windows was always going to be the one running this."""
+    installer = tmp_path / "setup.exe"
+    installer.write_bytes(b"MZ")
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        if len(calls) == 1:
+            raise PermissionError(13, "Permission denied")
+        return object()
+
+    monkeypatch.setattr(windows_kernel.subprocess, "run", fake_run)
+    windows_kernel._run_installer(installer, "C:\\Temp\\setup.exe")
+
+    assert len(calls) == 2
+    assert calls[1][0] == "cmd.exe"
+    assert "C:\\Temp\\setup.exe" in calls[1]
+    assert "/S" in calls[1], "the fallback must stay a silent install"
+
+
+def test_a_failure_to_run_names_the_file_the_user_can_run(tmp_path,
+                                                          monkeypatch):
+    monkeypatch.setattr(winbridge, "in_wsl", lambda: True)
+    monkeypatch.setattr(windows_kernel, "latest",
+                        lambda: Release("9.9.9", "s.exe", "0" * 64))
+    monkeypatch.setattr(windows_kernel, "installed_version", lambda: None)
+    monkeypatch.setattr(winbridge, "windows_temp", lambda: tmp_path)
+    monkeypatch.setattr(windows_kernel, "_download",
+                        lambda *a, **k: tmp_path / "s.exe")
+    monkeypatch.setattr(winbridge, "to_windows_path",
+                        lambda p: "C:\\Temp\\s.exe")
+
+    def explode(*a, **k):
+        raise OSError(13, "Permission denied")
+
+    monkeypatch.setattr(windows_kernel, "_run_installer", explode)
+    with pytest.raises(KernelInstallError) as exc:
+        windows_kernel.install()
+    assert "C:\\Temp\\s.exe" in str(exc.value), (
+        "a user who cannot be helped automatically needs the path to "
+        "double-click")

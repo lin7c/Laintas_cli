@@ -205,6 +205,35 @@ def _download(release: Release, into: Path,
     return target
 
 
+def _run_installer(installer: Path, windows_path: str):
+    """Run the downloaded installer, whatever the mount will allow.
+
+    Two ways, because `/mnt/c` is not an ordinary filesystem. Python creates
+    a file without the execute bit, and a DrvFs mounted with `metadata` (the
+    default this CLI's own distribution uses) keeps that faithfully — so
+    exec'ing the freshly downloaded installer fails with EACCES even though
+    Windows would happily run it. `chmod` fixes that case.
+
+    It does not fix every case: a `/mnt` mounted `noexec`, which some
+    hardened setups do, refuses regardless of the bits. There the answer is
+    to stop asking Linux to execute it at all and hand the Windows path to
+    `cmd.exe`, which is the process that was always going to run it.
+    """
+    try:
+        installer.chmod(0o755)
+    except OSError:
+        # A mount without metadata reports 0777 and ignores this. Nothing to
+        # report either way — the attempt below is the real test.
+        pass
+    try:
+        return subprocess.run([str(installer), "/S"], capture_output=True,
+                              timeout=INSTALL_TIMEOUT, cwd="/")
+    except PermissionError:
+        return subprocess.run(["cmd.exe", "/c", windows_path, "/S"],
+                              capture_output=True, timeout=INSTALL_TIMEOUT,
+                              cwd="/")
+
+
 def install(progress: Optional[Callable[[int, int], None]] = None,
             force: bool = False) -> dict:
     """Download, verify and install the kernel. Returns what happened."""
@@ -237,15 +266,15 @@ def install(progress: Optional[Callable[[int, int], None]] = None,
             "the installer landed somewhere Windows cannot run it from")
 
     try:
-        done = subprocess.run([str(installer), "/S"], capture_output=True,
-                              timeout=INSTALL_TIMEOUT, cwd="/")
+        done = _run_installer(installer, windows_installer)
     except subprocess.TimeoutExpired as exc:
         raise KernelInstallError(
             "the installer did not finish in ten minutes; run it yourself "
             f"from {windows_installer}") from exc
     except OSError as exc:
         raise KernelInstallError(
-            f"could not run the installer: {exc}") from exc
+            f"could not run the installer: {exc}. Run it yourself from "
+            f"{windows_installer}") from exc
 
     exe = kernel_exe()
     if exe is None:
