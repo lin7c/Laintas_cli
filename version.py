@@ -5,4 +5,4 @@ self-updater (updater.py, `/v` command) both read this value, so it must match
 the version published in the release `manifest.json`.
 """
 
-__version__ = "1.24.2"
+__version__ = "1.24.3"
