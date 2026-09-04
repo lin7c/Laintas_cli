@@ -52,6 +52,7 @@ import agent_contract        # Declared outputs + deterministic acceptance for a
 import branch as branch_mod   # Run-scoped supervision: one delegated unit of work
 import critic                 # Long-task external progress critic (drift/looping supervisor)
 import intent                 # Pre-work intent alignment: understand the request before acting on it
+import repair_signals         # The user's reaction to the previous answer (capture only)
 import branches               # Per-task-kind workflow pinned beside the agreed reading
 import skill_router           # Dynamic skill routing: rank skills by task relevance (embedding, lexical fallback)
 import context_router         # Zero-network task routing for advertised tool schemas
@@ -6170,6 +6171,87 @@ def _consolidate_memories_on_compact(deps, session: dict, working: dict) -> None
         pass
 
 
+def _launch_repair_classifier(user_text: str, thread_messages, row: dict, *,
+                              deps, session, run_id: str) -> None:
+    """One auxiliary call, on a background thread, judging the user's turn.
+
+    Off the critical path on purpose. Nothing in this turn reads the verdict --
+    it is written to the signal log for a later pass -- so making the user wait
+    for it would buy nothing and would put a network round trip in front of
+    every prompt from the second one onward.
+
+    Tool-less, like the critic and the memory extractor: this call classifies
+    one exchange and never acts, so shipping the tool registry with it is pure
+    waste.
+    """
+    try:
+        prior_users = repair_signals.user_turns(thread_messages)
+        if prior_users and prior_users[-1].strip() == str(user_text or "").strip():
+            prior_users = prior_users[:-1]
+        assistant_text = repair_signals.last_assistant_text(thread_messages)
+        if not prior_users or not assistant_text:
+            return
+        model, provider = aux_model_override()
+        cwd = os.getcwd()
+
+        def _call(system_prompt, messages, kind, _s=session, _cwd=cwd,
+                  _traj=str(run_id or ""), _m=model, _p=provider):
+            resp = deps.call_backend(
+                session=_s, message="", system_prompt=system_prompt,
+                current_path=_cwd, messages=messages, tools_enabled=False,
+                model_override=_m or None, provider_override=_p or None,
+                task_kind=kind, trajectory_id=_traj)
+            return (resp or {}).get("reply", "") if isinstance(resp, dict) else ""
+
+        def _judge_fn(messages):
+            return _call(repair_signals.SYSTEM_PROMPT, messages,
+                         "repair_signal")
+
+        def _reflect_fn(messages):
+            return _call(repair_signals.REFLECTION_PROMPT, messages,
+                         "repair_reflection")
+
+        def _worker():
+            session_id = str(row.get("session_id") or "")
+            trace_id = str(row.get("run_id") or "")
+            turn_index = int(row.get("turn_index", -1))
+            try:
+                verdict = repair_signals.classify(
+                    user_text, assistant_text, prior_users, _judge_fn)
+                if not verdict:
+                    return
+                repair_signals.record_verdict(
+                    verdict, session_id=session_id, run_id=trace_id,
+                    turn_index=turn_index)
+            except Exception as error:
+                repair_signals.note_failure("classify", error)
+                return
+            # A second call only where there is something to explain. The
+            # classes outside REPAIR_KINDS -- a refinement, a change of mind,
+            # an ordinary next step -- are not failures, and reflecting on
+            # them would spend a call to tell the model nothing went wrong.
+            if str(verdict.get("kind")) not in repair_signals.REPAIR_KINDS:
+                return
+            try:
+                reflection = repair_signals.reflect(
+                    user_text, assistant_text, prior_users, _reflect_fn)
+                if not reflection:
+                    return
+                repair_signals.record_reflection(
+                    reflection, session_id=session_id, run_id=trace_id,
+                    turn_index=turn_index)
+                # Into the turn that is already running: it is the one that
+                # has to do better, and it rebuilds this tail every iteration.
+                repair_signals.publish_note(
+                    trace_id, repair_signals.format_note(verdict, reflection))
+            except Exception as error:
+                repair_signals.note_failure("reflect", error)
+
+        threading.Thread(target=_worker, daemon=True).start()
+    except Exception as error:
+        repair_signals.note_failure("launch_classifier", error)
+
+
 def _config_int(key: str, default: int) -> int:
     """Runtime config as an int, WITHOUT treating a deliberate 0 as unset.
 
@@ -7428,6 +7510,7 @@ def _build_user_message(original_input: str, state: dict, memory_entries: list,
     volatile_block = ""
     _env = vol.get("env") or {}
     for tag, value in (("plan_mode", _env.get("plan_mode")),
+                       ("user_correction", vol.get("repair_note")),
                        ("inbox", vol.get("inbox")),
                        ("sub_agent_results", vol.get("parallel_results")),
                        ("relevant_memory", vol.get("memory_highlight")),
@@ -9226,6 +9309,19 @@ def run_agent_loop(
                      run_id=_run_id,
                      pid=os.getpid(),
                      hostname=socket.gethostname())
+    # The user's reaction to the previous answer is the one judgement in this
+    # system that is not the agent's own. Capture only: see repair_signals.
+    try:
+        _repair_row = repair_signals.on_user_turn(
+            original_input or "", thread_messages,
+            session_id=_session_id or "", run_id=_run_id or "",
+            agent_id=agent_id or "")
+        if _repair_row and repair_signals.enabled():
+            _launch_repair_classifier(
+                original_input or "", thread_messages, _repair_row,
+                deps=deps, session=session, run_id=_run_id or "")
+    except Exception as _repair_error:
+        repair_signals.note_failure("on_user_turn", _repair_error)
     # Each new run_agent_loop turn starts with a fresh overflow-recovery budget:
     # _overflow_retry is persisted in `state`, so without this a prior turn that
     # ended at the give-up cap (retry==2) would make the next turn abort on its
@@ -9950,6 +10046,10 @@ def run_agent_loop(
                 "plan_mode": plan_mode.get_plan_prompt(),
             },
             "inbox": inbox_str,
+            # Taken, not read: a correction stated once is guidance, and the
+            # same sentence repeated on every iteration becomes a standing
+            # accusation the model answers instead of working.
+            "repair_note": repair_signals.take_note(str(_run_id or "")),
             "parallel_results": _format_parallel_results(inbox_msgs),
             "memory_highlight": "\n".join(filter(None, (
                 _memory_highlight, _legacy_memory_highlight))),
@@ -12731,6 +12831,12 @@ def run_agent_loop(
     event_log.append("turn_ended", reason=_exit_reason, loops=loop + 1,
                      session_id=_session_id, run_id=_run_id,
                      completion_source=_completion_source)
+    try:
+        repair_signals.on_turn_end(
+            _exit_reason, session_id=_session_id or "",
+            run_id=_run_id or "", agent_id=agent_id or "")
+    except Exception as _repair_error:
+        repair_signals.note_failure("on_turn_end", _repair_error)
     _last_debug_entries = get_debug_logs()
     if _last_debug_entries:
         _last_debug_entries[-1].loop_exit_reason = _exit_reason

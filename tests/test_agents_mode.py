@@ -577,23 +577,72 @@ class AgentsModeTests(unittest.TestCase):
                             for style, text, *_ in focus))
         self.assertNotIn("Task completed", "".join(text for _style, text in lines))
 
-    def test_running_agent_shows_thinking_then_writing(self):
+    def test_a_working_agent_gets_the_cli_status_row_not_a_placeholder(self):
+        """The same row the plain CLI paints during a turn — branded relay
+        spinner, the verb, and an elapsed clock."""
         agent = self._agent("writer")
         agent.status = "thinking"
         controller = agents_mode.AgentsModeController("term0", object(), {})
         controller.selected_id = agent.id
+
         with mock.patch.object(agents_mode.time, "monotonic", return_value=0):
             first = controller._activity_line(agent.id)[1]
-        with mock.patch.object(agents_mode.time, "monotonic", return_value=0.21):
-            second = controller._activity_line(agent.id)[1]
-        self.assertEqual(first, "●  ·  ·")
-        self.assertEqual(second, "·  ●  ·")
+        self.assertEqual("L· Thinking… 0.0s", first)
+
+        # The spinner advances on the CLI's own frame interval, and the clock
+        # is real: both come from the elapsed time, not a redraw counter.
+        with mock.patch.object(agents_mode.time, "monotonic", return_value=1.5):
+            later = controller._activity_line(agent.id)[1]
+        self.assertEqual("L» Thinking… 1.5s", later)
 
         agent_ui_events.hub.emit(
             "ai_stream", agent_id=agent.id, terminal_name="term0",
             detail="partial")
+        with mock.patch.object(agents_mode.time, "monotonic", return_value=2.0):
+            self.assertEqual("L» Writing… 2.0s",
+                             controller._activity_line(agent.id)[1])
 
-        self.assertEqual(controller._activity_line(agent.id)[1], "◐ Writing…")
+    def test_the_status_verb_carries_the_moving_highlight(self):
+        """The shimmer is the CLI's, glyph for glyph — a second implementation
+        of it is a second thing to keep in step."""
+        agent = self._agent("writer")
+        agent.status = "thinking"
+        controller = agents_mode.AgentsModeController("term0", object(), {})
+
+        with mock.patch.object(agents_mode.time, "monotonic", return_value=0.3):
+            fragments = controller._status_fragments(agent.id, width=40)
+        verb = "".join(text for _style, text in fragments)
+        self.assertIn("Thinking…", verb)
+        # Split into per-character styled runs: a plain label would be one.
+        styles = {style for style, _text in fragments}
+        self.assertGreater(len(styles), 2, fragments)
+
+    def test_an_idle_agent_has_no_status_row(self):
+        agent = self._agent("writer")
+        agent.status = "idle"
+        controller = agents_mode.AgentsModeController("term0", object(), {})
+        self.assertEqual([], controller._status_fragments(agent.id, width=80))
+        self.assertIsNone(controller._activity_line(agent.id))
+
+    def test_the_elapsed_clock_restarts_with_the_next_stretch_of_work(self):
+        """A finished-then-restarted Agent counts from the restart, not from
+        the age of some earlier task."""
+        agent = self._agent("writer")
+        controller = agents_mode.AgentsModeController("term0", object(), {})
+
+        agent.status = "thinking"
+        with mock.patch.object(agents_mode.time, "monotonic", return_value=10):
+            controller._working_elapsed(agent)
+        with mock.patch.object(agents_mode.time, "monotonic", return_value=13):
+            self.assertEqual(3, round(controller._working_elapsed(agent)))
+        agent.status = "idle"
+        with mock.patch.object(agents_mode.time, "monotonic", return_value=20):
+            self.assertEqual(0, controller._working_elapsed(agent))
+        agent.status = "running"
+        with mock.patch.object(agents_mode.time, "monotonic", return_value=30):
+            self.assertEqual(0, round(controller._working_elapsed(agent)))
+        with mock.patch.object(agents_mode.time, "monotonic", return_value=31):
+            self.assertEqual(1, round(controller._working_elapsed(agent)))
 
     def test_primary_follow_uses_wrapped_screen_rows_after_five_turns(self):
         agent = self._agent("primary", role="primary")
@@ -627,7 +676,7 @@ class AgentsModeTests(unittest.TestCase):
         self.assertNotIn("END-5", scrolled)
         self.assertIn("END-5", followed)
 
-    def test_primary_activity_remains_below_latest_wrapped_row(self):
+    def test_the_newest_wrapped_row_survives_and_activity_moves_to_the_band(self):
         agent = self._agent("primary", role="primary")
         agent.status = "thinking"
 
@@ -647,8 +696,13 @@ class AgentsModeTests(unittest.TestCase):
             rendered = "".join(
                 text for _style, text in controller.focus_fragments())
 
+        # The newest physical row is still on screen after wrapping...
         self.assertIn("END-LATEST", rendered)
-        self.assertIn("●  ·  ·", rendered)
+        # ...and the transcript no longer carries a copy of the status: that
+        # belongs to the band above the input, so it appears once per screen.
+        self.assertNotIn("Thinking…", rendered)
+        band = "".join(text for _style, text in controller.band_fragments())
+        self.assertIn("Thinking…", band)
 
     def test_focus_height_matches_full_layout_at_standard_terminal_size(self):
         agent = self._agent("primary", role="primary")
@@ -660,8 +714,22 @@ class AgentsModeTests(unittest.TestCase):
                 controller, "_terminal_size", return_value=(80, 25)):
             width, body_height = controller._focus_body_height()
 
+        # Below 96 columns the roster is hidden, so Focus gets the lot.
         self.assertEqual(width, 80)
-        self.assertEqual(body_height, 12)
+        # Every row of the root layout that is not Focus's body, named. If a
+        # row is added or removed on one side and not the other, the newest
+        # transcript line gets clipped off the bottom — which is invisible
+        # until someone notices output going missing.
+        chrome = (
+            1     # header
+            + 1   # header rule
+            + 1   # status band rule
+            + 2   # status band
+            + 1   # input
+            + 1   # key hints
+        )
+        focus_title = 2   # Agent name and its rule
+        self.assertEqual(body_height, 25 - chrome - focus_title)
 
     def test_assignment_uses_employee_channels_and_reports_failed_loop(self):
         agent = self._agent("employee")

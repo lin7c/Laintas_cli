@@ -2,10 +2,10 @@
 
 `register_command` gives a slash command, which only a human can type. Until an
 extension calls `register_tool`, the model is never offered it and does not know
-it exists -- which is what happened to `code-atlas`: it declared `toolPrefix`,
-wrote a TOOL_SPEC, called `register_tool(name, fn, spec)`, and the call raised
-TypeError into its own `except Exception: pass`. The tool was absent from every
-request the extension was ever installed for.
+it exists -- which is what happened to one shipped extension: it declared
+`toolPrefix`, wrote a TOOL_SPEC, called `register_tool(name, fn, spec)`, and the
+call raised TypeError into its own `except Exception: pass`. The tool was absent
+from every request the extension was ever installed for.
 """
 import os
 import sys
@@ -105,7 +105,7 @@ class ToolFormTests(unittest.TestCase):
 
 class ErrorAttributionTests(unittest.TestCase):
     """A TypeError from the handler's BODY is a bug in the extension, not bad
-    arguments from the model. Conflating them is how code-atlas's registration
+    arguments from the model. Conflating them is how that registration
     failure spent its whole life looking like a compatibility downgrade."""
 
     def setUp(self):

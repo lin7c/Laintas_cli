@@ -247,13 +247,29 @@ def _guess_type(path: str) -> str:
                                 "application/octet-stream")
 
 
+#: An upload the user has to sit through is one they will cancel. Past this
+#: many files the right answer is "name a narrower folder", said quickly,
+#: rather than a walk that returns some minutes later with a list too big to
+#: upload anyway.
+WALK_LOCAL_MAX_FILES = 20_000
+
+
 def walk_local(root: str) -> list[tuple[str, str]]:
     """(absolute local path, path relative to `root`) for every file under a
     directory. Symlinks are not followed — a link out of the tree would upload
-    something the user did not mean to share."""
+    something the user did not mean to share.
+
+    Raises ValueError past WALK_LOCAL_MAX_FILES rather than collecting a
+    drive's worth of paths into memory: the caller can say which folder, and
+    the failure has to arrive while they are still watching.
+    """
     collected = []
     root = os.path.abspath(root)
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        if len(collected) > WALK_LOCAL_MAX_FILES:
+            raise ValueError(
+                f"{root} holds more than {WALK_LOCAL_MAX_FILES} files. "
+                f"Share a specific folder inside it instead.")
         dirnames[:] = [d for d in dirnames
                        if not os.path.islink(os.path.join(dirpath, d))
                        and d not in (".git", "node_modules", "__pycache__", ".laintas")]

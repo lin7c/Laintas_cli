@@ -7,7 +7,9 @@
   "toolPrefix": "blindpick.",
   "capabilities": [
     "fs.read",
-    "fs.write"
+    "fs.write",
+    "shell",
+    "model"
   ],
   "minCliVersion": "1.0.0"
 }

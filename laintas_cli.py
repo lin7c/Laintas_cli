@@ -123,6 +123,21 @@ def _open_external_url(url: str) -> bool:
         return False
 
 
+def is_windows_host() -> bool:
+    """True when this process is the Windows product, not a Linux install.
+
+    The Windows build is this same Linux CLI running inside a private WSL 2
+    distribution, so ``platform.system()`` says "Linux" and every host-shaped
+    decision below would otherwise be made for the wrong machine. The launcher
+    states what it is through LAINTAS_HOST; the distribution name is only a
+    fallback for a launcher older than that variable, and it is settable
+    through LAINTAS_WSL_DISTRO, so a user who renamed their distribution would
+    otherwise lose everything keyed off this.
+    """
+    return (os.environ.get("LAINTAS_HOST") == "windows"
+            or os.environ.get("WSL_DISTRO_NAME") == "Laintas-CLI")
+
+
 def _initial_ui_preferences_for_host(preferences: dict) -> dict:
     """Apply host-specific UI defaults without overriding a user choice.
 
@@ -131,16 +146,10 @@ def _initial_ui_preferences_for_host(preferences: dict) -> dict:
     inside a modern Windows terminal where clickable UI is expected, so turn
     it on there unless the user explicitly saved ``enable_mouse = false``.
 
-    The Windows launcher states what it is through LAINTAS_HOST. The
-    distribution name is only a fallback for a launcher older than that
-    variable: it is settable through LAINTAS_WSL_DISTRO, so a user who
-    renamed their distribution would otherwise lose the mouse and have no way
-    to connect the two facts.
+    What counts as that distribution is `is_windows_host`.
     """
     result = dict(preferences)
-    windows_host = (os.environ.get("LAINTAS_HOST") == "windows"
-                    or os.environ.get("WSL_DISTRO_NAME") == "Laintas-CLI")
-    if "enable_mouse" not in result and windows_host:
+    if "enable_mouse" not in result and is_windows_host():
         result["enable_mouse"] = True
     return result
 
@@ -3143,18 +3152,6 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
             "that path also accepts a .pdf. With no arguments, lists images in "
             "the working directory and recent browser screenshots. `--text` "
             "is accepted as an alias for the `text` action.")),
-    CommandSpec(
-        "/codemap", "Build and read a Laintas Code Map of a GitHub repository",
-        "Account & Session",
-        "/codemap [list|build <url> [ref] [--model <id>]|status <id>|read <id> [node]|delete <id>]",
-        subcommands=("list", "build", "status", "read", "delete"),
-        help_text=(
-            "Maps a public GitHub repository into layers you can read: what the "
-            "system does, what each part is made of, and the real declarations "
-            "with their file:line. A build runs on the server for minutes to "
-            "hours and is billed to your account, so 'build' queues it and "
-            "returns an id; 'read' prints the finished map as text. Free "
-            "accounts keep 2 maps, memberships 4, and more at $1 a month each.")),
     CommandSpec("/login", "Re-authenticate with Laintas", "Account & Session"),
     CommandSpec(
         "/training", "Manage optional training-data sharing", "Account & Session",
@@ -6842,6 +6839,25 @@ def generate_cli_prop_template() -> str:
     existing project templates carrying them keep working.
     """
     shell_info = SHELL_NAME
+    # The Windows product is this same Linux CLI inside a private WSL 2
+    # distribution, so the OS line alone tells the model the opposite of what
+    # it needs to know: it reads "Linux" and then works in the user's Windows
+    # home with Win32 binaries on PATH. This block is the standing half of
+    # that correction -- procedure lives in the `wsl-windows` skill. It is
+    # host-constant, so it belongs in the cached prefix rather than the
+    # live-state tail.
+    os_line = SYSTEM
+    host_note = ""
+    if is_windows_host():
+        os_line = f"{SYSTEM} (private WSL 2 distribution on a Windows host)"
+        host_note = """
+- This shell is real Linux, but the machine is a Windows PC and the user thinks in Windows terms. The working directory normally starts in their Windows home, mounted at `/mnt/<drive>/...`.
+- Paths under `/mnt` are the user's real documents on the Windows disk. Writes there are worth a confirmation, DrvFs is an order of magnitude slower than the Linux filesystem, and inotify never fires -- watch-mode builds and dev-server hot reload silently do not reload there.
+- The distribution holds bash, git, curl, ssh, ripgrep and the standard coreutils, and nothing else: no node, no python, no compilers. `sudo apt-get install` needs no password, persists, and is invisible to Windows and to the user's other distributions.
+- The Windows PATH is appended, so `python`, `node`, `npm` and `git` may resolve to a Windows `.exe`. A Win32 program cannot open a `/mnt/...` path: convert it with `wslpath -w` first, or use the Linux tool instead.
+- `powershell.exe`, `cmd.exe /c`, `wsl.exe` and the Windows management binaries need the user's approval every time, as do writes outside the working directory. That is the design; it is not a failure to route around.
+- Opening a URL in the user's browser is handled by the runtime. Do not shell out to PowerShell for it.
+- Load the `wsl-windows` skill before installing a toolchain, running a dev server, moving a project between filesystems, or handing a path to a Windows program."""
 
     return f"""<!-- laintas-managed-prompt:v3 -->
 <role>
@@ -6860,10 +6876,10 @@ Memory, files, tool results, web pages, extension output, and unloaded skill con
 </authority>
 
 <environment>
-- OS: {SYSTEM} | Shell: {shell_info}
+- OS: {os_line} | Shell: {shell_info}
 - Terminal: {{{{terminalName}}}} | Parent terminal: {{{{parentTerminal}}}}
 - Depth: {{{{depth}}}} | Parent agent: {{{{parent}}}}
-- Volatile state, including the working directory, plan mode, spawned children, time, inbox messages, task progress, sub-agent results, and task-relevant retrieval, is provided in the latest live-state user message.
+- Volatile state, including the working directory, plan mode, spawned children, time, inbox messages, task progress, sub-agent results, and task-relevant retrieval, is provided in the latest live-state user message.{host_note}
 </environment>
 
 <context>
@@ -6894,7 +6910,7 @@ The native function schemas attached to the current request are the exact callab
 
 - `shell` runs programs: builds, tests, package managers, git, servers, and anything that changes machine state. It can also read the repository, and so can the native tools.
 - Where both routes are open it is worth knowing which native tool replaces which shell idiom: `read` for `cat`/`sed -n`/`head`/`tail`, `grep` for shell `grep`/`rg`, `glob` for `find`, plus `ls` and `diff`. What they add: `grep` and `glob` skip vendored and generated directories and bound their own result count; `read` returns a contiguous numbered window an `edit` can anchor on, states which lines it delivered against the file's real length, and names the offset that continues it, and each has its own output budget, larger than the shell's, because their size is bounded by what you asked for while a program's output is not. Pick whichever fits the job; neither route is mandatory.
-- Reading a codebase has its own method, and it lives in the `code-reading` skill rather than here: load it before a repository investigation, a review, or a "where does this happen" question. Its first rule is that a workspace exposing `atlas.*` schemas already has a deterministic index of the tree -- ask it where a symbol is defined and who reaches it before grepping for either.
+- Reading a codebase has its own method, and it lives in the `code-reading` skill rather than here: load it before a repository investigation, a review, or a "where does this happen" question. Its first rule is to locate before reading: find the lines that answer the question, then read those with enough margin to see the block around them.
 - Chaining several operations into one shell string shares one output budget and one exit code across all of them, so a long chain loses its middle and cannot attribute a failure to the command that caused it. Separate calls in the same turn cost the same and keep both.
 - Do not use shell to bypass a capability the runtime withheld.
 - If a required capability is absent, call `tool_search` with the intended action. Its result may expose authorized matching schemas on the next model turn; it never grants permission.
@@ -12914,73 +12930,6 @@ def _training_control_request(session: dict, method: str,
     return body
 
 
-def _cmd_codemap(parts: list, raw_args: str) -> None:
-    """Laintas Code Map from the prompt: queue a build, watch it, read it.
-
-    Deliberately not a blocking wait. A build runs for minutes to hours on the
-    server, and a terminal command that sat on that would be a terminal the
-    user cannot use — so the build is queued and its id is printed, and the
-    same command reads it back later.
-    """
-    try:
-        import code_map as cm
-    except ImportError:
-        console.print("[red]Code Map is unavailable in this build.[/red]")
-        return
-
-    action = parts[1].strip().lower() if len(parts) > 1 else "list"
-    rest = raw_args.split(None, 1)[1].strip() if len(raw_args.split(None, 1)) > 1 else ""
-
-    try:
-        if action in ("list", "ls"):
-            jobs = cm.maps()
-            if not jobs:
-                console.print("[dim]No code maps yet. /codemap build <github url>[/dim]")
-            for job in jobs:
-                console.print(escape(cm.describe(job)))
-            console.print(f"[dim]{escape(cm.summarize_capacity(cm.capacity()))}[/dim]")
-
-        elif action == "build":
-            words = rest.split()
-            if not words:
-                raise SlashCommandUsageError(
-                    "Usage: /codemap build <github url> [ref] [--model <id>]")
-            model = ""
-            if "--model" in words:
-                at = words.index("--model")
-                model = words[at + 1] if at + 1 < len(words) else ""
-                words = words[:at] + words[at + 2:]
-            job = cm.build(words[0], words[1] if len(words) > 1 else "HEAD", model=model)
-            console.print(f"[green]Queued[/green] {escape(str(job.get('id')))} — "
-                          f"{escape(str(job.get('title')))}")
-            console.print("[dim]Takes minutes to hours. /codemap status <id>[/dim]")
-
-        elif action in ("status", "st"):
-            if not rest:
-                raise SlashCommandUsageError("Usage: /codemap status <id>")
-            console.print(escape(cm.describe(cm.status(rest.split()[0]))))
-
-        elif action in ("read", "show"):
-            words = rest.split()
-            if not words:
-                raise SlashCommandUsageError("Usage: /codemap read <id> [node]")
-            console.print(escape(cm.outline(words[0], words[1] if len(words) > 1 else "")
-                                 or "No such node in this map."))
-
-        elif action in ("delete", "rm"):
-            if not rest:
-                raise SlashCommandUsageError("Usage: /codemap delete <id>")
-            cm.delete(rest.split()[0])
-            console.print("[green]Deleted.[/green]")
-
-        else:
-            raise SlashCommandUsageError(
-                "Usage: /codemap [list|build <url> [ref] [--model <id>]|"
-                "status <id>|read <id> [node]|delete <id>]")
-    except cm.CodeMapError as problem:
-        console.print(f"[red]{escape(str(problem))}[/red]")
-
-
 def _cmd_training(parts: list, session: dict) -> None:
     """Manage explicit, account-scoped training-data consent."""
     action = parts[1].strip().lower() if len(parts) > 1 else "status"
@@ -16393,8 +16342,7 @@ def _cmd_prompt(raw_args: str, parts: list, session: dict) -> None:
                 fields = None
             finally:
                 if _reader_was_running:
-                    _start_bg_input_reader(get_user_message_queue(),
-                                           get_user_interrupt_event())
+                    _restart_bg_input_reader()
         else:
             console.print(Panel(
                 _po.get_failure_template(),
@@ -18668,54 +18616,52 @@ def _agents_repl_submit(text: str) -> tuple[bool, str]:
     return True, "Sent"
 
 
-def _cmd_agents(parts: list, session: dict, agent_registry=None,
-                existing_session=None):
-    """Open Agents Mode; retain a plain snapshot for scripts and fallback."""
-    args = list(parts[1:])
-    plain = "--plain" in args or not sys.stdin.isatty()
-    args = [item for item in args if item != "--plain"]
-    if len(args) > 1:
-        console.print("[yellow]Usage: /agents \\[tree|agent-id|--plain][/yellow]")
-        return
-    # `tree` is an output command, not an initial selection for Agents Mode.
-    # Keep it deterministic in both interactive and non-interactive shells.
-    if args and args[0].lower() == "tree":
-        _cmd_agents_plain(["/agents", "tree"])
-        return
-    if plain:
-        _cmd_agents_plain(["/agents", *args])
-        return
-    current = get_current_agent()
-    if current is not None and current.role == "primary":
-        repl_state = getattr(handle_meta_command, "_last_agent_state", None)
-        repl_history = getattr(handle_meta_command, "_last_chat_history", None)
-        if isinstance(repl_state, dict):
-            current.state = repl_state
-        if isinstance(repl_history, list):
-            current.chat_history = repl_history
-        if current.status not in {"queued", "running", "thinking", "waiting"}:
-            current.runtime_session = existing_session
-    terminal_name = agent_scope_terminal(current) if current else "term0"
-    requested = args[0] if args else ""
-    if requested:
-        candidate = get_agent(requested)
-        if candidate is None:
-            matches = [agent for agent in get_all_agents()
-                       if str(agent.name or "").casefold() == requested.casefold()]
-            candidate = matches[0] if len(matches) == 1 else None
-        if (candidate is None
-                or agent_scope_terminal(candidate) != terminal_name):
-            console.print(
-                f"[red]Agent '{escape(requested)}' is not available in "
-                f"{escape(terminal_name)}.[/red]")
-            return
-        from agent_loop import set_dialog_agent_for_terminal
-        set_dialog_agent_for_terminal(terminal_name, candidate.id)
+def _open_agents_view(session: dict, agent_registry=None,
+                      existing_session=None, fallback_args=None,
+                      on_close=None) -> bool:
+    """Hand the physical terminal to the /agents view. True when it opened.
+
+    Callable from ANY thread, which is the point: the view is where work is
+    dispatched to other Agents, and the moment a person most needs it is
+    while a turn is running — when the main thread is inside the loop and
+    cannot dispatch anything. The view runs in its own thread either way.
+
+    ``on_close`` runs once the terminal has come back, in the view's thread.
+    The mid-run opener uses it to restart the input reader it stopped.
+    """
+    fallback_args = list(fallback_args or [])
+
+    def _closed() -> None:
+        _exit_agents_view()
+        if on_close is not None:
+            try:
+                on_close()
+            except Exception:
+                pass
+
     try:
         import agents_mode
         if _agents_view_is_active():
             console.print("[yellow]/agents view is already open.[/yellow]")
-            return existing_session
+            return False
+        current = get_current_agent()
+        # Only re-point the registry at the REPL's live objects when the
+        # primary is idle. Mid-run the loop owns state and history, and
+        # `handle_meta_command`'s copies are whatever the last command left
+        # behind — assigning those over a running turn swaps the objects out
+        # from under it.
+        if (current is not None and current.role == "primary"
+                and current.status not in {
+                    "queued", "running", "thinking", "waiting"}):
+            repl_state = getattr(handle_meta_command, "_last_agent_state", None)
+            repl_history = getattr(
+                handle_meta_command, "_last_chat_history", None)
+            if isinstance(repl_state, dict):
+                current.state = repl_state
+            if isinstance(repl_history, list):
+                current.chat_history = repl_history
+            current.runtime_session = existing_session
+        terminal_name = agent_scope_terminal(current) if current else "term0"
         external_cb = (
             (lambda events: agent_registry._push_events(events))
             if agent_registry is not None and agent_registry.agent_id else None)
@@ -18734,9 +18680,9 @@ def _cmd_agents(parts: list, session: dict, agent_registry=None,
             mirror=repl_mirror.hub)
 
         # The view is only a display + router: it runs in its own thread
-        # while this main thread returns to the REPL loop and executes
-        # whatever the view injects — the exact same pipeline as typing at
-        # the outer prompt.
+        # while the main thread stays where it was — back in the REPL loop
+        # executing whatever the view injects, or still inside the turn that
+        # was running when the view was opened.
         _enter_agents_view(controller)
 
         def _view():
@@ -18747,21 +18693,63 @@ def _cmd_agents(parts: list, session: dict, agent_registry=None,
                     f"[red]Agents Mode failed: {type(exc).__name__}: "
                     f"{escape(str(exc))}[/red]")
                 console.print("[dim]Falling back to /agents --plain.[/dim]")
-                _cmd_agents_plain(["/agents", *args])
+                _cmd_agents_plain(["/agents", *fallback_args])
             finally:
-                _exit_agents_view()
+                _closed()
 
         threading.Thread(
             target=_view, daemon=True, name="agents-view").start()
-        return existing_session
+        return True
     except (KeyboardInterrupt, EOFError):
-        return
+        return False
     except Exception as exc:
-        _exit_agents_view()
+        _closed()
         console.print(
             f"[red]Agents Mode failed: {type(exc).__name__}: {exc}[/red]")
         console.print("[dim]Falling back to /agents --plain.[/dim]")
+        _cmd_agents_plain(["/agents", *fallback_args])
+        return False
+
+
+def _cmd_agents(parts: list, session: dict, agent_registry=None,
+                existing_session=None):
+    """Open Agents Mode; retain a plain snapshot for scripts and fallback."""
+    args = list(parts[1:])
+    plain = "--plain" in args or not sys.stdin.isatty()
+    args = [item for item in args if item != "--plain"]
+    if len(args) > 1:
+        console.print("[yellow]Usage: /agents \\[tree|agent-id|--plain][/yellow]")
+        return
+    # `tree` is an output command, not an initial selection for Agents Mode.
+    # Keep it deterministic in both interactive and non-interactive shells.
+    if args and args[0].lower() == "tree":
+        _cmd_agents_plain(["/agents", "tree"])
+        return
+    if plain:
         _cmd_agents_plain(["/agents", *args])
+        return
+    current = get_current_agent()
+    terminal_name = agent_scope_terminal(current) if current else "term0"
+    requested = args[0] if args else ""
+    if requested:
+        candidate = get_agent(requested)
+        if candidate is None:
+            matches = [agent for agent in get_all_agents()
+                       if str(agent.name or "").casefold() == requested.casefold()]
+            candidate = matches[0] if len(matches) == 1 else None
+        if (candidate is None
+                or agent_scope_terminal(candidate) != terminal_name):
+            console.print(
+                f"[red]Agent '{escape(requested)}' is not available in "
+                f"{escape(terminal_name)}.[/red]")
+            return
+        from agent_loop import set_dialog_agent_for_terminal
+        set_dialog_agent_for_terminal(terminal_name, candidate.id)
+    if _open_agents_view(session, agent_registry=agent_registry,
+                         existing_session=existing_session,
+                         fallback_args=args):
+        return existing_session
+    return None
 
 
 def _cmd_focus(parts: list) -> None:
@@ -21198,7 +21186,45 @@ def _cmd_extensions(parts: list, session: dict) -> None:
         if not rest:
             console.print("[yellow]Usage: /extensions trust <name>[/yellow]")
             return
-        ok, msg = mgr.trust(rest[0])
+        target = rest[0]
+        # Approving used to print a hash and nothing else, which is a
+        # signature on a document nobody read. Two of the three things listed
+        # here reach the MODEL rather than the user -- tool schemas and skill
+        # prose -- and an extension runs in this process, so the approval is
+        # the only boundary there is.
+        facts = mgr.disclosure(target)
+        if facts is None:
+            console.print(f"[red]Extension {escape(target)!r} is not installed.[/red]")
+            return
+        console.print(
+            f"[bold]{escape(facts['name'])}[/bold] "
+            f"{escape(facts['version'])}"
+            + (f" — {escape(facts['publisher'])}" if facts["publisher"] else ""))
+        if facts["description"]:
+            console.print(f"  {escape(facts['description'])}")
+        console.print(f"  [dim]path[/dim]      {escape(facts['path'])} "
+                      f"({facts['files']} files)")
+        console.print(f"  [dim]tools[/dim]     {escape(facts['tool_namespace'])}* "
+                      f"[dim](schemas the model is offered)[/dim]")
+        for skill in facts["skills"]:
+            console.print(f"  [dim]skill[/dim]     {escape(skill['name'])} "
+                          f"[dim](instructions injected into the model's "
+                          f"context)[/dim]")
+            if skill["description"]:
+                console.print(f"            [dim]{escape(skill['description'][:110])}[/dim]")
+        console.print(
+            "  [dim]declares[/dim]  "
+            + (escape(", ".join(facts["capabilities"])) if facts["capabilities"]
+               else "nothing"))
+        console.print("[yellow]An extension runs inside this process with your "
+                      "permissions. What it declares is a disclosure, not a "
+                      "sandbox.[/yellow]")
+        answer = _read_single_key_choice(allow_always=False,
+                                         auto_confirm_seconds=None)
+        if answer != "yes":
+            console.print("[dim]Not trusted.[/dim]")
+            return
+        ok, msg = mgr.trust(target)
         console.print(f"[green]{msg}[/green]" if ok else f"[red]{msg}[/red]")
         return
 
@@ -21586,9 +21612,6 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
     elif action in ("/messages", "/msg"):
         _cmd_messages(parts)
 
-    elif action == "/codemap":
-        _cmd_codemap(parts, raw_args)
-
     elif action == "/login":
         _cmd_login(session, agent_registry)
 
@@ -21936,8 +21959,8 @@ def show_help(command: str = ""):
                 ("<text>", "plain text → AI agent loop"),
                 ("Alt+0", "read the messages behind the L> mark"),
                 ("Alt+1..9", "select a status slot; ↑↓ change it, Enter apply"),
-                ("Alt+A", "switch agent, including while a task is running "
-                          "(applies when the turn finishes)"),
+                ("Alt+A", "open the /agents view, including mid-task — "
+                          "hand work to another agent while this one runs"),
             ])
         for spec in COMMAND_SPECS:
             if spec.group != title:
@@ -22505,6 +22528,14 @@ def _parse_agent_target(text: str) -> tuple[str, str]:
 # queuing supplementary text working the way it did with readline().
 _bg_reader_thread: Optional[threading.Thread] = None
 _bg_reader_stop = threading.Event()
+# (queue, interrupt_event) the live reader was started on — the pair the
+# running loop actually drains and checks. Restarts reuse it.
+_bg_reader_args: tuple = ()
+# Set for the duration of a foreground turn. Alt+A opens the /agents view
+# from the reader's thread, which has neither the REPL's session dict nor any
+# way to know whether the turn it interrupted is still going.
+_repl_session: dict = {}
+_foreground_run_active = False
 _bg_prompt_session: Optional[PromptSession] = None
 _run_input_state = "idle"
 _run_input_state_lock = threading.RLock()
@@ -22656,13 +22687,8 @@ def _bg_reader_cbreak_mode(target_queue: queue.Queue,
     double Ctrl+C. In CBREAK the terminal turns Ctrl+C into SIGINT before it
     reaches us, so the run's own SIGINT handler still owns that key.
     """
-    global _pending_agent_switch
     stop = stop_event if stop_event is not None else _bg_reader_stop
     buf: list[str] = []
-    # The switcher borrows the same single line the typed buffer uses. Only
-    # one of them is on screen at a time, and `painted` is how many cells the
-    # current occupant is using — without it, erasing guesses.
-    chooser = {"open": False, "rows": [], "sel": "", "painted": 0}
 
     def _buf_cells():
         return sum(2 if unicodedata.east_asian_width(c) in ('W', 'F') else 1
@@ -22677,54 +22703,11 @@ def _bg_reader_cbreak_mode(target_queue: queue.Queue,
         _erase_line(_buf_cells())
         buf.clear()
 
-    def _current_agent_id_or_empty() -> str:
-        try:
-            agent = get_current_agent()
-        except Exception:
-            agent = None
-        return str(getattr(agent, "id", "") or "")
-
-    def _chooser_draw():
-        current = _current_agent_id_or_empty()
-        segments = _agent_switch_segments(
-            chooser["rows"], chooser["sel"], current, _terminal_width())
-        _erase_line(chooser["painted"])
-        sys.stdout.write('\r' + _agent_switch_render(segments))
-        sys.stdout.flush()
-        chooser["painted"] = sum(_cell_len(text) for _, text in segments)
-
-    def _chooser_open():
-        rows = _agent_switch_rows()
-        if len(rows) < 2:
-            # Nothing to switch to. Saying so beats a widget that does not
-            # react, which reads as a broken key.
-            _erase_line(_buf_cells())
-            sys.stdout.write(
-                '\r\x1b[38;5;244mOnly one agent is registered — '
-                '/hire <name> adds another.\x1b[0m\n')
-            sys.stdout.flush()
-            if buf:
-                sys.stdout.write(''.join(buf))
-                sys.stdout.flush()
-            return
-        _erase_line(_buf_cells())        # hide the draft, keep it
-        chooser["open"] = True
-        chooser["rows"] = rows
-        chooser["painted"] = 0
-        chooser["sel"] = _agent_switch_initial(
-            rows, _current_agent_id_or_empty())
-        _chooser_draw()
-
-    def _chooser_close(message: str = ""):
-        _erase_line(chooser["painted"])
-        chooser["painted"] = 0
-        chooser["open"] = False
-        if message:
-            sys.stdout.write('\r' + message + '\n')
-        if buf:
-            sys.stdout.write(''.join(buf))
-        sys.stdout.flush()
-
+    # Alt+A cannot open the view from inside the loop: this thread is holding
+    # the terminal in CBREAK, and the view's prompt_toolkit app needs it. So
+    # the key breaks the loop, the `with` releases the hold, and the view is
+    # opened below.
+    open_view = False
     try:
         with terminal_arbiter.hold("bg-input", TermMode.CBREAK,
                                    timeout=2.0) as term:
@@ -22739,48 +22722,10 @@ def _bg_reader_cbreak_mode(target_queue: queue.Queue,
                 if key.name == "eof":
                     break
 
-                # ── the switcher owns the keyboard while it is open ──
-                if chooser["open"]:
-                    if key.name in ("escape", "ctrl-c"):
-                        _chooser_close()
-                        continue
-                    if key.name == "alt" and str(key.text or "").lower() == "a":
-                        _chooser_close()
-                        continue
-                    if key.name in ("up", "left"):
-                        chooser["sel"] = _agent_switch_step(
-                            chooser["rows"], chooser["sel"], -1)
-                        _chooser_draw()
-                        continue
-                    if key.name in ("down", "right"):
-                        chooser["sel"] = _agent_switch_step(
-                            chooser["rows"], chooser["sel"], 1)
-                        _chooser_draw()
-                        continue
-                    if key.name == "enter":
-                        target = chooser["sel"]
-                        if target and target != _current_agent_id_or_empty():
-                            _pending_agent_switch = target
-                            _chooser_close(
-                                f"\x1b[38;5;244mSwitching to "
-                                f"{_agent_switch_label(target)} when this turn "
-                                f"finishes.\x1b[0m")
-                        else:
-                            _chooser_close()
-                        continue
-                    if key.is_text and len(key.text) == 1 and key.text.isdigit():
-                        jumped = _agent_switch_jump(chooser["rows"], key.text)
-                        if jumped:
-                            chooser["sel"] = jumped
-                            _chooser_draw()
-                        continue
-                    # Anything else is not a switcher key; ignore it rather
-                    # than letting it fall through into the draft.
-                    continue
-
                 if key.name == "alt" and str(key.text or "").lower() == "a":
-                    _chooser_open()
-                    continue
+                    _clear_visible_line()
+                    open_view = True
+                    break
 
                 if key.name == "escape":
                     _clear_visible_line()
@@ -22828,172 +22773,42 @@ def _bg_reader_cbreak_mode(target_queue: queue.Queue,
         # so stay silent instead; the run continues, only supplementary
         # typing is unavailable until the next step.
         return
+    if open_view:
+        _open_agents_view_from_run()
 
 
-# ── Mid-run agent switcher (Alt+A) ──────────────────────────────────────
-# Switching agent rebinds the REPL's state and history objects, and during a
-# run the loop owns both — which is why the prompt's own slot switcher does
-# not do it either, it submits "/agent <id>" and lets the main loop follow up
-# (see _rprompt_commit). So this picks a target and parks it; the main loop
-# performs the switch the moment it is idle again. The alternative, stopping
-# the task to honour a keystroke, throws away work the user never said to
-# discard.
-
-_pending_agent_switch = ""
-
-
-def _agent_switch_rows() -> list:
-    """``(depth, id, label)`` in choose-tree order — the switcher's contents."""
-    rows = []
-    try:
-        tree = agent_tree_rows()
-    except Exception:
-        return rows
-    for depth, agent in tree:
-        agent_id = str(getattr(agent, "id", "") or "")
-        if not agent_id:
-            continue
-        name = str(getattr(agent, "name", "") or "")
-        rows.append((depth, agent_id, name if name and name != agent_id
-                     else agent_id))
-    return rows
+# ── Alt+A during a run: go to the /agents view ──────────────────────────
+# The view is where work is handed to another Agent — selecting one there and
+# typing calls start_agent_assignment, which runs it on its own thread in its
+# own private PTY. That is the parallelism; nothing else in the CLI dispatches
+# it. But the view is a slash command, and slash commands are dispatched by
+# the main thread after _get_input() returns — which never happens while a
+# turn is running. So the one situation that needs the multi-agent surface was
+# the one situation that could not reach it.
+#
+# Alt+A is that door. It used to park a focus change for the main loop to
+# apply later, which moved the registry pointer and dispatched nothing.
 
 
-def _agent_switch_initial(rows, current_id: str) -> str:
-    """Where the switcher opens.
+def _open_agents_view_from_run() -> None:
+    """Hand the terminal to the /agents view from the input reader's thread.
 
-    On the previously selected agent, so Alt+A then Enter is "back to the one
-    I was just on" — tmux's last-window, which is the switch people actually
-    make. Falling back to the next one in the ring keeps a single press useful
-    the first time, when there is no previous.
+    The caller has already left its terminal hold. The turn keeps running on
+    the main thread throughout: its output goes to the mirror the view
+    displays, and its approvals are routed to the view's own y/n UI by
+    _arrow_approval_prompt, so nothing draws over the view.
     """
-    ids = [row[1] for row in rows]
-    if not ids:
-        return ""
-    try:
-        previous = previous_agent_id()
-    except Exception:
-        previous = ""
-    if previous and previous in ids and previous != current_id:
-        return previous
-    if current_id in ids and len(ids) > 1:
-        return ids[(ids.index(current_id) + 1) % len(ids)]
-    return ids[0]
+    _set_run_input_state("idle")
 
+    def _resume() -> None:
+        # Only while a turn is still running. If the run finished while the
+        # view was open, the main loop is about to draw its own prompt, and a
+        # reader holding the terminal in CBREAK would fight it for stdin.
+        if _foreground_run_active:
+            _restart_bg_input_reader()
 
-def _agent_switch_step(rows, selected_id: str, delta: int) -> str:
-    """Move the selection around the ring."""
-    ids = [row[1] for row in rows]
-    if not ids:
-        return ""
-    if selected_id not in ids:
-        return ids[0]
-    return ids[(ids.index(selected_id) + delta) % len(ids)]
-
-
-def _agent_switch_jump(rows, digit: str) -> str:
-    """The agent whose stable index is ``digit``, or "" when there is none.
-
-    Indices are the registry's own (agent_loop.AgentInfo.index), not positions
-    in this list: a number that means something different depending on what is
-    open is a number nobody can learn.
-    """
-    try:
-        wanted = int(digit)
-    except (TypeError, ValueError):
-        return ""
-    for _depth, agent_id, _label in rows:
-        agent = get_agent(agent_id)
-        if agent is not None and int(getattr(agent, "index", -1)) == wanted:
-            return agent_id
-    return ""
-
-
-def _apply_pending_agent_switch(session, interactive_session) -> str:
-    """Perform a switch parked by Alt+A. Returns the agent switched to, or "".
-
-    Called from the REPL between turns, never from the key handler: switching
-    rebinds the state and history objects the agent loop holds while it runs.
-    It goes through ``/agent`` rather than reimplementing the switch, because
-    a second implementation of it is a second one to keep correct.
-    """
-    global _pending_agent_switch
-    target = _pending_agent_switch
-    if not target:
-        return ""
-    _pending_agent_switch = ""
-    try:
-        _cmd_agent(["/agent", target], session, interactive_session)
-    except Exception as exc:
-        console.print(f"[yellow]Could not switch to {escape(target)}: "
-                      f"{escape(str(exc))}[/yellow]")
-        return ""
-    return target
-
-
-def _agent_switch_label(agent_id: str) -> str:
-    """The name a person recognises, falling back to the id."""
-    try:
-        agent = get_agent(agent_id)
-    except Exception:
-        agent = None
-    name = str(getattr(agent, "name", "") or "") if agent is not None else ""
-    return name or str(agent_id or "")
-
-
-def _agent_switch_segments(rows, selected_id: str, current_id: str,
-                           width: int) -> list:
-    """``(style, text)`` segments for the one-line switcher.
-
-    One line, because the run's Rich Live region owns the rows below and a
-    taller widget would fight it for them. Segments rather than a rendered
-    string for the same reason _shimmer_segments returns them: the caller owns
-    the escape codes for its own surface.
-    """
-    segments = [("label", "switch agent ")]
-    for depth, agent_id, label in rows:
-        marker = ("  " * depth + ("\u2514 " if depth else ""))
-        agent = get_agent(agent_id)
-        index = int(getattr(agent, "index", 0)) if agent is not None else 0
-        text = f"{index} {marker}{label}"
-        if agent_id == current_id:
-            text += "*"
-        style = ("selected" if agent_id == selected_id
-                 else "current" if agent_id == current_id else "item")
-        segments.append((style, f" {text} "))
-    segments.append(("hint", "  \u2191\u2193 pick \u00b7 0-9 jump \u00b7 "
-                             "Enter switch \u00b7 Esc cancel"))
-    # Trim from the hint end first: the entries are the content, and a hint
-    # that scrolls the line is worse than no hint.
-    budget = max(20, int(width or 80) - 1)
-    used = 0
-    trimmed = []
-    for style, text in segments:
-        cells = _cell_len(text)
-        if used + cells > budget:
-            room = budget - used
-            if room > 1:
-                trimmed.append((style, _crop_cells(text, room)))
-            break
-        trimmed.append((style, text))
-        used += cells
-    return trimmed
-
-
-_AGENT_SWITCH_STYLES = {
-    "label": "\x1b[38;5;244m",
-    "item": "\x1b[38;5;250m",
-    "current": "\x1b[38;5;250m",
-    "selected": "\x1b[7m",
-    "hint": "\x1b[38;5;240m",
-}
-
-
-def _agent_switch_render(segments) -> str:
-    out = []
-    for style, text in segments:
-        out.append(_AGENT_SWITCH_STYLES.get(style, "") + text + "\x1b[0m")
-    return "".join(out)
+    if not _open_agents_view(_repl_session, on_close=_resume):
+        _resume()
 
 
 def _start_bg_input_reader(target_queue: queue.Queue,
@@ -23008,9 +22823,12 @@ def _start_bg_input_reader(target_queue: queue.Queue,
     the same queue that run_agent_loop() drains between iterations).
     interrupt_event: when given, a bare Esc press sets it (soft interrupt).
     """
-    global _bg_reader_thread, _bg_reader_stop
+    global _bg_reader_thread, _bg_reader_stop, _bg_reader_args
     if _bg_reader_thread is not None and _bg_reader_thread.is_alive():
         return  # already running
+    # Remember what this reader was wired to, so the paths that pause it for
+    # a prompt can put it back on the same wiring. See _restart_bg_input_reader.
+    _bg_reader_args = (target_queue, interrupt_event)
 
     # A stop event per thread, captured in the closure. The single global
     # event this replaces was cleared on every start, which un-stopped any
@@ -23045,6 +22863,22 @@ def _start_bg_input_reader(target_queue: queue.Queue,
     # each restart site) keeps the status line honest for every path that
     # pauses the reader mid-run.
     _set_run_input_state("running")
+
+
+def _restart_bg_input_reader() -> None:
+    """Put the reader back on the queue and event the RUN is watching.
+
+    Every path that pauses the reader for a prompt used to restart it with
+    the module-level user queue/event. For a primary Agent the run does not
+    watch those: _run_agent_loop_with_interrupt starts the reader on
+    ``active_agent.message_queue`` / ``active_agent.abort_event`` and hands
+    the same pair to run_agent_loop. So after the first approval of a turn —
+    and any shell command or file write raises one — supplementary typing
+    went into a queue nobody drains and Esc set an event nobody checks.
+    """
+    if not _bg_reader_args:
+        return
+    _start_bg_input_reader(*_bg_reader_args)
 
 
 def _stop_bg_input_reader() -> bool:
@@ -23370,8 +23204,7 @@ def _compact_parallel_approval_prompt(title: str, body: str, question: str, *,
                     highlight=False)
         finally:
             if _reader_was_running:
-                _start_bg_input_reader(get_user_message_queue(),
-                                       get_user_interrupt_event())
+                _restart_bg_input_reader()
             tools_mod.resume_all_parallel_live_displays(_paused)
             tools_mod.clear_awaiting_approval(_agent_label)
     return choice or "no"
@@ -23515,8 +23348,7 @@ def _prompt_for_approval(title: str, body: str, question: str, *,
         choice = _single_key_approval()
     finally:
         if _reader_was_running:
-            _start_bg_input_reader(get_user_message_queue(),
-                                   get_user_interrupt_event())
+            _restart_bg_input_reader()
 
     if choice is not None and choice.startswith("a "):
         return "always"
@@ -23779,6 +23611,11 @@ def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
     # /agents mirror. Output outside a run (banner, prompts, idle chatter)
     # stays off Agent screens.
     repl_mirror.hub.start_recording()
+    # What Alt+A needs to open the /agents view from the reader's thread.
+    global _repl_session, _foreground_run_active
+    if isinstance(session, dict):
+        _repl_session = session
+    _foreground_run_active = True
     response = None
     run_error = ""
 
@@ -23921,6 +23758,7 @@ def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
         }
     finally:
         repl_mirror.hub.stop_recording()
+        _foreground_run_active = False
         if primary_admitted and active_agent is not None:
             if isinstance(response, dict) and "session" in response:
                 active_agent.runtime_session = response.get("session")
@@ -24076,7 +23914,6 @@ def _parse_subtask_json(text: str):
 
 def main():
     """Entry point."""
-    global _pending_agent_switch
     # A terminal the CLI has not run in before starts from the settings last
     # used rather than from nothing. TERMINAL_ID is derived from the tty and
     # POSIX session id when the emulator offers nothing better, and both
@@ -24964,12 +24801,6 @@ def main():
     # Main interactive loop
 
     while True:
-        # ── a switch requested with Alt+A while the last turn was running ──
-        # Here, and not where the key was pressed: switching rebinds the state
-        # and history objects the agent loop was holding, and the loop is only
-        # done with them now.
-        _apply_pending_agent_switch(session, interactive_session)
-
         # ── the directory we are standing in may have been deleted ──
         _repl_cwd = _recover_deleted_cwd()
         # ── term0 health check ──

@@ -40,6 +40,27 @@ _SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 _SAFE_TOOL_PREFIX = re.compile(r"^[a-z][a-z0-9_]{0,15}\.$")
 
 
+def related_trust_paths(directory: Path) -> tuple[Path, ...]:
+    """Everything besides main.py that the trust hash must cover.
+
+    Code, and also PROMPTS. An extension contributes skills through
+    `ctx.register_skills`, and a SKILL.md is injected into the model's context
+    as instructions -- the half of a package that a sandbox bounds nothing
+    about. Hashing only `.py` would let the prose an extension tells the model
+    change without the approval that installed it becoming invalid.
+    """
+    seen: dict[str, Path] = {}
+    for path in sorted(directory.rglob("*")):
+        if not path.is_file() or path.is_symlink():
+            continue
+        if path.name == "main.py" and path.parent == directory:
+            continue
+        relative = path.relative_to(directory)
+        if path.suffix == ".py" or relative.parts[:1] == ("skills",):
+            seen[str(path)] = path
+    return tuple(seen[key] for key in sorted(seen))
+
+
 def _positional_arity(func: Callable) -> Optional[int]:
     """Return the number of positional parameters, or None if it can't be determined."""
     try:
@@ -113,6 +134,9 @@ class ExtensionContext:
     backend: BackendGateway
     cwd: str
     _runtime: "ExtensionRuntime"
+    #: Where this extension's own files live. `cwd` is the user's working
+    #: directory and says nothing about the package.
+    directory: Optional[Path] = None
 
     def register_command(self, name: str, handler: Callable, *,
                          description: str = "",
@@ -133,12 +157,12 @@ class ExtensionContext:
           the schema's properties as keyword arguments and returns a str/dict.
 
         The second form exists because an extension lives outside this package
-        and has no clean way to build a `Tool`: `code-atlas` shipped calling it
-        this way, the call raised `TypeError`, its own `except Exception: pass`
-        swallowed that, and `atlas.lookup` was silently absent from every
-        request for the extension's whole life. An extension that registers no
-        tool is invisible to the model no matter what its manifest declares --
-        slash commands are typed by the user and never reach the request.
+        and has no clean way to build a `Tool`. One shipped calling it that
+        way, the call raised `TypeError`, its own `except Exception: pass`
+        swallowed that, and its tools were silently absent from every request
+        for the extension's whole life. An extension that registers no tool is
+        invisible to the model no matter what its manifest declares -- slash
+        commands are typed by the user and never reach the request.
         """
         if isinstance(tool, Tool):
             if handler is not None or spec is not None:
@@ -153,9 +177,9 @@ class ExtensionContext:
             args = params or {}
             # Bind BEFORE calling. Wrapping the call in `except TypeError`
             # instead would label a TypeError raised inside the handler's own
-            # body as "invalid parameters" — the same mislabelling that let
-            # code-atlas's registration failure look like a compatibility
-            # downgrade for as long as it was installed.
+            # body as "invalid parameters" — the same mislabelling that let a
+            # registration failure look like a compatibility downgrade for as
+            # long as the extension was installed.
             try:
                 inspect.signature(_fn).bind(**args)
             except TypeError as exc:
@@ -174,6 +198,25 @@ class ExtensionContext:
             schema=spec.get("parameters") or {"type": "object", "properties": {}},
             invoke=_invoke,
         ))
+
+    def register_skills(self, subdirectory: str = "skills") -> None:
+        """Contribute this extension's own skills to the catalog.
+
+        An extension owns its prompts the same way it owns its tools. Method
+        for a tool the model may not have is worse than no method at all: it
+        reads as an instruction, and nothing in the catalog says the
+        capability behind it is absent. Registering here binds the two -- the
+        skills appear when the extension loads and go when it unloads.
+        """
+        if self.directory is None:
+            raise ValueError("extension directory is unknown")
+        root = (self.directory / str(subdirectory)).resolve()
+        if not str(root).startswith(str(self.directory.resolve())):
+            raise ValueError("skills directory must be inside the extension")
+        if not root.is_dir():
+            raise ValueError(f"no skills directory at {subdirectory!r}")
+        import skills as _skills
+        _skills.register_extension_skill_root(self.name, root)
 
     def register_loop(self, handler: Callable) -> None:
         self._runtime.register_loop(self.name, handler)
@@ -302,11 +345,7 @@ class ExtensionRuntime:
                 trusted_by = str(install_meta.get("trustedBy") or "")
                 if install_meta and trusted_by not in ("ed25519", "evolution-lab"):
                     import trust_store as _ts
-                    related = tuple(
-                        p for p in sorted(directory.rglob("*.py"))
-                        if p.is_file() and not p.is_symlink()
-                        and p.name != "main.py"
-                    )
+                    related = related_trust_paths(directory)
                     status = _ts.extension_status(
                         "runtime", name, entrypoint,
                         related_paths=related)
@@ -330,7 +369,8 @@ class ExtensionRuntime:
                 if not callable(setup):
                     raise ValueError("extension must define setup(ctx)")
                 ctx = ExtensionContext(
-                    name, self._console, self._backend, str(Path.cwd()), self)
+                    name, self._console, self._backend, str(Path.cwd()), self,
+                    directory)
                 setup(ctx)
                 self._loaded[name] = LoadedExtension(
                     name, directory, module_name, module,
@@ -356,6 +396,9 @@ class ExtensionRuntime:
         self._loops.pop(name, None)
         self._tool_prefixes.pop(name, None)
         get_registry().unregister_source(f"extension:{name}")
+        # Prompts leave with the tools they describe.
+        import skills as _skills
+        _skills.unregister_extension_skill_roots(name)
 
     def unload(self, name: str) -> tuple[bool, str]:
         with self._lock:

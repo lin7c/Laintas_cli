@@ -1,4 +1,13 @@
-"""Full-screen Focus + Agent Rail + Event Feed interface."""
+"""Full-screen multi-Agent view: roster, transcript, and a live status band.
+
+The status band is the same row the plain CLI paints while a turn runs —
+``L› Thinking… 12.4s · model · MODE`` with the green highlight sweeping
+across the verb. It is not a lookalike: the frames and the shimmer come from
+``agent_loop._thinking_spinner_frame`` / ``_shimmer_segments``, which exist
+precisely so Rich and prompt_toolkit can render one visual language without
+either touching the other's cursor region. An Agent that is working looks the
+same here as it does at the prompt, because it is the same row.
+"""
 
 from __future__ import annotations
 
@@ -30,6 +39,14 @@ import agent_loop
 import agent_ui_events
 
 
+#: The roster column's width, shared by its renderer and the layout so the
+#: two cannot drift and start cropping at different places.
+RAIL_WIDTH = 30
+
+#: Statuses that mean "this Agent is doing something right now". They get the
+#: animated relay spinner instead of a static glyph, everywhere they appear.
+WORKING = ("running", "thinking", "queued", "waiting")
+
 STATUS = {
     "running": (symbols.DOT, "class:running"),
     "thinking": (symbols.DOT_HALF, "class:thinking"),
@@ -41,6 +58,31 @@ STATUS = {
     "aborted": (symbols.FAIL, "class:error"),
     "idle": (symbols.DOT_OPEN, "class:idle"),
 }
+
+
+def _spinner_frame(elapsed: float) -> str:
+    """The CLI's branded relay frame. Every frame is two cells, so nothing
+    to the right of it ever shifts as the animation advances."""
+    try:
+        return agent_loop._thinking_spinner_frame(elapsed)
+    except Exception:
+        return symbols.SPINNER_RELAY[0]
+
+
+def _shimmer_fragments(label: str, elapsed: float) -> list:
+    """``(style, text)`` for a label with the CLI's moving highlight band.
+
+    agent_loop returns Rich style strings; prompt_toolkit understands the
+    same color vocabulary, so they are used verbatim rather than mapped —
+    a mapping is a second place for the two renderers to drift apart.
+    """
+    try:
+        segments = agent_loop._shimmer_segments(label, elapsed)
+    except Exception:
+        return [("class:thinking", label)]
+    return [(f"fg:{style}" if style.startswith("#")
+             else f"bold fg:{style.split()[-1]}" if style else "",
+             text) for style, text in segments]
 
 # Default md.* styles for the Agents panel, in prompt_toolkit syntax. These
 # preserve the original hard-coded look and act as the fallback for any
@@ -93,6 +135,16 @@ STYLE = Style.from_dict({
     "pane.title": "bold #8b949e",
     "pane.title.focus": "bold #4ade80",
     "muted": "#8b949e",
+    # The relay spinner carries the CLI's accent green wherever it appears.
+    "spinner": "bold #3fb950",
+    "rail.mark": "bold #4ade80",
+    "rail.gutter": "#0d1117",
+    "rail.name": "#c9d1d9",
+    "rail.name.selected": "bold #f0f6fc",
+    "rail.task": "#6e7681",
+    "badge": "bold #d29922",
+    "key": "#8b949e bold",
+    "stream": "#6e7681",
     "rail.selected": "bg:#1f2937 bold #f0f6fc",
     "rail": "#c9d1d9",
     "running": "bold #3fb950",
@@ -107,7 +159,8 @@ STYLE = Style.from_dict({
     "user": "bold #f0f6fc",
     "tool": "#d2a8ff",
     "message": "#d2a8ff",
-    "input": "bold #3fb950",
+    "input": "bold #4ade80",
+    "input.caret": "#3fb950",
     "feed.time": "#6e7681",
     "feed.agent": "#a78bfa",
     "feed.text": "#b1bac4",
@@ -169,7 +222,9 @@ class AgentsModeController:
         self.focus_scroll: dict[str, int] = defaultdict(int)
         self.follow: dict[str, bool] = defaultdict(lambda: True)
         self.read_seq: dict[str, int] = defaultdict(int)
-        self.notice = f"Enter: send {symbols.BULLET} @Agent one-shot {symbols.BULLET} Tab: Agents {symbols.BULLET} Esc: exit"
+        # Empty until something has happened. The key hints live on their own
+        # row; repeating them here spent a line on what was already on screen.
+        self.notice = ""
         self._approval_lock = threading.Lock()
         self._approvals: list[dict] = []
         self._closed = threading.Event()
@@ -178,6 +233,11 @@ class AgentsModeController:
         self._feed_cache: tuple[tuple[int, int], FormattedText] | None = None
         self._drafts: dict[str, str] = defaultdict(str)
         self._input_buffer: Optional[Buffer] = None
+        # When each Agent started its current stretch of work, so the status
+        # row can show an elapsed clock. Kept here rather than read off the
+        # Agent because a primary has no assignment to carry one, and a clock
+        # that only some Agents have is worse than none.
+        self._work_since: dict[str, float] = {}
         selected = agent_loop.get_dialog_agent_for_terminal(self.terminal_name)
         if selected is not None and agent_loop.agent_deployment_terminal(selected) == self.terminal_name:
             selected = None
@@ -242,17 +302,41 @@ class AgentsModeController:
     def _focus_body_height(self) -> tuple[int, int]:
         """Return (width, physical rows available below the Focus header)."""
         width, height = self._terminal_size()
-        # Root layout rows outside `main`: top header + separator, input and
-        # notice, optional footer, and (on sufficiently large terminals) the
-        # two Feed separators plus its four rows. Focus itself adds a two-row
-        # title/divider. Keeping this calculation aligned with run() prevents
-        # prompt_toolkit from clipping the newest body row at the bottom.
-        reserved = 2 + 2 + 2
-        if height >= 16:
+        # Root layout rows outside `main`: header + its separator, the input
+        # and notice rows, the optional hint row, and the status band with its
+        # separator. Focus itself adds a two-row title/divider. Keeping this
+        # aligned with run() prevents prompt_toolkit from clipping the newest
+        # body row at the bottom.
+        reserved = (
+            1                       # header
+            + 1                     # header rule
+            + 1                     # input
+            + 2                     # Focus's own title and rule
+        )
+        if self.notice:
             reserved += 1
-        if width >= 60 and height >= 18:
-            reserved += 6
-        return width, max(3, height - reserved)
+        if height >= 16:            # key hints
+            reserved += 1
+        if height >= 14:            # status band and its rule
+            reserved += 3
+        return self._focus_pane_width(), max(3, height - reserved)
+
+    def _focus_pane_width(self) -> int:
+        """Columns the transcript actually gets, not the terminal's.
+
+        The panes beside it are fixed-width and conditional; wrapping to the
+        terminal instead let long lines run under the rail, which reads as
+        corruption rather than as an overflow.
+        """
+        width, _height = self._terminal_size()
+        pane = width
+        if width >= 96:                       # rail + its separator
+            pane -= 31
+        if (width >= 140 and self.pending_approval() is None):
+            pane -= 30                        # inspector + its separator
+        if self.pending_approval() is not None and width >= 120:
+            pane -= 43                        # approval side + its separator
+        return max(20, pane)
 
     def _rail_page_size(self) -> int:
         _width, height = self._terminal_size()
@@ -312,6 +396,15 @@ class AgentsModeController:
         return str(state.get("_assignment_task") or state.get("objective")
                    or previous_task or "idle")
 
+    def _rail_subtitle(self, agent, status: str) -> str:
+        """One line under an idle Agent's name: outcome first, then task."""
+        if status in {"error", "aborted"}:
+            return str(getattr(agent, "error", "") or "failed")
+        task = self._current_task(agent)
+        if status in {"done", "ready"}:
+            return f"done {symbols.BULLET} {task}" if task != "idle" else "done"
+        return task
+
     def _display_status(self, agent, events=None) -> str:
         """Combine authoritative runtime state with the last durable UI event."""
         status = str(getattr(agent, "status", "idle") or "idle")
@@ -344,9 +437,10 @@ class AgentsModeController:
         for agent in visible:
             selected = agent.id == self.selected_id
             status = self._display_status(agent, event_rows[agent.id])
-            icon, status_style = STATUS.get(status, (f"{symbols.DOT_OPEN}", "class:idle"))
+            working = status in WORKING
             unread = self.unread(agent.id, event_rows[agent.id])
-            row_style = "class:rail.selected" if selected else "class:rail"
+            name_style = ("class:rail.name.selected" if selected
+                          else "class:rail.name")
 
             def handler(mouse_event, agent_id=agent.id):
                 if mouse_event.event_type == MouseEventType.MOUSE_UP:
@@ -356,14 +450,51 @@ class AgentsModeController:
                 elif mouse_event.event_type == MouseEventType.SCROLL_DOWN:
                     self.scroll_rail(1)
 
-            suffix = f"  {unread}" if unread else ""
-            fragments.extend([
-                (status_style, f" {icon} ", handler),
-                (row_style, str(agent.name or agent.id), handler),
-                ("class:muted", suffix + "\n", handler),
-                ("class:muted", "   " + self._crop(
-                    self._current_task(agent), 24) + "\n\n", handler),
-            ])
+            # A bar in the gutter marks the selection. Reversing the whole row
+            # instead makes the rail flash on every redraw of an animated
+            # neighbour, and buries the status colour that carries the meaning.
+            gutter = ("class:rail.mark", f"{symbols.TREE_VERT} ") if selected \
+                else ("class:rail.gutter", "  ")
+            fragments.append((*gutter, handler))
+            if working:
+                fragments.append(
+                    ("class:spinner",
+                     _spinner_frame(self._working_elapsed(agent)) + " ",
+                     handler))
+            else:
+                icon, status_style = STATUS.get(
+                    status, (symbols.DOT_OPEN, "class:idle"))
+                fragments.append((status_style, f"{icon}  ", handler))
+            fragments.append((name_style, self._crop(
+                agent.name or agent.id, RAIL_WIDTH - 9), handler))
+            if unread:
+                fragments.append(("class:badge", f" {unread}", handler))
+            fragments.append(("", "\n", handler))
+
+            # Second line: what it is doing, in the same words the status band
+            # uses — an idle Agent says so rather than showing a stale task.
+            # Under the name, not under the gutter: gutter (2) + status (3).
+            indent = " " * 5
+            # The bar continues down the second row: a mark that covers only
+            # the name makes the two rows look like different entries.
+            fragments.append((*gutter, handler))
+            if working:
+                elapsed = self._working_elapsed(agent)
+                fragments.append(("class:muted", indent[2:], handler))
+                fragments.extend(
+                    (style, text, handler)
+                    for style, text in _shimmer_fragments(
+                        self._crop(self._work_verb(agent),
+                                   RAIL_WIDTH - len(indent) - 6), elapsed))
+                fragments.append(
+                    ("class:muted", f" {elapsed:.0f}s\n", handler))
+            else:
+                fragments.append((
+                    "class:rail.task",
+                    indent[2:] + self._crop(self._rail_subtitle(agent, status),
+                                        RAIL_WIDTH - len(indent) - 1)
+                    + "\n", handler))
+            fragments.append(("", "\n", handler))
         if self.rail_offset + page < len(agents):
             fragments.append((f"class:muted", f"  {symbols.ARROW_D} more Agents\n"))
         if not fragments:
@@ -548,32 +679,106 @@ class AgentsModeController:
         fragments.append((style, text[position:]))
         return fragments
 
-    def _activity_line(self, agent_id: str) -> tuple[str, str] | None:
-        agent = agent_loop.get_agent(agent_id)
-        if agent is None or agent.status not in {
-                "running", "thinking", "queued", "waiting"}:
-            return None
-        if agent.status == "queued":
-            return f"class:queued", f"{symbols.DOT_DASH} Queued…"
-        if agent.status == "waiting":
-            return f"class:waiting", f"{symbols.DOT_OPEN} Waiting…"
-        events = agent_ui_events.hub.agent_events(agent_id, limit=30)
-        for event in reversed(events):
+    def _working_elapsed(self, agent) -> float:
+        """Seconds this Agent has been in its current stretch of work.
+
+        Started when it enters a working state and forgotten when it leaves,
+        so a finished-then-restarted Agent counts from the restart rather
+        than showing the age of some earlier task.
+        """
+        agent_id = str(getattr(agent, "id", "") or "")
+        if not agent_id:
+            return 0.0
+        now = time.monotonic()
+        if str(getattr(agent, "status", "")) not in WORKING:
+            self._work_since.pop(agent_id, None)
+            return 0.0
+        started = self._work_since.get(agent_id)
+        if started is None:
+            # Prefer the assignment's own clock when there is one: it began
+            # before this view opened, and restarting the count at zero when
+            # someone presses Alt+A would misreport a long-running task.
+            active = getattr(agent, "active_assignment", None)
+            wall_start = getattr(active, "started_at", None) if active else None
+            started = now
+            if wall_start:
+                try:
+                    started = now - max(0.0, time.time() - float(wall_start))
+                except Exception:
+                    started = now
+            self._work_since[agent_id] = started
+        return max(0.0, now - started)
+
+    def _work_verb(self, agent) -> str:
+        """What this Agent is doing, in the CLI's own vocabulary."""
+        status = str(getattr(agent, "status", "") or "")
+        if status == "queued":
+            return "Queued…"
+        if status == "waiting":
+            return "Waiting…"
+        for event in reversed(
+                agent_ui_events.hub.agent_events(agent.id, limit=30)):
             if event.event_type == "ai_stream":
-                return f"class:thinking", f"{symbols.DOT_HALF} Writing…"
+                return "Writing…"
             if event.event_type == "ai_end":
-                return None
+                return "Working…"
             if event.event_type == "tool_started":
-                return "class:thinking", f"{symbols.DOT_HALF} {event.summary or 'Running tool…'}"
+                return self._crop(event.summary or "Running…", 28)
             if event.event_type in {"tool_finished", "agent_started"}:
                 break
-        # Three dots animate with the application's refresh tick. The larger
-        # dot advances one position per frame, giving feedback without a
-        # literal "Thinking" placeholder.
-        phase = int(time.monotonic() * 5) % 3
-        dots = [f"{symbols.BULLET}", f"{symbols.BULLET}", f"{symbols.BULLET}"]
-        dots[phase] = f"{symbols.DOT}"
-        return "class:thinking", "  ".join(dots)
+        return "Thinking…"
+
+    def _status_fragments(self, agent_id: str, width: int = 0,
+                          context: bool = True) -> list:
+        """The live status row for one Agent, or [] when it is not working.
+
+        Same shape as the row the plain CLI paints during a turn:
+        ``L› Thinking… 12.4s · model · MODE``. The spinner frame and the
+        highlight band are computed from the elapsed clock rather than a
+        frame counter, so the animation stays smooth at any redraw rate and
+        identical to the CLI's.
+        """
+        agent = agent_loop.get_agent(agent_id)
+        if agent is None or str(getattr(agent, "status", "")) not in WORKING:
+            return []
+        elapsed = self._working_elapsed(agent)
+        verb = self._work_verb(agent)
+        fragments = [("class:spinner", _spinner_frame(elapsed) + " ")]
+        fragments.extend(_shimmer_fragments(verb, elapsed))
+        fragments.append(("class:muted", f" {elapsed:.1f}s"))
+        # The model/mode tail is the first thing to go on a narrow screen:
+        # the verb and the clock are the row, the rest is context.
+        if context and width >= 64:
+            tail = self._runtime_context(agent)
+            if tail:
+                fragments.append(("class:muted",
+                                  f" {symbols.BULLET} {tail}"))
+        return fragments
+
+    def _runtime_context(self, agent) -> str:
+        """``model · MODE`` for the status row's tail, best-effort."""
+        parts = []
+        try:
+            model, _provider = agent_loop.resolve_agent_model(agent)
+            model = str(model or "") or agent_loop._live_status_model()
+            if model:
+                parts.append(model.split("/")[-1])
+        except Exception:
+            pass
+        try:
+            mode = str(agent_loop._active_mode_label() or "")
+            if mode:
+                parts.append(mode)
+        except Exception:
+            pass
+        return f" {symbols.BULLET} ".join(parts)
+
+    def _activity_line(self, agent_id: str) -> tuple[str, str] | None:
+        """Flat (style, text) activity summary — kept for non-animated uses."""
+        fragments = self._status_fragments(agent_id, context=False)
+        if not fragments:
+            return None
+        return "class:thinking", "".join(text for _style, text in fragments)
 
     def _mirror_lines(self, agent_id: str) -> Optional[list[str]]:
         """Real-REPL conversation scrollback for REPL-executed Agents.
@@ -660,16 +865,10 @@ class AgentsModeController:
         return list(reversed(reverse_rows))
 
     def _focus_mirror_fragments(self, agent_id: str, lines: list[str]):
-        activity = self._activity_line(agent_id)
+        # No activity row here: the status band below the transcript owns
+        # "what is happening now", and showing it twice on one screen made
+        # each copy look like a different fact.
         width, height = self._focus_body_height()
-        stream_tail = ""
-        if activity:
-            height = max(3, height - 1)
-            # While the Agent is writing, surface what it is saying live —
-            # the full reply is mirrored in place once streaming completes.
-            stream_tail = self._stream_tail(agent_id)
-            if stream_tail:
-                height = max(3, height - 1)
         offset = max(0, self.focus_scroll[agent_id])
         # `focus_scroll` is a physical-row offset. Long/CJK/ANSI lines are
         # wrapped before slicing so follow=0 really means the visible bottom,
@@ -683,38 +882,53 @@ class AgentsModeController:
             events = agent_ui_events.hub.agent_events(agent_id)
             if events:
                 self.read_seq[agent_id] = events[-1].seq
-        header_name = self._crop(self._agent_name(agent_id), max(1, width - 2))
-        fragments = [("class:header", f"  {header_name}\n"),
-                     ("class:separator", "  " + "─" * max(
-                         1, min(50, width - 2)) + "\n")]
+        fragments = self._focus_header(agent_id, width)
+        fragments.extend(self._bottom_pad(len(visible), height))
         for row in visible:
             fragments.append(("", " "))
             fragments.extend((style, value) for style, value, *_rest in row)
             fragments.append(("", "\n"))
-        if stream_tail:
-            fragments.append((
-                "class:muted",
-                "  " + self._crop(stream_tail, max(20, width - 6)) + "\n"))
-        if activity:
-            style, text = activity
-            fragments.append((style, "  " + text + "\n"))
         return FormattedText(fragments)
+
+    @staticmethod
+    def _bottom_pad(used: int, height: int) -> list:
+        """Blank rows above the content so a short transcript sits on the
+        floor of the pane, where the newest line is always in the same place
+        — right above the status band the eye is already on."""
+        return [("", "\n" * max(0, height - used))] if height > used else []
+
+    def _focus_header(self, agent_id: str, width: int) -> list:
+        """Name, role and scroll position — the transcript's own title bar."""
+        name = self._crop(self._agent_name(agent_id), max(1, width - 20))
+        agent = agent_loop.get_agent(agent_id)
+        role = str(getattr(agent, "role", "") or "") if agent else ""
+        head = [("class:header", f"  {name}")]
+        if role and role != "primary":
+            head.append(("class:muted", f"  {role}"))
+        offset = self.focus_scroll[agent_id]
+        if offset:
+            head.append(("class:badge", f"  {symbols.ARROW_U}{offset}"))
+        head.append(("", "\n"))
+        head.append(("class:separator",
+                     " " + "─" * max(1, width - 2) + "\n"))
+        return head
 
     def focus_fragments(self):
         agent_id = self.selected_id
         if not agent_id:
             return FormattedText([
-                ("class:muted", "\n  No Agents in this terminal"),
-                ("class:muted", "\n\n  Hire an employee with /hire, or press Esc to exit.\n"),
+                ("class:muted", "\n  No Agents in this terminal\n\n"),
+                ("class:muted", "  Hire one with "),
+                ("class:key", "/hire <name>"),
+                ("class:muted", ", or press "),
+                ("class:key", "Esc"),
+                ("class:muted", " to leave.\n"),
             ])
         mirror_lines = self._mirror_lines(agent_id)
         if mirror_lines is not None:
             return self._focus_mirror_fragments(agent_id, mirror_lines)
         lines = self._event_lines(agent_id)
-        activity = self._activity_line(agent_id)
-        if activity:
-            lines.extend([activity, ("", "")])
-        _width, height = self._focus_body_height()
+        width, height = self._focus_body_height()
         offset = max(0, self.focus_scroll[agent_id])
         end = max(0, len(lines) - offset)
         start = max(0, end - height)
@@ -723,12 +937,92 @@ class AgentsModeController:
             events = agent_ui_events.hub.agent_events(agent_id)
             if events:
                 self.read_seq[agent_id] = events[-1].seq
-        fragments = [("class:header", f"  {self._agent_name(agent_id)}\n"),
-                     ("class:separator", "  " + "─" * 50 + "\n")]
+        fragments = self._focus_header(agent_id, width)
+        fragments.extend(self._bottom_pad(len(visible), height))
         for style, line in visible:
             fragments.append((style, "  "))
             fragments.extend(self._inline_markdown(style, line))
             fragments.append((style, "\n"))
+        return FormattedText(fragments)
+
+    def band_fragments(self):
+        """The live band above the input: what is happening, right now.
+
+        One row for the Agent in focus, in the CLI's own status language, and
+        one dim row of the text it is producing. When focus is idle the band
+        reports the other Agents still working, so leaving a worker and going
+        to talk to someone else never means losing sight of it.
+        """
+        width, _height = self._terminal_size()
+        rows: list = []
+        status = self._status_fragments(self.selected_id, width)
+        if status:
+            rows.append([("class:muted", " ")] + status)
+            tail = self._stream_tail(self.selected_id)
+            if tail:
+                rows.append([("class:stream", " " + symbols.INFO + " "),
+                             ("class:stream", self._crop(tail, width - 4))])
+        else:
+            elsewhere = [
+                agent for agent in self.agents()
+                if agent.id != self.selected_id
+                and self._display_status(agent) in WORKING]
+            if elsewhere:
+                row = [("class:muted", " ")]
+                for index, agent in enumerate(elsewhere[:3]):
+                    if index:
+                        row.append(("class:muted", f"  {symbols.BULLET}  "))
+                    row.append(("class:spinner", _spinner_frame(
+                        self._working_elapsed(agent)) + " "))
+                    row.append(("class:rail.name", str(agent.name or agent.id)))
+                    row.append(("class:muted",
+                                f" {self._working_elapsed(agent):.0f}s"))
+                if len(elsewhere) > 3:
+                    row.append(("class:muted",
+                                f"  +{len(elsewhere) - 3} more"))
+                rows.append(row)
+            else:
+                rows.append([("class:muted", f" {self._agent_name(self.selected_id)} is idle"
+                              if self.selected_id else " No Agents here")])
+
+        fragments = []
+        for index, row in enumerate(rows):
+            if index:
+                fragments.append(("", "\n"))
+            fragments.extend(row)
+        while sum(1 for _s, text in fragments if "\n" in text) < 1:
+            fragments.append(("", "\n"))
+        return FormattedText(fragments)
+
+    def hint_fragments(self):
+        """Keys that apply to what is on screen, not a fixed keycap dump."""
+        if self.pending_approval() is not None:
+            keys = [("y", "approve"), ("n", "deny"), ("Esc", "exit")]
+        elif self.overlay:
+            keys = [("Alt+" + symbols.ARROW_U + symbols.ARROW_D, "pick"),
+                    ("Tab", "close"), ("Esc", "exit")]
+        else:
+            keys = [("Enter", "send"),
+                    ("@name", "one-shot"),
+                    ("Alt+" + symbols.ARROW_U + symbols.ARROW_D, "agent"),
+                    ("Alt+" + symbols.ARROW_L + symbols.ARROW_R, "terminal"),
+                    ("Esc", "exit")]
+        # Drop from the right as the terminal narrows: the first hints are the
+        # ones a person needs, and a row that wraps costs a whole line.
+        width, _height = self._terminal_size()
+        fragments: list = []
+        used = 0
+        for index, (key, what) in enumerate(keys):
+            lead = f"  {symbols.BULLET}  " if index else " "
+            cost = get_cwidth(lead + key + " " + what)
+            if used + cost > width - 1:
+                break
+            fragments.extend([
+                ("class:muted", lead),
+                ("class:key", key),
+                ("class:muted", f" {what}"),
+            ])
+            used += cost
         return FormattedText(fragments)
 
     def feed_fragments(self):
@@ -813,26 +1107,37 @@ class AgentsModeController:
         return FormattedText(rows)
 
     def header_fragments(self):
+        """Identity on the left, a census of the roster on the right.
+
+        The census is the reason to look up here: how many Agents are working
+        and how many are waiting on you. Both are counts a person acts on;
+        neither is visible from the transcript alone.
+        """
         agents = self.agents()
         statuses = {a.id: self._display_status(a) for a in agents}
-        running = sum(statuses[a.id] in {
-            "running", "thinking", "queued"} for a in agents)
+        working = sum(statuses[a.id] in WORKING for a in agents)
         attention = sum(self.unread(a.id) > 0 for a in agents)
         width, _height = self._terminal_size()
-        if width < 100:
-            pieces = [f"[{self._agent_name(self.selected_id)}] "]
-            pieces.extend(
-                f"{STATUS.get(statuses[a.id], (f'{symbols.DOT_OPEN}', ''))[0]}{a.name}"
-                + (f"({self.unread(a.id)})" if self.unread(a.id) else "")
-                for a in agents[:4])
-            return FormattedText([("class:header", " ".join(pieces)),
-                                  ("class:muted", "  Tab:switch")])
-        return FormattedText([
-            ("class:header.brand", f" LAINTAS  /  AGENTS  {symbols.BULLET} {self.terminal_name}"),
-            ("class:muted", f"   {running} running  {symbols.BULLET}  {attention} attention  {symbols.BULLET}  Focus: "),
-            ("class:agent", self._agent_name(self.selected_id)),
-            ("class:muted", "   Alt+←/→ terminals"),
-        ])
+
+        left = [("class:header.brand", f" {self.terminal_name}")]
+        if self.selected_id:
+            left.extend([
+                ("class:separator", f"  {symbols.TREE_VERT}  "),
+                ("class:agent", self._agent_name(self.selected_id)),
+            ])
+        right = []
+        if working:
+            right.append(("class:running", f"{working} working"))
+        if attention:
+            if right:
+                right.append(("class:muted", f"  {symbols.BULLET}  "))
+            right.append(("class:badge", f"{attention} for you"))
+        if not right:
+            right = [("class:muted", "all idle")]
+
+        used = sum(get_cwidth(text) for _style, text in left + right)
+        gap = max(2, width - used - 1)
+        return FormattedText(left + [("", " " * gap)] + right)
 
     def dispatch(self, raw: str) -> None:
         text = str(raw or "").strip()
@@ -1247,7 +1552,8 @@ class AgentsModeController:
         def _terminal_next(_event):
             self.cycle_terminal(1)
 
-        rail = Window(FormattedTextControl(self.rail_fragments), width=30,
+        rail = Window(FormattedTextControl(self.rail_fragments),
+                      width=RAIL_WIDTH,
                       wrap_lines=False, style="class:rail")
         focus = Window(FormattedTextControl(
             lambda: FormattedText([
@@ -1298,10 +1604,9 @@ class AgentsModeController:
             buffer=input_buffer,
             input_processors=[BeforeInput(
                 lambda: FormattedText([
-                    ("class:input", f" @{self._agent_name(self.selected_id)} > ")]))])
-        feed_filter = Condition(lambda: (
-            self._terminal_size()[0] >= 60
-            and self._terminal_size()[1] >= 18))
+                    ("class:input", f" {self._agent_name(self.selected_id)} "),
+                    ("class:input.caret", f"{symbols.INFO} ")]))])
+        band_filter = Condition(lambda: self._terminal_size()[1] >= 14)
         verbose_footer_filter = Condition(lambda: self._terminal_size()[1] >= 16)
         root = HSplit([
             Window(FormattedTextControl(self.header_fragments), height=1),
@@ -1311,25 +1616,23 @@ class AgentsModeController:
             ConditionalContainer(
                 main, filter=~overlay_filter & (
                     ~approval_filter | approval_wide_filter)),
+            # The live band sits directly above the input, where the eye
+            # already is while typing — the same place the plain CLI paints
+            # its status row, for the same reason.
             ConditionalContainer(
                 Window(height=1, char="─", style="class:separator"),
-                filter=feed_filter),
+                filter=band_filter),
             ConditionalContainer(
-                Window(FormattedTextControl(self.feed_fragments), height=4),
-                filter=feed_filter),
-            ConditionalContainer(
-                Window(height=1, char="─", style="class:separator"),
-                filter=feed_filter),
+                Window(FormattedTextControl(self.band_fragments), height=2),
+                filter=band_filter),
             Window(input_control, height=1),
-            Window(FormattedTextControl(
-                lambda: FormattedText([("class:muted", " " + self.notice)])),
-                height=1),
             ConditionalContainer(
-                Window(FormattedTextControl(lambda: FormattedText([
-                    ("class:muted",
-                     f" Esc/Ctrl-C: exit {symbols.BULLET} Enter: send {symbols.BULLET} Tab: Agents {symbols.BULLET} "
-                     f"Alt+{symbols.ARROW_U}/{symbols.ARROW_D}: focus {symbols.BULLET} PgUp/PgDn: scroll")
-                ])), height=1),
+                Window(FormattedTextControl(
+                    lambda: FormattedText(
+                        [("class:muted", " " + self.notice)])), height=1),
+                filter=Condition(lambda: bool(self.notice))),
+            ConditionalContainer(
+                Window(FormattedTextControl(self.hint_fragments), height=1),
                 filter=verbose_footer_filter),
         ])
         self.app = Application(
@@ -1348,7 +1651,10 @@ class AgentsModeController:
                         str(getattr(agent, "status", "")) in {
                             "running", "thinking", "queued", "waiting"}
                         for agent in self.agents())
-                    await asyncio.sleep(0.2 if active else 0.8)
+                    # The relay spinner advances every 140ms and the
+                    # highlight band sweeps continuously; redrawing slower
+                    # than the frame interval turns both into a stutter.
+                    await asyncio.sleep(0.08 if active else 0.8)
                     if active and self.app is not None and not self.app.is_done:
                         self.app.invalidate()
             self.app.create_background_task(_animate_live_work())

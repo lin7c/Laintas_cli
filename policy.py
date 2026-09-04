@@ -609,6 +609,129 @@ _GIT_PREFIX = (
 )
 
 
+#: Recursive readers, each with: the options that actually bound the WALK, and
+#: how many positional arguments come before the path.
+#:
+#: `du` has an empty tuple on purpose. `-s` and `-d N` bound what it PRINTS and
+#: not what it visits -- GNU du walks the whole tree either way, which is why
+#: `du -sh` on five directories of a mounted drive sat for a minute and had to
+#: be killed. An option that shortens the output is not a ceiling on the cost.
+_RECURSIVE_READERS: tuple[tuple[str, tuple[str, ...], int], ...] = (
+    ("find", (r"-maxdepth\b", r"-prune\b", r"-quit\b"), 0),
+    ("du", (), 0),
+    ("ncdu", (), 0),
+    ("tree", (r"(?:^|\s)-L\s*\d",), 0),
+    # Pattern first, path second.
+    ("rg", (r"--max-?depth\b",), 1),
+    ("ag", (r"--depth\b",), 1),
+)
+
+#: Recursion carried in a flag rather than in the command's nature. Neither has
+#: a depth option at all, so there is nothing that could bound them.
+_RECURSIVE_FLAGGED: tuple[tuple[str, str, int], ...] = (
+    ("grep", r"(?:^|[;&|]\s*|\n\s*)(?:\S*/)?grep\s+(?:-\w*[rR]\b|--recursive\b)", 1),
+    ("ls", r"(?:^|[;&|]\s*|\n\s*)(?:\S*/)?ls\s+(?:-\w*R\b|--recursive\b)", 0),
+    ("cp", r"(?:^|[;&|]\s*|\n\s*)(?:\S*/)?cp\s+(?:-\w*[rR]\b|--recursive\b)", 0),
+)
+
+
+def _recursion_target(command: str, name: str, skip: int) -> str:
+    """The directory a recursive command was pointed at, as written.
+
+    `skip` is how many positional arguments belong to the command before the
+    path does: `grep -r PATTERN DIR` has one, `find DIR` has none. Reading the
+    pattern as the path is how `grep -r needle /somewhere` looked local.
+    """
+    match = re.search(
+        r"(?:^|[;&|]\s*|\n\s*)(?:\S*/)?" + name + r"\b([^\n;&|]*)", command)
+    if match is None:
+        return ""
+    seen = 0
+    tokens = match.group(1).split()
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token.startswith("-"):
+            # An option that takes a value swallows the next token, which is
+            # otherwise mistaken for the path.
+            if token in ("-e", "--regexp", "--include", "--exclude", "-f",
+                         "--file", "-m", "--max-count", "-g", "--glob",
+                         # du's own value-taking options: without these,
+                         # `du -d 1 /data` reads "1" as the directory.
+                         "-d", "--max-depth", "-t", "--threshold",
+                         "-X", "--exclude-from", "-L", "--level"):
+                index += 2
+                continue
+            index += 1
+            continue
+        if seen < skip:
+            seen += 1
+            index += 1
+            continue
+        return token
+    return "."
+
+
+def is_unbounded_recursion(command: str, cwd=None) -> bool:
+    """Whether *command* walks a tree of unknown size with no ceiling.
+
+    Not a list of slow filesystems, and not a list of big directories: both
+    lists are endless, and neither is knowable from here. The shape of the
+    command is knowable. A recursive walk with no depth bound, rooted OUTSIDE
+    the directory the user is working in, is a command whose cost nobody in
+    this process can estimate -- the tree may be a project, a home directory,
+    a mounted disk, a network share, or a whole machine, and the ones that
+    hang look identical to the ones that return instantly until they do not.
+
+    Inside the working directory it stays friction-free: that tree is the
+    user's own, they chose it, and its scale is the thing they are least
+    likely to be surprised by.
+
+    The precedent is `_check_paths`: writing inside cwd is ordinary, writing
+    outside it is worth one question. This applies the same boundary to
+    reading, where the cost is the traversal rather than the target.
+    """
+    stripped = _unwrap_parent(command)
+    stripped = re.sub(r"^sudo(?:\s+-\S+)*\s+", "", stripped)
+
+    for name, bounded_by, skip in _RECURSIVE_READERS:
+        if not re.search(r"(?:^|[;&|]\s*|\n\s*)(?:\S*/)?" + name + r"\s", stripped):
+            continue
+        if any(re.search(flag, stripped) for flag in bounded_by):
+            continue
+        if _escapes_working_directory(_recursion_target(stripped, name, skip), cwd):
+            return True
+
+    for name, pattern, skip in _RECURSIVE_FLAGGED:
+        if re.search(pattern, stripped) and _escapes_working_directory(
+                _recursion_target(stripped, name, skip), cwd):
+            return True
+    return False
+
+
+def _escapes_working_directory(target: str, cwd=None) -> bool:
+    """True when *target* is not inside the directory the user is working in.
+
+    An empty or unparseable target means the command took its default, which
+    is the working directory -- inside, and therefore not asked about.
+    """
+    if not target:
+        return False
+    target = target.strip().strip("'\"")
+    if not target or target.startswith("-"):
+        return False
+    try:
+        base = Path(cwd or os.getcwd()).resolve()
+        resolved = (base / os.path.expanduser(target)).resolve()
+    except (ValueError, OSError):
+        return True
+    try:
+        resolved.relative_to(base)
+        return False
+    except ValueError:
+        return True
+
+
 def is_destructive_git_command(command: str) -> bool:
     """Return whether *command* is a git operation that destroys work.
 
@@ -845,6 +968,17 @@ def evaluate(command: str, cwd: str = None,
     if mode != "disabled" and any(is_destructive_git_command(v) for v in variants):
         reason = ("destructive git command always requires approval "
                   "(audit and enforce modes alike)")
+        _write_audit(_audit_entry(command, "needs_approval", reason, cwd, req_id, agent_id))
+        return PolicyDecision("needs_approval", "", reason)
+
+    # An unbounded walk of a tree nobody sized is the shape that killed a
+    # session outright: `fs.glob` over a drive root never returned, and the
+    # native tools now bound themselves. A shell command has nobody to stop
+    # it, so the ceiling has to be the user's answer.
+    if mode != "disabled" and any(is_unbounded_recursion(v, cwd) for v in variants):
+        reason = ("recursive walk with no depth bound, outside the working "
+                  "directory: bound it (-maxdepth, a named subdirectory) or "
+                  "approve the full scan")
         _write_audit(_audit_entry(command, "needs_approval", reason, cwd, req_id, agent_id))
         return PolicyDecision("needs_approval", "", reason)
 

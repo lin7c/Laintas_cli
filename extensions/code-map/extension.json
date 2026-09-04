@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 2,
+  "name": "code-map",
+  "version": "1.0.0",
+  "entrypoint": "main.py",
+  "description": "Build and read a Laintas Code Map: a layered architecture map of a public GitHub repository",
+  "toolPrefix": "code_map.",
+  "capabilities": [
+    "network"
+  ],
+  "minCliVersion": "1.0.0"
+}

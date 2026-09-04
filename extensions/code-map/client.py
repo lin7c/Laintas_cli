@@ -1,4 +1,4 @@
-"""Laintas Code Map, from the terminal.
+"""Laintas Code Map HTTP client (code-map extension).
 
 Code Map builds a layered map of a repository on the server: a deterministic
 index of modules, declarations and real call edges, with a model naming each
@@ -18,8 +18,6 @@ from typing import Any
 
 import requests
 
-from web_search import laintas_session
-
 BASE_PATH = "/api/agent/code-map"
 MAP_ID = re.compile(r"^[0-9a-f]{32}$")
 TIMEOUT = 30
@@ -37,6 +35,11 @@ class CodeMapError(RuntimeError):
 
 def _call(method: str, path: str, *, params: dict | None = None,
           body: dict | None = None) -> Any:
+    # Imported here, not at module scope: the extension host loads this file
+    # by path, and a top-level import of a CLI module would make the client
+    # unimportable outside a running CLI -- including from its own tests.
+    from web_search import laintas_session
+
     auth = laintas_session()
     if auth is None:
         raise CodeMapError("not signed in to Laintas — run /login")

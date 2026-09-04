@@ -91,6 +91,20 @@ def read_manifest(directory: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+#: The vocabulary a manifest may declare in `capabilities`.
+#:
+#: This is a DISCLOSURE, not a sandbox, and the difference is worth being
+#: precise about: an extension is Python loaded into this process, so nothing
+#: here can stop `import os`. What the declaration buys is an informed
+#: approval -- the person who runs `/extensions trust` is told what the package
+#: says it does before their approval lets it load. An unknown value is
+#: rejected because a typo that silently declares nothing is worse than a
+#: package that declares nothing on purpose.
+KNOWN_CAPABILITIES: frozenset = frozenset({
+    "fs.read", "fs.write", "shell", "network", "model", "browser", "storage",
+})
+
+
 def validate_manifest(value: dict, directory_name: str = "") -> list[str]:
     """Return a list of validation errors (empty list = valid).
 
@@ -117,6 +131,16 @@ def validate_manifest(value: dict, directory_name: str = "") -> list[str]:
         version = value.get("version", "")
         if not re.match(r"^\d+\.\d+\.\d+", str(version)):
             errors.append("version must look like semver (e.g. 1.0.0)")
+    capabilities = value.get("capabilities")
+    if capabilities is not None:
+        if not isinstance(capabilities, list):
+            errors.append("capabilities must be a list")
+        else:
+            unknown = [c for c in capabilities if c not in KNOWN_CAPABILITIES]
+            if unknown:
+                errors.append(
+                    f"unknown capabilities: {', '.join(map(str, unknown))} "
+                    f"(known: {', '.join(sorted(KNOWN_CAPABILITIES))})")
     prefix = value.get("toolPrefix")
     if prefix is not None:
         if not isinstance(prefix, str) or not re.fullmatch(r"[a-z][a-z0-9_]{0,15}\.", prefix):
@@ -163,11 +187,15 @@ def compute_integrity(directory: Path) -> str:
 
 
 def _related_files(directory: Path) -> tuple[Path, ...]:
-    """All .py files besides main.py, for trust-store related_paths."""
-    return tuple(
-        p for p in sorted(directory.rglob("*.py"))
-        if p.is_file() and not p.is_symlink() and p.name != "main.py"
-    )
+    """Everything besides main.py the trust hash covers — code and prompts.
+
+    One definition, in extension_runtime: an installer that hashed a different
+    set than the loader checks would report a package as trusted and then
+    refuse to load it, or the reverse.
+    """
+    import extension_runtime
+
+    return extension_runtime.related_trust_paths(directory)
 
 
 # ── archive helpers ────────────────────────────────────────────────────────
@@ -523,6 +551,52 @@ class ExtensionManager:
         result = trust_store.trust_extension(
             _TRUST_KIND, name, entrypoint, related_paths=related)
         return True, f"Trusted {name} ({result.get('sha256', '')[:12]})."
+
+    def disclosure(self, name: str) -> Optional[dict]:
+        """What trusting this extension would let it put in front of you.
+
+        Approving used to print a hash and nothing else, which is a signature
+        on a document nobody read. Two of the three lines below reach the
+        MODEL rather than the user -- tool schemas and skill prose -- and
+        prose is the half no sandbox would bound even if there were one.
+        """
+        directory = self._find_directory(name)
+        if directory is None:
+            return None
+        try:
+            manifest = read_manifest(directory)
+        except (OSError, ValueError):
+            return None
+
+        skills = []
+        skills_root = directory / "skills"
+        if skills_root.is_dir():
+            for child in sorted(skills_root.iterdir()):
+                skill_file = child / "SKILL.md"
+                if not skill_file.is_file():
+                    continue
+                summary = ""
+                try:
+                    for line in skill_file.read_text(encoding="utf-8").splitlines():
+                        if line.startswith("description:"):
+                            summary = line.split(":", 1)[1].strip()
+                            break
+                except OSError:
+                    pass
+                skills.append({"name": child.name, "description": summary})
+
+        return {
+            "name": manifest.get("name") or directory.name,
+            "version": manifest.get("version") or "",
+            "description": manifest.get("description") or "",
+            "publisher": manifest.get("publisher") or "",
+            "capabilities": list(manifest.get("capabilities") or []),
+            "tool_namespace": manifest.get("toolPrefix")
+                              or f"extension.{directory.name}.",
+            "skills": skills,
+            "path": str(directory),
+            "files": len(_related_files(directory)) + 1,
+        }
 
     def untrust(self, name: str) -> tuple[bool, str]:
         """Revoke trust for an extension."""

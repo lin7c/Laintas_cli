@@ -1,7 +1,7 @@
 ---
 name: code-reading
 description: Reading an unfamiliar codebase to answer a question or prepare a change - what to ask the index for, what to grep for, how wide a window to read, and when a result is too incomplete to conclude from. Load before a repository investigation, review, or "where does X happen" question; not needed to reopen a file you already read this turn.
-version: 1.0.0
+version: 2.1.0
 triggers:
   - read the code
   - understand the codebase
@@ -20,50 +20,12 @@ The goal is a correct answer for the fewest bytes pulled into context. Bytes
 you read stay in the context for the rest of the task, so a whole file read to
 confirm one function is paid for on every later turn.
 
-Three questions, in order: *does an index already know this?*, *where is it?*,
-*how much of it do I actually need to read?*
-
-## Ask the index first, when there is one
-
-If `atlas.*` tools appear in the native schemas, this workspace has the Code
-Atlas extension: a deterministic graph of the tree (modules, classes,
-functions, and the import/call/inherit edges between them). It is built by a
-parser, not a model, so it cannot invent a definition or an edge that is not
-in the source.
-
-Use it in this order:
-
-1. **`atlas.stale`** - first, once per task. It compares the stored file
-   hashes against the tree on disk. A stale index is worse than no index: it
-   answers confidently and wrongly. If it reports stale, either re-index
-   (`/atlas index .`) or fall back to `grep`/`read` for this task and say
-   which you did.
-2. **`atlas.find(name, kind?)`** - where a symbol is defined, as `file:line`.
-   Replaces grepping for `def foo`/`class Foo` and the guessing that follows.
-   It distinguishes an exact hit from a substring near-miss; treat the
-   near-miss list as candidates, not as the answer.
-3. **`atlas.outline(module)`** - every class with its methods and the
-   top-level functions, with line numbers, *without reading the file*. This is
-   the one that saves the most: it turns "read a 9000-line module to find the
-   entry point" into one call plus one narrow `read`.
-4. **`atlas.neighbors(node_id)`** - both directions of every edge touching a
-   node, with `file:line` evidence. The reverse direction (*who reaches this?*)
-   is what grep is worst at: callers spell the call differently than the
-   definition spells itself, and grep cannot see an alias or a re-export.
-5. **`atlas.lookup(src, dst)`** - exact transitive dependency paths between
-   two modules, for "can this layer even reach that one".
-
-No index yet (`no index at ...`)? Building one costs a single
-`/atlas index .` run and no model tokens. Worth it for anything larger than a
-couple of files; skip it for a one-file question.
-
-The index knows structure, never behavior. Once it has told you *where*, the
-answer to *what it does* still comes from reading those lines.
+Two questions, in order: *where is it?*, and *how much of it do I actually
+need to read?*
 
 ## Locate before reading
 
-Without an index, or for anything the graph does not model (strings, config,
-templates, generated code):
+Reading starts by finding the lines that matter, not by opening a file:
 
 - `grep` by content, `glob` by path shape, `ls` for one directory level.
 - Narrow each call - a precise pattern, a specific path, a bounded range.
@@ -110,8 +72,9 @@ that used to take fifteen windows takes three or four page turns.
   branch that matters -> the effect), and stop when the question is answered.
   Breadth-first reading of a subsystem produces context, not an answer.
 - **To make a change**: read the target and its immediate neighbors - the
-  callers you will affect and the tests that cover it. `atlas.neighbors` gives
-  that set directly; grep gives it approximately.
+  callers you will affect and the tests that cover it. A grep for the
+  symbol gives that set approximately; widen it when a caller could spell
+  the call differently (an alias, a re-export, a dynamic dispatch).
 - **To review**: read the complete diff or the complete target, not a sample.
   A review that read part of the change cannot report on the part it skipped,
   and must say so.

@@ -103,6 +103,32 @@ PROJECT_SKILLS_SUBDIR = "skills"
 SCOPE_PROJECT = "project"
 SCOPE_USER = "user"
 SCOPE_BUNDLED = "bundled"
+SCOPE_EXTENSION = "extension"
+
+
+#: Skill directories contributed by loaded extensions, keyed by extension name.
+#: An extension owns its prompts the same way it owns its tools: when the model
+#: is offered `code_map.*`, the method for using it arrives with them, and when
+#: the extension is unloaded both go away together. Leaving that prose in a
+#: bundled skill would describe tools that are not there -- worse than silence,
+#: because the model cannot tell instructions from a capability it lacks.
+_extension_skill_roots: dict[str, Path] = {}
+
+
+def register_extension_skill_root(owner: str, root: Path) -> None:
+    """Add one extension's `skills/` directory to the catalog."""
+    _extension_skill_roots[str(owner)] = Path(root)
+    invalidate_scan()
+
+
+def unregister_extension_skill_roots(owner: str) -> None:
+    """Drop it again. Unloading an extension must take its prompts with it."""
+    if _extension_skill_roots.pop(str(owner), None) is not None:
+        invalidate_scan()
+
+
+def extension_skill_roots() -> dict[str, Path]:
+    return dict(_extension_skill_roots)
 
 
 def project_skills_dir() -> Path:
@@ -329,7 +355,7 @@ class SkillMetadata:
     version: str = ""
     dir_path: str = ""
     managed_by: str = ""              # e.g. "org" — see MANAGED_MARKER
-    scope: str = SCOPE_USER           # project / user / bundled
+    scope: str = SCOPE_USER           # project / user / extension / bundled
     #: Assertion lifecycle, mirroring memory_system: a learned skill cites the
     #: source it was learned from and goes `stale` when that source moves.
     status: str = "active"
@@ -523,6 +549,8 @@ def scan_metadata() -> dict[str, SkillMetadata]:
     _scan_project = str(project_skills_dir())
     _absorb(project_skills_dir(), SCOPE_PROJECT)
     _absorb(SKILLS_DIR, SCOPE_USER, managed=True)
+    for _owner, _root in sorted(_extension_skill_roots.items()):
+        _absorb(_root, SCOPE_EXTENSION)
     _absorb(BUNDLED_SKILLS_DIR, SCOPE_BUNDLED)
 
     _scan_done = True

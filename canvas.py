@@ -282,18 +282,34 @@ def scratch_board(root: str = ".") -> tuple[str, bool]:
     return (candidate, True)
 
 
+#: A board is something a person made and put somewhere they can find again.
+#: Past this depth the walk is searching a dependency tree, not a workspace.
+_BOARD_MAX_DEPTH = 8
+_BOARD_ENTRY_BUDGET = 50_000
+
+
 def find_boards(root: str = ".", limit: int = 40) -> list:
     """Boards under `root`, newest first.
 
     Skips the directories that make a recursive walk useless in a real project;
     a board is something a person made, and it is not in node_modules.
+
+    The early exit is on FOUND boards, which is no exit at all when there are
+    none: the walk then runs to the end of the tree, and on a Windows drive
+    seen through WSL that is minutes to never. Depth and an entry budget bound
+    the search itself, so "no boards here" costs the same as finding some.
     """
     skip = {"node_modules", ".git", "venv", ".venv", "__pycache__",
-            "dist", "build", ".laintas"}
+            "dist", "build", ".laintas", ".pnpm-store", ".cache", ".npm"}
     found = []
+    scanned = 0
     root = os.path.expanduser(root or ".")
-    for base, dirs, files in os.walk(root):
+    base_depth = root.rstrip(os.sep).count(os.sep)
+    for base, dirs, files in os.walk(root, followlinks=False):
+        if base.count(os.sep) - base_depth >= _BOARD_MAX_DEPTH:
+            dirs[:] = []
         dirs[:] = [d for d in dirs if d not in skip and not d.startswith(".")]
+        scanned += len(dirs) + len(files)
         for name in files:
             if not is_canvas_path(name):
                 continue
@@ -302,7 +318,7 @@ def find_boards(root: str = ".", limit: int = 40) -> list:
                 found.append((os.path.getmtime(full), full))
             except OSError:
                 pass
-        if len(found) >= limit * 4:
+        if len(found) >= limit * 4 or scanned >= _BOARD_ENTRY_BUDGET:
             break
     found.sort(reverse=True)
     return [p for _mtime, p in found[:limit]]

@@ -111,7 +111,7 @@ class CanvasViewer:
     ``boards`` and ``load_board`` are optional: give them and the session can
     switch to another file without closing (``b``). They are passed in rather
     than looked up here because this class knows about scenes, not about what
-    a board file is — the same viewer shows a whiteboard and a code atlas.
+    a board file is — the same viewer shows a whiteboard and a code map.
     """
 
     def __init__(self, scene: ic.Scene, *, title: str = "",
@@ -127,7 +127,7 @@ class CanvasViewer:
         self.empty_hint = list(empty_hint or [])
         self.picker_open = False
         self.picker_at = 0
-        # Drawing is off until asked for: on a read-only scene (a code atlas)
+        # Drawing is off until asked for: on a read-only scene (a code map)
         # there is nothing to draw on, and on a board a stray keystroke should
         # not put a rectangle in somebody's diagram.
         self.editor = editor

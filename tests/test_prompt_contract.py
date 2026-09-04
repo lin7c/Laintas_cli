@@ -91,7 +91,10 @@ class PromptContractTests(unittest.TestCase):
         """
         prompt = laintas_cli.generate_cli_prop_template()
         self.assertIn("`code-reading` skill", prompt)
-        self.assertIn("atlas.", prompt)
+        # The cached prefix names no extension's tools. `code_map.*` lived here
+        # while Code Map was built in; an uninstalled extension would have left
+        # the sentence describing a capability the model does not have.
+        self.assertNotIn("code_map", prompt)
         # Moved out of the prefix; still stated by the gateway's core-tool
         # guide and by the skill.
         self.assertNotIn("leading line-number prefixes are display only", prompt)
@@ -100,12 +103,73 @@ class PromptContractTests(unittest.TestCase):
         self.assertTrue(skill.is_file())
         text = skill.read_text(encoding="utf-8")
         self.assertTrue(text.isascii())
-        # The index-first order is the point of the skill; atlas.stale is what
-        # keeps a cached index from answering confidently and wrongly.
-        for tool in ("atlas.stale", "atlas.find", "atlas.outline",
-                     "atlas.neighbors", "atlas.lookup"):
-            self.assertIn(tool, text)
-        self.assertLess(text.index("atlas.stale"), text.index("atlas.find"))
+        # The bundled skill describes only what every workspace has. Method for
+        # an extension's tools ships with that extension.
+        self.assertNotIn("code_map", text)
+        self.assertNotIn("atlas", text)
+
+    def test_a_linux_host_is_told_nothing_about_windows(self):
+        """The block is host-conditional, so it costs a Linux install nothing."""
+        environment = {k: v for k, v in os.environ.items()
+                       if k not in ("LAINTAS_HOST", "WSL_DISTRO_NAME")}
+        with mock.patch.dict(os.environ, environment, clear=True):
+            prompt = laintas_cli.generate_cli_prop_template()
+        self.assertNotIn("WSL", prompt)
+        self.assertNotIn("/mnt/", prompt)
+        self.assertNotIn("wsl-windows", prompt)
+
+    def test_the_windows_host_is_not_described_to_the_model_as_linux(self):
+        """`platform.system()` says Linux; the machine is a Windows PC.
+
+        Left at that one word the model works in the user's Windows home
+        believing it is on a Linux box, with Win32 binaries ahead of nothing
+        on PATH. The standing facts belong in the cached prefix because they
+        are true for every task on this host; the procedure is in the
+        `wsl-windows` skill, paid for only by tasks that need it.
+        """
+        with mock.patch.dict(os.environ, {"LAINTAS_HOST": "windows"},
+                             clear=False):
+            prompt = laintas_cli.generate_cli_prop_template()
+        self.assertIn("private WSL 2 distribution on a Windows host", prompt)
+        # The four facts a task cannot recover on its own once it is wrong.
+        self.assertIn("/mnt/", prompt)          # where the user's files are
+        self.assertIn("inotify", prompt)        # why watch mode does nothing
+        self.assertIn("no node, no python", prompt)   # what is not installed
+        self.assertIn("wslpath -w", prompt)     # Win32 cannot open a /mnt path
+        self.assertIn("`wsl-windows` skill", prompt)
+        self.assertTrue(prompt.isascii())
+
+    def test_the_windows_block_survives_a_renamed_distribution(self):
+        """LAINTAS_WSL_DISTRO renames it; a name check would lose the block."""
+        with mock.patch.dict(
+                os.environ,
+                {"LAINTAS_HOST": "windows",
+                 "WSL_DISTRO_NAME": "Laintas-Work"}, clear=False):
+            self.assertTrue(laintas_cli.is_windows_host())
+
+    def test_the_windows_skill_is_bundled_and_covers_the_expensive_mistakes(self):
+        skill = Path("default_skills/wsl-windows/SKILL.md")
+        self.assertTrue(skill.is_file())
+        text = skill.read_text(encoding="utf-8")
+        self.assertTrue(text.isascii())
+        for topic in ("wslpath", "appendWindowsPath", "usePolling",
+                      "explorer.exe", "0.0.0.0", "apt-get install",
+                      "systemd"):
+            self.assertIn(topic, text)
+
+    def test_the_shell_skill_does_not_require_a_tool_the_windows_rootfs_may_lack(self):
+        """`rg` is bundled now, but the advice must not read as a prerequisite.
+
+        `grep`/`glob` are native tools with no package behind them, which is
+        what makes the absence of ripgrep a non-event rather than a task that
+        stops to install something.
+        """
+        text = Path("default_skills/shell-linux/SKILL.md").read_text(
+            encoding="utf-8")
+        self.assertIn("Where neither is installed", text)
+        rootfs = Path("build/windows/Dockerfile.rootfs").read_text(
+            encoding="utf-8")
+        self.assertIn("ripgrep", rootfs)
 
     def test_the_prompt_never_asks_for_fewer_tool_calls(self):
         """Narrowing a call and making fewer calls are opposite instructions.

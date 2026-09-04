@@ -6,7 +6,9 @@
   "description": "Generate SWE-bench predictions with laintas-cli; scoring stays with the official harness",
   "capabilities": [
     "fs.read",
-    "fs.write"
+    "fs.write",
+    "shell",
+    "model"
   ],
   "minCliVersion": "1.0.0"
 }

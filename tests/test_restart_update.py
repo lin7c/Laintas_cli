@@ -270,6 +270,82 @@ class FrozenUpdateTests(unittest.TestCase):
             self.assertTrue(target.stat().st_mode & stat.S_IXUSR)
             self.assertEqual(list(Path(tmp).glob(".laintas-cli-update-*")), [])
 
+    def test_unwritable_install_dir_replaces_through_sudo(self):
+        """The Windows distribution's layout: root-owned dir, user session.
+
+        /usr/local/bin belongs to root because the Windows installer writes it
+        as root, while the distribution logs in as `laintas`. Without the sudo
+        path every `/v update` there aborted after downloading the whole
+        binary.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "laintas-cli"
+            target.write_bytes(b"old-binary")
+            target.chmod(0o755)
+            archive = self._archive(b"new-binary")
+            checksum = updater._sha256_bytes(archive)
+            sums = f"{checksum}  laintas-cli_linux_amd64.tar.gz\n".encode()
+            calls = []
+
+            def fake_run(command, **kwargs):
+                calls.append(command)
+                if command[2:] == ["true"]:
+                    return SimpleNamespace(returncode=0, stdout=b"")
+                # Stand in for what root's `install` would do.
+                Path(command[-1]).write_bytes(Path(command[-2]).read_bytes())
+                return SimpleNamespace(returncode=0, stdout=b"")
+
+            with mock.patch.object(updater.sys, "executable", str(target)), \
+                    mock.patch.object(
+                        updater.os, "uname",
+                        return_value=SimpleNamespace(machine="x86_64")), \
+                    mock.patch.object(
+                        updater.os, "access", return_value=False), \
+                    mock.patch.object(
+                        updater.shutil, "which",
+                        side_effect=lambda name: "/usr/bin/" + name), \
+                    mock.patch.object(
+                        updater.subprocess, "run", side_effect=fake_run), \
+                    mock.patch.object(
+                        updater, "_download", side_effect=[sums, archive]):
+                installed = updater.apply_frozen_update(
+                    {"version": "9.9.9"}, "latest", lambda _message: None)
+
+            self.assertEqual(installed, str(target))
+            self.assertEqual(target.read_bytes(), b"new-binary")
+            self.assertEqual(calls[0], ["/usr/bin/sudo", "-n", "true"])
+            self.assertEqual(calls[1][:4],
+                             ["/usr/bin/sudo", "-n", "/usr/bin/install", "-m"])
+
+    def test_unwritable_install_dir_without_sudo_never_downloads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "laintas-cli"
+            target.write_bytes(b"old-binary")
+            messages = []
+
+            with mock.patch.object(updater.sys, "executable", str(target)), \
+                    mock.patch.object(
+                        updater.os, "access", return_value=False), \
+                    mock.patch.object(
+                        updater.shutil, "which", return_value=None), \
+                    mock.patch.dict(
+                        updater.os.environ,
+                        {"LAINTAS_HOST": "windows"}, clear=False), \
+                    mock.patch.object(
+                        updater, "_download",
+                        side_effect=AssertionError(
+                            "downloaded before checking write access")):
+                installed = updater.apply_frozen_update(
+                    {"version": "9.9.9"}, "latest", messages.append)
+
+            self.assertIsNone(installed)
+            self.assertEqual(target.read_bytes(), b"old-binary")
+            self.assertTrue(any("No write permission" in m for m in messages))
+            # Telling a Windows user to "re-run with sudo" points at a command
+            # line the launcher never gives them.
+            self.assertTrue(any("Windows installer" in m for m in messages))
+            self.assertFalse(any("sudo" in m for m in messages))
+
     def test_binary_replacement_rejects_checksum_mismatch(self):
         with tempfile.TemporaryDirectory() as tmp:
             target = Path(tmp) / "laintas-cli"
