@@ -24203,6 +24203,16 @@ def main():
                     action="/v update", level="good")
         except Exception:
             pass
+    # Wait for a Windows kernel, if this is the Windows build. The kernel
+    # dials us; `win.*` tools appear when it arrives and disappear when it
+    # goes, so a machine without one has exactly the tool surface it had
+    # before. Never blocks startup and never raises.
+    try:
+        import windows_host as _windows_host
+        _windows_host.start_host()
+    except Exception:
+        pass
+
     # Register as remote agent (only if authenticated)
     agent_registry = AgentRegistry()
     _session_start_cwd = os.getcwd()
