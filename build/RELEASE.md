@@ -36,6 +36,24 @@ The local diagnostic modules currently registered (`event_log` / `critic` /
 serve CLI recovery and local diagnostics only; they upload nothing to the
 training pipeline.
 
+**The Windows build depends on a second channel.** `/windows install`
+downloads `helpwo-kernel.exe` from `helpwo.laintas.com/downloads/`, which is
+published by the *Helpwo* build, not this one. Nothing in a laintas_cli
+release contains the kernel, so a release cannot break it — but a Helpwo
+deploy that drops `latest.json` breaks `/windows install` for every installed
+CLI, and this is the only document that would tell you where to look. Check
+it is answering before and after a release:
+
+```bash
+curl -fsSL https://helpwo.laintas.com/downloads/latest.json | python3 -m json.tool
+```
+
+It must name an `asset` that exists beside it and a 64-character `sha256`;
+the CLI refuses anything else rather than running an unverified installer.
+`Helpwo`'s `npm run build` regenerates the file from what is actually in
+`public/downloads/`, so the fix is almost always a redeploy of that site
+rather than a change here.
+
 Set the single version number in [version.py](../version.py):
 
 ```python
@@ -209,6 +227,7 @@ curl -fsSIL "$base/laintas-cli_linux_amd64.tar.gz"
 curl -fsSIL "$base/laintas-cli_windows_amd64_setup.exe"
 curl -fsSIL https://cli.laintas.com/install.sh
 curl -fsSIL https://cli.laintas.com/install.ps1
+curl -fsSIL https://helpwo.laintas.com/downloads/latest.json
 ```
 
 Confirm that:
@@ -218,6 +237,8 @@ Confirm that:
   return `200`
 - the download page shows the new version and its cards link at the new tag
 - `src_manifest.zip` matches the file checksums in the manifest
+- `downloads/latest.json` still resolves — the Windows build's `/windows
+  install` reads it, and it is published by a different repository
 
 `/v` reads the GitHub release, not `cli.laintas.com` — the two `curl` checks
 against that host above cover the install scripts the site serves, and

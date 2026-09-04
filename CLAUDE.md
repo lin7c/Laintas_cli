@@ -38,6 +38,8 @@ The .deb launcher (`/usr/bin/laintas-cli`) lazy-installs `requirements.txt` via 
 
 A companion React/Vite download site lives in `laintas_cli_download/` (separate build, not part of the Python package).
 
+New top-level modules must be added to `package_manifest.json` — it drives setup.py, the PyInstaller spec, the CI source bundle and the `/v` self-update manifest, and a module missing from it ships in *no* artifact. `tests/test_build_release_assets.py` fails when one is missing.
+
 **To publish a release, use `.github/workflows/release.yml`** — it builds Linux amd64/arm64 binaries and a source package, then publishes checksums and update manifests to GitHub Releases.
 
 ## Architecture (read PROJECT.md for full detail)
@@ -70,6 +72,14 @@ The project has grown from two core modules to ten, organized in layers:
 
   Created by `remote_browser/rb.py save <name>` after a human signs in through the temporary live-view route; `identity.check` / `web_search.probe_identity()` verify a session is still alive before a task depends on it. Manual sign-in pays off for **login walls** (sessions last weeks); it does not for anti-bot walls (exemptions are short-lived and IP-bound — measured dead within 3 days).
   - Optional deps (`pip install .[web]`): `trafilatura` for article extraction — without it the fallback keeps nav bars and footers in what the model reads — and `curl_cffi` for the fingerprint rung.
+
+**The Windows machine (Windows build only):**
+- **`winbridge.py`** — the one place that answers "am I in WSL", "where is the Windows profile", "what is this path on the other side". Always via `wslpath` / `cmd.exe`; never by assembling `/mnt/c/Users/<name>`, which silently writes to the wrong place when the profile has moved.
+- **`windows_kernel.py`** — locate / download / checksum / silently install / start / stop `helpwo-kernel.exe`. Backs `/windows`. **`install()` has no tier argument on purpose**: `--allow-machine-read` and `--allow-machine-write` come from a word the user typed in `/windows start`. Installing is not permission, and a test asserts the string `allow-machine` never appears in `install()`.
+- **`windows_host.py`** — the connection. **The CLI listens; the kernel dials it.** The kernel's promise is that it opens no port, and Windows forwards `localhost` into WSL in that direction by default. Rendezvous file (port + one-time token) under `%LOCALAPPDATA%\Laintas\`.
+- **`windows_tools.py`** — the `win.*` tools, registered on connect **only for the tier the kernel actually granted** and unregistered when it goes. Registered as `source="builtin"` (not a source tag) because the registry refuses to invoke non-builtins and strips their context, and `win.screenshot` needs `ctx.cwd`.
+
+Everything about *which mechanism answers* — accessibility tree, window manager, or pixels — lives in the kernel, not here, so Helpwo's browser agent and this CLI cannot drift apart on it.
 
 **Cross-cutting subsystems:**
 - **`policy.py`** (~370 lines) — Security policy engine: evaluates every command as allow/needs_approval/deny via regex rules. Config in `~/.laintas/policy.json` (mtime-cached, zero-restart updates). Audit log in `~/.laintas/audit.log`. Three modes: audit, enforce, disabled.

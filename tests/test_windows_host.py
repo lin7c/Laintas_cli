@@ -20,6 +20,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import winbridge  # noqa: E402
 import windows_host  # noqa: E402
 import windows_tools  # noqa: E402
 from tools import get_registry  # noqa: E402
@@ -239,7 +240,7 @@ def test_a_disconnect_releases_a_waiting_call(host):
 def test_no_host_is_started_off_wsl(monkeypatch):
     """A Linux or macOS session must not grow a listener it has no use for."""
     monkeypatch.delenv("LAINTAS_KERNEL_RENDEZVOUS", raising=False)
-    monkeypatch.setattr(windows_host, "in_wsl", lambda: False)
+    monkeypatch.setattr(winbridge, "in_wsl", lambda: False)
     windows_host.stop_host()
     assert windows_host.start_host() is None
 

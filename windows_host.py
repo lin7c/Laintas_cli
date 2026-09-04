@@ -37,11 +37,12 @@ import os
 import secrets
 import socket
 import struct
-import subprocess
 import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Optional
+
+import winbridge
 
 FRAME_JSON = 0
 FRAME_BINARY = 1
@@ -53,51 +54,17 @@ MAX_FRAME = 32 * 1024 * 1024
 CALL_TIMEOUT = 45.0
 
 
-def in_wsl() -> bool:
-    """True when this process is inside a WSL distribution."""
-    if os.environ.get("WSL_DISTRO_NAME"):
-        return True
-    try:
-        release = Path("/proc/sys/kernel/osrelease").read_text()
-    except OSError:
-        return False
-    return "microsoft" in release.lower()
+def rendezvous_path() -> Optional[Path]:
+    """Where the CLI publishes its endpoint.
 
-
-def _windows_localappdata() -> Optional[Path]:
-    """Resolve %LOCALAPPDATA% as a path this side can write.
-
-    Through interop rather than by guessing `/mnt/c/Users/<name>`: the user
-    may have moved their profile, the drive may not be `c`, and a guessed
-    path that happens to exist is worse than none.
+    Under LOCALAPPDATA rather than the workspace: the workspace is a folder
+    the user chooses and may delete, and a rendezvous that vanishes with it
+    would look like the CLI had gone away.
     """
     override = os.environ.get("LAINTAS_KERNEL_RENDEZVOUS")
     if override:
-        return None  # the caller uses the override directly
-    try:
-        raw = subprocess.run(
-            ["cmd.exe", "/c", "echo %LOCALAPPDATA%"],
-            capture_output=True, text=True, timeout=10,
-            cwd="/",  # cmd.exe warns and falls back when cwd is a UNC path
-        ).stdout.strip()
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if not raw or raw.startswith("%"):
-        return None
-    try:
-        converted = subprocess.run(["wslpath", "-u", raw],
-                                   capture_output=True, text=True,
-                                   timeout=10).stdout.strip()
-    except (OSError, subprocess.SubprocessError):
-        return None
-    return Path(converted) if converted else None
-
-
-def rendezvous_path() -> Optional[Path]:
-    override = os.environ.get("LAINTAS_KERNEL_RENDEZVOUS")
-    if override:
         return Path(override)
-    base = _windows_localappdata()
+    base = winbridge.localappdata()
     if base is None:
         return None
     return base / "Laintas" / "kernel-rendezvous.json"
@@ -401,7 +368,8 @@ def start_host() -> Optional[WindowsHost]:
     with _host_lock:
         if _host is not None:
             return _host
-        if not in_wsl() and not os.environ.get("LAINTAS_KERNEL_RENDEZVOUS"):
+        if (not winbridge.in_wsl()
+                and not os.environ.get("LAINTAS_KERNEL_RENDEZVOUS")):
             return None
         host = WindowsHost()
 

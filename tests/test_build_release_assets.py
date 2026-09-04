@@ -115,3 +115,26 @@ def test_release_asset_verification_and_stale_cleanup(tmp_path):
     assert not any(path.name.startswith("laintas-cli_") for path in tmp_path.iterdir())
     assert not (tmp_path / "SHA256SUMS.txt").exists()
     assert (tmp_path / "manifest.json").is_file()
+
+
+def test_release_doc_names_the_channel_the_windows_build_depends_on():
+    """`/windows install` reads a file published by a *different* repository.
+
+    Nothing in a laintas_cli release contains the kernel, so a release here
+    cannot break it — which is exactly why it is easy to forget. A Helpwo
+    deploy that drops `latest.json` breaks `/windows install` for every
+    installed CLI, and build/RELEASE.md is the only place that would tell
+    somebody where to look.
+    """
+    import re
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    import windows_kernel
+
+    doc = (Path(build_release_assets.REPO) / "build/RELEASE.md").read_text(
+        encoding="utf-8")
+    host = re.sub(r"^https?://", "", windows_kernel.DOWNLOAD_ORIGIN)
+    assert host in doc, (
+        f"build/RELEASE.md does not mention {host}, which the Windows build "
+        f"downloads the kernel from")
+    assert "latest.json" in doc

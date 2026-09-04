@@ -1325,6 +1325,7 @@ import hooks as hooks_mod        # trusted Python hooks + argv hooks
 import backend_profiles          # backend trust domains + credential isolation
 import ppos_client               # secure PPOS Agent API + autonomous policy
 import trust_store               # workspace trust for executable customization
+import winbridge                 # facts about the Windows side of WSL (no-op elsewhere)
 import usage_tracker             # local AI token/cost accounting (/usage)
 import agent_ui_events           # observable events for full-screen Agents Mode
 import mode_manager              # declarative user-selectable agent modes
@@ -3306,6 +3307,26 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
                 subcommands=("list", "check", "capture", "delete")),
     CommandSpec("/policy", "Show or set security policy", "Config & Tools", "/policy [audit|enforce|disabled [--yes]|reset]", subcommands=("audit", "enforce", "disabled", "reset")),
     CommandSpec("/trust", "Review or change workspace trust", "Config & Tools", "/trust [status|allow|revoke]", subcommands=("status", "allow", "revoke")),
+    CommandSpec(
+        "/windows", "Reach the Windows machine this CLI runs inside of",
+        "Config & Tools",
+        "/windows [status | install [--force] | start [read|write] | stop]",
+        subcommands=("status", "install", "start", "stop"),
+        help_text=(
+            "On the Windows build this CLI is a Linux program inside a "
+            "private WSL distribution, so the machine you are sitting at - "
+            "its windows, its applications, its screen - is out of reach "
+            "until a small helper is running on the Windows side. `install` "
+            "downloads it, checks its published checksum and installs it "
+            "without further questions. "
+            "`start` is separate, and the word you give it decides how much "
+            "of your machine the agent may touch: with no word, its own "
+            "workspace folder and nothing else; `read` adds seeing every "
+            "window and the screen; `write` adds driving applications with "
+            "your real keyboard and mouse. It opens its own console window - "
+            "that window is the connection, and closing it is how you cut "
+            "access in a hurry."
+        )),
     CommandSpec("/hooks", "Manage executable hooks", "Config & Tools", "/hooks [status|trust|revoke|reload]", subcommands=("status", "trust", "revoke", "reload")),
     CommandSpec("/backend", "Manage backend trust profiles", "Config & Tools", "/backend [status|list|use <name>|config]", subcommands=("status", "list", "use", "config")),
     CommandSpec(
@@ -15029,6 +15050,134 @@ def _cmd_mode(raw_args: str, parts: list) -> bool:
     return False
 
 
+def _cmd_windows(parts: list) -> None:
+    """`/windows` — the Windows machine this CLI is running inside of.
+
+    Install and start are separate commands on purpose. Installing puts a
+    program on the user's disk; starting it with `write` hands the agent the
+    keyboard, the mouse and every window on the machine. Rolling those into
+    one step would mean the second decision was made by whoever wanted the
+    first.
+    """
+    import windows_kernel
+    import windows_tools
+
+    sub = (parts[1].lower() if len(parts) > 1 else "status")
+
+    if not winbridge.in_wsl() and sub != "status":
+        console.print("[yellow]/windows only does anything on the Windows "
+                      "build, which runs inside WSL.[/yellow]")
+        return
+
+    if sub == "status":
+        try:
+            state = windows_kernel.status()
+        except Exception as exc:
+            console.print(f"[red]could not read the kernel status: {exc}[/red]")
+            return
+        if not state["wsl"]:
+            console.print(Panel(
+                "This is not the Windows build, so there is no Windows "
+                "machine to reach.",
+                title="Windows", border_style="dim"))
+            return
+        tiers = state.get("tiers") or {}
+        if state["connected"]:
+            granted = ("machine-write" if tiers.get("machineWrite")
+                       else "machine-read" if tiers.get("machineRead")
+                       else "workspace only")
+        else:
+            granted = "—"
+        tools = state.get("tools") or []
+        lines = [
+            f"Installed    {'yes' if state['installed'] else 'no'}"
+            + (f"  (v{state['version']})" if state.get("version") else ""),
+            f"Running      {'yes' if state['processRunning'] else 'no'}",
+            f"Connected    {'yes' if state['connected'] else 'no'}",
+            f"Granted      {granted}",
+            f"Tools        {', '.join(tools) if tools else '(none)'}",
+        ]
+        if not state["installed"]:
+            lines += ["", "Install it with:  /windows install"]
+        elif not state["connected"]:
+            lines += ["", "Start it with:    /windows start read",
+                      "                  /windows start write"]
+        console.print(Panel("\n".join(lines), title="Windows kernel",
+                            border_style="cyan"))
+        return
+
+    if sub == "install":
+        force = any(p.lower() in ("--force", "-f") for p in parts[2:])
+        console.print("[dim]checking helpwo.laintas.com…[/dim]")
+        last = [-1]
+
+        def progress(done: int, total: int) -> None:
+            if not total:
+                return
+            percent = int(done * 100 / total)
+            if percent >= last[0] + 10:
+                last[0] = percent
+                console.print(f"[dim]  {percent}%  "
+                              f"({done // 1048576} of {total // 1048576} MB)"
+                              f"[/dim]")
+
+        try:
+            result = windows_kernel.install(progress=progress, force=force)
+        except windows_kernel.KernelInstallError as exc:
+            console.print(f"[red]{exc}[/red]")
+            return
+        if result["action"] == "kept":
+            console.print(f"[green]Already on v{result['version']}.[/green] "
+                          "Use /windows install --force to reinstall.")
+            return
+        console.print(Panel(
+            f"{result['action'].title()} v{result['version']}\n"
+            f"{result['path']}\n\n"
+            "Nothing can reach your machine yet. Start it with one of:\n"
+            "  /windows start          workspace folder only\n"
+            "  /windows start read     + see every window and the screen\n"
+            "  /windows start write    + drive applications, keyboard, mouse",
+            title="Windows kernel", border_style="green"))
+        return
+
+    if sub == "start":
+        tier = (parts[2].lower() if len(parts) > 2 else "workspace")
+        if tier in ("--read", "-r"):
+            tier = "read"
+        elif tier in ("--write", "-w"):
+            tier = "write"
+        try:
+            result = windows_kernel.start(tier)
+        except windows_kernel.KernelInstallError as exc:
+            console.print(f"[red]{exc}[/red]")
+            return
+        note = {
+            "workspace": "It can see its workspace folder and nothing else.",
+            "read": "It can see every window and the screen. It changes "
+                    "nothing.",
+            "write": "It can drive applications and use your real keyboard "
+                     "and mouse.",
+        }[result["tier"]]
+        console.print(Panel(
+            f"Started in its own window.\n{note}\n\n"
+            "The first run signs in through your browser. Leave that window "
+            "open — closing it disconnects the machine, and that is also how "
+            "you revoke access in a hurry.",
+            title=f"Windows kernel · {result['tier']}",
+            border_style="yellow" if result["tier"] == "write" else "cyan"))
+        return
+
+    if sub == "stop":
+        if windows_kernel.stop():
+            console.print("[green]Stopped.[/green]")
+        else:
+            console.print("[dim]Nothing was running.[/dim]")
+        return
+
+    console.print("usage: /windows [status | install [--force] | "
+                  "start [read|write] | stop]")
+
+
 def _cmd_trust(parts: list) -> None:
     global _extra_cmd_handler_cache, _extra_cmd_mtime_cache
     sub = parts[1].lower() if len(parts) > 1 else "status"
@@ -21668,6 +21817,9 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
     elif action == "/mode":
         return _cmd_mode(raw_args, parts)
 
+    elif action == "/windows":
+        _cmd_windows(parts)
+
     elif action == "/trust":
         _cmd_trust(parts)
 
@@ -24212,6 +24364,25 @@ def main():
         _windows_host.start_host()
     except Exception:
         pass
+
+    # Say once, on the Windows build, that the machine is reachable and how.
+    # Not a background download: 63 MB and an installer are a decision, and
+    # the tier it later runs with is a bigger one.
+    if args.depth == 0:
+        try:
+            import winbridge as _winbridge
+            if _winbridge.in_wsl():
+                import windows_kernel as _windows_kernel
+                if _windows_kernel.kernel_exe() is None:
+                    startup_mail.post(
+                        "windows",
+                        "This CLI can drive Windows itself",
+                        "Reading windows, clicking buttons and taking "
+                        "screenshots need a small helper on the Windows "
+                        "side. Install it with /windows install.",
+                        action="/windows install", level="info")
+        except Exception:
+            pass
 
     # Register as remote agent (only if authenticated)
     agent_registry = AgentRegistry()

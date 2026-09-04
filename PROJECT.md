@@ -204,6 +204,7 @@ cycle detection, normalized progress/status, and an append-only event history.
 | `/work [status|list|resume|history]` | Inspect unified work state |
 | `/plan enter|submit|revise|approve` | Manage versioned, reviewed plans |
 | `/task` | View or update the active WorkGraph steps |
+| `/windows [status\|install\|start [read\|write]\|stop]` | The Windows machine this CLI runs inside of. Install and start are separate: starting decides how much of the machine the agent may touch |
 | `/scan` | Rescan PATH for executables |
 | `/debug` | Browse AI interaction debug logs (TUI) |
 | `/cwd` | Show current working directory |
@@ -215,6 +216,43 @@ cycle detection, normalized progress/status, and an append-only event history.
 | `/reload` | Delete all default files and restart laintas-cli (from `.extra_command.py`) |
 | `/clear` | Clear screen |
 | `/exit, /quit` | Exit (cascading cleanup of all terminals) |
+
+### 12.1 The Windows machine (`winbridge` / `windows_kernel` / `windows_host` / `windows_tools`)
+
+On the Windows build this CLI is a Linux program inside a private WSL
+distribution, so the machine the user is actually sitting at — its windows,
+its applications, its screen — is on the other side of a boundary this
+process cannot cross. It is reached through `helpwo-kernel.exe`, the same
+program Helpwo uses for remote workspaces, which already owns the
+accessibility tree, screen capture and input synthesis behind its own guard.
+Nothing here reimplements any of that.
+
+| Module | Role |
+|---|---|
+| `winbridge` | The only place that answers "am I in WSL", "where is the Windows profile", "what is this path called on the other side" — all through `wslpath` and `cmd.exe`, never by assembling `/mnt/c/Users/<name>` |
+| `windows_kernel` | Locate, download, checksum, silently install, start and stop the kernel. Backs `/windows` |
+| `windows_host` | The connection. **The CLI listens and the kernel dials it** — the kernel's promise is that it opens no port, and Windows forwards `localhost` into WSL in that direction by default |
+| `windows_tools` | The `win.*` tools, registered when a kernel connects and **only for the tier it actually granted**, unregistered when it goes |
+
+Three properties worth not breaking:
+
+- **Install is not permission.** `install()` has no tier argument. The
+  `--allow-machine-read` / `--allow-machine-write` flags come from a word the
+  user typed in `/windows start`, never from the install step. A CLI that
+  installed the kernel and started it with write access would have made the
+  decision the tiers exist to leave with the user.
+- **The kernel gets its own console window.** Its README is right that the
+  window *is* the connection and closing it is how access is revoked in a
+  hurry. A kernel hidden behind this process is one the user cannot stop.
+- **Tools are offered only when they work.** A `win.*` tool that exists and
+  always fails costs the model turns to discover, and it tends to invent a
+  cruder workaround rather than report that the capability is off.
+
+Mechanism ordering is the kernel's decision, but the tool descriptions carry
+it because the model is the one choosing: `win.snapshot` → `win.invoke` is one
+cheap round trip that never moves the pointer, while `win.screenshot` →
+`win.click` costs a vision call per look and takes the mouse from whoever is
+at the machine.
 
 ### 13. Web Search & Fetch (`web_search.py`)
 
