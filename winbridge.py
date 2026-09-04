@@ -15,6 +15,15 @@ none: it silently writes to the wrong place.
 Answers are cached for the life of the process. Each one costs an interop
 process launch, which on a cold WSL boot is not fast, and none of them
 changes while the CLI is running.
+
+**Windows programs do not speak UTF-8 by default.** A console program writes
+in the machine's OEM code page — 936 on a Chinese install, 932 on a Japanese
+one — so decoding its output as UTF-8 raises `UnicodeDecodeError` on the
+first non-ASCII byte. That is not a rare edge: `tasklist` says
+"\u4fe1\u606f: ..." when nothing matched, and the first byte of that is
+0xD0 in GBK. Every interop call here decodes defensively, and the one call
+whose *content* has to survive intact — the path from `%LOCALAPPDATA%`, which
+contains the user's name — asks `cmd.exe` for UTF-8 first.
 """
 
 from __future__ import annotations
@@ -45,9 +54,25 @@ def in_wsl() -> bool:
     return "microsoft" in release.lower()
 
 
+def decode(raw: bytes) -> str:
+    """Bytes from a Windows program, made safe to look at.
+
+    UTF-8 where it is valid, and a replacement pass where it is not, rather
+    than raising. Callers here are matching ASCII — a drive path, a version
+    number, a process name — so a mangled character costs nothing, while an
+    exception loses the whole answer. Shared so no caller has to remember.
+    """
+    if not raw:
+        return ""
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode("utf-8", errors="replace")
+
+
 def _run(argv: list[str]) -> str:
     try:
-        done = subprocess.run(argv, capture_output=True, text=True,
+        done = subprocess.run(argv, capture_output=True,
                               timeout=INTEROP_TIMEOUT,
                               # cmd.exe warns and falls back to
                               # C:\Windows when the working directory is a
@@ -56,7 +81,7 @@ def _run(argv: list[str]) -> str:
                               cwd="/")
     except (OSError, subprocess.SubprocessError):
         return ""
-    return (done.stdout or "").strip()
+    return decode(done.stdout or b"").strip()
 
 
 def to_wsl_path(windows_path: str) -> Optional[Path]:
@@ -82,7 +107,11 @@ def to_windows_path(path: Path) -> Optional[str]:
 
 
 def _env(name: str) -> Optional[Path]:
-    raw = _run(["cmd.exe", "/c", f"echo %{name}%"])
+    # `chcp 65001` first: this is the one interop call whose content must
+    # survive exactly, because the path contains the user's account name and
+    # a replaced character points at a directory that does not exist. The
+    # redirect keeps chcp's own banner out of the output.
+    raw = _run(["cmd.exe", "/c", f"chcp 65001 > nul & echo %{name}%"])
     if not raw or raw.startswith("%"):
         return None
     return to_wsl_path(raw)

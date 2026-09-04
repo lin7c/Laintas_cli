@@ -27,6 +27,16 @@ assets are not the public channel — this is.
 
 The digest is checked before anything is executed. A truncated download and a
 substituted one look identical to a program that only checks the HTTP status.
+
+Two things a first real Windows run taught this file, both of which look like
+the feature being broken rather than the environment being itself:
+
+  * **Send a real User-Agent.** `urllib`'s default is `Python-urllib/3.x`,
+    which the CDN in front of the download host answers with 403 — the same
+    request from a browser succeeds, so it reads as "the file is missing".
+  * **Console output is not UTF-8.** Windows programs write in the machine's
+    OEM code page; `tasklist` reporting no match on a Chinese install starts
+    with byte 0xD0. Decoding goes through `winbridge.decode`.
 """
 
 from __future__ import annotations
@@ -57,12 +67,27 @@ KERNEL_EXE = "helpwo-kernel.exe"
 #: user's temp directory.
 MAX_INSTALLER_BYTES = 200 * 1024 * 1024
 
+#: Sent on every request to the download host. `urllib`'s default UA is a
+#: known crawler signature and the CDN in front of that host rejects it with
+#: 403 — a failure that reads as a missing file and cost a real install run.
+USER_AGENT_TEMPLATE = "laintas-cli/{version} (+https://cli.laintas.com)"
+
 DOWNLOAD_TIMEOUT = 60
 #: NSIS silent installs are quick, but a machine with aggressive endpoint
 #: protection can spend a while on a 63 MB executable before letting it run.
 INSTALL_TIMEOUT = 600
 
 _SAFE_ASSET = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,120}\.exe$")
+
+
+def _request(url: str) -> urllib.request.Request:
+    try:
+        from version import __version__ as cli_version
+    except Exception:
+        cli_version = "0.0.0"
+    return urllib.request.Request(
+        url, headers={"User-Agent": USER_AGENT_TEMPLATE.format(
+            version=cli_version)})
 
 
 class KernelInstallError(RuntimeError):
@@ -103,10 +128,10 @@ def installed_version() -> Optional[str]:
         return None
     try:
         done = subprocess.run([str(exe), "--version"], capture_output=True,
-                              text=True, timeout=30, cwd="/")
+                              timeout=30, cwd="/")
     except (OSError, subprocess.SubprocessError):
         return None
-    text = (done.stdout or done.stderr or "").strip()
+    text = winbridge.decode(done.stdout or done.stderr or b"").strip()
     match = re.search(r"\d+\.\d+\.\d+", text)
     return match.group(0) if match else None
 
@@ -117,7 +142,8 @@ def latest() -> Release:
     """Read the published pointer. Raises with a usable message."""
     url = f"{DOWNLOAD_ORIGIN}/latest.json"
     try:
-        with urllib.request.urlopen(url, timeout=DOWNLOAD_TIMEOUT) as response:
+        with urllib.request.urlopen(_request(url),
+                                    timeout=DOWNLOAD_TIMEOUT) as response:
             payload = json.loads(response.read(64 * 1024).decode("utf-8"))
     except (urllib.error.URLError, ValueError, OSError) as exc:
         raise KernelInstallError(
@@ -144,7 +170,7 @@ def _download(release: Release, into: Path,
     digest = hashlib.sha256()
     written = 0
     try:
-        with urllib.request.urlopen(release.url,
+        with urllib.request.urlopen(_request(release.url),
                                     timeout=DOWNLOAD_TIMEOUT) as response:
             total = int(response.headers.get("Content-Length") or 0)
             if total and total > MAX_INSTALLER_BYTES:
@@ -212,7 +238,7 @@ def install(progress: Optional[Callable[[int, int], None]] = None,
 
     try:
         done = subprocess.run([str(installer), "/S"], capture_output=True,
-                              text=True, timeout=INSTALL_TIMEOUT, cwd="/")
+                              timeout=INSTALL_TIMEOUT, cwd="/")
     except subprocess.TimeoutExpired as exc:
         raise KernelInstallError(
             "the installer did not finish in ten minutes; run it yourself "
@@ -223,7 +249,7 @@ def install(progress: Optional[Callable[[int, int], None]] = None,
 
     exe = kernel_exe()
     if exe is None:
-        detail = (done.stderr or done.stdout or "").strip()[:400]
+        detail = winbridge.decode(done.stderr or done.stdout or b"").strip()[:400]
         raise KernelInstallError(
             "the installer ran but the kernel is not where it should be"
             + (f": {detail}" if detail else "")
@@ -284,10 +310,12 @@ def running() -> bool:
     try:
         done = subprocess.run(
             ["tasklist.exe", "/FI", f"IMAGENAME eq {KERNEL_EXE}", "/NH"],
-            capture_output=True, text=True, timeout=30, cwd="/")
+            capture_output=True, timeout=30, cwd="/")
     except (OSError, subprocess.SubprocessError):
         return False
-    return KERNEL_EXE.lower() in (done.stdout or "").lower()
+    # "no tasks match" is a localised sentence in the OEM code page, which is
+    # why this decodes defensively and then only looks for an ASCII name.
+    return KERNEL_EXE.lower() in winbridge.decode(done.stdout or b"").lower()
 
 
 def stop() -> bool:
@@ -296,7 +324,7 @@ def stop() -> bool:
         return False
     try:
         subprocess.run(["taskkill.exe", "/IM", KERNEL_EXE, "/F"],
-                       capture_output=True, text=True, timeout=30, cwd="/")
+                       capture_output=True, timeout=30, cwd="/")
     except (OSError, subprocess.SubprocessError):
         return False
     return True

@@ -232,3 +232,90 @@ def test_status_is_readable_on_a_machine_with_none_of_this(monkeypatch):
     assert state["wsl"] is False
     assert state["installed"] is False
     assert state["connected"] is False
+
+
+# -- what the first real Windows run taught -------------------------------
+
+def test_windows_console_output_does_not_crash_the_status(monkeypatch):
+    """A Chinese Windows answers `tasklist` with GBK bytes.
+
+    `信息: 没有运行的任务…` begins with 0xD0, so decoding it as UTF-8 raised
+    and `/windows status` reported a codec error instead of a status. The
+    only thing being looked for in that output is an ASCII process name.
+    """
+    gbk = "信息: 没有运行的任务匹配指定标准。".encode("gbk")
+    assert gbk[0] == 0xD0
+
+    class Done:
+        stdout = gbk
+        stderr = b""
+
+    monkeypatch.setattr(winbridge, "in_wsl", lambda: True)
+    monkeypatch.setattr(windows_kernel.subprocess, "run",
+                        lambda *a, **k: Done())
+    assert windows_kernel.running() is False
+
+
+def test_decode_never_raises_on_any_byte():
+    assert winbridge.decode(b"") == ""
+    assert winbridge.decode(b"plain ascii") == "plain ascii"
+    assert winbridge.decode("信息".encode("gbk"))  # no exception
+    assert winbridge.decode(bytes(range(256)))    # no exception
+
+
+def test_the_localappdata_lookup_asks_windows_for_utf8(monkeypatch):
+    """The one interop call whose content must survive intact.
+
+    A replaced character in the path points at a directory that does not
+    exist, so this call switches the console to UTF-8 rather than decoding
+    defensively.
+    """
+    seen = {}
+
+    def fake_run(argv, **kwargs):
+        seen["argv"] = argv
+
+        class Done:
+            stdout = b"C:\\Users\\lin7c\\AppData\\Local\n"
+        return Done()
+
+    monkeypatch.setattr(winbridge.subprocess, "run", fake_run)
+    monkeypatch.setattr(winbridge, "in_wsl", lambda: True)
+    monkeypatch.setattr(winbridge, "to_wsl_path", lambda p: Path("/mnt/c/x"))
+    winbridge.reset_cache()
+    try:
+        assert winbridge.localappdata() == Path("/mnt/c/x")
+    finally:
+        winbridge.reset_cache()
+    assert "chcp 65001" in " ".join(seen["argv"])
+
+
+def test_downloads_do_not_go_out_as_python_urllib():
+    """The CDN in front of the download host answers that UA with 403.
+
+    It looked exactly like the file being missing, which is the reason this
+    is pinned rather than left to whatever urllib defaults to.
+    """
+    request = windows_kernel._request("https://example.test/latest.json")
+    agent = request.get_header("User-agent")
+    assert agent
+    assert "urllib" not in agent.lower()
+    assert agent.startswith("laintas-cli/")
+
+
+def test_every_download_request_carries_that_agent(served, monkeypatch):
+    publish(served)
+    agents = []
+    real = windows_kernel.urllib.request.urlopen
+
+    def spy(req, *args, **kwargs):
+        agents.append(req.get_header("User-agent"))
+        return real(req, *args, **kwargs)
+
+    monkeypatch.setattr(windows_kernel.urllib.request, "urlopen", spy)
+    release = windows_kernel.latest()
+    into = served.parent / "dl"
+    into.mkdir()
+    windows_kernel._download(release, into, None)
+    assert len(agents) == 2, "both the listing and the installer"
+    assert all(a and a.startswith("laintas-cli/") for a in agents)
