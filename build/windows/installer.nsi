@@ -8,6 +8,7 @@ ManifestDPIAware true
 !include "MUI2.nsh"
 !include "FileFunc.nsh"
 !include "LogicLib.nsh"
+!include "TextFunc.nsh"
 
 !ifndef APP_VERSION
   !define APP_VERSION "0.0.0"
