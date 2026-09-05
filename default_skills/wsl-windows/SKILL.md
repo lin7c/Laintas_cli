@@ -1,7 +1,7 @@
 ---
 name: wsl-windows
 description: Working on a Windows machine from inside the private WSL distribution the Windows build runs in.
-version: 1.2.0
+version: 1.3.0
 triggers:
   - windows
   - wsl
@@ -16,13 +16,6 @@ triggers:
   - npm install
   - path translation
   - explorer
-  - clipboard
-  - wechat
-  - qq
-  - desktop app
-  - click a button
-  - screenshot
-  - automate an application
 ---
 
 # Windows, Through WSL
@@ -174,55 +167,14 @@ blast radius is one disposable rootfs that the installer can rebuild.
 
 Everything above is about reaching Windows *files and programs* from this
 Linux side. Reaching its **running applications** -- clicking a button in a
-desktop app, reading what is on screen -- is a different mechanism entirely,
-and it only exists when `helpwo-kernel.exe` is running on the Windows side
-with the machine tiers switched on.
+desktop app, reading what is on screen -- is a different mechanism entirely.
+It exists only while `helpwo-kernel.exe` is running on the Windows side with a
+machine tier switched on, and it has its own skill: **`windows-machine`**.
 
-You can tell without asking: if the `win.*` tools are in your tool list, a
-kernel is connected and the tier is on. **If they are not there, the
-capability is off** -- say so and tell the user to start the kernel with
+You can tell whether it is available without asking: if the `win.*` tools are
+in your tool list, a kernel is connected and the tier is on, and the
+`windows-machine` skill is offered alongside them. **If they are not there,
+the capability is off** -- say so, and tell the user to start the kernel with
 `--allow-machine-read` (to look) or `--allow-machine-write` (to act). Do not
-try to substitute a PowerShell script that drives the UI; that is the thing
-those switches exist to gate.
-
-### Always try `win.snapshot` before `win.screenshot`
-
-They are not two ways to do the same thing.
-
-- `win.snapshot` reads the accessibility tree and hands back **named,
-  addressable controls**. Acting on one with `win.invoke` calls the control's
-  own method: no pointer moves, no focus is taken, and the user can keep
-  typing in another window while it happens. It costs one cheap round trip.
-- `win.screenshot` gives you a picture, which you then have to spend an
-  `image.describe` or `image.to_text` call to read, and acting on it means
-  `win.click` at coordinates -- the real mouse, taken away from whoever is
-  sitting at the machine. **Every look is a separate model call and a
-  separate charge.** A twenty-step task done this way is twenty of them.
-
-So: snapshot, invoke, set_value. Fall to the pixel path only when snapshot
-tells you to.
-
-### When snapshot comes back empty
-
-A result with `opaque: true` means the window draws its own interface -- its
-buttons and text are pixels in video memory with no controls behind them, so
-there is nothing for the tree to report. This is normal for some
-applications, most visibly WeChat 4.x and QQ NT. It is **not** a failure to
-retry, and taking another snapshot will return the same thing.
-
-Two honest responses, in order:
-
-1. Fall back to `win.screenshot` plus `win.click`, and tell the user you are
-   doing it and why -- it is slower and costs more per step, and they should
-   get to decide whether the task is worth that.
-2. If the task is really "send a message" or "read my chats", say plainly
-   that driving a messaging client by automation carries a real risk to the
-   user's account, and let them choose. Never reach for a hooking library or
-   a protocol client to get around it.
-
-### The pointer is shared
-
-`win.click`, `win.type` and `win.key` use the one real mouse and keyboard. If
-the user is at the machine, they will see it happen and their own typing will
-land in the wrong place. Prefer the tree; when you cannot, keep the run short
-and say what you are about to do.
+substitute a PowerShell script that drives the UI; that is the thing those
+switches exist to gate.

@@ -352,6 +352,12 @@ class SkillMetadata:
     name: str
     description: str = ""
     trigger_patterns: list[str] = field(default_factory=list)
+    #: A tool that must be registered right now for this skill to be worth
+    #: offering. Capabilities that come and go with a piece of hardware or a
+    #: second process — the Windows kernel is the first — otherwise sit in
+    #: every prompt on every machine describing something that is not there.
+    #: Empty means unconditional, which is almost every skill.
+    requires_tool: str = ""
     version: str = ""
     dir_path: str = ""
     managed_by: str = ""              # e.g. "org" — see MANAGED_MARKER
@@ -493,6 +499,7 @@ def _parse_skill_md(skill_dir: Path) -> tuple[SkillMetadata, str]:
         name=meta.get("name", name),
         description=meta.get("description", ""),
         trigger_patterns=triggers,
+        requires_tool=str(meta.get("requires_tool", "") or "").strip(),
         version=meta.get("version", ""),
         dir_path=str(skill_dir),
         status=status,
@@ -922,6 +929,25 @@ def get_activated_skills_context() -> str:
     return "\n\n".join(parts) if parts else ""
 
 
+def skill_is_available(meta: "SkillMetadata") -> bool:
+    """Whether this skill describes something that exists right now.
+
+    A skill about driving Windows applications is instructions for tools that
+    only appear while `helpwo-kernel.exe` is connected with a machine tier on.
+    Listing it the rest of the time spends prompt on a capability the model
+    cannot reach, and — worse than the cost — invites it to plan around one.
+    """
+    if not meta.requires_tool:
+        return True
+    try:
+        from tools import get_registry
+        return get_registry().get(meta.requires_tool) is not None
+    except Exception:
+        # A registry that cannot be consulted is not evidence of absence, and
+        # hiding a skill on an import error would be a silent capability loss.
+        return True
+
+
 def describe_skills_for_prompt() -> str:
     """Render a compact skill catalog for the system prompt.
 
@@ -934,6 +960,8 @@ def describe_skills_for_prompt() -> str:
 
     lines = ["Available skills. Load a relevant skill with `skill.load` before relying on its instructions:"]
     for name, meta in sorted(_skill_metadata.items()):
+        if not skill_is_available(meta):
+            continue
         state = _skill_states.get(name)
         status = "loaded" if (state and state.loaded) else "available"
         desc = meta.description[:100] if meta.description else "(no description)"

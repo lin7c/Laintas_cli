@@ -250,8 +250,16 @@ def run_exec(body: dict, sse: SseWriter, resolve_cwd, agent_id: Optional[str] = 
         if needs_approval:
             destructive = bool(_policy.is_delete_command(cmd)
                                or _policy.is_destructive_git_command(cmd))
+            # Carry the rule's own words. When the approval came from a
+            # policy match the reason is the content of the question — the
+            # credential tier stops commands that look entirely ordinary
+            # until you are told which rule matched. When approval is on
+            # because the user asked for it on every command, there is no
+            # rule and nothing to add.
+            reason = (decision.reason or "") if decision.action == "needs_approval" else ""
             if not sse.event({"t": "approval", "reqId": req_id, "cmd": cmd,
-                              "cwd": cwd, "destructive": destructive}):
+                              "cwd": cwd, "destructive": destructive,
+                              "reason": reason}):
                 return
             if not req.approval.wait(timeout=APPROVAL_TIMEOUT):
                 sse.event({"t": "final", "status": "aborted",
