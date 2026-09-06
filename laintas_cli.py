@@ -22202,6 +22202,9 @@ def get_loop_deps() -> LoopDeps:
 
 #: Name of the colleague every session starts with. Undeployed: it exists so
 #: the prompt's agent slot has a second value, not because it has work.
+#: The two colleagues every session starts with. Undeployed: they exist so
+#: the prompt's agent slot has somewhere to switch to, and each has one
+#: speciality the primary deliberately does not.
 DEFAULT_SUB_AGENT_NAME = "scout"
 
 #: What `scout` is for. Written onto the agent only when it has no prompt of
@@ -22231,6 +22234,38 @@ working on afterwards. That shapes what a good result looks like:
 - Report what you did not do. Scope you left out, a test you could not run, a
   bug you found and deliberately did not fix — those belong in the answer, not
   in the next person's afternoon.
+"""
+
+#: The third colleague. `scout` works one job carefully; this one is given
+#: work that may not be one job at all, and its whole contribution is deciding
+#: that honestly and then owning what comes back.
+#:
+#: Short for the same reason scout's is: the how-to-work half lives in the
+#: decomposition branch (branches.DECOMPOSITION_TREE), which is chosen per
+#: request and names the tools that carry it out. Repeating "write a .hwo, bind
+#: them in a .hwg" here would be a second copy to keep in agreement.
+DECOMPOSER_SUB_AGENT_NAME = "foreman"
+FOREMAN_PROFILE_TITLE = "Work Divider"
+FOREMAN_PROFILE_DESCRIPTION = (
+    "Given work that may divide: decides whether it actually does, runs the "
+    "parts that can run at once, and answers for the joined result")
+FOREMAN_PROFILE_PROMPT = """\
+You are given work that may divide into parts that can run at the same time.
+Deciding whether it really does is the job, and the honest answer is usually
+that it does not.
+
+- A split you cannot justify costs more than doing it in order. Parts that
+  need the same files, or where one is only waiting on another's answer, are
+  one part — saying so is the right result, not a failure to find work to
+  parallelise.
+- You answer for the joined result, not for the parts. Whatever each part
+  reports, the thing that was asked for either works or it does not, and
+  establishing which is yours.
+- A part's result you have not looked at is a claim. Read what it actually
+  changed before you carry it into your answer.
+- Say which parts ran and what each one produced, including any that came
+  back with nothing. A part that quietly did no work is the failure this
+  shape hides best.
 """
 
 _LOGO_LINES = [
@@ -24604,42 +24639,59 @@ def main():
 
         # A registry with exactly one agent in it makes the prompt's agent
         # slot a control with nothing to control: Alt+select it and there is
-        # no second value to cycle to. Every session therefore starts with one
-        # colleague already registered — undeployed, holding no terminal
-        # lease, costing nothing until it is actually addressed. Switching to
-        # it (Alt+select the agent slot, or /agent scout) gives it its own
+        # no second value to cycle to. Every session therefore starts with two
+        # colleagues already registered — both undeployed, holding no terminal
+        # lease, costing nothing until one is actually addressed. Switching to
+        # one (Alt+select the agent slot, or /agent <name>) gives it its own
         # conversation and its own state; /hire adds more.
+        #
+        # They differ in what they are given, not in what they may do: `scout`
+        # works one job carefully, `foreman` is asked whether the request is
+        # one job at all (see split_agents / branch_agents in agent_loop).
         if args.depth == 0:
-            try:
-                _scout = get_agent(DEFAULT_SUB_AGENT_NAME)
-                if _scout is None:
-                    _scout = register_agent(
-                        name=DEFAULT_SUB_AGENT_NAME, depth=0,
-                        parent_id=primary.id, role="pool",
-                        load_existing=True)
+            def _ensure_default_agent(name, title, description, prompt):
+                """Register one always-present colleague, undeployed."""
+                agent = get_agent(name)
+                if agent is None:
+                    agent = register_agent(
+                        name=name, depth=0, parent_id=primary.id,
+                        role="pool", load_existing=True)
                 # Undeployed by definition: a restored copy must not come back
                 # holding a terminal lease it was never re-granted.
-                _scout.deployment_terminal = None
-                _scout.stationed_terminal = None
+                agent.deployment_terminal = None
+                agent.stationed_terminal = None
                 # Give it its speciality only if it has none. A restored copy
                 # with an edited prompt keeps it.
-                if not str(getattr(_scout.profile, "prompt", "") or "").strip():
-                    _scout.profile.title = SCOUT_PROFILE_TITLE
-                    _scout.profile.description = SCOUT_PROFILE_DESCRIPTION
-                    _scout.profile.prompt = SCOUT_PROFILE_PROMPT
+                if not str(getattr(agent.profile, "prompt", "") or "").strip():
+                    agent.profile.title = title
+                    agent.profile.description = description
+                    agent.profile.prompt = prompt
+                return agent
+
+            try:
+                _ensure_default_agent(
+                    DEFAULT_SUB_AGENT_NAME, SCOUT_PROFILE_TITLE,
+                    SCOUT_PROFILE_DESCRIPTION, SCOUT_PROFILE_PROMPT)
+                _ensure_default_agent(
+                    DECOMPOSER_SUB_AGENT_NAME, FOREMAN_PROFILE_TITLE,
+                    FOREMAN_PROFILE_DESCRIPTION, FOREMAN_PROFILE_PROMPT)
                 startup_mail.post(
                     "default-sub-agent",
-                    f"'{DEFAULT_SUB_AGENT_NAME}' is registered and undeployed",
-                    "A second agent so the prompt's agent slot has somewhere "
-                    "to switch to. It owns no terminal and does nothing until "
-                    "you address it.",
+                    f"'{DEFAULT_SUB_AGENT_NAME}' and "
+                    f"'{DECOMPOSER_SUB_AGENT_NAME}' are registered and undeployed",
+                    f"{DEFAULT_SUB_AGENT_NAME} works one job carefully. "
+                    f"{DECOMPOSER_SUB_AGENT_NAME} is the one to give work that "
+                    "may divide: it is asked whether the request splits into "
+                    "parts that can run at once, and builds a workflow graph "
+                    "when it does. Neither owns a terminal or does anything "
+                    "until you address it.",
                     action=(f"Alt+1 selects the agent slot — then up/down "
-                            f"and Enter — or /agent {DEFAULT_SUB_AGENT_NAME}"))
-            except Exception as _scout_exc:
+                            f"and Enter — or /agent {DECOMPOSER_SUB_AGENT_NAME}"))
+            except Exception as _default_agent_exc:
                 startup_mail.post(
                     "default-sub-agent",
-                    "Could not register the default sub-agent",
-                    str(_scout_exc), level="warn")
+                    "Could not register the default sub-agents",
+                    str(_default_agent_exc), level="warn")
 
             # Come back to whichever agent this terminal was last using.
             # Deliberately after every agent is registered: a remembered id

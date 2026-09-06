@@ -667,9 +667,10 @@ class BranchTests(IntentLoopTestCase):
         self._tmp_home.cleanup()
         super().tearDown()
 
-    def _spec_reply(self, path):
+    def _spec_reply(self, path, split=()):
         payload = json.loads(SPEC_REPLY)
         payload["branch_path"] = list(path)
+        payload["split_path"] = list(split)
         return json.dumps(payload, ensure_ascii=False)
 
     def test_the_path_pins_guidance_from_every_node_it_passed(self):
@@ -715,14 +716,58 @@ class BranchTests(IntentLoopTestCase):
         for prompt in self.prompts():
             self.assertNotIn("<task_branch", prompt)
 
-    def test_a_disabled_agent_is_not_asked_to_walk_the_tree(self):
+    def _intent_body(self) -> str:
+        asked = [c for c in self.calls if c.get("task_kind") == "intent"]
+        self.assertTrue(asked)
+        return "".join(str(m.get("content") or "")
+                       for m in asked[0].get("messages") or [])
+
+    def test_a_disabled_agent_is_not_asked_to_walk_the_task_tree(self):
         # Asking a model to place a request whose answer is then discarded is
         # a paragraph of prompt for nothing.
         self.config = {"critic_enabled": False}
         self.run_loop(loops=3, agent_id="primary")
-        asked = [c for c in self.calls if c.get("task_kind") == "intent"]
-        self.assertTrue(asked)
-        self.assertNotIn("DECISION TREE", str(asked[0].get("messages")))
+        body = self._intent_body()
+        self.assertNotIn('"refactor"', body)
+        self.assertNotIn("branch_path", body)
+
+    def test_the_primary_is_not_asked_to_weigh_parallelism_either(self):
+        # Same rule as the task tree, for the same reason: the agent you talk
+        # to all day should not be pricing a split on every sentence.
+        self.config = {"critic_enabled": False}     # defaults: scout, foreman
+        self.run_loop(loops=3, agent_id="primary")
+        self.assertNotIn("split_path", self._intent_body())
+
+    def test_the_agent_whose_job_it_is_gets_asked(self):
+        self.config = {"critic_enabled": False, "split_agents": "primary"}
+        self.run_loop(loops=3, agent_id="primary")
+        body = self._intent_body()
+        self.assertIn("split_path", body)
+        self.assertIn('"split"', body)
+
+    def test_a_request_that_does_not_divide_pins_nothing(self):
+        self.config = {"critic_enabled": False, "split_agents": "primary"}
+        self.intent_replies = [self._spec_reply([], split=["single"])] * 2
+        self.run_loop(loops=3, agent_id="primary")
+        for prompt in self.prompts():
+            self.assertNotIn("<task_split", prompt)
+
+    def test_a_request_that_divides_is_told_to_build_the_graph(self):
+        self.config = {"critic_enabled": False, "split_agents": "primary"}
+        self.intent_replies = [self._spec_reply([], split=["split"])] * 2
+        self.run_loop(loops=3, agent_id="primary")
+        pinned = [p for p in self.prompts() if "<task_split" in p]
+        self.assertTrue(pinned, "a split request must pin the graph guidance")
+        self.assertIn(".hwg", pinned[0])
+
+    def test_an_unenabled_agents_answer_is_discarded(self):
+        """A stale or hand-written split_path must not pin guidance to an
+        agent the setting does not name."""
+        self.config = {"critic_enabled": False}     # primary not named
+        self.intent_replies = [self._spec_reply([], split=["split"])] * 2
+        self.run_loop(loops=3, agent_id="primary")
+        for prompt in self.prompts():
+            self.assertNotIn("<task_split", prompt)
 
     def test_an_enabled_agent_is_given_the_tree(self):
         self.config = {"critic_enabled": False, "branch_agents": "*"}

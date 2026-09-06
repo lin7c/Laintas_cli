@@ -111,14 +111,15 @@ SELF_ASK_SYSTEM = (
     "3. Prefer few, sharp requirements over many vague ones.\n"
     "4. Keep the requester's own language for `goal`, `text` and `anchor`. "
     "Anchors are compared literally against the request.\n"
-    "5. If a DECISION TREE is given below, walk it and report the ids of the "
-    "nodes you passed through in `branch_path`, outermost first. Choose from "
-    "the ids offered at each step and nowhere else. Report an empty list when "
-    "the request does not fit: a wrong placement is worse than none, because "
-    "it is followed with confidence. When no tree is given, report an empty "
-    "list.\n\n"
+    "5. Each DECISION TREE given below names the field to report it in. "
+    "Walk it and report the ids of the nodes you passed through in that "
+    "field, outermost first. Choose from the ids offered at each step and "
+    "nowhere else. Report an empty list when the request does not fit: a "
+    "wrong placement is worse than none, because it is followed with "
+    "confidence. A tree that is not given gets an empty list.\n\n"
     "Return ONLY a JSON object, no prose:\n"
     '{"goal": "one sentence", "branch_path": ["node-id", ...], '
+    '"split_path": ["node-id", ...], '
     '"requirements": [{"id": "R1", "text": "...", "anchor": "verbatim words"}], '
     '"out_of_scope": ["..."], "deliverables": ["..."], '
     '"open_questions": [{"id": "Q1", "q": "...", "needs": "user|evidence", '
@@ -284,6 +285,24 @@ def is_anchored(anchor: str, task: str) -> bool:
     return a in _norm(task)
 
 
+def _node_ids(raw) -> list:
+    """Plausible decision-tree node ids, in order. Shape only.
+
+    Which tree they belong to and whether they form a real path is
+    ``branches.walk``'s job — it is the only thing holding the tree.
+    """
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple)):
+        return []
+    ids = []
+    for item in list(raw)[:MAX_BRANCH_DEPTH]:
+        node_id = _line(item, 64)
+        if _BRANCH_ID_RE.match(node_id):
+            ids.append(node_id)
+    return ids
+
+
 def validate_spec(spec, task: str) -> dict:
     """Normalise a raw spec and drop everything not supported by the request.
 
@@ -295,7 +314,7 @@ def validate_spec(spec, task: str) -> dict:
     or off, so it is logged rather than discarded.
     """
     out = {
-        "goal": "", "branch_path": [], "branch_label": "",
+        "goal": "", "branch_path": [], "branch_label": "", "split_path": [],
         "requirements": [], "out_of_scope": [], "deliverables": [],
         "open_questions": [], "assumptions": [], "task_breakdown": [],
         "dropped_anchors": 0, "round": 0, "spec_version": 1,
@@ -304,16 +323,8 @@ def validate_spec(spec, task: str) -> dict:
         return out
 
     out["goal"] = _line(spec.get("goal"), 300)
-    # Shape only. Whether these ids form a real path is checked against the
-    # tree itself (branches.walk), which is the only thing that knows.
-    raw_path = spec.get("branch_path")
-    if isinstance(raw_path, str):
-        raw_path = [raw_path]
-    if isinstance(raw_path, (list, tuple)):
-        for item in list(raw_path)[:MAX_BRANCH_DEPTH]:
-            node_id = _line(item, 64)
-            if _BRANCH_ID_RE.match(node_id):
-                out["branch_path"].append(node_id)
+    for field in ("branch_path", "split_path"):
+        out[field] = _node_ids(spec.get(field))
 
     seen_ids = set()
     for index, item in enumerate(spec.get("requirements") or []):
@@ -395,9 +406,9 @@ def build_self_ask_messages(task: str, prior: Optional[dict] = None,
         parts.append(SELF_ASK_FOLLOWUP)
         parts.append("SPEC SO FAR:\n" + json.dumps(
             {k: prior.get(k) for k in (
-                "goal", "branch_path", "requirements", "out_of_scope",
-                "deliverables", "open_questions", "assumptions",
-                "task_breakdown")},
+                "goal", "branch_path", "split_path", "requirements",
+                "out_of_scope", "deliverables", "open_questions",
+                "assumptions", "task_breakdown")},
             ensure_ascii=False, indent=1))
     parts.append(f"Round {round_index}. Return the JSON object now.")
     return [{"role": "user", "content": "\n\n".join(parts)}]

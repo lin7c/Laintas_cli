@@ -212,6 +212,7 @@ _DEFAULT_CONFIG = {
     "intent_debate_rounds": 2,        # Rounds the agent may dispute the intent review before the question goes to the user (0 disables the argument entirely).
     "intent_escalate_to_user": True,   # True = an argument neither side can settle from the request stops and asks the user; unattended runs continue on a named assumption instead.
     "branch_agents": "scout",         # Comma-separated agent ids/names that get a task-kind workflow pinned into their prompt (see branches.py); "*" = all, empty = none. The primary is deliberately absent: a prescriptive workflow suits a specialist and not the agent you talk to all day.
+    "split_agents": "foreman",        # Agents asked whether the request divides into parts that can run at once (branches.DECOMPOSITION_TREE); "*" = all, empty = none. Same reasoning as branch_agents: the agent you talk to all day should not be weighing parallelism on every sentence.
     "enable_mouse": False,             # REPL input box: click-to-position the cursor. Off by default: terminal mouse reporting hijacks native drag-to-select of scrollback (Shift+drag is the only workaround), which costs more than click-to-position gains
     "confirm_direct_commands": False,  # False = commands the USER types directly at the REPL run like a normal terminal (no policy approval prompt, e.g. rm); True = subject direct commands to the same needs_approval prompt as AI-issued ones. Hard `deny` policy rules always apply regardless.
     "trigger_scan_interval": 0.5,      # seconds between trigger scanner sweeps
@@ -1040,6 +1041,7 @@ _RUNTIME_CONFIG_DESCRIPTIONS = {
     "intent_debate_rounds": "Rounds the agent may dispute the intent review before the question goes to the user (0 disables)",
     "intent_escalate_to_user": "Ask the user when an intent dispute cannot be settled from the request (unattended runs continue on a named assumption)",
     "branch_agents": "Agents that get a refactor/modify workflow pinned into their prompt (comma-separated ids or names, * for all, empty for none)",
+    "split_agents": "Agents asked whether a request divides into parts that can run at once, and told to build a workflow graph when it does (comma-separated ids or names, * for all, empty for none)",
     "confirm_direct_commands": "Ask for approval on commands YOU type directly at the REPL (False = run like a normal terminal; hard deny rules still apply)",
     "enable_mouse": "Enable mouse click-to-position in the REPL input box",
     "tool_output_fold": "Max lines of tool output shown before folding (first half + … + last half); 0 = suppress preview",
@@ -9921,16 +9923,37 @@ def run_agent_loop(
                 _int_tree_block = ""
                 try:
                     _int_agent = get_current_agent()
+                except Exception:
+                    _int_agent = None
+                _int_agent_id = _branch_agent_id(_int_agent, agent_id)
+                _int_agent_name = str(getattr(_int_agent, "name", "") or "")
+                try:
                     if branches.agent_enabled(
-                            _branch_agent_id(_int_agent, agent_id),
-                            str(getattr(_int_agent, "name", "") or ""),
+                            _int_agent_id, _int_agent_name,
                             str(get_runtime_config("branch_agents") or "")):
                         _int_tree_block = branches.render_questions(
                             branches.load_tree(),
-                            agent_id=_branch_agent_id(_int_agent, agent_id),
-                            agent_name=str(getattr(_int_agent, "name", "") or ""))
+                            agent_id=_int_agent_id,
+                            agent_name=_int_agent_name)
                 except Exception:
                     _int_tree_block = ""
+                # The shape question rides the same pass, and is put only to
+                # the agent whose job the answer is. Weighing parallelism on
+                # every sentence is the same paragraph-for-nothing the task
+                # tree avoids by naming its agents.
+                try:
+                    _split_questions = ""
+                    if branches.agent_enabled(
+                            _int_agent_id, _int_agent_name,
+                            str(get_runtime_config("split_agents") or "")):
+                        _split_questions = branches.render_questions(
+                            branches.decomposition_tree(), field="split_path")
+                    if _split_questions:
+                        _int_tree_block = "\n\n".join(
+                            part for part in (_int_tree_block, _split_questions)
+                            if part)
+                except Exception:
+                    pass
 
                 def _intent_worker(_task=original_input, _fn=_intent_llm_fn,
                                    _out=_intent_result,
@@ -10159,6 +10182,23 @@ def run_agent_loop(
                         _branch_nodes)
             except Exception:
                 _branch_section = ""
+            # "single" is the common answer and carries no guidance: a request
+            # that does not divide must read exactly like any other turn.
+            try:
+                _split_nodes = branches.select(
+                    (_intent_spec_now or {}).get("split_path") or [],
+                    agent_id=_branch_agent_id(current_agent, agent_id),
+                    agent_name=str(getattr(current_agent, "name", "") or ""),
+                    allowed=str(get_runtime_config("split_agents") or ""),
+                    tree=branches.decomposition_tree())
+                if any(node.guidance for node in _split_nodes):
+                    _branch_section = "\n\n".join(
+                        part for part in (
+                            _branch_section,
+                            branches.render(_split_nodes, tag="task_split"))
+                        if part)
+            except Exception:
+                pass
             _intent_section = intent.render_understanding(_intent_spec_now)
             system_prompt = (
                 system_prompt.rstrip() + "\n\n" + intent.HOOK_SECTION

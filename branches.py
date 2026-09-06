@@ -1,4 +1,4 @@
-"""The task decision tree — a few yes/no questions whose path selects a workflow.
+"""Decision trees — a few yes/no questions whose path selects a workflow.
 
 A refactor and a bug fix are not the same job at different sizes, and neither
 are "replace this with a library" and "restructure it in place". Given one set
@@ -33,6 +33,13 @@ Four things shape it:
     files is a tree whose shape you cannot see and whose links break on a
     rename. ``guidance`` accepts a string or a list of lines, since the awkward
     part of prose in JSON is the escaping, not the file.
+
+Two trees are shipped, walked by the same validator in the same pass. The task
+tree (``load_tree``) is user-owned and asks what kind of job this is. The
+decomposition tree (``decomposition_tree``) is runtime-owned and asks whether
+the request is one job at all; its guidance names the tools that carry the
+answer out, which is why it is not the user's to redefine. Each names the spec
+field it is reported in, so two paths can come back from one pass.
 
 Never raises: a malformed tree degrades to no branch, which is how the agent
 worked before this module existed.
@@ -275,6 +282,74 @@ DEFAULT_TREE = {
 }
 
 
+# ── The decomposition tree ────────────────────────────────────────────────
+# A second, much smaller tree, asked in the same pass and validated by the same
+# walk. It answers one question — does this request divide? — and the answer is
+# a decision about the SHAPE of the work, not about what kind of code it is, so
+# it cannot hang under DEFAULT_TREE's root without inheriting a meaning it does
+# not have.
+#
+# It is runtime-owned rather than user-owned (no branches.json equivalent),
+# because the "split" guidance names the tools that carry it out: a node id the
+# runtime does not expect is guidance nobody can act on.
+#
+# "single" carries NO guidance on purpose. Most requests do not divide, and a
+# turn that does not divide should read exactly like any other turn — the cost
+# of asking is the question, not a paragraph of advice about not needing one.
+
+DECOMPOSITION_TREE = {
+    "version": 1,
+    "root": "shape",
+    "nodes": {
+        "shape": {
+            "question": (
+                "Does this request divide into parts that can be worked on at "
+                "the same time and checked separately?"),
+            "children": ["split", "single"],
+        },
+        "single": {
+            "label": "Single",
+            "choice": (
+                "no — one line of work, or parts that need the same files, or "
+                "parts where one only waits on another"),
+        },
+        "split": {
+            "label": "Split",
+            "choice": (
+                "yes — two or more parts that touch different files, each with "
+                "a result that can be judged on its own"),
+            "guidance": [
+                "This request divides, so run it as a graph instead of doing",
+                "the parts one after another by hand.",
+                "",
+                "1. Write one `.hwo` per part: what it is given, what it must",
+                "   return (`out(...)`), and the steps to get there.",
+                "2. Write a `.hwg` binding them: parts that own different files",
+                "   fan out with `=>` and converge on a node declaring",
+                "   `{ join: \"all\" }`. Give the joining node the check that",
+                "   decides whether the whole thing worked.",
+                "3. Run it with the `hwg` tool.",
+                "",
+                "Load the hwo-workflows skill before authoring these if you",
+                "have not written one before — the grammar is small but it is",
+                "checked, and a graph that does not compile has told you",
+                "something before it costs a model call.",
+                "",
+                "**Two parts that need the same file are one part.** Concurrent",
+                "edits to one file is the failure this split exists to avoid.",
+                "",
+                "**A part that can only be judged together with another part is",
+                "not a part.** Fold it into the one it depends on rather than",
+                "giving the graph a branch whose result means nothing alone.",
+                "",
+                "If writing the graph shows the parts were not really separate,",
+                "say so and do the work directly. A graph is not the goal.",
+            ],
+        },
+    },
+}
+
+
 # ── Loading ───────────────────────────────────────────────────────────────
 
 def tree_path() -> Path:
@@ -293,7 +368,15 @@ def _text(value, limit: int = MAX_GUIDANCE_CHARS) -> str:
     return str(value or "").strip()[:limit]
 
 
-def _parse_tree(data) -> Tree:
+def parse_tree(data) -> Tree:
+    """Parse a decision tree from a dict, without reading the user's file.
+
+    The task tree is user-owned and reached through ``load_tree``. A tree the
+    runtime decides on is not the user's to redefine — its guidance names the
+    tools that carry the decision out, so a node id the runtime does not
+    expect is guidance nobody can act on. Same shape, same validated walk,
+    supplied by the caller.
+    """
     if not isinstance(data, dict):
         return Tree(problems=("the tree file is not an object",))
     raw_nodes = data.get("nodes")
@@ -366,20 +449,36 @@ def _parse_tree(data) -> Tree:
     return Tree(root=root, nodes=nodes, problems=tuple(problems))
 
 
+_DECOMPOSITION: Optional[Tree] = None
+
+
+def decomposition_tree() -> Tree:
+    """The shape question: does this request divide?
+
+    Parsed on first use and kept, without ``load_tree``'s lock: the input is a
+    module constant, so two threads racing here both build the same tree and
+    the loser's copy is simply discarded.
+    """
+    global _DECOMPOSITION
+    if _DECOMPOSITION is None:
+        _DECOMPOSITION = parse_tree(DECOMPOSITION_TREE)
+    return _DECOMPOSITION
+
+
 def load_tree() -> Tree:
     """The user's tree if there is one, otherwise the shipped default."""
     path = tree_path()
     try:
         raw = path.read_text(encoding="utf-8")
     except (OSError, UnicodeError):
-        return _parse_tree(DEFAULT_TREE)
+        return parse_tree(DEFAULT_TREE)
     try:
         data = json.loads(raw)
     except ValueError as exc:
         # Falling back to the default would hide the mistake and quietly give
         # the user someone else's workflow; an unusable tree means no branch.
         return Tree(problems=(f"{path}: invalid JSON ({exc})",))
-    parsed = _parse_tree(data)
+    parsed = parse_tree(data)
     if not parsed.usable:
         return parsed
     return parsed
@@ -409,7 +508,7 @@ def write_default_tree() -> Optional[Path]:
 # ── Walking ───────────────────────────────────────────────────────────────
 
 def render_questions(tree: Tree, *, agent_id: str = "",
-                     agent_name: str = "") -> str:
+                     agent_name: str = "", field: str = "branch_path") -> str:
     """The tree as the intent pass sees it: ids, questions, and what each means.
 
     Ids rather than yes/no, because the walk is validated step by step against
@@ -438,7 +537,7 @@ def render_questions(tree: Tree, *, agent_id: str = "",
     if not lines:
         return ""
     return ("DECISION TREE — walk it and report the ids of the nodes you pass "
-            "through, in order, as `branch_path`. Stop at the node that asks "
+            f"through, in order, as `{field}`. Stop at the node that asks "
             "no further question. Report an empty list if the request does not "
             "fit the tree; a wrong path is worse than none, because it is "
             "followed with confidence.\n" + "\n".join(lines))
@@ -497,7 +596,7 @@ def path_label(reached) -> str:
     return " → ".join(node.label for node in reached if node.label)
 
 
-def render(reached) -> str:
+def render(reached, *, tag: str = "task_branch") -> str:
     """The system-prompt section: the decisions, then their accumulated advice.
 
     The path is rendered even when the guidance under it is thin. "This is a
@@ -512,7 +611,7 @@ def render(reached) -> str:
     body = "\n\n".join(node.guidance for node in reached if node.guidance)
     if not body:
         body = "No further guidance for this path; work the way it implies."
-    return (f'<task_branch path="{label}">\n{body}\n</task_branch>')
+    return (f'<{tag} path="{label}">\n{body}\n</{tag}>')
 
 
 def select(path, *, agent_id: str = "", agent_name: str = "",
