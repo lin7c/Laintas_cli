@@ -929,3 +929,115 @@ def test_tool_nodes_are_refused_by_name(tmp_path, monkeypatch):
     assert result["ok"] is False
     assert "#render#" in result["msg"]
     assert "only Helpwo executes" in result["msg"]
+
+
+class HwgInterruptTests(unittest.TestCase):
+    """Esc must reach a running graph.
+
+    An hwg(action="run") call blocks the agent loop, and the loop is where Esc
+    is normally noticed. Without the caller's event reaching the runner, a long
+    graph — and every agent and command inside it — was deaf to the interrupt
+    until it finished on its own.
+    """
+
+    def test_a_set_event_stops_the_graph_before_any_node_runs(self):
+        with tempfile.TemporaryDirectory() as tmp, _Chdir(tmp):
+            Path("flow.hwg").write_text(
+                "(a.hwo)#a#\n(b.hwo)#b#\n#a# -> #b#\n", encoding="utf-8")
+            abort = threading.Event()
+            abort.set()
+            with mock.patch.object(hwg_runner.hwo_runner, "run_hwo_file") as run:
+                result = hwg_runner.run_hwg_file(
+                    "flow.hwg", deps=object(), session={}, abort_event=abort)
+            run.assert_not_called()
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result.get("cancelled"))
+        self.assertIn("interrupted", result["msg"])
+
+    def test_an_interrupted_run_is_left_resumable(self):
+        with tempfile.TemporaryDirectory() as tmp, _Chdir(tmp):
+            Path("flow.hwg").write_text(
+                "(a.hwo)#a#\n(b.hwo)#b#\n#a# -> #b#\n", encoding="utf-8")
+            abort = threading.Event()
+
+            def _first_node(*_args, **_kwargs):
+                # The user presses Esc while node #a# is running.
+                abort.set()
+                return {"ok": True, "msg": "done", "outputs": {}}
+
+            with mock.patch.object(hwg_runner.hwo_runner, "run_hwo_file",
+                                   side_effect=_first_node) as run:
+                result = hwg_runner.run_hwg_file(
+                    "flow.hwg", deps=object(), session={}, abort_event=abort)
+                # #b# was queued by #a#'s completion and must not have started.
+                self.assertEqual(1, run.call_count)
+
+            run_id = result["runId"]
+            saved = workflow_state.load_run(run_id)
+
+        self.assertTrue(result.get("cancelled"))
+        self.assertEqual("paused", saved["status"])
+        self.assertEqual(["b"], saved["ready"],
+                         "the outstanding node was lost, so resume would "
+                         "restart the graph instead of continuing it")
+
+    def test_a_node_already_running_is_cancelled(self):
+        with tempfile.TemporaryDirectory() as tmp, _Chdir(tmp):
+            Path("flow.hwg").write_text("(a.hwo)#a#\n", encoding="utf-8")
+            abort = threading.Event()
+            released = threading.Event()
+
+            def _slow_node(*_args, **kwargs):
+                # A node that never returns on its own, like a real workflow
+                # step waiting on a model. It watches the event it was handed.
+                node_abort = kwargs.get("abort_event")
+                for _ in range(200):
+                    if node_abort is not None and node_abort.is_set():
+                        released.set()
+                        return {"ok": False, "msg": "aborted"}
+                    time.sleep(0.02)
+                return {"ok": True, "msg": "never", "outputs": {}}
+
+            threading.Timer(0.3, abort.set).start()
+            with mock.patch.object(hwg_runner.hwo_runner, "run_hwo_file",
+                                   side_effect=_slow_node):
+                started = time.monotonic()
+                result = hwg_runner.run_hwg_file(
+                    "flow.hwg", deps=object(), session={}, abort_event=abort)
+                elapsed = time.monotonic() - started
+
+        self.assertTrue(released.is_set(),
+                        "the running node was never told to stop")
+        self.assertTrue(result.get("cancelled"), result)
+        self.assertLess(elapsed, 3.0,
+                        "the graph outlived the interrupt by too much")
+
+    def test_an_interrupted_run_actually_resumes(self):
+        with tempfile.TemporaryDirectory() as tmp, _Chdir(tmp):
+            Path("flow.hwg").write_text(
+                "(a.hwo)#a#\n(b.hwo)#b#\n#a# -> #b#\n", encoding="utf-8")
+            abort = threading.Event()
+            ran = []
+
+            def _node(*_args, **kwargs):
+                ran.append(kwargs.get("path"))
+                if len(ran) == 1:
+                    abort.set()          # Esc while #a# is running
+                return {"ok": True, "msg": "done", "outputs": {}}
+
+            with mock.patch.object(hwg_runner.hwo_runner, "run_hwo_file",
+                                   side_effect=_node):
+                first = hwg_runner.run_hwg_file(
+                    "flow.hwg", deps=object(), session={}, abort_event=abort)
+                self.assertTrue(first.get("cancelled"))
+
+                # The user resumes. The interrupt is over, so a fresh event.
+                second = hwg_runner.resume_hwg_run(
+                    first["runId"], deps=object(), session={},
+                    abort_event=threading.Event())
+
+        self.assertTrue(second["ok"], second)
+        # #a# had already delivered when the interrupt was noticed, so the
+        # resume picks up at #b# rather than redoing finished work.
+        self.assertEqual(["a.hwo", "b.hwo"], ran)

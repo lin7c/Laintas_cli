@@ -474,7 +474,7 @@ def _cache_key(path: str, node: dict, inputs: dict, workspace: str = "") -> str:
 
 
 def _run_hwo_with_policy(node: dict, deps, session: dict, parent_id: Optional[str], inputs: dict,
-                         events_cb=None) -> dict:
+                         events_cb=None, abort_event=None) -> dict:
     policy = node.get("policy") or {}
     attempts = int(policy.get("retry") or 0) + 1
     timeout = _duration_seconds(policy.get("timeout"))
@@ -490,8 +490,14 @@ def _run_hwo_with_policy(node: dict, deps, session: dict, parent_id: Optional[st
 
     last = {"ok": False, "msg": "not run"}
     for attempt in range(1, max(1, attempts) + 1):
+        if abort_event is not None and abort_event.is_set():
+            return {"ok": False, "cancelled": True,
+                    "msg": f"HWG node #{node['id']}# cancelled before it started."}
         holder: dict = {}
-        abort_event = threading.Event()
+        # The node's own event fires on this node's timeout; the caller's
+        # fires on Esc. The node watches one event, so the two are bridged by
+        # a watcher below rather than by asking every callee to take two.
+        node_abort = threading.Event()
 
         def target():
             holder.update(hwo_runner.run_hwo_file(
@@ -500,16 +506,31 @@ def _run_hwo_with_policy(node: dict, deps, session: dict, parent_id: Optional[st
                 session=session,
                 parent_id=parent_id,
                 inputs=inputs,
-                abort_event=abort_event,
+                abort_event=node_abort,
                 events_cb=events_cb,
                 tool_scope=policy.get("tools"),
             ))
 
         t = threading.Thread(target=target, daemon=True, name=f"hwg-node-{node['id']}")
         t.start()
-        t.join(timeout=timeout)
+        # Poll rather than a single join(timeout): the caller's Esc has to
+        # reach the node while it is running, not only after its timeout.
+        _deadline = time.monotonic() + timeout if timeout else None
+        _cancelled = False
+        while t.is_alive():
+            if abort_event is not None and abort_event.is_set():
+                _cancelled = True
+                node_abort.set()
+                break
+            if _deadline is not None and time.monotonic() >= _deadline:
+                break
+            t.join(timeout=0.2)
+        if _cancelled:
+            t.join(timeout=2.0)
+            return {"ok": False, "cancelled": True,
+                    "msg": f"HWG node #{node['id']}# cancelled by the user."}
         if t.is_alive():
-            abort_event.set()
+            node_abort.set()
             t.join(timeout=2.0)
             last = {"ok": False, "msg": f"HWG node #{node['id']}# timed out after {timeout:g}s."}
             break
@@ -597,7 +618,16 @@ def _emit_run(run: dict, event_type: str, payload: dict, events_cb=None) -> dict
 
 def run_hwg_file(path: str, deps, session: dict, parent_id: Optional[str] = None,
                  inputs: Optional[dict] = None, resume_run: Optional[dict] = None,
-                 events_cb=None) -> dict:
+                 events_cb=None, abort_event=None) -> dict:
+    """Execute a .hwg graph.
+
+    ``abort_event`` is the caller's interrupt (Esc, or an aborted parent
+    Agent). It is checked at every frontier boundary and handed to each node,
+    so a graph stops on the same keystroke that stops an ordinary turn. Without
+    it a long graph was unstoppable: the tool call blocks the agent loop, so
+    the loop's own interrupt checkpoints are never reached until the graph
+    finishes on its own.
+    """
     statements, err = _read_and_validate(path)
     if err:
         return {"ok": False, "msg": err}
@@ -666,6 +696,23 @@ def run_hwg_file(path: str, deps, session: dict, parent_id: Optional[str] = None
     run.pop("pending", None)
 
     while ready:
+        # A user interrupt is honoured at frontier boundaries: nodes already
+        # running are cancelled inside _run_hwo_with_policy, and nothing new
+        # is launched. The run is left `paused` with its ready queue intact,
+        # so `hwg resume` picks up exactly where it stopped rather than
+        # restarting the graph.
+        if abort_event is not None and abort_event.is_set():
+            run["status"] = "paused"
+            run["ready"] = ready
+            run = workflow_state.checkpoint(run, "run_interrupted", {})
+            run = _emit_run(run, "workflow_paused", {"reason": "interrupted"},
+                            events_cb)
+            return {"ok": False, "cancelled": True,
+                    "msg": (f"HWG run {run['runId']} interrupted by the user "
+                            f"with {len(ready)} node(s) still queued. "
+                            f"Resume with hwg(action=\"resume\", "
+                            f"run_id=\"{run['runId']}\")."),
+                    "runId": run["runId"]}
         # Drain one frontier, capped to the same six-worker budget used by HWO
         # parallel blocks. Nodes added by routing below wait for the next
         # frontier, so no node can race an upstream value it consumes.
@@ -764,7 +811,8 @@ def run_hwg_file(path: str, deps, session: dict, parent_id: Optional[str] = None
             current, node_inputs = work[index]
             try:
                 results[index] = _run_hwo_with_policy(
-                    current, deps, session, parent_id, node_inputs, events_cb)
+                    current, deps, session, parent_id, node_inputs, events_cb,
+                    abort_event=abort_event)
             except Exception as exc:
                 results[index] = {
                     "ok": False,
@@ -789,6 +837,18 @@ def run_hwg_file(path: str, deps, session: dict, parent_id: Optional[str] = None
                 "ok": False,
                 "msg": f"HWG node #{current['id']}# returned no result.",
             }
+            if result.get("cancelled"):
+                # A node the user stopped is not a node that failed. Routing it
+                # like a failure would report "no edge said what a failure here
+                # means" — an authoring complaint about a graph that is fine —
+                # and would burn the node's retry budget on the way. Put it
+                # back on the queue so `hwg resume` re-runs it from the top.
+                _update_node_task(
+                    run, current["id"], "pending", None, None)
+                next_ready.insert(0, current["id"])
+                fatal = fatal or {
+                    "node": current["id"], "reason": "interrupted"}
+                continue
             if result.get("contractError"):
                 _update_node_task(
                     run, current["id"], "blocked", None, result.get("msg", ""))
@@ -841,6 +901,19 @@ def run_hwg_file(path: str, deps, session: dict, parent_id: Optional[str] = None
             else:
                 next_ready.extend(successors)
 
+        if fatal and fatal.get("reason") == "interrupted":
+            # Same ending as an interrupt caught at a frontier boundary: the
+            # run is paused and resumable, not failed.
+            run["status"] = "paused"
+            run["ready"] = next_ready + ready
+            run = workflow_state.checkpoint(run, "run_interrupted", fatal)
+            run = _emit_run(run, "workflow_paused",
+                            {"reason": "interrupted"}, events_cb)
+            return {"ok": False, "cancelled": True, "runId": run["runId"],
+                    "msg": (f"HWG run {run['runId']} interrupted by the user "
+                            f"while #{fatal['node']}# was running. Resume "
+                            f"with hwg(action=\"resume\", "
+                            f"run_id=\"{run['runId']}\").")}
         if fatal:
             run["status"] = "failed"
             event = ("output_contract_violated"
@@ -999,14 +1072,33 @@ def _choose_next(current: dict, outs: list, verdict: str, outputs: dict, run: di
 
 def resume_hwg_run(run_id: str, deps, session: dict, parent_id: Optional[str] = None,
                    verdict: str = "PASS", outputs: Optional[dict] = None,
-                   events_cb=None) -> dict:
+                   events_cb=None, abort_event=None) -> dict:
     run = workflow_state.load_run(run_id)
     if not run:
         return {"ok": False, "msg": f"HWG run not found: {run_id}"}
     if run.get("kind") != "hwg":
         return {"ok": False, "msg": f"Run {run_id} is not an HWG run."}
-    if run.get("status") != "paused" or not run.get("pendingInterrupt"):
+    if run.get("status") != "paused":
         return {"ok": False, "msg": f"HWG run {run_id} is not paused."}
+    if not run.get("pendingInterrupt"):
+        # Paused by the user (Esc), not by a manual node asking for a verdict.
+        # There is no verdict to apply and no node to route from — the ready
+        # queue saved at the interrupt IS the outstanding work, so hand it
+        # straight back to the executor. Without this branch every
+        # user-interrupted run was unresumable, and the message the interrupt
+        # printed was pointing at a command that would refuse it.
+        if not (run.get("ready") or []):
+            return {"ok": False, "msg": (
+                f"HWG run {run_id} was interrupted with no work outstanding; "
+                f"there is nothing to resume.")}
+        run["status"] = "running"
+        workflow_state.checkpoint(run, "interrupt_resumed", {
+            "ready": list(run.get("ready") or [])})
+        return run_hwg_file(
+            run["source"], deps, session, parent_id=parent_id,
+            inputs=run.get("inputs") or {}, resume_run=run,
+            events_cb=events_cb, abort_event=abort_event,
+        )
     node_id = run["pendingInterrupt"]["node"]
     node_outputs = dict(outputs or {})
     node_outputs.setdefault("verdict", verdict.upper())
@@ -1043,7 +1135,7 @@ def resume_hwg_run(run_id: str, deps, session: dict, parent_id: Optional[str] = 
     return run_hwg_file(
         run["source"], deps, session, parent_id=parent_id,
         inputs=run.get("inputs") or {}, resume_run=run,
-        events_cb=events_cb,
+        events_cb=events_cb, abort_event=abort_event,
     )
 
 

@@ -4986,6 +4986,26 @@ _status_cache: dict = {
 }
 
 
+# The thread running the turn the prompt is describing. A sub-agent runs its
+# own main loop on its own thread, often on a pinned model (#name@model#), and
+# it must not rename the prompt of the Agent the user is talking to.
+_foreground_run_thread: Optional[threading.Thread] = None
+
+
+def _is_foreground_turn(task_kind: str) -> bool:
+    """True when this backend call IS the turn the status line describes.
+
+    Two conditions, and both are needed. The kind separates the user's turn
+    from the auxiliary calls that share this transport (see the call site in
+    call_backend_stream); the thread separates the foreground Agent's turn
+    from a sub-agent's, which is a main_loop call too.
+    """
+    if str(task_kind or "") != "main_loop":
+        return False
+    return threading.current_thread() is (_foreground_run_thread
+                                          or threading.main_thread())
+
+
 def _update_status_cache(**kwargs) -> None:
     """Patch one or more fields in the module-level status cache."""
     _status_cache.update(kwargs)
@@ -8533,7 +8553,18 @@ def call_backend_stream(
         _effective_model = (selected_model if selected_model in ("auto", "")
                             else streamed_model if streamed_model not in ("", "auto")
                             else selected_model)
-        if _effective_model:
+        # ONLY the user's own turn may name the model on the prompt. Every
+        # auxiliary call goes through this same function on its own model —
+        # compaction, its review pass, intent routing, the critic, memory
+        # extraction, vision — and each of them used to write its model into
+        # the status cache. So the prompt would sit there reading
+        # "@cf/google/gemma-4-26b-a4b-it" (the vision family the gateway picked
+        # for one image the turn happened to look at) while every actual
+        # request went to the model the user had selected. Nothing reset it:
+        # the next main-loop call only overwrites it if it echoes a name, so a
+        # wrong label survived until the following turn — which is exactly why
+        # it looked intermittent.
+        if _effective_model and _is_foreground_turn(task_kind):
             _update_status_cache(model=_effective_model)
 
         raw_text = accumulated.strip()
@@ -22731,6 +22762,11 @@ def _parse_agent_target(text: str) -> tuple[str, str]:
 # queuing supplementary text working the way it did with readline().
 _bg_reader_thread: Optional[threading.Thread] = None
 _bg_reader_stop = threading.Event()
+# How long the reader keeps trying to take the terminal before it gives up and
+# tells the user Esc is unavailable. Long enough to outlast an approval prompt
+# that is still releasing, short enough that a genuinely stuck holder is
+# reported rather than waited on forever.
+_BG_READER_BUSY_RETRY_SECONDS = 30.0
 # (queue, interrupt_event) the live reader was started on — the pair the
 # running loop actually drains and checks. Restarts reuse it.
 _bg_reader_args: tuple = ()
@@ -22911,71 +22947,104 @@ def _bg_reader_cbreak_mode(target_queue: queue.Queue,
     # the key breaks the loop, the `with` releases the hold, and the view is
     # opened below.
     open_view = False
-    try:
-        with terminal_arbiter.hold("bg-input", TermMode.CBREAK,
-                                   timeout=2.0) as term:
-            if not term.interactive:
-                _bg_reader_line_mode(target_queue, stop)
+    # The hold can lose a race with a prompt that has not finished releasing
+    # the terminal. That used to end the reader for the rest of the turn —
+    # silently — so Esc did nothing at all and the user had no way to know.
+    # Keep trying while the stop event is clear, and say so if we give up.
+    # ``hold`` is a context manager: TerminalBusy comes out of __enter__, not
+    # out of the call, so entry is done by hand here to tell "could not take
+    # the terminal" (retry) apart from "lost it mid-read" (give up).
+    _busy_deadline = time.monotonic() + _BG_READER_BUSY_RETRY_SECONDS
+    _hold_cm = None
+    term = None
+    while True:
+        if stop.is_set():
+            return
+        _hold_cm = terminal_arbiter.hold("bg-input", TermMode.CBREAK,
+                                         timeout=2.0)
+        try:
+            term = _hold_cm.__enter__()
+        except TerminalBusy:
+            _hold_cm = None
+            if time.monotonic() >= _busy_deadline:
+                # Degrading to line mode would put a second reader back on
+                # fd 0 — the exact bug the arbiter exists to prevent — so
+                # give the escape hatch instead of a rival reader.
+                console.print(
+                    "\n[yellow]Esc is unavailable for this turn: another "
+                    "prompt is holding the terminal. Press Ctrl+C twice "
+                    "quickly to force exit.[/yellow]")
                 return
-            while not stop.is_set():
-                key = term.read_key(timeout=0.3)
-                if key is None:
-                    continue
+            if stop.wait(timeout=0.25):
+                return
+            continue
+        break
+    try:
+        # Entered above; released through __exit__ in the finally below.
+        if not term.interactive:
+            _bg_reader_line_mode(target_queue, stop)
+            return
+        while not stop.is_set():
+            key = term.read_key(timeout=0.3)
+            if key is None:
+                continue
 
-                if key.name == "eof":
-                    break
+            if key.name == "eof":
+                break
 
-                if key.name == "alt" and str(key.text or "").lower() == "a":
-                    _clear_visible_line()
-                    open_view = True
-                    break
+            if key.name == "alt" and str(key.text or "").lower() == "a":
+                _clear_visible_line()
+                open_view = True
+                break
 
-                if key.name == "escape":
-                    _clear_visible_line()
-                    if interrupt_event is not None:
-                        # Printed once per press, not once per press *plus*
-                        # once per key that followed it: a held Esc used to
-                        # repaint this whole paragraph down the screen.
-                        already_set = interrupt_event.is_set()
-                        interrupt_event.set()
-                        if not already_set:
-                            console.print(
-                                "\n[dim]Esc received - stopping. A tool "
-                                "already running finishes first; press "
-                                "Ctrl+C twice quickly to force exit "
-                                "now.[/dim]")
-                    else:
-                        _set_run_input_state("input_active")
-                    continue
+            if key.name == "escape":
+                _clear_visible_line()
+                if interrupt_event is not None:
+                    # Printed once per press, not once per press *plus*
+                    # once per key that followed it: a held Esc used to
+                    # repaint this whole paragraph down the screen.
+                    already_set = interrupt_event.is_set()
+                    interrupt_event.set()
+                    if not already_set:
+                        console.print(
+                            "\n[dim]Esc received - stopping. A tool "
+                            "already running finishes first; press "
+                            "Ctrl+C twice quickly to force exit "
+                            "now.[/dim]")
+                else:
+                    _set_run_input_state("input_active")
+                continue
 
-                if key.name == "enter":
-                    if buf:
-                        line = ''.join(buf)
-                        sys.stdout.write('\n')
-                        sys.stdout.flush()
-                        _clear_visible_line()
-                        _queue_supplementary(target_queue, line)
-                    continue
-
-                if key.name == "backspace":
-                    if buf:
-                        removed = buf.pop()
-                        cells = 2 if unicodedata.east_asian_width(removed) in ('W', 'F') else 1
-                        sys.stdout.write('\b \b' * cells)
-                        sys.stdout.flush()
-                    continue
-
-                if key.is_text:
-                    sys.stdout.write(key.text)
+            if key.name == "enter":
+                if buf:
+                    line = ''.join(buf)
+                    sys.stdout.write('\n')
                     sys.stdout.flush()
-                    buf.extend(key.text)
+                    _clear_visible_line()
+                    _queue_supplementary(target_queue, line)
+                continue
+
+            if key.name == "backspace":
+                if buf:
+                    removed = buf.pop()
+                    cells = 2 if unicodedata.east_asian_width(removed) in ('W', 'F') else 1
+                    sys.stdout.write('\b \b' * cells)
+                    sys.stdout.flush()
+                continue
+
+            if key.is_text:
+                sys.stdout.write(key.text)
+                sys.stdout.flush()
+                buf.extend(key.text)
     except TerminalBusy:
-        # Someone else legitimately owns the terminal (an approval prompt
-        # that outlived its stop signal, say). Degrading to line mode would
-        # put a second reader back on fd 0 — the exact bug this replaces —
-        # so stay silent instead; the run continues, only supplementary
-        # typing is unavailable until the next step.
+        # The hold succeeded and was then revoked mid-read. Nothing to
+        # reclaim from this thread; the run continues without a reader.
         return
+    finally:
+        try:
+            _hold_cm.__exit__(None, None, None)
+        except Exception:
+            pass
     if open_view:
         _open_agents_view_from_run()
 
@@ -23719,6 +23788,42 @@ def _repl_process_depth() -> int:
     return _REPL_PROCESS_DEPTH
 
 
+def _stop_run_descendants(active_agent, descendants_before) -> int:
+    """Abort every sub-agent this foreground run created. Returns how many.
+
+    Only descendants that appeared DURING the run are touched. An Agent that
+    was already deployed or working in the background before the turn started
+    is independent work and must survive; a root created by this turn cascades
+    to its own descendants through ``abort_agent``.
+
+    Called from two places that used to disagree: a crashed turn (which always
+    cleaned up) and an Esc interrupt (which never did, so the children of an
+    interrupted turn kept running, kept spending tokens, and kept holding
+    their PTYs long after the user had stopped the parent).
+    """
+    if active_agent is None:
+        return 0
+    stopped = 0
+    try:
+        import agent_loop as _agent_loop_mod
+        _new_descendants = (
+            _agent_loop_mod.agent_descendants(active_agent.id)
+            - set(descendants_before or ()))
+        for _child_id in list(_new_descendants):
+            _child = _agent_loop_mod.get_agent(_child_id)
+            # Roots only: abort_agent already cascades, so aborting a child
+            # whose parent is also in the set would do the same work twice.
+            if (_child is not None
+                    and _child.parent_id not in _new_descendants
+                    and _child.status in {
+                        "queued", "running", "thinking", "waiting"}):
+                if _agent_loop_mod.abort_agent(_child_id):
+                    stopped += 1
+    except Exception:
+        pass
+    return stopped
+
+
 def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
                                    chat_history, events_cb=None,
                                    existing_session=None,
@@ -23815,10 +23920,11 @@ def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
     # stays off Agent screens.
     repl_mirror.hub.start_recording()
     # What Alt+A needs to open the /agents view from the reader's thread.
-    global _repl_session, _foreground_run_active
+    global _repl_session, _foreground_run_active, _foreground_run_thread
     if isinstance(session, dict):
         _repl_session = session
     _foreground_run_active = True
+    _foreground_run_thread = threading.current_thread()
     response = None
     run_error = ""
 
@@ -23901,23 +24007,7 @@ def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
         _trace = traceback.format_exc()
 
         # Stop only descendants created during this failed foreground run.
-        # Pre-existing deployed/background Agents are independent work and
-        # must survive; newly-created roots cascade to their descendants.
-        if active_agent is not None:
-            try:
-                import agent_loop as _agent_loop_mod
-                _new_descendants = (
-                    _agent_loop_mod.agent_descendants(active_agent.id)
-                    - _descendants_before)
-                for _child_id in list(_new_descendants):
-                    _child = _agent_loop_mod.get_agent(_child_id)
-                    if (_child is not None
-                            and _child.parent_id not in _new_descendants
-                            and _child.status in {
-                                "queued", "running", "thinking", "waiting"}):
-                        _agent_loop_mod.abort_agent(_child_id)
-            except Exception:
-                pass
+        _stop_run_descendants(active_agent, _descendants_before)
 
         for _key in ("_active_tool", "_pending_history",
                      "_pending_tool_calls"):
@@ -23962,6 +24052,20 @@ def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
     finally:
         repl_mirror.hub.stop_recording()
         _foreground_run_active = False
+        _foreground_run_thread = None
+        # Esc stops the AGENT the user was talking to. Everything that turn
+        # started underneath it has to stop with it — a sub-agent runs on its
+        # own thread watching its OWN abort_event, which setting the parent's
+        # never touched. This runs before the event is cleared below, and
+        # before the reader is torn down, so an Esc pressed during teardown
+        # still lands.
+        if _interrupt_event.is_set():
+            _stopped = _stop_run_descendants(active_agent, _descendants_before)
+            if _stopped:
+                console.print(
+                    f"[dim]Stopped {_stopped} sub-agent"
+                    f"{'s' if _stopped != 1 else ''} started by this "
+                    f"turn.[/dim]")
         if primary_admitted and active_agent is not None:
             if isinstance(response, dict) and "session" in response:
                 active_agent.runtime_session = response.get("session")

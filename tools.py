@@ -4416,6 +4416,10 @@ def _bi_hwo(params: dict, ctx: ToolCtx) -> dict:
     if action == "compile":
         r = hwo_runner.compile_hwo_file(path)
     else:
+        # An HWO run blocks this tool call, which blocks the agent loop, which
+        # is where Esc is normally noticed. Without the caller's event the
+        # whole workflow — every agent it spawns, every command they run — was
+        # deaf to the interrupt until it finished on its own.
         r = hwo_runner.run_hwo_file(
             path=path,
             deps=ctx.deps,
@@ -4423,6 +4427,7 @@ def _bi_hwo(params: dict, ctx: ToolCtx) -> dict:
             parent_id=ctx.agent_id,
             inputs=params.get("inputs") if isinstance(params.get("inputs"), dict) else None,
             events_cb=ctx.events_cb,
+            abort_event=_ctx_abort_event(ctx),
         )
     out = {"ok": r.get("ok", False), "result": r.get("msg", "")}
     if r.get("outputs"):
@@ -4445,11 +4450,14 @@ def _bi_hwg(params: dict, ctx: ToolCtx) -> dict:
     if action == "compile":
         result = hwg_runner.compile_hwg_file(path)
     elif action == "run":
+        # See _bi_hwo: a graph run holds the agent loop, so it has to watch the
+        # caller's interrupt itself. It pauses on Esc and is resumable.
         result = hwg_runner.run_hwg_file(
             path, ctx.deps, ctx.session, parent_id=ctx.agent_id,
             inputs=(params.get("inputs")
                     if isinstance(params.get("inputs"), dict) else None),
             events_cb=ctx.events_cb,
+            abort_event=_ctx_abort_event(ctx),
         )
     elif action == "resume":
         result = hwg_runner.resume_hwg_run(
@@ -4458,6 +4466,7 @@ def _bi_hwg(params: dict, ctx: ToolCtx) -> dict:
             outputs=(params.get("outputs")
                      if isinstance(params.get("outputs"), dict) else None),
             events_cb=ctx.events_cb,
+            abort_event=_ctx_abort_event(ctx),
         )
     elif action == "status":
         result = hwg_runner.status(run_id or None)
@@ -7444,6 +7453,30 @@ def _browser_should_auto_snapshot() -> bool:
         return True
 
 
+def _ctx_abort_event(ctx: ToolCtx):
+    """The Event a tool should watch to notice the user stopping this turn.
+
+    Esc sets ``ctx.interrupt_event`` — the foreground Agent's own abort event
+    for a primary, the module-level user event otherwise. A sub-agent gets its
+    own ``abort_event`` instead, which is what ``abort_agent`` cascades onto.
+    Watching only one of the two is why several call sites used to ignore Esc
+    in exactly one of the two cases; prefer the caller's, fall back to the
+    owner's, and return None when neither exists.
+    """
+    ev = getattr(ctx, "interrupt_event", None)
+    if ev is not None:
+        return ev
+    agent_id = getattr(ctx, "agent_id", None)
+    if not agent_id:
+        return None
+    try:
+        import agent_loop as _al
+        owner = _al.get_agent(agent_id)
+    except Exception:
+        return None
+    return getattr(owner, "abort_event", None) if owner is not None else None
+
+
 def _check_tool_interrupt(ctx: ToolCtx) -> None:
     """Raise InterruptedError if the agent loop has signalled a soft interrupt.
 
@@ -7452,7 +7485,7 @@ def _check_tool_interrupt(ctx: ToolCtx) -> None:
     agent loop already catches tool exceptions and turns them into an ordinary
     {ok: False, error} result, so raising here is safe on every path.
     """
-    ev = getattr(ctx, "interrupt_event", None)
+    ev = _ctx_abort_event(ctx)
     if ev is not None and ev.is_set():
         raise InterruptedError("interrupted by user")
 
