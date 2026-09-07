@@ -77,33 +77,58 @@ REPEAT_STOP = 6
 #: Files tracked per agent (policy: file_read_retention.max_cached_files).
 MAX_TRACKED_FILES = 64
 
-#: Delivered bodies, keyed by (path, fingerprint, page). Process-local and
-#: deliberately NOT part of the agent's persisted state: it is a cache, and a
-#: cache in the resume file is just a bigger resume file. Serving a re-read
+#: Delivered bodies, keyed by (path, fingerprint, page, GEOMETRY). Process-local
+#: and deliberately NOT part of the agent's persisted state: it is a cache, and
+#: a cache in the resume file is just a bigger resume file. Serving a re-read
 #: from here is Helpwo's `tryServeCachedView` (AutonomousKernel.ts): it saves
 #: the disk round-trip and, more importantly, guarantees that one page number
 #: never yields two different bodies inside a turn.
-_BODY_CACHE: "dict[tuple, str]" = {}
+#:
+#: The geometry is load-bearing and was missing until 2026-09-07. A page number
+#: is NOT a property of the file: the page table is built per agent, from the
+#: context headroom that agent had when it first opened the file
+#: (`page_chars_for`), and frozen there. Measured on agent_loop.py: with 60k of
+#: headroom "page 2" is lines 255-807, with 400k it is lines 2540-5269. Keyed on
+#: the page number alone, a second agent was served the FIRST agent's bytes
+#: under its own line numbers — and those numbers are what a later `edit`
+#: anchors on. The key now carries the line span (plus the two render options
+#: that also change the bytes), so two agents with different page tables simply
+#: miss each other's entries instead of colliding.
+_BODY_CACHE: "dict[tuple, dict]" = {}
 _BODY_CACHE_LOCK = threading.Lock()
 MAX_CACHED_BODY_CHARS = 200_000
 MAX_CACHED_BODIES = 24
 
 
-def cache_body(path: str, fp: tuple, page: int, payload: dict) -> None:
-    """Remember one delivered page (body plus the counts that describe it)."""
+def _body_key(path: str, fp: tuple, page: int, geometry) -> tuple:
+    return (path, tuple(fp), int(page), tuple(geometry or ()))
+
+
+def cache_body(path: str, fp: tuple, page: int, payload: dict,
+               geometry=()) -> None:
+    """Remember one delivered page (body plus the counts that describe it).
+
+    `geometry` identifies what the body actually IS — the line span and the
+    render options that produced it — so a page number cached by one agent
+    cannot be read back by an agent whose page table says something else.
+    """
     body = (payload or {}).get("body") or ""
     if not body or len(body) > MAX_CACHED_BODY_CHARS:
         return
     with _BODY_CACHE_LOCK:
-        _BODY_CACHE[(path, tuple(fp), int(page))] = dict(payload)
+        _BODY_CACHE[_body_key(path, fp, page, geometry)] = dict(payload)
         while len(_BODY_CACHE) > MAX_CACHED_BODIES:
             _BODY_CACHE.pop(next(iter(_BODY_CACHE)), None)
 
 
-def cached_body(path: str, fp: tuple, page: int) -> dict:
-    """Exactly what was last delivered for this page of this file version."""
+def cached_body(path: str, fp: tuple, page: int, geometry=()) -> dict:
+    """Exactly what was last delivered for this page of this file version.
+
+    Empty when nothing was cached for this exact geometry — a miss costs one
+    disk read, while a false hit costs the caller its line numbers.
+    """
     with _BODY_CACHE_LOCK:
-        hit = _BODY_CACHE.get((path, tuple(fp), int(page)))
+        hit = _BODY_CACHE.get(_body_key(path, fp, page, geometry))
         return dict(hit) if hit else {}
 
 
@@ -496,8 +521,21 @@ def note_window(state: dict, path: str, start: int, end: int) -> int:
 
     0 = not a walk. 1 = it resumed where the last window ended. N = the Nth
     step of a walk down the same file.
+
+    Kept in its OWN store, not in the page table. Writing it into `_pager` put
+    an entry there with no `fp` and no `pages`, which made the next paged read
+    of that file look like a rebuild: `get_file_state` found a mismatched
+    fingerprint, set `repaged`, and the reader was told "file changed since it
+    was last read: pages recomputed" about a file nobody had touched. The walk
+    streak also died in that rebuild, so the one read pattern this is here to
+    notice went unnoticed as soon as the caller mixed the two modes.
     """
-    entry = _store(state).setdefault(path, {})
+    store = state.get("_pager_walk")
+    if not isinstance(store, dict):
+        store = {}
+        state["_pager_walk"] = store
+    entry = store.pop(path, None) or {}      # re-inserted below, so the dict
+    store[path] = entry                      # doubles as an LRU by key order
     last = entry.get("last_window")
     streak = int(entry.get("walk_streak") or 0)
     if last and abs(int(last[1]) + 1 - start) <= WALK_TOLERANCE_LINES:
@@ -506,7 +544,10 @@ def note_window(state: dict, path: str, start: int, end: int) -> int:
         streak = 0
     entry["last_window"] = [start, end]
     entry["walk_streak"] = streak
-    entry["seq"] = entry.get("seq") or 0
+    # Bounded like the page table: a walk record is two integers, but a session
+    # that touches thousands of files should not carry all of them forever.
+    while len(store) > MAX_TRACKED_FILES:
+        store.pop(next(iter(store)), None)
     return streak
 
 

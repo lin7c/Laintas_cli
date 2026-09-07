@@ -1677,6 +1677,44 @@ class EphemeralSessionTests(unittest.TestCase):
         self.assertEqual(third["new_output"], "")
         self.assertFalse(second["completed"])
 
+    def test_terminal_read_names_the_cursor_that_re_reads_a_skipped_burst(self):
+        """A burst larger than max_chars keeps the tail — and says so.
+
+        The cursor advances to the end either way, so without `resume_cursor`
+        the skipped middle is unreachable and unmentioned: a build whose only
+        compile error sat in it reads as a build that passed.
+        """
+        session = _FakeInteractiveSession("bash")
+        session.start()
+        session.full_output += "HEAD-MARKER\n" + ("x" * 5000) + "\nTAIL-MARKER\n"
+        terminal = mock.Mock(session=session)
+        ctx = tools.ToolCtx(
+            agent_id="reader", deps=_deps(),
+            get_terminal=lambda name: terminal)
+
+        result = tools._bi_terminal_read({"name": "term0", "max_chars": 200}, ctx)
+
+        self.assertTrue(result["truncated"])
+        self.assertGreater(result["dropped_chars"], 0)
+        self.assertIn("TAIL-MARKER", result["new_output"])
+        self.assertNotIn("HEAD-MARKER", result["new_output"])
+        self.assertIn(f"cursor={result['resume_cursor']}", result["result"])
+
+        # Reading from the named cursor walks FORWARD from it: the tail is what
+        # the caller already has, so a second tail would be no answer at all.
+        again = tools._bi_terminal_read(
+            {"name": "term0", "cursor": result["resume_cursor"],
+             "max_chars": 200}, ctx)
+        self.assertIn("HEAD-MARKER", again["new_output"])
+        self.assertNotIn("TAIL-MARKER", again["new_output"])
+        self.assertGreater(again["resume_cursor"], result["resume_cursor"])
+
+        # ...and it keeps walking rather than jumping back to the live end.
+        third = tools._bi_terminal_read(
+            {"name": "term0", "cursor": again["resume_cursor"],
+             "max_chars": 20000}, ctx)
+        self.assertIn("TAIL-MARKER", third["new_output"])
+
     def test_terminal_read_reports_completed_job_and_real_exit_code(self):
         session = _FakeInteractiveSession("finite")
         session.start()

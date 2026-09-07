@@ -649,6 +649,140 @@ class HandRolledPagingTests(unittest.TestCase):
         second = self.read(page="next")
         self.assertNotIn("hand-rolled", second.get("note", ""))
 
+    def test_a_window_does_not_make_the_next_paged_read_report_a_rebuild(self):
+        """Walk bookkeeping lives outside the page table, and has to.
+
+        Kept inside it, a windowed read left an entry with no fingerprint, so
+        the first paged read of that file failed the fingerprint check, rebuilt,
+        and announced "file changed since it was last read: pages recomputed" —
+        about a file nobody had touched. The streak died in that rebuild too.
+        """
+        self.read(offset=1, limit=50)
+        first_page = self.read()
+        self.assertNotIn("pages recomputed", first_page.get("note", ""))
+        self.assertNotIn("_pager", str(self.state.get("_pager_walk") or {}))
+
+        # ...and the streak still spans the paged read that sits between two
+        # hand-rolled windows.
+        self.read(offset=51, limit=50)
+        self.assertIn("hand-rolled", self.read(offset=101, limit=50)["note"])
+
+
+class RefusedReadTests(unittest.TestCase):
+    """A read that gets refused must not have moved the cursor first.
+
+    `_open_page` used to commit everything — cursor, delivery count, pins —
+    before the visibility gate could decline. A refused `page='next'` therefore
+    evicted the page the reader was ON (it was no longer the cursor page, so the
+    projection replaced it with a stub) and delivered nothing in its place: the
+    reader lost a page it could see and gained a sentence.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = os.path.join(self.tmp.name, "module.py")
+        with open(self.path, "w", encoding="utf-8") as fh:
+            fh.write(_py_source(60))
+        self.state = {"_ctx_headroom_chars": 30_000}
+        self.ctx = tools.ToolCtx(cwd=self.tmp.name, agent_id="reader",
+                                 state=self.state)
+
+    def entry(self):
+        return self.state["_pager"][self.path]
+
+    def test_a_refused_page_turn_leaves_the_cursor_where_it_was(self):
+        first = tools._bi_fs_read({"path": self.path}, self.ctx)
+        self.assertEqual(1, first["page"])
+        # The reader already holds page 2's lines from an earlier targeted look.
+        span = self.entry()["pages"][1]
+        self.state["_visible_reads"] = {self.path: [[span[0], span[1]]]}
+
+        refused = tools._bi_fs_read({"path": self.path, "page": "next"},
+                                    self.ctx)
+
+        self.assertFalse(refused["ok"])
+        self.assertTrue(refused["_advisory"])
+        self.assertEqual(1, self.entry()["page"], "cursor moved on a refusal")
+        self.assertEqual({"1": 1}, self.entry()["reads"],
+                         "a refused read counted as a delivery")
+        self.assertEqual({1}, file_pager.live_pages(self.state, self.path),
+                         "page 1 stopped being live and would be evicted")
+
+    def test_the_page_is_still_reachable_once_it_is_no_longer_visible(self):
+        tools._bi_fs_read({"path": self.path}, self.ctx)
+        span = self.entry()["pages"][1]
+        self.state["_visible_reads"] = {self.path: [[span[0], span[1]]]}
+        tools._bi_fs_read({"path": self.path, "page": "next"}, self.ctx)
+
+        self.state["_visible_reads"] = {}
+        delivered = tools._bi_fs_read({"path": self.path, "page": "next"},
+                                      self.ctx)
+        self.assertTrue(delivered["ok"])
+        self.assertEqual(2, delivered["page"])
+        self.assertEqual(2, self.entry()["page"])
+
+    def test_a_refusal_does_not_swallow_the_repaged_warning(self):
+        """The notice that page numbers moved survives a refused read."""
+        tools._bi_fs_read({"path": self.path}, self.ctx)
+        with open(self.path, "a", encoding="utf-8") as fh:
+            fh.write("\n\ndef appended():\n    pass\n")
+        # Refuse the next read outright, then read for real.
+        self.state["_visible_reads"] = {self.path: [[1, 10_000]]}
+        refused = tools._bi_fs_read({"path": self.path}, self.ctx)
+        self.assertFalse(refused["ok"])
+        self.state["_visible_reads"] = {}
+        after = tools._bi_fs_read({"path": self.path}, self.ctx)
+        self.assertIn("pages recomputed", after.get("note", ""))
+
+
+class CacheGeometryTests(unittest.TestCase):
+    """One page NUMBER is not one page of content.
+
+    The page table is built per agent from the headroom that agent had when it
+    opened the file, and frozen there — so "page 2" is lines 255-807 for one
+    agent and 2540-5269 for another. Keyed on the number alone, the shared body
+    cache served the first agent's bytes to the second under the second's own
+    line numbers, and those numbers are what a later edit anchors on.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = os.path.join(self.tmp.name, "module.py")
+        with open(self.path, "w", encoding="utf-8") as fh:
+            fh.write(_py_source(120))
+        file_pager._BODY_CACHE.clear()
+        self.addCleanup(file_pager._BODY_CACHE.clear)
+
+    def _read(self, agent, headroom, **params):
+        params.setdefault("path", self.path)
+        return tools._bi_fs_read(params, tools.ToolCtx(
+            cwd=self.tmp.name, agent_id=agent,
+            state={"_ctx_headroom_chars": headroom}))
+
+    def test_a_different_page_table_does_not_read_another_agents_page(self):
+        small = self._read("a1", 30_000)
+        large = self._read("a2", 400_000)
+
+        self.assertGreater(small["pages"], large["pages"])
+        self.assertIsNone(large.get("cached_view"))
+        self.assertNotEqual(small["result"], large["result"])
+        self.assertEqual(large["lines_returned"],
+                         large["result"].count("\n") + 1)
+
+    def test_the_same_page_table_still_shares_the_cached_body(self):
+        first = self._read("a1", 30_000)
+        second = self._read("a2", 30_000)
+        self.assertTrue(second["cached_view"])
+        self.assertEqual(first["result"], second["result"])
+
+    def test_line_numbering_is_part_of_what_the_cache_remembers(self):
+        numbered = self._read("a1", 30_000)
+        raw = self._read("a2", 30_000, line_numbers=False)
+        self.assertIn("→", numbered["result"])
+        self.assertNotIn("→", raw["result"])
+
 
 if __name__ == "__main__":
     unittest.main()

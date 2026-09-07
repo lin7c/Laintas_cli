@@ -990,12 +990,16 @@ def _bi_skill_unload(params: dict, ctx: ToolCtx) -> dict:
 _COUNT_LINES_MAX_BYTES = 64 * 1024 * 1024
 
 
-def _open_page(params: dict, ctx: ToolCtx, abs_path: str) -> tuple:
-    """Move this agent's cursor for one file and return (entry, page, reads, notes).
+def _resolve_page(params: dict, ctx: ToolCtx, abs_path: str) -> tuple:
+    """Pick the page this call wants WITHOUT moving anything.
 
-    Everything that changes cursor state happens here so `_bi_fs_read` keeps
-    one code path for actually reading bytes. Returns ``(None, 0, 0, [])`` when
-    the file has no pages (empty or unreadable).
+    Returns ``(entry, page, previous, notes)``, or ``(None, 0, 0, [])`` when the
+    file has no pages (empty or unreadable). Split from `_commit_page` because
+    the read can still be REFUSED after this point: until 2026-09-07 the cursor
+    had already moved by then, so a refused `page='next'` evicted the page the
+    reader was on (it was no longer the cursor page, so the projection replaced
+    it with a stub) and delivered nothing in its place. Resolving and committing
+    are now two steps with the refusal in between.
     """
     import file_pager
 
@@ -1013,12 +1017,27 @@ def _open_page(params: dict, ctx: ToolCtx, abs_path: str) -> tuple:
         return None, 0, 0, []
 
     notes: list = []
-    if entry.pop("repaged", False):
+    # Read, do not consume: a refused read must not swallow the one notice that
+    # says the page numbers moved.
+    if entry.get("repaged"):
         notes.append("file changed since it was last read: pages recomputed, "
                      "earlier page numbers and line references may have moved")
 
     previous = int(entry.get("page") or 0)
     page = file_pager.resolve_page(entry, params.get("page"))
+    return entry, page, previous, notes
+
+
+def _commit_page(entry: dict, params: dict, abs_path: str, page: int,
+                 previous: int, notes: list) -> int:
+    """Move this agent's cursor onto `page` and return how often it was served.
+
+    Everything that changes cursor state happens here, after the read is known
+    to be going ahead.
+    """
+    import file_pager
+
+    entry.pop("repaged", None)
 
     # The note describes the page being LEFT. Attaching it before the cursor
     # moves is what makes `read(path, page="next", note="...")` one call.
@@ -1045,7 +1064,7 @@ def _open_page(params: dict, ctx: ToolCtx, abs_path: str) -> tuple:
         notes.append(f"page {previous} dropped from your context"
                      + ("" if params.get("note") else
                         " with no summary (pass note= next time to keep one)"))
-    return entry, page, reads, notes
+    return reads
 
 
 def _read_already_visible(ctx: ToolCtx, abs_path: str, start: int, end: int,
@@ -1175,11 +1194,12 @@ def _bi_fs_read(params: dict, ctx: ToolCtx) -> dict:
     _windowed = params.get("offset") is not None or params.get("limit") is not None
     _page_state = None
     _page_no = 0
+    _prev_page = 0
     _repeat_count = 0
     _page_notice: list = []
     if not _windowed and isinstance(getattr(ctx, "state", None), dict):
         try:
-            _page_state, _page_no, _repeat_count, _page_notice = _open_page(
+            _page_state, _page_no, _prev_page, _page_notice = _resolve_page(
                 params, ctx, abs_path)
         except Exception:
             _page_state = None                      # never fail a read on this
@@ -1207,6 +1227,17 @@ def _bi_fs_read(params: dict, ctx: ToolCtx) -> dict:
     if _blocked:
         return _blocked
 
+    # Past the refusal, so the cursor may move: the reader is getting bytes.
+    # `_page_state` deliberately stays set if this fails — offset/limit already
+    # came from the page table, and a result that described itself as a window
+    # while reading a page's lines would be the wrong kind of wrong.
+    if _page_state is not None:
+        try:
+            _repeat_count = _commit_page(_page_state, params, abs_path,
+                                         _page_no, _prev_page, _page_notice)
+        except Exception:
+            _repeat_count = 0                       # never fail a read on this
+
     # A windowed read that resumes where the last one ended is a page turn the
     # caller is doing by hand — the one read pattern that is distinguishable
     # from a targeted look without guessing.
@@ -1227,12 +1258,23 @@ def _bi_fs_read(params: dict, ctx: ToolCtx) -> dict:
     # A page of an unchanged file is byte-identical to what was delivered
     # before, so serve it from the process cache (Helpwo's tryServeCachedView):
     # no disk round-trip, and one page number can never yield two bodies.
+    #
+    # The geometry is part of the key, and has to be: the cache is shared by
+    # every agent in the process, but a page NUMBER is not — each agent builds
+    # its own page table from the headroom it had when it opened the file, so
+    # "page 2" is a different span for a child with a fuller thread. The line
+    # span plus the two options that change the rendering identify the bytes;
+    # the page number alone identified the wrong ones.
     _cached = ""
     _fingerprint_for_cache = (0, 0)
+    _cache_geometry: tuple = ()
     if _page_state is not None:
         import file_pager as _fp
         _fingerprint_for_cache = _fp.fingerprint(abs_path)
-        _cached = _fp.cached_body(abs_path, _fingerprint_for_cache, _page_no)
+        _cache_geometry = (offset, offset + limit - 1, bool(line_numbers),
+                           int(max_bytes))
+        _cached = _fp.cached_body(abs_path, _fingerprint_for_cache, _page_no,
+                                  _cache_geometry)
 
     # Walk the file by LINES, never by a byte prefix. Slicing a prefix looks
     # equivalent and is not: on a file larger than max_bytes every offset past
@@ -1347,7 +1389,7 @@ def _bi_fs_read(params: dict, ctx: ToolCtx) -> dict:
             "total_lines": total_lines or None,
             "truncated": byte_truncated or line_truncated,
             "byte_truncated": byte_truncated,
-        })
+        }, _cache_geometry)
         if _page_notice:
             result["note"] = "; ".join(_page_notice)
     try:
@@ -1765,22 +1807,76 @@ def _bi_fs_write(params: dict, ctx: ToolCtx) -> dict:
     }, abs_path)
 
 
+#: Directory entries returned by one `fs.ls`. A listing has no natural size, and
+#: an unbounded one used to be cut by the generic middle-truncation in the agent
+#: loop — which for a JSON array means the model receives syntactically broken
+#: JSON with no way to ask for the rest. Bounded here instead, with an offset,
+#: so the cut is the tool's own and is always resumable.
+FS_LS_DEFAULT_LIMIT = 100
+FS_LS_MAX_LIMIT = 5000
+
+
 def _bi_fs_ls(params: dict, ctx: ToolCtx) -> dict:
     path = params.get("path", ".")
     abs_path = os.path.abspath(os.path.join(ctx.cwd or os.getcwd(), path)) \
         if not os.path.isabs(path) else path
     try:
+        offset = max(0, int(params.get("offset", 0) or 0))
+        limit = int(params.get("limit", FS_LS_DEFAULT_LIMIT)
+                    or FS_LS_DEFAULT_LIMIT)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "offset and limit must be integers"}
+    limit = max(1, min(limit, FS_LS_MAX_LIMIT))
+    try:
+        names = sorted(os.listdir(abs_path))
         entries = []
-        for name in sorted(os.listdir(abs_path)):
+        for name in names[offset:offset + limit]:
             full = os.path.join(abs_path, name)
             entries.append({
                 "name": name,
                 "type": "dir" if os.path.isdir(full) else "file",
                 "size": os.path.getsize(full) if os.path.isfile(full) else None,
             })
-        return {"ok": True, "result": entries, "path": abs_path}
+        _fs_ls_fit_budget(entries)
+        result = {"ok": True, "result": entries, "path": abs_path,
+                  "count": len(entries), "total": len(names), "offset": offset}
+        if offset + len(entries) < len(names):
+            result["truncated"] = True
+            result["note"] = (
+                f"{len(names) - offset - len(entries)} more entr(ies) in this "
+                f"directory - continue with offset={offset + len(entries)}")
+        return result
     except OSError as e:
         return {"ok": False, "error": str(e)}
+
+
+def _fs_ls_fit_budget(entries: list) -> None:
+    """Drop trailing entries until the rendered array fits the loop's budget.
+
+    A count alone cannot do this: 100 entries is 6k characters with short names
+    and 12k with long ones. What the count could not prevent is the generic
+    middle-truncation upstream, which for a JSON array means the model gets two
+    half-arrays with an unknown number of entries missing between them and no
+    offset that recovers them. Trimming here keeps the array intact and keeps
+    the resume offset honest, because `count` is computed after this runs.
+    """
+    if not entries:
+        return
+    try:
+        import agent_loop as _al
+        budget = _al._tool_output_budget(
+            "fs.ls", int(_al.get_runtime_config("output_truncate") or 3000))
+    except Exception:
+        budget = 6000
+    budget = max(1_000, budget - 400)           # room for the metadata footer
+    for _ in range(64):                         # bounded; each pass drops ≥1/8
+        size = len(json.dumps(entries, ensure_ascii=False, indent=2,
+                              default=str))
+        if size <= budget or len(entries) <= 1:
+            return
+        keep = max(1, min(len(entries) - 1,
+                          int(len(entries) * budget / size)))
+        del entries[keep:]
 
 
 def _bi_time_now(params: dict, ctx: ToolCtx) -> dict:
@@ -5620,10 +5716,32 @@ def _bi_terminal_read(params: dict, ctx: ToolCtx) -> dict:
         return {"ok": False, "error": "cursor and max_chars must be integers"}
     cursor = max(0, min(cursor, len(full)))
     delta = full[cursor:]
-    cursors[key] = len(full)
     truncated = len(delta) > max_chars
-    if truncated:
+    dropped_chars = 0
+    resume_cursor = cursor
+    head_first = False
+    if not truncated:
+        cursors[key] = len(full)
+    elif requested_cursor is None:
+        # Live tail: on a burst bigger than the window the freshest output is
+        # what the caller wants, and the cursor moves to the end. The skipped
+        # middle is still buffered, so say how much was skipped and from where —
+        # a caller told nothing but "truncated: true" reads a build log whose
+        # compile error sat in the dropped middle as a build that passed.
+        dropped_chars = len(delta) - max_chars
         delta = delta[-max_chars:]
+        cursors[key] = len(full)
+    else:
+        # An explicit cursor is a request to resume FORWARD from that point, so
+        # this hands back the head of that window, not its tail — the tail is
+        # what the caller already saw and is trying to read behind. The cursor
+        # lands just past what was returned, so the next plain read continues
+        # from here instead of jumping to the end.
+        dropped_chars = len(delta) - max_chars
+        delta = delta[:max_chars]
+        cursors[key] = cursor + max_chars
+        resume_cursor = cursor + max_chars
+        head_first = True
     new_output = delta.strip()
     completed = not alive
     returncode = None
@@ -5641,10 +5759,23 @@ def _bi_terminal_read(params: dict, ctx: ToolCtx) -> dict:
         "ok": True, "status": "completed" if completed else "running",
         "completed": completed,
         "result": new_output or "(no new output)",
-        "new_output": new_output, "cursor": len(full),
+        "new_output": new_output, "cursor": cursors[key],
         "truncated": truncated, "alive": alive,
         "terminal": target,
     }
+    if truncated:
+        result["dropped_chars"] = dropped_chars
+        result["resume_cursor"] = resume_cursor
+        if head_first:
+            # What was cut is what comes AFTER this window.
+            result["result"] = (new_output or "") + (
+                f"\n...[{dropped_chars} more chars - continue with "
+                f"cursor={resume_cursor}]...")
+        else:
+            # What was cut is what came BEFORE this tail.
+            result["result"] = (
+                f"...[{dropped_chars} chars skipped - read them with "
+                f"cursor={resume_cursor}]...\n" + (new_output or ""))
     if returncode is not None:
         result["returncode"] = returncode
     return result
@@ -9187,10 +9318,21 @@ def register_builtin_tools() -> None:
         ),
         Tool(
             name="fs.ls",
-            description="List files in a directory (one level). Returns name/type/size.",
+            description="List files in a directory (one level). Returns name/type/size. "
+                        "Entries are sorted by name; one call returns at most `limit` of them "
+                        "and no more than fits one tool result. When there are more, the "
+                        "result says how many and names the offset that continues the "
+                        "listing.",
             schema={
                 "type": "object",
-                "properties": {"path": {"type": "string", "default": "."}},
+                "properties": {
+                    "path": {"type": "string", "default": "."},
+                    "offset": {"type": "integer", "minimum": 0, "default": 0,
+                               "description": "skip this many entries (continue a listing)"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 5000,
+                              "default": 100,
+                              "description": "max entries to return"},
+                },
             },
             invoke=_bi_fs_ls,
         ),
@@ -10553,7 +10695,10 @@ def register_builtin_tools() -> None:
             description=(
                 "Read only output added since this agent's previous read/send cursor. "
                 "Returns running/completed state and a real process exit code once "
-                "known. Completed terminal.exec jobs remain readable for 10 minutes."
+                "known. Completed terminal.exec jobs remain readable for 10 minutes. "
+                "When more than max_chars arrived at once you get the TAIL and a "
+                "`resume_cursor`: pass it back as `cursor` to read the skipped "
+                "middle, which is still buffered."
             ),
             schema={
                 "type": "object",
@@ -10571,7 +10716,9 @@ def register_builtin_tools() -> None:
             description=(
                 "Wait until a terminal.exec background job completes or timeout expires. "
                 "Returns new output, completion state, and the real exit code when known. "
-                "Use this instead of sleep followed by terminal.read for finite jobs."
+                "Use this instead of sleep followed by terminal.read for finite jobs. "
+                "Long output is tail-trimmed to max_chars and reports a "
+                "`resume_cursor` for the skipped middle, same as terminal.read."
             ),
             schema={
                 "type": "object",

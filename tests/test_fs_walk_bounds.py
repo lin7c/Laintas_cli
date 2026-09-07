@@ -10,6 +10,7 @@ Three properties keep that from recurring, and each covers a case the others
 miss: prune before descending, stop at a budget, and say so when the answer is
 partial.
 """
+import json
 import os
 import time
 import unittest
@@ -17,6 +18,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import mock
 
+import agent_loop
 import tools
 from tools import ToolCtx
 
@@ -174,6 +176,43 @@ class GrepStreamingTests(unittest.TestCase):
         self.assertEqual(3, result["matches"])
         self.assertTrue(result["truncated"])
         self.assertLess(result["files_scanned"], 40)
+
+    def test_ls_pages_a_large_directory_instead_of_being_cut_in_half(self):
+        """A listing is a JSON array; the generic truncation cuts its MIDDLE.
+
+        Unbounded, `fs.ls` on a big directory reached the agent loop as two
+        half-arrays with an unknown number of entries missing between them, no
+        total, and no offset that could recover them. Bounded here instead: the
+        array arrives whole, the cut is named, and walking the offsets returns
+        every entry exactly once.
+        """
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            names = [f"{'n' * 30}_{i:05d}.txt" for i in range(1200)]
+            for name in names:
+                (root / name).write_text("x", encoding="utf-8")
+            ctx = ToolCtx(cwd=str(root), state={})
+
+            first = tools.get_registry().invoke("fs.ls", {"path": "."}, ctx)
+            self.assertTrue(first["truncated"])
+            self.assertEqual(1200, first["total"])
+            self.assertIn(f"offset={first['count']}", first["note"])
+
+            rendered = agent_loop._format_tool_result_for_loop(
+                "fs.ls", first, 3000)
+            self.assertNotIn("middle cut", rendered)
+            self.assertIsInstance(
+                json.loads(rendered[:rendered.rindex("\n[")]), list)
+
+            seen, offset = [], 0
+            while True:
+                page = tools.get_registry().invoke(
+                    "fs.ls", {"path": ".", "offset": offset}, ctx)
+                seen += [e["name"] for e in page["result"]]
+                if not page.get("truncated"):
+                    break
+                offset += page["count"]
+            self.assertEqual(sorted(names), seen)
 
     def test_grep_reports_a_budget_stop(self):
         with TemporaryDirectory() as tmp:

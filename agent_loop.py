@@ -6721,7 +6721,8 @@ def _history_without_current_turn(chat_history: list, original_input: str) -> li
 #: appears in the code and in neither list, which is exactly the moment the
 #: author still remembers which one it should be.
 STATE_KEYS_CARRIED = frozenset({
-    "_files_seen", "_pager", "_pager_msgs", "_session_id", "_task_cwd",
+    "_files_seen", "_pager", "_pager_msgs", "_pager_walk", "_session_id",
+    "_task_cwd",
     "_thread_messages", "_thread_summary", "_thread_call_seq",
     "_fork_lineage", "_fork_name", "_fork_parent_session_id",
     # Idle-consolidation bookkeeping. All three must cross the turn boundary:
@@ -6780,6 +6781,10 @@ def prepare_state_for_repl(state: dict) -> dict:
         # them (see _project_paged_reads).
         "_pager": state.get("_pager") or {},
         "_pager_msgs": state.get("_pager_msgs") or {},
+        # Hand-rolled-paging detection. Its own store (not `_pager`) so a
+        # windowed read cannot leave a fingerprint-less entry in the page table
+        # and make the next paged read report a rebuild that never happened.
+        "_pager_walk": state.get("_pager_walk") or {},
         # Carry the active objective across REPL turns so explicit continuation
         # has a stable fallback (the live session also stores last_user_input).
         "objective": (state.get("objective") or "").strip(),
@@ -8234,6 +8239,9 @@ def _format_tool_result_for_loop(tool_name: str, result: dict, max_chars: int) -
         "truncated", "byte_truncated", "lines_returned", "total_lines",
         "matches", "files_scanned", "replacements", "exit_code",
         "duration_ms", "count", "path", "url", "size",
+        # A bounded listing is only resumable if the caller is told where it
+        # stopped: without these, `truncated=true` is a dead end.
+        "total", "offset", "note",
     )
     meta_bits = []
     if tool_name in {"terminal.exec", "terminal.read", "terminal.wait"}:
