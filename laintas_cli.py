@@ -1333,6 +1333,7 @@ import auto_pilot                # heuristic task classification + hint injectio
 import detail_trace              # /detail trace conversation/tool browser
 import resource_ui               # unified responsive resource browsers/managers
 import startup_mail              # session messages behind the L> mark
+import official_messages         # laintas.com announcements, into that same list
 
 # MCP client: lazy import (saves ~1.8s on startup)
 _mcp_mod = None
@@ -6151,12 +6152,7 @@ def verify_session(session: dict) -> Optional[dict]:
     # Call get-session to get full user info.
     req_args = None
     # Current SSO cookie first, then legacy names for a smooth migration.
-    for cookie_name in [
-        "__Secure-laintas-v2.session_token",
-        "laintas-v2.session_token",
-        "__Secure-better-auth.session_token",
-        "better-auth.session_token",
-    ]:
+    for cookie_name in official_messages.SESSION_COOKIE_NAMES:
         tok = cookies.get(cookie_name, "")
         if tok:
             req_args = {"cookies": {cookie_name: tok}}
@@ -24036,6 +24032,7 @@ def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
                 # advances with Enter (/continue). Only the foreground REPL
                 # passes this, so sub-agents are never affected.
                 max_loops_override=_step_cap,
+                step_mode=_step_cap is not None,
             )
     except Exception as exc:
         run_error = f"{type(exc).__name__}: {exc}"
@@ -25192,6 +25189,21 @@ def main():
 
         threading.Thread(target=_run_after_first_prompt, daemon=True,
                          name="startup-advisories").start()
+
+    # Official messages from laintas.com land in the same L> list as the local
+    # advisories. Behind the prompt and best-effort: a slow or unreachable site
+    # must never be something the first prompt waits on.
+    if session.get("userId") and _active_backend.sends_laintas_credentials:
+        def _sync_official_messages() -> None:
+            _first_prompt_started.wait(timeout=30)
+            try:
+                if official_messages.sync(session, LAINTAS_BASE):
+                    _refresh_live_prompt()
+            except Exception:
+                pass  # an announcement is never worth a traceback at startup
+
+        threading.Thread(target=_sync_official_messages, daemon=True,
+                         name="official-messages").start()
 
     # Main interactive loop
 

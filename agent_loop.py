@@ -6952,6 +6952,17 @@ def _term_buffer_lines(output: str) -> list:
     # Drop trailing lines that are only a shell-prompt echo (user@host:path#/$).
     while lines and re.match(r'^\s*\S+@\S+:.*[#$]\s*$', lines[-1]):
         lines.pop()
+    # `terminal_buffer_lines` is what `terminal.scroll` can reach: the depth
+    # the config promises, and the bound that keeps a terminal running for
+    # hours from turning its whole capture into a scrollable document. Older
+    # lines fall off the top, so a frozen anchor drifts once the buffer is
+    # full — the same thing a real scrollback does.
+    try:
+        depth = int(get_runtime_config("terminal_buffer_lines") or 0)
+    except Exception:
+        depth = 0
+    if depth > 0 and len(lines) > depth:
+        del lines[:len(lines) - depth]
     return lines
 
 
@@ -7022,6 +7033,10 @@ def get_terminals_snapshot(state: dict = None) -> str:
     store = _term_scroll_store(state)
     lines = []
     injected = False
+    # Whether any ALIVE terminal actually rendered. `alive` being non-empty is
+    # not the same thing: every one of them can be deduped away, and the header
+    # would then sit above the Dead block describing nothing.
+    alive_rendered = False
     if alive:
         for t in alive:
             buf = _term_buffer_lines(t.session.full_output or "")
@@ -7035,6 +7050,7 @@ def get_terminals_snapshot(state: dict = None) -> str:
                 continue
             entry["last_len"] = buf_len
             injected = True
+            alive_rendered = True
             window = buf[start:start + height]
             st_info = f" [stationed: {', '.join(t.stationed_agent_ids)}]" if t.stationed_agent_ids else ""
             if is_live:
@@ -7059,7 +7075,7 @@ def get_terminals_snapshot(state: dict = None) -> str:
     # "[SUB-TERMINALS — Alive]" header every turn.
     if not injected:
         return ""
-    if alive and lines:
+    if alive_rendered:
         lines.insert(0, "[SUB-TERMINALS — Alive]")
     return '\n'.join(lines)
 
@@ -7514,7 +7530,8 @@ def _thread_messages_for_turn(reply: str, executed: list) -> list:
 def _build_user_message(original_input: str, state: dict, memory_entries: list,
                         chat_history: list, loop: int, max_loops: int,
                         thread_mode: bool = False, first_turn: bool = True,
-                        volatile: Optional[dict] = None) -> str:
+                        volatile: Optional[dict] = None,
+                        terminals_snapshot: Optional[str] = None) -> str:
     """Compose the user-message body for one agent iteration.
 
     ``volatile`` carries the context blocks that used to live in the system
@@ -7538,7 +7555,13 @@ def _build_user_message(original_input: str, state: dict, memory_entries: list,
     terminal_section = _build_terminal_section(state)
     conversation_section = _build_conversation_section(chat_history)
     memory_section = _build_memory_section(memory_entries, state, chat_history)
-    terminals_snapshot = get_terminals_snapshot(state)
+    # The snapshot is CONSUMED: a live terminal with no new output since the
+    # last render is deliberately not re-injected, and rendering marks it as
+    # seen. So it is taken once per iteration by the caller and passed in;
+    # calling it again here would hand this message an empty section and
+    # blame it on "nothing new". Only callers outside the loop compute it.
+    if terminals_snapshot is None:
+        terminals_snapshot = get_terminals_snapshot(state)
     n_steps = len(state.get('terminalHistory', []))
     warnings = _detect_loop_warnings(state, original_input)
     files_seen = state.get("_files_seen", [])
@@ -9100,6 +9123,7 @@ def run_agent_loop(
     message_queue: queue.Queue = None,         # supplementary user messages
     continue_thread: bool = False,             # resume the same top-level turn (/continue)
     max_loops_override: int = None,             # per-run cap; avoids global config races
+    step_mode: bool = False,    # STEP mode: the cap is one iteration and reaching it is the expected pause, not exhaustion
     foreground: bool = False,   # this run is the tty-owning REPL turn (any role/depth)
 ) -> dict:
     """Run the autonomous agent loop (mirrors AutonomousKernel.ts).
@@ -10543,6 +10567,7 @@ def run_agent_loop(
             _live_state = _build_user_message(
                 original_input, state, memory_entries, history_context, loop, max_loops,
                 thread_mode=True, first_turn=False, volatile=_volatile_context,
+                terminals_snapshot=terminals_snapshot,
             )
             user_input = _live_state  # for debug display
             _thread_to_send = _project_paged_reads(thread_messages, state) + (
@@ -10562,6 +10587,7 @@ def run_agent_loop(
             user_input = _build_user_message(
                 original_input, state, memory_entries, history_context, loop, max_loops,
                 volatile=_volatile_context,
+                terminals_snapshot=terminals_snapshot,
             )
             # Same wrap-up in the legacy non-thread payload: tools are withheld
             # below either way, so without this the model would be silently
@@ -12956,6 +12982,10 @@ def run_agent_loop(
         user_input = _build_user_message(
             original_input, state, memory_entries, history_context, loop, max_loops,
             volatile=_volatile_context,
+            # This iteration's snapshot, not a fresh take: the next iteration
+            # renders its own, and consuming it twice inside one iteration is
+            # what emptied the section entirely.
+            terminals_snapshot=terminals_snapshot,
         )
 
         # ── Inject nudge if the model produced an empty turn ──
@@ -12974,13 +13004,16 @@ def run_agent_loop(
         # all iterations without a `break`. This is the max_loops exhaustion
         # case. Max turns exhaustion with explicit recovery message.licit recovery message.
         _exit_reason = TRANSITION_MAX_LOOPS
-        # STEP mode caps max_loops to 1 via max_loops_override (set only by
-        # the foreground REPL wrapper), so reaching the cap here is the
+        # STEP mode caps max_loops to 1, so reaching the cap here is the
         # expected pause, not an error: stay quiet, skip the exhaustion
-        # markers, and let the REPL pre-fill /continue. Sub-agents never pass
-        # max_loops_override, so their genuine exhaustion still reports as
-        # before.
-        _step_run = max_loops_override is not None
+        # markers, and let the REPL pre-fill /continue.
+        #
+        # Keyed on the caller SAYING it is a step run, not on
+        # `max_loops_override is not None`: Helpwo's chat and delegate paths
+        # pass an override for ordinary runs (their own max_loops), and would
+        # have had genuine exhaustion reported to a remote user as "press
+        # Enter to run the next step" — with `_max_loops_exhausted` never set.
+        _step_run = bool(step_mode)
         if _step_run:
             _exhaustion_msg = (
                 "STEP paused after this iteration. Press Enter to run the "

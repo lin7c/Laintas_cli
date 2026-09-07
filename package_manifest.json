@@ -91,6 +91,7 @@
     "tokenizer",
     "web_search",
     "startup_mail",
+    "official_messages",
     "cookie_store",
     "identity_store",
     "canvas",

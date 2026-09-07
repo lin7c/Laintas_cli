@@ -2150,6 +2150,46 @@ class TerminalScrollTests(unittest.TestCase):
         snap = agent_loop.get_terminals_snapshot(state)
         self.assertIn("line-101", snap)
 
+    def test_buffer_depth_bounds_scrollable_history(self):
+        # terminal_buffer_lines is the depth `terminal.scroll` can reach; an
+        # unbounded buffer turned an hours-long terminal into a document.
+        agent_loop.set_runtime_config("terminal_buffer_lines", 50)
+        sess = self._session(400)
+        self.assertEqual(len(agent_loop._term_buffer_lines(sess.full_output)), 50)
+        self._register(sess)
+        state = {}
+        tools._bi_terminal_scroll(
+            {"name": "testterm", "action": "top"}, self._ctx(state))
+        snap = agent_loop.get_terminals_snapshot(state)
+        self.assertIn("line-351", snap)          # oldest line still in buffer
+        self.assertNotIn("line-001", snap)       # fell off the top
+
+    def test_dead_only_snapshot_has_no_alive_header(self):
+        sess = self._session(10)
+        self._register(sess)
+        state = {}
+        agent_loop.get_terminals_snapshot(state)     # consume the live view
+        dead = self._session(5)
+        dead.alive = False
+        agent_loop.register_terminal(dead, "/bin/sh", 0, name="goner",
+                                     parent_terminal="term0")
+        snap = agent_loop.get_terminals_snapshot(state)
+        self.assertIn("Dead", snap)
+        self.assertNotIn("Alive", snap)
+
+    def test_snapshot_is_taken_once_per_iteration_not_twice(self):
+        # The loop takes the snapshot for its telemetry and _build_user_message
+        # renders it. Taking it twice marked the terminal as seen before the
+        # message was built, so the rendered section was always empty.
+        sess = self._session(100)
+        self._register(sess)
+        state = {}
+        snapshot = agent_loop.get_terminals_snapshot(state)
+        self.assertIn("line-100", snapshot)
+        msg = agent_loop._build_user_message(
+            "task", state, [], [], 0, 5, terminals_snapshot=snapshot)
+        self.assertIn("line-100", msg)
+
 
 class LazySnapshotTests(unittest.TestCase):
     def setUp(self):
@@ -2731,6 +2771,43 @@ class FinalTurnWrapUpTests(unittest.TestCase):
         import session_store
         self.assertTrue(session_store.is_continuable_reason(
             agent_loop.TRANSITION_MAX_LOOPS_WRAPUP))
+
+    def _run_always_tooling(self, max_loops, **kwargs):
+        """A model that only ever calls tools: the run ends by exhausting the
+        budget (TRANSITION_MAX_LOOPS), not by wrapping up with prose."""
+        deps = _deps()
+
+        def backend(**_kw):
+            return {"reply": "working", "finish_reason": "tool_calls",
+                    "tool_calls": [{"name": "fs.read",
+                                    "arguments": {"path": "a.txt"}}],
+                    "done": False, "error": False}
+
+        deps.call_backend = backend
+        with tempfile.TemporaryDirectory() as tmp, _chdir(tmp), \
+                mock.patch.object(agent_persistence, "AGENTS_DIR", Path(tmp) / "agents"):
+            Path(".laintas").mkdir()
+            Path("a.txt").write_text("hello", encoding="utf-8")
+            return agent_loop.run_agent_loop(
+                deps, "read a.txt repeatedly", {}, {}, [],
+                max_loops_override=max_loops, **kwargs)
+
+    def test_override_alone_is_not_step_mode(self):
+        # Helpwo's chat/delegate paths pass max_loops_override for ordinary
+        # runs. Treating any override as STEP mode reported real exhaustion to
+        # a remote caller as "press Enter for the next step".
+        result = self._run_always_tooling(1)
+        self.assertEqual(result.get("exit_reason"), agent_loop.TRANSITION_MAX_LOOPS)
+        self.assertTrue(result["state"].get("_max_loops_exhausted"))
+        self.assertIn("Turn limit reached",
+                      str(result["state"].get("shortTermMemory") or ""))
+
+    def test_step_mode_pauses_without_exhaustion_markers(self):
+        result = self._run_always_tooling(1, step_mode=True)
+        self.assertEqual(result.get("exit_reason"), agent_loop.TRANSITION_MAX_LOOPS)
+        self.assertFalse(result["state"].get("_max_loops_exhausted"))
+        self.assertNotIn("Turn limit reached",
+                         str(result["state"].get("shortTermMemory") or ""))
 
     def test_single_iteration_run_keeps_its_tools(self):
         # A one-iteration budget is the whole run, not a wrap-up turn: stripping
