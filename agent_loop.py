@@ -12853,19 +12853,34 @@ def run_agent_loop(
         # all iterations without a `break`. This is the max_loops exhaustion
         # case. Max turns exhaustion with explicit recovery message.licit recovery message.
         _exit_reason = TRANSITION_MAX_LOOPS
-        _exhaustion_msg = (
-            f"Turn limit reached ({max_loops}/{max_loops}). "
-            f"Use /continue to resume. "
-            f"Run /max, then /continue, to lift this limit for the current "
-            f"process and resume."
-        )
-        if events_cb is not None:
-            deps.console.print(f"[yellow]{symbols.WARN} {_exhaustion_msg}[/yellow]")
-        _append_short_memory(state, f"\n  {symbols.WARN} {_exhaustion_msg}")
-        state["_max_loops_exhausted"] = True
-        state["_exhaustion_loop_count"] = max_loops
-        if not reply:
-            reply = _exhaustion_msg
+        # STEP mode caps max_loops to 1 via max_loops_override (set only by
+        # the foreground REPL wrapper), so reaching the cap here is the
+        # expected pause, not an error: stay quiet, skip the exhaustion
+        # markers, and let the REPL pre-fill /continue. Sub-agents never pass
+        # max_loops_override, so their genuine exhaustion still reports as
+        # before.
+        _step_run = max_loops_override is not None
+        if _step_run:
+            _exhaustion_msg = (
+                "STEP paused after this iteration. Press Enter to run the "
+                "next step (input pre-filled with /continue)."
+            )
+            if not reply:
+                reply = _exhaustion_msg
+        else:
+            _exhaustion_msg = (
+                f"Turn limit reached ({max_loops}/{max_loops}). "
+                f"Use /continue to resume. "
+                f"Run /max, then /continue, to lift this limit for the current "
+                f"process and resume."
+            )
+            if events_cb is not None:
+                deps.console.print(f"[yellow]{symbols.WARN} {_exhaustion_msg}[/yellow]")
+            _append_short_memory(state, f"\n  {symbols.WARN} {_exhaustion_msg}")
+            state["_max_loops_exhausted"] = True
+            state["_exhaustion_loop_count"] = max_loops
+            if not reply:
+                reply = _exhaustion_msg
 
     # ── Telemetry: log exit reason to debug ──
     event_log.append("turn_ended", reason=_exit_reason, loops=loop + 1,

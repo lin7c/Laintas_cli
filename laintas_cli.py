@@ -3287,7 +3287,7 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec("/abort", "Abort an agent", "Agents & Terminals", "/abort <agent-id>"),
     CommandSpec("/hwo", "Open or run an orchestration workflow", "Planning & Tasks", "/hwo [file|run <file>|compile <file>]", subcommands=("run", "compile")),
     CommandSpec("/hwg", "Compile, run, visualize, or resume an HWO graph workflow", "Planning & Tasks", "/hwg {<file.hwg>|run|compile|resume|status|cancel} ...", subcommands=("run", "compile", "resume", "status", "cancel")),
-    CommandSpec("/mode", "Show, switch, or create agent modes", "Planning & Tasks", "/mode [act [always]|plan [task]|review|study|list|create|delete]", subcommands=("act", "always", "plan", "review", "study", "list", "create", "delete")),
+    CommandSpec("/mode", "Show, switch, or create agent modes", "Planning & Tasks", "/mode [act [always]|plan [task]|review|study|step|list|create|delete]", subcommands=("act", "always", "plan", "review", "study", "step", "list", "create", "delete")),
     CommandSpec("/plan", "Create, revise, review, or approve versioned plans", "Planning & Tasks", "/plan [enter <task>|submit|revise <feedback>|approve|exit|status|list]", subcommands=("enter", "submit", "revise", "approve", "exit", "status", "list")),
     CommandSpec("/prompt", "Open Prompt Lab or manage tested prompt overlays", "Planning & Tasks", "/prompt [issue|subcommand]", subcommands=("status", "branches", "open", "chat", "review", "test", "activate", "disable", "patches", "profiles", "profile", "use", "rollback", "feedback", "fail", "optimize", "apply", "discard", "list", "skill", "export", "install", "publish")),
     CommandSpec("/evolve", "Create, improve, test, and hot-load project extensions", "Planning & Tasks", "/evolve [idea|subcommand]", subcommands=("status", "branches", "open", "chat", "review", "test", "activate", "disable", "candidates", "profiles", "profile", "use", "rollback", "list", "help")),
@@ -11748,6 +11748,7 @@ _SLASH_ARG_RULES: dict[tuple[str, ...], SlashArgRule] = {
     ("/mode", "always"): _arg_rule(1, "/mode always"),
     ("/mode", "review"): _arg_rule(1, "/mode review"),
     ("/mode", "study"): _arg_rule(1, "/mode study"),
+    ("/mode", "step"): _arg_rule(1, "/mode step"),
     ("/mode", "approve"): _arg_rule(1, "/mode approve"),
     ("/mode", "list"): _arg_rule(1, "/mode list"),
     ("/mode", "status"): _arg_rule(1, "/mode status"),
@@ -23824,6 +23825,29 @@ def _stop_run_descendants(active_agent, descendants_before) -> int:
     return stopped
 
 
+def _maybe_step_prefill(response) -> None:
+    """In STEP mode, after a run that can still continue, pre-fill the next
+    prompt with /continue so a single Enter advances to the next iteration.
+
+    Called from the foreground wrapper's finally block; sub-agents do not
+    reach it. No-ops outside STEP mode or when the run is not continuable
+    (a clean end_turn or explicit task_complete needs no /continue).
+    """
+    try:
+        if not mode_manager.get_active_mode().get("step"):
+            return
+    except Exception:
+        return
+    reason = (response or {}).get("exit_reason") or ""
+    if not session_store.is_continuable_reason(str(reason)):
+        return
+    global _pending_prompt_default
+    _pending_prompt_default = "/continue"
+    console.print(
+        "[dim]STEP paused. Press Enter to run the next step "
+        "(input pre-filled with /continue).[/dim]")
+
+
 def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
                                    chat_history, events_cb=None,
                                    existing_session=None,
@@ -23985,6 +24009,13 @@ def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
     except Exception:
         effective_input = user_input
 
+    _step_cap = None
+    try:
+        if mode_manager.get_active_mode().get("step"):
+            _step_cap = 1
+    except Exception:
+        _step_cap = None
+
     try:
         loop_agent_id = active_agent.id if active_agent is not None else None
         with thread_agent(loop_agent_id or "primary"):
@@ -24001,6 +24032,10 @@ def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
                 interrupt_event=_interrupt_event,
                 message_queue=_msg_queue,
                 continue_thread=continue_thread,
+                # STEP mode caps each run to one model iteration; the user
+                # advances with Enter (/continue). Only the foreground REPL
+                # passes this, so sub-agents are never affected.
+                max_loops_override=_step_cap,
             )
     except Exception as exc:
         run_error = f"{type(exc).__name__}: {exc}"
@@ -24097,6 +24132,13 @@ def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
         signal.signal(signal.SIGINT, _old_sigint)
         _interrupt_event.clear()
         _set_run_input_state("idle")
+        # STEP mode: after every foreground run that can still continue,
+        # pre-fill /continue so pressing Enter advances the next iteration.
+        if response is not None:
+            try:
+                _maybe_step_prefill(response)
+            except Exception:
+                pass
 
     return response
 

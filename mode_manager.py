@@ -259,6 +259,37 @@ _BUILTINS = {
         "delete_auto_confirm_seconds": 60.0,
         "builtin": True,
     },
+    "step": {
+        "name": "step",
+        "description": "Run one model iteration at a time; press Enter (/continue) to advance",
+        "instructions": (
+            "STEP MODE: the CLI runs exactly one model iteration per turn, "
+            "then pauses and pre-fills /continue in the input bar. Pressing "
+            "Enter runs the next iteration. The conversation continues across "
+            "steps, so complete meaningful work within each turn and keep "
+            "building on prior context rather than rushing to finish.\n"
+            "For ordinary reversible work already authorized by the user, first "
+            "understand the user's intent, then act without requesting redundant "
+            "permission.\n"
+            "Before any dangerous or destructive operation, first perform a "
+            "comprehensive, systematic analysis of the target, purpose, blast "
+            "radius, live consumers and dependencies, reversibility or backup, "
+            "and safer alternatives. If any material uncertainty remains, stop "
+            "and ask the user.\n"
+            "Before any deletion, explain clearly to the user exactly what the "
+            "target is and contains, why it should be deleted, the exact deletion "
+            "scope and expected impact, and how it can be recovered; then obtain "
+            "the required fresh approval. A policy BLOCKED result forbids the "
+            "underlying operation, not merely that command spelling: never retry "
+            "it through find, xargs, a language runtime, or another equivalent "
+            "tool."
+        ),
+        "allowed_tools": None,
+        "denied_tools": None,
+        "auto_approve": "none",
+        "step": True,
+        "builtin": True,
+    },
 }
 
 
