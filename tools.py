@@ -5795,6 +5795,100 @@ def _terminal_output_len(term: Any) -> int:
         return 0
 
 
+def _bi_terminal_scroll(params: dict, ctx: ToolCtx) -> dict:
+    """Scroll a named terminal's viewport within its scrollable history.
+
+    Implements a wheel-like navigation over the terminal's buffered output:
+      - ``up=N``     move the viewport N lines toward older output (freeze)
+      - ``down=N``   move the viewport N lines toward newer output
+      - ``live``     pin the viewport back to the newest output (default)
+    ``N`` defaults to the viewport height (``terminal_tail_lines``). The
+    viewport itself (what ``<sub_terminals>`` renders) is controlled by the
+    frozen anchor this sets.
+    """
+    target = (params.get("name") or "").strip()
+    if not target:
+        return {"ok": False, "error": "missing 'name'"}
+    if ctx.get_terminal is None:
+        return {"ok": False, "error": "terminal access not available"}
+    term = ctx.get_terminal(target)
+    if term is None:
+        return {"ok": False, "error": f"terminal '{target}' not found"}
+    if term.session is None:
+        return {"ok": False, "error": f"terminal '{target}' has no session"}
+    import agent_loop as _al
+    term.session.read_output(timeout=0.2)
+    term.session.read_output(timeout=0)
+    try:
+        buf_len = len(_al._term_buffer_lines(term.session.full_output or ""))
+    except Exception:
+        buf_len = 0
+    height = max(1, int(_al.get_runtime_config("terminal_tail_lines") or 20))
+    store = _al._term_scroll_store(ctx.state)
+    entry = store.setdefault(target, {})
+    current_anchor = entry.get("anchor")
+
+    action = (params.get("action") or params.get("scroll") or "live").strip().lower()
+    if action in ("live", "bottom", "to_bottom", "follow", ""):
+        entry["anchor"] = None
+        start = max(0, buf_len - height)
+        is_live = True
+    elif action in ("up", "scroll_up", "back"):
+        try:
+            n = int(params.get("lines") or height)
+        except (TypeError, ValueError):
+            n = height
+        n = max(1, n)
+        if current_anchor is None:
+            current_anchor = max(0, buf_len - height)
+        entry["anchor"] = max(0, int(current_anchor) - n)
+        start = entry["anchor"]
+        is_live = False
+    elif action in ("down", "scroll_down", "forward"):
+        try:
+            n = int(params.get("lines") or height)
+        except (TypeError, ValueError):
+            n = height
+        n = max(1, n)
+        if current_anchor is None:
+            current_anchor = max(0, buf_len - height)
+        new_anchor = int(current_anchor) + n
+        bottom = max(0, buf_len - height)
+        if new_anchor >= bottom:
+            entry["anchor"] = None
+            start = bottom
+            is_live = True
+        else:
+            entry["anchor"] = new_anchor
+            start = new_anchor
+            is_live = False
+    elif action in ("top", "to_top", "first"):
+        entry["anchor"] = 0
+        start = 0
+        is_live = False
+    else:
+        return {"ok": False,
+                "error": f"unknown scroll action '{action}' (use up/down/live/top)"}
+
+    lines = _al._term_buffer_lines(term.session.full_output or "")
+    window = lines[start:start + height]
+    # Force the next snapshot to re-inject this window: a scroll is an explicit
+    # action, so the reader must SEE where it landed (even if no new output
+    # arrived) rather than hitting the "no change, skip" dedup path.
+    entry["last_len"] = 0
+    result = {
+        "ok": True,
+        "result": "\n".join(window) if window else "(no output)",
+        "terminal": target,
+        "action": action,
+        "start": start,
+        "is_live": is_live,
+        "height": height,
+        "buffer_len": len(lines),
+    }
+    return result
+
+
 def _bi_terminal_wait(params: dict, ctx: ToolCtx) -> dict:
     """Wait for a background terminal to finish, then return its final delta."""
     target = (params.get("name") or "").strip()
@@ -10710,6 +10804,33 @@ def register_builtin_tools() -> None:
                 "required": ["name"],
             },
             invoke=_bi_terminal_read,
+        ),
+        Tool(
+            name="terminal.scroll",
+            description=(
+                "Scroll a named terminal's viewport within its scrollable "
+                "history, like a mouse wheel. `action=up` moves the view toward "
+                "OLDER output (freeze); `action=down` moves toward NEWER output; "
+                "`action=live` pins back to the newest output (default). `lines` "
+                "defaults to the viewport height. After scrolling, the next "
+                "<sub_terminals> injection shows the chosen window."
+            ),
+            schema={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Terminal name"},
+                    "action": {
+                        "type": "string",
+                        "enum": ["up", "down", "live", "top"],
+                        "default": "live",
+                        "description": "up=older, down=newer, live=newest, top=oldest",
+                    },
+                    "lines": {"type": "integer",
+                              "description": "How many lines to move (default = viewport height)"},
+                },
+                "required": ["name"],
+            },
+            invoke=_bi_terminal_scroll,
         ),
         Tool(
             name="terminal.wait",

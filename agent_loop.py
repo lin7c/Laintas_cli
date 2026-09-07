@@ -104,7 +104,8 @@ _DEFAULT_CONFIG = {
     "output_truncate": 3000,      # chars — lastOutput tail truncation
     "paged_reads": True,          # fs.read without offset/limit reads by page and evicts the page it leaves (file_pager); False restores the plain 2000-line window
     "read_block_visible": True,   # decline a read whose lines are still visible in the model's own context (evicted content stays re-readable)
-    "terminal_tail_lines": 20,    # lines — sub-terminal snapshot
+    "terminal_tail_lines": 20,    # lines — sub-terminal snapshot viewport height
+    "terminal_buffer_lines": 5000,  # lines — per-terminal scrollable history depth
     "paste_summary": True,        # collapse large pastes into a [Pasted #N ~L lines] placeholder in the prompt (expanded on submit)
     "paste_summary_min_lines": 3, # paste line-count threshold that triggers the placeholder
     "paste_summary_min_chars": 150, # paste char-count threshold that triggers the placeholder
@@ -990,7 +991,8 @@ _RUNTIME_CONFIG_DESCRIPTIONS = {
     "output_truncate": "Maximum retained characters per tool-output section",
     "paged_reads": "Read files as paged documents: one page in context at a time, evicted pages leave an indexed stub",
     "read_block_visible": "Decline a re-read of lines the model can still see in its own transcript",
-    "terminal_tail_lines": "Terminal snapshot line count",
+    "terminal_tail_lines": "Terminal snapshot line count (viewport height)",
+    "terminal_buffer_lines": "Scrollable history depth per terminal (lines)",
     "disable_remote_terminal": "Opt this runtime environment out of Helpwo's interactive terminal (P2P shell)",
     "allow_remote_exec_without_approval": "Let Helpwo's AI run commands in this environment without local approval (P2P exec)",
     "remote_max_workers": "Maximum concurrently running remote tasks",
@@ -1068,7 +1070,8 @@ _RUNTIME_NONNEGATIVE = {
 }
 _RUNTIME_POSITIVE = {
     "max_loops", "max_tokens", "max_debug_entries", "output_truncate",
-    "terminal_tail_lines", "staleness_limit", "repetition_threshold",
+    "terminal_tail_lines", "terminal_buffer_lines", "staleness_limit",
+    "repetition_threshold",
     "warning_force_limit", "deterministic_repeat_limit",
     "microcompact_keep", "microcompact_read_budget",
     "history_max_messages", "message_truncate", "short_memory_max_chars",
@@ -6723,6 +6726,7 @@ def _history_without_current_turn(chat_history: list, original_input: str) -> li
 STATE_KEYS_CARRIED = frozenset({
     "_files_seen", "_pager", "_pager_msgs", "_pager_walk", "_session_id",
     "_task_cwd",
+    "_term_scroll", "_step_counter",
     "_thread_messages", "_thread_summary", "_thread_call_seq",
     "_fork_lineage", "_fork_name", "_fork_parent_session_id",
     # Idle-consolidation bookkeeping. All three must cross the turn boundary:
@@ -6781,6 +6785,9 @@ def prepare_state_for_repl(state: dict) -> dict:
         # them (see _project_paged_reads).
         "_pager": state.get("_pager") or {},
         "_pager_msgs": state.get("_pager_msgs") or {},
+        # Per-terminal scroll viewports: frozen anchor + incremental last_len
+        # must cross the turn boundary, or scrolling state would reset every turn.
+        "_term_scroll": dict(state.get("_term_scroll") or {}),
         # Hand-rolled-paging detection. Its own store (not `_pager`) so a
         # windowed read cannot leave a fingerprint-less entry in the page table
         # and make the next paged read report a rebuild that never happened.
@@ -6928,28 +6935,68 @@ def _build_conversation_section(chat_history: list) -> str:
     return '\n'.join(lines) if lines else "(no history)"
 
 
-def _clean_terminal_tail(output: str, n: int) -> str:
-    """Scrub PTY-capture noise from a named terminal's tail before injection.
+def _term_buffer_lines(output: str) -> list:
+    """Cleaned, prompt-echo-free lines of a terminal's full PTY output.
 
-    Raw ``full_output`` carries internal sentinels (``__LAINTAS_SHELL_*__`` /
-    ``__CMD_*__``), ANSI color codes, and trailing shell-prompt echoes that are
-    never part of real command output. Drop them so ``<sub_terminals>`` shows
-    only substance, matching what the per-call ``terminalHistory`` rows already
-    get from ``scrub_marker_noise``.
+    Raw captures carry internal sentinels (``__LAINTAS_SHELL_*__`` /
+    ``__CMD_*__``), ANSI color codes, and a trailing shell-prompt echo — none of
+    which are real command output. They are dropped here so every renderer
+    (tail view and scroll viewport) shows only substance, matching the per-call
+    ``terminalHistory`` rows that already get ``scrub_marker_noise``.
     """
     if not output:
-        return ""
+        return []
     text = tools_mod.scrub_marker_noise(output)
     text = re.sub(r'\x1b\[[0-9;?]*[a-zA-Z]', '', text)   # ANSI escape codes
     lines = text.split('\n')
     # Drop trailing lines that are only a shell-prompt echo (user@host:path#/$).
     while lines and re.match(r'^\s*\S+@\S+:.*[#$]\s*$', lines[-1]):
         lines.pop()
-    return '\n'.join(lines[-n:])
+    return lines
 
 
-def get_terminals_snapshot() -> str:
-    """Collect latest tail lines from each alive named terminal."""
+def _clean_terminal_tail(output: str, n: int) -> str:
+    """Scrub PTY-capture noise and return the last n cleaned lines."""
+    return '\n'.join(_term_buffer_lines(output)[-n:])
+
+
+def _term_scroll_store(state: dict) -> dict:
+    """Per-terminal viewport state, persisted with the session."""
+    if not isinstance(state, dict):
+        return {}
+    store = state.get("_term_scroll")
+    if not isinstance(store, dict):
+        store = {}
+        state["_term_scroll"] = store
+    return store
+
+
+def _term_viewport(state: dict, name: str, buf_len: int):
+    """Current viewport start for one terminal.
+
+    Returns ``(start, is_live, height)``. ``is_live=True`` means the viewport
+    tracks the newest output (start = last ``height`` lines); ``False`` means
+    the reader scrolled back into history and the start is frozen (anchor).
+    """
+    height = max(1, int(get_runtime_config("terminal_tail_lines") or 20))
+    store = _term_scroll_store(state)
+    entry = store.get(name)
+    anchor = (entry or {}).get("anchor")
+    bottom = max(0, buf_len - height)
+    if anchor is None:
+        return bottom, True, height
+    start = max(0, min(int(anchor), bottom))
+    return start, False, height
+
+
+def get_terminals_snapshot(state: dict = None) -> str:
+    """Collect the current viewport of each alive named terminal.
+
+    A terminal defaults to LIVE: it shows the newest ``terminal_tail_lines``
+    lines and, with no new output, is not re-injected (stale repetition removed).
+    When the reader has scrolled back (``terminal.scroll``), the frozen window is
+    rendered with a label showing how far up it is.
+    """
     terminals = get_all_terminals()
     if not terminals:
         return ""
@@ -6972,24 +7019,48 @@ def get_terminals_snapshot() -> str:
     dead = [t for t in terminals if not (t.session and t.session.is_alive())]
     if not alive and not dead:
         return ""
+    store = _term_scroll_store(state)
     lines = []
+    injected = False
     if alive:
-        lines.append("[SUB-TERMINALS — Alive]")
         for t in alive:
-            output = t.session.full_output or ""
-            n = int(get_runtime_config("terminal_tail_lines"))
-            tail = _clean_terminal_tail(output, n)
+            buf = _term_buffer_lines(t.session.full_output or "")
+            buf_len = len(buf)
+            start, is_live, height = _term_viewport(state, t.name, buf_len)
+            entry = store.setdefault(t.name, {})
+            last_len = int(entry.get("last_len") or 0)
+            # Live viewport: only inject when new output arrived; a frozen window
+            # is always injected because the reader asked to see history.
+            if is_live and buf_len == last_len:
+                continue
+            entry["last_len"] = buf_len
+            injected = True
+            window = buf[start:start + height]
             st_info = f" [stationed: {', '.join(t.stationed_agent_ids)}]" if t.stationed_agent_ids else ""
-            lines.append(f"  {t.name} ({t.command}){st_info}:")
-            if tail.strip():
-                for tl in tail.split('\n'):
+            if is_live:
+                head = (f"  {t.name} ({t.command}){st_info}: "
+                        f"showing last {len(window)}/{buf_len}")
+            else:
+                head = (f"  {t.name} ({t.command}){st_info}: scrolled up "
+                        f"{max(0, buf_len - height - start)} lines "
+                        f"(lines {start + 1}-{min(buf_len, start + len(window))}/{buf_len})")
+            lines.append(head)
+            if any(str(w).strip() for w in window):
+                for tl in window:
                     lines.append(f"    | {tl}")
             else:
                 lines.append("    (no output yet)")
     if dead:
+        injected = True
         lines.append("[SUB-TERMINALS — Dead]")
         for t in dead:
             lines.append(f"  {t.name} ({t.command})")
+    # Nothing new to say and nothing dead to report: don't emit an empty
+    # "[SUB-TERMINALS — Alive]" header every turn.
+    if not injected:
+        return ""
+    if alive and lines:
+        lines.insert(0, "[SUB-TERMINALS — Alive]")
     return '\n'.join(lines)
 
 
@@ -7467,7 +7538,7 @@ def _build_user_message(original_input: str, state: dict, memory_entries: list,
     terminal_section = _build_terminal_section(state)
     conversation_section = _build_conversation_section(chat_history)
     memory_section = _build_memory_section(memory_entries, state, chat_history)
-    terminals_snapshot = get_terminals_snapshot()
+    terminals_snapshot = get_terminals_snapshot(state)
     n_steps = len(state.get('terminalHistory', []))
     warnings = _detect_loop_warnings(state, original_input)
     files_seen = state.get("_files_seen", [])
@@ -10450,7 +10521,7 @@ def run_agent_loop(
         terminal_section = _build_terminal_section(state)
         memory_section = _build_memory_section(memory_entries, state, history_context)
         conversation_section = _build_conversation_section(history_context)
-        terminals_snapshot = get_terminals_snapshot()
+        terminals_snapshot = get_terminals_snapshot(state)
         history_for_backend = _prepare_history_for_backend(history_context)
         if _thread_mode:
             # Stage C — separate the PERMANENT thread from TRANSIENT live state:

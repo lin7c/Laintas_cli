@@ -2063,6 +2063,94 @@ class TerminalInjectionCleanupTests(unittest.TestCase):
         self.assertEqual(carried.get("_step_counter"), 7)
 
 
+class TerminalScrollTests(unittest.TestCase):
+    """Scroll-viewport tests: live follow, frozen history, incremental dedup."""
+
+    def setUp(self):
+        agent_loop.close_all_terminals()
+        agent_loop.reset_runtime_config()
+        agent_loop.set_runtime_config("terminal_tail_lines", 20)
+
+    def tearDown(self):
+        agent_loop.close_all_terminals()
+
+    @staticmethod
+    def _session(nlines):
+        class S:
+            def __init__(self, n):
+                self.full_output = ("\n".join(f"line-{i:03d}" for i in range(1, n + 1)) + "\n") if n else ""
+                self.alive = True
+                self.returncode = 0
+            def read_output(self, timeout=0.1):
+                return ""
+            def is_alive(self):
+                return self.alive
+        return S(nlines)
+
+    def _ctx(self, state):
+        from tools import ToolCtx
+        ctx = ToolCtx(state=state)
+        ctx.get_terminal = agent_loop.get_terminal
+        ctx.agent_id = "test"
+        return ctx
+
+    def _register(self, sess, name="testterm"):
+        agent_loop.register_terminal(self._session(0), "/bin/sh", 0, name="term0")
+        agent_loop.register_terminal(sess, "/bin/sh", 0, name=name, parent_terminal="term0")
+
+    def test_live_follows_newest_and_dedups_with_no_new_output(self):
+        sess = self._session(100)
+        self._register(sess)
+        state = {}
+        snap = agent_loop.get_terminals_snapshot(state)
+        self.assertIn("showing last 20/100", snap)
+        self.assertIn("line-100", snap)
+        self.assertNotIn("line-001", snap)
+        # no new output -> nothing injected (not even an empty header)
+        self.assertEqual(agent_loop.get_terminals_snapshot(state), "")
+
+    def test_scroll_up_freezes_and_scroll_down_returns_to_live(self):
+        sess = self._session(100)
+        self._register(sess)
+        state = {}
+        agent_loop.get_terminals_snapshot(state)
+        r = tools._bi_terminal_scroll({"name": "testterm", "action": "up"}, self._ctx(state))
+        self.assertTrue(r["ok"])
+        self.assertFalse(r["is_live"])
+        snap = agent_loop.get_terminals_snapshot(state)
+        self.assertIn("scrolled up", snap)
+        self.assertNotIn("line-100", snap)
+        # scroll down far -> back to live
+        rd = tools._bi_terminal_scroll(
+            {"name": "testterm", "action": "down", "lines": 1000}, self._ctx(state))
+        self.assertTrue(rd["is_live"])
+        self.assertIn("line-100", agent_loop.get_terminals_snapshot(state))
+
+    def test_scroll_up_clamps_at_top_and_action_forces_refresh(self):
+        sess = self._session(100)
+        self._register(sess)
+        state = {}
+        agent_loop.get_terminals_snapshot(state)
+        tools._bi_terminal_scroll(
+            {"name": "testterm", "action": "up", "lines": 1000}, self._ctx(state))
+        start, is_live, _ = agent_loop._term_viewport(state, "testterm", 100)
+        self.assertEqual(start, 0)
+        self.assertFalse(is_live)
+        self.assertIn("line-001", agent_loop.get_terminals_snapshot(state))
+        # an explicit scroll forces re-injection even without new output
+        r = tools._bi_terminal_scroll({"name": "testterm", "action": "live"}, self._ctx(state))
+        self.assertTrue(r["is_live"])
+
+    def test_live_with_new_output_injects_new_window(self):
+        sess = self._session(100)
+        self._register(sess)
+        state = {}
+        agent_loop.get_terminals_snapshot(state)
+        sess.full_output += "line-101\n"
+        snap = agent_loop.get_terminals_snapshot(state)
+        self.assertIn("line-101", snap)
+
+
 class LazySnapshotTests(unittest.TestCase):
     def setUp(self):
         agent_loop.reset_runtime_config()
