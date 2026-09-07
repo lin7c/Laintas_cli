@@ -37,6 +37,29 @@ class ResourceBrowserModelTests(unittest.TestCase):
         self.assertTrue(resource_ui.fuzzy_match("Mode Manager", "mdmgr"))
         self.assertFalse(resource_ui.fuzzy_match("Mode Manager", "xyz"))
 
+    def test_clean_ansi_strips_escapes_without_leaving_bracket_residue(self):
+        # Regression: ANSI SGR in stored tool/shell output used to survive as
+        # a visible "[31m" once the bare ESC byte was dropped as a control char.
+        self.assertEqual(resource_ui.clean_ansi("\x1b[31mred\x1b[0m"), "red")
+        self.assertEqual(resource_ui.clean_ansi("a\x1b[1;32mb\x1b[m c"), "ab c")
+        self.assertEqual(resource_ui.clean_ansi("a\r\nb"), "a\nb")
+        self.assertEqual(resource_ui.clean_ansi("plain text"), "plain text")
+        # plain() also removes Rich markup on top of ANSI.
+        self.assertEqual(
+            resource_ui.plain("\x1b[31m[b]red[/b]\x1b[0m"), "red")
+
+    def test_detail_fragments_strip_ansi_from_transcript_body(self):
+        browser = self._browser(presentation="timeline")
+        browser.detail = resource_ui.UIDetail(
+            "Conversation", lines=[
+                resource_ui.UILine("TOOL · shell", "class:detail.heading"),
+                resource_ui.UILine("\x1b[31mcolored output\x1b[0m"),
+            ], kind="timeline")
+        rendered = "".join(text for _, text in browser._detail_fragments())
+        self.assertNotIn("\x1b", rendered)
+        self.assertNotIn("[31m", rendered)
+        self.assertIn("colored output", rendered)
+
     def test_palette_matches_main_cli_green_red_and_violet_tokens(self):
         color = lambda name: resource_ui._STYLE.get_attrs_for_style_str(
             "class:" + name).color

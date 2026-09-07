@@ -33,11 +33,29 @@ from prompt_toolkit.utils import get_cwidth
 
 
 _MARKUP_RE = re.compile(r"\[/?[^\]]+\]")
+#: ANSI SGR / OSC / single-char escape sequences plus bare carriage return.
+#: Stripping these (rather than dropping only the ESC byte) is what stops
+#: ``\x1b[31m`` from surviving as a visible ``[31m`` residue in the browser.
+_ANSI_RE = re.compile(
+    r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[@-Z\\-~]|\x1b[()][AB12]|\x0d")
+
+
+def clean_ansi(value: Any) -> str:
+    """Remove ANSI escape sequences and bare CR from one display value.
+
+    This is the single sanitizer every render path (list, detail, timeline,
+    search indexing) routes through, so all ResourceBrowser call sites —
+    /told browse included — share the same behaviour.
+    """
+    return _ANSI_RE.sub("", str(value or "")).replace("\r", "")
 
 
 def plain(value: Any) -> str:
-    """Remove Rich markup and control characters from one display value."""
-    text = _MARKUP_RE.sub("", str(value or ""))
+    """Remove ANSI escapes, Rich markup, and control characters."""
+    # ANSI first: the markup regex would otherwise swallow the "[" of an
+    # SGR like "\x1b[0m", leaving a bare ESC that mis-triggers the single-char
+    # escape branch and eats the following letter (e.g. "\x1br" -> "r").
+    text = _MARKUP_RE.sub("", clean_ansi(str(value or "")))
     return "".join(ch for ch in text if ch in "\n\t" or ord(ch) >= 32)
 
 
@@ -346,9 +364,12 @@ class ResourceBrowser:
         if self.detail is not None and query:
             pattern = re.compile(re.escape(query), re.IGNORECASE)
             for line_index, line in enumerate(self.detail.lines):
+                # Search against the same sanitized text that is rendered, so
+                # match offsets align with what the user sees (ANSI escapes in
+                # stored tool/shell output would otherwise shift highlighting).
                 self._detail_matches.extend(
                     (line_index, match.start(), match.end())
-                    for match in pattern.finditer(line.text))
+                    for match in pattern.finditer(clean_ansi(line.text)))
         if not self._detail_matches:
             self._detail_match_index = -1
         elif reset or self._detail_match_index < 0:
@@ -712,14 +733,14 @@ class ResourceBrowser:
                     fragments.append(("class:timeline.rail", " │  "))
                     base_style = line.style or "class:detail"
                     fragments.extend(self._detail_text_fragments(
-                        line_index, line.text, base_style))
+                        line_index, clean_ansi(line.text), base_style))
                     fragments.append((base_style, "\n"))
             else:
                 prefix = "   " if self.presentation == "document" else " "
                 base_style = line.style or "class:detail"
                 fragments.append((base_style, prefix))
                 fragments.extend(self._detail_text_fragments(
-                    line_index, line.text, base_style))
+                    line_index, clean_ansi(line.text), base_style))
                 fragments.append((base_style, "\n"))
         if end < len(detail.lines):
             fragments.append(("class:muted",

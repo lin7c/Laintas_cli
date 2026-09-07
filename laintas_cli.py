@@ -20888,12 +20888,12 @@ def _cmd_told(parts: list) -> bool:
     if sub == "":
         if _user_msgs:
             console.print("[bold]You last asked:[/bold]")
-            console.print(f"  [cyan]{escape(_user_msgs[-1])}[/cyan]")
+            console.print(f"  [cyan]{escape(strip_ansi(_user_msgs[-1]))}[/cyan]")
         else:
             _fallback = getattr(handle_meta_command, '_last_original_input', None)
             if _fallback:
                 console.print("[bold]You last asked:[/bold]")
-                console.print(f"  [cyan]{escape(_fallback)}[/cyan]")
+                console.print(f"  [cyan]{escape(strip_ansi(_fallback))}[/cyan]")
             else:
                 console.print("[yellow]You haven't asked anything yet this session.[/yellow]")
                 console.print("[dim]Tip: /told log shows prompts from the on-disk journal "
@@ -20923,7 +20923,7 @@ def _cmd_told(parts: list) -> bool:
         else:
             console.print(f"[bold]All your messages ({len(_user_msgs)}):[/bold]")
             for i, msg in enumerate(_user_msgs, 1):
-                console.print(f"  [dim][{i}][/dim] {escape(msg)}")
+                console.print(f"  [dim][{i}][/dim] {escape(strip_ansi(msg))}")
 
     elif sub == "reply":
         n = _parse_n(args[1] if len(args) > 1 else "", 1)
@@ -20956,8 +20956,8 @@ def _cmd_told(parts: list) -> bool:
                      else f"{owner}last {len(recent)} turns")
             console.print(f"[bold]── {label} ──[/bold]")
             for idx, (u, a) in enumerate(recent, 1):
-                console.print(f"[bold]You:[/bold]        [cyan]{escape(u)}[/cyan]")
-                console.print(f"[bold]Assistant:[/bold]   [green]{escape(a)}[/green]")
+                console.print(f"[bold]You:[/bold]        [cyan]{escape(strip_ansi(u))}[/cyan]")
+                console.print(f"[bold]Assistant:[/bold]   [green]{escape(strip_ansi(a))}[/green]")
                 if idx < len(recent):
                     console.print()
 
@@ -21001,9 +21001,9 @@ def _cmd_told(parts: list) -> bool:
                         tstr = ""
                 text = evt.get("text", "") or ""
                 if tstr:
-                    console.print(f"  [dim]{tstr}[/dim]  {escape(text)}")
+                    console.print(f"  [dim]{tstr}[/dim]  {escape(strip_ansi(text))}")
                 else:
-                    console.print(f"  {escape(text)}")
+                    console.print(f"  {escape(strip_ansi(text))}")
 
     else:
         try:
@@ -21025,7 +21025,7 @@ def _cmd_told(parts: list) -> bool:
             label = "Last message" if len(recent) == 1 else f"Last {len(recent)} messages"
             console.print(f"[bold]{label}:[/bold]")
             for i, msg in enumerate(recent, 1):
-                console.print(f"  [dim][{i}][/dim] {escape(msg)}")
+                console.print(f"  [dim][{i}][/dim] {escape(strip_ansi(msg))}")
 
     return False
 
