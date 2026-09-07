@@ -2026,6 +2026,43 @@ class TerminalTriggerTests(unittest.TestCase):
         self.assertEqual(wake_calls, [])
 
 
+class TerminalInjectionCleanupTests(unittest.TestCase):
+    """Regression tests for <sub_terminals> noise/duplication cleanup and the
+    session-memory step counter."""
+
+    def test_clean_terminal_tail_strips_markers_ansi_and_prompt_echo(self):
+        # Real PTY tail order: output lines, then internal markers, then the
+        # shell-prompt echo (which becomes the trailing line once markers are
+        # scrubbed).
+        raw = (
+            "real line 1\n"
+            "real line 2\n"
+            "\x1b[31mcolored\x1b[0m\n"
+            "__LAINTAS_SHELL_CWD_abc__:/root\n"
+            "__LAINTAS_SHELL_END_abc__:0\n"
+            "__CMD_BEGIN_xyz__\n"
+            "__CMD_END_xyz__:0\n"
+            "root@host:/root# \n"
+        )
+        cleaned = agent_loop._clean_terminal_tail(raw, 20)
+        self.assertIn("real line 1", cleaned)
+        self.assertIn("real line 2", cleaned)
+        self.assertNotIn("__LAINTAS_SHELL", cleaned)
+        self.assertNotIn("__CMD_", cleaned)
+        self.assertNotIn("root@host", cleaned)     # trailing prompt echo dropped
+        self.assertNotIn("\x1b[", cleaned)         # ANSI stripped
+
+    def test_clean_terminal_tail_bounds_to_n_lines(self):
+        raw = "\n".join(f"line {i}" for i in range(10))
+        cleaned = agent_loop._clean_terminal_tail(raw, 3)
+        self.assertEqual(cleaned.split("\n"), ["line 7", "line 8", "line 9"])
+
+    def test_step_counter_carries_across_repl_turns(self):
+        state = {"_step_counter": 7}
+        carried = agent_loop.prepare_state_for_repl(state)
+        self.assertEqual(carried.get("_step_counter"), 7)
+
+
 class LazySnapshotTests(unittest.TestCase):
     def setUp(self):
         agent_loop.reset_runtime_config()

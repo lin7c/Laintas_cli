@@ -6796,6 +6796,10 @@ def prepare_state_for_repl(state: dict) -> dict:
         "_thread_messages": copy.deepcopy(thread_messages),
         "_thread_summary": str(state.get("_thread_summary") or ""),
         "_thread_call_seq": int(state.get("_thread_call_seq") or 0),
+        # Monotonic session-memory step counter: must cross the turn boundary
+        # or `Step N` numbering resets to 1 every turn (repeated "Step 1/2/3"
+        # blocks that read as overlapping histories).
+        "_step_counter": int(state.get("_step_counter") or 0),
         # Fork lineage must survive the turn boundary. This whitelist is the
         # only state that crosses it, so dropping the lineage here made every
         # snapshot after a resume look like a root-level session and made a
@@ -6924,12 +6928,44 @@ def _build_conversation_section(chat_history: list) -> str:
     return '\n'.join(lines) if lines else "(no history)"
 
 
+def _clean_terminal_tail(output: str, n: int) -> str:
+    """Scrub PTY-capture noise from a named terminal's tail before injection.
+
+    Raw ``full_output`` carries internal sentinels (``__LAINTAS_SHELL_*__`` /
+    ``__CMD_*__``), ANSI color codes, and trailing shell-prompt echoes that are
+    never part of real command output. Drop them so ``<sub_terminals>`` shows
+    only substance, matching what the per-call ``terminalHistory`` rows already
+    get from ``scrub_marker_noise``.
+    """
+    if not output:
+        return ""
+    text = tools_mod.scrub_marker_noise(output)
+    text = re.sub(r'\x1b\[[0-9;?]*[a-zA-Z]', '', text)   # ANSI escape codes
+    lines = text.split('\n')
+    # Drop trailing lines that are only a shell-prompt echo (user@host:path#/$).
+    while lines and re.match(r'^\s*\S+@\S+:.*[#$]\s*$', lines[-1]):
+        lines.pop()
+    return '\n'.join(lines[-n:])
+
+
 def get_terminals_snapshot() -> str:
-    """Collect latest 20 lines from each alive named terminal."""
+    """Collect latest tail lines from each alive named terminal."""
     terminals = get_all_terminals()
     if not terminals:
         return ""
     terminals = [t for t in terminals if t.session is not None]
+    if not terminals:
+        return ""
+    # The caller's own deployment terminal is already surfaced through the
+    # per-call terminalHistory / thread tool results; re-injecting its raw PTY
+    # tail here would duplicate that content and leak marker/prompt noise.
+    # The snapshot is for genuinely separate terminals (children, siblings).
+    try:
+        _me = _agent_registry.get(get_thread_agent_id()) or get_current_agent()
+        _skip = {agent_deployment_terminal(_me)} if _me is not None else set()
+    except Exception:
+        _skip = set()
+    terminals = [t for t in terminals if t.name not in _skip]
     if not terminals:
         return ""
     alive = [t for t in terminals if t.session and t.session.is_alive()]
@@ -6942,7 +6978,7 @@ def get_terminals_snapshot() -> str:
         for t in alive:
             output = t.session.full_output or ""
             n = int(get_runtime_config("terminal_tail_lines"))
-            tail = '\n'.join(output.split('\n')[-n:])
+            tail = _clean_terminal_tail(output, n)
             st_info = f" [stationed: {', '.join(t.stationed_agent_ids)}]" if t.stationed_agent_ids else ""
             lines.append(f"  {t.name} ({t.command}){st_info}:")
             if tail.strip():
@@ -12494,9 +12530,15 @@ def run_agent_loop(
             # as step history and few-shot-mimic them, amplifying filler. Keep step
             # memory to what's actually useful for resuming: what ran, what happened.
             _step_note = action_desc_short or "(no tool call)"
+            # Monotonic step numbering across REPL turns. `loop` resets to 0
+            # every turn, so numbering by it produced repeated "Step 1/2/3"
+            # blocks that looked like overlapping histories. The counter lives
+            # in carried state so it survives the turn boundary.
+            _step_idx = int(state.get("_step_counter", 0)) + 1
+            state["_step_counter"] = _step_idx
             _append_short_memory(
                 state,
-                f"\n  Step {loop+1}: {_step_note}"
+                f"\n  Step {_step_idx}: {_step_note}"
             )
         state["terminalHistory"].extend(per_call_rows)
         state.pop("_pending_history", None)
