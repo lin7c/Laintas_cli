@@ -125,6 +125,38 @@ class AccessControlTests(unittest.TestCase):
         self.assertEqual(self.module._task_queue.qsize(), 0)
 
 
+class ChannelTaskVisibilityTests(unittest.TestCase):
+    """A task from a channel runs in this terminal, so it shows in it.
+
+    `run_agent_loop` renders nothing from a worker thread, on purpose: worker
+    prints corrupt the REPL's display and a second Live region raises. So a
+    channel task ran completely invisibly -- the loop worked, the reply was
+    sent to the phone, and the terminal showed nothing at all. `events_cb` is
+    the sanctioned way out, and it was passed None."""
+
+    def setUp(self):
+        self.source = (ROOT / "laintas_cli.py").read_text()
+        self.body = self.source.split("def _run_extension_task(", 1)[1].split(
+            "\n    _extension_runtime =", 1)[0]
+
+    def test_progress_is_published_rather_than_dropped(self):
+        self.assertIn("events_cb=_show", self.body)
+        self.assertNotIn("events_cb=None", self.body)
+
+    def test_the_run_is_announced_the_way_a_typed_one_is(self):
+        self.assertIn("console.rule(", self.body)
+        # The banner names where the task came from.
+        self.assertIn('conversation or "extension"', self.body)
+
+    def test_tool_calls_and_output_are_both_shown(self):
+        for kind in ("ai_stream", "ai", "tool_started", "function", "system"):
+            self.assertIn(f'"{kind}"', self.body, kind)
+
+    def test_display_failure_never_breaks_the_task(self):
+        show = self.body.split("def _show(", 1)[1]
+        self.assertIn("except Exception", show)
+
+
 class SecretaryRoutingTests(unittest.TestCase):
     """Messages go to a secretary first, not straight to the agent.
 

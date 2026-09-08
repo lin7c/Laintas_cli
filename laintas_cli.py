@@ -24490,6 +24490,48 @@ def main():
                       "history": []})
             thread["history"].append({
                 "role": "user", "content": str(text), "input_kind": "prompt"})
+            # A task arriving from a channel runs in this terminal, so it is
+            # shown in this terminal -- announced the way a typed one is, then
+            # the agent's own output underneath. Without the banner the work
+            # appears from nowhere and there is no way to tell that a phone
+            # caused it, or that it is happening at all.
+            source = (conversation or "extension").split(":", 1)[0]
+            started_at = time.time()
+            console.print()
+            console.rule(f"[cyan]{source}[/cyan]", align="left")
+            console.print(f"[bold cyan]>[/bold cyan] {text}", markup=True,
+                          highlight=False)
+
+            def _show(events) -> None:
+                """Render a background run's progress without owning the tty.
+
+                A worker thread is never the foreground agent, so the loop
+                renders nothing itself -- deliberately, because worker prints
+                corrupt the REPL's display and a second Live region raises.
+                `events_cb` is the sanctioned way out: the loop publishes, and
+                this prints plainly. Without it a channel task ran completely
+                invisibly, which is what "I can't see it executing" was.
+                """
+                for event in events or []:
+                    kind = event.get("type")
+                    try:
+                        if kind == "ai_stream":
+                            console.print(str(event.get("content") or ""),
+                                          markup=False, highlight=False, end="")
+                        elif kind == "ai":
+                            console.print(str(event.get("content") or ""),
+                                          markup=False, highlight=False)
+                        elif kind == "tool_started":
+                            console.print(
+                                f"  [dim]· {event.get('name') or 'tool'}[/dim]")
+                        elif kind == "function":
+                            console.print(
+                                f"  [dim]· {event.get('name') or ''} "
+                                f"{str(event.get('content') or '')[:120]}[/dim]")
+                        elif kind == "system":
+                            console.print(f"  [dim]{event.get('content') or ''}[/dim]")
+                    except Exception:
+                        pass          # display must never break the task
             try:
                 if callable(on_progress):
                     on_progress("started")
@@ -24499,13 +24541,17 @@ def main():
                     session=session,
                     state=thread["state"],
                     chat_history=thread["history"],
-                    events_cb=None,
+                    events_cb=_show,
                     existing_session=None,
                     depth=0,
                 )
             except Exception as exc:
+                console.rule(f"[red]{source} failed[/red]", align="left")
                 return {"ok": False, "reply": "",
                         "error": f"{type(exc).__name__}: {exc}"}
+            console.rule(
+                f"[cyan]{source} done ({int(time.time() - started_at)}s)[/cyan]",
+                align="left")
             # Keep the thread from growing without bound; a channel is a long
             # lived conversation, not a session that ends.
             del thread["history"][:-40]
