@@ -64,29 +64,28 @@ const PAIRING_WINDOW_MS = parseInt(process.env.WA_PAIRING_WINDOW_MS || '180000',
 
 /** How this client identifies itself to WhatsApp.
  *
- * The three slots are not interchangeable, and the phone shows them
- * differently (Utils/validate-connection.js `generateRegistrationNode`):
+ * These exact three values are the only combination observed to complete a
+ * pairing against a real account. Two others did not:
  *
- *   [0] os           -> free text; this is the DEVICE NAME under Linked devices
- *   [1] platformType -> an ENUM, and the only thing that picks the ICON
- *   [2] version      -> free text, shown next to the name
+ *   ['laintas',     'Chrome',  '22']       -> never paired
+ *   ['Ubuntu',      'Chrome',  '22.04.4']  -> PAIRED
+ *   ['laintas-cli', 'Desktop', '22.04.4']  -> never paired
  *
- * So the name is ours to choose and the icon is not: `getPlatformType` maps
- * slot [1] onto proto.DeviceProps.PlatformType (CHROME, SAFARI, EDGE, DESKTOP,
- * IPAD, ...) and falls back to DESKTOP for anything it does not recognise.
- * WhatsApp draws its own artwork for those; a linked device cannot supply an
- * icon. DESKTOP is the honest choice for a CLI -- it is a desktop application,
- * not a browser tab, and the previous CHROME is why the phone said "Chrome".
+ * Only registration carries them (`generateRegistrationNode` puts slot [0] in
+ * `os` and slot [1] through `getPlatformType`); a reconnect sends neither, so
+ * this affects pairing and nothing else. That is precisely why it is easy to
+ * get wrong: changing it looks harmless right up until somebody needs to pair.
  *
- * Slot [0] was once a hand-made `'laintas'` alongside a malformed `'22'`
- * version, at a time when pairing by phone number was failing. Whether that
- * mattered was never established -- other causes were found and fixed -- so
- * the name is restored but the version stays a real one, and both remain
- * overridable if WhatsApp ever refuses this identity:
- *   WA_DEVICE_NAME, WA_PLATFORM (chrome|safari|edge|desktop|...), WA_OS_VERSION
+ * Slot [0] is also the name shown under Linked devices, so "laintas-cli" there
+ * is tempting -- it was tried in 1.2.0 and pairing stopped working. The
+ * evidence does not separate the name from the platform type, and settling
+ * that needs a real phone for every attempt, so the default stays on the
+ * combination known to work and the override is left for anyone willing to
+ * risk a failed pairing to get a nicer name:
+ *   WA_DEVICE_NAME, WA_PLATFORM, WA_OS_VERSION
  */
-const DEVICE_NAME = process.env.WA_DEVICE_NAME || 'laintas-cli';
-const PLATFORM = process.env.WA_PLATFORM || 'Desktop';
+const DEVICE_NAME = process.env.WA_DEVICE_NAME || 'Ubuntu';
+const PLATFORM = process.env.WA_PLATFORM || 'Chrome';
 const OS_VERSION = process.env.WA_OS_VERSION || '22.04.4';
 const BROWSER = [DEVICE_NAME, PLATFORM, OS_VERSION];
 

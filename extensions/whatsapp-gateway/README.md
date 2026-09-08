@@ -66,47 +66,30 @@ than run as a backlog of instructions.
 
 ## How the device appears on your phone
 
-Under **Linked devices** it shows as `laintas-cli`. That name is the `os` slot
-of the registration and is free text; the *icon* is not ours to choose --
-WhatsApp picks its own artwork from a fixed `PlatformType` enum (Chrome,
-Safari, Edge, Desktop, iPad, ...), and a linked device cannot supply one. The
-default is `Desktop`, which is what a CLI actually is; the earlier `Chrome` is
-why the phone used to say Chrome.
+Under **Linked devices** it shows as `Ubuntu` with a Chrome icon. That is not a
+cosmetic choice -- it is the only identity observed to complete a pairing:
+
+| `browser` triple | pairing |
+|---|---|
+| `['laintas', 'Chrome', '22']` | never paired |
+| `['Ubuntu', 'Chrome', '22.04.4']` | **paired** |
+| `['laintas-cli', 'Desktop', '22.04.4']` | never paired |
+
+Slot `[0]` is free text and is the displayed name, slot `[1]` picks the icon
+from a fixed `PlatformType` enum (a linked device cannot supply artwork), and
+slot `[2]` is a version string. Only **registration** sends them, so changing
+them appears harmless until the next pairing -- which is how 1.2.0 shipped a
+nicer name and a gateway that could no longer pair.
+
+The override is there for anyone willing to risk a failed pairing:
 
 ```
-WA_DEVICE_NAME="my box"   # the name under Linked devices
-WA_PLATFORM=Chrome        # which built-in icon; Desktop by default
+WA_DEVICE_NAME="laintas-cli" WA_PLATFORM=Chrome laintas-cli
 ```
 
-Both only apply when a device is **registered**, so changing them affects the
-next pairing, not the current one. Note what that costs: seeing a new name or
-icon means unlinking on the phone and pairing again, and the running session
-does not survive that -- `generateLoginNode` sends only the account and device
-number, so the identity is never re-sent on a reconnect.
-
-If the device is removed under Linked devices, the gateway says so explicitly
-and tells you to pair again; the revoked credentials are moved aside to
-`bridge/.auth.revoked` rather than deleted.
-
-## When pairing does not work
-
-`/whatsapp status` prints the sidecar's log path. That file holds WhatsApp's
-own account of the attempt -- `not logged in, attempting registration`,
-`logging in...`, `pair success recv`, `error in pairing` -- which is what
-distinguishes a code that never reached WhatsApp from one that was rejected.
-Set `WA_LOG_LEVEL=trace` for the full protocol exchange.
-
-If the phone *rejects* the code, the pairing reached WhatsApp and the companion
-registration was refused. Which client identity WhatsApp accepts is its
-decision, so that identity is configurable -- try another before assuming the
-gateway is broken:
-
-```
-WA_BROWSER=macos WA_BROWSER_CLIENT=Safari laintas-cli
-WA_BROWSER=windows laintas-cli
-```
-
-`/whatsapp status` shows the identity in use. Default is Ubuntu / Chrome.
+If a pairing then fails, unset it and pair again. The evidence does not
+separate the name from the platform type -- each attempt costs a real phone --
+so the default stays where it is known to work.
 
 ## Notes
 

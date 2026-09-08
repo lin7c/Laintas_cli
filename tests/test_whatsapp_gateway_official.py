@@ -249,14 +249,26 @@ class UntrustedSenderTests(unittest.TestCase):
 
 
 class DeviceIdentityTests(unittest.TestCase):
-    def test_the_device_name_is_ours_and_the_icon_is_an_enum(self):
+    """The default identity is the one observed to pair, not the prettiest.
+
+    Only registration carries these values, so changing them looks harmless
+    until somebody needs to pair. 1.2.0 changed them for a nicer device name
+    and pairing stopped working; ['Ubuntu', 'Chrome', '22.04.4'] is the only
+    combination that has completed a pairing against a real account."""
+
+    def test_the_default_is_the_combination_known_to_pair(self):
         source = BRIDGE.read_text()
-        # Slot 0 is free text and is the name shown under Linked devices.
-        self.assertIn("WA_DEVICE_NAME || 'laintas-cli'", source)
-        # Slot 1 only selects among WhatsApp's own artwork; Desktop is the
-        # honest one for a CLI, and CHROME is why the phone said "Chrome".
-        self.assertIn("WA_PLATFORM || 'Desktop'", source)
+        self.assertIn("WA_DEVICE_NAME || 'Ubuntu'", source)
+        self.assertIn("WA_PLATFORM || 'Chrome'", source)
+        self.assertIn("WA_OS_VERSION || '22.04.4'", source)
         self.assertIn("const BROWSER = [DEVICE_NAME, PLATFORM, OS_VERSION];", source)
+
+    def test_the_identity_stays_overridable(self):
+        # Overridable, but off the tested path -- the comment has to say so.
+        source = BRIDGE.read_text()
+        block = source.split("How this client identifies itself", 1)[1][:1600]
+        self.assertIn("PAIRED", block)
+        self.assertIn("never paired", block)
 
 
 class PairingResetScopeTests(unittest.TestCase):
