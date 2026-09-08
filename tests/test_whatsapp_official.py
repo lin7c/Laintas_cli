@@ -125,36 +125,43 @@ class AccessControlTests(unittest.TestCase):
         self.assertEqual(self.module._task_queue.qsize(), 0)
 
 
-class ChannelTaskVisibilityTests(unittest.TestCase):
-    """A task from a channel runs in this terminal, so it shows in it.
+class ChannelTaskExecutionTests(unittest.TestCase):
+    """A channel task is typed into this REPL, not run beside it.
 
-    `run_agent_loop` renders nothing from a worker thread, on purpose: worker
-    prints corrupt the REPL's display and a second Live region raises. So a
-    channel task ran completely invisibly -- the loop worked, the reply was
-    sent to the phone, and the terminal showed nothing at all. `events_cb` is
-    the sanctioned way out, and it was passed None."""
+    Starting a second agent loop on a worker thread produced a parallel
+    session: never the tty owner so it rendered nothing, and holding its own
+    history so it shared only a directory with the conversation the user can
+    see. What a channel should do is what the user does -- put the text in the
+    prompt and press enter -- and `_inject_input` is already exactly that, the
+    queue `/agents` and the Helpwo bridge hand lines to the single executor
+    through."""
 
     def setUp(self):
         self.source = (ROOT / "laintas_cli.py").read_text()
         self.body = self.source.split("def _run_extension_task(", 1)[1].split(
             "\n    _extension_runtime =", 1)[0]
 
-    def test_progress_is_published_rather_than_dropped(self):
-        self.assertIn("events_cb=_show", self.body)
-        self.assertNotIn("events_cb=None", self.body)
+    def test_the_task_goes_through_the_repl(self):
+        self.assertIn("_inject_input(str(text), done)", self.body)
 
-    def test_the_run_is_announced_the_way_a_typed_one_is(self):
-        self.assertIn("console.rule(", self.body)
-        # The banner names where the task came from.
-        self.assertIn('conversation or "extension"', self.body)
+    def test_no_second_agent_loop_is_started(self):
+        # The whole point: one executor, one conversation, one display.
+        self.assertNotIn("run_agent_loop(", self.body)
+        self.assertNotIn("events_cb", self.body)
 
-    def test_tool_calls_and_output_are_both_shown(self):
-        for kind in ("ai_stream", "ai", "tool_started", "function", "system"):
-            self.assertIn(f'"{kind}"', self.body, kind)
+    def test_the_result_is_taken_the_way_the_helpwo_bridge_takes_it(self):
+        self.assertIn("done.wait(", self.body)
+        self.assertIn('agent_state.get("lastReply")', self.body)
 
-    def test_display_failure_never_breaks_the_task(self):
-        show = self.body.split("def _show(", 1)[1]
-        self.assertIn("except Exception", show)
+    def test_the_injected_line_is_echoed(self):
+        # Injected input is not echoed by the main loop, so without this a
+        # task appears to run with nothing having asked for it.
+        self.assertIn("console.print(", self.body)
+        self.assertIn("{text}", self.body)
+
+    def test_a_task_that_never_finishes_reports_instead_of_hanging(self):
+        self.assertIn("EXTENSION_TASK_TIMEOUT", self.body)
+        self.assertIn("still running after", self.body)
 
 
 class SecretaryRoutingTests(unittest.TestCase):

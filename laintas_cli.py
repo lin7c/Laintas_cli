@@ -24463,100 +24463,51 @@ def main():
     # Project extensions receive a narrow inference gateway, never the raw
     # authenticated session. The normal backend path remains authoritative for
     # official authentication, model authorization and billing.
-    #: Durable per-conversation agent state for extension-run tasks, so a
-    #: channel like WhatsApp continues a thread instead of restarting cold on
-    #: every message. Keyed by the channel's conversation id.
-    _extension_task_threads: dict = {}
+    #: A channel task runs one at a time. Each occupies the REPL, and two of
+    #: them interleaving over one working directory is not something a phone
+    #: message should be able to cause.
     _extension_task_lock = threading.Lock()
+    #: Long enough for real work; a task that outlives it has almost certainly
+    #: stopped rather than slowed.
+    EXTENSION_TASK_TIMEOUT = 1800.0
 
     def _run_extension_task(text: str, conversation: str = "",
                             on_progress=None) -> dict:
-        """Execute one task for an extension, serialised across channels.
+        """Run a channel's task by typing it into this REPL.
 
-        Serialised on purpose: each call is a full agent loop that may hold a
-        PTY and run commands, and two of them interleaving over one working
-        directory is not something a phone message should be able to cause.
+        Not by starting a second agent loop beside it. That was the mistake:
+        a worker-thread loop is never the tty owner, so it renders nothing, and
+        it keeps its own history — a parallel session that happens to share a
+        directory. What a channel should do is exactly what the user does,
+        which is put the text in the prompt and press enter.
 
-        Approval posture comes from the active mode, exactly as `--execute`
-        takes it -- the mode decides what a task may do, the extension only
-        decides who may ask.
+        `_inject_input` already is that: the same queue `/agents` and the
+        Helpwo bridge use to hand a line to the single executor. The main loop
+        then routes it normally — meta command, shell passthrough, or agent —
+        renders it as the foreground turn, and shares the one conversation.
+        The result comes back the way the Helpwo bridge takes it, off
+        `agent_state` once the loop signals `done`.
+
+        Serialised here rather than relying on the queue: the caller wants the
+        answer to ITS task, and `lastReply` is a single slot.
         """
         with _extension_task_lock:
-            _sync_session_approval_from_mode()
-            key = conversation or "default"
-            thread = _extension_task_threads.setdefault(
-                key, {"state": {"shortTermMemory": "", "lastReply": "",
-                                "lastOutput": ""},
-                      "history": []})
-            thread["history"].append({
-                "role": "user", "content": str(text), "input_kind": "prompt"})
-            # A task arriving from a channel runs in this terminal, so it is
-            # shown in this terminal -- announced the way a typed one is, then
-            # the agent's own output underneath. Without the banner the work
-            # appears from nowhere and there is no way to tell that a phone
-            # caused it, or that it is happening at all.
             source = (conversation or "extension").split(":", 1)[0]
-            started_at = time.time()
-            console.print()
-            console.rule(f"[cyan]{source}[/cyan]", align="left")
-            console.print(f"[bold cyan]>[/bold cyan] {text}", markup=True,
-                          highlight=False)
-
-            def _show(events) -> None:
-                """Render a background run's progress without owning the tty.
-
-                A worker thread is never the foreground agent, so the loop
-                renders nothing itself -- deliberately, because worker prints
-                corrupt the REPL's display and a second Live region raises.
-                `events_cb` is the sanctioned way out: the loop publishes, and
-                this prints plainly. Without it a channel task ran completely
-                invisibly, which is what "I can't see it executing" was.
-                """
-                for event in events or []:
-                    kind = event.get("type")
-                    try:
-                        if kind == "ai_stream":
-                            console.print(str(event.get("content") or ""),
-                                          markup=False, highlight=False, end="")
-                        elif kind == "ai":
-                            console.print(str(event.get("content") or ""),
-                                          markup=False, highlight=False)
-                        elif kind == "tool_started":
-                            console.print(
-                                f"  [dim]· {event.get('name') or 'tool'}[/dim]")
-                        elif kind == "function":
-                            console.print(
-                                f"  [dim]· {event.get('name') or ''} "
-                                f"{str(event.get('content') or '')[:120]}[/dim]")
-                        elif kind == "system":
-                            console.print(f"  [dim]{event.get('content') or ''}[/dim]")
-                    except Exception:
-                        pass          # display must never break the task
-            try:
-                if callable(on_progress):
-                    on_progress("started")
-                response = run_agent_loop(
-                    get_loop_deps(),
-                    original_input=str(text),
-                    session=session,
-                    state=thread["state"],
-                    chat_history=thread["history"],
-                    events_cb=_show,
-                    existing_session=None,
-                    depth=0,
-                )
-            except Exception as exc:
-                console.rule(f"[red]{source} failed[/red]", align="left")
+            # Injected lines are not echoed, so a task would otherwise appear
+            # to run with nothing having asked for it.
+            console.print(f"\n[dim]({source})[/dim] [bold]{text}[/bold]",
+                          markup=True, highlight=False)
+            done = threading.Event()
+            _inject_input(str(text), done)
+            if callable(on_progress):
+                on_progress("started")
+            if not done.wait(timeout=EXTENSION_TASK_TIMEOUT):
                 return {"ok": False, "reply": "",
-                        "error": f"{type(exc).__name__}: {exc}"}
-            console.rule(
-                f"[cyan]{source} done ({int(time.time() - started_at)}s)[/cyan]",
-                align="left")
-            # Keep the thread from growing without bound; a channel is a long
-            # lived conversation, not a session that ends.
-            del thread["history"][:-40]
-            return {"ok": True, "reply": str(response.get("msg") or ""),
-                    "error": ""}
+                        "error": f"still running after "
+                                 f"{int(EXTENSION_TASK_TIMEOUT)}s"}
+            reply = (agent_state.get("lastReply")
+                     or agent_state.get("lastOutput") or "")
+            return {"ok": True, "reply": str(reply), "error": ""}
 
     _extension_runtime = extension_runtime.get_runtime()
     _extension_runtime.configure(
