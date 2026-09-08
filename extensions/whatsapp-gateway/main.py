@@ -56,6 +56,12 @@ _install_error = ""
 #: How the sidecar identified itself to WhatsApp. Which identity WhatsApp will
 #: accept on the link-code route is its decision, so this is worth showing.
 _browser = ""
+#: The paired account's own jid. The self-chat is addressed to it, and there is
+#: no other way to reach the Agent from WhatsApp -- the CLI is a linked device,
+#: not a contact, so no "laintas-cli" conversation exists to open.
+_me_jid = ""
+#: Whether this bridge session has already opened the self-chat.
+_greeted = False
 
 # QR hint is printed at most once per bridge session to avoid spamming the
 # terminal during reconnect cycles (408 timeout -> reconnect -> new QR).
@@ -83,6 +89,7 @@ def setup(ctx) -> None:
             ("status", "Show connection status and pairing info"),
             ("stop", "Stop the gateway"),
             ("logout", "Forget the paired session and show a fresh QR code"),
+            ("hello", "Open the chat with yourself, where you talk to the Agent"),
             ("send", "Send a message: send <number> <text>"),
         ],
     )
@@ -293,7 +300,7 @@ def _stop_bridge() -> None:
 
 
 def _handle_from_bridge(obj: dict) -> None:
-    global _qr_hinted, _last_status, _state, _http_port, _browser
+    global _qr_hinted, _last_status, _state, _http_port, _browser, _me_jid
     kind = obj.get("type")
 
     if kind == "status":
@@ -311,6 +318,11 @@ def _handle_from_bridge(obj: dict) -> None:
                          f"http://127.0.0.1:{port} instead.")
         else:
             _state = str(state or "")
+        if state == "open":
+            me = obj.get("me")
+            if isinstance(me, str) and me:
+                _me_jid = me
+                threading.Thread(target=_open_self_chat, daemon=True).start()
         if state == "gave_up":
             _log("")
             _log("WhatsApp: giving up after repeated failed connections.")
@@ -473,6 +485,35 @@ def _dispatch_send(jid: str, text: str) -> tuple[bool, str]:
         _pending_sends.pop(req_id, None)
 
 
+#: What the CLI sends itself once, to create the conversation.
+_GREETING = (
+    "laintas-cli is connected.\n\n"
+    "This chat is where you talk to it -- send a message here and it answers. "
+    "There is no separate laintas-cli contact: the CLI is a linked device of "
+    "this account, so this is the conversation.")
+
+
+def _open_self_chat() -> None:
+    """Put the self-chat in the chat list, once per bridge session.
+
+    "Message yourself" is easy to miss and hard to find on purpose-built menus,
+    and an empty conversation does not appear in the chat list at all -- so
+    there was nothing to tap even after pairing worked. Sending one message
+    creates it and pins it to the top, where a reply is the obvious next move."""
+    global _greeted
+    with _lock:
+        if _greeted or not _me_jid:
+            return
+        _greeted = True
+    ok, error = _dispatch_send(_me_jid, _GREETING)
+    if ok:
+        _log(f"Opened the WhatsApp chat with yourself ({_me_jid.split('@')[0]}). "
+             "Send a message there to talk to the Agent.")
+    else:
+        _greeted = False
+        _log(f"Could not open the self-chat: {error}")
+
+
 def _log(msg: str) -> None:
     if _console is not None:
         try:
@@ -555,6 +596,7 @@ def _tool_status(args: dict, ctx=None) -> dict:
             "dependencies_installed": BAILEYS.is_dir(),
             "log_file": str(LOG_FILE),
             "browser": _browser,
+            "self_chat": _me_jid,
             "last_error": _install_error,
         },
     }
@@ -564,8 +606,8 @@ def _tool_status(args: dict, ctx=None) -> dict:
 # /whatsapp command
 # ----------------------------------------------------------------------
 
-_USAGE = ("Usage: /whatsapp start | pairing <phone> | status | send <number> "
-          "<text> | logout | stop")
+_USAGE = ("Usage: /whatsapp start | pairing <phone> | status | hello | "
+          "send <number> <text> | logout | stop")
 
 
 def _handle_whatsapp(parts: list) -> None:
@@ -621,6 +663,8 @@ def _handle_whatsapp(parts: list) -> None:
         _log(f"QR page:        http://127.0.0.1:{_http_port}")
         _log(f"Session dir:    {AUTH_DIR}")
         _log(f"Dependencies:   {'installed' if BAILEYS.is_dir() else 'not installed'}")
+        if _me_jid:
+            _log(f"Your chat:      {_me_jid}   (message yourself there to talk to the Agent)")
         if _browser:
             _log(f"Identifies as:  {_browser}")
         _log(f"Sidecar log:    {LOG_FILE}"
@@ -644,6 +688,14 @@ def _handle_whatsapp(parts: list) -> None:
         sent, error = _send_to_bridge({"type": "logout"})
         _log("Paired session forgotten; a fresh QR code will appear shortly."
              if sent else f"Could not log out: {error}")
+
+    elif sub == "hello":
+        if not _me_jid:
+            _log("Not connected yet -- run /whatsapp start and wait for pairing.")
+            return
+        global _greeted
+        _greeted = False
+        _open_self_chat()
 
     elif sub == "send":
         if len(rest) < 2:

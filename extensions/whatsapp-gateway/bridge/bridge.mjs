@@ -570,7 +570,16 @@ async function connect({ allowReset = false } = {}) {
       lastPairingCode = null;
       reconnectDelay = RECONNECT_MIN_MS;
       failedConnects = 0;
-      emit({ type: 'status', state: 'open', reason: 'connected' });
+      // The parent needs the account's own jid to open the self-chat: there is
+      // no "laintas-cli" contact to message, only this account talking to
+      // itself, and that conversation may not exist in the chat list yet.
+      emit({
+        type: 'status',
+        state: 'open',
+        reason: 'connected',
+        me: socket?.user?.id ? cleanJid(socket.user.id) : null,
+        name: socket?.user?.name || null,
+      });
       return;
     }
 

@@ -248,6 +248,55 @@ class UntrustedSenderTests(unittest.TestCase):
                              2 * self.module.SELF_CHAT_HISTORY_TURNS)
 
 
+class SelfChatDiscoveryTests(unittest.TestCase):
+    """There is no laintas-cli contact to open.
+
+    The CLI is a linked device of the account, not a conversation partner, so
+    nothing named laintas-cli exists in the chat list. The only way in is the
+    account's chat with itself -- and an empty one of those is not shown at
+    all, so after a successful pairing there was still nothing to tap."""
+
+    def setUp(self):
+        self.module = _load_main()
+        self.logged: list[str] = []
+        self.module._log = self.logged.append
+        self.sent: list[tuple] = []
+        self.module._dispatch_send = lambda jid, text: (
+            self.sent.append((jid, text)), (True, ""))[1]
+
+    def test_connecting_opens_the_self_chat(self):
+        self.module._handle_from_bridge({
+            "type": "status", "state": "open", "reason": "connected",
+            "me": "8613677131067@s.whatsapp.net"})
+        for _ in range(100):
+            if self.sent:
+                break
+            time.sleep(0.02)
+        self.assertEqual(self.sent[0][0], "8613677131067@s.whatsapp.net")
+        self.assertIn("laintas-cli is connected", self.sent[0][1])
+
+    def test_it_only_greets_once_per_session(self):
+        frame = {"type": "status", "state": "open", "reason": "connected",
+                 "me": "8613677131067@s.whatsapp.net"}
+        for _ in range(3):
+            self.module._handle_from_bridge(frame)
+            time.sleep(0.1)
+        self.assertEqual(len(self.sent), 1)
+
+    def test_hello_reopens_it_on_demand(self):
+        self.module._me_jid = "8613677131067@s.whatsapp.net"
+        self.module._greeted = True
+        self.module._handle_whatsapp(["/whatsapp", "hello"])
+        self.assertEqual(len(self.sent), 1)
+
+    def test_status_names_the_chat_to_use(self):
+        self.module._me_jid = "8613677131067@s.whatsapp.net"
+        self.module._handle_whatsapp(["/whatsapp", "status"])
+        output = "\n".join(self.logged)
+        self.assertIn("Your chat", output)
+        self.assertIn("8613677131067", output)
+
+
 class DeviceIdentityTests(unittest.TestCase):
     """The default identity is the one observed to pair, not the prettiest.
 

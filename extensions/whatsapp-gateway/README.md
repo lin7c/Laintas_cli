@@ -42,11 +42,21 @@ The session is stored in `bridge/.auth/` and survives restarts — pair once.
 
 ## Talking to the Agent from WhatsApp
 
-Open the chat with **yourself** ("Message yourself" / your own number in the
-chat list) and type. That chat is the Agent's conversation: it answers there,
-with a short rolling history, so it reads as one thread rather than a series of
-unrelated questions. Nothing to configure -- the chat exists because the CLI is
-now a linked device of your account.
+**There is no `laintas-cli` contact to open.** The CLI is a linked *device* of
+your account, the same as WhatsApp Web -- not somebody you message. The way in
+is your account's chat with itself.
+
+You should not have to go looking for it: on connecting, the gateway sends one
+message into that chat, which creates it and puts it at the top of your chat
+list. Reply there and you are talking to the Agent. `/whatsapp hello` reopens
+it if it gets buried, and `/whatsapp status` prints which chat it is.
+
+To find it by hand instead: **new chat**, then your own name at the top of the
+contact list (labelled *Message yourself*), or search your own number.
+
+That chat is the Agent's conversation: it answers there with a short rolling
+history, so it reads as one thread rather than a series of unrelated
+questions.
 
 The two directions are deliberately not the same thing:
 
