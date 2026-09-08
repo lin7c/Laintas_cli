@@ -408,6 +408,7 @@ html { scroll-behavior: smooth; }
 .ops-card h3 { margin: 56px 0 13px; font-size: 21px; font-weight: 550; letter-spacing: -.025em; }.ops-card p { max-width: 460px; margin: 0; color: var(--ops-copy); font-size: 13px; line-height: 1.75; }
 .mini-graph { display: flex; align-items: center; margin-top: 29px; }.mini-graph span { display: inline-flex; align-items: center; gap: 5px; padding: 7px 8px; border: 1px solid var(--ops-line); border-radius: 5px; color: var(--ops-copy); font: 500 9px/1 var(--font-mono); }.mini-graph i { flex: 1; height: 1px; background: var(--ops-line-strong); }
 .policy-list { display: flex; gap: 5px; margin-top: 28px; }.policy-list span { padding: 6px 7px; border-radius: 4px; background: rgba(216,59,50,.12); color: #de6f68; font: 600 8px/1 var(--font-mono); }.policy-list span:nth-child(2) { background: rgba(189,138,46,.12); color: #c99b4a; }.policy-list span:last-child { background: rgba(24,162,102,.13); color: #62c58f; }
+.terminal-chips { display: flex; gap: 5px; margin-top: 28px; }.terminal-chips span { padding: 6px 8px; border: 1px solid var(--ops-line); border-radius: 4px; background: var(--ops-surface-2); color: var(--ops-copy); font: 600 9px/1 var(--font-mono); }
 
 .control-section { scroll-margin-top: 100px; display: grid; grid-template-columns: .86fr 1.14fr; align-items: center; gap: 70px; padding-top: 160px; padding-bottom: 150px; }
 .control-copy .section-kicker { margin-bottom: 25px; }.state-list { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 30px; }.state-list code { padding: 7px 9px; border: 1px solid var(--ops-line); border-radius: 5px; color: var(--ops-muted); background: var(--ops-surface); font-size: 10px; }
@@ -419,7 +420,8 @@ html { scroll-behavior: smooth; }
 .pricing-heading { display: flex; align-items: center; justify-content: space-between; gap: 40px; }
 .pricing-heading h2 { margin: 0; color: var(--ops-ink); font-size: clamp(38px, 5vw, 68px); font-weight: 550; line-height: 1.02; letter-spacing: -.06em; }
 .pricing-heading > div > p:not(.section-kicker) { max-width: 650px; margin: 22px 0 0; color: var(--ops-copy); font-size: 16px; line-height: 1.75; }
-.pricing-heading .button-light { flex: 0 0 auto; }
+.pricing-heading .button-light { flex: 0 0 auto; border-color: var(--ops-ink); background: var(--ops-ink); color: var(--ops-bg); }
+.pricing-heading .button-light:hover { border-color: var(--ops-ink); background: var(--ops-ink); }
 .pricing-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-top: 46px; }
 .price-card { position: relative; display: flex; flex-direction: column; padding: 30px; border: 1px solid var(--ops-line); border-radius: 12px; background: var(--ops-surface); transition: transform .2s ease, border-color .2s ease, box-shadow .2s ease; }
 .price-card:hover { transform: translateY(-3px); border-color: var(--ops-line-strong); }

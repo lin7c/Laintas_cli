@@ -19,6 +19,7 @@ export default function Header() {
   const { data: session, isPending } = auth.useSession();
   const [userOpen, setUserOpen] = useState(false);
   const [balance, setBalance] = useState(null);
+  const [version, setVersion] = useState('v1.25.1');
   const menuRef = useRef(null);
 
   useEffect(() => {
@@ -34,6 +35,13 @@ export default function Header() {
     }).catch(() => {});
   }, [session]);
 
+  useEffect(() => {
+    fetch('https://api.github.com/repos/lin7c/Laintas_cli/releases/latest')
+      .then((r) => r.ok ? r.json() : Promise.reject(new Error('release lookup failed')))
+      .then((d) => { if (d.tag_name) setVersion(d.tag_name); })
+      .catch(() => {});
+  }, []);
+
   async function signOut() {
     setUserOpen(false);
     try { await auth.signOut(); } finally { window.location.replace('https://accounts.laintas.com/login'); }
@@ -43,7 +51,7 @@ export default function Header() {
   return (
     <header className="site-header">
       <div className="header-inner">
-        <Link to="/" className="header-brand"><BrandMark compact /><span>laintas_cli</span><small>v1.18</small></Link>
+        <Link to="/" className="header-brand"><BrandMark compact /><span>laintas_cli</span><small>{version}</small></Link>
         <nav className="header-nav" aria-label="Product navigation">
           {NAV[lang].map(([label, href]) => (href.startsWith('/#')
             ? <a href={href} key={href}>{label}</a>
