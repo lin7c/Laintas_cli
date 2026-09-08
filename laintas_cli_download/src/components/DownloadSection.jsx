@@ -3,7 +3,7 @@ import { motion } from 'framer-motion';
 import {
   ArrowDownToLine, ArrowRight, Check, CheckCircle2, ChevronRight, CircleDot,
   Code2, Copy, ExternalLink, GitBranch, Monitor, Network, Package, Play,
-  Radar, RotateCcw, ShieldCheck, TerminalSquare, Waypoints, Zap,
+  Radar, RotateCcw, ShieldCheck, Layers3, TerminalSquare, Waypoints, Zap,
 } from 'lucide-react';
 import { useLanguage } from '@/contexts/LanguageContext';
 import SiteFooter from './SiteFooter';
