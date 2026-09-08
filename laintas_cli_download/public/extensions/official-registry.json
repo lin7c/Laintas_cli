@@ -18,12 +18,12 @@
       "sha256": "29315187eb19a4a5a5f0a5863025dde23e7db76b038a414e1b68a7a863f386d3"
     },
     {
-      "id": "laintas/whatsapp-gateway",
-      "name": "whatsapp-gateway",
-      "version": "1.3.0",
-      "description": "WhatsApp gateway: pair via QR or pairing code and send/receive messages, bridged to the laintas-cli Agent",
-      "url": "https://cli.laintas.com/extensions/official/whatsapp-gateway-1.3.0.lext",
-      "sha256": "9433a706293e6ba254ce55961235883e7d729bba9c1c3998d9389beaca590e41"
+      "id": "laintas/whatsapp",
+      "name": "whatsapp",
+      "version": "2.0.0",
+      "description": "Run laintas-cli from WhatsApp: message it a task, it executes and reports back",
+      "url": "https://cli.laintas.com/extensions/official/whatsapp-2.0.0.lext",
+      "sha256": "7c16b9d7214b772d2f3c4e6db1f97e0949bc874809214c61cd585206e330b0d9"
     }
   ]
 }

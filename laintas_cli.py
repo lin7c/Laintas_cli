@@ -24038,6 +24038,16 @@ def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
         run_error = f"{type(exc).__name__}: {exc}"
         _trace = traceback.format_exc()
 
+        # A turn that deleted its own working directory leaves every later
+        # path call raising ENOENT, so "the session was preserved" would be a
+        # lie: the next command would crash the same way. Move first, then
+        # report — the recovery names the deleted directory, which the
+        # traceback (pointing at getcwd) does not.
+        try:
+            _recover_deleted_cwd()
+        except Exception:
+            pass
+
         # Stop only descendants created during this failed foreground run.
         _stop_run_descendants(active_agent, _descendants_before)
 
@@ -24453,9 +24463,59 @@ def main():
     # Project extensions receive a narrow inference gateway, never the raw
     # authenticated session. The normal backend path remains authoritative for
     # official authentication, model authorization and billing.
+    #: Durable per-conversation agent state for extension-run tasks, so a
+    #: channel like WhatsApp continues a thread instead of restarting cold on
+    #: every message. Keyed by the channel's conversation id.
+    _extension_task_threads: dict = {}
+    _extension_task_lock = threading.Lock()
+
+    def _run_extension_task(text: str, conversation: str = "",
+                            on_progress=None) -> dict:
+        """Execute one task for an extension, serialised across channels.
+
+        Serialised on purpose: each call is a full agent loop that may hold a
+        PTY and run commands, and two of them interleaving over one working
+        directory is not something a phone message should be able to cause.
+
+        Approval posture comes from the active mode, exactly as `--execute`
+        takes it -- the mode decides what a task may do, the extension only
+        decides who may ask.
+        """
+        with _extension_task_lock:
+            _sync_session_approval_from_mode()
+            key = conversation or "default"
+            thread = _extension_task_threads.setdefault(
+                key, {"state": {"shortTermMemory": "", "lastReply": "",
+                                "lastOutput": ""},
+                      "history": []})
+            thread["history"].append({
+                "role": "user", "content": str(text), "input_kind": "prompt"})
+            try:
+                if callable(on_progress):
+                    on_progress("started")
+                response = run_agent_loop(
+                    get_loop_deps(),
+                    original_input=str(text),
+                    session=session,
+                    state=thread["state"],
+                    chat_history=thread["history"],
+                    events_cb=None,
+                    existing_session=None,
+                    depth=0,
+                )
+            except Exception as exc:
+                return {"ok": False, "reply": "",
+                        "error": f"{type(exc).__name__}: {exc}"}
+            # Keep the thread from growing without bound; a channel is a long
+            # lived conversation, not a session that ends.
+            del thread["history"][:-40]
+            return {"ok": True, "reply": str(response.get("msg") or ""),
+                    "error": ""}
+
     _extension_runtime = extension_runtime.get_runtime()
     _extension_runtime.configure(
         console=console,
+        task_callback=_run_extension_task,
         reserved_commands=[
             name for spec in COMMAND_SPECS for name in spec.all_names
         ],

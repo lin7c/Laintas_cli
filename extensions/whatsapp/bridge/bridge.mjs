@@ -293,6 +293,17 @@ function processInbound(line) {
     return;
   }
 
+  if (obj.type === 'react') {
+    // A task can run for minutes. A reaction is the cheapest possible "I have
+    // this" -- it lands instantly, needs no chunking, and does not clutter the
+    // conversation the way a running commentary of status messages would.
+    if (!socket || connectionState !== 'open') return;
+    socket.sendMessage(obj.jid, {
+      react: { text: String(obj.emoji ?? ''), key: obj.key },
+    }).catch(e => note(`reaction failed: ${e.message}`));
+    return;
+  }
+
   if (obj.type === 'pairing') {
     // Pairing-code mode: remember the phone. Request the code once the WS is
     // ready (handled by the connection.update QR branch, or now if it is up).
@@ -637,7 +648,10 @@ async function connect({ allowReset = false } = {}) {
       const isGroup = remoteJid.endsWith('@g.us');
       const from = cleanJid(msg.key.participant || msg.key.remoteJid);
       const name = msg.pushName || String(from).split('@')[0];
-      emit({ type: 'message', id, remoteJid, from, name, text, isGroup, selfChat });
+      emit({
+        type: 'message', id, remoteJid, from, name, text, isGroup, selfChat,
+        key: msg.key,        // needed to react to this specific message
+      });
     }
   });
 }

@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 2,
+  "name": "whatsapp",
+  "version": "2.0.0",
+  "entrypoint": "main.py",
+  "description": "Run laintas-cli from WhatsApp: message it a task, it executes and reports back",
+  "author": { "name": "laintas" },
+  "license": "MIT",
+  "toolPrefix": "whatsapp.",
+  "capabilities": ["network", "shell", "fs.read", "fs.write", "model", "storage"],
+  "minCliVersion": "1.25.0"
+}

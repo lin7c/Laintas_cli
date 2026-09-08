@@ -25,7 +25,7 @@ import json
 import re
 import sys
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -135,6 +135,41 @@ class _Registrar:
         return self._callback(*args, **kwargs)
 
 
+class TaskRunner:
+    """Run a full agent loop on an extension's behalf -- tools and all.
+
+    `BackendGateway` generates text and nothing else, which is the right shape
+    for an extension that wants a sentence written. It is the wrong shape for
+    one that is a REMOTE CONTROL: a message arriving from a phone asking to
+    check a disk, fix a file, run a deploy. Those need the agent, not the
+    model, and an extension with only `chat` can look like it works while
+    quietly being unable to do anything at all.
+
+    Approval posture is deliberately NOT a parameter. It comes from the active
+    mode, exactly as `--execute` takes it, so "may this run a command" stays one
+    decision the user makes in one place rather than something each extension
+    invents. A channel extension decides who may ask; the mode decides what
+    asking is allowed to do.
+    """
+
+    def __init__(self, callback: Optional[Callable[..., dict]] = None):
+        self._callback = callback
+
+    def run(self, text: str, *, conversation: str = "",
+            on_progress: Optional[Callable[[str], None]] = None) -> dict:
+        """Execute `text` as a task. Returns {ok, reply, error}.
+
+        `conversation` names a durable thread, so repeated calls from the same
+        chat continue rather than restarting cold. `on_progress` is called with
+        human-readable milestones for channels that can show them.
+        """
+        if self._callback is None:
+            return {"ok": False, "reply": "",
+                    "error": "task execution is not available in this session"}
+        return self._callback(text=str(text), conversation=str(conversation),
+                              on_progress=on_progress)
+
+
 class BackendGateway:
     """Narrow inference facade; raw authentication never crosses this API."""
 
@@ -160,6 +195,8 @@ class ExtensionContext:
     backend: BackendGateway
     cwd: str
     _runtime: "ExtensionRuntime"
+    #: Full agent execution. `backend` writes text; this one does the work.
+    tasks: TaskRunner = field(default_factory=TaskRunner)
     #: Where this extension's own files live. `cwd` is the user's working
     #: directory and says nothing about the package.
     directory: Optional[Path] = None
@@ -279,13 +316,16 @@ class ExtensionRuntime:
         self._tool_prefixes: dict[str, str] = {}
         self._console: Any = None
         self._backend = BackendGateway()
+        self._tasks = TaskRunner()
         self._reserved_commands: set[str] = set()
 
     def configure(self, console: Any = None,
                   backend_callback: Optional[Callable[..., dict]] = None,
-                  reserved_commands: Optional[list[str]] = None) -> None:
+                  reserved_commands: Optional[list[str]] = None,
+                  task_callback: Optional[Callable[..., dict]] = None) -> None:
         self._console = console
         self._backend = BackendGateway(backend_callback)
+        self._tasks = TaskRunner(task_callback)
         self._reserved_commands = {
             str(name).lower() for name in (reserved_commands or [])
         }
@@ -396,7 +436,7 @@ class ExtensionRuntime:
                     raise ValueError("extension must define setup(ctx)")
                 ctx = ExtensionContext(
                     name, self._console, self._backend, str(Path.cwd()), self,
-                    directory)
+                    tasks=self._tasks, directory=directory)
                 setup(ctx)
                 self._loaded[name] = LoadedExtension(
                     name, directory, module_name, module,
