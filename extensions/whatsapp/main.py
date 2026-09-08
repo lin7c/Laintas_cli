@@ -244,6 +244,12 @@ def _read_stderr(proc: subprocess.Popen) -> None:
         return
     loud = ("error", "fatal", "warn", "pair", "logged", "registration",
             "port ", "discarding", "giving up", "revoked")
+    # Errors that are real, logged, and require nothing of the user. WhatsApp
+    # answers some optional startup queries slowly or not at all; the session
+    # is already open by then and works. Shouting about it trains people to
+    # ignore the channel that carries the messages that do matter.
+    benign = ("init queries", "error in sending keep alive",
+              "failed to send keep alive")
     handle = None
     try:
         LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -264,7 +270,9 @@ def _read_stderr(proc: subprocess.Popen) -> None:
                     handle.flush()
                 except OSError:
                     handle = None
-            if any(word in line.lower() for word in loud):
+            lowered = line.lower()
+            if (any(word in lowered for word in loud)
+                    and not any(word in lowered for word in benign)):
                 _log(f"[whatsapp] {line[:300]}")
     finally:
         if handle is not None:

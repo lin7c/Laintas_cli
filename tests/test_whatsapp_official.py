@@ -248,6 +248,33 @@ class CredentialLocationTests(unittest.TestCase):
         self.assertLessEqual(unpacked, extension_manager.MAX_UNPACKED_BYTES)
 
 
+class ConsoleCaptureTests(unittest.TestCase):
+    """A dependency writing to stdout is both corruption and a key leak.
+
+    libsignal calls `console.info("Closing session:", session)` on every
+    session close. `console.info` goes to stdout -- the IPC channel -- and the
+    object it passes is a live Signal session including its private key."""
+
+    def test_console_is_rebound_away_from_stdout(self):
+        source = BRIDGE.read_text()
+        self.assertIn("for (const level of ['log', 'info', 'debug', 'warn', "
+                      "'error', 'trace', 'dir'])", source)
+        block = source.split("console capture", 1)[1][:1400]
+        self.assertIn("note(", block)          # stderr, never stdout
+
+    def test_object_arguments_are_dropped_not_truncated(self):
+        # Truncating would still leak whatever sorted first.
+        block = BRIDGE.read_text().split("console capture", 1)[1][:1400]
+        self.assertIn("typeof args[0] === 'string'", block)
+        self.assertNotIn("JSON.stringify(args", block)
+
+    def test_a_harmless_startup_timeout_does_not_shout(self):
+        module = _load_main()
+        source = (EXTENSION / "main.py").read_text()
+        self.assertIn("benign", source)
+        self.assertIn("init queries", source)
+
+
 class HardWonBridgeBehaviourTests(unittest.TestCase):
     """Regressions that each cost a real debugging session. Keep them pinned."""
 

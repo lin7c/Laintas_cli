@@ -175,6 +175,27 @@ function makeLogger(level = 'error') {
 
 const logger = makeLogger(process.env.WA_LOG_LEVEL || 'info');
 
+/* ---------------- console capture ----------------
+ * A dependency deep in the tree writes with `console.info`, which in Node goes
+ * to STDOUT -- this process's IPC channel. libsignal does exactly that on every
+ * session close (`session_record.js`: `console.info("Closing session:",
+ * session)`), so protocol noise landed in the frame stream and the parent
+ * printed each unparseable line back to the user.
+ *
+ * Worse than noise: the object it passes is a live Signal session, private key
+ * included. It was being written to a terminal and into the log file.
+ *
+ * So every console method is rebound to stderr AND only its leading string is
+ * kept. Dropping the object arguments is the point -- truncating them would
+ * still leak whatever happened to sort first. Nothing here has diagnostic
+ * value that a message alone does not carry. */
+for (const level of ['log', 'info', 'debug', 'warn', 'error', 'trace', 'dir']) {
+  console[level] = (...args) => {
+    const message = typeof args[0] === 'string' ? args[0] : '';
+    note(`[lib:${level}] ${message.slice(0, 200)}`.trimEnd());
+  };
+}
+
 /* ---------------- HTTP page: shows QR or status ---------------- */
 function htmlPage() {
   const title = 'WhatsApp Gateway';
