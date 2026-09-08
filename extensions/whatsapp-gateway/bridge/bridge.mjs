@@ -32,7 +32,7 @@
  */
 import http from 'node:http';
 import { URL } from 'node:url';
-import { promises as fs } from 'node:fs';
+import fsSync, { promises as fs } from 'node:fs';
 import path from 'node:path';
 import QRCode from 'qrcode';
 import makeWASocket, { useMultiFileAuthState, DisconnectReason } from '@whiskeysockets/baileys';
@@ -45,6 +45,14 @@ const PORT_ATTEMPTS = 10;
 /** Reconnect backoff bounds, in ms. */
 const RECONNECT_MIN_MS = 2000;
 const RECONNECT_MAX_MS = 60000;
+/** How long each pairing ref stays valid.
+ *
+ * Baileys walks a fixed list of pairing refs, ending the connection with
+ * `timedOut` once they run out -- at the stock 60s + 5x20s that is under three
+ * minutes to fetch a phone, find Linked devices and type eight characters. Any
+ * code still being typed when the socket dies is already dead. Six refs at
+ * three minutes each is a realistic window. */
+const PAIRING_WINDOW_MS = parseInt(process.env.WA_PAIRING_WINDOW_MS || '180000', 10);
 
 let latestQR = null;        // { png, ts }
 let connectionState = 'connecting';
@@ -52,6 +60,7 @@ let socket = null;
 let httpPort = HTTP_PORT;
 let pendingPairingPhone = null;   // set by a 'pairing' inbound command
 let pairingRequested = false;     // guard: request the code once per socket
+let lastPairingCode = null;       // so a replacement code can name what it kills
 let reconnectDelay = RECONNECT_MIN_MS;
 let reconnectTimer = null;
 let shuttingDown = false;
@@ -213,10 +222,19 @@ function processInbound(line) {
     const phone = String(obj.phone || '').replace(/\D/g, '');
     if (!phone) {
       emit({ type: 'status', state: 'pairing_error', reason: 'no phone number provided' });
-    } else {
-      pendingPairingPhone = phone;
-      pairingRequested = false;
-      if (socket) requestPairingCode();
+      return;
+    }
+    const switchingMode = !pendingPairingPhone || pendingPairingPhone !== phone;
+    pendingPairingPhone = phone;
+    pairingRequested = false;
+    if (socket && switchingMode) {
+      // The live socket was built for QR mode, with the short ref window that
+      // implies. Rebuild it so the code gets the full pairing window rather
+      // than whatever is left of a QR rotation.
+      connect().catch(e => emit({ type: 'status', state: 'pairing_error',
+                                  reason: e.message }));
+    } else if (socket) {
+      requestPairingCode();
     }
     return;
   }
@@ -237,7 +255,17 @@ async function requestPairingCode() {
   pairingRequested = true;
   try {
     const code = await socket.requestPairingCode(pendingPairingPhone);
-    emit({ type: 'pairing_code', code, phone: pendingPairingPhone });
+    // A code only lives as long as the socket that issued it. Say so, and say
+    // whether it replaces one the user may still be holding -- a silently
+    // superseded code is indistinguishable from a code that does not work.
+    emit({
+      type: 'pairing_code',
+      code,
+      phone: pendingPairingPhone,
+      expiresInSeconds: Math.round((PAIRING_WINDOW_MS * 6) / 1000),
+      supersedes: lastPairingCode,
+    });
+    lastPairingCode = code;
     connectionState = 'awaiting_pairing';
   } catch (e) {
     emit({ type: 'status', state: 'pairing_error', reason: e.message });
@@ -317,11 +345,29 @@ async function logout() {
   await connect();
 }
 
+/** True when the stored credentials are from a pairing that never finished.
+ *
+ * `requestPairingCode` writes `creds.me` immediately, before the user has
+ * typed anything. Baileys then branches on that field alone -- `creds.me` set
+ * means "log in as this account" -- so the next connection tries to log in
+ * with a pairing that was never completed, WhatsApp answers 401, and the
+ * session is torn down as `loggedOut`. Requesting a fresh code re-arms the
+ * same trap, which is why pairing appeared to fail every time: each attempt
+ * poisoned the next one. */
+function isAbandonedPairing(creds) {
+  return Boolean(creds && creds.me && creds.registered !== true);
+}
+
 async function connect() {
   retireSocket();
   // Re-read the auth state on every attempt: after a logout wipe, the previous
   // in-memory state describes credentials that no longer exist on disk.
-  const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+  let { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+  if (isAbandonedPairing(state.creds)) {
+    note('discarding credentials from an unfinished pairing');
+    await fs.rm(AUTH_DIR, { recursive: true, force: true });
+    ({ state, saveCreds } = await useMultiFileAuthState(AUTH_DIR));
+  }
   const generation = ++socketGeneration;
 
   connectionState = 'connecting';
@@ -329,6 +375,13 @@ async function connect() {
   socket = makeWASocket({
     auth: state,
     logger,
+    // Only stretch the window in pairing-code mode. `qrTimeout` is how long
+    // each ref is held, and in QR mode that is how long one image stays on the
+    // page -- stretching it there would leave a QR on screen long after
+    // WhatsApp stopped honouring it. In pairing mode nothing is displayed and
+    // the refs only bound how long the socket survives, which is exactly the
+    // time the user needs to type the code.
+    ...(pendingPairingPhone ? { qrTimeout: PAIRING_WINDOW_MS } : {}),
     browser: ['laintas', 'Chrome', '22'],
   });
 
@@ -358,6 +411,8 @@ async function connect() {
     if (connection === 'open') {
       connectionState = 'open';
       latestQR = null;
+      pendingPairingPhone = null;
+      lastPairingCode = null;
       reconnectDelay = RECONNECT_MIN_MS;
       emit({ type: 'status', state: 'open', reason: 'connected' });
       return;
@@ -403,11 +458,29 @@ async function connect() {
 
 process.stdin.setEncoding('utf-8');
 process.stdin.on('data', onStdinChunk);
-process.stdin.on('end', () => {
-  // The parent went away; do not linger as an orphan holding the port.
-  shuttingDown = true;
-  process.exit(0);
-});
+
+/** Treat end-of-stdin as "the parent is gone" ONLY when stdin is the pipe the
+ *  parent gave us.
+ *
+ *  Exiting on a bare 'end' looked right and was not: run the sidecar by hand,
+ *  or under anything that wires stdin to /dev/null, and EOF arrives
+ *  immediately -- racing the connection and killing the process before it
+ *  reaches WhatsApp. The symptom was a bridge that printed `listening` and
+ *  then nothing at all, intermittently, depending on which won the race. */
+let parentPipe = false;
+try {
+  parentPipe = fsSync.fstatSync(0).isFIFO();
+} catch {
+  parentPipe = false;      // no stdin to speak of; nothing to watch
+}
+if (parentPipe) {
+  process.stdin.on('end', () => {
+    shuttingDown = true;
+    process.exit(0);
+  });
+} else {
+  note('stdin is not a parent pipe; running without the orphan guard');
+}
 
 for (const signal of ['SIGTERM', 'SIGINT']) {
   process.on(signal, () => {

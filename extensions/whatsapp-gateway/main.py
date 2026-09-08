@@ -289,9 +289,19 @@ def _handle_from_bridge(obj: dict) -> None:
         _state = "awaiting_pairing"
         code = obj.get("code") or ""
         phone = obj.get("phone") or ""
-        _log(f"Pairing code for {phone}: {code}")
+        superseded = obj.get("supersedes")
+        if superseded and superseded != code:
+            # A code is only valid on the socket that issued it. Without this
+            # line a replacement is indistinguishable from "the code I was
+            # given does not work".
+            _log(f"The previous code ({superseded}) has expired -- use the new one below.")
+        _log(f"Pairing code for +{phone}: {code}")
         _log("Enter it in WhatsApp on your phone: Settings -> Linked devices -> "
              "Link with phone number instead.")
+        window = obj.get("expiresInSeconds")
+        if isinstance(window, int) and window > 0:
+            _log(f"Valid for about {window // 60} minutes; a new code is issued "
+                 "automatically if it lapses.")
 
     elif kind == "send_result":
         entry = _pending_sends.get(str(obj.get("reqId") or ""))
@@ -481,7 +491,15 @@ def _handle_whatsapp(parts: list) -> None:
         if not rest:
             _log("Usage: /whatsapp pairing <phone>, e.g. /whatsapp pairing 8613800138000")
             return
-        phone = str(rest[0]).strip()
+        # Accept whatever shape the number was typed in -- "(+86)136...",
+        # "+86 136 ...", "86-136-..." -- and show what it was read as, so a
+        # wrong country code is visible before the code is requested.
+        phone = "".join(ch for ch in " ".join(rest) if ch.isdigit())
+        if len(phone) < 8:
+            _log(f"{' '.join(rest)!r} does not look like a phone number with a "
+                 "country code. Example: /whatsapp pairing 8613800138000")
+            return
+        _log(f"Requesting a pairing code for +{phone}")
         ok, message = _ensure_bridge()
         if not ok:
             _log(message)
@@ -490,9 +508,9 @@ def _handle_whatsapp(parts: list) -> None:
         if not sent:
             _log(f"Could not request a pairing code: {error}")
             return
-        _log(f"Pairing-code mode requested for {phone}. An 8-char code will appear "
-             "shortly -- enter it in WhatsApp: Settings -> Linked devices -> Link "
-             "with phone number instead.")
+        # The instructions arrive with the code itself; repeating them here only
+        # competes with the line that carries the real one.
+        _log("Waiting for WhatsApp to issue the code...")
 
     elif sub == "status":
         _log(f"Bridge process: {'running' if _running() else 'not running'}")

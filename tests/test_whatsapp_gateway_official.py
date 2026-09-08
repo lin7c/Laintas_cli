@@ -218,6 +218,78 @@ class UnmanagedDirectoryTests(unittest.TestCase):
         self.assertEqual(before, extension_runtime.related_trust_paths(self.root))
 
 
+class AbandonedPairingTests(unittest.TestCase):
+    """A pairing code that was never entered must not poison the next attempt.
+
+    `requestPairingCode` writes `creds.me` before the user has typed anything,
+    and Baileys branches on that field alone: `creds.me` set means "log in as
+    this account". So the connection AFTER an abandoned pairing attempts a
+    login for a pairing that never completed, WhatsApp answers 401, and the
+    session is torn down as loggedOut -- which then re-arms the same trap on
+    the next code. That is why pairing failed every time it was tried."""
+
+    def test_the_sidecar_detects_credentials_from_an_unfinished_pairing(self):
+        source = BRIDGE.read_text()
+        self.assertIn("isAbandonedPairing", source)
+        # The condition is exactly "identified, but never confirmed".
+        self.assertIn("creds.me && creds.registered !== true", source)
+
+    def test_the_abandoned_state_is_discarded_before_connecting(self):
+        source = BRIDGE.read_text()
+        connect = source.split("async function connect()", 1)[1]
+        self.assertIn("isAbandonedPairing(state.creds)", connect)
+        wipe = connect.index("fs.rm(AUTH_DIR")
+        self.assertLess(wipe, connect.index("makeWASocket"),
+                        "the poisoned credentials must go before the socket is built")
+
+    def test_the_pairing_window_is_longer_than_the_stock_refs_allow(self):
+        # Stock Baileys gives 60s + 5x20s -- under three minutes to fetch a
+        # phone, find Linked devices and type eight characters.
+        source = BRIDGE.read_text()
+        self.assertIn("qrTimeout: PAIRING_WINDOW_MS", source)
+        self.assertGreaterEqual(
+            int(source.split("WA_PAIRING_WINDOW_MS || '", 1)[1].split("'", 1)[0]),
+            120000)
+
+
+class PairingCodeReportingTests(unittest.TestCase):
+    def setUp(self):
+        self.module = _load_main()
+        self.logged: list[str] = []
+        self.module._log = self.logged.append
+
+    def test_a_replacement_code_says_the_old_one_is_dead(self):
+        self.module._handle_from_bridge({
+            "type": "pairing_code", "code": "NEWCODE1", "phone": "8613677131067",
+            "supersedes": "SSC495HZ", "expiresInSeconds": 1080})
+        output = "\n".join(self.logged)
+        self.assertIn("SSC495HZ", output)
+        self.assertIn("expired", output)
+        self.assertIn("NEWCODE1", output)
+
+    def test_a_first_code_does_not_claim_to_supersede_anything(self):
+        self.module._handle_from_bridge({
+            "type": "pairing_code", "code": "FIRSTONE", "phone": "8613677131067",
+            "supersedes": None, "expiresInSeconds": 1080})
+        self.assertNotIn("expired", "\n".join(self.logged))
+
+    def test_a_messy_phone_number_is_normalised_and_echoed(self):
+        sent = []
+        self.module._ensure_bridge = lambda: (True, "started")
+        self.module._send_to_bridge = lambda obj: (sent.append(obj), (True, ""))[1]
+        self.module._handle_whatsapp(["/whatsapp", "pairing", "(+86)13677131067"])
+        self.assertEqual(sent[0]["phone"], "8613677131067")
+        self.assertIn("+8613677131067", "\n".join(self.logged))
+
+    def test_something_that_is_not_a_number_is_refused_before_dialling(self):
+        sent = []
+        self.module._ensure_bridge = lambda: (True, "started")
+        self.module._send_to_bridge = lambda obj: (sent.append(obj), (True, ""))[1]
+        self.module._handle_whatsapp(["/whatsapp", "pairing", "my-phone"])
+        self.assertEqual(sent, [])
+        self.assertIn("does not look like a phone number", "\n".join(self.logged))
+
+
 @unittest.skipUnless(_have_node(), "node is not installed")
 class BridgeProtocolTests(unittest.TestCase):
     """The sidecar's stdout is an IPC channel with exactly one writer."""
