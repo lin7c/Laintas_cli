@@ -164,6 +164,33 @@ class WhatsappGatewaySendHonestyTests(unittest.TestCase):
         self.assertEqual(self.module._pending_sends, {})
 
 
+class CredentialExposureTests(unittest.TestCase):
+    """A paired session is a credential: whatever can read it can send as the
+    account and read every message it receives, with no second factor and no
+    re-pairing. `useMultiFileAuthState` writes with the ambient umask, which on
+    a default install leaves the keys world-readable at 0644."""
+
+    def test_the_sidecar_clamps_the_umask_before_writing_anything(self):
+        source = BRIDGE.read_text()
+        self.assertIn("process.umask(0o077)", source)
+        # Before AUTH_DIR is even resolved, let alone written.
+        self.assertLess(source.index("process.umask"), source.index("const AUTH_DIR"))
+
+    def test_an_existing_session_is_tightened_too(self):
+        # The umask governs new files only; a session paired by an earlier
+        # build is the one actually worth protecting.
+        source = BRIDGE.read_text()
+        self.assertIn("secureAuthDir", source)
+        self.assertIn("chmod(AUTH_DIR, 0o700)", source)
+        self.assertIn("0o600", source)
+        connect = source.split("async function connect()", 1)[1]
+        self.assertLess(connect.index("secureAuthDir()"), connect.index("makeWASocket"))
+
+    def test_the_sidecar_log_is_not_world_readable(self):
+        # At trace level it holds raw protocol frames.
+        self.assertIn("os.chmod(LOG_FILE, 0o600)", (EXTENSION / "main.py").read_text())
+
+
 class WhatsappGatewayPackagingTests(unittest.TestCase):
     def test_publication_archive_ships_only_extension_source(self):
         with tempfile.TemporaryDirectory() as tmp:

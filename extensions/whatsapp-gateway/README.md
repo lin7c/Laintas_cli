@@ -68,7 +68,13 @@ WA_BROWSER=windows laintas-cli
 
 ## Notes
 
-- `bridge/.auth/` holds live WhatsApp credentials. It is excluded from the
-  published archive and from the trust hash; never copy it between machines.
+- `bridge/.auth/` holds live WhatsApp credentials -- whatever can read them can
+  send as the account and read every message it receives, with no second factor
+  and no re-pairing. The directory is kept at 0700 and its files at 0600, it is
+  excluded from the published archive and from the trust hash, and it should
+  never be copied between machines. `bridge.log` is 0600 for the same reason:
+  at `WA_LOG_LEVEL=trace` it records raw protocol frames.
+- The QR page binds 127.0.0.1 only. It is a pairing aid, not a service, and
+  nothing about it should be exposed or proxied.
 - The gateway never starts on its own. Loading the extension registers the
   command and the tools, nothing more.

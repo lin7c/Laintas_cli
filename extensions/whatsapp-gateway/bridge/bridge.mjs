@@ -37,6 +37,14 @@ import path from 'node:path';
 import QRCode from 'qrcode';
 import makeWASocket, { useMultiFileAuthState, DisconnectReason, Browsers } from '@whiskeysockets/baileys';
 
+/* A paired session is a credential, not a cache. Anything that can read
+ * AUTH_DIR can send as this WhatsApp account and read every message it
+ * receives -- no second factor, no re-pairing. `useMultiFileAuthState` writes
+ * with the ambient umask, which on a default install means world-readable
+ * (0644) keys. Clamp it before anything is written; the CLI holds its own
+ * session.json at 0600 for the same reason. */
+process.umask(0o077);
+
 const AUTH_DIR = process.env.WA_AUTH_DIR || path.resolve(process.cwd(), '.auth');
 const HTTP_PORT = parseInt(process.env.WA_HTTP_PORT || '8765', 10);
 const HOST = process.env.WA_HOST || '127.0.0.1';
@@ -385,11 +393,30 @@ function isAbandonedPairing(creds) {
   return Boolean(creds && creds.me && !creds.account);
 }
 
+/** Bring an existing auth directory up to 0700/0600.
+ *
+ * The umask above only governs files created from now on. A session paired by
+ * an earlier build still has its keys at 0644 on disk, and it is exactly the
+ * session worth protecting -- it is the one that works. */
+async function secureAuthDir() {
+  try {
+    await fs.chmod(AUTH_DIR, 0o700);
+  } catch {
+    return;                      // not created yet; the umask covers it
+  }
+  try {
+    for (const name of await fs.readdir(AUTH_DIR)) {
+      await fs.chmod(path.join(AUTH_DIR, name), 0o600).catch(() => {});
+    }
+  } catch { /* nothing readable to tighten */ }
+}
+
 async function connect() {
   retireSocket();
   // Re-read the auth state on every attempt: after a logout wipe, the previous
   // in-memory state describes credentials that no longer exist on disk.
   let { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+  await secureAuthDir();
   if (isAbandonedPairing(state.creds)) {
     note('discarding credentials from an unfinished pairing');
     await fs.rm(AUTH_DIR, { recursive: true, force: true });

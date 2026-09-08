@@ -221,7 +221,10 @@ def _read_stderr(proc: subprocess.Popen) -> None:
         LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
         if LOG_FILE.exists() and LOG_FILE.stat().st_size > LOG_MAX_BYTES:
             LOG_FILE.unlink()
+        # At WA_LOG_LEVEL=trace this file carries raw protocol frames, so it
+        # is treated as a credential too rather than a plain log.
         handle = LOG_FILE.open("a", encoding="utf-8")
+        os.chmod(LOG_FILE, 0o600)
     except OSError:
         handle = None
     try:
