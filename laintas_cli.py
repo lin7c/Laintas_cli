@@ -12799,61 +12799,12 @@ def _usage_pack_label(what: str, pack: dict) -> str:
 
 
 def _usage_buy_pack(what: str, session: dict) -> None:
-    """/usage buy <calls|storage> — add a recurring pack to the membership.
-
-    This spends real money, so it states the whole commitment (recurring, billed
-    with the membership) and takes an explicit yes before posting.
-    """
-    packs, why = _usage_top_ups(session)
-    pack = packs.get(what)
-    if not pack:
-        console.print(f"[yellow]{why or f'No {what} pack is available.'}[/yellow]")
-        return
-
-    console.print()
-    console.print(f"  [bold]{what} pack[/bold]  {_usage_pack_label(what, pack)}")
-    console.print("  [muted]Recurring: charged now, then on your membership's "
-                  "billing day. Cancel any time in Laintas settings.[/muted]")
-    try:
-        answer = input(f"\nBuy this {what} pack? [y/N] ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        console.print("\n[dim]Cancelled.[/dim]")
-        return
-    if answer not in ("y", "yes"):
-        console.print("[dim]Cancelled — nothing was charged.[/dim]")
-        return
-
-    profile = get_backend_profile()
-    headers, cookies = backend_profiles.request_auth(profile, session)
-    try:
-        resp = requests.post(f"{profile.base_url}/api/subscription/upgrades",
-                             json={"kind": pack.get("kind")},
-                             headers=headers, cookies=cookies, timeout=20)
-        data = resp.json() if resp.content else {}
-    except requests.RequestException as exc:
-        console.print(f"[red]Purchase failed to send ({type(exc).__name__}). "
-                      "Nothing was charged.[/red]")
-        return
-    except ValueError:
-        console.print(f"[red]Purchase failed (HTTP {resp.status_code}).[/red]")
-        return
-
-    if resp.status_code == 200 and data.get("success"):
-        console.print(f"[green]Added.[/green] {_fmt_cents(int(data.get('chargedCents') or 0))} "
-                      "charged; renews with your membership.")
-        console.print("[dim]Run /usage to see the new allowance.[/dim]")
-        return
-    if data.get("code") == "no_membership":
-        console.print("[yellow]Add-ons are billed with a membership, so there has to "
-                      "be one to bill them with.[/yellow]")
-        console.print("[dim]Subscribe at laintas.com/settings, then try again.[/dim]")
-        return
-    if data.get("code") in ("insufficient_balance", "insufficient_funds"):
-        console.print(f"[yellow]Not enough balance — this pack needs "
-                      f"{_fmt_cents(int(data.get('required_cents') or 0))}.[/yellow]")
-        console.print("[dim]Top up at laintas.com/settings.[/dim]")
-        return
-    console.print(f"[red]{data.get('error') or f'Purchase failed (HTTP {resp.status_code}).'}[/red]")
+    """Open the central market checkout; every account can buy independently."""
+    kind = "extra_storage_helpwo" if what == "storage" else "extra_calls_cli"
+    console.print("[bold]Laintas Market[/bold]")
+    console.print(f"https://laintas.com/market?kind={kind}")
+    console.print("[dim]Buy with your Laintas balance. Valid for 30 days; no membership required. "
+                  "Review the current price and optional renewal in the checkout.[/dim]")
 
 
 def _usage_sparkline(values: list[int]) -> str:
@@ -22322,69 +22273,76 @@ def show_banner(agent_name: str, session: dict = None):
         f"  [muted]cli[/muted] [accent.dim]v{__version__}[/accent.dim]"
         f"  [muted]{symbols.BULLET}[/muted]  [agent]{agent_name}[/agent]"
     )
-    console.print()
 
+    backend_profile = get_backend_profile()
+
+    # The environment summary is detail-mode output. With /detail off the
+    # banner is the logo, the version and the agent name: what the session
+    # is, not what it is configured with. Everything below stays one
+    # command away (/policy, /mode, /backend, /tasks) and comes back whole
+    # with /detail on.
     rows = []
-    if session:
-        account = (session.get("userEmail") or session.get("userName")
-                   or session.get("userId") or "")
+    if bool(get_runtime_config("detail")):
+        account = ((session.get("userEmail") or session.get("userName")
+                    or session.get("userId") or "") if session else "")
         if account:
             rows.append(("account", account))
-    rows.append(("system", f"{host_label()} {symbols.BULLET} {shell_info}"))
-    rows.append(("cwd", _shorten_path(os.getcwd())))
-    backend_profile = get_backend_profile()
-    rows.append((
-        "backend",
-        f"{backend_profile.base_url} "
-        f"[{backend_profile.kind}; {backend_profile.billing_label}]",
-    ))
-
-    try:
-        import plan_mode as _pm
-        agent_mode = (
-            "plan" if _pm.is_plan_mode()
-            else mode_manager.get_active_mode()["name"]
-        )
-        rows.append(("mode", agent_mode))
-    except Exception:
-        pass
-    try:
-        import policy as _pol
-        policy_mode = _pol.get_config().get("mode", "audit")
-        mode_style = {"audit": "cyan", "enforce": "yellow",
-                      "disabled": "red"}.get(policy_mode, "cyan")
+        rows.append(("system", f"{host_label()} {symbols.BULLET} {shell_info}"))
+        rows.append(("cwd", _shorten_path(os.getcwd())))
         rows.append((
-            "policy",
-            f"[{mode_style}]{policy_mode}[/{mode_style}]",
+            "backend",
+            f"{backend_profile.base_url} "
+            f"[{backend_profile.kind}; {backend_profile.billing_label}]",
         ))
-    except Exception:
-        pass
 
-    status_parts = []
-    try:
-        task_agent = get_current_agent()
-        task_session = str(
-            ((task_agent.state or {}).get("_session_id")
-             if task_agent else "") or "")
-        open_tasks = [
-            task for task in task_manager.list_tasks(
-                cwd=os.getcwd(), session_id=task_session or None)
-            if task.get("status") in ("pending", "in_progress")
-        ]
-        if open_tasks:
-            status_parts.append(
-                f"tasks: [accent]{len(open_tasks)} open[/accent]")
-    except Exception:
-        pass
-    if status_parts:
-        rows.append(("status", "  ".join(status_parts)))
+        try:
+            import plan_mode as _pm
+            agent_mode = (
+                "plan" if _pm.is_plan_mode()
+                else mode_manager.get_active_mode()["name"]
+            )
+            rows.append(("mode", agent_mode))
+        except Exception:
+            pass
+        try:
+            import policy as _pol
+            policy_mode = _pol.get_config().get("mode", "audit")
+            mode_style = {"audit": "cyan", "enforce": "yellow",
+                          "disabled": "red"}.get(policy_mode, "cyan")
+            rows.append((
+                "policy",
+                f"[{mode_style}]{policy_mode}[/{mode_style}]",
+            ))
+        except Exception:
+            pass
 
-    label_width = max(len(key) for key, _value in rows)
-    for key, value in rows:
-        console.print(
-            f"  [muted]{key.rjust(label_width)}[/muted]  "
-            f"[accent.dim]│[/accent.dim] {value}"
-        )
+        status_parts = []
+        try:
+            task_agent = get_current_agent()
+            task_session = str(
+                ((task_agent.state or {}).get("_session_id")
+                 if task_agent else "") or "")
+            open_tasks = [
+                task for task in task_manager.list_tasks(
+                    cwd=os.getcwd(), session_id=task_session or None)
+                if task.get("status") in ("pending", "in_progress")
+            ]
+            if open_tasks:
+                status_parts.append(
+                    f"tasks: [accent]{len(open_tasks)} open[/accent]")
+        except Exception:
+            pass
+        if status_parts:
+            rows.append(("status", "  ".join(status_parts)))
+
+    if rows:
+        console.print()
+        label_width = max(len(key) for key, _value in rows)
+        for key, value in rows:
+            console.print(
+                f"  [muted]{key.rjust(label_width)}[/muted]  "
+                f"[accent.dim]│[/accent.dim] {value}"
+            )
 
     # The advisory block that used to live here (usage tips, training-data
     # opt-in, and the session/Helpwo/update notices printed by main()) is

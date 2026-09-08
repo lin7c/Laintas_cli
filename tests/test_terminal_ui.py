@@ -209,7 +209,7 @@ class ResponsiveTerminalChromeTests(unittest.TestCase):
         for border in ("╭", "╮", "╰", "╯", "┏", "┓", "┗", "┛"):
             self.assertNotIn(border, rendered)
 
-    def test_startup_banner_preserves_original_environment_summary(self):
+    def _render_banner(self, *, detail: bool) -> str:
         output = io.StringIO()
         old_console = laintas_cli.console
         laintas_cli.console = Console(file=output, force_terminal=False, width=120)
@@ -218,6 +218,10 @@ class ResponsiveTerminalChromeTests(unittest.TestCase):
                                       return_value={"name": "act"}), \
                     mock.patch("plan_mode.is_plan_mode", return_value=False), \
                     mock.patch("policy.get_config", return_value={"mode": "audit"}), \
+                    mock.patch.object(laintas_cli, "get_runtime_config",
+                                      side_effect=lambda key: (
+                                          detail if key == "detail"
+                                          else agent_loop.get_runtime_config(key))), \
                     mock.patch.object(laintas_cli, "get_backend_profile",
                                       return_value=SimpleNamespace(
                                           base_url="https://laintas.com",
@@ -229,8 +233,23 @@ class ResponsiveTerminalChromeTests(unittest.TestCase):
                     "primary", {"userEmail": "user@example.com"})
         finally:
             laintas_cli.console = old_console
+        return output.getvalue()
 
-        rendered = output.getvalue()
+    def test_startup_banner_hides_environment_summary_when_detail_is_off(self):
+        """/detail off leaves the identity line and nothing to configure."""
+        rendered = self._render_banner(detail=False)
+        self.assertIn("╭─╮", rendered)
+        self.assertIn("cli", rendered)
+        for absent in ("user@example.com", "Linux", "https://laintas.com",
+                       "mode", "policy"):
+            self.assertNotIn(absent, rendered)
+        # The startup notices are posted regardless of the banner's size.
+        keys = [item.key for item in startup_mail.items()]
+        self.assertIn("tips", keys)
+        self.assertIn("training", keys)
+
+    def test_startup_banner_preserves_original_environment_summary(self):
+        rendered = self._render_banner(detail=True)
         self.assertIn("╭─╮", rendered)
         self.assertIn("cli", rendered)
         self.assertIn("user@example.com", rendered)
