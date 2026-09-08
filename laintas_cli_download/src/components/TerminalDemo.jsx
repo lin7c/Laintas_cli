@@ -54,10 +54,14 @@ export default function TerminalDemo() {
   const [lineIdx, setLineIdx] = useState(0);
   const [charIdx, setCharIdx] = useState(0);
   const [paused, setPaused] = useState(false);
+  // Honour OS-level "reduce motion": skip the typing animation and render the
+  // whole transcript at once. Evaluated once on mount (theme/language switches
+  // do not change the media query meaningfully for this component).
+  const reduceMotion = typeof window !== 'undefined' && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
   // Advance one line at a time; type each line's characters progressively.
   useEffect(() => {
-    if (paused) return undefined;
+    if (paused || reduceMotion) return undefined;
     if (lineIdx >= script.length) return undefined;
     const line = script[lineIdx];
     const text = line.text || '';
@@ -85,8 +89,12 @@ export default function TerminalDemo() {
     return () => window.clearTimeout(timer);
   }, [lineIdx, paused, script]);
 
-  const visible = script.slice(0, lineIdx).map((l) => ({ line: l, shown: l.text }));
-  if (lineIdx < script.length) {
+  // Reduce-motion users see the full transcript instantly; otherwise reveal it
+  // progressively as the typing animation advances.
+  const visible = reduceMotion
+    ? script.map((l) => ({ line: l, shown: l.text || '' }))
+    : script.slice(0, lineIdx).map((l) => ({ line: l, shown: l.text }));
+  if (!reduceMotion && lineIdx < script.length) {
     const cur = script[lineIdx];
     visible.push({ line: cur, shown: (cur.text || '').slice(0, charIdx) });
   }
