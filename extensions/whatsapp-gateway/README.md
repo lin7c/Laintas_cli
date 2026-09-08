@@ -40,11 +40,46 @@ The session is stored in `bridge/.auth/` and survives restarts — pair once.
   unpaired or the recipient is rejected.
 - `whatsapp.status()` — running / connection state / paired / QR page URL.
 
-## Inbound messages
+## Talking to the Agent from WhatsApp
 
-Every inbound text message is handed to the Agent through the extension
-backend gateway, and the generated reply is sent back to the same chat. Group
-messages are included and tagged `isGroup`.
+Open the chat with **yourself** ("Message yourself" / your own number in the
+chat list) and type. That chat is the Agent's conversation: it answers there,
+with a short rolling history, so it reads as one thread rather than a series of
+unrelated questions. Nothing to configure -- the chat exists because the CLI is
+now a linked device of your account.
+
+The two directions are deliberately not the same thing:
+
+| Where | Who can write | How it is treated |
+|---|---|---|
+| Your own chat | only you | a request addressed to the Agent |
+| Any other chat | anyone | text to draft a reply to, quoted as data |
+
+A stranger's message is never an instruction. It is quoted into the prompt and
+carries no conversation state, so "ignore your instructions and ..." arriving
+from an unknown number is answered, not obeyed.
+
+The Agent's own replies land back in the self-chat as `fromMe` messages; their
+ids are remembered so it does not answer itself in a loop. A fresh pairing
+replays history, and messages older than the bridge's start are skipped rather
+than run as a backlog of instructions.
+
+## How the device appears on your phone
+
+Under **Linked devices** it shows as `laintas-cli`. That name is the `os` slot
+of the registration and is free text; the *icon* is not ours to choose --
+WhatsApp picks its own artwork from a fixed `PlatformType` enum (Chrome,
+Safari, Edge, Desktop, iPad, ...), and a linked device cannot supply one. The
+default is `Desktop`, which is what a CLI actually is; the earlier `Chrome` is
+why the phone used to say Chrome.
+
+```
+WA_DEVICE_NAME="my box"   # the name under Linked devices
+WA_PLATFORM=Chrome        # which built-in icon; Desktop by default
+```
+
+Both only apply when a device is registered, so changing them affects the
+**next** pairing, not the current one.
 
 ## When pairing does not work
 

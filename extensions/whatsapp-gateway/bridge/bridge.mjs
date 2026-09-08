@@ -35,7 +35,7 @@ import { URL } from 'node:url';
 import fsSync, { promises as fs } from 'node:fs';
 import path from 'node:path';
 import QRCode from 'qrcode';
-import makeWASocket, { useMultiFileAuthState, DisconnectReason, Browsers } from '@whiskeysockets/baileys';
+import makeWASocket, { useMultiFileAuthState, DisconnectReason } from '@whiskeysockets/baileys';
 
 /* A paired session is a credential, not a cache. Anything that can read
  * AUTH_DIR can send as this WhatsApp account and read every message it
@@ -64,22 +64,31 @@ const PAIRING_WINDOW_MS = parseInt(process.env.WA_PAIRING_WINDOW_MS || '180000',
 
 /** How this client identifies itself to WhatsApp.
  *
- * This used to be a hand-made `['laintas', 'Chrome', '22']`, which puts
- * `os: "laintas"` and a version of `"22"` into the companion registration.
- * Every constant Baileys ships names a real platform with a real version, and
- * the link-code route has WhatsApp validate the companion far more strictly
- * than the QR route does -- a QR pairing only displays the name, so a made-up
- * one survives there and fails here.
+ * The three slots are not interchangeable, and the phone shows them
+ * differently (Utils/validate-connection.js `generateRegistrationNode`):
  *
- * Overridable because which identity WhatsApp accepts is its decision, not
- * ours: WA_BROWSER=ubuntu|macos|windows and WA_BROWSER_CLIENT=Chrome|Safari... */
-const BROWSER_FAMILIES = {
-  ubuntu: Browsers.ubuntu,
-  macos: Browsers.macOS,
-  windows: Browsers.windows,
-};
-const BROWSER = (BROWSER_FAMILIES[(process.env.WA_BROWSER || 'ubuntu').toLowerCase()]
-  || Browsers.ubuntu)(process.env.WA_BROWSER_CLIENT || 'Chrome');
+ *   [0] os           -> free text; this is the DEVICE NAME under Linked devices
+ *   [1] platformType -> an ENUM, and the only thing that picks the ICON
+ *   [2] version      -> free text, shown next to the name
+ *
+ * So the name is ours to choose and the icon is not: `getPlatformType` maps
+ * slot [1] onto proto.DeviceProps.PlatformType (CHROME, SAFARI, EDGE, DESKTOP,
+ * IPAD, ...) and falls back to DESKTOP for anything it does not recognise.
+ * WhatsApp draws its own artwork for those; a linked device cannot supply an
+ * icon. DESKTOP is the honest choice for a CLI -- it is a desktop application,
+ * not a browser tab, and the previous CHROME is why the phone said "Chrome".
+ *
+ * Slot [0] was once a hand-made `'laintas'` alongside a malformed `'22'`
+ * version, at a time when pairing by phone number was failing. Whether that
+ * mattered was never established -- other causes were found and fixed -- so
+ * the name is restored but the version stays a real one, and both remain
+ * overridable if WhatsApp ever refuses this identity:
+ *   WA_DEVICE_NAME, WA_PLATFORM (chrome|safari|edge|desktop|...), WA_OS_VERSION
+ */
+const DEVICE_NAME = process.env.WA_DEVICE_NAME || 'laintas-cli';
+const PLATFORM = process.env.WA_PLATFORM || 'Desktop';
+const OS_VERSION = process.env.WA_OS_VERSION || '22.04.4';
+const BROWSER = [DEVICE_NAME, PLATFORM, OS_VERSION];
 
 let latestQR = null;        // { png, ts }
 let connectionState = 'connecting';
@@ -94,6 +103,37 @@ let shuttingDown = false;
 /** Monotonic id of the live socket. A late event from a replaced socket is
  *  ignored rather than being allowed to schedule a second reconnect chain. */
 let socketGeneration = 0;
+/** Ids of messages this bridge sent itself.
+ *
+ *  In the self-chat the Agent's own reply comes straight back through
+ *  `messages.upsert` as another `fromMe` message in the same conversation.
+ *  Without remembering what we sent, answering it would answer ourselves, for
+ *  ever. Bounded so a long-running session does not grow without limit. */
+const ownMessageIds = new Set();
+const OWN_ID_MEMORY = 500;
+/** Only messages newer than this are acted on. A fresh pairing replays
+ *  history, and a self-chat full of old notes must not be re-run as a queue of
+ *  instructions. */
+const startedAt = Math.floor(Date.now() / 1000);
+
+function rememberOwnMessage(id) {
+  if (!id) return;
+  ownMessageIds.add(id);
+  if (ownMessageIds.size > OWN_ID_MEMORY) {
+    ownMessageIds.delete(ownMessageIds.values().next().value);
+  }
+}
+
+/** The account's own chat -- "Message yourself" in WhatsApp.
+ *
+ *  This is the conversation the user talks to the CLI in, so it is the one
+ *  place where a `fromMe` message is an instruction rather than an echo of
+ *  something they said to somebody else. */
+function isSelfChat(remoteJid) {
+  const own = socket?.user?.id;
+  if (!own || !remoteJid) return false;
+  return String(remoteJid).split('@')[0] === String(own).split(':')[0].split('@')[0];
+}
 
 /* ---------------- IPC to parent (Python) ---------------- */
 function emit(obj) {
@@ -238,7 +278,10 @@ function processInbound(line) {
       return;
     }
     socket.sendMessage(jid, { text: String(obj.text ?? '') })
-      .then(() => emit({ type: 'send_result', reqId, ok: true, jid }))
+      .then(sent => {
+        rememberOwnMessage(sent?.key?.id);
+        emit({ type: 'send_result', reqId, ok: true, jid });
+      })
       .catch(e => emit({ type: 'send_result', reqId, ok: false, error: e.message }));
     return;
   }
@@ -496,16 +539,30 @@ async function connect() {
     if (generation !== socketGeneration) return;
     if (type !== 'notify') return;
     for (const msg of messages) {
-      if (msg.key?.fromMe) continue;                 // ignore our own
       const text = msgText(msg);
       if (!text) continue;                            // ignore non-text for now
       const remoteJid = cleanJid(msg.key.remoteJid);
       if (!remoteJid || remoteJid === 'status@broadcast') continue;
-      const isGroup = remoteJid.endsWith('@g.us');
+
       const id = msg.key.id || `${Date.now()}-${Math.random()}`;
+      const selfChat = isSelfChat(remoteJid);
+
+      // `fromMe` is normally an echo of something the user typed to someone
+      // else and must be ignored -- except in their own chat, which is where
+      // they talk to the CLI. There, our own replies come back too, so skip
+      // the ones we just sent or the Agent answers itself for ever.
+      if (msg.key.fromMe) {
+        if (!selfChat || ownMessageIds.has(id)) continue;
+      }
+
+      // A new pairing replays history; old notes are not new instructions.
+      const ts = Number(msg.messageTimestamp || 0);
+      if (ts && ts < startedAt - 60) continue;
+
+      const isGroup = remoteJid.endsWith('@g.us');
       const from = cleanJid(msg.key.participant || msg.key.remoteJid);
       const name = msg.pushName || String(from).split('@')[0];
-      emit({ type: 'message', id, remoteJid, from, name, text, isGroup });
+      emit({ type: 'message', id, remoteJid, from, name, text, isGroup, selfChat });
     }
   });
 }
