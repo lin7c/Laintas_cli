@@ -252,6 +252,18 @@ class AbandonedPairingTests(unittest.TestCase):
         self.assertLess(wipe, connect.index("makeWASocket"),
                         "the poisoned credentials must go before the socket is built")
 
+    def test_the_client_identity_comes_from_the_library_constants(self):
+        # `os: "laintas"` with version "22" is not a platform WhatsApp knows.
+        # A QR pairing only displays the name, so a made-up one survives there;
+        # the link-code route has the companion registration validated.
+        source = BRIDGE.read_text()
+        self.assertIn("Browsers.ubuntu", source)
+        # Check the call, not the prose: the comment above it still quotes the
+        # old hand-made value to explain what was wrong with it.
+        call = source.split("socket = makeWASocket(", 1)[1].split("});", 1)[0]
+        self.assertIn("browser: BROWSER", call)
+        self.assertNotIn("laintas", call)
+
     def test_the_pairing_window_is_longer_than_the_stock_refs_allow(self):
         # Stock Baileys gives 60s + 5x20s -- under three minutes to fetch a
         # phone, find Linked devices and type eight characters.
@@ -317,6 +329,11 @@ class BridgeProtocolTests(unittest.TestCase):
             # and logging discipline, not about WhatsApp.
             (stub / "index.mjs").write_text(textwrap.dedent("""
                 export const DisconnectReason = { loggedOut: 401 };
+                export const Browsers = {
+                  ubuntu: b => ['Ubuntu', b, '22.04.4'],
+                  macOS: b => ['Mac OS', b, '14.4.1'],
+                  windows: b => ['Windows', b, '10.0.22631'],
+                };
                 export function useMultiFileAuthState() {
                   return Promise.resolve({ state: {}, saveCreds: () => {} });
                 }

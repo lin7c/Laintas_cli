@@ -54,6 +54,18 @@ own account of the attempt -- `not logged in, attempting registration`,
 distinguishes a code that never reached WhatsApp from one that was rejected.
 Set `WA_LOG_LEVEL=trace` for the full protocol exchange.
 
+If the phone *rejects* the code, the pairing reached WhatsApp and the companion
+registration was refused. Which client identity WhatsApp accepts is its
+decision, so that identity is configurable -- try another before assuming the
+gateway is broken:
+
+```
+WA_BROWSER=macos WA_BROWSER_CLIENT=Safari laintas-cli
+WA_BROWSER=windows laintas-cli
+```
+
+`/whatsapp status` shows the identity in use. Default is Ubuntu / Chrome.
+
 ## Notes
 
 - `bridge/.auth/` holds live WhatsApp credentials. It is excluded from the

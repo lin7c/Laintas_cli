@@ -35,7 +35,7 @@ import { URL } from 'node:url';
 import fsSync, { promises as fs } from 'node:fs';
 import path from 'node:path';
 import QRCode from 'qrcode';
-import makeWASocket, { useMultiFileAuthState, DisconnectReason } from '@whiskeysockets/baileys';
+import makeWASocket, { useMultiFileAuthState, DisconnectReason, Browsers } from '@whiskeysockets/baileys';
 
 const AUTH_DIR = process.env.WA_AUTH_DIR || path.resolve(process.cwd(), '.auth');
 const HTTP_PORT = parseInt(process.env.WA_HTTP_PORT || '8765', 10);
@@ -53,6 +53,25 @@ const RECONNECT_MAX_MS = 60000;
  * code still being typed when the socket dies is already dead. Six refs at
  * three minutes each is a realistic window. */
 const PAIRING_WINDOW_MS = parseInt(process.env.WA_PAIRING_WINDOW_MS || '180000', 10);
+
+/** How this client identifies itself to WhatsApp.
+ *
+ * This used to be a hand-made `['laintas', 'Chrome', '22']`, which puts
+ * `os: "laintas"` and a version of `"22"` into the companion registration.
+ * Every constant Baileys ships names a real platform with a real version, and
+ * the link-code route has WhatsApp validate the companion far more strictly
+ * than the QR route does -- a QR pairing only displays the name, so a made-up
+ * one survives there and fails here.
+ *
+ * Overridable because which identity WhatsApp accepts is its decision, not
+ * ours: WA_BROWSER=ubuntu|macos|windows and WA_BROWSER_CLIENT=Chrome|Safari... */
+const BROWSER_FAMILIES = {
+  ubuntu: Browsers.ubuntu,
+  macos: Browsers.macOS,
+  windows: Browsers.windows,
+};
+const BROWSER = (BROWSER_FAMILIES[(process.env.WA_BROWSER || 'ubuntu').toLowerCase()]
+  || Browsers.ubuntu)(process.env.WA_BROWSER_CLIENT || 'Chrome');
 
 let latestQR = null;        // { png, ts }
 let connectionState = 'connecting';
@@ -245,7 +264,7 @@ function processInbound(line) {
   }
 
   if (obj.type === 'ping') {
-    emit({ type: 'pong', state: connectionState, httpPort });
+    emit({ type: 'pong', state: connectionState, httpPort, browser: BROWSER });
   }
 }
 
@@ -301,7 +320,8 @@ function cleanJid(jid) {
 /* ---------------- WhatsApp connection ---------------- */
 async function start() {
   await listenOnFreePort();
-  emit({ type: 'status', state: 'listening', httpPort });
+  note(`identifying to WhatsApp as ${BROWSER.join(' / ')}`);
+  emit({ type: 'status', state: 'listening', httpPort, browser: BROWSER });
   await connect();
 }
 
@@ -389,7 +409,7 @@ async function connect() {
     // the refs only bound how long the socket survives, which is exactly the
     // time the user needs to type the code.
     ...(pendingPairingPhone ? { qrTimeout: PAIRING_WINDOW_MS } : {}),
-    browser: ['laintas', 'Chrome', '22'],
+    browser: BROWSER,
   });
 
   socket.ev.on('creds.update', saveCreds);

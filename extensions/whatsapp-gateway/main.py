@@ -53,6 +53,9 @@ _http_port = DEFAULT_HTTP_PORT
 #: `_tool_send` and `/whatsapp status`.
 _state = "stopped"
 _install_error = ""
+#: How the sidecar identified itself to WhatsApp. Which identity WhatsApp will
+#: accept on the link-code route is its decision, so this is worth showing.
+_browser = ""
 
 # QR hint is printed at most once per bridge session to avoid spamming the
 # terminal during reconnect cycles (408 timeout -> reconnect -> new QR).
@@ -287,12 +290,16 @@ def _stop_bridge() -> None:
 
 
 def _handle_from_bridge(obj: dict) -> None:
-    global _qr_hinted, _last_status, _state, _http_port
+    global _qr_hinted, _last_status, _state, _http_port, _browser
     kind = obj.get("type")
 
     if kind == "status":
         state = obj.get("state")
         if state == "listening":
+            browser = obj.get("browser")
+            if isinstance(browser, list) and browser:
+                global _browser
+                _browser = " / ".join(str(part) for part in browser)
             port = obj.get("httpPort")
             if isinstance(port, int):
                 _http_port = port
@@ -490,6 +497,7 @@ def _tool_status(args: dict, ctx=None) -> dict:
             "auth_dir": str(AUTH_DIR),
             "dependencies_installed": BAILEYS.is_dir(),
             "log_file": str(LOG_FILE),
+            "browser": _browser,
             "last_error": _install_error,
         },
     }
@@ -554,6 +562,8 @@ def _handle_whatsapp(parts: list) -> None:
         _log(f"QR page:        http://127.0.0.1:{_http_port}")
         _log(f"Session dir:    {AUTH_DIR}")
         _log(f"Dependencies:   {'installed' if BAILEYS.is_dir() else 'not installed'}")
+        if _browser:
+            _log(f"Identifies as:  {_browser}")
         _log(f"Sidecar log:    {LOG_FILE}"
              f"{'' if LOG_FILE.exists() else '  (not written yet)'}")
         if _install_error:
