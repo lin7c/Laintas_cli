@@ -1,0 +1,327 @@
+import importlib.util
+import json
+import subprocess
+import sys
+import tempfile
+import textwrap
+import threading
+import time
+import unittest
+import zipfile
+from pathlib import Path
+
+import extension_manager
+import extension_runtime
+from scripts import build_official_extensions
+
+
+ROOT = Path(__file__).resolve().parents[1]
+EXTENSION = ROOT / "extensions" / "whatsapp-gateway"
+BRIDGE = EXTENSION / "bridge" / "bridge.mjs"
+
+
+def _load_main():
+    """Import the extension's entry point without installing it."""
+    spec = importlib.util.spec_from_file_location(
+        "whatsapp_gateway_under_test", EXTENSION / "main.py",
+        submodule_search_locations=[str(EXTENSION)])
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _have_node() -> bool:
+    try:
+        subprocess.run(["node", "--version"], capture_output=True, timeout=10)
+        return True
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+class WhatsappGatewayManifestTests(unittest.TestCase):
+    def test_manifest_is_valid_and_official(self):
+        manifest = extension_manager.read_manifest(EXTENSION)
+        self.assertEqual(
+            extension_manager.validate_manifest(manifest, "whatsapp-gateway"), [])
+        self.assertIn("whatsapp-gateway", build_official_extensions.OFFICIAL_NAMES)
+
+    def test_sources_are_english(self):
+        for path in EXTENSION.rglob("*"):
+            if (not path.is_file()
+                    or extension_runtime._is_unmanaged(path.relative_to(EXTENSION))
+                    or path.suffix not in {".py", ".json", ".md", ".mjs"}):
+                continue
+            text = path.read_text(encoding="utf-8")
+            self.assertNotRegex(text, r"[一-鿿]", str(path))
+
+
+class WhatsappGatewayCommandTests(unittest.TestCase):
+    """`/whatsapp start` is the documented way in; it must exist.
+
+    It did not: the module comment and the published instructions both said
+    `start`, while the handler only knew `qrcode`, so the gateway could not be
+    started by anyone following the docs."""
+
+    def setUp(self):
+        self.module = _load_main()
+        self.logged: list[str] = []
+        self.module._log = self.logged.append
+        self.started: list[bool] = []
+
+        def fake_ensure():
+            self.started.append(True)
+            return True, "started"
+
+        self.module._ensure_bridge = fake_ensure
+
+    def _run(self, *args):
+        self.logged.clear()
+        self.module._handle_whatsapp(["/whatsapp", *args])
+        return "\n".join(self.logged)
+
+    def test_start_is_a_known_subcommand(self):
+        self._run("start")
+        self.assertEqual(len(self.started), 1)
+
+    def test_bare_command_and_qrcode_alias_also_start(self):
+        self._run()
+        self._run("qrcode")
+        self.assertEqual(len(self.started), 2)
+
+    def test_unknown_subcommand_still_reports_usage(self):
+        output = self._run("wobble")
+        self.assertIn("Unknown subcommand", output)
+        self.assertEqual(self.started, [])
+
+    def test_declared_subcommands_are_all_handled(self):
+        declared = ["start", "qrcode", "pairing", "status", "stop", "logout", "send"]
+        for name in declared:
+            with self.subTest(name=name):
+                self.assertNotIn("Unknown subcommand", self._run(name))
+
+
+class WhatsappGatewaySendHonestyTests(unittest.TestCase):
+    """A send that went nowhere must not be reported as delivered.
+
+    `_tool_send` used to write to the sidecar's pipe and return
+    `{"ok": True, "result": "Delivered ..."}` unconditionally -- with the
+    gateway stopped, with no pairing, and with the recipient rejected."""
+
+    def setUp(self):
+        self.module = _load_main()
+        self.module._log = lambda *_: None
+
+    def test_send_fails_when_the_gateway_is_not_running(self):
+        result = self.module._tool_send({"to": "8613800138000", "text": "hi"})
+        self.assertFalse(result["ok"])
+        self.assertIn("not running", result["error"])
+
+    def test_send_fails_when_running_but_unpaired(self):
+        self.module._running = lambda: True
+        self.module._state = "awaiting_scan"
+        result = self.module._tool_send({"to": "8613800138000", "text": "hi"})
+        self.assertFalse(result["ok"])
+        self.assertIn("not connected", result["error"])
+
+    def test_send_surfaces_the_sidecar_rejection(self):
+        self.module._running = lambda: True
+        self.module._state = "open"
+
+        def fake_write(obj):
+            entry = self.module._pending_sends[obj["reqId"]]
+            entry["result"] = {"ok": False, "error": "recipient not on WhatsApp"}
+            entry["event"].set()
+            return True, ""
+
+        self.module._send_to_bridge = fake_write
+        result = self.module._tool_send({"to": "8613800138000", "text": "hi"})
+        self.assertFalse(result["ok"])
+        self.assertIn("recipient not on WhatsApp", result["error"])
+
+    def test_send_reports_delivery_only_on_acknowledgement(self):
+        self.module._running = lambda: True
+        self.module._state = "open"
+
+        def fake_write(obj):
+            entry = self.module._pending_sends[obj["reqId"]]
+            entry["result"] = {"ok": True}
+            entry["event"].set()
+            return True, ""
+
+        self.module._send_to_bridge = fake_write
+        result = self.module._tool_send({"to": "8613800138000", "text": "hi"})
+        self.assertTrue(result["ok"])
+        self.assertIn("Delivered", result["result"])
+
+    def test_a_silent_sidecar_times_out_rather_than_claiming_success(self):
+        self.module._running = lambda: True
+        self.module._state = "open"
+        self.module.SEND_TIMEOUT = 0.05
+        self.module._send_to_bridge = lambda obj: (True, "")
+        result = self.module._tool_send({"to": "8613800138000", "text": "hi"})
+        self.assertFalse(result["ok"])
+        self.assertIn("did not acknowledge", result["error"])
+        self.assertEqual(self.module._pending_sends, {})
+
+
+class WhatsappGatewayPackagingTests(unittest.TestCase):
+    def test_publication_archive_ships_only_extension_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            archive_path = Path(tmp) / "whatsapp-gateway.lext"
+            extension_manager.create_publication_archive(EXTENSION, archive_path)
+            with zipfile.ZipFile(archive_path) as archive:
+                names = set(archive.namelist())
+                unpacked = sum(i.file_size for i in archive.infolist())
+        for required in ("main.py", "extension.json", "README.md",
+                         "package.json", "bridge/bridge.mjs"):
+            self.assertIn(required, names)
+        # The sidecar's dependency tree is thousands of files and the pairing
+        # credentials are the user's own; neither may be distributed.
+        for name in names:
+            self.assertNotIn("node_modules", name)
+            self.assertNotIn(".auth", name)
+        self.assertLessEqual(len(names), extension_manager.MAX_ARCHIVE_FILES)
+        self.assertLessEqual(unpacked, extension_manager.MAX_UNPACKED_BYTES)
+
+
+class UnmanagedDirectoryTests(unittest.TestCase):
+    """The trust hash and the archive must agree on what the author shipped."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name) / "demo"
+        (self.root / "bridge").mkdir(parents=True)
+        (self.root / "node_modules" / "dep").mkdir(parents=True)
+        (self.root / "bridge" / ".auth").mkdir()
+        (self.root / "main.py").write_text("x = 1\n")
+        (self.root / "bridge" / "bridge.mjs").write_text("// sidecar\n")
+        (self.root / "run.sh").write_text("#!/bin/sh\n")
+        (self.root / "node_modules" / "dep" / "index.js").write_text("//\n")
+        (self.root / "bridge" / ".auth" / "creds.json").write_text("{}\n")
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_hash_covers_a_sidecar_and_skips_vendored_and_secret_files(self):
+        covered = {
+            path.relative_to(self.root).as_posix()
+            for path in extension_runtime.related_trust_paths(self.root)
+        }
+        # A `main.py` that only launches a sidecar means the sidecar is the
+        # code an approval is really about.
+        self.assertIn("bridge/bridge.mjs", covered)
+        self.assertIn("run.sh", covered)
+        self.assertNotIn("node_modules/dep/index.js", covered)
+        self.assertNotIn("bridge/.auth/creds.json", covered)
+
+    def test_installing_dependencies_does_not_invalidate_an_approval(self):
+        before = extension_runtime.related_trust_paths(self.root)
+        (self.root / "node_modules" / "dep" / "setup.py").write_text("# gyp\n")
+        self.assertEqual(before, extension_runtime.related_trust_paths(self.root))
+
+
+@unittest.skipUnless(_have_node(), "node is not installed")
+class BridgeProtocolTests(unittest.TestCase):
+    """The sidecar's stdout is an IPC channel with exactly one writer."""
+
+    def _run_bridge(self, script: str) -> str:
+        """Run bridge.mjs against a stub Baileys and return its stdout."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stub = root / "node_modules" / "@whiskeysockets" / "baileys"
+            stub.mkdir(parents=True)
+            (stub / "package.json").write_text(json.dumps(
+                {"name": "@whiskeysockets/baileys", "version": "0.0.0",
+                 "type": "module", "main": "index.mjs"}))
+            # A socket that connects to nothing: these tests are about framing
+            # and logging discipline, not about WhatsApp.
+            (stub / "index.mjs").write_text(textwrap.dedent("""
+                export const DisconnectReason = { loggedOut: 401 };
+                export function useMultiFileAuthState() {
+                  return Promise.resolve({ state: {}, saveCreds: () => {} });
+                }
+                export default function makeWASocket({ logger }) {
+                  logger.error('noise that must not reach stdout');
+                  const handlers = {};
+                  return {
+                    ev: {
+                      on: (name, fn) => { handlers[name] = fn; },
+                      removeAllListeners: () => {},
+                    },
+                    end: () => {},
+                    sendMessage: () => Promise.reject(new Error('offline')),
+                  };
+                }
+            """))
+            qrcode = root / "node_modules" / "qrcode"
+            qrcode.mkdir(parents=True)
+            (qrcode / "package.json").write_text(json.dumps(
+                {"name": "qrcode", "version": "0.0.0", "type": "module",
+                 "main": "index.mjs"}))
+            (qrcode / "index.mjs").write_text(
+                "export default { toDataURL: () => Promise.resolve('data:,x') };\n")
+
+            bridge_copy = root / "bridge.mjs"
+            bridge_copy.write_text(BRIDGE.read_text())
+
+            proc = subprocess.Popen(
+                [sys.executable and "node", str(bridge_copy)],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True, cwd=str(root),
+                env={"PATH": "/usr/bin:/bin:/usr/local/bin",
+                     "WA_AUTH_DIR": str(root / ".auth"),
+                     "WA_HTTP_PORT": "0", "WA_LOG_LEVEL": "trace"})
+            out: list[str] = []
+            reader = threading.Thread(
+                target=lambda: out.extend(proc.stdout), daemon=True)
+            reader.start()
+            time.sleep(1.0)
+            proc.stdin.write(script)
+            proc.stdin.flush()
+            time.sleep(1.0)
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            reader.join(timeout=5)
+            for stream in (proc.stdin, proc.stdout, proc.stderr):
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+            return "".join(out)
+
+    def test_stdout_carries_only_parseable_ipc_frames(self):
+        # Baileys logs through pino, which writes to stdout by default. Sharing
+        # the channel with the IPC frames is what an explicit stderr logger
+        # exists to prevent.
+        output = self._run_bridge(json.dumps({"type": "ping"}) + "\n")
+        lines = [line for line in output.splitlines() if line.strip()]
+        self.assertTrue(lines, "the sidecar produced no frames")
+        for line in lines:
+            json.loads(line)   # raises if anything else wrote to stdout
+        self.assertNotIn("noise that must not reach stdout", output)
+
+    def test_a_frame_split_across_writes_is_reassembled(self):
+        # 'data' events arrive in pipe-sized chunks, so a long reply straddles
+        # two of them; splitting each chunk on its own dropped both halves.
+        frame = json.dumps({"type": "send", "reqId": "big",
+                            "to": "1@s.whatsapp.net", "text": "x" * 200000}) + "\n"
+        output = self._run_bridge(frame)
+        acks = [json.loads(line) for line in output.splitlines()
+                if line.strip() and json.loads(line).get("type") == "send_result"]
+        self.assertEqual([a["reqId"] for a in acks], ["big"])
+        self.assertFalse(acks[0]["ok"])
+
+    def test_every_send_is_acknowledged_even_when_it_cannot_be_delivered(self):
+        output = self._run_bridge(json.dumps(
+            {"type": "send", "reqId": "r1", "to": "1@s.whatsapp.net",
+             "text": "hi"}) + "\n")
+        acks = [json.loads(line) for line in output.splitlines()
+                if line.strip() and json.loads(line).get("type") == "send_result"]
+        self.assertEqual(len(acks), 1)
+        self.assertFalse(acks[0]["ok"])
+        self.assertTrue(acks[0]["error"])
+
+
+if __name__ == "__main__":
+    unittest.main()

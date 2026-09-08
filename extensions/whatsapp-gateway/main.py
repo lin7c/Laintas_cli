@@ -1,0 +1,533 @@
+"""Extension: whatsapp-gateway
+
+Bridge laintas-cli to WhatsApp via a Baileys (Node) sidecar process.
+
+Flow:
+  QR page (http://127.0.0.1:8765)  ->  scan with phone  ->  session saved
+  inbound WA message               ->  ctx.backend.chat ->  reply sent back
+
+The sidecar is started on demand by `/whatsapp start`, never on load: pairing
+puts a live WhatsApp session on this machine, so it waits to be asked.
+"""
+from __future__ import annotations
+
+import atexit
+import json
+import os
+import shutil
+import subprocess
+import threading
+import time
+import uuid
+from pathlib import Path
+
+BASE = Path(__file__).resolve().parent
+BRIDGE = BASE / "bridge" / "bridge.mjs"
+#: WhatsApp credentials live beside the sidecar. Never packaged, never hashed.
+AUTH_DIR = BASE / "bridge" / ".auth"
+NODE_MODULES = BASE / "node_modules"
+BAILEYS = NODE_MODULES / "@whiskeysockets" / "baileys"
+DEFAULT_HTTP_PORT = int(os.environ.get("WA_HTTP_PORT", "8765"))
+NODE_BIN = os.environ.get("WA_NODE", "node")
+NPM_BIN = os.environ.get("WA_NPM", "npm")
+
+#: How long an outbound send waits for the sidecar's acknowledgement.
+SEND_TIMEOUT = 20.0
+#: `npm install` on first use; Baileys is a large tree on a cold cache.
+INSTALL_TIMEOUT = 600.0
+
+_proc: subprocess.Popen | None = None
+_backend = None
+_console = None
+_lock = threading.RLock()
+
+#: The port the sidecar actually bound, which is not always the one we asked
+#: for -- it walks forward past a port already in use.
+_http_port = DEFAULT_HTTP_PORT
+#: Last connection state reported by the sidecar; drives the honest answers in
+#: `_tool_send` and `/whatsapp status`.
+_state = "stopped"
+_install_error = ""
+
+# QR hint is printed at most once per bridge session to avoid spamming the
+# terminal during reconnect cycles (408 timeout -> reconnect -> new QR).
+_qr_hinted = False
+_last_status = None
+
+#: reqId -> {"event": Event, "result": dict}. An outbound send is acknowledged
+#: by the sidecar, so the caller can be told what actually happened.
+_pending_sends: dict[str, dict] = {}
+
+
+def setup(ctx) -> None:
+    global _backend, _console
+    _backend = ctx.backend
+    _console = ctx.console
+
+    ctx.register_command(
+        "/whatsapp",
+        _handle_whatsapp,
+        description="WhatsApp gateway: pair via QR or pairing code, check status, send/receive",
+        subcommands=[
+            ("start", "Start the gateway and pair by QR code"),
+            ("qrcode", "Alias for start"),
+            ("pairing", "Pair by entering an 8-char code on your phone: pairing <phone>"),
+            ("status", "Show connection status and pairing info"),
+            ("stop", "Stop the gateway"),
+            ("logout", "Forget the paired session and show a fresh QR code"),
+            ("send", "Send a message: send <number> <text>"),
+        ],
+    )
+
+    ctx.register_tool(_make_send_tool())
+    ctx.register_tool(_make_status_tool())
+
+    # Bridge starts manually: only pulled up by `/whatsapp start`, never
+    # automatically. See the module docstring.
+    atexit.register(_stop_bridge)
+
+
+def teardown() -> None:
+    _stop_bridge()
+
+
+# ----------------------------------------------------------------------
+# bridge lifecycle
+# ----------------------------------------------------------------------
+
+def _running() -> bool:
+    return _proc is not None and _proc.poll() is None
+
+
+def _ensure_dependencies() -> tuple[bool, str]:
+    """Make sure `node` and the sidecar's npm tree are present.
+
+    The published package carries no `node_modules` -- Baileys is thousands of
+    files, far past the archive limits, and vendoring it would ship a
+    dependency tree nobody reviewed. So the first start installs it.
+    """
+    global _install_error
+    if shutil.which(NODE_BIN) is None:
+        _install_error = (
+            f"Node.js is required but {NODE_BIN!r} was not found on PATH. "
+            "Install Node 18+ and run /whatsapp start again.")
+        return False, _install_error
+    if BAILEYS.is_dir():
+        return True, ""
+    if shutil.which(NPM_BIN) is None:
+        _install_error = (
+            f"The sidecar's dependencies are not installed and {NPM_BIN!r} was "
+            f"not found on PATH. Run `npm install` in {BASE} manually.")
+        return False, _install_error
+    _log(f"Installing the WhatsApp sidecar's Node dependencies in {BASE} (first run only)...")
+    try:
+        result = subprocess.run(
+            [NPM_BIN, "install", "--omit=dev", "--no-audit", "--no-fund",
+             "--loglevel=error"],
+            cwd=str(BASE), capture_output=True, text=True, timeout=INSTALL_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        _install_error = f"`npm install` timed out after {int(INSTALL_TIMEOUT)}s."
+        return False, _install_error
+    except OSError as exc:
+        _install_error = f"`npm install` could not be run: {exc}"
+        return False, _install_error
+    if result.returncode != 0 or not BAILEYS.is_dir():
+        tail = (result.stderr or result.stdout or "").strip().splitlines()
+        _install_error = ("`npm install` failed: "
+                          + (tail[-1] if tail else f"exit {result.returncode}"))
+        return False, _install_error
+    _log("Sidecar dependencies installed.")
+    _install_error = ""
+    return True, ""
+
+
+def _ensure_bridge() -> tuple[bool, str]:
+    """Start the sidecar if it is not already up. Returns (ok, message)."""
+    global _proc, _qr_hinted, _state, _http_port
+    with _lock:
+        if _running():
+            return True, "already running"
+        ok, message = _ensure_dependencies()
+        if not ok:
+            return False, message
+
+        env = dict(os.environ)
+        env["WA_AUTH_DIR"] = str(AUTH_DIR)
+        env["WA_HTTP_PORT"] = str(DEFAULT_HTTP_PORT)
+        try:
+            _proc = subprocess.Popen(
+                [NODE_BIN, str(BRIDGE)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                stdin=subprocess.PIPE,
+                text=True,
+                env=env,
+                cwd=str(BRIDGE.parent),
+            )
+        except OSError as exc:
+            _proc = None
+            return False, f"Could not start the sidecar: {exc}"
+
+        _qr_hinted = False   # new bridge session -> allow one QR hint again
+        _http_port = DEFAULT_HTTP_PORT
+        _state = "starting"
+        _log(f"Bridge process started pid={_proc.pid}")
+        threading.Thread(target=_read_stdout, args=(_proc,), daemon=True).start()
+        threading.Thread(target=_read_stderr, args=(_proc,), daemon=True).start()
+        return True, "started"
+
+
+def _read_stdout(proc: subprocess.Popen) -> None:
+    if not proc.stdout:
+        return
+    for line in proc.stdout:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            # stdout is the IPC channel; anything unparseable is a bug in the
+            # sidecar worth seeing rather than dropping on the floor.
+            _log(f"[bridge] {line[:200]}")
+            continue
+        try:
+            _handle_from_bridge(obj)
+        except Exception as exc:            # one bad frame must not kill the reader
+            _log(f"[bridge] frame error: {type(exc).__name__}: {exc}")
+    _on_bridge_exit(proc)
+
+
+def _read_stderr(proc: subprocess.Popen) -> None:
+    if not proc.stderr:
+        return
+    for line in proc.stderr:
+        line = line.strip()
+        if line:
+            _log(f"[bridge:stderr] {line}")
+
+
+def _on_bridge_exit(proc: subprocess.Popen) -> None:
+    """The sidecar's stdout closed: it is gone. Say so, and fail waiting sends.
+
+    Nothing used to notice a dead sidecar. `/whatsapp status` reported the
+    process state only when asked, and an outbound send was reported as
+    delivered regardless."""
+    global _state
+    with _lock:
+        if _proc is not proc:
+            return
+        code = proc.poll()
+        _state = "stopped"
+    for entry in list(_pending_sends.values()):
+        entry["result"] = {"ok": False, "error": "the sidecar exited"}
+        entry["event"].set()
+    if code not in (0, None):
+        _log(f"WhatsApp sidecar exited with code {code}. Run /whatsapp start to restart it.")
+
+
+def _send_to_bridge(obj: dict) -> tuple[bool, str]:
+    with _lock:
+        if not _running() or not _proc or not _proc.stdin:
+            return False, "the gateway is not running"
+        try:
+            _proc.stdin.write(json.dumps(obj) + "\n")
+            _proc.stdin.flush()
+        except OSError as exc:
+            return False, f"could not reach the sidecar: {exc}"
+    return True, ""
+
+
+def _stop_bridge() -> None:
+    global _proc, _state
+    with _lock:
+        proc, _proc = _proc, None
+        _state = "stopped"
+    if proc and proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+def _handle_from_bridge(obj: dict) -> None:
+    global _qr_hinted, _last_status, _state, _http_port
+    kind = obj.get("type")
+
+    if kind == "status":
+        state = obj.get("state")
+        if state == "listening":
+            port = obj.get("httpPort")
+            if isinstance(port, int):
+                _http_port = port
+                if port != DEFAULT_HTTP_PORT:
+                    _log(f"Port {DEFAULT_HTTP_PORT} was busy; the QR page is on "
+                         f"http://127.0.0.1:{port} instead.")
+        else:
+            _state = str(state or "")
+        if state == "needs_rescan":
+            _qr_hinted = False        # a fresh QR deserves a fresh hint
+        # Suppress repetitive status spam. Only log meaningful transitions:
+        # the first time we see a state, or when it actually changes.
+        if state != _last_status:
+            _last_status = state
+            _log(f"State -> {state} {obj.get('reason') or ''}".strip())
+
+    elif kind == "qr":
+        # A QR frame IS the "waiting to be scanned" signal -- the sidecar sends
+        # no separate status for it, and without this the gateway still reports
+        # `starting` while it sits on the pairing page.
+        _state = "awaiting_scan"
+        # QR available at the HTTP page; log only once per bridge session.
+        if not _qr_hinted:
+            _qr_hinted = True
+            _log(f"QR code generated. Open http://127.0.0.1:{_http_port} in your "
+                 "browser and scan it with your phone to pair.")
+
+    elif kind == "pairing_code":
+        _state = "awaiting_pairing"
+        code = obj.get("code") or ""
+        phone = obj.get("phone") or ""
+        _log(f"Pairing code for {phone}: {code}")
+        _log("Enter it in WhatsApp on your phone: Settings -> Linked devices -> "
+             "Link with phone number instead.")
+
+    elif kind == "send_result":
+        entry = _pending_sends.get(str(obj.get("reqId") or ""))
+        if entry is not None:
+            entry["result"] = obj
+            entry["event"].set()
+        elif not obj.get("ok"):
+            _log(f"[send failed] {obj.get('error')}")
+
+    elif kind == "message":
+        _on_message(obj)
+
+    elif kind == "error":
+        _log(f"[error] {obj.get('message')}")
+
+
+def _on_message(msg: dict) -> None:
+    text = msg.get("text") or ""
+    jid = msg.get("remoteJid") or ""
+    if not text or not jid:
+        return
+    _log(f"Message from={msg.get('name')} jid={jid}: {text[:80]}")
+
+    def work():
+        reply = "(no reply generated)"
+        try:
+            res = _backend.chat(
+                f"Please reply to this WhatsApp message in a friendly, concise tone:\n{text}",
+                system_prompt=("You are the user's WhatsApp smart assistant. Reply "
+                               "briefly and appropriately, in the same language as "
+                               "the incoming message."),
+            )
+            reply = res.get("reply") or res.get("error") or reply
+        except Exception as exc:
+            reply = f"(assistant error: {exc})"
+        ok, error = _dispatch_send(jid, reply)
+        if not ok:
+            _log(f"Could not deliver the reply to {jid}: {error}")
+
+    threading.Thread(target=work, daemon=True).start()
+
+
+def _dispatch_send(jid: str, text: str) -> tuple[bool, str]:
+    """Send one message and wait for the sidecar's verdict.
+
+    The old version wrote to the pipe and returned success unconditionally, so
+    a stopped gateway, an unpaired session and a rejected recipient all read as
+    "Delivered" to the user and to the model."""
+    if not _running():
+        return False, ("the gateway is not running -- run /whatsapp start "
+                       "and pair first")
+    if _state != "open":
+        return False, (f"WhatsApp is not connected (state={_state or 'unknown'}); "
+                       f"pair at http://127.0.0.1:{_http_port}")
+    req_id = uuid.uuid4().hex
+    entry = {"event": threading.Event(), "result": {}}
+    _pending_sends[req_id] = entry
+    try:
+        ok, error = _send_to_bridge(
+            {"type": "send", "reqId": req_id, "to": jid, "text": text})
+        if not ok:
+            return False, error
+        if not entry["event"].wait(SEND_TIMEOUT):
+            return False, f"the sidecar did not acknowledge within {int(SEND_TIMEOUT)}s"
+        result = entry["result"]
+        if result.get("ok"):
+            return True, ""
+        return False, str(result.get("error") or "send failed")
+    finally:
+        _pending_sends.pop(req_id, None)
+
+
+def _log(msg: str) -> None:
+    if _console is not None:
+        try:
+            # Console.print reads square brackets as markup, and these messages
+            # carry things like "[bridge:stderr]" and arbitrary error text.
+            _console.print(msg, markup=False, highlight=False)
+            return
+        except TypeError:
+            try:
+                _console.print(msg)
+                return
+            except Exception:
+                pass
+        except Exception:
+            pass
+    print(msg)
+
+
+# ----------------------------------------------------------------------
+# tools
+# ----------------------------------------------------------------------
+
+def _make_send_tool():
+    from tools import Tool
+    return Tool(
+        name="whatsapp.send",
+        description=(
+            "Send a text message via the paired WhatsApp to a given user/group. "
+            "'to' is the recipient number, e.g. 8613800138000 (with country "
+            "code, no + sign). Fails if the gateway is not running or not yet "
+            "paired; check whatsapp.status first."),
+        schema={
+            "type": "object",
+            "properties": {
+                "to": {"type": "string",
+                       "description": "Recipient number or group JID, e.g. 8613800138000"},
+                "text": {"type": "string", "description": "Content to send"},
+            },
+            "required": ["to", "text"],
+        },
+        invoke=_tool_send,
+    )
+
+
+def _make_status_tool():
+    from tools import Tool
+    return Tool(
+        name="whatsapp.status",
+        description="Query the current WhatsApp gateway connection status and QR page URL.",
+        schema={"type": "object", "properties": {}},
+        invoke=_tool_status,
+    )
+
+
+def _to_jid(value: str) -> str:
+    return value if "@" in value else f"{value}@s.whatsapp.net"
+
+
+def _tool_send(args: dict, ctx=None) -> dict:
+    to = str(args.get("to") or "").strip()
+    text = str(args.get("text") or "").strip()
+    if not to or not text:
+        return {"ok": False, "error": "'to' and 'text' are both required"}
+    jid = _to_jid(to)
+    ok, error = _dispatch_send(jid, text)
+    if not ok:
+        return {"ok": False, "error": f"Could not send to {jid}: {error}"}
+    return {"ok": True, "result": f"Delivered to {jid}"}
+
+
+def _tool_status(args: dict, ctx=None) -> dict:
+    return {
+        "ok": True,
+        "result": {
+            "running": _running(),
+            "connection": _state,
+            "paired": _state == "open",
+            "qr_page": f"http://127.0.0.1:{_http_port}",
+            "auth_dir": str(AUTH_DIR),
+            "dependencies_installed": BAILEYS.is_dir(),
+            "last_error": _install_error,
+        },
+    }
+
+
+# ----------------------------------------------------------------------
+# /whatsapp command
+# ----------------------------------------------------------------------
+
+_USAGE = ("Usage: /whatsapp start | pairing <phone> | status | send <number> "
+          "<text> | logout | stop")
+
+
+def _handle_whatsapp(parts: list) -> None:
+    args = [str(p) for p in parts[1:]]
+    # `/whatsapp` with no subcommand starts the gateway in QR mode.
+    sub = args[0].lower() if args else "start"
+    rest = args[1:]
+
+    # `start` is the documented name; `qrcode` was the original one and stays
+    # an alias so anyone's muscle memory keeps working.
+    if sub in ("start", "qrcode"):
+        ok, message = _ensure_bridge()
+        if not ok:
+            _log(message)
+            return
+        if message == "already running":
+            _log(f"WhatsApp gateway is already running (state={_state}). "
+                 f"QR page: http://127.0.0.1:{_http_port}")
+            return
+        _log("WhatsApp gateway starting in QR mode. The QR page URL will be "
+             "printed as soon as the code is ready; scan it with your phone to pair.")
+
+    elif sub == "pairing":
+        if not rest:
+            _log("Usage: /whatsapp pairing <phone>, e.g. /whatsapp pairing 8613800138000")
+            return
+        phone = str(rest[0]).strip()
+        ok, message = _ensure_bridge()
+        if not ok:
+            _log(message)
+            return
+        sent, error = _send_to_bridge({"type": "pairing", "phone": phone})
+        if not sent:
+            _log(f"Could not request a pairing code: {error}")
+            return
+        _log(f"Pairing-code mode requested for {phone}. An 8-char code will appear "
+             "shortly -- enter it in WhatsApp: Settings -> Linked devices -> Link "
+             "with phone number instead.")
+
+    elif sub == "status":
+        _log(f"Bridge process: {'running' if _running() else 'not running'}")
+        _log(f"Connection:     {_state}")
+        _log(f"QR page:        http://127.0.0.1:{_http_port}")
+        _log(f"Session dir:    {AUTH_DIR}")
+        _log(f"Dependencies:   {'installed' if BAILEYS.is_dir() else 'not installed'}")
+        if _install_error:
+            _log(f"Last error:     {_install_error}")
+
+    elif sub == "stop":
+        if not _running():
+            _log("WhatsApp gateway is not running.")
+            return
+        _stop_bridge()
+        _log("WhatsApp gateway stopped.")
+
+    elif sub == "logout":
+        if not _running():
+            # Nothing is holding the credentials, so remove them directly.
+            shutil.rmtree(AUTH_DIR, ignore_errors=True)
+            _log("Paired session forgotten. Run /whatsapp start to pair again.")
+            return
+        sent, error = _send_to_bridge({"type": "logout"})
+        _log("Paired session forgotten; a fresh QR code will appear shortly."
+             if sent else f"Could not log out: {error}")
+
+    elif sub == "send":
+        if len(rest) < 2:
+            _log("Usage: /whatsapp send <number> <content>, e.g. /whatsapp send "
+                 "8613800138000 hello")
+            return
+        to, text = rest[0], " ".join(rest[1:])
+        result = _tool_send({"to": to, "text": text})
+        _log(result["result"] if result["ok"] else result["error"])
+
+    else:
+        _log(f"Unknown subcommand {sub!r}. {_USAGE}")

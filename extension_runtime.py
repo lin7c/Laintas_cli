@@ -40,6 +40,24 @@ _SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 _SAFE_TOOL_PREFIX = re.compile(r"^[a-z][a-z0-9_]{0,15}\.$")
 
 
+#: Directories inside an extension that are NOT part of what its author
+#: shipped: a dependency tree an installer fetched, credentials a pairing
+#: flow wrote, caches, VCS metadata.
+#:
+#: They are excluded from the trust hash and from the publication archive
+#: TOGETHER, and that pairing is the point -- an approval must cover exactly
+#: the bytes that were distributed. Hashing `node_modules` would break the
+#: approval on every `npm install`; packaging `.auth` would put one user's
+#: live session credentials inside everybody else's download.
+UNMANAGED_DIRECTORIES: frozenset = frozenset({
+    "node_modules", ".auth", ".git", ".laintas", "__pycache__", ".venv", "venv",
+})
+
+
+def _is_unmanaged(relative: Path) -> bool:
+    return any(part in UNMANAGED_DIRECTORIES for part in relative.parts)
+
+
 def related_trust_paths(directory: Path) -> tuple[Path, ...]:
     """Everything besides main.py that the trust hash must cover.
 
@@ -48,6 +66,13 @@ def related_trust_paths(directory: Path) -> tuple[Path, ...]:
     as instructions -- the half of a package that a sandbox bounds nothing
     about. Hashing only `.py` would let the prose an extension tells the model
     change without the approval that installed it becoming invalid.
+
+    And not only Python, either. An extension may ship its logic in a sidecar
+    that `main.py` merely launches -- a Node bridge, a shell script, a binary
+    manifest. Restricting the hash to `.py` and `skills/` left every one of
+    those files free to change under an approval that still read as valid, so
+    the rule is now the inverse: hash everything the author shipped, and skip
+    only `UNMANAGED_DIRECTORIES`.
     """
     seen: dict[str, Path] = {}
     for path in sorted(directory.rglob("*")):
@@ -56,8 +81,9 @@ def related_trust_paths(directory: Path) -> tuple[Path, ...]:
         if path.name == "main.py" and path.parent == directory:
             continue
         relative = path.relative_to(directory)
-        if path.suffix == ".py" or relative.parts[:1] == ("skills",):
-            seen[str(path)] = path
+        if _is_unmanaged(relative) or path.suffix in {".pyc", ".pyo"}:
+            continue
+        seen[str(path)] = path
     return tuple(seen[key] for key in sorted(seen))
 
 

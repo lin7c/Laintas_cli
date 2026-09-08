@@ -16,6 +16,14 @@
       "description": "Generate SWE-bench predictions with laintas-cli; scoring stays with the official harness",
       "url": "https://cli.laintas.com/extensions/official/swebench-1.0.0.lext",
       "sha256": "29315187eb19a4a5a5f0a5863025dde23e7db76b038a414e1b68a7a863f386d3"
+    },
+    {
+      "id": "laintas/whatsapp-gateway",
+      "name": "whatsapp-gateway",
+      "version": "1.1.0",
+      "description": "WhatsApp gateway: pair via QR or pairing code and send/receive messages, bridged to the laintas-cli Agent",
+      "url": "https://cli.laintas.com/extensions/official/whatsapp-gateway-1.1.0.lext",
+      "sha256": "68324d18db0a8f8195b2d0098bba6ae3b111bce43e0bf046d5251538518de41d"
     }
   ]
 }

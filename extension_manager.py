@@ -233,15 +233,26 @@ def create_archive(source_dir: Path, output: Path) -> Path:
 
 
 def create_publication_archive(source_dir: Path, output: Path) -> Path:
-    """Pack source without local install provenance, CLI state, or transient files."""
+    """Pack source without local install provenance, CLI state, or transient files.
+
+    The skip list is `extension_runtime.UNMANAGED_DIRECTORIES`, shared with the
+    trust hash so an approval covers exactly the distributed bytes. Two of its
+    entries matter here specifically: `node_modules`, because a fetched
+    dependency tree runs past `MAX_ARCHIVE_FILES` and is the installer's job,
+    and `.auth`, because an extension that pairs with an account writes live
+    credentials there -- packing the author's would hand them to every user.
+    """
+    import extension_runtime
+
     with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
         for file_path in sorted(source_dir.rglob("*")):
             if (not file_path.is_file() or file_path.is_symlink()
-                    or "__pycache__" in file_path.parts
-                    or ".laintas" in file_path.parts
                     or file_path.suffix in {".pyc", ".pyo"}):
                 continue
             relative = file_path.relative_to(source_dir)
+            if any(part in extension_runtime.UNMANAGED_DIRECTORIES
+                   for part in relative.parts):
+                continue
             if relative.as_posix() == "extension.json":
                 manifest = read_manifest(source_dir)
                 manifest.pop("install", None)
