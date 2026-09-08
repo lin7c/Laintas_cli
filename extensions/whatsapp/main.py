@@ -92,6 +92,21 @@ _task_queue: "queue.Queue[dict]" = queue.Queue()
 _worker: threading.Thread | None = None
 
 
+def _ensure_worker() -> None:
+    """Guarantee something is draining the queue.
+
+    The worker is a daemon thread, so if it never started or died the queue
+    just fills: messages accepted, nothing run, no reply, and no complaint
+    anywhere. Checking here means the only way to lose a message is to lose
+    the process.
+    """
+    global _worker
+    with _lock:
+        if _worker is None or not _worker.is_alive():
+            _worker = threading.Thread(target=_task_worker, daemon=True)
+            _worker.start()
+
+
 def setup(ctx) -> None:
     global _backend, _tasks, _console, _worker
     _backend = ctx.backend
@@ -116,10 +131,7 @@ def setup(ctx) -> None:
     ctx.register_tool(_make_send_tool())
     ctx.register_tool(_make_status_tool())
 
-    if _worker is None or not _worker.is_alive():
-        _worker = threading.Thread(target=_task_worker, daemon=True)
-        _worker.start()
-
+    _ensure_worker()
     atexit.register(_stop_bridge)
 
 
@@ -456,6 +468,7 @@ def _on_message(msg: dict) -> None:
     if not text or not _accepted(msg):
         return
     _record("in", text)
+    _ensure_worker()
     _task_queue.put({
         "text": text,
         "jid": msg.get("remoteJid") or "",
@@ -893,7 +906,9 @@ def _handle_whatsapp(parts: list) -> None:
             _log(f"Account:   +{_me_jid.split('@')[0]}   "
                  "(message yourself on WhatsApp to give it work)")
         if _task_queue.qsize():
-            _log(f"Running:   {_task_queue.qsize()} queued")
+            alive = _worker is not None and _worker.is_alive()
+            _log(f"Running:   {_task_queue.qsize()} queued"
+                 + ("" if alive else "   <- WORKER NOT RUNNING"))
         if _MESSAGES:
             last = _MESSAGES[-1]
             arrow = "->" if last["dir"] == "in" else "<-"
