@@ -78,8 +78,15 @@ WA_DEVICE_NAME="my box"   # the name under Linked devices
 WA_PLATFORM=Chrome        # which built-in icon; Desktop by default
 ```
 
-Both only apply when a device is registered, so changing them affects the
-**next** pairing, not the current one.
+Both only apply when a device is **registered**, so changing them affects the
+next pairing, not the current one. Note what that costs: seeing a new name or
+icon means unlinking on the phone and pairing again, and the running session
+does not survive that -- `generateLoginNode` sends only the account and device
+number, so the identity is never re-sent on a reconnect.
+
+If the device is removed under Linked devices, the gateway says so explicitly
+and tells you to pair again; the revoked credentials are moved aside to
+`bridge/.auth.revoked` rather than deleted.
 
 ## When pairing does not work
 

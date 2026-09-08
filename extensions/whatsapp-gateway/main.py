@@ -311,6 +311,17 @@ def _handle_from_bridge(obj: dict) -> None:
                          f"http://127.0.0.1:{port} instead.")
         else:
             _state = str(state or "")
+        if obj.get("needsPairing"):
+            # Being unlinked is not a passing state to fold into the status
+            # ticker. Left as one line among many it reads as noise, and the
+            # gateway silently sits at the pairing screen while the user is
+            # left wondering why WhatsApp stopped working.
+            _log("")
+            _log("WhatsApp: this device is no longer linked to your account.")
+            _log("  Someone removed it under Settings -> Linked devices, or the")
+            _log("  session was revoked. Nothing is connected until you pair again:")
+            _log("      /whatsapp pairing <your number>      (or /whatsapp start for a QR)")
+            _log("")
         if state == "needs_rescan":
             _qr_hinted = False        # a fresh QR deserves a fresh hint
         # Suppress repetitive status spam. Only log meaningful transitions:
@@ -597,7 +608,9 @@ def _handle_whatsapp(parts: list) -> None:
 
     elif sub == "status":
         _log(f"Bridge process: {'running' if _running() else 'not running'}")
-        _log(f"Connection:     {_state}")
+        _log(f"Connection:     {_state}"
+             + ("   <- not linked; run /whatsapp pairing <number>"
+                if _state in ("logged_out", "needs_rescan", "closed") else ""))
         _log(f"QR page:        http://127.0.0.1:{_http_port}")
         _log(f"Session dir:    {AUTH_DIR}")
         _log(f"Dependencies:   {'installed' if BAILEYS.is_dir() else 'not installed'}")

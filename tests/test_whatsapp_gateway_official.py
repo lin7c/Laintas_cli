@@ -259,6 +259,42 @@ class DeviceIdentityTests(unittest.TestCase):
         self.assertIn("const BROWSER = [DEVICE_NAME, PLATFORM, OS_VERSION];", source)
 
 
+class RevokedSessionTests(unittest.TestCase):
+    """Being unlinked on the phone must be visible, and recoverable.
+
+    The gateway used to delete the credentials and print one line in the status
+    ticker, so a device removed under Linked devices looked exactly like the
+    gateway having quietly stopped working."""
+
+    def test_revoked_credentials_are_archived_not_deleted(self):
+        source = BRIDGE.read_text()
+        self.assertIn("archiveAuthDir", source)
+        logout = source.split("async function logout()", 1)[1].split("}", 1)[0]
+        self.assertIn("archiveAuthDir()", logout)
+        self.assertNotIn("fs.rm(AUTH_DIR", logout)
+        self.assertIn("0o700", source.split("async function archiveAuthDir()", 1)[1][:600])
+
+    def test_the_user_is_told_what_happened_and_what_to_do(self):
+        module = _load_main()
+        logged: list[str] = []
+        module._log = logged.append
+        module._handle_from_bridge({
+            "type": "status", "state": "logged_out", "needsPairing": True,
+            "reason": "this device is no longer linked to the WhatsApp account"})
+        output = "\n".join(logged)
+        self.assertIn("no longer linked", output)
+        self.assertIn("Linked devices", output)
+        self.assertIn("/whatsapp pairing", output)
+
+    def test_status_flags_an_unlinked_gateway(self):
+        module = _load_main()
+        logged: list[str] = []
+        module._log = logged.append
+        module._state = "needs_rescan"
+        module._handle_whatsapp(["/whatsapp", "status"])
+        self.assertIn("not linked", "\n".join(logged))
+
+
 class CredentialExposureTests(unittest.TestCase):
     """A paired session is a credential: whatever can read it can send as the
     account and read every message it receives, with no second factor and no

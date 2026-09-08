@@ -405,12 +405,34 @@ function retireSocket() {
   try { old.end(undefined); } catch { /* already closed */ }
 }
 
+/** Set aside the credentials of a session the server has revoked.
+ *
+ * Deleting them outright was wrong twice over. It is unrecoverable if the 401
+ * was ever a misjudgement, and it destroys the only evidence of what happened
+ * -- which is what a revoked session looks like from the user's side: the
+ * device silently stops working and the gateway is quietly back at the pairing
+ * screen. One generation is kept; it is a credential, so 0700. */
+async function archiveAuthDir() {
+  const archive = `${AUTH_DIR}.revoked`;
+  try {
+    await fs.rm(archive, { recursive: true, force: true });
+    await fs.rename(AUTH_DIR, archive);
+    await fs.chmod(archive, 0o700).catch(() => {});
+    note(`revoked session moved to ${archive}`);
+  } catch {
+    // Renaming is best effort; the session is unusable either way.
+    await fs.rm(AUTH_DIR, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
 async function logout() {
   shuttingDown = false;
   retireSocket();
-  await fs.rm(AUTH_DIR, { recursive: true, force: true });
+  await archiveAuthDir();
   latestQR = null;
   pairingRequested = false;
+  pendingPairingPhone = null;
+  lastPairingCode = null;
   emit({ type: 'status', state: 'needs_rescan', reason: 'auth cleared' });
   reconnectDelay = RECONNECT_MIN_MS;
   await connect();
@@ -519,11 +541,18 @@ async function connect() {
       const code = lastDisconnect?.error?.output?.statusCode;
       connectionState = 'closed';
       if (code === DisconnectReason.loggedOut) {
-        // Terminal for this session, but not for the bridge: wipe the dead
-        // credentials and come back on a fresh QR. Exiting here used to leave
-        // a live process that could never pair again, while `/whatsapp status`
-        // still reported it as running.
-        emit({ type: 'status', state: 'logged_out', reason: 'account logged out, rescan required' });
+        // The device was unlinked on the phone (or the server rejected the
+        // login for good). Terminal for this session, not for the bridge:
+        // archive the dead credentials and come back on a fresh QR. Say WHY --
+        // the previous wording read like a transient state, so an unlinked
+        // device just looked like the gateway had stopped working.
+        emit({
+          type: 'status',
+          state: 'logged_out',
+          reason: 'this device is no longer linked to the WhatsApp account',
+          statusCode: code,
+          needsPairing: true,
+        });
         logout().catch(e => {
           emit({ type: 'error', message: `Re-pair failed: ${e.message}` });
           scheduleReconnect();
