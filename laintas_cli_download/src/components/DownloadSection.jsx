@@ -219,7 +219,7 @@ export default function DownloadSection() {
                 <div className="price-value"><span className="price-amount">{plan.price}</span><span className="price-period">{plan.period}</span></div>
                 <p className="price-desc">{desc}</p>
                 <ul className="price-features">{features.map((f) => <li key={f}><Check size={13} />{f}</li>)}</ul>
-                <a className="button price-cta" href={`https://laintas.com/pricing${plan.id === 'free' ? '#allowance-comparison' : ''}`} target="_blank" rel="noreferrer">{plan.highlight ? 'Subscribe' : lang === 'zh' ? '了解详情' : 'Learn more'}<ArrowRight size={15} /></a>
+                <a className="button price-cta" href={`https://laintas.com/pricing${plan.id === 'free' ? '#allowance-comparison' : ''}`} target="_blank" rel="noreferrer">{lang === 'zh' ? '了解详情' : 'Learn more'}<ArrowRight size={15} /></a>
               </article>
             );
           })}
