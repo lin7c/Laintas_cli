@@ -131,15 +131,28 @@ function rememberOwnMessage(id) {
   }
 }
 
+/** Strip a jid down to the account it names: no device suffix, no domain. */
+function bareId(jid) {
+  return String(jid || '').split('@')[0].split(':')[0];
+}
+
 /** The account's own chat -- "Message yourself" in WhatsApp.
  *
- *  This is the conversation the user talks to the CLI in, so it is the one
- *  place where a `fromMe` message is an instruction rather than an echo of
- *  something they said to somebody else. */
+ *  One account has TWO addresses and WhatsApp uses both. The phone number
+ *  (`8613...@s.whatsapp.net`) and the LID (`59567...@lid`) name the same
+ *  account, and which one appears on an inbound message is WhatsApp's choice,
+ *  not ours -- outbound to the phone number is delivered to this chat while
+ *  the reply comes back addressed by LID.
+ *
+ *  Matching only `user.id` therefore recognised the messages we sent and none
+ *  of the ones we received: every task typed on the phone was classified "not
+ *  the self-chat" and dropped in silence. Both addresses are this account, so
+ *  both count; nothing here widens beyond it. */
 function isSelfChat(remoteJid) {
-  const own = socket?.user?.id;
-  if (!own || !remoteJid) return false;
-  return String(remoteJid).split('@')[0] === String(own).split(':')[0].split('@')[0];
+  const target = bareId(remoteJid);
+  if (!target) return false;
+  return target === bareId(socket?.user?.id)
+      || target === bareId(socket?.user?.lid);
 }
 
 /* ---------------- IPC to parent (Python) ---------------- */
@@ -665,6 +678,13 @@ async function connect({ allowReset = false } = {}) {
       // A new pairing replays history; old notes are not new instructions.
       const ts = Number(msg.messageTimestamp || 0);
       if (ts && ts < startedAt - 60) continue;
+
+      // A dropped message used to leave no trace at all, which is why "I sent
+      // it and nothing happened" took a guess to diagnose rather than a look.
+      if (!selfChat) {
+        note(`ignoring message from ${remoteJid} (not the self-chat; `
+           + `self is ${bareId(socket?.user?.id)}/${bareId(socket?.user?.lid)})`);
+      }
 
       const isGroup = remoteJid.endsWith('@g.us');
       const from = cleanJid(msg.key.participant || msg.key.remoteJid);

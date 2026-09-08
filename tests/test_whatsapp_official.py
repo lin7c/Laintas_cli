@@ -87,9 +87,8 @@ class TaskRunnerContractTests(unittest.TestCase):
         # The inbound path must reach the agent. `_backend.chat` survives only
         # for summarising the agent's own output.
         self.assertIn("_tasks.run(", source)
-        run_one = source.split("def _run_one(", 1)[1].split("\ndef ", 1)[0]
-        self.assertIn("_tasks.run(", run_one)
-        self.assertNotIn("_backend.chat", run_one)
+        handle = source.split("def _handle_job(", 1)[1].split("\ndef ", 1)[0]
+        self.assertIn("_tasks.run(", handle)
 
 
 class AccessControlTests(unittest.TestCase):
@@ -126,61 +125,172 @@ class AccessControlTests(unittest.TestCase):
         self.assertEqual(self.module._task_queue.qsize(), 0)
 
 
-class ExecutionFlowTests(unittest.TestCase):
+class SecretaryRoutingTests(unittest.TestCase):
+    """Messages go to a secretary first, not straight to the agent.
+
+    Not every message is a task. A channel that assumes otherwise runs
+    "thanks" as a shell command, and can never be asked to change anything
+    about the CLI itself -- its mode, its model -- because those are not work
+    for the agent, they are work on the agent."""
+
     def setUp(self):
         self.module = _load_main()
-        self.module._log = lambda *_: None
-        self.sent: list[tuple] = []
-        self.reacted: list[str] = []
-        self.module._send = lambda jid, text: (self.sent.append((jid, text)), (True, ""))[1]
-        self.module._react = lambda jid, key, emoji: self.reacted.append(emoji)
+        self.logged: list[str] = []
+        self.module._log = self.logged.append
+        self.sent: list[str] = []
+        self.module._send = lambda jid, t: (self.sent.append(t), (True, ""))[1]
+        self.module._react = lambda *a: None
+        self.decision = ""
+
+        outer = self
+
+        class Backend:
+            def chat(_s, message, system_prompt="", **kw):
+                if "ONE json object" in system_prompt:
+                    return {"reply": outer.decision}
+                return {"reply": "reported"}
 
         class Tasks:
-            def __init__(self, outer):
-                self.outer = outer
-                self.calls = []
+            def __init__(_s):
+                _s.ran = []
 
-            def run(self, text, conversation="", on_progress=None):
-                self.calls.append({"text": text, "conversation": conversation})
-                return self.outer.result
+            def run(_s, text, conversation="", on_progress=None):
+                _s.ran.append(text)
+                return {"ok": True, "reply": "x" * 900, "error": ""}
 
-        self.tasks = Tasks(self)
+        self.module._backend = Backend()
+        self.tasks = Tasks()
         self.module._tasks = self.tasks
-        self.result = {"ok": True, "reply": "disk is at 57%", "error": ""}
 
-    def _job(self, text="check disk"):
-        return {"text": text, "jid": "me@s.whatsapp.net", "key": {"id": "x"}}
+    def _job(self, text="do a thing"):
+        return {"text": text, "jid": "me@s.whatsapp.net", "key": {"id": "1"}}
 
-    def test_a_task_is_acknowledged_then_answered(self):
-        self.module._run_one(self._job())
-        # Acknowledged before running: a long task must not look like nothing
-        # happened.
-        self.assertEqual(self.reacted[0], "⏳")
-        self.assertEqual(self.reacted[-1], "✅")
-        self.assertIn("disk is at 57%", self.sent[0][1])
+    def test_execute_reaches_the_agent_with_the_rewritten_task(self):
+        self.decision = '{"action":"execute","task":"check disk usage"}'
+        self.module._handle_job(self._job("磁盘"))
+        self.assertEqual(self.tasks.ran, ["check disk usage"])
+        self.assertIn("reported", self.sent[-1])
 
-    def test_the_conversation_is_scoped_to_the_chat(self):
-        self.module._run_one(self._job())
-        self.assertEqual(self.tasks.calls[0]["conversation"],
-                         "whatsapp:me@s.whatsapp.net")
+    def test_answer_runs_nothing(self):
+        self.decision = '{"action":"answer","text":"you are welcome"}'
+        self.module._handle_job(self._job("thanks"))
+        self.assertEqual(self.tasks.ran, [])
+        self.assertEqual(self.sent[-1], "you are welcome")
 
-    def test_a_failed_task_says_so(self):
-        self.result = {"ok": False, "reply": "", "error": "tool exploded"}
-        self.module._run_one(self._job())
-        self.assertEqual(self.reacted[-1], "❌")
-        self.assertIn("tool exploded", self.sent[0][1])
+    def test_mode_and_model_are_changed_not_executed(self):
+        self.module._set_mode = lambda v: f"mode -> {v}"
+        self.module._set_model = lambda v: f"model -> {v}"
+        self.decision = '{"action":"mode","value":"act"}'
+        self.module._handle_job(self._job("switch to act"))
+        self.assertEqual(self.sent[-1], "mode -> act")
+        self.decision = '{"action":"model","value":"opus"}'
+        self.module._handle_job(self._job("use opus"))
+        self.assertEqual(self.sent[-1], "model -> opus")
+        self.assertEqual(self.tasks.ran, [])
 
-    def test_a_task_that_produced_nothing_is_not_reported_as_an_answer(self):
-        self.result = {"ok": True, "reply": "", "error": ""}
-        self.module._run_one(self._job())
-        self.assertIn("no output", self.sent[0][1])
+    def test_status_is_answered_from_state(self):
+        self.decision = '{"action":"status"}'
+        self.module._handle_job(self._job("what mode are you in"))
+        self.assertIn("mode:", self.sent[-1])
+        self.assertEqual(self.tasks.ran, [])
 
-    def test_tasks_run_one_at_a_time(self):
-        # Each is a full agent loop that may hold a PTY and run commands.
+    def test_an_unreachable_secretary_does_not_swallow_the_message(self):
+        # The user asked for something; running it is closer to their intent
+        # than silence.
+        self.decision = "not json at all"
+        self.module._handle_job(self._job("look at the environment"))
+        self.assertEqual(self.tasks.ran, ["look at the environment"])
+
+    def test_a_failed_task_is_reported_as_failed(self):
+        self.decision = '{"action":"execute","task":"boom"}'
+
+        class Failing:
+            def run(_s, *a, **k):
+                return {"ok": False, "reply": "", "error": "tool exploded"}
+
+        self.module._tasks = Failing()
+        self.module._handle_job(self._job())
+        self.assertIn("tool exploded", self.sent[-1])
+
+
+class TerminalQuietTests(unittest.TestCase):
+    """A phone conversation must not scroll through someone's workspace."""
+
+    def setUp(self):
+        self.module = _load_main()
+        self.logged: list[str] = []
+        self.module._log = self.logged.append
+        self.module._MESSAGES.clear()
+        while not self.module._task_queue.empty():
+            self.module._task_queue.get_nowait()
+
+    def test_an_inbound_message_is_recorded_not_printed(self):
+        self.module._on_message({"text": "check disk", "selfChat": True,
+                                 "remoteJid": "me@s.whatsapp.net", "key": {}})
+        self.assertEqual(self.logged, [])
+        self.assertEqual(len(self.module._MESSAGES), 1)
+        self.assertEqual(self.module._MESSAGES[0]["dir"], "in")
+
+    def test_the_conversation_is_readable_on_demand(self):
+        self.module._record("in", "check disk")
+        self.module._record("out", "26G free")
+        self.module._handle_whatsapp(["/whatsapp", "message"])
+        output = "\n".join(self.logged)
+        self.assertIn("check disk", output)
+        self.assertIn("26G free", output)
+
+    def test_the_history_stays_bounded(self):
+        for i in range(self.module.MESSAGE_HISTORY + 30):
+            self.module._record("in", f"m{i}")
+        self.assertEqual(len(self.module._MESSAGES), self.module.MESSAGE_HISTORY)
+
+
+class LifecycleTests(unittest.TestCase):
+    """One word for what is going on, and no chore to get back to work."""
+
+    def setUp(self):
+        self.module = _load_main()
+        self.logged: list[str] = []
+        self.module._log = self.logged.append
+
+    def test_phase_distinguishes_running_from_usable(self):
+        self.module._running = lambda: False
+        self.assertEqual(self.module._phase(), "stopped")
+        self.module._running = lambda: True
+        for state, phase in (("open", "connected"),
+                             ("awaiting_scan", "unlinked"),
+                             ("needs_rescan", "unlinked"),
+                             ("gave_up", "failed"),
+                             ("closed", "retrying"),
+                             ("starting", "starting")):
+            self.module._state = state
+            self.assertEqual(self.module._phase(), phase, state)
+
+    def test_status_names_the_next_step(self):
+        self.module._running = lambda: True
+        self.module._state = "awaiting_scan"
+        self.module._handle_whatsapp(["/whatsapp", "status"])
+        self.assertIn("/whatsapp pairing", "\n".join(self.logged))
+
+    def test_bare_command_reports_status(self):
+        self.module._running = lambda: False
+        self.module._handle_whatsapp(["/whatsapp"])
+        self.assertIn("stopped", "\n".join(self.logged))
+
+    def test_a_stale_sidecar_restarts_itself(self):
+        # Restarting by hand after an update is a chore the tool invented.
         source = (EXTENSION / "main.py").read_text()
-        self.assertIn("_task_queue", source)
-        self.assertIn("def _task_worker", source)
-        self.assertIn("_task_queue.get()", source)
+        self.assertIn("def _bridge_is_stale", source)
+        start = source.split('if sub in ("start", "restart")', 1)[1][:700]
+        self.assertIn("_bridge_is_stale()", start)
+        self.assertIn("_stop_bridge()", start)
+
+    def test_the_hello_command_is_gone(self):
+        # It existed because the entry point was unclear, which is a thing to
+        # fix rather than paper over with a command.
+        source = (EXTENSION / "main.py").read_text()
+        self.assertNotIn('sub == "hello"', source)
+        self.assertNotIn('sub == "test"', source)
 
 
 class SummaryAndChunkingTests(unittest.TestCase):
@@ -189,7 +299,11 @@ class SummaryAndChunkingTests(unittest.TestCase):
         self.module._log = lambda *_: None
 
     def test_a_short_answer_is_sent_verbatim(self):
-        self.assertEqual(self.module._summarise("q", "42"), "42")
+        class Backend:
+            def chat(_s, *a, **k):
+                return {"reply": ""}
+        self.module._backend = Backend()
+        self.assertEqual(self.module._report("q", "q", "42"), "42")
 
     def test_a_long_answer_is_summarised_for_a_phone(self):
         class Backend:
@@ -197,7 +311,7 @@ class SummaryAndChunkingTests(unittest.TestCase):
                 return {"reply": "short version"}
 
         self.module._backend = Backend()
-        self.assertEqual(self.module._summarise("q", "x" * 2000), "short version")
+        self.assertEqual(self.module._report("q", "q", "x" * 2000), "short version")
 
     def test_summarising_is_a_nicety_not_a_gate(self):
         class Backend:
@@ -205,7 +319,7 @@ class SummaryAndChunkingTests(unittest.TestCase):
                 raise RuntimeError("model down")
 
         self.module._backend = Backend()
-        out = self.module._summarise("q", "y" * 2000)
+        out = self.module._report("q", "q", "y" * 2000)
         self.assertTrue(out.startswith("y"))
 
     def test_long_text_is_chunked_under_the_limit(self):
@@ -246,6 +360,36 @@ class CredentialLocationTests(unittest.TestCase):
             self.assertNotIn(".auth", name)
         self.assertLessEqual(len(names), extension_manager.MAX_ARCHIVE_FILES)
         self.assertLessEqual(unpacked, extension_manager.MAX_UNPACKED_BYTES)
+
+
+class SelfChatAddressingTests(unittest.TestCase):
+    """One account has two addresses and WhatsApp uses both.
+
+    The phone number (`8613...@s.whatsapp.net`) and the LID
+    (`59567...@lid`) name the same account. Outbound to the phone number is
+    delivered to the self-chat while the reply comes back addressed by LID, so
+    matching only `user.id` recognised everything we sent and nothing we
+    received -- every task typed on the phone was dropped in silence."""
+
+    def test_both_addresses_of_the_account_are_recognised(self):
+        source = BRIDGE.read_text()
+        block = source.split("function isSelfChat", 1)[1].split("\n}", 1)[0]
+        self.assertIn("socket?.user?.id", block)
+        self.assertIn("socket?.user?.lid", block)
+
+    def test_the_comparison_ignores_device_suffix_and_domain(self):
+        # `8613...:2@s.whatsapp.net` and `8613...@s.whatsapp.net` are the same
+        # account.
+        source = BRIDGE.read_text()
+        bare = source.split("function bareId", 1)[1].split("\n}", 1)[0]
+        self.assertIn("split('@')[0]", bare)
+        self.assertIn("split(':')[0]", bare)
+
+    def test_a_dropped_message_leaves_a_trace(self):
+        # Silence made "I sent it and nothing happened" a guess rather than a
+        # look at the log.
+        source = BRIDGE.read_text()
+        self.assertIn("ignoring message from", source)
 
 
 class ConsoleCaptureTests(unittest.TestCase):

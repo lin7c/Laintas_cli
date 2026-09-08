@@ -13,35 +13,72 @@ cli   ->  /dev/vda2 is at 57% (34G of 63G). Biggest: /root/laintas_cli
           ⏱ 34s
 ```
 
+## How it works
+
+Messages do not go straight to the agent. They go to a **secretary** — an AI
+that belongs to this extension — whose job is to work out what the message
+actually is:
+
+| you send | secretary does |
+|---|---|
+| "check the disk" | runs it on the machine, reports back |
+| "switch to act mode" | changes the CLI's mode |
+| "use opus" | changes the model |
+| "what mode are you in?" | answers; runs nothing |
+| "thanks" | answers; runs nothing |
+
+That indirection is the design. Not every message is a task — a channel that
+assumes otherwise runs "thanks" as a shell command, and can never be asked to
+change anything *about* the CLI, because a mode or a model is not work for the
+agent, it is work on the agent.
+
+When the answer is "run it", it goes to the agent loop with tools. The
+secretary then reports back in its own words: the agent writes for a terminal,
+which is unreadable on a phone.
+
+If the secretary cannot be reached, the message is executed rather than
+dropped — you asked for something, and doing it is closer to your intent than
+silence.
+
 ## Where you message it
 
 **There is no `laintas-cli` contact.** The CLI is a linked *device* of your
-account, like WhatsApp Web — not somebody you message. You talk to it in your
-account's chat with itself.
+account, like WhatsApp Web. You talk to it in your account's chat with itself —
+the chat titled with **your own name**, not with the CLI's.
 
-You should not have to hunt for it: on connecting, the gateway sends one message
-into that chat, which creates it and puts it at the top of your chat list.
-`/whatsapp hello` reopens it, `/whatsapp status` names it.
+On connecting it sends one message there, which creates that chat and puts it at
+the top of your list. Reply to it.
 
-## What it runs
+## Watching the conversation
 
-Messages go to the **agent**, not to a chat model — the same loop `--execute`
-uses, with tools. It can read files, run commands, search, edit code.
+Messages are **not** printed into the CLI. That screen belongs to whoever is
+sitting at it.
 
-**What a task may do is not decided here.** It comes from the active mode,
-exactly as `--execute` takes it. The mode decides what execution may touch; this
-extension only decides who may ask. To widen or narrow it, change the mode —
-not this extension.
+```
+/whatsapp            # status, and the last thing said
+/whatsapp message    # the conversation, most recent last
+/whatsapp message 50 # more of it
+```
 
-## Who may ask
+## Lifecycle
 
-Only your own chat. The CLI is a linked device of your account, so that chat is
-writable by you alone, and a message there is from the person who owns the
-machine.
+`/whatsapp` reports one word for what is going on:
 
-Every other chat is ignored outright — not answered, not executed. A message
-saying "run this" from someone else's phone is not a capability this extension
-has.
+| phase | meaning | next step |
+|---|---|---|
+| `stopped` | nothing running | `/whatsapp start` |
+| `starting` | up, not at WhatsApp yet | wait |
+| `unlinked` | at WhatsApp, no account linked | `/whatsapp pairing <number>` |
+| `connected` | linked and usable | message yourself |
+| `retrying` | lost the connection, coming back | wait |
+| `failed` | gave up | `/whatsapp restart` |
+
+Note that `connected` means *usable*, not "a process exists" — those came apart
+often enough to be worth separate words.
+
+`/whatsapp stop` ends it. `/whatsapp restart` restarts it. And if the sidecar is
+updated underneath a running one, `/whatsapp start` notices and restarts it for
+you rather than telling you to stop and start.
 
 ## Setup
 

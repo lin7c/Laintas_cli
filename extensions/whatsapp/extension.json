@@ -1,7 +1,7 @@
 {
   "schemaVersion": 2,
   "name": "whatsapp",
-  "version": "2.0.1",
+  "version": "2.1.0",
   "entrypoint": "main.py",
   "description": "Run laintas-cli from WhatsApp: message it a task, it executes and reports back",
   "author": { "name": "laintas" },

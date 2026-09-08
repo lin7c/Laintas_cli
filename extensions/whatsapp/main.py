@@ -1,15 +1,23 @@
 """Extension: whatsapp
 
-Run laintas-cli from WhatsApp. You message the CLI a task, it EXECUTES the
-task, and it reports the result back to the same chat.
+Run laintas-cli from WhatsApp, through a secretary.
 
-    phone                  ->  "check the disk and tell me what is eating it"
-    laintas-cli            ->  reacts, runs a full agent loop (tools included)
-    laintas-cli            ->  sends back a summary of what it did
+Messages do not go straight to the agent. They go to an AI that belongs to this
+extension, whose job is to decide what the message actually is:
 
-The distinction that matters: this runs `ctx.tasks`, the agent, not
-`ctx.backend`, the model. A version built on the latter can hold a conversation
-and cannot do a single thing you ask of it.
+    phone      ->  "check the disk"          -> secretary -> run it on the machine
+    phone      ->  "switch to act mode"      -> secretary -> change the mode
+    phone      ->  "use opus"                -> secretary -> change the model
+    phone      ->  "what mode are you in?"   -> secretary -> answer, run nothing
+    phone      ->  "thanks"                  -> secretary -> answer, run nothing
+
+Then it reports back in its own words. That indirection is the design: not
+every message is a task, and a channel that assumes otherwise runs "thanks" as
+a shell command and cannot be asked to change anything about the CLI itself.
+
+The secretary decides WHAT to do; `ctx.tasks` does the doing when the answer is
+"run it", which is the agent loop with tools -- not `ctx.backend`, which only
+writes text.
 
 Access control is one rule: only the account's own chat is acted on. The CLI is
 a linked device of your account, so that chat is writable by you alone, and a
@@ -95,10 +103,11 @@ def setup(ctx) -> None:
         _handle_whatsapp,
         description="Run laintas-cli from WhatsApp: message it a task, it executes",
         subcommands=[
-            ("start", "Start the gateway (pairs by QR if not linked yet)"),
+            ("start", "Start the gateway (links by QR if no account yet)"),
             ("pairing", "Link by entering an 8-char code: pairing <phone>"),
-            ("status", "Connection, linked account, and where to message it"),
-            ("hello", "Open the chat you message it in"),
+            ("status", "Connection, linked account, and queue"),
+            ("message", "Show the WhatsApp conversation: message [count]"),
+            ("restart", "Restart the gateway"),
             ("send", "Send a message to someone: send <number> <text>"),
             ("stop", "Stop the gateway"),
             ("logout", "Forget the linked account"),
@@ -123,7 +132,51 @@ def teardown() -> None:
 # ----------------------------------------------------------------------
 
 def _running() -> bool:
+    """The sidecar process exists. Says nothing about whether it works."""
     return _proc is not None and _proc.poll() is None
+
+
+#: What "connected" means, stated once so every caller agrees.
+#:
+#:   stopped    nothing running
+#:   starting   process up, has not reached WhatsApp yet
+#:   unlinked   reached WhatsApp, no account linked -- needs a QR or a code
+#:   connected  linked and usable; this is the only state that can carry a task
+#:   retrying   was connected, lost it, coming back on its own
+#:   failed     gave up; needs a person
+def _phase() -> str:
+    if not _running():
+        return "stopped"
+    if _state == "open":
+        return "connected"
+    if _state in ("awaiting_scan", "awaiting_pairing", "needs_rescan", "logged_out"):
+        return "unlinked"
+    if _state == "gave_up":
+        return "failed"
+    if _state in ("closed", "connecting"):
+        return "retrying"
+    return "starting"
+
+
+def _bridge_is_stale() -> bool:
+    """True when the sidecar on disk is newer than the one running.
+
+    Restarting by hand after an update is a chore invented by the tool, not by
+    the task. If the file changed, the running process is the wrong one.
+    """
+    if not _running() or _proc is None:
+        return False
+    try:
+        started = time.time() - float(
+            open(f"/proc/{_proc.pid}/stat").read().split()[21]) / os.sysconf("SC_CLK_TCK")
+        # /proc gives ticks since boot; compare against boot time instead.
+        with open("/proc/uptime") as handle:
+            boot = time.time() - float(handle.read().split()[0])
+        started = boot + float(
+            open(f"/proc/{_proc.pid}/stat").read().split()[21]) / os.sysconf("SC_CLK_TCK")
+        return BRIDGE.stat().st_mtime > started
+    except (OSError, ValueError, IndexError):
+        return False
 
 
 def _ensure_dependencies() -> tuple[bool, str]:
@@ -402,97 +455,222 @@ def _on_message(msg: dict) -> None:
     text = (msg.get("text") or "").strip()
     if not text or not _accepted(msg):
         return
+    _record("in", text)
     _task_queue.put({
         "text": text,
         "jid": msg.get("remoteJid") or "",
         "key": msg.get("key"),
     })
-    waiting = _task_queue.qsize()
-    _log(f"WhatsApp task queued: {text[:70]}"
-         + (f"   ({waiting} waiting)" if waiting > 1 else ""))
 
 
 # ----------------------------------------------------------------------
 # execution
 # ----------------------------------------------------------------------
 
-_SUMMARY_SYSTEM = (
-    "You are summarising what laintas-cli just did, for someone reading it on a "
-    "phone. Lead with the answer or the outcome. Keep it a few short lines. "
-    "Include concrete results -- numbers, paths, names -- and say plainly if it "
-    "failed or did nothing. No preamble, no markdown headings. Reply in the "
-    "language of the request.")
+#: What the user sent and what came back. Kept here rather than printed: the
+#: CLI's own screen belongs to whoever is sitting at it, and a phone
+#: conversation scrolling through it is noise in someone else's workspace.
+#: `/whatsapp message` is where it belongs.
+_MESSAGES: list[dict] = []
+MESSAGE_HISTORY = 100
+
+
+def _record(direction: str, text: str, note: str = "") -> None:
+    _MESSAGES.append({"at": time.strftime("%H:%M:%S"), "dir": direction,
+                      "text": text, "note": note})
+    del _MESSAGES[:-MESSAGE_HISTORY]
+
+
+_SECRETARY_SYSTEM = """You are the WhatsApp secretary for laintas-cli, a coding \
+agent running on the user's own machine. The user messages you from their phone. \
+You decide what each message means and reply with ONE json object, nothing else.
+
+  {"action":"execute","task":"<instruction for the agent>"}
+      The user wants something done on the machine: inspect, build, fix, deploy,
+      answer a question about their code or system. Rewrite their message as a
+      clear instruction. This is the default for anything that needs the machine.
+
+  {"action":"answer","text":"<your reply>"}
+      Nothing needs to run: small talk, a question you can already answer from
+      the context below, or a request you need clarified before acting.
+
+  {"action":"mode","value":"<mode name>"}
+      They want to change how the agent behaves. Available: %(modes)s
+
+  {"action":"model","value":"<model name or 'auto'>"}
+      They want to change the model.
+
+  {"action":"status"}
+      They are asking how the CLI is set up or what is going on.
+
+Current state:  mode=%(mode)s  model=%(model)s  directory=%(cwd)s
+
+Judge by intent, not keywords. Prefer "execute" when they clearly want work \
+done; prefer "answer" when acting on a guess could do the wrong thing."""
+
+_REPORT_SYSTEM = (
+    "You are the WhatsApp secretary for laintas-cli, reporting back to the user "
+    "on their phone. Lead with the answer or the outcome. Keep it a few short "
+    "lines. Include the concrete results -- numbers, paths, names -- and say "
+    "plainly if it failed or did nothing. No preamble, no markdown headings. "
+    "Reply in the language the user wrote in.")
+
+
+def _cli_state() -> dict:
+    """What the secretary needs to know to make a sensible decision."""
+    state = {"mode": "unknown", "model": "auto", "cwd": os.getcwd(),
+             "modes": "act, plan"}
+    try:
+        import mode_manager
+        active = mode_manager.get_active_mode()
+        state["mode"] = (active or {}).get("name", "unknown") if isinstance(
+            active, dict) else str(active or "unknown")
+        names = [m.get("name", "") for m in mode_manager.list_modes()
+                 if isinstance(m, dict)]
+        if names:
+            state["modes"] = ", ".join(n for n in names if n)
+    except Exception:
+        pass
+    try:
+        import agent_loop
+        state["model"] = agent_loop.get_runtime_config("model") or "auto"
+    except Exception:
+        pass
+    return state
+
+
+def _decide(text: str) -> dict:
+    """Ask the secretary what this message is. Falls back to executing it.
+
+    A secretary that cannot be reached must not swallow the message: the user
+    asked for something, and running it is closer to their intent than silence.
+    """
+    state = _cli_state()
+    try:
+        res = _backend.chat(text, system_prompt=_SECRETARY_SYSTEM % state)
+        raw = (res.get("reply") or "").strip()
+        start, end = raw.find("{"), raw.rfind("}")
+        if start >= 0 and end > start:
+            decision = json.loads(raw[start:end + 1])
+            if isinstance(decision, dict) and decision.get("action"):
+                return decision
+    except Exception as exc:
+        _log(f"[whatsapp] secretary unavailable ({type(exc).__name__}); "
+             "treating the message as a task")
+    return {"action": "execute", "task": text}
+
+
+def _set_mode(value: str) -> str:
+    try:
+        import mode_manager
+        ok, message = mode_manager.activate(str(value))
+        return message if message else ("mode changed" if ok else "could not change mode")
+    except Exception as exc:
+        return f"could not change mode: {exc}"
+
+
+def _set_model(value: str) -> str:
+    try:
+        import sys as _sys
+        cli = _sys.modules.get("laintas_cli")
+        if cli is None or not hasattr(cli, "_rprompt_apply_model_choice"):
+            return "model switching is not available in this session"
+        ok, message = cli._rprompt_apply_model_choice(str(value))
+        return message if message else ("model changed" if ok else "could not change model")
+    except Exception as exc:
+        return f"could not change model: {exc}"
 
 
 def _task_worker() -> None:
-    """Run queued tasks one at a time, reporting each back to its chat."""
     while True:
         job = _task_queue.get()
         try:
-            _run_one(job)
+            _handle_job(job)
         except Exception as exc:
             try:
-                _send(job.get("jid", ""), f"(task failed: {type(exc).__name__}: {exc})")
+                _reply(job, f"(failed: {type(exc).__name__}: {exc})", "❌")
             except Exception:
                 pass
         finally:
             _task_queue.task_done()
 
 
-def _run_one(job: dict) -> None:
-    jid, key, text = job.get("jid", ""), job.get("key"), job["text"]
+def _handle_job(job: dict) -> None:
+    text = job["text"]
+    _react(job.get("jid", ""), job.get("key"), "⏳")
 
-    # A reaction is the cheapest acknowledgement there is: instant, no
-    # chunking, no clutter. Without it a long task looks like nothing happened.
-    _react(jid, key, "⏳")
+    decision = _decide(text)
+    action = str(decision.get("action") or "execute")
 
+    if action == "answer":
+        _reply(job, str(decision.get("text") or "").strip() or "(no reply)", "✅")
+        return
+
+    if action == "mode":
+        _reply(job, _set_mode(decision.get("value") or ""), "✅")
+        return
+
+    if action == "model":
+        _reply(job, _set_model(decision.get("value") or ""), "✅")
+        return
+
+    if action == "status":
+        state = _cli_state()
+        _reply(job, (f"mode: {state['mode']}\nmodel: {state['model']}\n"
+                     f"directory: {state['cwd']}\n"
+                     f"queued: {_task_queue.qsize()}"), "✅")
+        return
+
+    # execute
+    task = str(decision.get("task") or text)
     done = threading.Event()
-    threading.Thread(target=_progress_ping, args=(jid, done, text),
+    threading.Thread(target=_progress_ping, args=(job, done, task),
                      daemon=True).start()
-
     started = time.time()
     try:
-        result = _tasks.run(text, conversation=f"whatsapp:{jid}")
+        result = _tasks.run(task, conversation=f"whatsapp:{job.get('jid','')}")
     finally:
         done.set()
-    elapsed = time.time() - started
+    elapsed = int(time.time() - started)
 
     if not result.get("ok"):
-        _react(jid, key, "❌")
-        _send(jid, f"Task failed: {result.get('error') or 'unknown error'}")
+        _reply(job, f"Task failed: {result.get('error') or 'unknown error'}", "❌")
         return
-
-    reply = (result.get("reply") or "").strip()
-    summary = _summarise(text, reply) if reply else "(the task produced no output)"
-    _react(jid, key, "✅")
-    _send(jid, f"{summary}\n\n⏱ {int(elapsed)}s")
+    output = (result.get("reply") or "").strip()
+    report = _report(text, task, output) if output else "(the task produced no output)"
+    _reply(job, f"{report}\n\n⏱ {elapsed}s", "✅")
 
 
-def _progress_ping(jid: str, done: threading.Event, text: str) -> None:
-    """Say it is still working, once, if the task outlives PROGRESS_AFTER."""
-    if done.wait(PROGRESS_AFTER):
-        return
-    _send(jid, f"Still working on: {text[:60]}...")
+def _report(asked: str, task: str, output: str) -> str:
+    """Let the secretary say what happened, in its own words.
 
-
-def _summarise(request: str, reply: str) -> str:
-    """Compress the agent's output into something readable on a phone.
-
-    The agent's own reply is written for a terminal -- long, and often a
-    transcript of its reasoning. Sending that to a phone is unreadable.
+    The agent writes for a terminal -- long, and often a transcript of its
+    reasoning. Relaying that to a phone verbatim is unreadable.
     """
-    if len(reply) <= 600:
-        return reply
     try:
         res = _backend.chat(
-            f"Request:\n{request}\n\nWhat laintas-cli did and found:\n{reply}",
-            system_prompt=_SUMMARY_SYSTEM)
+            f"They asked:\n{asked}\n\nI ran:\n{task}\n\nResult:\n{output}",
+            system_prompt=_REPORT_SYSTEM)
         summary = (res.get("reply") or "").strip()
         if summary:
             return summary
     except Exception:
         pass
-    return reply[:CHUNK_LIMIT]     # summarising is a nicety, not a gate
+    return output[:CHUNK_LIMIT]
+
+
+def _reply(job: dict, text: str, emoji: str) -> None:
+    _react(job.get("jid", ""), job.get("key"), emoji)
+    ok, error = _send(job.get("jid", ""), text)
+    _record("out", text, "" if ok else f"delivery failed: {error}")
+    if not ok:
+        _log(f"[whatsapp] could not reply: {error}")
+
+
+def _progress_ping(job: dict, done: threading.Event, task: str) -> None:
+    if done.wait(PROGRESS_AFTER):
+        return
+    _send(job.get("jid", ""), f"Still working on: {task[:60]}...")
 
 
 # ----------------------------------------------------------------------
@@ -568,11 +746,16 @@ def _open_own_chat() -> None:
             return
         _greeted = True
     ok, error = _send(_me_jid, _GREETING)
-    if ok:
-        _log(f"WhatsApp ready. Message yourself ({_me_jid.split('@')[0]}) to run tasks.")
-    else:
+    if not ok:
         _greeted = False
         _log(f"Could not open your chat: {error}")
+        return
+    # Saying "message yourself" is not directions. The chat is titled with the
+    # user's OWN name, which does not read as a place to send a message, and if
+    # they have never used it the reflex is to look for a contact that is not
+    # there.
+    _log(f"WhatsApp connected (+{_me_jid.split('@')[0]}). I sent you a message; "
+         "it is the chat titled with your own name.")
 
 
 # ----------------------------------------------------------------------
@@ -635,8 +818,8 @@ def _tool_status(args: dict, ctx=None) -> dict:
 # /whatsapp
 # ----------------------------------------------------------------------
 
-_USAGE = ("Usage: /whatsapp start | pairing <phone> | status | hello | "
-          "send <number> <text> | logout | stop")
+_USAGE = ("Usage: /whatsapp [status] | message [n] | start | restart | stop | "
+          "pairing <phone> | send <number> <text> | logout")
 
 
 def _log(msg: str) -> None:
@@ -660,18 +843,26 @@ def _log(msg: str) -> None:
 def _handle_whatsapp(parts: list) -> None:
     global _greeted
     args = [str(p) for p in parts[1:]]
-    sub = args[0].lower() if args else "start"
+    sub = args[0].lower() if args else "status"
     rest = args[1:]
 
-    if sub in ("start", "qrcode"):
+    if sub in ("start", "restart"):
+        if sub == "restart" and _running():
+            _stop_bridge()
+            _log("Stopped; starting again.")
+        elif _running() and _bridge_is_stale():
+            # The sidecar was updated under a running process. Nobody should
+            # have to know that, or be told to stop and start.
+            _stop_bridge()
+            _log("The sidecar was updated; restarting it.")
         ok, message = _ensure_bridge()
         if not ok:
             _log(message)
         elif message == "already running":
-            _log(f"WhatsApp is already running (state={_state}).")
+            _log(f"WhatsApp is already {_phase()}.")
         else:
-            _log("WhatsApp starting. If it is not linked yet, a QR page or "
-                 "pairing code will appear shortly.")
+            _log("WhatsApp starting. If no account is linked yet, a QR page or "
+                 "a pairing code will follow.")
 
     elif sub == "pairing":
         if not rest:
@@ -691,25 +882,41 @@ def _handle_whatsapp(parts: list) -> None:
              else f"Could not request a code: {error}")
 
     elif sub == "status":
-        _log(f"Gateway:      {'running' if _running() else 'not running'}")
-        _log(f"Connection:   {_state}"
-             + ("   <- not linked; run /whatsapp pairing <number>"
-                if _state in ("logged_out", "needs_rescan", "closed") else ""))
-        if _me_jid:
-            _log(f"Your chat:    {_me_jid}   (message yourself there to run tasks)")
+        phase = _phase()
+        hint = {
+            "stopped": "   -> /whatsapp start",
+            "unlinked": "   -> /whatsapp pairing <your number>",
+            "failed": "   -> /whatsapp restart",
+        }.get(phase, "")
+        _log(f"WhatsApp:  {phase}{hint}")
+        if phase == "connected":
+            _log(f"Account:   +{_me_jid.split('@')[0]}   "
+                 "(message yourself on WhatsApp to give it work)")
         if _task_queue.qsize():
-            _log(f"Tasks queued: {_task_queue.qsize()}")
-        _log(f"Credentials:  {AUTH_DIR}")
-        _log(f"Log:          {LOG_FILE}")
+            _log(f"Running:   {_task_queue.qsize()} queued")
+        if _MESSAGES:
+            last = _MESSAGES[-1]
+            arrow = "->" if last["dir"] == "in" else "<-"
+            _log(f"Last:      {last['at']} {arrow} "
+                 f"{last['text'].replace(chr(10), ' ')[:60]}"
+                 "    (/whatsapp message for more)")
         if _install_error:
-            _log(f"Last error:   {_install_error}")
+            _log(f"Error:     {_install_error}")
+        _log(f"Log:       {LOG_FILE}")
 
-    elif sub == "hello":
-        if not _me_jid:
-            _log("Not linked yet -- run /whatsapp start first.")
+    elif sub in ("message", "messages"):
+        if not _MESSAGES:
+            _log("No WhatsApp messages yet." if _phase() == "connected"
+                 else f"No messages -- WhatsApp is {_phase()}.")
             return
-        _greeted = False
-        _open_own_chat()
+        count = 20
+        if rest and rest[0].isdigit():
+            count = max(1, min(int(rest[0]), MESSAGE_HISTORY))
+        for item in _MESSAGES[-count:]:
+            arrow = "->" if item["dir"] == "in" else "<-"
+            body = item["text"].replace("\n", " ")[:110]
+            _log(f"  {item['at']}  {arrow}  {body}"
+                 + (f"   [{item['note']}]" if item["note"] else ""))
 
     elif sub == "send":
         if len(rest) < 2:

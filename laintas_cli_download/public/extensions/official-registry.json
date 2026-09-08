@@ -20,10 +20,10 @@
     {
       "id": "laintas/whatsapp",
       "name": "whatsapp",
-      "version": "2.0.1",
+      "version": "2.1.0",
       "description": "Run laintas-cli from WhatsApp: message it a task, it executes and reports back",
-      "url": "https://cli.laintas.com/extensions/official/whatsapp-2.0.1.lext",
-      "sha256": "abc8bf7333f637fb2bc507eed8ee05d6d4fc248383a4ba8264caf6468505a4fc"
+      "url": "https://cli.laintas.com/extensions/official/whatsapp-2.1.0.lext",
+      "sha256": "075a1736261e8daf86120366b1b4fea0cad998317c418ea1cdf0896792d6e0d0"
     }
   ]
 }
