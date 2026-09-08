@@ -1,7 +1,7 @@
 {
   "schemaVersion": 2,
   "name": "whatsapp-gateway",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "entrypoint": "main.py",
   "description": "WhatsApp gateway: pair via QR or pairing code and send/receive messages, bridged to the laintas-cli Agent",
   "author": { "name": "laintas" },

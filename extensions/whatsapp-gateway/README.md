@@ -46,6 +46,14 @@ Every inbound text message is handed to the Agent through the extension
 backend gateway, and the generated reply is sent back to the same chat. Group
 messages are included and tagged `isGroup`.
 
+## When pairing does not work
+
+`/whatsapp status` prints the sidecar's log path. That file holds WhatsApp's
+own account of the attempt -- `not logged in, attempting registration`,
+`logging in...`, `pair success recv`, `error in pairing` -- which is what
+distinguishes a code that never reached WhatsApp from one that was rejected.
+Set `WA_LOG_LEVEL=trace` for the full protocol exchange.
+
 ## Notes
 
 - `bridge/.auth/` holds live WhatsApp credentials. It is excluded from the

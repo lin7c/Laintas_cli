@@ -99,7 +99,7 @@ function makeLogger(level = 'error') {
   return logger;
 }
 
-const logger = makeLogger(process.env.WA_LOG_LEVEL || 'error');
+const logger = makeLogger(process.env.WA_LOG_LEVEL || 'info');
 
 /* ---------------- HTTP page: shows QR or status ---------------- */
 function htmlPage() {
@@ -353,9 +353,16 @@ async function logout() {
  * with a pairing that was never completed, WhatsApp answers 401, and the
  * session is torn down as `loggedOut`. Requesting a fresh code re-arms the
  * same trap, which is why pairing appeared to fail every time: each attempt
- * poisoned the next one. */
+ * poisoned the next one.
+ *
+ * The marker is `account`, not `registered`. Only a pairing the server
+ * confirmed carries `account` and `signalIdentities`, written together by
+ * `configureSuccessfulPairing` for BOTH pairing routes. `registered` is set
+ * only along the link-code path (Socket/messages-recv.js), so testing it
+ * would classify a perfectly good QR-paired session as abandoned and delete
+ * it on the next start. */
 function isAbandonedPairing(creds) {
-  return Boolean(creds && creds.me && creds.registered !== true);
+  return Boolean(creds && creds.me && !creds.account);
 }
 
 async function connect() {

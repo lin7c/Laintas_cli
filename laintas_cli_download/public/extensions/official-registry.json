@@ -20,10 +20,10 @@
     {
       "id": "laintas/whatsapp-gateway",
       "name": "whatsapp-gateway",
-      "version": "1.1.1",
+      "version": "1.1.2",
       "description": "WhatsApp gateway: pair via QR or pairing code and send/receive messages, bridged to the laintas-cli Agent",
-      "url": "https://cli.laintas.com/extensions/official/whatsapp-gateway-1.1.1.lext",
-      "sha256": "7574b70acef2c58834c815f085f61151f7dc3e79c7a85cb0f56b30c9f544c915"
+      "url": "https://cli.laintas.com/extensions/official/whatsapp-gateway-1.1.2.lext",
+      "sha256": "9580423640efbff21957635e72f1a5bd600e5a69a3105473470f03c07ba43786"
     }
   ]
 }

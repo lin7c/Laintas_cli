@@ -26,6 +26,11 @@ BRIDGE = BASE / "bridge" / "bridge.mjs"
 #: WhatsApp credentials live beside the sidecar. Never packaged, never hashed.
 AUTH_DIR = BASE / "bridge" / ".auth"
 NODE_MODULES = BASE / "node_modules"
+#: Where the sidecar's diagnostics are kept. They used to go only to the REPL,
+#: where the lines that explain a failed pairing scroll past among everything
+#: else and are gone by the time anyone asks what happened.
+LOG_FILE = BASE / "bridge" / "bridge.log"
+LOG_MAX_BYTES = 512 * 1024
 BAILEYS = NODE_MODULES / "@whiskeysockets" / "baileys"
 DEFAULT_HTTP_PORT = int(os.environ.get("WA_HTTP_PORT", "8765"))
 NODE_BIN = os.environ.get("WA_NODE", "node")
@@ -199,12 +204,42 @@ def _read_stdout(proc: subprocess.Popen) -> None:
 
 
 def _read_stderr(proc: subprocess.Popen) -> None:
+    """Keep the sidecar's diagnostics on disk, and the interesting ones on screen.
+
+    WhatsApp's own account of a pairing -- "not logged in, attempting
+    registration", "logging in...", "pair success recv", "error in pairing" --
+    arrives here. All of it is written to LOG_FILE so a failure can be read
+    afterwards; only the lines that change what the user should do are printed."""
     if not proc.stderr:
         return
-    for line in proc.stderr:
-        line = line.strip()
-        if line:
-            _log(f"[bridge:stderr] {line}")
+    interesting = ("error", "fatal", "warn", "pair", "logged", "registration",
+                   "port ", "discarding", "orphan guard")
+    try:
+        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        if LOG_FILE.exists() and LOG_FILE.stat().st_size > LOG_MAX_BYTES:
+            LOG_FILE.unlink()
+        handle = LOG_FILE.open("a", encoding="utf-8")
+    except OSError:
+        handle = None
+    try:
+        for line in proc.stderr:
+            line = line.strip()
+            if not line:
+                continue
+            if handle is not None:
+                try:
+                    handle.write(f"{time.strftime('%H:%M:%S')} {line}\n")
+                    handle.flush()
+                except OSError:
+                    handle = None
+            if any(word in line.lower() for word in interesting):
+                _log(f"[bridge] {line[:300]}")
+    finally:
+        if handle is not None:
+            try:
+                handle.close()
+            except OSError:
+                pass
 
 
 def _on_bridge_exit(proc: subprocess.Popen) -> None:
@@ -454,6 +489,7 @@ def _tool_status(args: dict, ctx=None) -> dict:
             "qr_page": f"http://127.0.0.1:{_http_port}",
             "auth_dir": str(AUTH_DIR),
             "dependencies_installed": BAILEYS.is_dir(),
+            "log_file": str(LOG_FILE),
             "last_error": _install_error,
         },
     }
@@ -518,6 +554,8 @@ def _handle_whatsapp(parts: list) -> None:
         _log(f"QR page:        http://127.0.0.1:{_http_port}")
         _log(f"Session dir:    {AUTH_DIR}")
         _log(f"Dependencies:   {'installed' if BAILEYS.is_dir() else 'not installed'}")
+        _log(f"Sidecar log:    {LOG_FILE}"
+             f"{'' if LOG_FILE.exists() else '  (not written yet)'}")
         if _install_error:
             _log(f"Last error:     {_install_error}")
 

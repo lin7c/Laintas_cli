@@ -231,8 +231,18 @@ class AbandonedPairingTests(unittest.TestCase):
     def test_the_sidecar_detects_credentials_from_an_unfinished_pairing(self):
         source = BRIDGE.read_text()
         self.assertIn("isAbandonedPairing", source)
-        # The condition is exactly "identified, but never confirmed".
-        self.assertIn("creds.me && creds.registered !== true", source)
+        # The condition is exactly "identified, but never confirmed by the
+        # server". `account` is what `configureSuccessfulPairing` writes on
+        # BOTH pairing routes.
+        self.assertIn("creds.me && !creds.account", source)
+
+    def test_a_completed_qr_pairing_is_never_treated_as_abandoned(self):
+        # `registered` is set only along the link-code path, so testing it
+        # would classify a working QR-paired session as abandoned and delete
+        # its credentials on the next start.
+        source = BRIDGE.read_text()
+        condition = source.split("function isAbandonedPairing", 1)[1].split("}", 1)[0]
+        self.assertNotIn("registered", condition)
 
     def test_the_abandoned_state_is_discarded_before_connecting(self):
         source = BRIDGE.read_text()
