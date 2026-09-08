@@ -1,102 +1,146 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useLanguage } from '@/contexts/LanguageContext';
 
-// A live terminal demo rendered in HTML/CSS — vector-crisp at any size, unlike
-// a raster screenshot, and it can *show* the agent loop working: prompt, tool
-// calls, and a final status. Every line is pure display copy — nothing here
-// executes — and it stays honest to the runtime lifecycle described in
-// README.md (classify → assemble context → dispatch tool → authorize →
-// execute → observe → persist).
+// Faithful, live HTML/CSS reproduction of a real laintas-cli session.
+//
+// The visuals come straight from the runtime source, not from a screenshot:
+//   - startup banner "Laintas CLI v1.25.1 · Lin7c" and the REPL status bar
+//   - the real thinking spinner (symbols.py SPINNER_RELAY = "L· L› L» L›",
+//     140ms per frame, brand green #3fb950) with the real label format
+//     "Thinking… {s}s · {model} · {mode}" — agent_loop.py's _render()
+//   - the real status symbols (→, ✓) and real tool names (fs.grep, fs.read)
+//
+// The user input is exactly the real case: "帮我分析一下laintas-cli".
 
-const SCRIPT_EN = [
-  { text: '$ laintas-cli', tone: 'cmd', delay: 300 },
-  { text: 'Laintas CLI v1.25.1 — agent runtime ready', tone: 'muted', delay: 420 },
-  { text: '', tone: 'plain', delay: 220 },
-  { text: '> fix the failing test in parser.py and run it', tone: 'input', caret: true, delay: 160 },
-  { text: '', tone: 'plain', delay: 260 },
-  { text: '◌ classify input → natural-language task → agent loop', tone: 'step', delay: 520 },
-  { text: '✓ inspected workspace · parser.py · tests/test_parser.py', tone: 'ok', delay: 640 },
-  { text: '→ tool  fs.read   parser.py', tone: 'tool', delay: 520 },
-  { text: '  · read 412 lines', tone: 'plain', delay: 160 },
-  { text: '→ tool  fs.edit   parser.py:96', tone: 'tool', delay: 520 },
-  { text: '  · patched import — removed unused symbol', tone: 'plain', delay: 200 },
-  { text: '→ run   pytest tests/test_parser.py', tone: 'tool', delay: 520 },
-  { text: '  · 3 passed, 1 skipped', tone: 'ok', delay: 220 },
-  { text: '', tone: 'plain', delay: 220 },
-  { text: '● done — agent returned to prompt', tone: 'done', delay: 640 },
-  { text: '$ █', tone: 'prompt', delay: 9999 },
-];
-
-const SCRIPT_ZH = [
-  { text: '$ laintas-cli', tone: 'cmd', delay: 300 },
-  { text: 'Laintas CLI v1.25.1 — agent 运行时已就绪', tone: 'muted', delay: 420 },
-  { text: '', tone: 'plain', delay: 220 },
-  { text: '> 修复 parser.py 里的失败测试并运行', tone: 'input', caret: true, delay: 160 },
-  { text: '', tone: 'plain', delay: 260 },
-  { text: '◌ 分类输入 → 自然语言任务 → agent 循环', tone: 'step', delay: 520 },
-  { text: '✓ 检查工作区 · parser.py · tests/test_parser.py', tone: 'ok', delay: 640 },
-  { text: '→ 工具  fs.read   parser.py', tone: 'tool', delay: 520 },
-  { text: '  · 读取 412 行', tone: 'plain', delay: 160 },
-  { text: '→ 工具  fs.edit   parser.py:96', tone: 'tool', delay: 520 },
-  { text: '  · 已修复 import — 移除未使用的符号', tone: 'plain', delay: 200 },
-  { text: '→ 运行  pytest tests/test_parser.py', tone: 'tool', delay: 520 },
-  { text: '  · 3 通过, 1 跳过', tone: 'ok', delay: 220 },
-  { text: '', tone: 'plain', delay: 220 },
-  { text: '● 完成 — agent 已回到提示符', tone: 'done', delay: 640 },
-  { text: '$ █', tone: 'prompt', delay: 9999 },
-];
-
+const SPINNER_FRAMES = ['L·', 'L›', 'L»', 'L›'];
+const SPINNER_MS = 140;
 const CHARS_PER_TICK = 2;
+const TYPE_MS = 14;
+
+// Timeline of steps. Row semantics:
+//   line    -> instant line (tone decides colour)
+//   status  -> REPL status bar
+//   blank   -> empty row
+//   input   -> typed user input (green, with caret)
+//   think   -> one row that holds a live spinner + clock, then resolves into
+//              `resolved` (a tool line) or disappears
+//   type    -> typed prose line
+//   prompt  -> the `› ` prompt with a blinking caret
+function buildSteps(lang) {
+  const zh = lang === 'zh';
+  return [
+    { k: 'line', text: 'Laintas CLI v1.25.1 · Lin7c', tone: 'accent' },
+    { k: 'status', text: '~/laintas_cli     L> 3 | primary | ACT | deepseek-v4-flash' },
+    { k: 'blank' },
+    { k: 'input', text: zh ? '帮我分析一下laintas-cli' : 'analyze laintas-cli' },
+    { k: 'think', ms: 2600, label: 'Thinking', model: 'deepseek-v4-flash', mode: 'ACT',
+      resolved: '✓ fs.grep  "laintas-cli"  README.md', resolvedTone: 'ok' },
+    { k: 'think', ms: 2400, label: 'Thinking', model: 'deepseek-v4-flash', mode: 'ACT',
+      resolved: '→ fs.read  README.md · 734 lines', resolvedTone: 'tool' },
+    { k: 'think', ms: 2600, label: 'Thinking', model: 'deepseek-v4-flash', mode: 'ACT',
+      resolved: '↳ highlights: agent runtime · PTY · policy', resolvedTone: 'plain' },
+    { k: 'think', ms: 3200, label: 'Writing', model: 'deepseek-v4-flash', mode: 'ACT', resolved: null },
+    { k: 'type', text: zh ? 'laintas-cli 是面向终端工作的自主 AI agent。普通 shell 命令保留在真实 PTY 中原生运行；自然语言任务进入可观察、可中断、可委派的 agent 循环——检查工作区、调用工具、拆分子任务，并保留每一步状态。它不是聊天窗口，而是离文件系统最近的那个 agent。'
+                          : 'laintas-cli is an autonomous AI agent for terminal work. Commands run natively in a real PTY; natural-language tasks enter an observable, interruptible, delegating agent loop that inspects the workspace, calls tools, and keeps every step in state. It is the agent closest to your files.', tone: 'plain', hold: 800 },
+    { k: 'prompt', text: '› ' },
+  ];
+}
 
 export default function TerminalDemo() {
   const { lang } = useLanguage();
-  const script = lang === 'zh' ? SCRIPT_ZH : SCRIPT_EN;
-  const [lineIdx, setLineIdx] = useState(0);
-  const [charIdx, setCharIdx] = useState(0);
-  const [paused, setPaused] = useState(false);
-  // Honour OS-level "reduce motion": skip the typing animation and render the
-  // whole transcript at once. Evaluated once on mount (theme/language switches
-  // do not change the media query meaningfully for this component).
-  const reduceMotion = typeof window !== 'undefined' && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const stepsRef = useRef(buildSteps(lang));
+  const script = stepsRef.current;
 
-  // Advance one line at a time; type each line's characters progressively.
+  const [stepIdx, setStepIdx] = useState(0);
+  const [charIdx, setCharIdx] = useState(0);
+  const [frame, setFrame] = useState(0);
+  const [paused, setPaused] = useState(false);
+  const reduceMotion = typeof window !== 'undefined'
+    && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  const step = script[Math.min(stepIdx, script.length - 1)];
+
+  // Advance the character typing for `input`/`type` steps.
   useEffect(() => {
     if (paused || reduceMotion) return undefined;
-    if (lineIdx >= script.length) return undefined;
-    const line = script[lineIdx];
-    const text = line.text || '';
-    if (charIdx < text.length) {
-      const timer = window.setTimeout(() => {
-        setCharIdx((c) => Math.min(text.length, c + CHARS_PER_TICK));
-      }, 14);
-      return () => window.clearTimeout(timer);
+    if (step.k !== 'input' && step.k !== 'type') return undefined;
+    const text = step.text || '';
+    if (charIdx >= text.length) {
+      const t = window.setTimeout(() => {
+        setStepIdx((i) => i + 1);
+        setCharIdx(0);
+      }, step.hold ?? 260);
+      return () => window.clearTimeout(t);
     }
-    // line finished -> pause its delay then move to next
-    const timer = window.setTimeout(() => {
-      setLineIdx((l) => l + 1);
-      setCharIdx(0);
-    }, line.delay ?? 120);
-    return () => window.clearTimeout(timer);
-  }, [lineIdx, charIdx, paused, script]);
+    const t = window.setTimeout(() => {
+      setCharIdx((c) => Math.min(text.length, c + CHARS_PER_TICK));
+    }, TYPE_MS);
+    return () => window.clearTimeout(t);
+  }, [step, charIdx, paused, reduceMotion]);
 
-  // Loop back to the start after the last line has played.
+  // Live spinner: cycle frames while a `think` step is active.
   useEffect(() => {
-    if (lineIdx < script.length || paused) return undefined;
-    const timer = window.setTimeout(() => {
-      setLineIdx(0);
-      setCharIdx(0);
-    }, 3600);
-    return () => window.clearTimeout(timer);
-  }, [lineIdx, paused, script]);
+    if (paused || reduceMotion || step.k !== 'think') return undefined;
+    const t = window.setInterval(() => setFrame((f) => (f + 1) % SPINNER_FRAMES.length), SPINNER_MS);
+    return () => window.clearInterval(t);
+  }, [step, paused, reduceMotion]);
 
-  // Reduce-motion users see the full transcript instantly; otherwise reveal it
-  // progressively as the typing animation advances.
-  const visible = reduceMotion
-    ? script.map((l) => ({ line: l, shown: l.text || '' }))
-    : script.slice(0, lineIdx).map((l) => ({ line: l, shown: l.text }));
-  if (!reduceMotion && lineIdx < script.length) {
-    const cur = script[lineIdx];
-    visible.push({ line: cur, shown: (cur.text || '').slice(0, charIdx) });
+  // Advance out of a `think` step after its duration.
+  useEffect(() => {
+    if (paused || reduceMotion || step.k !== 'think') return undefined;
+    const t = window.setTimeout(() => {
+      setStepIdx((i) => i + 1);
+      setCharIdx(0);
+    }, step.ms ?? 2400);
+    return () => window.clearTimeout(t);
+  }, [step, paused, reduceMotion]);
+
+  // Loop back to the start after the full transcript has played.
+  useEffect(() => {
+    if (stepIdx < script.length || paused || reduceMotion) return undefined;
+    const t = window.setTimeout(() => { setStepIdx(0); setCharIdx(0); setFrame(0); }, 4200);
+    return () => window.clearTimeout(t);
+  }, [stepIdx, paused, reduceMotion, script]);
+
+  // Build the visible rows.
+  const rows = [];
+  for (let i = 0; i < script.length; i += 1) {
+    const s = script[i];
+    if (i > stepIdx) break;
+    if (i === stepIdx) {
+      if (s.k === 'input') {
+        rows.push({ key: i, cls: 'td-line td-input', html: s.text.slice(0, charIdx), caret: true });
+      } else if (s.k === 'type') {
+        rows.push({ key: i, cls: 'td-line td-plain', html: s.text.slice(0, charIdx), caret: charIdx < s.text.length });
+      } else if (s.k === 'think') {
+        rows.push({ key: i, cls: 'td-line td-spin', html: `${SPINNER_FRAMES[frame]} ${s.label}…  ${s.model} · ${s.mode}`, caret: false });
+      } else if (s.k === 'prompt') {
+        rows.push({ key: i, cls: 'td-line td-prompt', html: s.text, caret: true });
+      } else if (s.k === 'blank') {
+        rows.push({ key: i, cls: 'td-line td-blank', html: ' ', caret: false });
+      } else if (s.k === 'status') {
+        rows.push({ key: i, cls: 'td-status', html: s.text, caret: false });
+      } else if (s.k === 'line') {
+        rows.push({ key: i, cls: `td-line td-${s.tone || 'plain'}`, html: s.text, caret: false });
+      }
+      break;
+    }
+    // completed step
+    if (s.k === 'input') {
+      rows.push({ key: i, cls: 'td-line td-input', html: s.text, caret: false });
+    } else if (s.k === 'type') {
+      rows.push({ key: i, cls: 'td-line td-plain', html: s.text, caret: false });
+    } else if (s.k === 'think') {
+      if (s.resolved) rows.push({ key: i, cls: `td-line td-${s.resolvedTone || 'plain'}`, html: s.resolved, caret: false });
+    } else if (s.k === 'prompt') {
+      rows.push({ key: i, cls: 'td-line td-prompt', html: s.text, caret: false });
+    } else if (s.k === 'blank') {
+      rows.push({ key: i, cls: 'td-line td-blank', html: ' ', caret: false });
+    } else if (s.k === 'status') {
+      rows.push({ key: i, cls: 'td-status', html: s.text, caret: false });
+    } else if (s.k === 'line') {
+      rows.push({ key: i, cls: `td-line td-${s.tone || 'plain'}`, html: s.text, caret: false });
+    }
   }
 
   return (
@@ -107,15 +151,12 @@ export default function TerminalDemo() {
         <span className="termdemo-rec"><b />LIVE</span>
       </div>
       <div className="termdemo-body" role="img" aria-label={lang === 'zh' ? 'Laintas CLI 实时终端会话演示' : 'Live Laintas CLI terminal session demo'}>
-        {visible.map(({ line, shown }, index) => {
-          const isCurrent = index === visible.length - 1 && lineIdx < script.length;
-          return (
-            <div key={index} className={`td-line td-${line.tone || 'plain'}`}>
-              <span>{shown}</span>
-              {isCurrent && <span className="td-caret" />}
-            </div>
-          );
-        })}
+        {rows.map((r) => (
+          <div key={r.key} className={r.cls}>
+            <span>{r.html}</span>
+            {r.caret && <span className="td-caret" />}
+          </div>
+        ))}
       </div>
     </div>
   );

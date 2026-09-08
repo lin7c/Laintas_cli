@@ -388,8 +388,13 @@ html { scroll-behavior: smooth; }
 .td-ok { color: #62c58f; }
 .td-tool { color: #8fc7ee; }
 .td-done { color: #62c58f; font-weight: 600; }
+.td-accent { color: #6ad29c; }
 .td-prompt { color: #d3d9d2; }
 .td-muted, .td-plain { color: #8b938b; }
+.td-blank { color: transparent; }
+.td-spin { color: #7fd8ad; font-weight: 600; }
+.td-spin .td-clock { color: #8b949e; font-weight: 400; }
+.td-status { padding: 2px 0; color: var(--ops-muted); font-size: 11px; letter-spacing: .01em; }
 .td-caret { display: inline-block; width: 8px; height: 15px; margin-left: 2px; vertical-align: text-bottom; background: #7fd8ad; animation: blink .8s step-end infinite; }
 .hero-terminal figcaption { display: flex; align-items: flex-start; gap: 28px; padding: 20px 4px 0; }.hero-terminal figcaption > div { display: flex; flex-direction: column; gap: 6px; }.hero-terminal figcaption strong { font-size: 13px; }.hero-terminal figcaption span { color: var(--ops-muted); font-size: 12px; line-height: 1.6; }
 
