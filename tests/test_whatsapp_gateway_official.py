@@ -259,6 +259,59 @@ class DeviceIdentityTests(unittest.TestCase):
         self.assertIn("const BROWSER = [DEVICE_NAME, PLATFORM, OS_VERSION];", source)
 
 
+class PairingResetScopeTests(unittest.TestCase):
+    """Discarding an unfinished pairing must not happen on a reconnect.
+
+    `requestPairingCode` writes `creds.me` when the code is issued, so from
+    then until the user types it the credentials legitimately look unfinished.
+    Resetting on every connect deleted the pairing in progress, registered a
+    new device and issued a different code -- so the code in the user's hand
+    was already dead, every time, and the stream of registrations drew
+    `Connection Terminated by Server` from WhatsApp."""
+
+    def test_the_reset_is_opt_in_per_connect(self):
+        source = BRIDGE.read_text()
+        self.assertIn("async function connect({ allowReset = false } = {})", source)
+        self.assertIn("if (allowReset && isAbandonedPairing(state.creds))", source)
+
+    def test_only_starting_a_pairing_resets(self):
+        source = BRIDGE.read_text()
+        # Startup clears last run's leftovers, and a new pairing starts clean.
+        self.assertEqual(source.count("allowReset: true"), 2)
+        start = source.split("async function start()", 1)[1].split("\n}", 1)[0]
+        self.assertIn("allowReset: true", start)
+        pairing = source.split("if (obj.type === 'pairing')", 1)[1].split(
+            "if (obj.type === 'logout')", 1)[0]
+        self.assertIn("allowReset: true", pairing)
+
+    def test_a_reconnect_never_resets(self):
+        source = BRIDGE.read_text()
+        sched = source.split("function scheduleReconnect()", 1)[1].split("\n}", 1)[0]
+        self.assertIn("connect()", sched)
+        self.assertNotIn("allowReset", sched)
+
+    def test_reconnects_are_bounded(self):
+        # Unbounded retry is not resilience: each re-registration is a new
+        # device request, and enough of them is what the server refuses.
+        source = BRIDGE.read_text()
+        self.assertIn("MAX_FAILED_CONNECTS", source)
+        self.assertIn("failedConnects > MAX_FAILED_CONNECTS", source)
+        self.assertIn("state: 'gave_up'", source)
+        # A connection that actually reaches open clears the count.
+        opened = source.split("if (connection === 'open')", 1)[1].split("return;", 1)[0]
+        self.assertIn("failedConnects = 0", opened)
+
+    def test_giving_up_is_reported_to_the_user(self):
+        module = _load_main()
+        logged: list[str] = []
+        module._log = logged.append
+        module._handle_from_bridge({"type": "status", "state": "gave_up",
+                                    "reason": "6 attempts", "needsPairing": True})
+        output = "\n".join(logged)
+        self.assertIn("giving up", output.lower())
+        self.assertIn("/whatsapp start", output)
+
+
 class RevokedSessionTests(unittest.TestCase):
     """Being unlinked on the phone must be visible, and recoverable.
 
@@ -314,7 +367,7 @@ class CredentialExposureTests(unittest.TestCase):
         self.assertIn("secureAuthDir", source)
         self.assertIn("chmod(AUTH_DIR, 0o700)", source)
         self.assertIn("0o600", source)
-        connect = source.split("async function connect()", 1)[1]
+        connect = source.split("async function connect(", 1)[1]
         self.assertLess(connect.index("secureAuthDir()"), connect.index("makeWASocket"))
 
     def test_the_sidecar_log_is_not_world_readable(self):
@@ -404,7 +457,7 @@ class AbandonedPairingTests(unittest.TestCase):
 
     def test_the_abandoned_state_is_discarded_before_connecting(self):
         source = BRIDGE.read_text()
-        connect = source.split("async function connect()", 1)[1]
+        connect = source.split("async function connect(", 1)[1]
         self.assertIn("isAbandonedPairing(state.creds)", connect)
         wipe = connect.index("fs.rm(AUTH_DIR")
         self.assertLess(wipe, connect.index("makeWASocket"),

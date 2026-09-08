@@ -99,6 +99,14 @@ let pairingRequested = false;     // guard: request the code once per socket
 let lastPairingCode = null;       // so a replacement code can name what it kills
 let reconnectDelay = RECONNECT_MIN_MS;
 let reconnectTimer = null;
+/** Consecutive reconnects that never reached `open`.
+ *
+ *  An unbounded retry loop is not resilience: each attempt that re-registers
+ *  is a new device request to WhatsApp, and enough of them is what the server
+ *  answers with `Connection Terminated by Server`. Stop, and say so, rather
+ *  than hammering the account. */
+let failedConnects = 0;
+const MAX_FAILED_CONNECTS = 6;
 let shuttingDown = false;
 /** Monotonic id of the live socket. A late event from a replaced socket is
  *  ignored rather than being allowed to schedule a second reconnect chain. */
@@ -301,8 +309,9 @@ function processInbound(line) {
       // The live socket was built for QR mode, with the short ref window that
       // implies. Rebuild it so the code gets the full pairing window rather
       // than whatever is left of a QR rotation.
-      connect().catch(e => emit({ type: 'status', state: 'pairing_error',
-                                  reason: e.message }));
+      connect({ allowReset: true })         // a new pairing starts clean
+        .catch(e => emit({ type: 'status', state: 'pairing_error',
+                           reason: e.message }));
     } else if (socket) {
       requestPairingCode();
     }
@@ -373,11 +382,23 @@ async function start() {
   await listenOnFreePort();
   note(`identifying to WhatsApp as ${BROWSER.join(' / ')}`);
   emit({ type: 'status', state: 'listening', httpPort, browser: BROWSER });
-  await connect();
+  await connect({ allowReset: true });      // clear anything left by last run
 }
 
 function scheduleReconnect() {
   if (shuttingDown || reconnectTimer) return;
+  failedConnects += 1;
+  if (failedConnects > MAX_FAILED_CONNECTS) {
+    emit({
+      type: 'status',
+      state: 'gave_up',
+      reason: `${MAX_FAILED_CONNECTS} connection attempts in a row did not `
+        + 'complete; not retrying so the account is not hammered',
+      needsPairing: true,
+    });
+    note('giving up after repeated failed connections');
+    return;
+  }
   const delay = reconnectDelay;
   reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX_MS);
   note(`reconnecting in ${delay}ms`);
@@ -435,6 +456,7 @@ async function logout() {
   lastPairingCode = null;
   emit({ type: 'status', state: 'needs_rescan', reason: 'auth cleared' });
   reconnectDelay = RECONNECT_MIN_MS;
+  failedConnects = 0;
   await connect();
 }
 
@@ -476,13 +498,28 @@ async function secureAuthDir() {
   } catch { /* nothing readable to tighten */ }
 }
 
-async function connect() {
+/** @param allowReset only true when a NEW pairing is being started.
+ *
+ *  Discarding an unfinished pairing on every connect was a self-destroying
+ *  loop, and the reason pairing kept failing. `requestPairingCode` writes
+ *  `creds.me` the moment a code is issued, so from then until the user has
+ *  typed it the credentials legitimately look "unfinished". Any reconnect in
+ *  that window -- and WhatsApp was closing the socket every 30-90s -- deleted
+ *  the pairing the user was in the middle of, registered a brand new device,
+ *  and issued a different code. The code in their hand was dead before they
+ *  could type it, every time, and the stream of fresh registrations is what
+ *  drew `Connection Terminated by Server`.
+ *
+ *  So the reset belongs to starting a pairing, not to reconnecting. A
+ *  reconnect that finds genuinely dead credentials still recovers: the login
+ *  is refused, and the loggedOut branch archives them once, with a message. */
+async function connect({ allowReset = false } = {}) {
   retireSocket();
   // Re-read the auth state on every attempt: after a logout wipe, the previous
   // in-memory state describes credentials that no longer exist on disk.
   let { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
   await secureAuthDir();
-  if (isAbandonedPairing(state.creds)) {
+  if (allowReset && isAbandonedPairing(state.creds)) {
     note('discarding credentials from an unfinished pairing');
     await fs.rm(AUTH_DIR, { recursive: true, force: true });
     ({ state, saveCreds } = await useMultiFileAuthState(AUTH_DIR));
@@ -533,6 +570,7 @@ async function connect() {
       pendingPairingPhone = null;
       lastPairingCode = null;
       reconnectDelay = RECONNECT_MIN_MS;
+      failedConnects = 0;
       emit({ type: 'status', state: 'open', reason: 'connected' });
       return;
     }

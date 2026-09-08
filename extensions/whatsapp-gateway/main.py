@@ -311,7 +311,14 @@ def _handle_from_bridge(obj: dict) -> None:
                          f"http://127.0.0.1:{port} instead.")
         else:
             _state = str(state or "")
-        if obj.get("needsPairing"):
+        if state == "gave_up":
+            _log("")
+            _log("WhatsApp: giving up after repeated failed connections.")
+            _log(f"  {obj.get('reason') or ''}")
+            _log("  Check the sidecar log, then start again when ready:")
+            _log("      /whatsapp start")
+            _log("")
+        elif obj.get("needsPairing"):
             # Being unlinked is not a passing state to fold into the status
             # ticker. Left as one line among many it reads as noise, and the
             # gateway silently sits at the pairing screen while the user is
