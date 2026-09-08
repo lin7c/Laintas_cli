@@ -1595,6 +1595,12 @@ def _bi_fs_delete(params: dict, ctx: ToolCtx) -> dict:
                 "error": "Delete target changed while awaiting approval; review again",
                 "path": abs_path}
 
+    # Refresh the recorded live directory first: the recovery below picks its
+    # landing spot from it, and a stale value would strand the session in an
+    # unrelated tree instead of the deleted directory's nearest survivor.
+    if before["kind"] == "directory":
+        paths.ensure_live_cwd(fallback=ctx.cwd)
+
     try:
         if before["kind"] == "directory":
             if recursive:
@@ -1606,10 +1612,24 @@ def _bi_fs_delete(params: dict, ctx: ToolCtx) -> dict:
     except OSError as exc:
         return {"ok": False, "error": str(exc), "path": abs_path}
 
-    return {"ok": True,
-            "result": f"Deleted {before['kind']} {abs_path}",
-            "path": abs_path, "kind": before["kind"],
-            "entries_deleted": before["count"]}
+    result = {"ok": True,
+              "result": f"Deleted {before['kind']} {abs_path}",
+              "path": abs_path, "kind": before["kind"],
+              "entries_deleted": before["count"]}
+
+    # Deleting the directory the session sits in leaves the process on an
+    # unlinked inode, and the very next path call anywhere in the CLI fails
+    # with ENOENT. Move now, while we still know which directory went away,
+    # instead of surfacing it later as a crash somewhere unrelated.
+    if before["kind"] == "directory":
+        cwd, left_behind = paths.ensure_live_cwd(fallback=ctx.cwd)
+        if left_behind:
+            result["cwd"] = cwd
+            result["previous_cwd"] = left_behind
+            result["result"] += (
+                f"\nThe working directory {left_behind} was inside it; "
+                f"the session moved to {cwd or 'no reachable directory'}.")
+    return result
 
 
 def _ppos_client(ctx: ToolCtx) -> ppos_client.PPOSClient:

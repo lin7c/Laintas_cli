@@ -194,9 +194,11 @@ def project_dir() -> Path:
     """Return the .laintas/ directory in the current working directory.
 
     This is a function (not a constant) because os.chdir() can change
-    the cwd during a session.
+    the cwd during a session. It resolves through ``live_cwd()`` so a session
+    whose directory was deleted lands on a surviving one instead of raising
+    ENOENT out of every path-building call.
     """
-    return Path.cwd() / _PROJECT_SUBDIR
+    return Path(live_cwd()) / _PROJECT_SUBDIR
 
 
 def project_file(name: str) -> Path:

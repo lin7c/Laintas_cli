@@ -670,7 +670,18 @@ def _recover_cwd_into_state(state: dict, *, agent_id: str = "",
         cwd, left_behind = paths.ensure_live_cwd(state.get("cwd") or "")
     except Exception:
         return ""
-    if not left_behind or not cwd:
+    if not cwd:
+        return cwd
+    if not left_behind:
+        # Someone closer to the deletion may have moved the process already
+        # (fs.delete recovers as soon as it removes a directory). The process
+        # is then fine but the run's recorded directory is still the dead one,
+        # so the model would keep addressing paths under it.
+        stale = str(state.get("cwd") or "")
+        if not stale or os.path.isdir(stale):
+            return cwd
+        left_behind = stale
+    if left_behind == cwd:
         return cwd
     state["cwd"] = cwd
     _append_short_memory(state, (

@@ -41,6 +41,29 @@ _pending_task: bool = False
 _loaded_cwd: Optional[str] = None
 
 
+def _project_key() -> str:
+    """Resolved path of the project this plan state belongs to.
+
+    Goes through ``paths.live_cwd()`` rather than ``Path.cwd()``: deleting the
+    directory the session sits in is ordinary (the agent itself may have just
+    removed it), and on Linux ``getcwd`` then raises ENOENT. Plan mode is
+    consulted from the REPL menus, so letting that escape ended the whole CLI
+    with a traceback naming getcwd instead of the deleted directory.
+    """
+    try:
+        return str(Path(paths.live_cwd()).resolve())
+    except OSError:
+        return ""
+
+
+def _same_project(other: str) -> bool:
+    """True when ``other`` names the directory this session is working in."""
+    try:
+        return str(Path(other).resolve()) == _project_key()
+    except OSError:
+        return False
+
+
 def ensure_plans_dir() -> Path:
     PLANS_DIR.mkdir(parents=True, exist_ok=True)
     return PLANS_DIR
@@ -53,12 +76,12 @@ def _load_state() -> dict:
         return project_state
     data = json_store.load_json(_STATE_PATH, default=dict)
     if isinstance(data, dict) and isinstance(data.get("projects"), dict):
-        return data["projects"].get(str(Path.cwd().resolve()), {})
+        return data["projects"].get(_project_key(), {})
     # Backward compatibility with the original single-project state.
     if isinstance(data, dict):
         plan = data.get("current_plan") or {}
         plan_cwd = plan.get("cwd") if isinstance(plan, dict) else None
-        if not plan_cwd or Path(plan_cwd).resolve() == Path.cwd().resolve():
+        if not plan_cwd or _same_project(plan_cwd):
             return data
     return {}
 
@@ -74,7 +97,7 @@ def _save_state(state: dict) -> bool:
     if not (isinstance(all_state, dict) and isinstance(all_state.get("projects"), dict)):
         all_state = {}
     projects = all_state.setdefault("projects", {})
-    projects[str(Path.cwd().resolve())] = state
+    projects[_project_key()] = state
     try:
         json_store.save_json_atomic(_STATE_PATH, all_state)
         return True
@@ -85,7 +108,7 @@ def _save_state(state: dict) -> bool:
 def _restore_state() -> None:
     """Restore an active plan for this project after a process restart."""
     global _plan_mode, _current_plan, _pending_task, _loaded_cwd
-    _loaded_cwd = str(Path.cwd().resolve())
+    _loaded_cwd = _project_key()
     _plan_mode = False
     _pending_task = False
     _current_plan = None
@@ -99,10 +122,7 @@ def _restore_state() -> None:
         return
     plan_file = plan.get("file")
     plan_cwd = plan.get("cwd")
-    try:
-        same_project = not plan_cwd or Path(plan_cwd).resolve() == Path.cwd().resolve()
-    except OSError:
-        same_project = False
+    same_project = not plan_cwd or _same_project(plan_cwd)
     if not same_project or not plan_file or not Path(plan_file).is_file():
         return
     if not plan.get("work_id"):
@@ -138,7 +158,7 @@ _restore_state()
 
 
 def _ensure_project_state() -> None:
-    if _loaded_cwd != str(Path.cwd().resolve()):
+    if _loaded_cwd != _project_key():
         _restore_state()
 
 
@@ -219,7 +239,7 @@ def enter_plan_mode(task: str, session_id: Optional[str] = None) -> dict:
             "updated": now,
             "status": "drafting",
             "approved": False,
-            "cwd": str(Path.cwd().resolve()),
+            "cwd": _project_key(),
             "session_id": session_id,
         }
 
@@ -228,9 +248,9 @@ def enter_plan_mode(task: str, session_id: Optional[str] = None) -> dict:
         plan_file.write_text(content, encoding="utf-8")
 
         work = workgraph.create_work(
-            task, cwd=str(Path.cwd().resolve()), session_id=session_id)
+            task, cwd=_project_key(), session_id=session_id)
         revision = workgraph.add_revision(
-            work["id"], content, cwd=str(Path.cwd().resolve()), author="system")
+            work["id"], content, cwd=_project_key(), author="system")
         plan.update({
             "work_id": work["id"],
             "revision": revision["revision"],
@@ -463,7 +483,7 @@ def attach_work(work_id: str, session_id: Optional[str] = None) -> Optional[dict
             "status": ("review_pending" if work["status"] == "REVIEW_PENDING"
                        else "drafting"),
             "approved": False,
-            "cwd": str(Path.cwd().resolve()),
+            "cwd": _project_key(),
             "work_id": work_id,
             "revision": revision["revision"],
             "content_sha": revision["content_sha"],
@@ -471,7 +491,7 @@ def attach_work(work_id: str, session_id: Optional[str] = None) -> Optional[dict
         }
         _plan_mode = work["status"] in {"DRAFT", "REVIEW_PENDING", "NEEDS_USER", "BLOCKED"}
         _pending_task = False
-        _loaded_cwd = str(Path.cwd().resolve())
+        _loaded_cwd = _project_key()
         workgraph.set_active_work(work_id, session_id=session_id)
         _save_state({"plan_mode": _plan_mode, "current_plan": _current_plan if _plan_mode else None})
         return dict(_current_plan)

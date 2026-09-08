@@ -200,5 +200,56 @@ class AgentLoopRecoveryTests(_CwdCase):
         self.assertIn("no longer exists", state.get("shortTermMemory", ""))
 
 
+class DeleteToolRecoveryTests(_CwdCase):
+    """fs.delete removing the directory the session is standing in."""
+
+    def _delete(self, path, recursive=True):
+        import tools
+        ctx = tools.ToolCtx(cwd=self.deep)
+        with mock.patch.object(tools, "_check_file_delete_policy",
+                               return_value=None):
+            return tools._bi_fs_delete(
+                {"path": path, "recursive": recursive}, ctx)
+
+    def test_deleting_the_cwd_moves_the_session_and_says_so(self):
+        result = self._delete(os.path.join(self._root, "a", "b"))
+        self.assertTrue(result["ok"])
+        self.assertEqual(self.deep, result["previous_cwd"])
+        self.assertEqual(os.path.realpath(os.path.join(self._root, "a")),
+                         os.path.realpath(result["cwd"]))
+        self.assertEqual(os.path.realpath(result["cwd"]),
+                         os.path.realpath(os.getcwd()))
+        self.assertIn("was inside it", result["result"])
+        self.assertIn(self.deep, result["result"])
+
+    def test_an_unrelated_delete_leaves_the_session_where_it_is(self):
+        other = os.path.join(self._root, "elsewhere")
+        os.makedirs(other)
+        result = self._delete(other)
+        self.assertTrue(result["ok"])
+        self.assertNotIn("previous_cwd", result)
+        self.assertEqual(os.path.realpath(self.deep),
+                         os.path.realpath(os.getcwd()))
+
+
+class PlanModeWithoutACwdTests(_CwdCase):
+    """Plan mode is consulted from the REPL menus, so it must never be the
+    thing that turns a deleted directory into a dead session."""
+
+    def test_state_lookups_survive_a_deleted_directory(self):
+        import plan_mode
+        shutil.rmtree(os.path.join(self._root, "a", "b"))
+        self.assertIsInstance(plan_mode.is_plan_mode(), bool)
+        self.assertTrue(os.path.isdir(os.getcwd()))
+        key = plan_mode._project_key()
+        self.assertTrue(key and os.path.isdir(key))
+
+    def test_project_paths_survive_a_deleted_directory(self):
+        shutil.rmtree(os.path.join(self._root, "a", "b"))
+        import workgraph
+        self.assertTrue(str(paths.project_dir()).endswith(".laintas"))
+        self.assertTrue(str(workgraph.db_path()).endswith("workgraph.db"))
+
+
 if __name__ == "__main__":
     unittest.main()

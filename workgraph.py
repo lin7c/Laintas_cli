@@ -47,7 +47,9 @@ class WorkGraphConflict(WorkGraphError):
 
 
 def db_path(cwd: Optional[str] = None) -> Path:
-    root = Path(cwd).resolve() if cwd else Path.cwd().resolve()
+    # live_cwd(), not Path.cwd(): a session whose directory was deleted still
+    # has to be able to name its work-graph file (see paths.ensure_live_cwd).
+    root = Path(cwd).resolve() if cwd else Path(paths.live_cwd()).resolve()
     return root / ".laintas" / "workgraph.db"
 
 
