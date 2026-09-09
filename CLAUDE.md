@@ -16,7 +16,7 @@ python laintas_cli.py --execute "task"   # Non-interactive single task
 python laintas_cli.py --backend URL      # Override LAINTAS_BACKEND
 ```
 
-There IS a test suite — 39 files under `tests/`, 664 tests. Activate the venv first (`source venv/bin/activate`); two modules import `pytest`, which the system python lacks.
+There IS a test suite — 118 files under `tests/`, ~2,600 test functions. Activate the venv first (`source venv/bin/activate`); two modules import `pytest`, which the system python lacks.
 
 ```bash
 python3 -m unittest discover -s tests          # full suite, ~70s
@@ -47,15 +47,15 @@ New top-level modules must be added to `package_manifest.json` — it drives set
 The project has grown from two core modules to ten, organized in layers:
 
 **Core (original two):**
-- **`laintas_cli.py`** (~19,600 lines) — Entry point, REPL, PTY execution (`InteractiveSession`, `SubTerminalSession`), OAuth/session auth, `AgentRegistry` (remote heartbeat + polling), meta-command dispatch, prompt template generation, debug TUI.
-- **`agent_loop.py`** (~8,600 lines) — Library: `run_agent_loop()`, runtime config, debug ring buffer, terminal registry (named persistent sub-terminals), agent registry (tree hierarchy, spawning, inboxes, abort), context compression, memory formatting, policy integration.
+- **`laintas_cli.py`** (~26,100 lines) — Entry point, REPL, PTY execution (`InteractiveSession`, `SubTerminalSession`), OAuth/session auth, `AgentRegistry` (remote heartbeat + polling), meta-command dispatch, prompt template generation, debug TUI.
+- **`agent_loop.py`** (~13,200 lines) — Library: `run_agent_loop()`, runtime config, debug ring buffer, terminal registry (named persistent sub-terminals), agent registry (tree hierarchy, spawning, inboxes, abort), context compression, memory formatting, policy integration.
 
 **Tools & extensibility layer (Phase 3):**
-- **`tools.py`** (~7,200 lines) — `ToolRegistry` singleton: structured `Tool` dataclass (name, JSONSchema params, invoke callable) + `ToolCtx`. Built-in tools registered at import time. All modules share one registry.
-- **`skills.py`** (~720 lines) — Loads user-installed skill directories from `~/.laintas/skills/`. Each skill is a `skill.py` that exposes `get_tools() -> list[Tool]`. Tags tools with `source="skill:<name>"`.
-- **`mcp_client.py`** (~430 lines) — Bridges async `mcp` SDK to the sync Tool registry. Runs a dedicated asyncio thread, one child subprocess per configured MCP server, registers tools as `source="mcp:<server>"`. Config lives in `~/.laintas/mcp.json`.
-- **`web_search.py`** (~2,900 lines) - Backs `web.search` and `web.fetch`.
-  - **Search**: engine chain (Google -> DuckDuckGo -> laintas_search), fast-fail cooldown, structured error types, `region`/`timelimit` filters.
+- **`tools.py`** (~11,600 lines) — `ToolRegistry` singleton: structured `Tool` dataclass (name, JSONSchema params, invoke callable) + `ToolCtx`. Built-in tools registered at import time. All modules share one registry.
+- **`skills.py`** (~1,285 lines) — Loads user-installed skill directories from `~/.laintas/skills/`. Each skill is a `skill.py` that exposes `get_tools() -> list[Tool]`. Tags tools with `source="skill:<name>"`.
+- **`mcp_client.py`** (~435 lines) — Bridges async `mcp` SDK to the sync Tool registry. Runs a dedicated asyncio thread, one child subprocess per configured MCP server, registers tools as `source="mcp:<server>"`. Config lives in `~/.laintas/mcp.json`.
+- **`web_search.py`** (~3,000 lines) - Backs `web.search` and `web.fetch`.
+  - **Search**: ordered engine chain (default `tavily -> google -> duckduckgo -> cn-bing -> laintas_search -> laintas_gateway`), fast-fail cooldown, structured error types, `region`/`timelimit` filters.
   - **Fetch**: escalates instead of failing — plain HTTP → curl_cffi TLS fingerprint → rendered browser → hand the challenge to the user in the live view → Wayback snapshot. Each result names its rung in `transport`; failures list every rung tried. Every URL and **every redirect hop** is SSRF-checked (`_guard_url`) — this runs on the user's machine, so an unguarded fetch reaches their LAN and cloud metadata.
   - The render tier owns its browser on one dedicated thread (`_RenderWorker`) because Playwright's sync API is thread-affine; `browser.*` tools skip sessions marked `_owned_by_web_fetch`.
   - Proxy config is shared with the headless browser via `browser_egress_overrides()` (`egress_from_env` falls back to it), with per-host "auto" routing.

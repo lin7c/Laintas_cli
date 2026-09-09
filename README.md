@@ -406,6 +406,114 @@ all read the GitHub release the CI workflow publishes.
 
 The history below is curated from the repository tags and changes, following an Added/Changed/Fixed-style release-note structure rather than reproducing raw commit messages. The tagged public history currently represented in this repository begins at v1.3.0.
 
+### [v1.25.2](https://github.com/lin7c/Laintas_cli/releases/tag/v1.25.2) — 2026-09-09
+
+**Added**
+
+- Arrow-key cursor movement in the main input (left/right move by one char,
+  up/down via history), gated off while the rprompt slot modal owns those keys.
+- `/extensions untrust` subcommand and completion descriptions for the new
+  `/mode` / `/plan` / `/task` subcommands (`/task mine`, `/task agent`).
+
+**Changed**
+
+- The usage/purchase checkout link now points at `market.laintas.com`.
+- cli.laintas.com redesigned with a live rendered terminal demo, agent copy,
+  and a pricing section.
+
+### [v1.25.1](https://github.com/lin7c/Laintas_cli/releases/tag/v1.25.1) — 2026-09-08
+
+**Changed**
+
+- Rebuilt the cli.laintas.com terminal demo from real laintas-cli visuals
+  (real thinking spinner and case) and re-added the missing `Layers3` import
+  that had caused a runtime `ReferenceError`.
+
+### [v1.25.0](https://github.com/lin7c/Laintas_cli/releases/tag/v1.25.0) — 2026-09-07
+
+**Added**
+
+- Wheel-style scrollable viewport for sub-terminal output, with a
+  `terminal_read` cursor walk and hand-rolled paging detection.
+- `/mode step` runs one model iteration at a time; Esc now reaches everything
+  the turn started.
+- The CLI can install and start the Windows kernel from `/windows`, reaching
+  the Windows machine through the kernel that already runs on it.
+
+**Changed**
+
+- The CLI asks before a command reads a secret and explains why; ANSI escapes
+  are stripped in `/told` rendering; `<sub_terminals>` injection is deduped
+  with a monotonic session-memory step counter.
+
+### [v1.24.0](https://github.com/lin7c/Laintas_cli/releases/tag/v1.24.0) — 2026-09-04
+
+**Added**
+
+- Windows now ships as a single NSIS installer on GitHub that bundles a real
+  terminal (conhost could not deliver a click) into a private WSL
+  distribution, instead of an empty directory.
+- The built-in `code-map` extension, repair signals, and policy hardening
+  with an agents-mode overhaul.
+- Learned, project-scoped skills with a lifecycle, plus evidence-backed
+  memory assertions with idle consolidation.
+
+**Changed**
+
+- Project switched to FSL-1.1-MIT licensing (see `docs/LICENSING.md`), with
+  English throughout the CLI source/tests/release docs and `fs.write` gaining
+  `mkdir -p`.
+- Storage gained cloud folder tools plus usage/billing tools, with a tty-depth
+  fix; Windows interop was hardened.
+
+### [v1.23.0](https://github.com/lin7c/Laintas_cli/releases/tag/v1.23.0) — 2026-08-31
+
+**Changed**
+
+- CLI source, tests and release docs are now in English throughout.
+- Branches became a decision tree walked once whose path selects the workflow,
+  so a refactor and a fix get different workflows.
+- A new terminal starts from the settings last used and remembers the agent.
+- Alt+A picks another agent while a task is running, with stable indices and
+  tree order for terminals and agents.
+
+### [v1.22.0](https://github.com/lin7c/Laintas_cli/releases/tag/v1.22.0) — 2026-08-31
+
+**Added**
+
+- Intent anchoring: the spec is built on turn zero, the agreed reading is
+  pinned, and subsequent work is compared against it with three verdicts —
+  the honest end when nobody can win the argument.
+- `L>` message mark, a mailbox, and configurable rprompt slots in the prompt.
+- Built-in `code_map` replaces the code-atlas extension.
+- The working-directory session survives the directory being deleted under it.
+
+### [v1.21.0](https://github.com/lin7c/Laintas_cli/releases/tag/v1.21.0) — 2026-08-28
+
+**Added**
+
+- Ctrl+Z / Ctrl+Y undo-redo; Ctrl+X Ctrl+S / Ctrl+X Ctrl+O selection segments.
+
+**Changed**
+
+- Improved turn robustness, context cost, and parallel read dispatch.
+
+### [v1.20.0](https://github.com/lin7c/Laintas_cli/releases/tag/v1.20.0) — 2026-08-25
+
+**Added**
+
+- A soft-interrupt propagated into every long-running tool wait, and a guard
+  against the Playwright sync-API spinning forever.
+- Critic nudges are persisted with a cooldown, and its failures are visible;
+  free-form critic scoring was replaced with five anchored bands.
+
+**Changed**
+
+- Periodic output repetition is detected via a rolling-window match and warned
+  about once before a repetition force-exit; blanket number/path normalization
+  in output fingerprints was dropped.
+- `reasoning_effort` is now shown in the spinner and rprompt.
+
 ### [v1.19.0](https://github.com/lin7c/Laintas_cli/releases/tag/v1.19.0) — 2026-08-23
 
 **Added**

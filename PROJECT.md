@@ -4,9 +4,9 @@
 
 Laintas CLI is an autonomous AI agent for the terminal. Users type natural-language tasks at a prompt; the AI agent loop calls a backend API (Laintas/Helpwo), receives a reply with a shell command, executes that command in a pseudo-terminal, feeds the output back to the AI, and iterates until the task is done. System commands typed directly are executed via PTY passthrough with no AI involvement.
 
-**Version:** 1.10.1
+**Version:** 1.25.2
 **Python:** >= 3.10
-**Files:** 62 Python modules (~40,000+ lines total) — see CLAUDE.md for the full module table
+**Files:** 103 top-level Python modules (~155,000+ lines total) — see CLAUDE.md for the full module table
 
 ---
 
@@ -113,19 +113,19 @@ All tunable parameters are accessible via `get_runtime_config()`/`set_runtime_co
 
 | Key | Default | Description |
 |---|---|---|
-| `max_loops` | 10 | Max AI loop iterations per task |
+| `max_loops` | 30 | Max AI loop iterations per task |
+| `reasoning_effort` | `low` | Thinking gear sent to the gateway; maps down to the account's nearest supported gear |
 | `max_tokens` | 0 | Output-token cap to request; 0 = the model's full budget (gateway-resolved per request) |
 | `max_debug_entries` | 50 | Debug ring buffer size |
-| `loop_delay` | 1.5 | Seconds between loop iterations |
+| `loop_delay` | 0.2 | Seconds between loop iterations (failures back off adaptively) |
 | `output_truncate` | 3000 | Char limit for `lastOutput` tail |
-| `poll_timeout` | 10.0 | Seconds to wait for first command output |
 | `terminal_tail_lines` | 20 | Lines shown in sub-terminal snapshot |
 | `heartbeat_interval` | 30 | Seconds between agent heartbeats |
-| `search_engine` | `auto` | Search engine: `auto` (Google→DDG→laintas_search chain), `google`, `duckduckgo`, `laintas_search` |
-| `search_laintas_api_key` | _(none)_ | API key for `search.laintas.com` (required for laintas_search engine) |
+| `search_engine` | `auto` | Search engine chain: `auto` = tavily → google → duckduckgo → cn-bing → laintas_search → laintas_gateway; or an ordered engine list |
+| `search_laintas_api_key` | _(none)_ | API key for `search.laintas.com` (sent as `X-API-KEY`; empty skips laintas_search) |
 | `search_laintas_api_url` | `https://search.laintas.com` | Base URL for laintas_search API |
-| `search_proxy` | _(none)_ | Proxy URL for web.search/web.fetch (e.g. `socks5://127.0.0.1:1080`, `http://proxy:8080`); env `LAINTAS_HTTP_PROXY` |
-| `search_cookie_enabled` | `false` | Enable shared cookie jar for web.search/web.fetch (Google consent cookie auto-injected) |
+| `search_proxy` | _(none)_ | Proxy URL for web.search/web.fetch (e.g. `socks5://127.0.0.1:1080`, `http://host:port`); env `LAINTAS_HTTP_PROXY` |
+| `search_cookie_enabled` | `false` | Share a persistent cookie jar across web.search/web.fetch/browser, stored in `~/.laintas/cookies.json` |
 
 ### 6. Backend API Client (`call_backend_stream`)
 
