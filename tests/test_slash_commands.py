@@ -217,6 +217,68 @@ class SlashRegistryTests(unittest.TestCase):
         self.assertEqual(buffer.text, "line1\n")
         buffer.validate_and_handle.assert_not_called()
 
+    def _active_binding(self, keys):
+        """The binding whose filter is currently True (ptk fires matches[-1]).
+        Mirrors the main-input modal state (rprompt modal inactive), where the
+        explicit arrow-key bindings must be the ones that resolve."""
+        active = [
+            binding for binding in laintas_cli._build_keybindings().bindings
+            if tuple(binding.keys) == tuple(keys) and binding.filter()
+        ]
+        self.assertEqual(len(active), 1, f"expected exactly one active {keys}")
+        return active[0]
+
+    def test_arrow_left_right_move_cursor_in_main_input(self):
+        """Left/Right move the cursor one char in the normal (non-modal) state."""
+        left = self._active_binding((laintas_cli.Keys.Left,))
+        right = self._active_binding((laintas_cli.Keys.Right,))
+
+        buffer = laintas_cli.Buffer()
+        buffer.text = "hello"
+        buffer.cursor_position = len(buffer.text)
+        left.handler(mock.Mock(current_buffer=buffer, arg=1))
+        self.assertEqual(buffer.cursor_position, 4)
+        right.handler(mock.Mock(current_buffer=buffer, arg=1))
+        self.assertEqual(buffer.cursor_position, 5)
+
+    def test_arrow_left_wont_move_before_line_start(self):
+        left = self._active_binding((laintas_cli.Keys.Left,))
+        buffer = laintas_cli.Buffer()
+        buffer.text = "hi"
+        buffer.cursor_position = 0
+        left.handler(mock.Mock(current_buffer=buffer, arg=1))
+        self.assertEqual(buffer.cursor_position, 0)
+
+    def test_arrow_up_down_move_across_multiline_buffer(self):
+        """Up/Down move across lines in multiline input (auto_up/auto_down)."""
+        up = self._active_binding((laintas_cli.Keys.Up,))
+        down = self._active_binding((laintas_cli.Keys.Down,))
+
+        buffer = laintas_cli.Buffer()
+        buffer.text = "aaa\nbbbb"
+        buffer.cursor_position = 5  # inside the "bbbb" (row 1) line
+        self.assertEqual(buffer.document.cursor_position_row, 1)
+        up.handler(mock.Mock(current_buffer=buffer, arg=1))
+        self.assertEqual(buffer.document.cursor_position_row, 0)
+        down.handler(mock.Mock(current_buffer=buffer, arg=1))
+        self.assertEqual(buffer.document.cursor_position_row, 1)
+
+    def test_arrow_bindings_are_inert_while_rprompt_slot_selected(self):
+        """When a right-prompt slot is selected the arrow bindings must not
+        move the input cursor (the modal up/down handlers own those keys)."""
+        laintas_cli._rprompt_modal_slot = "agent"
+        try:
+            matches = [
+                binding for binding
+                in laintas_cli._build_keybindings().bindings
+                if tuple(binding.keys) == (laintas_cli.Keys.Up,)
+            ]
+            active = [b for b in matches if b.filter()]
+            # The modal up/down binding is active; the movement one is not.
+            self.assertEqual(len(active), 1)
+        finally:
+            laintas_cli._rprompt_modal_slot = ""
+
     def test_all_static_subcommands_have_contextual_descriptions(self):
         for spec in laintas_cli.COMMAND_SPECS:
             for entry in spec.contextual_completions:

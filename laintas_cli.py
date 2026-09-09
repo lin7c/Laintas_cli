@@ -3194,7 +3194,7 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec(
         "/extensions", "Install, manage, and publish community extensions",
         "Account & Session",
-        "/extensions [list|available [all|official|community]|search <keyword>|install <src>|publish <name>|remove <name>|trust <name>|info <name>|create <name>|pack <name>]",
+        "/extensions [list|available [all|official|community]|search <keyword>|install <src>|publish <name>|remove <name>|trust <name>|untrust <name>|info <name>|create <name>|pack <name>]",
         subcommands=("list", "available", "search", "install", "publish", "remove", "trust", "untrust", "info", "create", "pack"),
         completion_descriptions=(
             ("list", "List installed extensions"),
@@ -3286,13 +3286,44 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec("/spawn", "Spawn a sub-agent", "Agents & Terminals", "/spawn [name:] <task>"),
     CommandSpec("/tell", "Send a message to an agent", "Agents & Terminals", "/tell <agent-id> <message|json>"),
     CommandSpec("/abort", "Abort an agent", "Agents & Terminals", "/abort <agent-id>"),
-    CommandSpec("/hwo", "Open or run an orchestration workflow", "Planning & Tasks", "/hwo [file|run <file>|compile <file>]", subcommands=("run", "compile")),
-    CommandSpec("/hwg", "Compile, run, visualize, or resume an HWO graph workflow", "Planning & Tasks", "/hwg {<file.hwg>|run|compile|resume|status|cancel} ...", subcommands=("run", "compile", "resume", "status", "cancel")),
-    CommandSpec("/mode", "Show, switch, or create agent modes", "Planning & Tasks", "/mode [act [always]|plan [task]|review|study|step|list|create|delete]", subcommands=("act", "always", "plan", "review", "study", "step", "list", "create", "delete")),
-    CommandSpec("/plan", "Create, revise, review, or approve versioned plans", "Planning & Tasks", "/plan [enter <task>|submit|revise <feedback>|approve|exit|status|list]", subcommands=("enter", "submit", "revise", "approve", "exit", "status", "list")),
+    CommandSpec("/hwo", "Open or run an orchestration workflow", "Planning & Tasks", "/hwo [file|run <file>|compile <file>|status|view <file>]", subcommands=("run", "compile", "status", "view")),
+    CommandSpec("/hwg", "Compile, run, visualize, or resume a graph workflow", "Planning & Tasks", "/hwg {<file.hwg>|run|compile|resume|status|gantt|cancel} ...", subcommands=("run", "compile", "resume", "status", "gantt", "cancel")),
+    CommandSpec("/mode", "Show, switch, or create agent modes", "Planning & Tasks", "/mode [act [always]|auto|plan [task]|review|study|step|list|create|delete]", subcommands=("act", "always", "auto", "plan", "review", "study", "step", "list", "create", "delete"), completion_descriptions=(
+        ("act", "Normal execution mode (confirmations on)"),
+        ("always", "ACT with writes & commands auto-approved this session (ACT*)"),
+        ("auto", "Autonomous: auto-confirm ordinary actions after 3s, deletes after 60s"),
+        ("plan", "Reviewed, read-only planning for a task"),
+        ("review", "Read-only code and design review"),
+        ("study", "Read-only memory capture"),
+        ("step", "Run one model iteration per Enter"),
+        ("list", "List available modes"),
+        ("create", "Create a custom mode"),
+        ("delete", "Delete a custom mode"),
+    )),
+    CommandSpec("/plan", "Create, revise, review, or approve versioned plans", "Planning & Tasks", "/plan [enter <task>|submit|revise <feedback>|approve|exit|status|list]", subcommands=("enter", "submit", "revise", "approve", "exit", "status", "list"), completion_descriptions=(
+        ("enter", "Enter plan mode for a task and draft a plan"),
+        ("submit", "Submit the current plan for review"),
+        ("revise", "Revise the current plan from feedback"),
+        ("approve", "Approve the current plan"),
+        ("exit", "Exit plan mode"),
+        ("status", "Show current plan status"),
+        ("list", "List saved plans"),
+    )),
     CommandSpec("/prompt", "Open Prompt Lab or manage tested prompt overlays", "Planning & Tasks", "/prompt [issue|subcommand]", subcommands=("status", "branches", "open", "chat", "review", "test", "activate", "disable", "patches", "profiles", "profile", "use", "rollback", "feedback", "fail", "optimize", "apply", "discard", "list", "skill", "export", "install", "publish")),
     CommandSpec("/evolve", "Create, improve, test, and hot-load project extensions", "Planning & Tasks", "/evolve [idea|subcommand]", subcommands=("status", "branches", "open", "chat", "review", "test", "activate", "disable", "candidates", "profiles", "profile", "use", "rollback", "list", "help")),
-    CommandSpec("/task", "Track project tasks", "Planning & Tasks", "/task [list|add|show|start|done|del|progress|note|subtask]", subcommands=("list", "add", "show", "start", "done", "del", "progress", "note", "subtask")),
+    CommandSpec("/task", "Track project tasks", "Planning & Tasks", "/task [list|mine|agent|add|show|start|done|del|progress|note|subtask]", subcommands=("list", "mine", "agent", "add", "show", "start", "done", "del", "progress", "note", "subtask"), completion_descriptions=(
+        ("list", "List tasks"),
+        ("mine", "List tasks owned by the current agent"),
+        ("agent", "List tasks for a specific agent"),
+        ("add", "Create a new task"),
+        ("show", "Show task details"),
+        ("start", "Mark a task in progress"),
+        ("done", "Mark a task completed"),
+        ("del", "Delete a task"),
+        ("progress", "Update completion progress"),
+        ("note", "Append a progress note"),
+        ("subtask", "Create a child task"),
+    )),
     CommandSpec("/work", "Inspect or resume unified WorkGraph state", "Planning & Tasks", "/work [status|list|resume|history]", subcommands=("status", "list", "resume", "history")),
     CommandSpec("/workflow", "Run a multi-phase workflow", "Planning & Tasks", "/workflow {start|status|advance|approve|end|list}", subcommands=("start", "status", "advance", "approve", "end", "list")),
     CommandSpec("/model", "List or select a deployed terminal model override", "Config & Tools", "/model [terminal|aux] [id|reset]", subcommands=("aux", "reset", "clear", "default")),
@@ -4814,6 +4845,33 @@ def _build_keybindings() -> KeyBindings:
         if _rprompt_modal_slot:
             _rprompt_modal_exit()
         _expand_placeholder_at_cursor(event.current_buffer)
+
+    # ── Arrow-key cursor movement (main input buffer) ──────────────────
+    # Explicit bindings so cursor navigation is guaranteed in the normal
+    # (non-modal) state instead of silently leaning on prompt_toolkit's
+    # merged emacs/basic defaults. Each is gated on ~_rprompt_modal_active so
+    # it can never double-fire with the slot-selection up/down/Alt+arrows
+    # below: prompt_toolkit fires *every* binding whose filter is True
+    # (matches[-1]), so the two sets must be mutually exclusive. Movement goes
+    # through _PasteGuardBuffer.cursor_position, which keeps the cursor out of
+    # paste placeholders automatically.
+    _main_movement = ~_rprompt_modal_active
+
+    @kb.add("left", filter=_main_movement)
+    def _(event):
+        event.current_buffer.cursor_left(count=event.arg)
+
+    @kb.add("right", filter=_main_movement)
+    def _(event):
+        event.current_buffer.cursor_right(count=event.arg)
+
+    @kb.add("up", filter=_main_movement)
+    def _(event):
+        event.current_buffer.auto_up(count=event.arg)
+
+    @kb.add("down", filter=_main_movement)
+    def _(event):
+        event.current_buffer.auto_down(count=event.arg)
 
     @kb.add("escape", "0")
     def _(event):
@@ -12802,7 +12860,7 @@ def _usage_buy_pack(what: str, session: dict) -> None:
     """Open the central market checkout; every account can buy independently."""
     kind = "extra_storage_helpwo" if what == "storage" else "extra_calls_cli"
     console.print("[bold]Laintas Market[/bold]")
-    console.print(f"https://laintas.com/market?kind={kind}")
+    console.print(f"https://market.laintas.com/?kind={kind}")
     console.print("[dim]Buy with your Laintas balance. Valid for 30 days; no membership required. "
                   "Review the current price and optional renewal in the checkout.[/dim]")
 
