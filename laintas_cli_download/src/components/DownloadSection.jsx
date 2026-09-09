@@ -9,7 +9,7 @@ import { useLanguage } from '@/contexts/LanguageContext';
 import SiteFooter from './SiteFooter';
 import TerminalDemo from './TerminalDemo';
 
-const RELEASE_FALLBACK = 'v1.25.1';
+const RELEASE_FALLBACK = 'v1.25.2';
 // Release files are served by GitHub Releases, the one place CI publishes to.
 const RELEASE_BASE = 'https://github.com/lin7c/Laintas_cli/releases/latest/download';
 const RELEASE_API = 'https://api.github.com/repos/lin7c/Laintas_cli/releases/latest';

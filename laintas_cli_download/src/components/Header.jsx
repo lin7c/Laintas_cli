@@ -19,7 +19,7 @@ export default function Header() {
   const { data: session, isPending } = auth.useSession();
   const [userOpen, setUserOpen] = useState(false);
   const [balance, setBalance] = useState(null);
-  const [version, setVersion] = useState('v1.25.1');
+  const [version, setVersion] = useState('v1.25.2');
   const menuRef = useRef(null);
 
   useEffect(() => {
