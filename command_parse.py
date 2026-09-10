@@ -56,6 +56,35 @@ _CMD_STRING_FLAGS = {"/c", "/k"}
 # canonical form of this trick.
 _STDIN_SHELLS = _SHELL_WRAPPERS | {"eval"}
 
+# Programs whose own arguments are another command: `nohup rm -rf /` runs `rm`,
+# not `nohup`. The parser already looks inside interpreters (`sh -c …`); these are
+# the same idea from the other direction, and were the other half of the hole —
+# a rule that reads only the first word sees `nohup` and waves the payload past.
+#
+# Only prefixes with one calling convention are here: their own flags start with
+# `-`, and the command begins at the first word that is neither a flag nor (for
+# `env`) a VAR=value assignment. Prefixes that take a positional argument before
+# the command — `timeout 5 …`, `xargs -n1 …` — are deliberately excluded: their
+# duration/count word cannot be told from a command word without per-tool
+# knowledge, and guessing wrong there would hide a command rather than surface it.
+_TRANSPARENT_PREFIXES = {"nohup", "command", "exec", "setsid", "env"}
+
+
+def _prefix_payload(program: str, rest: list) -> str:
+    """The command a transparent prefix will run, or "" if none is left.
+
+    Bias is toward surfacing a candidate: when in doubt the remainder is returned
+    for re-analysis, because an extra command inspected is safe while a command
+    skipped is the bypass this closes.
+    """
+    for idx, word in enumerate(rest):
+        if word.startswith("-"):
+            continue                       # the prefix's own option
+        if program == "env" and _ASSIGNMENT_RE.match(word):
+            continue                       # `env FOO=bar cmd` — assignment, not the command
+        return " ".join(rest[idx:])
+    return ""
+
 _ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 _VAR_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
 
@@ -584,6 +613,11 @@ def analyze(command: str, *, _depth: int = 0) -> Analysis:
 
         if program == "eval" and rest:
             payloads.append(" ".join(rest))
+
+        if program in _TRANSPARENT_PREFIXES:
+            prefix_payload = _prefix_payload(program, rest)
+            if prefix_payload:
+                payloads.append(prefix_payload)
 
         if from_pipe and program in _STDIN_SHELLS:
             # The script arrives on stdin. The producing segment was analysed on

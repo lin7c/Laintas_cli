@@ -52,6 +52,14 @@ BYPASS_CASES = [
     ("cd then relative",      "cd / && rm -rf ."),
     ("xargs",                 "echo / | xargs rm -rf"),
     ("env prefix",            "LC_ALL=C rm -rf /"),
+    # Transparent command prefixes: the prefix is the program, the real command
+    # is its argument. The guard unwrapped `sh -c` but not these.
+    ("nohup prefix",          "nohup rm -rf /"),
+    ("command builtin",       "command rm -rf /"),
+    ("exec replacement",      "exec rm -rf /"),
+    ("setsid prefix",         "setsid rm -rf /"),
+    ("env -i prefix",         "env -i rm -rf /"),
+    ("env assignment prefix", "env FOO=bar rm -rf /"),
 ]
 
 # Ordinary commands that must keep working. Over-blocking is its own outage.
@@ -70,6 +78,12 @@ BENIGN_CASES = [
     "curl -s https://example.com",
     "tar -czf out.tar.gz src/",
     'sed -i "s/foo/bar/" file.txt',
+    # The prefixes above, used the ordinary way — must stay allowed.
+    "env python3 app.py",
+    "nohup npm run build",
+    "command -v git",
+    "exec bash",
+    "env NODE_ENV=production node server.js",
 ]
 
 
