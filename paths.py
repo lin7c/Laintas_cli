@@ -390,3 +390,60 @@ def ensure_live_cwd(fallback: str = "") -> tuple:
 def live_cwd(fallback: str = "") -> str:
     """``ensure_live_cwd`` for callers that only need a path they can use."""
     return ensure_live_cwd(fallback)[0] or str(fallback or "")
+
+
+# --- .gitignore exceptions for shared project state -------------------------
+# `.laintas/` is ignored wholesale (see the README and CLAUDE.md), but a few
+# things inside it are *shared artefacts* rather than local state: the API
+# contract two agents agree on, and the handoff envelopes one worker leaves for
+# the next. Those have to reach the other person through the repository, so
+# they need re-including.
+#
+# Re-including a path under an ignored directory takes three lines, not one —
+# git cannot re-include a file whose parent directory is excluded. The
+# directory is un-ignored, its contents re-ignored, and only the wanted
+# subdirectory let back through:
+#
+#     !.laintas/
+#     .laintas/*
+#     !.laintas/contract/
+#
+# This lives here, shared, because the middle line is destructive to anything
+# added before it: two modules each appending their own copy of the scaffolding
+# would put a second `.laintas/*` *after* the first module's exception and
+# silently re-ignore it. One helper that writes the scaffolding at most once
+# makes the order the modules run in stop mattering.
+
+def ensure_project_path_committable(name: str, note: str = "",
+                                    cwd=None) -> bool:
+    """Un-ignore ``.laintas/<name>/`` in the project's .gitignore.
+
+    Best-effort and idempotent. Returns whether the file was changed. Does
+    nothing when there is no .gitignore, when ``.laintas/`` was never ignored
+    in the first place, or when this exception is already present.
+    """
+    marker = f"!{_PROJECT_SUBDIR}/{name}/"
+    contents_rule = f"{_PROJECT_SUBDIR}/*"
+    try:
+        path = Path(cwd or live_cwd()) / ".gitignore"
+        if not path.is_file():
+            return False
+        text = path.read_text(encoding="utf-8")
+        lines = {line.strip() for line in text.splitlines()}
+        if marker in lines:
+            return False
+        ignored = {_PROJECT_SUBDIR, f"{_PROJECT_SUBDIR}/",
+                   f"/{_PROJECT_SUBDIR}", f"/{_PROJECT_SUBDIR}/"}
+        if not (ignored & lines):
+            return False        # nothing is excluding it; no exception needed
+        block = f"\n{note}" if note else "\n"
+        if contents_rule not in lines:
+            block += f"!{_PROJECT_SUBDIR}/\n{contents_rule}\n"
+        block += f"{marker}\n"
+        with open(path, "a", encoding="utf-8") as f:
+            if not text.endswith("\n"):
+                f.write("\n")
+            f.write(block)
+        return True
+    except OSError:
+        return False

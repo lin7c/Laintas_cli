@@ -302,6 +302,21 @@ the AI agent can reason about cause: `captcha`, `rate_limited`, `network`,
 | `.loop_command.py` | Working directory | Custom loop command handlers (auto-created) |
 | `.laintas/prompt-lab/` | Project directory | Prompt Lab branches, tested overlays, profiles, and activation history |
 | `.laintas/workgraph.db` | Project directory | Transactional objective, plan revisions, steps, workflow, approvals, and events |
+| `.laintas/contract/` | Project directory | The API contract two agents agreed on — **committed**, not ignored |
+| `.laintas/handoff/` | Project directory | Handoff envelopes: what one worker left the next — **committed**, not ignored |
+
+
+Two of those are deliberately **not** ignored. `.laintas/` is this CLI's local
+runtime state and checking it in is a documented mistake, but the contract and
+the handoff envelopes are shared artefacts: they are how two agents — or two
+people — agree on an interface and hand work over, and neither is worth
+anything unless it is versioned and shows up in review.
+
+Carving them out of an ignored directory takes three git rules, one of which
+re-excludes everything inside `.laintas/`. `paths.ensure_project_path_committable`
+owns those rules for both, because two modules each appending their own copy
+would put the second re-exclude *after* the first module's exception and
+silently re-ignore it.
 
 ---
 

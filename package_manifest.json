@@ -10,6 +10,7 @@
     "git_attribution",
     "contract_store",
     "contract_notify",
+    "handoff",
     "local_runtime",
     "resource_ui",
     "agents_mode",

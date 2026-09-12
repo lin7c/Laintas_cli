@@ -3259,6 +3259,36 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
             "terminal; deployment always requires an explicit target."
         )),
     CommandSpec(
+        "/handoff", "Hand the work to the next person as a file, not a chat log",
+        "Agents & Terminals",
+        "/handoff [list|new <title>|show <id>|claim <id>|release <id>|note <id> <text>|close <id>|reopen <id>|sync [id]|remote|fetch <remote-path>]",
+        subcommands=("list", "new", "show", "claim", "release", "note", "close",
+                     "reopen", "sync", "remote", "fetch"),
+        completion_descriptions=(
+            ("list", "Every handoff in this workspace and what is left on it"),
+            ("new", "Write one before you stop for the day"),
+            ("show", "Open one: baseline, what is outstanding, what not to retry"),
+            ("claim", "Say you are picking it up"),
+            ("release", "Put it back without closing it"),
+            ("note", "Record something the next person needs to know"),
+            ("close", "Mark it handed over and done"),
+            ("reopen", "Undo a close"),
+            ("sync", "Merge with the shared copy through Laintas storage"),
+            ("remote", "List handoffs other machines shared for this repository"),
+            ("fetch", "Take a handoff somebody else created"),
+        ),
+        help_text=(
+            "An envelope in .laintas/handoff/, meant to be committed. It carries "
+            "where the work sits, what is still outstanding and what not to try "
+            "again \u2014 not the conversation, because a transcript cannot be "
+            "merged or verified. What is outstanding is re-checked against the "
+            "workspace every time it is opened rather than believed from the "
+            "file, so it cannot go stale. /handoff sync reconciles it with "
+            "whoever else holds it: both sides can append while apart and "
+            "neither loses anything, and two people claiming the same handoff is "
+            "reported rather than silently resolved."
+        )),
+    CommandSpec(
         "/shared", "Share files with Helpwo through Laintas storage",
         "Agents & Terminals",
         "/shared [list [path]|push <local> [remote]|pull <remote> [local]|rm <path>|mkdir <path>|mv <from> <to>|cp <from> <to>|usage]",
@@ -11765,6 +11795,17 @@ _SLASH_ARG_RULES: dict[tuple[str, ...], SlashArgRule] = {
     ("/help",): _arg_rule(1, "/help [command]"),
     ("/messages",): _arg_rule(
         2, "/messages [list|read <n>|seen|dismiss <n>|clear]"),
+    # `new` and `note` carry free text, so they stay unconstrained; the leaves
+    # below take an id and nothing else, and saying so turns a typo into a
+    # usage line instead of a confusing "unknown handoff" error.
+    ("/handoff", "show"): _arg_rule(2, "/handoff show <id>"),
+    ("/handoff", "claim"): _arg_rule(2, "/handoff claim <id>"),
+    ("/handoff", "release"): _arg_rule(2, "/handoff release <id>"),
+    ("/handoff", "close"): _arg_rule(2, "/handoff close <id>"),
+    ("/handoff", "reopen"): _arg_rule(2, "/handoff reopen <id>"),
+    ("/handoff", "sync"): _arg_rule(2, "/handoff sync [id]"),
+    ("/handoff", "remote"): _arg_rule(1, "/handoff remote"),
+    ("/handoff", "fetch"): _arg_rule(2, "/handoff fetch <remote-path>"),
     ("/messages", "list"): _arg_rule(1, "/messages list"),
     ("/messages", "seen"): _arg_rule(1, "/messages seen"),
     ("/messages", "clear"): _arg_rule(1, "/messages clear"),
@@ -14563,6 +14604,254 @@ def _cmd_shared(parts: list, session: dict) -> None:
 
         console.print(f"[yellow]Unknown subcommand: {escape(sub)}[/yellow] — run /shared help")
 
+    except ss.SharedStorageError as exc:
+        console.print(f"[red]{escape(str(exc))}[/red]")
+    except BlockingOperationCancelled:
+        console.print("[dim]Cancelled.[/dim]")
+
+
+def _handoff_actor(session: dict) -> str:
+    """Who this machine is acting as, in a handoff's terms.
+
+    The Laintas account first, because that is the identity the other side
+    already knows from storage and from the message centre. Git's user.name is
+    the fallback for a signed-out session, and it is a real answer rather than
+    a placeholder: in a repository, that is who the work will be attributed to
+    anyway.
+    """
+    name = (session.get("userName") or session.get("userEmail") or "").strip()
+    if name:
+        return name
+    try:
+        out = subprocess.run(["git", "config", "user.name"], capture_output=True,
+                             text=True, timeout=5, check=False)
+        if out.returncode == 0 and out.stdout.strip():
+            return out.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return os.environ.get("USER") or "unknown"
+
+
+def _handoff_state_label(state: dict) -> str:
+    colour = {"open": "yellow", "claimed": "cyan", "closed": "green"}
+    text = f"[{colour.get(state['status'], 'white')}]{state['status']}[/]"
+    if state["holder"]:
+        text += f" [dim]({escape(state['holder'])})[/dim]"
+    if state["contested"]:
+        text += f" [red]{symbols.BULLET} contested[/red]"
+    return text
+
+
+def _handoff_print_one(env: dict, cwd: str) -> None:
+    import handoff
+
+    state = handoff.project(env)
+    console.print(f"\n[bold]{escape(env['title'])}[/bold]  [dim]{escape(env['id'])}[/dim]")
+    line = _handoff_state_label(state)
+    if env.get("to"):
+        line += f" [dim]{symbols.BULLET} for {escape(env['to'])}[/dim]"
+    console.print(line)
+
+    repo = env.get("repo") or {}
+    if repo.get("git"):
+        base = f"{repo.get('branch') or '?'} @ {(repo.get('commit') or '')[:12]}"
+        console.print(f"[dim]baseline:[/dim] {escape(base)}")
+        if repo.get("dirty"):
+            # The single most expensive thing to discover late: the work the
+            # envelope describes is not in any commit, so pulling the named
+            # branch gets the successor a tree without it.
+            console.print(
+                "[yellow]  the tree was dirty when this was written — the work is "
+                "not in that commit, only on the author's disk[/yellow]")
+
+    drifted = handoff.contract_drifted(env, cwd)
+    if drifted is True:
+        console.print("[yellow]the API contract changed since this handoff was "
+                      "written — re-read .laintas/contract/[/yellow]")
+    elif drifted is False:
+        console.print("[dim]API contract unchanged since it was written[/dim]")
+
+    for entry in env.get("avoid") or []:
+        console.print(f"  [red]{symbols.BULLET}[/red] don't: {escape(entry)}")
+
+    result = handoff.remaining(env, cwd)
+    if result["checked"]:
+        if result["ok"]:
+            console.print("[green]all declared acceptance checks pass against the "
+                          "current workspace[/green]")
+        else:
+            console.print(f"[bold]outstanding ({len(result['gaps'])}):[/bold]")
+            for gap in result["gaps"]:
+                console.print(f"  [yellow]{symbols.BULLET}[/yellow] {escape(gap)}")
+
+    if state["contested"]:
+        who = ", ".join(escape(c["actor"]) for c in state["contested"])
+        console.print(f"[red]also claimed by {who} — {escape(state['holder'])} holds it "
+                      f"(earliest claim wins); agree before both of you work[/red]")
+
+    events = env.get("events") or []
+    if events:
+        console.print("[dim]log:[/dim]")
+        for event in events[-8:]:
+            when = time.strftime("%m-%d %H:%M", time.localtime(event["ts"]))
+            note = f" — {escape(event['note'])}" if event["note"] else ""
+            console.print(f"  [dim]{when}[/dim] {escape(event['actor'])} "
+                          f"[bold]{event['kind']}[/bold]{note}")
+        if len(events) > 8:
+            console.print(f"  [dim]… {len(events) - 8} earlier[/dim]")
+
+
+def _handoff_print_list(envs: list, cwd: str) -> None:
+    import handoff
+
+    if not envs:
+        console.print("[dim]No handoffs here yet. "
+                      "Use /handoff new <title> before you stop for the day.[/dim]")
+        return
+    table = Table(title=f"Handoffs ({len(envs)})")
+    table.add_column("Id", style="cyan")
+    table.add_column("Title")
+    table.add_column("State")
+    table.add_column("Left", justify="right", style="dim")
+    table.add_column("Updated", style="dim")
+    for env in envs:
+        state = handoff.project(env)
+        result = handoff.remaining(env, cwd)
+        left = "—" if not result["checked"] else (
+            "[green]0[/green]" if result["ok"] else f"[yellow]{len(result['gaps'])}[/yellow]")
+        table.add_row(
+            env["id"], env["title"], _handoff_state_label(state), left,
+            time.strftime("%m-%d %H:%M", time.localtime(state["lastAt"] or 0)))
+    console.print(table)
+
+
+def _cmd_handoff(parts: list, session: dict) -> None:
+    """Hand the work to the next person as a file, not as a conversation.
+
+    A handoff envelope lives at .laintas/handoff/<id>.json and is meant to be
+    committed. It carries where the work sits, what is still outstanding (which
+    is re-checked against the workspace every time it is read, never trusted
+    from the file), and what not to try again — but never the transcript.
+
+    `sync` reconciles it through Laintas storage for people who are not sharing
+    a repository remote. That is a fetch-merge-push, so two people can both
+    append while offline and neither loses anything.
+    """
+    import handoff
+    import shared_storage as ss
+
+    sub = (parts[1].lower() if len(parts) > 1 else "").strip()
+    args = [str(a) for a in parts[2:]]
+    cwd = paths.live_cwd()
+    actor = _handoff_actor(session)
+
+    if sub in ("help", "-h", "--help"):
+        console.print(
+            "Usage: [bold]/handoff[/bold] [list|new <title>|show <id>|claim <id>|"
+            "release <id>|note <id> <text>|close <id>|reopen <id>|"
+            "sync \\[id]|remote|fetch <remote-path>]\n"
+            "[dim]An envelope in .laintas/handoff/ — committable, mergeable, and "
+            "re-verified against the workspace instead of believed.[/dim]\n"
+            "[dim]new: add \"don't do X\" notes with --avoid \"…\" (repeatable), "
+            "and name the successor with --to <who>.[/dim]")
+        return
+
+    try:
+        if sub in ("", "list", "ls"):
+            _handoff_print_list(handoff.list_all(cwd), cwd)
+            return
+
+        if sub == "new":
+            to, avoid, words = "", [], []
+            index = 0
+            while index < len(args):
+                token = args[index]
+                if token == "--to" and index + 1 < len(args):
+                    to, index = args[index + 1], index + 2
+                elif token == "--avoid" and index + 1 < len(args):
+                    avoid.append(args[index + 1])
+                    index += 2
+                else:
+                    words.append(token)
+                    index += 1
+            title = " ".join(words).strip()
+            if not title:
+                console.print("[yellow]Give it a title: /handoff new <what this is>[/yellow]")
+                return
+            env = handoff.create(title, actor, to=to, avoid=avoid, cwd=cwd)
+            console.print(f"[green]Created {escape(env['id'])}.[/green]")
+            _handoff_print_one(env, cwd)
+            console.print(
+                "\n[dim]Commit .laintas/handoff/ so it reaches them through the repo, "
+                "or run /handoff sync to put it in Laintas storage.[/dim]")
+            return
+
+        if not args and sub in ("show", "claim", "release", "note", "close", "reopen", "fetch"):
+            console.print(f"[yellow]Which handoff? /handoff {sub} <id>[/yellow]")
+            return
+
+        if sub == "show":
+            _handoff_print_one(handoff.load(args[0], cwd), cwd)
+            return
+
+        if sub in ("claim", "release", "close", "reopen", "note"):
+            note = " ".join(args[1:]).strip()
+            if sub == "note" and not note:
+                console.print("[yellow]Nothing to record: /handoff note <id> <text>[/yellow]")
+                return
+            env = handoff.append(args[0], sub, actor, note, cwd=cwd)
+            state = handoff.project(env)
+            if sub == "claim" and state["holder"] != actor:
+                # Claiming does not always win, and being told so immediately is
+                # the whole point of surfacing a contest rather than locking.
+                console.print(
+                    f"[red]{escape(state['holder'])} claimed this first — your claim is "
+                    f"recorded but does not hold it. Talk to them before working.[/red]")
+            else:
+                console.print(f"[green]{sub} recorded on {escape(env['id'])}.[/green]")
+            _handoff_print_one(env, cwd)
+            return
+
+        if sub == "sync":
+            client = _shared_storage_client(session)
+            targets = ([handoff.load(args[0], cwd)] if args
+                       else handoff.list_all(cwd))
+            if not targets:
+                console.print("[dim]Nothing here to sync.[/dim]")
+                return
+            for env in targets:
+                with _safe_status(f"[dim]Syncing {env['id']}…[/dim]"):
+                    result = handoff.sync(env["id"], client, cwd)
+                gained = result["gained"]
+                detail = (f"[green]+{gained} new event(s) from the shared copy[/green]"
+                          if gained else "[dim]already in step[/dim]")
+                console.print(f"{escape(env['id'])} {symbols.BULLET} {detail}")
+            return
+
+        if sub == "remote":
+            client = _shared_storage_client(session)
+            with _safe_status("[dim]Listing shared handoffs…[/dim]"):
+                found = handoff.list_remote(client, cwd=cwd)
+            if not found:
+                console.print("[dim]No handoffs in storage for this repository.[/dim]")
+                return
+            for path in found:
+                console.print(f"  {escape(path)}")
+            console.print("[dim]/handoff fetch <path> to take one.[/dim]")
+            return
+
+        if sub == "fetch":
+            client = _shared_storage_client(session)
+            with _safe_status("[dim]Fetching…[/dim]"):
+                env = handoff.fetch(args[0], client, cwd)
+            console.print(f"[green]Fetched {escape(env['id'])}.[/green]")
+            _handoff_print_one(env, cwd)
+            return
+
+        console.print(f"[yellow]Unknown subcommand: {escape(sub)}[/yellow] — run /handoff help")
+
+    except handoff.HandoffError as exc:
+        console.print(f"[red]{escape(str(exc))}[/red]")
     except ss.SharedStorageError as exc:
         console.print(f"[red]{escape(str(exc))}[/red]")
     except BlockingOperationCancelled:
@@ -21816,6 +22105,9 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
 
     elif action == "/login":
         _cmd_login(session, agent_registry)
+
+    elif action == "/handoff":
+        _cmd_handoff(parts, session)
 
     elif action == "/training":
         _cmd_training(parts, session)

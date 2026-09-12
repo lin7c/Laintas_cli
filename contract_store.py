@@ -55,6 +55,8 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+import paths
+
 CONTRACT_DIR = ".laintas/contract"
 SPEC_FILE = "openapi.json"
 LOCK_FILE = "contract.lock.json"
@@ -139,45 +141,27 @@ def load(cwd: Optional[str] = None) -> tuple[dict, dict]:
 # unless it is versioned and shows up in review.
 #
 # Git cannot re-include a file whose parent directory is excluded, so a bare
-# `!.laintas/contract/**` would silently do nothing. The three lines below
-# un-exclude the directory, re-exclude everything directly inside it, then
-# un-exclude the contract — which is the documented way to carve one path out
-# of an ignored tree.
-_GITIGNORE_MARKER = "!.laintas/contract/"
-_GITIGNORE_BLOCK = """
-# laintas_cli's project state stays ignored; the API contract does not. It is
-# the agreement between the frontend and backend agents, so it belongs in
-# review and in history like any other interface definition.
-!.laintas/
-.laintas/*
-!.laintas/contract/
-"""
+# `!.laintas/contract/**` would silently do nothing. The rules that do work are
+# written by `paths.ensure_project_path_committable`, which is shared with
+# `handoff` for a reason worth knowing: one of those rules re-excludes
+# everything inside `.laintas/`, so a second module appending its own copy
+# after this one would re-ignore the contract. The helper writes that part at
+# most once, whichever module gets there first.
+_GITIGNORE_NOTE = (
+    "# laintas_cli's project state stays ignored; the API contract does not. It is\n"
+    "# the agreement between the frontend and backend agents, so it belongs in\n"
+    "# review and in history like any other interface definition.\n")
 
 
 def _ensure_gitignore_exception(cwd: Optional[str] = None) -> bool:
     """Make sure the contract is committable. Best-effort and idempotent.
 
-    Returns whether the file was modified. Does nothing when there is no
-    .gitignore to amend, when `.laintas/` was never ignored in the first place,
-    or when the exception is already present.
+    Shared with ``handoff`` via ``paths``: both re-include a subdirectory of an
+    ignored ``.laintas/``, and the scaffolding that takes must be written at
+    most once — a second copy appended later would re-ignore whatever the first
+    one let through.
     """
-    try:
-        path = Path(cwd or os.getcwd()) / ".gitignore"
-        if not path.is_file():
-            return False
-        text = path.read_text(encoding="utf-8")
-        if _GITIGNORE_MARKER in text:
-            return False
-        lines = {line.strip() for line in text.splitlines()}
-        if not ({".laintas/", ".laintas", "/.laintas/", "/.laintas"} & lines):
-            return False        # nothing is excluding it; no exception needed
-        with open(path, "a", encoding="utf-8") as f:
-            if not text.endswith("\n"):
-                f.write("\n")
-            f.write(_GITIGNORE_BLOCK)
-        return True
-    except OSError:
-        return False
+    return paths.ensure_project_path_committable("contract", _GITIGNORE_NOTE, cwd)
 
 
 def save(spec: dict, lock: dict, cwd: Optional[str] = None) -> None:
