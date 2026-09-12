@@ -106,6 +106,12 @@ _DEFAULT_CONFIG = {
     "read_block_visible": True,   # decline a read whose lines are still visible in the model's own context (evicted content stays re-readable)
     "terminal_tail_lines": 20,    # lines — sub-terminal snapshot viewport height
     "terminal_buffer_lines": 5000,  # lines — per-terminal scrollable history depth
+    # Seconds a terminal command may produce NOTHING before it is presumed
+    # stuck and its foreground process group is signalled. This is an IDLE
+    # budget, never a runtime cap: a build that keeps printing keeps its lease
+    # for as long as it takes. Raise it for commands that legitimately go
+    # quiet (a long link step, a slow remote fetch); lower it to fail fast.
+    "shell_idle_timeout": 120.0,  # seconds of silence before a command is presumed stuck
     "paste_summary": True,        # collapse large pastes into a [Pasted #N ~L lines] placeholder in the prompt (expanded on submit)
     "paste_summary_min_lines": 3, # paste line-count threshold that triggers the placeholder
     "paste_summary_min_chars": 150, # paste char-count threshold that triggers the placeholder
@@ -391,6 +397,47 @@ def _shimmer_label(label: str, elapsed: float):
     for style, value in _shimmer_segments(label, elapsed):
         txt.append(value, style=style or None)
     return txt
+
+
+#: Gears whose thinking phase routinely runs for minutes before any answer
+#: text arrives (glm-5.3 at `max` has streamed 30k+ reasoning tokens). Without
+#: a word from us, a long silent "Thinking…" reads as a hang and gets
+#: interrupted — which throws the whole thinking phase away.
+_HEAVY_THINKING_GEARS = frozenset({"high", "max"})
+#: Quiet period before the hint appears, so ordinary replies never flash it.
+_SLOW_THINKING_HINT_S = 15.0
+
+
+def _slow_thinking_hint(gear: str, elapsed: float, has_reply: bool,
+                        width: int = 0) -> str:
+    """The reassurance shown under a long "Thinking…", or "" for none.
+
+    `gear` is the one the gateway reports actually serving (its `_reasoning`
+    frame), which it only sends for models that have a thinking knob — so a
+    model without one never gets told its effort is high.
+
+    It occupies ONE row, so a sentence that does not fit is not shortened by
+    the caller's crop (which would end the reassurance mid-word, reading as
+    the freeze it exists to deny) but replaced by a shorter phrasing that
+    still says the two things that matter: this is the gear, and waiting is
+    expected. `width` of 0 means unconstrained.
+    """
+    if has_reply or gear not in _HEAVY_THINKING_GEARS or elapsed < _SLOW_THINKING_HINT_S:
+        return ""
+    phrasings = (
+        f"Thinking effort is {gear} - the model may think for several minutes "
+        "before answering. Please don't interrupt.",
+        f"Thinking effort is {gear} - this can take minutes. Please don't interrupt.",
+        f"{gear} effort - minutes of thinking is normal. Don't interrupt.",
+        f"{gear} effort - thinking, minutes is normal.",
+        f"{gear} effort - still thinking.",
+    )
+    if width <= 0:
+        return phrasings[0]
+    for text in phrasings:
+        if len(text) <= width:
+            return text
+    return phrasings[-1]
 
 
 # ── Activity status (the row shown while a tool call runs) ─────────────
@@ -987,7 +1034,7 @@ def _active_mode_label() -> str:
 _runtime_config: dict[str, object] = {}
 
 _RUNTIME_CONFIG_DESCRIPTIONS = {
-    "reasoning_effort": "How hard the model thinks before answering (none/low/medium/high/max). Thinking is billed as output tokens, so higher costs more; a model that cannot do the chosen gear gets its nearest lower one",
+    "reasoning_effort": "How hard the model thinks before answering (auto/none/low/medium/high/max). Thinking is billed as output tokens, so higher costs more; a model that cannot do the chosen level gets its nearest lower one. `auto` lets the backend pick per request from the task itself - mechanical steps drop to none, judgement calls climb to high, and only your own words (\"think hard\") reach max.",
     "rprompt_slots_detail_on": "Comma-separated right-prompt slots shown with detail on (messages,agent,mode,model,effort,terminal); empty hides the row",
     "rprompt_slots_detail_off": "Comma-separated right-prompt slots shown with detail off (messages,agent,mode,model,effort,terminal); empty hides the row",
     "rprompt_slot_order": "Left-to-right display order of right-prompt slots (agent,mode,model,effort,terminal); the messages mark is always leftmost; omitted slots follow in default order",
@@ -1004,6 +1051,7 @@ _RUNTIME_CONFIG_DESCRIPTIONS = {
     "read_block_visible": "Decline a re-read of lines the model can still see in its own transcript",
     "terminal_tail_lines": "Terminal snapshot line count (viewport height)",
     "terminal_buffer_lines": "Scrollable history depth per terminal (lines)",
+    "shell_idle_timeout": "Seconds of silence before a terminal command is presumed stuck (idle budget, not a runtime cap)",
     "disable_remote_terminal": "Opt this runtime environment out of Helpwo's interactive terminal (P2P shell)",
     "allow_remote_exec_without_approval": "Let Helpwo's AI run commands in this environment without local approval (P2P exec)",
     "remote_max_workers": "Maximum concurrently running remote tasks",
@@ -1082,6 +1130,7 @@ _RUNTIME_NONNEGATIVE = {
 _RUNTIME_POSITIVE = {
     "max_loops", "max_tokens", "max_debug_entries", "output_truncate",
     "terminal_tail_lines", "terminal_buffer_lines", "staleness_limit",
+    "shell_idle_timeout",
     "repetition_threshold",
     "warning_force_limit", "deterministic_repeat_limit",
     "microcompact_keep", "microcompact_read_budget",
@@ -1092,6 +1141,9 @@ _RUNTIME_POSITIVE = {
 }
 
 _RUNTIME_LIMITS = {
+    # Floor of 5s: anything shorter kills ordinary commands that pause to
+    # think. Ceiling of 24h: past that the budget stops being a safety net.
+    "shell_idle_timeout": (5, 86400),
     "remote_max_workers": (1, 64),
     "remote_queue_size": (0, 128),
     "remote_control_workers": (1, 4),
@@ -1107,7 +1159,7 @@ _RUNTIME_LIMITS = {
 # "high, low, max, medium, none", which tells a user nothing about which way is
 # more; in declaration order it reads as the ladder it is.
 _RUNTIME_ENUM_CHOICES: dict[str, tuple[str, ...]] = {
-    "reasoning_effort": ("none", "low", "medium", "high", "max"),
+    "reasoning_effort": ("auto", "none", "low", "medium", "high", "max"),
     "repetition_policy": ("warn", "interrupt"),
     "stream_preview": ("off", "one", "detail"),
     "theme": ("dark", "light", "mono"),
@@ -4547,6 +4599,9 @@ def spawn_subagent(parent_id: str, task: str, deps,
             parent_agent_id=parent.id,
             terminal_name=agent_scope_terminal(child),
             summary=task, detail=task, status="queued")
+        import aipow_bridge
+        aipow_bridge.emit("agent.spawn", {"agent_id": child.id,
+                                          "parent_agent_id": parent.id})
     except Exception:
         pass
 
@@ -9347,6 +9402,16 @@ def run_agent_loop(
         and not state.get("_suppress_terminal_render")
         and getattr(deps.console, "render_terminal", True) is not False
     )
+    try:
+        import aipow_bridge
+        aipow_bridge.bind(state.get("cwd") or os.getcwd())
+        if not _is_background_agent and not continue_thread:
+            aipow_bridge.message("human.message", original_input,
+                                 session_id=_session_id, run_id=_run_id,
+                                 agent_id=str(agent_id or "main"))
+        aipow_bridge.sample()
+    except Exception:
+        pass
     if not _owns_local_render:
         # LoopDeps is commonly shared by parent and child agents. Never replace
         # display callbacks on the shared object from a background thread.
@@ -10952,6 +11017,10 @@ def run_agent_loop(
             state.get('_model_override', ''),
             state.get('_provider_override', ''),
         )
+        # HWO's `#name:gear#` pin, inherited down the workflow tree. Empty for
+        # every ordinary run, which leaves the request on /config
+        # reasoning_effort exactly as before.
+        _request_effort = str(state.get('_effort_override') or '').strip()
         _context_capture = {
             "system_sections": _system_sections,
             "metadata": {
@@ -10990,6 +11059,7 @@ def run_agent_loop(
                 allowed_tool_names=_request_tool_names,
                 model_override=_request_model or None,
                 provider_override=_request_provider or None,
+                effort_override=_request_effort or None,
                 task_kind=_task_kind,
                 trajectory_id=_run_id,
                 context_capture=_context_capture,
@@ -10999,11 +11069,12 @@ def run_agent_loop(
             _rungs = (
                 ((), ""),
                 (("provider_override", "task_kind", "trajectory_id",
-                  "context_capture"),
-                 "provider/labelling fields"),
+                  "context_capture", "effort_override"),
+                 "provider/labelling fields and the thinking pin"),
                 (("provider_override", "task_kind", "trajectory_id",
-                  "context_capture", "messages", "allowed_tool_names",
-                  "model_override", "interrupt_event", "on_chunk"),
+                  "context_capture", "effort_override", "messages",
+                  "allowed_tool_names", "model_override", "interrupt_event",
+                  "on_chunk"),
                  "the message thread and tool authorization"),
             )
             _last_exc = None
@@ -11029,7 +11100,7 @@ def run_agent_loop(
             # Rich permits one Live per Console, so ordinary non-blocking
             # agent.spawn races crashed the entire CLI with LiveError.
             _render_stream_live = _owns_local_render
-            stream_state = {"reply": "", "command": "", "started": False}
+            stream_state = {"reply": "", "command": "", "started": False, "gear": ""}
             # Capture model/mode labels once for the spinner text
             # Not "auto": that is a real routing mode, so an unknown model
             # shown as "auto" reads as "the router is on" rather than "we could
@@ -11046,6 +11117,10 @@ def run_agent_loop(
                 # Check for soft-interrupt during streaming
                 if _interrupt.is_set():
                     raise InterruptedError("user interrupt during streaming")
+                if field == "gear":
+                    # Metadata, not model output: must not flip `started`.
+                    stream_state["gear"] = value
+                    return
                 if field == "reply":
                     stream_state["reply"] += value
                     # Event delivery is independent of local terminal
@@ -11105,7 +11180,17 @@ def run_agent_loop(
                             style="#8b949e",
                         )
                     if _cw >= 72:
-                        _gear = f" {symbols.BULLET} {_spin_effort}" if _spin_effort else ""
+                        # What was asked for, and what the serving account
+                        # actually took when the two differ — `auto` resolving
+                        # to a gear, or a gear mapped down to an account's
+                        # floor. Both are otherwise invisible at the moment
+                        # they matter, which is while the call is running.
+                        _eff_gear = stream_state["gear"]
+                        if _spin_effort and _eff_gear and _eff_gear != _spin_effort:
+                            _gear_label = f"{_spin_effort}{symbols.ARROW_R}{_eff_gear}"
+                        else:
+                            _gear_label = _spin_effort
+                        _gear = f" {symbols.BULLET} {_gear_label}" if _gear_label else ""
                         _txt.append(f" {symbols.BULLET} {_spin_model}{_gear} {symbols.BULLET} {_spin_mode}", style="#8b949e")
                     _spinner.text = _txt
                     parts.append(_spinner)
@@ -11119,6 +11204,14 @@ def run_agent_loop(
                         _tail = _rlines[-_cap:]
                         _rows = [_crop_cells(line, _cw - 2) for line in _tail]
                         _rows = ([""] * (_cap - len(_rows))) + _rows
+                        # Until the reply starts these rows are blank, so the
+                        # long-thinking hint takes the last one — the Live
+                        # region's height stays exactly what it was.
+                        _hint = _slow_thinking_hint(
+                            stream_state["gear"], _elapsed, bool(stream_state["reply"]),
+                            width=_cw - 2)
+                        if _hint:
+                            _rows[-1] = _crop_cells(_hint, _cw - 2)
                         parts.append(Text("\n".join(_rows), style="muted"))
                     if stream_state["command"] and _detail:
                         cmd_preview = stream_state["command"]
@@ -11377,6 +11470,15 @@ def run_agent_loop(
         # structural parsing, do not surface the malformed text as a normal
         # answer; the next turn gets a format nudge instead.
         display_reply = "" if response.get("_parse_failed") else reply
+        if display_reply and _owns_local_render:
+            try:
+                import aipow_bridge
+                aipow_bridge.message("assistant.visible", display_reply,
+                                     channel="commentary" if tool_calls else "final",
+                                     session_id=_session_id, run_id=_run_id,
+                                     agent_id=str(agent_id or "main"))
+            except Exception:
+                pass
         _reply_rendered_normally = False
         if display_reply:
             if events_cb is not None and not _reply_already_rendered:
@@ -12476,6 +12578,11 @@ def run_agent_loop(
         # Concat all per-call outputs into lastOutput so the next prompt's fallback
         # rendering and shortTermMemory see every result, not just the last.
         if formatted_outputs:
+            try:
+                import aipow_bridge
+                aipow_bridge.sample()
+            except Exception:
+                pass
             state["lastOutput"] = ("\n---\n".join(formatted_outputs))[: int(get_runtime_config("output_truncate") or 3000) * 2]
             for _row in per_call_rows:
                 event_log.append("tool_result",

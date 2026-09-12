@@ -309,6 +309,28 @@ class ResponsiveTerminalChromeTests(unittest.TestCase):
             [str(span.style) for span in later.spans],
         )
 
+    def test_slow_thinking_hint_only_for_heavy_gear_after_quiet_spell(self):
+        hint = agent_loop._slow_thinking_hint
+        self.assertIn("max", hint("max", 20.0, False))
+        self.assertIn("high", hint("high", 20.0, False))
+        # Too early, answer already streaming, low/medium, or no gear frame.
+        self.assertEqual("", hint("max", 5.0, False))
+        self.assertEqual("", hint("max", 20.0, True))
+        self.assertEqual("", hint("medium", 60.0, False))
+        self.assertEqual("", hint("", 60.0, False))
+
+    def test_slow_thinking_hint_fits_the_row_it_is_given(self):
+        hint = agent_loop._slow_thinking_hint
+        for width in (30, 46, 60, 80, 120):
+            text = hint("max", 20.0, False, width=width)
+            self.assertLessEqual(len(text), width, f"width={width}: {text!r}")
+            # Still says the gear and that waiting is expected.
+            self.assertIn("max", text)
+            self.assertTrue(text.endswith("."), text)
+        # Narrower than even the shortest phrasing: the caller crops, but the
+        # hint must never come back empty while the condition holds.
+        self.assertTrue(hint("max", 20.0, False, width=5))
+
     def test_cell_crop_handles_cjk_and_preserves_budget(self):
         cropped = agent_loop._crop_cells("目录/非常长的文件名.py", 12, middle=True)
         self.assertLessEqual(agent_loop._cell_len(cropped), 12)

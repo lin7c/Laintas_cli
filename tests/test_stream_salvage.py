@@ -54,6 +54,29 @@ def _run(lines, boom=None):
             {}, "hello", "system", "/tmp", tools_enabled=False)
 
 
+class ReasoningGearFrameTests(unittest.TestCase):
+    def test_gear_frame_reaches_on_chunk_and_not_the_reply(self):
+        profile = backend_profiles.BackendProfile(
+            "custom", "custom", "https://ai.example.com")
+        chunks = []
+        lines = _sse(
+            {"_reasoning": {"requested": "max", "effective": "max",
+                            "upstream": "ark-coding"}},
+            {"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]},
+        )
+        with mock.patch.object(laintas_cli, "get_backend_profile", return_value=profile), \
+                mock.patch.object(laintas_cli.requests, "post",
+                                  return_value=_FakeResponse(lines)), \
+                mock.patch.object(laintas_cli, "get_selected_model", return_value=""), \
+                mock.patch.object(laintas_cli, "get_selected_provider", return_value=""):
+            result = laintas_cli.call_backend_stream(
+                {}, "hello", "system", "/tmp", tools_enabled=False,
+                on_chunk=lambda field, value: chunks.append((field, value)))
+
+        self.assertIn(("gear", "max"), chunks)
+        self.assertEqual(result["reply"], "ok")
+
+
 class StreamSalvageTests(unittest.TestCase):
     def test_context_receipt_is_requested_and_captured_out_of_band(self):
         profile = backend_profiles.BackendProfile(

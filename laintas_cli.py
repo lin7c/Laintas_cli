@@ -1483,27 +1483,35 @@ def pty_passthrough(command: str, timeout: int = 120) -> dict:
 # foreground process group of a command that was streaming output the whole
 # time. Silence is the signal that something is actually wrong: a wedged
 # program, a pager, a prompt waiting for input nobody will type.
+# The live value is `/config shell_idle_timeout`; this stays the factory
+# default and the fallback (tools.shell_idle_timeout resolves the pair).
 SHELL_IDLE_TIMEOUT_SECONDS = 120.0
 
 
 def _marker_poll_exec(session, command: str, timeout: int = None,
-                      strip_ansi_codes: bool = True) -> dict:
+                      strip_ansi_codes: bool = True,
+                      abort_event: Optional[threading.Event] = None) -> dict:
     """Serialize a command on a persistent terminal session.
 
     ``timeout`` is an IDLE budget (seconds without new output), not a total
-    runtime budget. None uses SHELL_IDLE_TIMEOUT_SECONDS.
+    runtime budget. None uses the configured `shell_idle_timeout`.
+
+    ``abort_event`` lets a watcher (the REPL's Esc reader) stop waiting on a
+    command that is never going to finish, without waiting out the budget.
     """
     lock = getattr(session, "command_lock", None)
     if lock is None:
         return _marker_poll_exec_unlocked(
-            session, command, timeout, strip_ansi_codes)
+            session, command, timeout, strip_ansi_codes, abort_event)
     with lock:
         return _marker_poll_exec_unlocked(
-            session, command, timeout, strip_ansi_codes)
+            session, command, timeout, strip_ansi_codes, abort_event)
 
 
 def _marker_poll_exec_unlocked(session, command: str, timeout: int = None,
-                               strip_ansi_codes: bool = True) -> dict:
+                               strip_ansi_codes: bool = True,
+                               abort_event: Optional[threading.Event] = None
+                               ) -> dict:
     """Execute a command through a persistent bash session via marker-poll.
 
     Returns {stdout, stderr, returncode, success}.
@@ -1549,9 +1557,10 @@ def _marker_poll_exec_unlocked(session, command: str, timeout: int = None,
     # Idle clock: reset by any new byte from the command. A 40-minute build that
     # keeps printing is working; two minutes of total silence is not.
     _idle_budget = float(timeout if timeout is not None
-                         else SHELL_IDLE_TIMEOUT_SECONDS)
+                         else tools_mod.shell_idle_timeout())
     _last_output_at = time.time()
     _seen_len = 0
+    interrupted = False
 
     while time.time() - _last_output_at < _idle_budget:
         time.sleep(0.08)
@@ -1600,6 +1609,13 @@ def _marker_poll_exec_unlocked(session, command: str, timeout: int = None,
         if not session.is_alive():
             cmd_output = tools_mod.scrub_marker_noise(new_content)
             break
+        # Esc: stop waiting now. The command is still the terminal's problem,
+        # so fall through to the same recovery the idle timeout uses —
+        # returning while a foreground program still owns the shell would
+        # leave the next command typing into it.
+        if abort_event is not None and abort_event.is_set():
+            interrupted = True
+            break
 
     stderr_note = ""
     if returncode == -1 and session.is_alive():
@@ -1608,12 +1624,13 @@ def _marker_poll_exec_unlocked(session, command: str, timeout: int = None,
         # into the stuck program and time out too.
         _idle_for = int(time.time() - _last_output_at)
         _ran_for = int(time.time() - poll_start)
+        _why = (f"interrupted after {_ran_for}s" if interrupted
+                else f"no output for {_idle_for}s (ran {_ran_for}s)")
         if tools_mod.recover_stuck_shell(session):
-            stderr_note = (f"no output for {_idle_for}s (ran {_ran_for}s); "
-                           "foreground process stopped, terminal recovered")
+            stderr_note = (f"{_why}; foreground process stopped, "
+                           "terminal recovered")
         else:
-            stderr_note = (f"no output for {_idle_for}s (ran {_ran_for}s); "
-                           "terminal still busy")
+            stderr_note = f"{_why}; terminal still busy"
     elif returncode != -1:
         try:
             session._laintas_shell_dirty = False
@@ -8120,6 +8137,13 @@ def _should_inject_gateway_tool_guide(system_prompt: str) -> bool:
     return "laintas-managed-prompt:v3" not in str(system_prompt or "")
 
 
+#: Values an HWO `#name:gear#` pin may carry — the same set /config offers for
+#: `reasoning_effort`, `auto` included. Spelled out rather than imported from
+#: agent_loop at module scope (that import is deferred everywhere else in this
+#: file); tests/test_stream_salvage.py asserts the two never drift apart.
+_EFFORT_PIN_VALUES = frozenset({"auto", "none", "low", "medium", "high", "max"})
+
+
 def call_backend_stream(
     session: dict,
     message: str,
@@ -8134,6 +8158,7 @@ def call_backend_stream(
     allowed_tool_names: Optional[set[str]] = None,
     model_override: Optional[str] = None,
     provider_override: Optional[str] = None,
+    effort_override: Optional[str] = None,
     task_kind: str = "",
     trajectory_id: str = "",
     context_capture: Optional[dict] = None,
@@ -8163,8 +8188,14 @@ def call_backend_stream(
         "maxTokens": int(get_runtime_config("max_tokens")),
         # The gear, not a provider parameter: the gateway maps it onto whatever
         # the account that ends up serving this call was measured to accept.
-        # See /config reasoning_effort.
-        "reasoningEffort": str(get_runtime_config("reasoning_effort")),
+        # See /config reasoning_effort. An HWO `#name:gear#` pin overrides it
+        # for that agent and its descendants; anything else is ignored rather
+        # than forwarded, so a malformed pin cannot turn into an unknown value
+        # on the wire (the gateway would silently substitute its default and
+        # the run would look like the pin worked).
+        "reasoningEffort": (effort_override
+                            if str(effort_override or "").strip().lower() in _EFFORT_PIN_VALUES
+                            else str(get_runtime_config("reasoning_effort"))),
         # Billing attribution: without this the gateway books the call under
         # its default product ("helpwo") — quota and /usage stats then miss it.
         "source": "cli",
@@ -8173,6 +8204,13 @@ def call_backend_stream(
         # gateway guide for backward compatibility unless they deliberately
         # adopt the v3 marker.
         "injectToolGuide": _should_inject_gateway_tool_guide(system_prompt),
+        # Ask the gateway for the list of model ids an HWO `@model` pin may
+        # name. Only the gateway knows which accounts an operator has switched
+        # on, and this CLI has no other place that tells the model what is
+        # pinnable — without it a workflow either pins an id that fails the
+        # step or never pins at all. The gateway adds it only when this request
+        # actually carries the hwo tool.
+        "injectModelPins": bool(tools_enabled),
     }
     # Training-capture labels. Bucketing metadata only: the gateway records them
     # verbatim but derives no fact from them, so a tampered value can misfile a
@@ -8399,6 +8437,15 @@ def call_backend_stream(
                 billing_info = dict(evt["_billing"] or {})
                 billing_info["billingDomain"] = backend_profile.kind
                 billing_info["official"] = backend_profile.sends_laintas_credentials
+                continue
+            if "_reasoning" in evt:
+                # The thinking gear the serving account actually got (the
+                # gateway maps an unsupported gear down). Sent only for models
+                # with a thinking knob; drives the long-thinking hint.
+                _gear = str((evt.get("_reasoning") or {}).get("effective") or "")
+                if on_chunk is not None and _gear:
+                    try: on_chunk("gear", _gear)
+                    except Exception: pass
                 continue
             # Capture the actual model name streamed by the backend (first
             # non-empty occurrence wins) for the status-bar display.
@@ -23266,7 +23313,8 @@ def _bg_reader_line_mode(target_queue: queue.Queue,
 
 def _bg_reader_cbreak_mode(target_queue: queue.Queue,
                            interrupt_event: Optional[threading.Event] = None,
-                           stop_event: Optional[threading.Event] = None):
+                           stop_event: Optional[threading.Event] = None,
+                           interrupt_hint: Optional[str] = None):
     """Supplementary input + Esc-to-interrupt while the agent loop runs.
 
     Holds the terminal through the arbiter, so this reader cannot coexist
@@ -23359,11 +23407,11 @@ def _bg_reader_cbreak_mode(target_queue: queue.Queue,
                     already_set = interrupt_event.is_set()
                     interrupt_event.set()
                     if not already_set:
-                        console.print(
+                        console.print(interrupt_hint or (
                             "\n[dim]Esc received - stopping. A tool "
                             "already running finishes first; press "
                             "Ctrl+C twice quickly to force exit "
-                            "now.[/dim]")
+                            "now.[/dim]"))
                 else:
                     _set_run_input_state("input_active")
                 continue
@@ -23437,7 +23485,8 @@ def _open_agents_view_from_run() -> None:
 
 
 def _start_bg_input_reader(target_queue: queue.Queue,
-                           interrupt_event: Optional[threading.Event] = None):
+                           interrupt_event: Optional[threading.Event] = None,
+                           interrupt_hint: Optional[str] = None):
     """Start a background thread that reads stdin for supplementary messages
     and Esc-to-interrupt during run_agent_loop().
 
@@ -23453,7 +23502,7 @@ def _start_bg_input_reader(target_queue: queue.Queue,
         return  # already running
     # Remember what this reader was wired to, so the paths that pause it for
     # a prompt can put it back on the same wiring. See _restart_bg_input_reader.
-    _bg_reader_args = (target_queue, interrupt_event)
+    _bg_reader_args = (target_queue, interrupt_event, interrupt_hint)
 
     # A stop event per thread, captured in the closure. The single global
     # event this replaces was cleared on every start, which un-stopped any
@@ -23471,7 +23520,7 @@ def _start_bg_input_reader(target_queue: queue.Queue,
                 # Fall back to prompt_toolkit only when cbreak fails.
                 if interrupt_event is not None:
                     _bg_reader_cbreak_mode(target_queue, interrupt_event,
-                                           stop_event)
+                                           stop_event, interrupt_hint)
                 else:
                     _bg_reader_prompt_mode(target_queue, interrupt_event,
                                            stop_event)
@@ -24626,6 +24675,9 @@ def _parse_subtask_json(text: str):
 
 def main():
     """Entry point."""
+    if sys.argv[1:2] == ["pow"]:
+        import ai_pow
+        raise SystemExit(ai_pow.main(sys.argv[2:]))
     # A terminal the CLI has not run in before starts from the settings last
     # used rather than from nothing. TERMINAL_ID is derived from the tty and
     # POSIX session id when the emulator offers nothing better, and both
@@ -26258,7 +26310,40 @@ def main():
                 )
 
                 if _use_term0:
-                    result = _marker_poll_exec(_term0_info.session, user_input, strip_ansi_codes=False)
+                    # Esc reaches a running command. Until this existed the
+                    # only key that did anything during a term0 command was
+                    # Ctrl+C, and outside an AI run SIGINT is still bound to
+                    # `shutdown` — so the one available interrupt killed the
+                    # whole CLI. The reader owns the terminal in CBREAK for
+                    # the command's lifetime and hands Esc to the poll loop
+                    # as an event, never a signal.
+                    _shell_abort = threading.Event()
+                    _shell_reader = False
+                    try:
+                        _start_bg_input_reader(
+                            queue.Queue(), _shell_abort,
+                            interrupt_hint=(
+                                "\n[dim]Esc received - stopping the command "
+                                "and reclaiming the terminal.[/dim]"))
+                        # Only ours to stop. _start_bg_input_reader is a
+                        # no-op when a reader is already running, and
+                        # stopping a reader some other path owns would take
+                        # Esc away from it.
+                        _shell_reader = (
+                            _bg_reader_args[1] is _shell_abort
+                            if _bg_reader_args else False)
+                    except Exception:
+                        # No reader is a worse terminal, not a broken one:
+                        # the command still runs and still times out.
+                        pass
+                    try:
+                        result = _marker_poll_exec(
+                            _term0_info.session, user_input,
+                            strip_ansi_codes=False,
+                            abort_event=_shell_abort)
+                    finally:
+                        if _shell_reader:
+                            _stop_bg_input_reader()
                     _sync_cwd_from_term0(_term0_info.session)
                     # marker-poll captures output but doesn't echo to the user's
                     # terminal (unlike pty_passthrough, which echoes directly) —
@@ -26274,6 +26359,13 @@ def main():
                             sys.stdout.flush()
                         except (BrokenPipeError, OSError):
                             pass
+                    # A command that never signalled completion explains
+                    # itself in stderr. That note only ever went into
+                    # chat_history, so the user watched two minutes of
+                    # silence end in a mangled screen with no reason given.
+                    _note = result.get("stderr", "")
+                    if _note and result.get("returncode", 0) == -1:
+                        console.print(f"[yellow]{_note}[/yellow]")
                 elif _agents_view_is_active():
                     # PTY passthrough hands the whole terminal to the child
                     # program; impossible while the /agents view owns it.

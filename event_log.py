@@ -130,6 +130,11 @@ def append(event_type: str, **fields) -> int:
     Never raises — a logging failure is swallowed (the loop must not break
     because the event log is unwritable). Returns -1 on failure.
     """
+    try:
+        import aipow_bridge
+        aipow_bridge.journal(event_type, fields)
+    except Exception:
+        pass
     _gaps = schema_gaps(event_type, fields)
     if _gaps:
         for _name in _gaps:

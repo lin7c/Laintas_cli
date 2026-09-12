@@ -260,7 +260,10 @@ class CycleValueTests(_SlotTestBase):
         self.assertEqual(calls, [])
         persist.assert_not_called()
 
-    def test_cycle_effort_wraps_max_to_none(self):
+    def test_cycle_effort_wraps_max_to_auto(self):
+        """`auto` sits at the head of the effort choices — it is a mode (let
+        the backend decide per request), not a point on the scale, so the
+        wraparound from the top gear lands on it before `none`."""
         self._select("effort")
         calls = []
         with mock.patch("agent_loop.get_runtime_config",
@@ -271,7 +274,7 @@ class CycleValueTests(_SlotTestBase):
                 mock.patch.object(laintas_cli.terminal_preferences,
                                   "set_ui_preference"):
             laintas_cli._rprompt_cycle_value(1)
-        self.assertEqual(laintas_cli._rprompt_modal_value, "none")
+        self.assertEqual(laintas_cli._rprompt_modal_value, "auto")
         self.assertEqual(calls, [])
 
     def test_cycle_model_with_cache(self):

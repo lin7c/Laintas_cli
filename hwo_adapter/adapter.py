@@ -14,12 +14,15 @@ samples/ + test_parity.py guard against drift.
 
 ── Canonical AST (JSON) ─────────────────────────────────────────────────
   task     : {"type": "task",     "text": str}
-  agent    : {"type": "agent",    "name": str, "promptFile": str|None, "model": str|None, "body": [node, ...]}
+  agent    : {"type": "agent",    "name": str, "promptFile": str|None, "model": str|None,
+              "effort": str|None, "body": [node, ...]}
   parallel : {"type": "parallel", "body": [node, ...]}
 
 ── Grammar ──────────────────────────────────────────────────────────────
   #name# { ... }            an agent with a body
   #name@model# { ... }      pin the agent to a backend model (e.g. #fe@glm-5.2#)
+  #name@model:gear# { ... } also pin how hard it thinks (#fe@glm-5.2:high#)
+  #name:gear# { ... }       pin the gear only, leaving the model unpinned
   (prop.md)#name# { ... }   leading prompt-file prefix
   #name#(prop.md) { ... }   trailing prompt-file prefix (alias)
   // ... //                 parallel block (agents only)
@@ -115,6 +118,27 @@ def _extract_call(content: str, keyword: str) -> Optional[str]:
     return None
 
 
+def _split_effort(token: str, pos: int) -> tuple[str, Optional[str]]:
+    """Split a `name`/`model` token into its value and an optional `:gear`.
+
+    An unknown gear is a parse error rather than a silently ignored suffix: the
+    author asked for a thinking level and would otherwise get the default with
+    nothing to say so, and a typo'd gear is indistinguishable from a model id
+    that happens to contain a colon (none do).
+    """
+    head, sep, gear = token.partition(":")
+    if not sep:
+        return token.strip(), None
+    gear = gear.strip().lower()
+    if not gear:
+        raise HwoParseError("Empty thinking gear after ':'", pos)
+    if gear not in EFFORT_GEARS:
+        raise HwoParseError(
+            f"Unknown thinking gear '{gear}' — use one of: " + ", ".join(EFFORT_GEARS),
+            pos)
+    return head.strip(), gear
+
+
 def _parse_io_block(content: str) -> dict:
     def read(kind: str) -> list:
         inner = _extract_call(content, kind)
@@ -123,6 +147,13 @@ def _parse_io_block(content: str) -> dict:
         return [p for p in (_parse_param(x) for x in _split_top_level(inner)) if p["name"]]
 
     return {"in": read("in"), "out": read("out")}
+
+
+#: Thinking gears a pin may name. The same five the products offer, plus
+#: `auto`, which asks the gateway to choose per request. Kept as literal
+#: strings rather than imported: this parser is vendored into two products and
+#: must not depend on the gateway's model registry to read a file.
+EFFORT_GEARS: tuple[str, ...] = ("auto", "none", "low", "medium", "high", "max")
 
 
 class HwoParseError(Exception):
@@ -221,6 +252,14 @@ class _Parser:
         name, sep, model = raw_name.partition("@")
         name = name.strip()
         model = model.strip() if sep else None
+        # An optional `:gear` suffix pins how hard this agent thinks. It rides
+        # on the model when one is pinned (#fe@glm-5.2:high#) and on the name
+        # when none is (#fe:high#). Unambiguous because gear names are a closed
+        # set and no model id or agent name contains ':'.
+        if sep:
+            model, effort = _split_effort(model or "", start)
+        else:
+            name, effort = _split_effort(name, start)
         if not name:
             raise HwoParseError("Empty agent name", start)
         if sep and not model:
@@ -250,7 +289,8 @@ class _Parser:
         if self._peek() != "}":
             raise HwoParseError(f'Unclosed body for agent "{name}", expected }}', self.i)
         self._expect("}")
-        node = {"type": "agent", "name": name, "promptFile": prompt_file, "model": model, "body": body}
+        node = {"type": "agent", "name": name, "promptFile": prompt_file, "model": model,
+                "effort": effort, "body": body}
         if io is not None:
             node["io"] = io
         return node

@@ -79,6 +79,7 @@ class HwoAgent:
     parent: Optional["HwoAgent"] = field(default=None, repr=False)
     prompt_file: Optional[str] = None
     model: Optional[str] = None
+    effort: Optional[str] = None                # #name:gear# thinking pin
     io: Optional[dict] = None
 
     def all_tasks(self) -> list:
@@ -380,8 +381,12 @@ def _session_to_hwo(session: HwoSession) -> str:
         pad = "  " * depth
         prompt = f"({agent.prompt_file})" if agent.prompt_file else ""
         model = f"@{agent.model}" if agent.model else ""
+        # Studio does not edit the thinking pin, but it must write back every
+        # pin it read: a round trip that drops one silently rewrites the
+        # author's workflow.
+        effort = f":{agent.effort}" if agent.effort else ""
         lines.append(
-            f"{pad}{prompt}#{agent.name}{model}#{_io_text(agent.io)} {{")
+            f"{pad}{prompt}#{agent.name}{model}{effort}#{_io_text(agent.io)} {{")
         for task in agent.tasks:
             lines.append(f"{pad}  -> {task.text}")
         for child in agent.children:
@@ -417,7 +422,8 @@ def _runner_agent_to_ui(ra, parent: Optional[HwoAgent] = None) -> HwoAgent:
     ua = HwoAgent(
         name=ra.name, parent=parent,
         prompt_file=getattr(ra, "prompt_file", None),
-        model=getattr(ra, "model", None), io=getattr(ra, "io", None))
+        model=getattr(ra, "model", None), effort=getattr(ra, "effort", None),
+        io=getattr(ra, "io", None))
     for item in ra.body:
         k = getattr(item, "kind", "")
         if k == "task":
@@ -1218,6 +1224,7 @@ def run_hwo_ui(root_agent_name: str,
                 ("class:inspector.value", f"  children    {len(agent.children)}\n"),
                 ("class:inspector.value", f"  all tasks   {len(agent.all_tasks())}\n"),
                 ("class:inspector.value", f"  model       {agent.model or 'auto'}\n"),
+                ("class:inspector.value", f"  thinking    {agent.effort or 'inherit'}\n"),
                 ("class:inspector.value", f"  prompt      {agent.prompt_file or 'default'}\n"),
             ])
         elif row.kind == "task":

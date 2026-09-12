@@ -3,6 +3,7 @@ import os
 import queue
 import re
 import shlex
+import subprocess
 import tempfile
 import threading
 import time
@@ -1466,6 +1467,73 @@ class EphemeralSessionTests(unittest.TestCase):
             self.assertEqual(again["result"], "true|cat")
         finally:
             terminal.session.close()
+
+    def test_a_backgrounded_command_runs_and_reports_completion(self):
+        """`{ cmd &; }` is a bash syntax error, and a syntax error voids the
+        whole wrapper line — including the end marker. `npm run dev &` used
+        to neither start nor ever finish: the caller waited out the entire
+        idle budget and then signalled a shell with nothing running in it."""
+        import laintas_cli
+
+        session = laintas_cli.InteractiveSession(
+            laintas_cli.DEFAULT_SHELL, timeout=0, stream_output=False,
+            persistent=True, cwd="/tmp")
+        session.start()
+        time.sleep(0.1)
+        session.read_output(timeout=0.1)
+        try:
+            started = time.monotonic()
+            result = laintas_cli._marker_poll_exec(
+                session, "sleep 37 &", timeout=10)
+            elapsed = time.monotonic() - started
+            # Reported completion, rather than being reclaimed by the budget.
+            self.assertEqual(0, result["returncode"])
+            self.assertLess(elapsed, 5)
+            self.assertNotIn("syntax error", result["stdout"])
+
+            # The job is real: a child of the terminal, still running.
+            children = subprocess.run(
+                ["pgrep", "-P", str(session.pid)],
+                capture_output=True, text=True).stdout.split()
+            running = [
+                pid for pid in children
+                if "sleep 37" in subprocess.run(
+                    ["ps", "-o", "args=", "-p", pid],
+                    capture_output=True, text=True).stdout]
+            self.assertEqual(1, len(running), children)
+
+            # And the terminal is immediately usable, not left dirty.
+            after = laintas_cli._marker_poll_exec(session, "echo __AFTER''__")
+            self.assertEqual(0, after["returncode"])
+            self.assertIn("__AFTER__", after["stdout"])
+        finally:
+            session.close()
+
+    def test_a_trailing_terminator_is_not_doubled(self):
+        """The same trap from the other side: `{ ls ;; }` is also an error.
+
+        An escaped `\\&` is a literal ampersand and still needs its `;`,
+        which is what keeps this from being a naive endswith check.
+        """
+        for command, expected_body in (
+                ("echo hi", "echo hi;"),
+                ("ls;", "ls;"),                    # already terminated
+                ("sleep 1 &", "sleep 1 &"),        # `&` IS the terminator
+                ("sleep 1&", "sleep 1&"),
+                ("echo a\\&", "echo a\\&;"),      # escaped: a literal, not an operator
+                ("true && echo both", "true && echo both;"),
+        ):
+            payload = tools.shell_payload_for_pty(
+                command, noninteractive=True, token="t")
+            body = payload.split("}; ", 1)[0] + "}"
+            self.assertEqual(
+                f"__laintas_run_t() {{ {expected_body} }}", body)
+            # The real arbiter: bash itself must accept the wrapper.
+            probe = subprocess.run(
+                ["bash", "-c", f"{payload} 2>/dev/null; echo __RC''__:$?"],
+                capture_output=True, text=True)
+            self.assertNotIn("syntax error", probe.stderr, command)
+            self.assertIn("__RC__:", probe.stdout, command)
 
     def test_direct_terminal_command_only_overrides_pager_variables(self):
         import laintas_cli

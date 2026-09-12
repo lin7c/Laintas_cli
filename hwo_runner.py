@@ -39,6 +39,7 @@ class HwoAgent:
     body: list = field(default_factory=list)   # list[HwoStep]
     prompt_file: Optional[str] = None           # optional (file.md) prefix override
     model: Optional[str] = None                 # optional #name@model# backend-model pin
+    effort: Optional[str] = None                # optional #name:gear# thinking-effort pin
     io: Optional[dict] = None                   # optional [in(...), out(...)] contract
 
 
@@ -63,6 +64,19 @@ from hwo_adapter import (  # noqa: E402
 )
 
 
+def _resolve_pins(agent_step, ctx) -> tuple:
+    """``(model, effort)`` for this agent: its own pin wins, else the parent's.
+
+    The two pins are independent axes on purpose. An agent may pin only how
+    hard it thinks (``#linter:none#``) and leave routing alone, or pin a model
+    and inherit the thinking gear from the agent above it. Inheritance is what
+    makes a pin on the top agent mean "this whole subtree", which is how the
+    model pin has always behaved and the only behaviour an author can predict.
+    """
+    return (getattr(agent_step, "model", None) or ctx.model_override,
+            getattr(agent_step, "effort", None) or ctx.effort_override)
+
+
 def _to_node(d: dict) -> HwoStep:
     """Convert a shared JSON-AST node into the local dataclass model."""
     t = d["type"]
@@ -73,6 +87,7 @@ def _to_node(d: dict) -> HwoStep:
             name=d["name"],
             prompt_file=d.get("promptFile"),
             model=d.get("model"),
+            effort=d.get("effort"),
             io=d.get("io"),
             body=[_to_node(c) for c in d["body"]],
         )
@@ -94,8 +109,9 @@ def summarize_steps(steps: list, indent: int = 0) -> list:
             lines.append(f"{pad}- task: {step.text.replace(chr(10), ' ')[:100]}")
         elif step.kind == 'agent':
             _model = f"@{step.model}" if step.model else ""
+            _effort = f":{step.effort}" if step.effort else ""
             _io = _format_io_summary(step.io) if step.io else ""
-            lines.append(f"{pad}- agent: #{step.name}{_model}#{_io}")
+            lines.append(f"{pad}- agent: #{step.name}{_model}{_effort}#{_io}")
             lines.extend(summarize_steps(step.body, indent + 1))
         elif step.kind == 'parallel':
             lines.append(f"{pad}- parallel:")
@@ -594,6 +610,7 @@ class HwoCtx:
     workflow_manifest: Optional[dict] = None   # name -> {parent_name, sibling_names, child_names, prompt_file}
     prompt_override: Optional[str] = None      # resolved (prompt.md) content, inherited down the tree
     model_override: Optional[str] = None       # #name@model# backend-model pin, inherited down the tree
+    effort_override: Optional[str] = None      # #name:gear# thinking pin, inherited down the tree
     tool_scope: Optional[list] = None          # HWG node tool allowlist; narrows every agent in this file
     workflow_inputs: Optional[dict] = None     # structured inputs from hwo(...) or HWG
     workflow_input_types: Optional[dict] = None
@@ -899,6 +916,8 @@ def _run_task_group(texts: list[str], ctx: HwoCtx, inherited: str = "") -> dict:
         child.state['_tool_allowlist'] = list(ctx.tool_scope)
     if ctx.model_override:
         child.state['_model_override'] = ctx.model_override
+    if ctx.effort_override:
+        child.state['_effort_override'] = ctx.effort_override
 
     full_input = _format_hwo_todo_goal(texts, ctx, inherited)
     _emit(ctx, "agent_spawned", {
@@ -1032,10 +1051,11 @@ def _run_agent(agent_step: HwoAgent, ctx: HwoCtx, inherited: str = "") -> dict:
     if ctx.tool_scope:
         child.state['_tool_allowlist'] = list(ctx.tool_scope)
 
-    # Model pin: this agent's own `@model` wins, else inherit the parent's pin.
-    model_override = agent_step.model or ctx.model_override
+    model_override, effort_override = _resolve_pins(agent_step, ctx)
     if model_override:
         child.state['_model_override'] = model_override
+    if effort_override:
+        child.state['_effort_override'] = effort_override
 
     team_manifest = generate_team_manifest(agent_step.name, ctx.workflow_manifest) if ctx.workflow_manifest else ""
     returned_outputs = {}
@@ -1090,6 +1110,7 @@ def _run_agent(agent_step: HwoAgent, ctx: HwoCtx, inherited: str = "") -> dict:
                     workflow_manifest=ctx.workflow_manifest,
                     prompt_override=prompt_override,
                     model_override=model_override,
+                    effort_override=effort_override,
                     tool_scope=ctx.tool_scope,
                     workflow_inputs=ctx.workflow_inputs,
                     workflow_input_types=ctx.workflow_input_types,
@@ -1148,6 +1169,7 @@ def _run_agent(agent_step: HwoAgent, ctx: HwoCtx, inherited: str = "") -> dict:
                     workflow_manifest=ctx.workflow_manifest,
                     prompt_override=prompt_override,
                     model_override=model_override,
+                    effort_override=effort_override,
                     tool_scope=ctx.tool_scope,
                     workflow_inputs=ctx.workflow_inputs,
                     workflow_input_types=ctx.workflow_input_types,

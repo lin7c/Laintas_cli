@@ -74,6 +74,11 @@ def record(*, model: str, prompt_tokens: int, completion_tokens: int,
             "truncated": bool(truncated),
             "pid": os.getpid(),
         }
+        try:
+            import aipow_bridge
+            aipow_bridge.usage(rec)
+        except Exception:
+            pass
         line = json.dumps(rec, ensure_ascii=False) + "\n"
         with _LOCK:
             _SESSION.append(rec)

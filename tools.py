@@ -6190,7 +6190,7 @@ def _bi_session_start(params: dict, ctx: ToolCtx) -> dict:
     try:
         # Idle budget (seconds of silence), not a runtime cap — see
         # SHELL_IDLE_TIMEOUT_SECONDS.
-        timeout = max(1, int(params.get("timeout", int(SHELL_IDLE_TIMEOUT_SECONDS))))
+        timeout = max(1, int(params.get("timeout", int(shell_idle_timeout()))))
     except (TypeError, ValueError):
         return {"ok": False, "error": "timeout must be an integer"}
 
@@ -6709,6 +6709,21 @@ SHELL_AUTOMATION_ASSIGNMENTS = (
 )
 
 
+def _ends_with_terminator(body: str) -> bool:
+    """True if `body` already ends in a command terminator bash accepts
+    directly before a closing `}`.
+
+    `&&` is an operator waiting for its right-hand side, not a terminator.
+    An escaped `\\&` is a literal ampersand — the character, not the
+    background operator — so it still needs a `;` after it; that is what the
+    backslash count is for (an odd run means the `&` is escaped).
+    """
+    if body.endswith("&&") or not body.endswith(("&", ";")):
+        return False
+    head = body[:-1]
+    return (len(head) - len(head.rstrip("\\"))) % 2 == 0
+
+
 def shell_payload_for_pty(command: str, *, noninteractive: bool = False,
                           token: str = "", agent_automation: bool = True) -> str:
     """Return the command form safe to embed in a one-line marker wrapper.
@@ -6734,8 +6749,15 @@ def shell_payload_for_pty(command: str, *, noninteractive: bool = False,
         SHELL_AUTOMATION_ASSIGNMENTS
         if agent_automation else SHELL_PAGER_ASSIGNMENTS
     )
+    body = payload.rstrip()
+    # `&` already terminates a command, so `{ cmd &; }` is a bash syntax
+    # error — and a syntax error voids the WHOLE wrapper line, including the
+    # end marker at the end of it. A backgrounded command therefore neither
+    # ran nor ever reported completion: the caller sat out the full idle
+    # budget and then signalled a shell that had nothing running in it.
+    # `{ cmd ;; }` is the same trap approached from the other side.
     return (
-        f"{function_name}() {{ {payload}; }}; "
+        f"{function_name}() {{ {body}{'' if _ends_with_terminator(body) else ';'} }}; "
         f"{assignments} {function_name}; "
         f"{rc_name}=$?; unset -f {function_name}; (exit \"${rc_name}\")"
     )
@@ -6968,7 +6990,7 @@ def _exec_in_deployed_shell(command: str, session: Any, timeout: int,
         session.send_keys(wrapped + "\n")
         # Idle clock: `timeout` bounds SILENCE, not runtime. A command that
         # keeps printing keeps its lease for as long as it needs.
-        _idle_budget = max(1.0, float(timeout or SHELL_IDLE_TIMEOUT_SECONDS))
+        _idle_budget = max(1.0, float(timeout or shell_idle_timeout()))
         _started_at = time.monotonic()
         _last_output = time.monotonic()
         _seen_len = 0
@@ -7071,6 +7093,22 @@ def _exec_in_deployed_shell(command: str, session: Any, timeout: int,
 # streaming output the whole time. Silence is the real symptom: a hung process,
 # a pager, a prompt waiting for input that will never come.
 SHELL_IDLE_TIMEOUT_SECONDS = 120.0
+
+
+def shell_idle_timeout() -> float:
+    """The configured idle budget (`/config shell_idle_timeout`).
+
+    The constant above stays the factory value and the fallback: agent_loop
+    imports tools, so the lookup is done lazily here rather than at import
+    time, and any failure to reach the registry degrades to the default
+    instead of taking the shell path down with it.
+    """
+    try:
+        import agent_loop
+        value = float(agent_loop.get_runtime_config("shell_idle_timeout"))
+    except Exception:
+        return SHELL_IDLE_TIMEOUT_SECONDS
+    return value if value > 0 else SHELL_IDLE_TIMEOUT_SECONDS
 SHELL_PROCESS_EXIT_WAIT_SECONDS = 5.0
 SHELL_PROCESS_TERM_GRACE_SECONDS = 0.5
 SHELL_PROCESS_KILL_WAIT_SECONDS = 2.0
@@ -7158,10 +7196,10 @@ def _shell_idle_budget(params: dict) -> float:
     try:
         value = params.get("timeout")
         if value is None:
-            return SHELL_IDLE_TIMEOUT_SECONDS
+            return shell_idle_timeout()
         return max(1.0, float(value))
     except (TypeError, ValueError):
-        return SHELL_IDLE_TIMEOUT_SECONDS
+        return shell_idle_timeout()
 
 
 def _command_has_cd_prefix(command: str) -> bool:

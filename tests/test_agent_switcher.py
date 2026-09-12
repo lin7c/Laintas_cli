@@ -88,8 +88,8 @@ class ReaderRewiringTests(unittest.TestCase):
         seen = []
         started = threading.Event()
 
-        def _record(q, ev, _stop):
-            seen.append((q, ev))
+        def _record(q, ev, _stop, hint=None):
+            seen.append((q, ev, hint))
             started.set()
 
         with mock.patch.object(laintas_cli, "_bg_reader_cbreak_mode", _record), \
@@ -114,8 +114,8 @@ class ReaderRewiringTests(unittest.TestCase):
         restarted = []
         started = threading.Event()
 
-        def _record(q, ev, _stop):
-            restarted.append((q, ev))
+        def _record(q, ev, _stop, hint=None):
+            restarted.append((q, ev, hint))
             started.set()
 
         with mock.patch.object(laintas_cli, "_bg_reader_cbreak_mode", _record), \
@@ -129,7 +129,7 @@ class ReaderRewiringTests(unittest.TestCase):
                 thread.join(5)
             laintas_cli._bg_reader_thread = None
 
-        self.assertEqual([(run_queue, run_event)], restarted)
+        self.assertEqual([(run_queue, run_event, None)], restarted)
         # Specifically NOT the module-level pair, which is what it used to be.
         self.assertIsNot(run_queue, agent_loop.get_user_message_queue())
         self.assertIsNot(run_event, agent_loop.get_user_interrupt_event())

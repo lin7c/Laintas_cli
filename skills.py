@@ -926,6 +926,12 @@ def get_activated_skills_context() -> str:
     for name, state in _skill_states.items():
         if state.loaded and state.body:
             parts.append(f"### Skill: {name}\n{state.body}")
+            try:
+                import aipow_bridge
+                aipow_bridge.emit("skill.used", {"name": name,
+                                                 "basis": "context_injected"})
+            except Exception:
+                pass
     return "\n\n".join(parts) if parts else ""
 
 
