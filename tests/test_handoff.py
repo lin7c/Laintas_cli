@@ -398,3 +398,122 @@ class TestCorruptEnvelopesDoNotTakeDownTheListing(HandoffTestCase):
         self.write_raw("wrong-type.json", '"a bare string"')
         self.write_raw("no-id.json", '{"version": 1}')
         self.assertEqual(len(handoff.list_all(self.cwd)), 1)
+
+
+class TestPortableToken(HandoffTestCase):
+    """One string, any channel — and what it does when the channel damages it."""
+
+    def test_round_trips_through_a_token(self):
+        env = self.make(to="bob", avoid=["别重跑 015,已经应用过了"],
+                        contract={"outputs": [{"name": "m", "type": "file"}]},
+                        expect={"m": "migrations/020.sql"})
+        back = handoff.decode_token(handoff.export_token(env))
+        self.assertEqual(back["id"], env["id"])
+        self.assertEqual(back["avoid"], env["avoid"])
+        self.assertEqual(back["expect"], env["expect"])
+        # Same header on both sides, which is what lets the two copies merge.
+        self.assertEqual(handoff.header_digest(back), handoff.header_digest(env))
+
+    def test_survives_what_chat_clients_do_to_long_lines(self):
+        # Every mail agent and chat client rewraps a 700-character line, and
+        # some add leading indentation. None of that may matter.
+        token = handoff.export_token(self.make())
+        wrapped = "\n   ".join(token[i:i + 40] for i in range(0, len(token), 40))
+        self.assertEqual(handoff.decode_token(f"  \n{wrapped}\n\n")["id"],
+                         handoff.decode_token(token)["id"])
+
+    def test_a_truncated_paste_is_refused_not_half_imported(self):
+        # The likeliest damage by far, and the one that would otherwise produce
+        # a plausible-looking partial handoff. Two guards catch it depending on
+        # where the cut lands, and both must refuse: base64 rejects a length
+        # that cannot be a valid encoding, and the digest catches a cut that
+        # happens to land on a 4-character boundary and decodes cleanly.
+        token = handoff.export_token(self.make())
+        for cut in range(1, 9):
+            with self.subTest(cut=cut), self.assertRaises(handoff.HandoffError):
+                handoff.decode_token(token[:-cut])
+        body = token.split(":", 3)[3]
+        self.assertEqual(len(body[:-4]) % 4, len(body) % 4,
+                         "this cut must stay base64-decodable to test the digest")
+        with self.assertRaises(handoff.HandoffError) as ctx:
+            handoff.decode_token(token[:-4])
+        self.assertIn("incomplete", str(ctx.exception))
+
+    def test_an_altered_body_is_refused(self):
+        token = handoff.export_token(self.make())
+        flipped = token[:-5] + ("A" if token[-5] != "A" else "B") + token[-4:]
+        with self.assertRaises(handoff.HandoffError):
+            handoff.decode_token(flipped)
+
+    def test_rubbish_is_rejected_by_shape_before_anything_else(self):
+        for bad in ("", "hello", "laintas-handoff", "laintas-handoff:1:abc",
+                    "other-tool:1:abcd1234:xxxx"):
+            with self.assertRaises(handoff.HandoffError):
+                handoff.decode_token(bad)
+
+    def test_a_newer_token_version_is_refused(self):
+        token = handoff.export_token(self.make())
+        parts = token.split(":", 3)
+        with self.assertRaises(handoff.HandoffError) as ctx:
+            handoff.decode_token(":".join([parts[0], "99", parts[2], parts[3]]))
+        self.assertIn("upgrade", str(ctx.exception))
+
+    def test_a_decompression_bomb_is_bounded(self):
+        # A few hundred kilobytes of base64 that inflates to 200MB. Without the
+        # cap this is a way to kill the process with one pasted message.
+        import base64 as b64
+        import gzip
+        import hashlib as hl
+        payload = gzip.compress(b"\0" * (200 * 1024 * 1024), 9)
+        token = (f"{handoff.TOKEN_PREFIX}:{handoff.TOKEN_VERSION}:"
+                 f"{hl.sha256(payload).hexdigest()[:8]}:"
+                 f"{b64.urlsafe_b64encode(payload).rstrip(b'=').decode()}")
+        with self.assertRaises(handoff.HandoffError) as ctx:
+            handoff.decode_token(token)
+        self.assertIn("expands", str(ctx.exception))
+
+    def test_absurd_input_is_refused_before_it_is_decoded(self):
+        with self.assertRaises(handoff.HandoffError):
+            handoff.decode_token("laintas-handoff:1:abcdabcd:"
+                                 + "A" * (handoff.MAX_TOKEN_CHARS + 1))
+
+    def test_looks_like_token_tolerates_surrounding_whitespace(self):
+        self.assertTrue(handoff.looks_like_token("\n  laintas-handoff:1:x:y"))
+        self.assertFalse(handoff.looks_like_token("/tmp/some.handoff"))
+        self.assertFalse(handoff.looks_like_token(""))
+
+
+class TestImportEnvelope(HandoffTestCase):
+    def test_importing_something_new_writes_it(self):
+        import tempfile as tf
+        with tf.TemporaryDirectory() as elsewhere:
+            theirs = handoff.create("their work", "bob", cwd=elsewhere)
+            token = handoff.export_token(theirs)
+        env = handoff.import_envelope(handoff.decode_token(token), self.cwd)
+        self.assertTrue(handoff.handoff_path(env["id"], self.cwd).exists())
+        self.assertEqual(env["createdBy"], "bob")
+
+    def test_importing_can_only_add_events_never_remove_them(self):
+        # The property that makes accepting a handoff from anyone reasonable.
+        env = self.make()
+        mine = handoff.append(env["id"], "note", "ann", "local only", cwd=self.cwd)
+        stale = handoff.parse(dict(env))          # a copy from before that note
+        merged = handoff.import_envelope(stale, self.cwd)
+        notes = [e["note"] for e in merged["events"]]
+        self.assertIn("local only", notes)
+        self.assertEqual(len(merged["events"]), len(mine["events"]))
+
+    def test_a_forged_header_under_a_known_id_is_refused(self):
+        env = self.make()
+        forged = handoff.parse(dict(env, avoid=["do the dangerous thing"]))
+        with self.assertRaises(handoff.HandoffError):
+            handoff.import_envelope(forged, self.cwd)
+        # The local copy is untouched by the attempt.
+        self.assertEqual(handoff.load(env["id"], self.cwd)["avoid"], env["avoid"])
+
+    def test_foreign_repo_is_detected(self):
+        import tempfile as tf
+        self.assertFalse(handoff.foreign_repo(self.make(), self.cwd))
+        with tf.TemporaryDirectory() as elsewhere:
+            theirs = handoff.create("their work", "bob", cwd=elsewhere)
+        self.assertTrue(handoff.foreign_repo(theirs, self.cwd))

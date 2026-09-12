@@ -3261,9 +3261,9 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec(
         "/handoff", "Hand the work to the next person as a file, not a chat log",
         "Agents & Terminals",
-        "/handoff [list|new <title>|show <id>|claim <id>|release <id>|note <id> <text>|close <id>|reopen <id>|sync [id]|remote|fetch <remote-path>]",
+        "/handoff [list|new <title>|show <id>|claim <id>|release <id>|note <id> <text>|close <id>|reopen <id>|sync [id]|export <id> [file]|import <token|file>|remote|fetch <remote-path>]",
         subcommands=("list", "new", "show", "claim", "release", "note", "close",
-                     "reopen", "sync", "remote", "fetch"),
+                     "reopen", "sync", "export", "import", "remote", "fetch"),
         completion_descriptions=(
             ("list", "Every handoff in this workspace and what is left on it"),
             ("new", "Write one before you stop for the day"),
@@ -3274,6 +3274,8 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
             ("close", "Mark it handed over and done"),
             ("reopen", "Undo a close"),
             ("sync", "Merge with the shared copy through Laintas storage"),
+            ("export", "Render it as one string to send over any channel"),
+            ("import", "Take a handoff somebody pasted or mailed you"),
             ("remote", "List handoffs other machines shared for this repository"),
             ("fetch", "Take a handoff somebody else created"),
         ),
@@ -11804,6 +11806,7 @@ _SLASH_ARG_RULES: dict[tuple[str, ...], SlashArgRule] = {
     ("/handoff", "close"): _arg_rule(2, "/handoff close <id>"),
     ("/handoff", "reopen"): _arg_rule(2, "/handoff reopen <id>"),
     ("/handoff", "sync"): _arg_rule(2, "/handoff sync [id]"),
+    ("/handoff", "export"): _arg_rule(3, "/handoff export <id> [file]"),
     ("/handoff", "remote"): _arg_rule(1, "/handoff remote"),
     ("/handoff", "fetch"): _arg_rule(2, "/handoff fetch <remote-path>"),
     ("/messages", "list"): _arg_rule(1, "/messages list"),
@@ -14749,7 +14752,7 @@ def _cmd_handoff(parts: list, session: dict) -> None:
         console.print(
             "Usage: [bold]/handoff[/bold] [list|new <title>|show <id>|claim <id>|"
             "release <id>|note <id> <text>|close <id>|reopen <id>|"
-            "sync \\[id]|remote|fetch <remote-path>]\n"
+            "sync \\[id]|export <id> \\[file]|import <token|file>|remote|fetch <remote-path>]\n"
             "[dim]An envelope in .laintas/handoff/ — committable, mergeable, and "
             "re-verified against the workspace instead of believed.[/dim]\n"
             "[dim]new: add \"don't do X\" notes with --avoid \"…\" (repeatable), "
@@ -14826,6 +14829,51 @@ def _cmd_handoff(parts: list, session: dict) -> None:
                 detail = (f"[green]+{gained} new event(s) from the shared copy[/green]"
                           if gained else "[dim]already in step[/dim]")
                 console.print(f"{escape(env['id'])} {symbols.BULLET} {detail}")
+            return
+
+        if sub == "export":
+            env = handoff.load(args[0], cwd)
+            token = handoff.export_token(env)
+            if len(args) > 1:
+                target = os.path.abspath(os.path.expanduser(args[1]))
+                with open(target, "w", encoding="utf-8") as f:
+                    f.write(token + "\n")
+                console.print(f"[green]Wrote {escape(target)} "
+                              f"({len(token)} chars).[/green]")
+                console.print("[dim]Attach it to mail or chat. The other side runs "
+                              "/handoff import <file>.[/dim]")
+                return
+            console.print(f"[dim]Send this to them — any channel. "
+                          f"{len(token)} chars, no account or link needed:[/dim]")
+            # Printed without markup or highlighting so what they copy is
+            # exactly what was generated; line wrapping is harmless because
+            # decode strips whitespace before it does anything else.
+            console.print(token, markup=False, highlight=False)
+            console.print("[dim]They run: /handoff import <paste>[/dim]")
+            return
+
+        if sub == "import":
+            source = " ".join(args)
+            if not handoff.looks_like_token(source):
+                path = os.path.abspath(os.path.expanduser(args[0]))
+                if not os.path.isfile(path):
+                    console.print(
+                        "[yellow]Paste the token, or give a file: "
+                        "/handoff import <token|file>[/yellow]")
+                    return
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    source = f.read()
+            incoming = handoff.decode_token(source)
+            if handoff.foreign_repo(incoming, cwd):
+                console.print(
+                    "[yellow]This handoff was written against a different "
+                    "repository — its outstanding checks are paths, and they will "
+                    "fail here for reasons that are not about the work.[/yellow]")
+            existed = handoff.handoff_path(incoming["id"], cwd).exists()
+            env = handoff.import_envelope(incoming, cwd)
+            console.print(f"[green]{'Merged into' if existed else 'Imported'} "
+                          f"{escape(env['id'])}.[/green]")
+            _handoff_print_one(env, cwd)
             return
 
         if sub == "remote":

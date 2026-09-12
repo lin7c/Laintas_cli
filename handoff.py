@@ -60,6 +60,7 @@ values or raises :class:`HandoffError`; the REPL command owns all printing.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -649,3 +650,133 @@ def list_remote(client, key: str = "", cwd: Optional[str] = None) -> list:
     folder = f"{REMOTE_PREFIX}/{bucket}"
     return [e.path for e in client.list(folder)
             if not e.is_dir and e.path.endswith(".json")]
+
+
+# ---------------------------------------------------------------------------
+# Portable form — one string, any channel
+# ---------------------------------------------------------------------------
+#
+# Storage sync needs both sides signed into the same Laintas account. Plenty of
+# handoffs are not like that: a contractor, somebody at another company, a
+# colleague who just wants it in WeChat. Rather than open a channel for them,
+# the envelope becomes **one self-contained string** that travels over whatever
+# the two people already use — mail, chat, a pasted message, a file.
+#
+# That is deliberately the whole protocol. There is no port to open, no account
+# to provision, no link to expire, and nothing to keep running: a handoff that
+# arrives by email works the same in five years as it does today, because
+# everything needed to read it is in the string.
+#
+# Format:  laintas-handoff:1:<digest8>:<base64url of gzipped JSON>
+#
+#   * base64url without padding, so the token survives a URL, a filename and a
+#     chat client that treats `+` as a space;
+#   * all whitespace is stripped before decoding, because every chat client and
+#     mail agent in existence will rewrap a 700-character line;
+#   * `digest8` covers the *compressed bytes*, so a truncated paste — by far
+#     the most likely corruption, and the one that otherwise yields a
+#     plausible-looking partial handoff — fails loudly instead of importing.
+#
+# **What this does not do is authenticate.** A checksum detects damage, not
+# forgery, and there is no key to sign with that the other side could verify
+# without exactly the server infrastructure this avoids. So a handoff token is
+# worth what the person who sent it is worth, the same as any attachment: it is
+# imported into a file you can read and diff before acting on, and importing it
+# can only ever *add* events to your own copy. Nothing in it executes.
+
+TOKEN_PREFIX = "laintas-handoff"
+TOKEN_VERSION = "1"
+
+#: Refuse absurd input before spending memory on it. An envelope is a few
+#: kilobytes; a megabyte of base64 is not a handoff.
+MAX_TOKEN_CHARS = 1_000_000
+#: Bound on what the token is allowed to inflate to. Without this a crafted
+#: token is a decompression bomb: a few hundred bytes of base64 that expands
+#: until the process dies.
+MAX_DECOMPRESSED_BYTES = 4 * 1024 * 1024
+
+_WHITESPACE = re.compile(r"\s+")
+
+
+def export_token(env: dict) -> str:
+    """Render an envelope as one string to paste into any channel."""
+    import gzip
+
+    payload = gzip.compress(
+        _canonical({k: v for k, v in env.items() if k != "_"}).encode("utf-8"), 9)
+    digest = hashlib.sha256(payload).hexdigest()[:8]
+    body = base64.urlsafe_b64encode(payload).rstrip(b"=").decode("ascii")
+    return f"{TOKEN_PREFIX}:{TOKEN_VERSION}:{digest}:{body}"
+
+
+def looks_like_token(text: str) -> bool:
+    return _WHITESPACE.sub("", str(text or "")).startswith(f"{TOKEN_PREFIX}:")
+
+
+def decode_token(text: str) -> dict:
+    """Turn a pasted token back into an envelope. Validates before it trusts."""
+    import zlib
+
+    raw = str(text or "")
+    if len(raw) > MAX_TOKEN_CHARS:
+        raise HandoffError("that is far too large to be a handoff token")
+    compact = _WHITESPACE.sub("", raw)
+    parts = compact.split(":", 3)
+    if len(parts) != 4 or parts[0] != TOKEN_PREFIX:
+        raise HandoffError("that is not a handoff token")
+    if parts[1] != TOKEN_VERSION:
+        raise HandoffError(
+            f"handoff token format v{parts[1]} is not v{TOKEN_VERSION} — upgrade laintas_cli")
+    digest, body = parts[2], parts[3]
+
+    try:
+        payload = base64.urlsafe_b64decode(body + "=" * (-len(body) % 4))
+    except (ValueError, TypeError) as exc:
+        raise HandoffError(f"the token is damaged and cannot be decoded: {exc}") from exc
+    if hashlib.sha256(payload).hexdigest()[:8] != digest:
+        # Overwhelmingly this is a paste that lost its tail. Saying so beats a
+        # JSON error, and refusing beats importing the half that survived.
+        raise HandoffError(
+            "the token is incomplete or was altered in transit — copy the whole "
+            "thing, or send it as a file with /handoff export <id> <file>")
+
+    try:
+        # Bounded so a crafted token cannot inflate until the process dies.
+        # `decompress(data, max_length)` stops at the cap, and anything left in
+        # `unconsumed_tail` means the real size is over it.
+        engine = zlib.decompressobj(16 + zlib.MAX_WBITS)
+        text_bytes = engine.decompress(payload, MAX_DECOMPRESSED_BYTES)
+        if engine.unconsumed_tail:
+            raise HandoffError("that token expands to far more than a handoff")
+        data = json.loads(text_bytes.decode("utf-8"))
+    except HandoffError:
+        raise
+    except (zlib.error, UnicodeDecodeError, ValueError) as exc:
+        raise HandoffError(f"the token does not contain a handoff: {exc}") from exc
+    return parse(data, source="token")
+
+
+def import_envelope(incoming: dict, cwd: Optional[str] = None) -> dict:
+    """Adopt a received envelope, merging into any copy already here.
+
+    Merging rather than replacing is the safety property that makes accepting a
+    handoff from anyone reasonable: the worst a hostile or stale token can do to
+    a handoff you already hold is add events to it, and a header that disagrees
+    is refused outright by :func:`merge`.
+    """
+    if handoff_path(incoming["id"], cwd).exists():
+        incoming, _ = merge(load(incoming["id"], cwd), incoming)
+    _write(incoming, cwd)
+    _ensure_gitignore_exception(cwd)
+    return incoming
+
+
+def foreign_repo(env: dict, cwd: Optional[str] = None) -> bool:
+    """Whether this envelope was written against a different repository.
+
+    Worth saying out loud on import: the acceptance checks are paths, and paths
+    from another repository will fail for reasons that have nothing to do with
+    the work.
+    """
+    theirs = (env.get("repo") or {}).get("key")
+    return bool(theirs) and theirs != repo_baseline(cwd).get("key")
