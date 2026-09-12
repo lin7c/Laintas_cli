@@ -4,7 +4,7 @@ import { useLanguage } from '@/contexts/LanguageContext';
 // Faithful, live HTML/CSS reproduction of a real laintas-cli session.
 //
 // Visuals come from the runtime source, not a screenshot:
-//   - startup banner "Laintas CLI v1.25.2 · Lin7c" and the REPL status bar
+//   - startup banner "Laintas CLI v1.26.0 · Lin7c" and the REPL status bar
 //   - the real thinking spinner (symbols.py SPINNER_RELAY = "L· L› L» L›",
 //     140ms/frame, green #3fb950) with label format "Thinking… · model · mode"
 //   - real symbols → ✓ ↳ and real tool names (fs.grep, fs.read)
@@ -28,7 +28,7 @@ const TYPE_MS = 14;
 function buildSteps(lang) {
   const zh = lang === 'zh';
   return [
-    { k: 'line', text: 'Laintas CLI v1.25.2 · Lin7c', tone: 'accent', delay: 340 },
+    { k: 'line', text: 'Laintas CLI v1.26.0 · Lin7c', tone: 'accent', delay: 340 },
     { k: 'status', text: '~/laintas_cli     L> 3 | primary | ACT | deepseek-v4-flash', delay: 320 },
     { k: 'blank', delay: 200 },
     { k: 'input', text: zh ? '帮我分析一下laintas-cli' : 'analyze laintas-cli', hold: 340 },
