@@ -108,7 +108,7 @@ SCOPE_EXTENSION = "extension"
 
 #: Skill directories contributed by loaded extensions, keyed by extension name.
 #: An extension owns its prompts the same way it owns its tools: when the model
-#: is offered `code_map.*`, the method for using it arrives with them, and when
+#: is offered its tools, the method for using it arrives with them, and when
 #: the extension is unloaded both go away together. Leaving that prose in a
 #: bundled skill would describe tools that are not there -- worse than silence,
 #: because the model cannot tell instructions from a capability it lacks.

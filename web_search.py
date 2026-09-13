@@ -1100,7 +1100,7 @@ def _gateway_available() -> str:
 
 
 #: The signed-in Laintas session, for other code that talks to the gateway with
-#: the same credential — the bundled `code-map` extension does, and a second
+#: the same credential — extensions do, and a second
 #: copy of this logic would be a second place to get "never send these to a
 #: non-Laintas backend" wrong. Extensions reach it through a lazy import, so
 #: this stays a one-way dependency: core never imports an extension.

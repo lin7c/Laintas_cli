@@ -54,7 +54,16 @@ class DisclosureTests(unittest.TestCase):
     def setUp(self):
         self.root = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
-        shutil.copytree(REPO / "extensions" / "code-map", self.root / "code-map")
+        sample = self.root / "sample"
+        (sample / "skills" / "sample").mkdir(parents=True)
+        (sample / "extension.json").write_text(json.dumps({
+            "schemaVersion": 2, "name": "sample", "version": "1.0.0",
+            "entrypoint": "main.py", "description": "A sample extension",
+            "toolPrefix": "sample.", "capabilities": ["network"]}), encoding="utf-8")
+        (sample / "main.py").write_text("def register(ctx):\n    pass\n", encoding="utf-8")
+        (sample / "skills" / "sample" / "SKILL.md").write_text(
+            "---\nname: sample\ndescription: Reads a public GitHub repository\n---\n",
+            encoding="utf-8")
         for patch in (mock.patch.object(paths, "extensions_dir",
                                         lambda: self.root),
                       mock.patch.object(paths, "global_extensions_dir",
@@ -66,10 +75,10 @@ class DisclosureTests(unittest.TestCase):
     def test_it_names_what_reaches_the_model(self):
         """Tool schemas and skill prose, which is the half a sandbox would
         not have bounded even if there were one."""
-        facts = self.manager.disclosure("code-map")
-        self.assertEqual("code-map", facts["name"])
-        self.assertEqual("code_map.", facts["tool_namespace"])
-        self.assertEqual(["code-map"], [s["name"] for s in facts["skills"]])
+        facts = self.manager.disclosure("sample")
+        self.assertEqual("sample", facts["name"])
+        self.assertEqual("sample.", facts["tool_namespace"])
+        self.assertEqual(["sample"], [s["name"] for s in facts["skills"]])
         self.assertIn("public GitHub repository",
                       facts["skills"][0]["description"])
         self.assertGreater(facts["files"], 1)

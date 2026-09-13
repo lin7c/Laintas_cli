@@ -91,10 +91,6 @@ class PromptContractTests(unittest.TestCase):
         """
         prompt = laintas_cli.generate_cli_prop_template()
         self.assertIn("`code-reading` skill", prompt)
-        # The cached prefix names no extension's tools. `code_map.*` lived here
-        # while Code Map was built in; an uninstalled extension would have left
-        # the sentence describing a capability the model does not have.
-        self.assertNotIn("code_map", prompt)
         # Moved out of the prefix; still stated by the gateway's core-tool
         # guide and by the skill.
         self.assertNotIn("leading line-number prefixes are display only", prompt)
@@ -105,7 +101,6 @@ class PromptContractTests(unittest.TestCase):
         self.assertTrue(text.isascii())
         # The bundled skill describes only what every workspace has. Method for
         # an extension's tools ships with that extension.
-        self.assertNotIn("code_map", text)
         self.assertNotIn("atlas", text)
 
     def test_a_linux_host_is_told_nothing_about_windows(self):
