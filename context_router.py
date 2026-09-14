@@ -65,6 +65,12 @@ _GROUPS: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
       "progress"),
      ("plan.", "workflow.", "work.status")),
     (("task", "todo", "issue"), ("task.",)),
+    # Work the person does and the agent checks. An OPEN list keeps these
+    # visible regardless of wording (agent_loop._visible_tool_names_for_task).
+    (("retask", "reverse task", "walk me through", "guide me", "step by step",
+      "exercise", "quiz", "homework", "practice", "shot list", "photo shoot",
+      "integrate", "set up my account", "i will do it"),
+     ("retask.",)),
     (("rule", "always", "from now on", "remember to"),
      ("rule.",)),
     (("delete", "remove", "erase"),
@@ -108,6 +114,10 @@ _INPUT_ALIASES = {
     "\u56e2\u961f": "team", "\u5458\u5de5": "worker", "\u7ec8\u7aef": "terminal",
     "\u8fdb\u7a0b": "process", "\u670d\u52a1": "service", "\u670d\u52a1\u5668": "server",
     "\u65e5\u5fd7": "logs", "\u7aef\u53e3": "port", "\u90e8\u7f72": "deploy",
+    "\u9006\u5411\u4efb\u52a1": "retask", "\u5e26\u6211": "guide me",
+    "\u4e00\u6b65\u6b65": "step by step", "\u505a\u9898": "exercise",
+    "\u51fa\u9898": "quiz", "\u7ec3\u4e60": "practice", "\u62cd\u6444": "photo shoot",
+    "\u5206\u955c": "shot list", "\u63a5\u5165": "integrate", "\u5bf9\u63a5": "integrate",
     "\u89c4\u5212": "plan", "\u8ba1\u5212": "plan", "\u91cc\u7a0b\u7891": "milestone",
     "\u4efb\u52a1": "task", "\u5f85\u529e": "todo", "\u5de5\u5355": "issue",
     "\u89c4\u5219": "rule", "\u4ee5\u540e\u90fd": "from now on", "\u6bcf\u6b21\u90fd": "always",

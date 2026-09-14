@@ -7930,6 +7930,163 @@ def _canvas_board(params: dict, ctx: ToolCtx, create: bool = False):
     return (editor, "")
 
 
+def _retask_root(ctx: ToolCtx) -> str:
+    import os
+    return os.path.abspath(ctx.cwd or os.getcwd())
+
+
+def _retask_path(params: dict, ctx: ToolCtx, *, must_exist: bool = True):
+    """Resolve the list a call is about: an explicit path, else the active one."""
+    import os
+    import retask as retask_mod
+    root = _retask_root(ctx)
+    raw = str(params.get("path") or "").strip()
+    if not raw:
+        path = retask_mod.find_active(root) or next(iter(retask_mod.find_files(root)), None)
+        if not path:
+            return None, "no .retask list in this workspace; create one with retask.create"
+        return path, ""
+    path = os.path.abspath(os.path.join(root, raw))
+    if not path.endswith(retask_mod.EXTENSION):
+        return None, f"{raw} is not a {retask_mod.EXTENSION} file"
+    if path != root and not path.startswith(root + os.sep):
+        return None, f"{raw} is outside the workspace"
+    if must_exist and not os.path.isfile(path):
+        return None, f"no such list: {raw}"
+    return path, ""
+
+
+def _retask_summary(path: str, doc, ctx: ToolCtx, changed=None) -> dict:
+    import os
+    import retask as retask_mod
+    root = _retask_root(ctx)
+    done, total = retask_mod.progress(doc)
+    current = retask_mod.current_task(doc)
+    return {
+        "path": os.path.relpath(path, root),
+        "title": doc.title,
+        "progress": f"{done}/{total}",
+        "current": current.id if current else "",
+        "changes": [
+            {"id": t.id, "title": t.title, "status": t.status,
+             "note": t.notes[-1] if t.notes else ""}
+            for t in (changed if changed is not None else doc.tasks)
+        ],
+    }
+
+
+def _bi_retask_create(params: dict, ctx: ToolCtx) -> dict:
+    import os
+    import retask as retask_mod
+    root = _retask_root(ctx)
+    try:
+        doc = retask_mod.new_retask(
+            params.get("title") or "", params.get("goal") or "",
+            params.get("tasks") or [])
+    except retask_mod.RetaskError as exc:
+        return {"ok": False, "error": str(exc)}
+    raw = str(params.get("path") or "").strip() or retask_mod.file_name_for(doc.title)
+    path, error = _retask_path({"path": raw}, ctx, must_exist=False)
+    if error:
+        return {"ok": False, "error": error}
+    if os.path.exists(path):
+        return {"ok": False, "error": (
+            f"{os.path.relpath(path, root)} already exists; "
+            "change it with retask.update or pick another path")}
+    retask_mod.save(path, doc)
+    summary = _retask_summary(path, doc, ctx)
+    return {"ok": True,
+            "result": (f"created {summary['path']} ({len(doc.tasks)} tasks); "
+                       f"current task: {summary['current'] or 'none'}. "
+                       "The person sees it with /retask or Alt+R."),
+            "retask": summary}
+
+
+def _bi_retask_update(params: dict, ctx: ToolCtx) -> dict:
+    import copy
+    import os
+    import retask as retask_mod
+    path, error = _retask_path(params, ctx)
+    if error:
+        return {"ok": False, "error": error}
+    try:
+        doc = retask_mod.load(path)
+    except retask_mod.RetaskError as exc:
+        return {"ok": False, "error": str(exc)}
+    before = copy.deepcopy(doc)
+    task_id = str(params.get("id") or "").strip()
+    outcome = {"ok": True, "gaps": []}
+    try:
+        for raw in params.get("add_tasks") or []:
+            taken = {t.id for t in doc.tasks}
+            n = len(doc.tasks) + 1
+            while f"t{n}" in taken:
+                n += 1
+            doc.tasks.append(retask_mod.task_from_input(raw, f"t{n}"))
+        if task_id:
+            task = doc.task(task_id)
+            if task is None:
+                return {"ok": False, "error": (
+                    f"no task {task_id}; tasks are {', '.join(t.id for t in doc.tasks)}")}
+            if params.get("remove"):
+                doc.tasks.remove(task)
+                for other in doc.tasks:
+                    other.after = [d for d in other.after if d != task_id]
+            else:
+                if "title" in params:
+                    task.title = str(params["title"] or "").strip()
+                if "description" in params:
+                    task.description = str(params["description"] or "").strip("\n")
+                if "checks" in params:
+                    task.checks = [str(c).strip() for c in params["checks"] or [] if str(c).strip()]
+                if "after" in params:
+                    task.after = [str(a).strip() for a in params["after"] or [] if str(a).strip()]
+                if params.get("status"):
+                    retask_mod.validate(doc)
+                    outcome = retask_mod.set_status(
+                        doc, task_id, str(params["status"]), note=str(params.get("note") or ""),
+                        base_dir=os.path.dirname(path), root=_retask_root(ctx))
+                    if not outcome["ok"] and outcome.get("status") != retask_mod.REJECTED:
+                        return {"ok": False, "error": outcome["error"]}
+                elif params.get("note"):
+                    task.notes.append(f"{retask_mod._stamp()} {retask_mod._one_line(params['note'])}")
+        elif params.get("status") or params.get("note") or params.get("remove"):
+            return {"ok": False, "error": "pass the task id to change"}
+        retask_mod.validate(doc)
+    except retask_mod.RetaskError as exc:
+        return {"ok": False, "error": str(exc)}
+    retask_mod.save(path, doc)
+    summary = _retask_summary(path, doc, ctx, retask_mod.changed_tasks(before, doc))
+    if not outcome["ok"]:
+        # The rejection is saved and shown to the person: it is a result, not
+        # a tool failure — but the model must not read it as success.
+        return {"ok": False, "error": outcome["error"], "gaps": outcome["gaps"],
+                "retask": summary}
+    return {"ok": True,
+            "result": f"{summary['path']} {summary['progress']} done; "
+                      f"current task: {summary['current'] or 'none (all closed)'}",
+            "retask": summary}
+
+
+def _bi_retask_read(params: dict, ctx: ToolCtx) -> dict:
+    import retask as retask_mod
+    path, error = _retask_path(params, ctx)
+    if error:
+        return {"ok": False, "error": error}
+    try:
+        doc = retask_mod.load(path)
+    except retask_mod.RetaskError as exc:
+        return {"ok": False, "error": str(exc)}
+    summary = _retask_summary(path, doc, ctx, [])
+    others = [p for p in retask_mod.find_files(_retask_root(ctx)) if p != path]
+    text = retask_mod.serialize(doc)
+    if others:
+        import os
+        text += "\n(other lists: " + ", ".join(
+            os.path.relpath(p, _retask_root(ctx)) for p in others[:10]) + ")"
+    return {"ok": True, "result": text, "retask": summary}
+
+
 def _bi_canvas_list(params: dict, ctx: ToolCtx) -> dict:
     """Boards under the working directory, newest first."""
     import os
@@ -11141,6 +11298,87 @@ def register_builtin_tools() -> None:
             invoke=_bi_task_complete,
         ),
         # ── Browser live-view debug tools (P1) ───────────────────────
+        Tool(
+            name="retask.create",
+            description=(
+                "Hand work to the PERSON as a checklist they can see (/retask, "
+                "Alt+R) — only for steps only they can do: signing in to a "
+                "dashboard, creating API keys, paying, answering an exercise. "
+                "Never for work you can do yourself. Each task: one action, a "
+                "text description saying where to go, what to do and which file "
+                "the result goes in (no images or videos — this is a terminal), "
+                "and checks that decide done. Load the retask skill first."),
+            schema={
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "What the list achieves, short"},
+                    "goal": {"type": "string", "description": "One line: what is true when every task is done"},
+                    "path": {"type": "string", "description": "Optional .retask path; defaults to <title>.retask in the workspace"},
+                    "tasks": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {"type": "string", "description": "Optional; defaults to t1, t2, …"},
+                                "title": {"type": "string"},
+                                "description": {"type": "string", "description": "Markdown: where to go, what to do, where the result goes"},
+                                "checks": {"type": "array", "items": {"type": "string"},
+                                           "description": 'Each one of: file_exists <path> | contains <path> "<text>" | matches <path> "<regex>" | min_length <path> <n> | review "<what you will judge>". Paths are relative to the list file.'},
+                                "after": {"type": "array", "items": {"type": "string"}, "description": "Task ids that must be closed first"},
+                            },
+                            "required": ["title"],
+                        },
+                    },
+                },
+                "required": ["title", "tasks"],
+            },
+            capabilities=frozenset({"fs.write"}),
+            invoke=_bi_retask_create,
+        ),
+        Tool(
+            name="retask.update",
+            description=(
+                "Change the person's checklist. status=done runs the task's "
+                "checks against the workspace first: a failing check makes the "
+                "task `rejected` with the gaps noted (returned as ok=false) — "
+                "tell the person what is missing. A task with a review check "
+                "needs a note naming the evidence you looked at. Also edits "
+                "title/description/checks/after, appends tasks, or removes one. "
+                "Statuses: todo, doing, submitted, done, rejected, skipped."),
+            schema={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Optional; defaults to the open list"},
+                    "id": {"type": "string", "description": "Task id to change"},
+                    "status": {"type": "string", "enum": ["todo", "doing", "submitted", "done", "rejected", "skipped"]},
+                    "note": {"type": "string", "description": "One line kept in the task's history (evidence, why rejected, hint given)"},
+                    "title": {"type": "string"},
+                    "description": {"type": "string"},
+                    "checks": {"type": "array", "items": {"type": "string"}},
+                    "after": {"type": "array", "items": {"type": "string"}},
+                    "add_tasks": {"type": "array", "items": {"type": "object"},
+                                  "description": "Tasks to append, same shape as retask.create"},
+                    "remove": {"type": "boolean", "description": "Remove task `id`"},
+                },
+            },
+            capabilities=frozenset({"fs.read", "fs.write"}),
+            invoke=_bi_retask_update,
+        ),
+        Tool(
+            name="retask.read",
+            description=(
+                "Read the person's checklist in full (every description, check "
+                "and note). The per-turn <retask> block only carries the "
+                "current task; read this before rewriting tasks."),
+            schema={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Optional; defaults to the open list"},
+                },
+            },
+            capabilities=frozenset({"fs.read"}),
+            invoke=_bi_retask_read,
+        ),
         Tool(
             name="canvas.list",
             description=(

@@ -109,7 +109,9 @@
     "context_snapshot",
     "infinite_canvas",
     "prop_ui",
-    "vision"
+    "vision",
+    "retask",
+    "retask_view"
   ],
 
   "packages": [

@@ -3191,8 +3191,7 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
             "Sharing is off by default. 'on' explicitly allows Laintas to retain "
             "gateway-observed CLI model inputs and outputs. 'off' stops future "
             "collection; previously collected training data is retained.")),
-    CommandSpec("/usage", "Show AI usage — local token stats + Laintas backend usage", "Account & Session", "/usage [7d|30d|90d|local|buy <calls|storage>]", subcommands=("local", "buy")),
-    CommandSpec("/resume", "Resume a saved session (picker; echo last N events, default 20)", "Account & Session", "/resume [N|all|latest]"),
+    CommandSpec("/usage", "Show AI usage — local token stats + Laintas backend usage", "Account & Session", "/usage [7d|30d|90d|local|buy <calls|storage>]", subcommands=("local", "buy")),    CommandSpec("/resume", "Resume a saved session (picker; echo last N events, default 20)", "Account & Session", "/resume [N|all|latest]"),
     CommandSpec("/fork", "Fork current context into a named branch, or start a new session from current context", "Account & Session", "/fork [name]"),
     CommandSpec("/new", "Start a new live session", "Account & Session", "/new",
                 aliases=("/clear", "/new-session", "/reset-session")),
@@ -3337,6 +3336,10 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec("/abort", "Abort an agent", "Agents & Terminals", "/abort <agent-id>"),
     CommandSpec("/hwo", "Open or run an orchestration workflow", "Planning & Tasks", "/hwo [file|run <file>|compile <file>|status|view <file>]", subcommands=("run", "compile", "status", "view")),
     CommandSpec("/hwg", "Compile, run, visualize, or resume a graph workflow", "Planning & Tasks", "/hwg {<file.hwg>|run|compile|resume|status|gantt|cancel} ...", subcommands=("run", "compile", "resume", "status", "gantt", "cancel")),
+    CommandSpec("/retask", "Open the checklist of work the AI handed to you (Alt+R)", "Planning & Tasks", "/retask [<file.retask>|list|done <id> [note]]", subcommands=("list", "done"), completion_descriptions=(
+        ("list", "List the .retask checklists in this workspace"),
+        ("done", "Say a task is finished so the AI checks it"),
+    )),
     CommandSpec("/mode", "Show, switch, or create agent modes", "Planning & Tasks", "/mode [act [always]|auto|plan [task]|review|study|step|list|create|delete]", subcommands=("act", "always", "auto", "plan", "review", "study", "step", "list", "create", "delete"), completion_descriptions=(
         ("act", "Normal execution mode (confirmations on)"),
         ("always", "ACT with writes & commands auto-approved this session (ACT*)"),
@@ -4171,6 +4174,8 @@ _first_prompt_started = threading.Event()
 #: Private pt_prompt result meaning "the user pressed Alt+0". Not a command,
 #: not something the REPL ever sees — pt_prompt consumes it and re-prompts.
 _MAILBOX_SENTINEL = "\x00laintas-messages\x00"
+#: Alt+R leaves the prompt to open the .retask checklist, the same detour.
+_RETASK_SENTINEL = "\x00laintas-retask\x00"
 
 
 def _rprompt_queue_notice(text: str) -> None:
@@ -4952,6 +4957,19 @@ def _build_keybindings() -> KeyBindings:
             event.current_buffer.text or "")
         event.app.exit(result=_MAILBOX_SENTINEL)
 
+    @kb.add("escape", "r")
+    def _(event):
+        """Alt+R: the checklist of work the AI handed to the person (.retask).
+
+        Whatever is typed so far comes back when the viewer closes.
+        """
+        global _pending_prompt_default
+        if _rprompt_modal_slot:
+            _rprompt_modal_exit()
+        _pending_prompt_default = _expand_pastes(
+            event.current_buffer.text or "")
+        event.app.exit(result=_RETASK_SENTINEL)
+
     # ── Right-prompt slot selection (Alt+1..9) ─────────────────────────
     for _digit in "123456789":
 
@@ -5635,6 +5653,9 @@ def pt_prompt(cwd: str) -> str:
     """
     while True:
         result = _pt_prompt_once(cwd)
+        if result == _RETASK_SENTINEL:
+            _open_retask_view()
+            continue
         if result != _MAILBOX_SENTINEL:
             return result
         _show_mailbox()
@@ -5704,9 +5725,9 @@ def _pt_prompt_once(cwd: str) -> str:
                         rprompt=_render_rprompt,
                         complete_while_typing=True,
                     )
-            if user_input == _MAILBOX_SENTINEL:
+            if user_input in (_MAILBOX_SENTINEL, _RETASK_SENTINEL):
                 _reset_paste_registry()
-                return _MAILBOX_SENTINEL
+                return user_input
             expanded = _expand_pastes(user_input) if user_input else user_input
             _reset_paste_registry()
             return expanded.strip() if expanded else ""
@@ -8361,7 +8382,18 @@ def call_backend_stream(
             # Non-retryable error — return immediately
             try:
                 err_data = response.json()
-                return {"reply": f"Server Error: {err_data.get('detail', response.text[:200])}", "command": "", "rules": "", "done": True, "error": True}
+                # Headline + detail + remedy, and "refused" rather than "Server
+                # Error" for a 4xx: "Server Error: Unable to reserve this request"
+                # was how an empty wallet looked, indistinguishable from an outage.
+                _msg = str(err_data.get("detail") or err_data.get("error") or response.text[:200])
+                _title = str(err_data.get("title") or err_data.get("error") or "")
+                if _title and _title not in _msg:
+                    _msg = f"{_title}: {_msg}"
+                if err_data.get("remedy"):
+                    _msg += f" — {err_data['remedy']}"
+                _prefix = "Request refused" if response.status_code < 500 else "Server Error"
+                return {"reply": f"{_prefix}: {_msg}", "command": "", "rules": "", "done": True, "error": True,
+                        "error_code": str(err_data.get("code") or "")}
             except Exception:
                 return {"reply": f"Server Error: HTTP {response.status_code}", "command": "", "rules": "", "done": True, "error": True}
 
@@ -13666,6 +13698,106 @@ def _cmd_img(raw_args: str) -> None:
     console.print(out["text"], markup=False, highlight=False)
 
 
+def _open_retask_view(path: str = "") -> None:
+    """Open a checklist full screen: the given one, else the open one here."""
+    import retask as retask_mod
+    cwd = os.getcwd()
+    if not path:
+        path = retask_mod.find_active(cwd) or next(iter(retask_mod.find_files(cwd)), "")
+    if not path:
+        console.print("[dim]No .retask checklist here. The AI makes one when "
+                      "a step needs you.[/dim]")
+        return
+    try:
+        import retask_view
+        retask_view.open_viewer(path, root=cwd)
+    except Exception as exc:
+        console.print(f"[error]retask view failed: {type(exc).__name__}: {exc}[/error]")
+
+
+def _cmd_retask(raw_args: str) -> None:
+    """/retask — the work the AI handed to you, and what it will check."""
+    import retask as retask_mod
+    cwd = os.getcwd()
+    verb, rest = _split_verb(raw_args, ("list", "done", "help"),
+                             lambda p: p.endswith(retask_mod.EXTENSION))
+
+    if verb == "help":
+        console.print(r"[bold]/retask[/bold] [dim]— checklists of work the AI hands to you[/dim]")
+        console.print(r"  /retask                  open the current checklist (also Alt+R)")
+        console.print(r"  /retask <file.retask>    open a specific one")
+        console.print(r"  /retask list             every checklist in this workspace")
+        console.print(r"  /retask done <id> \[note] say a task is finished; the AI checks it")
+        console.print(r"[dim]In the view: ↑↓ select · Enter fold · y copy the task · "
+                      r"s I finished this · m mouse on/off · q close. Mouse is off so you "
+                      r"can select and copy text directly.[/dim]")
+        return
+
+    if not verb:
+        path = rest.strip()
+        if path and not os.path.isfile(path):
+            console.print(f"[error]No such checklist: {path}[/error]")
+            return
+        _open_retask_view(path)
+        return
+
+    if verb == "list":
+        files = retask_mod.find_files(cwd)
+        if not files:
+            console.print("[dim]No .retask checklists here.[/dim]")
+            return
+        for path in files:
+            try:
+                doc = retask_mod.load(path)
+            except retask_mod.RetaskError as exc:
+                console.print(f"  {os.path.relpath(path, cwd)}  [error]{exc}[/error]")
+                continue
+            done, total = retask_mod.progress(doc)
+            current = retask_mod.current_task(doc)
+            line = Text(f"  {os.path.relpath(path, cwd)}", style="white")
+            line.append(f"  {doc.title}", style="agent")
+            line.append(f"  {done}/{total} done", style="muted")
+            if current:
+                line.append(f"  {symbols.BULLET} now: {current.id} {current.title}", style="muted")
+            console.print(line)
+        return
+
+    # done <id> [note]
+    task_id, _, note = rest.partition(" ")
+    if not task_id:
+        console.print("[error]Usage: /retask done <id> [note][/error]")
+        return
+    path = retask_mod.find_active(cwd)
+    if not path:
+        console.print("[dim]No open .retask checklist here.[/dim]")
+        return
+    try:
+        doc = retask_mod.load(path)
+        target = doc.task(task_id)
+        block = retask_mod.claim_block(doc, target) if target else ""
+        if block:
+            console.print(f"[error]{task_id} {block}.[/error]")
+            return
+        import copy
+        before = copy.deepcopy(doc)
+        outcome = retask_mod.set_status(doc, task_id, retask_mod.SUBMITTED, note=note)
+        if not outcome["ok"]:
+            console.print(f"[error]{outcome['error']}[/error]")
+            return
+        retask_mod.save(path, doc)
+    except retask_mod.RetaskError as exc:
+        console.print(f"[error]{exc}[/error]")
+        return
+    done, total = retask_mod.progress(doc)
+    display_live_retask({
+        "title": doc.title, "progress": f"{done}/{total}",
+        "changes": [{"id": t.id, "title": t.title, "status": t.status,
+                     "note": t.notes[-1] if t.notes else ""}
+                    for t in retask_mod.changed_tasks(before, doc)],
+    })
+    console.print("[dim]The AI checks it on your next message.[/dim]")
+
+
 def _cmd_canvas(raw_args: str) -> None:
     """/canvas — whiteboards, from the terminal.
 
@@ -17286,6 +17418,43 @@ def display_live_task_list(tasks: list[dict], agent_id: str) -> None:
         if status == "in_progress" and progress:
             line.append(f"  {progress}%", style="muted")
         console.print(line)
+
+
+_LIVE_RETASK_STATUS_UI = {
+    "todo": (f"{symbols.DOT_OPEN}", "white"),
+    "doing": ("▶", "warning"),
+    "submitted": ("?", "accent"),
+    "done": (f"{symbols.OK}", "success"),
+    "rejected": ("✗", "error"),
+    "skipped": ("–", "muted"),
+}
+
+
+def display_live_retask(summary: dict) -> None:
+    """Print the checklist lines a retask change touched.
+
+    Same shape as display_live_task_list — a header with the running count,
+    then one line per changed task — plus the latest note under a task the
+    check just passed or turned back, because "why not" is the part the
+    person needs.
+    """
+    changes = summary.get("changes") or []
+    if not changes:
+        return
+    header = Text("Retask", style="bold white")
+    header.append(f" {symbols.BULLET} {summary.get('title', '')}", style="agent")
+    header.append(f"  {summary.get('progress', '')} done", style="muted")
+    console.print(header)
+    for change in changes:
+        status = str(change.get("status") or "todo")
+        mark, style = _LIVE_RETASK_STATUS_UI.get(status, (symbols.BULLET, "white"))
+        line = Text(f"  {mark} ", style=style)
+        line.append(str(change.get("title") or change.get("id") or ""), style="white")
+        console.print(line)
+        note = str(change.get("note") or "")
+        if note and status in ("done", "rejected", "submitted"):
+            note = re.sub(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2} ", "", note)
+            console.print(Text(f"      └ {note}", style="error" if status == "rejected" else "muted"))
 
 
 def _render_task_todolist(tasks: list[dict], cwd: str) -> None:
@@ -22373,6 +22542,9 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
     elif action == "/hwg":
         _cmd_hwg(parts, session)
 
+    elif action == "/retask":
+        _cmd_retask(raw_args)
+
     elif action in ("/v", "/version", "/update"):
         _cmd_version(action, parts)
 
@@ -22618,6 +22790,7 @@ def get_loop_deps() -> LoopDeps:
             request_file_write_approval=request_file_write_approval,
             request_file_delete_approval=request_file_delete_approval,
             display_task_list=display_live_task_list,
+            display_retask=display_live_retask,
         )
     return _loop_deps
 

@@ -1,0 +1,60 @@
+{
+  "_comment": "Shared by laintas_cli (tests/test_retask.py) and Helpwo (scripts/retask-core.test.mjs). A .retask file must parse to the same thing on both sides; edit here and both suites check it.",
+  "tokenize": [
+    {"line": "file_exists .env", "tokens": ["file_exists", ".env"]},
+    {"line": "contains .env \"WECHAT_MCH_ID=\"", "tokens": ["contains", ".env", "WECHAT_MCH_ID="]},
+    {"line": "review \"截图显示 \\\"已保存\\\"\"", "tokens": ["review", "截图显示 \"已保存\""]},
+    {"line": "matches a.md \"a\\\\d+\"", "tokens": ["matches", "a.md", "a\\d+"]},
+    {"line": "  min_length   answers/q1.md   200 ", "tokens": ["min_length", "answers/q1.md", "200"]},
+    {"line": "contains x \"\"", "tokens": ["contains", "x", ""]}
+  ],
+  "parse": [
+    {
+      "name": "full",
+      "text": "retask 1\ntitle: 接入微信支付\ngoal: 沙箱跑通一笔支付\n\n## [x] t1 注册商户号\ncheck: contains .env \"WECHAT_MCH_ID=\"\nnote: 2026-09-14 10:02 passed: .env ok\n\n在 pay.weixin.qq.com 注册。\n\n第二段。\n\n## [>] t2 拿到密钥\nafter: t1\ncheck: contains .env \"WECHAT_API_V3_KEY=\"\ncheck: review \"后台显示密钥已设置\"\n\n登录后台。\n",
+      "expect": {
+        "title": "接入微信支付",
+        "goal": "沙箱跑通一笔支付",
+        "tasks": [
+          {"id": "t1", "title": "注册商户号", "status": "done", "after": [],
+           "checks": ["contains .env \"WECHAT_MCH_ID=\""],
+           "notes": ["2026-09-14 10:02 passed: .env ok"],
+           "description": "在 pay.weixin.qq.com 注册。\n\n第二段。"},
+          {"id": "t2", "title": "拿到密钥", "status": "doing", "after": ["t1"],
+           "checks": ["contains .env \"WECHAT_API_V3_KEY=\"", "review \"后台显示密钥已设置\""],
+           "notes": [], "description": "登录后台。"}
+        ],
+        "current": "t2",
+        "progress": [1, 2]
+      }
+    },
+    {
+      "name": "all marks and no description",
+      "text": "retask 1\ntitle: marks\n## [ ] a one\n## [?] b two\n## [!] c three\n## [-] d four\n",
+      "expect": {
+        "title": "marks", "goal": "",
+        "tasks": [
+          {"id": "a", "title": "one", "status": "todo", "after": [], "checks": [], "notes": [], "description": ""},
+          {"id": "b", "title": "two", "status": "submitted", "after": [], "checks": [], "notes": [], "description": ""},
+          {"id": "c", "title": "three", "status": "rejected", "after": [], "checks": [], "notes": [], "description": ""},
+          {"id": "d", "title": "four", "status": "skipped", "after": [], "checks": [], "notes": [], "description": ""}
+        ],
+        "current": "b",
+        "progress": [1, 4]
+      }
+    }
+  ],
+  "invalid": [
+    {"name": "no version line", "text": "title: x\n## [ ] t1 a\n"},
+    {"name": "no tasks", "text": "retask 1\ntitle: x\n"},
+    {"name": "no title", "text": "retask 1\n## [ ] t1 a\n"},
+    {"name": "unknown mark", "text": "retask 1\ntitle: x\n## [y] t1 a\n"},
+    {"name": "duplicate id", "text": "retask 1\ntitle: x\n## [ ] t1 a\n## [ ] t1 b\n"},
+    {"name": "unknown dependency", "text": "retask 1\ntitle: x\n## [ ] t1 a\nafter: t9\n"},
+    {"name": "cycle", "text": "retask 1\ntitle: x\n## [ ] t1 a\nafter: t2\n## [ ] t2 b\nafter: t1\n"},
+    {"name": "unknown check", "text": "retask 1\ntitle: x\n## [ ] t1 a\ncheck: exists .env\n"},
+    {"name": "wrong arity", "text": "retask 1\ntitle: x\n## [ ] t1 a\ncheck: contains .env\n"},
+    {"name": "unterminated quote", "text": "retask 1\ntitle: x\n## [ ] t1 a\ncheck: review \"oops\n"},
+    {"name": "text before first header", "text": "retask 1\ntitle: x\nstray\n## [ ] t1 a\n", "valid": true}
+  ]
+}

@@ -37,6 +37,7 @@ import agent_roles           # Specialized agent roles (explorer, reviewer, etc.
 import workflow_engine        # Structured multi-phase workflow engine
 import task_manager          # Structured task tracking (session + persisted)
 import workgraph             # Unified objective/plan/steps/workflow authority
+import retask                # Work handed to the person (.retask checklists)
 import paths                 # Centralized path management
 import json_store            # atomic small-JSON read/write
 import peer_coordination     # Cross-instance file-conflict coordination
@@ -5058,6 +5059,7 @@ class LoopDeps:
     request_file_write_approval: Optional[Callable[[str, str, str], bool]] = None
     request_file_delete_approval: Optional[Callable[[str, str, str], bool]] = None
     display_task_list: Optional[Callable[[list, str], None]] = None
+    display_retask: Optional[Callable[[dict], None]] = None
 
 
 def _print_markdown_safely(deps: LoopDeps, content: str) -> None:
@@ -7686,6 +7688,15 @@ def _build_user_message(original_input: str, state: dict, memory_entries: list,
     tasks_block = ""
     if tasks_snapshot:
         tasks_block = f"\n<active_tasks>\n{tasks_snapshot}\n</active_tasks>\n"
+    # Work handed to the person (.retask). Rebuilt from the file every turn, so
+    # it survives compaction and new sessions the way the conversation cannot.
+    try:
+        _retask_block = retask.context_block(
+            state.get("_task_cwd") or state.get("cwd") or os.getcwd())
+    except Exception:
+        _retask_block = ""
+    if _retask_block:
+        tasks_block += f"\n{_retask_block}\n"
 
     approved_plan = workgraph.approved_plan_context(
         cwd=os.getcwd(),
@@ -8883,6 +8894,13 @@ def _visible_tool_names_for_task(
         return set(authorized_names)
     routed = context_router.stable_visible_names(
         query, tools_mod.get_registry().list(), state)
+    # An open checklist means the person is mid-way through work the agent
+    # must check; "done" rarely contains a routing keyword.
+    try:
+        if retask.find_active(state.get("_task_cwd") or state.get("cwd") or os.getcwd()):
+            routed |= {"retask.create", "retask.update", "retask.read"}
+    except Exception:
+        pass
     return set(authorized_names) & routed
 
 
@@ -12170,6 +12188,14 @@ def run_agent_loop(
                                     owner_agent_id=agent_id,
                                 )
                                 deps.display_task_list(_live_tasks, agent_id or "current")
+
+                        if (name in {"retask.create", "retask.update"}
+                                and isinstance(result.get("retask"), dict)
+                                and deps.display_retask is not None):
+                            try:
+                                deps.display_retask(result["retask"])
+                            except Exception:
+                                pass
 
                         if name == "shell.exec" and result.get("cwd"):
                             state["cwd"] = str(result["cwd"])
