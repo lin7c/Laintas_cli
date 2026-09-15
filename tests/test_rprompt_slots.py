@@ -515,12 +515,22 @@ class SlotKeybindingTests(_SlotTestBase):
     def setUpClass(cls):
         cls.kb = laintas_cli._build_keybindings()
 
-    def _find(self, *keys):
+    def _find(self, *keys, modal=None):
+        """Find a binding by key sequence.
+
+        Several keys (up/down/-/=) are bound twice: once for the main input
+        buffer (filter=~_rprompt_modal_active) and once for the rprompt slot
+        modal (filter=_rprompt_modal_active). Registration order decides which
+        one a plain first-match returns, so tests that exercise the modal
+        bindings must pass modal=True to select the right one.
+        """
         wanted = tuple(keys)
+        modal_filter = getattr(laintas_cli, "_rprompt_modal_active")
         for binding in self.kb.bindings:
             if binding.keys == wanted:
-                return binding
-        self.fail(f"no binding for {wanted!r}")
+                if modal is None or modal == (binding.filter is modal_filter):
+                    return binding
+        self.fail(f"no binding for {wanted!r} (modal={modal})")
 
     def test_alt_digit_bindings_select_visible_positions(self):
         for digit in "123456789":
@@ -531,7 +541,7 @@ class SlotKeybindingTests(_SlotTestBase):
 
     def test_cycle_bindings_only_active_while_modal(self):
         for keys in (("up",), ("=",), ("down",), ("-",)):
-            binding = self._find(*keys)
+            binding = self._find(*keys, modal=True)
             laintas_cli._rprompt_modal_slot = ""
             self.assertFalse(binding.filter())
             laintas_cli._rprompt_modal_slot = "mode"
@@ -541,7 +551,7 @@ class SlotKeybindingTests(_SlotTestBase):
     def test_alt_arrow_move_bindings(self):
         for keys, delta in (((Keys.Escape, Keys.Left), -1),
                             ((Keys.Escape, Keys.Right), 1)):
-            binding = self._find(*keys)
+            binding = self._find(*keys, modal=True)
             laintas_cli._rprompt_modal_slot = "mode"
             with mock.patch.object(laintas_cli, "_rprompt_move_slot") as move:
                 binding.handler(SimpleNamespace(app=mock.Mock()))
