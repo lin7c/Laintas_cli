@@ -178,6 +178,12 @@ _DEFAULT_CONFIG = {
     # Canonical model id only: the gateway resolves duplicate upstreams using
     # supplier priority/failover. Never pin compaction to OpenRouter here.
     "aux_provider": "",
+    # Thinking level for the review pass of compaction. `auto` leaves it to the
+    # backend, which treats review as a judgement call and thinks at `medium`:
+    # measured 2026-09-15 that is 4k-11k reasoning tokens and 1.5-4 minutes per
+    # chunk, so a long thread could block a turn for a quarter of an hour.
+    # `none` keeps the review and drops the thinking.
+    "compact_review_effort": "auto",
     "auto_format": True,            # run the best-available code formatter in place after a full-file write (no-op if none installed); surgical edits stay byte-precise
     "auto_snapshot": True,          # lazily checkpoint before the first workspace-mutating tool call in a top-level task (no-op outside a git repo)
     "browser_action_delay_min": 0.3,   # min seconds of anti-bot delay before browser actions
@@ -1043,6 +1049,7 @@ _RUNTIME_CONFIG_DESCRIPTIONS = {
     "compact_chunk_tokens": "Largest slice of thread handed to the summarizer in one call",
     "aux_model": "Model for compaction / critic / memory-extraction (empty = use the main model)",
     "aux_provider": "Provider paired with aux_model",
+    "compact_review_effort": "Thinking level for the summary-review step of context compaction (auto = backend picks, currently medium; none = no thinking, much faster compaction)",
     "max_loops": "Maximum agent-loop iterations per task",
     "max_tokens": "Output-token cap to request (0 = whatever the model and window allow)",
     "max_debug_entries": "In-memory debug entry limit",
@@ -1166,6 +1173,7 @@ _RUNTIME_ENUM_CHOICES: dict[str, tuple[str, ...]] = {
     "theme": ("dark", "light", "mono"),
     "markdown_theme": ("default", "green-red", "custom"),
     "critic_profile": ("lenient", "balanced", "strict"),
+    "compact_review_effort": ("auto", "none", "low", "medium", "high", "max"),
     # search_engine is deliberately not enumerated here: the set of valid names
     # now depends on the user's own engine registry, and a fixed vocabulary
     # would reject the very entries they added. web_search.resolve_chain
@@ -5060,6 +5068,9 @@ class LoopDeps:
     request_file_delete_approval: Optional[Callable[[str, str, str], bool]] = None
     display_task_list: Optional[Callable[[list, str], None]] = None
     display_retask: Optional[Callable[[dict], None]] = None
+    # Transient status row: `status(markup_text)` returns a context manager
+    # that shows a spinner while the block runs (laintas_cli._safe_status).
+    status: Optional[Callable[..., Any]] = None
 
 
 def _print_markdown_safely(deps: LoopDeps, content: str) -> None:
@@ -5729,12 +5740,14 @@ def _llm_review_summary(deps, session, current_path: str, source_text: str,
                     candidate.strip() + "\n</candidate-summary>")
         review_model = str(ctxpol.load().get("summary_review_model")
                            or "deepseek-v4-flash").strip()
+        effort = str(get_runtime_config("compact_review_effort") or "auto").strip().lower()
+        extra = {} if effort == "auto" else {"effort_override": effort}
         resp = deps.call_backend(
             session=session, message=evidence, system_prompt=prompt,
             current_path=current_path, history=[], lang=lang,
             tools_enabled=False, model_override=review_model,
             provider_override=None, task_kind="compaction_review",
-            trajectory_id=trajectory_id,
+            trajectory_id=trajectory_id, **extra,
         )
         reviewed = ((resp or {}).get("reply", "")
                     if isinstance(resp, dict) else "").strip()
@@ -5969,9 +5982,70 @@ def _project_paged_reads(thread_messages: list, state: dict) -> list:
     return out
 
 
+def compaction_status_text(*, auto: bool, usable: int = 0, window: int = 0) -> str:
+    """The status shown while compaction runs, shared by /compact and the loop.
+
+    Automatic compaction used to run with no indication at all: a long session
+    crossed its budget, the turn blocked for minutes on summarise + review
+    calls, and the only visible symptom was a CLI that looked hung (2026-09-15:
+    a 120k-token thread, four review rounds of 1.5-4 minutes each). The extra
+    lines name the knobs a user reaches for at exactly that moment.
+    """
+    lines = [f"Compacting session context… {symbols.BULLET} Esc/Ctrl+C cancel"]
+    if auto:
+        configured = int(get_runtime_config("model_context_window") or 0)
+        knob = ("model_context_window"
+                if configured and configured != _DEFAULT_CONFIG["model_context_window"]
+                else "context_window_adopt_cap")
+        lines.append(
+            f"Auto-compact: the thread passed its {usable:,}-token budget "
+            f"(window {window:,}). Raise the trigger: /config {knob} <tokens>")
+    effort = str(get_runtime_config("compact_review_effort") or "auto").strip().lower()
+    if effort != "none":
+        lines.append(
+            f"Summary review thinking: {effort}. "
+            "Compact faster without it: /config compact_review_effort none")
+    return "\n".join(f"[dim]{line}[/dim]" for line in lines)
+
+
+@contextmanager
+def _compaction_status(deps, text: str):
+    """Show `text` while a compaction runs, without ever failing the compaction."""
+    console = getattr(deps, "console", None)
+    if console is None or getattr(console, "render_terminal", True) is False:
+        yield
+        return
+    opened = None
+    status = getattr(deps, "status", None)
+    if status is not None:
+        try:
+            opened = status(text)
+            opened.__enter__()
+        except Exception:
+            # Another Live already owns the console (the activity row, a
+            # stream). A missing spinner must not turn into a skipped compaction.
+            opened = None
+    if opened is None:
+        try:
+            console.print(text)
+        except Exception:
+            pass
+    try:
+        yield
+    finally:
+        if opened is not None:
+            try:
+                opened.__exit__(None, None, None)
+            except Exception:
+                pass
+
+
 def _compact_thread_messages(thread_messages: list, deps, session, lang: str, state: dict,
-                             *, force: bool = False) -> bool:
+                             *, force: bool = False, announce: bool = False) -> bool:
     """opencode-style compaction of the native message thread, IN PLACE.
+
+    ``announce=True`` (the automatic paths) shows a status row while the
+    summarizer runs; /compact leaves it False because it owns its own spinner.
 
     When the thread exceeds the model's usable window: (1) PRUNE — truncate old
     `role:tool` outputs to the policy char cap, protecting the recent tail and
@@ -6045,9 +6119,14 @@ def _compact_thread_messages(thread_messages: list, deps, session, lang: str, st
         head = thread_messages[:tail_start]
         if not any((_serialize_thread_msg(m) or "").strip() for m in head):
             return changed
-        summary = _summarize_head_in_chunks(
-            deps, session, head, state.get("_thread_summary"), lang,
-            str(state.get("_run_id") or ""))
+        announcement = (
+            _compaction_status(deps, compaction_status_text(
+                auto=True, usable=usable, window=window))
+            if announce else nullcontext())
+        with announcement:
+            summary = _summarize_head_in_chunks(
+                deps, session, head, state.get("_thread_summary"), lang,
+                str(state.get("_run_id") or ""))
         if not summary:
             return changed
         state["_thread_summary"] = summary
@@ -10656,7 +10735,8 @@ def run_agent_loop(
             # reads in context (no re-read amnesia) while bounding the thread size.
             # (`lang` is assigned later in the loop, so derive it here.)
             _compact_thread_messages(thread_messages, deps, session,
-                                     _detect_lang(original_input), state)
+                                     _detect_lang(original_input), state,
+                                     announce=True)
             _publish_context_headroom(thread_messages, state)
             _live_state = _build_user_message(
                 original_input, state, memory_entries, history_context, loop, max_loops,
@@ -11401,7 +11481,8 @@ def run_agent_loop(
                 state["_overflow_retry"] = retry + 1
                 if events_cb is not None:
                     deps.console.print("[dim yellow](context overflow — compacting and retrying)[/dim yellow]")
-                _compact_thread_messages(thread_messages, deps, session, lang, state, force=True)
+                _compact_thread_messages(thread_messages, deps, session, lang, state,
+                                         force=True, announce=True)
                 add_debug_log(debug_entry)
                 continue
             if events_cb is not None:
@@ -11639,7 +11720,8 @@ def run_agent_loop(
             if (_thread_mode and _trunc_count >= 2 and thread_messages
                     and _kind != "tool_args_malformed"):
                 _compact_thread_messages(
-                    thread_messages, deps, session, lang, state, force=True)
+                    thread_messages, deps, session, lang, state, force=True,
+                    announce=True)
 
             if _kind == "tool_args_malformed":
                 # No limit was hit — the arguments simply did not parse. Write

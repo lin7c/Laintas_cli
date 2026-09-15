@@ -582,6 +582,14 @@ class ExtensionRuntime:
             if found is None:
                 return []
             subs = found[2] if len(found) > 2 else []
+            if callable(subs):
+                # Runtime values (seat names, organisations) cannot be
+                # declared at load time. The provider runs on a keystroke, so
+                # a failing one must cost the completion, not the prompt.
+                try:
+                    subs = list(subs() or [])
+                except Exception:
+                    return []
         return [(entry[0], entry[1]) for entry in subs]
 
 

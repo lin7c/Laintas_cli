@@ -149,6 +149,19 @@ def host_label() -> str:
     return "Windows (WSL 2)" if is_windows_host() else SYSTEM
 
 
+def _device_name() -> str:
+    """This machine as a short label, e.g. "lin7c-pc (Windows (WSL 2))".
+
+    Sent with each chat request so the gateway's experience can say which
+    device a piece of work happened on. Never raises: a missing hostname just
+    means the turn goes unlabelled.
+    """
+    try:
+        return f"{socket.gethostname()} ({host_label()})"[:60]
+    except Exception:
+        return ""
+
+
 def _initial_ui_preferences_for_host(preferences: dict) -> dict:
     """Apply host-specific UI defaults without overriding a user choice.
 
@@ -1271,7 +1284,7 @@ from agent_loop import (
     DebugEntry, TerminalInfo, AgentInfo, EmployeeProfile, AgentToolPolicy,
     add_debug_log, clear_debug_logs, get_recent_tool_failures,
     next_debug_loop, get_debug_logs,
-    run_agent_loop, LoopDeps,
+    run_agent_loop, LoopDeps, compaction_status_text,
     register_terminal, unregister_terminal,
     get_terminal, get_all_terminals, close_all_terminals,
     rename_terminal,
@@ -3191,7 +3204,25 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
             "Sharing is off by default. 'on' explicitly allows Laintas to retain "
             "gateway-observed CLI model inputs and outputs. 'off' stops future "
             "collection; previously collected training data is retained.")),
-    CommandSpec("/usage", "Show AI usage — local token stats + Laintas backend usage", "Account & Session", "/usage [7d|30d|90d|local|buy <calls|storage>]", subcommands=("local", "buy")),    CommandSpec("/resume", "Resume a saved session (picker; echo last N events, default 20)", "Account & Session", "/resume [N|all|latest]"),
+    CommandSpec(
+        "/usage", "Show AI usage — local token stats + Laintas backend usage",
+        "Account & Session", "/usage [7d|30d|90d] [local] | buy <calls|storage>",
+        subcommands=("7d", "30d", "90d", "local", "buy"),
+        completion_descriptions=(
+            ("7d", "Backend usage for the last 7 days"),
+            ("30d", "Backend usage for the last 30 days (default)"),
+            ("90d", "Backend usage for the last 90 days"),
+            ("local", "Local token stats only, no network"),
+            ("buy", "Buy a call or storage pack"),
+        )),
+    CommandSpec(
+        "/resume", "Resume a saved session (picker; echo last N events, default 20)",
+        "Account & Session", "/resume [N|all|latest]",
+        subcommands=("latest", "all"),
+        completion_descriptions=(
+            ("latest", "Restore the newest session without the picker"),
+            ("all", "Echo the whole conversation after restoring"),
+        )),
     CommandSpec("/fork", "Fork current context into a named branch, or start a new session from current context", "Account & Session", "/fork [name]"),
     CommandSpec("/new", "Start a new live session", "Account & Session", "/new",
                 aliases=("/clear", "/new-session", "/reset-session")),
@@ -3450,6 +3481,10 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec(
         "/prop", "Inspect complete model context and system prompts", "Config & Tools",
         "/prop [sys] [N]",
+        subcommands=("sys",),
+        completion_descriptions=(
+            ("sys", "Only the effective system prompt and its sources"),
+        ),
         help_text=(
             "With no arguments, opens the most recent user conversation's complete "
             "provider context. N selects the Nth newest conversation (1 is newest); "
@@ -3466,7 +3501,11 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec("/snapshot", "Create a git checkpoint", "History", "/snapshot [label]"),
     CommandSpec("/snapshots", "List git checkpoints", "History"),
     CommandSpec("/compact", "Compact the current session context", "History",
-                "/compact [status|--force]", subcommands=("status",)),
+                "/compact [status|--force]", subcommands=("status", "--force"),
+                completion_descriptions=(
+                    ("status", "Show context size without compacting"),
+                    ("--force", "Compact even below the usual threshold"),
+                )),
     CommandSpec("/continue", "Continue the current live session", "History"),
     CommandSpec("/told", "Replay prompts or a selected Agent's conversation", "History",
                 "/told [agent-id [reply [N]|all]|N|all|reply [N]|log [N]]",
@@ -3516,6 +3555,496 @@ def _find_command_spec(name: str) -> Optional[CommandSpec]:
     )
 
 
+# ── Argument completion beyond the first word ──────────────────────────
+# CommandSpec.subcommands only describes the word right after a command. What
+# follows is mostly runtime data — terminal names, task ids, saved logins,
+# model ids, files of one kind — so it is looked up here. Providers run on a
+# keystroke: each must be cheap and must never raise. File-backed lookups go
+# through a short cache; in-memory registries are read directly so a terminal
+# created a moment ago is offered at once.
+
+_ARG_COMPLETION_CACHE: dict[str, tuple[float, list]] = {}
+_ARG_COMPLETION_TTL = 2.0
+
+
+def _cached_candidates(key: str, loader) -> list[tuple[str, str]]:
+    now = time.monotonic()
+    hit = _ARG_COMPLETION_CACHE.get(key)
+    if hit and now - hit[0] < _ARG_COMPLETION_TTL:
+        return hit[1]
+    try:
+        rows = [(str(value), str(meta or "")) for value, meta in (loader() or [])
+                if str(value or "")]
+    except Exception:
+        rows = []
+    _ARG_COMPLETION_CACHE[key] = (now, rows)
+    return rows
+
+
+def _static_candidates(*pairs: tuple[str, str]):
+    return lambda _fragment, _prior: list(pairs)
+
+
+def _cached_provider(key: str, loader):
+    return lambda _fragment, _prior: _cached_candidates(key, loader)
+
+
+def _path_candidates(suffixes: tuple[str, ...] = (), *, dirs_only: bool = False):
+    """Files under the directory the fragment names, keeping what was typed.
+
+    Directories are always offered so a file one level down stays reachable.
+    """
+    def provider(fragment: str, _prior) -> list[tuple[str, str]]:
+        head, tail = os.path.split(os.path.expanduser(fragment))
+        base = head or "."
+        prefix = fragment[:len(fragment) - len(tail)]
+        try:
+            names = sorted(os.listdir(base))
+        except OSError:
+            return []
+        rows = []
+        for name in names:
+            if name.startswith(".") and not tail.startswith("."):
+                continue
+            full = os.path.join(base, name)
+            if os.path.isdir(full):
+                rows.append((f"{prefix}{name}/", "directory"))
+            elif not dirs_only and (not suffixes or name.lower().endswith(suffixes)):
+                rows.append((f"{prefix}{name}", "file"))
+            if len(rows) >= 200:
+                break
+        return rows
+    return provider
+
+
+def _terminal_candidates(*, include_primary: bool = False,
+                         alive_only: bool = False, stationed_only: bool = False):
+    def provider(_fragment, _prior) -> list[tuple[str, str]]:
+        rows = []
+        for term in get_all_terminals():
+            if term.name == "term0" and not include_primary:
+                continue
+            alive = bool(term.session and term.session.is_alive())
+            if (alive_only and not alive) or (
+                    stationed_only and not term.stationed_agent_id):
+                continue
+            owner = f" {symbols.BULLET} {term.stationed_agent_id}" if term.stationed_agent_id else ""
+            rows.append((term.name, f"{'alive' if alive else 'stopped'} terminal{owner}"))
+        return rows
+    return provider
+
+
+def _agent_candidates(*, active_only: bool = False):
+    def provider(_fragment, _prior) -> list[tuple[str, str]]:
+        rows = []
+        for agent in get_all_agents():
+            if active_only and agent.status in {"done", "aborted", "error"}:
+                continue
+            label = agent.name if agent.name and agent.name != agent.id else agent.role
+            rows.append((agent.id, f"{label} {symbols.BULLET} {agent.status}"))
+        return rows
+    return provider
+
+
+def _model_candidates(_fragment, _prior) -> list[tuple[str, str]]:
+    """Model ids from the catalogue Alt+3 already keeps.
+
+    The catalogue is a network fetch, so a keystroke never waits for it: the
+    first `/model ` starts it in the background (only inside the live prompt,
+    never from tests or scripts) and the ids appear on the next keystroke.
+    """
+    def loader():
+        if (_rprompt_model_cache
+                and _rprompt_model_cache_key == _rprompt_backend_cache_key()):
+            return [(mid, "model") for mid in _rprompt_model_cache]
+        if _prompt_session is not None:
+            _rprompt_kick_model_fetch()
+        return []
+    return _cached_candidates("models", loader)
+
+
+def _help_candidates(fragment: str, _prior) -> list[tuple[str, str]]:
+    slash = fragment.startswith("/")
+    rows = []
+    for name in completion_command_names():
+        spec = _find_command_spec(name)
+        rows.append((name if slash else name.lstrip("/"),
+                     spec.description if spec else "extension command"))
+    return rows
+
+
+def _task_scope() -> tuple[str, Optional[str]]:
+    current = get_current_agent()
+    state = (current.state or {}) if current else {}
+    return (str(state.get("_task_cwd") or os.getcwd()),
+            str(state.get("_session_id") or "") or None)
+
+
+def _task_candidates(statuses: Optional[frozenset] = None):
+    def loader():
+        cwd, session_id = _task_scope()
+        return [
+            (task.get("id"), f"{task.get('status', 'pending')} {symbols.BULLET} "
+                             f"{task.get('subject', '')}")
+            for task in task_manager.list_tasks(cwd=cwd, session_id=session_id)
+            if task.get("status") != "deleted"
+            and (statuses is None or task.get("status") in statuses)
+        ]
+    return _cached_provider(f"tasks:{sorted(statuses or ())}", loader)
+
+
+def _custom_mode_loader():
+    return [(item["name"], item.get("description", "custom mode"))
+            for item in mode_manager.list_modes() if not item.get("builtin")]
+
+
+def _skill_loader(loaded: Optional[bool] = None):
+    def loader():
+        return [(item["name"], item.get("description") or "skill")
+                for item in skills_mod.list_skills()
+                if loaded is None or bool(item.get("loaded")) == loaded]
+    return loader
+
+
+def _mcp_server_loader():
+    config = json.loads(Path(paths.MCP_FILE).read_text(encoding="utf-8"))
+    return [(name, str((cfg or {}).get("command") or "MCP server"))
+            for name, cfg in (config.get("servers") or {}).items()]
+
+
+def _memory_loader():
+    import memory_system
+    rows = [(entry.get("name"), entry.get("description") or "persistent memory")
+            for entry in memory_system.list_memories()]
+    entries, _errors, _ = _load_project_memory_entries()
+    rows.extend((str(entry.get("id")), str(entry.get("content") or "")[:60])
+                for entry in entries)
+    return rows
+
+
+def _message_loader():
+    return [(str(position), item.title)
+            for position, item in enumerate(startup_mail.items(), 1)]
+
+
+def _handoff_loader():
+    import handoff
+    return [(env["id"], env.get("title", "")) for env in handoff.list_all(paths.live_cwd())]
+
+
+def _retask_task_loader():
+    import retask as retask_mod
+    path = retask_mod.find_active(os.getcwd())
+    if not path:
+        return []
+    return [(task.id, f"{task.status} {symbols.BULLET} {task.title}")
+            for task in retask_mod.load(path).tasks]
+
+
+def _run_loader(kind: Optional[str]):
+    def loader():
+        import workflow_state
+        return [(run.get("runId"), f"{run.get('status')} {symbols.BULLET} {run.get('source') or ''}")
+                for run in workflow_state.list_runs()
+                if kind is None or (run.get("kind") == "hwo") == (kind == "hwo")]
+    return loader
+
+
+def _snapshot_loader():
+    import snapshot as snap
+    return [(item["sha"][:12], item.get("label") or "(no label)")
+            for item in reversed(snap.list_for(os.getcwd()))]
+
+
+def _installed_extension_loader():
+    import extension_manager
+    return [(entry["name"], entry.get("description") or "extension")
+            for entry in extension_manager.ExtensionManager().list_installed()]
+
+
+def _web_engine_loader():
+    import web_search
+    return [(name, meta.get("describe") or meta.get("kind") or "engine")
+            for name, meta in sorted(web_search.load_engine_registry()[0].items())]
+
+
+def _cookie_domain_loader():
+    import cookie_store
+    return [(domain, f"{count} cookie(s)") for domain, count in cookie_store.summary()]
+
+
+def _identity_loader():
+    import identity_store
+    return [(name, "saved login") for name in identity_store.names()]
+
+
+_IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
+_YES_FLAG = _static_candidates(("--yes", "Skip the confirmation prompt"))
+_FORCE_FLAG = _static_candidates(("--force", "Proceed even when it would normally refuse"))
+_TASK_IDS = _task_candidates()
+
+#: command -> ((pattern, provider), ...). A pattern matches the words already
+#: typed after the command: a literal, a tuple of literals, or "*" for any.
+_ARG_COMPLETIONS: dict[str, tuple] = {
+    "/help": (((), _help_candidates),),
+    "/usage": ((("buy",), _static_candidates(
+        ("calls", "Buy a call pack"), ("storage", "Buy a storage pack"))),),
+    "/model": (
+        ((), _terminal_candidates(include_primary=True, stationed_only=True)),
+        ((), _model_candidates),
+        (("aux",), _model_candidates),
+        (("aux",), _static_candidates(("reset", "Use the terminal's own model again"))),
+        (("*",), lambda fragment, prior: (
+            _model_candidates(fragment, prior) + [("reset", "Clear this terminal's override")]
+            if get_terminal(prior[0]) is not None else [])),
+    ),
+    "/term": ((("rename",), _terminal_candidates()),),
+    "/terminate": (((), _terminal_candidates()),),
+    "/send": (
+        ((), _terminal_candidates(include_primary=True, alive_only=True)),
+        (("*",), _static_candidates(("--wait", "Seconds to wait for output (0-30)"))),
+    ),
+    "/tell": (((), _agent_candidates()),),
+    "/abort": (((), _agent_candidates(active_only=True)),),
+    "/tool": (((), lambda _f, _p: [
+        (tool.name, tool.description[:80]) for tool in tools_mod.get_registry().list()]),),
+    "/task": (
+        ((("show", "del", "progress", "note", "subtask"),), _TASK_IDS),
+        (("start",), _task_candidates(frozenset({"pending"}))),
+        (("done",), _task_candidates(frozenset({"pending", "in_progress"}))),
+        (("agent",), _agent_candidates()),
+    ),
+    "/work": ((("resume",), _cached_provider("work", lambda: [
+        (item["id"], f"{item.get('status')} {symbols.BULLET} {item.get('objective', '')[:60]}")
+        for item in workgraph.list_work()])),),
+    "/mode": (
+        ((), _cached_provider("modes", _custom_mode_loader)),
+        (("act",), _static_candidates(("always", "Auto-approve writes and commands this session"))),
+        (("delete",), _cached_provider("modes", _custom_mode_loader)),
+    ),
+    "/backend": ((("use",), _cached_provider("backends", lambda: [
+        (profile.name, f"{profile.kind} {symbols.BULLET} {profile.base_url}")
+        for profile in backend_profiles.list_profiles()])),),
+    "/policy": ((("disabled",), _YES_FLAG),),
+    "/trust": ((("allow",), _YES_FLAG),),
+    "/hooks": ((("trust",), _YES_FLAG),),
+    "/windows": (
+        (("start",), _static_candidates(
+            ("read", "Also see every window and the screen"),
+            ("write", "Also drive applications, keyboard and mouse"))),
+        (("install",), _FORCE_FLAG),
+    ),
+    "/skill": (
+        ((("trust", "revoke"),), _cached_provider("skills", _skill_loader())),
+        (("load",), _cached_provider("skills:unloaded", _skill_loader(False))),
+        (("unload",), _cached_provider("skills:loaded", _skill_loader(True))),
+        (("unload",), _static_candidates(("all", "Unload every loaded skill"))),
+        (("trust", "*"), _YES_FLAG),
+    ),
+    "/mcp": (
+        ((("trust", "revoke", "connect", "disconnect", "tools"),),
+         _cached_provider("mcp", _mcp_server_loader)),
+        (("trust", "*"), _YES_FLAG),
+    ),
+    "/memory": ((("show",), _cached_provider("memory", _memory_loader)),),
+    "/messages": (((("read", "dismiss"),), _cached_provider("messages", _message_loader)),),
+    "/handoff": (
+        ((("show", "claim", "release", "note", "close", "reopen", "sync", "export"),),
+         _cached_provider("handoff", _handoff_loader)),
+        (("import",), _path_candidates()),
+        (("export", "*"), _path_candidates()),
+    ),
+    "/retask": (
+        ((), _path_candidates((".retask",))),
+        (("done",), _cached_provider("retask", _retask_task_loader)),
+    ),
+    "/identity": (((("check", "delete", "capture"),),
+                   _cached_provider("identities", _identity_loader)),),
+    "/web": (
+        (("engines",), _static_candidates(("init", "Write a starter engine file"))),
+        (("test",), _cached_provider("engines", _web_engine_loader)),
+        (("cookies",), _static_candidates(
+            ("list", "Show stored clearance cookies"), ("clear", "Delete stored cookies"))),
+        (("cookies", "clear"), _cached_provider("cookie-domains", _cookie_domain_loader)),
+    ),
+    "/version": (
+        (("update",), _FORCE_FLAG),
+        (("enterprise",), _static_candidates(
+            ("on", "Install or update the organisation layer"),
+            ("off", "Remove it and go back to a personal CLI"),
+            ("gateway", "Download the self-hosted gateway bundle"))),
+        (("enterprise", ("on",)), _FORCE_FLAG),
+    ),
+    "/extensions": (
+        ((("remove", "trust", "untrust", "info", "pack", "publish"),),
+         _cached_provider("extensions", _installed_extension_loader)),
+        (("available",), _static_candidates(
+            ("all", "Official and community"), ("official", "Reviewed by Laintas"),
+            ("community", "User-published, unreviewed"))),
+        (("install",), _path_candidates((".lext",))),
+        (("install", "*"), _static_candidates(
+            ("--global", "Install for every workspace"), ("--force", "Replace an installed version"))),
+        (("install", "*", ("--global", "--force")), _static_candidates(
+            ("--global", "Install for every workspace"), ("--force", "Replace an installed version"))),
+        (("create", "*"), _static_candidates(("--desc", "One-line description"))),
+        (("pack", "*"), _static_candidates(("--output", "Where to write the .lext"))),
+    ),
+    "/evolve": (
+        (("open",), _cached_provider("evolve-branches", lambda: [
+            (b.get("id"), f"{b.get('status')} {symbols.BULLET} {str(b.get('description') or '')[:60]}")
+            for b in evolution_lab.list_branches()])),
+        ((("review", "test", "activate"),), _cached_provider("evolve-candidates", lambda: [
+            (c.get("id"), f"{c.get('status')} {symbols.BULLET} {c.get('name')}")
+            for c in evolution_lab.list_candidates()])),
+        (("activate", "*"), _FORCE_FLAG),
+        (("disable",), lambda _f, _p: [
+            (item["name"], f"v{item.get('version') or '?'}")
+            for item in extension_runtime.get_runtime().list()]),
+        (("use",), _cached_provider("evolve-profiles", lambda: [
+            (p.get("name"), f"{len(p.get('extensions') or {})} extension(s)")
+            for p in evolution_lab.list_profiles()])),
+    ),
+    "/prompt": (
+        (("open",), _cached_provider("prompt-branches", lambda: [
+            (b.get("id"), f"{b.get('status')} {symbols.BULLET} {str(b.get('description') or '')[:60]}")
+            for b in prompt_lab.list_branches()])),
+        ((("review", "test", "activate", "disable"),), _cached_provider("prompt-patches", lambda: [
+            (p.get("id"), f"{p.get('status')} {symbols.BULLET} {p.get('title') or ''}")
+            for p in prompt_lab.list_patches()])),
+        (("activate", "*"), _FORCE_FLAG),
+        (("use",), _cached_provider("prompt-profiles", lambda: [
+            (p.get("name"), f"{len(p.get('patches') or [])} patch(es)")
+            for p in prompt_lab.list_profiles()])),
+    ),
+    "/hwo": (
+        ((), _path_candidates((".hwo",))),
+        ((("run", "compile", "view"),), _path_candidates((".hwo",))),
+        (("status",), _cached_provider("runs:hwo", _run_loader("hwo"))),
+    ),
+    "/hwg": (
+        ((), _path_candidates((".hwg",))),
+        ((("run", "compile"),), _path_candidates((".hwg",))),
+        ((("resume", "status", "gantt", "cancel"),), _cached_provider("runs:hwg", _run_loader("hwg"))),
+        (("resume", "*"), _static_candidates(("PASS", "The paused node passed"), ("FAIL", "The paused node failed"))),
+    ),
+    "/img": (
+        ((), _path_candidates(_IMAGE_SUFFIXES)),
+        (("text",), _path_candidates((*_IMAGE_SUFFIXES, ".pdf"))),
+    ),
+    "/canvas": (
+        ((), _path_candidates((".excalidraw",))),
+        ((("text", "open", "new"),), _path_candidates((".excalidraw",))),
+    ),
+    "/undo": (((), _cached_provider("snapshots", _snapshot_loader)),),
+    "/shared": (
+        (("push",), _path_candidates()),
+        (("pull", "*"), _path_candidates()),
+        ((("rm", "delete"), "*"), _YES_FLAG),
+    ),
+    "/debug": (
+        (("*",), lambda fragment, prior: _path_candidates()(fragment, prior)
+         if prior[0].isdigit() else []),
+        (("*", "*"), lambda _f, prior: [("--raw", "Do not redact credentials")]
+         if prior[0].isdigit() else []),
+    ),
+    "/ppos": (
+        (("storage",), _static_candidates(
+            ("show", "Quota and per-work usage"), ("cleanup", "Find unreferenced media"))),
+        (("storage", "cleanup"), _static_candidates(("--apply", "Actually delete them"))),
+        (("work",), _static_candidates(
+            ("get", "Read one work"), ("delete", "Permanently delete one work"),
+            ("update", "Edit one work from JSON"))),
+        (("draft",), _static_candidates(("save", "Create or replace a private draft"))),
+        (("draft", "save"), _path_candidates((".md", ".markdown"))),
+        (("publish", "*", "*"), _path_candidates((".md", ".markdown"))),
+        ((("community-review", "platform-review"),), _static_candidates(
+            ("queue", "List items awaiting a decision"), ("decide", "Record a decision"))),
+        (("agent",), _static_candidates(
+            ("status", "Show the AI write policy"), ("enable", "Allow AI writes"),
+            ("disable", "Stop AI writes"), ("policy", "Show or set caps and allowlists"))),
+        ((("agent",), ("enable", "disable")), _static_candidates(
+            ("publish", "Publishing"), ("comment", "Comments"),
+            ("community_review", "Community moderation"),
+            ("platform_review", "Platform moderation"), ("all", "Every scope"))),
+        (("agent", "policy"), _static_candidates(("set", "Change one policy value"))),
+        (("agent", "policy", "set"), _static_candidates(
+            ("communities", "Comma-separated allowlist"), ("daily-publish", "Daily publish cap"),
+            ("daily-comment", "Daily comment cap"), ("fee-cap-cents", "Maximum fee per action"),
+            ("minimum-confidence", "Minimum review confidence"))),
+    ),
+}
+
+
+def _workflow_template_loader():
+    import workflow_engine
+    return [(name, "workflow template")
+            for name in workflow_engine.list_workflow_templates()]
+
+
+# /workflow start: templates come after the optional --replace.
+_ARG_COMPLETIONS["/workflow"] = (
+    (("start",), _static_candidates(("--replace", "Replace the active workflow"))),
+    (("start",), _cached_provider("workflows", _workflow_template_loader)),
+    (("start", "--replace"), _cached_provider("workflows", _workflow_template_loader)),
+)
+
+
+def _dynamic_arg_candidates(command: str, prior: list[str], fragment: str):
+    """Yield (value, description) for the words typed so far after `command`."""
+    lowered = [word.casefold() for word in prior]
+    for pattern, provider in _ARG_COMPLETIONS.get(command, ()):
+        if provider is None or len(pattern) != len(lowered):
+            continue
+        if not all(part == "*" or (word in part if isinstance(part, tuple) else word == part)
+                   for part, word in zip(pattern, lowered)):
+            continue
+        try:
+            yield from (provider(fragment, prior) or [])
+        except Exception:
+            continue
+
+
+def _flag_completions(words: list[str], trailing_space: bool, flags: dict):
+    """Completions for a command made of `--flag [value]` pairs.
+
+    `flags` maps each flag to (description, value provider or None). A flag
+    with a provider takes a value, and right after it only values are offered.
+    """
+    prior = words if trailing_space else words[:-1]
+    fragment = "" if trailing_space else (words[-1] if words else "")
+    if prior and prior[-1] in flags and flags[prior[-1]][1] is not None:
+        try:
+            return list(flags[prior[-1]][1](fragment, prior) or []), fragment
+        except Exception:
+            return [], fragment
+    return [(flag, meta[0]) for flag, meta in flags.items() if flag not in prior], fragment
+
+
+_NO_VALUE_HINT = _static_candidates()
+
+def _role_candidates(_fragment, _prior) -> list[tuple[str, str]]:
+    import agent_roles
+    return [(role.name, role.description) for role in agent_roles.list_roles()]
+
+
+_HIRE_FLAGS = {
+    "--profile": ("Start from a built-in employee role", _role_candidates),
+    "--prompt": ("Read the employee prompt from a file", _path_candidates()),
+    "--tools": ("Comma-separated tool names, or inherit", _static_candidates(
+        ("inherit", "Follow whatever tools are registered later"))),
+    "--model": ("Base model id (omit the id to pick one)", _model_candidates),
+    "--terminal": ("Deploy straight into a live terminal", _terminal_candidates(alive_only=True)),
+}
+
+_HELPWO_FLAGS = {
+    "--port": ("Local gateway port", _NO_VALUE_HINT),
+    "--host": ("Loopback address to bind", _static_candidates(
+        ("127.0.0.1", "IPv4 loopback"), ("localhost", "loopback name"), ("::1", "IPv6 loopback"))),
+    "--dist": ("A local Helpwo build directory", _path_candidates(dirs_only=True)),
+    "--remote": ("Open the hosted app and share this environment", None),
+}
+
+
 class MetaCompleter(Completer):
     """Context-aware completer: /-commands, shell commands from PATH, and paths."""
 
@@ -3559,7 +4088,10 @@ class MetaCompleter(Completer):
         its displayed value remains unchanged.  Selecting it naturally moves
         the user into the command's next argument context.
         """
-        exact = value.casefold() == fragment.casefold()
+        # A directory keeps the cursor inside it: "src/" + space would end
+        # the argument just as the user reaches the files under it.
+        exact = (value.casefold() == fragment.casefold()
+                 and not value.endswith("/"))
         return Completion(
             value + (" " if exact else ""),
             start_position=-len(fragment),
@@ -3708,25 +4240,20 @@ class MetaCompleter(Completer):
                     yield from self._config_completions(partial)
                     return
 
-                # Context-aware employee command completion. These values are
-                # runtime data, so they cannot live in static CommandSpec.
-                if head_lower == "/hire":
-                    hire_words = partial.split()
-                    if "--profile" in hire_words:
-                        profile_index = hire_words.index("--profile")
-                        if profile_index == len(hire_words) - 1:
-                            fragment = ""
-                        elif profile_index == len(hire_words) - 2:
-                            fragment = hire_words[-1]
-                        else:
-                            fragment = None
-                        if fragment is not None:
-                            import agent_roles
-                            for role in agent_roles.list_roles():
-                                if role.name.startswith(fragment.lower()):
-                                    yield self._completion(
-                                        role.name, fragment, role.description)
-                            return
+                # Flag-shaped commands: after a flag that takes a value only
+                # its values are offered; otherwise the flags not yet used.
+                if head_lower in ("/hire", "/helpwo"):
+                    words = partial.split()
+                    trailing_space = not partial or partial.endswith(" ")
+                    candidates, fragment = _flag_completions(
+                        words, trailing_space,
+                        _HIRE_FLAGS if head_lower == "/hire" else _HELPWO_FLAGS)
+                    if head_lower == "/helpwo" and len(words) <= (0 if trailing_space else 1):
+                        candidates = [("stop", "Stop the gateway and go offline"), *candidates]
+                    for value, meta in candidates:
+                        if value.casefold().startswith(fragment.casefold()):
+                            yield self._completion(value, fragment, meta)
+                    return
                 if head_lower in ("/agent", "/agents", "/station", "/st"):
                     words = partial.split()
                     trailing_space = tail.endswith(" ")
@@ -3735,6 +4262,7 @@ class MetaCompleter(Completer):
                         candidates = []
                         if head_lower == "/agents":
                             candidates.append(("tree", "show employee tree"))
+                            candidates.append(("--plain", "script-friendly snapshot"))
                         if head_lower == "/agent":
                             # /agent takes a single agent-id-or-name argument.
                             # Include every agent (primary is a valid switch
@@ -3774,11 +4302,25 @@ class MetaCompleter(Completer):
                             if value.lower().startswith(fragment.lower()):
                                 yield self._completion(value, fragment, meta)
                         return
-                if spec and " " not in partial:
-                    for entry in spec.contextual_completions:
-                        if entry.value.casefold().startswith(partial.casefold()):
-                            yield self._completion(
-                                entry.value, partial, entry.description)
+                if spec:
+                    # Static subcommands for the first word, then runtime
+                    # values (terminals, ids, files) for any position.
+                    words = partial.split()
+                    trailing_space = not partial or partial.endswith(" ")
+                    prior = words if trailing_space else words[:-1]
+                    fragment = "" if trailing_space else words[-1]
+                    seen = set()
+                    if not prior:
+                        for entry in spec.contextual_completions:
+                            if entry.value.casefold().startswith(fragment.casefold()):
+                                seen.add(entry.value)
+                                yield self._completion(
+                                    entry.value, fragment, entry.description)
+                    for value, meta in _dynamic_arg_candidates(spec.name, prior, fragment):
+                        if value in seen or not value.casefold().startswith(fragment.casefold()):
+                            continue
+                        seen.add(value)
+                        yield self._completion(value, fragment, meta)
                 elif not spec:
                     # Extension-registered commands (e.g. /org): query
                     # subcommand metadata from extension_runtime, supporting
@@ -8220,6 +8762,10 @@ def call_backend_stream(
         # Billing attribution: without this the gateway books the call under
         # its default product ("helpwo") — quota and /usage stats then miss it.
         "source": "cli",
+        # Which machine this turn ran on. The gateway's experience labels each
+        # episode with it, so work on the Windows laptop and on a server that
+        # share a path like /root stays distinguishable. A label, not an id.
+        "deviceName": _device_name(),
         # Managed v3 prompts are complete contracts and native schemas already
         # carry tool-specific instructions. Older or custom prompts retain the
         # gateway guide for backward compatibility unless they deliberately
@@ -10557,6 +11103,7 @@ class AgentRegistry:
             display_sub_terminal_preview=display_sub_terminal_preview,
             display_file_diff=display_file_diff,
             console=console, Markdown=Markdown,
+            status=_safe_status,
             pty_passthrough=pty_passthrough,
             request_command_approval=lambda cmd, reason: self._request_approval(
                 req_id, cmd, os.getcwd()) == "approve",
@@ -11815,7 +12362,7 @@ def _handle_enterprise(parts: list) -> None:
     target = words[0].lower() if words else "on"
     if target in ("cli", "install", "update"):
         target = "on"          # the names the frozen-binary era used
-    if target not in ("on", "off", "gateway"):
+    if target not in ("on", "off", "gateway") or len(words) > 1:
         console.print(
             "[yellow]Usage: /v enterprise [on|off|gateway] \\[--force][/yellow]\n"
             "  [dim]on      — Install or update the organisation layer (default)[/dim]\n"
@@ -11870,10 +12417,30 @@ _SLASH_ARG_RULES: dict[tuple[str, ...], SlashArgRule] = {
         (name,): _arg_rule(0, name)
         for name in (
             "/cwd", "/scan", "/login", "/max",
-            "/tools", "/prop", "/snapshots", "/continue",
+            "/tools", "/snapshots", "/continue",
         )
     },
+    # /prop takes `sys` and/or a conversation number; prop_ui.parse_target
+    # validates the words themselves. It used to sit in the zero-argument set
+    # above, which made both documented forms unreachable.
+    ("/prop",): _arg_rule(2, "/prop [sys] [N]"),
     ("/help",): _arg_rule(1, "/help [command]"),
+    ("/why",): _arg_rule(1, "/why [N|tool|terminal|agent]"),
+    ("/usage",): _arg_rule(2, "/usage [7d|30d|90d] [local]"),
+    ("/usage", "buy"): _arg_rule(2, "/usage buy <calls|storage>"),
+    ("/img", "list"): _arg_rule(1, "/img list"),
+    ("/img", "help"): _arg_rule(1, "/img help"),
+    ("/retask", "list"): _arg_rule(1, "/retask list"),
+    ("/retask", "help"): _arg_rule(1, "/retask help"),
+    ("/canvas",): _arg_rule(1, "/canvas [<path>|text <path>|new <path>|open [path]|list]"),
+    ("/canvas", "list"): _arg_rule(1, "/canvas list"),
+    ("/canvas", "help"): _arg_rule(1, "/canvas help"),
+    ("/canvas", "new"): _arg_rule(2, "/canvas new <path>"),
+    ("/canvas", "open"): _arg_rule(2, "/canvas open [path]"),
+    ("/canvas", "text"): _arg_rule(2, "/canvas text <path>"),
+    ("/handoff", "list"): _arg_rule(1, "/handoff list"),
+    ("/handoff", "ls"): _arg_rule(1, "/handoff list"),
+    ("/handoff", "help"): _arg_rule(1, "/handoff help"),
     ("/messages",): _arg_rule(
         2, "/messages [list|read <n>|seen|dismiss <n>|clear]"),
     # `new` and `note` carry free text, so they stay unconstrained; the leaves
@@ -11900,7 +12467,8 @@ _SLASH_ARG_RULES: dict[tuple[str, ...], SlashArgRule] = {
     ("/training", "off"): _arg_rule(1, "/training off"),
     # --port/--host/--dist are key+value pairs, so the ceiling has to cover
     # them together, not just the two it was written for.
-    ("/helpwo",): _arg_rule(6, "/helpwo [--port N] [--dist <path>] [--remote]"),
+    ("/helpwo",): _arg_rule(
+        7, "/helpwo [--port N] [--host ADDR] [--dist <path>] [--remote] | stop"),
     ("/helpwo", "stop"): _arg_rule(1, "/helpwo stop"),
     ("/terminate",): _arg_rule(1, "/terminate <name>"),
     ("/shared", "usage"): _arg_rule(1, "/shared usage"),
@@ -11912,6 +12480,36 @@ _SLASH_ARG_RULES: dict[tuple[str, ...], SlashArgRule] = {
     ("/shared", "cp"): _arg_rule(3, "/shared cp <from> <to>"),
     ("/shared", "rm"): _arg_rule(
         3, "/shared rm <path> [--yes]", flag_start=2, allowed_flags=("--yes",)),
+    # The handler accepts these spellings too; without their own rules they
+    # silently ignored whatever followed.
+    ("/shared", "ls"): _arg_rule(2, "/shared list [path]"),
+    ("/shared", "delete"): _arg_rule(
+        3, "/shared rm <path> [--yes]", flag_start=2, allowed_flags=("--yes",)),
+    ("/shared", "move"): _arg_rule(3, "/shared mv <from> <to>"),
+    ("/shared", "rename"): _arg_rule(3, "/shared mv <from> <to>"),
+    ("/shared", "copy"): _arg_rule(3, "/shared cp <from> <to>"),
+    ("/shared", "help"): _arg_rule(1, "/shared help"),
+    ("/windows", "status"): _arg_rule(1, "/windows status"),
+    ("/windows", "stop"): _arg_rule(1, "/windows stop"),
+    ("/windows", "start"): _arg_rule(2, "/windows start [read|write]"),
+    ("/windows", "install"): _arg_rule(
+        2, "/windows install [--force]", flag_start=1,
+        allowed_flags=("--force", "-f")),
+    ("/web", "status"): _arg_rule(1, "/web status"),
+    ("/web", "engines"): _arg_rule(2, "/web engines [init]"),
+    ("/web", "test"): _arg_rule(2, "/web test [engine]"),
+    ("/web", "cookies"): _arg_rule(3, "/web cookies [clear [domain]]"),
+    ("/identity", "list"): _arg_rule(1, "/identity list"),
+    ("/identity", "check"): _arg_rule(2, "/identity check <name>"),
+    ("/identity", "delete"): _arg_rule(2, "/identity delete <name>"),
+    ("/identity", "capture"): _arg_rule(3, "/identity capture <name> [domains]"),
+    ("/ppos", "account"): _arg_rule(1, "/ppos account"),
+    ("/ppos", "status"): _arg_rule(1, "/ppos status"),
+    ("/ppos", "help"): _arg_rule(1, "/ppos help"),
+    ("/ppos", "communities"): _arg_rule(3, "/ppos communities [page] [size]"),
+    ("/ppos", "works"): _arg_rule(3, "/ppos works [page] [size]"),
+    ("/ppos", "storage"): _arg_rule(4, "/ppos storage [show|cleanup [--apply] [hours]]"),
+    ("/hwo", "status"): _arg_rule(2, "/hwo status [runId]"),
     ("/abort",): _arg_rule(1, "/abort <agent-id>"),
     ("/agent",): _arg_rule(1, "/agent [agent-id-or-name]"),
     ("/undo",): _arg_rule(1, "/undo [sha]"),
@@ -11923,6 +12521,9 @@ _SLASH_ARG_RULES: dict[tuple[str, ...], SlashArgRule] = {
     ("/model", "default"): _arg_rule(1, "/model default"),
     ("/mode", "act"): _arg_rule(2, "/mode act [always]"),
     ("/mode", "always"): _arg_rule(1, "/mode always"),
+    ("/mode", "act-always"): _arg_rule(1, "/mode act-always"),
+    ("/mode", "auto"): _arg_rule(1, "/mode auto"),
+    ("/mode", "delete"): _arg_rule(2, "/mode delete [name]"),
     ("/mode", "review"): _arg_rule(1, "/mode review"),
     ("/mode", "study"): _arg_rule(1, "/mode study"),
     ("/mode", "step"): _arg_rule(1, "/mode step"),
@@ -11951,6 +12552,34 @@ _SLASH_ARG_RULES: dict[tuple[str, ...], SlashArgRule] = {
     ("/hwg", "gantt"): _arg_rule(2, "/hwg gantt <runId>"),
     ("/hwg", "cancel"): _arg_rule(2, "/hwg cancel <runId>"),
     ("/task", "list"): _arg_rule(1, "/task list"),
+    ("/task", "mine"): _arg_rule(1, "/task mine"),
+    ("/task", "agent"): _arg_rule(2, "/task agent <agent-id>"),
+    ("/policy", "status"): _arg_rule(1, "/policy status"),
+    ("/evolve", "status"): _arg_rule(1, "/evolve status"),
+    ("/evolve", "branches"): _arg_rule(1, "/evolve branches"),
+    ("/evolve", "candidates"): _arg_rule(1, "/evolve candidates"),
+    ("/evolve", "list"): _arg_rule(1, "/evolve list"),
+    ("/evolve", "profiles"): _arg_rule(1, "/evolve profiles"),
+    ("/evolve", "rollback"): _arg_rule(1, "/evolve rollback"),
+    ("/evolve", "help"): _arg_rule(1, "/evolve help"),
+    ("/evolve", "open"): _arg_rule(2, "/evolve open [branch-id]"),
+    ("/evolve", "review"): _arg_rule(2, "/evolve review [candidate-id]"),
+    ("/evolve", "test"): _arg_rule(2, "/evolve test [candidate-id]"),
+    ("/evolve", "activate"): _arg_rule(3, "/evolve activate [candidate-id] [--force]"),
+    ("/evolve", "disable"): _arg_rule(2, "/evolve disable [extension]"),
+    ("/evolve", "use"): _arg_rule(2, "/evolve use [profile]"),
+    ("/prompt", "branches"): _arg_rule(1, "/prompt branches"),
+    ("/prompt", "patches"): _arg_rule(1, "/prompt patches"),
+    ("/prompt", "profiles"): _arg_rule(1, "/prompt profiles"),
+    ("/prompt", "rollback"): _arg_rule(1, "/prompt rollback"),
+    ("/prompt", "help"): _arg_rule(1, "/prompt help"),
+    ("/prompt", "status"): _arg_rule(2, "/prompt status [id]"),
+    ("/prompt", "open"): _arg_rule(2, "/prompt open [branch-id]"),
+    ("/prompt", "review"): _arg_rule(2, "/prompt review [patch-id]"),
+    ("/prompt", "test"): _arg_rule(2, "/prompt test [patch-id]"),
+    ("/prompt", "activate"): _arg_rule(3, "/prompt activate [patch-id] [--force]"),
+    ("/prompt", "disable"): _arg_rule(2, "/prompt disable [patch-id]"),
+    ("/prompt", "use"): _arg_rule(2, "/prompt use [profile]"),
     ("/task", "show"): _arg_rule(2, "/task show <id>"),
     ("/task", "start"): _arg_rule(2, "/task start <id>"),
     ("/task", "done"): _arg_rule(2, "/task done <id>"),
@@ -12029,8 +12658,12 @@ _SLASH_ARG_RULES: dict[tuple[str, ...], SlashArgRule] = {
     ("/extensions", "trust"): _arg_rule(2, "/extensions trust <name>"),
     ("/extensions", "untrust"): _arg_rule(2, "/extensions untrust <name>"),
     ("/extensions", "info"): _arg_rule(2, "/extensions info <name>"),
-    ("/extensions", "create"): _arg_rule(2, "/extensions create <name>"),
-    ("/extensions", "pack"): _arg_rule(2, "/extensions pack <name>"),
+    # create/pack take one optional key+value pair, so the ceiling covers it;
+    # the handler checks that the pair is the right flag.
+    ("/extensions", "create"): _arg_rule(
+        4, "/extensions create <name> [--desc <text>]"),
+    ("/extensions", "pack"): _arg_rule(
+        4, "/extensions pack <name> [--output <path>]"),
 }
 
 
@@ -13196,12 +13829,14 @@ def _show_usage_command(args: list, session: dict) -> None:
         _usage_buy_pack(what, session)
         return
 
-    rng, local_only = "30d", False
+    rng, local_only, range_given = "30d", False, False
     for a in words:
-        if a == "local":
+        # Each word at most once: "/usage 7d 90d" used to keep the last range
+        # and never say the first one was thrown away.
+        if a == "local" and not local_only:
             local_only = True
-        elif a in ("7d", "30d", "90d"):
-            rng = a
+        elif a in ("7d", "30d", "90d") and not range_given:
+            rng, range_given = a, True
         else:
             raise SlashCommandUsageError("Usage: /usage [7d|30d|90d|local|buy <calls|storage>]")
     days = {"7d": 7, "30d": 30, "90d": 90}[rng]
@@ -13622,9 +14257,14 @@ def _cmd_img(raw_args: str) -> None:
     args = (raw_args or "").strip()
     # `--text` predates the verb and people will keep typing it; accepted
     # quietly rather than corrected, since it means exactly what `text` means.
-    for flag in ("--text", "--ocr"):
-        if flag in args:
-            args = ("text " + args.replace(flag, " ")).strip()
+    # Matched as whole words: a substring replace rewrote paths such as
+    # `shot--text.png`, and `--text --ocr` produced "text text <path>".
+    tokens = args.split()
+    if any(tok in ("--text", "--ocr") for tok in tokens):
+        tokens = [tok for tok in tokens if tok not in ("--text", "--ocr")]
+        if tokens and tokens[0].lower() == "text":
+            tokens = tokens[1:]
+        args = " ".join(["text", *tokens])
 
     verb, rest = _split_verb(
         args, ("text", "list", "help"),
@@ -15391,6 +16031,9 @@ def _cmd_mode(raw_args: str, parts: list) -> bool:
         # and command auto-approved for this session (shown as ACT*). Plain
         # `/mode act` restores confirmations by clearing that session state,
         # giving a mid-session way to turn auto-approve back off.
+        if sub == "act" and len(parts) > 2 and parts[2].lower() != "always":
+            console.print("[yellow]Usage: /mode act \\[always][/yellow]")
+            return False
         _always = (sub in ("always", "act-always")
                    or any(p.lower() == "always" for p in parts[2:]))
         if _in_plan:
@@ -15544,6 +16187,9 @@ def _cmd_mode(raw_args: str, parts: list) -> bool:
         ))
 
     elif sub:
+        if len(parts) > 2:
+            console.print(f"[yellow]Usage: /mode {_escape(sub)}[/yellow]")
+            return False
         if mode_manager.get_mode(sub) is None:
             ok, msg = False, f"Unknown mode: {sub}"
         else:
@@ -15959,7 +16605,7 @@ def _cmd_ppos(parts: list, session: dict) -> None:
                 raise ValueError("Usage: /ppos storage [show|cleanup [--apply] [hours]]")
         elif sub == "work":
             operation = parts[2].lower() if len(parts) > 2 else ""
-            if operation == "delete" and len(parts) > 3:
+            if operation == "delete" and len(parts) == 4:
                 _ppos_print(client.delete_work(parts[3], autonomous=False))
             elif operation == "update" and len(parts) > 4:
                 patch = json.loads(" ".join(parts[4:]))
@@ -15970,7 +16616,7 @@ def _cmd_ppos(parts: list, session: dict) -> None:
                     markdown_path=str(patch.get("path") or ""),
                     tags=patch.get("tags"), self_score=patch.get("self_score"),
                     community=str(patch.get("community_id") or ""), autonomous=False))
-            elif operation == "get" and len(parts) > 3:
+            elif operation == "get" and len(parts) == 4:
                 _ppos_print(client.read("work", filters={"work_id": parts[3]}))
             else:
                 raise ValueError(
@@ -15979,6 +16625,8 @@ def _cmd_ppos(parts: list, session: dict) -> None:
         elif sub in ("account", "status"):
             _ppos_print(client.read(sub))
         elif sub in ("communities", "works"):
+            if not all(p.isdigit() for p in parts[2:4]):
+                raise ValueError(f"Usage: /ppos {sub} [page] [size] — both are whole numbers")
             page = int(parts[2]) if len(parts) > 2 else 1
             page_size = int(parts[3]) if len(parts) > 3 else 20
             _ppos_print(client.read(sub, page=page, page_size=page_size))
@@ -16186,6 +16834,11 @@ def _cmd_policy(parts: list) -> bool:
     elif sub == "reset":
         _reset_session_approvals()
         console.print("[green]Session auto-approvals cleared.[/green]")
+    elif sub not in ("", "status"):
+        # A typo such as "/policy enfroce" used to print the status panel,
+        # which reads as if the change had been accepted.
+        console.print(
+            "[yellow]Usage: /policy \\[status|audit|enforce|disabled \\[--yes]|reset][/yellow]")
     else:
         _cfg = _pol_cmd.get_config()
         _mode = _cfg.get("mode", "audit")
@@ -18134,6 +18787,9 @@ def _cmd_debug(parts: list) -> None:
                 if n <= 0:
                     raise ValueError("N must be greater than 0")
                 filename = parts[2]
+                unexpected = [p for p in parts[3:] if p != "--raw"]
+                if unexpected:
+                    raise ValueError(f"unexpected argument {unexpected[0]!r}")
                 raw_export = "--raw" in parts[3:]
                 entries = get_debug_logs()[:n]
                 if not entries:
@@ -20156,8 +20812,11 @@ def _cmd_helpwo(raw_args: str, parts: list, agent_registry: AgentRegistry,
             console.print(r"[dim]Usage: /helpwo \[--port N] \[--dist <path>] \[--remote] | stop[/dim]")
             return
         else:
-            console.print(f"[yellow]Ignoring unrecognized argument: {arg}[/yellow]")
-            i += 1
+            # Refused rather than ignored: "/helpwo stpo" used to start the
+            # gateway it was meant to stop.
+            console.print(f"[red]Unexpected argument: {escape(arg)}[/red]")
+            console.print(r"[dim]Usage: /helpwo \[--port N] \[--host ADDR] \[--dist <path>] \[--remote] | stop[/dim]")
+            return
 
     dist_path = None
     if not remote:
@@ -20593,6 +21252,9 @@ def _web_engines(parts: list) -> None:
         else:
             console.print(f"[yellow]{path} already exists — edit it in place.[/yellow]")
         return
+    if len(parts) >= 3:
+        console.print(r"[yellow]Usage: /web engines \[init][/yellow]")
+        return
 
     entries, errors = ws.load_engine_registry()
     health = {h["engine"]: h for h in ws.engine_health()}
@@ -20893,7 +21555,7 @@ def _cmd_compact(parts: list, session: dict) -> bool:
         compact_chat if isinstance(compact_chat, list) else [])
     try:
         with _safe_status(
-                f"[dim]Compacting session context… {symbols.BULLET} Esc/Ctrl+C cancel[/dim]",
+                compaction_status_text(auto=False),
                 spinner="dots"):
             result = run_cancellable_blocking(
                 lambda _cancel: compact_session_context(
@@ -21419,6 +22081,14 @@ def _cmd_told(parts: list) -> bool:
     # Default subcommand: bare "/told" opens the interactive history browser;
     # "/told <agent>" (scoped, no subcommand) keeps the last-turns text replay.
     sub = args[0].lower() if args else ("reply" if scoped_agent_id else "browse")
+    _told_usage = ("[yellow]Usage: /told [agent-id [reply \\[N]|all]|N|all|"
+                   "reply \\[N]|log \\[N]][/yellow]")
+    # Only reply/log take a count; everything else is a single word. A count
+    # that is not a number used to fall back to the default without a word.
+    if (len(args) > (2 if sub in ("reply", "log") else 1)
+            or (len(args) == 2 and not args[1].isdigit())):
+        console.print(_told_usage)
+        return False
     if scoped_agent_id:
         if _terminal_agents.configured:
             _chat = _terminal_agents.chat_history_for(scoped_agent_id)
@@ -21568,9 +22238,7 @@ def _cmd_told(parts: list) -> bool:
             n = int(sub)
         except ValueError:
             console.print(f"[red]Unknown subcommand: {escape(sub)}[/red]")
-            console.print(
-                "[yellow]Usage: /told [agent-id [reply \\[N]|all]|N|all|"
-                "reply \\[N]|log \\[N]][/yellow]")
+            console.print(_told_usage)
             return False
         if n <= 0:
             console.print("[yellow]N must be a positive integer.[/yellow]")
@@ -21680,6 +22348,9 @@ def _cmd_hwo(parts: list, session: dict) -> None:
                 parent_id=current.id if current else None,
                 initial_session=loaded,
             )
+    elif sub in ("run", "compile", "view"):
+        # Without a file these used to fall through to the blank editor.
+        console.print(f"[yellow]Usage: /hwo {sub} <file.hwo>[/yellow]")
     else:
         # /hwo  — blank TUI
         root_name = current.name if current else "primary"
@@ -22016,11 +22687,11 @@ def _cmd_extensions(parts: list, session: dict) -> None:
             console.print("[yellow]Usage: /extensions create <name> [--desc \"description\"][/yellow]")
             return
         name = rest[0]
-        desc = ""
-        if "--desc" in rest:
-            idx = rest.index("--desc")
-            if idx + 1 < len(rest):
-                desc = rest[idx + 1]
+        extra = rest[1:]
+        if extra and (extra[0] != "--desc" or len(extra) != 2):
+            console.print("[yellow]Usage: /extensions create <name> [--desc \"description\"][/yellow]")
+            return
+        desc = extra[1] if extra else ""
         try:
             target = mgr.create(name, description=desc)
             console.print(f"[green]Created extension scaffold at {target}[/green]")
@@ -22034,11 +22705,11 @@ def _cmd_extensions(parts: list, session: dict) -> None:
             console.print("[yellow]Usage: /extensions pack <name> [--output <path>][/yellow]")
             return
         name = rest[0]
-        output = None
-        if "--output" in rest:
-            idx = rest.index("--output")
-            if idx + 1 < len(rest):
-                output = Path(rest[idx + 1])
+        extra = rest[1:]
+        if extra and (extra[0] != "--output" or len(extra) != 2):
+            console.print("[yellow]Usage: /extensions pack <name> [--output <path>][/yellow]")
+            return
+        output = Path(extra[1]) if extra else None
         try:
             result_path = mgr.pack(name, output)
             console.print(f"[green]Packed {name} -> {result_path}[/green]")
@@ -22785,6 +23456,7 @@ def get_loop_deps() -> LoopDeps:
             display_file_diff=display_file_diff,
             console=console,
             Markdown=Markdown,
+            status=_safe_status,
             pty_passthrough=pty_passthrough,
             request_command_approval=request_command_approval,
             request_file_write_approval=request_file_write_approval,
@@ -26002,8 +26674,23 @@ def main():
         _fork_parts = user_input.strip().split(maxsplit=1)
         if (_fork_parts and _fork_parts[0].lower() == "/fork"
                 and args.depth == 0 and not _is_dialogue):
-            _fork_name = (_fork_parts[1].strip()
-                          if len(_fork_parts) > 1 else "")
+            # /fork is intercepted before meta dispatch, so the "/fork [name]"
+            # argument rule never ran here: "/fork a b" silently made a fork
+            # named "a b", and quotes became part of the name. A name with a
+            # space is still possible — quote it.
+            try:
+                _fork_words = (shlex.split(_fork_parts[1])
+                               if len(_fork_parts) > 1 else [])
+            except ValueError:
+                _fork_words = None
+            if _fork_words is None or len(_fork_words) > 1:
+                console.print(
+                    "[yellow]Usage: /fork \\[name][/yellow] "
+                    "[dim]— quote a name that contains spaces[/dim]")
+                if injected_done is not None:
+                    injected_done.set()
+                continue
+            _fork_name = _fork_words[0].strip() if _fork_words else ""
             if _fork_name:
                 # /fork <name> - save current context as named fork snapshot.
                 # Reject if an identical lineage path already exists.
@@ -26121,6 +26808,15 @@ def main():
         _new_parts = user_input.strip().split(maxsplit=1)
         if (_new_parts and _new_parts[0].lower() in _NEW_SESSION_COMMANDS
                 and args.depth == 0 and not _is_dialogue):
+            if len(_new_parts) > 1:
+                # Discarding the session is not something to do on a
+                # mistyped line; "/clear screen" used to wipe the context.
+                console.print(
+                    f"[yellow]Usage: {escape(_new_parts[0].lower())}[/yellow] "
+                    "[dim]— takes no arguments[/dim]")
+                if injected_done is not None:
+                    injected_done.set()
+                continue
             _active_work = workgraph.get_active_work(cwd=_session_start_cwd)
             if (_active_work and _active_work.get("status")
                     not in {"COMPLETED", "CANCELLED", "FAILED"}):

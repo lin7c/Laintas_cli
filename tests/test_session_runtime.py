@@ -664,6 +664,91 @@ class AgentTerminationTests(unittest.TestCase):
         self.assertEqual(state, original)
         self.assertEqual(calls, [])
 
+    _STRUCTURED_SUMMARY = (
+        "## Goal\n- initial task\n## Constraints & Preferences\n- (none)\n"
+        "## Durable User Rules\n- (none)\n## Progress\n### Done\n- (none)\n"
+        "### In Progress\n- task\n### Blocked\n- (none)\n## Key Decisions\n- (none)\n"
+        "## Next Steps\n- continue\n## Critical Context\n- compacted\n"
+        "## Relevant Files\n- (none)")
+
+    def _summary_deps(self):
+        return _deps([{"reply": self._STRUCTURED_SUMMARY, "tool_calls": [],
+                       "finish_reason": "stop", "done": True, "error": False}])
+
+    @staticmethod
+    def _short_thread():
+        messages = [{"role": "user", "content": "initial task"}]
+        for index in range(1, 5):
+            messages.extend([
+                {"role": "assistant", "content": f"answer {index}"},
+                {"role": "user", "content": f"follow-up {index}"},
+            ])
+        return messages
+
+    @staticmethod
+    def _recording_status(shown):
+        @contextmanager
+        def status(text, **_kwargs):
+            shown.append(text)
+            yield
+        return status
+
+    def test_auto_compaction_shows_status_with_trigger_and_thinking_hints(self):
+        deps, _calls = self._summary_deps()
+        shown = []
+        deps.status = self._recording_status(shown)
+        agent_loop.set_runtime_config("model_context_window", 20000)
+        messages = [{"role": "user", "content": "initial task"}]
+        for index in range(1, 7):
+            messages.extend([
+                {"role": "assistant", "content": f"answer {index} " + "x" * 6000},
+                {"role": "user", "content": f"follow-up {index}"},
+            ])
+
+        changed = agent_loop._compact_thread_messages(
+            messages, deps, {}, "EN", {"_thread_messages": messages}, announce=True)
+
+        self.assertTrue(changed)
+        self.assertEqual(len(shown), 1)
+        self.assertIn("Esc/Ctrl+C cancel", shown[0])
+        self.assertIn("/config model_context_window", shown[0])
+        self.assertIn("/config compact_review_effort none", shown[0])
+
+    def test_manual_compaction_does_not_open_a_second_status(self):
+        deps, _calls = self._summary_deps()
+        shown = []
+        deps.status = self._recording_status(shown)
+        state = {"_thread_messages": self._short_thread(), "terminalHistory": []}
+
+        result = agent_loop.compact_session_context(
+            deps, {}, state, [{"role": "user", "content": "follow-up 4"}])
+
+        self.assertTrue(result["changed"])
+        self.assertEqual(shown, [])
+
+    def test_compaction_review_thinking_follows_config(self):
+        for effort, expected in (("auto", None), ("none", "none"), ("low", "low")):
+            with self.subTest(effort=effort):
+                agent_loop.set_runtime_config("compact_review_effort", effort)
+                deps, calls = self._summary_deps()
+                state = {"_thread_messages": self._short_thread(), "terminalHistory": []}
+                agent_loop.compact_session_context(
+                    deps, {}, state, [{"role": "user", "content": "follow-up 4"}])
+                self.assertEqual(calls[1]["task_kind"], "compaction_review")
+                self.assertEqual(calls[1].get("effort_override"), expected)
+                self.assertIsNone(calls[0].get("effort_override"))
+
+    def test_compaction_status_text_names_the_right_knobs(self):
+        manual = agent_loop.compaction_status_text(auto=False)
+        self.assertIn("Esc/Ctrl+C cancel", manual)
+        self.assertNotIn("Auto-compact", manual)
+        self.assertIn("/config compact_review_effort none", manual)
+        auto = agent_loop.compaction_status_text(auto=True, usable=150000, window=200000)
+        self.assertIn("/config context_window_adopt_cap", auto)
+        agent_loop.set_runtime_config("compact_review_effort", "none")
+        self.assertNotIn("compact_review_effort",
+                         agent_loop.compaction_status_text(auto=False))
+
     def test_manual_compaction_rolls_back_when_summary_fails(self):
         deps, calls = _deps([{"reply": "", "tool_calls": []}])
         messages = [{"role": "user", "content": "initial"}]
