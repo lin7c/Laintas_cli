@@ -934,7 +934,18 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
     def _handle_sso_login(self, query: str) -> None:
         """Stub /api/sso/login - redirect to the main page (no SSO in local mode)."""
         qs = parse_qs(query)
-        return_to = qs.get("return_to", [f"http://127.0.0.1:{_server_port()}/"])[0]
+        return_to = qs.get("return_to", [""])[0]
+        # Open-redirect guard: this endpoint 302s to a caller-supplied URL, so
+        # only same-origin absolute paths (or our own loopback origin) are
+        # allowed — anything else falls back to the local root.
+        parsed = urlparse(return_to)
+        if not return_to or parsed.scheme or parsed.netloc:
+            if (parsed.scheme in ("http", "https")
+                    and parsed.netloc in (f"127.0.0.1:{_server_port()}",
+                                          f"localhost:{_server_port()}")):
+                pass  # our own origin, allow
+            else:
+                return_to = "/"
         self.send_response(302)
         self.send_header("Location", return_to)
         self.send_header("Content-Length", "0")

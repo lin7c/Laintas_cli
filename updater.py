@@ -557,6 +557,16 @@ def apply_source_update(manifest: dict, changed_files: list, channel_dir: str,
         import zipfile
         try:
             with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                # Zip-slip guard: every entry must be a plain install-dir
+                # relative name, same rule as the manifest filenames. A
+                # tampered bundle must fail closed, not extract first and
+                # verify later — extractall writes every entry, including
+                # ones the manifest never mentions.
+                for entry in zf.namelist():
+                    if not _safe_name(entry.rstrip("/")) and not entry.endswith("/"):
+                        log(f"[red]Source bundle contains an unsafe path: "
+                            f"{entry!r}. Aborting.[/red]")
+                        return False
                 zf.extractall(tmpdir)
         except zipfile.BadZipFile:
             log("[red]Source bundle is not a valid zip. Aborting.[/red]")

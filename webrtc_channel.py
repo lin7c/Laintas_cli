@@ -1136,7 +1136,7 @@ class WebrtcManager:
                 finally:
                     conn.close()
 
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             status, resp_headers, body = await asyncio.wait_for(
                 loop.run_in_executor(None, _do_request), timeout=25)
             if len(body) > _MAX_HTTP_BYTES:
@@ -1275,7 +1275,7 @@ class WebrtcManager:
 
     async def _pump_rfb_to_channel(self, channel, sock):
         """x11vnc → noVNC. Raw RFB bytes as binary frames, with backpressure."""
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         try:
             while True:
                 data = await loop.sock_recv(sock, 65536)
