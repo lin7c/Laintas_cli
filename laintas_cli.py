@@ -5674,6 +5674,31 @@ def _is_foreground_turn(task_kind: str) -> bool:
                                           or threading.main_thread())
 
 
+def _backend_retry_notice(reason: str, delay: float, attempt: int,
+                          max_retries: int) -> str:
+    return (f"[dim yellow]{symbols.WARN} Backend {reason} — retrying in "
+            f"{delay:.0f}s (attempt {attempt + 2}/{max_retries + 1}). "
+            "Esc to stop.[/dim yellow]")
+
+
+def _announce_backend_retry(task_kind: str, reason: str, delay: float,
+                            attempt: int, max_retries: int) -> None:
+    """Say why the turn is waiting instead of leaving "Thinking…" to explain it.
+
+    Timeouts, refused connections, 429 and 5xx were retried in silence: up to
+    four 420s attempts behind a status row that only ever said "Thinking…",
+    and the heavy-thinking reassurance cannot help because the gear is not
+    known until a response starts. Auxiliary calls stay quiet — they share
+    this transport but are not the turn the user is watching.
+    """
+    if not _is_foreground_turn(task_kind):
+        return
+    try:
+        console.print(_backend_retry_notice(reason, delay, attempt, max_retries))
+    except Exception:
+        pass
+
+
 def _update_status_cache(**kwargs) -> None:
     """Patch one or more fields in the module-level status cache."""
     _status_cache.update(kwargs)
@@ -7239,7 +7264,8 @@ def ensure_auth() -> Optional[dict]:
     # 1. Try cached session
     session = load_session()
     if session:
-        user_info = verify_session(session)
+        with _safe_status("[dim]Checking sign-in…[/dim]"):
+            user_info = verify_session(session)
         if user_info:
             session["userId"] = user_info["id"]
             session["userName"] = user_info.get("name", "")
@@ -8879,6 +8905,8 @@ def call_backend_stream(
             except requests.Timeout:
                 if _attempt < _MAX_RETRIES:
                     _delay = min(_RETRY_BASE * (2 ** _attempt), _RETRY_CAP)
+                    _announce_backend_retry(task_kind, "timed out", _delay,
+                                            _attempt, _MAX_RETRIES)
                     if interrupt_event is not None:
                         if interrupt_event.wait(timeout=_delay):
                             raise InterruptedError("interrupted during retry delay")
@@ -8889,6 +8917,8 @@ def call_backend_stream(
             except requests.ConnectionError:
                 if _attempt < _MAX_RETRIES:
                     _delay = min(_RETRY_BASE * (2 ** _attempt), _RETRY_CAP)
+                    _announce_backend_retry(task_kind, "unreachable", _delay,
+                                            _attempt, _MAX_RETRIES)
                     if interrupt_event is not None:
                         if interrupt_event.wait(timeout=_delay):
                             raise InterruptedError("interrupted during retry delay")
@@ -8918,6 +8948,11 @@ def call_backend_stream(
                     except ValueError:
                         pass
                 _delay = min(_delay, _RETRY_CAP)
+                _announce_backend_retry(
+                    task_kind,
+                    ("is rate-limiting (429)" if response.status_code == 429
+                     else f"returned {response.status_code}"),
+                    _delay, _attempt, _MAX_RETRIES)
                 if interrupt_event is not None:
                     if interrupt_event.wait(timeout=_delay):
                         raise InterruptedError("interrupted during retry delay")
@@ -13767,7 +13802,8 @@ def _cmd_training(parts: list, session: dict) -> None:
         raise SlashCommandUsageError(
             "Usage: /training [status|on|off]")
 
-    state = _training_control_request(session, "GET")
+    with _safe_status("[dim]Checking training-data sharing…[/dim]"):
+        state = _training_control_request(session, "GET")
     if state is None:
         return
     available = bool(state.get("collection_available", True))
@@ -13796,7 +13832,8 @@ def _cmd_training(parts: list, session: dict) -> None:
     }
     if action == "on":
         payload["confirm_scope"] = scope
-    updated = _training_control_request(session, "PUT", payload)
+    with _safe_status("[dim]Saving training-data preference…[/dim]"):
+        updated = _training_control_request(session, "PUT", payload)
     if updated is None:
         return
     if action == "on":
@@ -21560,7 +21597,7 @@ def _cmd_compact(parts: list, session: dict) -> bool:
             result = run_cancellable_blocking(
                 lambda _cancel: compact_session_context(
                     compact_deps, compact_session, compact_working_state,
-                    compact_working_chat))
+                    compact_working_chat, interrupt_event=_cancel))
     except BlockingOperationCancelled:
         console.print("[dim]Context compaction cancelled.[/dim]")
         return False
@@ -22496,7 +22533,7 @@ def _cmd_extensions(parts: list, session: dict) -> None:
 
     mgr = extension_manager.ExtensionManager(
         runtime=extension_runtime.get_runtime(), console=console,
-        community_scanner=_scan_community)
+        community_scanner=_scan_community, status=_safe_status)
 
     if sub == "list":
         entries = mgr.list_installed()
@@ -23386,6 +23423,25 @@ def show_help(command: str = ""):
 
     console.print()
     group_order = list(dict.fromkeys(spec.group for spec in COMMAND_SPECS))
+
+    def _print_group(title: str, rows: list) -> None:
+        # Rich grid, not hand-rolled ljust: usage strings vary from "/cwd" to
+        # multi-branch monsters like /helpwo, and a fixed pad width computed
+        # from the longest one pushed every description past the wrap column
+        # onto unindented continuation lines. A borderless Table wraps both
+        # columns with a hanging indent and keeps descriptions aligned.
+        table = RichTable.grid(padding=(0, 2))
+        # Long usage strings (/helpwo, /usage …) may exceed any sane column
+        # width; let them fold within the column rather than overflow="ignore",
+        # which renders past the column edge and overwrites the description.
+        table.add_column(style="accent.dim", max_width=64, overflow="fold")
+        table.add_column(style="muted", ratio=1)
+        for cmd, desc in rows:
+            table.add_row(Text(cmd), Text(desc))
+        console.print(f"  [accent]{title}[/accent]")
+        console.print(Padding(table, (0, 0, 0, 4)))
+        console.print()
+
     for title in group_order:
         rows = []
         if title == "Basics":
@@ -23404,12 +23460,7 @@ def show_help(command: str = ""):
             if spec.aliases:
                 label += f"  ({', '.join(spec.aliases)})"
             rows.append((label, spec.description))
-        console.print(f"  [accent]{title}[/accent]")
-        cmd_w = max(len(c) for c, _ in rows)
-        for cmd, desc in rows:
-            padded = escape(cmd.ljust(cmd_w))
-            console.print(f"    [accent.dim]{padded}[/accent.dim]  [muted]{escape(desc)}[/muted]")
-        console.print()
+        _print_group(title, rows)
 
     # Extension-registered commands (e.g. /org) are not in COMMAND_SPECS.
     # Show them in their own group so /help reflects everything the user can
@@ -23419,7 +23470,6 @@ def show_help(command: str = ""):
     except Exception:
         ext_names = []
     if ext_names:
-        console.print("  [accent]Extensions[/accent]")
         ext_rows = []
         for name in ext_names:
             try:
@@ -23427,11 +23477,8 @@ def show_help(command: str = ""):
             except Exception:
                 desc = ""
             ext_rows.append((name, desc))
-        cmd_w = max(len(c) for c, _ in ext_rows) if ext_rows else 1
-        for cmd, desc in ext_rows:
-            padded = escape(cmd.ljust(cmd_w))
-            console.print(f"    [accent.dim]{padded}[/accent.dim]  [muted]{escape(desc)}[/muted]")
-        console.print()
+        if ext_rows:
+            _print_group("Extensions", ext_rows)
 
 
 # ── LoopDeps factory (lazy init after all functions defined) ─────────
@@ -26290,7 +26337,13 @@ def main():
                     console.print(f"[dim yellow]mcp config present but SDK missing: {_get_mcp_mod().MCP_IMPORT_ERROR}[/dim yellow]")
                     console.print("[dim]Install with: pip install mcp[/dim]")
             else:
-                _mcp_results = _get_mcp_mod().get_manager().connect_all_enabled()
+                # Servers initialise one after another, up to ~20s each, and
+                # the results only print once all of them are done.
+                if _get_mcp_mod().CONFIG_PATH.exists():
+                    with _safe_status("[dim]Connecting MCP servers…[/dim]"):
+                        _mcp_results = _get_mcp_mod().get_manager().connect_all_enabled()
+                else:
+                    _mcp_results = _get_mcp_mod().get_manager().connect_all_enabled()
                 for n, ok, m in _mcp_results:
                     if n == "(none)":
                         continue
