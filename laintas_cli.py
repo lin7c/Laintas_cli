@@ -3512,8 +3512,6 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
                 subcommands=("all", "reply", "log")),
     # Keep /reload discoverable, but its existing handler and behavior stay untouched.
     CommandSpec("/reload", "Reload default files and restart", "History"),
-    CommandSpec("/focus", "Deprecated: use /station to run another Agent", "Agents & Terminals",
-                palette=False),
 )
 
 _NEW_SESSION_COMMANDS = ("/new", "/clear", "/new-session", "/reset-session")
@@ -20200,13 +20198,6 @@ def _cmd_agents(parts: list, session: dict, agent_registry=None,
     return None
 
 
-def _cmd_focus(parts: list) -> None:
-    """The shared-terminal focus UI was removed."""
-    console.print(
-        "[yellow]/focus is unavailable. Each terminal has one foreground Agent; "
-        "use /station to run another Agent in its own terminal.[/yellow]")
-
-
 def _cmd_spawn(raw_args: str, session: dict, agent_registry: AgentRegistry) -> None:
     if not raw_args:
         console.print("[yellow]Usage: /spawn \\[name:] <task...>[/yellow]")
@@ -23089,9 +23080,6 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
 
     elif action == "/name":
         _cmd_name(raw_args, session, agent_registry)
-
-    elif action == "/focus":
-        _cmd_focus(parts)
 
     elif action == "/memory":
         _cmd_memory(parts)
