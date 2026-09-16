@@ -1939,10 +1939,14 @@ class SubTerminalSession:
     close, full_output, returncode, command).
     """
 
-    def __init__(self, command: str, timeout: int = 120):
+    def __init__(self, command: str, timeout: int = 120,
+                 use_tmux: Optional[bool] = None):
         self.command = command
         self.timeout = timeout
-        self._use_tmux = "TMUX" in os.environ
+        # None = follow the environment. Background sessions (one per user of
+        # an application) pass False: a tmux window per user is clutter no one
+        # asked for, and nobody attaches to them.
+        self._use_tmux = ("TMUX" in os.environ) if use_tmux is None else bool(use_tmux)
         self._tmux_window: str = ""
         self._pty: Optional[InteractiveSession] = None
         self._alive: bool = False
@@ -2279,7 +2283,10 @@ def _build_connected_subterminal_cmd(terminal_name: str,
                                      auto_connect: bool = False,
                                      parent_terminal: str = "term0",
                                      terminal_id: Optional[str] = None,
-                                     extra_args: Optional[list] = None) -> str:
+                                     extra_args: Optional[list] = None,
+                                     depth: int = 1,
+                                     env: Optional[dict] = None,
+                                     cwd: Optional[str] = None) -> str:
     """Command line for a user-facing sub-terminal running a nested CLI.
 
     Carries the terminal's identity (name + remote parent agent id) so that
@@ -2287,14 +2294,22 @@ def _build_connected_subterminal_cmd(terminal_name: str,
     auto_connect=True (used by Helpwo's term-new) registers at startup.
     terminal_id overrides the id derived from the parent terminal — an app
     sub-terminal keeps one per folder, so its terminal preferences survive a
-    new SSH login. extra_args are appended, each quoted.
+    new SSH login. extra_args are appended, each quoted. env adds variable
+    assignments in front of the command (e.g. a session's own LAINTAS_HOME).
     """
     terminal_id = terminal_id or paths.child_terminal_id(
         terminal_name, parent_terminal or "term0")
-    parts = [f"LAINTAS_TERMINAL_ID={shlex.quote(terminal_id)}",
-             shlex.quote(sys.executable),
-             shlex.quote(os.path.abspath(__file__)),
-             "--depth", "1",
+    parts = [f"LAINTAS_TERMINAL_ID={shlex.quote(terminal_id)}"]
+    for key, value in (env or {}).items():
+        if not re.fullmatch(r"[A-Z_][A-Z0-9_]*", str(key)):
+            raise ValueError(f"invalid environment variable name: {key!r}")
+        parts.append(f"{key}={shlex.quote(str(value))}")
+    # A frozen executable is the CLI itself, not a Python interpreter.
+    # Passing __file__ to it makes argparse reject the child invocation.
+    parts.append(shlex.quote(sys.executable))
+    if not getattr(sys, "frozen", False):
+        parts.append(shlex.quote(_LAUNCH_SCRIPT_PATH))
+    parts += ["--depth", str(max(1, int(depth))),
              "--terminal-name", shlex.quote(terminal_name),
              "--parent-terminal", shlex.quote(parent_terminal or "term0")]
     if remote_parent_id:
@@ -2302,7 +2317,10 @@ def _build_connected_subterminal_cmd(terminal_name: str,
     if auto_connect:
         parts.append("--connect")
     parts += [shlex.quote(str(arg)) for arg in (extra_args or [])]
-    return " ".join(parts)
+    command = " ".join(parts)
+    if cwd:
+        command = f"cd -- {shlex.quote(str(cwd))} && {command}"
+    return command
 
 
 def connect_terminal_to_helpwo(agent_registry: "AgentRegistry", session: dict,
@@ -9885,6 +9903,10 @@ class AgentRegistry:
         self._last_agent_id: str = ""
         # Serializes background Helpwo chats (they share the REPL history).
         self._chat_run_lock = threading.Lock()
+        # Set when this process serves a registered application (/app) or one
+        # of its users' sessions: {"approval": "deny" | "auto"}. None for
+        # Helpwo and every ordinary CLI. See _request_approval and _handle_chat.
+        self.app_mode: Optional[dict] = None
         self._remote_executor = self._new_remote_executor()
         self._remote_control_executor = ThreadPoolExecutor(
             max_workers=self.REMOTE_CONTROL_EXECUTOR_THREADS,
@@ -10383,6 +10405,12 @@ class AgentRegistry:
                 self._handle_term_new(req_id, payload)
             elif kind == "term-close":
                 self._handle_term_close(req_id, payload)
+            elif kind in ("session-open", "session-close", "session-list"):
+                if self.app_mode is None or not _HOSTED_APP.get("manifest"):
+                    self._push_final(req_id, "fail",
+                                     f"'{kind}' is only available to a hosted application")
+                else:
+                    _handle_app_session_message(self, req_id, kind, payload)
             elif kind == "disconnect":
                 self._handle_disconnect(req_id, payload)
             elif kind == "abort":
@@ -10433,14 +10461,22 @@ class AgentRegistry:
         they still go through REPL injection.
         """
         content = payload.get("message", "")
+        if not isinstance(content, str):
+            self._push_final(req_id, "fail", "'message' must be a string")
+            return
 
         console.print(Panel(
-            f"[bold cyan]Remote message from Helpwo:[/bold cyan]\n{content}",
+            f"[bold cyan]Remote message from "
+            f"{'the application' if self.app_mode is not None else 'Helpwo'}:"
+            f"[/bold cyan]\n{escape(content)}",
             title="Incoming",
             border_style="cyan",
         ))
 
-        if content.lstrip().startswith("/"):
+        # An application's message is conversation, never a command line: a
+        # leading "/" would otherwise run as a slash command in this REPL
+        # (/policy disabled, /mode act always, …).
+        if content.lstrip().startswith("/") and self.app_mode is None:
             done = threading.Event()
             _inject_input(content, done)
             if not done.wait(timeout=120):
@@ -11525,6 +11561,20 @@ class AgentRegistry:
 
         Returns "approve", "reject", or "modify". Timeout defaults to 5 min.
         """
+        if self.app_mode is not None:
+            # Whoever sends an application's messages must never be the one
+            # who approves what they cause. The manifest decides, up front:
+            # "auto" approves what the policy engine did not already deny,
+            # except destructive deletes; anything else is refused.
+            decision = ("approve"
+                        if self.app_mode.get("approval") == "auto" and not destructive
+                        else "reject")
+            self._push_events([{
+                "type": "approval-decided",
+                "content": f"{decision}: {command[:200]}",
+                "meta": {"decision": decision, "by": "application-config"},
+            }], req_id=req_id)
+            return decision
         approval_ev = threading.Event()
         response_dict: dict = {}
 
@@ -21168,8 +21218,14 @@ def _report_app_runtime(app: str, runtime: dict, *, open_url: bool) -> None:
         console.print("[dim]/t to look at the sub-terminal; running the command again "
                       "replaces it.[/dim]")
     elif status == "exited":
+        code = runtime.get("returncode")
         console.print(f"[red]Sub-terminal [bold]{escape(app)}[/bold] exited before "
-                      f"{escape(label)} was ready.[/red]")
+                      f"{escape(label)} was ready"
+                      f"{f' (exit code {code})' if code not in (None, -1) else ''}.[/red]")
+        tail = str(runtime.get("output_tail") or "").strip()
+        if tail:
+            console.print(Panel(escape(tail), title="Last output of the sub-terminal",
+                                border_style="red"))
     else:
         console.print(f"[yellow]{escape(label)} is not ready after waiting; "
                       f"/t to look at sub-terminal [bold]{escape(app)}[/bold].[/yellow]")
@@ -21216,31 +21272,12 @@ def _launch_app_subterminal(app: str, *, persistent: bool, options: dict,
             _APP_LAUNCHES.pop(app, None)
 
     directory, state = app_host.ensure_state(app, os.getcwd(), persistent)
-    launch_id = secrets.token_hex(8)
-    app_host.clear_runtime(directory)
-    cmd = _build_connected_subterminal_cmd(
-        app,
-        agent_registry.agent_id if agent_registry else None,
-        parent_terminal="term0",
-        terminal_id=state["terminal_id"],
-        extra_args=["--app", app, "--app-state", str(directory),
-                    "--app-launch-id", launch_id,
-                    "--app-options", json.dumps(options or {}, ensure_ascii=True)],
-    )
-    sub = SubTerminalSession(cmd)
-    sub.start()
-    time.sleep(0.1)
-    if not sub.is_alive():
-        console.print(f"[red]Could not start sub-terminal '{escape(app)}'.[/red]")
-        return None
-    sub.read_output(timeout=0.1)
     try:
-        register_terminal(sub, app_host.terminal_command(app), 0, name=app,
-                          parent_terminal="term0")
+        sub, launch_id = _spawn_app_terminal(
+            app, app, directory, state, options,
+            remote_parent_id=agent_registry.agent_id if agent_registry else None)
     except Exception as exc:
-        sub.close()
-        console.print(f"[red]Could not register sub-terminal '{escape(app)}': "
-                      f"{escape(str(exc))}[/red]")
+        console.print(f"[red]{escape(str(exc))}[/red]")
         return None
     _APP_LAUNCHES[app] = {"state_dir": directory, "launch_id": launch_id}
     console.print(
@@ -21252,6 +21289,8 @@ def _launch_app_subterminal(app: str, *, persistent: bool, options: dict,
     def _await() -> dict:
         runtime = app_host.wait_runtime(directory, launch_id, timeout=90.0,
                                         alive=sub.is_alive)
+        if runtime.get("status") == "exited":
+            runtime.update(_subterminal_exit_details(sub))
         _report_app_runtime(app, runtime, open_url=open_url)
         return runtime
 
@@ -21259,6 +21298,177 @@ def _launch_app_subterminal(app: str, *, persistent: bool, options: dict,
         return _await()
     threading.Thread(target=_await, daemon=True, name=f"app-launch-{app}").start()
     return {"status": "launching"}
+
+
+def _subterminal_exit_details(sub) -> dict:
+    """Exit code and the last lines a dead sub-terminal printed.
+
+    Without them "exited before it was ready" is all anyone learns, and the
+    reason — a traceback, an argparse error — is gone with the PTY.
+    """
+    details: dict = {}
+    try:
+        details["returncode"] = getattr(sub, "returncode", None)
+    except Exception:
+        pass
+    try:
+        text = str(getattr(sub, "full_output", "") or "")
+        text = re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*(\x07|\x1b\\)|\r", "", text)
+        lines = [line for line in text.splitlines() if line.strip()]
+        details["output_tail"] = "\n".join(lines[-25:])[-4000:]
+    except Exception:
+        pass
+    return details
+
+
+def _spawn_app_terminal(name: str, app: str, directory, state: dict, options: dict, *,
+                        remote_parent_id: Optional[str] = None, depth: int = 1,
+                        env: Optional[dict] = None, cwd: Optional[str] = None,
+                        use_tmux: Optional[bool] = None) -> tuple:
+    """Start and register one application sub-terminal. Returns (session, launch_id).
+
+    The nested CLI reports back through the runtime file in ``directory``
+    under ``launch_id``. Raises with a readable message on failure.
+    """
+    launch_id = secrets.token_hex(8)
+    app_host.clear_runtime(directory)
+    cmd = _build_connected_subterminal_cmd(
+        name, remote_parent_id,
+        parent_terminal="term0",
+        terminal_id=state["terminal_id"],
+        extra_args=["--app", app, "--app-state", str(directory),
+                    "--app-launch-id", launch_id,
+                    "--app-options", json.dumps(options or {}, ensure_ascii=True)],
+        depth=depth, env=env, cwd=cwd,
+    )
+    sub = SubTerminalSession(cmd, use_tmux=use_tmux)
+    sub.start()
+    time.sleep(0.1)
+    if not sub.is_alive():
+        raise RuntimeError(f"could not start sub-terminal '{name}'")
+    sub.read_output(timeout=0.1)
+    try:
+        register_terminal(sub, app_host.terminal_command(name), 0, name=name,
+                          parent_terminal="term0")
+    except Exception as exc:
+        sub.close()
+        raise RuntimeError(f"could not register sub-terminal '{name}': {exc}") from exc
+    return sub, launch_id
+
+
+# Per-user sessions of the application this process hosts:
+# user -> {"name", "state_dir", "launch_id", "home"}.
+_APP_SESSIONS: dict = {}
+_APP_SESSIONS_LOCK = threading.RLock()
+
+
+def _app_session_alive(record: dict) -> bool:
+    term = get_terminal(record["name"])
+    return bool(term is not None and term.session is not None and term.session.is_alive())
+
+
+def _app_session_forget(user: str) -> None:
+    record = _APP_SESSIONS.pop(user, None)
+    if record is None:
+        return
+    if get_terminal(record["name"]) is not None:
+        unregister_terminal(record["name"])
+    app_host.remove_session_dir(record["home"])
+
+
+def _app_session_public(user: str, runtime: dict, persistent: bool) -> dict:
+    """What the application gets back: how to reach this user's agent."""
+    return {"user": user, "url": runtime.get("url", ""),
+            "token": runtime.get("token", ""), "agentId": runtime.get("agent_id", ""),
+            "persistent": persistent}
+
+
+def _app_session_open(manifest, user: str) -> dict:
+    """Give one end user their own temporary sub-terminal and agent.
+
+    The sub-terminal is a nested CLI with its own LAINTAS_HOME and working
+    directory, so the agent in it loads nothing of the operator's (memory,
+    rules, skills) and nothing of any other user's. The application talks to
+    it directly with the bridge address and token returned here. Opening an
+    already-open session returns the same one.
+    """
+    persistent = manifest.persistence == app_host.PERSISTENCE_WORKSPACE
+    name = app_host.session_terminal_name(manifest.name, user)
+    with _APP_SESSIONS_LOCK:
+        for other in [u for u, rec in _APP_SESSIONS.items() if not _app_session_alive(rec)]:
+            _app_session_forget(other)
+        record = _APP_SESSIONS.get(user)
+        if record is None:
+            if len(_APP_SESSIONS) >= manifest.max_sessions:
+                raise RuntimeError(f"session limit reached ({manifest.max_sessions})")
+            stale = get_terminal(name)
+            if stale is not None:
+                unregister_terminal(name)
+            home, work = app_host.session_dirs(_HOSTED_APP["state_dir"], user, persistent)
+            app_host.link_credentials(home)
+            directory, state = app_host.ensure_state(manifest.name, str(work), persistent)
+            options = {"session_user": user, "prompt": manifest.prompt,
+                       "tools": list(manifest.session_tools),
+                       "auto_approve": bool(manifest.auto_approve),
+                       "idle_minutes": int(manifest.session_idle_minutes)}
+            try:
+                _sub, launch_id = _spawn_app_terminal(
+                    name, manifest.name, directory, state, options,
+                    depth=_REPL_PROCESS_DEPTH + 1,
+                    env={"LAINTAS_HOME": str(home)}, cwd=str(work), use_tmux=False)
+            except Exception:
+                app_host.remove_session_dir(home)
+                raise
+            record = {"name": name, "state_dir": directory, "launch_id": launch_id,
+                      "home": home}
+            _APP_SESSIONS[user] = record
+            console.print(f"[dim]Session opened for user {escape(user)} "
+                          f"(sub-terminal {escape(name)}).[/dim]")
+    runtime = app_host.wait_runtime(record["state_dir"], record["launch_id"], timeout=90.0,
+                                    alive=lambda: _app_session_alive(record))
+    if runtime.get("status") != "ready":
+        with _APP_SESSIONS_LOCK:
+            if _APP_SESSIONS.get(user) is record:
+                _app_session_forget(user)
+        raise RuntimeError(f"session did not start: "
+                           f"{runtime.get('message') or runtime.get('status')}")
+    return _app_session_public(user, runtime, persistent)
+
+
+def _app_session_close(user: str) -> bool:
+    with _APP_SESSIONS_LOCK:
+        if user not in _APP_SESSIONS:
+            return False
+        _app_session_forget(user)
+    console.print(f"[dim]Session closed for user {escape(user)}.[/dim]")
+    return True
+
+
+def _handle_app_session_message(registry, req_id: str, kind: str, payload: dict) -> None:
+    """session-open / session-close / session-list from the hosted application."""
+    manifest = _HOSTED_APP["manifest"]
+    if kind == "session-list":
+        with _APP_SESSIONS_LOCK:
+            users = [{"user": user, "alive": _app_session_alive(rec)}
+                     for user, rec in sorted(_APP_SESSIONS.items())]
+        registry._push_final(req_id, "success",
+                             json.dumps({"sessions": users, "max": manifest.max_sessions}))
+        return
+    user = payload.get("user")
+    if not isinstance(user, str) or not app_host.USER_ID_RE.match(user):
+        registry._push_final(req_id, "fail", "'user' must match [A-Za-z0-9._-]{1,64}")
+        return
+    if kind == "session-close":
+        closed = _app_session_close(user)
+        registry._push_final(req_id, "success" if closed else "fail",
+                             json.dumps({"user": user, "closed": closed}))
+        return
+    try:
+        result = _app_session_open(manifest, user)
+    except Exception as exc:
+        registry._push_final(req_id, "fail", str(exc)[:500])
+        return
+    registry._push_final(req_id, "success", json.dumps(result))
 
 
 def _close_app_subterminal(app: str) -> bool:
@@ -21296,6 +21506,9 @@ def _bootstrap_hosted_app(args, agent_registry: AgentRegistry, session: dict) ->
             result = _helpwo_start_in_process(
                 options, agent_registry, session, state=state,
                 state_dir=directory, open_browser=False)
+        elif options.get("session_user"):
+            result = _app_session_start_in_process(args.app, options, agent_registry,
+                                                   session, state)
         else:
             result = _app_start_in_process(args.app, agent_registry, session,
                                            state, directory)
@@ -21322,6 +21535,12 @@ def _app_start_in_process(name: str, agent_registry: AgentRegistry, session: dic
         return {"status": "error",
                 "message": f"'{name}' is not trusted (or changed since); /app trust {name}"}
     app_host.activate(manifest.name, manifest.prompt, builtin=False)
+    _HOSTED_APP["manifest"] = manifest
+    agent_registry.app_mode = {"approval": "deny"}
+    # Throwaway session folders of a previous run of this application.
+    import shutil
+    from pathlib import Path
+    shutil.rmtree(Path(state_dir) / "sessions", ignore_errors=True)
 
     persisted_port = state.get("port") if state.get("persistent") else None
     port = manifest.port or persisted_port or 0
@@ -21341,9 +21560,12 @@ def _app_start_in_process(name: str, agent_registry: AgentRegistry, session: dic
     console.print(Panel(
         f"[green]Hosting application [bold]{escape(manifest.name)}[/bold][/green]\n"
         f"Bridge: {bridge_url}  agent: {agent_id}\n"
-        f"[dim]Only the conversation API is exposed: POST /api/agents/<id>/send "
-        f"(kind chat/abort/approval-response), GET /api/agents/<id>/updates. "
-        f"Authenticate with the header 'Authorization: token <token>'.[/dim]",
+        f"[dim]POST /api/agents/<id>/send (kind chat/abort, or session-open/"
+        f"session-close/session-list with payload.user), GET "
+        f"/api/agents/<id>/updates. Header 'Authorization: token <token>'. "
+        f"Sessions: up to {manifest.max_sessions}, tools "
+        f"{', '.join(manifest.session_tools) or '(none)'}, approvals "
+        f"{'auto' if manifest.auto_approve else 'refused'}.[/dim]",
         title="App", border_style="green"))
 
     result = {"status": "ready", "mode": "app", "url": bridge_url,
@@ -21368,6 +21590,70 @@ def _app_start_in_process(name: str, agent_registry: AgentRegistry, session: dic
                       f"output → {log_path}[/dim]")
         result.update({"app_pid": proc.pid, "log": str(log_path)})
     return result
+
+
+def _app_session_start_in_process(name: str, options: dict,
+                                  agent_registry: AgentRegistry, session: dict,
+                                  state: dict) -> dict:
+    """Inside one user's session sub-terminal: become that user's agent.
+
+    This process already runs with the session's own LAINTAS_HOME and working
+    directory (set by the launcher). What is left is to narrow the agent to
+    the manifest's tools, fix how approvals are decided, and open a bridge
+    that accepts only conversation.
+    """
+    import helpwo_server
+    import agent_loop as _al
+
+    user = str(options.get("session_user") or "")
+    if not app_host.USER_ID_RE.match(user):
+        return {"status": "error", "message": "invalid session user"}
+    app_host.activate(name, str(options.get("prompt") or ""), builtin=False,
+                      session_user=user)
+    requested = {str(item) for item in (options.get("tools") or [])}
+    allowed = sorted(app_host.SESSION_BASE_TOOLS
+                     | (requested & app_host.SESSION_OPTIONAL_TOOLS))
+    primary = get_agent("primary")
+    if primary is None:
+        return {"status": "error", "message": "no primary agent in the session"}
+    primary.profile.tool_policy = _al.AgentToolPolicy(allowed_tools=allowed)
+    agent_registry.app_mode = {
+        "approval": "auto" if options.get("auto_approve") is True else "deny"}
+
+    ok, msg = helpwo_server.start_server(
+        agent_registry, port=0, session=session,
+        token=state.get("token") or None,
+        agent_id=state.get("local_agent_id") or None,
+        app_profile={"name": f"{name}:{user}",
+                     "allowed_kinds": app_host.SESSION_ALLOWED_KINDS})
+    if not ok:
+        return {"status": "error", "message": msg}
+
+    idle_minutes = int(options.get("idle_minutes") or 0)
+    if idle_minutes > 0:
+        def _close_when_idle() -> None:
+            import signal as _signal
+            limit = idle_minutes * 60
+            while True:
+                time.sleep(min(30.0, max(1.0, limit / 4)))
+                busy = primary.status in {"queued", "running", "thinking", "waiting"}
+                if not busy and helpwo_server.idle_seconds() >= limit:
+                    console.print(f"[dim]Idle for {idle_minutes} min — closing session.[/dim]")
+                    os.kill(os.getpid(), _signal.SIGTERM)
+                    return
+
+        threading.Thread(target=_close_when_idle, daemon=True,
+                         name="app-session-idle").start()
+
+    console.print(Panel(
+        f"[green]Session of [bold]{escape(name)}[/bold] for user "
+        f"[bold]{escape(user)}[/bold][/green]\n"
+        f"Tools: {', '.join(allowed)}\n"
+        f"Approvals: {agent_registry.app_mode['approval']}",
+        title="App session", border_style="green"))
+    return {"status": "ready", "mode": "session", "url": helpwo_server.get_url(),
+            "agent_id": state.get("local_agent_id") or "",
+            "token": state.get("token") or "", "message": msg}
 
 
 def _cmd_helpwo(raw_args: str, parts: list, agent_registry: AgentRegistry,
@@ -21507,10 +21793,17 @@ def _cmd_app(parts: list, agent_registry: AgentRegistry) -> None:
             f"[bold]{escape(manifest.name)}[/bold] ({manifest.scope}: {escape(manifest.source)})\n"
             f"{escape(manifest.description)}\n\n"
             f"Command: [bold]{escape(manifest.command) or '(none)'}[/bold]\n"
-            f"Persistence: {manifest.persistence}\n\n"
-            "[dim]Trusting lets this application talk to its own agent, which can "
-            "run tools in this folder under your normal approval policy. The "
-            "command above runs as you.[/dim]",
+            f"Persistence: {manifest.persistence}\n"
+            f"Per-user sessions: up to {manifest.max_sessions}, tools "
+            f"[bold]{escape(', '.join(manifest.session_tools) or '(none)')}[/bold], "
+            f"approvals [bold]{'AUTO' if manifest.auto_approve else 'refused'}[/bold], "
+            f"idle close {manifest.session_idle_minutes or 'never'} min\n\n"
+            "[dim]The command above runs as you. Each end user the application "
+            "opens a session for gets a sub-terminal and agent of their own, with "
+            "a separate LAINTAS_HOME and folder, billed to your account. Those "
+            "agents run as your OS user: with shell.exec and auto approvals an end "
+            "user can run commands as you — run the CLI in a container or under a "
+            "dedicated account if the users are not trusted.[/dim]",
             title="Trust application", border_style="yellow"))
         try:
             answer = input("Trust it? [y/N] ").strip().lower()

@@ -51,11 +51,31 @@ PERSISTENCE_NONE = "none"
 PERSISTENCE_WORKSPACE = "workspace"
 PERSISTENCE_MODES = (PERSISTENCE_NONE, PERSISTENCE_WORKSPACE)
 
-# What a manifest application may send its agent. Deliberately only the
-# conversation: the local filesystem, exec and PTY routes Helpwo uses would
-# hand an arbitrary program this machine's shell and disk, which no manifest
-# can be trusted with by default.
-APP_ALLOWED_KINDS = frozenset({"chat", "abort", "approval-response"})
+# What a manifest application may send. The conversation, plus asking for and
+# releasing per-user sessions. Never approval-response: an application that can
+# answer its own agent's approval requests has approved everything. Never the
+# filesystem, exec or PTY kinds Helpwo uses.
+APP_ALLOWED_KINDS = frozenset({"chat", "abort",
+                               "session-open", "session-close", "session-list"})
+# What an application may send to one user's session sub-terminal.
+SESSION_ALLOWED_KINDS = frozenset({"chat", "abort"})
+
+# One end user's identity as the application names it. The application owns
+# its users; the CLI only needs a stable, path-safe key.
+USER_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+
+# Tools a session agent always has: without them it cannot finish a turn.
+SESSION_BASE_TOOLS = frozenset({"task.complete", "time.now"})
+# Tools a manifest may give session agents. Everything else — other agents and
+# terminals, memory, rules, skills, the browser, storage, host-side file tools —
+# either reaches outside the session or runs in this process rather than in
+# the session's terminal, so it is not offered at all.
+SESSION_OPTIONAL_TOOLS = frozenset({
+    "shell.exec", "web.search", "web.fetch", "image.describe", "image.to_text",
+    "media.generate_image", "media.generate_video", "sleep",
+})
+SESSION_DEFAULT_TOOLS = ("shell.exec",)
+MAX_SESSIONS_LIMIT = 200
 
 # Prefix every app terminal's registry command carries, so /app and /helpwo can
 # tell their own sub-terminal from a user's /term of the same name.
@@ -227,6 +247,10 @@ class AppManifest:
     prompt: str = ""
     persistence: str = PERSISTENCE_NONE
     port: Optional[int] = None
+    session_tools: list = field(default_factory=lambda: list(SESSION_DEFAULT_TOOLS))
+    auto_approve: bool = False
+    max_sessions: int = 10
+    session_idle_minutes: int = 30
     scope: str = "user"          # user | project
     source: str = ""
     raw: dict = field(default_factory=dict)
@@ -250,7 +274,9 @@ def parse_manifest(data, source: str, scope: str = "user"
     if not isinstance(data, dict):
         return None, "manifest must be a JSON object"
     unknown = set(data) - {"name", "description", "command", "prompt",
-                           "persistence", "port"}
+                           "persistence", "port", "session_tools",
+                           "auto_approve", "max_sessions",
+                           "session_idle_minutes"}
     if unknown:
         return None, f"unknown field(s): {', '.join(sorted(unknown))}"
     name = data.get("name")
@@ -275,9 +301,32 @@ def parse_manifest(data, source: str, scope: str = "user"
     if port is not None and (not isinstance(port, int) or isinstance(port, bool)
                              or not 1 <= port <= 65535):
         return None, "port must be an integer 1-65535"
+    session_tools = data.get("session_tools", list(SESSION_DEFAULT_TOOLS))
+    if (not isinstance(session_tools, list)
+            or not all(isinstance(item, str) for item in session_tools)):
+        return None, "session_tools must be a list of tool names"
+    refused = sorted(set(session_tools) - SESSION_OPTIONAL_TOOLS)
+    if refused:
+        return None, (f"session_tools may only name "
+                      f"{', '.join(sorted(SESSION_OPTIONAL_TOOLS))}; "
+                      f"not {', '.join(refused)}")
+    auto_approve = data.get("auto_approve", False)
+    if not isinstance(auto_approve, bool):
+        return None, "auto_approve must be true or false"
+    max_sessions = data.get("max_sessions", 10)
+    if (not isinstance(max_sessions, int) or isinstance(max_sessions, bool)
+            or not 1 <= max_sessions <= MAX_SESSIONS_LIMIT):
+        return None, f"max_sessions must be an integer 1-{MAX_SESSIONS_LIMIT}"
+    idle = data.get("session_idle_minutes", 30)
+    if (not isinstance(idle, int) or isinstance(idle, bool)
+            or not 0 <= idle <= 7 * 24 * 60):
+        return None, "session_idle_minutes must be an integer 0-10080 (0 = never)"
     return AppManifest(
         name=name, description=description.strip(), command=command.strip(),
         prompt=prompt.strip(), persistence=persistence, port=port,
+        session_tools=list(dict.fromkeys(session_tools)),
+        auto_approve=auto_approve, max_sessions=max_sessions,
+        session_idle_minutes=idle,
         scope=scope, source=str(source), raw=dict(data),
     ), ""
 
@@ -308,6 +357,57 @@ def discover_manifests(cwd: str) -> tuple[dict[str, AppManifest], list[str]]:
                 continue
             found[manifest.name] = manifest
     return found, problems
+
+
+# ── per-user sessions ───────────────────────────────────────────────────
+
+def session_terminal_name(app: str, user: str) -> str:
+    return f"{app}.u.{user}"
+
+
+def session_dirs(app_state_dir: Path, user: str, persistent: bool) -> tuple[Path, Path]:
+    """(home, work) for one user's session sub-terminal.
+
+    A separate LAINTAS_HOME is the isolation: memory, durable rules, skills,
+    agent files, sessions and event logs all live under the home or the working
+    directory, so nothing one user's agent learns or writes is loaded into
+    another's, and nothing of the operator's is loaded into either. A
+    persistent application keeps the folder; otherwise it is thrown away when
+    the session closes.
+    """
+    base = Path(app_state_dir) / ("users" if persistent else "sessions")
+    leaf = user if persistent else f"{user}-{secrets.token_hex(4)}"
+    root = base / leaf
+    home, work = root / "home", root / "work"
+    for directory in (root, home, work):
+        _ensure_private_dir(directory)
+    return home, work
+
+
+def link_credentials(home: Path) -> None:
+    """Let the session reach the model backend as the operator's account.
+
+    Only the login and backend profiles are shared — they decide who is billed,
+    which is the operator's (and the application's) business, not the user's.
+    Nothing else from the operator's home is visible to a session.
+    """
+    for name in ("session.json", "backends.json"):
+        source = _home() / name
+        target = Path(home) / name
+        if not source.exists() or target.exists() or target.is_symlink():
+            continue
+        try:
+            target.symlink_to(source)
+        except OSError:
+            pass
+
+
+def remove_session_dir(home: Path) -> None:
+    import shutil
+    root = Path(home).parent
+    if root.parent.name != "sessions":
+        return  # persistent sessions keep their folder
+    shutil.rmtree(root, ignore_errors=True)
 
 
 # ── trust ───────────────────────────────────────────────────────────────
@@ -361,11 +461,13 @@ _active_lock = threading.Lock()
 _active: Optional[dict] = None
 
 
-def activate(name: str, prompt: str, *, builtin: bool) -> None:
-    """Mark this process as the host of one application."""
+def activate(name: str, prompt: str, *, builtin: bool,
+             session_user: str = "") -> None:
+    """Mark this process as the host of one application (or one user's session)."""
     global _active
     with _active_lock:
-        _active = {"name": name, "prompt": prompt or "", "builtin": bool(builtin)}
+        _active = {"name": name, "prompt": prompt or "", "builtin": bool(builtin),
+                   "session_user": session_user or ""}
 
 
 def active_app() -> Optional[dict]:
@@ -390,6 +492,14 @@ def render_prompt_section() -> str:
             "that application. Your conversation is separate from the main "
             "laintas_cli terminal's agent."
         )
+        if app.get("session_user"):
+            body += (
+                " You serve exactly one end user of that application, in a "
+                "session of your own: your working directory is that user's, "
+                "and nothing from other users' sessions is available to you. "
+                "Actions that need approval are decided by the application's "
+                "configuration, not by the person you are talking to."
+            )
         if app["prompt"]:
             body += ("\n\nThe application's own description of your job "
                      "(written by its author):\n" + app["prompt"])

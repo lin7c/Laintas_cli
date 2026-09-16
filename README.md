@@ -409,18 +409,46 @@ sub-terminal, `/helpwo` serves in place as before.
 
 ```json
 {"name": "notes", "description": "…", "command": "node server.js",
- "prompt": "What this app's agent is for.", "persistence": "none", "port": 8123}
+ "prompt": "What this app's agent is for.", "persistence": "none", "port": 8123,
+ "session_tools": ["shell.exec"], "auto_approve": false,
+ "max_sessions": 10, "session_idle_minutes": 30}
 ```
 
 A manifest must be trusted (`/app trust <name>`) before it starts, and again
-after it changes. Its sub-terminal exposes a loopback bridge with only the
-conversation API — `POST /api/agents/<id>/send` with kind
-`chat`/`abort`/`approval-response`, `GET /api/agents/<id>/updates` — with
-`Authorization: token <token>`; no filesystem, exec, PTY or tunnel routes. The
-`command` runs with `LAINTAS_APP_BRIDGE_URL`, `LAINTAS_APP_TOKEN`,
-`LAINTAS_APP_AGENT_ID` and `LAINTAS_APP_NAME` in its environment, logs to the
-app's state folder, and is stopped with the sub-terminal. `persistence:
-"workspace"` keeps the token, port and conversation per folder, as Helpwo does.
+after it changes. The `command` runs with `LAINTAS_APP_BRIDGE_URL`,
+`LAINTAS_APP_TOKEN`, `LAINTAS_APP_AGENT_ID` and `LAINTAS_APP_NAME` in its
+environment, logs to the app's state folder, and stops with the sub-terminal.
+
+**Many users.** The CLI does not know the application's users, bill them or
+define a protocol for them — the application does all of that. What the CLI
+provides is isolation: the application asks for a session per user id and gets
+a temporary sub-terminal with its own agent.
+
+| Send to the app bridge (`POST /api/agents/<id>/send`) | Result (`final` event in `/updates`) |
+|---|---|
+| `{"kind": "session-open", "payload": {"user": "alice"}}` | `{"user", "url", "token", "agentId", "persistent"}` — alice's own bridge |
+| `{"kind": "session-close", "payload": {"user": "alice"}}` | closes her sub-terminal and agent |
+| `{"kind": "session-list"}` | open sessions |
+
+The application then talks to `url` with `token`: `chat` and `abort` only.
+Each session is a nested CLI with **its own `LAINTAS_HOME` and working
+directory** — no operator memory, rules or skills, nothing from other users —
+sharing only the login that decides billing. Its agent has
+`task.complete`, `time.now` and the manifest's `session_tools` (chosen from
+`shell.exec`, `web.search`, `web.fetch`, `image.*`, `media.*`, `sleep`); shell
+commands run in the session's own terminal. Approvals are never answered by the
+application: they are refused, or with `"auto_approve": true` granted unless the
+policy engine denies them or they are destructive deletes. Slash commands in
+messages are treated as text. Sessions close after `session_idle_minutes`
+without requests, and all of them close with the application.
+
+Every session runs as the operator's OS user. Separate homes keep agents from
+*loading* each other's data; they do not stop a shell command from *reading*
+another folder. If end users are untrusted and have `shell.exec`, run the CLI in
+a container or under a dedicated account.
+
+With `persistence: "workspace"` the token and port are kept per folder, and each
+user's session folder and conversation survive restarts.
 
 ## Development
 

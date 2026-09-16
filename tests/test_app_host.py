@@ -11,6 +11,7 @@ The properties pinned here are the ones the design depends on:
 import io
 import json
 import os
+import shlex
 import socket
 import sys
 import tempfile
@@ -123,6 +124,12 @@ class ManifestTests(_Home):
             {"name": "ok", "port": 70000},
             {"name": "ok", "shell": True},
             {"name": "ok", "prompt": 3},
+            {"name": "ok", "session_tools": ["fs.write"]},
+            {"name": "ok", "session_tools": ["agent.spawn"]},
+            {"name": "ok", "session_tools": "shell.exec"},
+            {"name": "ok", "auto_approve": "yes"},
+            {"name": "ok", "max_sessions": 0},
+            {"name": "ok", "session_idle_minutes": -1},
         ]
         for data in cases:
             with self.subTest(data=data):
@@ -152,6 +159,49 @@ class ManifestTests(_Home):
         self.assertFalse(app_host.is_trusted(changed))
         self.assertTrue(app_host.revoke("notes"))
         self.assertFalse(app_host.revoke("notes"))
+
+
+class SessionManifestTests(unittest.TestCase):
+    def test_defaults_are_shell_only_with_approvals_refused(self):
+        manifest, _ = app_host.parse_manifest({"name": "notes"}, "/x.json")
+        self.assertEqual(manifest.session_tools, ["shell.exec"])
+        self.assertFalse(manifest.auto_approve)
+        self.assertEqual(manifest.max_sessions, 10)
+
+    def test_the_bridge_never_accepts_approval_responses(self):
+        self.assertNotIn("approval-response", app_host.APP_ALLOWED_KINDS)
+        self.assertNotIn("approval-response", app_host.SESSION_ALLOWED_KINDS)
+        self.assertNotIn("session-open", app_host.SESSION_ALLOWED_KINDS)
+
+
+class SessionDirTests(_Home):
+    def test_persistent_user_folders_are_stable_and_throwaway_ones_are_not(self):
+        state = self.home / "state"
+        home1, work1 = app_host.session_dirs(state, "alice", persistent=True)
+        home2, _ = app_host.session_dirs(state, "alice", persistent=True)
+        self.assertEqual(home1, home2)
+        t1, _ = app_host.session_dirs(state, "alice", persistent=False)
+        t2, _ = app_host.session_dirs(state, "alice", persistent=False)
+        self.assertNotEqual(t1, t2)
+        self.assertTrue(work1.is_dir())
+
+    def test_throwaway_folders_are_removed_and_persistent_ones_kept(self):
+        state = self.home / "state"
+        kept, _ = app_host.session_dirs(state, "alice", persistent=True)
+        gone, _ = app_host.session_dirs(state, "bob", persistent=False)
+        app_host.remove_session_dir(kept)
+        app_host.remove_session_dir(gone)
+        self.assertTrue(kept.exists())
+        self.assertFalse(gone.parent.exists())
+
+    def test_only_login_and_backends_are_shared_with_a_session(self):
+        (self.home / "session.json").write_text("{}", encoding="utf-8")
+        (self.home / "memory").mkdir()
+        (self.home / "memory" / "secret.md").write_text("operator", encoding="utf-8")
+        home, _ = app_host.session_dirs(self.home / "state", "alice", persistent=True)
+        app_host.link_credentials(home)
+        self.assertTrue((home / "session.json").is_symlink())
+        self.assertFalse((home / "memory").exists())
 
 
 class PromptSectionTests(unittest.TestCase):
@@ -311,6 +361,152 @@ class AppProcessTests(_Home):
             os.killpg(proc.pid, 0)
 
 
+class AppModeRegistryTests(unittest.TestCase):
+    def _registry(self, approval):
+        registry = laintas_cli.AgentRegistry.__new__(laintas_cli.AgentRegistry)
+        registry.app_mode = {"approval": approval}
+        registry.pushed = []
+        registry._push_events = lambda events, req_id=None: registry.pushed.extend(events)
+        registry._push_final = lambda req_id, status, summary, **k: registry.pushed.append(
+            {"type": "final", "status": status, "summary": summary})
+        return registry
+
+    def test_refused_without_waiting_for_anyone(self):
+        registry = self._registry("deny")
+        self.assertEqual(registry._request_approval("r", "rm -rf x", "/"), "reject")
+
+    def test_auto_approves_but_never_a_destructive_delete(self):
+        registry = self._registry("auto")
+        self.assertEqual(registry._request_approval("r", "make", "/"), "approve")
+        self.assertEqual(registry._request_approval("r", "rm -rf x", "/", destructive=True),
+                         "reject")
+
+    def test_a_slash_message_is_not_run_as_a_command(self):
+        registry = self._registry("deny")
+        with _Capture(), \
+                mock.patch.object(laintas_cli, "_inject_input") as injected, \
+                mock.patch.object(laintas_cli, "get_agent", return_value=None), \
+                mock.patch.object(laintas_cli, "run_agent_loop",
+                                  return_value={"success": True, "msg": "ok"}) as loop:
+            registry._chat_run_lock = threading.Lock()
+            registry._active_req_lock = threading.Lock()
+            registry._active_requests = {}
+            registry._session = {}
+            registry._build_loop_deps = lambda req_id: None
+            registry._handle_chat("r1", {"message": "/policy disabled"}, None, lambda: [])
+        injected.assert_not_called()
+        self.assertEqual(loop.call_args.kwargs["original_input"], "/policy disabled")
+
+    def test_session_kinds_are_refused_outside_a_hosted_application(self):
+        registry = self._registry("deny")
+        registry.app_mode = None
+        registry._processing_message = threading.Event()
+        with _Capture(), mock.patch.dict(laintas_cli._HOSTED_APP, {}, clear=True):
+            registry._handle_remote_message(
+                {"reqId": "r", "kind": "session-open", "payload": {"user": "a"}}, None, None)
+        self.assertEqual(registry.pushed[-1]["status"], "fail")
+
+
+class SessionCommandTests(unittest.TestCase):
+    def test_frozen_child_runs_binary_without_a_script_argument(self):
+        with mock.patch.object(laintas_cli.sys, "frozen", True, create=True), \
+                mock.patch.object(laintas_cli.sys, "executable", "/opt/laintas cli"):
+            args = shlex.split(laintas_cli._build_connected_subterminal_cmd(
+                "helpwo", extra_args=["--app", "helpwo"]))
+        self.assertEqual(args[1:4], ["/opt/laintas cli", "--depth", "1"])
+        self.assertEqual(args[-2:], ["--app", "helpwo"])
+        self.assertNotIn(laintas_cli._LAUNCH_SCRIPT_PATH, args)
+
+    def test_source_child_runs_script_with_python(self):
+        with mock.patch.object(laintas_cli.sys, "frozen", False, create=True), \
+                mock.patch.object(laintas_cli.sys, "executable", "/opt/venv/bin/python"), \
+                mock.patch.object(laintas_cli, "_LAUNCH_SCRIPT_PATH", "/src/cli project/laintas_cli.py"):
+            args = shlex.split(laintas_cli._build_connected_subterminal_cmd("helpwo"))
+        self.assertEqual(args[1:5], ["/opt/venv/bin/python",
+                                   "/src/cli project/laintas_cli.py", "--depth", "1"])
+
+    def test_session_command_carries_its_own_home_folder_and_depth(self):
+        command = laintas_cli._build_connected_subterminal_cmd(
+            "notes.u.alice", None, terminal_id="app-notes-x", depth=2,
+            env={"LAINTAS_HOME": "/tmp/h o"}, cwd="/tmp/w",
+            extra_args=["--app", "notes"])
+        self.assertTrue(command.startswith("cd -- /tmp/w && "))
+        self.assertIn("LAINTAS_HOME='/tmp/h o'", command)
+        self.assertIn("--depth 2", command)
+
+    def test_bad_environment_names_are_refused(self):
+        with self.assertRaises(ValueError):
+            laintas_cli._build_connected_subterminal_cmd("x", None, env={"A;rm": "1"})
+
+    def test_session_agent_sees_only_its_allowed_tools(self):
+        import agent_loop
+        agent = agent_loop.register_agent(name="app-tool-probe", role="pool")
+        try:
+            agent.profile.tool_policy = agent_loop.AgentToolPolicy(
+                allowed_tools=sorted(app_host.SESSION_BASE_TOOLS | {"shell.exec"}))
+            names = agent_loop._allowed_tool_names_for_state({}, agent.id)
+        finally:
+            agent_loop.unregister_agent(agent.id)
+        self.assertIn("shell.exec", names)
+        for forbidden in ("fs.write", "agent.spawn", "mem.read", "terminal.send", "browser.open"):
+            self.assertNotIn(forbidden, names)
+
+
+class SessionManagerTests(_Home):
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(laintas_cli._APP_SESSIONS.clear)
+        hosted = mock.patch.dict(laintas_cli._HOSTED_APP,
+                                 {"state_dir": self.home / "state"}, clear=True)
+        hosted.start()
+        self.addCleanup(hosted.stop)
+        self.manifest, _ = app_host.parse_manifest(
+            {"name": "notes", "max_sessions": 2}, "/x.json")
+        self.spawned = []
+
+        def spawn(name, app, directory, state, options, **kw):
+            self.spawned.append((name, options, kw))
+            launch_id = f"L{len(self.spawned)}"
+            app_host.write_runtime(directory, launch_id, status="ready",
+                                   url="http://127.0.0.1:9", token=state["token"],
+                                   agent_id=state["local_agent_id"])
+            return object(), launch_id
+
+        for target, value in (("_spawn_app_terminal", spawn),
+                              ("_app_session_alive", lambda record: True),
+                              ("get_terminal", lambda name: None),
+                              ("unregister_terminal", lambda name: True)):
+            patcher = mock.patch.object(laintas_cli, target, side_effect=value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_each_user_gets_a_distinct_session_and_reopen_returns_the_same(self):
+        with _Capture():
+            alice = laintas_cli._app_session_open(self.manifest, "alice")
+            bob = laintas_cli._app_session_open(self.manifest, "bob")
+            again = laintas_cli._app_session_open(self.manifest, "alice")
+        self.assertEqual(len(self.spawned), 2)
+        self.assertNotEqual(alice["token"], bob["token"])
+        self.assertNotEqual(alice["agentId"], bob["agentId"])
+        self.assertEqual(alice, again)
+        name, options, kw = self.spawned[0]
+        self.assertEqual(name, "notes.u.alice")
+        self.assertEqual(options["tools"], ["shell.exec"])
+        self.assertFalse(options["auto_approve"])
+        self.assertFalse(kw["use_tmux"])
+        homes = {kw["env"]["LAINTAS_HOME"] for _n, _o, kw in self.spawned}
+        self.assertEqual(len(homes), 2)
+
+    def test_the_session_limit_holds(self):
+        with _Capture():
+            laintas_cli._app_session_open(self.manifest, "a")
+            laintas_cli._app_session_open(self.manifest, "b")
+            with self.assertRaises(RuntimeError):
+                laintas_cli._app_session_open(self.manifest, "c")
+            self.assertTrue(laintas_cli._app_session_close("a"))
+            laintas_cli._app_session_open(self.manifest, "c")
+
+
 class _Capture:
     def __enter__(self):
         self.buffer = io.StringIO()
@@ -365,7 +561,7 @@ class CommandTests(_Home):
         started = []
 
         class _Sub:
-            def __init__(self, command):
+            def __init__(self, command, **_kw):
                 self.command = command
                 started.append(command)
 
@@ -409,6 +605,20 @@ class CommandTests(_Home):
             self.assertIn(fragment, command)
         opened.assert_called_once_with("http://127.0.0.1:1/?token=t")
         self.assertIn("running in sub-terminal", out.text)
+
+    def test_an_early_exit_reports_its_code_and_last_output(self):
+        sub = mock.Mock(returncode=2,
+                        full_output="\x1b[31mTraceback (most recent call last):\x1b[0m\r\n"
+                                    "SyntaxError: bad\r\n")
+        details = laintas_cli._subterminal_exit_details(sub)
+        self.assertEqual(details["returncode"], 2)
+        self.assertIn("SyntaxError: bad", details["output_tail"])
+        self.assertNotIn("\x1b", details["output_tail"])
+        with _Capture() as out:
+            laintas_cli._report_app_runtime("helpwo", {"status": "exited", **details},
+                                            open_url=False)
+        self.assertIn("exit code 2", out.text)
+        self.assertIn("SyntaxError: bad", out.text)
 
     def test_no_console_browser_is_started_without_a_display(self):
         runtime = {"status": "ready", "open_url": "http://127.0.0.1:1/?token=t"}

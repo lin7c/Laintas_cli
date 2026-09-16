@@ -29,6 +29,7 @@ import json
 import mimetypes
 import os
 import re
+import time
 import secrets
 import shutil
 import socket
@@ -668,6 +669,8 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
         holds the token this machine's disk and shell. Helpwo is trusted with
         that; an application registered through a manifest is not.
         """
+        global _last_request_at
+        _last_request_at = time.monotonic()
         if _app_profile is None:
             return True
         if method == "GET" and (path == "/api/agents"
@@ -1648,6 +1651,9 @@ _local_agent_id_ref: str = ""
 # Set when the bridge serves a registered application rather than Helpwo:
 # {"name": str, "allowed_kinds": frozenset}. None = the full Helpwo bridge.
 _app_profile: Optional[dict] = None
+# Monotonic time of the last request that reached a route (idle detection for
+# per-user session sub-terminals).
+_last_request_at: float = 0.0
 _local_requests_lock = threading.Lock()
 _local_request_ids: set[str] = set()
 
@@ -1841,6 +1847,8 @@ def start_server(agent_registry: Any, dist_dir: Optional[Path] = None,
     # alias lets the same Helpwo frontend use the existing agent request
     # contract while all traffic remains on loopback.
     _local_agent_id_ref = agent_id or f"local-{os.getpid():x}"
+    global _last_request_at
+    _last_request_at = time.monotonic()
     _local_root_ref = Path(os.getcwd()).resolve()
     _bind_host = host or "127.0.0.1"
     _auth_token_value = secrets.token_urlsafe(32) if token is None else token
@@ -1929,6 +1937,11 @@ def stop_server() -> None:
     with _local_requests_lock:
         _local_request_ids.clear()
     _event_buffer.clear()
+
+
+def idle_seconds() -> float:
+    """Seconds since the bridge last served a request (since start if none)."""
+    return max(0.0, time.monotonic() - _last_request_at)
 
 
 def get_url(with_token: bool = False) -> str:
