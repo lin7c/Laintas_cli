@@ -115,6 +115,9 @@ class Budget:
     own loop caps", which is what every batch had before."""
     wall_clock_max: float = 0.0        # 0 = no branch-level deadline
     stall_seconds: float = STALL_SECONDS
+    # A reported-usage stop threshold, not a pre-request token reservation.
+    # In-flight requests can overshoot; missing usage must not be invented.
+    token_max: int = 0
 
 
 @dataclass
@@ -141,9 +144,10 @@ class Branch:
     #: yet closed it in the same millisecond it was created — measured live,
     #: with both children left running outside any branch.
     sealed: bool = True
+    tokens_reported: int = 0
 
     def open_members(self) -> list:
-        return [m for m in self.members.values() if not m.settled]
+        return [m for m in list(self.members.values()) if not m.settled]
 
     def ledger(self) -> list:
         """The branch's outcome, as data. This is what a caller acts on."""
@@ -205,6 +209,14 @@ def open_branch(owner_agent_id: str, kind: str, members: list,
     else:
         _emit("branch_opened", branch, members=len(branch.members), kind=kind)
     return branch
+
+
+def add_member(branch: "Branch", agent_id: str, goal: str) -> None:
+    """Attach a spawned child before sealing its supervisor."""
+    with _LOCK:
+        if branch.status != STATUS_OPEN or branch.sealed:
+            raise RuntimeError("Cannot add a member to a sealed or closed branch.")
+        branch.members[agent_id] = Member(agent_id=agent_id, goal=goal)
 
 
 def seal(branch_id: str) -> None:
@@ -274,6 +286,9 @@ def _supervise(branch: "Branch") -> None:
             if deadline and now > deadline:
                 _drain(branch, f"branch budget of "
                                f"{int(branch.budget.wall_clock_max)}s reached")
+                return
+            if branch.budget.token_max and reported_tokens(branch) >= branch.budget.token_max:
+                _drain(branch, "reported token budget reached")
                 return
             if _owner_gone(branch):
                 _drain(branch, "the agent that opened this branch is gone")
@@ -503,11 +518,26 @@ def interrupt(branch_id: str) -> None:
 
 # ── Reporting ──────────────────────────────────────────────────────────────
 
+def record_usage(branch_ids, tokens: int) -> None:
+    """Account each billed response once per owning ancestor branch."""
+    with _LOCK:
+        for branch_id in set(branch_ids):
+            branch = _BRANCHES.get(branch_id)
+            if branch is not None:
+                branch.tokens_reported += max(0, tokens)
+
+
+def reported_tokens(branch: "Branch") -> int:
+    return branch.tokens_reported
+
+
 def status_report(branch: "Branch") -> dict:
     """What the owner needs to decide, as data."""
     return {
         "branch_id": branch.branch_id,
         "kind": branch.kind,
+        "reported_tokens": reported_tokens(branch),
+        "token_stop_threshold": branch.budget.token_max,
         "status": branch.status,
         "elapsed_seconds": round(
             (branch.closed_at or time.time()) - branch.opened_at, 1),

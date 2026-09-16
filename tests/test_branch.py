@@ -103,6 +103,17 @@ class SupervisionTests(unittest.TestCase):
         self.assertIn("no observable progress", member.detail)
         self.assertTrue(self.runtime.agents["c1"].aborted)
 
+    def test_reported_budget_stops_open_members_without_a_waiting_ui(self):
+        self._agent("budget-child")
+        b = self._branch(["budget-child"], token_max=100)
+        branch.record_usage([b.branch_id, b.branch_id], 70)
+        self.assertEqual(branch.reported_tokens(b), 70)
+        branch.record_usage([b.branch_id], 35)
+        self.assertTrue(self._wait_until(lambda: b.status == branch.STATUS_CLOSED))
+        self.assertTrue(self.runtime.agents["budget-child"].aborted)
+        self.assertEqual(branch.status_report(b)["reported_tokens"], 105)
+        self.assertIn("token budget", b.close_reason)
+
     def test_a_member_that_keeps_working_is_left_alone(self):
         info = self._agent("c1")
         b = self._branch(["c1"], stall_seconds=0.6)
