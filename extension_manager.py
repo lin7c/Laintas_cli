@@ -358,13 +358,32 @@ Edit `main.py` and `extension.json`, then install locally:
 
 # ── extension manager ──────────────────────────────────────────────────────
 
+class _PrintedStatus:
+    """Fallback status: print the message on entry, nothing on exit."""
+
+    def __init__(self, emit, message: str):
+        self._emit = emit
+        self._message = message
+
+    def __enter__(self):
+        self._emit(self._message)
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+
 class ExtensionManager:
     """Install, uninstall, list, pack, scaffold, and trust extensions."""
 
-    def __init__(self, runtime=None, console=None, community_scanner=None):
+    def __init__(self, runtime=None, console=None, community_scanner=None,
+                 status=None):
         self._rt = runtime
         self._console = console
         self._community_scanner = community_scanner
+        # `status(markup)` -> context manager showing a spinner (the CLI passes
+        # its deadlock-free _safe_status). None prints the message once.
+        self._status_factory = status
 
     # ── output helper ──────────────────────────────────────────────────
     def _print(self, message: str = "") -> None:
@@ -372,6 +391,15 @@ class ExtensionManager:
             self._console.print(message)
         else:
             print(message)
+
+    def _status(self, message: str):
+        """Indicator for a silent wait: a spinner when wired, else one line."""
+        if self._status_factory is not None:
+            try:
+                return self._status_factory(message)
+            except Exception:
+                pass
+        return _PrintedStatus(self._print, message)
 
     def _confirm(self, prompt: str) -> bool:
         """Ask the user for a yes/no confirmation."""
@@ -936,14 +964,15 @@ class ExtensionManager:
         import requests
         info_url = (f"{COMMUNITY_REGISTRY_ORIGIN}/api/extensions/community/"
                     f"{quote(author)}/{quote(slug)}")
-        info_response = requests.get(info_url, timeout=30)
-        info_response.raise_for_status()
-        info = info_response.json()
-        version = str(info.get("version") or "")
-        download_response = requests.post(
-            info_url + "/download", timeout=30)
-        download_response.raise_for_status()
-        download = download_response.json()
+        with self._status(f"[dim]Looking up {identifier} in the community registry…[/dim]"):
+            info_response = requests.get(info_url, timeout=30)
+            info_response.raise_for_status()
+            info = info_response.json()
+            version = str(info.get("version") or "")
+            download_response = requests.post(
+                info_url + "/download", timeout=30)
+            download_response.raise_for_status()
+            download = download_response.json()
         archive_url = str(download.get("downloadUrl") or "")
         expected_sha = str(download.get("sha256") or info.get("sha256") or "").lower()
         if not re.fullmatch(r"[0-9a-f]{64}", expected_sha):
@@ -970,7 +999,12 @@ class ExtensionManager:
             manifest = read_manifest(staging)
             if manifest.get("name") != slug or str(manifest.get("version")) != version:
                 raise RuntimeError("Downloaded package identity does not match the registry.")
-            report = self._community_scanner(staging)
+            # One model call over the whole source tree, with no timeout of its
+            # own: the longest silent wait in an install.
+            with self._status(
+                    f"[dim]AI is reviewing {identifier} for risky code… "
+                    "this can take a minute[/dim]"):
+                report = self._community_scanner(staging)
             risk = str(report.get("risk") or "").lower()
             if risk not in {"low", "medium", "high", "critical"}:
                 raise RuntimeError("AI source review returned an invalid risk level.")

@@ -1285,6 +1285,7 @@ from agent_loop import (
     add_debug_log, clear_debug_logs, get_recent_tool_failures,
     next_debug_loop, get_debug_logs,
     run_agent_loop, LoopDeps, compaction_status_text,
+    captured_system_prompt, lab_prompt_fallback,
     register_terminal, unregister_terminal,
     get_terminal, get_all_terminals, close_all_terminals,
     rename_terminal,
@@ -3776,7 +3777,7 @@ def _identity_loader():
     return [(name, "saved login") for name in identity_store.names()]
 
 
-_IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
+_IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff")
 _YES_FLAG = _static_candidates(("--yes", "Skip the confirmation prompt"))
 _FORCE_FLAG = _static_candidates(("--force", "Proceed even when it would normally refuse"))
 _TASK_IDS = _task_candidates()
@@ -7795,6 +7796,93 @@ def _resume_effective_session_id(blob: Optional[dict]) -> str:
     return session_id
 
 
+def _lease_id_for_blob(blob: dict) -> str:
+    """The identity to lock a resume snapshot under.
+
+    Snapshots written before session ids existed carry none, and the lease
+    used to be skipped entirely for them — 12 of the 60 saved on this machine,
+    several holding 80 turns. The snapshot's own id locks those: two
+    instances restoring the same file is exactly what must not happen, and
+    that is true whether or not the conversation had an id at the time.
+    """
+    session_id = _resume_effective_session_id(blob)
+    if session_id:
+        return session_id
+    own_id = re.sub(r"[^A-Za-z0-9_-]", "-", str((blob or {}).get("id") or ""))[:48]
+    return f"snapshot-{own_id}" if own_id else ""
+
+
+#: The live session this process holds a lease on, so a switch releases the
+#: old one and exit releases the last one.
+_LIVE_SESSION_LEASE: dict = {"cwd": "", "session_id": ""}
+
+
+def _live_session_lease_owner(cwd: str, session_id: str) -> Optional[dict]:
+    """The live peer holding `session_id` here, or None.
+
+    Read-only, so it answers "may I touch this session" without taking it.
+    peer_coordination owns the lock format; this reads it rather than
+    re-deriving the path, and never writes.
+    """
+    if not session_id:
+        return None
+    try:
+        import peer_coordination
+        lock_path = (paths.SESSION_LOCKS_DIR / peer_coordination._cwd_hash(cwd)
+                     / f"{peer_coordination._normalize_session_id(session_id)}.lock")
+        owner = peer_coordination._read_lease(lock_path)
+        if (owner and owner.get("instance_id") != paths.PROCESS_INSTANCE_ID
+                and peer_coordination._pid_alive(int(owner.get("pid") or 0))):
+            return owner
+    except Exception:
+        return None
+    return None
+
+
+def _hold_live_session_lease(session: Optional[dict], cwd: str) -> None:
+    """Hold the lease for as long as this process runs the session.
+
+    The lease used to be taken only by /resume, which left the ordinary case
+    unprotected: an instance that simply started and worked held nothing, so a
+    second instance's /resume on that very conversation was granted and both
+    wrote the same autosave. Ownership belongs to running the session, not to
+    the command that happened to open it.
+    """
+    session_id = str((session or {}).get("session_id")
+                     or (session or {}).get("id") or "")
+    if not session_id:
+        return
+    _release_live_session_lease()
+    try:
+        import peer_coordination
+        if peer_coordination.acquire_session_lease(cwd, session_id).get("ok"):
+            _LIVE_SESSION_LEASE.update(cwd=cwd, session_id=session_id)
+    except Exception:
+        pass   # best-effort: never keep a session from starting
+
+
+def _release_live_session_lease() -> None:
+    held = dict(_LIVE_SESSION_LEASE)
+    if not held.get("session_id"):
+        return
+    _LIVE_SESSION_LEASE.update(cwd="", session_id="")
+    try:
+        import peer_coordination
+        peer_coordination.release_session_lease(held["cwd"], held["session_id"])
+    except Exception:
+        pass
+
+
+def _close_live_session(session: Optional[dict]) -> None:
+    """Close this process's live session and give up its lease."""
+    if not session:
+        return
+    try:
+        session_store.close_session(session)
+    finally:
+        _release_live_session_lease()
+
+
 def _acquire_resume_lease(blob: dict) -> Optional[dict]:
     """Try to take ownership of a resumed session before restoring it.
 
@@ -7803,9 +7891,9 @@ def _acquire_resume_lease(blob: dict) -> Optional[dict]:
     progress.  Returns the blob to resume on success, or None (with a
     warning printed) when another live instance currently owns it.
     """
-    session_id = _resume_effective_session_id(blob)
+    session_id = _lease_id_for_blob(blob)
     if not session_id:
-        return blob   # no session id → nothing to lock
+        return blob   # nothing identifies this snapshot → nothing to lock
     try:
         import peer_coordination
         result = peer_coordination.acquire_session_lease(blob.get("cwd") or os.getcwd(),
@@ -12727,6 +12815,10 @@ def _validate_slash_args(action: str, args: list[str]) -> None:
                 f"Unexpected argument: {invalid[0]}. Usage: {rule.usage}")
 
 
+#: Commands whose handler reads `raw_args` and ends in free text.
+_FREE_TEXT_TAIL_COMMANDS = frozenset({"/img"})
+
+
 def _parse_slash_command(cmd: str) -> tuple[str, str, list[str]]:
     """Return (action, raw_args, argv) without losing raw argument spacing."""
     stripped = (cmd or "").strip()
@@ -12740,6 +12832,10 @@ def _parse_slash_command(cmd: str) -> tuple[str, str, list[str]]:
     try:
         args = shlex.split(raw_args) if raw_args else []
     except ValueError as exc:
+        if action in _FREE_TEXT_TAIL_COMMANDS:
+            # The tail is a question in prose — "what's wrong here?" is
+            # an unclosed quote to shlex, not a mistake by the user.
+            return action, raw_args, [action, *raw_args.split()]
         raise SlashCommandUsageError(
             f"Invalid quoting: {exc}. Close the quote or escape it, then retry."
         ) from exc
@@ -13127,9 +13223,11 @@ def _validate_prop_template(prop: str) -> tuple[list[str], list[str], list[str]]
 
 def _render_prop_effective(prop: str, redact: bool = True,
                            prompt_section: Optional[str] = None) -> str:
+    import durable_rules
     import memory_system
     import plan_mode
     import workflow_engine
+    from agent_loop import _INBOX_POINTER
 
     current = get_current_agent()
     entries, memory_errors, _ = _load_project_memory_entries()
@@ -13159,7 +13257,10 @@ def _render_prop_effective(prop: str, redact: bool = True,
         "activeFile": "None",
         "depth": str(current.depth if current else 0),
         "nextDepth": str((current.depth if current else 0) + 1),
-        "inbox": "(empty)",
+        # Same values the agent loop substitutes; this preview had drifted
+        # (no durableRules, a different inbox string) from what the model sees.
+        "inbox": _INBOX_POINTER,
+        "durableRules": durable_rules.format_for_prompt(os.getcwd()),
         "children": ", ".join(children) or "(none)",
         "parent": current.parent_id if current and current.parent_id else "(none)",
         "terminalName": (getattr(current, "home_terminal", None) if current else None) or "(none)",
@@ -13299,10 +13400,9 @@ def _prompt_lab_create(description: str, session: dict) -> dict:
         base_prompt = paths.project_file(paths.CWD_CLI_PROP).read_text(encoding="utf-8")
     except OSError:
         base_prompt = generate_cli_prop_template()
-    lab_section = prompt_lab.get_prompt_lab_section()
-    effective_prompt = base_prompt.replace("{{promptOpt}}", lab_section)
-    if lab_section and "{{promptOpt}}" not in base_prompt:
-        effective_prompt = effective_prompt.rstrip() + "\n\n" + lab_section
+    effective_prompt = (
+        captured_system_prompt(str(state.get("_session_id") or "default"))
+        or lab_prompt_fallback(base_prompt, prompt_lab.get_prompt_lab_section()))
     branch = prompt_lab.capture_incident(
         description=description,
         chat_history=chat_history,
@@ -14258,6 +14358,37 @@ def _split_verb(raw_args: str, verbs: tuple, is_path) -> tuple:
     return "", args
 
 
+def _leading_path_arg(text: str) -> tuple:
+    """Split "<path> <rest>" where the path may contain spaces. (path, rest).
+
+    The dispatcher's argv already honours quotes, but /img and /canvas keep a
+    free-text tail and so read the raw string — and splitting that on the
+    first space turned `"my shot.png"` into the path `"my`. Accepted, in
+    order: a quoted path, backslash-escaped spaces, and an unquoted name with
+    spaces when some prefix of the words names a file that exists (a macOS
+    screenshot is `Screenshot 2026-09-15 at 10.00.00.png`, and nobody quotes
+    that). Otherwise the first word, so a missing file still says "no such
+    file" about the word the user typed.
+    """
+    text = (text or "").strip()
+    if not text:
+        return "", ""
+    if text[0] in "\"'":
+        end = text.find(text[0], 1)
+        if end > 0:
+            return text[1:end], text[end + 1:].strip()
+    words = re.findall(r"(?:\\\s|\S)+", text)
+    if not words:
+        return "", ""
+    unescape = lambda s: re.sub(r"\\(\s)", r"\1", s)
+    for count in range(len(words), 1, -1):
+        match = re.match(r"\s*" + r"\s+".join(map(re.escape, words[:count])), text)
+        candidate = unescape(match.group(0).strip()) if match else ""
+        if candidate and os.path.isfile(os.path.expanduser(candidate)):
+            return candidate, text[match.end():].strip()
+    return unescape(words[0]), text[len(words[0]):].strip()
+
+
 def _img_candidates(limit: int = 12) -> list:
     """Recently-touched images worth offering, newest first.
 
@@ -14323,17 +14454,20 @@ def _cmd_img(raw_args: str) -> None:
             return
         console.print(r"[bold]Recent images[/bold] [dim](run /img <path> \[question])[/dim]")
         for path in candidates:
-            size = os.path.getsize(path)
-            console.print(f"  [cyan]{path}[/cyan] [dim]{size / 1024:.0f} KB[/dim]")
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                continue
+            # Printed the way it has to be typed back.
+            shown = shlex.quote(path) if re.search(r"\s", path) else path
+            console.print(f"  [cyan]{escape(shown)}[/cyan] [dim]{size / 1024:.0f} KB[/dim]")
         return
 
     as_text = verb == "text"
-    parts = rest.split(None, 1)
-    if not parts:
+    path, question = _leading_path_arg(rest)
+    if not path:
         console.print(r"[yellow]/img text <path>  —  a file path is required[/yellow]")
         return
-    path = parts[0]
-    question = parts[1].strip() if len(parts) > 1 else ""
 
     session = load_session()
     try:
@@ -14342,20 +14476,19 @@ def _cmd_img(raw_args: str) -> None:
                 console.print("[dim]`text` transcribes the whole document; the "
                               "question is ignored. Drop it to ask about the "
                               "image instead.[/dim]")
-            with console.status("[dim]Transcribing…[/dim]"):
+            with _safe_status("[dim]Transcribing…[/dim]"):
                 out = vision.image_to_text(
                     path, session=session,
                     post_json=_gateway_post_json_for_cli(session))
-            header = f"[bold]Text of[/bold] [cyan]{path}[/cyan]"
+            header = f"[bold]Text of[/bold] [cyan]{escape(path)}[/cyan]"
             if out.get("pages"):
                 header += f" [dim]({out['pages']} page(s))[/dim]"
         else:
-            with console.status("[dim]Looking…[/dim]"):
+            with _safe_status("[dim]Looking…[/dim]"):
                 out = vision.describe_image(
                     path, question, session=session,
-                    call_backend=call_backend_stream,
-                    list_models=lambda: fetch_available_models(session)[0])
-            header = (f"[bold]{path}[/bold] "
+                    call_backend=_vision_backend_for_cli(session))
+            header = (f"[bold]{escape(path)}[/bold] "
                       f"[dim]read by {out.get('model', '?')}"
                       f"{' · cached' if out.get('cached') else ''}[/dim]")
     except vision.VisionError as e:
@@ -14535,7 +14668,7 @@ def _cmd_canvas(raw_args: str) -> None:
         return
 
     if verb == "new":
-        path = rest.split(None, 1)[0] if rest.split() else ""
+        path, _extra = _leading_path_arg(rest)
         if not path:
             console.print(r"[yellow]/canvas new <name>.excalidraw[/yellow]")
             return
@@ -14558,14 +14691,17 @@ def _cmd_canvas(raw_args: str) -> None:
         return
 
     if verb == "open":
-        _canvas_open(rest.split(None, 1)[0] if rest.split() else "", canvas_mod)
+        _canvas_open(_leading_path_arg(rest)[0], canvas_mod)
         return
 
     if verb and verb != "text":
         console.print(f"[yellow]/canvas: unknown action '{verb}'. Try /canvas help[/yellow]")
         return
 
-    path = rest.split(None, 1)[0]
+    path, _extra = _leading_path_arg(rest)
+    if not path:
+        console.print(r"[yellow]/canvas text <path>  —  a board path is required[/yellow]")
+        return
     try:
         scene = canvas_mod.read_scene(path)
     except canvas_mod.CanvasError as e:
@@ -14754,21 +14890,17 @@ def _canvas_open(path: str, canvas_mod) -> None:
 
 
 def _gateway_post_json_for_cli(session):
-    """POST JSON to the configured gateway with this session's credentials."""
-    import backend_profiles
+    """POST JSON to the configured gateway with this session's credentials.
 
-    def post_json(route: str, body: dict):
-        profile = get_backend_profile()
-        headers, cookies = backend_profiles.request_auth(profile, session)
-        resp = requests.post(profile.base_url.rstrip("/") + route,
-                             headers=headers, cookies=cookies, json=body,
-                             timeout=180)
-        try:
-            return resp.status_code, resp.json()
-        except ValueError:
-            return resp.status_code, {"detail": resp.text[:300]}
+    The same transport `image.to_text` uses; only the profile lookup is this
+    module's, so a /backend switch applies to /img exactly as to the agent.
+    """
+    return tools_mod.gateway_post_json(session, get_profile=get_backend_profile)
 
-    return post_json
+
+def _vision_backend_for_cli(session):
+    """The vision transport `image.describe` uses, for /img."""
+    return tools_mod.vision_call_backend(session, get_profile=get_backend_profile)
 
 
 def _cmd_help(parts: list) -> None:
@@ -21551,6 +21683,22 @@ def _cmd_max() -> None:
 
 
 
+def _persist_session_state(agent_state: dict, chat_history: list, cwd: str,
+                           live_session: Optional[dict], *, tasks=None):
+    """Write the autosave, the resume state and the live-session record together.
+
+    The REPL's exit paths and /compact each spelled these three out by hand,
+    and /compact had already dropped the autosave. Returns the live session as
+    session_store last recorded it (the input unchanged when there is none).
+    """
+    save_session_snapshot(agent_state, chat_history, cwd)
+    save_resume_state(agent_state, chat_history, cwd)
+    if live_session:
+        return session_store.sync_runtime(
+            live_session, agent_state, chat_history, cwd=cwd, tasks=tasks)
+    return live_session
+
+
 def _cmd_compact(parts: list, session: dict) -> bool:
     compact_arg = parts[1].lower() if len(parts) > 1 else ""
     if len(parts) > 2 or compact_arg not in ("", "status", "--force"):
@@ -21606,19 +21754,15 @@ def _cmd_compact(parts: list, session: dict) -> bool:
     handle_meta_command._last_agent_state = compact_state
     current_live = getattr(handle_meta_command, '_current_live_session', None)
     cwd = ((current_live or {}).get("cwd") or os.getcwd())
+    current_live = _persist_session_state(
+        compact_state, compact_chat if isinstance(compact_chat, list) else [],
+        cwd, current_live,
+        tasks=(task_manager.export_active_tasks(
+                   cwd=cwd,
+                   session_id=str(compact_state.get("_session_id") or "") or None)
+               if current_live else None))
     if current_live:
-        current_live = session_store.sync_runtime(
-            current_live, compact_state,
-            compact_chat if isinstance(compact_chat, list) else [],
-            cwd=cwd,
-            tasks=task_manager.export_active_tasks(
-                cwd=cwd,
-                session_id=str(compact_state.get("_session_id") or "") or None),
-        )
         handle_meta_command._current_live_session = current_live
-    save_resume_state(
-        compact_state,
-        compact_chat if isinstance(compact_chat, list) else [], cwd)
     event_log.append(
         "context_compacted",
         before_tokens=result["tokens"],
@@ -25943,7 +26087,20 @@ def main():
                     _prev_ch,
                     _session_start_cwd,
                 )
-            session_store.close_session(_previous_live_session)
+            # Not if another instance is still running it. Two CLIs launched
+            # in one terminal derive the same TERMINAL_ID and therefore read
+            # the same "current session" pointer, and the second one used to
+            # close the first one's live session out from under it.
+            _prev_owner = _live_session_lease_owner(
+                _session_start_cwd,
+                str(_previous_live_session.get("session_id")
+                    or _previous_live_session.get("id") or ""))
+            if _prev_owner is None:
+                session_store.close_session(_previous_live_session)
+            else:
+                console.print(
+                    f"[dim]Leaving the session open: another instance "
+                    f"(pid {_prev_owner.get('pid', '?')}) is running it.[/dim]")
 
         if not _explicit_startup_resume:
             try:
@@ -25954,6 +26111,7 @@ def main():
 
         current_live_session = session_store.create_session(
             _session_start_cwd, agent_state, chat_history)
+        _hold_live_session_lease(current_live_session, _session_start_cwd)
         handle_meta_command._current_live_session = current_live_session
 
         # "Is there a session to resume here" used to be answered by parsing
@@ -26011,11 +26169,11 @@ def main():
             if _selected_resume:
                 _selected_resume = _acquire_resume_lease(_selected_resume)
             if _selected_resume:
-                if current_live_session:
-                    session_store.close_session(current_live_session)
+                _close_live_session(current_live_session)
                 agent_state = _restore_resume_blob(_selected_resume, chat_history)
                 current_live_session = session_store.create_session(
                     _session_start_cwd, agent_state, chat_history)
+                _hold_live_session_lease(current_live_session, _session_start_cwd)
                 handle_meta_command._current_live_session = current_live_session
                 console.print(
                     f"[green]Resumed previous session in this directory "
@@ -26422,14 +26580,9 @@ def main():
             os._exit(0)
         console.print("\n[yellow]Shutting down...[/yellow]")
         if args.depth == 0 and not _quit_checkpoint_saved:
-            save_session_snapshot(agent_state, chat_history, _session_start_cwd)
-            save_resume_state(agent_state, chat_history, _session_start_cwd)
-            if current_live_session:
-                session_store.sync_runtime(
-                    current_live_session, agent_state, chat_history,
-                    cwd=_session_start_cwd,
-                    tasks=_active_task_export(),
-                )
+            _persist_session_state(
+                agent_state, chat_history, _session_start_cwd,
+                current_live_session, tasks=_active_task_export())
         stop_trigger_scanner()
         _terminal_agents.close()
         close_all_terminals()
@@ -26618,16 +26771,12 @@ def main():
         # Ctrl+D → exit
         if user_input.strip() == "/exit" and not _is_dialogue:
             if args.depth == 0:
-                save_session_snapshot(agent_state, chat_history, _session_start_cwd)
-                save_resume_state(agent_state, chat_history, _session_start_cwd)
+                _persist_session_state(
+                    agent_state, chat_history, _session_start_cwd,
+                    current_live_session, tasks=_active_task_export())
                 _quit_checkpoint_saved = True
                 if current_live_session:
-                    session_store.sync_runtime(
-                        current_live_session, agent_state, chat_history,
-                        cwd=_session_start_cwd,
-                    tasks=_active_task_export(),
-                    )
-                    session_store.close_session(current_live_session)
+                    _close_live_session(current_live_session)
                     handle_meta_command._current_live_session = None
             stop_trigger_scanner()
             close_all_terminals()
@@ -26685,10 +26834,10 @@ def main():
             if _blob and not _blob.get("chat_history"):
                 console.print("[yellow]Saved session has no conversation to resume.[/yellow]")
             elif _blob:
-                if current_live_session:
-                    session_store.close_session(current_live_session)
+                _close_live_session(current_live_session)
                 agent_state = _restore_resume_blob(_blob, chat_history)
                 current_live_session = session_store.create_session(_session_start_cwd, agent_state, chat_history)
+                _hold_live_session_lease(current_live_session, _session_start_cwd)
                 handle_meta_command._current_live_session = current_live_session
                 handle_meta_command._last_agent_state = agent_state
                 handle_meta_command._last_chat_history = chat_history
@@ -26785,8 +26934,7 @@ def main():
                 # is saved as an anonymous fork checkpoint first so it can be
                 # resumed later.
                 save_resume_state(agent_state, chat_history, _session_start_cwd)
-                if current_live_session:
-                    session_store.close_session(current_live_session)
+                _close_live_session(current_live_session)
                 # Inherit chat_history (copy) + state; new session_id.
                 _inherited_history = list(chat_history)
                 _inherited_state = dict(agent_state)
@@ -26831,6 +26979,7 @@ def main():
                 _ensure_session_id(agent_state)
                 current_live_session = session_store.create_session(
                     _session_start_cwd, agent_state, chat_history)
+                _hold_live_session_lease(current_live_session, _session_start_cwd)
                 handle_meta_command._current_live_session = current_live_session
                 handle_meta_command._last_agent_state = agent_state
                 handle_meta_command._last_chat_history = chat_history
@@ -26883,8 +27032,7 @@ def main():
                 if injected_done is not None:
                     injected_done.set()
                 continue
-            if current_live_session:
-                session_store.close_session(current_live_session)
+            _close_live_session(current_live_session)
             chat_history.clear()
             agent_state = {
                 "shortTermMemory": "",
@@ -26892,6 +27040,7 @@ def main():
                 "lastOutput": "",
             }
             current_live_session = session_store.create_session(_session_start_cwd, agent_state, chat_history)
+            _hold_live_session_lease(current_live_session, _session_start_cwd)
             handle_meta_command._current_live_session = current_live_session
             handle_meta_command._last_agent_state = agent_state
             handle_meta_command._last_chat_history = chat_history
@@ -26917,7 +27066,7 @@ def main():
                     cwd=_session_start_cwd,
                     tasks=_active_task_export(),
                 )
-                session_store.close_session(current_live_session)
+                _close_live_session(current_live_session)
                 handle_meta_command._current_live_session = None
             if _checkpoint:
                 console.print(
@@ -26953,14 +27102,9 @@ def main():
                 # Writing a generic autosave here used to create a duplicate
                 # picker entry with the same conversation and a different id.
                 if args.depth == 0 and not _is_top_level_quit:
-                    save_session_snapshot(agent_state, chat_history, _session_start_cwd)
-                    save_resume_state(agent_state, chat_history, _session_start_cwd)
-                    if current_live_session:
-                        session_store.sync_runtime(
-                            current_live_session, agent_state, chat_history,
-                            cwd=_session_start_cwd,
-                    tasks=_active_task_export(),
-                        )
+                    _persist_session_state(
+                        agent_state, chat_history, _session_start_cwd,
+                        current_live_session, tasks=_active_task_export())
                 if interactive_session:
                     interactive_session.close()
                 if injected_done is not None:

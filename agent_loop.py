@@ -3301,6 +3301,31 @@ def get_agent(agent_id: str) -> Optional[AgentInfo]:
         return _agent_registry.get(agent_id)
 
 
+def scheduler_status(agent_id: str) -> dict:
+    """Where an agent stands in the scheduler: running, or queued at position N.
+
+    Callers (tool results, UI) use this to make the concurrency cap visible
+    instead of silently parking a spawned child in the FIFO.
+    """
+    with _registry_lock:
+        info = _agent_registry.get(agent_id)
+        if info is None:
+            return {"status": "unknown"}
+        if info.status == "queued":
+            position = next(
+                (i for i, (qid, _) in enumerate(_wait_queue) if qid == agent_id),
+                None)
+            return {
+                "status": "queued",
+                "queue_position": (position + 1) if position is not None else None,
+                "running_count": _running_count,
+                "max_concurrent": _max_concurrent,
+            }
+        return {"status": info.status,
+                "running_count": _running_count,
+                "max_concurrent": _max_concurrent}
+
+
 def begin_primary_run(agent_id: str = "primary") -> tuple[bool, str]:
     """Atomically acquire the one execution lease for a primary Agent."""
     agent = get_agent(agent_id)
@@ -5673,7 +5698,8 @@ def _is_context_overflow(error_text: str) -> bool:
 
 def _llm_summarize(deps, session, current_path: str, head_text: str,
                    prev_summary: Optional[str], lang: str,
-                   trajectory_id: str = "") -> Optional[str]:
+                   trajectory_id: str = "",
+                   interrupt_event: Optional[threading.Event] = None) -> Optional[str]:
     """Summarize the conversation HEAD into opencode's structured running summary.
 
     Makes one tool-less backend completion using the shared summary prompt
@@ -5701,6 +5727,9 @@ def _llm_summarize(deps, session, current_path: str, head_text: str,
             tools_enabled=False,
             model_override=_aux_m or None, provider_override=_aux_p or None,
             task_kind="compaction", trajectory_id=trajectory_id,
+            # Without it Esc could not reach a summarizer call at all: the turn
+            # sat on every remaining chunk before noticing the interrupt.
+            **({"interrupt_event": interrupt_event} if interrupt_event is not None else {}),
         )
         text = (resp or {}).get("reply", "") if isinstance(resp, dict) else ""
         text = (text or "").strip()
@@ -5727,7 +5756,8 @@ def _valid_structured_summary(text: str, lang: str) -> bool:
 
 def _llm_review_summary(deps, session, current_path: str, source_text: str,
                         candidate: str, prev_summary: Optional[str], lang: str,
-                        trajectory_id: str = "") -> str:
+                        trajectory_id: str = "",
+                        interrupt_event: Optional[threading.Event] = None) -> str:
     """Evidence-review a candidate with DeepSeek; fail closed to the draft."""
     if ctxpol is None or not source_text.strip() or not candidate.strip():
         return candidate
@@ -5742,6 +5772,8 @@ def _llm_review_summary(deps, session, current_path: str, source_text: str,
                            or "deepseek-v4-flash").strip()
         effort = str(get_runtime_config("compact_review_effort") or "auto").strip().lower()
         extra = {} if effort == "auto" else {"effort_override": effort}
+        if interrupt_event is not None:
+            extra["interrupt_event"] = interrupt_event
         resp = deps.call_backend(
             session=session, message=evidence, system_prompt=prompt,
             current_path=current_path, history=[], lang=lang,
@@ -5825,7 +5857,8 @@ def _per_request_overhead_tokens(state: dict) -> int:
 
 def _summarize_head_in_chunks(deps, session, head: list,
                               prev_summary: Optional[str], lang: str,
-                              trajectory_id: str) -> Optional[str]:
+                              trajectory_id: str,
+                              interrupt_event: Optional[threading.Event] = None) -> Optional[str]:
     """Summarize the head a slice at a time, folding each into a running summary.
 
     The head used to go up in ONE call. On a long session that is a single
@@ -5865,17 +5898,22 @@ def _summarize_head_in_chunks(deps, session, head: list,
     summary = prev_summary
     completed_any = False
     for index, part in enumerate(slices):
+        if interrupt_event is not None and interrupt_event.is_set():
+            # Esc between chunks. Same rule as a failed chunk: a partial fold
+            # never replaces the head, so stopping here loses nothing.
+            return None
         text = "\n".join(s for s in (_serialize_thread_msg(m) for m in part) if s)
         if not text.strip():
             continue
         merged = _llm_summarize(deps, session, cwd, text, summary, lang,
-                                trajectory_id)
+                                trajectory_id, interrupt_event)
         if not merged:
             # Atomic commit: a partial fold does not cover the whole head and
             # therefore must never replace it. The caller keeps the original.
             return None
         summary = _llm_review_summary(
-            deps, session, cwd, text, merged, summary, lang, trajectory_id)
+            deps, session, cwd, text, merged, summary, lang, trajectory_id,
+            interrupt_event)
         if not _valid_structured_summary(summary, lang):
             return None
         completed_any = True
@@ -5890,11 +5928,9 @@ def _publish_context_headroom(thread_messages: list, state: dict) -> None:
     before tools run, not after. Best-effort: the pager has its own default.
     """
     try:
-        window = _effective_context_window()
-        usable = ctxpol.usable_tokens(
-            window, int(get_runtime_config("max_tokens") or 8192))
-        free = max(0, usable - _thread_tokens(thread_messages)
-                   - _per_request_overhead_tokens(state))
+        budget = compaction_budget(state)
+        free = max(0, budget["reserved"] - budget["overhead"]
+                   - _thread_tokens(thread_messages))
         state["_ctx_headroom_chars"] = int(free * 3.5)
     except Exception:
         state.pop("_ctx_headroom_chars", None)
@@ -6041,7 +6077,8 @@ def _compaction_status(deps, text: str):
 
 
 def _compact_thread_messages(thread_messages: list, deps, session, lang: str, state: dict,
-                             *, force: bool = False, announce: bool = False) -> bool:
+                             *, force: bool = False, announce: bool = False,
+                             interrupt_event: Optional[threading.Event] = None) -> bool:
     """opencode-style compaction of the native message thread, IN PLACE.
 
     ``announce=True`` (the automatic paths) shows a status row while the
@@ -6064,14 +6101,20 @@ def _compact_thread_messages(thread_messages: list, deps, session, lang: str, st
     if ctxpol is None or len(thread_messages) < 4:
         return False
     try:
-        window = _effective_context_window()
-        max_out = int(get_runtime_config("max_tokens") or 8192)
-        usable = ctxpol.usable_tokens(window, max_out)
-        # Reserve what the request will add on top of the thread, or compaction
-        # hits its target and the assembled request still overflows.
-        usable = max(4000, usable - _per_request_overhead_tokens(state))
-        if not force and (usable <= 0 or _thread_tokens(thread_messages) <= usable):
-            return False
+        # Reserves what the request adds on top of the thread (system prompt +
+        # tool catalogue), or compaction hits its target and the assembled
+        # request still overflows. Shared with /compact status and the pager.
+        budget = compaction_budget(state)
+        window, usable = budget["window"], budget["usable"]
+        if not force:
+            # The policy's own off switch (`"auto": false`). ctxpol.is_overflow
+            # honours it, but this path re-implements the check to include the
+            # overhead and had dropped the switch. Overflow recovery and
+            # /compact pass force=True and still compact.
+            if not ctxpol.load().get("auto", True):
+                return False
+            if usable <= 0 or _thread_tokens(thread_messages) <= usable:
+                return False
 
         # Recent tail to preserve verbatim (token-budgeted, from the end).
         keep_recent = ctxpol.keep_recent_tokens(usable)
@@ -6126,13 +6169,19 @@ def _compact_thread_messages(thread_messages: list, deps, session, lang: str, st
         with announcement:
             summary = _summarize_head_in_chunks(
                 deps, session, head, state.get("_thread_summary"), lang,
-                str(state.get("_run_id") or ""))
+                str(state.get("_run_id") or ""), interrupt_event)
         if not summary:
             return changed
         state["_thread_summary"] = summary
         summary_msg = {"role": "user",
                        "content": f"[CONVERSATION SUMMARY — earlier turns compacted]\n{summary}"}
         thread_messages[:] = [summary_msg] + thread_messages[tail_start:]
+        # Every compaction that produced a summary mines it for memories, the
+        # automatic ones included. This call used to live in
+        # compact_session_context, so it ran on /compact and never on the
+        # compactions that actually happen during work.
+        _consolidate_memories_on_compact(
+            deps, session, {**state, "_thread_messages": thread_messages})
         return True
     except Exception:
         return False
@@ -6250,20 +6299,86 @@ def aux_model_override() -> tuple[str, str]:
     return model, ""
 
 
+def _aux_backend_reply(deps, session, *, system_prompt: str, messages: list,
+                       task_kind: str, trajectory_id: str = "", cwd: str = "",
+                       model: Optional[str] = None,
+                       provider: Optional[str] = None) -> str:
+    """One tool-less auxiliary completion; returns the reply text or "".
+
+    Every judge and extractor used to spell this call out in its own closure,
+    and one copy had already drifted (tools attached, main model billed, no
+    task_kind). A single definition keeps those arguments from diverging again.
+    """
+    resp = deps.call_backend(
+        session=session, message="", system_prompt=system_prompt,
+        current_path=cwd or os.getcwd(), messages=messages,
+        tools_enabled=False,
+        model_override=model or None, provider_override=provider or None,
+        task_kind=task_kind, trajectory_id=trajectory_id)
+    return (resp or {}).get("reply", "") if isinstance(resp, dict) else ""
+
+
+def captured_system_prompt(session_id: str) -> str:
+    """The system prompt the newest captured model call actually sent, or "".
+
+    Prompt-lab incidents are about what the model saw. Three call sites used to
+    rebuild that from the template by hand, each differently and none of them
+    the way the loop does; the context snapshot already stores the real thing.
+    """
+    try:
+        import context_snapshot
+        conversation = context_snapshot.load_conversation(
+            str(session_id or "default"), 1)
+    except Exception:
+        return ""
+    for call in reversed((conversation or {}).get("calls") or []):
+        prompt = call.get("system_prompt") if isinstance(call, dict) else None
+        if isinstance(prompt, str) and prompt.strip():
+            return prompt
+    return ""
+
+
+def lab_prompt_fallback(template: str, lab_section: str) -> str:
+    """Template with the prompt-lab section applied, for before any call exists."""
+    prompt = template.replace("{{promptOpt}}", lab_section)
+    if lab_section and "{{promptOpt}}" not in template:
+        prompt = prompt.rstrip() + "\n\n" + lab_section
+    return prompt
+
+
+def compaction_budget(state: Optional[dict] = None) -> dict:
+    """The one context budget: auto-compaction's trigger, /compact status and
+    the pager's headroom all read it.
+
+    It used to be computed in three places, and /compact status left out the
+    per-request overhead (system prompt + tool catalogue, often tens of
+    thousands of tokens) that the trigger subtracts — so status could read far
+    below 100% on a thread auto-compaction was already summarising.
+    """
+    window = _effective_context_window()
+    max_out = int(get_runtime_config("max_tokens") or 8192)
+    reserved = ctxpol.usable_tokens(window, max_out) if ctxpol is not None else 0
+    overhead = _per_request_overhead_tokens(state or {})
+    return {
+        "window": window,
+        "reserved": reserved,
+        "overhead": overhead,
+        "usable": max(4000, reserved - overhead) if ctxpol is not None else 0,
+    }
+
+
 def session_context_status(state: dict) -> dict:
     """Return read-only token/budget information for `/compact status`."""
     messages = (state or {}).get("_thread_messages") or []
     if not isinstance(messages, list):
         messages = []
-    window = _effective_context_window()
-    max_out = int(get_runtime_config("max_tokens") or 8192)
-    usable = ctxpol.usable_tokens(window, max_out) if ctxpol is not None else 0
+    budget = compaction_budget(state)
     return {
         "supported": ctxpol is not None,
         "messages": len(messages),
         "tokens": _thread_tokens(messages),
-        "window": window,
-        "usable": usable,
+        "window": budget["window"],
+        "usable": budget["usable"],
         "summary": bool((state or {}).get("_thread_summary")),
     }
 
@@ -6304,13 +6419,10 @@ def _consolidate_memories_on_compact(deps, session: dict, working: dict) -> None
             # Same fix as the critic: extraction emits a JSON array and never
             # calls a tool, so shipping the tool registry and the core-tool
             # guide on every call is pure waste.
-            resp = deps.call_backend(
-                session=_s, message="", system_prompt=system_prompt,
-                current_path=_cwd, messages=messages,
-                tools_enabled=False,
-                model_override=_am or None, provider_override=_ap or None,
-                task_kind="mem_extract", trajectory_id=_traj)
-            return (resp or {}).get("reply", "") if isinstance(resp, dict) else ""
+            return _aux_backend_reply(
+                deps, _s, system_prompt=system_prompt, messages=messages,
+                task_kind="mem_extract", trajectory_id=_traj, cwd=_cwd,
+                model=_am, provider=_ap)
 
         def _worker(_text=convo, _fn=_mem_llm_fn, _s=session):
             try:
@@ -6348,12 +6460,10 @@ def _launch_repair_classifier(user_text: str, thread_messages, row: dict, *,
 
         def _call(system_prompt, messages, kind, _s=session, _cwd=cwd,
                   _traj=str(run_id or ""), _m=model, _p=provider):
-            resp = deps.call_backend(
-                session=_s, message="", system_prompt=system_prompt,
-                current_path=_cwd, messages=messages, tools_enabled=False,
-                model_override=_m or None, provider_override=_p or None,
-                task_kind=kind, trajectory_id=_traj)
-            return (resp or {}).get("reply", "") if isinstance(resp, dict) else ""
+            return _aux_backend_reply(
+                deps, _s, system_prompt=system_prompt, messages=messages,
+                task_kind=kind, trajectory_id=_traj, cwd=_cwd,
+                model=_m, provider=_p)
 
         def _judge_fn(messages):
             return _call(repair_signals.SYSTEM_PROMPT, messages,
@@ -6532,13 +6642,10 @@ def _consolidate_memories_when_idle(deps, session: dict, state: dict,
         def _llm(messages_arg, *, system_prompt=mem_extract.SYSTEM_PROMPT,
                  _s=session, _cwd=_cwd, _traj=_traj, _am=_am, _ap=_ap,
                  _kind="mem_extract"):
-            resp = deps.call_backend(
-                session=_s, message="", system_prompt=system_prompt,
-                current_path=_cwd, messages=messages_arg,
-                tools_enabled=False,
-                model_override=_am or None, provider_override=_ap or None,
-                task_kind=_kind, trajectory_id=_traj)
-            return (resp or {}).get("reply", "") if isinstance(resp, dict) else ""
+            return _aux_backend_reply(
+                deps, _s, system_prompt=system_prompt, messages=messages_arg,
+                task_kind=_kind, trajectory_id=_traj, cwd=_cwd,
+                model=_am, provider=_ap)
 
         def _worker(_text=convo, _limit=review_limit, _s=session):
             global _idle_consolidation_running
@@ -6574,7 +6681,8 @@ def _consolidate_memories_when_idle(deps, session: dict, state: dict,
 
 
 def compact_session_context(deps, session: dict, state: dict,
-                            chat_history: Optional[list] = None) -> dict:
+                            chat_history: Optional[list] = None,
+                            interrupt_event: Optional[threading.Event] = None) -> dict:
     """Safely force-compact the current session without touching work state.
 
     Work happens on a copy and is committed only when something changed, so a
@@ -6600,7 +6708,8 @@ def compact_session_context(deps, session: dict, state: dict,
             lang_source = _stringify_message_content(item.get("content", ""))
             break
     changed = _compact_thread_messages(
-        messages, deps, session, _detect_lang(lang_source), working, force=True)
+        messages, deps, session, _detect_lang(lang_source), working, force=True,
+        interrupt_event=interrupt_event)
     working["_thread_messages"] = messages
     history = working.get("terminalHistory") or []
     compacted_history = _microcompact_history(
@@ -6624,7 +6733,6 @@ def compact_session_context(deps, session: dict, state: dict,
     if changed:
         state.clear()
         state.update(working)
-        _consolidate_memories_on_compact(deps, session, working)
     after = session_context_status(working if changed else state)
     return {
         **before,
@@ -9770,10 +9878,10 @@ def run_agent_loop(
             if not _issue:
                 _issue = "Review the latest AI behavior and identify what should improve"
             try:
-                _base_prompt = deps.read_file(
-                    str(paths.project_file(paths.CWD_CLI_PROP))) or deps.generate_prompt()
-                _effective_prompt = _base_prompt.replace(
-                    "{{promptOpt}}", prompt_lab.get_prompt_lab_section())
+                _effective_prompt = captured_system_prompt(_session_id) or lab_prompt_fallback(
+                    deps.read_file(str(paths.project_file(paths.CWD_CLI_PROP)))
+                    or deps.generate_prompt(),
+                    prompt_lab.get_prompt_lab_section())
                 _branch = prompt_lab.capture_incident(
                     _issue, chat_history=chat_history, agent_state=state,
                     effective_prompt=_effective_prompt)
@@ -10126,15 +10234,10 @@ def run_agent_loop(
 
                     def _judge_llm_fn(messages, _s=session, _cwd=_judge_cwd,
                                       _traj=_run_id, _m=_judge_m, _p=_judge_p):
-                        resp = deps.call_backend(
-                            session=_s, message="",
-                            system_prompt=intent.JUDGE_SYSTEM,
-                            current_path=_cwd, messages=messages,
-                            tools_enabled=False,
-                            model_override=_m or None,
-                            provider_override=_p or None,
-                            task_kind="intent_judge", trajectory_id=_traj)
-                        return (resp or {}).get("reply", "") if isinstance(resp, dict) else ""
+                        return _aux_backend_reply(
+                            deps, _s, system_prompt=intent.JUDGE_SYSTEM,
+                            messages=messages, task_kind="intent_judge",
+                            trajectory_id=_traj, cwd=_cwd, model=_m, provider=_p)
 
                     def _judge_worker(_task=original_input,
                                       _spec=_intent_st.get("spec"),
@@ -10163,15 +10266,10 @@ def run_agent_loop(
 
                 def _compare_llm_fn(messages, _s=session, _cwd=_cmp_cwd,
                                     _traj=_run_id, _m=_cmp_aux_m, _p=_cmp_aux_p):
-                    resp = deps.call_backend(
-                        session=_s, message="",
-                        system_prompt=intent.COMPARE_SYSTEM,
-                        current_path=_cwd, messages=messages,
-                        tools_enabled=False,
-                        model_override=_m or None,
-                        provider_override=_p or None,
-                        task_kind="intent_compare", trajectory_id=_traj)
-                    return (resp or {}).get("reply", "") if isinstance(resp, dict) else ""
+                    return _aux_backend_reply(
+                        deps, _s, system_prompt=intent.COMPARE_SYSTEM,
+                        messages=messages, task_kind="intent_compare",
+                        trajectory_id=_traj, cwd=_cwd, model=_m, provider=_p)
 
                 # The full thread, not a tail: step numbers must be thread
                 # indices, or a correction naming "step 3" names nothing.
@@ -10219,15 +10317,10 @@ def run_agent_loop(
                     # own words is meant to reach the working model, which has
                     # the whole toolset — not to be answered from a 26B
                     # model's recollection of how some product looks.
-                    resp = deps.call_backend(
-                        session=_s, message="",
-                        system_prompt=intent.SELF_ASK_SYSTEM,
-                        current_path=_cwd, messages=messages,
-                        tools_enabled=False,
-                        model_override=_m or None,
-                        provider_override=_p or None,
-                        task_kind="intent", trajectory_id=_traj)
-                    return (resp or {}).get("reply", "") if isinstance(resp, dict) else ""
+                    return _aux_backend_reply(
+                        deps, _s, system_prompt=intent.SELF_ASK_SYSTEM,
+                        messages=messages, task_kind="intent",
+                        trajectory_id=_traj, cwd=_cwd, model=_m, provider=_p)
 
                 # Only offer the tree to an agent that would actually get a
                 # branch: asking a model to place a request whose answer is
@@ -10736,7 +10829,7 @@ def run_agent_loop(
             # (`lang` is assigned later in the loop, so derive it here.)
             _compact_thread_messages(thread_messages, deps, session,
                                      _detect_lang(original_input), state,
-                                     announce=True)
+                                     announce=True, interrupt_event=_interrupt)
             _publish_context_headroom(thread_messages, state)
             _live_state = _build_user_message(
                 original_input, state, memory_entries, history_context, loop, max_loops,
@@ -10986,15 +11079,11 @@ def run_agent_loop(
                     # the main loop's 17.4k — for 10.1% of all input spend, and
                     # every captured critic sample carried a tool catalogue the
                     # judging task has no use for.
-                    resp = deps.call_backend(
-                        session=_s, message="",
-                        system_prompt=_system_prompt,
-                        current_path=_cwd, messages=messages,
-                        tools_enabled=False,
-                        model_override=_aux_m or None,
-                        provider_override=_aux_p or None,
-                        task_kind="critic", trajectory_id=_traj)
-                    return (resp or {}).get("reply", "") if isinstance(resp, dict) else ""
+                    return _aux_backend_reply(
+                        deps, _s, system_prompt=_system_prompt,
+                        messages=messages, task_kind="critic",
+                        trajectory_id=_traj, cwd=_cwd,
+                        model=_aux_m, provider=_aux_p)
 
                 _anchor = (thread_messages[_critic_anchor_idx]
                            if 0 < _critic_anchor_idx < len(thread_messages) else None)
@@ -11482,7 +11571,8 @@ def run_agent_loop(
                 if events_cb is not None:
                     deps.console.print("[dim yellow](context overflow — compacting and retrying)[/dim yellow]")
                 _compact_thread_messages(thread_messages, deps, session, lang, state,
-                                         force=True, announce=True)
+                                         force=True, announce=True,
+                                         interrupt_event=_interrupt)
                 add_debug_log(debug_entry)
                 continue
             if events_cb is not None:
@@ -11721,7 +11811,7 @@ def run_agent_loop(
                     and _kind != "tool_args_malformed"):
                 _compact_thread_messages(
                     thread_messages, deps, session, lang, state, force=True,
-                    announce=True)
+                    announce=True, interrupt_event=_interrupt)
 
             if _kind == "tool_args_malformed":
                 # No limit was hit — the arguments simply did not parse. Write
@@ -13304,14 +13394,10 @@ def run_agent_loop(
                 # never invokes a tool; no aux model, so it billed the main
                 # model; and no task_kind, so its records were
                 # indistinguishable from main-loop turns in the training set.
-                resp = deps.call_backend(
-                    session=_s, message="",
-                    system_prompt=system_prompt,
-                    current_path=_cwd, messages=messages,
-                    tools_enabled=False,
-                    model_override=_am or None, provider_override=_ap or None,
-                    task_kind="mem_extract", trajectory_id=_traj)
-                return (resp or {}).get("reply", "") if isinstance(resp, dict) else ""
+                return _aux_backend_reply(
+                    deps, _s, system_prompt=system_prompt, messages=messages,
+                    task_kind="mem_extract", trajectory_id=_traj, cwd=_cwd,
+                    model=_am, provider=_ap)
 
             def _mem_worker(_text=_mem_convo, _fn=_mem_llm_fn, _s=_mem_session):
                 try:

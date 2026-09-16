@@ -32,6 +32,7 @@ activate only after a second live peer is detected (or an explicit
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -429,21 +430,80 @@ def acquire_session_lease(cwd: str, session_id: str) -> dict:
         except OSError:
             pass
         lock_path = lock_dir / f"{sid}.lock"
+        payload = {
+            "instance_id": _coord_instance_id(),
+            "pid": os.getpid(),
+            "acquired_at": time.time(),
+        }
+        # Atomic claim with content: write the full payload to a unique temp
+        # file, then os.link() it into place. link() fails with
+        # FileExistsError when the lock already exists, and the linked file
+        # is never observed empty — unlike O_CREAT|O_EXCL, where a contender
+        # can read the lock between creation and the first write and mistake
+        # it for unowned. The old read-check-write sequence let two
+        # simultaneous instances both see "no owner" and both claim the lease
+        # (measured: 18% of concurrent attempts), so two /resume calls could
+        # restore the same session and overwrite each other's autosave.
+        tmp = lock_dir / f".{sid}.{uuid_hex()}.tmp"
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        try:
+            try:
+                os.link(str(tmp), str(lock_path))
+                owned = True
+            except FileExistsError:
+                owned = False
+            except OSError as link_err:
+                if link_err.errno not in (errno.EXDEV, errno.EPERM,
+                                          errno.EOPNOTSUPP, errno.ENOTSUP):
+                    raise
+                # Filesystem without hardlink support: fall back to the
+                # exclusive-create claim (small empty-file window remains,
+                # but still far narrower than the old read-check-write).
+                try:
+                    fd = os.open(str(lock_path),
+                                 os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                        json.dump(payload, fh)
+                    owned = True
+                except FileExistsError:
+                    owned = False
+            if owned:
+                _held_leases.add((_cwd_hash(cwd), sid))
+                return {"ok": True, "owner": None}
+        finally:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
         owner = _read_lease(lock_path)
         if owner is not None and owner.get("instance_id") == _coord_instance_id():
             _held_leases.add((_cwd_hash(cwd), sid))
             return {"ok": True, "owner": None}   # already ours
         if owner is not None and _pid_alive(int(owner.get("pid") or 0)):
             return {"ok": False, "owner": owner}  # held by a live peer
-        # No owner, or a stale owner (pid dead) → take over.
-        payload = {
-            "instance_id": _coord_instance_id(),
-            "pid": os.getpid(),
-            "acquired_at": time.time(),
-        }
+        # No owner, or a stale owner (pid dead) → take over. The rename is
+        # atomic: if a second stale-breaker races us, only one os.replace()
+        # lands and the loser's next acquire attempt sees the winner's live
+        # pid and backs off.
         tmp = lock_dir / f".{sid}.{uuid_hex()}.tmp"
         tmp.write_text(json.dumps(payload), encoding="utf-8")
-        os.replace(str(tmp), str(lock_path))
+        try:
+            os.replace(str(tmp), str(lock_path))
+        except OSError:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            # Lost the takeover race or the target vanished — re-read and
+            # judge whoever owns it now.
+            owner = _read_lease(lock_path)
+            if owner is not None and owner.get("instance_id") == _coord_instance_id():
+                _held_leases.add((_cwd_hash(cwd), sid))
+                return {"ok": True, "owner": None}
+            if owner is not None and _pid_alive(int(owner.get("pid") or 0)):
+                return {"ok": False, "owner": owner}
+            return {"ok": False, "owner": owner,
+                    "error": "lease takeover race"}
         _held_leases.add((_cwd_hash(cwd), sid))
         return {"ok": True, "owner": None, "took_over": owner is not None}
     except OSError:

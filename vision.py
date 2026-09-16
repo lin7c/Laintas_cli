@@ -77,7 +77,7 @@ _DESCRIBE_SYSTEM = (
     "thing you can report. Do not speculate about what is outside the frame."
 )
 
-#: (sha256, kind, question) -> text. An agent loop re-asks the same thing more
+#: (sha256, kind, question) -> {text, model[, pages]}. An agent loop re-asks the same thing more
 #: often than a person does — a retry after a failed edit, a second pass over
 #: the same screenshot — and each repeat is a paid call on a tier the session
 #: is not otherwise paying. Bounded because a long session can accumulate a lot
@@ -126,6 +126,23 @@ def _read_image(path: str) -> tuple[bytes, str]:
     return raw, hashlib.sha256(raw).hexdigest()
 
 
+#: Formats sent as they are. Everything else is re-encoded: the vision and OCR
+#: endpoints take PNG, JPEG, WebP and GIF, and a small TIFF, BMP or MPO (what
+#: an iPhone JPEG decodes as) used to go out under its own MIME type and be
+#: refused upstream.
+_PASSTHROUGH_FORMATS = {
+    "PNG": "image/png", "JPEG": "image/jpeg",
+    "WEBP": "image/webp", "GIF": "image/gif",
+}
+
+
+def _exif_rotation(img) -> int:
+    try:
+        return int(img.getexif().get(0x0112, 1) or 1)
+    except Exception:
+        return 1
+
+
 def _fit(raw: bytes, max_edge: int, *, jpeg_quality: int = 0) -> tuple[bytes, str]:
     """Downscale to fit `max_edge`. Returns (bytes, mime).
 
@@ -145,9 +162,23 @@ def _fit(raw: bytes, max_edge: int, *, jpeg_quality: int = 0) -> tuple[bytes, st
     except Exception as e:
         raise VisionError(f"could not decode the image ({type(e).__name__}: {e})")
 
+    fmt = img.format or ""
+    rotated = _exif_rotation(img) not in (0, 1)
+    if max(img.size) <= max_edge and fmt in _PASSTHROUGH_FORMATS and not rotated:
+        return raw, _PASSTHROUGH_FORMATS[fmt]
+
+    # A phone photo stores "upright" in EXIF rather than in its pixels, and
+    # neither provider applies the tag; re-encoding without it hands the model
+    # a sideways page.
+    from PIL import ImageOps
+    img = ImageOps.exif_transpose(img)
     if max(img.size) <= max_edge:
-        mime = Image.MIME.get(img.format or "", "") or "image/png"
-        return raw, mime
+        # Only here because the format is not one the endpoints accept (TIFF,
+        # BMP, an iPhone's MPO) or the pixels had to be turned. Lossless, so
+        # a small scan keeps the text edges the passthrough branch protects.
+        out = io.BytesIO()
+        img.save(out, format="PNG")
+        return out.getvalue(), "image/png"
 
     scale = max_edge / float(max(img.size))
     new_size = (max(1, int(img.width * scale)), max(1, int(img.height * scale)))
@@ -177,7 +208,8 @@ def describe_image(path: str, question: str = "", *, session=None,
     key = (digest, "describe", question)
     cached = _cache_get(key)
     if cached is not None:
-        return {"ok": True, "text": cached, "model": "(cached)", "cached": True}
+        return {"ok": True, "text": cached["text"],
+                "model": cached.get("model") or "(cached)", "cached": True}
 
     payload, mime = _fit(raw, DESCRIBE_MAX_EDGE)
     data_url = _data_url(payload, mime)
@@ -215,7 +247,7 @@ def describe_image(path: str, question: str = "", *, session=None,
     if not text:
         raise VisionError("the vision endpoint returned an empty response")
     model = str(result.get("model") or "gateway vision priority")
-    _cache_put(key, text)
+    _cache_put(key, {"text": text, "model": model})
     return {"ok": True, "text": text, "model": model, "cached": False}
 
 
@@ -258,7 +290,8 @@ def image_to_text(path: str, *, session=None, post_json=None,
     key = (digest, "ocr", str(pages or ""))
     cached = _cache_get(key)
     if cached is not None:
-        return {"ok": True, "text": cached, "pages": None, "cached": True}
+        return {"ok": True, "text": cached["text"], "pages": cached.get("pages"),
+                "cached": True, "model": cached.get("model", "")}
 
     if post_json is None:
         raise VisionError("no backend callable was provided")
@@ -285,7 +318,8 @@ def image_to_text(path: str, *, session=None, post_json=None,
         raise VisionError(
             "OCR returned no text. If this is a photograph rather than a "
             "document, image.describe is the tool that reads it.")
-    _cache_put(key, rendered)
+    _cache_put(key, {"text": rendered, "pages": data.get("pagesProcessed"),
+                     "model": data.get("model", "")})
     return {"ok": True, "text": rendered,
             "pages": data.get("pagesProcessed"), "cached": False,
             "model": data.get("model", "")}

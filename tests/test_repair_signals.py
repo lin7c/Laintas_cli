@@ -372,7 +372,12 @@ class LoopWiringTests(unittest.TestCase):
         launcher = launcher[:launcher.index("\ndef ", 10)]
         self.assertIn("threading.Thread", launcher)
         self.assertIn("daemon=True", launcher)
-        self.assertIn("tools_enabled=False", launcher)
+        # Tool-less through the shared auxiliary call, which is where
+        # tools_enabled=False now lives for every judge and extractor.
+        self.assertIn("_aux_backend_reply(", launcher)
+        helper = text[text.index("def _aux_backend_reply"):]
+        helper = helper[:helper.index("\ndef ", 10)]
+        self.assertIn("tools_enabled=False", helper)
         # It must not fire when capture is off, or an opt-in switch would
         # silently still cost one auxiliary call per turn.
         self.assertIn("repair_signals.enabled()", text)

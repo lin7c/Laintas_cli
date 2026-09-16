@@ -161,6 +161,30 @@ class ExtensionMarketplaceTests(unittest.TestCase):
             extension_manager.ExtensionManager.detect_source("laintas/blindpick"),
             "marketplace")
 
+    def test_status_factory_wraps_silent_waits_and_falls_back_to_a_line(self):
+        shown = []
+
+        class Spinner:
+            def __init__(self, message):
+                shown.append(message)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+        with extension_manager.ExtensionManager(status=Spinner)._status("[dim]Reviewing…[/dim]"):
+            pass
+        self.assertEqual(shown, ["[dim]Reviewing…[/dim]"])
+
+        plain = extension_manager.ExtensionManager()
+        printed = []
+        with mock.patch.object(plain, "_print", side_effect=printed.append):
+            with plain._status("waiting"):
+                pass
+        self.assertEqual(printed, ["waiting"])
+
     def test_safe_extract_rejects_excessive_unpacked_size(self):
         with tempfile.TemporaryDirectory() as tmp:
             stream = Path(tmp) / "large.lext"

@@ -3541,11 +3541,23 @@ def _bi_agent_spawn(params: dict, ctx: ToolCtx) -> dict:
         if not child_ids:
             return {"ok": False, "error": f"parallel spawn failed (parent '{parent_id}' not found)"}
 
+        import agent_loop as _al_sched
+        _sched = [_al_sched.scheduler_status(cid) for cid in child_ids]
+        _queued = [s for s in _sched if s.get("status") == "queued"]
+
         task_desc = ", ".join(t.get("role", t.get("task", "?")[:30]) for t in tasks_list)
-        return {"ok": True,
+        result = {"ok": True,
                 "result": f"Spawned {len(child_ids)} agents in parallel: [{task_desc}]. "
                           f"IDs: {', '.join(child_ids)}. Check inbox for results.",
                 "child_ids": child_ids}
+        if _queued:
+            _cap = _queued[0].get("max_concurrent")
+            result["result"] += (
+                f" NOTE: concurrency cap ({_cap}) reached — "
+                f"{len(_queued)} of them are QUEUED and start when a slot frees; "
+                "they are not stalled, just waiting for a slot.")
+            result["scheduler"] = _sched
+        return result
 
     # ── Single agent mode ──
     task = params.get("task", "").strip()
@@ -3570,14 +3582,26 @@ def _bi_agent_spawn(params: dict, ctx: ToolCtx) -> dict:
     )
     if child_id is None:
         return {"ok": False, "error": f"spawn failed (parent '{parent_id}' not found)"}
+
+    import agent_loop as _al_sched
+    _sched = _al_sched.scheduler_status(child_id)
+
     role_note = f" (role: {role})" if role else ""
     contract_note = (
         f" under a contract for {', '.join(o['name'] for o in contract['outputs'])}"
         if contract else "")
+    _msg = (f"Spawned child agent '{child_id}'{role_note}"
+            f"{contract_note} for task: {task[:120]}")
+    if _sched.get("status") == "queued":
+        _pos = _sched.get("queue_position")
+        _pos_txt = f" at queue position {_pos}" if _pos else ""
+        _msg += (f" — QUEUED{_pos_txt}: concurrency cap "
+                 f"({_sched.get('max_concurrent')}) is full; it starts when a "
+                 "slot frees. Not an error, not stalled.")
     return {"ok": True,
-            "result": (f"Spawned child agent '{child_id}'{role_note}"
-                       f"{contract_note} for task: {task[:120]}"),
-            "child_id": child_id}
+            "result": _msg,
+            "child_id": child_id,
+            **({"scheduler": _sched} if _sched.get("status") == "queued" else {})}
 
 
 _PARENT_DECISION_NOTE = (
@@ -7775,23 +7799,39 @@ def _check_tool_interrupt(ctx: ToolCtx) -> None:
 
 # ── Images: reading a picture on behalf of a model that cannot see ───
 
+def _default_backend_profile():
+    # The profile lives on laintas_cli (it tracks /backend switches);
+    # backend_profiles only knows how to authenticate against one.
+    import laintas_cli
+    return laintas_cli.get_backend_profile()
+
+
 def _vision_backend(ctx: ToolCtx):
+    """The agent's handle on `vision_call_backend`, bound to its session."""
+    return vision_call_backend(ctx.session)
+
+
+def vision_call_backend(default_session=None, get_profile=None):
     """A non-streaming call to the gateway-owned vision model family.
 
     The endpoint, rather than the CLI, selects the first live model in the
     administrator's image-understanding order.  This keeps CLI, Helpwo and
     every other client on one failover policy.
+
+    `/img` and `image.describe` both come through here. `/img` once posted to
+    the ordinary chat stream instead, which runs the user's text model — a
+    model that cannot see — so the one path a person types gave the wrong
+    answer while the agent's path was right.
     """
     import backend_profiles
-    import laintas_cli
     import requests
 
     def call_backend(*, session=None, message="", system_prompt="",
                      current_path="", messages=None, tools_enabled=False,
                      model_override=None, task_kind="vision", **_kwargs):
-        profile = laintas_cli.get_backend_profile()
+        profile = (get_profile or _default_backend_profile)()
         headers, cookies = backend_profiles.request_auth(
-            profile, session if session is not None else ctx.session)
+            profile, session if session is not None else default_session)
         body = {
             "message": message,
             "messages": messages or [],
@@ -7828,6 +7868,11 @@ def _vision_backend(ctx: ToolCtx):
 
 
 def _gateway_post_json(ctx: ToolCtx):
+    """The agent's handle on `gateway_post_json`, bound to its session."""
+    return gateway_post_json(ctx.session)
+
+
+def gateway_post_json(session=None, get_profile=None):
     """A `post_json(route, body) -> (status, json)` bound to this session.
 
     Goes through the configured backend profile, so the OCR call is billed,
@@ -7835,14 +7880,11 @@ def _gateway_post_json(ctx: ToolCtx):
     the whole reason it is not a direct call to the provider.
     """
     import backend_profiles
-    import laintas_cli
     import requests
 
     def post_json(route: str, body: dict):
-        # The profile lives on laintas_cli (it tracks /backend switches);
-        # backend_profiles only knows how to authenticate against one.
-        profile = laintas_cli.get_backend_profile()
-        headers, cookies = backend_profiles.request_auth(profile, ctx.session)
+        profile = (get_profile or _default_backend_profile)()
+        headers, cookies = backend_profiles.request_auth(profile, session)
         resp = requests.post(profile.base_url.rstrip("/") + route,
                              headers=headers, cookies=cookies, json=body,
                              timeout=180)
@@ -7854,12 +7896,25 @@ def _gateway_post_json(ctx: ToolCtx):
     return post_json
 
 
+def _image_tool_path(params: dict, ctx: ToolCtx) -> str:
+    """Resolve `path` against the agent's directory, as fs.* and canvas.* do.
+
+    Left relative, it was opened against the process directory, so an agent
+    working elsewhere read nothing — or a same-named image from another tree.
+    """
+    raw = str(params.get("path") or "").strip()
+    if not raw:
+        return ""
+    raw = os.path.expanduser(raw)
+    return raw if os.path.isabs(raw) else os.path.join(ctx.cwd or os.getcwd(), raw)
+
+
 def _bi_image_describe(params: dict, ctx: ToolCtx) -> dict:
     """Ask a vision model a question about an image file."""
     import vision
     try:
         out = vision.describe_image(
-            str(params.get("path") or ""),
+            _image_tool_path(params, ctx),
             str(params.get("question") or ""),
             session=ctx.session, call_backend=_vision_backend(ctx))
     except vision.VisionError as e:
@@ -7881,7 +7936,7 @@ def _bi_image_to_text(params: dict, ctx: ToolCtx) -> dict:
     pages = [int(p) for p in pages] if isinstance(pages, list) else None
     try:
         out = vision.image_to_text(
-            str(params.get("path") or ""), session=ctx.session,
+            _image_tool_path(params, ctx), session=ctx.session,
             post_json=_gateway_post_json(ctx), pages=pages)
     except vision.VisionError as e:
         return {"ok": False, "error": f"image.to_text: {e}"}
@@ -9732,7 +9787,13 @@ def register_builtin_tools() -> None:
                         "A deployed agent runs directly in its persistent deployment "
                         "terminal, so cd, export, aliases, and compound-command shell "
                         "state persist. An undeployed agent uses an isolated, non-PTY "
-                        "subprocess. Returns output and exit status. For REPLs or commands "
+                        "subprocess. Returns output and exit status. "
+                        "It BLOCKS your loop until the command exits, and `timeout` bounds "
+                        "only SILENCE, not total runtime — a command that keeps printing "
+                        "holds the turn indefinitely. For anything expected to take minutes "
+                        "(builds, full test suites, whole-disk searches, servers) run it with "
+                        "terminal.exec instead, which returns immediately, and collect it with "
+                        "terminal.read or terminal.wait. For REPLs or commands "
                         "that need keystrokes without a deployment terminal, start an "
                         "agent-private PTY with session.start instead.",
             schema={
@@ -10269,9 +10330,11 @@ def register_builtin_tools() -> None:
         # ── Agent tools ─────────────────────────────────────────────
         Tool(
             name="agent.spawn",
-            description="Spawn a disposable in-process child agent for one sub-task. "
-                        "It has an isolated context, runs in its own thread, posts results "
-                        "to your inbox, and is not a hired employee. "
+            description="NON-BLOCKING. Spawn a disposable in-process child agent for one "
+                        "sub-task and keep working: it runs on its own thread and posts its "
+                        "result to your inbox, which you receive at the start of a later "
+                        "turn. (The tool called `spawn` is the BLOCKING one.) "
+                        "It has an isolated context and is not a hired employee. "
                         "The judgement roles (reviewer, silent-failure-hunter, tester) "
                         "come with a MANDATORY contract: their findings must cite "
                         "path:line locations that the runtime resolves against the "
@@ -10280,8 +10343,9 @@ def register_builtin_tools() -> None:
                         "Supports specialized roles (explorer, architect, reviewer, "
                         "silent-failure-hunter, simplifier, tester) and fire-and-forget "
                         "parallel spawning via the 'tasks' parameter (check inbox for results). "
-                        "wait=true hands the whole batch to spawn_parallel instead (live status "
-                        "table, max 6 tasks) -- prefer calling spawn_parallel "
+                        "wait=true makes this call BLOCK: it hands the whole batch to "
+                        "spawn_parallel (live status table, max 6 tasks) and holds your loop "
+                        "until every child is finished -- prefer calling spawn_parallel "
                         "directly when you already know you want to wait.",
             schema={
                 "type": "object",
@@ -10305,8 +10369,12 @@ def register_builtin_tools() -> None:
                         },
                     },
                     "wait": {"type": "boolean", "default": False,
-                             "description": "Block until all children complete. Delegates to "
-                                            "spawn_parallel (ignores 'timeout')."},
+                             "description": "OPTIONAL, defaults to false. true BLOCKS your "
+                                            "whole turn until every child finishes — only "
+                                            "use it when you cannot do useful work in "
+                                            "parallel. Prefer leaving it false (results "
+                                            "arrive in your inbox) or calling spawn_parallel "
+                                            "directly for a live status table."},
                     "contract": {
                         "type": "object",
                         "description": (
@@ -10457,7 +10525,8 @@ def register_builtin_tools() -> None:
         ),
         Tool(
             name="agent.wait",
-            description=("Wait for another agent to finish (blocking). Without a timeout it "
+            description=("BLOCKING. Wait for ONE named agent to finish — the single-agent "
+                         "form of await_spawns. Without a timeout it "
                          "waits as long as that agent keeps making progress, and gives up "
                          "only once it goes silent."),
             schema={
@@ -10734,7 +10803,10 @@ def register_builtin_tools() -> None:
         Tool(
             name="spawn",
             description=(
-                "Spawn a disposable sub-agent for one delegated task and WAIT for it to complete. "
+                "BLOCKING. Spawn ONE sub-agent and hold your loop until it finishes — you can "
+                "do nothing else meanwhile. Use it only when the very next thing you do needs "
+                "that result; otherwise use agent.spawn, which is the non-blocking form of "
+                "this same mechanism. "
                 "If the concurrency cap is reached the sub-agent queues and starts when a slot frees. "
                 "Give COMPLETE instructions in goal: file paths, conventions, constraints."
             ),
@@ -10751,11 +10823,14 @@ def register_builtin_tools() -> None:
         Tool(
             name="spawn_parallel",
             description=(
-                "Spawn multiple sub-agents in PARALLEL. Returns batch_id and child_ids "
-                "immediately by default while results continue to arrive through your "
-                "inbox, so continue useful independent work. Set wait=true only for a "
+                "NON-BLOCKING by default. Spawn multiple sub-agents in PARALLEL: returns "
+                "batch_id and child_ids "
+                "immediately while results continue to arrive through your "
+                "inbox, so continue useful independent work — whichever child finishes "
+                "first reaches you first, without waiting for the slowest. "
+                "Set wait=true only for a "
                 "real barrier that requires ALL results before the next action; that "
-                "compatibility mode returns a combined structured report. Max 6 agents "
+                "BLOCKING mode returns a combined structured report. Max 6 agents "
                 "per batch. "
                 "Each member must work on DIFFERENT files — decompose by file boundaries. "
                 "Agents beyond the concurrency cap queue automatically. "
@@ -10847,10 +10922,16 @@ def register_builtin_tools() -> None:
         Tool(
             name="await_spawns",
             description=(
-                "Wait for spawned sub-agents to finish and collect their results. "
+                "BLOCKING, and all-or-nothing: it returns only once EVERY selected child "
+                "has finished, so the ones that finished early sit unused until the "
+                "slowest one ends. There is no 'first result' mode. "
                 "Select a returned batch_id or child agent_ids. If both are omitted, "
-                "waits for ALL children of the current agent. Use only when the next "
-                "action truly depends on those results."
+                "waits for ALL children of the current agent — not just the last batch. "
+                "It gives up after 20 minutes, and on that timeout (or on Esc) every "
+                "child still running is ABORTED and its work is lost. "
+                "Use only when the next action truly depends on all of those results; "
+                "otherwise read them from your inbox as they arrive, and use "
+                "branch_status to see where the batch stands without blocking."
             ),
             schema={
                 "type": "object",
@@ -11075,7 +11156,10 @@ def register_builtin_tools() -> None:
         Tool(
             name="terminal.create",
             description=(
-                "Create a named managed laintas-cli terminal. It remains available for "
+                "Create a named managed laintas-cli terminal with NO command running in "
+                "it yet — for stationing an agent, or for sending keystrokes later. To "
+                "start a terminal that runs a command, use terminal.exec instead. It "
+                "remains available for "
                 "later sends/stationing while its parent terminal is alive. Terminating "
                 "a parent recursively ends child terminals and their deployed agents; "
                 "use session.start for a disposable agent-private PTY."
@@ -11098,7 +11182,9 @@ def register_builtin_tools() -> None:
         Tool(
             name="terminal.exec",
             description=(
-                "Run an arbitrary shell command in a background sub-terminal. "
+                "NON-BLOCKING. Run an arbitrary shell command in a background sub-terminal "
+                "and keep working — the right tool for anything slow, where shell.exec "
+                "would hold your loop until it exits. "
                 "Optionally set a trigger regex: any new output line matching the "
                 "pattern will push a watch.trigger event to the agent's inbox. This "
                 "call reports started/running, not a successful process exit; use "
@@ -11146,8 +11232,11 @@ def register_builtin_tools() -> None:
         Tool(
             name="session.start",
             description=(
-                "Start one agent-private temporary PTY for an interactive command. "
-                "It is not a named terminal and closes with the agent run."
+                "Start one agent-private temporary PTY for an INTERACTIVE command — a REPL, "
+                "an ssh login, anything that asks questions and needs keystrokes back. "
+                "You may hold only one at a time, it is not a named terminal, and it closes "
+                "with the agent run. For a non-interactive command that merely takes a long "
+                "time, terminal.exec is the one to use."
             ),
             schema={
                 "type": "object",

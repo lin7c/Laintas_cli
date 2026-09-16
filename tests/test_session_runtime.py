@@ -3,6 +3,7 @@ import copy
 import json
 import os
 import tempfile
+import threading
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
@@ -737,6 +738,123 @@ class AgentTerminationTests(unittest.TestCase):
                 self.assertEqual(calls[1]["task_kind"], "compaction_review")
                 self.assertEqual(calls[1].get("effort_override"), expected)
                 self.assertIsNone(calls[0].get("effort_override"))
+
+    @staticmethod
+    def _multi_chunk_thread():
+        messages = [{"role": "user", "content": "initial task"}]
+        for index in range(1, 9):
+            messages.extend([
+                {"role": "assistant", "content": f"answer {index} " + "word " * 4000},
+                {"role": "user", "content": f"follow-up {index}"},
+            ])
+        return messages
+
+    def test_esc_during_compaction_stops_before_the_next_chunk(self):
+        event = threading.Event()
+        deps, calls = self._summary_deps()
+        recorded = deps.call_backend
+        seen_events = []
+
+        def backend(**kwargs):
+            seen_events.append(kwargs.get("interrupt_event"))
+            event.set()  # Esc lands while the first summarizer call runs
+            return recorded(**kwargs)
+
+        deps.call_backend = backend
+        agent_loop.set_runtime_config("compact_chunk_tokens", 4000)
+        messages = self._multi_chunk_thread()
+        before = copy.deepcopy(messages)
+
+        changed = agent_loop._compact_thread_messages(
+            messages, deps, {}, "EN", {"_thread_messages": messages},
+            force=True, interrupt_event=event)
+
+        self.assertFalse(changed)
+        self.assertEqual(messages, before)
+        self.assertLessEqual(len(calls), 2)  # the first draft and its review only
+        self.assertTrue(seen_events)
+        self.assertTrue(all(seen is event for seen in seen_events))
+
+    def test_compaction_already_interrupted_makes_no_calls(self):
+        event = threading.Event()
+        event.set()
+        deps, calls = self._summary_deps()
+        agent_loop.set_runtime_config("compact_chunk_tokens", 4000)
+        messages = self._multi_chunk_thread()
+
+        changed = agent_loop._compact_thread_messages(
+            messages, deps, {}, "EN", {"_thread_messages": messages},
+            force=True, interrupt_event=event)
+
+        self.assertFalse(changed)
+        self.assertEqual(calls, [])
+
+    def test_status_trigger_and_headroom_share_one_budget(self):
+        agent_loop.set_runtime_config("model_context_window", 200000)
+        with mock.patch.object(agent_loop, "_per_request_overhead_tokens",
+                               return_value=50000):
+            budget = agent_loop.compaction_budget({})
+            status = agent_loop.session_context_status({"_thread_messages": []})
+            state = {}
+            agent_loop._publish_context_headroom([], state)
+        self.assertEqual(budget["usable"], 130000)   # 200k - 20k reserve - 50k overhead
+        self.assertEqual(status["usable"], budget["usable"])
+        self.assertEqual(state["_ctx_headroom_chars"], int(130000 * 3.5))
+
+    def test_policy_auto_off_stops_automatic_but_not_forced_compaction(self):
+        policy = dict(agent_loop.ctxpol.load(), auto=False)
+        agent_loop.set_runtime_config("model_context_window", 20000)
+        with mock.patch.object(agent_loop.ctxpol, "load", return_value=policy):
+            deps, calls = self._summary_deps()
+            messages = self._multi_chunk_thread()
+            self.assertFalse(agent_loop._compact_thread_messages(
+                messages, deps, {}, "EN", {"_thread_messages": messages}))
+            self.assertEqual(calls, [])
+
+            deps, calls = self._summary_deps()
+            messages = self._multi_chunk_thread()
+            self.assertTrue(agent_loop._compact_thread_messages(
+                messages, deps, {}, "EN", {"_thread_messages": messages}, force=True))
+            self.assertTrue(calls)
+
+    def test_automatic_compaction_also_consolidates_memories(self):
+        agent_loop.set_runtime_config("mem_extract_on_compact", True)
+        agent_loop.set_runtime_config("model_context_window", 20000)
+        deps, _calls = self._summary_deps()
+        seen = {}
+
+        def _inline_thread(target=None, daemon=None, **_kw):
+            class _Thread:
+                def start(self_inner):
+                    target()
+            return _Thread()
+
+        def _fake_extract(text, llm_fn, *, session=None):
+            seen["text"] = text
+            return []
+
+        messages = self._multi_chunk_thread()
+        with mock.patch.object(agent_loop.threading, "Thread", _inline_thread), \
+                mock.patch.object(agent_loop.mem_extract, "extract_and_store", _fake_extract):
+            changed = agent_loop._compact_thread_messages(
+                messages, deps, {}, "EN", {"_thread_messages": messages})
+
+        self.assertTrue(changed)
+        self.assertIn("summary", seen["text"].lower())
+
+    def test_aux_backend_reply_is_tool_less_and_tagged(self):
+        deps, calls = _deps([{"reply": "verdict"}])
+        reply = agent_loop._aux_backend_reply(
+            deps, {"token": "t"}, system_prompt="judge", messages=[{"role": "user", "content": "x"}],
+            task_kind="critic", trajectory_id="run-1", cwd="/work", model="aux-model", provider="")
+        self.assertEqual(reply, "verdict")
+        call = calls[0]
+        self.assertFalse(call["tools_enabled"])
+        self.assertEqual(call["task_kind"], "critic")
+        self.assertEqual(call["trajectory_id"], "run-1")
+        self.assertEqual(call["current_path"], "/work")
+        self.assertEqual(call["model_override"], "aux-model")
+        self.assertIsNone(call["provider_override"])
 
     def test_compaction_status_text_names_the_right_knobs(self):
         manual = agent_loop.compaction_status_text(auto=False)
