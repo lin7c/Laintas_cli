@@ -44,22 +44,46 @@ def _log_path() -> Path:
     return Path(paths.project_dir()) / "events.jsonl"
 
 
+#: Tail windows tried, in order, when recovering the last sequence number.
+#: The number lives on the final line, so the first window almost always
+#: answers it. Reading the whole file instead cost 1.8 SECONDS on a 41 MB log
+#: (57k events) — once per process, but paid at the first event of every
+#: session, and the log only grows.
+_SEQ_TAIL_WINDOWS = (64 * 1024, 1024 * 1024)
+
+
+def _last_seq_in(path: Path) -> int:
+    """The highest `seq` recorded in a log, read from its tail."""
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return 0
+    for window in (*_SEQ_TAIL_WINDOWS, size):
+        try:
+            with open(path, "rb") as fh:
+                if window < size:
+                    fh.seek(size - window)
+                    fh.readline()   # drop the partial line the seek landed in
+                chunk = fh.read()
+        except OSError:
+            return 0
+        for line in reversed(chunk.decode("utf-8", "replace").splitlines()):
+            try:
+                found = int(json.loads(line).get("seq") or 0)
+            except (AttributeError, ValueError, TypeError, json.JSONDecodeError):
+                continue
+            if found:
+                return found
+        if window >= size:
+            break
+    return 0
+
+
 def _next_seq(path: Path) -> int:
     """Return a process-safe, restart-safe advisory sequence for one log."""
     key = str(path.resolve())
     if key not in _SEQ_BY_PATH:
-        last = 0
-        try:
-            for line in reversed(path.read_text(encoding="utf-8").splitlines()):
-                try:
-                    last = int(json.loads(line).get("seq") or 0)
-                    if last:
-                        break
-                except (ValueError, TypeError, json.JSONDecodeError):
-                    continue
-        except OSError:
-            pass
-        _SEQ_BY_PATH[key] = last
+        _SEQ_BY_PATH[key] = _last_seq_in(path)
     _SEQ_BY_PATH[key] += 1
     return _SEQ_BY_PATH[key]
 

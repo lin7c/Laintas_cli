@@ -248,6 +248,7 @@ class ResourceBrowser:
                  pane_labels: Optional[tuple[str, str]] = None,
                  assistant_handler: Optional[AssistantHandler] = None,
                  assistant_placeholder: str = "Ask about this context",
+                 assistant_label: str = "AI",
                  input=None, output=None):
         self.title = title
         self.load_items = load_items
@@ -264,6 +265,7 @@ class ResourceBrowser:
         self.pane_labels = pane_labels or _PANE_LABELS[self.presentation]
         self.assistant_handler = assistant_handler
         self.assistant_placeholder = assistant_placeholder
+        self.assistant_label = assistant_label
         self._input = input
         self._output = output
 
@@ -755,7 +757,7 @@ class ResourceBrowser:
         if self.searchable:
             rows.append(("SEARCH", "/  find in focused pane    n/N  next/previous match"))
         if self.assistant_handler is not None:
-            rows.append(("AI", "a  focus AI input    Enter  submit    Esc  return"))
+            rows.append((self.assistant_label, "a  focus input    Enter  submit    Esc  return"))
         action_text = "    ".join(f"{action.key}  {action.label}"
                                   for action in self.actions)
         if action_text:
@@ -817,8 +819,8 @@ class ResourceBrowser:
         return [("class:search.prompt", f"  {label}  ")]
 
     def _assistant_prompt_fragments(self):
-        label = "Thinking…" if self.assistant_busy else self.assistant_placeholder
-        return [("class:assistant.prompt", f"  AI  {label}  ")]
+        label = "Working…" if self.assistant_busy else self.assistant_placeholder
+        return [("class:assistant.prompt", f"  {self.assistant_label}  {label}  ")]
 
     def _submit_assistant(self) -> None:
         """Run the optional inspector assistant without blocking terminal repaint."""
@@ -828,7 +830,8 @@ class ResourceBrowser:
         item, detail = self._selected_item(), self.detail
         self._assistant_interrupt.clear()
         self.assistant_busy = True
-        self.status = "AI is inspecting the selected context…"
+        self.status = ("AI is inspecting the selected context…" if self.assistant_label == "AI"
+                       else "Applying command…")
         self.status_style = "class:muted"
 
         def work() -> None:
@@ -849,12 +852,12 @@ class ResourceBrowser:
                     self.focus = "detail"
                     if not self.is_wide:
                         self.mode = "detail"
-                self.status = action_result.message or "AI response ready"
-                self.status_style = action_result.message_style
                 if action_result.refresh:
                     self.reload(preserve=True)
+                self.status = action_result.message or f"{self.assistant_label} complete"
+                self.status_style = action_result.message_style
             except Exception as exc:
-                self.status = f"AI request failed: {type(exc).__name__}: {exc}"
+                self.status = f"{self.assistant_label} failed: {type(exc).__name__}: {exc}"
                 self.status_style = "class:error"
             finally:
                 self.assistant_busy = False
@@ -1069,7 +1072,7 @@ class ResourceBrowser:
             elif self.assistant_active:
                 if self.assistant_busy:
                     self._assistant_interrupt.set()
-                    self.status = "Cancelling AI inspection…"
+                    self.status = f"Cancelling {self.assistant_label.lower()}…"
                     self.status_style = "class:muted"
                 self.assistant_active = False
                 pane = (self.mode if not self.is_wide else self.focus)
@@ -1221,7 +1224,11 @@ class ResourceBrowser:
                     self.detail_cache.clear()
                     self.detail = None
                     self.detail_key = ""
-                    self.reload(preserve=True)
+                    with self._lock:
+                        status, style = self.status, self.status_style
+                        self.reload(preserve=True)
+                        if not self.status:
+                            self.status, self.status_style = status, style
                     self.app.invalidate()
             self.app.create_background_task(_refresh_loop())
 

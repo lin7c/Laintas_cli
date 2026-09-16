@@ -253,6 +253,22 @@ class MidRunHandoverTests(_RegistryCase):
         self.assertFalse(presser.is_alive(),
                          "the reader thread outlived its test")
 
+        # And the thread the reader STARTED. _open_agents_view runs the view
+        # on its own daemon thread and calls on_close from that thread's
+        # `finally`; the reader returns as soon as it has handed the view
+        # over, so joining the reader proves nothing about it. Left running,
+        # its on_close lands in a later test — `_resume` sees the
+        # `_foreground_run_active` this test set and calls
+        # `_restart_bg_input_reader`, which MidRunOpenerTests has patched and
+        # records as its own. That is the one-run-in-two failure, and it only
+        # appeared in directories with enough project state to slow this
+        # thread down.
+        for _thread in threading.enumerate():
+            if _thread.name == "agents-view":
+                _thread.join(5)
+                self.assertFalse(_thread.is_alive(),
+                                 "the agents-view thread outlived its test")
+
         # The view came up while the turn was mid-flight...
         self.assertTrue(observed.get("view_active"), "view never opened")
         self.assertTrue(observed.get("screen_owner_is_view"),

@@ -243,7 +243,7 @@ _DEFAULT_CONFIG = {
     "auto_pilot_decompose_max_tokens": 500, # max tokens for decomposition LLM call
     "auto_pilot_auto_execute": False,  # Phase 3: auto-spawn sub-agents for decomposed tasks (opt-in)
     "auto_pilot_max_parallel": 4,      # Phase 3: max parallel sub-agents for auto-execution
-    "auto_pilot_budget_tokens": 50000, # Phase 3: token budget for auto-execution (all sub-agents combined)
+    "auto_pilot_budget_tokens": 50000, # reported-usage stop threshold; in-flight calls may overshoot
     "tool_output_fold": 30,          # max lines of tool output shown before folding (first half + … + last half); 0 = suppress preview entirely
     # ── Web search / fetch ──
     "search_engine": "auto",            # auto = default chain (google, duckduckgo, cn-bing, laintas_search, laintas_gateway); or a space/comma separated list of engine names
@@ -2471,7 +2471,8 @@ def save_resume_checkpoint(state: dict, chat_history: list, cwd: str) -> Optiona
 def save_fork_state(state: dict, chat_history: list, cwd: str,
                     fork_name: str, fork_lineage: list = None,
                     fork_parent_session_id: str = "",
-                    child_session_id: str = "") -> Optional[dict]:
+                    child_session_id: str = "", *,
+                    source_snapshot: Optional[dict] = None) -> Optional[dict]:
     """Save a named fork snapshot of the current session context.
 
     Like ``save_resume_checkpoint`` but tagged with stable parent/child session
@@ -2480,9 +2481,14 @@ def save_fork_state(state: dict, chat_history: list, cwd: str,
     parents without colliding. Also writes the child's per-session file.
     """
     try:
-        payload = _build_resume_payload(state, chat_history, cwd, "fork")
+        # Historical forks must retain the selected snapshot's summary and
+        # tasks, not reconstruct them from the source session's current tip.
+        payload = (copy.deepcopy(source_snapshot) if source_snapshot is not None
+                   else _build_resume_payload(state, chat_history, cwd, "fork"))
         if payload is None:
             return None
+        payload.update(id=uuid.uuid4().hex[:12], kind="fork", cwd=cwd,
+                       timestamp=time.time())
         parent_session_id = _normalize_session_id(
             fork_parent_session_id or payload.get("session_id"))
         # A fork is a child conversation, not another filename for its parent.
@@ -2496,7 +2502,7 @@ def save_fork_state(state: dict, chat_history: list, cwd: str,
             normalize_fork_lineage(fork_lineage)
             or normalize_fork_lineage([fork_name]))
         branch_name = " ".join(str(fork_name or "").split())[:_FORK_NAME_MAX]
-        branch_state = prepare_state_for_repl(state or {})
+        branch_state = prepare_state_for_repl(copy.deepcopy(state or {}))
         branch_state["_session_id"] = child_session_id
         branch_state["_fork_parent_session_id"] = parent_session_id
         branch_state["_fork_lineage"] = lineage
@@ -2511,6 +2517,12 @@ def save_fork_state(state: dict, chat_history: list, cwd: str,
         payload["fork_parent_session_id"] = parent_session_id
         payload["fork_created_at"] = payload["timestamp"]
         payload["state"] = branch_state
+        # Tasks are copied on checkout into a new work item. Never attach a
+        # child to its parent's mutable work graph or agent ownership.
+        payload["active_work_id"] = None
+        for task in payload.get("tasks") or []:
+            task.pop("owner_agent_id", None)
+            task.pop("parent_agent_id", None)
         paths.SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
         # Key by immutable branch identity. Name-keyed files collide when two
         # different parents both have a child called e.g. "experiment".
@@ -2870,6 +2882,9 @@ class AgentInfo:
     chain_id: Optional[str] = None            # serial pipeline this agent belongs to
     chain_step_index: int = -1                # 0-based position in chain (-1 = not in chain)
     group_id: Optional[str] = None            # parallel group this agent belongs to
+    concurrency_limit: int = 0               # group-local cap; global scheduler still applies
+    route_reason: str = ""
+    usage_tokens: int = 0                    # provider-reported tokens for this runtime identity
     result: str = ""                          # final result text (set by mark_agent_finished)
     error: str = ""                           # error text if status=error
     # ── Contract (agent_contract) ──────────────────────────────────────
@@ -2884,6 +2899,7 @@ class AgentInfo:
     # ── Employee / assignment model ─────────────────────────────────
     profile: EmployeeProfile = field(default_factory=EmployeeProfile)
     active_assignment: Optional[AgentAssignment] = None
+    deployment_pending: bool = False          # short admission reservation during PTY startup
     assignment_history: list[dict] = field(default_factory=list)
     assignment_lock: Any = field(default_factory=threading.Lock, repr=False)
 
@@ -3246,6 +3262,17 @@ def exit_waiting(agent_id: str) -> None:
             _running_count += 1
 
 
+def _has_scheduler_capacity(info) -> bool:
+    """Called under _registry_lock. Group limits never discard queued work."""
+    if _running_count >= _max_concurrent:
+        return False
+    if info.group_id and info.concurrency_limit > 0:
+        occupied = sum(1 for other in _agent_registry.values()
+                       if other.group_id == info.group_id and other.slot_held)
+        return occupied < info.concurrency_limit
+    return True
+
+
 def schedule_agent(agent_id: str, start_fn) -> None:
     """Run start_fn(ok) when a concurrency slot is available.
 
@@ -3256,12 +3283,15 @@ def schedule_agent(agent_id: str, start_fn) -> None:
     global _running_count
     with _registry_lock:
         info = _agent_registry.get(agent_id)
-        if info is None or info.abort_event.is_set() or info.status == "aborted":
+        parent = _agent_registry.get(info.parent_id) if info and info.parent_id else None
+        if (info is None or info.lifecycle_terminated or info.abort_event.is_set()
+                or info.status == "aborted"
+                or (info.parent_id and (parent is None or parent.lifecycle_terminated or parent.abort_event.is_set()))):
             can_run = False
             cancelled = True
         else:
             cancelled = False
-            can_run = _running_count < _max_concurrent
+            can_run = _has_scheduler_capacity(info)
             if can_run:
                 info.status = "running"
                 info.slot_held = True
@@ -3283,7 +3313,16 @@ def _pump_queue() -> None:
         with _registry_lock:
             if not _wait_queue or _running_count >= _max_concurrent:
                 break
-            agent_id, start_fn = _wait_queue.pop(0)
+            # Preserve FIFO among runnable entries, without letting a capped
+            # group block unrelated groups that still have room.
+            index = next((i for i, (aid, _) in enumerate(_wait_queue)
+                          if aid not in _agent_registry
+                          or _agent_registry[aid].abort_event.is_set()
+                          or _agent_registry[aid].status != "queued"
+                          or _has_scheduler_capacity(_agent_registry[aid])), None)
+            if index is None:
+                break
+            agent_id, start_fn = _wait_queue.pop(index)
             info = _agent_registry.get(agent_id)
             if (info is None or info.status != "queued"
                     or info.abort_event.is_set()):
@@ -3410,7 +3449,8 @@ def get_or_hire_pool_agent() -> AgentInfo:
 
 def start_agent_assignment(agent_id: str, task: str, deps,
                            session: Optional[dict] = None,
-                           events_cb=None) -> tuple[bool, str, Optional[AgentAssignment]]:
+                           events_cb=None, *, expected_parent_id: Optional[str] = None
+                           ) -> tuple[bool, str, Optional[AgentAssignment]]:
     """Start one concrete background assignment for a hired employee.
 
     Employee capability/profile is persistent; state and chat history are fresh
@@ -3433,6 +3473,13 @@ def start_agent_assignment(agent_id: str, task: str, deps,
     # Agents Mode and remote control can otherwise start the same employee at
     # the same time and make two runners share mutable state/history.
     with employee.assignment_lock:
+        if employee.deployment_pending:
+            return False, "Agent deployment is in progress.", None
+        if expected_parent_id is not None:
+            manager = get_agent(expected_parent_id)
+            if (employee.parent_id != expected_parent_id or manager is None
+                    or manager.lifecycle_terminated or manager.abort_event.is_set()):
+                return False, "Manager changed or was cancelled before admission.", None
         if employee.lifecycle_terminated:
             return False, f"Agent '{agent_id}' has been terminated.", None
         if employee.active_assignment is not None or employee.status in {
@@ -4107,7 +4154,8 @@ def swap_station(old_agent_id: str, new_agent_id: str,
 
 def close_all_agents() -> None:
     """Clean up all agent registrations. Signals abort to running children first."""
-    global _current_agent_id, _running_count, _wait_queue
+    global _current_agent_id, _running_count, _wait_queue, _station_service
+    _station_service = None
     cancelled = []
     ephemeral_sessions = []
     with _registry_lock:
@@ -4544,7 +4592,8 @@ def spawn_subagent(parent_id: str, task: str, deps,
                    spawn_context: str = "",
                    state_overrides: Optional[dict] = None,
                    contract: Optional[dict] = None,
-                   report_to_parent: bool = True) -> Optional[str]:
+                   report_to_parent: bool = True,
+                   concurrency_limit: int = 0) -> Optional[str]:
     """Start an in-process child agent via the HWO scheduler.
 
     The child:
@@ -4556,7 +4605,7 @@ def spawn_subagent(parent_id: str, task: str, deps,
     Returns the child's agent_id, or None if the parent doesn't exist.
     """
     parent = get_agent(parent_id)
-    if parent is None:
+    if parent is None or parent.lifecycle_terminated or parent.abort_event.is_set():
         return None
 
     if not can_spawn(parent_id):
@@ -4602,7 +4651,11 @@ def spawn_subagent(parent_id: str, task: str, deps,
     # be the way out of every restriction its parent was given.
     _parent_scope = parent.state.get("_tool_allowlist")
     if _parent_scope:
-        child.state["_tool_allowlist"] = list(_parent_scope)
+        requested_scope = child.state.get("_tool_allowlist")
+        child.state["_tool_allowlist"] = (
+            [name for name in requested_scope if _tool_in_scope(name, _parent_scope)]
+            or ["__no_inherited_tools__"]
+            if requested_scope else list(_parent_scope))
     # _task_cwd is parent-owned EXCEPT when the caller pinned one in
     # state_overrides. state_overrides is a trusted-code-only parameter
     # (extensions / CLI internals, never model tool input), and a caller
@@ -4624,6 +4677,7 @@ def spawn_subagent(parent_id: str, task: str, deps,
     child.chain_id = chain_id
     child.chain_step_index = chain_step_index
     child.group_id = group_id
+    child.concurrency_limit = max(0, int(concurrency_limit))
     child.chat_history.append({
         "role": "user", "content": task, "input_kind": "prompt"})
     try:
@@ -4649,7 +4703,7 @@ def spawn_subagent(parent_id: str, task: str, deps,
     # changes back file-by-file when it finishes — see worktree_manager.py.
     _worktree_info = None
     if not child.state.get("cwd"):
-        _base_cwd = parent.state.get("cwd") or os.getcwd()
+        _base_cwd = parent.state.get("cwd") or parent.state.get("_task_cwd") or os.getcwd()
         try:
             import worktree_manager
             if worktree_manager.is_git_repo(_base_cwd):
@@ -4662,6 +4716,8 @@ def spawn_subagent(parent_id: str, task: str, deps,
                 # finished work" impossible to build on top.
                 child.state["_worktree_branch"] = _worktree_info.branch
                 child.state["_worktree_path"] = _worktree_info.path
+            elif child.state.get("_require_worktree"):
+                raise RuntimeError("Automatic writing task requires an isolated Git worktree.")
         except Exception as _wt_err:
             # Isolation was promised for a git-backed task. Never disguise a
             # failed worktree as a safe spawn in the parent's shared checkout.
@@ -4764,16 +4820,19 @@ def spawn_subagent(parent_id: str, task: str, deps,
         except Exception as _merge_err:
             return f"\n\n[worktree] merge failed, changes left at {_worktree_info.path}: {_merge_err}"
 
-    def _runner(ok: bool):
+    def _runner(ok: bool, start_error: str = ""):
         if not ok:
-            child.status = "aborted"
+            child.status = "error" if start_error else "aborted"
+            child.error = start_error
+            failure_text = start_error or "Cancelled while queued."
+            failure_kind = "runtime_exception" if start_error else "aborted"
             try:
                 import agent_ui_events
                 agent_ui_events.hub.emit(
                     "agent_error", agent_id=child.id,
                     parent_agent_id=parent.id,
                     terminal_name=agent_scope_terminal(child),
-                    summary="Cancelled while queued.", status="aborted")
+                    summary=failure_text, status=child.status)
             except Exception:
                 pass
             if _worktree_info is not None:
@@ -4786,12 +4845,12 @@ def spawn_subagent(parent_id: str, task: str, deps,
                 send_to_agent(parent_id, {
                     "from": child.id,
                     "kind": "child-error",
-                    "status": "aborted",
+                    "status": child.status,
                     "role": role or "general",
-                    "error": "Cancelled while queued.",
-                    "failure_kind": "aborted",
-                    "failure": {"kind": "aborted",
-                                "message": "Cancelled while queued."},
+                    "error": failure_text,
+                    "failure_kind": failure_kind,
+                    "failure": {"kind": failure_kind,
+                                "message": failure_text},
                     "retry_policy": "parent_decides",
                 })
             return
@@ -4981,7 +5040,10 @@ def spawn_subagent(parent_id: str, task: str, deps,
     t = threading.Thread(target=lambda: schedule_agent(child.id, _runner),
                          daemon=True, name=f"laintas-sched-{child.id}")
     child.thread = t
-    t.start()
+    try:
+        t.start()
+    except Exception as exc:
+        _runner(False, f"Could not start child thread: {exc}")
     return child.id
 
 
@@ -7007,7 +7069,8 @@ STATE_KEYS_TURN_ONLY = frozenset({
     # none of them appears in the copy below, so none of them crosses.
     "_assignment_task", "_evolution_lab_branch", "_max_write_lines",
     "_overflow_retry", "_parent_agent_id", "_prompt_lab_branch",
-    "_prompt_lab_root", "_run_id", "_satisfied_rule_ids", "_silent_fail_count",
+    "_prompt_lab_root", "_run_id", "_satisfied_rule_ids", "_require_worktree",
+    "_silent_fail_count",
     "_sys_prompt_churn_causes", "_sys_prompt_parts", "_task_kind",
     "_test_warning_issued", "_tool_allowlist", "_truncation_retry_count",
     "_truncation_counts", "_unanswered_prompt", "_work_id", "_worktree_branch",
@@ -9693,33 +9756,21 @@ def run_agent_loop(
     # If _run_agent_loop_with_interrupt set a pending plan, pre-spawn
     # sub-agents before the main loop starts.  The main agent then runs
     # as orchestrator with knowledge of the pre-spawned agents.
-    _auto_pilot_orchestrator = None
     if depth == 0 and agent_id:
         _ap_plan = auto_pilot.get_pending_plan()
         if _ap_plan is not None:
-            _ap_strategy = _ap_plan.get("strategy", "")
-            _ap_subtasks = _ap_plan.get("subtasks", [])
-            _ap_mode = _ap_plan.get("mode", "parallel")
-            _ap_max = int(get_runtime_config("auto_pilot_max_parallel") or 4)
-            _ap_orch = auto_pilot.AutoPilotOrchestrator(
-                max_parallel=_ap_max,
-                budget_tokens=int(get_runtime_config("auto_pilot_budget_tokens") or 50000),
-            )
-            for _ap_st in _ap_subtasks[:_ap_max]:
-                _ap_child = spawn_subagent(
-                    parent_id=agent_id,
-                    task=_ap_st,
-                    deps=deps,
-                    session=None,
-                    events_cb=events_cb,
-                )
-                if _ap_child:
-                    _ap_orch.track_agent(_ap_child, _ap_st, time.time())
-            if _ap_orch.spawned_agents:
-                _auto_pilot_orchestrator = _ap_orch
-                _ap_hint = _ap_orch.build_orchestrator_hint()
-                if _ap_hint:
-                    original_input = _ap_hint + "\n\n" + original_input
+            from station_service import service_for
+            _ap_results = service_for(sys.modules[__name__]).route_parallel(
+                agent_id, _ap_plan.get("subtasks") or [], deps,
+                session=session, events_cb=events_cb,
+                run_id=_run_id, session_id=_session_id,
+                max_parallel=int(get_runtime_config("auto_pilot_max_parallel") or 4))
+            _ap_lines = [f"{result.agent_id or 'unassigned'}: {result.message}"
+                         for result in _ap_results]
+            if _ap_lines:
+                original_input = ("[Automatically routed tasks]\n" + "\n".join(_ap_lines)
+                                  + "\nCollect child results; handle unassigned tasks yourself.\n"
+                                  + original_input)
     # ── Durable prompt admission (opencode pattern) ──
     # Write the prompt to the event log BEFORE execution starts, so a crash
     # never loses what the user asked. Recovery can detect an incomplete task.
@@ -11531,6 +11582,26 @@ def run_agent_loop(
         debug_entry.done = response.get("done", len(tool_calls) == 0)
         debug_entry.error = response.get("error", False)
         debug_entry.billing = response.get("_billing", {})
+        if agent_id:
+            reported = response.get("_billing") or {}
+            try:
+                spent = int(reported.get("totalTokens") or
+                            (int(reported.get("promptTokens") or 0)
+                             + int(reported.get("completionTokens") or 0)))
+            except (ValueError, TypeError):
+                spent = 0
+            with _registry_lock:
+                billed_agent = _agent_registry.get(agent_id)
+                if billed_agent is not None:
+                    billed_agent.usage_tokens += max(0, spent)
+                billed_branches = set()
+                visited = set()
+                while billed_agent is not None and billed_agent.id not in visited:
+                    visited.add(billed_agent.id)
+                    if billed_agent.group_id:
+                        billed_branches.add(billed_agent.group_id)
+                    billed_agent = _agent_registry.get(billed_agent.parent_id)
+            branch_mod.record_usage(billed_branches, spent)
 
         if response.get("error"):
             _err_text = response.get("reply", "") or ""

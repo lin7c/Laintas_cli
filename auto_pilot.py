@@ -273,8 +273,6 @@ class AutoPilotOrchestrator:
         """
         if not subtasks or len(subtasks) < 2:
             return None
-        if len(subtasks) > self.max_parallel:
-            subtasks = subtasks[: self.max_parallel]
 
         if strategy == PARALLEL_HINT:
             return {

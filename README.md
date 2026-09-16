@@ -354,9 +354,35 @@ See [`SECURITY_CUSTOMIZATION.md`](SECURITY_CUSTOMIZATION.md) for the threat mode
 
 Run `/help` for the authoritative list for your installed version, including extension commands.
 
+`/resume [N|all|latest]` forks the selected saved context into an independent
+session, including its conversation summary and copied tasks. It can branch
+from a session running in another terminal without taking ownership or
+overwriting that session. `--resume` and `--continue` use the same behavior.
+`/fork [name]` branches from the current context; a named fork is saved for
+later use. Explicit `--execute --session-id` retains its logical-session
+continuation behavior.
+
+`/station` opens the live agent/terminal manager. Press `v` to switch between
+delegation and terminal views, `Enter` for details, `e` to open the existing
+terminal/dialogue view, and `a` to enter a management command. Commands include
+`task <work>`, `auto <work>`, `suggest <work>`, `bind <terminal>`, `cancel`,
+and `unstation`. In terminal view, `close` shows affected resources and
+`close confirm` closes them only if the confirmed resources are still current.
+Closing Station itself leaves running work alone.
+
+Outside the manager, `/station <agent-id> [terminal] --task <work>` assigns an
+employee; `/station suggest --task <work>` previews routing and
+`/station auto --task <work>` starts an isolated child. Existing Auto-Pilot
+auto-execution uses the same service when `auto_pilot_auto_execute` is enabled.
+Independent tasks exceeding `auto_pilot_max_parallel` queue without being
+discarded. `auto_pilot_budget_tokens` stops remaining work after reported usage
+reaches its threshold; in-flight calls may exceed it, and unavailable provider
+usage cannot be counted. Automatic writing tasks require Git worktree isolation.
+Role selection and routing never broaden the parent's tool permissions.
+
 | Area | Commands | Purpose |
 |---|---|---|
-| Session | `/login`, `/resume`, `/told`, `/detail` | Authentication, recovery, conversation and trace inspection |
+| Session | `/login`, `/fork`, `/resume`, `/told`, `/detail` | Authentication, context branching, conversation and trace inspection |
 | Behavior | `/mode`, `/plan`, `/model`, `/config`, `/theme` | Working posture, planning, model override, preferences |
 | Knowledge | `/memory`, `/rule`, `/skill` | Persistent context, constraints, progressive skills |
 | Execution | `/term`, `/spawn`, `/agents`, `/task` | Terminals, delegated agents, and task tracking |

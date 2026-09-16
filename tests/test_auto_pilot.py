@@ -453,11 +453,11 @@ class TestAutoPilotOrchestrator:
         assert plan["mode"] == "chain"
         assert len(plan["spawns"]) == 2
 
-    def test_plan_caps_at_max_parallel(self):
+    def test_plan_retains_tasks_beyond_parallel_capacity(self):
         orch = auto_pilot.AutoPilotOrchestrator(max_parallel=2)
         plan = orch.plan_execution(auto_pilot.PARALLEL_HINT, ["a", "b", "c", "d"])
         assert plan is not None
-        assert len(plan["spawns"]) == 2
+        assert len(plan["spawns"]) == 4
 
     def test_plan_returns_none_for_simple(self):
         orch = auto_pilot.AutoPilotOrchestrator()

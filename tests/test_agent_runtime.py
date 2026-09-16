@@ -2630,6 +2630,8 @@ class BackgroundCriticTests(unittest.TestCase):
         critic_calls = []
         critic_started = threading.Event()
         release_critic = threading.Event()
+        critic_released = threading.Event()
+        critic_timed_out = threading.Event()
 
         def backend(**kwargs):
             if kwargs.get("system_prompt") == critic_mod.SYSTEM_PROMPT:
@@ -2637,9 +2639,11 @@ class BackgroundCriticTests(unittest.TestCase):
                 critic_started.set()
                 # Held open until the NEXT main call happens. If the loop
                 # waited for the critic, that call could never happen and this
-                # would sit here for the full timeout — which the elapsed-time
-                # assertion below turns into a failure.
-                release_critic.wait(timeout=6)
+                # would sit here for the full timeout. Check that dependency
+                # directly instead of timing unrelated initialization and I/O.
+                if not release_critic.wait(timeout=6):
+                    critic_timed_out.set()
+                critic_released.set()
                 return {"reply": '{"on_track": true, "score": 90, "issue": ""}',
                         "tool_calls": [], "done": False, "error": False}
             main_calls.append(kwargs)
@@ -2663,18 +2667,15 @@ class BackgroundCriticTests(unittest.TestCase):
                                   side_effect=lambda k: overrides.get(k, real_config(k))):
             Path(".laintas").mkdir()
             Path("a.txt").write_text("hello", encoding="utf-8")
-            _t0 = time.monotonic()
             agent_loop.run_agent_loop(deps, "keep going", {}, {}, [],
                                       max_loops_override=3)
-            _elapsed = time.monotonic() - _t0
 
         release_critic.set()
         self.assertTrue(critic_started.is_set(), "critic never ran")
         self.assertGreaterEqual(len(main_calls), 2)
-        # Serialized, the second main call would have had to wait out the
-        # critic's 6s hold. Concurrent, it goes straight through.
-        self.assertLess(_elapsed, 4.0,
-                        "the loop blocked on the background critic")
+        self.assertTrue(critic_released.wait(1), "critic did not finish its wait")
+        self.assertFalse(critic_timed_out.is_set(),
+                         "the second main call waited for the background critic")
 
 
 class BackendSignatureLadderTests(unittest.TestCase):

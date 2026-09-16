@@ -834,6 +834,7 @@ def select_dialog(
     search: bool = False,
     hint: str = "",
     action_keys=None,
+    on_action=None,
     enter_action: str = "",
     letter_shortcuts: bool = False,
     refresh_interval: float = 0.05,
@@ -869,13 +870,17 @@ def select_dialog(
     action_keys : dict[str, str] | None
         Map of ``key → action_name``.  When a key is pressed the dialog exits
         returning ``(action_name, absolute_index)`` instead of an item.  The
-        caller can loop and re-invoke for multi-step pickers (like the resume
-        picker's d/x keys).
+        caller can loop and re-invoke for multi-step pickers, or use
+        on_action to handle an action without leaving the screen.
     enter_action : str
         When non-empty (and ``action_keys`` is also set), Enter returns
         ``(enter_action, idx)`` instead of the raw item.  Useful for pickers
         where Enter triggers an action (e.g. "resume", "toggle") rather than
         returning a value.
+    on_action : callable | None
+        Optional in-place action handler(action, index). Return a dictionary
+        with items, selected_index and hint to refresh without closing the
+        application; return None to use the normal action return value.
     letter_shortcuts : bool
         When True, pressing a letter jumps to the first option whose label
         starts with that letter and confirms (muscle-memory compat for
@@ -1092,6 +1097,8 @@ def select_dialog(
             return
         vis = _clamp_sel()
         if not vis:
+            if on_action is not None:
+                return
             if act_keys:
                 event.app.exit(result=(None, -1))
             else:
@@ -1111,9 +1118,27 @@ def select_dialog(
 
         @kb.add(_key)
         def _ak(event, _a=_action):
+            nonlocal hint
             if _in_grace():
                 return
             vis = _clamp_sel()
+            if on_action is not None:
+                if not vis:
+                    return
+                update = on_action(_a, sel[0])
+                if update is not None:
+                    items[:] = update["items"]
+                    norm[:] = [
+                        (str(it[0]), str(it[1]) if len(it) > 1 else "")
+                        if isinstance(it, (tuple, list)) else (str(it), "")
+                        for it in items
+                    ]
+                    sel[0] = max(0, min(update.get("selected_index", sel[0]),
+                                        len(norm) - 1))
+                    hint = update.get("hint", hint)
+                    _marquee_last_sel[0] = -1
+                    event.app.invalidate()
+                    return
             if vis and 0 <= sel[0] < len(items):
                 event.app.exit(result=(_a, sel[0]))
             else:
@@ -3217,7 +3242,7 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
             ("buy", "Buy a call or storage pack"),
         )),
     CommandSpec(
-        "/resume", "Resume a saved session (picker; echo last N events, default 20)",
+        "/resume", "Fork a saved session (picker; echo last N events, default 20)",
         "Account & Session", "/resume [N|all|latest]",
         subcommands=("latest", "all"),
         completion_descriptions=(
@@ -3297,10 +3322,12 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec("/term", "List, create, or rename terminals", "Agents & Terminals", "/term [name|rename <old> <new>]", aliases=("/t",), subcommands=("rename",)),
     CommandSpec("/helpwo", "Connect this CLI to Helpwo as a runtime environment (this folder = its workspace), or open the local/hosted app; /helpwo stop to go offline", "Agents & Terminals", "/helpwo [--port N] [--host ADDR] [--dist <path>] [--remote] | stop", subcommands=("stop",)),
     CommandSpec(
-        "/station", "Bind an employee to a terminal and optionally start work",
+        "/station", "Manage agents and terminals; route or assign work",
         "Agents & Terminals", "/station <agent-id> [terminal] [--task <work>]",
-        aliases=("/st",),
+        aliases=("/st",), subcommands=("auto", "suggest"),
         help_text=(
+            "With no arguments, opens Station. Use /station auto --task <work> to route "
+            "an isolated child, or /station suggest --task <work> to preview. "
             "Without --task, deploys or moves the employee. With --task, starts a fresh "
             "background Assignment with isolated state/history. For an undeployed "
             "employee, omitting the terminal with --task uses a private temporary "
@@ -7911,6 +7938,22 @@ def _acquire_resume_lease(blob: dict) -> Optional[dict]:
     return blob
 
 
+def _fork_resume_blob(blob: dict, cwd: str) -> Optional[dict]:
+    """Branch from a saved context without acquiring or changing its owner."""
+    parent_id = _resume_effective_session_id(blob)
+    lineage = normalize_fork_lineage(blob.get("fork_lineage"))
+    child_id = uuid.uuid4().hex[:16]
+    # Identity-derived names remain distinct across concurrent callers.
+    name = f"branch-{child_id}"
+    child = save_fork_state(
+        blob.get("state") or {}, blob.get("chat_history") or [], cwd,
+        name, normalize_fork_lineage(lineage + [name]), parent_id,
+        child_id, source_snapshot=blob)
+    if child is None:
+        console.print("[red]Could not create a branch from the saved session.[/red]")
+    return child
+
+
 def _restore_resume_blob(blob: dict, chat_history: list) -> dict:
     """Restore full-fidelity conversation state from a per-cwd resume blob.
 
@@ -7924,7 +7967,7 @@ def _restore_resume_blob(blob: dict, chat_history: list) -> dict:
     older = (blob.get("older_summary") or "").strip()
     if older:
         chat_history.append({"role": "knowledge", "content": f"[resumed session context]\n{older}"})
-    chat_history.extend(blob.get("chat_history") or [])
+    chat_history.extend(copy.deepcopy(blob.get("chat_history") or []))
     restored_session_id = _resume_effective_session_id(blob)
     try:
         if blob.get("active_work_id"):
@@ -8188,8 +8231,8 @@ def _build_fork_tree_rows(choices: list) -> list[tuple[dict, str]]:
 def show_resume_picker(cwd: str) -> Optional[dict]:
     """Full-screen `/t`-style picker for saved resume sessions.
 
-    Arrow keys to navigate, Enter to resume the highlighted session, d for a
-    details preview, x to delete a checkpoint, q/Esc to cancel. Returns the
+    Arrow keys to navigate, Enter to fork the highlighted session, d for a
+    details preview, x to delete in place, q/Esc to cancel. Returns the
     chosen blob, or None if cancelled.
     """
     choices = _resume_choices(cwd)
@@ -8230,18 +8273,32 @@ def show_resume_picker(cwd: str) -> Optional[dict]:
         return labels
 
     sel_idx = 0
-    status_msg = ""
+    base_hint = f"{symbols.ARROW_U}{symbols.ARROW_D} navigate  ↵ fork  d details  x delete  q cancel"
+
+    def _on_action(action, idx):
+        nonlocal tree_rows
+        if action != "delete":
+            return None
+        try:
+            delete_resume_state(cwd, tree_rows[idx][0])
+            tree_rows = _build_fork_tree_rows(_resume_choices(cwd))
+            message = ("Deleted saved session." if tree_rows else
+                       "No saved sessions remain. Press q or Esc to close.")
+        except Exception as exc:
+            message = f"Could not delete saved session: {exc}"
+        return {"items": _build_labels(), "selected_index": idx,
+                "hint": f"{message}\n{base_hint}"}
+
     while tree_rows:
         labels = _build_labels()
-        hint = f"{symbols.ARROW_U}{symbols.ARROW_D} navigate  ↵ resume  d details  x delete  q cancel"
-        if status_msg:
-            hint = f"{status_msg}\n{hint}"
+        hint = base_hint
         result = select_dialog(
             labels,
-            title="Resume Session",
+            title="Fork Saved Session",
             full_screen=True,
             selected_index=sel_idx,
             action_keys={"d": "details", "x": "delete"},
+            on_action=_on_action,
             enter_action="resume",
             hint=hint,
         )
@@ -8251,7 +8308,6 @@ def show_resume_picker(cwd: str) -> Optional[dict]:
         if action is None or idx < 0 or idx >= len(tree_rows):
             return None
         item = tree_rows[idx][0]
-        status_msg = ""
         if action == "resume":
             return item
         if action == "details":
@@ -8260,15 +8316,6 @@ def show_resume_picker(cwd: str) -> Optional[dict]:
                 _print_resume_transcript(item, 20)
                 _press_enter_to_continue()
             sel_idx = idx
-        elif action == "delete":
-            delete_resume_state(cwd, item)
-            # Rebuild tree after deletion
-            choices = _resume_choices(cwd)
-            if not choices:
-                return None
-            tree_rows = _build_fork_tree_rows(choices)
-            status_msg = "[green]Deleted saved session.[/green]"
-            sel_idx = min(idx, len(tree_rows) - 1)
     return None
 
 
@@ -8837,6 +8884,7 @@ def call_backend_stream(
     task_kind: str = "",
     trajectory_id: str = "",
     context_capture: Optional[dict] = None,
+    max_tokens_override: Optional[int] = None,
 ) -> dict:
     """Call Helpwo backend /api/chat/stream, same as Helpwo frontend.
     Returns parsed {reply, command, memory, done, _billing} dict.
@@ -8860,7 +8908,8 @@ def call_backend_stream(
         "currentPath": current_path,
         "systemPrompt": system_prompt,
         "lang": lang,
-        "maxTokens": int(get_runtime_config("max_tokens")),
+        "maxTokens": int(max_tokens_override if max_tokens_override is not None
+                         else get_runtime_config("max_tokens")),
         # The gear, not a provider parameter: the gateway maps it onto whatever
         # the account that ends up serving this call was measured to accept.
         # See /config reasoning_effort. An HWO `#name:gear#` pin overrides it
@@ -9269,7 +9318,8 @@ def call_backend_stream(
         # and invent false ones (granted > asked). Fall back to the local
         # value only for gateways too old to report a budget.
         _max_tokens = int((budget_info or {}).get("granted")
-                          or get_runtime_config("max_tokens") or 0)
+                          or (max_tokens_override if max_tokens_override is not None
+                              else get_runtime_config("max_tokens")) or 0)
         _clean_stop = finish_reason in ("stop", "end_turn", "tool_calls")
         # On some models reasoning tokens are counted OUTSIDE max_tokens (a
         # 40,000-token request measured 106,108 completion tokens on
@@ -19381,180 +19431,93 @@ def _cmd_why(parts: list) -> None:
 
 
 
+def _station_terminal_factory(name):
+    terminal = (InteractiveSession(DEFAULT_SHELL, timeout=0, stream_output=False,
+                                   persistent=True) if name == "term0"
+                else SubTerminalSession(DEFAULT_SHELL))
+    try:
+        terminal.start()
+        if not terminal.is_alive():
+            raise RuntimeError("Terminal did not start.")
+        return terminal
+    except BaseException:
+        terminal.close()
+        raise
+
+
 def _cmd_station(parts: list, agent_registry: AgentRegistry, session: dict) -> bool:
-    station_args = [_normalize_slash_arg(item) for item in parts[1:]]
-    task = ""
-    task_marker = next(
-        (i for i, item in enumerate(station_args)
-         if item in {"--task", "--"}), None)
-    if task_marker is not None:
-        task = " ".join(station_args[task_marker + 1:]).strip()
-        station_args = station_args[:task_marker]
-        if not task:
-            console.print(
-                "[yellow]Usage: /station <agent-id> \\[terminal] "
-                "--task <work>[/yellow]")
-            return False
-    if not station_args or len(station_args) > 2:
-        console.print(
-            "[yellow]Usage: /station <agent-id> \\[terminal] "
-            "\\[--task <work>][/yellow]")
-        return False
+    import agent_loop as runtime
+    from agent_router import RouteRequest
+    from station_service import service_for
+    from station_ui import show_station
 
-    agent_id_arg = station_args[0]
-    target_agent = get_agent(agent_id_arg)
-    if target_agent is None:
-        console.print(
-            f"[red]Agent '{agent_id_arg}' not found. Use /hire to create one.[/red]")
-        return False
     manager = get_current_agent()
-    manager_terminal = agent_deployment_terminal(manager) or "term0"
-    explicit_terminal = len(station_args) == 2
-    existing_deployment = agent_deployment_terminal(target_agent)
-    if task and not explicit_terminal and not existing_deployment:
-        assignment_events = (
-            (lambda events: agent_registry._push_events(events))
-            if agent_registry and agent_registry.agent_id else None
-        )
-        ok, message, assignment = start_agent_assignment(
-            target_agent.id, task, get_loop_deps(),
-            session=session, events_cb=assignment_events)
-        style = "green" if ok else "red"
-        console.print(f"[{style}]{message}[/{style}]")
-        if ok and assignment:
-            console.print(
-                f"[dim]Task runs in a private temporary terminal. Inspect with "
-                f"/agents {target_agent.id}; send updates with /tell "
-                f"{target_agent.id} <message>.[/dim]")
+    if manager is None:
+        console.print("[red]No active manager.[/red]")
         return False
-    if not explicit_terminal and not existing_deployment:
-        console.print(
-            "[yellow]An undeployed agent needs an explicit target terminal, or "
-            "use --task to run it in a private temporary terminal.[/yellow]")
+    service = service_for(runtime)
+    events = (lambda items: agent_registry._push_events(items)) if (
+        agent_registry and agent_registry.agent_id) else None
+    args = [_normalize_slash_arg(item) for item in parts[1:]]
+    if not args:
+        if not sys.stdin.isatty():
+            agents, terminals = service.snapshot()
+            console.print(f"Station: {len(agents)} agents, {len(terminals)} terminals")
+            for agent in agents:
+                console.print(f"{agent.id}: {agent.status} · {agent.deployment or 'not stationed'}")
+            return False
+        selected_key = ""
+        while True:
+            outcome = show_station(service, owner_id=manager.id, deps=get_loop_deps(),
+                                   session=session, create_terminal=_station_terminal_factory,
+                                   events_cb=events, initial_key=selected_key)
+            if outcome.action != "open" or outcome.item is None:
+                break
+            selected_key = outcome.item.key
+            if selected_key.startswith("terminal:"):
+                terminal = get_terminal(outcome.item.payload.name)
+                if terminal and terminal.session and terminal.session.is_alive():
+                    enter_session(terminal.session, display_name=terminal.name,
+                                  display_cmd=terminal.command)
+            else:
+                _cmd_agents(["/agents", outcome.item.payload.id], session,
+                            agent_registry=agent_registry)
         return False
-    name = station_args[1] if explicit_terminal else existing_deployment
-    if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", name):
-        console.print("[red]Invalid terminal name.[/red]")
+    marker = next((i for i, value in enumerate(args) if value in {"--task", "--"}), None)
+    task = " ".join(args[marker + 1:]).strip() if marker is not None else ""
+    positional = args[:marker] if marker is not None else args
+    if (not positional or len(positional) > 2 or (marker is not None and not task)
+            or (positional[0] in {"auto", "suggest"} and (not task or len(positional) != 1))):
+        console.print("[yellow]Usage: /station <agent-id> [terminal] [--task <work>] "
+                      "or /station auto|suggest --task <work>[/yellow]")
         return False
-    if name.lower() in ("current", "here", "term0"):
-        name = "term0"
-
-    # Special case: deploy to the parent REPL (term0). Term0 should
-    # already have a real persistent bash session created at startup.
-    # If it doesn't (crashed or not created), recreate it.
-    if name == "term0":
-        term0_info = get_terminal("term0")
-        if (term0_info is None
-                or term0_info.session is None
-                or not term0_info.session.is_alive()):
-            if term0_info is not None:
-                unregister_terminal("term0")
-                if get_agent(target_agent.id) is None:
-                    console.print(
-                        f"[red]Agent '{target_agent.id}' ended with its previous "
-                        "deployment terminal.[/red]")
-                    return False
-            try:
-                _term0 = InteractiveSession(
-                    DEFAULT_SHELL, timeout=0, stream_output=False,
-                    persistent=True)
-                _term0.start()
-                time.sleep(0.08)
-                if _term0.is_alive():
-                    _term0.read_output(timeout=0.1)
-                if not _term0.is_alive():
-                    console.print("[red]Could not start term0.[/red]")
-                    return False
-                register_terminal(_term0, DEFAULT_SHELL, 0, name="term0")
-            except Exception as exc:
-                console.print(f"[red]Could not start term0: {exc}[/red]")
+    target = positional[0]
+    if target not in {"auto", "suggest"}:
+        agent = get_agent(target)
+        if agent is None:
+            console.print(f"[red]Agent '{escape(target)}' not found.[/red]")
+            return False
+        if len(positional) == 2 or not task:
+            terminal = positional[1] if len(positional) == 2 else agent_deployment_terminal(agent)
+            if not terminal:
+                console.print("[yellow]Specify a terminal, or use --task for a private task terminal.[/yellow]")
                 return False
-        if not station_agent(target_agent.id, "term0"):
-            console.print(
-                f"[red]Could not deploy agent '{target_agent.id}' to term0. "
-                "Finish or cancel its active assignment first.[/red]")
-            return False
-        console.print(f"[green]Stationed [bold]{target_agent.id}[/bold] in this REPL (term0)[/green]")
-        if task:
-            assignment_events = (
-                (lambda events: agent_registry._push_events(events))
-                if agent_registry and agent_registry.agent_id else None
-            )
-            ok, message, assignment = start_agent_assignment(
-                target_agent.id, task, get_loop_deps(),
-                session=session, events_cb=assignment_events)
-            style = "green" if ok else "red"
-            console.print(f"[{style}]{message}[/{style}]")
-        return False
-
-    # Sub-terminal path: inspect existing terminal
-    existing = get_terminal(name)
-    if existing and existing.session and existing.session.is_alive():
-        # Re-use the existing lifecycle container. shell.exec remains an
-        # independent synchronous subprocess and never shares this PTY.
-        if not station_agent(target_agent.id, name):
-            console.print(
-                f"[red]Could not deploy agent '{target_agent.id}' to '{name}'. "
-                "Finish or cancel its active assignment first.[/red]")
-            return False
-        console.print(f"[green]Stationed [bold]{target_agent.id}[/bold] → terminal [bold]{name}[/bold] (existing)[/green]")
-    else:
-        if existing:
-            unregister_terminal(name)
-            if get_agent(target_agent.id) is None:
-                console.print(
-                    f"[red]Agent '{target_agent.id}' ended with its previous "
-                    "deployment terminal.[/red]")
+            result = service.deploy(agent.id, terminal, owner_id=manager.id,
+                                    create_terminal=_station_terminal_factory)
+            console.print(escape(result.message))
+            if not result.ok:
                 return False
-
-        # A station is a work place, not another CLI identity.  The employee
-        # loop stays in-process; POSIX uses a dedicated PTY.
-        shell_cmd = DEFAULT_SHELL
-        sub = SubTerminalSession(shell_cmd)
-        sub.start()
-        time.sleep(0.1)
-        if not sub.is_alive():
-            console.print(f"[red]Could not start terminal '{name}'.[/red]")
-            return False
-        sub.read_output(timeout=0.1)
-        try:
-            register_terminal(
-                sub, shell_cmd, 0, name=name,
-                parent_terminal=manager_terminal)
-        except Exception as exc:
-            sub.close()
-            console.print(f"[red]Could not register terminal '{name}': {exc}[/red]")
-            return False
-        if not station_agent(target_agent.id, name):
-            unregister_terminal(name)
-            console.print(
-                f"[red]Could not deploy agent '{target_agent.id}' to '{name}'.[/red]")
-            return False
-        console.print(
-            f"[green]Stationed [bold]{target_agent.id}[/bold] → "
-            f"terminal [bold]{name}[/bold] "
-            f"(shell)[/green]")
-
+        target = agent.id
     if task:
-        assignment_events = (
-            (lambda events: agent_registry._push_events(events))
-            if agent_registry and agent_registry.agent_id else None
-        )
-        ok, message, assignment = start_agent_assignment(
-            target_agent.id, task, get_loop_deps(),
-            session=session, events_cb=assignment_events)
-        style = "green" if ok else "red"
-        console.print(f"[{style}]{message}[/{style}]")
-        if ok and assignment:
-            console.print(
-                f"[dim]Task: {assignment.task}\n"
-                f"Inspect with /agents {target_agent.id}; send updates with "
-                f"/tell {target_agent.id} <message>.[/dim]")
-    else:
-        console.print(
-            f"[dim]Assign work with /station {target_agent.id} {name} "
-            "--task \"...\"[/dim]")
-
+        request = RouteRequest(manager.id, task, uuid.uuid4().hex,
+                               session_id=str(manager.state.get("_session_id") or ""),
+                               target_id="" if target in {"auto", "suggest"} else target)
+        if target == "suggest":
+            decision = service.preview(request)
+            console.print(escape(f"{decision.action}: {decision.reason}"))
+        else:
+            result = service.assign(request, get_loop_deps(), session=session, events_cb=events)
+            console.print(escape(result.message))
     return False
 
 
@@ -26167,7 +26130,7 @@ def main():
         if _resume_blob and _resume_blob.get("chat_history"):
             _selected_resume = _choose_resume_blob(_session_start_cwd, "latest")
             if _selected_resume:
-                _selected_resume = _acquire_resume_lease(_selected_resume)
+                _selected_resume = _fork_resume_blob(_selected_resume, _session_start_cwd)
             if _selected_resume:
                 _close_live_session(current_live_session)
                 agent_state = _restore_resume_blob(_selected_resume, chat_history)
@@ -26176,7 +26139,7 @@ def main():
                 _hold_live_session_lease(current_live_session, _session_start_cwd)
                 handle_meta_command._current_live_session = current_live_session
                 console.print(
-                    f"[green]Resumed previous session in this directory "
+                    f"[green]Started an independent branch from saved context "
                     f"({_resume_turn_count(_selected_resume)} turn(s), "
                     f"{_format_time_ago(_selected_resume.get('timestamp', 0))}).[/green]"
                 )
@@ -26430,21 +26393,11 @@ def main():
                 "array of strings, no explanation. "
                 'Example: ["subtask 1", "subtask 2", "subtask 3"]'
             )
-            # Temporarily lower max_tokens for the decomposition call.
-            from agent_loop import get_runtime_config as _grc, set_runtime_config as _src
-            _orig_max = _grc("max_tokens")
-            _decompose_max = int(_grc("auto_pilot_decompose_max_tokens") or 500)
-            _src("max_tokens", _decompose_max)
-            try:
-                result = call_backend_stream(
-                    _session,
-                    message=task,
-                    system_prompt=system_prompt,
-                    current_path=os.getcwd(),
-                    tools_enabled=False,
-                )
-            finally:
-                _src("max_tokens", _orig_max)
+            result = call_backend_stream(
+                _session, message=task, system_prompt=system_prompt,
+                current_path=os.getcwd(), tools_enabled=False,
+                max_tokens_override=int(get_runtime_config("auto_pilot_decompose_max_tokens") or 500),
+            )
             reply = (result or {}).get("reply", "")
             if not reply:
                 return None
@@ -26790,9 +26743,8 @@ def main():
                 injected_done.set()
             return
 
-        # /resume — restore this directory's saved conversation (full-fidelity).
-        # Like mainstream agent CLIs, this does not consume/delete the saved
-        # session; it remains available for future launches until overwritten.
+        # /resume is the compatibility entry point for forking saved context.
+        # Source identity and files stay untouched, even when a peer owns them.
         # /resume [N|all|latest] — the argument controls how many messages to
         # echo after restoring (N, default 20; 0 = silent; "all" = full). When
         # multiple sessions are saved, a full-screen picker chooses which one;
@@ -26830,10 +26782,11 @@ def main():
             if _blob and not _blob.get("chat_history"):
                 console.print("[yellow]Saved session has no conversation to resume.[/yellow]")
             elif _blob:
-                _blob = _acquire_resume_lease(_blob)
+                _blob = _fork_resume_blob(_blob, _session_start_cwd)
             if _blob and not _blob.get("chat_history"):
                 console.print("[yellow]Saved session has no conversation to resume.[/yellow]")
             elif _blob:
+                save_resume_state(agent_state, chat_history, _session_start_cwd)
                 _close_live_session(current_live_session)
                 agent_state = _restore_resume_blob(_blob, chat_history)
                 current_live_session = session_store.create_session(_session_start_cwd, agent_state, chat_history)
@@ -26849,7 +26802,7 @@ def main():
                 _n = _resume_turn_count(_blob)
                 _ago = _format_time_ago(_blob.get("timestamp", 0))
                 console.print(
-                    f"[green]Resumed previous session in this directory "
+                    f"[green]Started an independent branch from saved context "
                     f"({_n} turn(s), {_ago}).[/green]"
                 )
                 _print_resume_transcript(_blob, _echo_limit)
@@ -26975,7 +26928,8 @@ def main():
                 chat_history.clear()
                 chat_history.extend(_inherited_history)
                 agent_state.clear()
-                agent_state.update(prepare_state_for_repl(_inherited_state))
+                agent_state.update(_restore_resume_blob(_fork_blob, [])
+                                   if _fork_blob else prepare_state_for_repl(_inherited_state))
                 _ensure_session_id(agent_state)
                 current_live_session = session_store.create_session(
                     _session_start_cwd, agent_state, chat_history)

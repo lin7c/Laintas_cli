@@ -1242,7 +1242,7 @@ class SlashRegistryTests(unittest.TestCase):
     def test_station_task_starts_assignment_without_switching_manager(self):
         agent_loop.close_all_agents()
         manager = agent_loop.register_agent(name="primary", role="primary")
-        employee = agent_loop.register_agent(name="alice", role="pool")
+        employee = agent_loop.register_agent(name="alice", role="pool", parent_id=manager.id)
         agent_loop.set_current_agent_id(manager.id)
         terminal = mock.Mock()
         terminal.session.is_alive.return_value = True
@@ -1250,10 +1250,10 @@ class SlashRegistryTests(unittest.TestCase):
         registry = _Registry()
         try:
             with mock.patch.object(
-                    laintas_cli, "get_terminal", return_value=terminal), \
-                    mock.patch.object(laintas_cli, "station_agent") as station, \
+                    agent_loop, "get_terminal", return_value=terminal), \
+                    mock.patch.object(agent_loop, "station_agent") as station, \
                     mock.patch.object(
-                        laintas_cli, "start_agent_assignment",
+                        agent_loop, "start_agent_assignment",
                         return_value=(True, "started", assignment)) as start:
                 laintas_cli.handle_meta_command(
                     "/station alice work-a --task fix login race",
