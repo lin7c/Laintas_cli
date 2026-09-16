@@ -532,6 +532,8 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
             return
         parsed = urlparse(self.path)
         path = parsed.path
+        if not self._app_route_allowed("GET", path):
+            return
 
         # A GET is not a state change, so it needs the token but not the
         # cross-site checks — and it is the request that exchanges ?token=
@@ -588,6 +590,8 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
             return
         parsed = urlparse(self.path)
         path = parsed.path
+        if not self._app_route_allowed("POST", path):
+            return
 
         # The tunnel carries whatever content type the previewed app posts, so
         # it cannot pass through _guard_write's JSON requirement. It keeps the
@@ -656,6 +660,24 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
     def do_HEAD(self) -> None:
         return self._proxy_only_method("HEAD")
 
+    def _app_route_allowed(self, method: str, path: str) -> bool:
+        """In application mode only the conversation API exists.
+
+        Everything else this bridge serves — the local filesystem, exec, PTYs,
+        the HTTP tunnel, VNC, the static Helpwo build — would hand whatever
+        holds the token this machine's disk and shell. Helpwo is trusted with
+        that; an application registered through a manifest is not.
+        """
+        if _app_profile is None:
+            return True
+        if method == "GET" and (path == "/api/agents"
+                                or re.match(r"^/api/agents/[^/]+/updates$", path)):
+            return True
+        if method == "POST" and re.match(r"^/api/agents/[^/]+/send$", path):
+            return True
+        self._json(404, {"error": "not available to applications"})
+        return False
+
     def _proxy_only_method(self, method: str) -> None:
         """Methods the bridge answers only for the loopback HTTP tunnel.
 
@@ -666,6 +688,8 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
         if not self._trusted_host():
             return
         parsed = urlparse(self.path)
+        if not self._app_route_allowed(method, parsed.path):
+            return
         if parsed.path.startswith("/api/local-proxy/"):
             return self._handle_local_proxy(parsed, method)
         self._json(405, {"error": "method not allowed"})
@@ -707,6 +731,8 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
             "workspacePath": str(_local_root() or ""),
             "localBridge": True,
         }
+        if _app_profile is not None:
+            entry["app"] = _app_profile.get("name") or ""
         self._json(200, [entry])
 
     def _handle_updates(self, agent_id: str, since: int) -> None:
@@ -729,6 +755,10 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
         kind = body.get("kind", "chat")
         req_id = body.get("reqId") or body.get("id") or ""
         payload = body.get("payload") or {}
+
+        if _app_profile is not None and kind not in _app_profile.get("allowed_kinds", ()):
+            self._json(403, {"error": f"kind '{kind}' is not available to applications"})
+            return
 
         # If the message has no reqId, generate one (the frontend always
         # sends one, but be defensive).
@@ -1615,6 +1645,9 @@ _session_ref: Optional[dict] = None  # CLI session dict (for backend auth)
 # server are on the same machine, so a plain HTTP file API is sufficient.
 _local_root_ref: Optional[Path] = None
 _local_agent_id_ref: str = ""
+# Set when the bridge serves a registered application rather than Helpwo:
+# {"name": str, "allowed_kinds": frozenset}. None = the full Helpwo bridge.
+_app_profile: Optional[dict] = None
 _local_requests_lock = threading.Lock()
 _local_request_ids: set[str] = set()
 
@@ -1755,7 +1788,9 @@ def start_server(agent_registry: Any, dist_dir: Optional[Path] = None,
                  port: int = DEFAULT_PORT,
                  session: Optional[dict] = None,
                  host: str = "127.0.0.1",
-                 token: Optional[str] = None) -> tuple[bool, str]:
+                 token: Optional[str] = None,
+                 agent_id: Optional[str] = None,
+                 app_profile: Optional[dict] = None) -> tuple[bool, str]:
     """Start the local Helpwo gateway server.
 
     LOOPBACK ONLY, by design. A browser grants Web Crypto, Service Workers,
@@ -1771,10 +1806,17 @@ def start_server(agent_registry: Any, dist_dir: Optional[Path] = None,
     token defaults to a fresh random one. Pass "" to disable authentication;
     only sensible for a throwaway sandbox.
 
+    agent_id replaces the per-process ``local-<pid>`` alias. Helpwo stores its
+    conversations under that id, so a sub-terminal that persists passes the
+    same one every launch.
+
+    app_profile serves a registered application instead of Helpwo: no static
+    build, and only the conversation routes (see _app_route_allowed).
+
     Returns (success, message).
     """
     global _server, _server_thread, _registry_ref, _dist_dir_ref, _server_port_val, _session_ref, _local_root_ref, _local_agent_id_ref
-    global _auth_token_value, _bind_host
+    global _auth_token_value, _bind_host, _app_profile
 
     if is_running():
         return True, f"already running on {get_url()}"
@@ -1783,18 +1825,22 @@ def start_server(agent_registry: Any, dist_dir: Optional[Path] = None,
         _session_ref = session
 
     # Resolve dist directory
-    resolved_dist = dist_dir or _find_dist()
-    if resolved_dist is None:
+    resolved_dist = None if app_profile is not None else (dist_dir or _find_dist())
+    if resolved_dist is None and app_profile is None:
         return False, ("Helpwo dist directory not found. Set LAINTAS_HELPWO_DIST "
                        "or ensure /root/Helpwo/dist exists.")
 
     _registry_ref = agent_registry
-    _dist_dir_ref = resolved_dist.resolve()
+    _dist_dir_ref = resolved_dist.resolve() if resolved_dist is not None else None
+    _app_profile = (
+        {"name": str(app_profile.get("name") or ""),
+         "allowed_kinds": frozenset(app_profile.get("allowed_kinds") or ())}
+        if app_profile is not None else None)
     _server_port_val = port
     # Local mode never requires cloud registration. The stable-for-process
     # alias lets the same Helpwo frontend use the existing agent request
     # contract while all traffic remains on loopback.
-    _local_agent_id_ref = f"local-{os.getpid():x}"
+    _local_agent_id_ref = agent_id or f"local-{os.getpid():x}"
     _local_root_ref = Path(os.getcwd()).resolve()
     _bind_host = host or "127.0.0.1"
     _auth_token_value = secrets.token_urlsafe(32) if token is None else token
@@ -1806,11 +1852,12 @@ def start_server(agent_registry: Any, dist_dir: Optional[Path] = None,
     # process's agent loop and whoever is driving the browser. Declaring the
     # second one is what turns on the compare-and-swap that keeps them from
     # silently overwriting each other.
-    try:
-        import peer_coordination
-        peer_coordination.attach_external_actor(peer_coordination.HELPWO_BRIDGE_ACTOR)
-    except Exception:
-        pass
+    if _app_profile is None:
+        try:
+            import peer_coordination
+            peer_coordination.attach_external_actor(peer_coordination.HELPWO_BRIDGE_ACTOR)
+        except Exception:
+            pass
 
     try:
         srv = ThreadingHTTPServer(
@@ -1822,6 +1869,7 @@ def start_server(agent_registry: Any, dist_dir: Optional[Path] = None,
         _dist_dir_ref = None
         _local_root_ref = None
         _local_agent_id_ref = ""
+        _app_profile = None
         return False, f"cannot bind {_bind_host}:{port}: {e}"
 
     srv.daemon_threads = True
@@ -1846,6 +1894,7 @@ def start_server(agent_registry: Any, dist_dir: Optional[Path] = None,
 def stop_server() -> None:
     """Stop the local Helpwo gateway server."""
     global _server, _server_thread, _registry_ref, _dist_dir_ref, _session_ref, _local_root_ref, _local_agent_id_ref
+    global _app_profile
 
     # Kill the PTYs and commands this bridge owns before dropping the socket;
     # otherwise a `/helpwo stop` leaves orphaned shells attached to nothing.
@@ -1876,6 +1925,7 @@ def stop_server() -> None:
     _session_ref = None
     _local_root_ref = None
     _local_agent_id_ref = ""
+    _app_profile = None
     with _local_requests_lock:
         _local_request_ids.clear()
     _event_buffer.clear()

@@ -54,6 +54,7 @@
     "hwo_runner",
     "hwo_ui",
     "hwo_view",
+    "app_host",
     "helpwo_server",
     "repl_mirror",
     "updater",

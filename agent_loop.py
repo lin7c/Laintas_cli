@@ -10574,6 +10574,15 @@ def run_agent_loop(
         )
         if mode_section:
             system_prompt = system_prompt.rstrip() + "\n\n" + mode_section
+        # An application sub-terminal (/helpwo, /app) tells its agent whom it
+        # serves. Empty in every ordinary CLI process.
+        try:
+            import app_host as _app_host
+            _hosted_app_section = _app_host.render_prompt_section()
+        except Exception:
+            _hosted_app_section = ""
+        if _hosted_app_section:
+            system_prompt = system_prompt.rstrip() + "\n\n" + _hosted_app_section
         if _prompt_lab_section and not _prompt_lab_has_slot:
             system_prompt = system_prompt.rstrip() + "\n\n" + _prompt_lab_section
         if not _durable_rules_has_slot:

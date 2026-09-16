@@ -388,8 +388,39 @@ Role selection and routing never broaden the parent's tool permissions.
 | Execution | `/term`, `/spawn`, `/agents`, `/task` | Terminals, delegated agents, and task tracking |
 | Workflows | `/hwo`, `/hwg` | Live orchestration and durable graph execution |
 | Plugins | `/mcp`, `/extensions`, `/evolve`, `/reload`, `/trust` | External tools and executable customization |
-| Connectivity | `/backend`, `/web`, `/identity`, `/helpwo`, `/shared` | Inference, search/fetch, browser identity, remote runtime, the cloud folder Helpwo mounts |
+| Connectivity | `/backend`, `/web`, `/identity`, `/helpwo`, `/shared` | Inference, search/fetch, browser identity, Helpwo in its own sub-terminal, the cloud folder Helpwo mounts |
+| Applications | `/app` | Run a registered application in its own sub-terminal with its own agent |
 | Administration | `/policy`, `/usage`, `/training`, `/v`, `/org` | Policy, allowance, data preference, updates, Enterprise |
+
+### Hosted applications: `/helpwo` and `/app`
+
+`/helpwo` no longer serves Helpwo from the terminal you typed it in. It opens a
+sub-terminal named `helpwo` — a nested CLI whose agent serves only Helpwo — so
+Helpwo's conversation is never the main terminal's. The sub-terminal's folder is
+Helpwo's workspace, and everything Helpwo keys its data by is kept per folder in
+`~/.laintas/app-state/helpwo/<folder-hash>/`: the login token (the cookie keeps
+working), the port (the browser origin, so IndexedDB data stays reachable), the
+bridge agent id, and the agent's conversation (`~/.laintas/agents/app-helpwo-*.json`).
+`/helpwo stop` closes the sub-terminal and everything in it. Typed inside any
+sub-terminal, `/helpwo` serves in place as before.
+
+`/app` runs other applications the same way, from manifests in
+`~/.laintas/apps/*.json` or `./.laintas/apps/*.json`:
+
+```json
+{"name": "notes", "description": "…", "command": "node server.js",
+ "prompt": "What this app's agent is for.", "persistence": "none", "port": 8123}
+```
+
+A manifest must be trusted (`/app trust <name>`) before it starts, and again
+after it changes. Its sub-terminal exposes a loopback bridge with only the
+conversation API — `POST /api/agents/<id>/send` with kind
+`chat`/`abort`/`approval-response`, `GET /api/agents/<id>/updates` — with
+`Authorization: token <token>`; no filesystem, exec, PTY or tunnel routes. The
+`command` runs with `LAINTAS_APP_BRIDGE_URL`, `LAINTAS_APP_TOKEN`,
+`LAINTAS_APP_AGENT_ID` and `LAINTAS_APP_NAME` in its environment, logs to the
+app's state folder, and is stopped with the sub-terminal. `persistence:
+"workspace"` keeps the token, port and conversation per folder, as Helpwo does.
 
 ## Development
 

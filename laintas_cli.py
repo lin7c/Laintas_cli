@@ -19,6 +19,7 @@ import os
 import re
 import sys
 import json
+import secrets
 import time
 import uuid
 import errno
@@ -1350,6 +1351,8 @@ import tools as tools_mod    # noqa: E402 — load after agent_loop so registry 
 import skills as skills_mod  # noqa: E402
 import task_manager          # noqa: E402 — resume blob rehydrates the task plan
 import paths                 # Centralized path management
+import app_host              # applications hosted in their own sub-terminal
+import agent_persistence     # per-agent conversation files
 import terminal_preferences  # durable choices isolated to this logical terminal
 import migrate as migrate_mod  # Auto-migration from old layout
 import hwo_ui as hwo_ui_mod  # /hwo orchestration UI
@@ -2274,14 +2277,19 @@ class SubTerminalSession:
 def _build_connected_subterminal_cmd(terminal_name: str,
                                      remote_parent_id: Optional[str] = None,
                                      auto_connect: bool = False,
-                                     parent_terminal: str = "term0") -> str:
+                                     parent_terminal: str = "term0",
+                                     terminal_id: Optional[str] = None,
+                                     extra_args: Optional[list] = None) -> str:
     """Command line for a user-facing sub-terminal running a nested CLI.
 
     Carries the terminal's identity (name + remote parent agent id) so that
     running /connect inside it can hand exactly this terminal to Helpwo.
     auto_connect=True (used by Helpwo's term-new) registers at startup.
+    terminal_id overrides the id derived from the parent terminal — an app
+    sub-terminal keeps one per folder, so its terminal preferences survive a
+    new SSH login. extra_args are appended, each quoted.
     """
-    terminal_id = paths.child_terminal_id(
+    terminal_id = terminal_id or paths.child_terminal_id(
         terminal_name, parent_terminal or "term0")
     parts = [f"LAINTAS_TERMINAL_ID={shlex.quote(terminal_id)}",
              shlex.quote(sys.executable),
@@ -2293,6 +2301,7 @@ def _build_connected_subterminal_cmd(terminal_name: str,
         parts += ["--remote-parent-id", shlex.quote(remote_parent_id)]
     if auto_connect:
         parts.append("--connect")
+    parts += [shlex.quote(str(arg)) for arg in (extra_args or [])]
     return " ".join(parts)
 
 
@@ -3320,7 +3329,30 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
             "Agent/terminal, PageUp/PageDown scrolls, and Esc exits."
         )),
     CommandSpec("/term", "List, create, or rename terminals", "Agents & Terminals", "/term [name|rename <old> <new>]", aliases=("/t",), subcommands=("rename",)),
-    CommandSpec("/helpwo", "Connect this CLI to Helpwo as a runtime environment (this folder = its workspace), or open the local/hosted app; /helpwo stop to go offline", "Agents & Terminals", "/helpwo [--port N] [--host ADDR] [--dist <path>] [--remote] | stop", subcommands=("stop",)),
+    CommandSpec("/helpwo", "Run Helpwo in its own sub-terminal with its own agent (this folder = its workspace; login, data and conversation persist per folder); /helpwo stop closes it", "Agents & Terminals", "/helpwo [--port N] [--host ADDR] [--dist <path>] [--remote] | stop", subcommands=("stop",)),
+    CommandSpec(
+        "/app", "Run a registered application in its own sub-terminal with its own agent",
+        "Agents & Terminals", "/app [list|start <name>|stop <name>|trust <name>|revoke <name>]",
+        subcommands=("list", "start", "stop", "trust", "revoke"),
+        completion_descriptions=(
+            ("list", "List registered applications and their state"),
+            ("start", "Start a trusted application in its own sub-terminal"),
+            ("stop", "Stop an application and close its sub-terminal"),
+            ("trust", "Trust an application (required before first start)"),
+            ("revoke", "Revoke an application's trust"),
+        ),
+        help_text=(
+            "Applications are described by manifests in ~/.laintas/apps/*.json or "
+            "./.laintas/apps/*.json: name, description, command, prompt, "
+            "persistence (none|workspace), port. Starting one creates a "
+            "sub-terminal of the same name whose agent serves only that "
+            "application, and a loopback bridge that exposes nothing but the "
+            "conversation (send chat/abort/approval-response, poll updates). "
+            "The manifest's command is started with LAINTAS_APP_BRIDGE_URL, "
+            "LAINTAS_APP_TOKEN and LAINTAS_APP_AGENT_ID in its environment. "
+            "A manifest must be trusted before it can start, and again after "
+            "it changes. Helpwo is not an /app; use /helpwo."
+        )),
     CommandSpec(
         "/station", "Manage agents and terminals; route or assign work",
         "Agents & Terminals", "/station <agent-id> [terminal] [--task <work>]",
@@ -3826,6 +3858,9 @@ _ARG_COMPLETIONS: dict[str, tuple] = {
     ),
     "/term": ((("rename",), _terminal_candidates()),),
     "/terminate": (((), _terminal_candidates()),),
+    "/app": ((("start", "stop", "trust", "revoke"), _cached_provider("apps", lambda: [
+        (manifest.name, manifest.description or manifest.scope)
+        for manifest in app_host.discover_manifests(os.getcwd())[0].values()])),),
     "/send": (
         ((), _terminal_candidates(include_primary=True, alive_only=True)),
         (("*",), _static_candidates(("--wait", "Seconds to wait for output (0-30)"))),
@@ -4275,7 +4310,7 @@ class MetaCompleter(Completer):
                         words, trailing_space,
                         _HIRE_FLAGS if head_lower == "/hire" else _HELPWO_FLAGS)
                     if head_lower == "/helpwo" and len(words) <= (0 if trailing_space else 1):
-                        candidates = [("stop", "Stop the gateway and go offline"), *candidates]
+                        candidates = [("stop", "Close the Helpwo sub-terminal"), *candidates]
                     for value, meta in candidates:
                         if value.casefold().startswith(fragment.casefold()):
                             yield self._completion(value, fragment, meta)
@@ -12641,6 +12676,12 @@ _SLASH_ARG_RULES: dict[tuple[str, ...], SlashArgRule] = {
     ("/helpwo",): _arg_rule(
         7, "/helpwo [--port N] [--host ADDR] [--dist <path>] [--remote] | stop"),
     ("/helpwo", "stop"): _arg_rule(1, "/helpwo stop"),
+    ("/app",): _arg_rule(2, "/app [list|start <name>|stop <name>|trust <name>|revoke <name>]"),
+    ("/app", "list"): _arg_rule(1, "/app list"),
+    ("/app", "start"): _arg_rule(2, "/app start <name>"),
+    ("/app", "stop"): _arg_rule(2, "/app stop <name>"),
+    ("/app", "trust"): _arg_rule(2, "/app trust <name>"),
+    ("/app", "revoke"): _arg_rule(2, "/app revoke <name>"),
     ("/terminate",): _arg_rule(1, "/terminate <name>"),
     ("/shared", "usage"): _arg_rule(1, "/shared usage"),
     ("/shared", "list"): _arg_rule(2, "/shared list [path]"),
@@ -14920,18 +14961,29 @@ def _canvas_open(path: str, canvas_mod) -> None:
         console.print("[red]The Helpwo gateway is not available in this build.[/red]")
         return
 
-    if not helpwo_server.is_running():
-        console.print("[dim]Starting the Helpwo gateway…[/dim]")
+    if helpwo_server.is_running():
+        url = helpwo_server.get_url(with_token=True)
+    elif _hosts_helpwo_here():
+        console.print("[yellow]Helpwo is not running in this sub-terminal. "
+                      "Run /helpwo here, then open the board from its file tree.[/yellow]")
+        return
+    else:
+        # Helpwo lives in its own sub-terminal; wait for it, since the whole
+        # point of this command is the URL.
         try:
-            _cmd_helpwo("", ["/helpwo"], None, load_session())
+            runtime = _launch_app_subterminal(
+                app_host.HELPWO_APP, persistent=True, options={},
+                agent_registry=None, open_url=False, wait=True) or {}
         except Exception as e:
             console.print(f"[red]Could not start it: {type(e).__name__}: {e}[/red]")
             console.print("[dim]Run /helpwo yourself, then open the board from its file tree.[/dim]")
             return
-        if not helpwo_server.is_running():
+        url = runtime.get("open_url") or ""
+        if not url:
+            if runtime.get("status") == "launching":
+                console.print("[dim]Run /canvas open again once Helpwo reports ready.[/dim]")
             return
 
-    url = helpwo_server.get_url(with_token=True)
     console.print(f"[bold]Open:[/bold] [cyan]{url}[/cyan]")
     if path:
         console.print(f"[dim]This folder is mounted there as a workspace — open "
@@ -20823,56 +20875,32 @@ def _disconnect_from_helpwo(agent_registry: AgentRegistry) -> None:
         console.print(f"[yellow]Sub-terminal [bold]{name}[/bold] withdrawn from Helpwo.[/yellow]")
 
 
-def _cmd_helpwo(raw_args: str, parts: list, agent_registry: AgentRegistry,
-                session: dict) -> None:
-    """Connect this CLI to Helpwo as a runtime environment, or open the app.
+_HELPWO_USAGE = (r"[dim]Usage: /helpwo \[--port N] \[--host ADDR] \[--dist <path>] "
+                 r"\[--remote] | stop[/dim]")
 
-    /helpwo              - local dist if found, else the hosted web app
-    /helpwo --port 8080  - start the local server on a custom port
-    /helpwo --dist <p>   - use a custom local dist directory
-    /helpwo --remote     - skip the local server; open the hosted web app
-    /helpwo stop         - go offline: stop the LOCAL gateway if running, and
-                           withdraw this CLI's runtime environment from Helpwo
+# The application this process hosts, when it is an app sub-terminal
+# (--app). Empty in every ordinary CLI.
+_HOSTED_APP: dict = {}
 
-    Connecting exposes THIS CLI as a runtime environment in Helpwo — the
-    current working directory is its workspace (files ride the direct P2P
-    channel, never the server) and its shell is the environment's terminal.
-    There is no separate "mount a folder" step: the environment IS this CLI at
-    its cwd. cd elsewhere and re-run /helpwo --remote to move the environment.
+# Launches this process started, by application name: {"state_dir", "launch_id"}.
+_APP_LAUNCHES: dict = {}
 
-    Local mode is offline-first: its UI, filesystem bridge and command bridge
-    stay on 127.0.0.1 and do not require login or cloud registration. AI calls
-    still use the configured backend when available. ``--remote`` is the
-    explicit cloud mode and registers this CLI with the hosted app.
+
+def _hosts_helpwo_here() -> bool:
+    """Whether /helpwo acts in THIS process rather than launching a sub-terminal.
+
+    The main terminal (depth 0) never serves Helpwo itself: Helpwo gets its
+    own sub-terminal and its own agent. Inside a sub-terminal — the Helpwo
+    one, or any other nested CLI — it runs where it is typed.
     """
+    return _REPL_PROCESS_DEPTH > 0 or _HOSTED_APP.get("name") == app_host.HELPWO_APP
+
+
+def _parse_helpwo_flags(parts: list) -> Optional[dict]:
+    """/helpwo flags → options, or None after saying what was wrong."""
     import helpwo_server
 
-    # Subcommand: stop — go fully offline (local server + cloud environment).
-    if len(parts) >= 2 and parts[1].lower() == "stop":
-        stopped_any = False
-        if helpwo_server.is_running():
-            helpwo_server.stop_server()
-            console.print("[yellow]Helpwo gateway stopped.[/yellow]")
-            stopped_any = True
-        if agent_registry is not None and agent_registry.agent_id:
-            _disconnect_from_helpwo(agent_registry)
-            stopped_any = True
-        if not stopped_any:
-            console.print("[dim]Helpwo is not running and this CLI isn't connected.[/dim]")
-        return
-
-    if helpwo_server.is_running():
-        url = helpwo_server.get_url()
-        console.print(f"[dim]Helpwo gateway already running at "
-                      f"{helpwo_server.get_url(with_token=True)}[/dim]")
-        console.print(f"[dim]Open {url} in your browser, or /helpwo stop to stop.[/dim]")
-        return
-
-    # Parse optional flags
-    port = helpwo_server.DEFAULT_PORT
-    dist_override = None
-    remote = False
-    bind_host = "127.0.0.1"
+    opts = {"port": None, "dist": None, "remote": False, "host": "127.0.0.1"}
     args = parts[1:]
     i = 0
     while i < len(args):
@@ -20880,28 +20908,29 @@ def _cmd_helpwo(raw_args: str, parts: list, agent_registry: AgentRegistry,
         if arg == "--port":
             if i + 1 >= len(args):
                 console.print("[red]--port requires a value.[/red]")
-                console.print(r"[dim]Usage: /helpwo \[--port N] \[--dist <path>] \[--remote] | stop[/dim]")
-                return
+                console.print(_HELPWO_USAGE)
+                return None
             try:
                 port = int(args[i + 1])
             except ValueError:
-                console.print(f"[red]Invalid port: {args[i + 1]}[/red]")
-                return
+                console.print(f"[red]Invalid port: {escape(args[i + 1])}[/red]")
+                return None
             if port < 1 or port > 65535:
                 console.print(f"[red]Port must be 1-65535, got {port}[/red]")
-                return
+                return None
+            opts["port"] = port
             i += 2
         elif arg == "--dist":
             if i + 1 >= len(args):
                 console.print("[red]--dist requires a path.[/red]")
-                console.print(r"[dim]Usage: /helpwo \[--port N] \[--dist <path>] \[--remote] | stop[/dim]")
-                return
-            dist_override = args[i + 1]
+                console.print(_HELPWO_USAGE)
+                return None
+            opts["dist"] = args[i + 1]
             i += 2
         elif arg == "--host":
             if i + 1 >= len(args):
                 console.print("[red]--host requires an address.[/red]")
-                return
+                return None
             # Loopback only, and not as caution — as correctness. A browser
             # withholds Web Crypto, Service Workers, File System Access and the
             # clipboard outside a secure context, and plain HTTP on a routable
@@ -20910,6 +20939,7 @@ def _cmd_helpwo(raw_args: str, parts: list, agent_registry: AgentRegistry,
             # IS a secure context. The two ways to reach this from elsewhere
             # keep that property instead of fighting it.
             if args[i + 1] not in helpwo_server.LOOPBACK_HOSTS:
+                port = opts["port"] or helpwo_server.DEFAULT_PORT
                 console.print(
                     f"[red]--host must be loopback "
                     f"({', '.join(helpwo_server.LOOPBACK_HOSTS)}).[/red]")
@@ -20924,32 +20954,57 @@ def _cmd_helpwo(raw_args: str, parts: list, agent_registry: AgentRegistry,
                 console.print(
                     "[dim]  /helpwo --remote                                  "
                     "# share this environment peer-to-peer instead[/dim]")
-                return
-            bind_host = args[i + 1]
+                return None
+            opts["host"] = args[i + 1]
             i += 2
         elif arg == "--remote":
-            remote = True
+            opts["remote"] = True
             i += 1
         elif arg.startswith("--"):
-            console.print(f"[red]Unknown option: {arg}[/red]")
-            console.print(r"[dim]Usage: /helpwo \[--port N] \[--dist <path>] \[--remote] | stop[/dim]")
-            return
+            console.print(f"[red]Unknown option: {escape(arg)}[/red]")
+            console.print(_HELPWO_USAGE)
+            return None
         else:
             # Refused rather than ignored: "/helpwo stpo" used to start the
             # gateway it was meant to stop.
             console.print(f"[red]Unexpected argument: {escape(arg)}[/red]")
-            console.print(r"[dim]Usage: /helpwo \[--port N] \[--host ADDR] \[--dist <path>] \[--remote] | stop[/dim]")
-            return
+            console.print(_HELPWO_USAGE)
+            return None
+    return opts
 
+
+def _helpwo_start_in_process(opts: dict, agent_registry: AgentRegistry,
+                             session: dict, *, state: Optional[dict] = None,
+                             state_dir=None, open_browser: bool = True) -> dict:
+    """Serve Helpwo from THIS process. Returns a runtime record.
+
+    This is what runs inside the Helpwo sub-terminal. With ``state`` (from
+    app_host) the token, port and agent ids are the persisted ones, so the
+    browser's cookie, origin and stored conversations all carry over.
+
+    Record: {"status": "ready"|"error", "mode", "url", "open_url", "message"}.
+    """
+    import helpwo_server
+
+    if helpwo_server.is_running():
+        url = helpwo_server.get_url()
+        console.print(f"[dim]Helpwo gateway already running at "
+                      f"{helpwo_server.get_url(with_token=True)}[/dim]")
+        console.print(f"[dim]Open {url} in your browser, or /helpwo stop to stop.[/dim]")
+        return {"status": "ready", "mode": "local", "url": url,
+                "open_url": helpwo_server.get_url(with_token=True),
+                "message": "already running"}
+
+    remote = bool(opts.get("remote"))
     dist_path = None
     if not remote:
-        if dist_override:
+        if opts.get("dist"):
             from pathlib import Path
-            p = Path(dist_override).expanduser()
+            p = Path(opts["dist"]).expanduser()
             if not p.is_dir() or not (p / "index.html").is_file():
                 console.print(f"[red]Invalid dist directory: {p}[/red]")
                 console.print("[dim]The directory must contain index.html.[/dim]")
-                return
+                return {"status": "error", "message": f"invalid dist directory: {p}"}
             dist_path = p.resolve()
         else:
             dist_path = helpwo_server._find_dist()
@@ -20976,29 +21031,58 @@ def _cmd_helpwo(raw_args: str, parts: list, agent_registry: AgentRegistry,
     if remote:
         url = _helpwo_web_app_url()
         if url is None:
-            console.print(
-                "[red]No hosted Helpwo web app for the current backend "
-                f"({get_backend_profile().base_url}). Set LAINTAS_HELPWO_DIST "
-                "or use --dist to point at a local build instead.[/red]")
-            return
+            message = ("No hosted Helpwo web app for the current backend "
+                       f"({get_backend_profile().base_url}). Set LAINTAS_HELPWO_DIST "
+                       "or use --dist to point at a local build instead.")
+            console.print(f"[red]{message}[/red]")
+            return {"status": "error", "message": message}
+        # Helpwo keys this environment's tabs and conversations by agent id;
+        # the gateway revives a previous id when asked, so ask for ours.
+        if state and state.get("persistent") and not agent_registry.agent_id:
+            agent_registry._last_agent_id = str(state.get("remote_agent_id") or "")
         # Best-effort link: a failed handshake (not logged in, backend
         # unreachable) shouldn't block opening the web app itself — same
         # graceful-degradation as local mode, which starts the server either
         # way and only warns that no agent is registered.
-        connect_terminal_to_helpwo(agent_registry, session, quiet=False,
-                                   workspace=_auto_workspace)
-        console.print(f"[dim]Opening {url}[/dim]")
-        try:
-            _open_external_url(url)
-        except Exception:
-            pass
-        return
+        linked = connect_terminal_to_helpwo(agent_registry, session, quiet=False,
+                                            workspace=_auto_workspace)
+        if linked and state_dir is not None and state and state.get("persistent"):
+            app_host.update_state(state_dir, remote_agent_id=agent_registry.agent_id or "")
+        if open_browser:
+            console.print(f"[dim]Opening {url}[/dim]")
+            try:
+                _open_external_url(url)
+            except Exception:
+                pass
+        return {"status": "ready", "mode": "remote", "url": url, "open_url": url,
+                "linked": bool(linked),
+                "message": ("environment linked" if linked else
+                            "web app available, but this environment is not linked "
+                            "(log in with /login inside the sub-terminal)")}
 
-    ok, msg = helpwo_server.start_server(agent_registry, dist_dir=dist_path, port=port,
-                                         session=session, host=bind_host)
+    persisted_port = (state or {}).get("port")
+    port = opts.get("port") or persisted_port or helpwo_server.DEFAULT_PORT
+    start_kwargs = dict(dist_dir=dist_path, session=session, host=opts.get("host") or "127.0.0.1")
+    if state:
+        start_kwargs["token"] = state.get("token") or None
+        start_kwargs["agent_id"] = state.get("local_agent_id") or None
+    ok, msg = helpwo_server.start_server(agent_registry, port=port, **start_kwargs)
+    if not ok and state and not opts.get("port") and not persisted_port:
+        # First launch for this folder and the default port is taken: take
+        # any free one. It is remembered below, so the browser origin — and
+        # with it everything Helpwo stored — stays the same from now on.
+        ok, msg = helpwo_server.start_server(agent_registry, port=0, **start_kwargs)
     if not ok:
+        if persisted_port and not opts.get("port"):
+            msg += (f" — this folder's Helpwo always uses port {persisted_port} so its "
+                    f"browser data stays reachable; free it, or pass --port N to move "
+                    f"(data stored under the old port stays with the old port)")
         console.print(f"[red]{msg}[/red]")
-        return
+        return {"status": "error", "message": msg}
+
+    bound_port = helpwo_server._server_port()
+    if state_dir is not None and state and state.get("persistent"):
+        app_host.update_state(state_dir, port=bound_port)
 
     # The token rides in the URL on the first visit only; after that the
     # browser's cookie carries it. Same shape as Jupyter.
@@ -21010,7 +21094,7 @@ def _cmd_helpwo(raw_args: str, parts: list, agent_registry: AgentRegistry,
     # Loopback-only by construction, so there is no insecure-origin case left
     # to warn about — only the question of how to reach it from elsewhere.
     console.print(f"  [dim]Remote machine? Forward the port from your own computer:[/dim]")
-    console.print(f"  [dim]  ssh -N -L {port}:127.0.0.1:{port} <user>@<this-host>[/dim]")
+    console.print(f"  [dim]  ssh -N -L {bound_port}:127.0.0.1:{bound_port} <user>@<this-host>[/dim]")
     console.print(
         f"  [dim]then open the URL above — loopback is a secure context, so every "
         f"browser feature keeps working. To share the environment itself instead, "
@@ -21024,11 +21108,429 @@ def _cmd_helpwo(raw_args: str, parts: list, agent_registry: AgentRegistry,
 
     console.print("[dim]  /helpwo stop to stop the gateway and go offline.[/dim]")
 
-    # Open the browser
+    if open_browser:
+        try:
+            _open_external_url(url)
+        except Exception:
+            pass
+    return {"status": "ready", "mode": "local", "url": helpwo_server.get_url(),
+            "open_url": url, "port": bound_port, "message": msg}
+
+
+def _can_open_graphical_browser() -> bool:
+    """Whether opening a URL would show a window rather than take the terminal.
+
+    Without a display, webbrowser falls back to lynx/w3m, which run in the
+    foreground of this very terminal. Called from the background thread that
+    reports an app's readiness, that browser and the REPL fight over the tty
+    and the next thing the user types is eaten by the browser.
+    """
+    if sys.platform in ("darwin", "win32"):
+        return True
+    if os.environ.get("WSL_INTEROP") or os.environ.get("WSL_DISTRO_NAME"):
+        return True
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
+def _app_label(app: str) -> str:
+    return "Helpwo" if app == app_host.HELPWO_APP else app
+
+
+def _report_app_runtime(app: str, runtime: dict, *, open_url: bool) -> None:
+    """Tell the main terminal how an app sub-terminal's startup went."""
+    label = _app_label(app)
+    status = runtime.get("status")
+    if status == "ready":
+        lines = [f"[green]{escape(label)} is running in sub-terminal "
+                 f"[bold]{escape(app)}[/bold][/green]"]
+        if runtime.get("open_url"):
+            lines.append(f"URL: [cyan]{escape(str(runtime['open_url']))}[/cyan]")
+        elif runtime.get("url"):
+            lines.append(f"Bridge: [cyan]{escape(str(runtime['url']))}[/cyan]")
+        if runtime.get("mode") == "remote" and not runtime.get("linked"):
+            lines.append(f"[yellow]{escape(str(runtime.get('message') or ''))}[/yellow]")
+        if runtime.get("log"):
+            lines.append(f"App log: [dim]{escape(str(runtime['log']))}[/dim]")
+        lines.append(
+            "[dim]It has its own agent and its own conversation. "
+            f"/t opens the terminal list; /{'helpwo' if app == app_host.HELPWO_APP else 'app'} "
+            f"stop{'' if app == app_host.HELPWO_APP else ' ' + app} closes it.[/dim]")
+        console.print(Panel("\n".join(lines), title=label, border_style="green"))
+        if open_url and runtime.get("open_url") and _can_open_graphical_browser():
+            try:
+                _open_external_url(str(runtime["open_url"]))
+            except Exception:
+                pass
+    elif status == "error":
+        console.print(
+            f"[red]{escape(label)} could not start in sub-terminal "
+            f"[bold]{escape(app)}[/bold]: {escape(str(runtime.get('message') or 'unknown error'))}[/red]")
+        console.print("[dim]/t to look at the sub-terminal; running the command again "
+                      "replaces it.[/dim]")
+    elif status == "exited":
+        console.print(f"[red]Sub-terminal [bold]{escape(app)}[/bold] exited before "
+                      f"{escape(label)} was ready.[/red]")
+    else:
+        console.print(f"[yellow]{escape(label)} is not ready after waiting; "
+                      f"/t to look at sub-terminal [bold]{escape(app)}[/bold].[/yellow]")
+
+
+def _launch_app_subterminal(app: str, *, persistent: bool, options: dict,
+                            agent_registry: Optional[AgentRegistry],
+                            open_url: bool, wait: bool = False) -> Optional[dict]:
+    """Run an application in its own named sub-terminal with its own agent.
+
+    The sub-terminal is a nested laintas_cli (--app) whose primary agent is the
+    application's dedicated agent, so the conversation is separate from this
+    terminal's by construction. Closing the sub-terminal ends all of it.
+
+    Returns the runtime record when it is (or already was) known, a
+    {"status": "launching"} placeholder when waiting in the background, or
+    None when nothing was started.
+    """
+    label = _app_label(app)
+    existing = get_terminal(app)
+    if existing is not None:
+        alive = existing.session is not None and existing.session.is_alive()
+        if not app_host.is_app_terminal(existing, app):
+            if alive:
+                console.print(
+                    f"[red]A terminal named [bold]{escape(app)}[/bold] already exists and "
+                    f"is not {escape(label)}'s. /terminate {escape(app)} first.[/red]")
+                return None
+            unregister_terminal(app)
+        else:
+            launch = _APP_LAUNCHES.get(app) or {}
+            runtime = (app_host.read_runtime(launch["state_dir"])
+                       if launch.get("state_dir") else {})
+            current = runtime.get("launch_id") == launch.get("launch_id")
+            if alive and current and runtime.get("status") == "ready":
+                _report_app_runtime(app, runtime, open_url=False)
+                return runtime
+            if alive and not (current and runtime.get("status")):
+                console.print(f"[dim]{escape(label)} is still starting in sub-terminal "
+                              f"[bold]{escape(app)}[/bold].[/dim]")
+                return {"status": "launching"}
+            # Dead, or alive with a failed/stopped app: start over cleanly.
+            unregister_terminal(app)
+            _APP_LAUNCHES.pop(app, None)
+
+    directory, state = app_host.ensure_state(app, os.getcwd(), persistent)
+    launch_id = secrets.token_hex(8)
+    app_host.clear_runtime(directory)
+    cmd = _build_connected_subterminal_cmd(
+        app,
+        agent_registry.agent_id if agent_registry else None,
+        parent_terminal="term0",
+        terminal_id=state["terminal_id"],
+        extra_args=["--app", app, "--app-state", str(directory),
+                    "--app-launch-id", launch_id,
+                    "--app-options", json.dumps(options or {}, ensure_ascii=True)],
+    )
+    sub = SubTerminalSession(cmd)
+    sub.start()
+    time.sleep(0.1)
+    if not sub.is_alive():
+        console.print(f"[red]Could not start sub-terminal '{escape(app)}'.[/red]")
+        return None
+    sub.read_output(timeout=0.1)
     try:
-        _open_external_url(url)
-    except Exception:
-        pass
+        register_terminal(sub, app_host.terminal_command(app), 0, name=app,
+                          parent_terminal="term0")
+    except Exception as exc:
+        sub.close()
+        console.print(f"[red]Could not register sub-terminal '{escape(app)}': "
+                      f"{escape(str(exc))}[/red]")
+        return None
+    _APP_LAUNCHES[app] = {"state_dir": directory, "launch_id": launch_id}
+    console.print(
+        f"[dim]Starting {escape(label)} in sub-terminal [bold]{escape(app)}[/bold] "
+        f"with its own agent"
+        f"{' (login, data and conversation persist for this folder)' if persistent else ''}"
+        f"…[/dim]")
+
+    def _await() -> dict:
+        runtime = app_host.wait_runtime(directory, launch_id, timeout=90.0,
+                                        alive=sub.is_alive)
+        _report_app_runtime(app, runtime, open_url=open_url)
+        return runtime
+
+    if wait:
+        return _await()
+    threading.Thread(target=_await, daemon=True, name=f"app-launch-{app}").start()
+    return {"status": "launching"}
+
+
+def _close_app_subterminal(app: str) -> bool:
+    term = get_terminal(app)
+    if term is None or not app_host.is_app_terminal(term, app):
+        return False
+    unregister_terminal(app)
+    _APP_LAUNCHES.pop(app, None)
+    return True
+
+
+def _bootstrap_hosted_app(args, agent_registry: AgentRegistry, session: dict) -> None:
+    """Inside an app sub-terminal: start the application, then report back.
+
+    The report is the runtime file the launching terminal is waiting on. It is
+    written on every path, failure included — a parent left waiting on a
+    process that quietly gave up is the failure this file exists to prevent.
+    """
+    from pathlib import Path
+
+    directory = Path(args.app_state)
+    state = app_host.load_state(directory)
+    try:
+        options = json.loads(args.app_options or "{}")
+    except ValueError:
+        options = {}
+    if not isinstance(options, dict):
+        options = {}
+    _HOSTED_APP.update({"name": args.app, "state_dir": directory, "state": state,
+                        "launch_id": args.app_launch_id or ""})
+    try:
+        if args.app == app_host.HELPWO_APP:
+            app_host.activate(app_host.HELPWO_APP, app_host.HELPWO_AGENT_PROMPT,
+                              builtin=True)
+            result = _helpwo_start_in_process(
+                options, agent_registry, session, state=state,
+                state_dir=directory, open_browser=False)
+        else:
+            result = _app_start_in_process(args.app, agent_registry, session,
+                                           state, directory)
+    except Exception as exc:
+        result = {"status": "error", "message": f"{type(exc).__name__}: {exc}"}
+    try:
+        app_host.write_runtime(directory, args.app_launch_id or "", **result)
+    except Exception as exc:
+        console.print(f"[red]Could not report startup to the main terminal: {exc}[/red]")
+
+
+def _app_start_in_process(name: str, agent_registry: AgentRegistry, session: dict,
+                          state: dict, state_dir) -> dict:
+    """Serve one manifest application from THIS process (its sub-terminal)."""
+    import helpwo_server
+
+    manifests, _problems = app_host.discover_manifests(os.getcwd())
+    manifest = manifests.get(name)
+    if manifest is None:
+        return {"status": "error", "message": f"no manifest named '{name}'"}
+    # Checked again here, not only where it was launched: the file may have
+    # changed in between, and a changed manifest is an untrusted one.
+    if not app_host.is_trusted(manifest):
+        return {"status": "error",
+                "message": f"'{name}' is not trusted (or changed since); /app trust {name}"}
+    app_host.activate(manifest.name, manifest.prompt, builtin=False)
+
+    persisted_port = state.get("port") if state.get("persistent") else None
+    port = manifest.port or persisted_port or 0
+    ok, msg = helpwo_server.start_server(
+        agent_registry, port=port, session=session,
+        token=state.get("token") or None,
+        agent_id=state.get("local_agent_id") or None,
+        app_profile={"name": manifest.name,
+                     "allowed_kinds": app_host.APP_ALLOWED_KINDS})
+    if not ok:
+        return {"status": "error", "message": msg}
+    bound_port = helpwo_server._server_port()
+    if state.get("persistent"):
+        app_host.update_state(state_dir, port=bound_port)
+    bridge_url = helpwo_server.get_url()
+    agent_id = state.get("local_agent_id") or ""
+    console.print(Panel(
+        f"[green]Hosting application [bold]{escape(manifest.name)}[/bold][/green]\n"
+        f"Bridge: {bridge_url}  agent: {agent_id}\n"
+        f"[dim]Only the conversation API is exposed: POST /api/agents/<id>/send "
+        f"(kind chat/abort/approval-response), GET /api/agents/<id>/updates. "
+        f"Authenticate with the header 'Authorization: token <token>'.[/dim]",
+        title="App", border_style="green"))
+
+    result = {"status": "ready", "mode": "app", "url": bridge_url,
+              "agent_id": agent_id, "message": msg}
+    if manifest.command:
+        from pathlib import Path
+        log_path = Path(state_dir) / "app.log"
+        try:
+            proc = app_host.spawn_app_process(
+                manifest.command, cwd=os.getcwd(), log_path=log_path,
+                env_extra={
+                    "LAINTAS_APP_NAME": manifest.name,
+                    "LAINTAS_APP_BRIDGE_URL": bridge_url,
+                    "LAINTAS_APP_TOKEN": state.get("token") or "",
+                    "LAINTAS_APP_AGENT_ID": agent_id,
+                })
+        except Exception as exc:
+            helpwo_server.stop_server()
+            return {"status": "error",
+                    "message": f"could not start '{manifest.command}': {exc}"}
+        console.print(f"[dim]Started: {escape(manifest.command)} (pid {proc.pid}); "
+                      f"output → {log_path}[/dim]")
+        result.update({"app_pid": proc.pid, "log": str(log_path)})
+    return result
+
+
+def _cmd_helpwo(raw_args: str, parts: list, agent_registry: AgentRegistry,
+                session: dict) -> None:
+    """Run Helpwo in its own sub-terminal, with its own agent.
+
+    /helpwo              - local dist if found, else the hosted web app
+    /helpwo --port 8080  - start the local server on a custom port
+    /helpwo --dist <p>   - use a custom local dist directory
+    /helpwo --remote     - skip the local server; open the hosted web app
+    /helpwo stop         - close the Helpwo sub-terminal (and, inside a
+                           sub-terminal, stop the gateway / withdraw the
+                           environment served from there)
+
+    From the main terminal this creates the sub-terminal ``helpwo``: a nested
+    CLI whose agent serves only Helpwo, so Helpwo's conversation is never this
+    terminal's. Its folder is Helpwo's workspace, and what Helpwo keys its data
+    by — login token, port (the browser origin), agent id, the agent's own
+    conversation — is kept per folder, so a restart picks up where it was.
+
+    Inside a sub-terminal (including that one) it serves Helpwo in place, as
+    before: local mode is loopback and offline-capable; ``--remote``
+    registers with the hosted app.
+    """
+    import helpwo_server
+
+    hosts_here = _hosts_helpwo_here()
+
+    # Subcommand: stop.
+    if len(parts) >= 2 and parts[1].lower() == "stop":
+        stopped_any = False
+        if not hosts_here and _close_app_subterminal(app_host.HELPWO_APP):
+            console.print("[yellow]Helpwo sub-terminal closed (its agent and gateway "
+                          "with it).[/yellow]")
+            stopped_any = True
+        if helpwo_server.is_running():
+            helpwo_server.stop_server()
+            console.print("[yellow]Helpwo gateway stopped.[/yellow]")
+            stopped_any = True
+        if agent_registry is not None and agent_registry.agent_id:
+            _disconnect_from_helpwo(agent_registry)
+            stopped_any = True
+        if stopped_any and _HOSTED_APP.get("state_dir"):
+            try:
+                app_host.write_runtime(_HOSTED_APP["state_dir"],
+                                       _HOSTED_APP.get("launch_id", ""), status="stopped")
+            except Exception:
+                pass
+        if not stopped_any:
+            console.print("[dim]Helpwo is not running and this CLI isn't connected.[/dim]")
+        return
+
+    opts = _parse_helpwo_flags(parts)
+    if opts is None:
+        return
+
+    if hosts_here:
+        _helpwo_start_in_process(
+            opts, agent_registry, session,
+            state=_HOSTED_APP.get("state") if _HOSTED_APP.get("name") == app_host.HELPWO_APP else None,
+            state_dir=_HOSTED_APP.get("state_dir") if _HOSTED_APP.get("name") == app_host.HELPWO_APP else None)
+        return
+
+    _launch_app_subterminal(app_host.HELPWO_APP, persistent=True, options=opts,
+                            agent_registry=agent_registry, open_url=True)
+
+
+def _cmd_app(parts: list, agent_registry: AgentRegistry) -> None:
+    """/app list | start <name> | stop <name> | trust <name> | revoke <name>
+
+    Any application described by a manifest (~/.laintas/apps/*.json, or the
+    project's .laintas/apps/*.json) runs the way Helpwo does: in its own
+    sub-terminal, with its own agent. Helpwo itself is not one of them — it
+    has /helpwo.
+    """
+    sub = parts[1].lower() if len(parts) >= 2 else "list"
+    name = parts[2] if len(parts) >= 3 else ""
+    manifests, problems = app_host.discover_manifests(os.getcwd())
+
+    if sub == "list":
+        if not manifests:
+            console.print("[dim]No applications registered. Add a manifest to "
+                          f"{app_host.user_manifest_dir()} or ./.laintas/apps/.[/dim]")
+            console.print('[dim]  {"name": "myapp", "description": "…", '
+                          '"command": "node server.js", "prompt": "…", '
+                          '"persistence": "none"}[/dim]')
+        else:
+            table = RichTable(box=box.SIMPLE, show_edge=False)
+            for column in ("App", "Scope", "Trusted", "Running", "Persistence", "Description"):
+                table.add_column(column)
+            for manifest in sorted(manifests.values(), key=lambda m: m.name):
+                term = get_terminal(manifest.name)
+                running = bool(term is not None
+                               and app_host.is_app_terminal(term, manifest.name)
+                               and term.session is not None and term.session.is_alive())
+                table.add_row(escape(manifest.name), manifest.scope,
+                              "yes" if app_host.is_trusted(manifest) else "[yellow]no[/yellow]",
+                              "[green]yes[/green]" if running else "no",
+                              manifest.persistence, escape(manifest.description))
+            console.print(table)
+        for problem in problems:
+            console.print(f"[yellow]Skipped {escape(problem)}[/yellow]")
+        return
+
+    if sub not in ("start", "stop", "trust", "revoke"):
+        console.print("[yellow]Usage: /app \\[list|start <name>|stop <name>|"
+                      "trust <name>|revoke <name>][/yellow]")
+        return
+    if not name:
+        console.print(f"[yellow]Usage: /app {sub} <name>[/yellow]")
+        return
+    if name == app_host.HELPWO_APP:
+        console.print("[yellow]Helpwo has its own command: /helpwo[/yellow]")
+        return
+
+    if sub == "stop":
+        if _close_app_subterminal(name):
+            console.print(f"[yellow]Application [bold]{escape(name)}[/bold] stopped "
+                          f"(sub-terminal, agent and its process).[/yellow]")
+        else:
+            console.print(f"[dim]'{escape(name)}' is not running.[/dim]")
+        return
+    if sub == "revoke":
+        if app_host.revoke(name):
+            console.print(f"[yellow]Trust for [bold]{escape(name)}[/bold] revoked.[/yellow]")
+        else:
+            console.print(f"[dim]'{escape(name)}' was not trusted.[/dim]")
+        return
+
+    manifest = manifests.get(name)
+    if manifest is None:
+        console.print(f"[red]No application named '{escape(name)}'. /app list[/red]")
+        return
+
+    if sub == "trust":
+        console.print(Panel(
+            f"[bold]{escape(manifest.name)}[/bold] ({manifest.scope}: {escape(manifest.source)})\n"
+            f"{escape(manifest.description)}\n\n"
+            f"Command: [bold]{escape(manifest.command) or '(none)'}[/bold]\n"
+            f"Persistence: {manifest.persistence}\n\n"
+            "[dim]Trusting lets this application talk to its own agent, which can "
+            "run tools in this folder under your normal approval policy. The "
+            "command above runs as you.[/dim]",
+            title="Trust application", border_style="yellow"))
+        try:
+            answer = input("Trust it? [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            answer = ""
+        if answer in ("y", "yes"):
+            app_host.trust(manifest)
+            console.print(f"[green]Trusted. /app start {escape(name)}[/green]")
+        else:
+            console.print("[dim]Not trusted.[/dim]")
+        return
+
+    # start
+    if not app_host.is_trusted(manifest):
+        console.print(f"[yellow]'{escape(name)}' is not trusted, or its manifest "
+                      f"changed since it was. Review it with /app trust {escape(name)}.[/yellow]")
+        return
+    _launch_app_subterminal(
+        name, persistent=manifest.persistence == app_host.PERSISTENCE_WORKSPACE,
+        options={}, agent_registry=agent_registry, open_url=False)
 
 
 def _cmd_term(parts: list, agent_registry: AgentRegistry, interactive_session) -> bool:
@@ -23308,6 +23810,9 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
 
     elif action == "/helpwo":
         _cmd_helpwo(raw_args, parts, agent_registry, session)
+
+    elif action == "/app":
+        _cmd_app(parts, agent_registry)
 
     elif action in ("/t", "/term"):
         return _cmd_term(parts, agent_registry, interactive_session)
@@ -25724,6 +26229,11 @@ def main():
                         help="Helpwo backend agent id of the primary CLI that owns this sub-terminal")
     parser.add_argument("--connect", action="store_true", default=False,
                         help="Hand this sub-terminal over to Helpwo at startup (internal; used by term-new)")
+    # Internal: this sub-terminal hosts an application (/helpwo, /app).
+    parser.add_argument("--app", type=str, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--app-state", type=str, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--app-launch-id", type=str, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--app-options", type=str, default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     # Which process this is decides who may draw on the tty (see
@@ -26204,6 +26714,20 @@ def main():
     # PTY session managed at REPL level (must be before shutdown for nonlocal)
     interactive_session = None
 
+    # An application sub-terminal that persists keeps its agent's conversation
+    # in its own file (per application, per folder) instead of primary.json.
+    _restore_app_conversation = False
+    if args.app and args.app_state and args.depth > 0:
+        try:
+            from pathlib import Path as _AppPath
+            _app_state = app_host.load_state(_AppPath(args.app_state))
+            if _app_state.get("persistent") and _app_state.get("conversation_id"):
+                agent_persistence.set_storage_alias(
+                    "primary", str(_app_state["conversation_id"]))
+                _restore_app_conversation = True
+        except Exception as _app_state_exc:
+            console.print(f"[yellow]Application state unreadable: {_app_state_exc}[/yellow]")
+
     # Register the primary agent.
     # If launched as a sub-terminal with an explicit identity, register that
     # agent (role=deployed) and tag it with the parent context. Otherwise
@@ -26230,6 +26754,11 @@ def main():
     else:
         primary = register_agent(name="primary", depth=0, role="primary",
                                  load_existing=True)
+        if _restore_app_conversation:
+            # Everywhere else the REPL's fresh locals replace what was loaded;
+            # an application's agent picks its conversation back up instead.
+            chat_history[:] = copy.deepcopy(primary.chat_history or [])
+            agent_state.update(prepare_state_for_repl(primary.state or {}))
         # The REPL and Agents Mode are two views over these exact objects.
         # Never let the registry retain a restored copy while the REPL mutates
         # different state/history instances.
@@ -26525,6 +27054,10 @@ def main():
             except Exception:
                 pass
             try:
+                app_host.stop_app_processes(timeout=2.0)
+            except Exception:
+                pass
+            try:
                 stop_trigger_scanner()
                 close_all_terminals()
                 close_all_agents()
@@ -26661,6 +27194,9 @@ def main():
 
         threading.Thread(target=_sync_official_messages, daemon=True,
                          name="official-messages").start()
+
+    if args.app and args.app_state and args.depth > 0:
+        _bootstrap_hosted_app(args, agent_registry, session)
 
     # Main interactive loop
 

@@ -49,8 +49,23 @@ def _ensure_dir() -> None:
         pass
 
 
+# A process may store one agent under a different file. An application
+# sub-terminal's primary is "primary" to every in-process lookup, but its
+# conversation belongs to that application in that folder, not to the global
+# primary.json every other CLI also writes.
+_ID_ALIASES: dict[str, str] = {}
+
+
+def set_storage_alias(agent_id: str, stored_as: Optional[str]) -> None:
+    """Persist ``agent_id`` under ``stored_as`` in this process (None clears)."""
+    if stored_as:
+        _ID_ALIASES[agent_id] = stored_as
+    else:
+        _ID_ALIASES.pop(agent_id, None)
+
+
 def _agent_file(agent_id: str) -> Path:
-    return AGENTS_DIR / f"{agent_id}.json"
+    return AGENTS_DIR / f"{_ID_ALIASES.get(agent_id, agent_id)}.json"
 
 
 def save_agent_state(agent: "AgentInfo") -> bool:

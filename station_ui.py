@@ -1,4 +1,5 @@
 """Station presentation; all mutations go through StationService."""
+import re
 import shlex
 import uuid
 
@@ -91,6 +92,26 @@ def show_station(service, *, owner_id, deps, session, create_terminal,
         mode[0] = "terminals" if mode[0] == "agents" else "agents"
         return ui.UIActionResult(message=f"View: {mode[0]}", refresh=True)
 
+    def _deploy_key_terminal(item):
+        # One-keystroke deploy targets a terminal named after the agent;
+        # "bind <terminal>" remains the way to pick a specific terminal.
+        agent = item.payload
+        name = re.sub(r"[^A-Za-z0-9._-]+", "-", agent.name or agent.id).strip("-")
+        return (name or agent.id)[:64]
+
+    def deploy_selected(item):
+        if item is None or not item.key.startswith("agent:"):
+            return ui.UIActionResult(message="Select an agent to deploy.",
+                                     message_style="class:warning")
+        return refresh_result(service.deploy(item.payload.id, _deploy_key_terminal(item),
+                                             owner_id=owner_id, create_terminal=create_terminal))
+
+    def undeploy_selected(item):
+        if item is None or not item.key.startswith("agent:"):
+            return ui.UIActionResult(message="Select an agent to unstation.",
+                                     message_style="class:warning")
+        return refresh_result(service.undeploy(item.payload.id, owner_id))
+
     def command(item, detail, text, interrupt):
         if interrupt.is_set():
             return ui.UIActionResult(message="Cancelled.")
@@ -143,12 +164,14 @@ def show_station(service, *, owner_id, deps, session, create_terminal,
     return ui.ResourceBrowser(
         title="Station", load_items=load_items, load_detail=load_detail,
         actions=[ui.UIAction("v", "view_mode", "Agents / terminals", toggle, allow_empty=True),
-                 ui.UIAction("e", "open", "Open terminal / dialogue")],
+                 ui.UIAction("e", "open", "Open terminal / dialogue"),
+                 ui.UIAction("s", "deploy", "Station to own terminal", deploy_selected),
+                 ui.UIAction("u", "undeploy", "Release deployment", undeploy_selected)],
         primary_action="view", refresh_interval=.5, presentation="operations",
         pane_labels=("RELATIONSHIPS", "TASK & ACTIVITY"),
         empty_message="No resources. Use /hire or /term to create one.",
         assistant_handler=command,
-        assistant_placeholder="task / auto / suggest / bind / cancel / unstation",
+        assistant_placeholder="task / auto / suggest / bind / cancel / unstation  ·  s deploy / u unstation",
         assistant_label="Command",
         initial_key=initial_key,
     ).run()
