@@ -3,7 +3,7 @@
 Helpwo mounts the same storage as a cloud folder ("Laintas Storage"), so a file
 pushed from here appears in the Helpwo file tree, and anything Helpwo writes
 there can be pulled back down. It is per-account, server-side and persistent —
-unlike ``/connect``, which shares a live folder only while the CLI is running
+unlike ``/helpwo --remote``, which shares a live folder only while the CLI is running
 and streams it peer-to-peer.
 
 Everything goes through the agent_gateway's ``/api/storage/*`` endpoints using

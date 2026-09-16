@@ -81,7 +81,7 @@ _AI_EXEC_MAX_OUTPUT = 256 * 1024    # matches the old server-relayed exec's cap
 
 # Live reference to the AgentRegistry instance that owns this WebrtcManager,
 # so path checks can also allow the folder the user explicitly shared via
-# /connect <folder> or /helpwo (agent_registry.workspace_path) — not just
+# /helpwo (agent_registry.workspace_path) — not just
 # policy.py's allowedRoots. allowedRoots gates autonomous AI shell commands;
 # workspace_path is a separate, deliberate per-connection consent the user
 # already gave when they chose what to share. Conflating the two meant a
@@ -94,7 +94,7 @@ _registry_ref: Optional[Any] = None
 def set_agent_registry(registry: Any) -> None:
     """Called once from laintas_cli.py's _ensure_webrtc() so path checks stay
     in sync with the live registry (workspace_path can change via a later
-    /connect <folder> without needing to reconstruct the WebrtcManager)."""
+    /helpwo without needing to reconstruct the WebrtcManager)."""
     global _registry_ref
     _registry_ref = registry
 

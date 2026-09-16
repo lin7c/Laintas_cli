@@ -2290,7 +2290,7 @@ def _build_connected_subterminal_cmd(terminal_name: str,
     """Command line for a user-facing sub-terminal running a nested CLI.
 
     Carries the terminal's identity (name + remote parent agent id) so that
-    running /connect inside it can hand exactly this terminal to Helpwo.
+    running /helpwo --remote inside it can hand exactly this terminal to Helpwo.
     auto_connect=True (used by Helpwo's term-new) registers at startup.
     terminal_id overrides the id derived from the parent terminal — an app
     sub-terminal keeps one per folder, so its terminal preferences survive a
@@ -2333,8 +2333,8 @@ def connect_terminal_to_helpwo(agent_registry: "AgentRegistry", session: dict,
     its UI); at depth ≥ 1 it hands this sub-terminal over. `name` optionally
     sets a custom display/terminal name (kept for internal/sub-terminal callers;
     the user-facing custom name now lives in /name). `workspace` is the absolute
-    folder to SHARE as Helpwo's remote workspace — bare /connect passes None, so
-    linking alone shares nothing; Helpwo only goes remote once a folder is set.
+    folder to SHARE as Helpwo's remote workspace — callers that pass None
+    link without sharing anything; Helpwo only goes remote once a folder is set.
     Starts heartbeat + message poll so Helpwo can chat / term-new / term-close.
     """
     if (get_backend_profile().sends_laintas_credentials
@@ -2342,7 +2342,7 @@ def connect_terminal_to_helpwo(agent_registry: "AgentRegistry", session: dict,
         if not quiet:
             console.print("[red]/helpwo requires login. Run /login first.[/red]")
         return False
-    is_sub = agent_registry.depth > 0
+    is_sub = agent_registry.depth > 0 and not agent_registry.as_environment
     meta = agent_registry.terminal_meta if is_sub else None
     current = (meta or {}).get("name") if is_sub else agent_registry.agent_name
 
@@ -3433,7 +3433,7 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
         help_text=(
             "Reads and writes the same per-account storage Helpwo mounts as its "
             "\"Laintas Storage\" cloud folder: push a file here and it is in the "
-            "Helpwo file tree, pull one that Helpwo wrote. Unlike /connect, it "
+            "Helpwo file tree, pull one that Helpwo wrote. Unlike /helpwo --remote, it "
             "does not need a live link and it outlives this process — the files "
             "sit on the server. Storage above the plan's free allowance is "
             "billed monthly; /shared usage shows where you stand."
@@ -9700,7 +9700,7 @@ class TerminalSession:
         import pty, ssl
         from websockets.sync.client import connect
 
-        # requests (used for /connect's HTTP registration) bundles its own
+        # requests (used for /helpwo's HTTP registration) bundles its own
         # certifi CA store, so it works even when the OS trust store is
         # missing/broken — a common state on minimal Linux installs. The
         # websockets library has no such fallback: left to its default
@@ -9873,20 +9873,27 @@ class AgentRegistry:
         # ── Sub-terminal identity (two-end handshake with Helpwo) ────────
         # depth 0 = primary CLI (auto-registers = "online"). depth ≥ 1 = a
         # nested CLI inside a sub-terminal: it registers ONLY when the user
-        # runs /connect there (or Helpwo asked for it via term-new), carrying
+        # runs /helpwo --remote there (or Helpwo asked for it via term-new), carrying
         # terminal_meta so Helpwo can show the CLI-side name/definition.
         self.depth: int = 0
         self.parent_remote_id: Optional[str] = None
         self.terminal_meta: Optional[dict] = None
+        # A nested CLI that exists to BE a runtime environment (the Helpwo
+        # app sub-terminal behind /helpwo --remote) rather than a terminal
+        # handed to Helpwo. It registers like a Windows kernel does — a
+        # workspace, no terminal identity, no parent — because Helpwo files
+        # anything carrying `terminal` under the terminal dock and keeps it
+        # out of the runtime-environment picker.
+        self.as_environment: bool = False
         # Absolute host path the user chose to SHARE as Helpwo's remote
-        # workspace via `/connect <folder>`. None = link only, share nothing
+        # workspace via /helpwo. None = link only, share nothing
         # (Helpwo keeps its virtual workspace). Only meaningful at depth 0.
         self.workspace_path: Optional[str] = None
         # Raw PTY relay sessions are tracked separately from nested CLI
         # terminals so disconnect/unregister can revoke them all.
         self._remote_terminal_lock = threading.RLock()
         self._remote_terminals: dict[str, "TerminalSession"] = {}
-        # REPL state callbacks, stashed by main() so /connect can start the
+        # REPL state callbacks, stashed by main() so /helpwo can start the
         # message poll outside main's scope.
         self._state_cb = None
         self._chat_cb = None
@@ -10005,7 +10012,7 @@ class AgentRegistry:
                         ice_servers=configured_ice_servers(self._rtc_config),
                     )
                     # So the WebRTC path/exec checks can also allow the
-                    # folder explicitly shared via /connect or /helpwo
+                    # folder explicitly shared via /helpwo
                     # (self.workspace_path), not just policy.py's
                     # allowedRoots (a separate, unrelated command-safety
                     # list that doesn't include an arbitrary shared cwd by
@@ -10039,7 +10046,7 @@ class AgentRegistry:
 
     def register(self, session: dict, name: str = None, quiet: bool = False) -> bool:
         """Register this CLI as a remote agent with Helpwo backend."""
-        # A disconnect shuts down the old pool; allow a later /connect to
+        # A disconnect shuts down the old pool; allow a later /helpwo to
         # create a fresh one on the same registry instance.
         if self._remote_executor is None:
             self._remote_executor = self._new_remote_executor()
@@ -10075,7 +10082,7 @@ class AgentRegistry:
         if profile.sends_laintas_credentials:
             payload["userEmail"] = user_email
             payload["userName"] = user_name
-        if self.parent_remote_id:
+        if self.parent_remote_id and not self.as_environment:
             payload["parentId"] = self.parent_remote_id
         if self.workspace_path:
             # The one folder the user opted to share; Helpwo mounts this as the
@@ -10085,7 +10092,7 @@ class AgentRegistry:
             # Ask the gateway to resurrect the same agentId so Helpwo tabs
             # and sub-terminal parent links survive re-registration.
             payload["previousAgentId"] = self._last_agent_id
-        if self.terminal_meta:
+        if self.terminal_meta and not self.as_environment:
             payload["terminal"] = self.terminal_meta
             payload["goal"] = (f"Sub-terminal '{self.terminal_meta.get('name', '')}'"
                                f" on {hostname}")
@@ -10304,7 +10311,7 @@ class AgentRegistry:
         if (not self.agent_id or
                 (get_backend_profile().sends_laintas_credentials and not self._session)):
             return
-        # Reconnect (/connect <new-name>, /name) must not stack a second poll
+        # Reconnect (/helpwo --remote again, /name) must not stack a second poll
         # thread — the existing loop re-reads self.agent_id each iteration.
         if self._message_poll_thread is not None and self._message_poll_thread.is_alive():
             return
@@ -11221,7 +11228,7 @@ class AgentRegistry:
 
     def _handle_term_new(self, req_id: str, payload: dict):
         """Helpwo's add-terminal action creates a named sub-terminal here (same path as
-        /term <name>) running a nested laintas_cli that auto-/connects, so it
+        /term <name>) running a nested laintas_cli that auto-links (--connect), so it
         registers itself back to Helpwo as a managed terminal."""
         if self.depth > 0:
             self._push_final(req_id, "fail", "term-new must target the primary CLI (depth 0)")
@@ -15084,7 +15091,7 @@ def _cmd_login(session: dict, agent_registry: AgentRegistry) -> None:
         session.clear()
         session.update(new_session)
         # Refresh the Helpwo link only if this terminal was already
-        # /connect-ed — logging in never auto-links (two-end handshake).
+        # linked — logging in never auto-links (two-end handshake).
         if agent_registry.agent_id:
             agent_registry.register(session, quiet=True)
         console.print(f"[green]Logged in as {new_session.get('userEmail') or new_session.get('userName') or new_session['userId']}[/green]")
@@ -15293,7 +15300,7 @@ def _cmd_name(raw_args: str, session: dict, agent_registry: AgentRegistry) -> No
         config["agentName"] = name
         save_config(config)
         console.print(f"[green]Agent name set to: {name}[/green]")
-        # Re-register under the new name only if already /connect-ed —
+        # Re-register under the new name only if already linked —
         # renaming never auto-links (two-end handshake).
         if agent_registry.agent_id:
             agent_registry.unregister()
@@ -15611,7 +15618,7 @@ def _cmd_shared(parts: list, session: dict) -> None:
 
     The same storage Helpwo mounts as its "Laintas Storage" cloud folder, so
     this is how a terminal hands work to a Helpwo session and takes it back.
-    Unlike /connect, it outlives the process and needs no live link.
+    Unlike /helpwo --remote, it outlives the process and needs no live link.
     """
     import shared_storage as ss
 
@@ -20906,7 +20913,7 @@ def _disconnect_from_helpwo(agent_registry: AgentRegistry) -> None:
         console.print("[dim]This CLI isn't connected to Helpwo.[/dim]")
         return
 
-    if getattr(agent_registry, "depth", 0) == 0:
+    if getattr(agent_registry, "depth", 0) == 0 or agent_registry.as_environment:
         name = agent_registry.agent_name
         agent_registry._last_agent_id = ""  # explicit — don't resurrect
         agent_registry.workspace_path = None
@@ -21471,10 +21478,39 @@ def _handle_app_session_message(registry, req_id: str, kind: str, payload: dict)
     registry._push_final(req_id, "success", json.dumps(result))
 
 
+def _let_subterminal_exit(sess, timeout: float = 8.0) -> None:
+    """Ask a nested CLI to shut down and give it time to do so.
+
+    Closing a terminal session sends SIGTERM and follows with SIGKILL 0.3s
+    later. A nested CLI's SIGTERM handler first flushes its events and
+    unregisters from Helpwo, which takes seconds, so the SIGKILL landed first
+    and the gateway kept listing the environment as online until its
+    heartbeat timed out.
+    """
+    pid = getattr(sess, "pid", -1)
+    if not isinstance(pid, int) or pid <= 0:
+        return
+    try:
+        if not sess.is_alive():
+            return
+        os.kill(pid, signal.SIGTERM)
+    except Exception:
+        return
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            if not sess.is_alive():
+                return
+        except Exception:
+            return
+        time.sleep(0.1)
+
+
 def _close_app_subterminal(app: str) -> bool:
     term = get_terminal(app)
     if term is None or not app_host.is_app_terminal(term, app):
         return False
+    _let_subterminal_exit(term.session)
     unregister_terminal(app)
     _APP_LAUNCHES.pop(app, None)
     return True
@@ -26965,7 +27001,7 @@ def main():
         handle_meta_command._last_events_cb = None
         handle_meta_command._last_existing_session = None
 
-    # Stash REPL state callbacks + terminal identity so /connect (now or later)
+    # Stash REPL state callbacks + terminal identity so /helpwo (now or later)
     # can register this instance with full context.
     agent_registry.depth = args.depth
     agent_registry._state_cb = lambda: agent_state
@@ -26978,6 +27014,10 @@ def main():
             "createdAt": time.time(),
             "createdBy": args.parent_terminal or "term0",
         }
+        # The Helpwo app sub-terminal is how the main terminal's /helpwo is
+        # implemented, not a terminal the user hands over: it goes online as
+        # a runtime environment.
+        agent_registry.as_environment = args.app == app_host.HELPWO_APP
 
     if session.get("userId") or not _active_backend.sends_laintas_credentials:
         if args.depth == 0 and args.monitor_only:
@@ -27002,7 +27042,7 @@ def main():
         else:
             startup_mail.post(
                 "helpwo", "This sub-terminal isn't linked to Helpwo yet.",
-                action="/connect")
+                action="/helpwo --remote")
 
     # PTY session managed at REPL level (must be before shutdown for nonlocal)
     interactive_session = None

@@ -689,3 +689,73 @@ class CommandTests(_Home):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HelpwoEnvironmentRegistrationTests(unittest.TestCase):
+    """The Helpwo app sub-terminal goes online as a runtime environment.
+
+    Helpwo files every agent that carries `terminal` under the terminal dock
+    and keeps it out of the runtime-environment picker, so the sub-terminal
+    behind the main terminal's /helpwo --remote must register the way a
+    kernel does: a workspace, no terminal identity, no parent.
+    """
+
+    def _payload(self, as_environment: bool) -> dict:
+        import laintas_cli
+        registry = laintas_cli.AgentRegistry()
+        registry.depth = 1
+        registry.parent_remote_id = "parent-agent"
+        registry.terminal_meta = {"name": "helpwo", "command": "laintas-cli",
+                                  "createdAt": 0, "createdBy": "term0"}
+        registry.as_environment = as_environment
+        registry.workspace_path = "/srv/project"
+        response = mock.Mock(status_code=200)
+        response.json.return_value = {"agentId": "a1", "agentSecret": "s1"}
+        try:
+            with mock.patch.object(laintas_cli.requests, "post",
+                                   return_value=response) as post:
+                self.assertTrue(registry.register({"userId": "u1"}, quiet=True))
+            return post.call_args.kwargs["json"]
+        finally:
+            registry._remote_executor.shutdown(wait=False, cancel_futures=True)
+            registry._remote_control_executor.shutdown(wait=False, cancel_futures=True)
+
+    def test_environment_registers_without_terminal_identity(self):
+        payload = self._payload(as_environment=True)
+        self.assertNotIn("terminal", payload)
+        self.assertNotIn("parentId", payload)
+        self.assertEqual(payload["workspacePath"], "/srv/project")
+
+    def test_ordinary_sub_terminal_still_registers_as_terminal(self):
+        payload = self._payload(as_environment=False)
+        self.assertEqual(payload["terminal"]["name"], "helpwo")
+        self.assertEqual(payload["parentId"], "parent-agent")
+
+
+class SubterminalGracefulExitTests(unittest.TestCase):
+    def test_waits_for_a_slow_sigterm_handler(self):
+        """The nested CLI unregisters from Helpwo inside its SIGTERM handler;
+        closing must not SIGKILL it before that finishes."""
+        import subprocess
+        import laintas_cli
+        marker = Path(tempfile.mkdtemp()) / "unregistered"
+        script = (
+            "import signal, sys, time\n"
+            "def h(*_):\n"
+            "    time.sleep(1.5)\n"
+            f"    open({str(marker)!r}, 'w').write('ok')\n"
+            "    sys.exit(0)\n"
+            "signal.signal(signal.SIGTERM, h)\n"
+            "print('ready', flush=True)\n"
+            "time.sleep(60)\n")
+        proc = subprocess.Popen([sys.executable, "-c", script], stdout=subprocess.PIPE)
+        try:
+            proc.stdout.readline()
+            sess = SimpleNamespace(pid=proc.pid, is_alive=lambda: proc.poll() is None)
+            laintas_cli._let_subterminal_exit(sess, timeout=8.0)
+            self.assertIsNotNone(proc.poll())
+            self.assertTrue(marker.exists())
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
