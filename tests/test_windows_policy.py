@@ -92,6 +92,24 @@ class WindowsCommandDecisionTests(unittest.TestCase):
                         '-DisableRealtimeMonitoring $true"'):
             self.assertEqual(self.decide(command).action, "deny", command)
 
+    def test_format_as_an_argument_is_not_the_disk_formatter(self):
+        """Audit 2026-09-17: `docker ps --format` was denied as `format`."""
+        for command in ('docker ps --format "{{.Names}}"',
+                        "docker inspect web --format '{{.State.Status}}'",
+                        "git log --format=%H -1"):
+            self.assertNotEqual(self.decide(command).action, "deny", command)
+        for command in ("cmd.exe /c format D: /y", "echo x; diskpart /s s.txt",
+                        "C:\\Windows\\System32\\format.com C:"):
+            self.assertEqual(self.decide(command).action, "deny", command)
+
+    def test_a_saved_config_loses_the_superseded_format_rule(self):
+        old_rule = r"(?i)\b(?:format|diskpart|bcdedit|bootrec)(?:\.exe)?\s"
+        cfg = {"deny": [old_rule], "needs_approval": [], "denyFileWrite": []}
+        with mock.patch.object(policy.json_store, "save_json_atomic"):
+            migrated = policy._migrate_config(cfg)
+        self.assertNotIn(old_rule, migrated["deny"])
+        self.assertTrue(any("diskpart" in rule for rule in migrated["deny"]))
+
     def test_an_encoded_rm_is_denied_through_the_wrapper(self):
         decision = self.decide("powershell.exe -enc cgBtACAALQByAGYAIAAvAA==")
         self.assertEqual(decision.action, "deny")

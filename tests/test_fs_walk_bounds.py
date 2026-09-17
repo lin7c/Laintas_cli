@@ -227,5 +227,50 @@ class GrepStreamingTests(unittest.TestCase):
         self.assertIn("incomplete", result)
 
 
+class GrepNoFalseNegativeTests(unittest.TestCase):
+    """A zero-match answer must mean "not there", not "not looked at".
+
+    Audit 2026-09-17: laintas_cli.py grew past the old 1 MB ceiling, grep
+    skipped it and returned ok/0 matches/not truncated, and the agent spent
+    twenty turns hunting for code that was in that file.
+    """
+
+    def _grep(self, root, **params):
+        ctx = ToolCtx(cwd=str(root), state={})
+        return tools.get_registry().invoke("fs.grep", dict(params), ctx)
+
+    def test_named_large_file_is_searched_regardless_of_size(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "big.py").write_text("x = 1\n" * 400 + "summarized\n", encoding="utf-8")
+            result = self._grep(root, pattern="summarized", path="big.py",
+                                max_file_size=100)
+        self.assertEqual(1, result["matches"])
+        self.assertNotIn("skipped_files", result)
+
+    def test_walk_reports_a_skipped_file_as_incomplete(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "big.py").write_text("x = 1\n" * 400 + "summarized\n", encoding="utf-8")
+            result = self._grep(root, pattern="summarized", path=".",
+                                max_file_size=100)
+        self.assertEqual(0, result["matches"])
+        self.assertTrue(result["truncated"])
+        self.assertIn("incomplete", result)
+        self.assertEqual("big.py", result["skipped_files"][0]["file"])
+
+    def test_extension_include_matches_at_any_depth(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "top.ts").write_text("nothing\n", encoding="utf-8")
+            (root / "a" / "b").mkdir(parents=True)
+            (root / "a" / "b" / "deep.ts").write_text("usable\n", encoding="utf-8")
+            loose = self._grep(root, pattern="usable", include="*.ts")
+            anchored = self._grep(root, pattern="usable", include="a/*.ts")
+        self.assertEqual(1, loose["matches"])
+        self.assertEqual(os.path.join("a", "b", "deep.ts"), loose["result"][0]["file"])
+        self.assertEqual(0, anchored["matches"])
+
+
 if __name__ == "__main__":
     unittest.main()

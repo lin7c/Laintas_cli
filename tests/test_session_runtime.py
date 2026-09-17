@@ -750,11 +750,34 @@ class AgentTerminationTests(unittest.TestCase):
             yield
         return status
 
+    def test_zero_context_budget_stops_before_backend_request(self):
+        agent_loop.set_runtime_config("use_message_thread", True)
+        with mock.patch.object(agent_loop, "compaction_budget", return_value={
+                "window": 32000, "reserved": 12000, "overhead": 35000, "usable": 0}):
+            result, calls, _ = self._run([{"reply": "must not run"}])
+        self.assertEqual(calls, [])
+        self.assertFalse(result["success"])
+
+    def test_failed_compaction_stops_overbudget_request(self):
+        agent_loop.set_runtime_config("use_message_thread", True)
+        agent_loop.set_runtime_config("intent_enabled", False)
+        with mock.patch.object(agent_loop, "compaction_budget", return_value={
+                "window": 32000, "reserved": 12000, "overhead": 11990, "usable": 10}), \
+                mock.patch.object(agent_loop, "_coordinate_compaction", return_value=False):
+            result, calls, _ = self._run([{"reply": "must not run"}], prompt="large task " * 200)
+        self.assertEqual(calls, [])
+        self.assertFalse(result["success"])
+
     def test_auto_compaction_shows_status_with_trigger_and_thinking_hints(self):
         deps, _calls = self._summary_deps()
         shown = []
         deps.status = self._recording_status(shown)
-        agent_loop.set_runtime_config("model_context_window", 20000)
+        agent_loop.set_runtime_config("model_context_window", 32000)
+        # A real 4k thread budget, after output reserve and fixed overhead.
+        budget_patch = mock.patch.object(agent_loop, "compaction_budget", return_value={
+            "window": 32000, "reserved": 12000, "overhead": 8000, "usable": 4000})
+        budget_patch.start()
+        self.addCleanup(budget_patch.stop)
         # The default is none (no hint); the hint only appears when thinking
         # is explicitly enabled, so pin a level here to test the hint itself.
         agent_loop.set_runtime_config("compact_review_effort", "medium")
@@ -935,7 +958,12 @@ class AgentTerminationTests(unittest.TestCase):
 
     def test_policy_auto_off_stops_automatic_but_not_forced_compaction(self):
         policy = dict(agent_loop.ctxpol.load(), auto=False)
-        agent_loop.set_runtime_config("model_context_window", 20000)
+        agent_loop.set_runtime_config("model_context_window", 32000)
+        # A real 4k thread budget, after output reserve and fixed overhead.
+        budget_patch = mock.patch.object(agent_loop, "compaction_budget", return_value={
+            "window": 32000, "reserved": 12000, "overhead": 8000, "usable": 4000})
+        budget_patch.start()
+        self.addCleanup(budget_patch.stop)
         with mock.patch.object(agent_loop.ctxpol, "load", return_value=policy):
             deps, calls = self._summary_deps()
             messages = self._multi_chunk_thread()
@@ -951,7 +979,12 @@ class AgentTerminationTests(unittest.TestCase):
 
     def test_automatic_compaction_also_consolidates_memories(self):
         agent_loop.set_runtime_config("mem_extract_on_compact", True)
-        agent_loop.set_runtime_config("model_context_window", 20000)
+        agent_loop.set_runtime_config("model_context_window", 32000)
+        # A real 4k thread budget, after output reserve and fixed overhead.
+        budget_patch = mock.patch.object(agent_loop, "compaction_budget", return_value={
+            "window": 32000, "reserved": 12000, "overhead": 8000, "usable": 4000})
+        budget_patch.start()
+        self.addCleanup(budget_patch.stop)
         deps, _calls = self._summary_deps()
         seen = {}
 

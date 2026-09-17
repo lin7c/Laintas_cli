@@ -1535,6 +1535,44 @@ class EphemeralSessionTests(unittest.TestCase):
             self.assertNotIn("syntax error", probe.stderr, command)
             self.assertIn("__RC__:", probe.stdout, command)
 
+    def test_a_search_that_finds_nothing_is_not_a_failure(self):
+        def classify(command, returncode=1, output="(no output)"):
+            return tools._classify_shell_result(
+                command, {"ok": False, "returncode": returncode, "result": output})
+        for command in ("grep -rn TODO src", "ps aux | grep '[n]ginx'",
+                        "cd x && rg needle", "LC_ALL=C git grep foo"):
+            result = classify(command)
+            self.assertTrue(result["ok"], command)
+            self.assertEqual("no_match", result["outcome"], command)
+            self.assertEqual(1, result["returncode"], command)
+        # A real failure keeps its failure.
+        self.assertFalse(classify("grep foo missing.txt", returncode=2)["ok"])
+        self.assertFalse(classify("false")["ok"])
+        self.assertFalse(classify("grep foo x; make")["ok"])
+        self.assertFalse(classify("grep foo x", output="grep: x: denied")["ok"])
+
+    def test_errexit_does_not_kill_or_poison_the_persistent_shell(self):
+        """Audit 2026-09-17: `set -e; false` exited the shell before the end
+        marker; `set -e; true` made the NEXT call's plain `false` exit it."""
+        sequences = (
+            ["set -e; false; echo __NOPE''__", "false", "echo __ALIVE''__"],
+            ["set -euo pipefail; true", "false", "echo __ALIVE''__"],
+            ["cd /tmp && source /dev/stdin <<< 'set -e'", "false", "echo __ALIVE''__"],
+        )
+        for commands in sequences:
+            script = ""
+            for index, command in enumerate(commands):
+                payload = tools.shell_payload_for_pty(
+                    command, noninteractive=True, token=f"t{index}")
+                script += f"{payload} 2>&1; echo __END{index}__:$?\n"
+            probe = subprocess.run(["bash", "--norc", "--noprofile", "-i"],
+                                   input=script, capture_output=True,
+                                   text=True, timeout=20)
+            self.assertIn("__END0__:", probe.stdout, commands)
+            self.assertIn("__END1__:1", probe.stdout, commands)
+            self.assertIn("__ALIVE__", probe.stdout, commands)
+            self.assertNotIn("__NOPE__", probe.stdout, commands)
+
     def test_direct_terminal_command_only_overrides_pager_variables(self):
         import laintas_cli
 

@@ -114,3 +114,28 @@ Tests use controllable thread events and a fake backend, covering:
 What this verifies is scheduling and data integrity, not a new live-model
 latency benchmark. The real cost and duration of background work still depend
 on the model and its concurrency limits.
+
+## Oversized turns and model budgets
+
+A known provider window below the configured window is a hard ceiling. Window
+memory is reloaded when the selected model changes. Fixed request overhead can
+leave zero usable message tokens; the CLI reports that condition and does not
+invent a minimum budget or send an oversized request after failed compaction.
+
+If a complete recent turn alone exceeds the foreground threshold, foreground
+compaction can summarize the whole conversation, including a single large user
+message or completed tool exchange. Incomplete tool exchanges are retained.
+Small short conversations still make manual compaction a no-op.
+
+Generation and review explicitly request the policy's summary output limit
+(default 4096 tokens, reduced for small windows). Source chunks reserve space for
+prompts, the previous summary, the review draft and output. Auxiliary calls use
+a conservative 32000-token ceiling, lowered by a remembered or observed smaller
+model window, and validate the assembled input before sending. An unknown model
+can still reject its first request; a reported smaller window informs subsequent
+attempts. An oversized legacy summary fails safely instead of being sliced.
+
+Truncated, filtered, tool-calling or oversized summary responses cannot replace
+source history. A failed review retains the complete generated draft, preserving
+the existing review fallback. These checks bound requests and reject incomplete
+results; they do not prove semantic fidelity of a model-generated summary.

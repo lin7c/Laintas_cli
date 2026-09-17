@@ -54,6 +54,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -621,9 +622,56 @@ def apply_source_update(manifest: dict, changed_files: list, channel_dir: str,
                     os.remove(bak)
                 except OSError:
                     pass
+
+        # 5) a changed requirements.txt means the update may have introduced
+        # a NEW pip dependency that file replacement alone cannot install
+        # (v1.29.2: terminal_preview.py shipped with pyte, and every
+        # source-updated install crashed /t with ModuleNotFoundError).
+        # Verify the declared deps are importable and tell the user exactly
+        # what to run when one is not — never fail the update over it.
+        req_dest = os.path.join(base, "requirements.txt")
+        if any(dest == req_dest for dest, _ in applied):
+            missing = _missing_dependencies(req_dest)
+            if missing:
+                log("[yellow]This update added Python dependencies that are "
+                    "not installed in this environment: "
+                    f"{', '.join(missing)}.[/yellow]")
+                log("[yellow]Install them with:[/yellow] "
+                    f"pip install {' '.join(missing)}")
         return True
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _missing_dependencies(req_path: str) -> list:
+    """Names from requirements.txt whose top-level module is not importable.
+
+    Best-effort: an unparseable or unreadable file yields [] rather than
+    blocking an otherwise-complete update. Lines are simple
+    ``name>=x.y`` specs; extras/environment markers are skipped via the
+    same import-name mapping setup.py would need, approximated by
+    stripping everything from the first of ``><=! ;[`` onward.
+    """
+    import importlib.util
+    try:
+        with open(req_path, "r", encoding="utf-8") as fh:
+            lines = fh.readlines()
+    except OSError:
+        return []
+    missing = []
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        # Skip optional extras sections if a file ever grows them
+        if line.startswith("-") or " #" in line:
+            continue
+        name = re.split(r"[><=!;\[ ]", line, maxsplit=1)[0].strip()
+        if not name:
+            continue
+        if importlib.util.find_spec(name) is None:
+            missing.append(name)
+    return missing
 
 
 def apply_frozen_update(manifest: dict, channel_dir: str, log) -> Optional[str]:

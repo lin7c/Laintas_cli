@@ -162,7 +162,10 @@ _DEFAULT_CONFIG = {
         # Same tier as `mkfs` and `dd of=/dev/…` on the Linux side: no
         # approval prompt is meaningful for these because there is nothing to
         # restore afterwards.
-        r"(?i)\b(?:format|diskpart|bcdedit|bootrec)(?:\.exe)?\s",
+        # Program position only: `docker ps --format`, `git log --format`
+        # are arguments, not the disk formatter (variants are already split
+        # into single commands, so `^` covers `cmd /c format` too).
+        r"(?i)(?:^|[;&|(]\s*|[\\/])(?:format|diskpart|bcdedit|bootrec)(?:\.exe|\.com)?\s",
         r"(?i)\bvssadmin(?:\.exe)?\s+delete\s+shadows\b",
         r"(?i)\bwbadmin(?:\.exe)?\s+delete\b",
         r"(?i)\bcipher(?:\.exe)?\s+/w\b",
@@ -486,6 +489,16 @@ def _migrate_config(cfg: dict) -> dict:
     _required_deny = [
         rule for rule in _DEFAULT_CONFIG["deny"] if rule.startswith("(?i)")
     ]
+    # v2026-09-17: rules replaced by a narrower form. Adding the new form alone
+    # would leave the old one in saved configs, still denying `docker ps
+    # --format` -- the false positive the replacement exists to remove.
+    _superseded_deny = [
+        r"(?i)\b(?:format|diskpart|bcdedit|bootrec)(?:\.exe)?\s",
+    ]
+    for rule in _superseded_deny:
+        if rule in deny_list:
+            deny_list = [r for r in deny_list if r != rule]
+            changed = True
     for rule in _required_approval:
         if rule not in approval_list:
             approval_list.append(rule)

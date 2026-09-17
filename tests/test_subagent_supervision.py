@@ -363,6 +363,8 @@ class ProviderWindowMemoryTests(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self._home = paths.LAINTAS_HOME
         self._window = agent_loop._provider_context_window
+        self._window_model = agent_loop._provider_window_model
+        self._cache_loaded = agent_loop._provider_window_cache_loaded
         self._key = agent_loop._provider_window_key
         # Isolate through LAINTAS_HOME, the same seam the product uses, so the
         # test proves the real path resolution rather than a patched constant.
@@ -375,7 +377,8 @@ class ProviderWindowMemoryTests(unittest.TestCase):
         agent_loop._provider_context_window = self._window
         agent_loop._provider_window_key = self._key
         agent_loop._provider_window_persisted.clear()
-        agent_loop._provider_window_cache_loaded = True
+        agent_loop._provider_window_cache_loaded = self._cache_loaded
+        agent_loop._provider_window_model = self._window_model
 
     def _cold_start(self):
         agent_loop._provider_context_window = 0

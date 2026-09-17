@@ -1098,6 +1098,17 @@ def _read_already_visible(ctx: ToolCtx, abs_path: str, start: int, end: int,
     ranges = file_pager.visible_ranges(state, abs_path)
     if not ranges or not file_pager.covered(ranges, start, end):
         return None
+    # Decline once. A caller that asks again for the same lines after being
+    # told they are visible evidently cannot use what it holds (cut to a
+    # budget, lost in a summary, or simply not found) -- the audit of
+    # 2026-09-17 saw one range refused three times in a row, each refusal a
+    # full model round trip. The second ask gets the bytes.
+    refused = state.setdefault("_read_visible_refusals", {})
+    key = f"{abs_path}:{start}-{end}"
+    if refused.get(key):
+        refused.pop(key, None)
+        return None
+    refused[key] = True
     shown = ", ".join(f"{a}-{b}" for a, b in ranges[:4])
     return {
         "ok": False,
@@ -2826,6 +2837,9 @@ def _fs_active_excludes(search_root: str) -> list[str]:
             if not (seg and f"/{seg}/" in root)]
 
 
+_GREP_MAX_FILE_SIZE = 8 * 1024 * 1024
+
+
 def _bi_fs_grep(params: dict, ctx: ToolCtx) -> dict:
     """Search for a regex pattern in files under a directory.
 
@@ -2840,7 +2854,11 @@ def _bi_fs_grep(params: dict, ctx: ToolCtx) -> dict:
     exclude = params.get("exclude", "")
     max_results = int(params.get("max_results", 100))
     case_sensitive = params.get("case_sensitive", True)
-    max_file_size = int(params.get("max_file_size", 1048576))  # 1MB default
+    # The size ceiling only guards the directory walk against generated blobs;
+    # a file the caller named is always read (line by line, so size is not a
+    # memory concern). Either way a skipped file is reported, never silent:
+    # a zero-match answer that quietly left files out is false evidence.
+    max_file_size = int(params.get("max_file_size") or _GREP_MAX_FILE_SIZE)
 
     if not pattern:
         return {"ok": False, "error": "missing 'pattern'"}
@@ -2856,6 +2874,7 @@ def _bi_fs_grep(params: dict, ctx: ToolCtx) -> dict:
 
     if not os.path.exists(abs_path):
         return {"ok": False, "error": f"Path not found: {abs_path}"}
+    base_dir = ctx.cwd or os.getcwd()
 
     # Exclude common directories
     exclude_patterns = ([e for e in exclude.split(",") if e.strip()]
@@ -2864,15 +2883,23 @@ def _bi_fs_grep(params: dict, ctx: ToolCtx) -> dict:
     results = []
     files_scanned = 0
     truncated = False
+    skipped = []
 
     limit = _WalkLimit(abs_path)
-    if os.path.isfile(abs_path):
+    explicit_file = os.path.isfile(abs_path)
+    if explicit_file:
         files = [abs_path]
     else:
         if isinstance(include, str):
             include = [g.strip() for g in include.split(",") if g.strip()]
         if not include:
             include = ["**/*"]
+        # `*.ts` means "TypeScript files" to every caller (ripgrep, gitignore);
+        # read as "top level only" it scanned one file and answered "no match"
+        # for a whole project. A pattern with no directory part matches at any
+        # depth; one that names a directory (`src/*.ts`) keeps its anchor.
+        include = [pat if "/" in pat.replace(os.sep, "/") else "**/" + pat
+                   for pat in include]
         matchers = [_glob_matcher(pat) for pat in include]
         prefix, max_depth = _glob_walk_plan(include)
         walk_root = os.path.join(abs_path, prefix) if prefix else abs_path
@@ -2917,9 +2944,13 @@ def _bi_fs_grep(params: dict, ctx: ToolCtx) -> dict:
         # Check file size
         try:
             fsize = os.path.getsize(filepath)
-            if fsize > max_file_size:
+            if fsize > max_file_size and not explicit_file:
+                skipped.append({"file": os.path.relpath(filepath, base_dir),
+                                "reason": f"larger than max_file_size ({fsize} bytes)"})
                 continue
-        except OSError:
+        except OSError as exc:
+            skipped.append({"file": os.path.relpath(filepath, base_dir),
+                            "reason": f"unreadable: {exc.strerror or exc}"})
             continue
 
         try:
@@ -2927,14 +2958,16 @@ def _bi_fs_grep(params: dict, ctx: ToolCtx) -> dict:
                 for lineno, line in enumerate(f, 1):
                     if regex.search(line):
                         results.append({
-                            "file": os.path.relpath(filepath, ctx.cwd or os.getcwd()),
+                            "file": os.path.relpath(filepath, base_dir),
                             "line": lineno,
                             "content": line.rstrip('\n')[:500],
                         })
                         if len(results) >= max_results:
                             truncated = True
                             break
-        except OSError:
+        except OSError as exc:
+            skipped.append({"file": os.path.relpath(filepath, base_dir),
+                            "reason": f"unreadable: {exc.strerror or exc}"})
             continue
         files_scanned += 1
 
@@ -2943,11 +2976,23 @@ def _bi_fs_grep(params: dict, ctx: ToolCtx) -> dict:
         "result": results,
         "matches": len(results),
         "files_scanned": files_scanned,
-        "truncated": truncated or bool(limit.reason),
+        "truncated": truncated or bool(limit.reason) or bool(skipped),
         "entries_scanned": limit.entries,
+        # Result paths are relative to this, which is the working directory,
+        # not `path` -- joining them onto `path` doubles the directory.
+        "paths_relative_to": base_dir,
     }
+    notes = []
     if limit.reason:
-        payload["incomplete"] = _walk_incomplete_note(limit)
+        notes.append(_walk_incomplete_note(limit))
+    if skipped:
+        payload["skipped_files"] = skipped[:20]
+        notes.append(
+            f"{len(skipped)} file(s) were NOT searched (see skipped_files), so zero "
+            "matches there is not evidence of absence. Search a skipped file by "
+            "passing it as `path`, or raise `max_file_size`.")
+    if notes:
+        payload["incomplete"] = " ".join(notes)
     return payload
 
 
@@ -6811,6 +6856,15 @@ def _ends_with_terminator(body: str) -> bool:
     return (len(head) - len(head.rstrip("\\"))) % 2 == 0
 
 
+# Shell options a command may flip that change how LATER commands behave.
+# Deliberately not `set +o` wholesale: in a command substitution job control
+# reads as off, and replaying that would switch it off in the real shell.
+_RESTORED_SHELL_OPTIONS = ("errexit nounset pipefail xtrace verbose noclobber "
+                           "noglob errtrace functrace noexec")
+_ENABLES_ERREXIT_RE = re.compile(
+    r"(?:^|[;&|({\s])set\s+(?:-[A-Za-z]*e[A-Za-z]*\b|(?:-[A-Za-z]+\s+)*-o\s+errexit\b)")
+
+
 def shell_payload_for_pty(command: str, *, noninteractive: bool = False,
                           token: str = "", agent_automation: bool = True) -> str:
     """Return the command form safe to embed in a one-line marker wrapper.
@@ -6837,16 +6891,33 @@ def shell_payload_for_pty(command: str, *, noninteractive: bool = False,
         if agent_automation else SHELL_PAGER_ASSIGNMENTS
     )
     body = payload.rstrip()
+    # The function body runs in the persistent shell, so an errexit it turns
+    # on would outlive it: `set -e; false` killed the shell before the end
+    # marker, and a successful `set -e; true` left a trap for the NEXT call's
+    # ordinary non-zero exit. Commands that enable errexit therefore run in a
+    # subshell (their `set -e` still aborts the command itself, with its real
+    # exit code; cd/export from such a command do not persist). The option
+    # snapshot below undoes anything the heuristic misses (`source x.sh`).
+    subshell = bool(_ENABLES_ERREXIT_RE.search(command))
     # `&` already terminates a command, so `{ cmd &; }` is a bash syntax
     # error — and a syntax error voids the WHOLE wrapper line, including the
     # end marker at the end of it. A backgrounded command therefore neither
     # ran nor ever reported completion: the caller sat out the full idle
     # budget and then signalled a shell that had nothing running in it.
     # `{ cmd ;; }` is the same trap approached from the other side.
+    terminated = f"{body}{'' if _ends_with_terminator(body) else ';'}"
+    if subshell:
+        terminated = f"( {terminated} );"
+    opts_name = f"__laintas_opts_{safe_token}"
+    traps_name = f"__laintas_traps_{safe_token}"
     return (
-        f"{function_name}() {{ {body}{'' if _ends_with_terminator(body) else ';'} }}; "
+        f"{function_name}() {{ {terminated} }}; "
+        f"{opts_name}=$(shopt -po {_RESTORED_SHELL_OPTIONS}); "
+        f"{traps_name}=$(trap -p ERR RETURN DEBUG); "
         f"{assignments} {function_name}; "
-        f"{rc_name}=$?; unset -f {function_name}; (exit \"${rc_name}\")"
+        f"{rc_name}=$?; unset -f {function_name}; "
+        f"eval \"${opts_name}\"; trap - ERR RETURN DEBUG; eval \"${traps_name}\"; "
+        f"unset {opts_name} {traps_name}; (exit \"${rc_name}\")"
     )
 
 
@@ -7304,7 +7375,54 @@ def _command_has_cd_prefix(command: str) -> bool:
     return False
 
 
+_SEARCH_PROGRAMS = {"grep", "egrep", "fgrep", "rg", "ag", "ack"}
+
+
+def _last_program_is_search(command: str) -> bool:
+    """Whether the command's final pipeline stage is a text search."""
+    tail = re.split(r"\|\||&&|[;|\n]", command.strip())[-1].strip()
+    try:
+        words = shlex.split(tail)
+    except ValueError:
+        words = tail.split()
+    while words and ("=" in words[0] and not words[0].startswith("-")):
+        words = words[1:]  # FOO=bar grep ...
+    if words and words[0] in ("sudo", "command", "env", "nice", "timeout"):
+        words = [w for w in words[1:] if not re.fullmatch(r"-\S*|\d+[smh]?", w)]
+    if not words:
+        return False
+    program = os.path.basename(words[0])
+    if program == "git" and len(words) > 1 and words[1] == "grep":
+        return True
+    return program in _SEARCH_PROGRAMS
+
+
+def _classify_shell_result(command: str, result: dict) -> dict:
+    """Tell "searched and found nothing" apart from "the command failed".
+
+    grep exits 1 on no match. Reported as ok=False it read as a failure, and
+    the audit of 2026-09-17 found models "repairing" cleanup checks whose whole
+    point was to find nothing. Only exit 1 with no output from a search as the
+    last stage qualifies; the real exit code stays on the result.
+    """
+    if (isinstance(result, dict) and not result.get("ok")
+            and result.get("returncode") == 1
+            and str(result.get("result") or "").strip() in ("", "(no output)")
+            and not result.get("error")
+            and _last_program_is_search(command)):
+        result["ok"] = True
+        result["outcome"] = "no_match"
+        result["result"] = "(no matches; exit 1 from the search is not an error)"
+    return result
+
+
 def _bi_shell_exec(params: dict, ctx: ToolCtx) -> dict:
+    """Execute a shell command, then classify a search's empty exit 1."""
+    return _classify_shell_result(str(params.get("command") or ""),
+                                  _bi_shell_exec_raw(params, ctx))
+
+
+def _bi_shell_exec_raw(params: dict, ctx: ToolCtx) -> dict:
     """Execute a shell command.
 
     A deployed agent executes on its persistent terminal. An undeployed worker
@@ -9752,11 +9870,16 @@ def register_builtin_tools() -> None:
                     "pattern": {"type": "string", "description": "regex pattern to search for"},
                     "path": {"type": "string", "default": ".", "description": "file or directory to search"},
                     "include": {"type": "string", "default": "**/*",
-                                "description": "comma-separated glob patterns to include"},
+                                "description": "comma-separated glob patterns to include, relative to path. "
+                                               "A pattern without '/' matches at any depth ('*.ts' = every .ts file); "
+                                               "one with '/' is anchored ('src/*.ts' = only directly under src)"},
                     "exclude": {"type": "string", "default": "",
                                 "description": "comma-separated glob patterns to exclude"},
                     "max_results": {"type": "integer", "default": 100},
                     "case_sensitive": {"type": "boolean", "default": True},
+                    "max_file_size": {"type": "integer", "default": _GREP_MAX_FILE_SIZE,
+                                      "description": "bytes; larger files in a directory walk are skipped and listed "
+                                                     "in skipped_files. A file passed as path is always searched"},
                 },
                 "required": ["pattern"],
             },

@@ -5838,6 +5838,57 @@ def _is_context_overflow(error_text: str) -> bool:
     return bool(_OVERFLOW_RE.search(str(error_text)))
 
 
+def _summary_token_count(text: str) -> int:
+    return (tokenizer.count_tokens(text) if tokenizer is not None
+            else ctxpol.estimate_tokens(text))
+
+
+_summary_observed_windows: dict[str, int] = {}
+
+
+def _summary_window(model: str) -> int:
+    """Conservative ceiling until this model has reported its real window."""
+    if not model:
+        return min(32000, _effective_context_window())
+    try:
+        known = json_store.load_json(_provider_window_file(), {}) or {}
+        window = int(_summary_observed_windows.get(model) or known.get(model) or 32000)
+        return min(32000, window) if window > 0 else 32000
+    except Exception:
+        return 32000
+
+
+def _summary_output_limit() -> int:
+    models = (aux_model_override()[0],
+              str(ctxpol.load().get("summary_review_model") or "deepseek-v4-flash"))
+    return max(1, min(int(ctxpol.load().get("summary_output_tokens") or 4096),
+                      min(_summary_window(model) for model in models) // 8))
+
+
+def _summary_request_fits(model: str, prompt: str, message: str) -> bool:
+    return (_summary_token_count(prompt) + _summary_token_count(message)
+            + _summary_output_limit() + 512 <= _summary_window(model))
+
+
+def _note_summary_window(response, model: str) -> None:
+    if isinstance(response, dict):
+        try:
+            window = int((response.get("_budget") or {}).get("contextWindow") or 0)
+            if window > 0 and model:
+                _summary_observed_windows[model] = window
+        except (TypeError, ValueError):
+            pass
+
+
+def _complete_summary_response(response) -> bool:
+    """Nonempty text is insufficient: a cut stream may have every heading."""
+    return (isinstance(response, dict) and not response.get("error")
+            and not response.get("_truncated") and not response.get("tool_calls")
+            and response.get("finish_reason") in (None, "", "stop", "end_turn")
+            and isinstance(response.get("reply"), str)
+            and _summary_token_count(response["reply"]) <= _summary_output_limit())
+
+
 def _llm_summarize(deps, session, current_path: str, head_text: str,
                    prev_summary: Optional[str], lang: str,
                    trajectory_id: str = "",
@@ -5859,7 +5910,10 @@ def _llm_summarize(deps, session, current_path: str, head_text: str,
                        "\n</trusted-previous-summary>\n\n<source-transcript>\n" +
                        head_text + "\n</source-transcript>")
         _aux_m, _aux_p = aux_model_override()
+        if not _summary_request_fits(_aux_m, sys_prompt, message):
+            return None
         resp = deps.call_backend(
+            max_tokens_override=_summary_output_limit(),
             session=session,
             message=message,
             system_prompt=sys_prompt,
@@ -5873,7 +5927,8 @@ def _llm_summarize(deps, session, current_path: str, head_text: str,
             # sat on every remaining chunk before noticing the interrupt.
             **({"interrupt_event": interrupt_event} if interrupt_event is not None else {}),
         )
-        if not isinstance(resp, dict) or resp.get("error"):
+        _note_summary_window(resp, _aux_m)
+        if not _complete_summary_response(resp):
             return None
         text = (resp or {}).get("reply", "") if isinstance(resp, dict) else ""
         text = (text or "").strip()
@@ -5919,14 +5974,18 @@ def _llm_review_summary(deps, session, current_path: str, source_text: str,
         extra = {} if effort == "auto" else {"effort_override": effort}
         if interrupt_event is not None:
             extra["interrupt_event"] = interrupt_event
+        if not _summary_request_fits(review_model, prompt, evidence):
+            return candidate
         resp = deps.call_backend(
+            max_tokens_override=_summary_output_limit(),
             session=session, message=evidence, system_prompt=prompt,
             current_path=current_path, history=[], lang=lang,
             tools_enabled=False, model_override=review_model,
             provider_override=None, task_kind="compaction_review",
             trajectory_id=trajectory_id, **extra,
         )
-        if not isinstance(resp, dict) or resp.get("error"):
+        _note_summary_window(resp, review_model)
+        if not _complete_summary_response(resp):
             return candidate
         reviewed = ((resp or {}).get("reply", "")
                     if isinstance(resp, dict) else "").strip()
@@ -6074,6 +6133,21 @@ def _summarize_head_in_chunks(deps, session, head: list,
     the next fold, keeping both generation and review source inputs bounded.
     """
     chunk_budget = max(4000, int(get_runtime_config("compact_chunk_tokens") or 24000))
+    # Review includes both the previous summary and the new draft. Reserve
+    # both before splitting source; validate the fully assembled calls as well.
+    output = _summary_output_limit()
+    previous = max(output, _summary_token_count(prev_summary or ""))
+    generation_window = _summary_window(aux_model_override()[0])
+    review_window = _summary_window(str(ctxpol.load().get("summary_review_model")
+                                       or "deepseek-v4-flash"))
+    chunk_budget = min(
+        chunk_budget,
+        generation_window - previous - output - 1024
+        - _summary_token_count(ctxpol.summary_prompt(lang)),
+        review_window - previous - 2 * output - 1024
+        - _summary_token_count(ctxpol.review_prompt(lang, previous_summary=prev_summary)))
+    if chunk_budget <= 0:
+        return None
     cwd = current_path or os.getcwd()
 
     slices = _summary_source_chunks(head, chunk_budget)
@@ -6338,6 +6412,9 @@ def _coordinate_compaction(messages, deps, session, lang, state, *,
         return False
     budget = compaction_budget(state)
     usable = budget["usable"]
+    if usable <= 0:
+        coordinator.close()
+        return False
     foreground_at = int(usable * get_runtime_config("compact_auto_ratio"))
     key = _compaction_job_key(state)
 
@@ -6461,7 +6538,7 @@ def _compact_thread_messages(thread_messages: list, deps, session, lang: str, st
     and always proceeds to prune + summarize — used after a provider
     context-overflow error to shrink the thread before retrying the turn.
     """
-    if ctxpol is None or len(thread_messages) < 4:
+    if ctxpol is None or not thread_messages:
         return False
     try:
         # Reserves what the request adds on top of the thread (system prompt +
@@ -6470,6 +6547,8 @@ def _compact_thread_messages(thread_messages: list, deps, session, lang: str, st
         budget = compaction_budget(state)
         window, usable = budget["window"], budget["usable"]
         before_tokens = _thread_tokens(thread_messages)
+        if usable <= 0:
+            return False
         # A successful prune must leave working room, not merely slip below
         # the trigger and compact again after the next tool result.
         target = int(usable * get_runtime_config("compact_target_ratio"))
@@ -6506,8 +6585,23 @@ def _compact_thread_messages(thread_messages: list, deps, session, lang: str, st
 
         # 2) Keep a bounded recent tail, including within one long user turn.
         # Never separate a tool result from its assistant tool-call batch.
-        if tail_start <= 1 or tail_start >= len(thread_messages):
-            return changed
+        # An oversized recent turn can itself occupy the whole window. In
+        # that case fold the complete conversation, keeping tool batches whole.
+        # Never compact an unfinished tool exchange.
+        emergency = (_thread_tokens(thread_messages[tail_start:]) >= trigger
+                     or tail_start <= 1 or tail_start >= len(thread_messages))
+        if emergency:
+            if before_tokens < trigger:
+                return changed
+            pending = set()
+            for message in thread_messages:
+                pending.update(call.get("id") for call in message.get("tool_calls", [])
+                               if call.get("id"))
+                if message.get("role") == "tool":
+                    pending.discard(message.get("tool_call_id"))
+            if pending:
+                return changed
+            tail_start = len(thread_messages)
         head = thread_messages[:tail_start]
         if not any((_serialize_thread_msg(m) or "").strip() for m in head):
             return changed
@@ -6566,6 +6660,7 @@ _provider_context_window: int = 0
 # near the real window, paying for a summarization call and losing verbatim
 # history for nothing.
 _provider_window_cache_loaded = False
+_provider_window_model = None
 # What we believe is already on disk, per model. Without it the "has this
 # changed?" test has to read the file on every response, and answering it from
 # the in-memory window instead is wrong: that value can already equal `tokens`
@@ -6589,11 +6684,13 @@ def _provider_window_key() -> str:
 
 def _load_remembered_provider_window() -> None:
     """Seed _provider_context_window from the last run that saw the real one."""
-    global _provider_context_window, _provider_window_cache_loaded
-    if _provider_window_cache_loaded:
+    global _provider_context_window, _provider_window_cache_loaded, _provider_window_model
+    key = _provider_window_key()
+    if _provider_window_cache_loaded and _provider_window_model == key:
         return
     _provider_window_cache_loaded = True
-    key = _provider_window_key()
+    _provider_window_model = key
+    _provider_context_window = 0
     if not key:
         return
     try:
@@ -6601,17 +6698,19 @@ def _load_remembered_provider_window() -> None:
         value = int(remembered.get(key) or 0)
     except Exception:
         value = 0
-    if value > 0 and value > _provider_context_window:
+    if value > 0:
         _provider_context_window = value
 
 
 def _note_provider_context_window(tokens: int) -> None:
-    global _provider_context_window
+    global _provider_context_window, _provider_window_model, _provider_window_cache_loaded
     if not tokens or tokens <= 0:
         return
     tokens = int(tokens)
     _provider_context_window = tokens
     key = _provider_window_key()
+    _provider_window_model = key
+    _provider_window_cache_loaded = True
     if not key or _provider_window_persisted.get(key) == tokens:
         return
     try:
@@ -6642,7 +6741,7 @@ def _effective_context_window() -> int:
         cap = int(get_runtime_config("context_window_adopt_cap")
                   or _CONTEXT_WINDOW_ADOPT_CAP)
         return min(_provider_context_window, cap)
-    return configured
+    return min(configured, _provider_context_window) if _provider_context_window > 0 else configured
 
 
 def aux_model_override() -> tuple[str, str]:
@@ -6727,7 +6826,7 @@ def compaction_budget(state: Optional[dict] = None) -> dict:
         "window": window,
         "reserved": reserved,
         "overhead": overhead,
-        "usable": max(4000, reserved - overhead) if ctxpol is not None else 0,
+        "usable": max(0, reserved - overhead) if ctxpol is not None else 0,
     }
 
 
@@ -7066,7 +7165,10 @@ def compact_session_context(deps, session: dict, state: dict,
     if not before["supported"]:
         return {**before, "ok": False, "changed": False,
                 "error": "context compaction policy is unavailable"}
-    if before["messages"] < 4:
+    if before["usable"] <= 0:
+        return {**before, "ok": False, "changed": False,
+                "error": "system prompt, tools and output reserve exhaust the context window"}
+    if before["messages"] < 4 and before["tokens"] < before["auto_at"]:
         return {**before, "ok": True, "changed": False,
                 "after_tokens": before["tokens"],
                 "reason": "not enough message history to compact"}
@@ -7096,7 +7198,8 @@ def compact_session_context(deps, session: dict, state: dict,
         1 for item in messages
         if isinstance(item, dict) and item.get("role") == "user")
     tail_turns = max(1, int(ctxpol.load().get("tail_turns", 2) or 2))
-    if not changed and user_turn_count > tail_turns + 1:
+    if not changed and (user_turn_count > tail_turns + 1
+                        or before["tokens"] >= before["auto_at"]):
         return {
             **before,
             "ok": False,
@@ -7379,7 +7482,7 @@ STATE_KEYS_TURN_ONLY = frozenset({
     "_persisted_employee", "_recent_failures", "_retry_count", "_role_name",
     "_snapshot_done", "_snapshot_pending", "_snapshot_sha", "_submitted_outputs",
     "_suppress_terminal_render", "_sys_prompt_churn", "_sys_prompt_digest",
-    "_thread_mode", "_visible_reads", "_workflow_phase",
+    "_thread_mode", "_visible_reads", "_read_visible_refusals", "_workflow_phase",
     # Run-scoped identity and bookkeeping. All turn-only by current behaviour:
     # none of them appears in the copy below, so none of them crosses.
     "_assignment_task", "_evolution_lab_branch", "_max_write_lines",
@@ -11211,6 +11314,11 @@ def run_agent_loop(
             )
             state["_transient_prompt_tokens"] = _thread_tokens(
                 [{"role": "user", "content": _live_state}]) if _live_state.strip() else 0
+            if compaction_budget(state)["usable"] <= 0:
+                deps.console.print("[yellow]Context window exhausted by system prompt, tools "
+                                   "and output reserve; reduce them or select a larger model.[/yellow]")
+                _exit_reason = TRANSITION_BACKEND_ERROR
+                break
             _coordinate_compaction(thread_messages, deps, session,
                                    _detect_lang(original_input), state,
                                    announce=True, interrupt_event=_interrupt)
@@ -11218,6 +11326,11 @@ def run_agent_loop(
                 _exit_reason = TRANSITION_INTERRUPTED if _interrupt.is_set() else TRANSITION_BACKEND_ERROR
                 if not _interrupt.is_set():
                     deps.console.print("[yellow]Context compaction is still cancelling; retry this turn shortly.[/yellow]")
+                break
+            if _thread_tokens(thread_messages) > compaction_budget(state)["usable"]:
+                deps.console.print("[yellow]Context still exceeds the model budget after compaction; "
+                                   "history was retained. Retry /compact or select a larger model.[/yellow]")
+                _exit_reason = TRANSITION_BACKEND_ERROR
                 break
             _publish_context_headroom(thread_messages, state)
             user_input = _live_state  # for debug display

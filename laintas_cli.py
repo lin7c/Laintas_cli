@@ -11991,7 +11991,22 @@ def show_terminal_manager(primary_session=None, agent_registry=None) -> None:
 
 def _show_terminal_manager_once(primary_session=None):
     """Live terminal manager with output preview and in-place lifecycle actions."""
-    from terminal_preview import TerminalPreview
+    # pyte is a runtime extra on source installs: an old venv reached by a
+    # /v self-update carries the new module but not the new dependency
+    # (v1.29.2 shipped terminal_preview.py + pyte together and every
+    # source-updated install crashed /t with ModuleNotFoundError). Degrade
+    # to the raw output view instead of failing the whole command.
+    try:
+        from terminal_preview import TerminalPreview
+    except ImportError:
+        TerminalPreview = None
+
+    class _RawPreview:
+        """Stand-in that skips VT rendering and returns the raw output."""
+
+        def render(self, output, columns, rows):
+            return None
+
     previews = {}
 
     def collect_rows():
@@ -12038,7 +12053,8 @@ def _show_terminal_manager_once(primary_session=None):
         output = getattr(session, "raw_output", None) if session else ""
         if not isinstance(output, str):
             output = session.full_output if session else ""
-        preview = previews.setdefault(name, TerminalPreview())
+        preview_cls = TerminalPreview or _RawPreview
+        preview = previews.setdefault(name, preview_cls())
         columns, rows = 100, 24
         fd = getattr(session, "master_fd", -1)
         if isinstance(fd, int) and fd >= 0:
