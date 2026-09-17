@@ -1365,7 +1365,6 @@ import extension_runtime         # hot-loaded project extension runtime
 import workgraph                 # unified objective/plan/steps/workflow state
 import hooks as hooks_mod        # trusted Python hooks + argv hooks
 import backend_profiles          # backend trust domains + credential isolation
-import ppos_client               # secure PPOS Agent API + autonomous policy
 import trust_store               # workspace trust for executable customization
 import winbridge                 # facts about the Windows side of WSL (no-op elsewhere)
 import usage_tracker             # local AI token/cost accounting (/usage)
@@ -3522,33 +3521,6 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
         )),
     CommandSpec("/hooks", "Manage executable hooks", "Config & Tools", "/hooks [status|trust|revoke|reload]", subcommands=("status", "trust", "revoke", "reload")),
     CommandSpec("/backend", "Manage backend trust profiles", "Config & Tools", "/backend [status|list|use <name>|config]", subcommands=("status", "list", "use", "config")),
-    CommandSpec(
-        "/ppos", "Publish to, and manage, your PPOS account", "Config & Tools",
-        "/ppos [account|storage|communities|works|work|draft|publish|comment|review|agent] ...",
-        subcommands=("account", "storage", "communities", "works", "work", "status", "publish",
-                     "draft", "comment", "community-review", "platform-review", "agent", "help"),
-        completion_descriptions=(
-            ("account", "Read the signed-in PPOS identity and account details"),
-            ("status", "Check PPOS account and service availability"),
-            ("storage", "Inspect quota or clean up unreferenced uploaded media"),
-            ("communities", "List communities you can publish to and your roles"),
-            ("works", "List published works and private drafts with their storage usage"),
-            ("work", "Read, edit, or permanently delete one existing work"),
-            ("draft", "Save Markdown privately without review, indexing, or a review fee"),
-            ("publish", "Submit Markdown or an existing draft to the review workflow"),
-            ("comment", "Post a comment with an optional 0–100 reader rating"),
-            ("community-review", "Inspect or decide moderation items for communities you manage"),
-            ("platform-review", "Admin-only: inspect or decide the platform review queue"),
-            ("agent", "Configure AI write scopes, daily caps, fees, and allowlists"),
-            ("help", "Show grouped PPOS commands, syntax, effects, and permission levels"),
-        ),
-        help_text=(
-            "Draft saves are private and do not enter review or incur a review fee. Publishing "
-            "uploads local images and videos into PPOS storage and rewrites their links. "
-            "/ppos storage shows what each work occupies; "
-            "/ppos storage cleanup reclaims media no work references any more. "
-            "Reads are briefly cached. AI-initiated writes stay disabled until "
-            "/ppos agent enable <scope>; /ppos agent policy shows caps and allowlists.")),
     CommandSpec("/max", "Lift runtime limits for this process", "Config & Tools"),
     CommandSpec("/tools", "List registered tools", "Config & Tools"),
     CommandSpec("/tool", "Invoke a tool directly", "Config & Tools", "/tool <name> [json-params]"),
@@ -4025,31 +3997,6 @@ _ARG_COMPLETIONS: dict[str, tuple] = {
          if prior[0].isdigit() else []),
         (("*", "*"), lambda _f, prior: [("--raw", "Do not redact credentials")]
          if prior[0].isdigit() else []),
-    ),
-    "/ppos": (
-        (("storage",), _static_candidates(
-            ("show", "Quota and per-work usage"), ("cleanup", "Find unreferenced media"))),
-        (("storage", "cleanup"), _static_candidates(("--apply", "Actually delete them"))),
-        (("work",), _static_candidates(
-            ("get", "Read one work"), ("delete", "Permanently delete one work"),
-            ("update", "Edit one work from JSON"))),
-        (("draft",), _static_candidates(("save", "Create or replace a private draft"))),
-        (("draft", "save"), _path_candidates((".md", ".markdown"))),
-        (("publish", "*", "*"), _path_candidates((".md", ".markdown"))),
-        ((("community-review", "platform-review"),), _static_candidates(
-            ("queue", "List items awaiting a decision"), ("decide", "Record a decision"))),
-        (("agent",), _static_candidates(
-            ("status", "Show the AI write policy"), ("enable", "Allow AI writes"),
-            ("disable", "Stop AI writes"), ("policy", "Show or set caps and allowlists"))),
-        ((("agent",), ("enable", "disable")), _static_candidates(
-            ("publish", "Publishing"), ("comment", "Comments"),
-            ("community_review", "Community moderation"),
-            ("platform_review", "Platform moderation"), ("all", "Every scope"))),
-        (("agent", "policy"), _static_candidates(("set", "Change one policy value"))),
-        (("agent", "policy", "set"), _static_candidates(
-            ("communities", "Comma-separated allowlist"), ("daily-publish", "Daily publish cap"),
-            ("daily-comment", "Daily comment cap"), ("fee-cap-cents", "Maximum fee per action"),
-            ("minimum-confidence", "Minimum review confidence"))),
     ),
 }
 
@@ -12772,12 +12719,6 @@ _SLASH_ARG_RULES: dict[tuple[str, ...], SlashArgRule] = {
     ("/identity", "check"): _arg_rule(2, "/identity check <name>"),
     ("/identity", "delete"): _arg_rule(2, "/identity delete <name>"),
     ("/identity", "capture"): _arg_rule(3, "/identity capture <name> [domains]"),
-    ("/ppos", "account"): _arg_rule(1, "/ppos account"),
-    ("/ppos", "status"): _arg_rule(1, "/ppos status"),
-    ("/ppos", "help"): _arg_rule(1, "/ppos help"),
-    ("/ppos", "communities"): _arg_rule(3, "/ppos communities [page] [size]"),
-    ("/ppos", "works"): _arg_rule(3, "/ppos works [page] [size]"),
-    ("/ppos", "storage"): _arg_rule(4, "/ppos storage [show|cleanup [--apply] [hours]]"),
     ("/hwo", "status"): _arg_rule(2, "/hwo status [runId]"),
     ("/abort",): _arg_rule(1, "/abort <agent-id>"),
     ("/agent",): _arg_rule(1, "/agent [agent-id-or-name]"),
@@ -16808,230 +16749,6 @@ def _cmd_backend(parts: list) -> None:
         console.print(str(backend_profiles.ensure_template()))
     else:
         console.print("[yellow]Usage: /backend \\[status|list|use <name>|config][/yellow]")
-
-
-def _ppos_print(value) -> None:
-    console.print(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True,
-                             default=str))
-
-
-def _cmd_ppos_agent(parts: list, session: dict) -> None:
-    action = parts[2].lower() if len(parts) > 2 else "status"
-    if action in ("status", "policy") and len(parts) <= 3:
-        _ppos_print(ppos_client.load_policy())
-        return
-    if action in ("enable", "disable"):
-        enabled = action == "enable"
-        scope = parts[3].lower().replace("-", "_") if len(parts) > 3 else ""
-        if not scope or scope == "all":
-            policy = ppos_client.update_policy(enabled=enabled)
-            if not enabled and scope == "all":
-                for item in ("publish", "comment", "community_review", "platform_review"):
-                    policy = ppos_client.update_policy(scope=item, scope_enabled=False)
-        else:
-            policy = ppos_client.update_policy(
-                enabled=True if enabled else None, scope=scope, scope_enabled=enabled)
-        server = ppos_client.PPOSClient(session).sync_server_policy()
-        _ppos_print({"local": policy, "server": server})
-        return
-    if action == "policy" and len(parts) >= 5 and parts[3].lower() == "set":
-        key = parts[4].lower().replace("-", "_")
-        value = parts[5] if len(parts) > 5 else ""
-        if key in ("communities", "community_allowlist"):
-            policy = ppos_client.update_policy(
-                community_allowlist=[v for v in value.split(",") if v])
-        elif key.startswith("daily_"):
-            scope = key[len("daily_"):]
-            policy = ppos_client.update_policy(daily_cap=(scope, int(value)))
-        elif key == "fee_cap_cents":
-            policy = ppos_client.update_policy(fee_cap_cents=int(value))
-        elif key in ("minimum_confidence", "minimum_review_confidence"):
-            policy = ppos_client.update_policy(minimum_review_confidence=float(value))
-        else:
-            raise ValueError("policy key must be communities, daily-<scope>, "
-                             "fee-cap-cents, or minimum-confidence")
-        server = ppos_client.PPOSClient(session).sync_server_policy()
-        _ppos_print({"local": policy, "server": server})
-        return
-    console.print("[yellow]Usage: /ppos agent [status|enable [scope]|disable [scope|all]|"
-                  "policy [set <key> <value>]][/yellow]")
-
-
-def _ppos_bytes(value) -> str:
-    amount = float(value or 0)
-    for unit in ("B", "KB", "MB", "GB"):
-        if amount < 1024 or unit == "GB":
-            return f"{amount:.0f} {unit}" if unit == "B" else f"{amount:.1f} {unit}"
-        amount /= 1024
-    return f"{amount:.1f} GB"
-
-
-def _ppos_show_storage(detail: dict) -> None:
-    """Storage as a bill: what the ceiling is, what is on it, what can go."""
-    used, limit = int(detail.get("used_bytes") or 0), int(detail.get("limit_bytes") or 1)
-    console.print(
-        f"[bold]PPOS storage[/bold]  {_ppos_bytes(used)} / {_ppos_bytes(limit)}"
-        f"  ({used * 100 // max(1, limit)}%)   free {_ppos_bytes(detail.get('remaining_bytes'))}"
-        + ("   [red]FULL[/red]" if detail.get("read_only") else ""))
-    console.print(
-        f"[dim]{detail.get('works_count', 0)}/{detail.get('max_works', 30)} works"
-        f" · {detail.get('comment_count', 0)} comments counted as "
-        f"{_ppos_bytes(detail.get('comment_bytes'))}"
-        f" · top-up 100 MB = $1/month"
-        + ("" if detail.get("review_fee_waived") else " · $1 review fee per publish")
-        + "[/dim]")
-    works = detail.get("works") or []
-    if not works:
-        return
-    table = RichTable(show_header=True, header_style="bold", box=None, padding=(0, 2, 0, 0))
-    table.add_column("Work ID", overflow="fold")
-    table.add_column("Title", overflow="fold")
-    table.add_column("Status")
-    table.add_column("Size", justify="right")
-    for work in works[:30]:
-        state = ("draft/private" if work.get("is_draft") else
-                 f"{work.get('status', '')}/{work.get('community_status', '')}")
-        table.add_row(work.get("id", ""), (work.get("title") or "")[:48],
-                      state,
-                      _ppos_bytes(work.get("storage_bytes")))
-    console.print(table)
-    if len(works) > 30:
-        console.print(f"[dim]… and {len(works) - 30} more; see /ppos works[/dim]")
-
-
-def _cmd_ppos(parts: list, session: dict) -> None:
-    """Explicit-user PPOS commands; autonomous policy gates live in AI tools."""
-    sub = parts[1].lower() if len(parts) > 1 else "status"
-    try:
-        if sub == "agent":
-            _cmd_ppos_agent(parts, session)
-            return
-        client = ppos_client.PPOSClient(session)
-        if sub == "storage":
-            operation = parts[2].lower() if len(parts) > 2 else "show"
-            if operation in ("show", "detail"):
-                _ppos_show_storage(client.read("storage"))
-            elif operation in ("cleanup", "sweep"):
-                flags = [p.lower() for p in parts[3:]]
-                apply_now = "--apply" in flags or "apply" in flags
-                hours = next((int(p) for p in flags if p.isdigit()), 24)
-                result = client.cleanup_storage(
-                    dry_run=not apply_now, min_age_hours=hours, autonomous=False)
-                console.print(
-                    f"Scanned {result.get('objects_scanned', 0)} objects, found "
-                    f"{result.get('orphans_found', 0)} unreferenced "
-                    f"({_ppos_bytes(result.get('bytes_reclaimable'))})"
-                    + (f", deleted {result.get('orphans_deleted', 0)}."
-                       if apply_now else ". Add --apply to actually delete them."))
-                if result.get("skipped_recent"):
-                    console.print(f"[dim]Skipped {result['skipped_recent']} file(s) newer than "
-                                  f"{hours}h — they may belong to a publish in progress[/dim]")
-                _ppos_print(result.get("orphans") or [])
-            else:
-                raise ValueError("Usage: /ppos storage [show|cleanup [--apply] [hours]]")
-        elif sub == "work":
-            operation = parts[2].lower() if len(parts) > 2 else ""
-            if operation == "delete" and len(parts) == 4:
-                _ppos_print(client.delete_work(parts[3], autonomous=False))
-            elif operation == "update" and len(parts) > 4:
-                patch = json.loads(" ".join(parts[4:]))
-                if not isinstance(patch, dict):
-                    raise ValueError("update detail must be a JSON object")
-                _ppos_print(client.update_work(
-                    parts[3], title=str(patch.get("title") or ""),
-                    markdown_path=str(patch.get("path") or ""),
-                    tags=patch.get("tags"), self_score=patch.get("self_score"),
-                    community=str(patch.get("community_id") or ""), autonomous=False))
-            elif operation == "get" and len(parts) == 4:
-                _ppos_print(client.read("work", filters={"work_id": parts[3]}))
-            else:
-                raise ValueError(
-                    "Usage: /ppos work [get <id>|delete <id>|update <id> "
-                    '{"title":…,"path":…,"tags":[…],"self_score":…,"community_id":…}]')
-        elif sub in ("account", "status"):
-            _ppos_print(client.read(sub))
-        elif sub in ("communities", "works"):
-            if not all(p.isdigit() for p in parts[2:4]):
-                raise ValueError(f"Usage: /ppos {sub} [page] [size] — both are whole numbers")
-            page = int(parts[2]) if len(parts) > 2 else 1
-            page_size = int(parts[3]) if len(parts) > 3 else 20
-            _ppos_print(client.read(sub, page=page, page_size=page_size))
-        elif sub == "publish":
-            if len(parts) < 5:
-                raise ValueError("Usage: /ppos publish <community> <score-0..100> <markdown-path> [title] [--draft-id=<id>]")
-            draft_flag = next((p for p in parts[5:] if p.startswith("--draft-id=")), "")
-            draft_id = draft_flag.split("=", 1)[1] if draft_flag else ""
-            title_parts = [p for p in parts[5:] if not p.startswith("--draft-id=")]
-            _ppos_print(client.publish_markdown(
-                parts[4], community=parts[2], self_score=float(parts[3]),
-                title=" ".join(title_parts), draft_id=draft_id, autonomous=False))
-        elif sub == "draft":
-            operation = parts[2].lower() if len(parts) > 2 else ""
-            if operation != "save" or len(parts) < 4:
-                raise ValueError("Usage: /ppos draft save <markdown-path> [draft-id] [title]")
-            draft_id = parts[4] if len(parts) > 4 and parts[4] != "-" else ""
-            title = " ".join(parts[5:]) if len(parts) > 5 else ""
-            _ppos_print(client.save_draft(
-                parts[3], draft_id=draft_id, title=title, autonomous=False))
-        elif sub == "comment":
-            if len(parts) < 4:
-                raise ValueError("Usage: /ppos comment <work-id> <comment> [rating]")
-            rating = None
-            comment_parts = parts[3:]
-            if len(comment_parts) > 1 and comment_parts[-1].isdigit():
-                rating = int(comment_parts.pop())
-            _ppos_print(client.comment(
-                parts[2], " ".join(comment_parts), rating=rating, autonomous=False))
-        elif sub in ("community-review", "platform-review"):
-            level = sub.split("-", 1)[0]
-            operation = parts[2].lower() if len(parts) > 2 else "queue"
-            if operation == "queue":
-                page = int(parts[3]) if len(parts) > 3 else 1
-                _ppos_print(client.read(f"{level}_review_queue", page=page))
-            elif operation == "decide":
-                if len(parts) < 7:
-                    raise ValueError(
-                        f"Usage: /ppos {sub} decide <id> <approve|reject|escalate> "
-                        "<confidence> <json-comment-reason-evidence>")
-                detail = json.loads(" ".join(parts[6:]))
-                if not isinstance(detail, dict):
-                    raise ValueError("review detail must be a JSON object")
-                _ppos_print(client.review_decision(
-                    level, parts[3], parts[4], confidence=float(parts[5]),
-                    comment=str(detail.get("comment") or ""),
-                    reason=str(detail.get("reason") or ""),
-                    evidence=detail.get("evidence") or [], score=detail.get("score"),
-                    community=str(detail.get("community") or ""), autonomous=False))
-            else:
-                raise ValueError(f"Usage: /ppos {sub} [queue [page]|decide ...]")
-        elif sub in ("help", "?"):
-            console.print(
-                "[bold]Read-only account information[/bold]\n"
-                "  /ppos account | status                         Identity, plan, and service status\n"
-                "  /ppos storage show                             Quota, free space, and per-work usage\n"
-                "  /ppos communities [page] [size]                Communities and your roles\n"
-                "  /ppos works [page] [size]                      Your published works and private drafts\n\n"
-                "[bold]Private drafting — no review fee[/bold]\n"
-                "  /ppos draft save <md> [draft-id|-] [title]     Create or replace a private draft\n"
-                "  /ppos work get <id>                            Read full Markdown and status\n\n"
-                "[bold]Publishing — submits for review[/bold]\n"
-                "  /ppos publish <community> <score> <md> [title] [--draft-id=<id>]\n"
-                "                                                   Publish new content or submit a draft\n\n"
-                "[bold]Content management — may mutate data[/bold]\n"
-                "  /ppos work update <id> <json>                  Edit title/body/tags/score/community\n"
-                "  /ppos work delete <id>                         Permanently delete one work\n"
-                "  /ppos storage cleanup [--apply] [hours]        Find or delete unreferenced media\n"
-                "  /ppos comment <work-id> <text> [rating]        Post a comment and optional rating\n\n"
-                "[bold]Moderation — role-gated[/bold]\n"
-                "  /ppos community-review queue|decide …          Community moderation\n"
-                "  /ppos platform-review queue|decide …           Admin-only platform moderation\n\n"
-                "[bold]AI permissions[/bold]\n"
-                "  /ppos agent status|enable|disable|policy …      Autonomous scopes, caps, and allowlists")
-        else:
-            console.print("[yellow]Usage: /ppos [account|storage|work|communities|works|status|"
-                          "draft|publish|comment|community-review|platform-review|agent] ...[/yellow]")
-    except (OSError, ValueError, ppos_client.PPOSClientError) as exc:
-        console.print(f"[red]PPOS: {exc}[/red]")
 
 
 def _cmd_hooks(parts: list) -> None:
@@ -24053,8 +23770,6 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
     elif action == "/backend":
         _cmd_backend(parts)
 
-    elif action == "/ppos":
-        _cmd_ppos(parts, session)
 
     elif action == "/hooks":
         _cmd_hooks(parts)

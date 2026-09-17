@@ -33,12 +33,12 @@ def _catalog():
     return {
         "schema_version": 1,
         "skills": [{
-            "name": "ppos-authoring",
+            "name": "demo-authoring",
             "description": "Create and publish interactive PPOS works.",
             "revision": "gateway-0123456789ab",
             "sha256": "a" * 64,
             "manual": "# PPOS authoring\n\nUse the native PPOS tools.",
-            "clients": {"laintas_cli": {"trigger_patterns": ["PPOS", "ppos-app"]}},
+            "clients": {"laintas_cli": {"trigger_patterns": ["Demo", "demo-app"]}},
         }],
     }
 
@@ -57,7 +57,7 @@ class GatewaySkillSyncTests(unittest.TestCase):
                     requests_module=fake,
                 )
 
-            target = root / "ppos-authoring"
+            target = root / "demo-authoring"
             self.assertTrue(result[0][1])
             self.assertTrue((target / "SKILL.md").is_file())
             self.assertFalse((target / "skill.py").exists())
@@ -66,15 +66,15 @@ class GatewaySkillSyncTests(unittest.TestCase):
             self.assertEqual(marker["managed_by"], "gateway")
             text = (target / "SKILL.md").read_text(encoding="utf-8")
             self.assertIn("version: gateway-0123456789ab", text)
-            self.assertIn("  - \"ppos-app\"", text)
+            self.assertIn("  - \"demo-app\"", text)
             self.assertEqual(fake.calls[0][1]["headers"]["Authorization"], "Bearer token")
 
     def test_user_owned_skill_with_same_name_is_preserved(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            target = root / "ppos-authoring"
+            target = root / "demo-authoring"
             target.mkdir(parents=True)
-            custom = "---\nname: ppos-authoring\ndescription: Mine\n---\nDo not replace.\n"
+            custom = "---\nname: demo-authoring\ndescription: Mine\n---\nDo not replace.\n"
             (target / "SKILL.md").write_text(custom, encoding="utf-8")
             fake = _Requests(_catalog())
             profile = backend_profiles.BackendProfile(

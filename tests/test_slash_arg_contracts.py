@@ -57,8 +57,7 @@ class ArgumentContractTests(unittest.TestCase):
                 "/handoff list mine", "/shared ls a b", "/shared delete a b",
                 "/windows stop now", "/windows start write now",
                 "/web status now", "/web test google bing",
-                "/identity delete a b", "/ppos account me", "/ppos works 1 2 3",
-                "/why 1 2", "/hwo status run1 run2", "/evolve status now",
+                "/identity delete a b", "/why 1 2", "/hwo status run1 run2", "/evolve status now",
                 "/prompt branches all", "/task mine now", "/task agent a b",
                 "/mode auto now", "/mode delete a b", "/policy status now"):
             with self.subTest(command=command):

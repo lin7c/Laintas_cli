@@ -10,7 +10,6 @@ Layout:
     ├── session.json                     # Authentication session
     ├── history                          # REPL command history
     ├── policy.json                      # Security policy rules
-    ├── ppos_policy.json                 # PPOS autonomous-action policy and counters
     ├── audit.log                        # Command audit trail
     ├── hooks.json                       # Shell-based hook definitions
     ├── hooks.py                         # Python function hooks
@@ -139,7 +138,6 @@ HOOKS_FILE        = LAINTAS_HOME / "hooks.json"
 PYTHON_HOOKS_FILE = LAINTAS_HOME / "hooks.py"
 MCP_FILE          = LAINTAS_HOME / "mcp.json"
 BACKENDS_FILE     = LAINTAS_HOME / "backends.json"
-PPOS_POLICY_FILE  = LAINTAS_HOME / "ppos_policy.json"
 TRUST_FILE        = LAINTAS_HOME / "trust.json"
 TASKS_FILE        = LAINTAS_HOME / "tasks.json"
 MESSAGES_READ_FILE = LAINTAS_HOME / "messages_read.json"
@@ -286,7 +284,6 @@ def ensure_home() -> None:
         except OSError:
             pass
     for private_file in (
-        CONFIG_FILE, SESSION_FILE, POLICY_FILE, PPOS_POLICY_FILE, HOOKS_FILE, PYTHON_HOOKS_FILE,
         MCP_FILE, BACKENDS_FILE, TRUST_FILE, INTERACTIVE_COMMANDS_FILE,
         MESSAGES_READ_FILE,
     ):

@@ -43,7 +43,6 @@
     "workflow_engine",
     "auto_pilot",
     "backend_profiles",
-    "ppos_client",
     "durable_rules",
     "trust_store",
     "paths",

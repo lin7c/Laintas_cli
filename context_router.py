@@ -54,6 +54,9 @@ _GROUPS: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
      ("agent.", "agent_", "spawn", "await_spawns", "hwo", "hwg")),
     (("terminal", "repl", "process", "service", "server", "daemon", "logs", "port", "deploy"),
      ("terminal.", "session.", "sleep")),
+    (("hosted app", "hosted application", "app manifest", "app hosting",
+      "host the application", "host an app", "/app"),
+     ("app.",)),
     # Storage used to route on nothing at all: the one tool that reached the
     # cloud folder (file_push) hung off the "deploy" group, so a user asking
     # to put a report in their cloud folder got no storage schema whatsoever.
@@ -82,7 +85,6 @@ _GROUPS: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
     (("contract", "interface agreement", "mock"), ("contract.",)),
     (("prompt", "system prompt"), ("prompt.",)),
     (("evolve", "experiment"), ("evolve.",)),
-    (("ppos",), ("ppos.",)),
     (("cost", "spend", "budget", "balance", "quota", "usage", "tokens",
       "how much", "expensive", "bill", "subscription"),
      ("account.",)),
@@ -115,6 +117,8 @@ _INPUT_ALIASES = {
     "\u8fdb\u7a0b": "process", "\u670d\u52a1": "service", "\u670d\u52a1\u5668": "server",
     "\u65e5\u5fd7": "logs", "\u7aef\u53e3": "port", "\u90e8\u7f72": "deploy",
     "\u9006\u5411\u4efb\u52a1": "retask", "\u5e26\u6211": "guide me",
+    "\u6258\u7ba1\u5e94\u7528": "hosted application",
+    "\u5e94\u7528\u6258\u7ba1": "app hosting", "\u5b50\u7ec8\u7aef\u5e94\u7528": "hosted app",
     "\u4e00\u6b65\u6b65": "step by step", "\u505a\u9898": "exercise",
     "\u51fa\u9898": "quiz", "\u7ec3\u4e60": "practice", "\u62cd\u6444": "photo shoot",
     "\u5206\u955c": "shot list", "\u63a5\u5165": "integrate", "\u5bf9\u63a5": "integrate",

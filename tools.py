@@ -41,7 +41,6 @@ from typing import Any, Callable, Optional
 import paths
 import durable_rules
 import git_attribution
-import ppos_client
 from hwo_adapter import HWO_TOOL_DESCRIPTION
 
 
@@ -1630,95 +1629,6 @@ def _bi_fs_delete(params: dict, ctx: ToolCtx) -> dict:
                 f"\nThe working directory {left_behind} was inside it; "
                 f"the session moved to {cwd or 'no reachable directory'}.")
     return result
-
-
-def _ppos_client(ctx: ToolCtx) -> ppos_client.PPOSClient:
-    return ppos_client.PPOSClient(ctx.session, agent_id=ctx.agent_id or "")
-
-
-def _bi_ppos_read(kind: str, params: dict, ctx: ToolCtx) -> dict:
-    try:
-        result = _ppos_client(ctx).read(
-            kind, page=params.get("page", 1), page_size=params.get("page_size", 20),
-            filters={k: v for k, v in params.items() if k not in ("page", "page_size")})
-        return {"ok": True, "result": result}
-    except ppos_client.PPOSClientError as exc:
-        return {"ok": False, "error": str(exc)}
-
-
-def _bi_ppos_publish(params: dict, ctx: ToolCtx) -> dict:
-    try:
-        community = params.get("community_id") or params.get("community")
-        result = _ppos_client(ctx).publish_markdown(
-            params["path"], community=community,
-            self_score=params["self_score"], title=params.get("title", ""),
-            draft_id=params.get("draft_id", ""), autonomous=True)
-        return {"ok": True, "result": result}
-    except (OSError, ppos_client.PPOSClientError) as exc:
-        return {"ok": False, "error": str(exc)}
-
-
-def _bi_ppos_draft_save(params: dict, ctx: ToolCtx) -> dict:
-    try:
-        result = _ppos_client(ctx).save_draft(
-            params["path"], draft_id=params.get("draft_id", ""),
-            title=params.get("title", ""), autonomous=True)
-        return {"ok": True, "result": result}
-    except (OSError, ppos_client.PPOSClientError) as exc:
-        return {"ok": False, "error": str(exc)}
-
-
-def _bi_ppos_comment(params: dict, ctx: ToolCtx) -> dict:
-    try:
-        result = _ppos_client(ctx).comment(
-            params["work_id"], params.get("body") or params.get("comment", ""), rating=params.get("rating"),
-            community=params.get("community", ""), autonomous=True)
-        return {"ok": True, "result": result}
-    except ppos_client.PPOSClientError as exc:
-        return {"ok": False, "error": str(exc)}
-
-
-def _bi_ppos_work_update(params: dict, ctx: ToolCtx) -> dict:
-    try:
-        result = _ppos_client(ctx).update_work(
-            params["work_id"], title=params.get("title", ""),
-            markdown_path=params.get("path", ""), tags=params.get("tags"),
-            self_score=params.get("self_score"),
-            community=params.get("community_id", ""), autonomous=True)
-        return {"ok": True, "result": result}
-    except (OSError, ppos_client.PPOSClientError) as exc:
-        return {"ok": False, "error": str(exc)}
-
-
-def _bi_ppos_work_delete(params: dict, ctx: ToolCtx) -> dict:
-    try:
-        return {"ok": True, "result": _ppos_client(ctx).delete_work(
-            params["work_id"], autonomous=True)}
-    except ppos_client.PPOSClientError as exc:
-        return {"ok": False, "error": str(exc)}
-
-
-def _bi_ppos_storage_cleanup(params: dict, ctx: ToolCtx) -> dict:
-    try:
-        return {"ok": True, "result": _ppos_client(ctx).cleanup_storage(
-            dry_run=params.get("dry_run", True),
-            min_age_hours=int(params.get("min_age_hours", 24)), autonomous=True)}
-    except ppos_client.PPOSClientError as exc:
-        return {"ok": False, "error": str(exc)}
-
-
-def _bi_ppos_review(level: str, params: dict, ctx: ToolCtx) -> dict:
-    try:
-        review_id = params.get("work_id") or params.get("review_id")
-        result = _ppos_client(ctx).review_decision(
-            level, review_id, params["decision"],
-            comment=params.get("comment", ""), reason=params.get("reason", ""),
-            evidence=params.get("evidence") or [], confidence=params["confidence"],
-            score=params.get("score"),
-            community=params.get("community_id") or params.get("community", ""), autonomous=True)
-        return {"ok": True, "result": result}
-    except ppos_client.PPOSClientError as exc:
-        return {"ok": False, "error": str(exc)}
 
 
 def _bi_fs_write(params: dict, ctx: ToolCtx) -> dict:
@@ -6000,6 +5910,159 @@ def _bi_terminal_terminate(params: dict, ctx: ToolCtx) -> dict:
     return {"ok": False, "error": f"terminal '{target}' not found"}
 
 
+# ── Hosted applications (/app) ─────────────────────────────────────────
+#
+# Slash commands are user-side REPL entry points and are never shown to the
+# model, so the agent-facing surface of /app is these tools. The trust gate
+# stays human: app.trust.request only *asks*, through the same approval
+# channel shell commands use, and never writes the trust file on its own.
+
+def _app_manifests(ctx: ToolCtx):
+    """Discover app manifests visible from ctx.cwd. Returns (manifests, problems)."""
+    import app_host
+    return app_host.discover_manifests(ctx.cwd or os.getcwd())
+
+
+def _app_running(ctx: ToolCtx, name: str) -> bool:
+    import app_host
+    if ctx.get_terminal is None:
+        return False
+    term = ctx.get_terminal(name)
+    return bool(term is not None
+                and app_host.is_app_terminal(term, name)
+                and term.session is not None and term.session.is_alive())
+
+
+def _app_approval(ctx: ToolCtx, action: str, detail: str):
+    """Ask the user through the standard command-approval channel.
+
+    Returns True/False on the user's answer, or None when no approval channel
+    exists (non-interactive context) — callers report that differently from a
+    refusal.
+    """
+    approve_fn = getattr(ctx.deps, "request_command_approval", None) if ctx.deps else None
+    if not callable(approve_fn):
+        return None
+    try:
+        return bool(approve_fn(action, detail))
+    except Exception:
+        return False
+
+
+def _bi_app_list(params: dict, ctx: ToolCtx) -> dict:
+    import app_host
+    manifests, problems = _app_manifests(ctx)
+    apps = [{
+        "name": m.name,
+        "scope": m.scope,
+        "description": m.description,
+        "persistence": m.persistence,
+        "port": m.port,
+        "trusted": app_host.is_trusted(m),
+        "running": _app_running(ctx, m.name),
+    } for m in sorted(manifests.values(), key=lambda m: m.name)]
+    result = {"ok": True, "apps": apps}
+    if problems:
+        result["problems"] = problems
+    return result
+
+
+def _bi_app_manifest_get(params: dict, ctx: ToolCtx) -> dict:
+    import app_host
+    name = (params.get("name") or "").strip()
+    if not name:
+        return {"ok": False, "error": "missing 'name'"}
+    manifests, _ = _app_manifests(ctx)
+    manifest = manifests.get(name)
+    if manifest is None:
+        return {"ok": False, "error": f"no application named '{name}'"}
+    return {"ok": True, "manifest": manifest.raw, "scope": manifest.scope,
+            "source": manifest.source, "trusted": app_host.is_trusted(manifest),
+            "running": _app_running(ctx, name)}
+
+
+def _bi_app_trust_request(params: dict, ctx: ToolCtx) -> dict:
+    import app_host
+    name = (params.get("name") or "").strip()
+    if not name:
+        return {"ok": False, "error": "missing 'name'"}
+    note = (params.get("note") or "").strip()
+    manifests, _ = _app_manifests(ctx)
+    manifest = manifests.get(name)
+    if manifest is None:
+        return {"ok": False, "error": f"no application named '{name}'"}
+    if app_host.is_trusted(manifest):
+        return {"ok": True, "already_trusted": True}
+    detail = ("Trust a hosted application manifest. Once trusted, the application "
+              "can be started in its own sub-terminal with its own agent, and its "
+              f"session agents may run: {', '.join(manifest.session_tools)}.")
+    if note:
+        detail = f"{note}\n\n{detail}"
+    verdict = _app_approval(ctx, f"app.trust {name}", detail)
+    if verdict is None:
+        return {"ok": False,
+                "error": "trusting requires user approval but no approval channel is available"}
+    if not verdict:
+        return {"ok": False, "error": "user denied the trust request",
+                "_user_denied": True}
+    app_host.trust(manifest)
+    return {"ok": True, "trusted": name}
+
+
+def _bi_app_start(params: dict, ctx: ToolCtx) -> dict:
+    import app_host
+    name = (params.get("name") or "").strip()
+    if not name:
+        return {"ok": False, "error": "missing 'name'"}
+    manifests, _ = _app_manifests(ctx)
+    manifest = manifests.get(name)
+    if manifest is None:
+        return {"ok": False, "error": f"no application named '{name}'"}
+    if not app_host.is_trusted(manifest):
+        return {"ok": False,
+                "error": f"'{name}' is not trusted; request trust first (app.trust.request)"}
+    if _app_running(ctx, name):
+        return {"ok": True, "already_running": True}
+    verdict = _app_approval(ctx, f"app.start {name}",
+                            f"Start hosted application '{name}' in its own sub-terminal "
+                            "with its own agent.")
+    if verdict is None:
+        return {"ok": False,
+                "error": "starting requires user approval but no approval channel is available"}
+    if not verdict:
+        return {"ok": False, "error": "user denied the start request",
+                "_user_denied": True}
+    import laintas_cli as _lc
+    runtime = _lc._launch_app_subterminal(
+        name, persistent=manifest.persistence == app_host.PERSISTENCE_WORKSPACE,
+        options={}, agent_registry=None, open_url=False)
+    if runtime is None:
+        return {"ok": False, "error": f"could not start '{name}' in a sub-terminal"}
+    return {"ok": True, "status": runtime.get("status") or "starting",
+            "runtime": runtime}
+
+
+def _bi_app_stop(params: dict, ctx: ToolCtx) -> dict:
+    name = (params.get("name") or "").strip()
+    if not name:
+        return {"ok": False, "error": "missing 'name'"}
+    if not _app_running(ctx, name):
+        return {"ok": False, "error": f"'{name}' is not running"}
+    verdict = _app_approval(ctx, f"app.stop {name}",
+                            f"Stop hosted application '{name}' and close its sub-terminal, "
+                            "agent, and process.")
+    if verdict is None:
+        return {"ok": False,
+                "error": "stopping requires user approval but no approval channel is available"}
+    if not verdict:
+        return {"ok": False, "error": "user denied the stop request",
+                "_user_denied": True}
+    import laintas_cli as _lc
+    if _lc._close_app_subterminal(name):
+        return {"ok": True, "stopped": name}
+    return {"ok": False, "error": f"could not stop '{name}'"}
+
+
 def _bi_terminal_create(params: dict, ctx: ToolCtx) -> dict:
     """Create a new named sub-terminal (no agent stationed)."""
     name = (params.get("name") or "").strip()
@@ -9198,194 +9261,61 @@ def register_builtin_tools() -> None:
             invoke=_bi_contract_mock,
         ),
         Tool(
-            name="ppos.account.get",
-            description="Read the signed-in user's PPOS account profile. Read-only and briefly cached.",
+            name="app.list",
+            description=(
+                "List hosted applications registered by manifests in "
+                "~/.laintas/apps/ or ./.laintas/apps/, with trust and running "
+                "state. Broken manifests are reported under 'problems'. Read-only."),
             schema={"type": "object", "properties": {}, "additionalProperties": False},
-            invoke=lambda p, c: _bi_ppos_read("account", p, c),
-            capabilities=frozenset({"network"}),
+            invoke=_bi_app_list,
         ),
         Tool(
-            name="ppos.storage.get",
-            description="Read PPOS storage usage and limits. Read-only and briefly cached.",
-            schema={"type": "object", "properties": {}, "additionalProperties": False},
-            invoke=lambda p, c: _bi_ppos_read("storage", p, c),
-            capabilities=frozenset({"network"}),
-        ),
-        Tool(
-            name="ppos.communities.list",
-            description="List PPOS communities one bounded page at a time.",
+            name="app.manifest.get",
+            description=(
+                "Read one hosted application's manifest (name, command, prompt, "
+                "persistence, port, session tools) with its trust and running "
+                "state. Use it to review a manifest before requesting trust. "
+                "Read-only."),
             schema={"type": "object", "properties": {
-                "page": {"type": "integer", "minimum": 1, "default": 1},
-                "page_size": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20},
-                "mine": {"type": "boolean", "default": True,
-                         "description": "Only communities you have joined"},
-            }, "additionalProperties": False},
-            invoke=lambda p, c: _bi_ppos_read("communities", p, c),
-            capabilities=frozenset({"network"}),
+                "name": {"type": "string", "minLength": 1},
+            }, "required": ["name"], "additionalProperties": False},
+            invoke=_bi_app_manifest_get,
         ),
         Tool(
-            name="ppos.works.list",
-            description="List your PPOS works one bounded page at a time, "
-                        "including how much storage each one occupies.",
+            name="app.trust.request",
+            description=(
+                "Request the user's approval to trust a hosted application. "
+                "Shows what the application's session agents may run. Nothing "
+                "is recorded unless the user approves; re-run after the "
+                "manifest changes, since trust follows the manifest digest."),
             schema={"type": "object", "properties": {
-                "page": {"type": "integer", "minimum": 1, "default": 1},
-                "page_size": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20},
-                "community_id": {"type": "string"},
-                "status": {"type": "string", "enum": ["pending", "active", "hidden", "rejected"]},
-            }, "additionalProperties": False},
-            invoke=lambda p, c: _bi_ppos_read("works", p, c),
-            capabilities=frozenset({"network"}),
+                "name": {"type": "string", "minLength": 1},
+                "note": {"type": "string",
+                         "description": "Short review summary shown to the user"},
+            }, "required": ["name"], "additionalProperties": False},
+            invoke=_bi_app_trust_request,
         ),
         Tool(
-            name="ppos.work.get",
-            description="Read one PPOS work in full, including its Markdown source.",
+            name="app.start",
+            description=(
+                "Start a trusted hosted application in its own sub-terminal "
+                "with its own dedicated agent, after user approval. Requires "
+                "trust first (app.trust.request). The user can also start it "
+                "directly with the /app slash command."),
             schema={"type": "object", "properties": {
-                "work_id": {"type": "string", "minLength": 1},
-            }, "required": ["work_id"], "additionalProperties": False},
-            invoke=lambda p, c: _bi_ppos_read("work", p, c),
-            capabilities=frozenset({"network"}),
+                "name": {"type": "string", "minLength": 1},
+            }, "required": ["name"], "additionalProperties": False},
+            invoke=_bi_app_start,
         ),
         Tool(
-            name="ppos.work.update",
-            description="Edit one of your PPOS works: title, tags, self score, community, or "
-                        "replace its Markdown from a local file (media is re-uploaded). "
-                        "Editing text re-enters review and re-charges the $1 review fee. "
-                        "Requires the manage opt-in.",
+            name="app.stop",
+            description=(
+                "Stop a running hosted application and close its sub-terminal, "
+                "agent, and process, after user approval."),
             schema={"type": "object", "properties": {
-                "work_id": {"type": "string", "minLength": 1},
-                "title": {"type": "string"},
-                "path": {"type": "string", "description": "Markdown file replacing the body"},
-                "tags": {"type": "array", "items": {"type": "string"}},
-                "self_score": {"type": "number", "minimum": 0, "maximum": 100},
-                "community_id": {"type": "string"},
-            }, "required": ["work_id"], "additionalProperties": False},
-            invoke=_bi_ppos_work_update,
-            capabilities=frozenset({"network", "external.write"}),
-        ),
-        Tool(
-            name="ppos.work.delete",
-            description="Delete one of your PPOS works and free the storage it occupied. "
-                        "Requires the manage opt-in.",
-            schema={"type": "object", "properties": {
-                "work_id": {"type": "string", "minLength": 1},
-            }, "required": ["work_id"], "additionalProperties": False},
-            invoke=_bi_ppos_work_delete,
-            capabilities=frozenset({"network", "external.write"}),
-        ),
-        Tool(
-            name="ppos.storage.cleanup",
-            description="Find (and optionally delete) PPOS media in R2 that no live work "
-                        "references any more — leftovers from failed publishes or deleted "
-                        "works. Defaults to a dry run; deleting requires the manage opt-in.",
-            schema={"type": "object", "properties": {
-                "dry_run": {"type": "boolean", "default": True},
-                "min_age_hours": {"type": "integer", "minimum": 1, "maximum": 720, "default": 24},
-            }, "additionalProperties": False},
-            invoke=_bi_ppos_storage_cleanup,
-            capabilities=frozenset({"network", "external.write"}),
-        ),
-        Tool(
-            name="ppos.status.get",
-            description="Read PPOS service and agent-account status. Read-only and briefly cached.",
-            schema={"type": "object", "properties": {}, "additionalProperties": False},
-            invoke=lambda p, c: _bi_ppos_read("status", p, c),
-            capabilities=frozenset({"network"}),
-        ),
-        Tool(
-            name="ppos.draft.save",
-            description="Save a UTF-8 Markdown file as an author-private PPOS draft, or replace "
-                        "an existing draft. Local media is uploaded and rewritten, but the draft "
-                        "is not reviewed, charged, indexed, or published. Requires the publish opt-in.",
-            schema={"type": "object", "properties": {
-                "path": {"type": "string", "minLength": 1,
-                         "description": "Local UTF-8 Markdown file to store"},
-                "draft_id": {"type": "string",
-                             "description": "Existing draft ID to replace; omit to create one"},
-                "title": {"type": "string", "description": "Optional title override"},
-            }, "required": ["path"], "additionalProperties": False},
-            invoke=_bi_ppos_draft_save,
-            capabilities=frozenset({"fs.read", "network", "external.write"}),
-        ),
-        Tool(
-            name="ppos.publish_markdown",
-            description="Publish a UTF-8 Markdown file to PPOS. Relative local images and "
-                        "videos (jpg/png/webp/gif/avif/bmp, mp4/webm/mov) are uploaded into "
-                        "PPOS storage and their links rewritten. "
-                        "Requires explicit local autonomous-publish opt-in.",
-            schema={"type": "object", "properties": {
-                "path": {"type": "string", "minLength": 1},
-                "community": {"type": "string", "minLength": 1},
-                "self_score": {"type": "number", "minimum": 0, "maximum": 100},
-                "title": {"type": "string"},
-                "draft_id": {"type": "string",
-                             "description": "Existing private draft to replace and submit"},
-            }, "required": ["path", "community", "self_score"], "additionalProperties": False},
-            invoke=_bi_ppos_publish,
-            capabilities=frozenset({"fs.read", "network", "external.write"}),
-        ),
-        Tool(
-            name="ppos.comment",
-            description="Post a PPOS comment, optionally with an ordinary 0-100 rating attached. "
-                        "Requires explicit local autonomous-comment opt-in.",
-            schema={"type": "object", "properties": {
-                "work_id": {"type": "string", "minLength": 1},
-                "comment": {"type": "string", "minLength": 1},
-                "rating": {"type": "number", "minimum": 0, "maximum": 100},
-                "community": {"type": "string"},
-            }, "required": ["work_id", "comment"], "additionalProperties": False},
-            invoke=_bi_ppos_comment,
-            capabilities=frozenset({"network", "external.write"}),
-        ),
-        Tool(
-            name="ppos.community_review.queue",
-            description="Read a bounded page from the PPOS community review queue.",
-            schema={"type": "object", "properties": {
-                "page": {"type": "integer", "minimum": 1, "default": 1},
-                "page_size": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20},
-                "community": {"type": "string"},
-            }, "additionalProperties": False},
-            invoke=lambda p, c: _bi_ppos_read("community_review_queue", p, c),
-            capabilities=frozenset({"network"}),
-        ),
-        Tool(
-            name="ppos.community_review.decide",
-            description="Approve, reject, or escalate a community review with structured rationale. "
-                        "Requires community-review opt-in and minimum confidence.",
-            schema={"type": "object", "properties": {
-                "review_id": {"type": "string", "minLength": 1},
-                "decision": {"type": "string", "enum": ["approve", "reject", "escalate"]},
-                "comment": {"type": "string"}, "reason": {"type": "string"},
-                "evidence": {"type": "array", "items": {"type": "object"}, "minItems": 1, "maxItems": 20},
-                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-                "score": {"type": "number", "minimum": 0, "maximum": 100},
-                "community": {"type": "string"},
-            }, "required": ["review_id", "decision", "confidence", "evidence", "community"], "additionalProperties": False},
-            invoke=lambda p, c: _bi_ppos_review("community", p, c),
-            capabilities=frozenset({"network", "external.write", "review.decide"}),
-        ),
-        Tool(
-            name="ppos.platform_review.queue",
-            description="Read a bounded page from the PPOS platform review queue.",
-            schema={"type": "object", "properties": {
-                "page": {"type": "integer", "minimum": 1, "default": 1},
-                "page_size": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20},
-            }, "additionalProperties": False},
-            invoke=lambda p, c: _bi_ppos_read("platform_review_queue", p, c),
-            capabilities=frozenset({"network"}),
-        ),
-        Tool(
-            name="ppos.platform_review.decide",
-            description="Approve, reject, or escalate a platform review with structured rationale. "
-                        "Disabled by default and requires explicit platform-review opt-in.",
-            schema={"type": "object", "properties": {
-                "review_id": {"type": "string", "minLength": 1},
-                "decision": {"type": "string", "enum": ["approve", "reject", "escalate"]},
-                "comment": {"type": "string"}, "reason": {"type": "string"},
-                "evidence": {"type": "array", "items": {"type": "object"}, "minItems": 1, "maxItems": 20},
-                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-            }, "required": ["review_id", "decision", "confidence", "evidence"], "additionalProperties": False},
-            invoke=lambda p, c: _bi_ppos_review("platform", p, c),
-            capabilities=frozenset({"network", "external.write", "review.decide"}),
+                "name": {"type": "string", "minLength": 1},
+            }, "required": ["name"], "additionalProperties": False},
+            invoke=_bi_app_stop,
         ),
         Tool(
             name="mem.read",

@@ -281,91 +281,21 @@
       "aliases": {"laintas_cli": "web.search"}
     },
 
-    {
-      "name": "ppos_account", "category": "ppos", "execContext": "either",
-      "description": "Read the signed-in PPOS account.", "params": {"type": "object", "properties": {}},
-      "aliases": {"laintas_cli": "ppos.account.get", "helpwo": "ppos_account"}
-    },
-    {
-      "name": "ppos_storage", "category": "ppos", "execContext": "either",
-      "description": "Read PPOS storage usage, limits, and the per-work breakdown.", "params": {"type": "object", "properties": {}},
-      "aliases": {"laintas_cli": "ppos.storage.get", "helpwo": "ppos_storage"}
-    },
-    {
-      "name": "ppos_communities", "category": "ppos", "execContext": "either",
-      "description": "List PPOS communities and roles.", "params": {"type": "object", "properties": {}},
-      "aliases": {"laintas_cli": "ppos.communities.list", "helpwo": "ppos_communities"}
-    },
-    {
-      "name": "ppos_works", "category": "ppos", "execContext": "either",
-      "description": "List the caller's PPOS works with the storage each one occupies.",
-      "params": {"type": "object", "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 50}, "offset": {"type": "integer", "minimum": 0}}},
-      "aliases": {"laintas_cli": "ppos.works.list", "helpwo": "ppos_works"}
-    },
-    {
-      "name": "ppos_work", "category": "ppos", "execContext": "either",
-      "description": "Read one PPOS work in full, including its Markdown source.",
-      "params": {"type": "object", "properties": {"work_id": {"type": "string"}}, "required": ["work_id"]},
-      "aliases": {"laintas_cli": "ppos.work.get", "helpwo": "ppos_work"}
-    },
-    {
-      "name": "ppos_work_update", "category": "ppos", "execContext": "either",
-      "description": "Edit one of your PPOS works: title, tags, self score, community, or replacement Markdown (its media is uploaded). Editing text re-enters review and re-charges the $1 review fee.",
-      "params": {"type": "object", "properties": {"work_id": {"type": "string"}, "title": {"type": "string"}, "path": {"type": "string"}, "tags": {"type": "array", "items": {"type": "string"}}, "self_score": {"type": "number", "minimum": 0, "maximum": 100}, "community_id": {"type": "string"}}, "required": ["work_id"]},
-      "aliases": {"laintas_cli": "ppos.work.update", "helpwo": "ppos_work_update"}
-    },
-    {
-      "name": "ppos_work_delete", "category": "ppos", "execContext": "either",
-      "description": "Delete one of your PPOS works and free the storage quota it occupied.",
-      "params": {"type": "object", "properties": {"work_id": {"type": "string"}}, "required": ["work_id"]},
-      "aliases": {"laintas_cli": "ppos.work.delete", "helpwo": "ppos_work_delete"}
-    },
-    {
-      "name": "ppos_storage_cleanup", "category": "ppos", "execContext": "either",
-      "description": "Find, and optionally delete, PPOS media that no live work references any more (leftovers from failed publishes or deleted works). Dry run by default.",
-      "params": {"type": "object", "properties": {"dry_run": {"type": "boolean"}, "min_age_hours": {"type": "integer", "minimum": 1, "maximum": 720}}},
-      "aliases": {"laintas_cli": "ppos.storage.cleanup", "helpwo": "ppos_storage_cleanup"}
-    },
-    {
-      "name": "ppos_draft_save", "category": "ppos", "execContext": "either",
-      "description": "Save Markdown as a private PPOS draft, or replace an existing draft. Media is uploaded, but no review is requested and no review fee is charged.",
-      "params": {"type": "object", "properties": {"path": {"type": "string"}, "draft_id": {"type": "string"}}, "required": ["path"]},
-      "aliases": {"laintas_cli": "ppos.draft.save", "helpwo": "ppos_draft_save"}
-    },
-    {
-      "name": "ppos_publish", "category": "ppos", "execContext": "either",
-      "description": "Publish Markdown to PPOS, optionally replacing and submitting an existing private draft. Relative local images and videos are uploaded into PPOS storage and their links rewritten.",
-      "params": {"type": "object", "properties": {"path": {"type": "string"}, "community_id": {"type": "string"}, "self_score": {"type": "number", "minimum": 0, "maximum": 100}, "draft_id": {"type": "string"}}, "required": ["path", "community_id", "self_score"]},
-      "aliases": {"laintas_cli": "ppos.publish_markdown", "helpwo": "ppos_publish"}
-    },
-    {
-      "name": "ppos_comment", "category": "ppos", "execContext": "either",
-      "description": "Post a comment with an optional 0-100 rating.",
-      "params": {"type": "object", "properties": {"work_id": {"type": "string"}, "body": {"type": "string"}, "rating": {"type": "number", "minimum": 0, "maximum": 100}}, "required": ["work_id", "body"]},
-      "aliases": {"laintas_cli": "ppos.comment", "helpwo": "ppos_comment"}
-    },
-    {
-      "name": "ppos_community_review_queue", "category": "ppos", "execContext": "either",
-      "description": "Read a community moderation queue.", "params": {"type": "object", "properties": {"community_id": {"type": "string"}}, "required": ["community_id"]},
-      "aliases": {"laintas_cli": "ppos.community_review.queue", "helpwo": "ppos_community_review_queue"}
-    },
-    {
-      "name": "ppos_community_review_decide", "category": "ppos", "execContext": "either",
-      "description": "Approve, reject, or escalate a community review with evidence.",
-      "params": {"type": "object", "properties": {"community_id": {"type": "string"}, "work_id": {"type": "string"}, "decision": {"type": "string", "enum": ["approve", "reject", "escalate"]}, "confidence": {"type": "number", "minimum": 0, "maximum": 1}, "evidence": {"type": "array", "items": {"type": "object"}}}, "required": ["community_id", "work_id", "decision", "confidence", "evidence"]},
-      "aliases": {"laintas_cli": "ppos.community_review.decide", "helpwo": "ppos_community_decide"}
-    },
-    {
-      "name": "ppos_platform_review_queue", "category": "ppos", "execContext": "either",
-      "description": "Read the admin-only platform review queue.", "params": {"type": "object", "properties": {}},
-      "aliases": {"laintas_cli": "ppos.platform_review.queue", "helpwo": "ppos_platform_review_queue"}
-    },
-    {
-      "name": "ppos_platform_review_decide", "category": "ppos", "execContext": "either",
-      "description": "Approve, reject, or escalate an admin-only platform review.",
-      "params": {"type": "object", "properties": {"work_id": {"type": "string"}, "decision": {"type": "string", "enum": ["approve", "reject", "escalate"]}, "confidence": {"type": "number", "minimum": 0, "maximum": 1}, "evidence": {"type": "array", "items": {"type": "object"}}}, "required": ["work_id", "decision", "confidence", "evidence"]},
-      "aliases": {"laintas_cli": "ppos.platform_review.decide", "helpwo": "ppos_platform_decide"}
-    },
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
 
     {
       "name": "hwo", "category": "hwo", "execContext": "backend",
@@ -377,6 +307,36 @@
         "inputs": {"type": "object", "additionalProperties": true}
       }, "required": ["action"]},
       "aliases": {"laintas_cli": "hwo", "helpwo": "hwo"}
+    },
+    {
+      "name": "app_list", "category": "app", "execContext": "host",
+      "description": "List hosted applications registered by manifests, with trust and running state.",
+      "params": {"type": "object", "properties": {}},
+      "aliases": {"laintas_cli": "app.list"}
+    },
+    {
+      "name": "app_manifest_get", "category": "app", "execContext": "host",
+      "description": "Read one hosted application's manifest with trust and running state.",
+      "params": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]},
+      "aliases": {"laintas_cli": "app.manifest.get"}
+    },
+    {
+      "name": "app_trust_request", "category": "app", "execContext": "host",
+      "description": "Request user approval to trust a hosted application. Nothing is recorded without approval.",
+      "params": {"type": "object", "properties": {"name": {"type": "string"}, "note": {"type": "string"}}, "required": ["name"]},
+      "aliases": {"laintas_cli": "app.trust.request"}
+    },
+    {
+      "name": "app_start", "category": "app", "execContext": "host",
+      "description": "Start a trusted hosted application in its own sub-terminal with its own agent, after user approval.",
+      "params": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]},
+      "aliases": {"laintas_cli": "app.start"}
+    },
+    {
+      "name": "app_stop", "category": "app", "execContext": "host",
+      "description": "Stop a running hosted application and close its sub-terminal, agent, and process, after user approval.",
+      "params": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]},
+      "aliases": {"laintas_cli": "app.stop"}
     }
   ]
 }
