@@ -1213,6 +1213,20 @@ class ResourceBrowser:
             mouse_support=True, refresh_interval=None,
             **io_options)
 
+    def _refresh_live(self) -> None:
+        """Refresh data without pulling a reader back to the first line."""
+        with self._lock:
+            key, scroll = self.detail_key, self.detail_scroll
+            status, style = self.status, self.status_style
+            self.detail_cache.clear()
+            self.detail = None
+            self.detail_key = ""
+            self.reload(preserve=True)
+            if self.detail_key == key:
+                self.detail_scroll = scroll
+            if not self.status:
+                self.status, self.status_style = status, style
+
     def _pre_run(self) -> None:
         self.reload(preserve=False)
         self._running = True
@@ -1221,14 +1235,7 @@ class ResourceBrowser:
                 import asyncio
                 while self._running and not self.app.is_done:
                     await asyncio.sleep(max(0.2, self.refresh_interval))
-                    self.detail_cache.clear()
-                    self.detail = None
-                    self.detail_key = ""
-                    with self._lock:
-                        status, style = self.status, self.status_style
-                        self.reload(preserve=True)
-                        if not self.status:
-                            self.status, self.status_style = status, style
+                    self._refresh_live()
                     self.app.invalidate()
             self.app.create_background_task(_refresh_loop())
 

@@ -22,6 +22,15 @@ class RecordingOutput(DummyOutput):
 
 
 class ResourceBrowserModelTests(unittest.TestCase):
+    def test_live_refresh_preserves_output_scroll_position(self):
+        browser = self._browser(detail=lambda item: resource_ui.UIDetail.text(
+            item.title, "\n".join(str(i) for i in range(100))))
+        browser.mode = "detail"
+        browser.reload()
+        browser.detail_scroll = 40
+        browser._refresh_live()
+        self.assertEqual(browser.detail_scroll, 40)
+
     def _browser(self, items=None, detail=None, **kwargs):
         rows = items or [
             resource_ui.UIItem("a", "Alpha", "first", payload=1),

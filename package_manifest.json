@@ -1,10 +1,10 @@
 {
   "_comment": "Single source of truth for all packaging (setup.py, PyInstaller specs, build_download_assets.sh, self-update manifest). Edit this, not the 4 consumers. See build/HEADLESS_BROWSER_PACKAGING.md for the per-platform frozen-deps strategy.",
   "version_source": "version.py",
-
   "modules": [
     "laintas_cli",
     "agent_loop",
+    "background_compaction",
     "agent_ui_events",
     "agent_router",
     "station_service",
@@ -47,6 +47,7 @@
     "trust_store",
     "paths",
     "terminal_preferences",
+    "terminal_preview",
     "migrate",
     "cloud_provider",
     "shared_storage",
@@ -73,6 +74,7 @@
     "ai_pow_report",
     "aipow_bridge",
     "session_store",
+    "session_lifecycle",
     "usage_tracker",
     "workflow_state",
     "hwg_runner",
@@ -116,7 +118,6 @@
     "retask",
     "retask_view"
   ],
-
   "packages": [
     "agent_tools",
     "context_policy",
@@ -126,36 +127,72 @@
     "hwo_adapter",
     "patch_adapter"
   ],
-
   "package_data": {
-    "agent_tools": ["catalog.json"],
-    "context_policy": ["policy.json"],
-    "diagnostics_adapter": ["registry.json"],
-    "format_adapter": ["registry.json"],
+    "agent_tools": [
+      "catalog.json"
+    ],
+    "context_policy": [
+      "policy.json"
+    ],
+    "diagnostics_adapter": [
+      "registry.json"
+    ],
+    "format_adapter": [
+      "registry.json"
+    ],
     "patch_adapter": []
   },
-
-  "data_dirs": ["default_skills", "docs"],
-
-  "extra_files": ["LICENSE", "PROJECT.md", "SECURITY_CUSTOMIZATION.md", "requirements.txt", "setup.py"],
-
+  "data_dirs": [
+    "default_skills",
+    "docs"
+  ],
+  "extra_files": [
+    "LICENSE",
+    "PROJECT.md",
+    "SECURITY_CUSTOMIZATION.md",
+    "requirements.txt",
+    "setup.py"
+  ],
   "frozen_deps": {
-    "linux":   ["websockets", "playwright", "aiortc", "av", "cffi"]
+    "linux": [
+      "websockets",
+      "playwright",
+      "aiortc",
+      "av",
+      "cffi",
+      "pyte"
+    ]
   },
-
   "extras_require": {
-    "browser": ["websockets>=12.0", "playwright>=1.40"],
-    "web":     ["trafilatura>=1.8", "curl_cffi>=0.7"],
-    "webrtc":  ["aiortc>=1.14"],
-    "mcp":     ["mcp>=1.0"],
-    "all":     ["websockets>=12.0", "playwright>=1.40", "aiortc>=1.14", "mcp>=1.0", "trafilatura>=1.8", "curl_cffi>=0.7"]
+    "browser": [
+      "websockets>=12.0",
+      "playwright>=1.40"
+    ],
+    "web": [
+      "trafilatura>=1.8",
+      "curl_cffi>=0.7"
+    ],
+    "webrtc": [
+      "aiortc>=1.14"
+    ],
+    "mcp": [
+      "mcp>=1.0"
+    ],
+    "all": [
+      "websockets>=12.0",
+      "playwright>=1.40",
+      "aiortc>=1.14",
+      "mcp>=1.0",
+      "trafilatura>=1.8",
+      "curl_cffi>=0.7"
+    ]
   },
-
   "core_requires": [
     "requests>=2.28.0",
     "certifi>=2024.0.0",
     "rich>=13.0.0",
     "prompt_toolkit>=3.0.0",
+    "pyte>=0.8.2,<0.9",
     "pysocks>=1.7"
   ]
 }

@@ -143,6 +143,34 @@ class PostWithInterruptTests(unittest.TestCase):
             laintas_cli._post_with_interrupt(
                 threading.Event(), url="http://example.invalid")
 
+    def test_cancelled_header_request_closes_its_late_response(self):
+        entered, release, closed = threading.Event(), threading.Event(), threading.Event()
+        event = threading.Event()
+        before = set(threading.enumerate())
+
+        class Response:
+            def close(self):
+                closed.set()
+
+        def post(**kwargs):
+            entered.set()
+            event.set()
+            release.wait(2)
+            return Response()
+
+        self._patch_post(post)
+        try:
+            with self.assertRaises(InterruptedError):
+                laintas_cli._post_with_interrupt(event, url="http://example.invalid")
+            self.assertTrue(entered.is_set())
+        finally:
+            release.set()
+            self.assertTrue(closed.wait(2))
+            for thread in set(threading.enumerate()) - before:
+                if thread.name == "backend-post":
+                    thread.join(2)
+                    self.assertFalse(thread.is_alive())
+
 
 if __name__ == "__main__":
     unittest.main()

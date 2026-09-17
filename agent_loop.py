@@ -4,6 +4,7 @@
 import hashlib
 import collections
 import copy
+import background_compaction
 import fnmatch
 import os
 import re
@@ -39,6 +40,7 @@ import task_manager          # Structured task tracking (session + persisted)
 import workgraph             # Unified objective/plan/steps/workflow authority
 import retask                # Work handed to the person (.retask checklists)
 import paths                 # Centralized path management
+import session_lifecycle
 import json_store            # atomic small-JSON read/write
 import peer_coordination     # Cross-instance file-conflict coordination
 import skills as skills_mod   # Progressive skill metadata + context loading
@@ -169,6 +171,13 @@ _DEFAULT_CONFIG = {
     # small auxiliary model's comfortable window instead of requiring the main
     # model's.
     "compact_chunk_tokens": 24000,
+    "compact_background": True,
+    "compact_background_ratio": 0.70,
+    "compact_auto_ratio": 0.90,
+    "compact_target_ratio": 0.50,
+    "compact_background_cooldown": 60,
+    "compact_background_min_tokens": 2000,
+    "compact_background_timeout": 180,
     # Model for the auxiliary calls (compaction, critic, memory extraction).
     # Empty = use whatever the terminal has selected, i.e. the main model, which
     # is the historical behaviour. These calls are tool-less, structured and
@@ -183,7 +192,7 @@ _DEFAULT_CONFIG = {
     # measured 2026-09-15 that is 4k-11k reasoning tokens and 1.5-4 minutes per
     # chunk, so a long thread could block a turn for a quarter of an hour.
     # `none` keeps the review and drops the thinking.
-    "compact_review_effort": "auto",
+    "compact_review_effort": "none",
     "auto_format": True,            # run the best-available code formatter in place after a full-file write (no-op if none installed); surgical edits stay byte-precise
     "auto_snapshot": True,          # lazily checkpoint before the first workspace-mutating tool call in a top-level task (no-op outside a git repo)
     "browser_action_delay_min": 0.3,   # min seconds of anti-bot delay before browser actions
@@ -1047,9 +1056,16 @@ _RUNTIME_CONFIG_DESCRIPTIONS = {
     "rprompt_slot_order": "Left-to-right display order of right-prompt slots (agent,mode,model,effort,terminal); the messages mark is always leftmost; omitted slots follow in default order",
     "context_window_adopt_cap": "Ceiling on the auto-adopted provider window — lower it to compact earlier. Every turn re-sends the thread, so this is a cost knob, not just an overflow guard",
     "compact_chunk_tokens": "Largest slice of thread handed to the summarizer in one call",
+    "compact_background": "Prepare context summaries silently while the agent continues working",
+    "compact_background_ratio": "Fraction of usable message budget that starts background compaction",
+    "compact_auto_ratio": "Fraction of usable message budget that requires foreground compaction or waiting",
+    "compact_target_ratio": "Desired remaining budget fraction after compaction; below background trigger",
+    "compact_background_cooldown": "Minimum seconds between speculative compaction attempts",
+    "compact_background_min_tokens": "Minimum estimated tokens reclaimed before committing a background summary",
+    "compact_background_timeout": "Maximum seconds allowed for a speculative summary and its review",
     "aux_model": "Model for compaction / critic / memory-extraction (empty = use the main model)",
     "aux_provider": "Provider paired with aux_model",
-    "compact_review_effort": "Thinking level for the summary-review step of context compaction (auto = backend picks, currently medium; none = no thinking, much faster compaction)",
+    "compact_review_effort": "Thinking level for the summary-review step of context compaction (default none = no thinking, fastest compaction; auto/low/medium/high/max re-enable it — costs output tokens)",
     "max_loops": "Maximum agent-loop iterations per task",
     "max_tokens": "Output-token cap to request (0 = whatever the model and window allow)",
     "max_debug_entries": "In-memory debug entry limit",
@@ -1149,6 +1165,12 @@ _RUNTIME_POSITIVE = {
 }
 
 _RUNTIME_LIMITS = {
+    "compact_background_ratio": (0.05, 0.95),
+    "compact_auto_ratio": (0.1, 1.0),
+    "compact_target_ratio": (0.01, 0.9),
+    "compact_background_cooldown": (0, 3600),
+    "compact_background_min_tokens": (1, 100000),
+    "compact_background_timeout": (1, 1800),
     # Floor of 5s: anything shorter kills ordinary commands that pause to
     # think. Ceiling of 24h: past that the budget stops being a safety net.
     "shell_idle_timeout": (5, 86400),
@@ -1267,6 +1289,11 @@ def _coerce_runtime_config_value(key: str, value):
     if (key == "browser_action_delay_max"
             and parsed < float(get_runtime_config("browser_action_delay_min"))):
         raise ValueError("browser_action_delay_max cannot be below browser_action_delay_min")
+    ratio_keys = ("compact_target_ratio", "compact_background_ratio", "compact_auto_ratio")
+    if key in ratio_keys:
+        target, background, auto = [parsed if k == key else get_runtime_config(k) for k in ratio_keys]
+        if not 0 < target < background < auto <= 1:
+            raise ValueError("Compaction requires target < background < auto <= 1")
     return parsed
 
 
@@ -2189,12 +2216,19 @@ def _fingerprint_payload(payload: dict) -> str:
 
 def _atomic_write_json_if_changed(
         dest, payload: dict, *, skip_if_unchanged: bool = True) -> bool:
-    """Atomically replace one JSON file so an interrupted save stays readable."""
+    cwd = payload.get("cwd") or os.getcwd()
+    with session_lifecycle.guard(cwd):
+        if session_lifecycle.is_deleted(cwd, payload):
+            return False
+        return _write_session_json(dest, payload, skip_if_unchanged=skip_if_unchanged)
+
+
+def _write_session_json(dest, payload: dict, *, skip_if_unchanged: bool = True) -> bool:
     dest.parent.mkdir(parents=True, exist_ok=True)
     cache_key = str(dest)
     if skip_if_unchanged:
         fp = _fingerprint_payload(payload)
-        if _LAST_RESUME_WRITE_FINGERPRINTS.get(cache_key) == fp:
+        if _LAST_RESUME_WRITE_FINGERPRINTS.get(cache_key) == fp and dest.exists():
             return False
     tmp = dest.with_name(f".{dest.name}.{uuid.uuid4().hex}.tmp")
     try:
@@ -2240,16 +2274,14 @@ def save_session_snapshot(state: dict, chat_history: list, cwd: str) -> None:
         payload = {
             "cwd": cwd,
             "timestamp": time.time(),
+            "session_id": _ensure_session_id(state),
             "shortTermMemory": mem,
             "objective": str(state.get("objective") or "").strip(),
             "recent_turns": turns,
         }
         dest = paths.SESSIONS_DIR / f"{_session_key(cwd)}.json"
         paths.SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
-        dest.write_text(
-            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
-            encoding="utf-8",
-        )
+        _atomic_write_json(dest, payload)
     except Exception:
         pass
 
@@ -2452,6 +2484,13 @@ def save_resume_state(state: dict, chat_history: list, cwd: str) -> None:
 
 
 def save_resume_checkpoint(state: dict, chat_history: list, cwd: str) -> Optional[dict]:
+    with session_lifecycle.guard(cwd):
+        if session_lifecycle.is_deleted(cwd, {"state": state}):
+            return None
+        return _save_resume_checkpoint_locked(state, chat_history, cwd)
+
+
+def _save_resume_checkpoint_locked(state: dict, chat_history: list, cwd: str) -> Optional[dict]:
     """Save a selectable resume checkpoint for this cwd, intended for `/q`."""
     try:
         payload = _build_resume_payload(state, chat_history, cwd, "checkpoint")
@@ -2473,6 +2512,20 @@ def save_fork_state(state: dict, chat_history: list, cwd: str,
                     fork_parent_session_id: str = "",
                     child_session_id: str = "", *,
                     source_snapshot: Optional[dict] = None) -> Optional[dict]:
+    with session_lifecycle.guard(cwd):
+        parent = fork_parent_session_id or (source_snapshot or {}).get("session_id") or state.get("_session_id")
+        if session_lifecycle.is_deleted(cwd, {"session_id": parent}):
+            return None
+        return _save_fork_state_locked(
+            state, chat_history, cwd, fork_name, fork_lineage,
+            fork_parent_session_id, child_session_id, source_snapshot=source_snapshot)
+
+
+def _save_fork_state_locked(state: dict, chat_history: list, cwd: str,
+                            fork_name: str, fork_lineage: list = None,
+                            fork_parent_session_id: str = "",
+                            child_session_id: str = "", *,
+                            source_snapshot: Optional[dict] = None) -> Optional[dict]:
     """Save a named fork snapshot of the current session context.
 
     Like ``save_resume_checkpoint`` but tagged with stable parent/child session
@@ -2565,7 +2618,7 @@ def list_resume_states(cwd: str) -> list:
                 continue
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
-                if data.get("cwd") != cwd:
+                if data.get("cwd") != cwd or session_lifecycle.is_deleted(cwd, data):
                     continue
                 if time.time() - data.get("timestamp", 0) > _RESUME_MAX_AGE:
                     continue
@@ -2660,7 +2713,8 @@ def latest_resume_summary(cwd: str) -> Optional[dict]:
                 data = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, ValueError):
                 continue
-            if data.get("cwd") != cwd or not data.get("chat_history"):
+            if (data.get("cwd") != cwd or not data.get("chat_history")
+                    or session_lifecycle.is_deleted(cwd, data)):
                 continue
             if now - data.get("timestamp", 0) > _RESUME_MAX_AGE:
                 continue
@@ -2691,7 +2745,8 @@ def load_resume_state(cwd: str, session_id: str = None) -> Optional[dict]:
             path = _resume_session_path(cwd, session_id)
             if path.exists():
                 data = json.loads(path.read_text(encoding="utf-8"))
-                if data.get("cwd") == cwd and time.time() - data.get("timestamp", 0) <= 7 * 86400:
+                if (data.get("cwd") == cwd and not session_lifecycle.is_deleted(cwd, data)
+                        and time.time() - data.get("timestamp", 0) <= 7 * 86400):
                     return data
             return None
         states = list_resume_states(cwd)
@@ -2713,59 +2768,82 @@ def clear_resume_state(cwd: str) -> None:
 
 
 def delete_resume_state(cwd: str, blob: dict) -> None:
-    """Delete one resume blob and every file that still references it.
+    """Delete a tree node and descendants, or only an explicitly selected snapshot.
 
-    A single logical session may exist in up to three files (checkpoint,
-    per-session, latest). Deleting only ``_path`` leaves the others to
-    "resurrect" the entry on the next ``list_resume_states`` call. This
-    removes the checkpoint file (for checkpoints) and conditionally removes
-    the per-session / latest files — only when their ``id`` still matches
-    the blob being deleted, so a newer autosave is never destroyed.
+    Read all retained and expired records: the picker is a filtered view, not
+    an authoritative inventory. Refuse the entire operation if any affected
+    session is open, including this process's own session.
     """
-    try:
+    if blob.get("cwd") and blob["cwd"] != cwd:
+        raise ValueError("Saved session belongs to a different directory")
+    with session_lifecycle.guard(cwd):
         key = _session_key(cwd)
-        blob_id = blob.get("id")
-        session_id = blob.get("session_id")
-
-        if blob.get("kind") == "checkpoint" and blob_id:
-            (paths.SESSIONS_DIR / f"{key}_resume_{blob_id}.json").unlink(missing_ok=True)
-
-        if blob.get("kind") == "fork":
-            # New fork files are keyed by child session id. Remove the exact
-            # discovered path first; the name-keyed candidate is only for v1.
-            source_path = blob.get("_path")
-            if source_path:
-                candidate = Path(source_path)
-                try:
-                    if candidate.parent.resolve() == paths.SESSIONS_DIR.resolve():
-                        candidate.unlink(missing_ok=True)
-                except OSError:
-                    pass
-            if session_id:
-                _resume_fork_path(cwd, session_id).unlink(missing_ok=True)
-            if blob.get("fork_name"):
-                _resume_fork_path(cwd, blob["fork_name"]).unlink(missing_ok=True)
-
-        if session_id:
-            sess_path = paths.SESSIONS_DIR / f"{key}_session_{_normalize_session_id(session_id)}.json"
-            if sess_path.exists():
-                try:
-                    data = json.loads(sess_path.read_text(encoding="utf-8"))
-                    if data.get("id") == blob_id:
-                        sess_path.unlink(missing_ok=True)
-                except Exception:
-                    pass
-
-        latest = _resume_latest_path(cwd)
-        if latest.exists():
+        files = set()
+        for pattern in (_resume_checkpoint_pattern(cwd), _resume_session_pattern(cwd),
+                        _resume_fork_pattern(cwd), f"{key}_live_*.json",
+                        f"{key}_current*.json"):
+            files.update(paths.SESSIONS_DIR.glob(pattern))
+        files.update([_resume_latest_path(cwd), paths.SESSIONS_DIR / f"{key}.json"])
+        records = []
+        for path in files:
+            if path.is_symlink() or not path.is_file():
+                continue
             try:
-                data = json.loads(latest.read_text(encoding="utf-8"))
-                if data.get("id") == blob_id:
-                    latest.unlink(missing_ok=True)
-            except Exception:
-                pass
-    except Exception:
-        pass
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if isinstance(data, dict) and data.get("cwd") == cwd:
+                records.append((path, data))
+        sid = session_lifecycle.identity(blob)
+        # Direct callers keep snapshot deletion for historical checkpoints.
+        subtree = blob.get("_tree_session_node", blob.get("kind") != "checkpoint")
+        affected = {sid} if sid else set()
+        legacy_parents = {}
+        for _, data in records:
+            raw_sid = str(data.get("session_id") or "")
+            if data.get("kind") == "fork" and raw_sid == str(
+                    data.get("parent_session_id") or data.get("fork_parent_session_id") or ""):
+                lineage = tuple(normalize_fork_lineage(data.get("fork_lineage")))
+                if lineage:
+                    legacy_parents.setdefault((raw_sid, lineage), set()).add(
+                        session_lifecycle.identity(data))
+
+        def parent_of(data):
+            parent = str(data.get("parent_session_id") or data.get("fork_parent_session_id")
+                         or (data.get("state") or {}).get("_fork_parent_session_id") or "")
+            if data.get("kind") == "fork" and parent == str(data.get("session_id") or ""):
+                lineage = tuple(normalize_fork_lineage(data.get("fork_lineage")))
+                candidates = legacy_parents.get((parent, lineage[:-1]), set())
+                if len(candidates) == 1:
+                    return next(iter(candidates))
+            return parent
+
+        if subtree:
+            while True:
+                children = {session_lifecycle.identity(data) for _, data in records
+                            if parent_of(data) in affected}
+                children.discard("")
+                if children <= affected:
+                    break
+                affected.update(children)
+        for session_id in affected:
+            lock = (paths.SESSION_LOCKS_DIR / peer_coordination._cwd_hash(cwd)
+                    / f"{peer_coordination._normalize_session_id(session_id)}.lock")
+            owner = peer_coordination._read_lease(lock)
+            if owner and peer_coordination._pid_alive(int(owner.get("pid") or 0)):
+                raise RuntimeError(
+                    f"Session {session_id} is open (pid {owner.get('pid')}). "
+                    "Switch away or close it before deleting this session tree.")
+        targets = [(path, data) for path, data in records
+                   if (session_lifecycle.identity(data) in affected if subtree
+                       else data.get("id") == blob.get("id")
+                       and session_lifecycle.identity(data) == sid
+                       and data.get("kind") != "live")]
+        if subtree:
+            session_lifecycle.mark_deleted(cwd, affected)
+        for path, _ in targets:
+            path.unlink(missing_ok=True)
+            _LAST_RESUME_WRITE_FINGERPRINTS.pop(str(path), None)
 
 
 def load_session_snapshot(cwd: str) -> Optional[dict]:
@@ -2775,6 +2853,8 @@ def load_session_snapshot(cwd: str) -> Optional[dict]:
         if not dest.exists():
             return None
         data = json.loads(dest.read_text(encoding="utf-8"))
+        if session_lifecycle.is_deleted(cwd, data):
+            return None
         # Discard snapshots older than 7 days
         if time.time() - data.get("timestamp", 0) > 7 * 86400:
             return None
@@ -5793,6 +5873,8 @@ def _llm_summarize(deps, session, current_path: str, head_text: str,
             # sat on every remaining chunk before noticing the interrupt.
             **({"interrupt_event": interrupt_event} if interrupt_event is not None else {}),
         )
+        if not isinstance(resp, dict) or resp.get("error"):
+            return None
         text = (resp or {}).get("reply", "") if isinstance(resp, dict) else ""
         text = (text or "").strip()
         if not text:
@@ -5820,19 +5902,20 @@ def _llm_review_summary(deps, session, current_path: str, source_text: str,
                         candidate: str, prev_summary: Optional[str], lang: str,
                         trajectory_id: str = "",
                         interrupt_event: Optional[threading.Event] = None) -> str:
-    """Evidence-review a candidate with DeepSeek; fail closed to the draft."""
+    """Review against the same bounded evidence as the draft; retain it on failure."""
     if ctxpol is None or not source_text.strip() or not candidate.strip():
         return candidate
     try:
         prompt = ctxpol.review_prompt(lang, previous_summary=prev_summary)
-        evidence = (("<trusted-previous-summary>\n" + prev_summary.strip() +
-                     "\n</trusted-previous-summary>\n\n") if prev_summary else "") + (
-                    "<source-transcript>\n" + source_text.strip() +
+        evidence = ("<trusted-previous-summary>\n" +
+                    (prev_summary or "(none)").strip() +
+                    "\n</trusted-previous-summary>\n\n<source-transcript>\n" +
+                    source_text.strip() +
                     "\n</source-transcript>\n\n<candidate-summary>\n" +
                     candidate.strip() + "\n</candidate-summary>")
         review_model = str(ctxpol.load().get("summary_review_model")
                            or "deepseek-v4-flash").strip()
-        effort = str(get_runtime_config("compact_review_effort") or "auto").strip().lower()
+        effort = str(get_runtime_config("compact_review_effort") or "none").strip().lower()
         extra = {} if effort == "auto" else {"effort_override": effort}
         if interrupt_event is not None:
             extra["interrupt_event"] = interrupt_event
@@ -5843,6 +5926,8 @@ def _llm_review_summary(deps, session, current_path: str, source_text: str,
             provider_override=None, task_kind="compaction_review",
             trajectory_id=trajectory_id, **extra,
         )
+        if not isinstance(resp, dict) or resp.get("error"):
+            return candidate
         reviewed = ((resp or {}).get("reply", "")
                     if isinstance(resp, dict) else "").strip()
         return reviewed if _valid_structured_summary(reviewed, lang) else candidate
@@ -5868,11 +5953,11 @@ def _serialize_thread_msg(m: dict) -> str:
     if not isinstance(content, str):
         content = str(content)
     if role == "tool":
-        if ctxpol is not None:
+        if ctxpol is not None and not ctxpol.is_protected_tool(m.get("name", "")):
             content = ctxpol.truncate_tool_output(content)
         return f"[Tool {m.get('name', 'result')}]: {content}"
     if role == "assistant":
-        calls = ", ".join((tc.get("function", {}) or {}).get("name", "")
+        calls = "\n".join(json.dumps(tc, ensure_ascii=False)
                           for tc in (m.get("tool_calls") or []))
         parts = []
         if content.strip():
@@ -5917,10 +6002,58 @@ def _per_request_overhead_tokens(state: dict) -> int:
     return total
 
 
+def _summary_source_chunks(head: list, budget: int) -> list[str]:
+    """Pack serialized evidence, keeping tool exchanges together when they fit.
+
+    The source budget excludes the system prompt, running summary and output.
+    Split an oversized exchange without dropping any of its serialized text.
+    """
+    count = tokenizer.count_tokens if tokenizer is not None else ctxpol.estimate_tokens
+    groups = []
+    for message in head:
+        text = _serialize_thread_msg(message)
+        if not text.strip():
+            continue
+        if message.get("role") == "tool" and groups:
+            groups[-1] += "\n" + text
+        else:
+            groups.append(text)
+    chunks = []
+    current = []
+    used = 0
+    for text in groups:
+        cost = count(text)
+        if current and used + cost + 1 > budget:
+            chunks.append("\n".join(current))
+            current, used = [], 0
+        while cost > budget:
+            # The cheap character bound is only a starting point; check the
+            # actual estimator so CJK and dense code obey the same budget.
+            low, high = 1, min(len(text), budget * 4)
+            while low < high:
+                mid = (low + high + 1) // 2
+                if count(text[:mid]) <= budget:
+                    low = mid
+                else:
+                    high = mid - 1
+            boundary = text.rfind("\n", 0, low)
+            cut = boundary + 1 if boundary >= low // 2 else low
+            chunks.append(text[:cut])
+            text = text[cut:]
+            cost = count(text)
+        if text:
+            current.append(text)
+            used += cost + 1
+    if current:
+        chunks.append("\n".join(current))
+    return chunks
+
+
 def _summarize_head_in_chunks(deps, session, head: list,
                               prev_summary: Optional[str], lang: str,
                               trajectory_id: str,
-                              interrupt_event: Optional[threading.Event] = None) -> Optional[str]:
+                              interrupt_event: Optional[threading.Event] = None,
+                              progress=None, *, current_path=None) -> Optional[str]:
     """Summarize the head a slice at a time, folding each into a running summary.
 
     The head used to go up in ONE call. On a long session that is a single
@@ -5935,50 +6068,45 @@ def _summarize_head_in_chunks(deps, session, head: list,
     `_llm_summarize` already supported for cross-compaction merges — so this
     reuses the existing prompt contract rather than inventing a second one.
 
-    Slices are cut on message boundaries, never mid-message: half a tool result
-    is worse than none, and an assistant tool_call separated from its result
-    reads as an action that never returned.
+    Budget the serialized source, after tool-output truncation. Keep complete
+    tool exchanges together where possible; split oversized exchanges without
+    dropping text. Review each fold against its source before trusting it in
+    the next fold, keeping both generation and review source inputs bounded.
     """
     chunk_budget = max(4000, int(get_runtime_config("compact_chunk_tokens") or 24000))
-    cwd = os.getcwd()
+    cwd = current_path or os.getcwd()
 
-    slices: list[list] = []
-    current: list = []
-    acc = 0
-    for message in head:
-        cost = _thread_tokens([message])
-        # Oversized single message: give it a slice of its own rather than
-        # letting it silently blow the budget it was supposed to respect.
-        if current and acc + cost > chunk_budget:
-            slices.append(current)
-            current, acc = [], 0
-        current.append(message)
-        acc += cost
-    if current:
-        slices.append(current)
+    slices = _summary_source_chunks(head, chunk_budget)
 
     summary = prev_summary
     completed_any = False
-    for index, part in enumerate(slices):
+    for index, text in enumerate(slices):
         if interrupt_event is not None and interrupt_event.is_set():
             # Esc between chunks. Same rule as a failed chunk: a partial fold
             # never replaces the head, so stopping here loses nothing.
             return None
-        text = "\n".join(s for s in (_serialize_thread_msg(m) for m in part) if s)
-        if not text.strip():
-            continue
+        if progress:
+            progress(f"Chunk {index + 1}/{len(slices)} · generating summary")
         merged = _llm_summarize(deps, session, cwd, text, summary, lang,
                                 trajectory_id, interrupt_event)
         if not merged:
             # Atomic commit: a partial fold does not cover the whole head and
             # therefore must never replace it. The caller keeps the original.
             return None
+        if interrupt_event is not None and interrupt_event.is_set():
+            return None
+        if progress:
+            progress(f"Chunk {index + 1}/{len(slices)} · reviewing summary")
         summary = _llm_review_summary(
             deps, session, cwd, text, merged, summary, lang, trajectory_id,
             interrupt_event)
+        if interrupt_event is not None and interrupt_event.is_set():
+            return None
         if not _valid_structured_summary(summary, lang):
             return None
         completed_any = True
+        if progress:
+            progress(f"Chunks completed: {index + 1}/{len(slices)}")
     return summary if completed_any else None
 
 
@@ -5991,8 +6119,11 @@ def _publish_context_headroom(thread_messages: list, state: dict) -> None:
     """
     try:
         budget = compaction_budget(state)
+        tokens = _thread_tokens(thread_messages)
+        state["_context_live_tokens"] = tokens
+        state["_context_live_messages"] = len(thread_messages)
         free = max(0, budget["reserved"] - budget["overhead"]
-                   - _thread_tokens(thread_messages))
+                   - tokens)
         state["_ctx_headroom_chars"] = int(free * 3.5)
     except Exception:
         state.pop("_ctx_headroom_chars", None)
@@ -6096,9 +6227,11 @@ def compaction_status_text(*, auto: bool, usable: int = 0, window: int = 0) -> s
                 if configured and configured != _DEFAULT_CONFIG["model_context_window"]
                 else "context_window_adopt_cap")
         lines.append(
-            f"Auto-compact: the thread passed its {usable:,}-token budget "
+            f"Auto-compact: the thread reached its "
+            f"{int(usable * get_runtime_config('compact_auto_ratio')):,}-token trigger "
+            f"(usable {usable:,}) "
             f"(window {window:,}). Raise the trigger: /config {knob} <tokens>")
-    effort = str(get_runtime_config("compact_review_effort") or "auto").strip().lower()
+    effort = str(get_runtime_config("compact_review_effort") or "none").strip().lower()
     if effort != "none":
         lines.append(
             f"Summary review thinking: {effort}. "
@@ -6111,14 +6244,15 @@ def _compaction_status(deps, text: str):
     """Show `text` while a compaction runs, without ever failing the compaction."""
     console = getattr(deps, "console", None)
     if console is None or getattr(console, "render_terminal", True) is False:
-        yield
+        yield lambda detail: None
         return
     opened = None
+    handle = None
     status = getattr(deps, "status", None)
     if status is not None:
         try:
             opened = status(text)
-            opened.__enter__()
+            handle = opened.__enter__()
         except Exception:
             # Another Live already owns the console (the activity row, a
             # stream). A missing spinner must not turn into a skipped compaction.
@@ -6128,8 +6262,20 @@ def _compaction_status(deps, text: str):
             console.print(text)
         except Exception:
             pass
+    def update(detail):
+        try:
+            message = text + "\n[dim]" + detail + "[/dim]"
+            if callable(handle):
+                handle(message)
+            elif handle is not None and hasattr(handle, "update"):
+                handle.update(message)
+            else:
+                console.print(f"[dim]{detail}[/dim]")
+        except Exception:
+            pass
+
     try:
-        yield
+        yield update
     finally:
         if opened is not None:
             try:
@@ -6138,9 +6284,164 @@ def _compaction_status(deps, text: str):
                 pass
 
 
+def _compaction_boundaries(messages: list, usable: int) -> tuple[int, int]:
+    """Shared pruning boundary and complete-exchange summary boundary."""
+    keep_recent = ctxpol.keep_recent_tokens(usable)
+    tail_turns = max(1, int(ctxpol.load().get("tail_turns", 2) or 2))
+    acc = recent_user_turns = 0
+    protect_from = len(messages)
+    for i in range(len(messages) - 1, 0, -1):
+        if messages[i].get("role") == "user":
+            recent_user_turns += 1
+            if recent_user_turns > tail_turns:
+                protect_from = i + 1
+                break
+        acc += _thread_tokens([messages[i]])
+        protect_from = i
+        if acc > keep_recent:
+            break
+    tail_start = next((i for i in range(protect_from, len(messages))
+                       if messages[i].get("role") == "user"), protect_from)
+    while 0 < tail_start < len(messages) and messages[tail_start].get("role") == "tool":
+        tail_start -= 1
+    return protect_from, tail_start
+
+
+def _compaction_owner(state):
+    return (str(state.get("_session_id") or ""), str(state.get("_agent_id") or ""),
+            str(state.get("_task_cwd") or state.get("cwd") or os.getcwd()))
+
+
+def _compaction_job_key(state):
+    return (_compaction_owner(state), state.get("_run_id"),
+            tuple(get_runtime_config(k) for k in (
+                "aux_model", "aux_provider", "compact_review_effort", "compact_chunk_tokens")),
+            _fingerprint_payload(ctxpol.load()))
+
+
+def _coordinate_compaction(messages, deps, session, lang, state, *,
+                           force=False, announce=True, interrupt_event=None,
+                           finish_only=False):
+    """Main-loop checkpoint: publish a ready prefix, speculate, or wait once."""
+    state.pop("_compaction_wait_failed", None)
+    coordinator = background_compaction.current.get()
+    if coordinator is None or ctxpol is None:
+        if finish_only:
+            return False
+        return _compact_thread_messages(messages, deps, session, lang, state,
+            force=force, announce=announce, interrupt_event=interrupt_event)
+    auto = ctxpol.load().get("auto", True)
+    enabled = auto and bool(get_runtime_config("compact_background"))
+    cooldown = int(get_runtime_config("compact_background_cooldown"))
+    if interrupt_event is not None and interrupt_event.is_set():
+        coordinator.close()
+        return False
+    budget = compaction_budget(state)
+    usable = budget["usable"]
+    foreground_at = int(usable * get_runtime_config("compact_auto_ratio"))
+    key = _compaction_job_key(state)
+
+    def matches(job):
+        return (job.key == key and job.previous == state.get("_thread_summary")
+                and messages[:len(job.prefix)] == job.prefix)
+
+    pending = coordinator.job
+    if pending is not None and (not enabled or not matches(pending)):
+        pending.cancel.set()
+    hard = not finish_only and (force or (auto and _thread_tokens(messages) >= foreground_at))
+    if pending is not None and hard and not pending.done.is_set():
+        status = (_compaction_status(deps, "Waiting for background context compaction… "
+                  + symbols.BULLET + " Esc/Ctrl+C cancel") if announce else nullcontext())
+        with status:
+            if not coordinator.wait(interrupt_event):
+                # Never send an over-budget request or start a second paid
+                # summary while an uncooperative cancelled worker is alive.
+                state["_compaction_wait_failed"] = True
+                return False
+
+    changed = False
+    ready = coordinator.take(cooldown)
+    if ready is not None:
+        state["_compact_background_at"] = time.time()
+    if (ready is not None and not ready.cancelled
+            and not ready.cancel.requested() and matches(ready)):
+        if _valid_structured_summary(ready.summary, lang):
+            summary_message = {"role": "user", "content":
+                "[CONVERSATION SUMMARY — earlier turns compacted]\n" + ready.summary}
+            reclaimed = _thread_tokens(ready.prefix) - _thread_tokens([summary_message])
+            if reclaimed >= int(get_runtime_config("compact_background_min_tokens")):
+                messages[:] = [summary_message] + messages[len(ready.prefix):]
+                state["_thread_summary"] = ready.summary
+                _consolidate_memories_on_compact(deps, session, {**state, "_thread_messages": messages})
+                changed = True
+
+    if finish_only:
+        return changed
+
+    tokens = _thread_tokens(messages)
+    if changed and tokens < foreground_at:
+        return True
+    if force or (auto and tokens >= foreground_at):
+        if not background_compaction.cancel_owner(_compaction_owner(state)):
+            state["_compaction_wait_failed"] = True
+            return False
+        return _compact_thread_messages(messages, deps, session, lang, state,
+            force=force, announce=announce, interrupt_event=interrupt_event) or changed
+    if not enabled or coordinator.job is not None or len(messages) < 4:
+        return changed
+    if tokens < int(usable * get_runtime_config("compact_background_ratio")):
+        return changed
+    if time.time() - float(state.get("_compact_background_at") or 0) < cooldown:
+        return changed
+    _, boundary = _compaction_boundaries(messages, usable)
+    if boundary <= 1 or boundary >= len(messages):
+        return changed
+    prefix = copy.deepcopy(messages[:boundary])
+    minimum = int(get_runtime_config("compact_background_min_tokens"))
+    if _thread_tokens(prefix) < minimum:
+        return changed
+    previous = state.get("_thread_summary")
+    signature = (key, previous, _fingerprint_payload({"prefix": prefix}))
+    owner = _compaction_owner(state)
+    frozen_session = copy.deepcopy(session)
+    frozen_deps = copy.copy(deps)
+    backend = deps.call_backend
+    aux_model, aux_provider = aux_model_override()
+    review_model = str(ctxpol.load().get("summary_review_model") or "deepseek-v4-flash")
+    review_effort = str(get_runtime_config("compact_review_effort") or "none")
+
+    def frozen_backend(**kwargs):
+        if kwargs.get("task_kind") == "compaction_review":
+            kwargs["model_override"] = review_model
+            kwargs.pop("effort_override", None)
+            if review_effort != "auto":
+                kwargs["effort_override"] = review_effort
+        else:
+            kwargs["model_override"] = aux_model or None
+            kwargs["provider_override"] = aux_provider or None
+        return backend(**kwargs)
+
+    frozen_deps.call_backend = frozen_backend
+    trajectory = str(state.get("_run_id") or "")
+
+    def worker(job):
+        with thread_agent(owner[1]):
+            return _summarize_head_in_chunks(frozen_deps, frozen_session, job.prefix,
+                job.previous, lang, trajectory, job.cancel, current_path=owner[2])
+
+    started = coordinator.start(owner=owner, key=key, prefix=prefix, previous=previous,
+        worker=worker, parent=interrupt_event,
+        timeout=int(get_runtime_config("compact_background_timeout")),
+        cooldown=cooldown, signature=signature)
+    if started:
+        state["_compact_background_at"] = time.time()
+    return changed
+
+
 def _compact_thread_messages(thread_messages: list, deps, session, lang: str, state: dict,
                              *, force: bool = False, announce: bool = False,
-                             interrupt_event: Optional[threading.Event] = None) -> bool:
+                             interrupt_event: Optional[threading.Event] = None,
+                             progress=None) -> bool:
     """opencode-style compaction of the native message thread, IN PLACE.
 
     ``announce=True`` (the automatic paths) shows a status row while the
@@ -6149,7 +6450,7 @@ def _compact_thread_messages(thread_messages: list, deps, session, lang: str, st
     When the thread exceeds the model's usable window: (1) PRUNE — truncate old
     `role:tool` outputs to the policy char cap, protecting the recent tail and
     protected tools; (2) if still over, SUMMARIZE the head via one tool-less LLM
-    call and replace it with a structured running summary (incrementally merged).
+    pipeline and replace it with a structured running summary (incrementally merged).
     Summarizes obsolete initial tasks instead of pinning the first message
     forever, and never splits an assistant tool_call from its paired role:tool
     result. The current objective and durable rules are injected separately as
@@ -6168,6 +6469,11 @@ def _compact_thread_messages(thread_messages: list, deps, session, lang: str, st
         # request still overflows. Shared with /compact status and the pager.
         budget = compaction_budget(state)
         window, usable = budget["window"], budget["usable"]
+        before_tokens = _thread_tokens(thread_messages)
+        # A successful prune must leave working room, not merely slip below
+        # the trigger and compact again after the next tool result.
+        target = int(usable * get_runtime_config("compact_target_ratio"))
+        trigger = int(usable * get_runtime_config("compact_auto_ratio"))
         if not force:
             # The policy's own off switch (`"auto": false`). ctxpol.is_overflow
             # honours it, but this path re-implements the check to include the
@@ -6175,25 +6481,11 @@ def _compact_thread_messages(thread_messages: list, deps, session, lang: str, st
             # /compact pass force=True and still compact.
             if not ctxpol.load().get("auto", True):
                 return False
-            if usable <= 0 or _thread_tokens(thread_messages) <= usable:
+            if usable <= 0 or before_tokens < trigger:
                 return False
 
         # Recent tail to preserve verbatim (token-budgeted, from the end).
-        keep_recent = ctxpol.keep_recent_tokens(usable)
-        tail_turns = max(1, int(ctxpol.load().get("tail_turns", 2) or 2))
-        acc = 0
-        protect_from = len(thread_messages)
-        recent_user_turns = 0
-        for i in range(len(thread_messages) - 1, 0, -1):
-            if thread_messages[i].get("role") == "user":
-                recent_user_turns += 1
-                if recent_user_turns > tail_turns:
-                    protect_from = i + 1
-                    break
-            acc += _thread_tokens([thread_messages[i]])
-            protect_from = i
-            if acc > keep_recent:
-                break
+        protect_from, tail_start = _compaction_boundaries(thread_messages, usable)
 
         changed = False
         # 1) Prune old tool outputs (outside the recent tail, not protected).
@@ -6209,16 +6501,11 @@ def _compact_thread_messages(thread_messages: list, deps, session, lang: str, st
                 if t != c:
                     m["content"] = t
                     changed = True
-        if not force and _thread_tokens(thread_messages) <= usable:
+        if not force and _thread_tokens(thread_messages) <= target:
             return changed
 
-        # 2) Summarize the head. Start the retained tail at a user-turn boundary;
-        #    this keeps an assistant/tool exchange paired with the user request
-        #    that caused it instead of retaining an orphan assistant message.
-        tail_start = protect_from
-        while (tail_start < len(thread_messages)
-               and thread_messages[tail_start].get("role") != "user"):
-            tail_start += 1
+        # 2) Keep a bounded recent tail, including within one long user turn.
+        # Never separate a tool result from its assistant tool-call batch.
         if tail_start <= 1 or tail_start >= len(thread_messages):
             return changed
         head = thread_messages[:tail_start]
@@ -6227,17 +6514,31 @@ def _compact_thread_messages(thread_messages: list, deps, session, lang: str, st
         announcement = (
             _compaction_status(deps, compaction_status_text(
                 auto=True, usable=usable, window=window))
-            if announce else nullcontext())
-        with announcement:
+            if announce else nullcontext(progress))
+        with announcement as report:
             summary = _summarize_head_in_chunks(
                 deps, session, head, state.get("_thread_summary"), lang,
-                str(state.get("_run_id") or ""), interrupt_event)
+                str(state.get("_run_id") or ""), interrupt_event, report)
         if not summary:
             return changed
-        state["_thread_summary"] = summary
         summary_msg = {"role": "user",
                        "content": f"[CONVERSATION SUMMARY — earlier turns compacted]\n{summary}"}
-        thread_messages[:] = [summary_msg] + thread_messages[tail_start:]
+        candidate = [summary_msg] + thread_messages[tail_start:]
+        if (interrupt_event is not None and interrupt_event.is_set()
+                or (_thread_tokens(candidate) > target
+                    and _thread_tokens(candidate) >= _thread_tokens(thread_messages))):
+            return changed
+        state["_thread_summary"] = summary
+        thread_messages[:] = candidate
+        state["_compact_background_at"] = time.time()
+        if announce:
+            try:
+                deps.console.print(
+                    f"[dim]Context compacted: {before_tokens:,} → "
+                    f"{_thread_tokens(candidate):,} tokens "
+                    f"(trigger {usable:,}).[/dim]")
+            except Exception:
+                pass
         # Every compaction that produced a summary mines it for memories, the
         # automatic ones included. This call used to live in
         # compact_session_context, so it ran on /compact and never on the
@@ -6420,7 +6721,8 @@ def compaction_budget(state: Optional[dict] = None) -> dict:
     window = _effective_context_window()
     max_out = int(get_runtime_config("max_tokens") or 8192)
     reserved = ctxpol.usable_tokens(window, max_out) if ctxpol is not None else 0
-    overhead = _per_request_overhead_tokens(state or {})
+    overhead = (_per_request_overhead_tokens(state or {})
+                + int((state or {}).get("_transient_prompt_tokens") or 0))
     return {
         "window": window,
         "reserved": reserved,
@@ -6437,11 +6739,17 @@ def session_context_status(state: dict) -> dict:
     budget = compaction_budget(state)
     return {
         "supported": ctxpol is not None,
-        "messages": len(messages),
-        "tokens": _thread_tokens(messages),
+        "messages": state.get("_context_live_messages", len(messages)),
+        "tokens": state.get("_context_live_tokens", _thread_tokens(messages)),
         "window": budget["window"],
         "usable": budget["usable"],
         "summary": bool((state or {}).get("_thread_summary")),
+        "auto_enabled": bool(ctxpol is not None and ctxpol.load().get("auto", True)),
+        "background_enabled": bool(get_runtime_config("compact_background")),
+        "background_at": int(budget["usable"] * get_runtime_config("compact_background_ratio")),
+        "auto_at": int(budget["usable"] * get_runtime_config("compact_auto_ratio")),
+        "target_tokens": int(budget["usable"] * get_runtime_config("compact_target_ratio")),
+        "background_status": background_compaction.status(_compaction_owner(state)),
     }
 
 
@@ -6744,13 +7052,17 @@ def _consolidate_memories_when_idle(deps, session: dict, state: dict,
 
 def compact_session_context(deps, session: dict, state: dict,
                             chat_history: Optional[list] = None,
-                            interrupt_event: Optional[threading.Event] = None) -> dict:
+                            interrupt_event: Optional[threading.Event] = None,
+                            progress=None) -> dict:
     """Safely force-compact the current session without touching work state.
 
     Work happens on a copy and is committed only when something changed, so a
     failed summarizer cannot corrupt the live transcript.
     """
     before = session_context_status(state)
+    if not background_compaction.cancel_owner(_compaction_owner(state)):
+        return {**before, "ok": False, "changed": False,
+                "error": "background compaction is still cancelling; try again shortly"}
     if not before["supported"]:
         return {**before, "ok": False, "changed": False,
                 "error": "context compaction policy is unavailable"}
@@ -6771,7 +7083,7 @@ def compact_session_context(deps, session: dict, state: dict,
             break
     changed = _compact_thread_messages(
         messages, deps, session, _detect_lang(lang_source), working, force=True,
-        interrupt_event=interrupt_event)
+        interrupt_event=interrupt_event, progress=progress)
     working["_thread_messages"] = messages
     history = working.get("terminalHistory") or []
     compacted_history = _microcompact_history(
@@ -7041,6 +7353,7 @@ def _history_without_current_turn(chat_history: list, original_input: str) -> li
 #: appears in the code and in neither list, which is exactly the moment the
 #: author still remembers which one it should be.
 STATE_KEYS_CARRIED = frozenset({
+    "_compact_background_at",
     "_files_seen", "_pager", "_pager_msgs", "_pager_walk", "_session_id",
     "_task_cwd",
     "_term_scroll", "_step_counter",
@@ -7055,6 +7368,8 @@ STATE_KEYS_CARRIED = frozenset({
 })
 
 STATE_KEYS_TURN_ONLY = frozenset({
+    "_compaction_wait_failed", "_transient_prompt_tokens",
+    "_context_live_tokens", "_context_live_messages",
     "_active_tool", "_agent_id", "_branch_completion_warned", "_capability_gaps",
     "_contract", "_contract_max_loops", "_contract_tools", "_ctx_headroom_chars",
     "_dynamic_context_query", "_dynamic_tool_names", "_escalation_suggested",
@@ -7093,6 +7408,7 @@ def prepare_state_for_repl(state: dict) -> dict:
         thread_messages = []
     return {
         "shortTermMemory": _trim_short_term_memory(state.get("shortTermMemory", "")),
+        "_compact_background_at": state.get("_compact_background_at", 0),
         "lastReply": "",
         "lastOutput": _trim_text(state.get("lastOutput", ""), output_limit),
         "terminalHistory": _microcompact_history(history, keep_recent=5),
@@ -9442,6 +9758,7 @@ def _publish_live_state(info, state: dict) -> None:
         pass
 
 
+@background_compaction.scoped
 def run_agent_loop(
     deps: LoopDeps,
     original_input: str,
@@ -10887,15 +11204,22 @@ def run_agent_loop(
             # summarize the head if the thread still exceeds the window. Keeps the
             # reads in context (no re-read amnesia) while bounding the thread size.
             # (`lang` is assigned later in the loop, so derive it here.)
-            _compact_thread_messages(thread_messages, deps, session,
-                                     _detect_lang(original_input), state,
-                                     announce=True, interrupt_event=_interrupt)
-            _publish_context_headroom(thread_messages, state)
             _live_state = _build_user_message(
                 original_input, state, memory_entries, history_context, loop, max_loops,
                 thread_mode=True, first_turn=False, volatile=_volatile_context,
                 terminals_snapshot=terminals_snapshot,
             )
+            state["_transient_prompt_tokens"] = _thread_tokens(
+                [{"role": "user", "content": _live_state}]) if _live_state.strip() else 0
+            _coordinate_compaction(thread_messages, deps, session,
+                                   _detect_lang(original_input), state,
+                                   announce=True, interrupt_event=_interrupt)
+            if state.pop("_compaction_wait_failed", False):
+                _exit_reason = TRANSITION_INTERRUPTED if _interrupt.is_set() else TRANSITION_BACKEND_ERROR
+                if not _interrupt.is_set():
+                    deps.console.print("[yellow]Context compaction is still cancelling; retry this turn shortly.[/yellow]")
+                break
+            _publish_context_headroom(thread_messages, state)
             user_input = _live_state  # for debug display
             _thread_to_send = _project_paged_reads(thread_messages, state) + (
                 [{"role": "user", "content": _live_state}] if _live_state.strip() else []
@@ -11650,9 +11974,12 @@ def run_agent_loop(
                 state["_overflow_retry"] = retry + 1
                 if events_cb is not None:
                     deps.console.print("[dim yellow](context overflow — compacting and retrying)[/dim yellow]")
-                _compact_thread_messages(thread_messages, deps, session, lang, state,
+                _coordinate_compaction(thread_messages, deps, session, lang, state,
                                          force=True, announce=True,
                                          interrupt_event=_interrupt)
+                if state.pop("_compaction_wait_failed", False):
+                    _exit_reason = TRANSITION_INTERRUPTED if _interrupt.is_set() else TRANSITION_BACKEND_ERROR
+                    break
                 add_debug_log(debug_entry)
                 continue
             if events_cb is not None:
@@ -11889,9 +12216,12 @@ def run_agent_loop(
             # Compact the thread itself once the cheap rung has failed.
             if (_thread_mode and _trunc_count >= 2 and thread_messages
                     and _kind != "tool_args_malformed"):
-                _compact_thread_messages(
+                _coordinate_compaction(
                     thread_messages, deps, session, lang, state, force=True,
                     announce=True, interrupt_event=_interrupt)
+                if state.pop("_compaction_wait_failed", False):
+                    _exit_reason = TRANSITION_INTERRUPTED if _interrupt.is_set() else TRANSITION_BACKEND_ERROR
+                    break
 
             if _kind == "tool_args_malformed":
                 # No limit was hit — the arguments simply did not parse. Write
@@ -13518,12 +13848,19 @@ def run_agent_loop(
     # must not carry them into its persisted state.
     state.pop("_active_tool", None)
     state.pop("_pending_history", None)
+    state.pop("_context_live_tokens", None)
+    state.pop("_context_live_messages", None)
 
     _close_failed_turn(chat_history, thread_messages if _thread_mode else None,
                        _exit_reason, deps if events_cb is not None else None,
                        state)
 
     if _thread_mode:
+        # Save an already-reviewed prefix if the last request overlapped its
+        # completion. Never start or wait for speculative work on turn exit.
+        _coordinate_compaction(thread_messages, deps, session,
+            _detect_lang(original_input), state, interrupt_event=_interrupt,
+            announce=False, finish_only=True)
         # Carry the authoritative structured transcript into the next top-level
         # interaction and into the resume file. This includes tool-call pairs.
         state["_thread_messages"] = copy.deepcopy(thread_messages)

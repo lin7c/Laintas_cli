@@ -110,6 +110,11 @@ def head(root):
     return raw.decode().strip() if raw else None
 
 
+def range_key(frm, to):
+    """Storage key for a from..to range review (PR-level evidence)."""
+    return "range-" + frm[:12] + "-" + to[:12]
+
+
 def commit_meta(root, ref):
     raw = git(root, "show", "-s", "--format=%H%n%T%n%P", ref).decode().splitlines()
     return {"commit": raw[0], "tree": raw[1], "parents": raw[2].split() if len(raw) > 2 else []}
@@ -671,10 +676,114 @@ class Recorder:
         except Exception as exc:
             record_error(self, exc)
             print("AI-PoW: proof sealed; HTML report could not be written", file=sys.stderr)
+        # Result axis: background review collection, opt-in, never blocks the commit.
+        if self.auto_review_enabled() or os.environ.get("AIPOW_AUTO_REVIEW") == "1":
+            try:
+                self.spawn_review(p["commit"])
+            except OSError:
+                pass
         return p
 
     def evaluate(self, db, proof):
         return evaluate_score(self.root, proof, self._events(db, proof["epoch"]))
+
+    # -- Result axis: external review evidence (optional `ocr` CLI) --------
+
+    def reviews_dir(self):
+        return self.directory / "reviews"
+
+    def collect_review(self, ref="HEAD", range_from=None, range_to=None):
+        """Run `ocr review` for one commit (or a from..to range) and store its JSON output.
+
+        Returns a summary dict. Never blocks the process score: a missing or
+        failing `ocr` only means the commit stays "unreviewed".
+        """
+        import shutil
+        if shutil.which("ocr") is None:
+            return {"reviewed": False, "reason": "ocr_not_found"}
+        if range_from or range_to:
+            if not (range_from and range_to):
+                raise ValueError("Range review needs both --from and --to")
+            frm = git(self.root, "rev-parse", "--verify", range_from + "^{commit}").decode().strip()
+            to = git(self.root, "rev-parse", "--verify", range_to + "^{commit}").decode().strip()
+            key = range_key(frm, to)
+            command = ["ocr", "review", "--from", frm, "--to", to, "--format", "json"]
+        else:
+            to = git(self.root, "rev-parse", "--verify", ref + "^{commit}").decode().strip()
+            key = to
+            command = ["ocr", "review", "--commit", to, "--format", "json"]
+        directory = self.reviews_dir()
+        if directory.is_symlink():
+            raise ValueError("Reviews directory must not be a symlink")
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path = directory / (key + ".json")
+        if path.is_file():
+            return {"reviewed": True, "reason": "cached", "path": str(path)}
+        with open(path, "wb") as out:
+            os.chmod(path, 0o600)
+            completed = subprocess.run(command,
+                                       cwd=self.root, stdout=out, stderr=subprocess.PIPE,
+                                       timeout=1800)
+        if completed.returncode != 0:
+            path.unlink(missing_ok=True)
+            return {"reviewed": False, "reason": "ocr_failed",
+                    "detail": completed.stderr.decode("utf-8", "replace")[:200]}
+        return {"reviewed": True, "reason": "collected", "path": str(path)}
+
+    def result_evidence(self, commit, diff_stats=None):
+        """Result-axis score for a commit from stored review evidence, if any."""
+        from ai_pow_scoring import result_score
+        path = self.reviews_dir() / (commit + ".json")
+        try:
+            with open(path, "rb") as source:
+                review = json.loads(source.read())
+        except (OSError, ValueError):
+            review = None
+        return result_score(review, diff_stats)
+
+    def result_row(self, commit):
+        """Compact result summary for index rows; None when unreviewed."""
+        if not (self.reviews_dir() / (commit + ".json")).is_file():
+            return None
+        score = self.result_evidence(commit, self.diff_stats({"commit": commit, "base": None}))
+        if score.get("status") != "reviewed":
+            return None
+        return {"value": score["value"], "findings": score["findings"]}
+
+    def auto_review_enabled(self):
+        """Persistent post-seal background review setting. Off unless set."""
+        try:
+            with self.connection() as db:
+                return self.get(db, "auto_review") == "1"
+        except (sqlite3.Error, TypeError):
+            return False
+
+    def set_auto_review(self, enabled):
+        with self.connection() as db:
+            self.put(db, "auto_review", "1" if enabled else "0")
+        return {"auto_review": bool(enabled)}
+
+    def spawn_review(self, commit):
+        """Detach a background review collection; commit latency is unaffected.
+
+        Best-effort: any failure here leaves the commit simply "unreviewed".
+        """
+        import shutil
+        if shutil.which("ocr") is None:
+            return {"spawned": False, "reason": "ocr_not_found"}
+        directory = self.reviews_dir()
+        if directory.is_symlink():
+            return {"spawned": False, "reason": "reviews_dir_symlink"}
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        log = directory / "auto.log"
+        fd = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        try:
+            subprocess.Popen(invocation() + ["--cwd", str(self.root), "review", "--commit", commit],
+                             stdin=subprocess.DEVNULL, stdout=fd, stderr=subprocess.STDOUT,
+                             start_new_session=True, cwd=self.root)
+        finally:
+            os.close(fd)
+        return {"spawned": True}
 
     def diff_stats(self, proof):
         """Derived from Git, not from the proof: what the commit itself changed."""
@@ -823,7 +932,8 @@ class Recorder:
                             "reasoning_tokens": contribution.get("reasoning_tokens"),
                             "operations": contribution.get("operations"),
                             "retained": contribution.get("retained"),
-                            "tasks": contribution.get("task_attempts")})
+                            "tasks": contribution.get("task_attempts"),
+                            "result": self.result_row(body["commit"])})
         latest = chain[0] if chain else None
         totals = cumulative_view(latest["cumulative"]) if latest else cumulative_view({})
         iteration = None
@@ -845,6 +955,8 @@ class Recorder:
     def html_report(self, ref="HEAD", destination=None):
         from ai_pow_report import render
         data = self.report_data(ref)
+        # Result axis: external review evidence, when collected for this commit.
+        data["result"] = self.result_evidence(data["current"]["commit"], data.get("diff"))
         data["links"] = {"index": "../index.html"}
         html = render(data).encode("utf-8")
         if len(html) > 8 * 1024 * 1024:
@@ -1445,6 +1557,12 @@ def main(argv=None):
     transcript.add_argument("path")
     quota = sub.add_parser("quota")
     quota.add_argument("--max-mib", type=int, required=True)
+    review = sub.add_parser("review", help="Collect external review evidence (ocr) for one commit")
+    review.add_argument("--commit", default="HEAD")
+    review.add_argument("--from", dest="range_from", help="With --to: review a range (PR view)")
+    review.add_argument("--to", dest="range_to")
+    review.add_argument("--auto", choices=("on", "off"),
+                        help="Persist the post-seal background review setting instead of collecting now")
     for name in ("run", "claude"):
         p = sub.add_parser(name)
         p.add_argument("args", nargs=argparse.REMAINDER)
@@ -1469,6 +1587,24 @@ def main(argv=None):
             result = recorder.import_claude_usage(args.path)
         elif action == "quota":
             result = recorder.set_quota(args.max_mib)
+        elif action == "review":
+            if args.auto:
+                result = recorder.set_auto_review(args.auto == "on")
+            else:
+                result = recorder.collect_review(args.commit, args.range_from, args.range_to)
+                if result.get("reviewed"):
+                    if args.range_from and args.range_to:
+                        frm = git(recorder.root, "rev-parse", "--verify",
+                                  args.range_from + "^{commit}").decode().strip()
+                        to = git(recorder.root, "rev-parse", "--verify",
+                                 args.range_to + "^{commit}").decode().strip()
+                        result["result"] = recorder.result_evidence(
+                            range_key(frm, to), recorder.diff_stats({"base": frm, "commit": to}))
+                    else:
+                        commit = git(recorder.root, "rev-parse", "--verify",
+                                     args.commit + "^{commit}").decode().strip()
+                        result["result"] = recorder.result_evidence(
+                            commit, recorder.diff_stats({"commit": commit, "base": None}))
         elif action == "task":
             evidence = []
             for name in args.evidence:

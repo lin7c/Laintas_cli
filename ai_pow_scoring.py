@@ -478,3 +478,74 @@ def ladder_step(previous, commit_score):
             "previous": format(before, ".1f"), "delta": format(delta, ".1f"),
             "rated_commits": (previous["rated_commits"] if previous else 0) + int(commit_score is not None),
             "starting_rating": 0}
+
+
+# ---------------------------------------------------------------------------
+# Result axis (review-result-v1)
+#
+# The process score above measures how work was done. This module scores the
+# artifact itself from external review evidence (open-code-review JSON output).
+# It is a separate axis, deliberately never merged into the process score:
+# missing evidence means "not reviewed", never a perfect or zero score.
+# ---------------------------------------------------------------------------
+
+RESULT_ALGORITHM = "review-result-v1"
+SEVERITY_WEIGHTS = {"critical": 8, "high": 4, "medium": 2, "low": 1}
+UNKNOWN_SEVERITY_WEIGHT = 2  # an unlabelled finding counts as medium
+# Weighted findings per 1000 changed lines at which the score reaches 0.
+DENSITY_SCALE = 40.0
+# Smallest denominator used for density, so a tiny diff cannot inflate one
+# finding into an automatic zero (1 high costs 20 points, 1 critical 40).
+MIN_SCALE_LINES = 500
+
+
+def _finding_weight(comment):
+    severity = str(comment.get("severity", "")).lower()
+    return SEVERITY_WEIGHTS.get(severity, UNKNOWN_SEVERITY_WEIGHT)
+
+
+def result_score(review, diff_stats=None):
+    """Score review findings for one commit.
+
+    review: parsed OCR JSON output ({"status": ..., "comments": [...]}) or None.
+    diff_stats: {"files", "insertions", "deletions"} from the proof, or None.
+
+    Returns a dict with the score and its evidence, or {"status": "unreviewed"}
+    when no review evidence exists. Never raises on malformed input.
+    """
+    if not isinstance(review, dict) or not isinstance(review.get("comments"), list):
+        return {"algorithm": RESULT_ALGORITHM, "status": "unreviewed"}
+    comments = [c for c in review["comments"] if isinstance(c, dict)]
+    counts = {}
+    weighted = 0
+    for comment in comments:
+        weight = _finding_weight(comment)
+        severity = str(comment.get("severity", "unknown")).lower() or "unknown"
+        counts[severity] = counts.get(severity, 0) + 1
+        weighted += weight
+    changed_lines = 0
+    if isinstance(diff_stats, dict):
+        changed_lines = int(diff_stats.get("insertions", 0) or 0) + int(diff_stats.get("deletions", 0) or 0)
+    if changed_lines <= 0:
+        # No measurable change scale: fall back to absolute weighted findings.
+        density = float(weighted)
+    else:
+        # Normalize per 1000 changed lines, but never let a tiny diff inflate
+        # density without bound: one finding on a one-line fix stays costly,
+        # not automatically fatal.
+        density = weighted * 1000.0 / max(changed_lines, MIN_SCALE_LINES)
+    # 100 with no findings, 0 at or above DENSITY_SCALE weighted findings
+    # per 1000 changed lines. Small samples stay conservative: a single
+    # critical finding in a tiny diff still costs real points.
+    value = max(0.0, 100.0 * (1.0 - density / DENSITY_SCALE))
+    return {
+        "algorithm": RESULT_ALGORITHM,
+        "status": "reviewed",
+        "value": round(value, 1),
+        "findings": len(comments),
+        "weighted_findings": weighted,
+        "by_severity": counts,
+        "changed_lines": changed_lines,
+        "density_per_kloc": round(density, 2),
+        "review_status": review.get("status"),
+    }

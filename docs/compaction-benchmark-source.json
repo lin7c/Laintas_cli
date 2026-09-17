@@ -1,0 +1,735 @@
+{
+  "live": false,
+  "synthetic": true,
+  "baseline": "92ae85a",
+  "results": [
+    {
+      "variant": "committed",
+      "seconds": 0.5403,
+      "calls": 48,
+      "input_tokens_estimate": 25964,
+      "valid_summary": true,
+      "requests": [
+        {
+          "kind": "compaction",
+          "seconds": 0.0,
+          "input_tokens_estimate": 296,
+          "source_present": false,
+          "error": false
+        },
+        {
+          "kind": "compaction_review",
+          "seconds": 0.0,
+          "input_tokens_estimate": 344,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction",
+          "seconds": 0.0,
+          "input_tokens_estimate": 741,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction_review",
+          "seconds": 0.0,
+          "input_tokens_estimate": 779,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction",
+          "seconds": 0.0,
+          "input_tokens_estimate": 303,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction_review",
+          "seconds": 0.0,
+          "input_tokens_estimate": 341,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction",
+          "seconds": 0.0,
+          "input_tokens_estimate": 741,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction_review",
+          "seconds": 0.0,
+          "input_tokens_estimate": 779,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction",
+          "seconds": 0.0,
+          "input_tokens_estimate": 303,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction_review",
+          "seconds": 0.0,
+          "input_tokens_estimate": 341,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction",
+          "seconds": 0.0,
+          "input_tokens_estimate": 741,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction_review",
+          "seconds": 0.0,
+          "input_tokens_estimate": 779,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction",
+          "seconds": 0.0,
+          "input_tokens_estimate": 303,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction_review",
+          "seconds": 0.0,
+          "input_tokens_estimate": 341,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction",
+          "seconds": 0.0,
+          "input_tokens_estimate": 741,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction_review",
+          "seconds": 0.0,
+          "input_tokens_estimate": 779,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction",
+          "seconds": 0.0,
+          "input_tokens_estimate": 303,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction_review",
+          "seconds": 0.0,
+          "input_tokens_estimate": 341,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction",
+          "seconds": 0.0,
+          "input_tokens_estimate": 741,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction_review",
+          "seconds": 0.0,
+          "input_tokens_estimate": 779,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction",
+          "seconds": 0.0,
+          "input_tokens_estimate": 303,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction_review",
+          "seconds": 0.0,
+          "input_tokens_estimate": 341,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction",
+          "seconds": 0.0,
+          "input_tokens_estimate": 741,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction_review",
+          "seconds": 0.0,
+          "input_tokens_estimate": 779,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction",
+          "seconds": 0.0,
+          "input_tokens_estimate": 303,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction_review",
+          "seconds": 0.0,
+          "input_tokens_estimate": 341,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction",
+          "seconds": 0.0,
+          "input_tokens_estimate": 741,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction_review",
+          "seconds": 0.0,
+          "input_tokens_estimate": 779,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction",
+          "seconds": 0.0,
+          "input_tokens_estimate": 303,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction_review",
+          "seconds": 0.0,
+          "input_tokens_estimate": 341,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction",
+          "seconds": 0.0,
+          "input_tokens_estimate": 741,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction_review",
+          "seconds": 0.0,
+          "input_tokens_estimate": 779,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction",
+          "seconds": 0.0,
+          "input_tokens_estimate": 303,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction_review",
+          "seconds": 0.0,
+          "input_tokens_estimate": 341,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction",
+          "seconds": 0.0,
+          "input_tokens_estimate": 741,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction_review",
+          "seconds": 0.0,
+          "input_tokens_estimate": 779,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction",
+          "seconds": 0.0,
+          "input_tokens_estimate": 303,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction_review",
+          "seconds": 0.0,
+          "input_tokens_estimate": 341,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction",
+          "seconds": 0.0,
+          "input_tokens_estimate": 741,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction_review",
+          "seconds": 0.0,
+          "input_tokens_estimate": 779,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction",
+          "seconds": 0.0,
+          "input_tokens_estimate": 303,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction_review",
+          "seconds": 0.0,
+          "input_tokens_estimate": 341,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction",
+          "seconds": 0.0,
+          "input_tokens_estimate": 741,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction_review",
+          "seconds": 0.0,
+          "input_tokens_estimate": 779,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction",
+          "seconds": 0.0,
+          "input_tokens_estimate": 303,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction_review",
+          "seconds": 0.0,
+          "input_tokens_estimate": 341,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction",
+          "seconds": 0.0,
+          "input_tokens_estimate": 741,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction_review",
+          "seconds": 0.0,
+          "input_tokens_estimate": 779,
+          "source_present": true,
+          "error": false
+        }
+      ]
+    },
+    {
+      "variant": "before_fix",
+      "seconds": 0.2582,
+      "calls": 48,
+      "input_tokens_estimate": 20312,
+      "valid_summary": true,
+      "requests": [
+        {
+          "kind": "compaction",
+          "seconds": 0.0,
+          "input_tokens_estimate": 296,
+          "source_present": false,
+          "error": false
+        },
+        {
+          "kind": "compaction_review",
+          "seconds": 0.0,
+          "input_tokens_estimate": 302,
+          "source_present": false,
+          "error": false
+        },
+        {
+          "kind": "compaction",
+          "seconds": 0.0,
+          "input_tokens_estimate": 746,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction_review",
+          "seconds": 0.0,
+          "input_tokens_estimate": 323,
+          "source_present": false,
+          "error": false
+        },
+        {
+          "kind": "compaction",
+          "seconds": 0.0,
+          "input_tokens_estimate": 303,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction_review",
+          "seconds": 0.0,
+          "input_tokens_estimate": 323,
+          "source_present": false,
+          "error": false
+        },
+        {
+          "kind": "compaction",
+          "seconds": 0.0,
+          "input_tokens_estimate": 746,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction_review",
+          "seconds": 0.0,
+          "input_tokens_estimate": 323,
+          "source_present": false,
+          "error": false
+        },
+        {
+          "kind": "compaction",
+          "seconds": 0.0,
+          "input_tokens_estimate": 303,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction_review",
+          "seconds": 0.0,
+          "input_tokens_estimate": 323,
+          "source_present": false,
+          "error": false
+        },
+        {
+          "kind": "compaction",
+          "seconds": 0.0,
+          "input_tokens_estimate": 746,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction_review",
+          "seconds": 0.0,
+          "input_tokens_estimate": 323,
+          "source_present": false,
+          "error": false
+        },
+        {
+          "kind": "compaction",
+          "seconds": 0.0,
+          "input_tokens_estimate": 303,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction_review",
+          "seconds": 0.0,
+          "input_tokens_estimate": 323,
+          "source_present": false,
+          "error": false
+        },
+        {
+          "kind": "compaction",
+          "seconds": 0.0,
+          "input_tokens_estimate": 746,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction_review",
+          "seconds": 0.0,
+          "input_tokens_estimate": 323,
+          "source_present": false,
+          "error": false
+        },
+        {
+          "kind": "compaction",
+          "seconds": 0.0,
+          "input_tokens_estimate": 303,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction_review",
+          "seconds": 0.0,
+          "input_tokens_estimate": 323,
+          "source_present": false,
+          "error": false
+        },
+        {
+          "kind": "compaction",
+          "seconds": 0.0,
+          "input_tokens_estimate": 746,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction_review",
+          "seconds": 0.0,
+          "input_tokens_estimate": 323,
+          "source_present": false,
+          "error": false
+        },
+        {
+          "kind": "compaction",
+          "seconds": 0.0,
+          "input_tokens_estimate": 303,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction_review",
+          "seconds": 0.0,
+          "input_tokens_estimate": 323,
+          "source_present": false,
+          "error": false
+        },
+        {
+          "kind": "compaction",
+          "seconds": 0.0,
+          "input_tokens_estimate": 746,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction_review",
+          "seconds": 0.0,
+          "input_tokens_estimate": 323,
+          "source_present": false,
+          "error": false
+        },
+        {
+          "kind": "compaction",
+          "seconds": 0.0,
+          "input_tokens_estimate": 303,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction_review",
+          "seconds": 0.0,
+          "input_tokens_estimate": 323,
+          "source_present": false,
+          "error": false
+        },
+        {
+          "kind": "compaction",
+          "seconds": 0.0,
+          "input_tokens_estimate": 746,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction_review",
+          "seconds": 0.0,
+          "input_tokens_estimate": 323,
+          "source_present": false,
+          "error": false
+        },
+        {
+          "kind": "compaction",
+          "seconds": 0.0,
+          "input_tokens_estimate": 303,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction_review",
+          "seconds": 0.0,
+          "input_tokens_estimate": 323,
+          "source_present": false,
+          "error": false
+        },
+        {
+          "kind": "compaction",
+          "seconds": 0.0,
+          "input_tokens_estimate": 746,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction_review",
+          "seconds": 0.0,
+          "input_tokens_estimate": 323,
+          "source_present": false,
+          "error": false
+        },
+        {
+          "kind": "compaction",
+          "seconds": 0.0,
+          "input_tokens_estimate": 303,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction_review",
+          "seconds": 0.0,
+          "input_tokens_estimate": 323,
+          "source_present": false,
+          "error": false
+        },
+        {
+          "kind": "compaction",
+          "seconds": 0.0,
+          "input_tokens_estimate": 746,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction_review",
+          "seconds": 0.0,
+          "input_tokens_estimate": 323,
+          "source_present": false,
+          "error": false
+        },
+        {
+          "kind": "compaction",
+          "seconds": 0.0,
+          "input_tokens_estimate": 303,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction_review",
+          "seconds": 0.0,
+          "input_tokens_estimate": 323,
+          "source_present": false,
+          "error": false
+        },
+        {
+          "kind": "compaction",
+          "seconds": 0.0,
+          "input_tokens_estimate": 746,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction_review",
+          "seconds": 0.0,
+          "input_tokens_estimate": 323,
+          "source_present": false,
+          "error": false
+        },
+        {
+          "kind": "compaction",
+          "seconds": 0.0,
+          "input_tokens_estimate": 303,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction_review",
+          "seconds": 0.0,
+          "input_tokens_estimate": 323,
+          "source_present": false,
+          "error": false
+        },
+        {
+          "kind": "compaction",
+          "seconds": 0.0,
+          "input_tokens_estimate": 746,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction_review",
+          "seconds": 0.0,
+          "input_tokens_estimate": 323,
+          "source_present": false,
+          "error": false
+        },
+        {
+          "kind": "compaction",
+          "seconds": 0.0,
+          "input_tokens_estimate": 303,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction_review",
+          "seconds": 0.0,
+          "input_tokens_estimate": 323,
+          "source_present": false,
+          "error": false
+        },
+        {
+          "kind": "compaction",
+          "seconds": 0.0,
+          "input_tokens_estimate": 746,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction_review",
+          "seconds": 0.0,
+          "input_tokens_estimate": 323,
+          "source_present": false,
+          "error": false
+        }
+      ]
+    },
+    {
+      "variant": "fixed",
+      "seconds": 0.0158,
+      "calls": 4,
+      "input_tokens_estimate": 13024,
+      "valid_summary": true,
+      "requests": [
+        {
+          "kind": "compaction",
+          "seconds": 0.0,
+          "input_tokens_estimate": 4208,
+          "source_present": false,
+          "error": false
+        },
+        {
+          "kind": "compaction_review",
+          "seconds": 0.0,
+          "input_tokens_estimate": 4270,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction",
+          "seconds": 0.0,
+          "input_tokens_estimate": 2254,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction_review",
+          "seconds": 0.0,
+          "input_tokens_estimate": 2292,
+          "source_present": true,
+          "error": false
+        }
+      ]
+    }
+  ],
+  "pipeline": false
+}

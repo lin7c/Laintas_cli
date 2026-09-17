@@ -34,6 +34,10 @@ class _LeaseHome(unittest.TestCase):
             __import__("pathlib").Path(self.tmp.name) / "session_locks")
         patched.start()
         self.addCleanup(patched.stop)
+        sessions = mock.patch.object(
+            paths, "SESSIONS_DIR", __import__("pathlib").Path(self.tmp.name) / "sessions")
+        sessions.start()
+        self.addCleanup(sessions.stop)
         peer_coordination._held_leases.clear()
         laintas_cli._LIVE_SESSION_LEASE.update(cwd="", session_id="")
         self.addCleanup(laintas_cli._release_live_session_lease)

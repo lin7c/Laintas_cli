@@ -42,17 +42,17 @@ New top-level modules must be added to `package_manifest.json` — it drives set
 
 **To publish a release, use `.github/workflows/release.yml`** — it builds Linux amd64/arm64 binaries and a source package, then publishes checksums and update manifests to GitHub Releases.
 
-### After a release: announce it (更新公告)
+### After a release: announce it (release announcement)
 
-Every release that users can install gets one official message, which reaches laintas.com's 消息中心, Helpwo's inbox and the CLI's `L>` inbox. Only after the release workflow for the tag has **succeeded** (the assets are downloadable — announcing a 404 is worse than not announcing):
+Every release that users can install gets one official message, which reaches laintas.com's message center, Helpwo's inbox and the CLI's `L>` inbox. Only after the release workflow for the tag has **succeeded** (the assets are downloadable — announcing a 404 is worse than not announcing):
 
 1. Write `/tmp/.../release-message.json` (scratch dir, not the repo):
    ```json
    {
      "slug": "cli-v1-24-0",
-     "titleZh": "[laintas-cli] v1.24.0 更新",
+     "titleZh": "[laintas-cli] v1.24.0 released",
      "titleEn": "[laintas-cli] v1.24.0 released",
-     "bodyZh": "· 用户看得懂的改动,一行一条\n\n运行 /v update 更新。",
+     "bodyZh": "· One user-facing change per line\n\nRun /v update to upgrade.",
      "bodyEn": "· One user-facing change per line\n\nRun /v update to upgrade.",
      "actionUrl": "https://github.com/lin7c/Laintas_cli/releases/tag/v1.24.0"
    }
@@ -63,7 +63,7 @@ Every release that users can install gets one official message, which reaches la
 2. Dry run and show the preview to the user: `node /root/laintas/server/publish-message.mjs <file>`.
 3. **Publish only after the user explicitly says so** — it goes to every account and cannot be recalled: `node /root/laintas/server/publish-message.mjs <file> --publish`.
 
-A typo in an already published message is fixed on the laintas.com admin page (系统 → 消息, silent edit), not by re-running the script.
+A typo in an already published message is fixed on the laintas.com admin page (System → Messages, silent edit), not by re-running the script.
 
 ## Architecture (read PROJECT.md for full detail)
 

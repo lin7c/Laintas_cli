@@ -196,8 +196,9 @@ class AgentsModeController:
                  existing_session=None,
                  execution_block_reason: str = "",
                  repl_submit_cb: Optional[Callable] = None,
-                 mirror=None):
+                 mirror=None, terminal_label: Optional[Callable] = None):
         self.terminal_name = terminal_name or "term0"
+        self.terminal_label = terminal_label or (lambda name: name)
         self.deps = deps
         self.session = session or {}
         self.external_events_cb = external_events_cb
@@ -1093,7 +1094,7 @@ class AgentsModeController:
                 self._current_task(agent), 25) + "\n\n"),
             ("class:inspector.label", "  RUNTIME\n"),
             ("class:inspector.value", f"  role       {agent.role}\n"),
-            ("class:inspector.value", f"  terminal   {self.terminal_name}\n"),
+            ("class:inspector.value", f"  terminal   {self.terminal_label(self.terminal_name)}\n"),
             ("class:inspector.value", f"  messages   {messages}\n"),
             ("class:inspector.value", f"  tools      {tools}\n"),
             ("class:inspector.value", f"  approvals  {approvals}\n"),
@@ -1119,7 +1120,7 @@ class AgentsModeController:
         attention = sum(self.unread(a.id) > 0 for a in agents)
         width, _height = self._terminal_size()
 
-        left = [("class:header.brand", f" {self.terminal_name}")]
+        left = [("class:header.brand", f" {self.terminal_label(self.terminal_name)}")]
         if self.selected_id:
             left.extend([
                 ("class:separator", f"  {symbols.TREE_VERT}  "),

@@ -506,8 +506,8 @@ def acquire_session_lease(cwd: str, session_id: str) -> dict:
                     "error": "lease takeover race"}
         _held_leases.add((_cwd_hash(cwd), sid))
         return {"ok": True, "owner": None, "took_over": owner is not None}
-    except OSError:
-        return {"ok": True, "owner": None}   # best-effort: don't block resume
+    except OSError as exc:
+        return {"ok": False, "owner": None, "error": str(exc)}
 
 
 def release_session_lease(cwd: str, session_id: str) -> None:

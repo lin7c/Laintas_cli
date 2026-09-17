@@ -665,6 +665,62 @@ class AgentTerminationTests(unittest.TestCase):
         self.assertEqual(state, original)
         self.assertEqual(calls, [])
 
+    def test_main_loop_continues_while_summary_runs_then_uses_it_next_request(self):
+        import background_compaction
+        agent_loop.set_runtime_config("use_message_thread", True)
+        agent_loop.set_runtime_config("intent_enabled", False)
+        agent_loop.set_runtime_config("critic_enabled", False)
+        agent_loop.set_runtime_config("mem_extract_on_idle", False)
+        entered, release = threading.Event(), threading.Event()
+        jobs, sent = [], []
+        deps, _ = self._summary_deps()
+        messages = [{"role": "user", "content": "a" * 6000},
+                    {"role": "assistant", "content": "b" * 1000},
+                    {"role": "user", "content": "recent instruction"},
+                    {"role": "assistant", "content": "recent answer"}]
+
+        def summarize(*args, **kwargs):
+            entered.set()
+            if not release.wait(2):
+                return None
+            return self._STRUCTURED_SUMMARY
+
+        def backend(**kwargs):
+            sent.append(copy.deepcopy(kwargs.get("messages")))
+            if len(sent) == 1:
+                self.assertTrue(entered.wait(2))
+                job = background_compaction.current.get().job
+                jobs.append(job)
+                self.assertFalse(job.done.is_set(), "main request must overlap background work")
+                release.set()
+                self.assertTrue(job.done.wait(2))
+            return {"reply": "continue" if len(sent) == 1 else "finished",
+                    "tool_calls": [{"name": "time.now", "arguments": {}}] if len(sent) == 1 else [],
+                    "finish_reason": "tool_calls" if len(sent) == 1 else "stop",
+                    "done": len(sent) > 1, "error": False}
+
+        deps.call_backend = backend
+        try:
+            with tempfile.TemporaryDirectory() as tmp, _chdir(tmp), \
+                    mock.patch.object(agent_loop, "_summarize_head_in_chunks", side_effect=summarize), \
+                    mock.patch.object(agent_loop, "compaction_budget", return_value={
+                        "window": 30000, "usable": 10000, "reserved": 12000, "overhead": 2000}), \
+                    mock.patch.object(agent_loop.ctxpol, "keep_recent_tokens", return_value=1000), \
+                    mock.patch.object(agent_loop, "_thread_tokens", side_effect=lambda ms:
+                        sum(len(m.get("content", "")) + 50 for m in ms)):
+                result = agent_loop.run_agent_loop(deps, "continue", {}, {
+                    "_thread_messages": messages}, [], max_loops_override=3)
+        finally:
+            release.set()
+            for job in jobs:
+                job.thread.join(2)
+                self.assertFalse(job.thread.is_alive())
+        self.assertEqual(len(sent), 2)
+        self.assertEqual(sent[0][0]["content"], messages[0]["content"])
+        self.assertIn("CONVERSATION SUMMARY", sent[1][0]["content"])
+        self.assertTrue(any(m.get("content") == "continue" for m in sent[1][1:]))
+        self.assertIsNone(background_compaction.current.get())
+
     _STRUCTURED_SUMMARY = (
         "## Goal\n- initial task\n## Constraints & Preferences\n- (none)\n"
         "## Durable User Rules\n- (none)\n## Progress\n### Done\n- (none)\n"
@@ -699,6 +755,9 @@ class AgentTerminationTests(unittest.TestCase):
         shown = []
         deps.status = self._recording_status(shown)
         agent_loop.set_runtime_config("model_context_window", 20000)
+        # The default is none (no hint); the hint only appears when thinking
+        # is explicitly enabled, so pin a level here to test the hint itself.
+        agent_loop.set_runtime_config("compact_review_effort", "medium")
         messages = [{"role": "user", "content": "initial task"}]
         for index in range(1, 7):
             messages.extend([
@@ -726,6 +785,79 @@ class AgentTerminationTests(unittest.TestCase):
 
         self.assertTrue(result["changed"])
         self.assertEqual(shown, [])
+
+    def test_compaction_progress_updates_live_status_for_each_stage(self):
+        deps, _ = self._summary_deps()
+        updates = []
+
+        @contextmanager
+        def status(text):
+            yield updates.append
+
+        deps.status = status
+        agent_loop.set_runtime_config("compact_chunk_tokens", 4000)
+        head = [{"role": "user", "content": "word " * 5000},
+                {"role": "assistant", "content": "word " * 5000}]
+        count = len(agent_loop._summary_source_chunks(head, 4000))
+        with agent_loop._compaction_status(deps, "Compacting") as progress:
+            result = agent_loop._summarize_head_in_chunks(
+                deps, {}, head,
+                None, "EN", "", progress=progress)
+        self.assertTrue(result)
+        self.assertTrue(any(f"Chunk 1/{count} · generating summary" in x for x in updates))
+        self.assertTrue(any(f"Chunk {count}/{count} · reviewing summary" in x for x in updates))
+        self.assertIn(f"Chunks completed: {count}/{count}", updates[-1])
+
+    def test_safe_status_updates_the_rendered_spinner(self):
+        with mock.patch.object(laintas_cli, "Live") as live:
+            with laintas_cli._safe_status("starting") as update:
+                update("[dim]Chunk 2/3 · reviewing summary[/dim]")
+                spinner = live.call_args.args[0]
+                self.assertEqual(spinner.text.plain, "Chunk 2/3 · reviewing summary")
+            live.return_value.__exit__.assert_called_once()
+
+    def test_long_single_turn_compacts_without_splitting_tool_batches(self):
+        deps, calls = self._summary_deps()
+        messages = [{"role": "user", "content": "complete the task"}]
+        for i in range(12):
+            messages.extend([
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"id": f"call-{i}", "type": "function",
+                     "function": {"name": "fs.read", "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": f"call-{i}",
+                 "name": "fs.read", "content": "x" * 1000}])
+        state = {"_thread_messages": messages}
+        with mock.patch.object(agent_loop, "compaction_budget", return_value={
+                "window": 20000, "usable": 10000}), \
+                mock.patch.object(agent_loop, "_thread_tokens", side_effect=lambda ms:
+                                  sum(len(m.get("content", "")) + 10 for m in ms)), \
+                mock.patch.object(agent_loop.ctxpol, "keep_recent_tokens", return_value=2000):
+            self.assertTrue(agent_loop._compact_thread_messages(messages, deps, {}, "EN", state))
+            self.assertIn("CONVERSATION SUMMARY", messages[0]["content"])
+            self.assertEqual(messages[1]["role"], "assistant")
+            call_ids = {tc["id"] for m in messages for tc in m.get("tool_calls", [])}
+            self.assertTrue(all(m["tool_call_id"] in call_ids
+                                for m in messages if m["role"] == "tool"))
+            calls_after = len(calls)
+            for _ in range(3):
+                messages.append({"role": "assistant", "content": "y" * 500})
+                self.assertFalse(agent_loop._compact_thread_messages(messages, deps, {}, "EN", state))
+            self.assertEqual(len(calls), calls_after)
+
+    def test_pruning_just_below_trigger_still_summarizes_for_headroom(self):
+        deps, calls = self._summary_deps()
+        messages = self._short_thread()
+        messages.insert(2, {"role": "tool", "content": "x" * 3000})
+        with mock.patch.object(agent_loop, "compaction_budget", return_value={
+                "window": 20000, "usable": 10000}), \
+                mock.patch.object(agent_loop, "_thread_tokens", side_effect=lambda ms:
+                                  8000 + len(ms[2]["content"]) if len(ms) > 8 else 100), \
+                mock.patch.object(agent_loop.ctxpol, "keep_recent_tokens", return_value=2000), \
+                mock.patch.object(agent_loop.ctxpol, "truncate_tool_output", return_value="short"):
+            self.assertTrue(agent_loop._compact_thread_messages(
+                messages, deps, {}, "EN", {"_thread_messages": messages}))
+        self.assertTrue(calls, "A near-threshold prune must continue to summarization")
+        self.assertIn("CONVERSATION SUMMARY", messages[0]["content"])
 
     def test_compaction_review_thinking_follows_config(self):
         for effort, expected in (("auto", None), ("none", "none"), ("low", "low")):
@@ -857,6 +989,7 @@ class AgentTerminationTests(unittest.TestCase):
         self.assertIsNone(call["provider_override"])
 
     def test_compaction_status_text_names_the_right_knobs(self):
+        agent_loop.set_runtime_config("compact_review_effort", "medium")
         manual = agent_loop.compaction_status_text(auto=False)
         self.assertIn("Esc/Ctrl+C cancel", manual)
         self.assertNotIn("Auto-compact", manual)
@@ -890,16 +1023,17 @@ class AgentTerminationTests(unittest.TestCase):
             {"role": "user", "content": "first"},
             {"role": "assistant", "content": "second"},
         ]
-        with mock.patch.object(agent_loop, "_thread_tokens", return_value=5000), \
+        with mock.patch.object(agent_loop, "_summary_source_chunks", return_value=["first", "second"]), \
                 mock.patch.object(agent_loop, "get_runtime_config",
                                   side_effect=lambda key: 6000 if key == "compact_chunk_tokens" else None), \
                 mock.patch.object(agent_loop, "_llm_summarize",
-                                  side_effect=["complete first chunk", None]), \
+                                  side_effect=[self._STRUCTURED_SUMMARY, None]) as summarize, \
                 mock.patch.object(agent_loop, "_llm_review_summary",
-                                  return_value="complete first chunk"):
+                                  return_value=self._STRUCTURED_SUMMARY):
             result = agent_loop._summarize_head_in_chunks(
                 mock.Mock(), {}, head, None, "EN", "test-run")
         self.assertIsNone(result)
+        self.assertEqual(summarize.call_count, 2)
 
     def test_chunked_summary_does_not_reuse_old_summary_on_first_failure(self):
         head = [{"role": "user", "content": "new history"}]

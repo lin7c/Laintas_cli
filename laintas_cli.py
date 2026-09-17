@@ -1357,6 +1357,7 @@ import terminal_preferences  # durable choices isolated to this logical terminal
 import migrate as migrate_mod  # Auto-migration from old layout
 import hwo_ui as hwo_ui_mod  # /hwo orchestration UI
 import browser_session as browser_mod  # headless-browser live-view stack
+import session_lifecycle
 import session_store             # durable live current-session state
 import event_log                 # prompt admission + interrupted-run recovery
 import prompt_lab                # project-scoped prompt diagnosis/testing branches
@@ -2526,6 +2527,10 @@ class InteractiveSession:
         self._closed: bool = False
         self._eof_reached: bool = False
         self.command_lock = threading.RLock()
+        # A foreground attachment owns the PTY reader until it detaches.
+        # Background scanners must never consume its output/control markers.
+        self.output_lock = threading.RLock()
+        self._output_decoder = codecs.getincrementaldecoder("utf-8")("replace")
 
     # ── start ─────────────────────────────────────────────────~~~~~~~~~
 
@@ -2627,6 +2632,21 @@ class InteractiveSession:
 
     def read_output(self, timeout: float = 0.15) -> str:
         """Non-blocking read from PTY. Returns newly-read text."""
+        if not self.output_lock.acquire(blocking=False):
+            return ""
+        try:
+            return self._read_output_unlocked(timeout)
+        finally:
+            self.output_lock.release()
+
+    def _record_output(self, data: bytes) -> str:
+        decoded = self._output_decoder.decode(data)
+        self._output_chunks.append(decoded)
+        self._output_total += len(decoded)
+        self._trim_output_chunks()
+        return decoded
+
+    def _read_output_unlocked(self, timeout: float) -> str:
         if self._closed:
             return ""
         if not self._started:
@@ -2656,11 +2676,8 @@ class InteractiveSession:
             return ""
 
         if data:
-            decoded = data.decode("utf-8", errors="replace")
+            decoded = self._record_output(data)
             new_chunks.append(decoded)
-            self._output_chunks.append(decoded)
-            self._output_total += len(decoded)
-            self._trim_output_chunks()
             if self.stream_output:
                 sys.stdout.write(decoded)
                 sys.stdout.flush()
@@ -2705,6 +2722,14 @@ class InteractiveSession:
 
     def _drain_remaining(self) -> None:
         """Read any leftover data from master fd after child exits."""
+        if not self.output_lock.acquire(blocking=False):
+            return
+        try:
+            self._drain_remaining_unlocked()
+        finally:
+            self.output_lock.release()
+
+    def _drain_remaining_unlocked(self) -> None:
         if self.master_fd < 0:
             return
         while True:
@@ -2715,10 +2740,7 @@ class InteractiveSession:
                 data = os.read(self.master_fd, 4096)
                 if not data:
                     break
-                decoded = data.decode("utf-8", errors="replace")
-                self._output_chunks.append(decoded)
-                self._output_total += len(decoded)
-                self._trim_output_chunks()
+                decoded = self._record_output(data)
                 if self.stream_output:
                     sys.stdout.write(decoded)
                     sys.stdout.flush()
@@ -3268,7 +3290,7 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
             ("buy", "Buy a call or storage pack"),
         )),
     CommandSpec(
-        "/resume", "Fork a saved session (picker; echo last N events, default 20)",
+        "/resume", "Switch to a saved session (picker; echo last N events, default 20)",
         "Account & Session", "/resume [N|all|latest]",
         subcommands=("latest", "all"),
         completion_descriptions=(
@@ -5789,6 +5811,15 @@ def _fit_rprompt(segments: list, budget: int) -> list:
     return segments
 
 
+_LOCAL_TERMINAL_NAME = "term0"
+_LOCAL_PARENT_TERMINAL = ""
+
+
+def _terminal_display_name(name: str) -> str:
+    """Expose the parent-visible identity while retaining the local shell key."""
+    return _LOCAL_TERMINAL_NAME if name == "term0" else name
+
+
 def _sync_status_context() -> None:
     """Refresh prompt context once per prompt, never on every keystroke."""
     try:
@@ -5828,7 +5859,7 @@ def _sync_status_context() -> None:
             model_source = "default"
         _update_status_cache(
             agent=str(agent.name or agent.id),
-            terminal=terminal_name,
+            terminal=_terminal_display_name(terminal_name),
             deployment="deployed" if deployment else "temporary",
             model=model or "auto",
             model_source=model_source,
@@ -6748,7 +6779,7 @@ def _safe_status(message, *, spinner="dots", **_ignored):
         yield
         return
     with status_live:
-        yield
+        yield lambda text: relay.update(text=Text.from_markup(text))
 
 
 def fetch_available_models(
@@ -7809,18 +7840,7 @@ def _resume_effective_session_id(blob: Optional[dict]) -> str:
     """
     if not blob:
         return ""
-    session_id = str(
-        blob.get("session_id")
-        or (blob.get("state") or {}).get("_session_id") or "")
-    parent_session_id = str(
-        blob.get("parent_session_id")
-        or blob.get("fork_parent_session_id") or "")
-    if (blob.get("kind") == "fork" and session_id
-            and session_id == parent_session_id):
-        legacy_id = re.sub(
-            r"[^A-Za-z0-9_-]", "-", str(blob.get("id") or "fork"))[:48]
-        return f"legacy-fork-{legacy_id}"
-    return session_id
+    return session_lifecycle.identity(blob)
 
 
 def _lease_id_for_blob(blob: dict) -> str:
@@ -7879,11 +7899,16 @@ def _hold_live_session_lease(session: Optional[dict], cwd: str) -> None:
                      or (session or {}).get("id") or "")
     if not session_id:
         return
-    _release_live_session_lease()
+    if _LIVE_SESSION_LEASE == {"cwd": cwd, "session_id": session_id}:
+        return
     try:
         import peer_coordination
-        if peer_coordination.acquire_session_lease(cwd, session_id).get("ok"):
-            _LIVE_SESSION_LEASE.update(cwd=cwd, session_id=session_id)
+        with session_lifecycle.guard(cwd):
+            if session_lifecycle.is_deleted(cwd, {"session_id": session_id}):
+                return
+            if peer_coordination.acquire_session_lease(cwd, session_id).get("ok"):
+                _release_live_session_lease()
+                _LIVE_SESSION_LEASE.update(cwd=cwd, session_id=session_id)
     except Exception:
         pass   # best-effort: never keep a session from starting
 
@@ -7918,6 +7943,14 @@ def _acquire_resume_lease(blob: dict) -> Optional[dict]:
     progress.  Returns the blob to resume on success, or None (with a
     warning printed) when another live instance currently owns it.
     """
+    with session_lifecycle.guard(blob.get("cwd") or os.getcwd()):
+        if session_lifecycle.is_deleted(blob.get("cwd") or os.getcwd(), blob):
+            console.print("[yellow]This saved session was deleted. Refresh the picker.[/yellow]")
+            return None
+        return _acquire_resume_lease_locked(blob)
+
+
+def _acquire_resume_lease_locked(blob: dict) -> Optional[dict]:
     session_id = _lease_id_for_blob(blob)
     if not session_id:
         return blob   # nothing identifies this snapshot → nothing to lock
@@ -7925,9 +7958,13 @@ def _acquire_resume_lease(blob: dict) -> Optional[dict]:
         import peer_coordination
         result = peer_coordination.acquire_session_lease(blob.get("cwd") or os.getcwd(),
                                                          session_id)
-    except Exception:
-        return blob   # best-effort: never block resume on a failure
+    except Exception as exc:
+        console.print(f"[red]Could not lock the saved session: {exc}[/red]")
+        return None
     if not result.get("ok"):
+        if result.get("error"):
+            console.print(f"[red]Could not lock the saved session: {result['error']}[/red]")
+            return None
         owner = result.get("owner") or {}
         console.print(
             f"[yellow]This session is already open in another running instance "
@@ -7936,6 +7973,82 @@ def _acquire_resume_lease(blob: dict) -> Optional[dict]:
             f"progress. Not resuming.[/yellow]")
         return None
     return blob
+
+
+def _archive_previous_session(cwd, live):
+    """Never write a startup checkpoint over a peer's more recent autosave."""
+    with session_lifecycle.guard(cwd):
+        owner = _live_session_lease_owner(cwd, str(live.get("session_id") or live.get("id") or ""))
+        if owner is not None:
+            console.print(f"[dim]Leaving session open in another instance (pid {owner.get('pid', '?')}).[/dim]")
+            return
+        history = live.get("chat_history") or []
+        if any(isinstance(m, dict) and m.get("role") == "user" for m in history):
+            save_resume_checkpoint(live.get("state") or live.get("agent_state") or {}, history, cwd)
+        session_store.close_session(live)
+
+
+def _switch_resume_session(blob, cwd, state, history, live):
+    """Acquire the destination before saving/closing the source; never fork.
+
+    A history row belongs to a session, so resume its current tip. Historical
+    snapshots remain available for inspection without silently rewinding work.
+    """
+    with session_lifecycle.guard(cwd):
+        sid = _resume_effective_session_id(blob)
+        if blob.get("cwd") != cwd or session_lifecycle.is_deleted(cwd, blob):
+            console.print("[yellow]Saved session is unavailable. Refresh the picker.[/yellow]")
+            return None
+        if sid and sid == str(state.get("_session_id") or (live or {}).get("session_id") or ""):
+            console.print("[dim]This session is already current.[/dim]")
+            return None
+        # Refresh after the picker: a peer may have saved or deleted the entry.
+        tip = load_resume_state(cwd, sid) if sid else None
+        if tip is not None:
+            blob = tip
+        elif blob.get("_path"):
+            source = Path(blob["_path"])
+            if source.parent.resolve() != paths.SESSIONS_DIR.resolve() or not source.is_file():
+                console.print("[yellow]Saved snapshot no longer exists.[/yellow]")
+                return None
+            try:
+                fresh = json.loads(source.read_text(encoding="utf-8"))
+                if fresh.get("cwd") != cwd or _resume_effective_session_id(fresh) != sid:
+                    return None
+                blob = fresh
+            except (OSError, ValueError):
+                return None
+        if not blob.get("chat_history"):
+            console.print("[yellow]Saved session has no conversation to resume.[/yellow]")
+            return None
+        if _acquire_resume_lease(blob) is None:
+            return None
+        lease_id = _lease_id_for_blob(blob)
+        new_live = None
+        try:
+            _persist_session_state(state, history, cwd, live)
+            _reset_fresh_session_context(cwd)
+            restored_history = []
+            restored = _restore_resume_blob(blob, restored_history)
+            new_live = session_store.create_session(cwd, restored, restored_history)
+            if live:
+                session_store.close_session(copy.deepcopy(live))
+        except Exception as exc:
+            import peer_coordination
+            peer_coordination.release_session_lease(cwd, lease_id)
+            try:
+                if new_live:
+                    session_store.close_session(new_live)
+                if live:
+                    session_store.save_session(live)
+            except OSError:
+                pass
+            console.print(f"[red]Could not restore session: {exc}[/red]")
+            return None
+        _release_live_session_lease()
+        _hold_live_session_lease(new_live, cwd)
+        history[:] = restored_history
+        return restored, new_live
 
 
 def _fork_resume_blob(blob: dict, cwd: str) -> Optional[dict]:
@@ -8087,7 +8200,7 @@ def _build_fork_tree_rows(choices: list) -> list[tuple[dict, str]]:
                      or choice.get("fork_parent_session_id") or "")
         # v1 named forks reused their parent's session id. Give those records a
         # virtual child identity at read time; never rewrite user history.
-        key = (f"legacy-fork:{choice.get('id') or id(choice)}"
+        key = (_resume_effective_session_id(choice)
                if sid and parent == sid else sid)
         if not key:
             key = f"fork:{choice.get('id') or id(choice)}"
@@ -8110,7 +8223,7 @@ def _build_fork_tree_rows(choices: list) -> list[tuple[dict, str]]:
                               or choice.get("fork_parent_session_id") or "")
         if choice.get("kind") == "fork":
             key = fork_keys[id(choice)]
-        elif lineage and lineage in lineage_to_key:
+        elif not choice.get("session_id") and lineage and lineage in lineage_to_key:
             key = lineage_to_key[lineage]
         elif lineage and not choice.get("session_id"):
             key = "legacy-lineage:" + "\x1f".join(lineage)
@@ -8187,6 +8300,8 @@ def _build_fork_tree_rows(choices: list) -> list[tuple[dict, str]]:
         # Enter on the branch header resumes its latest state. Older fork points
         # and checkpoints remain selectable as children.
         header = blobs[0]
+        for snapshot in blobs:
+            snapshot["_tree_session_node"] = snapshot is header
         if node["branch_name"]:
             header["_tree_branch_name"] = node["branch_name"]
         children = [{"blob": blob, "children": []} for blob in blobs[1:]]
@@ -8231,7 +8346,7 @@ def _build_fork_tree_rows(choices: list) -> list[tuple[dict, str]]:
 def show_resume_picker(cwd: str) -> Optional[dict]:
     """Full-screen `/t`-style picker for saved resume sessions.
 
-    Arrow keys to navigate, Enter to fork the highlighted session, d for a
+    Arrow keys to navigate, Enter to switch to the highlighted session, d for a
     details preview, x to delete in place, q/Esc to cancel. Returns the
     chosen blob, or None if cancelled.
     """
@@ -8273,7 +8388,7 @@ def show_resume_picker(cwd: str) -> Optional[dict]:
         return labels
 
     sel_idx = 0
-    base_hint = f"{symbols.ARROW_U}{symbols.ARROW_D} navigate  ↵ fork  d details  x delete  q cancel"
+    base_hint = f"{symbols.ARROW_U}{symbols.ARROW_D} navigate  ↵ resume  d details  x delete node/subtree  q cancel"
 
     def _on_action(action, idx):
         nonlocal tree_rows
@@ -8294,7 +8409,7 @@ def show_resume_picker(cwd: str) -> Optional[dict]:
         hint = base_hint
         result = select_dialog(
             labels,
-            title="Fork Saved Session",
+            title="Resume Saved Session",
             full_screen=True,
             selected_index=sel_idx,
             action_keys={"d": "details", "x": "delete"},
@@ -8726,21 +8841,45 @@ def _post_with_interrupt(interrupt_event: Optional[threading.Event], **kwargs):
         return requests.post(**kwargs)
 
     box: queue.Queue = queue.Queue(maxsize=1)
+    handoff = threading.Lock()
+    abandoned = threading.Event()
+
+    def close_late(value):
+        try:
+            value.close()
+        except Exception:
+            pass
 
     def _do():
         try:
-            box.put(("ok", requests.post(**kwargs)))
+            value = requests.post(**kwargs)
         except BaseException as exc:
-            box.put(("err", exc))
+            with handoff:
+                if not abandoned.is_set():
+                    box.put(("err", exc))
+            return
+        with handoff:
+            discard = abandoned.is_set() or interrupt_event.is_set()
+            if not discard:
+                box.put(("ok", value))
+        if discard:
+            close_late(value)
 
     threading.Thread(target=_do, daemon=True, name="backend-post").start()
 
     while True:
         if interrupt_event.is_set():
-            # The worker keeps its socket until the request completes; the
-            # response is dropped on the floor and closed when collected.
-            # We cannot abort a socket read already in flight, but we can
-            # stop making the user wait for it.
+            # Coordinate ownership with the header worker: either it closes
+            # a late response, or we close one already queued. Do not leave
+            # an unread streaming response relying on garbage collection.
+            with handoff:
+                abandoned.set()
+                try:
+                    kind, value = box.get_nowait()
+                except queue.Empty:
+                    kind, value = "empty", None
+            if kind == "ok":
+                close_late(value)
             raise InterruptedError("interrupted while waiting for the backend")
         try:
             kind, value = box.get(timeout=_BACKEND_POLL)
@@ -11842,14 +11981,26 @@ def _show_terminal_detail(name: str, cmd: str, sess, created: float, alive: bool
     console.print(Panel(detail_text, title=f"Terminal: {name}"))
 
 
-def show_terminal_manager(primary_session=None) -> None:
+def show_terminal_manager(primary_session=None, agent_registry=None) -> None:
+    while _show_terminal_manager_once(primary_session) == "new":
+        index = 1
+        while get_terminal(f"term{index}") is not None or f"term{index}" == _LOCAL_TERMINAL_NAME:
+            index += 1
+        _cmd_term(["/term", f"term{index}"], agent_registry, primary_session)
+
+
+def _show_terminal_manager_once(primary_session=None):
     """Live terminal manager with output preview and in-place lifecycle actions."""
+    from terminal_preview import TerminalPreview
+    previews = {}
 
     def collect_rows():
         rows = []
-        if primary_session is not None and primary_session.is_alive():
-            rows.append(("term0", primary_session.command,
-                         primary_session, 0.0, True, True))
+        root = get_terminal("term0")
+        current_session = root.session if root and root.session else primary_session
+        if current_session is not None and current_session.is_alive():
+            rows.append(("term0", current_session.command,
+                         current_session, 0.0, True, True))
         for term in get_all_terminals():
             if term.name == "term0":
                 continue
@@ -11868,7 +12019,7 @@ def show_terminal_manager(primary_session=None) -> None:
             agents = len(info.stationed_agent_ids) if info else 0
             items.append(resource_ui.UIItem(
                 key=name,
-                title=name + (" (primary)" if primary else ""),
+                title=_terminal_display_name(name) + (" (current)" if primary else ""),
                 subtitle=str(command or "No command").replace("\n", " "),
                 badge="PRIMARY" if primary else "TERM",
                 status=("alive" if alive else "ended") + (f"  {age}" if created else ""),
@@ -11884,24 +12035,36 @@ def show_terminal_manager(primary_session=None) -> None:
         read_output = getattr(session, "read_output", None)
         if alive and callable(read_output):
             read_output(timeout=0)
-        output = session.full_output if session else ""
+        output = getattr(session, "raw_output", None) if session else ""
+        if not isinstance(output, str):
+            output = session.full_output if session else ""
+        preview = previews.setdefault(name, TerminalPreview())
+        columns, rows = 100, 24
+        fd = getattr(session, "master_fd", -1)
+        if isinstance(fd, int) and fd >= 0:
+            try:
+                rows, columns = termios.tcgetwinsize(fd)
+                columns, rows = columns or 100, rows or 24
+            except (OSError, termios.error):
+                pass
+        screen = preview.render(output, columns, rows)
         metadata = [
             f"Status       {'alive' if alive else 'ended'}",
-            f"Parent       {(info.parent_terminal if info else None) or '(root)'}",
+            f"Parent       {(_LOCAL_PARENT_TERMINAL if primary else _terminal_display_name(info.parent_terminal or '') if info else '') or '(root)'}",
             f"Agents       {(', '.join(info.stationed_agent_ids) if info else '') or '(none)'}",
             f"Return code  {session.returncode if session else 'N/A'}",
             "",
             "Command",
             str(command or "(none)"),
             "",
-            f"Output · {len(output)} bytes",
-            output or "(no output yet)",
+            f"Output · {len(output)} characters buffered",
+            screen or "(no output yet)",
         ]
         detail = resource_ui.UIDetail.text(
             item.title, "\n".join(metadata),
             "Live output · refreshes automatically")
         for index, line in enumerate(detail.lines):
-            if line.text in {"Command", f"Output · {len(output)} bytes"}:
+            if line.text in {"Command", f"Output · {len(output)} characters buffered"}:
                 detail.lines[index] = resource_ui.UILine(line.text, "class:detail.heading")
         return detail
 
@@ -11928,6 +12091,7 @@ def show_terminal_manager(primary_session=None) -> None:
         load_items=load_items,
         load_detail=load_detail,
         actions=[
+            resource_ui.UIAction("n", "new", "New terminal", allow_empty=True),
             resource_ui.UIAction("e", "enter", "Enter"),
             resource_ui.UIAction("o", "observe", "Observe"),
             resource_ui.UIAction("x", "close", "Close", close, "class:error"),
@@ -11937,6 +12101,8 @@ def show_terminal_manager(primary_session=None) -> None:
         pane_labels=("TERMINALS", "LIVE OUTPUT"),
         empty_message="No terminals. Create one with /term <name>.",
     ).run()
+    if outcome.action == "new":
+        return "new"
     if outcome.item is None or outcome.action not in {"enter", "observe"}:
         return
     name, command, session, _created, alive, primary = outcome.item.payload
@@ -12252,6 +12418,16 @@ def observe_session(session, display_name: str = "", display_cmd: str = "") -> N
 
 
 def enter_session(session, display_name: str = "", display_cmd: str = "") -> None:
+    """Attach with exclusive PTY read ownership, including during redraw."""
+    pty_session = getattr(session, "_pty", None) or session
+    lock = getattr(pty_session, "output_lock", None)
+    if lock is None:
+        return _enter_session_raw(session, display_name, display_cmd)
+    with lock:
+        return _enter_session_raw(session, display_name, display_cmd)
+
+
+def _enter_session_raw(session, display_name: str = "", display_cmd: str = "") -> None:
     """Full interactive takeover of a sub-terminal session.
 
     All keystrokes are forwarded to the session. Type /back or /q in the
@@ -12354,7 +12530,7 @@ def enter_session(session, display_name: str = "", display_cmd: str = "") -> Non
                     if not data:
                         break                     # EOF on stdin
                     # Ctrl+\ (byte 0x1c) → force detach
-                    if data == b'\x1c':
+                    if b'\x1c' in data:
                         detached = True
                         break
                     try:
@@ -12374,13 +12550,22 @@ def enter_session(session, display_name: str = "", display_cmd: str = "") -> Non
                 except OSError:
                     break
                 if data:
+                    # Keep attached output in the same history the preview
+                    # and trigger scanner consume after we return.
+                    pty_session = getattr(session, "_pty", None) or session
+                    record = getattr(pty_session, "_record_output", None)
+                    if callable(record):
+                        record(data)
                     # Prepend any partial marker from previous read
                     data = partial_buf + data
                     partial_buf = b''
 
                     # Check for /back detach marker
                     if DETACH_MARKER in data:
-                        data = data.replace(DETACH_MARKER, b'')
+                        # The child's next prompt may already be in this
+                        # chunk. Do not repaint it over the parent's screen
+                        # or forward its cursor-position queries after exit.
+                        data = data.split(DETACH_MARKER, 1)[0]
                         detached = True
 
                     # Keep suffix that might be a partial marker
@@ -12408,9 +12593,9 @@ def enter_session(session, display_name: str = "", display_cmd: str = "") -> Non
         signal.signal(signal.SIGWINCH, old_sigwinch)
 
     if session_died:
-        console.print(f"\n[dim]{symbols.DOT} Sub-terminal exited. Returned to term0[/dim]")
+        console.print(f"\n[dim]{symbols.DOT} Sub-terminal exited. Returned to {escape(_terminal_display_name('term0'))}[/dim]")
     else:
-        console.print(f"\n[green]{symbols.DOT} Detached. Returned to term0[/green]")
+        console.print(f"\n[green]{symbols.DOT} Detached. Returned to {escape(_terminal_display_name('term0'))}[/green]")
 
 
 _extra_cmd_handler_cache = None
@@ -19649,7 +19834,7 @@ def _cmd_agent(parts: list, session: dict, interactive_session) -> bool:
             term = (getattr(a, "stationed_terminal", None)
                     or getattr(a, "deployment_terminal", None)
                     or "")
-            suffix = f" [dim]role={role}" + (f", term={term}" if term else "") + "[/dim]"
+            suffix = f" [dim]role={role}" + (f", term={escape(_terminal_display_name(term))}" if term else "") + "[/dim]"
             console.print(f"  [cyan]/agent {a.id}[/cyan]  {label}{suffix}")
         if not any_other:
             console.print("  [dim](no other agents)[/dim]")
@@ -19699,11 +19884,11 @@ def _cmd_agent(parts: list, session: dict, interactive_session) -> bool:
     if term:
         console.print(
             f"[dim]Terminal ownership unchanged. This agent is stationed at "
-            f"'{term}' (role={role}).[/dim]")
+            f"'{escape(_terminal_display_name(term))}' (role={role}).[/dim]")
     else:
         console.print(
             f"[dim]Terminal ownership unchanged. This agent is undeployed "
-            f"(role={role}); direct commands still run in term0.[/dim]")
+            f"(role={role}); direct commands still run in {escape(_terminal_display_name('term0'))}.[/dim]")
     return False
 
 
@@ -20044,6 +20229,7 @@ def _open_agents_view(session: dict, agent_registry=None,
             existing_session=existing_session,
             execution_block_reason=execution_block_reason,
             repl_submit_cb=_agents_repl_submit,
+            terminal_label=_terminal_display_name,
             mirror=repl_mirror.hub)
 
         # The view is only a display + router: it runs in its own thread
@@ -21611,14 +21797,15 @@ def _cmd_term(parts: list, agent_registry: AgentRegistry, interactive_session) -
         else:
             parent_identity = (
                 (agent_registry.terminal_meta or {}).get("name")
-                if agent_registry and agent_registry.depth > 0 else "term0"
-            ) or "term0"
+                if agent_registry and agent_registry.depth > 0 else _LOCAL_TERMINAL_NAME
+            ) or _LOCAL_TERMINAL_NAME
             lain_cmd = _build_connected_subterminal_cmd(
                 name,
                 agent_registry.agent_id if agent_registry else None,
                 parent_terminal=parent_identity,
+                depth=_REPL_PROCESS_DEPTH + 1,
             )
-            sub = SubTerminalSession(lain_cmd)
+            sub = SubTerminalSession(lain_cmd, use_tmux=False)
             sub.start()
             time.sleep(0.1)
             if not sub.is_alive():
@@ -21628,27 +21815,20 @@ def _cmd_term(parts: list, agent_registry: AgentRegistry, interactive_session) -
             try:
                 register_terminal(
                     sub, "laintas-cli", 0, name=name,
+                    # Registry keys are local to this CLI; parent_identity
+                    # is the public name passed to the nested process.
                     parent_terminal="term0")
             except Exception as exc:
                 sub.close()
                 console.print(
                     f"[red]Could not register terminal '{name}': {exc}[/red]")
                 return False
-            console.print(f"[green]Created sub-terminal [bold]{name}[/bold] (no agent stationed)[/green]")
+            console.print(f"[green]Created sub-terminal [bold]{name}[/bold] with its own CLI agent.[/green]")
     elif len(parts) > 2:
         console.print("[yellow]Usage: /term \\[name|rename <old> <new>][/yellow]")
     else:
         # /t or /term (no args) — list terminals browser
-        terminals = get_all_terminals()
-        has_primary = interactive_session is not None and interactive_session.is_alive()
-        if not terminals and not has_primary:
-            console.print("[dim]No active sub-terminal sessions. "
-                          "Use /station <agent-id> or let the AI spawn a command.[/dim]")
-        elif not terminals and has_primary:
-            # Only term0 exists — entering it is redundant (already in REPL).
-            console.print("[dim]No sub-terminals. You are already in term0 (primary).[/dim]")
-        else:
-            show_terminal_manager(interactive_session)
+        show_terminal_manager(interactive_session, agent_registry)
 
     return False
 
@@ -22233,6 +22413,15 @@ def _cmd_compact(parts: list, session: dict) -> bool:
             f"{info['messages']} messages {symbols.BULLET} {ratio:.0f}% of "
             f"{_fmt_tokens(info['usable'])} usable"
             + (f" {symbols.BULLET} summarized" if info["summary"] else ""))
+        if not info["auto_enabled"]:
+            console.print("[dim]Automatic and background compaction are disabled by context policy.[/dim]")
+        else:
+            background = (f"background at {_fmt_tokens(info['background_at'])}"
+                          if info["background_enabled"] else "background disabled")
+            console.print(
+                f"[dim]{background}; foreground at {_fmt_tokens(info['auto_at'])}; "
+                f"target {_fmt_tokens(info['target_tokens'])} tokens; "
+                f"background task: {info['background_status']}.[/dim]")
         return False
 
     # Compact an isolated copy so cancelling a slow summarizer cannot let its
@@ -22243,11 +22432,14 @@ def _cmd_compact(parts: list, session: dict) -> bool:
     try:
         with _safe_status(
                 compaction_status_text(auto=False),
-                spinner="dots"):
+                spinner="dots") as update_status:
             result = run_cancellable_blocking(
                 lambda _cancel: compact_session_context(
                     compact_deps, compact_session, compact_working_state,
-                    compact_working_chat, interrupt_event=_cancel))
+                    compact_working_chat, interrupt_event=_cancel,
+                    progress=(lambda detail: update_status(
+                        compaction_status_text(auto=False) + "\n[dim]" + detail + "[/dim]"))
+                    if update_status else None))
     except BlockingOperationCancelled:
         console.print("[dim]Context compaction cancelled.[/dim]")
         return False
@@ -23572,7 +23764,7 @@ def _build_mailbox_browser(*, input=None,
 
 def _mailbox_can_browse() -> bool:
     """The reader is a full-screen application; it needs a real terminal."""
-    if _IN_SUB_TERMINAL:
+    if _USE_SIMPLE_PROMPT:
         return False
     try:
         return bool(sys.stdin.isatty() and sys.stdout.isatty())
@@ -24600,6 +24792,7 @@ _injected_input_queue: queue.Queue = queue.Queue()
 _wakeup_r: Optional[int] = None
 _wakeup_w: Optional[int] = None
 _IN_SUB_TERMINAL = False
+_USE_SIMPLE_PROMPT = False
 
 
 def _init_injection_pipe():
@@ -24677,7 +24870,7 @@ def _get_input(cwd: str):
             except queue.Empty:
                 pass  # spurious wakeup — fall through to prompt
 
-    return _simple_prompt(cwd) if _IN_SUB_TERMINAL else pt_prompt(cwd)
+    return _simple_prompt(cwd) if _USE_SIMPLE_PROMPT else pt_prompt(cwd)
 
 
 def _parse_agent_target(text: str) -> tuple[str, str]:
@@ -26092,6 +26285,20 @@ def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
 
 
 def run_execute_mode(task: str, session: dict, depth: int, session_id: str = None) -> int:
+    if not session_id:
+        return _run_execute_mode(task, session, depth, session_id)
+    cwd = os.getcwd()
+    claim = {"session_id": session_id, "cwd": cwd}
+    if _acquire_resume_lease(claim) is None:
+        return 1
+    try:
+        return _run_execute_mode(task, session, depth, session_id)
+    finally:
+        import peer_coordination
+        peer_coordination.release_session_lease(cwd, session_id)
+
+
+def _run_execute_mode(task: str, session: dict, depth: int, session_id: str = None) -> int:
     """Non-interactive single-task execution.
 
     Called when laintas-cli is invoked with --execute. Runs one agent loop,
@@ -26114,8 +26321,6 @@ def run_execute_mode(task: str, session: dict, depth: int, session_id: str = Non
     chat_history = []
     if session_id:
         saved = load_resume_state(os.getcwd(), session_id=session_id)
-        if saved:
-            saved = _acquire_resume_lease(saved)
         if saved:
             agent_state = _restore_resume_blob(saved, chat_history)
         else:
@@ -26282,8 +26487,10 @@ def main():
 
     # Which process this is decides who may draw on the tty (see
     # _repl_process_depth).
-    global _REPL_PROCESS_DEPTH
+    global _REPL_PROCESS_DEPTH, _LOCAL_TERMINAL_NAME, _LOCAL_PARENT_TERMINAL
     _REPL_PROCESS_DEPTH = int(args.depth or 0)
+    _LOCAL_TERMINAL_NAME = args.terminal_name or "term0"
+    _LOCAL_PARENT_TERMINAL = args.parent_terminal or ""
 
     # The standing advisories (routing tips, the training opt-in, the mouse
     # hint) are re-posted from scratch on every start, so without a durable
@@ -26519,10 +26726,9 @@ def main():
         sys.exit(run_execute_mode(args.execute, session, args.depth, args.session_id))
 
     # ── Simple prompt (PTY subprocess mode) ──
-    _use_simple_prompt = args.simple_prompt or not sys.stdin.isatty()
-    if _use_simple_prompt:
-        global _IN_SUB_TERMINAL
-        _IN_SUB_TERMINAL = True
+    global _IN_SUB_TERMINAL, _USE_SIMPLE_PROMPT
+    _USE_SIMPLE_PROMPT = args.simple_prompt or not sys.stdin.isatty()
+    _IN_SUB_TERMINAL = args.depth > 0
 
     # Show banner (skip in child terminals to avoid Rich output in PTY)
     if args.depth == 0:
@@ -26595,29 +26801,7 @@ def main():
             startup_mail.post("session-store", "Session store warning",
                               str(_session_warning), level="warn")
         if _previous_live_session:
-            _prev_ch = _previous_live_session.get("chat_history") or []
-            _prev_user_turns = [m for m in _prev_ch if isinstance(m, dict) and m.get("role") == "user"]
-            if _prev_user_turns:
-                save_resume_checkpoint(
-                    _previous_live_session.get("state")
-                    or _previous_live_session.get("agent_state") or {},
-                    _prev_ch,
-                    _session_start_cwd,
-                )
-            # Not if another instance is still running it. Two CLIs launched
-            # in one terminal derive the same TERMINAL_ID and therefore read
-            # the same "current session" pointer, and the second one used to
-            # close the first one's live session out from under it.
-            _prev_owner = _live_session_lease_owner(
-                _session_start_cwd,
-                str(_previous_live_session.get("session_id")
-                    or _previous_live_session.get("id") or ""))
-            if _prev_owner is None:
-                session_store.close_session(_previous_live_session)
-            else:
-                console.print(
-                    f"[dim]Leaving the session open: another instance "
-                    f"(pid {_prev_owner.get('pid', '?')}) is running it.[/dim]")
+            _archive_previous_session(_session_start_cwd, _previous_live_session)
 
         if not _explicit_startup_resume:
             try:
@@ -26682,22 +26866,14 @@ def main():
         _resume_blob = (load_resume_state(_session_start_cwd)
                         if _explicit_startup_resume else None)
         if _resume_blob and _resume_blob.get("chat_history"):
-            _selected_resume = _choose_resume_blob(_session_start_cwd, "latest")
-            if _selected_resume:
-                _selected_resume = _fork_resume_blob(_selected_resume, _session_start_cwd)
-            if _selected_resume:
-                _close_live_session(current_live_session)
-                agent_state = _restore_resume_blob(_selected_resume, chat_history)
-                current_live_session = session_store.create_session(
-                    _session_start_cwd, agent_state, chat_history)
-                _hold_live_session_lease(current_live_session, _session_start_cwd)
+            switched = _switch_resume_session(
+                _resume_blob, _session_start_cwd, agent_state, chat_history,
+                current_live_session)
+            if switched is not None:
+                agent_state, current_live_session = switched
                 handle_meta_command._current_live_session = current_live_session
-                console.print(
-                    f"[green]Started an independent branch from saved context "
-                    f"({_resume_turn_count(_selected_resume)} turn(s), "
-                    f"{_format_time_ago(_selected_resume.get('timestamp', 0))}).[/green]"
-                )
-                _print_resume_transcript(_selected_resume, 20)
+                console.print("[green]Resumed saved session.[/green]")
+                _print_resume_transcript({"chat_history": chat_history}, 20)
         elif _explicit_startup_resume:
             console.print("[yellow]No saved session for this directory.[/yellow]")
 
@@ -26800,7 +26976,7 @@ def main():
         chat_history = sub.chat_history
         set_current_agent_id(args.agent_id)
     else:
-        primary = register_agent(name="primary", depth=0, role="primary",
+        primary = register_agent(name="primary", depth=args.depth, role="primary",
                                  load_existing=True)
         if _restore_app_conversation:
             # Everywhere else the REPL's fresh locals replace what was loaded;
@@ -26816,7 +26992,7 @@ def main():
         primary.deployment_terminal = "term0"
         primary.stationed_terminal = "term0"
         primary.home_terminal = "term0"
-        primary.parent_terminal = None
+        primary.parent_terminal = args.parent_terminal if args.depth > 0 else None
         set_current_agent_id("primary")
         # Anything already in the registry from a restore predates the rule
         # that every agent has a parent; adopt it once, here.
@@ -27327,8 +27503,7 @@ def main():
                 injected_done.set()
             return
 
-        # /resume is the compatibility entry point for forking saved context.
-        # Source identity and files stay untouched, even when a peer owns them.
+        # /resume switches logical sessions; /fork explicitly creates branches.
         # /resume [N|all|latest] — the argument controls how many messages to
         # echo after restoring (N, default 20; 0 = silent; "all" = full). When
         # multiple sessions are saved, a full-screen picker chooses which one;
@@ -27363,33 +27538,21 @@ def main():
             else:
                 # Multiple saved sessions — open the full-screen picker.
                 _blob = show_resume_picker(_session_start_cwd)
-            if _blob and not _blob.get("chat_history"):
-                console.print("[yellow]Saved session has no conversation to resume.[/yellow]")
-            elif _blob:
-                _blob = _fork_resume_blob(_blob, _session_start_cwd)
-            if _blob and not _blob.get("chat_history"):
-                console.print("[yellow]Saved session has no conversation to resume.[/yellow]")
-            elif _blob:
-                save_resume_state(agent_state, chat_history, _session_start_cwd)
-                _close_live_session(current_live_session)
-                agent_state = _restore_resume_blob(_blob, chat_history)
-                current_live_session = session_store.create_session(_session_start_cwd, agent_state, chat_history)
-                _hold_live_session_lease(current_live_session, _session_start_cwd)
-                handle_meta_command._current_live_session = current_live_session
-                handle_meta_command._last_agent_state = agent_state
-                handle_meta_command._last_chat_history = chat_history
-                handle_meta_command._last_original_input = (
-                    current_live_session.get("last_original_input")
-                    or current_live_session.get("last_user_input")
-                    or current_live_session.get("objective")
-                )
-                _n = _resume_turn_count(_blob)
-                _ago = _format_time_ago(_blob.get("timestamp", 0))
-                console.print(
-                    f"[green]Started an independent branch from saved context "
-                    f"({_n} turn(s), {_ago}).[/green]"
-                )
-                _print_resume_transcript(_blob, _echo_limit)
+            if _blob:
+                switched = _switch_resume_session(
+                    _blob, _session_start_cwd, agent_state, chat_history,
+                    current_live_session)
+                if switched is not None:
+                    agent_state, current_live_session = switched
+                    handle_meta_command._current_live_session = current_live_session
+                    handle_meta_command._last_agent_state = agent_state
+                    handle_meta_command._last_chat_history = chat_history
+                    handle_meta_command._last_original_input = (
+                        current_live_session.get("last_original_input")
+                        or current_live_session.get("last_user_input")
+                        or current_live_session.get("objective"))
+                    console.print("[green]Switched to saved session.[/green]")
+                    _print_resume_transcript({"chat_history": chat_history}, _echo_limit)
             if injected_done is not None:
                 injected_done.set()
             continue

@@ -1,0 +1,132 @@
+{
+  "live": true,
+  "synthetic": true,
+  "baseline": "92ae85a",
+  "results": [
+    {
+      "variant": "committed",
+      "seconds": 86.2785,
+      "calls": 4,
+      "input_tokens_estimate": 2752,
+      "valid_summary": true,
+      "requests": [
+        {
+          "kind": "compaction",
+          "seconds": 20.174,
+          "input_tokens_estimate": 296,
+          "source_present": false,
+          "error": false
+        },
+        {
+          "kind": "compaction_review",
+          "seconds": 16.072,
+          "input_tokens_estimate": 485,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction",
+          "seconds": 24.23,
+          "input_tokens_estimate": 889,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction_review",
+          "seconds": 25.445,
+          "input_tokens_estimate": 1082,
+          "source_present": true,
+          "error": false
+        }
+      ],
+      "summary": "## Goal\n- Fix `/srv/service/worker.py` on port 7319.\n## Constraints & Preferences\n- Do not deploy without approval.\n- If tests fail, repair them and rerun.\n- Preserve exact error and path.\n## Durable User Rules\n- (none)\n## Progress\n### Done\n- (none)\n### In Progress\n- Collecting tests (execution is not finished).\n### Blocked\n- (none)\n## Key Decisions\n- (none)\n## Next Steps\n- Investigate `/srv/service/worker.py` for errors.\n- Run tests and repair/rerun if they fail.\n## Critical Context\n- Target file: `/srv/service/worker.py`\n- Target port: 7319\n- Test collection is currently loading modules.\n## Relevant Files\n- `/srv/service/worker.py`: Target service file.",
+      "fact_markers": {
+        "7319": true,
+        "approval": true,
+        "ImportError": false,
+        "fastcodec": false,
+        "/srv/service/worker.py": true,
+        "exit 7": false
+      }
+    },
+    {
+      "variant": "before_fix",
+      "seconds": 52.7706,
+      "calls": 4,
+      "input_tokens_estimate": 2132,
+      "valid_summary": true,
+      "requests": [
+        {
+          "kind": "compaction",
+          "seconds": 17.822,
+          "input_tokens_estimate": 296,
+          "source_present": false,
+          "error": false
+        },
+        {
+          "kind": "compaction_review",
+          "seconds": 4.654,
+          "input_tokens_estimate": 412,
+          "source_present": false,
+          "error": false
+        },
+        {
+          "kind": "compaction",
+          "seconds": 23.042,
+          "input_tokens_estimate": 856,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction_review",
+          "seconds": 7.214,
+          "input_tokens_estimate": 568,
+          "source_present": false,
+          "error": false
+        }
+      ],
+      "summary": "## Goal\n- Fix `/srv/service/worker.py` on port 7319.\n\n## Constraints & Preferences\n- Do not deploy without approval.\n- If tests fail, repair them and rerun.\n- Preserve exact error and path.\n\n## Durable User Rules\n- (none)\n\n## Progress\n### Done\n- (none)\n### In Progress\n- Fixing `/srv/service/worker.py`\n### Blocked\n- (none)\n\n## Key Decisions\n- (none)\n\n## Next Steps\n- (none)\n\n## Critical Context\n- Target port: 7319\n\n## Relevant Files\n- `/srv/service/worker.py`: File requiring fixes.",
+      "fact_markers": {
+        "7319": true,
+        "approval": true,
+        "ImportError": false,
+        "fastcodec": false,
+        "/srv/service/worker.py": true,
+        "exit 7": false
+      }
+    },
+    {
+      "variant": "fixed",
+      "seconds": 23.4006,
+      "calls": 2,
+      "input_tokens_estimate": 1800,
+      "valid_summary": true,
+      "requests": [
+        {
+          "kind": "compaction",
+          "seconds": 18.567,
+          "input_tokens_estimate": 778,
+          "source_present": false,
+          "error": false
+        },
+        {
+          "kind": "compaction_review",
+          "seconds": 4.802,
+          "input_tokens_estimate": 1022,
+          "source_present": true,
+          "error": false
+        }
+      ],
+      "summary": "## Goal\n- Fix `/srv/service/worker.py` on port 7319.\n\n## Constraints & Preferences\n- Do not deploy without approval.\n- If tests fail, repair them and rerun.\n- Preserve exact error and path.\n\n## Durable User Rules\n- (none)\n\n## Progress\n### Done\n- Ran initial tests using `pytest /srv/service/test_worker.py`.\n### In Progress\n- Investigating `ImportError`.\n### Blocked\n- (none)\n\n## Key Decisions\n- (none)\n\n## Next Steps\n1. Resolve `ImportError: missing fastcodec` in `/srv/service/worker.py`.\n2. Rerun tests using `pytest /srv/service/test_worker.py`.\n\n## Critical Context\n- `ImportError: missing fastcodec in /srv/service/worker.py`\n- Test execution failed with `exit 7`.\n\n## Relevant Files\n- `/srv/service/worker.py`: The file requiring fixes.\n- `/srv/service/test_worker.py`: The test suite used for verification.",
+      "fact_markers": {
+        "7319": true,
+        "approval": true,
+        "ImportError": true,
+        "fastcodec": true,
+        "/srv/service/worker.py": true,
+        "exit 7": true
+      }
+    }
+  ],
+  "pipeline": false
+}

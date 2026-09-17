@@ -389,14 +389,39 @@ function sparks(){
 }
 
 const commitGrids=[...$('#content').querySelectorAll(':scope > .grid')];
+const r=data.result||null;
+const sevOrder=['critical','high','medium','low','unknown'];
+const resultAside=r&&r.status==='reviewed'
+  ?'<h3>Result score</h3>'+kv('Review result',n(r.value,1)+' / 100')
+    +kv('Findings',n(r.findings,0)+(r.by_severity&&r.findings?' · '+sevOrder.filter(s=>r.by_severity[s]).map(s=>n(r.by_severity[s],0)+' '+s).join(', '):''))
+    +kv('Density',r.density_per_kloc+' / kloc')
+    +'<p class="note">review-result-v1 · external review evidence ('+esc(r.review_status||'success')+'). Separate axis: never mixed into the process score.</p>'
+  :'<h3>Result score</h3>'+kv('Review result','not reviewed')
+    +'<p class="note">No external review evidence for this commit. Run <code>aipow review</code> to collect it. Missing evidence is not a perfect score.</p>';
+function resultPanel(){
+  if(!r||r.status!=='reviewed')return '';
+  const rows=(r.by_severity&&Object.keys(r.by_severity).length)
+    ?sevOrder.filter(s=>r.by_severity[s]).map(s=>{
+      const w={critical:8,high:4,medium:2,low:1}[s]??2;
+      return `<tr><td class="key">${esc(s)}</td><td class="r num">${n(r.by_severity[s],0)}</td>
+        <td class="r num">${n(r.by_severity[s]*w,0)}</td>
+        <td class="r opt">${track(r.by_severity[s]*w,r.weighted_findings||1)}</td></tr>`}).join('')
+    :'<tr><td colspan="4">No findings — clean review</td></tr>';
+  return `<div class="grid g21"><section class="panel"><header><h3>Review findings</h3><span class="unit">review-result-v1</span></header><div class="body flush">
+    <table><thead><tr><th>Severity</th><th class="r">Count</th><th class="r">Weighted</th><th class="r opt">Share</th></tr></thead><tbody>${rows}</tbody></table></div></section>
+  <section class="panel"><header><h3>Result score</h3><span class="unit">artifact axis</span></header><div class="body">
+    <div class="big-total"><b class="num">${n(r.value,1)}</b><span class="hint">/ 100 · ${n(r.findings,0)} findings · ${n(r.weighted_findings,0)} weighted</span></div>
+    <div class="score-track"><i style="width:${Math.max(0,Math.min(100,Number(r.value)||0))}%"></i></div>
+    <p class="note">Density ${n(r.density_per_kloc,1)} weighted findings per 1000 changed lines (${n(r.changed_lines,0)} changed lines). Scored from external review evidence only; the process score above is unaffected.</p></div></section></div>`;
+}
 scoreLayout(scoreHero('Iteration score',s.value,'/ 100','The score for this commit, based on recorded process retention.',
   '<h3>Score evidence</h3>'+kv('Retained edits',n(kept,0)+' / '+n(ops,0))+
-  kv('Evidence confidence',pct(s.confidence,0))+kv('Score status',s.status)+
+  kv('Evidence confidence',pct(s.confidence,0))+kv('Score status',s.status)+resultAside+
   `<div class="score-track"><i style="width:${Math.max(0,Math.min(100,Number(s.value)||0))}%"></i></div><p class="note">${esc(s.algorithm)} · ${esc(s.grade)}. This score does not verify code quality or passing tests.</p>`),[
   ['Efficiency & input','Human input, cost, retention and tool use',[commitGrids[0],commitGrids[2],commitGrids[3]]],
   ['Changes & execution','Files, session timelines and task records',[commitGrids[4],commitGrids[1],commitGrids[5]]],
   ['Verification & provenance','Checks, evidence and measurement methods',[commitGrids[6]]]
-]);
+],resultPanel());
 function paint(){waterfall();sparks()}
 $('#content').addEventListener('toggle',()=>requestAnimationFrame(paint),true);
 paint();
@@ -474,14 +499,15 @@ $('#content').innerHTML=`
 <div class="grid">
   ${panel('Commits','newest first · open one for its proof',
     `<div class="scroll"><table class="compact"><thead><tr><th>Date</th><th>Commit</th><th>Subject</th>
-      <th class="r opt">Duration</th><th class="r opt">AWC</th><th class="r">Edits</th><th class="r">Survival</th><th class="r opt">Score</th></tr></thead><tbody>`
+      <th class="r opt">Duration</th><th class="r opt">AWC</th><th class="r">Edits</th><th class="r">Survival</th><th class="r opt">Score</th><th class="r opt">Result</th></tr></thead><tbody>`
     +rows.map(p=>{const sv=p.operations?p.retained/p.operations:null;
       return `<tr><td>${esc(dayOf(p.date))}</td>
         <td><a href="${esc((data.links&&data.links.commit)||'reports/')}${esc(p.commit)}.html">${esc(p.commit.slice(0,7))}</a></td>
         <td class="key">${esc(p.title)}</td><td class="r opt">${dur(p.span_ms)}</td>
         <td class="r opt num">${isNum(p.awc)?Number(p.awc).toFixed(2):NA}</td><td class="r num">${n(p.retained,0)}</td>
         <td class="r"><span class="bar"><span class="track"><i style="width:${Math.round((sv||0)*100)}%"></i></span><span class="num">${pct(sv,0)}</span></span></td>
-        <td class="r opt num">${p.score?esc(p.score.value):NA}</td></tr>`}).join('')
+        <td class="r opt num">${p.score?esc(p.score.value):NA}</td>
+        <td class="r opt num">${p.result?n(p.result.value,1)+' <span class="hint">('+n(p.result.findings,0)+')</span>':'<span class="hint">—</span>'}</td></tr>`}).join('')
     +'</tbody></table></div>','flush')}
 </div>
 <div class="grid g3">

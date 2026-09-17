@@ -1,185 +1,127 @@
-# 自动任务路由与 Station 管理界面
+# Automatic task routing and the Station management UI
 
-状态：核心路由、共享 Station 服务和管理 UI 已实现，运行配置保持不变。
+Status: core routing, the shared Station service and the management UI are implemented; runtime configuration is unchanged.
 
-实现边界：请求幂等记录属于当前进程（最多 4096 条，满后拒绝新准入，不驱逐旧记录造成重复执行）；
-自动路由保守选择已有只读专业角色或隔离的通用子 agent，持久员工通过明确选择派发。
-`auto_pilot_budget_tokens` 已接入提供方实际返回用量及祖先运行累计，是达到阈值后的停止机制，
-不是在途请求的硬额度预留；提供方缺失用量时不伪造计费值。
-依赖图、跨重启恢复仍由原 WorkGraph/HWG 处理，Station 不新增持久任务存储或自动重放。
-下文保留设计原则与后续扩展验收条件；没有新增模型自动切换或全局学习排序。
+Implementation boundaries: the request-idempotency record is process-local (at most 4,096 entries; when full, new admissions are refused rather than evicting old records and risking duplicate execution). Automatic routing conservatively chooses an existing read-only specialist role or an isolated generic sub-agent; persistent employees are dispatched only by explicit selection. `auto_pilot_budget_tokens` is wired to the provider's actual reported usage plus ancestor-run accumulation; it is a stop condition once the threshold is reached, not a hard in-flight quota reservation, and missing provider usage is never faked. Dependency graphs and cross-restart recovery stay with the existing WorkGraph/HWG; Station adds no persistent task store and no automatic replay. The design principles and acceptance criteria for later extensions are kept below; no automatic model switching or global learned ranking was added.
 
-## 目标与边界
+## Goals and boundaries
 
-自动路由负责为一个已经明确边界的任务选择执行者。任务拆解、选择执行者、
-申请并发槽、运行与验收是不同阶段。不要再增加第二套 agent 注册表、队列或任务状态。
+Automatic routing picks an executor for a task whose boundaries are already clear. Decomposing the task, choosing an executor, claiming a concurrency slot, running, and accepting the result are distinct stages. Do not add a second agent registry, a second queue, or a second task state.
 
-`/station` 无参数打开统一管理界面；已有参数命令保持兼容。
-UI、命令和自动路由调用同一个服务入口。关闭界面不停止任务。
-本设计里的委派 `branch` 是运行监督单元，不是 `/fork` 的会话分支。
+`/station` with no arguments opens the unified management UI; existing parameterized commands stay compatible.
+The UI, the commands, and the automatic router call the same service entry point. Closing the UI does not stop tasks.
+A delegation `branch` in this design is a supervision unit for a run, not a `/fork` conversation branch.
 
-## 源码依据与复用点
+## Source basis and reuse points
 
-| 当前实现 | 已有能力 | 整合方式 |
+| Current implementation | Existing capability | Integration approach |
 |---|---|---|
-| `auto_pilot.py` | 分类、拆解、自动执行开关、线程局部 pending plan | 保留入口，逐步使用结构化任务；关键词只作提示 |
-| `agent_loop.py:EmployeeProfile` | 专业角色、能力标签、工具策略 | 匹配员工能力，不另建人员档案 |
-| `start_agent_assignment` | 员工任务锁、新任务状态、临时运行终端 | 员工执行适配器，补齐统一验收与监督接入 |
-| `spawn_subagent` | 父子关系、深度限制、工作树、结果回传 | 临时子 agent 执行适配器 |
-| `schedule_agent` | 共享并发上限、FIFO、取消出队回调 | 唯一执行槽队列 |
-| `branch.py` | 运行归属、超时、停滞检测、结果收敛 | 唯一委派监督机制；确认员工任务接入按 assignment 标识隔离 |
-| `agent_contract.py` | 输出契约、证据验证、文件范围 | 路由前校验与完成后验收 |
-| `workgraph.py` / HWG | 持久工作与依赖执行 | 需要依赖或重启恢复时沿用；不另写 DAG 执行器 |
-| `station_agent` / `swap_station` | 原子驻留、终端独占 | 绑定与切换的唯一底层实现 |
-| `agent_ui_events.py` | 有界运行事件流 | UI 活动和路由解释的通知来源 |
-| `resource_ui.py:ResourceBrowser` | 双栏、搜索、原地动作、周期刷新 | Station 的 UI 外壳 |
-| `agents_mode.py` | agent 对话、运行状态和输出展示 | 提取共享展示函数；保留对话入口 |
+| `auto_pilot.py` | Classification, decomposition, auto-run switch, thread-local pending plan | Keep the entry point; move gradually to structured tasks; keywords as hints only |
+| `agent_loop.py:EmployeeProfile` | Specialist roles, capability tags, tool policy | Match employee capabilities; do not build a second personnel registry |
+| `start_agent_assignment` | Employee assignment lock, new-task status, temporary run terminal | Adapter for employee execution; add unified acceptance and supervision hooks |
+| `spawn_subagent` | Parent/child relation, depth limits, worktree, result return | Adapter for temporary sub-agent execution |
+| `schedule_agent` | Shared concurrency cap, FIFO, cancel-from-queue callbacks | The single execution-slot queue |
+| `branch.py` | Run ownership, timeout, stall detection, result convergence | The single delegation supervision mechanism; confirm employee assignments are isolated by assignment identity |
+| `agent_contract.py` | Output contracts, evidence validation, file scope | Pre-route validation and post-completion acceptance |
+| `workgraph.py` / HWG | Persistent work and dependency execution | Reuse when dependencies or restart recovery are needed; do not write a second DAG executor |
+| `station_agent` / `swap_station` | Atomic stationing, terminal exclusivity | The single underlying implementation for binding and switching |
+| `agent_ui_events.py` | Bounded run-event stream | The notification source for UI activity and routing explanations |
+| `resource_ui.py:ResourceBrowser` | Two-pane, search, in-place actions, periodic refresh | The UI shell for Station |
+| `agents_mode.py` | Agent conversations, run state, output display | Extract shared display helpers; keep the conversation entry point |
 
-实施前的缺口（保留作审阅依据）：
+Gaps found before implementation (kept as review evidence):
 
-- `_cmd_station` 内混合参数解析、终端启动、绑定、任务提交、输出，且重复调用派任务逻辑。
-- Auto-Pilot 接收字符串子任务，没有显式依赖、工具需求、文件范围、验收约束。
-- 自动执行路径使用 `subtasks[:max_parallel]`；并发限制变成截断，没有保存超出部分供后续调度。
-- 自动执行创建预算跟踪对象后没有接入后续状态、token 更新，不能据此宣称有预算硬限制。
-- 拆解回调临时更改全局 `max_tokens`，有并发干扰风险；应改成请求级参数。
-- `get_pool_agents` 的实际过滤没有判断空闲；路由不能依赖其名称或注释判断是否可派任务。
-- 员工任务与临时子 agent 的生命周期不同，不能只按 `status == done` 统一完成语义。
+- `_cmd_station` mixes argument parsing, terminal startup, binding, task submission and output, and duplicates the task-dispatch logic.
+- Auto-Pilot receives string subtasks with no explicit dependencies, tool requirements, file scope, or acceptance constraints.
+- The automatic path uses `subtasks[:max_parallel]`; the concurrency limit acts as truncation, and the overflow is not saved for later scheduling.
+- The automatic path creates a budget-tracking object but never wires it to later state or token updates, so a hard budget limit cannot be claimed.
+- The decomposition callback temporarily mutates the global `max_tokens`, risking concurrent interference; it should be a per-request parameter.
+- `get_pool_agents` does not actually filter for idle; routing cannot rely on names or comments to decide dispatchability.
+- Employee assignments and temporary sub-agents have different lifecycles; completion cannot be unified on `status == done` alone.
 
-## 三种关系必须分开
+## Three relationships that must stay separate
 
-1. **委派关系**：`parent_id → child_ids`。决定任务责任与消息权限。
-   保留现有仅父子直接通信的约束；不能因同终端、同标签而扩大通信范围。
-2. **驻留关系**：agent → 持久终端。一个 agent 最多一个驻留终端，一个终端最多一个驻留者。
-   `home_terminal` 表示归属，不等同于部署，也不授予 PTY 读写权。
-3. **执行关系**：一次 assignment / child run → 执行者、资源、契约、结果。
-   临时 PTY 属于本次执行，不加入可永久驻留终端列表。
+1. **Delegation**: `parent_id → child_ids`. Determines task responsibility and messaging rights.
+   Keep the existing direct parent/child-only communication constraint; shared terminals or shared tags must not widen it.
+2. **Stationing**: agent → persistent terminal. One agent holds at most one stationed terminal; one terminal holds at most one stationed agent.
+   `home_terminal` marks ownership; it is not deployment and grants no PTY read/write access.
+3. **Execution**: one assignment / child run → executor, resources, contract, result.
+   A temporary PTY belongs to that execution and never joins the permanent terminal roster.
 
-持久员工复用 profile，每次 assignment 使用新上下文；临时子 agent 的身份在任务结束后收敛。
-持久 agent 不应为了被另一个管理者选中而自动修改 `parent_id`。
+A persistent employee reuses its profile with a fresh context per assignment; a temporary sub-agent's identity converges when its task ends.
+A persistent agent must not silently rewrite its `parent_id` just because another supervisor picked it.
 
-## 自动路由流程
+## Automatic routing flow
 
-`任务请求 → 边界校验 → 候选过滤 → 排序 → 原子准入 → 共享调度 → 验收 → 向父级回传`
+`task request → boundary validation → candidate filter → ranking → atomic admission → shared scheduling → acceptance → report to parent`
 
-新增 `agent_router.py`，只包含纯决策逻辑，不创建线程、终端、工作树，不修改注册表。
-输入使用不可变快照，输出 `RouteDecision`，可在单测中完全复现。
+A new `agent_router.py` holds pure decision logic only: it creates no threads, terminals or worktrees and mutates no registry.
+Inputs are immutable snapshots; the output is a `RouteDecision`, fully reproducible in unit tests.
 
-任务请求至少包含：
+A task request carries at least:
 
-- `request_id`、`session_id`、`run_id`、`owner_agent_id`；防止会话切换后接错任务。
-- 任务文本、`cwd`、专业角色、所需工具、读取/写入范围。
-- 依赖引用、输出契约、父级剩余预算、超时和是否允许创建子 agent。
-- 显式指定执行者（如有）；用户明确选择优先于自动匹配。
+- `request_id`, `session_id`, `run_id`, `owner_agent_id`; prevents picking up the wrong task after a session switch.
+- Task text, `cwd`, specialist role, required tools, read/write scope.
+- Dependency references, output contract, the parent's remaining budget, timeout, and whether creating sub-agents is allowed.
+- An explicitly named executor if any; an explicit user choice outranks automatic matching.
 
-这些是路由输入，不是新的持久任务存储。持久请求由现有工作图承载。
+These are routing inputs, not a new persistent task store; persistent requests live in the existing work graph.
 
-候选硬过滤先于排序：
+Hard candidate filtering precedes ranking:
 
-- 当前会话/运行授权范围内，且符合现有委派树；主 agent、其他父级的员工不自动借用。
-- 尚未终止；没有 active assignment；未处于 queued/running/waiting。
-- 专业能力与实际工具权限均满足。标签表示意图，工具权限才决定能否执行。
-- 指定终端仍存活、归属有效；所需上下文、cwd、执行隔离可提供。
-- 深度、预算和资源条件符合限制；父任务没有取消。
+- Within the current session/run authorization and the existing delegation tree; the main agent and other parents' employees are not borrowed automatically.
+- Not terminated; no active assignment; not queued/running/waiting.
+- Both the specialist capability and the actual tool permissions match. Tags express intent; tool permissions decide executability.
+- The named terminal is still alive with valid ownership; the required context, cwd and execution isolation can be provided.
+- Depth, budget and resource conditions fit the limits; the parent task is not cancelled.
 
-通过过滤后使用可解释的稳定排序：显式匹配、专业角色、能力覆盖、上下文适配、稳定 ID。
-不使用不可校准的“模型自报置信度”来授予权限。
-第一版不引入历史成功率学习、向量服务或自动模型切换。
+Survivors are ranked by an explainable stable order: explicit match, specialist role, capability coverage, context fit, stable ID.
+Uncalibratable "model self-reported confidence" is never used to grant permissions.
+The first version adds no success-rate learning, vector services, or automatic model switching.
 
-决策只能是：复用合格空闲员工、创建临时子 agent、等待、由父级执行、拒绝。
-拒绝工具需求与简单匹配不足要区分：权限不满足不能退化成偷偷放宽权限。
-无合格员工时，只有父级明确允许创建且资源满足才走现有 `spawn_subagent`。
+A decision can only be: reuse a qualified idle employee, spawn a temporary sub-agent, wait, let the parent execute, or refuse.
+Refusal for missing tool permissions is distinct from a mere ranking miss: unmet permissions must not degrade into silently widened permissions.
+With no qualified employee, the existing `spawn_subagent` is used only if the parent explicitly allows creation and resources permit.
 
-匹配并不保证准入成功。候选可能在决策后被另一任务占用；服务必须在现有锁下再验一次。
-竞争失败返回结构化原因，有限次重选；没有可行候选就返回等待/父级执行。
-禁止在锁内调用模型、启动 PTY 或等待线程。
+A match does not guarantee admission. The candidate may be taken by another task after the decision; the service must re-verify under the existing lock.
+Losing the race returns a structured reason with a bounded number of re-selections; with no viable candidate it returns wait/parent-executes.
+Calling models, starting PTYs, or waiting on threads inside the lock is forbidden.
 
-## 共用服务与运行闭环
+## The shared service and the run loop
 
-新增 `station_service.py`，提供：
+A new `station_service.py` provides:
 
-- `snapshot(scope)`：以短锁采集一致、不可变的 agent/terminal/assignment 视图。
-- `assign(request)`：手动指定和自动匹配共用校验、幂等准入和调度。
-- `deploy(agent, terminal)` / `undeploy(agent)`：包装现有驻留逻辑与资源创建回滚。
-- `cancel(run_ref)`：取消具体运行，不能只用可复用 agent ID 取消其后来的新任务。
+- `snapshot(scope)`: a consistent, immutable agent/terminal/assignment view gathered under a short lock.
+- `assign(request)`: shared validation, idempotent admission and scheduling for both manual assignment and automatic matching.
+- `deploy(agent, terminal)` / `undeploy(agent)`: wrap existing stationing logic with resource-creation rollback.
+- `cancel(run_ref)`: cancables a specific run; a reusable agent ID alone must not cancel its later, different tasks.
 
-服务显式传入 runtime adapter，避免反向导入 `laintas_cli` 或使用动态局部导入绕过循环依赖。
-保留两种执行适配器（员工 assignment、临时 subagent），共享准入与完成报告；不要强行合并生命周期。
+The service receives a runtime adapter explicitly; no reverse imports of `laintas_cli` and no dynamic local imports to dodge circular dependencies.
+Keep the two execution adapters (employee assignment, temporary sub-agent) with shared admission and completion reporting; do not force their lifecycles together.
 
-必须满足以下不变量：
+These invariants must hold:
 
-- `(session_id, run_id, request_id)` 幂等：同一请求重试只得到一次派发结果。
-  同一 ID 不同内容是冲突；不能按任务文本去重合法的重复请求。
-- 并发上限只限制同时执行数量。待执行任务全部保留，进入原调度机制；依赖未满足的不抢槽。
-- 一个 assignment 只有一个执行者；一个 agent 同时只持有一个 assignment；槽位只释放一次。
-- 统一报告要区分“返回结果”和“验收通过”；保留现有 contract/stage 与 branch outcome。
-  没有契约的正常退出只能标明未做契约验证，不能暗示已证明正确。
-- 父级取消先阻止新准入，再取消排队项、停止运行项，最后等待资源释放；取消具有幂等性。
-- 工作树、PTY、线程各有明确 owner；只清理本次创建的资源，失败中途同样回滚。
-- 私有 PTY 不代表文件系统隔离。员工路径不能直接假设拥有子 agent 工作树机制；
-  并行写任务必须接入既有工作树隔离或文件范围互斥，非 Git 且不能证明安全时串行执行。
-- 预算计量来自实际运行，原子预留和结算；在计量闭环实现前不声称支持 token 硬上限。
-  可先强制执行已具备的并发、轮数、时限约束。
-- 进程重启后旧运行标记为 interrupted，先核对资源和产物，不自动重放有副作用的任务。
-- 会话 fork 可继承计划文本，不继承存活的 assignment、PTY、线程或调度槽所有权。
+- `(session_id, run_id, request_id)` idempotency: retrying one request yields exactly one dispatch result.
+  The same IDs with different content is a conflict; legitimate duplicate requests must not be deduplicated by task text.
+- The concurrency cap limits only simultaneous execution. Queued tasks are all kept and enter the existing scheduler; unmet dependencies do not steal slots.
+- One assignment has exactly one executor; one agent holds at most one assignment at a time; a slot is released exactly once.
+- Unified reporting distinguishes "returned a result" from "passed acceptance"; keep the existing contract/stage and branch outcomes.
+  A clean exit without a contract is marked "contract not verified", never implied correct.
+- A parent cancel first blocks new admissions, then cancels queued items, then stops running ones, then waits for resources to be released; cancellation is idempotent.
+- Worktrees, PTYs and threads each have one clear owner; clean up only what this run created, and roll back on mid-flight failure.
+- A private PTY is not filesystem isolation. The employee path cannot assume it owns the sub-agent worktree mechanism;
+  parallel writing tasks must use the existing worktree isolation or file-scope mutual exclusion, or run serially when non-Git and not provably safe.
+- Budget accounting comes from actual runs with atomic reservation and settlement; until that loop is closed, do not claim hard token caps.
+  The already-available concurrency, round and deadline limits can be enforced first.
+- After a process restart, old runs are marked interrupted; resources and artifacts are checked before any replay — tasks with side effects are never replayed automatically.
+- A session fork may inherit plan text but not live assignments, PTYs, threads or scheduler-slot ownership.
 
-事件流用于通知，运行快照用于事实查询。UI 丢事件时重取快照，不靠事件重建唯一状态。
-闭环状态复用当前 assignment/stage/branch；只为缺失转换补字段，不再发明平行状态机。
+The event stream is for notifications; the run snapshot is the source of truth for queries. If the UI drops events it refetches the snapshot instead of rebuilding state from events.
+The closed loop reuses the current assignment/stage/branch; fields are added only for missing transitions — no parallel state machine.
 
-## Station UI
+## UI structure
 
-`/station` 作为管理入口，`/agents` 保留对话用途，`/term` 保留终端直达用途。
-采用现有 ResourceBrowser 的 operations 风格、颜色与状态词，初版只做双栏。
-
-```text
-STATION     Running 2 / 8     Queued 1     Routing: Suggest
-RELATIONSHIPS                    DETAILS / ACTIVITY
-Main                             Backend · running
-  Backend · running              Parent: Main
-    task: API validation         Home: term0
-    terminal: private (task)     Deployment: none
-  Reviewer · queued              Task terminal: private PTY
-    task: review                 Reason: role + tool access
-                                 Contract / scope / latest events
-
-↑↓ select  Tab focus  / search  Enter details  ? actions  q close
-```
-
-默认按委派树显示，终端作为关联字段，避免把驻留关系画成父子授权关系。
-提供“按终端”视图：持久终端和驻留者、空终端、未驻留员工分组；临时 PTY 只作运行子项。
-切换视图不改变实体关系。第一版可在同一个 Browser 内切换 loader，不引入多窗口框架。
-
-选中项详情包含父级、home、deployment、任务终端、排队原因、工具限制、文件范围、
-模型、路由理由、契约与最近活动。模型由现有 profile/继承配置决定，路由不擅自换模型。
-
-动作按类型与状态提供：派任务、绑定/解除驻留、查看对话、查看终端、取消任务、结束终端。
-“取消任务”和“结束终端”明确分开；后者应列出会受影响的 agent/任务。
-Enter 默认查看详情，不能意外派任务或终止资源。
-不可用动作说明具体原因；服务在执行时重新校验，不能信任过期 UI 状态。
-
-刷新要求：
-
-- 以 `agent:<id>`、`terminal:<id>`、`assignment:<id>` 为稳定 key，避免删除/结束后选中漂移。
-- 状态变化、取消、删空均原地刷新，不退出再重开全屏应用。
-- UI 关闭只释放自身订阅和刷新任务；不终止 agent，也不接管 shell 输出读取。
-- 长动作由受控执行器执行，UI 仅提交和显示结果；不得阻塞 prompt_toolkit 渲染线程。
-- 在既有 ResourceBrowser 中补最小必要能力；终端输出和 agent 活动继续使用各自现有数据源。
-
-## 实施顺序与验收
-
-1. 提取 Station 服务与 snapshot；旧 `/station` 参数调用服务，验证行为兼容。
-2. 新增只读 Station 双栏视图，再接入原地管理动作；共享 status/detail formatter。
-3. 路由先以 suggest 模式返回理由；沿用现有 auto-execute 配置决定是否真正执行。
-4. 修正任务截断，打通 branch/contract/实际预算/幂等派发；再放开自动执行。
-5. 需要依赖与重启恢复的任务接 WorkGraph/HWG，逐步移除重复 AutoPilot 跟踪状态。
-
-关键测试：
-
-- 同一员工并发准入两次只能成功一次；重复请求不得重复创建终端或 agent。
-- 候选在决策后忙碌/终止，终端在绑定时消失，注册失败后资源回滚。
-- 任务数超过并发上限不丢任务；排队取消、等待取消和完成/取消竞争只释放一次槽位。
-- 同终端不扩权；不能越过父子树借用其他父级员工；工具拒绝策略优先。
-- 工作树失败不得落回共享写；文件冲突保留产物，不能报告假成功。
-- 任务返回与验收结果不混淆；父级退出后监督可收敛。
-- 连续管理动作不退出应用；空状态、窄屏、选中实体消失、刷新期间按键均可控。
-- UI、命令、自动路由相同输入得到相同准入结果；现有 agents/terminal/resource UI 回归通过。
-- 所有测试使用隔离目录；成功、失败、取消之后都核对临时线程、PTY、工作树和文件清理。
+The management UI is a read-mostly console over the snapshot: agents, terminals and runs in the familiar browser shell.
+The layout keeps `ResourceBrowser`'s two panes: left for the roster, right for detail. Detail includes run status, routing explanation, resource ownership and recent events.
+In-place actions cover deploy/undeploy, cancel run, view events; confirmations required for irreversible ones (cancel, undeploy).
+Output from the unified dispatch path reuses the shared display helpers so interactive and dispatched runs render identically.

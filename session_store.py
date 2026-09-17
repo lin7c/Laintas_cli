@@ -10,6 +10,7 @@ import uuid
 from typing import Optional
 
 import paths
+import session_lifecycle
 
 _LAST_ERROR = ""
 _LAST_WRITE_FINGERPRINTS: dict[str, str] = {}
@@ -77,11 +78,19 @@ def _fingerprint_payload(payload: dict) -> str:
 
 def _atomic_write_json_if_changed(
         dest, payload: dict, *, skip_if_unchanged: bool = True) -> bool:
+    cwd = payload.get("cwd") or os.getcwd()
+    with session_lifecycle.guard(cwd):
+        if session_lifecycle.is_deleted(cwd, payload):
+            return False
+        return _write_session_json(dest, payload, skip_if_unchanged=skip_if_unchanged)
+
+
+def _write_session_json(dest, payload: dict, *, skip_if_unchanged: bool = True) -> bool:
     dest.parent.mkdir(parents=True, exist_ok=True)
     cache_key = str(dest)
     if skip_if_unchanged:
         fp = _fingerprint_payload(payload)
-        if _LAST_WRITE_FINGERPRINTS.get(cache_key) == fp:
+        if _LAST_WRITE_FINGERPRINTS.get(cache_key) == fp and dest.exists():
             return False
     tmp = dest.with_name(f".{dest.name}.{uuid.uuid4().hex}.tmp")
     try:
@@ -128,7 +137,8 @@ def _recover_latest_live(cwd: str) -> Optional[dict]:
         try:
             data = json.loads(candidate.read_text(encoding="utf-8"))
             owner = data.get("terminal_id") or data.get("instance_id")
-            if (data.get("cwd") == cwd and not data.get("closed_at")
+            if (data.get("cwd") == cwd and not session_lifecycle.is_deleted(cwd, data)
+                    and not data.get("closed_at")
                     and owner == _terminal_id()):
                 return data
         except (OSError, json.JSONDecodeError, TypeError):
@@ -143,6 +153,10 @@ def is_continuable_reason(reason: str) -> bool:
 def create_session(cwd: str, state: Optional[dict] = None, chat_history: Optional[list] = None) -> dict:
     now = time.time()
     session_id = _safe_id((state or {}).get("_session_id") or uuid.uuid4().hex[:16])
+    # The runtime, autosave and lease must name the same session from its
+    # first turn; otherwise the first autosave invents a second unleased ID.
+    if isinstance(state, dict):
+        state["_session_id"] = session_id
     session = {
         "id": session_id,
         "session_id": session_id,
@@ -172,7 +186,7 @@ def create_session(cwd: str, state: Optional[dict] = None, chat_history: Optiona
         session["agent_state"] = copy.deepcopy(session["state"])
     try:
         import workgraph
-        active = workgraph.get_active_work(cwd=cwd)
+        active = workgraph.get_active_work(cwd=cwd, session_id=session_id)
         if active:
             session["active_work_id"] = active["id"]
     except Exception:
@@ -198,7 +212,8 @@ def load_current_session(cwd: str) -> Optional[dict]:
                 # resurrect after /q or /new.
                 return None
         data = json.loads(path.read_text(encoding="utf-8"))
-        if data.get("cwd") != cwd or data.get("closed_at"):
+        if (data.get("cwd") != cwd or data.get("closed_at")
+                or session_lifecycle.is_deleted(cwd, data)):
             return None
         data.setdefault("id", data.get("session_id") or uuid.uuid4().hex[:16])
         data.setdefault("session_id", data.get("id"))
@@ -323,7 +338,8 @@ def sync_runtime(session: dict, state: dict, chat_history: list, *, cwd: str = N
         session["tasks"] = copy.deepcopy(tasks)
     try:
         import workgraph
-        active = workgraph.get_active_work(cwd=session.get("cwd") or cwd)
+        active = workgraph.get_active_work(cwd=session.get("cwd") or cwd,
+                                          session_id=session.get("session_id"))
         session["active_work_id"] = active["id"] if active else ""
     except Exception:
         pass

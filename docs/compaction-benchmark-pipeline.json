@@ -1,0 +1,147 @@
+{
+  "live": false,
+  "pipeline": true,
+  "synthetic": true,
+  "baseline": "92ae85a",
+  "results": [
+    {
+      "variant": "committed",
+      "seconds": 0.8007,
+      "calls": 6,
+      "input_tokens_estimate": 12796,
+      "valid_summary": true,
+      "requests": [
+        {
+          "kind": "compaction",
+          "seconds": 0.0,
+          "input_tokens_estimate": 3026,
+          "source_present": false,
+          "error": false
+        },
+        {
+          "kind": "compaction_review",
+          "seconds": 0.0,
+          "input_tokens_estimate": 3074,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction",
+          "seconds": 0.0,
+          "input_tokens_estimate": 2569,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction_review",
+          "seconds": 0.0,
+          "input_tokens_estimate": 2607,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction",
+          "seconds": 0.0,
+          "input_tokens_estimate": 741,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction_review",
+          "seconds": 0.0,
+          "input_tokens_estimate": 779,
+          "source_present": true,
+          "error": false
+        }
+      ]
+    },
+    {
+      "variant": "before_fix",
+      "seconds": 0.6413,
+      "calls": 6,
+      "input_tokens_estimate": 7344,
+      "valid_summary": true,
+      "requests": [
+        {
+          "kind": "compaction",
+          "seconds": 0.0,
+          "input_tokens_estimate": 3056,
+          "source_present": false,
+          "error": false
+        },
+        {
+          "kind": "compaction_review",
+          "seconds": 0.0,
+          "input_tokens_estimate": 302,
+          "source_present": false,
+          "error": false
+        },
+        {
+          "kind": "compaction",
+          "seconds": 0.0,
+          "input_tokens_estimate": 2594,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction_review",
+          "seconds": 0.0,
+          "input_tokens_estimate": 323,
+          "source_present": false,
+          "error": false
+        },
+        {
+          "kind": "compaction",
+          "seconds": 0.0,
+          "input_tokens_estimate": 746,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction_review",
+          "seconds": 0.0,
+          "input_tokens_estimate": 323,
+          "source_present": false,
+          "error": false
+        }
+      ]
+    },
+    {
+      "variant": "fixed",
+      "seconds": 0.7932,
+      "calls": 4,
+      "input_tokens_estimate": 13002,
+      "valid_summary": true,
+      "requests": [
+        {
+          "kind": "compaction",
+          "seconds": 0.0,
+          "input_tokens_estimate": 4200,
+          "source_present": false,
+          "error": false
+        },
+        {
+          "kind": "compaction_review",
+          "seconds": 0.0,
+          "input_tokens_estimate": 4262,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction",
+          "seconds": 0.0,
+          "input_tokens_estimate": 2251,
+          "source_present": true,
+          "error": false
+        },
+        {
+          "kind": "compaction_review",
+          "seconds": 0.0,
+          "input_tokens_estimate": 2289,
+          "source_present": true,
+          "error": false
+        }
+      ]
+    }
+  ]
+}

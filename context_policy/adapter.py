@@ -103,13 +103,25 @@ def is_protected_tool(name: str, policy: Optional[dict] = None) -> bool:
 
 
 def truncate_tool_output(text: str, policy: Optional[dict] = None) -> str:
-    """Truncate a tool output to ``tool_output_max_chars`` with a marker."""
+    """Truncate a tool output to ``tool_output_max_chars`` with a marker.
+
+    Head+tail, not head-only: a long tool result's most valuable lines are
+    often at the END — a traceback, a failing assertion, a summary line the
+    tool prints last. Keeping only the first ``cap`` chars cut exactly those
+    off, so the summarizer never saw the reason a call failed. The tail keeps
+    ``tail_ratio`` of the budget; the marker describes the omitted middle.
+    """
     p = policy or load()
-    cap = int(p.get("tool_output_max_chars", 2000))
+    cap = max(0, int(p.get("tool_output_max_chars", 2000)))
     if not isinstance(text, str) or len(text) <= cap:
         return text
+    ratio = float(p.get("tool_output_tail_ratio", 0.35))
+    tail = int(cap * max(0.0, min(1.0, ratio)))
+    head = max(0, cap - tail)
     omitted = len(text) - cap
-    return f"{text[:cap]}\n[truncated {omitted} chars for compaction]"
+    return (f"{text[:head]}\n"
+            f"[truncated {omitted} chars for compaction]\n"
+            f"{text[len(text) - tail:]}")
 
 
 # ---- file-read retention (re-read amnesia avoidance) ----

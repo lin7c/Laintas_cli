@@ -354,13 +354,22 @@ See [`SECURITY_CUSTOMIZATION.md`](SECURITY_CUSTOMIZATION.md) for the threat mode
 
 Run `/help` for the authoritative list for your installed version, including extension commands.
 
-`/resume [N|all|latest]` forks the selected saved context into an independent
-session, including its conversation summary and copied tasks. It can branch
-from a session running in another terminal without taking ownership or
-overwriting that session. `--resume` and `--continue` use the same behavior.
-`/fork [name]` branches from the current context; a named fork is saved for
-later use. Explicit `--execute --session-id` retains its logical-session
-continuation behavior.
+Context compaction starts silently in the background at 70% of the usable
+message budget. At 90%, the agent waits for that result or uses foreground
+compaction. `/compact` still forces compaction; `/compact status` shows the
+thresholds and worker state. See [background compaction](docs/background-compaction.md)
+for configuration, cancellation, and how new messages are preserved.
+
+`/resume [N|all|latest]` switches to an existing session without creating a
+branch. `--resume` and `--continue` do the same. Selecting a historical row
+resumes that session's latest saved state; use details to inspect the older
+snapshot. A session open in another terminal cannot be resumed concurrently.
+`/fork [name]` explicitly creates an independent branch from the current context.
+In the resume picker, deleting a session node deletes its saved snapshots and
+all descendant branches; deleting a historical snapshot removes only that
+snapshot. A tree containing an open session cannot be deleted: switch away or
+close its terminal first. Deleted sessions cannot be recreated by stale autosaves.
+Explicit `--execute --session-id` retains its logical-session continuation behavior.
 
 `/station` opens the live agent/terminal manager. Press `v` to switch between
 delegation and terminal views, `Enter` for details, `e` to open the existing
@@ -391,6 +400,14 @@ Role selection and routing never broaden the parent's tool permissions.
 | Connectivity | `/backend`, `/web`, `/identity`, `/helpwo`, `/shared` | Inference, search/fetch, browser identity, Helpwo in its own sub-terminal, the cloud folder Helpwo mounts |
 | Applications | `/app` | Run a registered application in its own sub-terminal with its own agent |
 | Administration | `/policy`, `/usage`, `/training`, `/v`, `/org` | Policy, allowance, data preference, updates, Enterprise |
+
+`/t` opens the terminal browser even when no child terminals exist. Press `n`
+to create the next available `termN`, `e` to enter the selected terminal,
+`o` to observe, or `x` twice to close it. `/term <name>` creates a named child.
+Inside a child CLI, `/back` (or `/q`) returns to its parent without stopping
+the child; `Ctrl+\\` is the force-detach shortcut. The prompt and Agents view
+show the child's name. LIVE OUTPUT reconstructs the current terminal screen
+instead of concatenating redraws, and refreshing preserves preview scrolling.
 
 ### Hosted applications: `/helpwo` and `/app`
 

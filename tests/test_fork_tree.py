@@ -229,6 +229,15 @@ class LineagePersistenceTests(unittest.TestCase):
 class ForkRoundTripTests(unittest.TestCase):
     """The persisted store, not just the in-memory tree builder."""
 
+    def setUp(self):
+        # Logical cwd labels must not create databases outside the test home.
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        database = mock.patch.object(agent_loop.workgraph, "db_path",
+                                     return_value=Path(home.name) / "workgraph.db")
+        database.start()
+        self.addCleanup(database.stop)
+
     def _history(self, text):
         return [{"role": "user", "content": text, "input_kind": "prompt"},
                 {"role": "assistant", "content": "ok"}]
