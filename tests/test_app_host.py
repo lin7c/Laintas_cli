@@ -4,8 +4,7 @@ The properties pinned here are the ones the design depends on:
   * a persistent application keeps every id the browser and the agent key
     their data by, and a non-persistent one keeps none of them;
   * the parent never mistakes an earlier launch's runtime report for this one;
-  * a manifest application reaches only the conversation API, never the disk
-    or the shell;
+  * trusted applications expose the authenticated runtime APIs;
   * the main terminal launches a sub-terminal instead of serving Helpwo itself.
 """
 import io
@@ -124,8 +123,7 @@ class ManifestTests(_Home):
             {"name": "ok", "port": 70000},
             {"name": "ok", "shell": True},
             {"name": "ok", "prompt": 3},
-            {"name": "ok", "session_tools": ["fs.write"]},
-            {"name": "ok", "session_tools": ["agent.spawn"]},
+            {"name": "ok", "session_tools": ["unknown.tool"]},
             {"name": "ok", "session_tools": "shell.exec"},
             {"name": "ok", "auto_approve": "yes"},
             {"name": "ok", "max_sessions": 0},
@@ -162,15 +160,15 @@ class ManifestTests(_Home):
 
 
 class SessionManifestTests(unittest.TestCase):
-    def test_defaults_are_shell_only_with_approvals_refused(self):
+    def test_defaults_are_shell_only_with_interactive_approvals(self):
         manifest, _ = app_host.parse_manifest({"name": "notes"}, "/x.json")
         self.assertEqual(manifest.session_tools, ["shell.exec"])
         self.assertFalse(manifest.auto_approve)
         self.assertEqual(manifest.max_sessions, 10)
 
-    def test_the_bridge_never_accepts_approval_responses(self):
-        self.assertNotIn("approval-response", app_host.APP_ALLOWED_KINDS)
-        self.assertNotIn("approval-response", app_host.SESSION_ALLOWED_KINDS)
+    def test_the_bridge_accepts_approval_responses(self):
+        self.assertIn("approval-response", app_host.APP_ALLOWED_KINDS)
+        self.assertIn("approval-response", app_host.SESSION_ALLOWED_KINDS)
         self.assertNotIn("session-open", app_host.SESSION_ALLOWED_KINDS)
 
 
@@ -278,6 +276,10 @@ class AppBridgeTests(unittest.TestCase):
         self.registry = _OfflineRegistry()
         self._cwd = os.getcwd()
         self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.addCleanup(self.registry.close)
+        self.addCleanup(os.chdir, self._cwd)
+        self.addCleanup(helpwo_server.stop_server)
         os.chdir(self._tmp.name)
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
@@ -289,12 +291,6 @@ class AppBridgeTests(unittest.TestCase):
         self.assertTrue(ok, msg)
         self.base = f"http://127.0.0.1:{port}"
         self.auth = {"Authorization": "token tok"}
-
-    def tearDown(self):
-        helpwo_server.stop_server()
-        os.chdir(self._cwd)
-        self.registry.close()
-        self._tmp.cleanup()
 
     def _post(self, path, body):
         return urlopen(Request(self.base + path, data=json.dumps(body).encode(),
@@ -311,23 +307,46 @@ class AppBridgeTests(unittest.TestCase):
                                      {"kind": "chat", "reqId": "r1", "payload": {"message": "hi"}}))
         self.assertTrue(reply["ok"])
 
-    def test_exec_is_refused(self):
-        with self.assertRaises(HTTPError) as refused:
-            self._post("/api/agents/local-notes-abc/send",
-                       {"kind": "exec", "reqId": "r2", "payload": {"command": "id"}})
-        self.assertEqual(refused.exception.code, 403)
-        self.assertEqual(self.registry.received, [])
+    def test_exec_and_approval_responses_are_accepted(self):
+        for kind in ("exec", "approval-response", "term-new"):
+            reply = json.load(self._post("/api/agents/local-notes-abc/send",
+                {"kind": kind, "reqId": kind, "payload": {}}))
+            self.assertTrue(reply["ok"])
 
-    def test_disk_shell_and_static_routes_do_not_exist(self):
-        for method, path in (("GET", "/api/local-fs/root"), ("GET", "/api/local-runtime"),
-                             ("POST", "/api/local-exec"), ("POST", "/api/local-fs/write"),
-                             ("GET", "/index.html"), ("PUT", "/api/local-proxy/3000/")):
-            with self.subTest(method=method, path=path):
-                request = Request(self.base + path, headers={**self.auth, "Content-Type": "application/json"},
-                                  data=(b"{}" if method != "GET" else None), method=method)
-                with self.assertRaises(HTTPError) as refused:
-                    urlopen(request, timeout=2)
-                self.assertEqual(refused.exception.code, 404)
+    def test_files_and_runtime_routes_are_available(self):
+        for path in ("/api/local-fs/root", "/api/local-runtime"):
+            with urlopen(Request(self.base + path, headers=self.auth), timeout=2) as response:
+                self.assertEqual(response.status, 200)
+        with self.assertRaises(HTTPError) as refused:
+            urlopen(Request(self.base + "/index.html", headers=self.auth), timeout=2)
+        self.assertEqual(refused.exception.code, 503)
+
+    def test_files_still_require_the_token(self):
+        with self.assertRaises(HTTPError) as refused:
+            urlopen(self.base + "/api/local-fs/root", timeout=2)
+        self.assertEqual(refused.exception.code, 403)
+
+    def test_auto_approval_applies_to_local_exec(self):
+        from types import SimpleNamespace
+        self.registry.app_mode = {"approval": "auto"}
+        policy = SimpleNamespace(evaluate=lambda *a, **k: SimpleNamespace(action="needs_approval"))
+        with mock.patch("local_runtime._policy_modules", return_value=(policy, lambda key: False)):
+            response = self._post("/api/local-exec", {"reqId": "auto-exec", "cmd": "printf app-ok"})
+            with response:
+                frames = [json.loads(line[6:]) for line in response.read().decode().splitlines()
+                          if line.startswith("data: ")]
+        self.assertFalse(any(x.get("t") == "approval" for x in frames))
+        self.assertEqual(frames[-1]["status"], "success")
+        self.assertIn("app-ok", json.dumps(frames))
+
+    def test_auto_approval_does_not_override_policy_deny(self):
+        self.registry.app_mode = {"approval": "auto"}
+        policy = SimpleNamespace(evaluate=lambda *a, **k: SimpleNamespace(action="deny", reason="test deny"))
+        with mock.patch("local_runtime._policy_modules", return_value=(policy, lambda key: False)):
+            with self._post("/api/local-exec", {"reqId": "deny-exec", "cmd": "printf should-not-run"}) as response:
+                result = response.read().decode()
+        self.assertIn("Blocked by policy", result)
+        self.assertNotIn('"t": "start"', result)
 
     def test_the_token_is_still_required(self):
         with self.assertRaises(HTTPError) as refused:
@@ -375,11 +394,25 @@ class AppModeRegistryTests(unittest.TestCase):
         registry = self._registry("deny")
         self.assertEqual(registry._request_approval("r", "rm -rf x", "/"), "reject")
 
-    def test_auto_approves_but_never_a_destructive_delete(self):
+    def test_auto_approves_including_destructive_operations(self):
         registry = self._registry("auto")
         self.assertEqual(registry._request_approval("r", "make", "/"), "approve")
         self.assertEqual(registry._request_approval("r", "rm -rf x", "/", destructive=True),
-                         "reject")
+                         "approve")
+
+    def test_interactive_approval_can_complete_via_bridge_response(self):
+        registry = self._registry("ask")
+        registry._active_req_lock = threading.Lock()
+        registry._pending_approvals = {}
+        def events(items, req_id=None):
+            for item in items:
+                if item["type"] == "needs-approval":
+                    registry._handle_approval_response("reply", {
+                        "targetReqId": req_id, "decision": "approve"})
+        registry._push_events = events
+        with mock.patch("mode_manager.get_auto_confirm_timeout", return_value=None), _Capture():
+            self.assertEqual(registry._request_approval("r", "make", "/", timeout=0.1), "approve")
+        self.assertEqual(registry._pending_approvals, {})
 
     def test_a_slash_message_is_not_run_as_a_command(self):
         registry = self._registry("deny")

@@ -31,6 +31,7 @@ SEEDED_KEYS = frozenset({"model", "provider", "mode", "agent", "ui"})
 PERSISTED_UI_KEYS = frozenset({
     "detail",
     "enable_mouse",
+    "input_arrow_keys",
     "paste_summary",
     "paste_summary_min_lines",
     "paste_summary_min_chars",

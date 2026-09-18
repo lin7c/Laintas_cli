@@ -279,6 +279,63 @@ class SlashRegistryTests(unittest.TestCase):
         finally:
             laintas_cli._rprompt_modal_slot = ""
 
+    def test_arrow_keys_can_be_switched_off_from_config(self):
+        """/config input_arrow_keys off makes the arrows inert in the input.
+
+        The filter is read per keystroke, so the switch applies to the next
+        key rather than at the next restart. "Off" has to stop prompt_toolkit's
+        own emacs bindings too, which is why an inert handler is registered
+        rather than the movement ones simply being skipped.
+        """
+        from agent_loop import get_runtime_config, set_runtime_config
+
+        def press(key):
+            """Run whatever handler prompt_toolkit would run: matches[-1]."""
+            active = [b for b in laintas_cli._build_keybindings().bindings
+                      if tuple(b.keys) == (key,) and b.filter()]
+            self.assertTrue(active, f"nothing bound to {key}")
+            buffer = laintas_cli.Buffer()
+            buffer.text = "hello"
+            buffer.cursor_position = 5
+            active[-1].handler(mock.Mock(current_buffer=buffer, arg=1))
+            return buffer.cursor_position
+
+        previous_slot = laintas_cli._rprompt_modal_slot
+        laintas_cli._rprompt_modal_slot = ""
+        try:
+            self.assertTrue(get_runtime_config("input_arrow_keys"),
+                            "the bindings must be on out of the box")
+            self.assertEqual(press(laintas_cli.Keys.Left), 4)
+
+            set_runtime_config("input_arrow_keys", False)
+            self.assertEqual(press(laintas_cli.Keys.Left), 5,
+                             "off must leave the cursor where it was")
+            self.assertEqual(press(laintas_cli.Keys.Up), 5)
+
+            set_runtime_config("input_arrow_keys", True)
+            self.assertEqual(press(laintas_cli.Keys.Left), 4)
+        finally:
+            set_runtime_config("input_arrow_keys", True)
+            laintas_cli._rprompt_modal_slot = previous_slot
+
+    def test_the_slot_modal_still_owns_up_down_while_arrows_are_off(self):
+        from agent_loop import set_runtime_config
+        previous_slot = laintas_cli._rprompt_modal_slot
+        try:
+            set_runtime_config("input_arrow_keys", False)
+            laintas_cli._rprompt_modal_slot = "mode"
+            active = [b for b in laintas_cli._build_keybindings().bindings
+                      if tuple(b.keys) == (laintas_cli.Keys.Up,) and b.filter()]
+            self.assertEqual(len(active), 1)
+            self.assertIn("Slot selected", active[-1].handler.__doc__ or "")
+        finally:
+            set_runtime_config("input_arrow_keys", True)
+            laintas_cli._rprompt_modal_slot = previous_slot
+
+    def test_the_input_key_switch_survives_a_restart(self):
+        import terminal_preferences
+        self.assertIn("input_arrow_keys", terminal_preferences.PERSISTED_UI_KEYS)
+
     def test_all_static_subcommands_have_contextual_descriptions(self):
         for spec in laintas_cli.COMMAND_SPECS:
             for entry in spec.contextual_completions:
@@ -2235,13 +2292,45 @@ class ResumeTranscriptTests(unittest.TestCase):
 
         text = self._render(blob, None)
 
-        self.assertIn("❯ check the project", text)
+        # Same vocabulary as a live turn: the prompt gutter + caret, one
+        # aligned tool row (no result body — the live loop never prints one),
+        # and the `!command` block for a shell run.
+        self.assertIn("│ › check the project", text)
         self.assertIn("Checking first.", text)
         self.assertIn("terminal.create", text)
         self.assertIn("worker", text)
-        self.assertIn("Created worker", text)
-        self.assertIn("$ ls", text)
+        self.assertNotIn("Created worker", text)
+        self.assertIn("ls", text)
         self.assertIn("a.py", text)
+
+    def test_replay_groups_reads_and_carries_status_meta(self):
+        """A replayed turn folds consecutive reads and keeps the live meta.
+
+        This is what made /resume look like a different program: every read
+        printed its own row with the whole result dumped underneath, while the
+        live loop shows one grouped row and a compact status tail.
+        """
+        blob = {
+            "chat_history": [
+                {"role": "tool", "tool_name": "fs.read", "display_name": "Read",
+                 "summary": "laintas_cli.py", "content": "body", "ok": True},
+                {"role": "tool", "tool_name": "fs.read", "display_name": "Read",
+                 "summary": "agent_loop.py", "content": "body", "ok": True},
+                {"role": "tool", "tool_name": "shell.exec", "display_name": "Bash",
+                 "summary": "pytest -q", "content": "boom", "ok": False,
+                 "returncode": 1},
+            ],
+            "older_summary": "", "turn_count": 1,
+        }
+
+        text = self._render(blob, None)
+
+        self.assertIn("2 sources", text)
+        self.assertIn("laintas_cli.py", text)
+        self.assertIn("agent_loop.py", text)
+        self.assertEqual(text.count("Read"), 1)
+        self.assertIn("exit 1", text)
+        self.assertIn("/why", text)
         self.assertNotIn("\nknowledge\n", text)
 
 

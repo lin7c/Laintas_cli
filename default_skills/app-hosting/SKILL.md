@@ -1,7 +1,7 @@
 ---
 name: app-hosting
-description: Host an application in its own sub-terminal with its own dedicated agent (/app), from a manifest the user places and trusts.
-version: 1.0.0
+description: Create, configure, start, update and stop hosted applications with dedicated agents and terminals through /app tools.
+version: 2.0.0
 triggers:
   - hosted app
   - host the application
@@ -12,51 +12,96 @@ triggers:
 
 # App Hosting (/app)
 
-A hosted application runs the way Helpwo does: in its own named sub-terminal,
-with its own dedicated agent whose only job is that application. A loopback
-bridge exposes nothing but the conversation (send chat / abort / approval
-response / poll updates) — never the CLI's disk or shell. Helpwo itself is the
-built-in instance of this mechanism (`/helpwo`), not a manifest app.
+Complete the user's hosting task with tools. Write the manifest yourself with
+`app.manifest.put`; do not hand file placement back to the user. Each app runs
+in a nested CLI with its own primary agent. Helpwo uses `/helpwo`, not a manifest.
 
-## The workflow you guide
+## Workflow
 
-1. **Draft the manifest** with the user. Fields:
-   - `name` — must match `^[a-z0-9][a-z0-9._-]{0,31}$`; `helpwo` and `term0` are reserved.
-   - `description` — short human-readable purpose.
-   - `command` — how the application is started (run with `LAINTAS_APP_BRIDGE_URL`).
-   - `prompt` — the dedicated agent's role.
-   - `persistence` — `"none"` (fresh every start) or `"workspace"` (login, data and conversation persist per folder).
-   - `port` — optional fixed port; otherwise one is assigned.
-   - `session_tools` — tools the app's session agents may use. Only a whitelist
-     is allowed (`shell.exec`, `web.search`, `web.fetch`, `image.describe`,
-     `image.to_text`, `media.generate_image`, `media.generate_video`, `sleep`);
-     default `["shell.exec"]`. Do not widen this without a reason.
-   - `auto_approve` (default false), `max_sessions` (default 10, max 200),
-     `session_idle_minutes` (default 30).
-2. **The user places the file** at `~/.laintas/apps/<name>.json` (global) or
-   `./.laintas/apps/<name>.json` (project; shadows a user manifest of the same
-   name). Never write this file yourself: the file's human placement is the root
-   of the trust chain.
-3. **Discover**: `app.list` shows registered apps, trust state, running state,
-   and any broken manifests (`problems`) you can help fix.
-4. **Trust**: read the manifest with `app.manifest.get`, summarise for the user
-   what its session agents may run, then call `app.trust.request` with that
-   summary as `note`. Nothing is recorded unless the user approves. Trust
-   follows the manifest digest: after any manifest change, trust must be
-   requested again.
-5. **Run**: `app.start` (asks approval) starts the sub-terminal and its agent;
-   `app.list` shows running state. `app.stop` (asks approval) closes the
-   sub-terminal, agent, and process together.
+1. Inspect the application and `app.list`; use `app.manifest.get` before updating
+   an existing app so unrelated settings survive.
+2. Write a valid manifest using `app.manifest.put` (project scope by default,
+   user scope when requested). Fix validation errors before launching.
+3. Call `app.start`. If the manifest is new or changed, this requests trust via
+   the normal approval policy. Existing trust covers later starts and stops.
+   `app.trust.request` is also available for a separate review. Do not edit the
+   trust store or bypass a refusal.
+4. Verify the returned runtime status and application behavior, including a
+   bridge chat and any configured agents/terminals. A successful manifest write
+   alone is not a running app. Inspect the returned log when startup fails.
+5. For updates, write the manifest, then `app.stop` and `app.start` to apply it.
+   Stop only apps within the user's request. `app.trust.revoke` revokes future
+   starts; it does not stop a running app.
 
-## Hard rules
+## Manifest
 
-- Manifest files are placed by the user, never by you.
-- Trust is a human decision: `app.trust.request` asks; it never records on its own.
-- Do not revoke trust for the user — that is the user's `/app revoke`.
-- Keep `session_tools` minimal; explain the implication of each addition.
+```json
+{
+  "name": "notes",
+  "description": "Notes application",
+  "command": "node server.js",
+  "prompt": "Maintain and operate the notes application; verify completed work.",
+  "persistence": "workspace",
+  "auto_approve": true,
+  "session_tools": ["*"],
+  "agent": {"capability_tags": ["coordination"]},
+  "terminals": [{"name": "worker-shell", "cwd": "."}],
+  "agents": [{
+    "name": "worker",
+    "parent": "primary",
+    "terminal": "worker-shell",
+    "prompt": "Implement and test assigned application changes.",
+    "capability_tags": ["coding", "testing"],
+    "tools": ["shell.exec", "fs.read", "task.complete"]
+  }]
+}
+```
 
-## User-side commands (mention them, do not run them)
+- `name`: lowercase letters, digits, `.`, `_`, `-`, up to 32 characters;
+  `helpwo` and `term0` are reserved.
+- `description`, `command`, `prompt`: strings; command and prompt are optional.
+- `persistence`: `none` (default) or `workspace`; optional `port`: 1–65535.
+- `agent`: primary agent configuration. `agents`: named children, with optional
+  `parent` (primary or an earlier entry) and `terminal` (a declared terminal).
+  Both accept `prompt`, `profile` (an existing employee role), `title`,
+  `description`, `capability_tags`, `model`, `provider`, `tools`, `denied_tools`.
+  Omitted model/provider inherit runtime selection; use an available model ID.
+  `tools: ["*"]` enables the normal tool catalogue. Explicit arrays restrict
+  visibility; denied tools still apply. Omitted child tools inherit their parent's allowed tools unless a role provides its own tool list. Use actual registered names.
+- `terminals`: `{name, command?, cwd?}`. Default command is the normal shell;
+  cwd is resolved relative to the app workspace (the user's folder in a session).
+  Only one agent may occupy a terminal. Unstationed children use temporary
+  terminals on assignment. These definitions create resources, not tasks;
+  the primary assigns work through the normal agent tools.
+- `session_tools`: session primary's fallback tool list; defaults to
+  `["shell.exec"]`. Accepts registered tool names or `["*"]`. An explicit
+  `agent.tools` overrides it. Each session also instantiates agents/terminals.
+- `auto_approve`: true completes approval requests automatically, including
+  destructive operations; false (default) emits `needs-approval` and accepts
+  `approval-response`. Choose true when the user wants autonomous operation.
+  Other runtime policy denials still apply.
+- `max_sessions`: 1–200, default 10. `session_idle_minutes`: 0–10080,
+  default 30; 0 disables idle shutdown.
 
-`/app list`, `/app trust <name>`, `/app start <name>`, `/app stop <name>`,
-`/app revoke <name>` — the same operations from the keyboard, without an agent
-in the middle.
+## Bridge contract
+
+The app command receives `LAINTAS_APP_BRIDGE_URL`, `LAINTAS_APP_TOKEN`,
+`LAINTAS_APP_AGENT_ID`, and `LAINTAS_APP_NAME`. Send
+`Authorization: token <token>`; never expose the operator token to untrusted
+end users. The bridge has the normal authenticated file, shell, terminal,
+proxy and agent APIs. Tool visibility is not an OS sandbox.
+
+POST `/api/agents/<id>/send` with `{kind, reqId, payload}`; poll
+GET `/api/agents/<id>/updates`. Supported kinds include `chat`, `abort`,
+`approval-response`, `exec`, `query`, `delegate`, and terminal operations.
+In interactive mode, answer `needs-approval` with `approval-response` and
+`payload.targetReqId` plus `payload.decision` (`approve` or `reject`).
+
+The main app bridge also accepts `session-open`, `session-close`, and
+`session-list` with `payload.user`. Session-open returns the user's own bridge
+URL, token and agentId. Sessions have separate homes, working directories and
+conversations, but run as the same OS user. Session bridges do not open nested
+user sessions. Closing the app closes its session processes too.
+
+User REPL equivalents: `/app list`, `/app trust <name>`, `/app start <name>`,
+`/app stop <name>`, `/app revoke <name>`. Use tools during agent work.

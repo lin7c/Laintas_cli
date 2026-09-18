@@ -430,3 +430,172 @@ class UpdateChannelTests(unittest.TestCase):
         for asset in ("laintas-cli_windows_amd64_setup.exe",
                       "laintas-cli_source.zip"):
             self.assertIn(asset, page)
+
+
+class SourceCheckoutTests(unittest.TestCase):
+    """A developer checkout is not an install target.
+
+    "sha256 differs from the release" is the same signal for "this file is
+    outdated" and "you edited this file five minutes ago", so a source update
+    applied to a git work tree silently reverts local work — and used to
+    delete its own backups afterwards.
+    """
+
+    @staticmethod
+    def _manifest(payload=b"released\n"):
+        import hashlib
+        return {"version": "9.9.9",
+                "files": {"laintas_cli.py": {
+                    "sha256": hashlib.sha256(payload).hexdigest()}}}
+
+    def test_a_git_work_tree_is_recognized(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(updater, "install_dir", return_value=tmp):
+                self.assertFalse(updater.is_source_checkout())
+                os.mkdir(os.path.join(tmp, ".git"))
+                self.assertTrue(updater.is_source_checkout())
+
+    def test_a_linked_worktree_is_recognized(self):
+        # `git worktree add` writes a .git FILE, not a directory.
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, ".git").write_text("gitdir: /repo/.git/worktrees/w\n")
+            with mock.patch.object(updater, "install_dir", return_value=tmp):
+                self.assertTrue(updater.is_source_checkout())
+
+    def test_apply_refuses_a_checkout_and_downloads_nothing(self):
+        messages = []
+        with tempfile.TemporaryDirectory() as tmp:
+            os.mkdir(os.path.join(tmp, ".git"))
+            Path(tmp, "laintas_cli.py").write_text("local edit\n")
+            with mock.patch.object(updater, "install_dir", return_value=tmp), \
+                    mock.patch.object(updater, "_download") as download:
+                ok = updater.apply_source_update(
+                    self._manifest(), [("laintas_cli.py", "x" * 64)],
+                    "latest", messages.append)
+        self.assertFalse(ok)
+        download.assert_not_called()
+        self.assertTrue(any("git checkout" in m for m in messages), messages)
+
+    def test_allow_checkout_lets_a_deliberate_overwrite_through(self):
+        import io
+        import zipfile
+        payload = b"released\n"
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("laintas_cli.py", payload)
+        manifest = self._manifest(payload)
+        sha = manifest["files"]["laintas_cli.py"]["sha256"]
+        with tempfile.TemporaryDirectory() as tmp:
+            os.mkdir(os.path.join(tmp, ".git"))
+            Path(tmp, "laintas_cli.py").write_text("local edit\n")
+            with mock.patch.object(updater, "install_dir", return_value=tmp), \
+                    mock.patch.object(updater, "_download",
+                                      return_value=buf.getvalue()):
+                ok = updater.apply_source_update(
+                    manifest, [("laintas_cli.py", sha)], "latest",
+                    lambda *_a, **_k: None, allow_checkout=True)
+            self.assertTrue(ok)
+            self.assertEqual(Path(tmp, "laintas_cli.py").read_bytes(), payload)
+            self.assertTrue(list(Path(tmp, ".laintas-update-backup").glob(
+                "*/laintas_cli.py")))
+
+    def test_the_slash_command_refuses_and_names_the_files(self):
+        printed = []
+        manifest = self._manifest()
+        with mock.patch.object(updater, "fetch_manifest", return_value=manifest), \
+                mock.patch.object(updater, "is_frozen", return_value=False), \
+                mock.patch.object(updater, "is_source_checkout", return_value=True), \
+                mock.patch.object(updater, "install_dir", return_value="/repo"), \
+                mock.patch.object(updater, "plan_changed_files",
+                                  return_value=[("laintas_cli.py", "a" * 64)]), \
+                mock.patch.object(updater, "apply_source_update") as apply_update, \
+                mock.patch.object(laintas_cli, "console",
+                                  SimpleNamespace(print=printed.append)):
+            laintas_cli.handle_version_command(["/v", "update"])
+        apply_update.assert_not_called()
+        text = "\n".join(str(m) for m in printed)
+        self.assertIn("git checkout", text)
+        self.assertIn("laintas_cli.py", text)
+        self.assertIn("git pull", text)
+
+    def test_overwrite_local_is_the_only_way_through(self):
+        manifest = self._manifest()
+        with mock.patch.object(updater, "fetch_manifest", return_value=manifest), \
+                mock.patch.object(updater, "is_frozen", return_value=False), \
+                mock.patch.object(updater, "is_source_checkout", return_value=True), \
+                mock.patch.object(updater, "install_dir", return_value="/repo"), \
+                mock.patch.object(updater, "plan_changed_files",
+                                  return_value=[("laintas_cli.py", "a" * 64)]), \
+                mock.patch.object(updater, "apply_source_update",
+                                  return_value=False) as apply_update, \
+                mock.patch.object(laintas_cli, "console",
+                                  SimpleNamespace(print=lambda *a, **k: None)):
+            laintas_cli.handle_version_command(["/v", "update", "--overwrite-local"])
+        apply_update.assert_called_once()
+        self.assertTrue(apply_update.call_args.kwargs["allow_checkout"])
+
+    def test_force_alone_never_overwrites_a_checkout(self):
+        # --force means "re-apply the same version"; a damaged-binary hint
+        # prints it, so it must not also mean "discard my edits".
+        manifest = self._manifest()
+        with mock.patch.object(updater, "fetch_manifest", return_value=manifest), \
+                mock.patch.object(updater, "is_frozen", return_value=False), \
+                mock.patch.object(updater, "is_source_checkout", return_value=True), \
+                mock.patch.object(updater, "install_dir", return_value="/repo"), \
+                mock.patch.object(updater, "plan_changed_files",
+                                  return_value=[("laintas_cli.py", "a" * 64)]), \
+                mock.patch.object(updater, "apply_source_update") as apply_update, \
+                mock.patch.object(laintas_cli, "console",
+                                  SimpleNamespace(print=lambda *a, **k: None)):
+            laintas_cli.handle_version_command(["/v", "update", "--force"])
+        apply_update.assert_not_called()
+
+    def test_an_ordinary_update_leaves_no_backup_behind(self):
+        """Disk is not free: a normal update replaced files that already match
+        the release, so their copies are worthless once it succeeds."""
+        import io
+        import zipfile
+        payload = b"released\n"
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("laintas_cli.py", payload)
+        manifest = self._manifest(payload)
+        sha = manifest["files"]["laintas_cli.py"]["sha256"]
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "laintas_cli.py").write_text("stale\n")
+            with mock.patch.object(updater, "install_dir", return_value=tmp), \
+                    mock.patch.object(updater, "_download",
+                                      return_value=buf.getvalue()):
+                ok = updater.apply_source_update(
+                    manifest, [("laintas_cli.py", sha)], "latest",
+                    lambda *_a, **_k: None)
+            self.assertTrue(ok)
+            self.assertEqual(Path(tmp, "laintas_cli.py").read_bytes(), payload)
+            self.assertFalse(Path(tmp, ".laintas-update-backup").exists(),
+                             "an ordinary update must not leave a backup dir")
+
+    def test_an_overwritten_edit_is_kept_as_a_backup(self):
+        """--overwrite-local is the one case where the replaced file may be
+        the only copy of someone's work."""
+        import io
+        import zipfile
+        payload = b"released\n"
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("laintas_cli.py", payload)
+        manifest = self._manifest(payload)
+        sha = manifest["files"]["laintas_cli.py"]["sha256"]
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "laintas_cli.py").write_text("local edit\n")
+            with mock.patch.object(updater, "install_dir", return_value=tmp), \
+                    mock.patch.object(updater, "_download",
+                                      return_value=buf.getvalue()):
+                ok = updater.apply_source_update(
+                    manifest, [("laintas_cli.py", sha)], "latest",
+                    lambda *_a, **_k: None, allow_checkout=True)
+            self.assertTrue(ok)
+            self.assertEqual(Path(tmp, "laintas_cli.py").read_bytes(), payload)
+            backups = list(Path(tmp, ".laintas-update-backup").glob(
+                "*/laintas_cli.py"))
+            self.assertEqual(len(backups), 1, "the replaced file must survive")
+            self.assertEqual(backups[0].read_text(), "local edit\n")

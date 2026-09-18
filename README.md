@@ -436,10 +436,18 @@ after it changes. The `command` runs with `LAINTAS_APP_BRIDGE_URL`,
 `LAINTAS_APP_TOKEN`, `LAINTAS_APP_AGENT_ID` and `LAINTAS_APP_NAME` in its
 environment, logs to the app's state folder, and stops with the sub-terminal.
 
-Agents reach the same operations as tools — `app.list`, `app.manifest.get`,
-`app.trust.request`, `app.start`, `app.stop` — with trust and start/stop behind
-the user's approval; the bundled `app-hosting` skill walks an agent through
-drafting a manifest and guiding the user through trust and start.
+Agents manage the full lifecycle with `app.manifest.put`, `app.list`,
+`app.manifest.get`, `app.start`, `app.stop`, `app.trust.request` and
+`app.trust.revoke`. Start requests trust once per manifest digest; subsequent
+starts and stops need no extra approval. Agents can write manifests directly.
+The bundled [app-hosting skill](default_skills/app-hosting/SKILL.md) documents
+all fields and the bridge contract.
+
+Manifests also support `agent` (primary configuration), `agents` (named children
+with parent, prompt, role/profile, model/provider, tool policy and terminal),
+and `terminals` (name, command, cwd). Startup creates these resources using the
+same agent registry and deployment service as `/station`; failed setup rolls
+back newly created resources. Each user session instantiates the same topology.
 
 **Many users.** The CLI does not know the application's users, bill them or
 define a protocol for them — the application does all of that. What the CLI
@@ -452,17 +460,16 @@ a temporary sub-terminal with its own agent.
 | `{"kind": "session-close", "payload": {"user": "alice"}}` | closes her sub-terminal and agent |
 | `{"kind": "session-list"}` | open sessions |
 
-The application then talks to `url` with `token`: `chat` and `abort` only.
-Each session is a nested CLI with **its own `LAINTAS_HOME` and working
-directory** — no operator memory, rules or skills, nothing from other users —
-sharing only the login that decides billing. Its agent has
-`task.complete`, `time.now` and the manifest's `session_tools` (chosen from
-`shell.exec`, `web.search`, `web.fetch`, `image.*`, `media.*`, `sleep`); shell
-commands run in the session's own terminal. Approvals are never answered by the
-application: they are refused, or with `"auto_approve": true` granted unless the
-policy engine denies them or they are destructive deletes. Slash commands in
-messages are treated as text. Sessions close after `session_idle_minutes`
-without requests, and all of them close with the application.
+The application talks to `url` with `token` using the normal authenticated
+bridge APIs, including files, shell, terminals, proxy, chat and approval replies.
+Each session is a nested CLI with its own `LAINTAS_HOME` and working directory,
+sharing the billing login. `session_tools` accepts registered tool names or
+`["*"]`; its default is `["shell.exec"]`. `agent.tools` overrides that fallback.
+`auto_approve: true` automatically grants approval requests, including deletes;
+false uses `needs-approval` / `approval-response` instead of rejecting all work.
+Other runtime policy denials still apply. Slash commands in messages are text.
+Sessions close after `session_idle_minutes` without requests and close with the
+application. Protect the bridge token: it grants the runtime's file/shell access.
 
 Every session runs as the operator's OS user. Separate homes keep agents from
 *loading* each other's data; they do not stop a shell command from *reading*

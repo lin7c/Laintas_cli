@@ -198,6 +198,17 @@ repopulated that directory once releasing moved into CI, so `/v update`, the
 page's download buttons and both install scripts all resolved to 404s against
 a channel that had stopped being fed. One channel now, the one CI writes.
 
+A **git checkout is never an update target.** `/v update` on a source install
+compares each file's sha256 against the release manifest, and that comparison
+cannot tell "this file is outdated" from "you edited this file an hour ago" —
+applied to the repo it is developed in, it silently reverts local work and
+reports success. On a work tree the command now refuses, lists the files that
+differ and points at `git pull`; `/v update --overwrite-local` is the way to
+do it on purpose. A successful ordinary update keeps no backup — it only replaced files that
+already match the release. `--overwrite-local` does keep one, under
+`.laintas-update-backup/<version>-<stamp>/` (last three sets), because there
+the replaced file may be the only copy of an edit.
+
 A frozen install downloads the **Linux** archive for its architecture on every
 platform, Windows included: there the CLI runs as that same binary inside its
 private WSL distribution. `laintas-cli.exe` and the distribution are replaced

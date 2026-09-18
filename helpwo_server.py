@@ -662,24 +662,10 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
         return self._proxy_only_method("HEAD")
 
     def _app_route_allowed(self, method: str, path: str) -> bool:
-        """In application mode only the conversation API exists.
-
-        Everything else this bridge serves — the local filesystem, exec, PTYs,
-        the HTTP tunnel, VNC, the static Helpwo build — would hand whatever
-        holds the token this machine's disk and shell. Helpwo is trusted with
-        that; an application registered through a manifest is not.
-        """
+        """Trusted apps use the normal bridge routes and authentication."""
         global _last_request_at
         _last_request_at = time.monotonic()
-        if _app_profile is None:
-            return True
-        if method == "GET" and (path == "/api/agents"
-                                or re.match(r"^/api/agents/[^/]+/updates$", path)):
-            return True
-        if method == "POST" and re.match(r"^/api/agents/[^/]+/send$", path):
-            return True
-        self._json(404, {"error": "not available to applications"})
-        return False
+        return True
 
     def _proxy_only_method(self, method: str) -> None:
         """Methods the bridge answers only for the loopback HTTP tunnel.
@@ -1196,7 +1182,12 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
         agent_id = getattr(reg, "agent_id", None) if reg is not None else None
         sse = self._sse_open()
         try:
-            local_runtime.run_exec(body, sse, _resolve_local_path, agent_id)
+            app_mode = getattr(reg, "app_mode", None) or {}
+            if _app_profile is not None and app_mode.get("approval") == "auto":
+                local_runtime.run_exec(body, sse, _resolve_local_path, agent_id,
+                                       auto_approve=True)
+            else:
+                local_runtime.run_exec(body, sse, _resolve_local_path, agent_id)
         except Exception as e:  # never leave the stream hanging open
             sse.event({"t": "final", "status": "fail", "error": str(e)})
 
@@ -1816,8 +1807,8 @@ def start_server(agent_registry: Any, dist_dir: Optional[Path] = None,
     conversations under that id, so a sub-terminal that persists passes the
     same one every launch.
 
-    app_profile serves a registered application instead of Helpwo: no static
-    build, and only the conversation routes (see _app_route_allowed).
+    app_profile serves a registered application instead of the static Helpwo
+    build, using the same authenticated runtime routes.
 
     Returns (success, message).
     """
@@ -1860,12 +1851,11 @@ def start_server(agent_registry: Any, dist_dir: Optional[Path] = None,
     # process's agent loop and whoever is driving the browser. Declaring the
     # second one is what turns on the compare-and-swap that keeps them from
     # silently overwriting each other.
-    if _app_profile is None:
-        try:
-            import peer_coordination
-            peer_coordination.attach_external_actor(peer_coordination.HELPWO_BRIDGE_ACTOR)
-        except Exception:
-            pass
+    try:
+        import peer_coordination
+        peer_coordination.attach_external_actor(peer_coordination.HELPWO_BRIDGE_ACTOR)
+    except Exception:
+        pass
 
     try:
         srv = ThreadingHTTPServer(

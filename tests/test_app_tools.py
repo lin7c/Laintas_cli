@@ -1,12 +1,4 @@
-"""Agent-facing /app tools: list / manifest.get / trust.request / start / stop.
-
-The properties pinned here are the ones the design depends on:
-  * discovery is read-only and reports broken manifests instead of failing;
-  * trust is only ever recorded behind the user's approval, and never when
-    no approval channel exists (that is not the user saying no);
-  * start refuses untrusted apps before any approval is requested;
-  * stop only touches a live application sub-terminal, behind approval.
-"""
+"""Agent-managed manifests and a single digest-bound trust gate for app startup."""
 import tempfile
 import unittest
 from pathlib import Path
@@ -102,6 +94,31 @@ class AppManifestGetTests(_AppToolBase):
         self.assertEqual(result["error"], "missing 'name'")
 
 
+class AppManifestPutTests(_AppToolBase):
+    def test_put_then_update_invalidates_trust(self):
+        result = tools._bi_app_manifest_put({"manifest": DEMO_MANIFEST}, self._ctx())
+        self.assertTrue(result["ok"])
+        manifest = app_host.discover_manifests(str(self.work))[0]["demo"]
+        app_host.trust(manifest)
+        result = tools._bi_app_manifest_put({"manifest": dict(DEMO_MANIFEST,
+            agents=[{"name": "worker", "tools": ["fs.read"]}])}, self._ctx())
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["trusted"])
+        self.assertEqual(app_host.discover_manifests(str(self.work))[0]["demo"].agents[0]["name"], "worker")
+
+    def test_invalid_update_preserves_previous_manifest(self):
+        result = tools._bi_app_manifest_put({"manifest": dict(DEMO_MANIFEST,
+            agents=[{"name": "bad", "terminal": "missing"}])}, self._ctx())
+        self.assertFalse(result["ok"])
+        self.assertEqual(tools._bi_app_manifest_get({"name": "demo"}, self._ctx())["manifest"], DEMO_MANIFEST)
+
+    def test_revoke_is_available_to_agent(self):
+        manifest = app_host.discover_manifests(str(self.work))[0]["demo"]
+        app_host.trust(manifest)
+        self.assertTrue(tools._bi_app_trust_revoke({"name": "demo"}, self._ctx())["revoked"])
+        self.assertFalse(app_host.is_trusted(manifest))
+
+
 class AppTrustRequestTests(_AppToolBase):
     def _manifest(self):
         return app_host.discover_manifests(str(self.work))[0]["demo"]
@@ -144,13 +161,21 @@ class AppTrustRequestTests(_AppToolBase):
 
 
 class AppStartTests(_AppToolBase):
-    def test_untrusted_refused_before_any_approval(self):
+    def test_start_requests_trust_once_then_launches(self):
         asked = []
         ctx = self._ctx(approve=lambda a, d: asked.append(a) or True)
-        result = tools._bi_app_start({"name": "demo"}, ctx)
+        with mock.patch("laintas_cli._launch_app_subterminal",
+                        return_value={"status": "ready"}) as launch:
+            result = tools._bi_app_start({"name": "demo"}, ctx)
+        self.assertTrue(result["ok"])
+        self.assertEqual(asked, ["app.trust demo"])
+        launch.assert_called_once()
+
+    def test_trust_denial_does_not_launch(self):
+        with mock.patch("laintas_cli._launch_app_subterminal") as launch:
+            result = tools._bi_app_start({"name": "demo"}, self._ctx(approve=lambda a, d: False))
         self.assertFalse(result["ok"])
-        self.assertIn("not trusted", result["error"])
-        self.assertEqual(asked, [])
+        launch.assert_not_called()
 
     def test_approval_then_launch(self):
         manifest = app_host.discover_manifests(str(self.work))[0]["demo"]
@@ -163,7 +188,7 @@ class AppStartTests(_AppToolBase):
         self.assertEqual(result["status"], "ready")
         launch.assert_called_once_with(
             "demo", persistent=False, options={}, agent_registry=None,
-            open_url=False)
+            open_url=False, wait=True)
 
     def test_failed_launch_is_an_error_not_a_fake_success(self):
         manifest = app_host.discover_manifests(str(self.work))[0]["demo"]
@@ -174,6 +199,15 @@ class AppStartTests(_AppToolBase):
             result = tools._bi_app_start({"name": "demo"}, ctx)
         self.assertFalse(result["ok"])
         self.assertIn("could not start", result["error"])
+
+    def test_failed_runtime_is_closed_and_reported(self):
+        app_host.trust(app_host.discover_manifests(str(self.work))[0]["demo"])
+        with mock.patch("laintas_cli._launch_app_subterminal", return_value={"status": "error", "message": "bad config"}), \
+                mock.patch("laintas_cli._close_app_subterminal") as close:
+            result = tools._bi_app_start({"name": "demo"}, self._ctx())
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["runtime"]["message"], "bad config")
+        close.assert_called_once_with("demo")
 
     def test_already_running_neither_asks_nor_launches(self):
         manifest = app_host.discover_manifests(str(self.work))[0]["demo"]
@@ -195,14 +229,15 @@ class AppStopTests(_AppToolBase):
         self.assertFalse(result["ok"])
         self.assertIn("not running", result["error"])
 
-    def test_denial_stops_nothing(self):
-        ctx = self._ctx(approve=lambda a, d: False,
+    def test_stop_does_not_repeat_approval(self):
+        approve = mock.Mock(return_value=False)
+        ctx = self._ctx(approve=approve,
                         get_terminal=lambda name: _alive_app_terminal("demo"))
-        with mock.patch("laintas_cli._close_app_subterminal") as close:
+        with mock.patch("laintas_cli._close_app_subterminal", return_value=True) as close:
             result = tools._bi_app_stop({"name": "demo"}, ctx)
-        self.assertFalse(result["ok"])
-        self.assertTrue(result["_user_denied"])
-        close.assert_not_called()
+        self.assertTrue(result["ok"])
+        approve.assert_not_called()
+        close.assert_called_once_with("demo")
 
     def test_approval_closes(self):
         ctx = self._ctx(approve=lambda a, d: True,

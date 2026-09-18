@@ -45,6 +45,7 @@ import json_store            # atomic small-JSON read/write
 import peer_coordination     # Cross-instance file-conflict coordination
 import skills as skills_mod   # Progressive skill metadata + context loading
 import symbols                # Centralized UI symbol constants
+import transcript_view        # Shared live/replay conversation rendering
 import event_log              # Durable prompt admission + turn event log
 import precheck               # Tool-precheck labeled-sample capture + inference stub
 import redactor               # Outbound secret/PII redaction + weak-label capture
@@ -237,6 +238,7 @@ _DEFAULT_CONFIG = {
     "branch_agents": "scout",         # Comma-separated agent ids/names that get a task-kind workflow pinned into their prompt (see branches.py); "*" = all, empty = none. The primary is deliberately absent: a prescriptive workflow suits a specialist and not the agent you talk to all day.
     "split_agents": "foreman",        # Agents asked whether the request divides into parts that can run at once (branches.DECOMPOSITION_TREE); "*" = all, empty = none. Same reasoning as branch_agents: the agent you talk to all day should not be weighing parallelism on every sentence.
     "enable_mouse": False,             # REPL input box: click-to-position the cursor. Off by default: terminal mouse reporting hijacks native drag-to-select of scrollback (Shift+drag is the only workaround), which costs more than click-to-position gains
+    "input_arrow_keys": True,          # REPL input box: ←/→ move the cursor, ↑/↓ move between lines and through history. Off = the four arrow keys do nothing in the input box (prompt_toolkit's own defaults are held off too, or "off" would be indistinguishable from "on"); the right-prompt slot modal still uses ↑/↓ while it is open. Read per keystroke, so /config applies to the next key without a restart.
     "confirm_direct_commands": False,  # False = commands the USER types directly at the REPL run like a normal terminal (no policy approval prompt, e.g. rm); True = subject direct commands to the same needs_approval prompt as AI-issued ones. Hard `deny` policy rules always apply regardless.
     "trigger_scan_interval": 0.5,      # seconds between trigger scanner sweeps
     "trigger_debounce_ms": 500.0,      # idle window before flushing buffered trigger matches
@@ -614,83 +616,24 @@ def pause_activity_status() -> None:
 
 def _cell_len(value: str) -> int:
     """Return terminal display-cell width (CJK/emoji aware)."""
-    try:
-        from rich.cells import cell_len
-        return cell_len(str(value or ""))
-    except Exception:
-        return len(str(value or ""))
+    return transcript_view.cell_len(value)
 
 
 def _crop_cells(value: str, width: int, *, middle: bool = False) -> str:
     """Crop plain text to exactly a display-cell budget without splitting glyphs."""
-    value = str(value or "")
-    width = max(0, int(width))
-    if _cell_len(value) <= width:
-        return value
-    if width <= 0:
-        return ""
-    if width == 1:
-        return "…"
-
-    def _take(text: str, budget: int, reverse: bool = False) -> str:
-        chars = reversed(text) if reverse else iter(text)
-        kept: list[str] = []
-        used = 0
-        for char in chars:
-            cells = max(0, _cell_len(char))
-            if used + cells > budget:
-                break
-            kept.append(char)
-            used += cells
-        if reverse:
-            kept.reverse()
-        return "".join(kept)
-
-    if not middle:
-        return _take(value, width - 1) + "…"
-    left_budget = (width - 1) // 2
-    right_budget = width - 1 - left_budget
-    return _take(value, left_budget) + "…" + _take(value, right_budget, reverse=True)
+    return transcript_view.crop_cells(value, width, middle=middle)
 
 
 def _shortest_unique(paths: list[str]) -> list[str]:
-    """Return the shortest distinguishing suffix for each path.
-
-    When multiple paths share the same basename (e.g. ``a/router.py`` and
-    ``b/router.py``), include enough parent segments to tell them apart.
-    """
-    if not paths:
-        return []
-    parts_list = [p.rstrip("/").replace("\\", "/").split("/") for p in paths]
-    result = []
-    for i, parts_i in enumerate(parts_list):
-        chosen = parts_i[-1] if parts_i else ""
-        for depth in range(1, len(parts_i) + 1):
-            candidate = "/".join(parts_i[-depth:])
-            if all(
-                candidate != "/".join(parts_j[-depth:])
-                for j, parts_j in enumerate(parts_list) if j != i
-            ):
-                chosen = candidate
-                break
-        result.append(chosen)
-    return result
+    """Return the shortest distinguishing suffix for each path."""
+    return transcript_view.shortest_unique(paths)
 
 
 def _compact_tool_line(display_name: str, hint: str, meta: str, width: int,
                        hint_middle: bool = True) -> tuple[str, str, str]:
     """Fit a compact tool row, preserving status metadata before command prose."""
-    name = str(display_name or "tool")
-    hint = re.sub(r"\s+", " ", str(hint or "")).strip()
-    meta = re.sub(r"\s+", " ", str(meta or "")).strip()
-    fixed = 5 + _cell_len(name) + (2 if hint else 0) + (2 if meta else 0)
-    available = max(8, int(width or 80) - fixed)
-    if meta:
-        meta_budget = min(max(12, available // 2), max(12, _cell_len(meta)))
-        meta = _crop_cells(meta, meta_budget, middle=("/why" in meta or "/debug" in meta))
-        available -= _cell_len(meta)
-    hint = _crop_cells(hint, max(4, available), middle=hint_middle)
-    return name, hint, meta
+    return transcript_view.compact_tool_line(display_name, hint, meta, width,
+                                             hint_middle=hint_middle)
 
 
 def _adaptive_loop_delay(base: float, *, failed: bool, retry_count: int = 0,
@@ -759,77 +702,18 @@ def _recover_cwd_into_state(state: dict, *, agent_id: str = "",
 
 def _bg_print(console, markup_text: str, width: int = 0) -> None:
     """Print Rich markup text with 'surface' background, padded to terminal width."""
-    from rich.text import Text
-    if not width:
-        width = console.width or 80
-    try:
-        t = Text.from_markup(markup_text)
-    except Exception:
-        t = Text(markup_text)
-    t.set_length(width)
-    t.stylize("surface")
-    console.print(t, highlight=False)
+    transcript_view.bg_print(console, markup_text, width)
 
 
 def _emit_simple_diff(console, diff_text: str, depth: int = 0, cap: int = 0) -> None:
     """Render a minimal diff: changed (+/-) lines only, folded at `cap` lines.
 
-    Used in simplified progress mode. Skips file headers, hunk markers and
-    unchanged context - the reader just wants a glance at what changed. Full
-    diff remains available via /debug or /detail on.
-
-    When cap=0 (default), reads tool_output_fold from runtime config.
-    When changed lines exceed cap, shows first half + "… N more" + last half
-    so both the opening and closing edits stay visible.
+    Used in simplified progress mode. When cap=0 (default), reads
+    tool_output_fold from runtime config.
     """
-    if not diff_text:
-        return
     if cap <= 0:
         cap = int(get_runtime_config("tool_output_fold") or 30)
-    from rich.markup import escape as _esc
-    _hunk = re.compile(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@")
-    changed = []          # (kind, lineno, text)
-    adds = dels = 0
-    old_no = new_no = 0
-    for ln in diff_text.splitlines():
-        m = _hunk.match(ln)
-        if m:
-            old_no, new_no = int(m.group(1)), int(m.group(2))
-            continue
-        if ln.startswith("+") and not ln.startswith("+++"):
-            adds += 1
-            changed.append(("success", "┃+", new_no, ln[1:]))
-            new_no += 1
-        elif ln.startswith("-") and not ln.startswith("---"):
-            dels += 1
-            changed.append(("error", "┃-", old_no, ln[1:]))
-            old_no += 1
-        elif ln.startswith(" "):
-            old_no += 1
-            new_no += 1
-    if not changed:
-        return
-    total = len(changed)
-
-    def _print_entry(style, mark, no, text):
-        if len(text) > 96:
-            text = text[:95] + "…"
-        _bg_print(console, f"{inner}[muted]{no:>4}[/muted] "
-                  f"[{style}]{mark}{_esc(text)}[/{style}]")
-
-    inner = "  " * depth + "  "
-    _bg_print(console, f"{inner}[accent]▍[/accent] [success]+{adds}[/success] [error]−{dels}[/error]")
-    if total <= cap:
-        for style, mark, no, text in changed:
-            _print_entry(style, mark, no, text)
-    else:
-        half = cap // 2
-        hidden = total - cap
-        for style, mark, no, text in changed[:half]:
-            _print_entry(style, mark, no, text)
-        _bg_print(console, f"{inner}     [muted]… {hidden} more change(s) {symbols.BULLET} /detail on for full[/muted]")
-        for style, mark, no, text in changed[-half:]:
-            _print_entry(style, mark, no, text)
+    transcript_view.emit_simple_diff(console, diff_text, depth=depth, cap=cap)
 
 
 # ── Transition Labels ─────────────────────────────────────────────
@@ -1129,6 +1013,7 @@ _RUNTIME_CONFIG_DESCRIPTIONS = {
     "split_agents": "Agents asked whether a request divides into parts that can run at once, and told to build a workflow graph when it does (comma-separated ids or names, * for all, empty for none)",
     "confirm_direct_commands": "Ask for approval on commands YOU type directly at the REPL (False = run like a normal terminal; hard deny rules still apply)",
     "enable_mouse": "Enable mouse click-to-position in the REPL input box",
+    "input_arrow_keys": "Arrow keys move the cursor/history in the REPL input box (off = they do nothing there)",
     "tool_output_fold": "Max lines of tool output shown before folding (first half + … + last half); 0 = suppress preview",
     "search_engine": "Search engine chain: 'auto', or an ordered list like 'cn-bing duckduckgo'. Built-ins: google, duckduckgo, cn-bing, laintas_search, laintas_gateway. Add your own JSON APIs in ~/.laintas/search_engines.json",
     "search_laintas_api_key": "API key for laintas_search (sent as X-API-KEY header; leave empty to skip laintas_search engine)",
@@ -5241,20 +5126,9 @@ class LoopDeps:
 
 
 def _print_markdown_safely(deps: LoopDeps, content: str) -> None:
-    """Render Markdown without allowing an optional highlighter failure to
-    terminate the agent loop.
-
-    Frozen PyInstaller builds load Pygments lexers lazily. If the executable's
-    embedded archive is damaged, Rich can raise zlib/import errors only when a
-    fenced code block first appears. Preserve the response as plain text and
-    tell the user how to repair the binary instead of losing the whole session.
-    """
-    try:
-        deps.console.print(deps.Markdown(content))
+    """Render Markdown without letting a highlighter failure end the run."""
+    if transcript_view.print_markdown(deps.console, content, deps.Markdown):
         return
-    except Exception:
-        deps.console.print(content, markup=False, highlight=False)
-
     if getattr(deps, "_markdown_render_warning_shown", False):
         return
     setattr(deps, "_markdown_render_warning_shown", True)
@@ -11682,8 +11556,9 @@ def run_agent_loop(
 
         # 5. Call backend (skip spinner in non-interactive/execute mode)
         lang = _detect_lang(original_input)
-        # Detail mode now controls background trace capture only.  Live tool
-        # progress deliberately stays in the existing compact presentation.
+        # Detail mode controls background trace capture only. Tool rows are
+        # rendered by transcript_view in one presentation, live and replayed
+        # alike; this flag only adds token counters to the streaming spinner.
         _detail = False
         _thinking_t0 = time.monotonic()
         # Resolved once, outside the presentation branches. Which of the three
@@ -12354,10 +12229,13 @@ def run_agent_loop(
                 # is to know where it stopped and to carry on. Freeing window
                 # room still helps: a smaller next request is a faster one, and
                 # speed is exactly what ran out.
-                _detail = str(response.get("_truncation_detail") or "").strip()
+                # Named apart from the `_detail` display flag above: reusing
+                # that name here silently switched the rest of the turn into
+                # verbose tool rendering after any transport cut.
+                _trunc_detail = str(response.get("_truncation_detail") or "").strip()
                 _append_short_memory(state, (
                     f"\n  {symbols.WARN} Your previous response was cut off in transit "
-                    f"({_detail or _kind}) — not by you, and not by a token limit. "
+                    f"({_trunc_detail or _kind}) — not by you, and not by a token limit. "
                     "The part that arrived is above and has been kept. Continue from "
                     "exactly where it stops; do not restart the answer, and do not "
                     "repeat what is already there."
@@ -12472,52 +12350,21 @@ def run_agent_loop(
 
         formatted_outputs: list[str] = []
         per_call_rows: list[dict] = []
-        _compact_read_hints: list[tuple[str, str]] = []
         _explicit_complete = False    # set when task.complete is invoked
         _plan_submitted = False       # set when plan.submit is invoked
         _complete_summary = ""
         _user_denied = False          # set when the user rejects an approval prompt
 
-        def _flush_compact_reads() -> None:
-            """Render one consecutive read group without reordering the timeline."""
-            if events_cb is None or not _compact_read_hints:
-                return
-            category = _compact_read_hints[0][0]
-            unique_reads = list(dict.fromkeys(item for _kind, item in _compact_read_hints))
-            # For Search category, extract the query from the first hint
-            # (fs.grep salient is "pattern in path"); show it in the label.
-            query_text = ""
-            display_reads = unique_reads
-            if category == "Search":
-                first_hint = _compact_read_hints[0][1]
-                if " in " in first_hint:
-                    query_text, _path_part = first_hint.split(" in ", 1)
-                    query_text = query_text.strip()[:40]
-                    # Strip the query prefix from each target for the tail
-                    display_reads = []
-                    for item in unique_reads:
-                        if " in " in item:
-                            _, path_part = item.split(" in ", 1)
-                            display_reads.append(path_part.strip())
-                        else:
-                            display_reads.append(item)
-            # Shortest unique suffix to disambiguate same-name files
-            shown_reads = _shortest_unique(display_reads[:3])
-            read_tail = f" {symbols.BULLET} ".join(shown_reads).replace("[", "\\[")
-            if len(unique_reads) > 3:
-                read_tail += f" {symbols.BULLET} +{len(unique_reads) - 3}"
-            label, singular, plural = {
-                "Search": ("Search", "result", "results"),
-                "List": ("List", "location", "locations"),
-                "Memory": ("Memory", "source", "sources"),
-            }.get(category, ("Read", "source", "sources"))
-            if query_text:
-                label = f'{label} "{query_text}"'
-            noun = singular if len(unique_reads) == 1 else plural
-            _bg_print(deps.console,
-                f"  [success]{symbols.DOT}[/success] [accent.dim]{label}[/accent.dim]  "
-                f"[muted]{len(unique_reads)} {noun} {symbols.BULLET} {read_tail}[/muted]")
-            _compact_read_hints.clear()
+        # Every tool row this turn prints goes through the same renderer
+        # /resume replays saved turns with, so there is one definition of what
+        # a tool call looks like instead of two that drift apart.
+        _view = transcript_view.TranscriptRenderer(
+            deps.console,
+            fold_limit=lambda: int(get_runtime_config("tool_output_fold") or 0),
+            markdown_cls=deps.Markdown,
+            command_block=deps.display_command_output,
+            depth=depth,
+        )
 
         if tool_calls:
             # A turn whose calls are ALL read-only is dispatched together: its
@@ -13086,16 +12933,13 @@ def run_agent_loop(
                 # material; treating tool output as knowledge made resume
                 # transcripts both noisy and semantically wrong.
                 if events_cb is not None:
-                    _history_tool = {
-                        "role": "tool",
-                        "content": formatted[:2000],
-                        "tool_name": name,
-                        "display_name": display_name,
-                        "summary": salient[:200],
-                        "call_id": call_id,
-                        "ok": bool(result.get("ok", False)),
-                        "returncode": _rc,
-                    }
+                    # The record the display reads. Built once, from the live
+                    # result, and carried into chat_history — a replay of this
+                    # event has everything the row needs, so /resume renders
+                    # it through the same code instead of guessing.
+                    _history_tool = transcript_view.build_tool_event(
+                        name, display_name, salient, formatted, result,
+                        elapsed=_tool_elapsed, call_id=call_id, returncode=_rc)
                     if _trace_recording:
                         _history_tool["trace"] = detail_trace.build_tool_trace(
                             name, display_name, arguments, result, formatted,
@@ -13120,131 +12964,13 @@ def run_agent_loop(
                 })
 
                 if events_cb is not None:
-                    from rich.markup import escape as _esc_hint
-                    # Green dot = quiet success; red dot = a call that
-                    # actually failed — same shape, color carries the verdict.
-                    ok_mark = f"[success]{symbols.DOT}[/success]" if result.get("ok") else f"[error]{symbols.DOT}[/error]"
-                    _hint_plain = (salient if salient else display_name) or ""
-                    if name in {"task.create", "task.update", "task.list", "task.get", "task.complete"} and result.get("ok"):
-                        if name == "task.complete":
-                            # A non-empty completion summary is rendered below
-                            # as the final answer. The old rule made that hidden
-                            # tool result look like collapsed content.
-                            if not str(result.get("summary") or "").strip():
-                                deps.console.rule(style="muted")
-                        # task.create / task.update / task.list / task.get: silent —
-                        # the live task list already reflects the changes.
-                    elif _detail:
-                        _bg_print(deps.console,
-                            f"  {ok_mark} [accent.dim]{display_name}[/accent.dim] [dim]{_esc_hint(_crop_cells(_hint_plain, max(20, deps.console.width - 20), middle=True))}[/dim]")
-                    else:
-                        # Simplified: one clean, aligned line per tool. A short
-                        # trailing meta carries the essentials (line count / exit
-                        # code); failures point to /debug. Full output stays in
-                        # terminalHistory / /debug.
-                        _mark2 = f"[success]{symbols.DOT}[/success]" if result.get("ok") else f"[error]{symbols.DOT}[/error]"
-                        _meta2 = ""
-                        if name == "terminal.send" and result.get("ok"):
-                            _nlines = len((formatted or "").split("\n")) if formatted else 0
-                            _meta2 = f"sent {symbols.BULLET} {_nlines}L" if _nlines else "sent"
-                        elif name == "terminal.exec" and result.get("ok"):
-                            if result.get("completed"):
-                                _meta2 = (f"completed {symbols.BULLET} exit {_rc}" if _rc is not None
-                                          else f"completed {symbols.BULLET} exit unknown")
-                            else:
-                                _meta2 = f"started {symbols.BULLET} running"
-                        elif name in ("terminal.read", "terminal.wait") and result.get("ok"):
-                            _status = result.get("status", "running")
-                            if result.get("completed"):
-                                _meta2 = (f"completed {symbols.BULLET} exit {_rc}" if _rc is not None
-                                          else f"completed {symbols.BULLET} exit unknown")
-                            else:
-                                _meta2 = _status.replace("_", " ")
-                        elif name == "shell.exec":
-                            _nlines = len((formatted or "").split("\n")) if formatted else 0
-                            if result.get("ok"):
-                                _meta2 = f"{_nlines}L {symbols.BULLET} exit {_rc}" if _nlines else f"exit {_rc}"
-                            else:
-                                _cause = str(result.get("error") or formatted or "").strip()
-                                _cause = re.sub(r"\s+", " ", _cause).replace("[", "\\[")
-                                _meta2 = f"exit {_rc}"
-                                if _cause:
-                                    _meta2 += f" {symbols.BULLET} {_cause[:120]}"
-                                _meta2 += f" {symbols.BULLET} /why"
-                        elif name == "fs.grep" and result.get("ok"):
-                            _matches = result.get("matches", 0)
-                            _meta2 = f"{_matches} match{'es' if _matches != 1 else ''}"
-                        elif name == "web.search" and result.get("ok"):
-                            # web_search.search reports the count as "count" and
-                            # the hits under "result" (tools.py then nests them
-                            # again under result["results"] beside the untrusted
-                            # -content notice). There has never been a top-level
-                            # "results" key, so reading one printed "0 results"
-                            # on every search that actually returned hits.
-                            _n = result.get("count")
-                            if not isinstance(_n, int):
-                                _payload = result.get("result")
-                                if isinstance(_payload, dict):
-                                    _payload = _payload.get("results")
-                                _n = len(_payload) if isinstance(_payload, list) else 0
-                            _meta2 = f"{_n} result{'s' if _n != 1 else ''}"
-                        elif not result.get("ok"):
-                            _cause = str(result.get("error") or formatted or "").strip()
-                            _cause = re.sub(r"\s+", " ", _cause).replace("[", "\\[")
-                            _meta2 = f"{_cause} {symbols.BULLET} /why" if _cause else "/why"
-                        if _tool_elapsed >= 2.0:
-                            _meta2 = f"{_meta2} {symbols.BULLET} {_tool_elapsed:.1f}s" if _meta2 else f"{_tool_elapsed:.1f}s"
-                        _quiet_read = (
-                            not _detail
-                            and bool(result.get("ok"))
-                            and name in {
-                                "fs.read", "fs.grep", "fs.list", "fs.ls",
-                                "memory.search", "memory.get",
-                            }
-                        )
-                        if _quiet_read:
-                            _read_category = (
-                                "Search" if name == "fs.grep"
-                                else "List" if name in {"fs.list", "fs.ls"}
-                                else "Memory" if name.startswith("memory.")
-                                else "Read"
-                            )
-                            _target = str(salient or _hint_plain or display_name).strip()
-                            if _target:
-                                if (_compact_read_hints
-                                        and _compact_read_hints[-1][0] != _read_category):
-                                    _flush_compact_reads()
-                                _compact_read_hints.append((_read_category, _target))
-                        else:
-                            _flush_compact_reads()
-                            # (Removed a dead _laintas_expand_shell_calls branch:
-                            # that flag was never set by any caller, so shell.exec
-                            # always used the compact/cropped line below.)
-                            _name2, _hint2, _meta2 = _compact_tool_line(
-                                display_name, _hint_plain, _meta2,
-                                deps.console.width,
-                                hint_middle=(name != "shell.exec"))
-                            _line = (
-                                f"  {_mark2} [accent.dim]{_esc_hint(_name2)}[/accent.dim]"
-                                f"  [muted]{_esc_hint(_hint2)}[/muted]"
-                            )
-                            if _meta2:
-                                _line += f"  [muted]{_esc_hint(_meta2)}[/muted]"
-                            _bg_print(deps.console, _line)
-                            # Folded preview for long shell.exec output
-                            if name == "shell.exec" and formatted:
-                                _fold_lim = int(get_runtime_config("tool_output_fold") or 0)
-                                if _fold_lim > 0:
-                                    _out_lines = [l for l in _strip_ansi(formatted).split("\n") if l.strip()]
-                                    if len(_out_lines) > _fold_lim:
-                                        _half = _fold_lim // 2
-                                        _hidden = len(_out_lines) - _fold_lim
-                                        _folded = (_out_lines[:_half]
-                                                   + [f"… {_hidden} more lines"]
-                                                   + _out_lines[-_half:])
-                                        for _fl in _folded:
-                                            _bg_print(deps.console,
-                                                f"    [muted]{_esc_hint(_fl)}[/muted]")
+                    # One call: the renderer decides silence, read grouping,
+                    # the status tail, folded output and the diff glance — the
+                    # same decisions it makes when /resume replays this event.
+                    try:
+                        _view.event(_history_tool)
+                    except Exception as _e:
+                        _diag("transcript_render_failed", tool=name, error=str(_e))
                     pending_events.append({"type": "system", "kind": "tool",
                                             "content": display_name,
                                             "meta": {"ok": result.get("ok", False),
@@ -13255,32 +12981,13 @@ def run_agent_loop(
                     events_cb(pending_events)
                     pending_events.clear()
 
-                    if _detail:
-                        # Display panels for shell.exec (mirror old UX)
-                        if name == "shell.exec":
-                            if result.get("via") in ("subprocess", "parent", "loop_command"):
-                                try:
-                                    deps.display_command_output(salient, _rc, formatted, depth=depth + 1)
-                                except Exception as _e: _diag("display_command_output_failed", tool=name, error=str(_e))
-                        elif name in ("fs.write", "fs.edit", "fs.multi_edit") and result.get("diff"):
-                            try:
-                                deps.display_file_diff(result.get("path") or salient or name,
-                                                       result.get("diff", ""),
-                                                       depth=depth + 1)
-                            except Exception as _e: _diag("display_file_diff_failed", tool=name, error=str(_e))
-                    elif name in ("fs.write", "fs.edit", "fs.multi_edit") and result.get("diff"):
-                        # Simplified diff: changed lines only, capped at 6.
-                        try:
-                            _emit_simple_diff(deps.console, result.get("diff", ""), depth=depth + 1)
-                        except Exception as _e: _diag("emit_simple_diff_failed", tool=name, error=str(_e))
-
                 # ── User-denied circuit breaker (inner loop) ──
                 # Stop dispatching the remaining tool calls in this turn — the
                 # outer loop will terminate immediately (see below).
                 if _user_denied:
                     break
 
-        _flush_compact_reads()
+        _view.flush()
 
         # ── User-denied circuit breaker (outer loop) ──
         # When the user explicitly rejects an approval prompt (command, file

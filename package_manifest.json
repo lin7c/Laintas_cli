@@ -19,6 +19,7 @@
     "agents_mode",
     "tools",
     "symbols",
+    "transcript_view",
     "skills",
     "mcp_client",
     "policy",

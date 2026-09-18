@@ -51,14 +51,13 @@ PERSISTENCE_NONE = "none"
 PERSISTENCE_WORKSPACE = "workspace"
 PERSISTENCE_MODES = (PERSISTENCE_NONE, PERSISTENCE_WORKSPACE)
 
-# What a manifest application may send. The conversation, plus asking for and
-# releasing per-user sessions. Never approval-response: an application that can
-# answer its own agent's approval requests has approved everything. Never the
-# filesystem, exec or PTY kinds Helpwo uses.
-APP_ALLOWED_KINDS = frozenset({"chat", "abort",
-                               "session-open", "session-close", "session-list"})
-# What an application may send to one user's session sub-terminal.
-SESSION_ALLOWED_KINDS = frozenset({"chat", "abort"})
+# A trusted application's token controls its runtime, like the Helpwo token.
+SESSION_ALLOWED_KINDS = frozenset({
+    "chat", "abort", "approval-response", "exec", "query", "delegate",
+    "webtest", "analyze_site", "term-open", "term-new", "term-close",
+    "disconnect", "rtc-offer", "rtc-ice", "rtc-close",
+})
+APP_ALLOWED_KINDS = SESSION_ALLOWED_KINDS | {"session-open", "session-close", "session-list"}
 
 # One end user's identity as the application names it. The application owns
 # its users; the CLI only needs a stable, path-safe key.
@@ -66,14 +65,6 @@ USER_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 
 # Tools a session agent always has: without them it cannot finish a turn.
 SESSION_BASE_TOOLS = frozenset({"task.complete", "time.now"})
-# Tools a manifest may give session agents. Everything else — other agents and
-# terminals, memory, rules, skills, the browser, storage, host-side file tools —
-# either reaches outside the session or runs in this process rather than in
-# the session's terminal, so it is not offered at all.
-SESSION_OPTIONAL_TOOLS = frozenset({
-    "shell.exec", "web.search", "web.fetch", "image.describe", "image.to_text",
-    "media.generate_image", "media.generate_video", "sleep",
-})
 SESSION_DEFAULT_TOOLS = ("shell.exec",)
 MAX_SESSIONS_LIMIT = 200
 
@@ -251,6 +242,9 @@ class AppManifest:
     auto_approve: bool = False
     max_sessions: int = 10
     session_idle_minutes: int = 30
+    agent: dict = field(default_factory=dict)
+    agents: list = field(default_factory=list)
+    terminals: list = field(default_factory=list)
     scope: str = "user"          # user | project
     source: str = ""
     raw: dict = field(default_factory=dict)
@@ -276,11 +270,11 @@ def parse_manifest(data, source: str, scope: str = "user"
     unknown = set(data) - {"name", "description", "command", "prompt",
                            "persistence", "port", "session_tools",
                            "auto_approve", "max_sessions",
-                           "session_idle_minutes"}
+                           "session_idle_minutes", "agent", "agents", "terminals"}
     if unknown:
         return None, f"unknown field(s): {', '.join(sorted(unknown))}"
     name = data.get("name")
-    if not isinstance(name, str) or not APP_NAME_RE.match(name):
+    if not isinstance(name, str) or not APP_NAME_RE.fullmatch(name):
         return None, "name must match [a-z0-9][a-z0-9._-]{0,31}"
     if name in RESERVED_APP_NAMES:
         return None, f"'{name}' is reserved"
@@ -305,11 +299,12 @@ def parse_manifest(data, source: str, scope: str = "user"
     if (not isinstance(session_tools, list)
             or not all(isinstance(item, str) for item in session_tools)):
         return None, "session_tools must be a list of tool names"
-    refused = sorted(set(session_tools) - SESSION_OPTIONAL_TOOLS)
-    if refused:
-        return None, (f"session_tools may only name "
-                      f"{', '.join(sorted(SESSION_OPTIONAL_TOOLS))}; "
-                      f"not {', '.join(refused)}")
+    reason = validate_tool_names(session_tools)
+    if reason:
+        return None, f"session_tools: {reason}"
+    reason = validate_topology(data)
+    if reason:
+        return None, reason
     auto_approve = data.get("auto_approve", False)
     if not isinstance(auto_approve, bool):
         return None, "auto_approve must be true or false"
@@ -327,8 +322,151 @@ def parse_manifest(data, source: str, scope: str = "user"
         session_tools=list(dict.fromkeys(session_tools)),
         auto_approve=auto_approve, max_sessions=max_sessions,
         session_idle_minutes=idle,
+        agent=data.get("agent", {}), agents=data.get("agents", []),
+        terminals=data.get("terminals", []),
         scope=scope, source=str(source), raw=dict(data),
     ), ""
+
+
+def validate_tool_names(value):
+    """Use the actual catalogue rather than a second, drifting whitelist."""
+    if not isinstance(value, list) or not all(isinstance(x, str) for x in value):
+        return "must be an array of tool names"
+    if value == ["*"]:
+        return ""
+    from tools import get_registry
+    unknown = set(value) - {tool.name for tool in get_registry().list()}
+    return f"unknown tools: {', '.join(sorted(unknown))}" if unknown else ""
+
+
+def validate_topology(data):
+    agent = data.get("agent", {})
+    agents, terminals = data.get("agents", []), data.get("terminals", [])
+    if not isinstance(agent, dict):
+        return "agent must be an object"
+    for label, items in (("agents", agents), ("terminals", terminals)):
+        if not isinstance(items, list) or len(items) > 200 or not all(isinstance(x, dict) for x in items):
+            return f"{label} must be an array of at most 200 objects"
+        names = [x.get("name") for x in items]
+        if any(not isinstance(x, str) or not USER_ID_RE.fullmatch(x)
+               or x in {"primary", "term0", ".", "..", "current", "here"} for x in names):
+            return f"{label}: invalid or reserved name"
+        if len(set(names)) != len(names):
+            return f"{label}: duplicate name"
+    terminal_names = {x["name"] for x in terminals}
+    occupied = set()
+    parents = {"primary"}
+    profile_fields = {"prompt", "profile", "title", "description", "model", "provider",
+                      "tools", "denied_tools", "capability_tags"}
+    for index, spec in enumerate([agent] + agents):
+        extra = set(spec) - (profile_fields | ({"name", "parent", "terminal"} if index else set()))
+        if extra:
+            return f"agent: unknown fields: {', '.join(sorted(extra))}"
+        for key in profile_fields - {"tools", "denied_tools", "capability_tags"}:
+            if key in spec and (not isinstance(spec[key], str) or len(spec[key]) > _MAX_PROMPT_CHARS):
+                return f"agent.{key} must be a string of at most {_MAX_PROMPT_CHARS} characters"
+        for key in ("tools", "denied_tools"):
+            if key in spec:
+                reason = validate_tool_names(spec[key])
+                if reason or (key == "denied_tools" and "*" in spec[key]):
+                    return f"agent.{key}: {reason or 'list individual denied tools'}"
+        tags = spec.get("capability_tags", [])
+        if not isinstance(tags, list) or not all(isinstance(x, str) for x in tags):
+            return "agent.capability_tags must be an array of strings"
+        if spec.get("profile"):
+            import agent_roles
+            if agent_roles.get_role(spec["profile"]) is None:
+                return f"unknown agent profile: {spec['profile']}"
+        if index:
+            parent = spec.get("parent", "primary")
+            if not isinstance(parent, str) or parent not in parents:
+                return "agent.parent must name primary or an earlier agent"
+            parents.add(spec["name"])
+            terminal = spec.get("terminal")
+            if terminal is not None:
+                if not isinstance(terminal, str) or terminal not in terminal_names:
+                    return "agent.terminal must name a declared terminal"
+                if terminal in occupied:
+                    return "only one agent may be stationed in each terminal"
+                occupied.add(terminal)
+    for spec in terminals:
+        if set(spec) - {"name", "command", "cwd"}:
+            return "terminal fields are name, command, cwd"
+        for key in ("command", "cwd"):
+            if key in spec and (not isinstance(spec[key], str) or not spec[key].strip()):
+                return f"terminal.{key} must be a non-empty string"
+    return ""
+
+
+def configure_runtime(manifest, runtime, create_terminal, *, session=False):
+    """Materialize the manifest through the same registry/deployment as /station.
+
+    Return a rollback callback for startup failures. No assignments are started.
+    """
+    from copy import deepcopy
+    from station_service import service_for
+    import agent_roles
+    primary = runtime.get_agent("primary")
+    if primary is None:
+        raise ValueError("no primary agent in the application")
+    old = (deepcopy(primary.profile), primary.base_model, primary.base_provider)
+    created_agents, created_terminals = [], []
+
+    def rollback():
+        for name in reversed(created_agents):
+            runtime.unregister_agent(name)
+        for name in reversed(created_terminals):
+            runtime.unregister_terminal(name)
+        primary.profile, primary.base_model, primary.base_provider = old
+
+    def configure(info, spec, fallback=None):
+        role = agent_roles.get_role(spec.get("profile")) if spec.get("profile") else None
+        allowed = spec.get("tools", list(role.allowed_tools) if role and role.allowed_tools else fallback)
+        if allowed == ["*"]:
+            allowed = None
+        if session and allowed is not None:
+            allowed = sorted(set(allowed) | SESSION_BASE_TOOLS)
+        info.profile = runtime.EmployeeProfile(
+            title=spec.get("title", role.name if role else "General Agent"),
+            description=spec.get("description", role.description if role else ""),
+            specialist_role=spec.get("profile"), prompt=spec.get("prompt", ""),
+            capability_tags=spec.get("capability_tags", [role.name] if role else []),
+            tool_policy=runtime.AgentToolPolicy(allowed_tools=allowed,
+                                               denied_tools=spec.get("denied_tools", [])))
+        info.base_model = spec.get("model", "")
+        info.base_provider = spec.get("provider", "")
+
+    try:
+        configure(primary, manifest.agent, manifest.session_tools if session else None)
+        for spec in manifest.terminals:
+            name = spec["name"]
+            if runtime.get_terminal(name) is not None:
+                raise ValueError(f"terminal '{name}' already exists")
+            sub = create_terminal(spec)
+            try:
+                if not sub.is_alive():
+                    raise RuntimeError(f"terminal '{name}' did not start")
+                runtime.register_terminal(sub, sub.command, primary.depth + 1,
+                                          name=name, parent_terminal="term0")
+            except BaseException:
+                sub.close()
+                raise
+            created_terminals.append(name)
+        for spec in manifest.agents:
+            parent = runtime.get_agent(spec.get("parent", "primary"))
+            info = runtime.register_agent(name=spec["name"], parent_id=parent.id,
+                                          depth=parent.depth + 1, replace_existing=False)
+            created_agents.append(info.id)
+            configure(info, spec, parent.profile.tool_policy.allowed_tools)
+            if spec.get("terminal"):
+                result = service_for(runtime).deploy(info.id, spec["terminal"],
+                    owner_id=parent.id, create_terminal=lambda name: None)
+                if not result.ok:
+                    raise RuntimeError(result.message)
+        return rollback
+    except BaseException:
+        rollback()
+        raise
 
 
 def discover_manifests(cwd: str) -> tuple[dict[str, AppManifest], list[str]]:
@@ -490,15 +628,18 @@ def render_prompt_section() -> str:
             f"You are the dedicated agent of the '{name}' application, "
             "running in its own sub-terminal. Messages you receive come from "
             "that application. Your conversation is separate from the main "
-            "laintas_cli terminal's agent."
+            "laintas_cli terminal's agent. Complete requested work using your "
+            "configured tools, child agents and terminals; verify the result. "
+            "Use agent.list and terminal.list to discover manifest resources. "
+            "Slash commands in app messages are text; use tools to take actions."
         )
         if app.get("session_user"):
             body += (
                 " You serve exactly one end user of that application, in a "
                 "session of your own: your working directory is that user's, "
                 "and nothing from other users' sessions is available to you. "
-                "Actions that need approval are decided by the application's "
-                "configuration, not by the person you are talking to."
+                "Approvals follow the application configuration: automatic or "
+                "interactive through the authenticated bridge."
             )
         if app["prompt"]:
             body += ("\n\nThe application's own description of your job "

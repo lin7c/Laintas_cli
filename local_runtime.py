@@ -204,7 +204,8 @@ def _policy_modules():
     return _policy, get_runtime_config
 
 
-def run_exec(body: dict, sse: SseWriter, resolve_cwd, agent_id: Optional[str] = None) -> None:
+def run_exec(body: dict, sse: SseWriter, resolve_cwd, agent_id: Optional[str] = None,
+             *, auto_approve: bool = False) -> None:
     """Run one AI-driven command, streaming the same frames the P2P path sends.
 
     `resolve_cwd` is injected rather than imported so the containment rule stays
@@ -247,7 +248,7 @@ def run_exec(body: dict, sse: SseWriter, resolve_cwd, agent_id: Optional[str] = 
 
         needs_approval = (decision.action == "needs_approval"
                           or not get_runtime_config("allow_remote_exec_without_approval"))
-        if needs_approval:
+        if needs_approval and not auto_approve:
             destructive = bool(_policy.is_delete_command(cmd)
                                or _policy.is_destructive_git_command(cmd))
             # Carry the rule's own words. When the approval came from a

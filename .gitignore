@@ -6,6 +6,7 @@ __pycache__/
 .parent_cmd
 *.bak
 *.bak-*
+.laintas-update-backup/
 log.md
 .pytest_cache/
 .ruff_cache/

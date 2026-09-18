@@ -5959,8 +5959,8 @@ def _bi_terminal_terminate(params: dict, ctx: ToolCtx) -> dict:
 #
 # Slash commands are user-side REPL entry points and are never shown to the
 # model, so the agent-facing surface of /app is these tools. The trust gate
-# stays human: app.trust.request only *asks*, through the same approval
-# channel shell commands use, and never writes the trust file on its own.
+# uses the standard approval policy once per manifest digest. Agents may
+# author manifests and manage the full lifecycle through these tools.
 
 def _app_manifests(ctx: ToolCtx):
     """Discover app manifests visible from ctx.cwd. Returns (manifests, problems)."""
@@ -6038,9 +6038,10 @@ def _bi_app_trust_request(params: dict, ctx: ToolCtx) -> dict:
         return {"ok": False, "error": f"no application named '{name}'"}
     if app_host.is_trusted(manifest):
         return {"ok": True, "already_trusted": True}
-    detail = ("Trust a hosted application manifest. Once trusted, the application "
-              "can be started in its own sub-terminal with its own agent, and its "
-              f"session agents may run: {', '.join(manifest.session_tools)}.")
+    detail = ("Trust this hosted application and its authenticated bridge, including "
+              "files, shell, terminals and agent operations. This trust covers start/stop "
+              "until the manifest changes. Manifest:\n" +
+              json.dumps(manifest.raw, ensure_ascii=False, indent=2))
     if note:
         detail = f"{note}\n\n{detail}"
     verdict = _app_approval(ctx, f"app.trust {name}", detail)
@@ -6064,25 +6065,20 @@ def _bi_app_start(params: dict, ctx: ToolCtx) -> dict:
     if manifest is None:
         return {"ok": False, "error": f"no application named '{name}'"}
     if not app_host.is_trusted(manifest):
-        return {"ok": False,
-                "error": f"'{name}' is not trusted; request trust first (app.trust.request)"}
+        result = _bi_app_trust_request({"name": name}, ctx)
+        if not result.get("ok"):
+            return result
     if _app_running(ctx, name):
         return {"ok": True, "already_running": True}
-    verdict = _app_approval(ctx, f"app.start {name}",
-                            f"Start hosted application '{name}' in its own sub-terminal "
-                            "with its own agent.")
-    if verdict is None:
-        return {"ok": False,
-                "error": "starting requires user approval but no approval channel is available"}
-    if not verdict:
-        return {"ok": False, "error": "user denied the start request",
-                "_user_denied": True}
     import laintas_cli as _lc
     runtime = _lc._launch_app_subterminal(
         name, persistent=manifest.persistence == app_host.PERSISTENCE_WORKSPACE,
-        options={}, agent_registry=None, open_url=False)
-    if runtime is None:
-        return {"ok": False, "error": f"could not start '{name}' in a sub-terminal"}
+        options={}, agent_registry=None, open_url=False, wait=True)
+    if runtime is None or runtime.get("status") in {"error", "exited", "timeout"}:
+        if runtime is not None:
+            _lc._close_app_subterminal(name)
+        return {"ok": False, "error": f"could not start '{name}' in a sub-terminal",
+                "runtime": runtime}
     return {"ok": True, "status": runtime.get("status") or "starting",
             "runtime": runtime}
 
@@ -6093,19 +6089,39 @@ def _bi_app_stop(params: dict, ctx: ToolCtx) -> dict:
         return {"ok": False, "error": "missing 'name'"}
     if not _app_running(ctx, name):
         return {"ok": False, "error": f"'{name}' is not running"}
-    verdict = _app_approval(ctx, f"app.stop {name}",
-                            f"Stop hosted application '{name}' and close its sub-terminal, "
-                            "agent, and process.")
-    if verdict is None:
-        return {"ok": False,
-                "error": "stopping requires user approval but no approval channel is available"}
-    if not verdict:
-        return {"ok": False, "error": "user denied the stop request",
-                "_user_denied": True}
     import laintas_cli as _lc
     if _lc._close_app_subterminal(name):
         return {"ok": True, "stopped": name}
     return {"ok": False, "error": f"could not stop '{name}'"}
+
+
+def _bi_app_manifest_put(params: dict, ctx: ToolCtx) -> dict:
+    """Validate before atomically writing an agent-authored manifest."""
+    import app_host
+    import json_store
+    scope = params.get("scope", "project")
+    if scope not in {"project", "user"}:
+        return {"ok": False, "error": "scope must be project or user"}
+    manifest, reason = app_host.parse_manifest(params.get("manifest"), "<draft>", scope)
+    if manifest is None:
+        return {"ok": False, "error": reason}
+    directory = (app_host.project_manifest_dir(ctx.cwd or os.getcwd())
+                 if scope == "project" else app_host.user_manifest_dir())
+    source = directory / f"{manifest.name}.json"
+    directory.mkdir(parents=True, exist_ok=True)
+    json_store.save_json_atomic(source, manifest.raw, mode=0o600)
+    manifest.source = str(source)
+    return {"ok": True, "source": str(source), "manifest": manifest.raw,
+            "trusted": app_host.is_trusted(manifest),
+            "restart_required": _app_running(ctx, manifest.name)}
+
+
+def _bi_app_trust_revoke(params: dict, ctx: ToolCtx) -> dict:
+    import app_host
+    name = params.get("name")
+    if not isinstance(name, str) or not app_host.APP_NAME_RE.fullmatch(name):
+        return {"ok": False, "error": "invalid application name"}
+    return {"ok": True, "revoked": app_host.revoke(name)}
 
 
 def _bi_terminal_create(params: dict, ctx: ToolCtx) -> dict:
@@ -9400,6 +9416,26 @@ def register_builtin_tools() -> None:
             invoke=_bi_app_manifest_get,
         ),
         Tool(
+            name="app.manifest.put",
+            description=("Create or update a hosted app manifest. Validates and atomically writes "
+                         "to project (default) or user scope. Supports agent, agents, terminals, "
+                         "session_tools and auto_approve. Call app.start to trust and launch; "
+                         "restart a running app to apply changes."),
+            schema={"type": "object", "properties": {
+                "manifest": {"type": "object"},
+                "scope": {"type": "string", "enum": ["project", "user"]},
+            }, "required": ["manifest"], "additionalProperties": False},
+            invoke=_bi_app_manifest_put,
+        ),
+        Tool(
+            name="app.trust.revoke",
+            description="Revoke a hosted application's saved trust. Does not stop a running app; use app.stop first if needed.",
+            schema={"type": "object", "properties": {
+                "name": {"type": "string", "minLength": 1},
+            }, "required": ["name"], "additionalProperties": False},
+            invoke=_bi_app_trust_revoke,
+        ),
+        Tool(
             name="app.trust.request",
             description=(
                 "Request the user's approval to trust a hosted application. "
@@ -9416,10 +9452,9 @@ def register_builtin_tools() -> None:
         Tool(
             name="app.start",
             description=(
-                "Start a trusted hosted application in its own sub-terminal "
-                "with its own dedicated agent, after user approval. Requires "
-                "trust first (app.trust.request). The user can also start it "
-                "directly with the /app slash command."),
+                "Start a hosted application with its configured agents and terminals. "
+                "Requests trust through the normal approval policy if needed; an unchanged "
+                "trusted manifest needs no additional start approval."),
             schema={"type": "object", "properties": {
                 "name": {"type": "string", "minLength": 1},
             }, "required": ["name"], "additionalProperties": False},
@@ -9429,7 +9464,7 @@ def register_builtin_tools() -> None:
             name="app.stop",
             description=(
                 "Stop a running hosted application and close its sub-terminal, "
-                "agent, and process, after user approval."),
+                "agent, and process. No extra approval is needed."),
             schema={"type": "object", "properties": {
                 "name": {"type": "string", "minLength": 1},
             }, "required": ["name"], "additionalProperties": False},

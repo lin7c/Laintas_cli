@@ -14,6 +14,7 @@ import asyncio
 import copy
 import io
 import symbols
+import transcript_view
 import textwrap
 import os
 import re
@@ -5493,13 +5494,22 @@ def _build_keybindings() -> KeyBindings:
     # ── Arrow-key cursor movement (main input buffer) ──────────────────
     # Explicit bindings so cursor navigation is guaranteed in the normal
     # (non-modal) state instead of silently leaning on prompt_toolkit's
-    # merged emacs/basic defaults. Each is gated on ~_rprompt_modal_active so
-    # it can never double-fire with the slot-selection up/down/Alt+arrows
-    # below: prompt_toolkit fires *every* binding whose filter is True
-    # (matches[-1]), so the two sets must be mutually exclusive. Movement goes
+    # merged emacs/basic defaults. prompt_toolkit calls exactly ONE handler per
+    # key — the LAST registered binding whose filter is True — so these are
+    # gated on ~_rprompt_modal_active to stay mutually exclusive with the
+    # slot-selection up/down/Alt+arrows registered below. Movement goes
     # through _PasteGuardBuffer.cursor_position, which keeps the cursor out of
     # paste placeholders automatically.
-    _main_movement = ~_rprompt_modal_active
+    #
+    # `input_arrow_keys` turns them off without a restart: the filter is read
+    # on each keystroke. Switching it off has to also stop prompt_toolkit's own
+    # emacs defaults, or "off" would behave exactly like "on" and the switch
+    # would be a lie — hence the inert handlers registered below, which win
+    # over the defaults for the same reason these do (ours are merged last).
+    _arrow_keys_enabled = Condition(
+        lambda: bool(get_runtime_config("input_arrow_keys")))
+    _main_movement = ~_rprompt_modal_active & _arrow_keys_enabled
+    _arrows_off = ~_rprompt_modal_active & ~_arrow_keys_enabled
 
     @kb.add("left", filter=_main_movement)
     def _(event):
@@ -5516,6 +5526,11 @@ def _build_keybindings() -> KeyBindings:
     @kb.add("down", filter=_main_movement)
     def _(event):
         event.current_buffer.auto_down(count=event.arg)
+
+    for _arrow in ("left", "right", "up", "down"):
+        @kb.add(_arrow, filter=_arrows_off)
+        def _(event):
+            """input_arrow_keys off: the arrow keys do nothing in the input."""
 
     @kb.add("escape", "0")
     def _(event):
@@ -8452,103 +8467,35 @@ def _show_resume_detail(item: dict) -> None:
             console.print(f"[dim]Parent:[/dim] [magenta]{_lineage[-2]}[/magenta]")
     history = item.get("chat_history") or []
     console.print(f"[dim]Events:[/dim] {len(history)}\n")
-    for msg in history[-6:]:
-        _print_resume_event(msg)
-        console.print()
+    _print_resume_events(history[-6:])
 
 
-def _resume_role_style(role: str) -> str:
-    """Map a chat role to a rich color for transcript rendering."""
-    if role == "user":
-        return "green"
-    if role == "assistant":
-        return "blue"
-    if role == "knowledge":
-        return "yellow"
-    return "cyan"
+def _resume_renderer() -> "transcript_view.TranscriptRenderer":
+    """The replay renderer — the same one the agent loop draws live turns with.
 
-
-_LEGACY_TOOL_EVENT_RE = re.compile(
-    r"^\[(?P<call>call_[^\]]+)\]\s+"
-    r"(?P<name>[^\s(]+)\((?P<summary>.*?)\)\s+→\s+(?P<result>.*)$",
-    re.DOTALL,
-)
-
-
-def _resume_tool_event(message: dict) -> Optional[dict]:
-    """Normalize new typed tools and legacy knowledge-tool records."""
-    if message.get("role") == "tool":
-        return {
-            "name": str(message.get("display_name")
-                        or message.get("tool_name") or "tool"),
-            "summary": str(message.get("summary") or ""),
-            "result": str(message.get("content") or ""),
-            "ok": message.get("ok"),
-            "legacy": False,
-        }
-    if message.get("role") != "knowledge":
-        return None
-    match = _LEGACY_TOOL_EVENT_RE.match(str(message.get("content") or ""))
-    if not match:
-        return None
-    data = match.groupdict()
-    summary = data["summary"].strip()
-    duplicate_prefix = data["name"] + " "
-    if summary.startswith(duplicate_prefix):
-        summary = summary[len(duplicate_prefix):].strip()
-    return {
-        "name": data["name"],
-        "summary": summary,
-        "result": data["result"].strip(),
-        "ok": None,
-        "legacy": True,
-    }
+    Everything about how an event looks (silent tools, grouped reads, the
+    status tail, folded output, diffs) lives in transcript_view; this only
+    supplies the console and the REPL's own shell-block/Markdown renderers,
+    which are the very ones LoopDeps hands the live path.
+    """
+    return transcript_view.TranscriptRenderer(
+        console,
+        fold_limit=lambda: int(get_runtime_config("tool_output_fold") or 0),
+        markdown_cls=Markdown,
+        command_block=display_command_output,
+    )
 
 
 def _print_resume_event(message: dict) -> None:
-    """Render one saved event with the same visual vocabulary as the REPL."""
-    tool = _resume_tool_event(message)
-    if tool is not None:
-        status = f"[success]{symbols.DOT}[/success]" if tool["ok"] is not False else f"[error]{symbols.DOT}[/error]"
-        summary = _md_escape(tool["summary"][:160])
-        suffix = f"  [muted]{summary}[/muted]" if summary else ""
-        console.print(
-            f"  {status} [accent.dim]{_md_escape(tool['name'])}[/accent.dim]{suffix}",
-            highlight=False,
-        )
-        result = tool["result"].strip()
-        if result:
-            result_style = (
-                "error" if tool["ok"] is False or "error" in result.lower()
-                else "muted"
-            )
-            console.print(Padding(
-                Text(result[:500], style=result_style), (0, 0, 0, 4)
-            ))
-        return
+    """Render one saved event exactly as the live loop rendered it."""
+    view = _resume_renderer()
+    view.event(message)
+    view.flush()
 
-    role = str(message.get("role") or "?")
-    content = str(message.get("content") or "")
-    if role == "user":
-        input_kind = message.get("input_kind") or "prompt"
-        if input_kind == "shell":
-            console.print(f"[muted]$ {_md_escape(content)}[/muted]", highlight=False)
-        elif input_kind == "interactive":
-            console.print(f"[muted]› {_md_escape(content)}[/muted]", highlight=False)
-        else:
-            console.print(f"[accent]❯[/accent] {_md_escape(content)}", highlight=False)
-    elif role == "assistant":
-        console.print(Markdown(content or "*(empty)*"))
-    elif role == "knowledge":
-        console.print("[warning]context[/warning]")
-        console.print(Padding(Text(content or "(empty)", style="muted"), (0, 0, 0, 2)))
-    elif role == "shell":
-        rc = message.get("returncode")
-        style = "error" if isinstance(rc, int) and rc != 0 else "muted"
-        console.print(Padding(Text(content or "(no output)", style=style), (0, 0, 0, 2)))
-    else:
-        console.print(f"[muted]{_md_escape(role)} {symbols.BULLET} {_md_escape(content)}[/muted]",
-                      highlight=False)
+
+def _print_resume_events(history: list) -> None:
+    """Replay a run of saved events."""
+    _resume_renderer().events(history)
 
 
 def _print_resume_transcript(blob: dict, limit: Optional[int]) -> None:
@@ -8576,10 +8523,9 @@ def _print_resume_transcript(blob: dict, limit: Optional[int]) -> None:
     )
     older = (blob.get("older_summary") or "").strip()
     if at_start and older:
-        console.print(f"[dim yellow][earlier session context]\n{older}[/dim yellow]\n")
-    for msg in window:
-        _print_resume_event(msg)
-        console.print()
+        console.print(f"[dim yellow][earlier session context]\n{older}[/dim yellow]")
+    _print_resume_events(window)
+    console.print()
 
 
 def read_file(path: str) -> Optional[str]:
@@ -11654,13 +11600,10 @@ class AgentRegistry:
 
         Returns "approve", "reject", or "modify". Timeout defaults to 5 min.
         """
-        if self.app_mode is not None:
-            # Whoever sends an application's messages must never be the one
-            # who approves what they cause. The manifest decides, up front:
-            # "auto" approves what the policy engine did not already deny,
-            # except destructive deletes; anything else is refused.
+        if self.app_mode is not None and self.app_mode.get("approval") != "ask":
+            # The trusted manifest chooses automatic or interactive approval.
             decision = ("approve"
-                        if self.app_mode.get("approval") == "auto" and not destructive
+                        if self.app_mode.get("approval") == "auto"
                         else "reject")
             self._push_events([{
                 "type": "approval-decided",
@@ -12665,13 +12608,18 @@ def handle_version_command(parts: list) -> None:
 
     sub = parts[1].lower() if len(parts) > 1 else ""
     force = any(p in ("--force", "-f") for p in parts[2:])
+    # Deliberately NOT --force: that flag is for "re-apply the same version"
+    # and is recommended casually (a damaged-binary hint prints it). Throwing
+    # away local edits needs a word that can only be typed on purpose.
+    overwrite_checkout = any(p == "--overwrite-local" for p in parts[2:])
 
     if sub == "enterprise":
         _handle_enterprise(parts[2:])
         return
 
     if sub not in ("", "update", "check"):
-        console.print("[yellow]Usage: /v  |  /v check  |  /v update \\[--force]  |  /v enterprise [on|off|gateway][/yellow]")
+        console.print("[yellow]Usage: /v  |  /v check  |  /v update \\[--force] "
+                      "\\[--overwrite-local]  |  /v enterprise [on|off|gateway][/yellow]")
         return
 
     console.print(f"[bold]laintas-cli[/bold] [cyan]v{updater.LOCAL_VERSION}[/cyan] "
@@ -12725,8 +12673,30 @@ def handle_version_command(parts: list) -> None:
         console.print("[green]All files already match the latest — nothing to download.[/green]")
         return
 
+    # A source install that is also a git checkout is where this CLI is
+    # developed. "Differs from the release" and "you edited it" are the same
+    # sha256 mismatch, so applying here silently reverts local work — which is
+    # what used to happen, days after a fix was written, with the update
+    # reporting success. The checkout updates with git.
+    if updater.is_source_checkout() and not overwrite_checkout:
+        console.print(
+            f"[yellow]{updater.install_dir()} is a git checkout — not updating "
+            f"it from the release.[/yellow]")
+        console.print(f"[dim]These {len(changed)} file(s) differ from v{remote_ver}; "
+                      f"applying the release would overwrite them:[/dim]")
+        for name, _sha in changed[:20]:
+            console.print(f"  [muted]{escape(name)}[/muted]")
+        if len(changed) > 20:
+            console.print(f"  [muted]… and {len(changed) - 20} more[/muted]")
+        console.print("[dim]Update this checkout with [bold]git pull[/bold]. "
+                      "To overwrite it with the release anyway: [bold]/v update "
+                      "--overwrite-local[/bold] — that one keeps a copy of the "
+                      "replaced files under .laintas-update-backup/.[/dim]")
+        return
+
     console.print(f"[bold]Downloading {len(changed)} changed file(s):[/bold]")
-    ok = updater.apply_source_update(manifest, changed, channel_dir, console.print)
+    ok = updater.apply_source_update(manifest, changed, channel_dir, console.print,
+                                     allow_checkout=overwrite_checkout)
     if not ok:
         console.print("[red]Update failed — no changes applied.[/red]")
         return
@@ -21335,6 +21305,7 @@ def _app_session_open(manifest, user: str) -> dict:
             directory, state = app_host.ensure_state(manifest.name, str(work), persistent)
             options = {"session_user": user, "prompt": manifest.prompt,
                        "tools": list(manifest.session_tools),
+                       "manifest": manifest.raw,
                        "auto_approve": bool(manifest.auto_approve),
                        "idle_minutes": int(manifest.session_idle_minutes)}
             try:
@@ -21475,6 +21446,21 @@ def _bootstrap_hosted_app(args, agent_registry: AgentRegistry, session: dict) ->
         console.print(f"[red]Could not report startup to the main terminal: {exc}[/red]")
 
 
+def _app_terminal_factory(spec):
+    """Start a manifest terminal without changing the host process's cwd."""
+    command = spec.get("command") or DEFAULT_SHELL
+    if spec.get("cwd"):
+        directory = os.path.abspath(os.path.expanduser(spec["cwd"]))
+        command = f"cd {shlex.quote(directory)} && {command}"
+    sub = SubTerminalSession(command, timeout=0, use_tmux=False)
+    try:
+        sub.start()
+        return sub
+    except BaseException:
+        sub.close()
+        raise
+
+
 def _app_start_in_process(name: str, agent_registry: AgentRegistry, session: dict,
                           state: dict, state_dir) -> dict:
     """Serve one manifest application from THIS process (its sub-terminal)."""
@@ -21491,7 +21477,12 @@ def _app_start_in_process(name: str, agent_registry: AgentRegistry, session: dic
                 "message": f"'{name}' is not trusted (or changed since); /app trust {name}"}
     app_host.activate(manifest.name, manifest.prompt, builtin=False)
     _HOSTED_APP["manifest"] = manifest
-    agent_registry.app_mode = {"approval": "deny"}
+    agent_registry.app_mode = {"approval": "auto" if manifest.auto_approve else "ask"}
+    import agent_loop as runtime
+    try:
+        rollback = app_host.configure_runtime(manifest, runtime, _app_terminal_factory)
+    except Exception as exc:
+        return {"status": "error", "message": f"application setup failed: {exc}"}
     # Throwaway session folders of a previous run of this application.
     import shutil
     from pathlib import Path
@@ -21506,6 +21497,7 @@ def _app_start_in_process(name: str, agent_registry: AgentRegistry, session: dic
         app_profile={"name": manifest.name,
                      "allowed_kinds": app_host.APP_ALLOWED_KINDS})
     if not ok:
+        rollback()
         return {"status": "error", "message": msg}
     bound_port = helpwo_server._server_port()
     if state.get("persistent"):
@@ -21515,12 +21507,12 @@ def _app_start_in_process(name: str, agent_registry: AgentRegistry, session: dic
     console.print(Panel(
         f"[green]Hosting application [bold]{escape(manifest.name)}[/bold][/green]\n"
         f"Bridge: {bridge_url}  agent: {agent_id}\n"
-        f"[dim]POST /api/agents/<id>/send (kind chat/abort, or session-open/"
-        f"session-close/session-list with payload.user), GET "
+        f"[dim]POST /api/agents/<id>/send (chat, exec, approval-response, "
+        f"terminal operations; session-open/session-close/session-list with payload.user), GET "
         f"/api/agents/<id>/updates. Header 'Authorization: token <token>'. "
         f"Sessions: up to {manifest.max_sessions}, tools "
         f"{', '.join(manifest.session_tools) or '(none)'}, approvals "
-        f"{'auto' if manifest.auto_approve else 'refused'}.[/dim]",
+        f"{'auto' if manifest.auto_approve else 'interactive'}.[/dim]",
         title="App", border_style="green"))
 
     result = {"status": "ready", "mode": "app", "url": bridge_url,
@@ -21539,6 +21531,7 @@ def _app_start_in_process(name: str, agent_registry: AgentRegistry, session: dic
                 })
         except Exception as exc:
             helpwo_server.stop_server()
+            rollback()
             return {"status": "error",
                     "message": f"could not start '{manifest.command}': {exc}"}
         console.print(f"[dim]Started: {escape(manifest.command)} (pid {proc.pid}); "
@@ -21553,9 +21546,8 @@ def _app_session_start_in_process(name: str, options: dict,
     """Inside one user's session sub-terminal: become that user's agent.
 
     This process already runs with the session's own LAINTAS_HOME and working
-    directory (set by the launcher). What is left is to narrow the agent to
-    the manifest's tools, fix how approvals are decided, and open a bridge
-    that accepts only conversation.
+    directory (set by the launcher). Apply the manifest's agent/terminal
+    definitions and approval mode, then open its authenticated bridge.
     """
     import helpwo_server
     import agent_loop as _al
@@ -21565,15 +21557,22 @@ def _app_session_start_in_process(name: str, options: dict,
         return {"status": "error", "message": "invalid session user"}
     app_host.activate(name, str(options.get("prompt") or ""), builtin=False,
                       session_user=user)
-    requested = {str(item) for item in (options.get("tools") or [])}
-    allowed = sorted(app_host.SESSION_BASE_TOOLS
-                     | (requested & app_host.SESSION_OPTIONAL_TOOLS))
+    manifest, error = app_host.parse_manifest(options.get("manifest") or {
+        "name": name, "session_tools": options.get("tools", []),
+        "auto_approve": bool(options.get("auto_approve")),
+    }, "<session-launch>")
+    if error:
+        return {"status": "error", "message": error}
     primary = get_agent("primary")
     if primary is None:
         return {"status": "error", "message": "no primary agent in the session"}
-    primary.profile.tool_policy = _al.AgentToolPolicy(allowed_tools=allowed)
+    try:
+        rollback = app_host.configure_runtime(manifest, _al, _app_terminal_factory, session=True)
+    except Exception as exc:
+        return {"status": "error", "message": f"session setup failed: {exc}"}
+    allowed = primary.profile.tool_policy.allowed_tools
     agent_registry.app_mode = {
-        "approval": "auto" if options.get("auto_approve") is True else "deny"}
+        "approval": "auto" if manifest.auto_approve else "ask"}
 
     ok, msg = helpwo_server.start_server(
         agent_registry, port=0, session=session,
@@ -21582,6 +21581,7 @@ def _app_session_start_in_process(name: str, options: dict,
         app_profile={"name": f"{name}:{user}",
                      "allowed_kinds": app_host.SESSION_ALLOWED_KINDS})
     if not ok:
+        rollback()
         return {"status": "error", "message": msg}
 
     idle_minutes = int(options.get("idle_minutes") or 0)
@@ -21591,7 +21591,8 @@ def _app_session_start_in_process(name: str, options: dict,
             limit = idle_minutes * 60
             while True:
                 time.sleep(min(30.0, max(1.0, limit / 4)))
-                busy = primary.status in {"queued", "running", "thinking", "waiting"}
+                busy = any(agent.status in {"queued", "running", "thinking", "waiting"}
+                           for agent in _al.get_all_agents())
                 if not busy and helpwo_server.idle_seconds() >= limit:
                     console.print(f"[dim]Idle for {idle_minutes} min — closing session.[/dim]")
                     os.kill(os.getpid(), _signal.SIGTERM)
@@ -21603,7 +21604,7 @@ def _app_session_start_in_process(name: str, options: dict,
     console.print(Panel(
         f"[green]Session of [bold]{escape(name)}[/bold] for user "
         f"[bold]{escape(user)}[/bold][/green]\n"
-        f"Tools: {', '.join(allowed)}\n"
+        f"Tools: {', '.join(allowed) if allowed is not None else 'all'}\n"
         f"Approvals: {agent_registry.app_mode['approval']}",
         title="App session", border_style="green"))
     return {"status": "ready", "mode": "session", "url": helpwo_server.get_url(),
@@ -21751,14 +21752,13 @@ def _cmd_app(parts: list, agent_registry: AgentRegistry) -> None:
             f"Persistence: {manifest.persistence}\n"
             f"Per-user sessions: up to {manifest.max_sessions}, tools "
             f"[bold]{escape(', '.join(manifest.session_tools) or '(none)')}[/bold], "
-            f"approvals [bold]{'AUTO' if manifest.auto_approve else 'refused'}[/bold], "
+            f"approvals [bold]{'AUTO' if manifest.auto_approve else 'interactive'}[/bold], "
             f"idle close {manifest.session_idle_minutes or 'never'} min\n\n"
-            "[dim]The command above runs as you. Each end user the application "
-            "opens a session for gets a sub-terminal and agent of their own, with "
-            "a separate LAINTAS_HOME and folder, billed to your account. Those "
-            "agents run as your OS user: with shell.exec and auto approvals an end "
-            "user can run commands as you — run the CLI in a container or under a "
-            "dedicated account if the users are not trusted.[/dim]",
+            f"Configuration:\n{escape(json.dumps(manifest.raw, ensure_ascii=False, indent=2))}\n\n"
+            "[dim]Trust grants this application's token access to the normal "
+            "file, shell, terminal and agent bridge APIs. App and session agents "
+            "run as your OS user and use your billing account. Trust covers "
+            "start/stop until the manifest changes.[/dim]",
             title="Trust application", border_style="yellow"))
         try:
             answer = input("Trust it? [y/N] ").strip().lower()
@@ -23032,9 +23032,7 @@ def _cmd_told(parts: list) -> bool:
                 console.print(
                     f"[bold]── {escape(scoped_agent_name)} {symbols.BULLET} complete "
                     f"conversation ({len(replayable)} events) ──[/bold]")
-                for message in replayable:
-                    _print_resume_event(message)
-                    console.print()
+                _print_resume_events(replayable)
             return False
         if not _user_msgs:
             console.print("[yellow]No user messages in this session yet.[/yellow]")
@@ -26755,10 +26753,16 @@ def main():
             import updater as _updater_check
             _remote_ver = _updater_check.check_update_available()
             if _remote_ver:
+                # On a git checkout the one-key action would be an offer to
+                # overwrite the working tree, so it says `git pull` instead.
+                _checkout = _updater_check.is_source_checkout()
                 startup_mail.post(
                     "update", f"Update available: v{_remote_ver}",
-                    f"This session is running v{__version__}.",
-                    action="/v update", level="good")
+                    f"This session is running v{__version__}."
+                    + (" This install is a git checkout; update it with "
+                       "`git pull` (/v update will not touch it)."
+                       if _checkout else ""),
+                    action="" if _checkout else "/v update", level="good")
         except Exception:
             pass
     # Wait for a Windows kernel, if this is the Windows build. The kernel
